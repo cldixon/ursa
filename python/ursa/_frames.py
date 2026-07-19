@@ -271,5 +271,11 @@ class NodeFrame(_Frame):
     def to_dicts(self) -> list[dict[str, Any]]:
         return self.collect().to_dicts()
 
+    def sink_parquet(self, path: str, **opts: Any) -> None:
+        self.collect().sink_parquet(path, **opts)
+
+    def sink_csv(self, path: str, **opts: Any) -> None:
+        self.collect().sink_csv(path)
+
     def __repr__(self) -> str:
         return f"<NodeFrame id={self._id_col!r} lazy; {len(self._plan)} step(s)>"

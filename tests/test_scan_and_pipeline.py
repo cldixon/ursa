@@ -110,6 +110,30 @@ def test_composed_pipeline_over_scan_source(tmp_path):
     assert df["id"].to_list() == [0]  # node 0 has the highest in-degree
 
 
+def test_sink_parquet_and_csv_roundtrip(tmp_path):
+    import pyarrow.parquet as pq
+
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    result = ur.degree(edges, direction="out").collect()
+
+    pq_path = tmp_path / "out.parquet"
+    result.sink_parquet(str(pq_path))
+    assert pq.read_table(str(pq_path)).num_rows == 3
+
+    csv_path = tmp_path / "out.csv"
+    result.sink_csv(str(csv_path))
+    assert "degree" in csv_path.read_text().splitlines()[0]
+
+
+def test_nodeframe_sink_collects_then_writes(tmp_path):
+    import pyarrow.parquet as pq
+
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    out = tmp_path / "pipeline.parquet"
+    edges.nodes().with_columns(deg=ur.degree(edges)).sink_parquet(str(out))
+    assert set(pq.read_table(str(out)).column_names) == {"id", "deg"}
+
+
 def test_unsupported_filter_predicate_is_honest():
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
     pipeline = (

@@ -33,6 +33,18 @@ class MaterializedFrame:
         """As a list of row dicts."""
         return self.to_arrow().to_pylist()
 
+    def sink_parquet(self, path: str, **opts: Any) -> None:
+        """Write the result to a Parquet file. ``opts`` pass through to pyarrow."""
+        import pyarrow.parquet as pq
+
+        pq.write_table(self.to_arrow(), path, **opts)
+
+    def sink_csv(self, path: str) -> None:
+        """Write the result to a CSV file."""
+        import pyarrow.csv as pacsv
+
+        pacsv.write_csv(self.to_arrow(), path)
+
     @property
     def columns(self) -> list[str]:
         return self._batch.schema.names
