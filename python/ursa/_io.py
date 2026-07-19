@@ -121,8 +121,33 @@ def _from_inmemory(op: str, data: Any, src, dst, id):
             source=source,
         )
     if id is not None:
-        return NodeFrame(id_col=id, plan=(_PlanStep(op, {"id": id}),))
+        return NodeFrame(
+            id_col=id,
+            plan=(_PlanStep(op, {"id": id}),),
+            source=_node_attr_batch(op, data, id),
+        )
     raise ValueError("provide either src= and dst= (EdgeFrame) or id= (NodeFrame)")
+
+
+def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:  # noqa: A002
+    """The node attribute table as a single pyarrow RecordBatch (id cast to int64).
+
+    Returns None if pyarrow isn't importable — ``collect()`` then surfaces a clear
+    error at execution time rather than at construction.
+    """
+    try:
+        import pyarrow as pa
+
+        tbl = data.to_arrow() if op == "from_polars" else data
+        idx = tbl.schema.get_field_index(id)
+        id_col = tbl.column(id)
+        chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
+        id_arr = pa.concat_arrays(chunks).cast(pa.int64())
+        tbl = tbl.set_column(idx, id, id_arr)
+        batches = tbl.combine_chunks().to_batches()
+        return batches[0] if batches else None
+    except Exception:
+        return None
 
 
 def _extract_edge_arrays(op: str, data: Any, src: str, dst: str) -> tuple[Any, Any] | None:

@@ -90,7 +90,11 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
-    return _run_query(edges, columns, filters, sort, limit)
+    # If this NodeFrame is a node attribute table, its columns join onto the algo
+    # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
+    nodes = getattr(frame, "_attr_table", None)
+    nodes_id = frame.id_col if nodes is not None else None
+    return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id)
 
 
 # --- the one execution entry ------------------------------------------------
@@ -100,9 +104,13 @@ def _run_query(
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None,
     limit: int | None,
+    nodes: Any | None = None,
+    nodes_id: str | None = None,
 ) -> MaterializedFrame:
     src, dst = _require_edges(edges)
-    batch = _native().run_node_query(src, dst, json.dumps(columns), filters, sort, limit)
+    batch = _native().run_node_query(
+        src, dst, json.dumps(columns), filters, sort, limit, nodes, nodes_id
+    )
     return MaterializedFrame(batch)
 
 

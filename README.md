@@ -38,7 +38,7 @@ the parts that prove the design is sound are real and tested end-to-end.
 | **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) kernels. Remaining frontier/BFS kernels are documented stubs. |
 | **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge files. |
 | **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
-| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm *and* a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, over in-memory or `scan_edges` sources. |
+| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, and **node-attribute enrichment** — a `from_arrow`/`from_polars` attribute table with graph metrics joined on by id (`ur.col("attr")` usable in filter/sort). Over in-memory or `scan_edges` sources. |
 
 ```python
 import ursa as ur, pyarrow as pa

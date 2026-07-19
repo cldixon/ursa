@@ -134,6 +134,46 @@ def test_nodeframe_sink_collects_then_writes(tmp_path):
     assert set(pq.read_table(str(out)).column_names) == {"id", "deg"}
 
 
+def test_attribute_frame_enrichment():
+    # A node attribute table (id + region + capacity), enriched with graph metrics
+    # and filtered/sorted on both attribute and computed columns.
+    nodes = ur.from_arrow(
+        pa.table(
+            {
+                "id": [0, 1, 2, 3],
+                "region": ["us", "us", "eu", "eu"],
+                "capacity": [10, 20, 30, 40],
+            }
+        ),
+        id="id",
+    )
+    # hub graph: everyone points at 0
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+
+    df = (
+        nodes.with_columns(indeg=ur.degree(edges, direction="in"))
+        .filter(ur.col("capacity") > 15)  # attribute-column filter
+        .sort("indeg", descending=True)
+    ).collect().to_polars()
+
+    # attributes + computed column both present
+    assert set(df.columns) == {"id", "region", "capacity", "indeg"}
+    # capacity > 15 keeps ids 1,2,3
+    assert set(df["id"].to_list()) == {1, 2, 3}
+    # node 1 (in-degree 1 from 0->1) sorts first
+    assert df["id"].to_list()[0] == 1
+    assert df["region"].to_list()[0] == "us"
+
+
+def test_attribute_frame_preserves_all_node_rows():
+    # A node present in the attribute table but absent from edges keeps its row
+    # (LEFT join), with a null/zero-ish computed value.
+    nodes = ur.from_arrow(pa.table({"id": [0, 1, 99], "tag": ["a", "b", "c"]}), id="id")
+    edges = ur.from_arrow(pa.table({"s": [0], "d": [1]}), src="s", dst="d")
+    df = nodes.with_columns(deg=ur.degree(edges, direction="out")).collect().to_polars()
+    assert set(df["id"].to_list()) == {0, 1, 99}
+
+
 def test_unsupported_filter_predicate_is_honest():
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
     pipeline = (

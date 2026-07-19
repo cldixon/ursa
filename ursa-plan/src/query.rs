@@ -19,7 +19,7 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{col, lit};
 use serde::Deserialize;
 
@@ -106,6 +106,13 @@ fn comparison_expr(c: &Comparison) -> Result<Expr> {
 }
 
 /// Build and execute one graph query as a single DataFusion plan.
+///
+/// The base is a [`GraphAlgorithmNode`] emitting `(id, values...)`. When `nodes`
+/// is supplied (a node **attribute** table with id column `nodes_id`), the
+/// algorithm outputs are LEFT-joined onto it by id — so the result carries the
+/// attribute columns plus the computed columns, and `filter`/`sort` can reference
+/// either. Filters/sort/limit are stock DataFusion `DataFrame` operations.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_node_query(
     src: &Int64Array,
     dst: &Int64Array,
@@ -113,6 +120,8 @@ pub fn execute_node_query(
     filters: &[Comparison],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
+    nodes: Option<RecordBatch>,
+    nodes_id: Option<String>,
 ) -> Result<RecordBatch> {
     let (topology, ids) =
         build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -136,22 +145,9 @@ pub fn execute_node_query(
         }
     }
 
-    // One LogicalPlan: the graph node, then the relational tail as stock nodes.
-    let base = LogicalPlan::Extension(Extension {
+    let graph_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns)),
     });
-    let mut builder = LogicalPlanBuilder::from(base);
-    for f in filters {
-        builder = builder.filter(comparison_expr(f)?)?;
-    }
-    if let Some((column, descending)) = sort {
-        builder = builder.sort(vec![col(&column).sort(!descending, false)])?;
-    }
-    if let Some(n) = limit {
-        builder = builder.limit(0, Some(n))?;
-    }
-    let plan = builder.build()?;
-    let out_schema: SchemaRef = Arc::new(plan.schema().as_arrow().clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -159,7 +155,40 @@ pub fn execute_node_query(
         .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
     runtime.block_on(async move {
         let ctx = graph_session();
-        let df = ctx.execute_logical_plan(plan).await?;
+        let graph_df = ctx.execute_logical_plan(graph_plan).await?;
+
+        // Base frame: either the graph output alone, or a node attribute table
+        // with the graph output left-joined onto it by id.
+        let mut df = match nodes {
+            Some(batch) => {
+                let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
+                let nodes_df = ctx.read_batch(batch)?;
+                // Rename the graph id so the join keys don't collide, then drop it.
+                let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
+                nodes_df
+                    .join(
+                        graph_df,
+                        JoinType::Left,
+                        &[id_col.as_str()],
+                        &["__ursa_gid"],
+                        None,
+                    )?
+                    .drop_columns(&["__ursa_gid"])?
+            }
+            None => graph_df,
+        };
+
+        for f in filters {
+            df = df.filter(comparison_expr(f)?)?;
+        }
+        if let Some((column, descending)) = sort {
+            df = df.sort(vec![col(&column).sort(!descending, false)])?;
+        }
+        if let Some(n) = limit {
+            df = df.limit(0, Some(n))?;
+        }
+
+        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await?;
         concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
     })
@@ -187,6 +216,8 @@ mod tests {
             &[],
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(batch.num_columns(), 2);
@@ -207,6 +238,8 @@ mod tests {
             }],
             Some(("pr".into(), true)),
             Some(1),
+            None,
+            None,
         )
         .unwrap();
         // Only node 0 has in-degree > 0 among the hub set; it also ranks highest.
@@ -229,7 +262,49 @@ mod tests {
             &[],
             None,
             None,
+            None,
+            None,
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn joins_algorithm_output_onto_node_attributes() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let (src, dst) = diamond();
+        // Attribute table: ids 0..3 with a "region" column; note id order differs
+        // from the graph's IdMap order, so the join must realign by id.
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("region", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![3, 2, 1, 0])),
+                Arc::new(StringArray::from(vec!["w", "x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+
+        let batch = execute_node_query(
+            &src,
+            &dst,
+            r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
+            &[],
+            Some(("id".into(), false)),
+            None,
+            Some(nodes),
+            Some("id".into()),
+        )
+        .unwrap();
+
+        // Columns: id, region (attr), indeg (algo)
+        let schema = batch.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(names.contains(&"region"));
+        assert!(names.contains(&"indeg"));
+        assert_eq!(batch.num_rows(), 4);
     }
 }

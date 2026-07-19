@@ -234,25 +234,38 @@ class EdgeFrame(_Frame):
 
 class NodeFrame(_Frame):
     """A frame with a designated ``id`` column. An attribute table for the graph;
-    carries no topology index."""
+    carries no topology index.
 
-    __slots__ = ("_id_col",)
+    ``_source`` holds the in-memory Arrow attribute table (id + attribute columns)
+    for frames built via ``from_arrow``/``from_polars`` with ``id=``; ``collect()``
+    left-joins algorithm outputs onto it by id. NodeFrames derived from
+    ``edges.nodes()`` carry no attributes (``_source is None``).
+    """
+
+    __slots__ = ("_id_col", "_source")
 
     def __init__(
         self,
         id_col: str,
         plan: tuple[_PlanStep, ...] = (),
+        source: Any | None = None,
     ) -> None:
         super().__init__(plan, has_index=False)
         self._id_col = id_col
+        self._source = source
 
     @property
     def id_col(self) -> str:
         """Original column name playing the id role."""
         return self._id_col
 
+    @property
+    def _attr_table(self) -> Any | None:
+        """The in-memory Arrow attribute table, if this frame has one."""
+        return self._source
+
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
-        return NodeFrame(self._id_col, (*self._plan, step))
+        return NodeFrame(self._id_col, (*self._plan, step), source=self._source)
 
     # Composed pipelines (with_columns of graph algorithms + filter/sort/head)
     # execute here. Returns the materialized result rather than another lazy

@@ -19,7 +19,7 @@
 //! - `scan_edges_arrow` — read a Parquet/CSV edge file through a DataFusion scan.
 //! - `_demo_*` — plain-list Python→Rust smoke kernels (no Arrow); kept for tests.
 
-use arrow::array::{make_array, Array, ArrayData, Int64Array};
+use arrow::array::{make_array, Array, ArrayData, Int64Array, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -50,7 +50,8 @@ fn int64_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Int64Array> {
 /// `{name, kind, ...params}`); `filters` are `(column, op, value)` comparisons;
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (src, dst, columns_json, filters, sort=None, limit=None))]
+#[pyo3(signature = (src, dst, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None))]
+#[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
     src: &Bound<'_, PyAny>,
@@ -59,6 +60,8 @@ fn run_node_query(
     filters: Vec<(String, String, f64)>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
+    nodes: Option<Bound<'_, PyAny>>,
+    nodes_id: Option<String>,
 ) -> PyResult<PyObject> {
     let src = int64_from_pyarrow(src)?;
     let dst = int64_from_pyarrow(dst)?;
@@ -67,9 +70,22 @@ fn run_node_query(
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
+    let nodes = match nodes {
+        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        None => None,
+    };
     let batch = py.allow_threads(move || {
-        execute_node_query(&src, &dst, &columns_json, &comparisons, sort, limit)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        execute_node_query(
+            &src,
+            &dst,
+            &columns_json,
+            &comparisons,
+            sort,
+            limit,
+            nodes,
+            nodes_id,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
     batch.to_pyarrow(py)
 }

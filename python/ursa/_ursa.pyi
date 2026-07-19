@@ -17,6 +17,8 @@ def run_node_query(
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None = ...,
     limit: int | None = ...,
+    nodes: Any | None = ...,
+    nodes_id: str | None = ...,
 ) -> Any: ...
 
 # Whole-graph directed edge density (eager scalar).
