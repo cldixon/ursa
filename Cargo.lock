@@ -101,6 +101,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "arrow-string",
+ "pyo3",
 ]
 
 [[package]]
@@ -261,6 +262,9 @@ name = "arrow-schema"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cfaf5e440be44db5413b75b72c2a87c1f8f0627117d110264048f2969b99e9"
+dependencies = [
+ "bitflags 2.13.1",
+]
 
 [[package]]
 name = "arrow-select"
@@ -2632,7 +2636,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "datafusion",
+ "futures",
  "object_store",
+ "tokio",
  "ursa-core",
 ]
 
@@ -2640,8 +2646,10 @@ dependencies = [
 name = "ursa-py"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "pyo3",
  "ursa-core",
+ "ursa-plan",
 ]
 
 [[package]]

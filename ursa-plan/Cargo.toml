@@ -12,3 +12,8 @@ ursa-core = { path = "../ursa-core" }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 object_store = { workspace = true }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

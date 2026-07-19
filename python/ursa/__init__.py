@@ -59,6 +59,7 @@ from ._io import (
     scan_edges,
     scan_nodes,
 )
+from ._result import MaterializedFrame
 
 # --- Graph-level statistics -------------------------------------------------
 from ._stats import avg_path_length, density, describe, diameter
@@ -82,6 +83,7 @@ __version__ = "0.1.0"
 __all__ = [
     "EdgeFrame",
     "Expr",
+    "MaterializedFrame",
     "NodeFrame",
     "avg_path_length",
     "betweenness",
