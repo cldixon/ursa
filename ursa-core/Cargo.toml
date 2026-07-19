@@ -1,0 +1,15 @@
+[package]
+name = "ursa-core"
+description = "Topology index and graph algorithm kernels for Ursa. Pure Rust; no DataFusion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+# criterion micro-benches land here (see benches/ in the v0.1 checklist).

@@ -1,0 +1,23 @@
+[package]
+name = "ursa-py"
+description = "PyO3 bindings for Ursa. Thin: expression/plan builders, collect() orchestration, Arrow FFI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_ursa"
+# cdylib for the Python extension module; rlib so it can be unit-tested in Rust.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ursa-core = { path = "../ursa-core" }
+pyo3 = { workspace = true, features = ["extension-module"] }
+
+# NOTE: ursa-plan (DataFusion) is intentionally NOT a dependency yet. The
+# skeleton proves the Python -> PyO3 -> ursa-core path with real kernels; the
+# DataFusion `collect()` orchestration (via ursa-plan) wires in next, at which
+# point this gains `ursa-plan = { path = "../ursa-plan" }` and the Arrow
+# PyCapsule FFI for zero-copy egress.

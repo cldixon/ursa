@@ -1,0 +1,14 @@
+[package]
+name = "ursa-plan"
+description = "DataFusion extensions for Ursa: custom plan nodes and ExecutionPlans that call ursa-core, plus scan/session plumbing and object_store integration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ursa-core = { path = "../ursa-core" }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+object_store = { workspace = true }

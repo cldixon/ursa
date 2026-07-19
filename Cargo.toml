@@ -1,0 +1,33 @@
+# Ursa — Cargo workspace.
+#
+# Layout mirrors the spec's crate split:
+#   ursa-core  — pure-Rust topology + algorithm kernels (arrow + rayon, NO DataFusion)
+#   ursa-plan  — DataFusion extensions: custom plan nodes + ExecutionPlans -> ursa-core
+#   ursa-py    — PyO3 bindings (thin)
+[workspace]
+resolver = "2"
+members = ["ursa-core", "ursa-plan", "ursa-py"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cldixon/ursa"
+authors = ["Ursa contributors"]
+
+# NOTE: these versions are a *coherence target* for the first full build. arrow,
+# datafusion, object_store and pyo3 are cross-coupled (datafusion re-exports a
+# specific arrow; arrow's `pyarrow` feature pins a specific pyo3). If the first
+# `cargo update` surfaces a conflict, bump the whole set together, not piecemeal.
+[workspace.dependencies]
+arrow = "54"
+rayon = "1.10"
+datafusion = "45"
+object_store = "0.11"
+pyo3 = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

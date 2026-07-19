@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock IS committed: this workspace produces a distributable wheel, so we
+# pin the exact arrow/datafusion/pyo3 resolution for reproducible builds.
+
+# Python / maturin
+__pycache__/
+*.py[cod]
+.venv/
+/dist
+/wheelhouse
+*.so
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
