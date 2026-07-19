@@ -113,19 +113,26 @@ and [uv](https://docs.astral.sh/uv/#installation).
 
 ## Roadmap
 
-The walking skeleton is done and the engine foundation is in place: every
-`collect()` is one DataFusion plan with a custom graph logical node. From here the
-spec fans out on top of that foundation:
+The engine foundation is in place — every `collect()` is one DataFusion plan with
+a custom graph logical node — and several features have fanned out on top of it:
+node-valued algorithms (pagerank, degree, connected_components, triangle_count,
+clustering_coefficient), composed pipelines, `scan_edges` sources, **node-attribute
+enrichment** (in-memory attribute tables joined to algorithm outputs by id), the
+eager `density` stat, and `sink_parquet`/`sink_csv` egress.
 
-1. **Attribute-rich frames** — `scan_nodes` attribute tables joined to algorithm
-   outputs by id; `ur.col("attr")` in `with_columns`/`filter`;
-   `ur.neighbors(edges).agg(...)`; weighted algorithms (`weight=`).
+Next, in rough priority order:
+
+1. **Finish the enrichment story** — `ur.neighbors(edges).agg(...)` (a segmented
+   CSR reduction), `scan_nodes` file-backed attribute tables, and weighted
+   algorithms (`weight=`, using the `edge_ids` permutation already in place).
 2. **Traversals** — `hop` / `shortest_path` / `random_walk` on new frontier/BFS
-   kernels (their own logical nodes with a seed input).
+   kernels (their own logical nodes with a seed input); this also unblocks the
+   `diameter` / `avg_path_length` stats.
 3. **Optimizer rules** — push node-set filters before traversal, fuse
    `neighbors().agg` into a segmented CSR reduction, share one topology build.
-4. **Breadth** — remaining algorithms (closeness, betweenness, louvain, …),
-   `sink_*` egress, object storage (`s3://`), string/UUID node ids, benchmarks.
+4. **Breadth** — remaining algorithms (closeness, betweenness, louvain,
+   label_propagation), `describe`, object storage (`s3://`), string/UUID node ids,
+   caching the topology index on the frame, benchmarks.
 
 ## License
 
