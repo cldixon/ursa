@@ -134,6 +134,26 @@ def test_nodeframe_sink_collects_then_writes(tmp_path):
     assert set(pq.read_table(str(out)).column_names) == {"id", "deg"}
 
 
+def test_standalone_algorithm_composes_as_a_nodeframe():
+    # ur.pagerank(edges) is dual-positioned: a with_columns expression AND a lazy
+    # NodeFrame you can filter/sort/head/collect directly.
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+    df = (
+        ur.pagerank(edges)
+        .filter(ur.col("pagerank") > 0.05)
+        .sort("pagerank", descending=True)
+        .head(2)
+        .collect()
+        .to_polars()
+    )
+    assert df.columns == ["id", "pagerank"]
+    assert len(df) == 2
+    assert df["id"].to_list()[0] == 0  # the hub ranks first
+    # and the same expression still works inside with_columns
+    both = edges.nodes().with_columns(pr=ur.pagerank(edges), deg=ur.degree(edges)).collect()
+    assert set(both.columns) == {"id", "pr", "deg"}
+
+
 def test_attribute_frame_enrichment():
     # A node attribute table (id + region + capacity), enriched with graph metrics
     # and filtered/sorted on both attribute and computed columns.

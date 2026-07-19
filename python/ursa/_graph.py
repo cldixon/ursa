@@ -25,8 +25,62 @@ from ._expr import Expr
 from ._frames import EdgeFrame, NodeFrame, _PlanStep
 
 
-def _graph_expr(verb: str, **params: Any) -> Expr:
-    return Expr("graph", {"verb": verb, **params})
+class GraphExpr(Expr):
+    """A node-valued graph algorithm — the spec's *dual-positioned* kernel.
+
+    Used inside ``with_columns(pr=ur.pagerank(edges))`` it reads as an expression
+    (the column definition). Used standalone it behaves as a lazy ``NodeFrame`` of
+    ``(id, value)``: any frame method promotes it to
+    ``edges.nodes().with_columns(<verb>=self)`` and delegates, so
+    ``ur.pagerank(edges).filter(...).sort(...).collect()`` composes like any frame.
+    """
+
+    def _frame(self) -> NodeFrame:
+        edges = self.payload["edges"]
+        return edges.nodes().with_columns(**{self.payload["verb"]: self})
+
+    def filter(self, predicate: Any) -> NodeFrame:
+        return self._frame().filter(predicate)
+
+    def with_columns(self, **exprs: Any) -> NodeFrame:
+        return self._frame().with_columns(**exprs)
+
+    def select(self, *columns: Any) -> NodeFrame:
+        return self._frame().select(*columns)
+
+    def sort(self, by: Any, *, descending: bool = False) -> NodeFrame:
+        return self._frame().sort(by, descending=descending)
+
+    def head(self, n: int = 10) -> NodeFrame:
+        return self._frame().head(n)
+
+    def distinct(self) -> NodeFrame:
+        return self._frame().distinct()
+
+    def collect(self) -> Any:
+        return self._frame().collect()
+
+    def to_polars(self) -> Any:
+        return self._frame().to_polars()
+
+    def to_arrow(self) -> Any:
+        return self._frame().to_arrow()
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        return self._frame().to_dicts()
+
+    def sink_parquet(self, path: str, **opts: Any) -> None:
+        self._frame().sink_parquet(path, **opts)
+
+    def sink_csv(self, path: str, **opts: Any) -> None:
+        self._frame().sink_csv(path, **opts)
+
+    def explain(self) -> str:
+        return self._frame().explain()
+
+
+def _graph_expr(verb: str, **params: Any) -> GraphExpr:
+    return GraphExpr("graph", {"verb": verb, **params})
 
 
 # --- traversal verbs (frame-valued) ----------------------------------------
@@ -41,8 +95,14 @@ class _NeighborAgg:
     def __init__(self, edges: EdgeFrame, direction: str, from_: Any) -> None:
         self._edges, self._direction, self._from = edges, direction, from_
 
-    def agg(self, expr: Expr) -> Expr:
-        return _graph_expr("neighbors_agg", direction=self._direction, from_=self._from, agg=expr)
+    def agg(self, expr: Expr) -> GraphExpr:
+        return _graph_expr(
+            "neighbors_agg",
+            edges=self._edges,
+            direction=self._direction,
+            from_=self._from,
+            agg=expr,
+        )
 
 
 def neighbors(edges: EdgeFrame, direction: str = "out", from_: Any = None) -> _NeighborAgg:
@@ -50,7 +110,7 @@ def neighbors(edges: EdgeFrame, direction: str = "out", from_: Any = None) -> _N
     return _NeighborAgg(edges, direction, from_)
 
 
-def degree(edges: EdgeFrame, direction: str = "out") -> Expr:
+def degree(edges: EdgeFrame, direction: str = "out") -> GraphExpr:
     """Per-node degree (UInt32). ``direction`` is 'out' | 'in' | 'both'."""
     return _graph_expr("degree", edges=edges, direction=direction)
 
@@ -129,45 +189,47 @@ def pagerank(
     max_iter: int = 30,
     tol: float = 1e-6,
     weight: Expr | None = None,
-) -> Expr:
+) -> GraphExpr:
     """PageRank (pull-based fixpoint)."""
     return _graph_expr(
         "pagerank", edges=edges, damping=damping, max_iter=max_iter, tol=tol, weight=weight
     )
 
 
-def connected_components(edges: EdgeFrame, mode: str = "weak") -> Expr:
+def connected_components(edges: EdgeFrame, mode: str = "weak") -> GraphExpr:
     """Connected components. ``mode='weak'`` for v0.1 (``'strong'`` later)."""
     return _graph_expr("connected_components", edges=edges, mode=mode)
 
 
-def triangle_count(edges: EdgeFrame) -> Expr:
+def triangle_count(edges: EdgeFrame) -> GraphExpr:
     """Per-node triangle count (treats edges as undirected)."""
     return _graph_expr("triangle_count", edges=edges)
 
 
-def clustering_coefficient(edges: EdgeFrame) -> Expr:
+def clustering_coefficient(edges: EdgeFrame) -> GraphExpr:
     """Local clustering coefficient (derived from triangles)."""
     return _graph_expr("clustering_coefficient", edges=edges)
 
 
-def betweenness(edges: EdgeFrame, sample: float | None = None, weight: Expr | None = None) -> Expr:
+def betweenness(
+    edges: EdgeFrame, sample: float | None = None, weight: Expr | None = None
+) -> GraphExpr:
     """Betweenness centrality (Brandes). ``sample=`` approximates; exact is O(nm)."""
     return _graph_expr("betweenness", edges=edges, sample=sample, weight=weight)
 
 
-def closeness(edges: EdgeFrame, weight: Expr | None = None) -> Expr:
+def closeness(edges: EdgeFrame, weight: Expr | None = None) -> GraphExpr:
     """Closeness centrality."""
     return _graph_expr("closeness", edges=edges, weight=weight)
 
 
-def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> Expr:
+def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> GraphExpr:
     """Community detection via label propagation."""
     return _graph_expr("label_propagation", edges=edges, max_iter=max_iter, seed=seed)
 
 
 def louvain(
     edges: EdgeFrame, weight: Expr | None = None, resolution: float = 1.0, seed: int | None = None
-) -> Expr:
+) -> GraphExpr:
     """Community detection via Louvain modularity optimization."""
     return _graph_expr("louvain", edges=edges, weight=weight, resolution=resolution, seed=seed)
