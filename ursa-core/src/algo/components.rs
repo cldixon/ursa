@@ -36,7 +36,11 @@ impl DisjointSet {
             return;
         }
         let (ra_rank, rb_rank) = (self.rank[ra as usize], self.rank[rb as usize]);
-        let (small, big) = if ra_rank < rb_rank { (ra, rb) } else { (rb, ra) };
+        let (small, big) = if ra_rank < rb_rank {
+            (ra, rb)
+        } else {
+            (rb, ra)
+        };
         self.parent[small as usize] = big;
         if ra_rank == rb_rank {
             self.rank[big as usize] += 1;

@@ -20,7 +20,9 @@ pub fn degree(topo: &Topology, dir: Direction) -> Vec<u32> {
         Direction::Both => {
             let out = topo.out();
             let inc = topo.incoming();
-            (0..n as u32).map(|u| out.degree(u) + inc.degree(u)).collect()
+            (0..n as u32)
+                .map(|u| out.degree(u) + inc.degree(u))
+                .collect()
         }
     }
 }

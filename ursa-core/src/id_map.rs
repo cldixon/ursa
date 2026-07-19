@@ -32,7 +32,10 @@ pub struct NullNodeId;
 
 impl std::fmt::Display for NullNodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "null value in src/dst column; set on_null=\"drop\" to skip")
+        write!(
+            f,
+            "null value in src/dst column; set on_null=\"drop\" to skip"
+        )
     }
 }
 
