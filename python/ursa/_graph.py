@@ -52,7 +52,7 @@ def neighbors(edges: EdgeFrame, direction: str = "out", from_: Any = None) -> _N
 
 def degree(edges: EdgeFrame, direction: str = "out") -> Expr:
     """Per-node degree (UInt32). ``direction`` is 'out' | 'in' | 'both'."""
-    return _graph_expr("degree", direction=direction)
+    return _graph_expr("degree", edges=edges, direction=direction)
 
 
 class _Hop:
@@ -131,41 +131,43 @@ def pagerank(
     weight: Expr | None = None,
 ) -> Expr:
     """PageRank (pull-based fixpoint)."""
-    return _graph_expr("pagerank", damping=damping, max_iter=max_iter, tol=tol, weight=weight)
+    return _graph_expr(
+        "pagerank", edges=edges, damping=damping, max_iter=max_iter, tol=tol, weight=weight
+    )
 
 
 def connected_components(edges: EdgeFrame, mode: str = "weak") -> Expr:
     """Connected components. ``mode='weak'`` for v0.1 (``'strong'`` later)."""
-    return _graph_expr("connected_components", mode=mode)
+    return _graph_expr("connected_components", edges=edges, mode=mode)
 
 
 def triangle_count(edges: EdgeFrame) -> Expr:
     """Per-node triangle count (treats edges as undirected)."""
-    return _graph_expr("triangle_count")
+    return _graph_expr("triangle_count", edges=edges)
 
 
 def clustering_coefficient(edges: EdgeFrame) -> Expr:
     """Local clustering coefficient (derived from triangles)."""
-    return _graph_expr("clustering_coefficient")
+    return _graph_expr("clustering_coefficient", edges=edges)
 
 
 def betweenness(edges: EdgeFrame, sample: float | None = None, weight: Expr | None = None) -> Expr:
     """Betweenness centrality (Brandes). ``sample=`` approximates; exact is O(nm)."""
-    return _graph_expr("betweenness", sample=sample, weight=weight)
+    return _graph_expr("betweenness", edges=edges, sample=sample, weight=weight)
 
 
 def closeness(edges: EdgeFrame, weight: Expr | None = None) -> Expr:
     """Closeness centrality."""
-    return _graph_expr("closeness", weight=weight)
+    return _graph_expr("closeness", edges=edges, weight=weight)
 
 
 def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> Expr:
     """Community detection via label propagation."""
-    return _graph_expr("label_propagation", max_iter=max_iter, seed=seed)
+    return _graph_expr("label_propagation", edges=edges, max_iter=max_iter, seed=seed)
 
 
 def louvain(
     edges: EdgeFrame, weight: Expr | None = None, resolution: float = 1.0, seed: int | None = None
 ) -> Expr:
     """Community detection via Louvain modularity optimization."""
-    return _graph_expr("louvain", weight=weight, resolution=resolution, seed=seed)
+    return _graph_expr("louvain", edges=edges, weight=weight, resolution=resolution, seed=seed)

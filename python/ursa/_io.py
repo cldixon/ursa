@@ -12,7 +12,7 @@ performed by the engine at ``collect()``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, overload
 
 from ._frames import EdgeFrame, NodeFrame, _PlanStep
 
@@ -78,6 +78,10 @@ def read_nodes(path: str | list[str], **kwargs: Any) -> NodeFrame:
     return scan_nodes(path, **kwargs).collect()
 
 
+@overload
+def from_polars(df: Any, *, src: str, dst: str) -> EdgeFrame: ...
+@overload
+def from_polars(df: Any, *, id: str) -> NodeFrame: ...
 def from_polars(
     df: Any, *, src: str | None = None, dst: str | None = None, id: str | None = None
 ) -> EdgeFrame | NodeFrame:
@@ -88,6 +92,10 @@ def from_polars(
     return _from_inmemory("from_polars", df, src, dst, id)
 
 
+@overload
+def from_arrow(tbl: Any, *, src: str, dst: str) -> EdgeFrame: ...
+@overload
+def from_arrow(tbl: Any, *, id: str) -> NodeFrame: ...
 def from_arrow(
     tbl: Any, *, src: str | None = None, dst: str | None = None, id: str | None = None
 ) -> EdgeFrame | NodeFrame:
@@ -97,7 +105,34 @@ def from_arrow(
 
 def _from_inmemory(op: str, data: Any, src, dst, id):
     if src is not None and dst is not None:
-        return EdgeFrame(src_col=src, dst_col=dst, plan=(_PlanStep(op, {"src": src, "dst": dst}),))
+        source = _extract_edge_arrays(op, data, src, dst)
+        return EdgeFrame(
+            src_col=src,
+            dst_col=dst,
+            plan=(_PlanStep(op, {"src": src, "dst": dst}),),
+            source=source,
+        )
     if id is not None:
         return NodeFrame(id_col=id, plan=(_PlanStep(op, {"id": id}),))
     raise ValueError("provide either src= and dst= (EdgeFrame) or id= (NodeFrame)")
+
+
+def _extract_edge_arrays(op: str, data: Any, src: str, dst: str) -> tuple[Any, Any] | None:
+    """Pull the src/dst columns out as contiguous int64 pyarrow arrays.
+
+    Returns None (rather than raising) if pyarrow isn't importable or the columns
+    can't be resolved — `collect()` then surfaces a clear error at execution time
+    instead of at construction. Node ids are cast to int64 (the v0.1 node-id type).
+    """
+    try:
+        import pyarrow as pa
+
+        tbl = data.to_arrow() if op == "from_polars" else data
+        arrays = []
+        for name in (src, dst):
+            column = tbl.column(name)
+            chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
+            arrays.append(pa.concat_arrays(chunks).cast(pa.int64()))
+        return (arrays[0], arrays[1])
+    except Exception:
+        return None

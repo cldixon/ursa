@@ -14,10 +14,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ursa-core = { path = "../ursa-core" }
+ursa-plan = { path = "../ursa-plan" }
+# `pyarrow` feature gives zero-copy Arrow interchange with Python (FromPyArrow /
+# ToPyArrow via the C data interface). It pins pyo3, so it must match ours.
+arrow = { workspace = true, features = ["pyarrow"] }
 pyo3 = { workspace = true, features = ["extension-module"] }
-
-# NOTE: ursa-plan (DataFusion) is intentionally NOT a dependency yet. The
-# skeleton proves the Python -> PyO3 -> ursa-core path with real kernels; the
-# DataFusion `collect()` orchestration (via ursa-plan) wires in next, at which
-# point this gains `ursa-plan = { path = "../ursa-plan" }` and the Arrow
-# PyCapsule FFI for zero-copy egress.

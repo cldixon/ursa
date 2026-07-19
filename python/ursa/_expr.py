@@ -119,6 +119,25 @@ class Expr:
     def alias(self, name: str) -> Expr:
         return Expr("alias", {"name": name, "operand": self})
 
+    # -- execution (standalone node-valued graph algorithms) -----------------
+    # A node-valued graph expression (e.g. ur.pagerank(edges)) is directly
+    # collectable in v0.1 — the "standalone NodeFrame spelling" of the kernel.
+    # The expression-in-with_columns spelling composes into a broader plan whose
+    # collect() is still being wired (see ursa._execute for the exact slice).
+    def collect(self) -> Any:
+        """Execute this graph algorithm and return a materialized frame."""
+        from ._execute import collect_graph_expr
+
+        return collect_graph_expr(self)
+
+    def to_polars(self) -> Any:
+        """Execute and return a ``polars.DataFrame`` (zero-copy via Arrow)."""
+        return self.collect().to_polars()
+
+    def to_arrow(self) -> Any:
+        """Execute and return a ``pyarrow.Table`` (zero-copy)."""
+        return self.collect().to_arrow()
+
     def __repr__(self) -> str:  # readable trees in the REPL and explain()
         k = self.kind
         p = self.payload

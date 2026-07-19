@@ -154,7 +154,11 @@ class EdgeFrame(_Frame):
     names are preserved for round-tripping and exposed via ``src_col`` / ``dst_col``.
     """
 
-    __slots__ = ("_dst_col", "_src_col")
+    # `_source` carries the actual in-memory Arrow endpoint arrays for frames
+    # built via `from_arrow`/`from_polars`. In the walking skeleton it is what
+    # lets a node-valued algorithm `.collect()` reach real data; frames from
+    # `scan_*` (file paths) leave it None until the scan is wired into collect().
+    __slots__ = ("_dst_col", "_source", "_src_col")
 
     def __init__(
         self,
@@ -162,10 +166,17 @@ class EdgeFrame(_Frame):
         dst_col: str,
         plan: tuple[_PlanStep, ...] = (),
         has_index: bool = True,
+        source: tuple[Any, Any] | None = None,
     ) -> None:
         super().__init__(plan, has_index)
         self._src_col = src_col
         self._dst_col = dst_col
+        self._source = source
+
+    @property
+    def _edge_arrays(self) -> tuple[Any, Any] | None:
+        """The (src, dst) Arrow arrays if this frame has an in-memory source."""
+        return self._source
 
     @property
     def src_col(self) -> str:
@@ -178,11 +189,14 @@ class EdgeFrame(_Frame):
         return self._dst_col
 
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> EdgeFrame:
+        # A row-changing op invalidates the in-memory source (it no longer
+        # matches the frame); property-only ops keep it.
         return EdgeFrame(
             self._src_col,
             self._dst_col,
             (*self._plan, step),
             has_index=self._has_index and not drops_index,
+            source=None if drops_index else self._source,
         )
 
     def nodes(self) -> NodeFrame:
