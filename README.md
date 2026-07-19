@@ -1,10 +1,11 @@
 # Ursa — Polars-shaped dataframes for graph data
 
-> **Status: v0.1 skeleton.** This repository is the initial scaffold for Ursa, an
-> in-memory, single-machine graph analytics library with a dataframe-first API —
-> what Polars is to tabular data, for graphs. The full design lives in
-> [`docs/SPEC.md`](docs/SPEC.md); this README describes what is *actually built
-> right now* and how the pieces fit.
+> **Status: v0.1 in progress.** An in-memory, single-machine graph analytics
+> library with a dataframe-first API — what Polars is to tabular data, for graphs.
+> The engine foundation is in place: real algorithm kernels, and `collect()`
+> executing as one DataFusion plan with graph ops as first-class logical nodes.
+> The full design lives in [`docs/SPEC.md`](docs/SPEC.md); this README describes
+> what is *actually built right now* and how the pieces fit.
 
 Ursa is a Rust core (Apache Arrow throughout), a DataFusion query engine with
 graph operators as first-class plan nodes, and a fluent, Polars-shaped Python
@@ -23,15 +24,14 @@ top = (
     )
     .sort("pagerank", descending=True)
     .head(20)
-    .collect()          # <- the one piece not yet wired (see Roadmap)
+    .collect()          # runs as one DataFusion plan; results are Arrow
 )
 ```
 
 ## What works today
 
-This is a **skeleton**: the architecture, crate boundaries, type surfaces, and the
-load-bearing seams are all in place, and the parts that prove the design is sound
-are real and tested end-to-end.
+The architecture, crate boundaries, and load-bearing seams are all in place, and
+the parts that prove the design is sound are real and tested end-to-end.
 
 | Layer | State |
 |---|---|
@@ -59,7 +59,6 @@ edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s",
 # ...or straight from a file (Parquet/CSV, projection pushed into the scan):
 ur.pagerank(ur.scan_edges("edges.parquet", src="s", dst="d")).collect().to_polars()
 ```
-```
 
 ## Architecture
 
@@ -67,9 +66,10 @@ ur.pagerank(ur.scan_edges("edges.parquet", src="s", dst="d")).collect().to_polar
 ursa/
 ├── ursa-core/    # Topology (CSR) + algorithm kernels. Pure Rust: arrow + rayon.
 │                 # NO DataFusion dependency. Independently testable.
-├── ursa-plan/    # DataFusion extensions: custom logical nodes, ExecutionPlans
-│                 # (-> ursa-core), optimizer rules, scan/session/object_store.
+├── ursa-plan/    # DataFusion extensions: custom logical node + ExecutionPlan
+│                 # (-> ursa-core), the query builder, scan/session plumbing.
 │                 # The ONE seam where our dialect lowers to DataFusion.
+│                 # (optimizer rules + object_store: future work)
 ├── ursa-py/      # PyO3 bindings. Thin: plan builders, collect(), Arrow FFI.
 └── python/ursa/  # Python package: dialect, frames, IO, graph verbs, stats.
 ```
@@ -80,8 +80,9 @@ takes Arrow columns plus a shared topology index in, and hands Arrow arrays out.
 Why DataFusion (not the Polars crates): extensibility is the designed use case —
 graph ops must be first-class citizens of *one* query plan, not coordinated by a
 "traffic cop" around a closed planner. The accepted cost is that we own a
-Polars-*shaped* expression frontend; it is deliberately quarantined in
-`ursa-plan/src/expr.rs` + `python/ursa/_expr.py` so that cost is one bounded seam.
+Polars-*shaped* expression frontend; it is deliberately quarantined at one seam —
+`python/ursa/_expr.py` builds the dialect, and `ursa-plan/src/query.rs` lowers it
+(today a small JSON column IR + comparison filters) to a DataFusion plan.
 
 ## Develop
 
