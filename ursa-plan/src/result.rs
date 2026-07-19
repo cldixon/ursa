@@ -12,7 +12,8 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
-    connected_components_weak, degree, pagerank, triangle_count, PageRankParams,
+    clustering_coefficient, connected_components_weak, degree, pagerank, triangle_count,
+    PageRankParams,
 };
 use ursa_core::{IdMap, Topology};
 
@@ -29,13 +30,14 @@ pub fn is_executable(algo: &GraphAlgo) -> bool {
             | GraphAlgo::PageRank { .. }
             | GraphAlgo::ConnectedComponents { .. }
             | GraphAlgo::TriangleCount
+            | GraphAlgo::ClusteringCoefficient
     )
 }
 
 /// Arrow value type produced by an algorithm.
 fn value_type(algo: &GraphAlgo) -> DataType {
     match algo {
-        GraphAlgo::PageRank { .. } => DataType::Float64,
+        GraphAlgo::PageRank { .. } | GraphAlgo::ClusteringCoefficient => DataType::Float64,
         _ => DataType::UInt32,
     }
 }
@@ -71,6 +73,9 @@ fn value_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
             Arc::new(UInt32Array::from(connected_components_weak(topo)))
         }
         GraphAlgo::TriangleCount => Arc::new(UInt32Array::from(triangle_count(topo))),
+        GraphAlgo::ClusteringCoefficient => {
+            Arc::new(Float64Array::from(clustering_coefficient(topo)))
+        }
         other => unreachable!("non-executable algorithm reached value_array: {other:?}"),
     }
 }

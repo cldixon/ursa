@@ -27,7 +27,13 @@ if TYPE_CHECKING:
 
 # Algorithms with a kernel wired into the execution path (mirrors
 # ursa_plan::result::is_executable on the Rust side).
-_EXECUTABLE = {"pagerank", "degree", "connected_components", "triangle_count"}
+_EXECUTABLE = {
+    "pagerank",
+    "degree",
+    "connected_components",
+    "triangle_count",
+    "clustering_coefficient",
+}
 
 # Comparison operators supported in filters, with the operator that results from
 # writing the comparison the other way round (literal on the left).

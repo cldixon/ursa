@@ -30,6 +30,7 @@ pub mod query;
 pub mod result;
 pub mod scan;
 pub mod session;
+pub mod stats;
 pub mod topology;
 
 pub use logical::{Direction, GraphAlgo};
@@ -39,4 +40,5 @@ pub use planner::graph_session;
 pub use query::{execute_node_query, Comparison};
 pub use scan::scan_edges_batch;
 pub use session::ursa_session;
+pub use stats::density;
 pub use topology::build_topology;

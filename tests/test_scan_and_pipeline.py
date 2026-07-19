@@ -40,6 +40,31 @@ def test_triangle_count_is_real_now():
     assert counts == {0: 1, 1: 1, 2: 1}
 
 
+def test_clustering_coefficient_collects():
+    # triangle 0-1-2: every node fully clustered -> 1.0
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    cc = {
+        r["id"]: r["clustering_coefficient"]
+        for r in ur.clustering_coefficient(edges).collect().to_dicts()
+    }
+    assert cc == {0: 1.0, 1: 1.0, 2: 1.0}
+
+
+def test_density_eager_scalar():
+    # directed triangle: 3 edges of 6 possible -> 0.5
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
+    d = ur.density(edges)
+    assert isinstance(d, float)
+    assert abs(d - 0.5) < 1e-12
+
+
+def test_density_over_scan_source(tmp_path):
+    path = tmp_path / "edges.csv"
+    path.write_text("s,d\n0,1\n1,2\n2,0\n")
+    edges = ur.scan_edges(str(path), src="s", dst="d")
+    assert abs(ur.density(edges) - 0.5) < 1e-12
+
+
 def test_composed_pipeline_collects():
     # node 0 is a hub everyone points at
     src = [1, 2, 3, 0]

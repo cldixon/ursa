@@ -19,6 +19,9 @@ def run_node_query(
     limit: int | None = ...,
 ) -> Any: ...
 
+# Whole-graph directed edge density (eager scalar).
+def graph_density(src: Any, dst: Any) -> float: ...
+
 # Scan a Parquet/CSV edge file -> (src, dst) pyarrow.RecordBatch.
 def scan_edges_arrow(path: str, src: str, dst: str) -> Any: ...
 

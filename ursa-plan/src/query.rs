@@ -65,6 +65,7 @@ impl ColumnSpec {
             },
             "connected_components" => GraphAlgo::ConnectedComponents { strong: false },
             "triangle_count" => GraphAlgo::TriangleCount,
+            "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "graph algorithm {other:?} is not wired into the execution path"

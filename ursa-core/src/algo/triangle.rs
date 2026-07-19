@@ -36,17 +36,14 @@ fn intersection_count(a: &[u32], b: &[u32]) -> u32 {
     count
 }
 
-/// Per-node triangle count, dense-indexed.
-pub fn triangle_count(topo: &Topology) -> Vec<u32> {
+/// The undirected, sorted, deduplicated adjacency (out ∪ in neighbours, self-loops
+/// dropped). Shared by triangle counting and clustering coefficient — the
+/// undirected degree of node `u` is `adjacency[u].len()`.
+pub(crate) fn undirected_adjacency(topo: &Topology) -> Vec<Vec<u32>> {
     let n = topo.n_nodes();
-    if n == 0 {
-        return Vec::new();
-    }
     let out = topo.out();
     let inc = topo.incoming();
-
-    // Undirected, sorted, deduplicated adjacency (no self-loops).
-    let adj: Vec<Vec<u32>> = (0..n)
+    (0..n)
         .into_par_iter()
         .map(|u| {
             let mut nbrs: Vec<u32> = out
@@ -60,11 +57,12 @@ pub fn triangle_count(topo: &Topology) -> Vec<u32> {
             nbrs.dedup();
             nbrs
         })
-        .collect();
+        .collect()
+}
 
-    // For each node u and each neighbour a, count neighbours of u that are also
-    // neighbours of a and greater than a — counting each triangle once per apex.
-    (0..n)
+/// Per-node triangle count over a prebuilt undirected adjacency.
+pub(crate) fn per_node_triangles(adj: &[Vec<u32>]) -> Vec<u32> {
+    (0..adj.len())
         .into_par_iter()
         .map(|u| {
             let nu = &adj[u];
@@ -77,6 +75,14 @@ pub fn triangle_count(topo: &Topology) -> Vec<u32> {
             count
         })
         .collect()
+}
+
+/// Per-node triangle count, dense-indexed.
+pub fn triangle_count(topo: &Topology) -> Vec<u32> {
+    if topo.n_nodes() == 0 {
+        return Vec::new();
+    }
+    per_node_triangles(&undirected_adjacency(topo))
 }
 
 #[cfg(test)]
