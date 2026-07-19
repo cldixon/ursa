@@ -12,9 +12,12 @@ performed by the engine at ``collect()``.
 
 from __future__ import annotations
 
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
 from ._frames import EdgeFrame, NodeFrame, _PlanStep
+
+if TYPE_CHECKING:
+    from ._result import MaterializedFrame
 
 
 def scan_edges(
@@ -43,7 +46,12 @@ def scan_edges(
             "format_opts": format_opts,
         },
     )
-    return EdgeFrame(src_col=src, dst_col=dst, plan=(step,))
+    return EdgeFrame(
+        src_col=src,
+        dst_col=dst,
+        plan=(step,),
+        scan={"path": path, "src": src, "dst": dst},
+    )
 
 
 def scan_nodes(
@@ -73,7 +81,7 @@ def read_edges(path: str | list[str], **kwargs: Any) -> EdgeFrame:
     return scan_edges(path, **kwargs).collect()
 
 
-def read_nodes(path: str | list[str], **kwargs: Any) -> NodeFrame:
+def read_nodes(path: str | list[str], **kwargs: Any) -> MaterializedFrame:
     """Eager convenience: ``scan_nodes(...).collect()``."""
     return scan_nodes(path, **kwargs).collect()
 

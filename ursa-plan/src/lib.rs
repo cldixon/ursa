@@ -24,11 +24,15 @@
 pub mod expr;
 pub mod logical;
 pub mod physical;
+pub mod relational;
 pub mod result;
+pub mod scan;
 pub mod session;
 pub mod topology;
 
 pub use logical::{Direction, GraphAlgo};
 pub use physical::{run_algorithm, GraphAlgorithmExec};
+pub use relational::{apply_relational, Comparison};
+pub use scan::scan_edges_batch;
 pub use session::ursa_session;
 pub use topology::build_topology;

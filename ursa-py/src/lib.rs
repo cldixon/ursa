@@ -20,7 +20,7 @@
 //! path calls these. The older `_demo_*` functions (plain lists, no Arrow) remain
 //! for the pure Python→Rust smoke tests.
 
-use arrow::array::{make_array, Array, ArrayData, Int64Array};
+use arrow::array::{make_array, Array, ArrayData, Int64Array, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -28,7 +28,9 @@ use pyo3::prelude::*;
 use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
 use ursa_core::topology::{Direction as CoreDirection, Topology};
 use ursa_plan::logical::Direction;
-use ursa_plan::{build_topology, run_algorithm, GraphAlgo};
+use ursa_plan::{
+    apply_relational, build_topology, run_algorithm, scan_edges_batch, Comparison, GraphAlgo,
+};
 
 // ---------------------------------------------------------------------------
 // Real execution path: pyarrow in → DataFusion ExecutionPlan → pyarrow out.
@@ -127,6 +129,40 @@ fn run_triangle_count(
     run_to_pyarrow(py, src, dst, GraphAlgo::TriangleCount)
 }
 
+/// Read a Parquet/CSV edge file's `src`/`dst` columns through a DataFusion scan
+/// and hand them back as a two-column `(src, dst)` pyarrow `RecordBatch`.
+#[pyfunction]
+fn scan_edges_arrow(py: Python<'_>, path: &str, src: &str, dst: &str) -> PyResult<PyObject> {
+    let batch = py.allow_threads(|| {
+        scan_edges_batch(path, src, dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
+}
+
+/// Apply a composed pipeline's relational tail (filter/sort/limit) to an assembled
+/// `(id, value...)` pyarrow `RecordBatch` via DataFusion. `filters` is a list of
+/// `(column, op, value)`; `sort` is `(column, descending)`.
+#[pyfunction]
+#[pyo3(signature = (batch, filters, sort=None, limit=None))]
+fn run_relational(
+    py: Python<'_>,
+    batch: &Bound<'_, PyAny>,
+    filters: Vec<(String, String, f64)>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+) -> PyResult<PyObject> {
+    let batch = RecordBatch::from_pyarrow_bound(batch)?;
+    let comparisons: Vec<Comparison> = filters
+        .into_iter()
+        .map(|(column, op, value)| Comparison { column, op, value })
+        .collect();
+    let out = py.allow_threads(move || {
+        apply_relational(batch, &comparisons, sort, limit)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    out.to_pyarrow(py)
+}
+
 fn parse_direction(direction: &str) -> PyResult<Direction> {
     match direction {
         "out" => Ok(Direction::Out),
@@ -218,6 +254,8 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_degree, m)?)?;
     m.add_function(wrap_pyfunction!(run_connected_components, m)?)?;
     m.add_function(wrap_pyfunction!(run_triangle_count, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(run_relational, m)?)?;
     // demo path
     m.add_function(wrap_pyfunction!(_demo_pagerank, m)?)?;
     m.add_function(wrap_pyfunction!(_demo_degree, m)?)?;

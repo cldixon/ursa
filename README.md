@@ -35,16 +35,30 @@ are real and tested end-to-end.
 
 | Layer | State |
 |---|---|
-| **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) kernels. `triangle_count` + frontier/BFS are documented stubs. |
-| **`ursa-py`** — PyO3 bindings | ✅ **Builds & wired.** A `ursa.demo` namespace runs the real kernels over in-memory edge lists — the full Python → PyO3 → Rust path, GIL released during compute. |
-| **Python dialect** (`ur.col`, `ur.pagerank`, …) | ✅ **Live.** The Polars-shaped expression tree and lazy `EdgeFrame`/`NodeFrame` plan-builder (role mapping, index-preservation contract, `.explain()`) are pure-Python and tested. |
-| **`ursa-plan`** — DataFusion extensions | 🚧 **Scaffolded.** Module structure, the custom logical-node params, and the *single* expression-lowering seam are laid out with documented `TODO`s. Implementing `collect()` (one kernel as a real `ExecutionPlan`) is the next step. |
+| **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` (sorted-adjacency intersection) kernels. Remaining frontier/BFS kernels are documented stubs. |
+| **`ursa-plan`** — DataFusion engine | ✅ **Executing.** `GraphAlgorithmExec` runs node-valued kernels as a real pipeline-breaking `ExecutionPlan`; a DataFusion scan reads Parquet/CSV edge files; a DataFusion `DataFrame` runs the `filter`/`sort`/`limit` tail of composed pipelines. |
+| **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
+| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm *and* a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, over in-memory or `scan_edges` sources. |
 
 ```python
-# The native path is real today via the demo namespace:
-from ursa import demo
-demo.pagerank([0, 0, 1, 2], [1, 2, 2, 0])      # -> [(0, 0.29…), (1, 0.13…), (2, 0.57…)]
-demo.degree([0, 0, 1, 2], [1, 2, 2, 0], direction="in")
+import ursa as ur, pyarrow as pa
+
+edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+
+# Composed pipeline — runs through DataFusion end to end:
+(
+    edges.nodes()
+    .with_columns(pr=ur.pagerank(edges), indeg=ur.degree(edges, direction="in"))
+    .filter(ur.col("indeg") > 0)
+    .sort("pr", descending=True)
+    .head(10)
+    .collect()
+    .to_polars()
+)
+
+# ...or straight from a file (Parquet/CSV, projection pushed into the scan):
+ur.pagerank(ur.scan_edges("edges.parquet", src="s", dst="d")).collect().to_polars()
+```
 ```
 
 ## Architecture

@@ -56,7 +56,9 @@ def test_nodes_derives_a_nodeframe():
     assert isinstance(nodes, ur.NodeFrame)
 
 
-def test_pipeline_builds_plan_but_collect_is_not_yet_wired():
+def test_composed_pipeline_builds_lazy_plan():
+    # Pure-Python structural check: a composed pipeline composes into a lazy
+    # NodeFrame plan (execution is covered in tests/test_scan_and_pipeline.py).
     edges = ur.scan_edges("g.parquet", src="a", dst="b")
     nodes = (
         edges.nodes()
@@ -67,11 +69,6 @@ def test_pipeline_builds_plan_but_collect_is_not_yet_wired():
         .sort("pr", descending=True)
         .head(20)
     )
-    # plan composes; collect() raises a clear "engine not wired yet" error.
     assert isinstance(nodes, ur.NodeFrame)
-    try:
-        nodes.collect()
-    except NotImplementedError as exc:
-        assert "DataFusion" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("collect() should not be implemented yet")
+    ops = [step.op for step in nodes._plan]
+    assert ops == ["scan_edges", "nodes", "with_columns", "sort", "head"]

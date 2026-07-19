@@ -60,10 +60,10 @@ def test_to_polars_egress():
     assert abs(df["pagerank"].sum() - 1.0) < 1e-6
 
 
-def test_collect_without_inmemory_source_errors_clearly():
-    # A scan_* source has no in-memory arrays yet; collect() should say so.
-    edges = ur.scan_edges("nonexistent.parquet", src="a", dst="b")
-    with pytest.raises(NotImplementedError, match="in-memory edges"):
+def test_collect_over_unsupported_scan_format_errors_clearly():
+    # scan_edges resolves .parquet/.csv; an unsupported extension errors clearly.
+    edges = ur.scan_edges("edges.json", src="a", dst="b")
+    with pytest.raises(RuntimeError, match="supports"):
         ur.pagerank(edges).collect()
 
 
