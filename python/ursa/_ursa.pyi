@@ -28,13 +28,6 @@ def _demo_pagerank(
     max_iter: int = ...,
     tol: float = ...,
 ) -> list[tuple[int, float]]: ...
-def _demo_pagerank(
-    src: list[int],
-    dst: list[int],
-    damping: float = ...,
-    max_iter: int = ...,
-    tol: float = ...,
-) -> list[tuple[int, float]]: ...
 def _demo_degree(
     src: list[int],
     dst: list[int],
