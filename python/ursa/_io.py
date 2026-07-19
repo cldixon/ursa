@@ -129,7 +129,7 @@ def _from_inmemory(op: str, data: Any, src, dst, id):
     raise ValueError("provide either src= and dst= (EdgeFrame) or id= (NodeFrame)")
 
 
-def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:  # noqa: A002
+def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:
     """The node attribute table as a single pyarrow RecordBatch (id cast to int64).
 
     Returns None if pyarrow isn't importable — ``collect()`` then surfaces a clear

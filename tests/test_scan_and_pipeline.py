@@ -151,10 +151,14 @@ def test_attribute_frame_enrichment():
     edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
 
     df = (
-        nodes.with_columns(indeg=ur.degree(edges, direction="in"))
-        .filter(ur.col("capacity") > 15)  # attribute-column filter
-        .sort("indeg", descending=True)
-    ).collect().to_polars()
+        (
+            nodes.with_columns(indeg=ur.degree(edges, direction="in"))
+            .filter(ur.col("capacity") > 15)  # attribute-column filter
+            .sort("indeg", descending=True)
+        )
+        .collect()
+        .to_polars()
+    )
 
     # attributes + computed column both present
     assert set(df.columns) == {"id", "region", "capacity", "indeg"}
