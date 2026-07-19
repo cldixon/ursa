@@ -2632,7 +2632,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "datafusion",
+ "futures",
  "object_store",
+ "tokio",
  "ursa-core",
 ]
 
