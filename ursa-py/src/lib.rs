@@ -1,37 +1,35 @@
 //! # ursa-py
 //!
-//! PyO3 bindings for Ursa. This crate is deliberately *thin*: its job is to build
-//! plans, orchestrate `collect()`, and move Arrow across the FFI boundary
-//! (zero-copy, via the Arrow PyCapsule / C data interface). Compute lives in
-//! `ursa-core`; planning and execution live in `ursa-plan`.
+//! PyO3 bindings for Ursa. This crate is deliberately *thin*: it moves Arrow
+//! across the FFI boundary (zero-copy, via the PyCapsule / C data interface) and
+//! calls into `ursa-plan`, which builds and executes one DataFusion plan.
 //!
 //! ## Two rules this layer enforces (spec §Runtime integration)
 //!
-//! 1. **Release the GIL** for the duration of execution (`py.allow_threads`) so
-//!    Ursa behaves inside threaded Python servers.
+//! 1. **Release the GIL** for the duration of execution (`py.allow_threads`).
 //! 2. **Arrow FFI via the PyCapsule interface** for zero-copy exchange with
-//!    polars/pyarrow — both ingress (`FromPyArrow`) and egress (`ToPyArrow`).
+//!    polars/pyarrow — ingress (`FromPyArrow`) and egress (`ToPyArrow`).
 //!
-//! ## Status: walking skeleton
+//! ## Surface
 //!
-//! `run_*` execute the node-valued kernels end-to-end through a real DataFusion
-//! `ExecutionPlan` (`ursa_plan::GraphAlgorithmExec`): pyarrow edge arrays in →
-//! `Arc<Topology>` → kernel → pyarrow `RecordBatch` out. The Python `collect()`
-//! path calls these. The older `_demo_*` functions (plain lists, no Arrow) remain
-//! for the pure Python→Rust smoke tests.
+//! - `run_node_query` — the one execution entry point: pyarrow edge arrays plus a
+//!   JSON column IR and a relational tail (filter/sort/limit) in, one pyarrow
+//!   `RecordBatch` out. Both `ur.pagerank(edges).collect()` and composed
+//!   `with_columns(...)` pipelines funnel through it.
+//! - `scan_edges_arrow` — read a Parquet/CSV edge file through a DataFusion scan.
+//! - `_demo_*` — plain-list Python→Rust smoke kernels (no Arrow); kept for tests.
 
-use arrow::array::{make_array, Array, ArrayData, Int64Array};
+use arrow::array::{make_array, Array, ArrayData, Int64Array, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
 use ursa_core::topology::{Direction as CoreDirection, Topology};
-use ursa_plan::logical::Direction;
-use ursa_plan::{build_topology, run_algorithm, GraphAlgo};
+use ursa_plan::{density, execute_node_query, scan_edges_batch, Comparison};
 
 // ---------------------------------------------------------------------------
-// Real execution path: pyarrow in → DataFusion ExecutionPlan → pyarrow out.
+// Real execution path: pyarrow in -> one DataFusion plan -> pyarrow out.
 // ---------------------------------------------------------------------------
 
 /// Read a pyarrow array into an `Int64Array`, erroring if it is not int64.
@@ -46,100 +44,74 @@ fn int64_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Int64Array> {
         })
 }
 
-/// Run a node-valued algorithm and hand the `(id, value)` batch back as a
-/// zero-copy pyarrow `RecordBatch`. The GIL is released across build + compute.
-fn run_to_pyarrow(
+/// Execute a graph query and return its `(id, values...)` batch as pyarrow.
+///
+/// `columns_json` is the query's output-column IR (a JSON list of
+/// `{name, kind, ...params}`); `filters` are `(column, op, value)` comparisons;
+/// `sort` is `(column, descending)`. The GIL is released across build + compute.
+#[pyfunction]
+#[pyo3(signature = (src, dst, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None))]
+#[allow(clippy::too_many_arguments)]
+fn run_node_query(
     py: Python<'_>,
     src: &Bound<'_, PyAny>,
     dst: &Bound<'_, PyAny>,
-    algo: GraphAlgo,
+    columns_json: &str,
+    filters: Vec<(String, String, f64)>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    nodes: Option<Bound<'_, PyAny>>,
+    nodes_id: Option<String>,
 ) -> PyResult<PyObject> {
     let src = int64_from_pyarrow(src)?;
     let dst = int64_from_pyarrow(dst)?;
+    let columns_json = columns_json.to_string();
+    let comparisons: Vec<Comparison> = filters
+        .into_iter()
+        .map(|(column, op, value)| Comparison { column, op, value })
+        .collect();
+    let nodes = match nodes {
+        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        None => None,
+    };
     let batch = py.allow_threads(move || {
-        let (topo, ids) =
-            build_topology(&src, &dst).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        run_algorithm(topo, ids, algo).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        execute_node_query(
+            &src,
+            &dst,
+            &columns_json,
+            &comparisons,
+            sort,
+            limit,
+            nodes,
+            nodes_id,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
     batch.to_pyarrow(py)
 }
 
+/// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
-#[pyo3(signature = (src, dst, damping=0.85, max_iter=30, tol=1e-6))]
-fn run_pagerank(
-    py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
-    damping: f64,
-    max_iter: u32,
-    tol: f64,
-) -> PyResult<PyObject> {
-    run_to_pyarrow(
-        py,
-        src,
-        dst,
-        GraphAlgo::PageRank {
-            damping,
-            max_iter,
-            tol,
-        },
-    )
+fn graph_density(py: Python<'_>, src: &Bound<'_, PyAny>, dst: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    py.allow_threads(move || {
+        density(&src, &dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
+/// Read a Parquet/CSV edge file's `src`/`dst` columns through a DataFusion scan
+/// and hand them back as a two-column `(src, dst)` pyarrow `RecordBatch`.
 #[pyfunction]
-#[pyo3(signature = (src, dst, direction="out"))]
-fn run_degree(
-    py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
-    direction: &str,
-) -> PyResult<PyObject> {
-    run_to_pyarrow(
-        py,
-        src,
-        dst,
-        GraphAlgo::Degree {
-            direction: parse_direction(direction)?,
-        },
-    )
-}
-
-#[pyfunction]
-fn run_connected_components(
-    py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
-) -> PyResult<PyObject> {
-    run_to_pyarrow(
-        py,
-        src,
-        dst,
-        GraphAlgo::ConnectedComponents { strong: false },
-    )
-}
-
-#[pyfunction]
-fn run_triangle_count(
-    py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
-) -> PyResult<PyObject> {
-    run_to_pyarrow(py, src, dst, GraphAlgo::TriangleCount)
-}
-
-fn parse_direction(direction: &str) -> PyResult<Direction> {
-    match direction {
-        "out" => Ok(Direction::Out),
-        "in" => Ok(Direction::In),
-        "both" => Ok(Direction::Both),
-        other => Err(PyValueError::new_err(format!(
-            "direction must be 'out', 'in', or 'both'; got {other:?}"
-        ))),
-    }
+fn scan_edges_arrow(py: Python<'_>, path: &str, src: &str, dst: &str) -> PyResult<PyObject> {
+    let batch = py.allow_threads(|| {
+        scan_edges_batch(path, src, dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
 }
 
 // ---------------------------------------------------------------------------
-// Demo kernels (plain lists, no Arrow) — the pure Python→PyO3→ursa-core proof.
+// Demo kernels (plain lists, no Arrow) — the pure Python->PyO3->ursa-core proof.
 // ---------------------------------------------------------------------------
 
 fn build_demo_topology(src: &[i64], dst: &[i64]) -> (Topology, Vec<i64>) {
@@ -214,10 +186,9 @@ fn _demo_connected_components(src: Vec<i64>, dst: Vec<i64>) -> Vec<(i64, u32)> {
 fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(__core_version, m)?)?;
     // real execution path
-    m.add_function(wrap_pyfunction!(run_pagerank, m)?)?;
-    m.add_function(wrap_pyfunction!(run_degree, m)?)?;
-    m.add_function(wrap_pyfunction!(run_connected_components, m)?)?;
-    m.add_function(wrap_pyfunction!(run_triangle_count, m)?)?;
+    m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_density, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
     // demo path
     m.add_function(wrap_pyfunction!(_demo_pagerank, m)?)?;
     m.add_function(wrap_pyfunction!(_demo_degree, m)?)?;

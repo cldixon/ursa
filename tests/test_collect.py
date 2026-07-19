@@ -45,7 +45,8 @@ def test_connected_components_collect():
     tbl = pa.table({"s": pa.array([0, 1, 3], pa.int64()), "d": pa.array([1, 2, 4], pa.int64())})
     edges = ur.from_arrow(tbl, src="s", dst="d")
     rows = ur.connected_components(edges).collect().to_dicts()
-    label = {r["id"]: r["component"] for r in rows}
+    # standalone columns are named after the algorithm (verb == column name)
+    label = {r["id"]: r["connected_components"] for r in rows}
     assert label[0] == label[1] == label[2]
     assert label[3] == label[4]
     assert label[0] != label[3]
@@ -60,10 +61,10 @@ def test_to_polars_egress():
     assert abs(df["pagerank"].sum() - 1.0) < 1e-6
 
 
-def test_collect_without_inmemory_source_errors_clearly():
-    # A scan_* source has no in-memory arrays yet; collect() should say so.
-    edges = ur.scan_edges("nonexistent.parquet", src="a", dst="b")
-    with pytest.raises(NotImplementedError, match="in-memory edges"):
+def test_collect_over_unsupported_scan_format_errors_clearly():
+    # scan_edges resolves .parquet/.csv; an unsupported extension errors clearly.
+    edges = ur.scan_edges("edges.json", src="a", dst="b")
+    with pytest.raises(RuntimeError, match="supports"):
         ur.pagerank(edges).collect()
 
 

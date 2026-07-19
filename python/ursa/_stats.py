@@ -23,8 +23,16 @@ def describe(edges: EdgeFrame, full: bool = False) -> NodeFrame:
 
 
 def density(edges: EdgeFrame) -> float:
-    """Edge density (eager; plain float)."""
-    raise NotImplementedError(f"density() {_ENGINE_TODO}")
+    """Directed edge density (eager; plain float).
+
+    ``m / (n * (n - 1))`` — edges present over edges possible (self-loops
+    excluded). Multiplicity counts as given; call ``.distinct()`` first for the
+    simple-graph value.
+    """
+    from ._execute import _native, _require_edges
+
+    src, dst = _require_edges(edges)
+    return float(_native().graph_density(src, dst))
 
 
 def avg_path_length(edges: EdgeFrame, sample: float | None = None) -> float:

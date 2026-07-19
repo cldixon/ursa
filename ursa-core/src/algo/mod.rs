@@ -16,11 +16,13 @@
 //! Every kernel takes a `&Topology` and returns dense, `u32`-indexed results;
 //! translation back to user ids happens at the Arrow boundary in `ursa-plan`.
 
+mod clustering;
 mod components;
 mod degree;
 mod pagerank;
 mod triangle;
 
+pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
 pub use degree::degree;
 pub use pagerank::{pagerank, PageRankParams};

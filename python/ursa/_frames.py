@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     # typing.Self is 3.11+; typing_extensions backports it for our 3.10 floor.
     from typing_extensions import Self
 
+    from ._result import MaterializedFrame
+
 _ENGINE_TODO = (
     "requires the DataFusion execution engine (ursa-plan), not yet wired in this "
     "skeleton. The topology index + kernels (ursa-core) and the plan builder "
@@ -155,10 +157,10 @@ class EdgeFrame(_Frame):
     """
 
     # `_source` carries the actual in-memory Arrow endpoint arrays for frames
-    # built via `from_arrow`/`from_polars`. In the walking skeleton it is what
-    # lets a node-valued algorithm `.collect()` reach real data; frames from
-    # `scan_*` (file paths) leave it None until the scan is wired into collect().
-    __slots__ = ("_dst_col", "_source", "_src_col")
+    # built via `from_arrow`/`from_polars`. `_scan` carries a file-source spec
+    # ({path, src, dst}) for frames built via `scan_edges`; `collect()` resolves
+    # it through a DataFusion scan. A frame has at most one of them.
+    __slots__ = ("_dst_col", "_scan", "_source", "_src_col")
 
     def __init__(
         self,
@@ -167,16 +169,23 @@ class EdgeFrame(_Frame):
         plan: tuple[_PlanStep, ...] = (),
         has_index: bool = True,
         source: tuple[Any, Any] | None = None,
+        scan: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(plan, has_index)
         self._src_col = src_col
         self._dst_col = dst_col
         self._source = source
+        self._scan = scan
 
     @property
     def _edge_arrays(self) -> tuple[Any, Any] | None:
         """The (src, dst) Arrow arrays if this frame has an in-memory source."""
         return self._source
+
+    @property
+    def _scan_spec(self) -> dict[str, Any] | None:
+        """The file-source spec if this frame was built via ``scan_edges``."""
+        return self._scan
 
     @property
     def src_col(self) -> str:
@@ -189,14 +198,15 @@ class EdgeFrame(_Frame):
         return self._dst_col
 
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> EdgeFrame:
-        # A row-changing op invalidates the in-memory source (it no longer
-        # matches the frame); property-only ops keep it.
+        # A row-changing op invalidates the in-memory source / scan spec (they no
+        # longer match the frame); property-only ops keep them.
         return EdgeFrame(
             self._src_col,
             self._dst_col,
             (*self._plan, step),
             has_index=self._has_index and not drops_index,
             source=None if drops_index else self._source,
+            scan=None if drops_index else self._scan,
         )
 
     def nodes(self) -> NodeFrame:
@@ -224,25 +234,61 @@ class EdgeFrame(_Frame):
 
 class NodeFrame(_Frame):
     """A frame with a designated ``id`` column. An attribute table for the graph;
-    carries no topology index."""
+    carries no topology index.
 
-    __slots__ = ("_id_col",)
+    ``_source`` holds the in-memory Arrow attribute table (id + attribute columns)
+    for frames built via ``from_arrow``/``from_polars`` with ``id=``; ``collect()``
+    left-joins algorithm outputs onto it by id. NodeFrames derived from
+    ``edges.nodes()`` carry no attributes (``_source is None``).
+    """
+
+    __slots__ = ("_id_col", "_source")
 
     def __init__(
         self,
         id_col: str,
         plan: tuple[_PlanStep, ...] = (),
+        source: Any | None = None,
     ) -> None:
         super().__init__(plan, has_index=False)
         self._id_col = id_col
+        self._source = source
 
     @property
     def id_col(self) -> str:
         """Original column name playing the id role."""
         return self._id_col
 
+    @property
+    def _attr_table(self) -> Any | None:
+        """The in-memory Arrow attribute table, if this frame has one."""
+        return self._source
+
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
-        return NodeFrame(self._id_col, (*self._plan, step))
+        return NodeFrame(self._id_col, (*self._plan, step), source=self._source)
+
+    # Composed pipelines (with_columns of graph algorithms + filter/sort/head)
+    # execute here. Returns the materialized result rather than another lazy
+    # frame, so the override signature intentionally differs from the base.
+    def collect(self) -> MaterializedFrame:  # ty: ignore[invalid-method-override]
+        from ._execute import collect_node_frame
+
+        return collect_node_frame(self)
+
+    def to_polars(self) -> Any:
+        return self.collect().to_polars()
+
+    def to_arrow(self) -> Any:
+        return self.collect().to_arrow()
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        return self.collect().to_dicts()
+
+    def sink_parquet(self, path: str, **opts: Any) -> None:
+        self.collect().sink_parquet(path, **opts)
+
+    def sink_csv(self, path: str, **opts: Any) -> None:
+        self.collect().sink_csv(path)
 
     def __repr__(self) -> str:
         return f"<NodeFrame id={self._id_col!r} lazy; {len(self._plan)} step(s)>"
