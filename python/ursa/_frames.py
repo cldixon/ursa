@@ -16,7 +16,11 @@ metadata are modelled here so the shape is exercisable now.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # typing.Self is 3.11+; typing_extensions backports it for our 3.10 floor.
+    from typing_extensions import Self
 
 _ENGINE_TODO = (
     "requires the DataFusion execution engine (ursa-plan), not yet wired in this "
@@ -45,54 +49,56 @@ class _Frame:
     it, row-changing ops drop it (rebuilt lazily on the next graph op).
     """
 
-    __slots__ = ("_plan", "_has_index")
+    __slots__ = ("_has_index", "_plan")
 
     def __init__(self, plan: tuple[_PlanStep, ...], has_index: bool) -> None:
         self._plan = plan
         self._has_index = has_index
 
     # -- internal helpers ----------------------------------------------------
-    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> "_Frame":
+    # Chainable verbs return `Self`, so `EdgeFrame.filter(...)` stays an
+    # `EdgeFrame` (and NodeFrame a NodeFrame) through a whole pipeline.
+    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> Self:
         new = self.__class__.__new__(self.__class__)
         _Frame.__init__(
             new,
-            self._plan + (step,),
+            (*self._plan, step),
             has_index=self._has_index and not drops_index,
         )
         return new
 
     # -- relational verbs (property-preserving unless noted) -----------------
-    def filter(self, predicate: Any) -> "_Frame":
+    def filter(self, predicate: Any) -> Self:
         # Row-changing on an EdgeFrame => drops the topology index (rebuilt lazily).
         return self._extend(_PlanStep("filter", {"predicate": predicate}), drops_index=True)
 
-    def select(self, *columns: Any) -> "_Frame":
+    def select(self, *columns: Any) -> Self:
         return self._extend(_PlanStep("select", {"columns": columns}))
 
-    def with_columns(self, **exprs: Any) -> "_Frame":
+    def with_columns(self, **exprs: Any) -> Self:
         return self._extend(_PlanStep("with_columns", {"exprs": exprs}))
 
-    def rename(self, mapping: dict[str, str]) -> "_Frame":
+    def rename(self, mapping: dict[str, str]) -> Self:
         return self._extend(_PlanStep("rename", {"mapping": mapping}))
 
-    def sort(self, by: Any, *, descending: bool = False) -> "_Frame":
+    def sort(self, by: Any, *, descending: bool = False) -> Self:
         return self._extend(_PlanStep("sort", {"by": by, "descending": descending}))
 
-    def head(self, n: int = 10) -> "_Frame":
+    def head(self, n: int = 10) -> Self:
         return self._extend(_PlanStep("head", {"n": n}))
 
     limit = head
 
-    def sample(self, n: int, *, seed: int | None = None) -> "_Frame":
+    def sample(self, n: int, *, seed: int | None = None) -> Self:
         return self._extend(_PlanStep("sample", {"n": n, "seed": seed}))
 
-    def distinct(self) -> "_Frame":
+    def distinct(self) -> Self:
         return self._extend(_PlanStep("distinct", {}), drops_index=True)
 
-    def group_by(self, *keys: Any) -> "_GroupBy":
+    def group_by(self, *keys: Any) -> _GroupBy:
         return _GroupBy(self, keys)
 
-    def join(self, other: "_Frame", *, on: Any = None, how: str = "inner") -> "_Frame":
+    def join(self, other: _Frame, *, on: Any = None, how: str = "inner") -> Self:
         return self._extend(_PlanStep("join", {"on": on, "how": how}))
 
     # -- inspection ----------------------------------------------------------
@@ -105,7 +111,7 @@ class _Frame:
         raise NotImplementedError(f"schema() {_ENGINE_TODO}")
 
     # -- materialization / egress (engine required) --------------------------
-    def collect(self) -> "_Frame":
+    def collect(self) -> Self:
         raise NotImplementedError(f"collect() {_ENGINE_TODO}")
 
     def to_polars(self):  # -> polars.DataFrame
@@ -148,7 +154,7 @@ class EdgeFrame(_Frame):
     names are preserved for round-tripping and exposed via ``src_col`` / ``dst_col``.
     """
 
-    __slots__ = ("_src_col", "_dst_col")
+    __slots__ = ("_dst_col", "_src_col")
 
     def __init__(
         self,
@@ -171,27 +177,27 @@ class EdgeFrame(_Frame):
         """Original column name playing the destination role."""
         return self._dst_col
 
-    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> "EdgeFrame":
+    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> EdgeFrame:
         return EdgeFrame(
             self._src_col,
             self._dst_col,
-            self._plan + (step,),
+            (*self._plan, step),
             has_index=self._has_index and not drops_index,
         )
 
-    def nodes(self) -> "NodeFrame":
+    def nodes(self) -> NodeFrame:
         """The distinct union of ``src`` and ``dst`` values, as a lazy NodeFrame."""
         return NodeFrame(
             id_col="id",
-            plan=self._plan + (_PlanStep("nodes", {"from": (self._src_col, self._dst_col)}),),
+            plan=(*self._plan, _PlanStep("nodes", {"from": (self._src_col, self._dst_col)})),
         )
 
-    def reverse(self) -> "EdgeFrame":
+    def reverse(self) -> EdgeFrame:
         """Swap the src/dst roles. Metadata-only — no data movement."""
         return EdgeFrame(
             self._dst_col,
             self._src_col,
-            self._plan + (_PlanStep("reverse", {}),),
+            (*self._plan, _PlanStep("reverse", {})),
             has_index=False,  # transpose becomes the new "out" direction
         )
 
@@ -221,8 +227,8 @@ class NodeFrame(_Frame):
         """Original column name playing the id role."""
         return self._id_col
 
-    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> "NodeFrame":
-        return NodeFrame(self._id_col, self._plan + (step,))
+    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
+        return NodeFrame(self._id_col, (*self._plan, step))
 
     def __repr__(self) -> str:
         return f"<NodeFrame id={self._id_col!r} lazy; {len(self._plan)} step(s)>"

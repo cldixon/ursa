@@ -33,46 +33,90 @@ class Expr:
     payload: dict[str, Any] = field(default_factory=dict)
 
     # -- operator overloads: build binary nodes, Polars-style ----------------
-    def _binary(self, op: str, other: Any) -> "Expr":
+    def _binary(self, op: str, other: Any) -> Expr:
         return Expr("binary", {"op": op, "left": self, "right": _wrap(other)})
 
-    def _rbinary(self, op: str, other: Any) -> "Expr":
+    def _rbinary(self, op: str, other: Any) -> Expr:
         return Expr("binary", {"op": op, "left": _wrap(other), "right": self})
 
-    def __add__(self, o: Any) -> "Expr": return self._binary("+", o)
-    def __radd__(self, o: Any) -> "Expr": return self._rbinary("+", o)
-    def __sub__(self, o: Any) -> "Expr": return self._binary("-", o)
-    def __rsub__(self, o: Any) -> "Expr": return self._rbinary("-", o)
-    def __mul__(self, o: Any) -> "Expr": return self._binary("*", o)
-    def __rmul__(self, o: Any) -> "Expr": return self._rbinary("*", o)
-    def __truediv__(self, o: Any) -> "Expr": return self._binary("/", o)
-    def __rtruediv__(self, o: Any) -> "Expr": return self._rbinary("/", o)
+    def __add__(self, o: Any) -> Expr:
+        return self._binary("+", o)
 
-    def __gt__(self, o: Any) -> "Expr": return self._binary(">", o)
-    def __ge__(self, o: Any) -> "Expr": return self._binary(">=", o)
-    def __lt__(self, o: Any) -> "Expr": return self._binary("<", o)
-    def __le__(self, o: Any) -> "Expr": return self._binary("<=", o)
-    def __eq__(self, o: Any) -> "Expr": return self._binary("==", o)  # type: ignore[override]
-    def __ne__(self, o: Any) -> "Expr": return self._binary("!=", o)  # type: ignore[override]
+    def __radd__(self, o: Any) -> Expr:
+        return self._rbinary("+", o)
 
-    def __and__(self, o: Any) -> "Expr": return self._binary("&", o)
-    def __or__(self, o: Any) -> "Expr": return self._binary("|", o)
-    def __invert__(self) -> "Expr": return Expr("unary", {"op": "~", "operand": self})
+    def __sub__(self, o: Any) -> Expr:
+        return self._binary("-", o)
+
+    def __rsub__(self, o: Any) -> Expr:
+        return self._rbinary("-", o)
+
+    def __mul__(self, o: Any) -> Expr:
+        return self._binary("*", o)
+
+    def __rmul__(self, o: Any) -> Expr:
+        return self._rbinary("*", o)
+
+    def __truediv__(self, o: Any) -> Expr:
+        return self._binary("/", o)
+
+    def __rtruediv__(self, o: Any) -> Expr:
+        return self._rbinary("/", o)
+
+    def __gt__(self, o: Any) -> Expr:
+        return self._binary(">", o)
+
+    def __ge__(self, o: Any) -> Expr:
+        return self._binary(">=", o)
+
+    def __lt__(self, o: Any) -> Expr:
+        return self._binary("<", o)
+
+    def __le__(self, o: Any) -> Expr:
+        return self._binary("<=", o)
+
+    # __eq__/__ne__ build comparison expressions (Polars semantics), not bools —
+    # a deliberate, documented divergence from object.__eq__.
+    def __eq__(self, o: Any) -> Expr:  # ty: ignore[invalid-method-override]
+        return self._binary("==", o)
+
+    def __ne__(self, o: Any) -> Expr:  # ty: ignore[invalid-method-override]
+        return self._binary("!=", o)
+
+    def __and__(self, o: Any) -> Expr:
+        return self._binary("&", o)
+
+    def __or__(self, o: Any) -> Expr:
+        return self._binary("|", o)
+
+    def __invert__(self) -> Expr:
+        return Expr("unary", {"op": "~", "operand": self})
 
     __hash__ = None  # type: ignore[assignment]  # Exprs are trees, not dict keys
 
     # -- aggregations (scoped pragmatically for v0.1) ------------------------
-    def _agg(self, name: str) -> "Expr":
+    def _agg(self, name: str) -> Expr:
         return Expr("agg", {"fn": name, "operand": self})
 
-    def mean(self) -> "Expr": return self._agg("mean")
-    def sum(self) -> "Expr": return self._agg("sum")
-    def min(self) -> "Expr": return self._agg("min")
-    def max(self) -> "Expr": return self._agg("max")
-    def count(self) -> "Expr": return self._agg("count")
-    def n_unique(self) -> "Expr": return self._agg("n_unique")
+    def mean(self) -> Expr:
+        return self._agg("mean")
 
-    def alias(self, name: str) -> "Expr":
+    def sum(self) -> Expr:
+        return self._agg("sum")
+
+    def min(self) -> Expr:
+        return self._agg("min")
+
+    def max(self) -> Expr:
+        return self._agg("max")
+
+    def count(self) -> Expr:
+        return self._agg("count")
+
+    def n_unique(self) -> Expr:
+        return self._agg("n_unique")
+
+    def alias(self, name: str) -> Expr:
         return Expr("alias", {"name": name, "operand": self})
 
     def __repr__(self) -> str:  # readable trees in the REPL and explain()
@@ -123,6 +167,6 @@ def dst() -> Expr:
     return Expr("dst")
 
 
-def id() -> Expr:  # noqa: A001  (mirrors ur.id(); shadows builtin deliberately)
+def id() -> Expr:
     """The id-role column of the ambient NodeFrame (abstract reference)."""
     return Expr("id")

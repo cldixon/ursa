@@ -71,6 +71,10 @@ Polars-*shaped* expression frontend; it is deliberately quarantined in
 
 ## Develop
 
+The Python side is managed with [uv](https://docs.astral.sh/uv/); linting and
+formatting use [ruff](https://docs.astral.sh/ruff/) and type-checking uses
+[ty](https://github.com/astral-sh/ty).
+
 ```bash
 # Rust core: real kernels, fast to build/test (arrow + rayon only)
 cargo test -p ursa-core
@@ -78,14 +82,19 @@ cargo test -p ursa-core
 # Whole workspace (compiles DataFusion; slower)
 cargo check
 
-# Python: build the native extension into a virtualenv and run all tests
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'          # or: maturin develop
-pytest                            # pure-Python tests run without the native build;
-                                  # native-kernel tests auto-skip until it's built
+# Python: uv creates the venv, builds the maturin extension, and installs the
+# dev dependency group in one step.
+uv sync
+
+uv run pytest                     # pure-Python tests + native-kernel tests
+uv run ruff check .               # lint
+uv run ruff format .              # format
+uv run ty check                   # type-check
 ```
 
-Requirements: Rust ≥ 1.80, Python ≥ 3.10.
+`uv run` rebuilds the native extension as needed, so editing Rust and re-running
+`uv run pytest` picks up the change. Requirements: Rust ≥ 1.80, Python ≥ 3.10,
+and [uv](https://docs.astral.sh/uv/#installation).
 
 ## Roadmap to a walking skeleton
 

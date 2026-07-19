@@ -42,9 +42,7 @@ class _NeighborAgg:
         self._edges, self._direction, self._from = edges, direction, from_
 
     def agg(self, expr: Expr) -> Expr:
-        return _graph_expr(
-            "neighbors_agg", direction=self._direction, from_=self._from, agg=expr
-        )
+        return _graph_expr("neighbors_agg", direction=self._direction, from_=self._from, agg=expr)
 
 
 def neighbors(edges: EdgeFrame, direction: str = "out", from_: Any = None) -> _NeighborAgg:
@@ -64,7 +62,7 @@ class _Hop:
     def __init__(self, edges: EdgeFrame, n: int, direction: str, seeds: Any = None) -> None:
         self._edges, self._n, self._direction, self._seeds = edges, n, direction, seeds
 
-    def from_(self, seeds: Any) -> "_Hop":
+    def from_(self, seeds: Any) -> _Hop:
         return _Hop(self._edges, self._n, self._direction, seeds)
 
     def distinct(self) -> EdgeFrame:
@@ -87,8 +85,11 @@ def hop(edges: EdgeFrame, n: int = 1, direction: str = "out") -> _Hop:
 
 
 def shortest_path(
-    edges: EdgeFrame, source: Any, target: Any,
-    weight: Expr | None = None, direction: str = "out",
+    edges: EdgeFrame,
+    source: Any,
+    target: Any,
+    weight: Expr | None = None,
+    direction: str = "out",
 ) -> EdgeFrame:
     """Single-pair shortest path. Returns an EdgeFrame: one row per edge on the
     path, in order, with a ``hop`` column (and a cost column when weighted).
@@ -101,8 +102,11 @@ def shortest_path(
 
 
 def random_walk(
-    edges: EdgeFrame, start: Any, steps: int,
-    walks_per_node: int = 1, seed: int | None = None,
+    edges: EdgeFrame,
+    start: Any,
+    steps: int,
+    walks_per_node: int = 1,
+    seed: int | None = None,
 ) -> NodeFrame:
     """Random walks; a frame of ``(walk_id, step, node)`` — feeds node2vec-style
     embedding pipelines directly."""
@@ -118,8 +122,14 @@ def random_walk(
 # NodeFrame of (id, value). The skeleton returns the Expr form; the standalone
 # NodeFrame spelling is produced by the same node at plan-build time.
 
-def pagerank(edges: EdgeFrame, damping: float = 0.85, max_iter: int = 30,
-             tol: float = 1e-6, weight: Expr | None = None) -> Expr:
+
+def pagerank(
+    edges: EdgeFrame,
+    damping: float = 0.85,
+    max_iter: int = 30,
+    tol: float = 1e-6,
+    weight: Expr | None = None,
+) -> Expr:
     """PageRank (pull-based fixpoint)."""
     return _graph_expr("pagerank", damping=damping, max_iter=max_iter, tol=tol, weight=weight)
 
@@ -139,8 +149,7 @@ def clustering_coefficient(edges: EdgeFrame) -> Expr:
     return _graph_expr("clustering_coefficient")
 
 
-def betweenness(edges: EdgeFrame, sample: float | None = None,
-                weight: Expr | None = None) -> Expr:
+def betweenness(edges: EdgeFrame, sample: float | None = None, weight: Expr | None = None) -> Expr:
     """Betweenness centrality (Brandes). ``sample=`` approximates; exact is O(nm)."""
     return _graph_expr("betweenness", sample=sample, weight=weight)
 
@@ -155,7 +164,8 @@ def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = N
     return _graph_expr("label_propagation", max_iter=max_iter, seed=seed)
 
 
-def louvain(edges: EdgeFrame, weight: Expr | None = None,
-            resolution: float = 1.0, seed: int | None = None) -> Expr:
+def louvain(
+    edges: EdgeFrame, weight: Expr | None = None, resolution: float = 1.0, seed: int | None = None
+) -> Expr:
     """Community detection via Louvain modularity optimization."""
     return _graph_expr("louvain", weight=weight, resolution=resolution, seed=seed)

@@ -17,14 +17,38 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
 ]
+dependencies = [
+    # typing.Self backport for the 3.10 floor (used only in type annotations).
+    "typing-extensions>=4.0; python_version < '3.11'",
+]
 
 [project.optional-dependencies]
-# polars is used ONLY by the interop shims (.to_polars / ur.from_polars).
+# polars is a real *runtime* optional dependency, used ONLY by the interop shims
+# (.to_polars / ur.from_polars). Installed by users who want the interop.
 polars = ["polars>=1.0"]
-dev = ["maturin>=1.5,<2.0", "pytest>=8.0", "polars>=1.0", "pyarrow>=15.0"]
 
 [project.urls]
 Repository = "https://github.com/cldixon/ursa"
+
+# --- uv-managed development tooling (PEP 735 dependency groups) --------------
+# Installed by `uv sync`; not part of the published wheel's dependencies.
+[dependency-groups]
+dev = [
+    "maturin>=1.5,<2.0",
+    "pytest>=8.0",
+    "polars>=1.0",
+    "pyarrow>=15.0",
+    "ruff>=0.14",
+    "ty>=0.0.1a1",
+    # always present for the type checker, even on 3.11+ where the runtime
+    # marker below would otherwise exclude it.
+    "typing-extensions>=4.0",
+]
+
+[tool.uv]
+# Build/install the maturin extension in editable mode on `uv sync` so the native
+# module tracks the Rust source. `uv run pytest` (etc.) rebuilds as needed.
+package = true
 
 [tool.maturin]
 # Mixed Rust/Python layout: Rust extension `ursa._ursa`, Python source under python/.
@@ -36,5 +60,34 @@ features = ["pyo3/extension-module"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+# --- ruff: lint + format ----------------------------------------------------
 [tool.ruff]
 line-length = 100
+src = ["python", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "A",    # flake8-builtins
+    "RUF",  # ruff-specific
+]
+# The public API deliberately mirrors the spec's names, which shadow builtins:
+# `ur.id()`, `scan_nodes(id=...)`, `from_polars(id=...)`. Allowed by design.
+ignore = ["A001", "A002", "A004"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ursa"]
+
+# --- ty: type checking ------------------------------------------------------
+[tool.ty.environment]
+python-version = "3.10"
+# First-party import roots: the package lives under python/.
+root = ["python"]
+
+[tool.ty.src]
+include = ["python", "tests"]

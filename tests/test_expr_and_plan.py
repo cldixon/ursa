@@ -58,10 +58,15 @@ def test_nodes_derives_a_nodeframe():
 
 def test_pipeline_builds_plan_but_collect_is_not_yet_wired():
     edges = ur.scan_edges("g.parquet", src="a", dst="b")
-    nodes = edges.nodes().with_columns(
-        pr=ur.pagerank(edges, damping=0.85),
-        deg=ur.degree(edges, direction="in"),
-    ).sort("pr", descending=True).head(20)
+    nodes = (
+        edges.nodes()
+        .with_columns(
+            pr=ur.pagerank(edges, damping=0.85),
+            deg=ur.degree(edges, direction="in"),
+        )
+        .sort("pr", descending=True)
+        .head(20)
+    )
     # plan composes; collect() raises a clear "engine not wired yet" error.
     assert isinstance(nodes, ur.NodeFrame)
     try:
