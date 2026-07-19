@@ -66,11 +66,16 @@ def main() -> None:
         id="id",
     )
     enriched = (
-        nodes.with_columns(pr=ur.pagerank(edges), indeg=ur.degree(edges, direction="in"))
+        nodes.with_columns(
+            pr=ur.pagerank(edges),
+            indeg=ur.degree(edges, direction="in"),
+            # neighbour aggregation: average seniority of each node's predecessors
+            nbr_seniority=ur.neighbors(edges, direction="in").agg(ur.col("seniority").mean()),
+        )
         .filter(ur.col("seniority") > 1)
         .sort("pr", descending=True)
     )
-    print("\n== attribute enrichment ==")
+    print("\n== attribute enrichment + neighbour aggregation ==")
     print(enriched.collect().to_polars())
 
     # -- 4. Whole-graph stat (eager) ----------------------------------------

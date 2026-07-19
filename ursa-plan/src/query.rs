@@ -13,15 +13,18 @@
 //! literal`); widening it is expression-lowering work that also belongs at this
 //! seam (`crate::expr`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch};
-use arrow::compute::concat_batches;
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
+use arrow::compute::{cast, concat_batches};
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{col, lit};
 use serde::Deserialize;
+use ursa_core::algo::AggKind;
+use ursa_core::IdMap;
 
 use crate::logical::{Direction, GraphAlgo};
 use crate::node::GraphAlgorithmNode;
@@ -50,11 +53,16 @@ struct ColumnSpec {
     tol: Option<f64>,
     #[serde(default)]
     direction: Option<String>,
+    // neighbours().agg(...) fields
+    #[serde(default)]
+    agg_fn: Option<String>,
+    #[serde(default)]
+    agg_column: Option<String>,
 }
 
 impl ColumnSpec {
-    fn to_column(&self) -> Result<OutputColumn> {
-        let algo = match self.kind.as_str() {
+    fn to_algo(&self) -> Result<GraphAlgo> {
+        Ok(match self.kind.as_str() {
             "pagerank" => GraphAlgo::PageRank {
                 damping: self.damping.unwrap_or(0.85),
                 max_iter: self.max_iter.unwrap_or(30),
@@ -71,8 +79,7 @@ impl ColumnSpec {
                     "graph algorithm {other:?} is not wired into the execution path"
                 )))
             }
-        };
-        Ok((self.name.clone(), algo))
+        })
     }
 }
 
@@ -85,6 +92,63 @@ fn parse_direction(d: &str) -> Result<Direction> {
             "direction must be 'out', 'in', or 'both'; got {other:?}"
         ))),
     }
+}
+
+fn parse_agg(name: &str) -> Result<AggKind> {
+    match name {
+        "mean" => Ok(AggKind::Mean),
+        "sum" => Ok(AggKind::Sum),
+        "min" => Ok(AggKind::Min),
+        "max" => Ok(AggKind::Max),
+        "count" => Ok(AggKind::Count),
+        "n_unique" => Ok(AggKind::NUnique),
+        other => Err(DataFusionError::NotImplemented(format!(
+            "neighbours aggregation {other:?} is not supported (use mean/sum/min/max/count/n_unique)"
+        ))),
+    }
+}
+
+/// Gather a numeric node-attribute column into a dense, IdMap-aligned vector:
+/// `result[d]` is the attribute of the node at dense index `d`, or `None` if that
+/// node has no attribute row (or a null value).
+fn dense_attr_column(
+    nodes: &RecordBatch,
+    id_col: &str,
+    attr_col: &str,
+    ids: &IdMap,
+) -> Result<Vec<Option<f64>>> {
+    let schema = nodes.schema();
+    let id_idx = schema
+        .index_of(id_col)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let attr_idx = schema.index_of(attr_col).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "neighbors().agg(): column {attr_col:?} not found in the node attribute table"
+        ))
+    })?;
+
+    let id_arr = cast(nodes.column(id_idx), &DataType::Int64)
+        .map_err(|e| DataFusionError::ArrowError(e, None))?;
+    let id_arr = id_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    let attr_arr = cast(nodes.column(attr_idx), &DataType::Float64).map_err(|_| {
+        DataFusionError::NotImplemented(format!(
+            "neighbors().agg() supports numeric attribute columns in v0.1; {attr_col:?} is not numeric"
+        ))
+    })?;
+    let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
+
+    let mut map: HashMap<i64, f64> = HashMap::with_capacity(nodes.num_rows());
+    for i in 0..nodes.num_rows() {
+        if id_arr.is_null(i) || attr_arr.is_null(i) {
+            continue;
+        }
+        map.insert(id_arr.value(i), attr_arr.value(i));
+    }
+    Ok(ids
+        .user_ids()
+        .iter()
+        .map(|uid| map.get(uid).copied())
+        .collect())
 }
 
 fn comparison_expr(c: &Comparison) -> Result<Expr> {
@@ -133,15 +197,40 @@ pub fn execute_node_query(
             "graph query has no output columns".into(),
         ));
     }
-    let columns: Vec<OutputColumn> = specs
-        .iter()
-        .map(ColumnSpec::to_column)
-        .collect::<Result<_>>()?;
-    for (_, algo) in &columns {
-        if !is_executable(algo) {
-            return Err(DataFusionError::NotImplemented(format!(
-                "graph algorithm {algo:?} is not wired into the execution path"
-            )));
+    let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
+    let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        if spec.kind == "neighbors_agg" {
+            let nodes_ref = nodes.as_ref().ok_or_else(|| {
+                DataFusionError::NotImplemented(
+                    "neighbors().agg() needs a node attribute table \
+                     (ur.from_arrow(nodes, id=...))"
+                        .into(),
+                )
+            })?;
+            let attr_col = spec.agg_column.as_deref().ok_or_else(|| {
+                DataFusionError::Execution("neighbors().agg() is missing its column".into())
+            })?;
+            let attr = dense_attr_column(nodes_ref, &nodes_id_name, attr_col, &ids)?;
+            let direction = parse_direction(spec.direction.as_deref().unwrap_or("out"))?;
+            let agg = parse_agg(spec.agg_fn.as_deref().unwrap_or("mean"))?;
+            columns.push(OutputColumn::NeighborAgg {
+                name: spec.name.clone(),
+                attr: Arc::new(attr),
+                direction: direction.into(),
+                agg,
+            });
+        } else {
+            let algo = spec.to_algo()?;
+            if !is_executable(&algo) {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "graph algorithm {algo:?} is not wired into the execution path"
+                )));
+            }
+            columns.push(OutputColumn::Algo {
+                name: spec.name.clone(),
+                algo,
+            });
         }
     }
 
@@ -306,5 +395,53 @@ mod tests {
         assert!(names.contains(&"region"));
         assert!(names.contains(&"indeg"));
         assert_eq!(batch.num_rows(), 4);
+    }
+
+    #[test]
+    fn neighbor_aggregation_over_an_attribute() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // hub: 1->0, 2->0, 3->0  (node 0's in-neighbours are 1,2,3)
+        let src = Int64Array::from(vec![1, 2, 3]);
+        let dst = Int64Array::from(vec![0, 0, 0]);
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("capacity", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+                Arc::new(Int64Array::from(vec![0, 10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let batch = execute_node_query(
+            &src,
+            &dst,
+            r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#,
+            &[],
+            Some(("id".into(), false)),
+            None,
+            Some(nodes),
+            Some("id".into()),
+        )
+        .unwrap();
+
+        // Find node 0's row and check the mean of its in-neighbours' capacities.
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let schema = batch.schema();
+        let nbr_idx = schema.index_of("nbr_cap").unwrap();
+        let nbr = batch
+            .column(nbr_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
+        assert!((nbr.value(row0) - 20.0).abs() < 1e-12); // mean(10, 20, 30)
     }
 }

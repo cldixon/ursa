@@ -19,12 +19,14 @@
 mod clustering;
 mod components;
 mod degree;
+mod neighbor_agg;
 mod pagerank;
 mod triangle;
 
 pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
 pub use degree::degree;
+pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, PageRankParams};
 pub use triangle::triangle_count;
 

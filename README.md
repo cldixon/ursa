@@ -122,8 +122,8 @@ eager `density` stat, and `sink_parquet`/`sink_csv` egress.
 
 Next, in rough priority order:
 
-1. **Finish the enrichment story** — `ur.neighbors(edges).agg(...)` (a segmented
-   CSR reduction), `scan_nodes` file-backed attribute tables, and weighted
+1. **Finish the enrichment story** — `scan_nodes` file-backed attribute tables,
+   string/non-numeric `neighbors().agg()` (numeric is done), and weighted
    algorithms (`weight=`, using the `edge_ids` permutation already in place).
 2. **Traversals** — `hop` / `shortest_path` / `random_walk` on new frontier/BFS
    kernels (their own logical nodes with a seed input); this also unblocks the

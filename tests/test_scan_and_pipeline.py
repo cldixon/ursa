@@ -189,6 +189,36 @@ def test_attribute_frame_enrichment():
     assert df["region"].to_list()[0] == "us"
 
 
+def test_neighbors_agg_mean_over_attribute():
+    # node 0 is a hub: 1,2,3 all point at it; aggregate a node attribute over
+    # each node's in-neighbours.
+    nodes = ur.from_arrow(
+        pa.table({"id": [0, 1, 2, 3], "capacity": [0.0, 10.0, 20.0, 30.0]}), id="id"
+    )
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3], "d": [0, 0, 0]}), src="s", dst="d")
+    out = {
+        r["id"]: r["nbr_cap"]
+        for r in nodes.with_columns(
+            nbr_cap=ur.neighbors(edges, direction="in").agg(ur.col("capacity").mean())
+        )
+        .collect()
+        .to_dicts()
+    }
+    assert abs(out[0] - 20.0) < 1e-9  # mean(10, 20, 30)
+    assert out[1] is None  # node 1 has no in-neighbours -> undefined
+
+
+def test_neighbors_agg_needs_attribute_table():
+    # Without a node attribute table (edges.nodes()), there is no attribute to
+    # aggregate -> a clear error.
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    pipeline = edges.nodes().with_columns(
+        x=ur.neighbors(edges).agg(ur.col("capacity").mean())
+    )
+    with pytest.raises((NotImplementedError, RuntimeError)):
+        pipeline.collect()
+
+
 def test_attribute_frame_preserves_all_node_rows():
     # A node present in the attribute table but absent from edges keeps its row
     # (LEFT join), with a null/zero-ish computed value.
