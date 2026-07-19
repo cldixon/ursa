@@ -8,28 +8,19 @@ from typing import Any
 
 def __core_version() -> str: ...
 
-# Real execution path: pyarrow int64 arrays in, pyarrow.RecordBatch out.
-def run_pagerank(
+# The one execution entry point: pyarrow edge arrays + a JSON column IR +
+# filter/sort/limit -> pyarrow.RecordBatch.
+def run_node_query(
     src: Any,
     dst: Any,
-    damping: float = ...,
-    max_iter: int = ...,
-    tol: float = ...,
-) -> Any: ...
-def run_degree(src: Any, dst: Any, direction: str = ...) -> Any: ...
-def run_connected_components(src: Any, dst: Any) -> Any: ...
-def run_triangle_count(src: Any, dst: Any) -> Any: ...
-
-# Scan a Parquet/CSV edge file -> (src, dst) pyarrow.RecordBatch.
-def scan_edges_arrow(path: str, src: str, dst: str) -> Any: ...
-
-# Relational tail of a composed collect(): filter/sort/limit via DataFrame.
-def run_relational(
-    batch: Any,
+    columns_json: str,
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None = ...,
     limit: int | None = ...,
 ) -> Any: ...
+
+# Scan a Parquet/CSV edge file -> (src, dst) pyarrow.RecordBatch.
+def scan_edges_arrow(path: str, src: str, dst: str) -> Any: ...
 
 # Demo path: plain lists in and out (pure Python->Rust smoke tests).
 def _demo_pagerank(

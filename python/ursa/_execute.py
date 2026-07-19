@@ -1,22 +1,22 @@
-"""Executing graph queries — the walking-skeleton ``collect()``.
+"""Executing graph queries — Ursa's ``collect()``.
 
-Thin Python orchestration over the real Rust execution path
-(``ursa_plan`` behind ``ursa._ursa.*``). Two shapes are wired end-to-end:
+Thin Python orchestration: it turns a query into a small description (output
+columns + a filter/sort/limit tail) and hands it to the Rust side
+(``ursa._ursa.run_node_query``), which builds and executes **one** DataFusion
+`LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — and returns one
+Arrow batch. Two shapes funnel through the same path:
 
-1. **A standalone node-valued algorithm** — ``ur.pagerank(edges).collect()``.
+1. **A standalone algorithm** — ``ur.pagerank(edges).collect()`` (one column).
 2. **A composed pipeline** — ``edges.nodes().with_columns(pr=ur.pagerank(edges),
-   ...).filter(...).sort(...).head(n).collect()``: every algorithm over the same
-   edges shares one ``IdMap`` (hence one id ordering), so results are assembled
-   into an aligned ``(id, value...)`` table, and the ``filter``/``sort``/``head``
-   tail runs through a DataFusion ``DataFrame`` (``run_relational``).
+   ...).filter(...).sort(...).head(n).collect()`` (many columns + tail).
 
 Edges may be in-memory (``from_arrow`` / ``from_polars``) or a ``scan_edges``
-Parquet/CSV file source (read through a DataFusion scan). Anything outside this
-surface raises a clear, honest error rather than pretending.
+Parquet/CSV file source. Anything outside the wired surface raises a clear error.
 """
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 from ._result import MaterializedFrame
@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 # ursa_plan::result::is_executable on the Rust side).
 _EXECUTABLE = {"pagerank", "degree", "connected_components", "triangle_count"}
 
-# Comparison operators supported in composed-pipeline filters, with the operator
-# that results from writing the comparison the other way round (literal on left).
+# Comparison operators supported in filters, with the operator that results from
+# writing the comparison the other way round (literal on the left).
 _FLIP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
 
 
@@ -42,8 +42,9 @@ def collect_graph_expr(expr: Expr) -> MaterializedFrame:
             "collect() on a bare expression is wired only for standalone node-valued "
             "graph algorithms (e.g. ur.pagerank(edges).collect())."
         )
-    src, dst = _require_edges(expr.payload.get("edges"))
-    return MaterializedFrame(_run_algo(expr, src, dst))
+    # A single column named after the algorithm, no relational tail.
+    column = _algo_column(expr.payload["verb"], expr)
+    return _run_query(expr.payload.get("edges"), [column], [], None, None)
 
 
 # --- composed with_columns pipeline ----------------------------------------
@@ -81,48 +82,43 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             "(e.g. edges.nodes().with_columns(pr=ur.pagerank(edges)).collect())."
         )
 
-    # All algorithms must run over the same edges (so their id orderings align).
     edges = _single_edges(graph_exprs.values())
+    columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
+    return _run_query(edges, columns, filters, sort, limit)
+
+
+# --- the one execution entry ------------------------------------------------
+def _run_query(
+    edges: EdgeFrame | None,
+    columns: list[dict[str, Any]],
+    filters: list[tuple[str, str, float]],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+) -> MaterializedFrame:
     src, dst = _require_edges(edges)
-
-    import pyarrow as pa
-
-    native = _native()
-    id_col: Any = None
-    columns: dict[str, Any] = {}
-    for name, expr in graph_exprs.items():
-        batch = _run_algo(expr, src, dst)
-        if id_col is None:
-            id_col = batch.column(0)
-        elif not batch.column(0).equals(id_col):
-            raise AssertionError("algorithm id columns are misaligned (different edge sets?)")
-        columns[name] = batch.column(1)
-
-    table = pa.record_batch({"id": id_col, **columns})
-    result = native.run_relational(table, filters, sort, limit)
-    return MaterializedFrame(result)
+    batch = _native().run_node_query(src, dst, json.dumps(columns), filters, sort, limit)
+    return MaterializedFrame(batch)
 
 
-# --- helpers ----------------------------------------------------------------
-def _run_algo(expr: Expr, src: Any, dst: Any) -> Any:
-    """Run one node-valued graph algorithm, returning its ``(id, value)`` batch."""
+def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
+    """Build the JSON IR for one output column from a graph expression."""
     verb = expr.payload["verb"]
     if verb not in _EXECUTABLE:
         raise NotImplementedError(
             f"the '{verb}' kernel is not wired into the execution path yet "
             f"(wired: {', '.join(sorted(_EXECUTABLE))})."
         )
-    native = _native()
     p = expr.payload
+    column: dict[str, Any] = {"name": name, "kind": verb}
     if verb == "pagerank":
-        return native.run_pagerank(
-            src, dst, p.get("damping", 0.85), p.get("max_iter", 30), p.get("tol", 1e-6)
+        column.update(
+            damping=p.get("damping", 0.85),
+            max_iter=p.get("max_iter", 30),
+            tol=p.get("tol", 1e-6),
         )
-    if verb == "degree":
-        return native.run_degree(src, dst, p.get("direction", "out"))
-    if verb == "connected_components":
-        return native.run_connected_components(src, dst)
-    return native.run_triangle_count(src, dst)
+    elif verb == "degree":
+        column["direction"] = p.get("direction", "out")
+    return column
 
 
 def _single_edges(exprs: Any) -> Any:

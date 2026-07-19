@@ -45,7 +45,8 @@ def test_connected_components_collect():
     tbl = pa.table({"s": pa.array([0, 1, 3], pa.int64()), "d": pa.array([1, 2, 4], pa.int64())})
     edges = ur.from_arrow(tbl, src="s", dst="d")
     rows = ur.connected_components(edges).collect().to_dicts()
-    label = {r["id"]: r["component"] for r in rows}
+    # standalone columns are named after the algorithm (verb == column name)
+    label = {r["id"]: r["connected_components"] for r in rows}
     assert label[0] == label[1] == label[2]
     assert label[3] == label[4]
     assert label[0] != label[3]

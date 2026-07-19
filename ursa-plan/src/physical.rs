@@ -1,21 +1,18 @@
-//! Physical execution: graph kernels as DataFusion `ExecutionPlan`s.
+//! Physical execution: the graph query operator.
 //!
-//! A graph kernel is **a physical operator that happens to consult a side data
-//! structure** (the [`ursa_core::Topology`]). DataFusion already contains
-//! pipeline breakers (sort, hash aggregate) that fully materialize before
-//! emitting; a node-valued graph algorithm is architecturally identical:
-//! [`GraphAlgorithmExec`] is a leaf operator that runs its kernel over the CSR
-//! and emits the result as a single Arrow `RecordBatch` into the downstream plan.
+//! [`GraphAlgorithmExec`] is a leaf `ExecutionPlan` that runs a query's
+//! node-valued algorithms over a shared topology and emits one aligned
+//! `(id, values...)` `RecordBatch`. It is produced from a
+//! [`crate::node::GraphAlgorithmNode`] by [`crate::planner::GraphExtensionPlanner`]
+//! during physical planning, so a graph query is a first-class citizen of the
+//! DataFusion plan rather than something orchestrated from outside it.
 //!
-//! ## Runtime traps respected here (spec §Runtime integration)
+//! ## Runtime trap respected here (spec §Runtime integration)
 //!
-//! 1. **Thread pools.** DataFusion executes on tokio (async, IO-oriented);
-//!    kernels want Rayon (data-parallel compute). Running Rayon loops directly on
-//!    tokio workers starves the runtime, so [`GraphAlgorithmExec::execute`]
-//!    dispatches the compute via `spawn_blocking` and streams the batch back.
-//! 2. **Determinism.** Stochastic kernels take a seed; that contract lives with
-//!    the kernels. The two currently-wired kernels (degree, pagerank) and the two
-//!    other executable ones (weak components, triangle count) are deterministic.
+//! DataFusion executes on tokio (async, IO-oriented); the kernels want Rayon
+//! (data-parallel compute). Running Rayon loops on tokio workers starves the
+//! runtime, so [`GraphAlgorithmExec::execute`] dispatches the compute via
+//! `spawn_blocking` and streams the batch back.
 
 use std::any::Any;
 use std::fmt;
@@ -33,48 +30,42 @@ use datafusion::physical_plan::{
 };
 use ursa_core::{IdMap, Topology};
 
-use crate::logical::GraphAlgo;
-use crate::result::{algorithm_batch, algorithm_schema, is_executable};
+use crate::result::{query_batch, query_schema, OutputColumn};
 
-/// A leaf `ExecutionPlan` that runs one node-valued graph algorithm over a shared
-/// topology and emits a `(id, value)` `RecordBatch`.
+/// A leaf `ExecutionPlan` that runs a graph query's algorithms and emits a
+/// single `(id, values...)` `RecordBatch`.
 #[derive(Debug)]
 pub struct GraphAlgorithmExec {
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
-    algo: GraphAlgo,
+    columns: Arc<Vec<OutputColumn>>,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl GraphAlgorithmExec {
-    /// Build the operator, validating that `algo` has a wired kernel.
-    pub fn try_new(topology: Arc<Topology>, ids: Arc<IdMap>, algo: GraphAlgo) -> Result<Self> {
-        if !is_executable(&algo) {
-            return Err(DataFusionError::NotImplemented(format!(
-                "graph algorithm {algo:?} is not yet wired into the execution path"
-            )));
-        }
-        let schema = algorithm_schema(&algo);
+    pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>, columns: Arc<Vec<OutputColumn>>) -> Self {
+        let schema = query_schema(&columns);
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
         );
-        Ok(GraphAlgorithmExec {
+        GraphAlgorithmExec {
             topology,
             ids,
-            algo,
+            columns,
             schema,
             properties,
-        })
+        }
     }
 }
 
 impl DisplayAs for GraphAlgorithmExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "GraphAlgorithmExec: algo={:?}", self.algo)
+        let names: Vec<&str> = self.columns.iter().map(|(n, _)| n.as_str()).collect();
+        write!(f, "GraphAlgorithmExec: columns=[{}]", names.join(", "))
     }
 }
 
@@ -92,8 +83,6 @@ impl ExecutionPlan for GraphAlgorithmExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        // Leaf: the topology is a side structure, not a child plan. (When
-        // filtered-subgraph seeds arrive via `.from_(...)`, that becomes a child.)
         vec![]
     }
 
@@ -112,12 +101,11 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let schema = self.schema.clone();
         let topo = self.topology.clone();
         let ids = self.ids.clone();
-        let algo = self.algo.clone();
+        let columns = self.columns.clone();
 
-        // Compute off the tokio worker: the kernel is CPU-bound (and Rayon-parallel
-        // inside), so it must not run on an async executor thread.
+        // CPU-bound (Rayon-parallel inside) — keep it off the tokio worker.
         let fut = async move {
-            tokio::task::spawn_blocking(move || algorithm_batch(&topo, &ids, &algo))
+            tokio::task::spawn_blocking(move || query_batch(&topo, &ids, &columns))
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))
         };
@@ -127,65 +115,25 @@ impl ExecutionPlan for GraphAlgorithmExec {
     }
 }
 
-/// Synchronous convenience: run an algorithm to completion and return its batch.
-///
-/// Spins a small multi-thread runtime, executes the operator, and collects the
-/// single output batch. This is the entry point the Python `collect()`
-/// orchestration calls; inside a larger DataFusion plan the operator is driven by
-/// the session's runtime instead.
-pub fn run_algorithm(
-    topology: Arc<Topology>,
-    ids: Arc<IdMap>,
-    algo: GraphAlgo,
-) -> Result<arrow::record_batch::RecordBatch> {
-    let exec = Arc::new(GraphAlgorithmExec::try_new(topology, ids, algo)?);
-    let ctx = Arc::new(TaskContext::default());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-
-    runtime.block_on(async move {
-        let stream = exec.execute(0, ctx)?;
-        let batches = datafusion::physical_plan::common::collect(stream).await?;
-        arrow::compute::concat_batches(&batches[0].schema(), &batches)
-            .map_err(|e| DataFusionError::ArrowError(e, None))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical::Direction;
+    use crate::logical::{Direction, GraphAlgo};
     use crate::topology::build_topology;
-    use arrow::array::{Float64Array, Int64Array};
-
-    fn diamond() -> (Arc<Topology>, Arc<IdMap>) {
-        let src = Int64Array::from(vec![0, 0, 1, 2]);
-        let dst = Int64Array::from(vec![1, 2, 2, 0]);
-        build_topology(&src, &dst).unwrap()
-    }
-
-    #[test]
-    fn rejects_unwired_algorithm() {
-        let (topo, ids) = diamond();
-        let err = GraphAlgorithmExec::try_new(topo, ids, GraphAlgo::Closeness);
-        assert!(err.is_err());
-    }
+    use arrow::array::Int64Array;
 
     #[tokio::test]
-    async fn execute_streams_a_result_batch() {
-        let (topo, ids) = diamond();
-        let exec = Arc::new(
-            GraphAlgorithmExec::try_new(
-                topo,
-                ids,
-                GraphAlgo::Degree {
-                    direction: Direction::Out,
-                },
-            )
-            .unwrap(),
-        );
+    async fn execute_streams_the_query_batch() {
+        let src = Int64Array::from(vec![0, 0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 2, 0]);
+        let (topo, ids) = build_topology(&src, &dst).unwrap();
+        let columns = Arc::new(vec![(
+            "deg".to_string(),
+            GraphAlgo::Degree {
+                direction: Direction::Out,
+            },
+        )]);
+        let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns));
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
         let batches = datafusion::physical_plan::common::collect(stream)
@@ -193,27 +141,6 @@ mod tests {
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
-    }
-
-    #[test]
-    fn run_algorithm_returns_pagerank_batch() {
-        let (topo, ids) = diamond();
-        let batch = run_algorithm(
-            topo,
-            ids,
-            GraphAlgo::PageRank {
-                damping: 0.85,
-                max_iter: 30,
-                tol: 1e-6,
-            },
-        )
-        .unwrap();
-        let pr = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        let sum: f64 = pr.values().iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6);
+        assert_eq!(batches[0].num_columns(), 2);
     }
 }

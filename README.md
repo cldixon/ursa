@@ -36,7 +36,7 @@ are real and tested end-to-end.
 | Layer | State |
 |---|---|
 | **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` (sorted-adjacency intersection) kernels. Remaining frontier/BFS kernels are documented stubs. |
-| **`ursa-plan`** — DataFusion engine | ✅ **Executing.** `GraphAlgorithmExec` runs node-valued kernels as a real pipeline-breaking `ExecutionPlan`; a DataFusion scan reads Parquet/CSV edge files; a DataFusion `DataFrame` runs the `filter`/`sort`/`limit` tail of composed pipelines. |
+| **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge files. |
 | **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
 | **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm *and* a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, over in-memory or `scan_edges` sources. |
 
@@ -110,18 +110,21 @@ uv run ty check                   # type-check
 `uv run pytest` picks up the change. Requirements: Rust ≥ 1.80, Python ≥ 3.10,
 and [uv](https://docs.astral.sh/uv/#installation).
 
-## Roadmap to a walking skeleton
+## Roadmap
 
-The next milestone is the smallest end-to-end vertical slice through the *real*
-engine, proving the operator contract before fanning out:
+The walking skeleton is done and the engine foundation is in place: every
+`collect()` is one DataFusion plan with a custom graph logical node. From here the
+spec fans out on top of that foundation:
 
-1. `scan_edges` (local CSV) → build `Arc<Topology>` in a DataFusion scan.
-2. `DegreeExec` / `PageRankExec` as real pipeline-breaking `ExecutionPlan`s
-   (kernel dispatched via `spawn_blocking`, results emitted as Arrow batches).
-3. `EdgeFrame.collect()` → `to_polars()` round-trip, zero-copy.
-
-Everything else in the spec (the full algorithm set, traversals, object storage,
-the optimizer rules) builds outward from that slice.
+1. **Attribute-rich frames** — `scan_nodes` attribute tables joined to algorithm
+   outputs by id; `ur.col("attr")` in `with_columns`/`filter`;
+   `ur.neighbors(edges).agg(...)`; weighted algorithms (`weight=`).
+2. **Traversals** — `hop` / `shortest_path` / `random_walk` on new frontier/BFS
+   kernels (their own logical nodes with a seed input).
+3. **Optimizer rules** — push node-set filters before traversal, fuse
+   `neighbors().agg` into a segmented CSR reduction, share one topology build.
+4. **Breadth** — remaining algorithms (closeness, betweenness, louvain, …),
+   `sink_*` egress, object storage (`s3://`), string/UUID node ids, benchmarks.
 
 ## License
 

@@ -1,9 +1,10 @@
 //! Assembling kernel outputs into Arrow `RecordBatch`es.
 //!
-//! This is the "Arrow arrays out" half of the operator contract: an `ursa-core`
-//! kernel returns a dense, `u32`-indexed `Vec`, and this module gathers it into a
-//! two-column `(id, value)` batch, translating dense indices back to user ids via
-//! the [`IdMap`]. Kernels never touch user ids; this boundary does.
+//! The "Arrow arrays out" half of the operator contract. A query names one or
+//! more node-valued algorithms as output columns; because every algorithm over
+//! the same topology shares one `IdMap`, they are all row-aligned, so the result
+//! is a single `(id, col_1, col_2, ...)` batch with dense→user id translation
+//! done once, here, at the boundary. Kernels never see user ids.
 
 use std::sync::Arc;
 
@@ -17,9 +18,10 @@ use ursa_core::{IdMap, Topology};
 
 use crate::logical::GraphAlgo;
 
-/// Whether this algorithm has a real kernel wired into the execution path yet.
-/// The walking skeleton supports the node-valued kernels that already exist in
-/// `ursa-core`; the rest lower to the same node but are not yet executable.
+/// One output column: a name and the algorithm that produces it.
+pub type OutputColumn = (String, GraphAlgo);
+
+/// Whether an algorithm has a kernel wired into the execution path.
 pub fn is_executable(algo: &GraphAlgo) -> bool {
     matches!(
         algo,
@@ -30,35 +32,26 @@ pub fn is_executable(algo: &GraphAlgo) -> bool {
     )
 }
 
-/// The output schema for an algorithm: `(id: Int64, <value>: <type>)`.
-pub fn algorithm_schema(algo: &GraphAlgo) -> SchemaRef {
-    let (name, dtype) = value_field(algo);
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new(name, dtype, false),
-    ]))
-}
-
-fn value_field(algo: &GraphAlgo) -> (&'static str, DataType) {
+/// Arrow value type produced by an algorithm.
+fn value_type(algo: &GraphAlgo) -> DataType {
     match algo {
-        GraphAlgo::PageRank { .. } => ("pagerank", DataType::Float64),
-        GraphAlgo::Degree { .. } => ("degree", DataType::UInt32),
-        GraphAlgo::ConnectedComponents { .. } => ("component", DataType::UInt32),
-        GraphAlgo::TriangleCount => ("triangle_count", DataType::UInt32),
-        // Non-executable algorithms still declare a nominal Float64 value column.
-        _ => ("value", DataType::Float64),
+        GraphAlgo::PageRank { .. } => DataType::Float64,
+        _ => DataType::UInt32,
     }
 }
 
-/// Run `algo` over `topo` and materialize the `(id, value)` batch.
-///
-/// Precondition: [`is_executable`] returns `true` for `algo` (validated at
-/// `GraphAlgorithmExec` construction). The dense value vector is produced by the
-/// kernel; the id column is the `IdMap`'s dense→user vector, so row `i` of both
-/// columns describes the same node.
-pub fn algorithm_batch(topo: &Topology, ids: &IdMap, algo: &GraphAlgo) -> RecordBatch {
-    let id_col: ArrayRef = Arc::new(Int64Array::from(ids.user_ids().to_vec()));
-    let value_col: ArrayRef = match algo {
+/// The output schema for a query: `id: Int64` followed by one column per output.
+pub fn query_schema(columns: &[OutputColumn]) -> SchemaRef {
+    let mut fields = vec![Field::new("id", DataType::Int64, false)];
+    for (name, algo) in columns {
+        fields.push(Field::new(name, value_type(algo), false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+/// Run one algorithm over `topo`, returning its dense value column as Arrow.
+fn value_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
+    match algo {
         GraphAlgo::Degree { direction } => {
             Arc::new(UInt32Array::from(degree(topo, (*direction).into())))
         }
@@ -78,11 +71,21 @@ pub fn algorithm_batch(topo: &Topology, ids: &IdMap, algo: &GraphAlgo) -> Record
             Arc::new(UInt32Array::from(connected_components_weak(topo)))
         }
         GraphAlgo::TriangleCount => Arc::new(UInt32Array::from(triangle_count(topo))),
-        other => unreachable!("non-executable algorithm reached algorithm_batch: {other:?}"),
-    };
+        other => unreachable!("non-executable algorithm reached value_array: {other:?}"),
+    }
+}
 
-    RecordBatch::try_new(algorithm_schema(algo), vec![id_col, value_col])
-        .expect("id/value column lengths equal n_nodes and match the schema")
+/// Materialize the `(id, values...)` batch for a query.
+///
+/// Precondition: every column's algorithm is [`is_executable`] (validated at
+/// query-build time). Row `i` of every column describes the same node.
+pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> RecordBatch {
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids.user_ids().to_vec()))];
+    for (_, algo) in columns {
+        arrays.push(value_array(topo, algo));
+    }
+    RecordBatch::try_new(query_schema(columns), arrays)
+        .expect("all columns have length n_nodes and match the schema")
 }
 
 #[cfg(test)]
@@ -92,53 +95,40 @@ mod tests {
     use crate::topology::build_topology;
 
     fn diamond() -> (Arc<Topology>, Arc<IdMap>) {
-        // 0->1, 0->2, 1->2, 2->0
         let src = Int64Array::from(vec![0, 0, 1, 2]);
         let dst = Int64Array::from(vec![1, 2, 2, 0]);
         build_topology(&src, &dst).unwrap()
     }
 
     #[test]
-    fn degree_batch_shape_and_values() {
+    fn multi_column_batch_is_aligned() {
         let (topo, ids) = diamond();
-        let batch = algorithm_batch(
-            &topo,
-            &ids,
-            &GraphAlgo::Degree {
-                direction: Direction::Out,
-            },
-        );
-        assert_eq!(batch.num_columns(), 2);
+        let columns = vec![
+            (
+                "deg".to_string(),
+                GraphAlgo::Degree {
+                    direction: Direction::Out,
+                },
+            ),
+            (
+                "pr".to_string(),
+                GraphAlgo::PageRank {
+                    damping: 0.85,
+                    max_iter: 30,
+                    tol: 1e-6,
+                },
+            ),
+        ];
+        let batch = query_batch(&topo, &ids, &columns);
+        assert_eq!(batch.num_columns(), 3); // id, deg, pr
         assert_eq!(batch.num_rows(), 3);
-        assert_eq!(batch.schema().field(1).name(), "degree");
+        assert_eq!(batch.schema().field(1).name(), "deg");
+        assert_eq!(batch.schema().field(2).name(), "pr");
         let deg = batch
             .column(1)
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
-        // node 0 (dense 0) has out-degree 2
-        assert_eq!(deg.value(0), 2);
-    }
-
-    #[test]
-    fn pagerank_batch_sums_to_one() {
-        let (topo, ids) = diamond();
-        let batch = algorithm_batch(
-            &topo,
-            &ids,
-            &GraphAlgo::PageRank {
-                damping: 0.85,
-                max_iter: 30,
-                tol: 1e-6,
-            },
-        );
-        assert_eq!(batch.schema().field(1).name(), "pagerank");
-        let pr = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        let sum: f64 = pr.values().iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6, "pagerank sum was {sum}");
+        assert_eq!(deg.value(0), 2); // node 0 out-degree
     }
 }
