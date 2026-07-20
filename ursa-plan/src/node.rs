@@ -27,7 +27,7 @@ pub struct GraphAlgorithmNode {
 
 impl GraphAlgorithmNode {
     pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>, columns: Vec<OutputColumn>) -> Self {
-        let arrow_schema = query_schema(&columns);
+        let arrow_schema = query_schema(&columns, ids.user_type());
         let schema = Arc::new(
             DFSchema::try_from(arrow_schema.as_ref().clone())
                 .expect("query schema converts to a DFSchema"),
@@ -132,7 +132,7 @@ impl HopNode {
         direction: Direction,
     ) -> Self {
         let schema = Arc::new(
-            DFSchema::try_from(hop_schema().as_ref().clone())
+            DFSchema::try_from(hop_schema(ids.user_type()).as_ref().clone())
                 .expect("hop schema converts to a DFSchema"),
         );
         HopNode {
@@ -238,7 +238,7 @@ impl ShortestPathNode {
         weighted: bool,
     ) -> Self {
         let schema = Arc::new(
-            DFSchema::try_from(path_schema().as_ref().clone())
+            DFSchema::try_from(path_schema(ids.user_type()).as_ref().clone())
                 .expect("path schema converts to a DFSchema"),
         );
         ShortestPathNode {
@@ -343,7 +343,7 @@ impl RandomWalkNode {
         seed: Option<u64>,
     ) -> Self {
         let schema = Arc::new(
-            DFSchema::try_from(walk_schema().as_ref().clone())
+            DFSchema::try_from(walk_schema(ids.user_type()).as_ref().clone())
                 .expect("walk schema converts to a DFSchema"),
         );
         RandomWalkNode {

@@ -5,116 +5,301 @@
 //! `u32` internal indices `0..n`, and all kernels operate in `u32` space over flat
 //! arrays. Results translate back to user ids only when materializing output.
 //!
-//! The skeleton implements the `i64` case (the common one — integer node ids).
-//! String / UUID ids follow the same shape with a different key type; that is
-//! future work and deliberately not abstracted prematurely here.
+//! Two user-id types are supported, discriminated by the Arrow column type at
+//! build time and kept as the [`IdMap`] enum's two variants: **`Int64`** (the
+//! zero-overhead common case) and **`Utf8`** (strings, which also cover
+//! UUID-as-string). The internal dense index is always `u32`. The id type is
+//! discovered once, when the topology is built, and every boundary that touches
+//! user ids goes through this module's Arrow-array methods, so nothing downstream
+//! needs to know which variant it is.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::datatypes::DataType;
 
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
 ///
 /// `u32` caps the node space at ~4.29B nodes — the correct trade for cache
 /// behaviour at the v0.1 target scale. A `u64` node space is a future feature flag.
-#[derive(Debug, Clone, Default)]
-pub struct IdMap {
-    /// dense index -> user id (gathered by position on output)
-    to_user: Vec<i64>,
-    /// user id -> dense index (hash map consulted on input)
-    to_dense: HashMap<i64, u32>,
+#[derive(Debug, Clone)]
+pub enum IdMap {
+    /// Integer user ids (the fast path).
+    Int64 {
+        to_user: Vec<i64>,
+        to_dense: HashMap<i64, u32>,
+    },
+    /// String user ids (also covers UUID-as-string).
+    Utf8 {
+        to_user: Vec<String>,
+        to_dense: HashMap<String, u32>,
+    },
 }
 
-/// Error raised when `src`/`dst` contains a null. The spec's lean is
-/// *error by default*, with an `on_null="drop"` opt-in resolved at a higher layer.
+/// Errors raised while building an [`IdMap`] from Arrow edge columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NullNodeId;
+pub enum IdError {
+    /// A `src`/`dst` value was null. The spec's lean is *error by default*, with an
+    /// `on_null="drop"` opt-in resolved at a higher layer.
+    Null,
+    /// `src` and `dst` had different id types (e.g. one string, one integer).
+    MixedTypes,
+    /// The id column's Arrow type is not a supported node-id type.
+    Unsupported(String),
+}
 
-impl std::fmt::Display for NullNodeId {
+impl std::fmt::Display for IdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "null value in src/dst column; set on_null=\"drop\" to skip"
-        )
+        match self {
+            IdError::Null => write!(
+                f,
+                "null value in src/dst column; set on_null=\"drop\" to skip"
+            ),
+            IdError::MixedTypes => write!(
+                f,
+                "src and dst node-id columns must have the same type (both int64 or both string)"
+            ),
+            IdError::Unsupported(t) => write!(
+                f,
+                "unsupported node-id type {t}; node ids must be int64 or string (Utf8)"
+            ),
+        }
     }
 }
 
-impl std::error::Error for NullNodeId {}
+impl std::error::Error for IdError {}
+
+/// Which supported family an Arrow id column belongs to.
+enum IdKind {
+    Int64,
+    Utf8,
+}
+
+fn id_kind(dt: &DataType) -> Result<IdKind, IdError> {
+    match dt {
+        DataType::Int64 => Ok(IdKind::Int64),
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(IdKind::Utf8),
+        other => Err(IdError::Unsupported(format!("{other:?}"))),
+    }
+}
+
+/// Downcast an id array to `Int64Array`, canonicalizing nothing (the caller has
+/// already confirmed the kind).
+fn as_int64(arr: &dyn Array) -> &Int64Array {
+    arr.as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column confirmed Int64")
+}
+
+/// View any Utf8/LargeUtf8 id array as `StringArray` (casting LargeUtf8 if needed).
+fn as_utf8(arr: &dyn Array) -> StringArray {
+    if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+        s.clone()
+    } else {
+        let cast = arrow::compute::cast(arr, &DataType::Utf8).expect("Utf8-family casts to Utf8");
+        cast.as_any()
+            .downcast_ref::<StringArray>()
+            .expect("cast to Utf8 yields StringArray")
+            .clone()
+    }
+}
 
 impl IdMap {
-    /// Build a map from an iterator of user ids, assigning dense indices in
-    /// first-seen order.
+    fn new_int64() -> Self {
+        IdMap::Int64 {
+            to_user: Vec::new(),
+            to_dense: HashMap::new(),
+        }
+    }
+
+    fn new_utf8() -> Self {
+        IdMap::Utf8 {
+            to_user: Vec::new(),
+            to_dense: HashMap::new(),
+        }
+    }
+
+    /// Build an integer map from an iterator of user ids, first-seen order. (Test
+    /// / convenience helper for the `Int64` fast path.)
     pub fn from_ids<I: IntoIterator<Item = i64>>(ids: I) -> Self {
-        let mut map = IdMap::default();
+        let mut map = IdMap::new_int64();
         for id in ids {
-            map.intern(id);
+            map.intern_i64(id);
         }
         map
     }
 
     /// Build the id map from the two edge endpoint columns, and return the edges
     /// re-expressed in dense `u32` space (`src_dense`, `dst_dense`) ready for
-    /// [`Topology::build`]. Errors on any null endpoint.
+    /// [`Topology::build`]. The id type is taken from the Arrow columns: `Int64`
+    /// (and other integer types are not accepted here — callers canonicalize to
+    /// `Int64` first) or `Utf8`/`LargeUtf8`. Errors on a null endpoint, mixed
+    /// src/dst types, or an unsupported id type.
     ///
     /// [`Topology::build`]: crate::topology::Topology::build
     pub fn from_edge_arrays(
-        src: &Int64Array,
-        dst: &Int64Array,
-    ) -> Result<(Self, Vec<u32>, Vec<u32>), NullNodeId> {
+        src: &dyn Array,
+        dst: &dyn Array,
+    ) -> Result<(Self, Vec<u32>, Vec<u32>), IdError> {
         assert_eq!(src.len(), dst.len(), "src/dst length mismatch");
-        let m = src.len();
-        let mut map = IdMap::default();
-        let mut src_dense = Vec::with_capacity(m);
-        let mut dst_dense = Vec::with_capacity(m);
-        for i in 0..m {
-            if src.is_null(i) || dst.is_null(i) {
-                return Err(NullNodeId);
+        let (sk, dk) = (id_kind(src.data_type())?, id_kind(dst.data_type())?);
+        match (sk, dk) {
+            (IdKind::Int64, IdKind::Int64) => {
+                let (s, d) = (as_int64(src), as_int64(dst));
+                let mut map = IdMap::new_int64();
+                let (mut sd, mut dd) = (Vec::with_capacity(s.len()), Vec::with_capacity(s.len()));
+                for i in 0..s.len() {
+                    if s.is_null(i) || d.is_null(i) {
+                        return Err(IdError::Null);
+                    }
+                    sd.push(map.intern_i64(s.value(i)));
+                    dd.push(map.intern_i64(d.value(i)));
+                }
+                Ok((map, sd, dd))
             }
-            src_dense.push(map.intern(src.value(i)));
-            dst_dense.push(map.intern(dst.value(i)));
+            (IdKind::Utf8, IdKind::Utf8) => {
+                let (s, d) = (as_utf8(src), as_utf8(dst));
+                let mut map = IdMap::new_utf8();
+                let (mut sd, mut dd) = (Vec::with_capacity(s.len()), Vec::with_capacity(s.len()));
+                for i in 0..s.len() {
+                    if s.is_null(i) || d.is_null(i) {
+                        return Err(IdError::Null);
+                    }
+                    sd.push(map.intern_str(s.value(i)));
+                    dd.push(map.intern_str(d.value(i)));
+                }
+                Ok((map, sd, dd))
+            }
+            _ => Err(IdError::MixedTypes),
         }
-        Ok((map, src_dense, dst_dense))
     }
 
-    /// Intern a user id, returning its dense index (assigning a new one if unseen).
-    #[inline]
-    pub fn intern(&mut self, user: i64) -> u32 {
-        if let Some(&d) = self.to_dense.get(&user) {
-            return d;
+    fn intern_i64(&mut self, user: i64) -> u32 {
+        match self {
+            IdMap::Int64 { to_user, to_dense } => {
+                if let Some(&idx) = to_dense.get(&user) {
+                    return idx;
+                }
+                let idx = to_user.len() as u32;
+                to_user.push(user);
+                to_dense.insert(user, idx);
+                idx
+            }
+            IdMap::Utf8 { .. } => unreachable!("intern_i64 on a Utf8 IdMap"),
         }
-        let d = self.to_user.len() as u32;
-        self.to_user.push(user);
-        self.to_dense.insert(user, d);
-        d
     }
 
-    /// Dense index for a user id, if present.
-    #[inline]
-    pub fn dense(&self, user: i64) -> Option<u32> {
-        self.to_dense.get(&user).copied()
+    fn intern_str(&mut self, user: &str) -> u32 {
+        match self {
+            IdMap::Utf8 { to_user, to_dense } => {
+                if let Some(&idx) = to_dense.get(user) {
+                    return idx;
+                }
+                let idx = to_user.len() as u32;
+                to_user.push(user.to_string());
+                to_dense.insert(user.to_string(), idx);
+                idx
+            }
+            IdMap::Int64 { .. } => unreachable!("intern_str on an Int64 IdMap"),
+        }
     }
 
-    /// User id for a dense index. Panics if out of range (kernels never produce
-    /// out-of-range indices).
-    #[inline]
-    pub fn user(&self, dense: u32) -> i64 {
-        self.to_user[dense as usize]
+    /// The Arrow type of the user id column: `Int64` or `Utf8`. Schemas for
+    /// result batches are built from this so the id/src/dst/node columns carry the
+    /// original id type.
+    pub fn user_type(&self) -> DataType {
+        match self {
+            IdMap::Int64 { .. } => DataType::Int64,
+            IdMap::Utf8 { .. } => DataType::Utf8,
+        }
+    }
+
+    /// All user ids in dense-index order, as an Arrow array (`Int64Array` |
+    /// `StringArray`) — the id column of a per-node result.
+    pub fn user_id_array(&self) -> ArrayRef {
+        match self {
+            IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(to_user.clone())),
+            IdMap::Utf8 { to_user, .. } => Arc::new(StringArray::from(
+                to_user.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+        }
+    }
+
+    /// User ids for a list of dense indices, as an Arrow array (`Int64Array` |
+    /// `StringArray`) — for hop/path/walk output id columns. Panics on an
+    /// out-of-range index (kernels never produce one).
+    pub fn gather_user(&self, dense: &[u32]) -> ArrayRef {
+        match self {
+            IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(
+                dense
+                    .iter()
+                    .map(|&d| to_user[d as usize])
+                    .collect::<Vec<_>>(),
+            )),
+            IdMap::Utf8 { to_user, .. } => Arc::new(StringArray::from(
+                dense
+                    .iter()
+                    .map(|&d| to_user[d as usize].as_str())
+                    .collect::<Vec<_>>(),
+            )),
+        }
+    }
+
+    /// Resolve a user-id array to dense indices (`None` for ids not in the map).
+    /// The array's type must match the map's id type; a mismatch is an
+    /// [`IdError::MixedTypes`]. Nulls resolve to `None`. Used for traversal
+    /// seeds/source/target/starts and the node-attribute join key.
+    pub fn dense_from_array(&self, arr: &dyn Array) -> Result<Vec<Option<u32>>, IdError> {
+        // An empty id array resolves to no indices regardless of type — so empty
+        // seeds work against a graph of either id type without a spurious mismatch.
+        if arr.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            IdMap::Int64 { to_dense, .. } => {
+                if !matches!(id_kind(arr.data_type())?, IdKind::Int64) {
+                    return Err(IdError::MixedTypes);
+                }
+                let a = as_int64(arr);
+                Ok((0..a.len())
+                    .map(|i| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            to_dense.get(&a.value(i)).copied()
+                        }
+                    })
+                    .collect())
+            }
+            IdMap::Utf8 { to_dense, .. } => {
+                if !matches!(id_kind(arr.data_type())?, IdKind::Utf8) {
+                    return Err(IdError::MixedTypes);
+                }
+                let a = as_utf8(arr);
+                Ok((0..a.len())
+                    .map(|i| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            to_dense.get(a.value(i)).copied()
+                        }
+                    })
+                    .collect())
+            }
+        }
     }
 
     /// Number of distinct nodes.
-    #[inline]
     pub fn len(&self) -> usize {
-        self.to_user.len()
+        match self {
+            IdMap::Int64 { to_user, .. } => to_user.len(),
+            IdMap::Utf8 { to_user, .. } => to_user.len(),
+        }
     }
 
-    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.to_user.is_empty()
-    }
-
-    /// The dense-index -> user-id vector, for gathering result columns in bulk.
-    pub fn user_ids(&self) -> &[i64] {
-        &self.to_user
+        self.len() == 0
     }
 }
 
@@ -123,20 +308,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interns_in_first_seen_order() {
+    fn interns_int_ids_in_first_seen_order() {
         let m = IdMap::from_ids([100, 7, 100, 42, 7]);
         assert_eq!(m.len(), 3);
-        assert_eq!(m.dense(100), Some(0));
-        assert_eq!(m.dense(7), Some(1));
-        assert_eq!(m.dense(42), Some(2));
-        assert_eq!(m.user(0), 100);
-        assert_eq!(m.dense(999), None);
+        assert_eq!(m.user_type(), DataType::Int64);
+        let ids = m.user_id_array();
+        let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ids.values(), &[100, 7, 42]);
     }
 
     #[test]
-    fn errors_on_null_endpoint() {
+    fn builds_int_map_from_edge_arrays() {
+        let src = Int64Array::from(vec![10, 10, 20, 30]);
+        let dst = Int64Array::from(vec![20, 30, 30, 10]);
+        let (map, sd, dd) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(sd, vec![0, 0, 1, 2]);
+        assert_eq!(dd, vec![1, 2, 2, 0]);
+    }
+
+    #[test]
+    fn builds_string_map_and_gathers_back() {
+        // a->b, a->c, b->c, c->a over string ids
+        let src = StringArray::from(vec!["a", "a", "b", "c"]);
+        let dst = StringArray::from(vec!["b", "c", "c", "a"]);
+        let (map, sd, dd) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        assert_eq!(map.user_type(), DataType::Utf8);
+        assert_eq!(map.len(), 3);
+        assert_eq!(sd, vec![0, 0, 1, 2]);
+        assert_eq!(dd, vec![1, 2, 2, 0]);
+
+        // dense -> user
+        let ids = map.user_id_array();
+        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(ids.value(0), "a");
+        assert_eq!(ids.value(2), "c");
+
+        // user -> dense (bulk), unknown -> None, null -> None
+        let query = StringArray::from(vec![Some("c"), Some("zzz"), None]);
+        let dense = map.dense_from_array(&query).unwrap();
+        assert_eq!(dense, vec![Some(2), None, None]);
+
+        // gather a subset back to user ids
+        let gathered = map.gather_user(&[2, 0]);
+        let gathered = gathered.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(gathered.value(0), "c");
+        assert_eq!(gathered.value(1), "a");
+    }
+
+    #[test]
+    fn large_utf8_is_accepted() {
+        use arrow::array::LargeStringArray;
+        let src = LargeStringArray::from(vec!["x", "y"]);
+        let dst = LargeStringArray::from(vec!["y", "x"]);
+        let (map, _sd, _dd) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        assert_eq!(map.user_type(), DataType::Utf8);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn rejects_null_mixed_and_unsupported() {
+        // null endpoint
         let src = Int64Array::from(vec![Some(1), None]);
         let dst = Int64Array::from(vec![Some(2), Some(3)]);
-        assert_eq!(IdMap::from_edge_arrays(&src, &dst).err(), Some(NullNodeId));
+        assert_eq!(
+            IdMap::from_edge_arrays(&src, &dst).err(),
+            Some(IdError::Null)
+        );
+
+        // mixed types
+        let s = Int64Array::from(vec![1, 2]);
+        let d = StringArray::from(vec!["a", "b"]);
+        assert_eq!(
+            IdMap::from_edge_arrays(&s, &d).err(),
+            Some(IdError::MixedTypes)
+        );
+
+        // unsupported type (float)
+        use arrow::array::Float64Array;
+        let s = Float64Array::from(vec![1.0, 2.0]);
+        let d = Float64Array::from(vec![2.0, 1.0]);
+        assert!(matches!(
+            IdMap::from_edge_arrays(&s, &d),
+            Err(IdError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn dense_from_array_rejects_wrong_type() {
+        let m = IdMap::from_ids([1, 2, 3]);
+        let wrong = StringArray::from(vec!["1"]);
+        assert_eq!(m.dense_from_array(&wrong), Err(IdError::MixedTypes));
     }
 }

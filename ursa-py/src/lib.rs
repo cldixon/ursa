@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{make_array, Array, ArrayData, Int64Array, RecordBatch};
+use arrow::array::{make_array, Array, ArrayData, ArrayRef, Int64Array, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -42,16 +42,12 @@ use ursa_plan::{
 // Real execution path: pyarrow in -> one DataFusion plan -> pyarrow out.
 // ---------------------------------------------------------------------------
 
-/// Read a pyarrow array into an `Int64Array`, erroring if it is not int64.
-fn int64_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Int64Array> {
-    let array = make_array(ArrayData::from_pyarrow_bound(obj)?);
-    array
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .cloned()
-        .ok_or_else(|| {
-            PyValueError::new_err("src/dst must be an int64 array (cast ids to int64 first)")
-        })
+/// Import a pyarrow array into an Arrow `ArrayRef`. No type restriction — the id
+/// type (int64 or string) is discovered and validated in `ursa-core`
+/// (`IdMap::from_edge_arrays` / `dense_from_array`), so ids of either type flow
+/// through this one seam.
+fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+    Ok(make_array(ArrayData::from_pyarrow_bound(obj)?))
 }
 
 /// Counts topology builds, so tests can prove the index-preservation contract
@@ -68,19 +64,20 @@ struct GraphIndex {
     ids: Arc<IdMap>,
 }
 
-/// Build the graph index from `(src, dst)` int64 arrays — the one place the CSR
-/// is constructed. The GIL is released for the build; the counter lets tests
-/// assert build-once behaviour.
+/// Build the graph index from `(src, dst)` arrays (int64 or string ids) — the one
+/// place the CSR is constructed. The id type is auto-detected from the Arrow
+/// columns. The GIL is released for the build; the counter lets tests assert
+/// build-once behaviour.
 #[pyfunction]
 fn build_index(
     py: Python<'_>,
     src: &Bound<'_, PyAny>,
     dst: &Bound<'_, PyAny>,
 ) -> PyResult<GraphIndex> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+    let src = array_from_pyarrow(src)?;
+    let dst = array_from_pyarrow(dst)?;
     let (topo, ids) = py.allow_threads(move || {
-        build_topology(&src, &dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        build_topology(src.as_ref(), dst.as_ref()).map_err(|e| PyValueError::new_err(e.to_string()))
     })?;
     TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
     Ok(GraphIndex { topo, ids })
@@ -138,9 +135,10 @@ fn run_node_query(
 
 /// Execute a `hop` traversal and return its `(src, dst)` edge batch as pyarrow.
 ///
-/// `seeds` is an int64 pyarrow array of user ids; `n` is the hop count and
-/// `direction` one of out/in/both. `filters`/`sort`/`limit`/`distinct` are the
-/// optional relational tail applied to the reached edges.
+/// `seeds` is a pyarrow array of user ids (int64 or string, matching the graph);
+/// `n` is the hop count and `direction` one of out/in/both.
+/// `filters`/`sort`/`limit`/`distinct` are the optional relational tail applied to
+/// the reached edges.
 #[pyfunction]
 #[pyo3(signature = (index, seeds, n, direction, filters, sort=None, limit=None, distinct=false))]
 #[allow(clippy::too_many_arguments)]
@@ -156,7 +154,7 @@ fn run_hop_query(
     distinct: bool,
 ) -> PyResult<PyObject> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
-    let seeds = int64_from_pyarrow(seeds)?;
+    let seeds = array_from_pyarrow(seeds)?;
     let direction = direction.to_string();
     let comparisons: Vec<Comparison> = filters
         .into_iter()
@@ -166,7 +164,7 @@ fn run_hop_query(
         execute_hop_query(
             topo,
             ids,
-            &seeds,
+            seeds.as_ref(),
             n,
             &direction,
             &comparisons,
@@ -180,8 +178,9 @@ fn run_hop_query(
 }
 
 /// Execute a `shortest_path` traversal and return its `(src, dst, hop)` path batch
-/// as pyarrow. `source`/`target` are int64 user ids; `direction` is out/in/both.
-/// `weighted` is reserved (errors for now — v0.1 is unweighted BFS). The
+/// as pyarrow. `source`/`target` are 1-element pyarrow arrays of user ids (int64
+/// or string, matching the graph); `direction` is out/in/both. `weighted` is
+/// reserved (errors for now — v0.1 is unweighted BFS). The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the path edges.
 #[pyfunction]
 #[pyo3(signature = (index, source, target, direction, weighted=false, filters=Vec::new(), sort=None, limit=None, distinct=false))]
@@ -189,8 +188,8 @@ fn run_hop_query(
 fn run_path_query(
     py: Python<'_>,
     index: PyRef<'_, GraphIndex>,
-    source: i64,
-    target: i64,
+    source: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     direction: &str,
     weighted: bool,
     filters: Vec<(String, String, f64)>,
@@ -199,6 +198,8 @@ fn run_path_query(
     distinct: bool,
 ) -> PyResult<PyObject> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
+    let source = array_from_pyarrow(source)?;
+    let target = array_from_pyarrow(target)?;
     let direction = direction.to_string();
     let comparisons: Vec<Comparison> = filters
         .into_iter()
@@ -208,8 +209,8 @@ fn run_path_query(
         execute_path_query(
             topo,
             ids,
-            source,
-            target,
+            source.as_ref(),
+            target.as_ref(),
             &direction,
             weighted,
             &comparisons,
@@ -223,9 +224,9 @@ fn run_path_query(
 }
 
 /// Execute a `random_walk` and return its `(walk_id, step, node)` node batch as
-/// pyarrow. `starts` is an int64 pyarrow array of user ids; `seed` (optional)
-/// makes the walk reproducible. The `filters`/`sort`/`limit`/`distinct` tail
-/// applies to the walk rows.
+/// pyarrow. `starts` is a pyarrow array of user ids (int64 or string, matching the
+/// graph); `seed` (optional) makes the walk reproducible. The
+/// `filters`/`sort`/`limit`/`distinct` tail applies to the walk rows.
 #[pyfunction]
 #[pyo3(signature = (index, starts, steps, walks_per_node, seed=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
 #[allow(clippy::too_many_arguments)]
@@ -242,7 +243,7 @@ fn run_walk_query(
     distinct: bool,
 ) -> PyResult<PyObject> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
-    let starts = int64_from_pyarrow(starts)?;
+    let starts = array_from_pyarrow(starts)?;
     let comparisons: Vec<Comparison> = filters
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
@@ -251,7 +252,7 @@ fn run_walk_query(
         execute_walk_query(
             topo,
             ids,
-            &starts,
+            starts.as_ref(),
             steps,
             walks_per_node,
             seed,
@@ -357,14 +358,19 @@ fn scan_nodes_arrow(
 
 fn build_demo_topology(src: &[i64], dst: &[i64]) -> (Topology, Vec<i64>) {
     use ursa_core::IdMap;
-    let mut map = IdMap::default();
-    let src_dense: Vec<u32> = src.iter().map(|&u| map.intern(u)).collect();
-    let dst_dense: Vec<u32> = dst.iter().map(|&u| map.intern(u)).collect();
-    let n = map.len();
-    (
-        Topology::build(n, src_dense, dst_dense),
-        map.user_ids().to_vec(),
+    let (map, src_dense, dst_dense) = IdMap::from_edge_arrays(
+        &Int64Array::from(src.to_vec()),
+        &Int64Array::from(dst.to_vec()),
     )
+    .expect("demo edges have no null endpoints");
+    let user = map
+        .user_id_array()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("demo ids are int64")
+        .values()
+        .to_vec();
+    (Topology::build(map.len(), src_dense, dst_dense), user)
 }
 
 /// The `ursa-core` version — the simplest possible proof the native module loaded.

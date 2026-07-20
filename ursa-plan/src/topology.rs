@@ -8,19 +8,22 @@
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
-use ursa_core::id_map::NullNodeId;
-use ursa_core::{IdMap, Topology};
+use arrow::array::Array;
+use ursa_core::{IdError, IdMap, Topology};
 
-/// Build the topology index from two `Int64` endpoint columns.
+/// Build the topology index from two endpoint columns. The node-id type is taken
+/// from the Arrow columns — `Int64` (the fast path) or `Utf8` strings; callers
+/// canonicalize other integer types to `Int64` first (see `scan.rs` / the Python
+/// `_io` layer).
 ///
 /// Returns the shared, immutable topology and the `IdMap` needed to map dense
 /// kernel outputs back to user ids. Errors on a null endpoint (the spec's
-/// error-by-default null policy; `on_null="drop"` is a higher-layer opt-in).
+/// error-by-default null policy; `on_null="drop"` is a higher-layer opt-in), on
+/// mixed src/dst id types, or on an unsupported id type.
 pub fn build_topology(
-    src: &Int64Array,
-    dst: &Int64Array,
-) -> Result<(Arc<Topology>, Arc<IdMap>), NullNodeId> {
+    src: &dyn Array,
+    dst: &dyn Array,
+) -> Result<(Arc<Topology>, Arc<IdMap>), IdError> {
     let (ids, src_dense, dst_dense) = IdMap::from_edge_arrays(src, dst)?;
     let topo = Topology::build(ids.len(), src_dense, dst_dense);
     Ok((Arc::new(topo), Arc::new(ids)))
@@ -29,6 +32,7 @@ pub fn build_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
 
     #[test]
     fn builds_from_arrow_columns() {

@@ -123,9 +123,10 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
     }
 }
 
-/// The output schema for a query: `id: Int64` followed by one column per output.
-pub fn query_schema(columns: &[OutputColumn]) -> SchemaRef {
-    let mut fields = vec![Field::new("id", DataType::Int64, false)];
+/// The output schema for a query: an `id` column (of the graph's user-id type)
+/// followed by one column per output.
+pub fn query_schema(columns: &[OutputColumn], id_type: DataType) -> SchemaRef {
+    let mut fields = vec![Field::new("id", id_type, false)];
     for col in columns {
         // Neighbour aggregates can be null (undefined over no attributed
         // neighbours); algorithm columns are dense and non-null.
@@ -137,20 +138,20 @@ pub fn query_schema(columns: &[OutputColumn]) -> SchemaRef {
 
 /// Materialize the `(id, values...)` batch for a query.
 pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> RecordBatch {
-    let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids.user_ids().to_vec()))];
+    let mut arrays: Vec<ArrayRef> = vec![ids.user_id_array()];
     for col in columns {
         arrays.push(col.value_array(topo));
     }
-    RecordBatch::try_new(query_schema(columns), arrays)
+    RecordBatch::try_new(query_schema(columns, ids.user_type()), arrays)
         .expect("all columns have length n_nodes and match the schema")
 }
 
-/// The output schema for a `hop`: an edge frame `(src: Int64, dst: Int64)` where
-/// `src` is the seed and `dst` the reached node. Both are non-null.
-pub fn hop_schema() -> SchemaRef {
+/// The output schema for a `hop`: an edge frame `(src, dst)` (of the graph's
+/// user-id type) where `src` is the seed and `dst` the reached node. Both non-null.
+pub fn hop_schema(id_type: DataType) -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("src", DataType::Int64, false),
-        Field::new("dst", DataType::Int64, false),
+        Field::new("src", id_type.clone(), false),
+        Field::new("dst", id_type, false),
     ]))
 }
 
@@ -164,24 +165,23 @@ pub fn hop_batch(
     direction: Direction,
 ) -> RecordBatch {
     let (seed_dense, reached_dense) = k_hop(topo, seeds, n, direction);
-    let src: Vec<i64> = seed_dense.iter().map(|&d| ids.user(d)).collect();
-    let dst: Vec<i64> = reached_dense.iter().map(|&d| ids.user(d)).collect();
     RecordBatch::try_new(
-        hop_schema(),
+        hop_schema(ids.user_type()),
         vec![
-            Arc::new(Int64Array::from(src)),
-            Arc::new(Int64Array::from(dst)),
+            ids.gather_user(&seed_dense),
+            ids.gather_user(&reached_dense),
         ],
     )
-    .expect("src and dst are equal-length int64 columns matching the hop schema")
+    .expect("src and dst are equal-length id columns matching the hop schema")
 }
 
 /// The output schema for a `shortest_path`: an edge frame `(src, dst, hop)` — one
-/// row per edge on the path, in order, with `hop` the 0-based position. All non-null.
-pub fn path_schema() -> SchemaRef {
+/// row per edge on the path, in order, with `hop` the 0-based position. `src`/`dst`
+/// carry the graph's user-id type; `hop` is Int64. All non-null.
+pub fn path_schema(id_type: DataType) -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("src", DataType::Int64, false),
-        Field::new("dst", DataType::Int64, false),
+        Field::new("src", id_type.clone(), false),
+        Field::new("dst", id_type, false),
         Field::new("hop", DataType::Int64, false),
     ]))
 }
@@ -197,35 +197,35 @@ pub fn path_batch(
     target: u32,
     direction: Direction,
 ) -> RecordBatch {
-    let mut src = Vec::new();
-    let mut dst = Vec::new();
+    let mut src_dense = Vec::new();
+    let mut dst_dense = Vec::new();
     let mut hop = Vec::new();
     if let Some(nodes) = shortest_path(topo, source, target, direction) {
         for (i, window) in nodes.windows(2).enumerate() {
-            src.push(ids.user(window[0]));
-            dst.push(ids.user(window[1]));
+            src_dense.push(window[0]);
+            dst_dense.push(window[1]);
             hop.push(i as i64);
         }
     }
     RecordBatch::try_new(
-        path_schema(),
+        path_schema(ids.user_type()),
         vec![
-            Arc::new(Int64Array::from(src)),
-            Arc::new(Int64Array::from(dst)),
+            ids.gather_user(&src_dense),
+            ids.gather_user(&dst_dense),
             Arc::new(Int64Array::from(hop)),
         ],
     )
-    .expect("src, dst, hop are equal-length int64 columns matching the path schema")
+    .expect("src, dst, hop are equal-length columns matching the path schema")
 }
 
 /// The output schema for a `random_walk`: a node frame `(walk_id, step, node)` —
 /// one row per visited node, `walk_id` identifying the walk and `step` its 0-based
 /// position along it. All non-null.
-pub fn walk_schema() -> SchemaRef {
+pub fn walk_schema(id_type: DataType) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("walk_id", DataType::Int64, false),
         Field::new("step", DataType::Int64, false),
-        Field::new("node", DataType::Int64, false),
+        Field::new("node", id_type, false),
     ]))
 }
 
@@ -241,16 +241,16 @@ pub fn walk_batch(
     seed: Option<u64>,
 ) -> RecordBatch {
     let walks = random_walk(topo, starts, steps, walks_per_node, seed);
-    let node: Vec<i64> = walks.node.iter().map(|&d| ids.user(d)).collect();
+    let node = ids.gather_user(&walks.node);
     RecordBatch::try_new(
-        walk_schema(),
+        walk_schema(ids.user_type()),
         vec![
             Arc::new(Int64Array::from(walks.walk_id)),
             Arc::new(Int64Array::from(walks.step)),
-            Arc::new(Int64Array::from(node)),
+            node,
         ],
     )
-    .expect("walk_id, step, node are equal-length int64 columns matching the walk schema")
+    .expect("walk_id, step, node are equal-length columns matching the walk schema")
 }
 
 #[cfg(test)]
