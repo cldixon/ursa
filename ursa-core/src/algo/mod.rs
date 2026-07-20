@@ -16,6 +16,7 @@
 //! Every kernel takes a `&Topology` and returns dense, `u32`-indexed results;
 //! translation back to user ids happens at the Arrow boundary in `ursa-plan`.
 
+mod bfs;
 mod clustering;
 mod components;
 mod degree;
@@ -24,6 +25,7 @@ mod neighbor_agg;
 mod pagerank;
 mod triangle;
 
+pub use bfs::{bfs_distances, shortest_path};
 pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
 pub use degree::degree;
@@ -35,7 +37,7 @@ pub use triangle::triangle_count;
 // ---------------------------------------------------------------------------
 // Frontier kernels (BFS / k-hop / unweighted shortest path).
 // ---------------------------------------------------------------------------
-// `k_hop` (above) is the first, backing `ur.hop`. Still to come: a distance-
-// returning `bfs` and the direction-optimizing top-down/bottom-up switch
-// (Beamer et al.) ported from the GAP suite, which will back `ur.shortest_path`
-// (unweighted) and BFS-derived stats (diameter, avg_path_length).
+// `k_hop` (hop.rs) backs `ur.hop`; `bfs_distances` / `shortest_path` (bfs.rs)
+// back `ur.shortest_path` and the BFS-derived stats (diameter, avg_path_length).
+// Still to come: the direction-optimizing top-down/bottom-up BFS switch (Beamer
+// et al.) from the GAP suite, and weighted SSSP (delta-stepping).

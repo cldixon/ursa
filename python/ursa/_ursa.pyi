@@ -35,8 +35,29 @@ def run_hop_query(
     distinct: bool = ...,
 ) -> Any: ...
 
+# A shortest_path traversal: edge arrays + int64 source/target + direction +
+# relational tail -> (src, dst, hop) pyarrow.RecordBatch of the path edges.
+def run_path_query(
+    src: Any,
+    dst: Any,
+    source: int,
+    target: int,
+    direction: str,
+    weighted: bool = ...,
+    filters: list[tuple[str, str, float]] = ...,
+    sort: tuple[str, bool] | None = ...,
+    limit: int | None = ...,
+    distinct: bool = ...,
+) -> Any: ...
+
 # Whole-graph directed edge density (eager scalar).
 def graph_density(src: Any, dst: Any) -> float: ...
+
+# Average shortest-path length over reachable ordered pairs (eager scalar).
+def graph_avg_path_length(src: Any, dst: Any, sample: float | None = ...) -> float: ...
+
+# Graph diameter (eager scalar); approximate is a lower-bound estimate.
+def graph_diameter(src: Any, dst: Any, approximate: bool) -> int: ...
 
 # Whole-graph one-row summary -> pyarrow.RecordBatch.
 def graph_describe(src: Any, dst: Any, full: bool) -> Any: ...

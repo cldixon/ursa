@@ -30,7 +30,9 @@ use datafusion::physical_plan::{
 };
 use ursa_core::{Direction, IdMap, Topology};
 
-use crate::result::{hop_batch, hop_schema, query_batch, query_schema, OutputColumn};
+use crate::result::{
+    hop_batch, hop_schema, path_batch, path_schema, query_batch, query_schema, OutputColumn,
+};
 
 /// A leaf `ExecutionPlan` that runs a graph query's algorithms and emits a
 /// single `(id, values...)` `RecordBatch`.
@@ -208,6 +210,105 @@ impl ExecutionPlan for HopExec {
             tokio::task::spawn_blocking(move || hop_batch(&topo, &ids, &seeds, n, direction))
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("hop kernel panicked: {e}")))
+        };
+
+        let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
+        Ok(Box::pin(stream))
+    }
+}
+
+/// A leaf `ExecutionPlan` that runs a `shortest_path` traversal and emits a single
+/// `(src, dst, hop)` edge `RecordBatch` of the path edges in order. Produced from a
+/// [`crate::node::ShortestPathNode`] by [`crate::planner::GraphExtensionPlanner`].
+#[derive(Debug)]
+pub struct ShortestPathExec {
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    source: u32,
+    target: u32,
+    direction: Direction,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl ShortestPathExec {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        source: u32,
+        target: u32,
+        direction: Direction,
+    ) -> Self {
+        let schema = path_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        ShortestPathExec {
+            topology,
+            ids,
+            source,
+            target,
+            direction,
+            schema,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for ShortestPathExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "ShortestPathExec: source={}, target={}, direction={:?}",
+            self.source, self.target, self.direction
+        )
+    }
+}
+
+impl ExecutionPlan for ShortestPathExec {
+    fn name(&self) -> &str {
+        "ShortestPathExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.schema.clone();
+        let topo = self.topology.clone();
+        let ids = self.ids.clone();
+        let (source, target, direction) = (self.source, self.target, self.direction);
+
+        // CPU-bound frontier walk — keep it off the tokio worker.
+        let fut = async move {
+            tokio::task::spawn_blocking(move || path_batch(&topo, &ids, source, target, direction))
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("shortest_path kernel panicked: {e}"))
+                })
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));

@@ -337,6 +337,39 @@ def test_plain_edge_frame_collect_is_honest():
         edges.collect()
 
 
+def test_shortest_path_returns_ordered_edges():
+    # path 0 -> 1 -> 2 -> 3
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    rows = ur.shortest_path(edges, 0, 3).collect().to_dicts()
+    assert [(r["src"], r["dst"], r["hop"]) for r in rows] == [(0, 1, 0), (1, 2, 1), (2, 3, 2)]
+
+
+def test_shortest_path_unreachable_is_empty():
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    # no directed path 3 -> 0
+    assert ur.shortest_path(edges, 3, 0).collect().to_dicts() == []
+
+
+def test_shortest_path_direction_in():
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    rows = ur.shortest_path(edges, 3, 0, direction="in").collect().to_dicts()
+    assert [(r["src"], r["dst"]) for r in rows] == [(3, 2), (2, 1), (1, 0)]
+
+
+def test_shortest_path_over_scan_source(tmp_path):
+    path = tmp_path / "edges.csv"
+    path.write_text("s,d\n0,1\n1,2\n2,3\n")
+    edges = ur.scan_edges(str(path), src="s", dst="d")
+    rows = ur.shortest_path(edges, 0, 3).collect().to_dicts()
+    assert len(rows) == 3
+
+
+def test_shortest_path_weighted_is_honest():
+    edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 2]}), src="s", dst="d")
+    with pytest.raises(NotImplementedError):
+        ur.shortest_path(edges, 0, 2, weight=ur.col("w")).collect()
+
+
 def test_describe_summarizes_the_graph():
     # directed triangle: 3 nodes, 3 edges, density 0.5, avg_degree 1
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
@@ -362,6 +395,27 @@ def test_describe_over_scan_source(tmp_path):
     row = ur.describe(edges).collect().to_dicts()[0]
     assert row["n_nodes"] == 3
     assert row["n_edges"] == 3
+
+
+def test_avg_path_length_and_diameter():
+    # directed triangle 0->1->2->0: avg path length 1.5, diameter 2
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
+    assert abs(ur.avg_path_length(edges) - 1.5) < 1e-12
+    assert ur.diameter(edges, approximate=False) == 2
+    assert isinstance(ur.diameter(edges), int)
+
+
+def test_path_stats_on_a_line():
+    # line 0->1->2->3: diameter 3 (0 to 3)
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    assert ur.diameter(edges, approximate=False) == 3
+
+
+def test_path_stats_over_scan_source(tmp_path):
+    path = tmp_path / "edges.csv"
+    path.write_text("s,d\n0,1\n1,2\n2,0\n")
+    edges = ur.scan_edges(str(path), src="s", dst="d")
+    assert abs(ur.avg_path_length(edges) - 1.5) < 1e-12
 
 
 def test_unsupported_filter_predicate_is_honest():

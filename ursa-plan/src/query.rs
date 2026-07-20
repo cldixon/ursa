@@ -27,9 +27,9 @@ use ursa_core::algo::AggKind;
 use ursa_core::IdMap;
 
 use crate::logical::{Direction, GraphAlgo};
-use crate::node::{GraphAlgorithmNode, HopNode};
+use crate::node::{GraphAlgorithmNode, HopNode, ShortestPathNode};
 use crate::planner::graph_session;
-use crate::result::{is_executable, OutputColumn};
+use crate::result::{is_executable, path_schema, OutputColumn};
 use crate::topology::build_topology;
 
 /// A single `column <op> literal` comparison (`op` in `> >= < <= == !=`).
@@ -383,6 +383,82 @@ pub fn execute_hop_query(
     })
 }
 
+/// Build and execute one `shortest_path` traversal as a single DataFusion plan.
+///
+/// A [`ShortestPathNode`] emits the path's `(src, dst, hop)` edge frame; the same
+/// optional relational tail as [`execute_hop_query`] runs on top. `source`/`target`
+/// are user ids; if either is unknown the result is an empty path. Weighted paths
+/// are not yet supported (`weighted` errors) — v0.1 is unweighted BFS.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_path_query(
+    src: &Int64Array,
+    dst: &Int64Array,
+    source: i64,
+    target: i64,
+    direction: &str,
+    weighted: bool,
+    filters: &[Comparison],
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> Result<RecordBatch> {
+    if weighted {
+        return Err(DataFusionError::NotImplemented(
+            "weighted shortest_path is not supported yet; omit weight= for unweighted BFS".into(),
+        ));
+    }
+    let (topology, ids) =
+        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+
+    // Unknown endpoint -> no path (an empty edge frame), short-circuiting the plan.
+    let (Some(source), Some(target)) = (ids.dense(source), ids.dense(target)) else {
+        return RecordBatch::try_new(path_schema(), empty_path_columns())
+            .map_err(|e| DataFusionError::ArrowError(e, None));
+    };
+
+    let path_plan = LogicalPlan::Extension(Extension {
+        node: Arc::new(ShortestPathNode::new(
+            topology, ids, source, target, direction, false,
+        )),
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
+    runtime.block_on(async move {
+        let ctx = graph_session();
+        let mut df = ctx.execute_logical_plan(path_plan).await?;
+
+        for f in filters {
+            df = df.filter(comparison_expr(f)?)?;
+        }
+        if distinct {
+            df = df.distinct()?;
+        }
+        if let Some((column, descending)) = sort {
+            df = df.sort(vec![col(&column).sort(!descending, false)])?;
+        }
+        if let Some(n) = limit {
+            df = df.limit(0, Some(n))?;
+        }
+
+        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+    })
+}
+
+/// Three empty Int64 columns matching [`path_schema`] — the no-path result.
+fn empty_path_columns() -> Vec<Arc<dyn Array>> {
+    vec![
+        Arc::new(Int64Array::from(Vec::<i64>::new())),
+        Arc::new(Int64Array::from(Vec::<i64>::new())),
+        Arc::new(Int64Array::from(Vec::<i64>::new())),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +691,45 @@ mod tests {
         let mut reached: Vec<i64> = dsts.values().to_vec();
         reached.sort_unstable();
         assert_eq!(reached, vec![1, 2]);
+    }
+
+    #[test]
+    fn path_query_returns_ordered_path_edges() {
+        // path 0 -> 1 -> 2 -> 3
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        let batch =
+            execute_path_query(&src, &dst, 0, 3, "out", false, &[], None, None, false).unwrap();
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.num_rows(), 3);
+        let schema = batch.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["src", "dst", "hop"]);
+        let hop = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(hop.values(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn path_query_unknown_endpoint_is_empty() {
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        // 99 is not a node
+        let batch =
+            execute_path_query(&src, &dst, 0, 99, "out", false, &[], None, None, false).unwrap();
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    #[test]
+    fn path_query_weighted_errors() {
+        let src = Int64Array::from(vec![0, 1]);
+        let dst = Int64Array::from(vec![1, 2]);
+        let err = execute_path_query(&src, &dst, 0, 2, "out", true, &[], None, None, false);
+        assert!(err.is_err());
     }
 
     #[test]

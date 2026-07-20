@@ -167,7 +167,13 @@ def shortest_path(
     Omit ``weight`` for unweighted BFS."""
     step = _PlanStep(
         "shortest_path",
-        {"source": source, "target": target, "weight": weight, "direction": direction},
+        {
+            "source": source,
+            "target": target,
+            "weight": weight,
+            "direction": direction,
+            "edges": edges,
+        },
     )
     return EdgeFrame(src_col=edges.src_col, dst_col=edges.dst_col, plan=(step,))
 

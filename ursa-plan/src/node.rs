@@ -15,7 +15,7 @@ use datafusion::common::{DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use ursa_core::{Direction, IdMap, Topology};
 
-use crate::result::{hop_schema, query_schema, OutputColumn};
+use crate::result::{hop_schema, path_schema, query_schema, OutputColumn};
 
 #[derive(Clone)]
 pub struct GraphAlgorithmNode {
@@ -202,6 +202,111 @@ impl UserDefinedLogicalNodeCore for HopNode {
             self.n,
             self.direction,
             self.seeds.len()
+        )
+    }
+
+    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, _inputs: Vec<LogicalPlan>) -> Result<Self> {
+        Ok(self.clone())
+    }
+}
+
+/// The custom logical node for a `shortest_path` traversal.
+///
+/// A sibling of [`HopNode`]: another leaf node with a baked-in source/target
+/// (dense indices) that emits an **edge** frame — here `(src, dst, hop)`, the
+/// edges of the single source→target path in order. `weighted` is carried for the
+/// future weighted SSSP; v0.1 is unweighted BFS. Lowered to
+/// `crate::physical::ShortestPathExec`.
+#[derive(Clone)]
+pub struct ShortestPathNode {
+    pub topology: Arc<Topology>,
+    pub ids: Arc<IdMap>,
+    pub source: u32,
+    pub target: u32,
+    pub direction: Direction,
+    pub weighted: bool,
+    schema: DFSchemaRef,
+}
+
+impl ShortestPathNode {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        source: u32,
+        target: u32,
+        direction: Direction,
+        weighted: bool,
+    ) -> Self {
+        let schema = Arc::new(
+            DFSchema::try_from(path_schema().as_ref().clone())
+                .expect("path schema converts to a DFSchema"),
+        );
+        ShortestPathNode {
+            topology,
+            ids,
+            source,
+            target,
+            direction,
+            weighted,
+            schema,
+        }
+    }
+}
+
+impl PartialEq for ShortestPathNode {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.topology, &other.topology)
+            && self.source == other.source
+            && self.target == other.target
+            && self.direction == other.direction
+            && self.weighted == other.weighted
+    }
+}
+
+impl Eq for ShortestPathNode {}
+
+impl PartialOrd for ShortestPathNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (self.source, self.target).partial_cmp(&(other.source, other.target))
+    }
+}
+
+impl Hash for ShortestPathNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.topology) as usize).hash(state);
+        self.source.hash(state);
+        self.target.hash(state);
+    }
+}
+
+impl fmt::Debug for ShortestPathNode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.fmt_for_explain(f)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for ShortestPathNode {
+    fn name(&self) -> &str {
+        "ShortestPath"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "ShortestPath: source={}, target={}, direction={:?}",
+            self.source, self.target, self.direction
         )
     }
 

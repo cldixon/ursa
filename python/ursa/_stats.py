@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from ._frames import EdgeFrame, NodeFrame, _PlanStep
 
-_ENGINE_TODO = "requires the DataFusion execution engine (ursa-plan), not yet wired."
-
 
 def describe(edges: EdgeFrame, full: bool = False) -> NodeFrame:
     """A lazy one-row summary frame (n_nodes, n_edges, density, avg_degree, ...).
@@ -36,10 +34,20 @@ def density(edges: EdgeFrame) -> float:
 
 
 def avg_path_length(edges: EdgeFrame, sample: float | None = None) -> float:
-    """Average shortest-path length (eager; sampled estimator by default)."""
-    raise NotImplementedError(f"avg_path_length() {_ENGINE_TODO}")
+    """Average shortest-path length over reachable ordered pairs (eager; directed,
+    following out-edges). ``sample`` (a fraction in (0, 1]) estimates from a subset
+    of sources; omit for the exact mean."""
+    from ._execute import _native, _require_edges
+
+    src, dst = _require_edges(edges)
+    return float(_native().graph_avg_path_length(src, dst, sample))
 
 
 def diameter(edges: EdgeFrame, approximate: bool = True) -> int:
-    """Graph diameter (eager; approximate by default, exact only on request)."""
-    raise NotImplementedError(f"diameter() {_ENGINE_TODO}")
+    """Graph diameter — the longest shortest path over reachable pairs (eager;
+    directed). ``approximate`` (default) is a lower-bound estimate; pass
+    ``approximate=False`` for the exact value."""
+    from ._execute import _native, _require_edges
+
+    src, dst = _require_edges(edges)
+    return int(_native().graph_diameter(src, dst, approximate))

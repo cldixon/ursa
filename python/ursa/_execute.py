@@ -114,11 +114,12 @@ def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
     return None
 
 
-# --- frame-positioned traversal (ur.hop) ------------------------------------
+# --- frame-positioned traversals (ur.hop / ur.shortest_path) ----------------
 def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
-    """Execute a traversal EdgeFrame (``ur.hop(edges, n).from_(seeds)`` plus an
-    optional ``filter``/``sort``/``head``/``distinct`` tail)."""
-    hop = None
+    """Execute a traversal EdgeFrame — ``ur.hop(edges, n).from_(seeds)`` or
+    ``ur.shortest_path(edges, s, t)`` — plus an optional
+    ``filter``/``sort``/``head``/``distinct`` tail."""
+    traversal = None
     filters: list[tuple[str, str, float]] = []
     sort: tuple[str, bool] | None = None
     limit: int | None = None
@@ -126,8 +127,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
 
     for step in frame._plan:
         op = step.op
-        if op == "hop":
-            hop = step
+        if op in ("hop", "shortest_path"):
+            traversal = step
         elif op in (
             "scan_edges",
             "from_arrow",
@@ -148,20 +149,47 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             distinct = True
         else:
             raise NotImplementedError(
-                f"collect() does not yet support the '{op}' step after a hop."
+                f"collect() does not yet support the '{op}' step after a traversal."
             )
 
-    if hop is None:
+    if traversal is None:
         raise NotImplementedError(
-            "collect() on an EdgeFrame is supported for traversals (ur.hop) in v0.1; "
-            "to compute metrics, call an algorithm on it (e.g. ur.pagerank(edges))."
+            "collect() on an EdgeFrame is supported for traversals (ur.hop, "
+            "ur.shortest_path) in v0.1; to compute metrics, call an algorithm on it "
+            "(e.g. ur.pagerank(edges))."
         )
 
-    src, dst = _require_edges(hop.args["edges"])
-    seeds = _resolve_seeds(hop.args["seeds"])
-    batch = _native().run_hop_query(
-        src, dst, seeds, int(hop.args["n"]), hop.args["direction"], filters, sort, limit, distinct
-    )
+    src, dst = _require_edges(traversal.args["edges"])
+    if traversal.op == "hop":
+        seeds = _resolve_seeds(traversal.args["seeds"])
+        batch = _native().run_hop_query(
+            src,
+            dst,
+            seeds,
+            int(traversal.args["n"]),
+            traversal.args["direction"],
+            filters,
+            sort,
+            limit,
+            distinct,
+        )
+    else:  # shortest_path
+        if traversal.args.get("weight") is not None:
+            raise NotImplementedError(
+                "weighted shortest_path is not supported yet; omit weight= for unweighted BFS."
+            )
+        batch = _native().run_path_query(
+            src,
+            dst,
+            int(traversal.args["source"]),
+            int(traversal.args["target"]),
+            traversal.args["direction"],
+            False,  # weighted
+            filters,
+            sort,
+            limit,
+            distinct,
+        )
     return MaterializedFrame(batch)
 
 

@@ -38,7 +38,7 @@ the parts that prove the design is sound are real and tested end-to-end.
 | **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) kernels. Remaining frontier/BFS kernels are documented stubs. |
 | **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge files. |
 | **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
-| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort), **`neighbors().agg()`** over numeric *and* string attributes, a **`hop()` traversal** (first-class `HopNode`, returns an `(src, dst)` EdgeFrame), and the **`describe()`** summary frame. Over in-memory or `scan_edges`/`scan_nodes` sources. |
+| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort), **`neighbors().agg()`** over numeric *and* string attributes, two **traversals** (`hop()` and `shortest_path()`, first-class `HopNode`/`ShortestPathNode` returning EdgeFrames), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources. |
 
 ```python
 import ursa as ur, pyarrow as pa
@@ -120,18 +120,19 @@ custom graph logical nodes — and many features have fanned out on top of it:
 node-valued algorithms (pagerank, degree, connected_components, triangle_count,
 clustering_coefficient), composed pipelines, `scan_edges`/`scan_nodes` sources,
 **node-attribute enrichment** (in-memory or file-backed tables joined by id),
-**`neighbors().agg()`** over numeric and string attributes, a first-class
-**`hop()` traversal** (its own `HopNode`, returning an `(src, dst)` EdgeFrame that
-composes with filter/sort/distinct), the eager **`density`** and one-row
-**`describe`** stats, and `sink_parquet`/`sink_csv` egress.
+**`neighbors().agg()`** over numeric and string attributes, two **traversals**
+(`hop()` and `shortest_path()`, each its own first-class logical node returning an
+EdgeFrame, on a shared single-source BFS kernel family), the eager whole-graph
+stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
+**`describe`**, and `sink_parquet`/`sink_csv` egress.
 
 Next, in rough priority order:
 
-1. **Weighted algorithms** (`weight=`, using the `edge_ids` permutation already in
-   place) and object storage (`s3://`) to complete the enrichment/IO story.
-2. **More traversals** — `shortest_path` / `random_walk` on the frontier/BFS
-   kernel family `hop` established (a distance-returning `bfs` unblocks the
-   `diameter` / `avg_path_length` stats).
+1. **Weighted algorithms** (`weight=` for pagerank/degree and weighted SSSP via
+   delta-stepping, using the `edge_ids` permutation already in place) and object
+   storage (`s3://`) to complete the enrichment/IO story.
+2. **`random_walk`** on the same frontier-kernel family, and the direction-
+   optimizing (top-down/bottom-up) BFS switch for scale.
 3. **Optimizer rules** — push node-set filters before traversal, fuse
    `neighbors().agg` into a segmented CSR reduction, share one topology build.
 4. **Breadth** — remaining algorithms (closeness, betweenness, louvain,

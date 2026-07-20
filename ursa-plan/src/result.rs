@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
     clustering_coefficient, connected_components_weak, degree, k_hop, neighbor_aggregate, pagerank,
-    triangle_count, AggKind, PageRankParams,
+    shortest_path, triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -157,6 +157,48 @@ pub fn hop_batch(
         ],
     )
     .expect("src and dst are equal-length int64 columns matching the hop schema")
+}
+
+/// The output schema for a `shortest_path`: an edge frame `(src, dst, hop)` — one
+/// row per edge on the path, in order, with `hop` the 0-based position. All non-null.
+pub fn path_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("src", DataType::Int64, false),
+        Field::new("dst", DataType::Int64, false),
+        Field::new("hop", DataType::Int64, false),
+    ]))
+}
+
+/// Materialize a `shortest_path`'s `(src, dst, hop)` batch: run the unweighted BFS
+/// path kernel and zip the dense node sequence into consecutive edges (translated
+/// back to user ids). An unreachable target (or a trivial one-node path) yields an
+/// empty batch.
+pub fn path_batch(
+    topo: &Topology,
+    ids: &IdMap,
+    source: u32,
+    target: u32,
+    direction: Direction,
+) -> RecordBatch {
+    let mut src = Vec::new();
+    let mut dst = Vec::new();
+    let mut hop = Vec::new();
+    if let Some(nodes) = shortest_path(topo, source, target, direction) {
+        for (i, window) in nodes.windows(2).enumerate() {
+            src.push(ids.user(window[0]));
+            dst.push(ids.user(window[1]));
+            hop.push(i as i64);
+        }
+    }
+    RecordBatch::try_new(
+        path_schema(),
+        vec![
+            Arc::new(Int64Array::from(src)),
+            Arc::new(Int64Array::from(dst)),
+            Arc::new(Int64Array::from(hop)),
+        ],
+    )
+    .expect("src, dst, hop are equal-length int64 columns matching the path schema")
 }
 
 #[cfg(test)]
