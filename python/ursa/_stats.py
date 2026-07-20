@@ -27,27 +27,24 @@ def density(edges: EdgeFrame) -> float:
     excluded). Multiplicity counts as given; call ``.distinct()`` first for the
     simple-graph value.
     """
-    from ._execute import _native, _require_edges
+    from ._execute import _native, _require_index
 
-    src, dst = _require_edges(edges)
-    return float(_native().graph_density(src, dst))
+    return float(_native().graph_density(_require_index(edges)))
 
 
 def avg_path_length(edges: EdgeFrame, sample: float | None = None) -> float:
     """Average shortest-path length over reachable ordered pairs (eager; directed,
     following out-edges). ``sample`` (a fraction in (0, 1]) estimates from a subset
     of sources; omit for the exact mean."""
-    from ._execute import _native, _require_edges
+    from ._execute import _native, _require_index
 
-    src, dst = _require_edges(edges)
-    return float(_native().graph_avg_path_length(src, dst, sample))
+    return float(_native().graph_avg_path_length(_require_index(edges), sample))
 
 
 def diameter(edges: EdgeFrame, approximate: bool = True) -> int:
     """Graph diameter — the longest shortest path over reachable pairs (eager;
     directed). ``approximate`` (default) is a lower-bound estimate; pass
     ``approximate=False`` for the exact value."""
-    from ._execute import _native, _require_edges
+    from ._execute import _native, _require_index
 
-    src, dst = _require_edges(edges)
-    return int(_native().graph_diameter(src, dst, approximate))
+    return int(_native().graph_diameter(_require_index(edges), approximate))

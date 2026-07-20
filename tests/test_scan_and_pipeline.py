@@ -461,6 +461,51 @@ def test_path_stats_over_scan_source(tmp_path):
     assert abs(ur.avg_path_length(edges) - 1.5) < 1e-12
 
 
+def test_topology_built_once_per_frame():
+    # The index-preservation contract: one frame -> the CSR is built exactly once,
+    # shared by every graph op over it, and reused across collect()s.
+    from ursa._execute import _native
+
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+    before = _native()._topology_build_count()
+
+    # three algorithms over ONE frame in a single pipeline
+    df = (
+        edges.nodes()
+        .with_columns(
+            pr=ur.pagerank(edges),
+            indeg=ur.degree(edges, direction="in"),
+            tri=ur.triangle_count(edges),
+        )
+        .collect()
+        .to_polars()
+    )
+    assert set(df.columns) == {"id", "pr", "indeg", "tri"}
+    after_first = _native()._topology_build_count()
+    assert after_first - before == 1  # built once for all three algorithms
+
+    # a second collect on the same frame reuses the cached index -> no rebuild
+    edges.nodes().with_columns(pr=ur.pagerank(edges)).collect()
+    assert _native()._topology_build_count() == after_first
+
+    # an eager stat over the same frame also reuses it
+    ur.density(edges)
+    assert _native()._topology_build_count() == after_first
+
+
+def test_index_rides_the_preserve_drop_rail():
+    # The cached handle is preserved by property-only ops and dropped by
+    # structural ones (matching the source/scan invalidation).
+    edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 2]}), src="s", dst="d")
+    ur.degree(edges).collect()  # force a build
+    built = edges._index
+    assert built is not None
+    # property-only op (rename) carries the same handle forward
+    assert edges.rename({})._index is built
+    # structural op (distinct) drops it
+    assert edges.distinct()._index is None
+
+
 def test_unsupported_filter_predicate_is_honest():
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
     pipeline = (
