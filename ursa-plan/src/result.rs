@@ -14,8 +14,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
     betweenness, closeness, clustering_coefficient, connected_components_weak, degree, k_hop,
-    label_propagation, louvain, neighbor_aggregate, pagerank, shortest_path, triangle_count,
-    AggKind, PageRankParams,
+    label_propagation, louvain, neighbor_aggregate, pagerank, random_walk, shortest_path,
+    triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -216,6 +216,41 @@ pub fn path_batch(
         ],
     )
     .expect("src, dst, hop are equal-length int64 columns matching the path schema")
+}
+
+/// The output schema for a `random_walk`: a node frame `(walk_id, step, node)` —
+/// one row per visited node, `walk_id` identifying the walk and `step` its 0-based
+/// position along it. All non-null.
+pub fn walk_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("walk_id", DataType::Int64, false),
+        Field::new("step", DataType::Int64, false),
+        Field::new("node", DataType::Int64, false),
+    ]))
+}
+
+/// Materialize a `random_walk`'s `(walk_id, step, node)` batch: run the walk
+/// kernel from the dense start set and translate the visited dense nodes back to
+/// user ids.
+pub fn walk_batch(
+    topo: &Topology,
+    ids: &IdMap,
+    starts: &[u32],
+    steps: u32,
+    walks_per_node: u32,
+    seed: Option<u64>,
+) -> RecordBatch {
+    let walks = random_walk(topo, starts, steps, walks_per_node, seed);
+    let node: Vec<i64> = walks.node.iter().map(|&d| ids.user(d)).collect();
+    RecordBatch::try_new(
+        walk_schema(),
+        vec![
+            Arc::new(Int64Array::from(walks.walk_id)),
+            Arc::new(Int64Array::from(walks.step)),
+            Arc::new(Int64Array::from(node)),
+        ],
+    )
+    .expect("walk_id, step, node are equal-length int64 columns matching the walk schema")
 }
 
 #[cfg(test)]

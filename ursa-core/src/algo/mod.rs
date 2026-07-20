@@ -27,6 +27,7 @@ mod label_prop;
 mod louvain;
 mod neighbor_agg;
 mod pagerank;
+mod random_walk;
 mod rng;
 mod triangle;
 
@@ -41,6 +42,7 @@ pub use label_prop::label_propagation;
 pub use louvain::louvain;
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, PageRankParams};
+pub use random_walk::{random_walk, Walks};
 pub use triangle::triangle_count;
 
 // ---------------------------------------------------------------------------

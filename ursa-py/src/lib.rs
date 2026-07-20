@@ -34,7 +34,8 @@ use ursa_core::topology::{Direction as CoreDirection, Topology};
 use ursa_core::IdMap;
 use ursa_plan::{
     avg_path_length, build_topology, density, describe, diameter, execute_hop_query,
-    execute_node_query, execute_path_query, scan_edges_batch, scan_nodes_batch, Comparison,
+    execute_node_query, execute_path_query, execute_walk_query, scan_edges_batch, scan_nodes_batch,
+    Comparison,
 };
 
 // ---------------------------------------------------------------------------
@@ -221,6 +222,49 @@ fn run_path_query(
     batch.to_pyarrow(py)
 }
 
+/// Execute a `random_walk` and return its `(walk_id, step, node)` node batch as
+/// pyarrow. `starts` is an int64 pyarrow array of user ids; `seed` (optional)
+/// makes the walk reproducible. The `filters`/`sort`/`limit`/`distinct` tail
+/// applies to the walk rows.
+#[pyfunction]
+#[pyo3(signature = (index, starts, steps, walks_per_node, seed=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[allow(clippy::too_many_arguments)]
+fn run_walk_query(
+    py: Python<'_>,
+    index: PyRef<'_, GraphIndex>,
+    starts: &Bound<'_, PyAny>,
+    steps: u32,
+    walks_per_node: u32,
+    seed: Option<u64>,
+    filters: Vec<(String, String, f64)>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> PyResult<PyObject> {
+    let (topo, ids) = (index.topo.clone(), index.ids.clone());
+    let starts = int64_from_pyarrow(starts)?;
+    let comparisons: Vec<Comparison> = filters
+        .into_iter()
+        .map(|(column, op, value)| Comparison { column, op, value })
+        .collect();
+    let batch = py.allow_threads(move || {
+        execute_walk_query(
+            topo,
+            ids,
+            &starts,
+            steps,
+            walks_per_node,
+            seed,
+            &comparisons,
+            sort,
+            limit,
+            distinct,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
+}
+
 /// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
 fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>) -> PyResult<f64> {
@@ -390,6 +434,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_path_query, m)?)?;
+    m.add_function(wrap_pyfunction!(run_walk_query, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
     m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;
     m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;

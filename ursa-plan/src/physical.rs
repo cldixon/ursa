@@ -31,7 +31,8 @@ use datafusion::physical_plan::{
 use ursa_core::{Direction, IdMap, Topology};
 
 use crate::result::{
-    hop_batch, hop_schema, path_batch, path_schema, query_batch, query_schema, OutputColumn,
+    hop_batch, hop_schema, path_batch, path_schema, query_batch, query_schema, walk_batch,
+    walk_schema, OutputColumn,
 };
 
 /// A leaf `ExecutionPlan` that runs a graph query's algorithms and emits a
@@ -309,6 +310,112 @@ impl ExecutionPlan for ShortestPathExec {
                 .map_err(|e| {
                     DataFusionError::Execution(format!("shortest_path kernel panicked: {e}"))
                 })
+        };
+
+        let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
+        Ok(Box::pin(stream))
+    }
+}
+
+/// A leaf `ExecutionPlan` that runs a `random_walk` and emits a single
+/// `(walk_id, step, node)` node `RecordBatch`. Produced from a
+/// [`crate::node::RandomWalkNode`] by [`crate::planner::GraphExtensionPlanner`].
+#[derive(Debug)]
+pub struct RandomWalkExec {
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    starts: Arc<Vec<u32>>,
+    steps: u32,
+    walks_per_node: u32,
+    seed: Option<u64>,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl RandomWalkExec {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        starts: Arc<Vec<u32>>,
+        steps: u32,
+        walks_per_node: u32,
+        seed: Option<u64>,
+    ) -> Self {
+        let schema = walk_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        RandomWalkExec {
+            topology,
+            ids,
+            starts,
+            steps,
+            walks_per_node,
+            seed,
+            schema,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for RandomWalkExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "RandomWalkExec: steps={}, walks_per_node={}, starts={}, seed={:?}",
+            self.steps,
+            self.walks_per_node,
+            self.starts.len(),
+            self.seed
+        )
+    }
+}
+
+impl ExecutionPlan for RandomWalkExec {
+    fn name(&self) -> &str {
+        "RandomWalkExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.schema.clone();
+        let topo = self.topology.clone();
+        let ids = self.ids.clone();
+        let starts = self.starts.clone();
+        let (steps, walks_per_node, seed) = (self.steps, self.walks_per_node, self.seed);
+
+        // CPU-bound stochastic walk — keep it off the tokio worker.
+        let fut = async move {
+            tokio::task::spawn_blocking(move || {
+                walk_batch(&topo, &ids, &starts, steps, walks_per_node, seed)
+            })
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("random_walk kernel panicked: {e}")))
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
