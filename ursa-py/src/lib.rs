@@ -26,7 +26,10 @@ use pyo3::prelude::*;
 
 use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
 use ursa_core::topology::{Direction as CoreDirection, Topology};
-use ursa_plan::{density, execute_node_query, scan_edges_batch, scan_nodes_batch, Comparison};
+use ursa_plan::{
+    density, describe, execute_hop_query, execute_node_query, scan_edges_batch, scan_nodes_batch,
+    Comparison,
+};
 
 // ---------------------------------------------------------------------------
 // Real execution path: pyarrow in -> one DataFusion plan -> pyarrow out.
@@ -90,6 +93,51 @@ fn run_node_query(
     batch.to_pyarrow(py)
 }
 
+/// Execute a `hop` traversal and return its `(src, dst)` edge batch as pyarrow.
+///
+/// `seeds` is an int64 pyarrow array of user ids; `n` is the hop count and
+/// `direction` one of out/in/both. `filters`/`sort`/`limit`/`distinct` are the
+/// optional relational tail applied to the reached edges.
+#[pyfunction]
+#[pyo3(signature = (src, dst, seeds, n, direction, filters, sort=None, limit=None, distinct=false))]
+#[allow(clippy::too_many_arguments)]
+fn run_hop_query(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    dst: &Bound<'_, PyAny>,
+    seeds: &Bound<'_, PyAny>,
+    n: u32,
+    direction: &str,
+    filters: Vec<(String, String, f64)>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> PyResult<PyObject> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    let seeds = int64_from_pyarrow(seeds)?;
+    let direction = direction.to_string();
+    let comparisons: Vec<Comparison> = filters
+        .into_iter()
+        .map(|(column, op, value)| Comparison { column, op, value })
+        .collect();
+    let batch = py.allow_threads(move || {
+        execute_hop_query(
+            &src,
+            &dst,
+            &seeds,
+            n,
+            &direction,
+            &comparisons,
+            sort,
+            limit,
+            distinct,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
+}
+
 /// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
 fn graph_density(py: Python<'_>, src: &Bound<'_, PyAny>, dst: &Bound<'_, PyAny>) -> PyResult<f64> {
@@ -98,6 +146,23 @@ fn graph_density(py: Python<'_>, src: &Bound<'_, PyAny>, dst: &Bound<'_, PyAny>)
     py.allow_threads(move || {
         density(&src, &dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })
+}
+
+/// Whole-graph one-row summary (`n_nodes, n_edges, density, avg_degree,
+/// n_components`) as a pyarrow `RecordBatch`. `full` computes `n_components`.
+#[pyfunction]
+fn graph_describe(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    dst: &Bound<'_, PyAny>,
+    full: bool,
+) -> PyResult<PyObject> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    let batch = py.allow_threads(move || {
+        describe(&src, &dst, full).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
 }
 
 /// Read a Parquet/CSV edge file's `src`/`dst` columns through a DataFusion scan
@@ -198,7 +263,9 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(__core_version, m)?)?;
     // real execution path
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
+    m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_describe, m)?)?;
     m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(scan_nodes_arrow, m)?)?;
     // demo path

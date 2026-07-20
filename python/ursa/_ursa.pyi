@@ -21,8 +21,25 @@ def run_node_query(
     nodes_id: str | None = ...,
 ) -> Any: ...
 
+# A hop traversal: edge arrays + int64 seed array + n/direction + relational
+# tail -> (src, dst) pyarrow.RecordBatch of reached pairs.
+def run_hop_query(
+    src: Any,
+    dst: Any,
+    seeds: Any,
+    n: int,
+    direction: str,
+    filters: list[tuple[str, str, float]],
+    sort: tuple[str, bool] | None = ...,
+    limit: int | None = ...,
+    distinct: bool = ...,
+) -> Any: ...
+
 # Whole-graph directed edge density (eager scalar).
 def graph_density(src: Any, dst: Any) -> float: ...
+
+# Whole-graph one-row summary -> pyarrow.RecordBatch.
+def graph_describe(src: Any, dst: Any, full: bool) -> Any: ...
 
 # Scan a Parquet/CSV edge file -> (src, dst) pyarrow.RecordBatch.
 def scan_edges_arrow(path: str, src: str, dst: str) -> Any: ...

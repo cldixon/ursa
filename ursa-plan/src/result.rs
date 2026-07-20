@@ -13,7 +13,7 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
-    clustering_coefficient, connected_components_weak, degree, neighbor_aggregate, pagerank,
+    clustering_coefficient, connected_components_weak, degree, k_hop, neighbor_aggregate, pagerank,
     triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
@@ -126,6 +126,37 @@ pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> Re
     }
     RecordBatch::try_new(query_schema(columns), arrays)
         .expect("all columns have length n_nodes and match the schema")
+}
+
+/// The output schema for a `hop`: an edge frame `(src: Int64, dst: Int64)` where
+/// `src` is the seed and `dst` the reached node. Both are non-null.
+pub fn hop_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("src", DataType::Int64, false),
+        Field::new("dst", DataType::Int64, false),
+    ]))
+}
+
+/// Materialize a `hop`'s `(src, dst)` edge batch: run `k_hop` over the topology
+/// and translate the dense `(seed, reached)` pairs back to user ids.
+pub fn hop_batch(
+    topo: &Topology,
+    ids: &IdMap,
+    seeds: &[u32],
+    n: u32,
+    direction: Direction,
+) -> RecordBatch {
+    let (seed_dense, reached_dense) = k_hop(topo, seeds, n, direction);
+    let src: Vec<i64> = seed_dense.iter().map(|&d| ids.user(d)).collect();
+    let dst: Vec<i64> = reached_dense.iter().map(|&d| ids.user(d)).collect();
+    RecordBatch::try_new(
+        hop_schema(),
+        vec![
+            Arc::new(Int64Array::from(src)),
+            Arc::new(Int64Array::from(dst)),
+        ],
+    )
+    .expect("src and dst are equal-length int64 columns matching the hop schema")
 }
 
 #[cfg(test)]

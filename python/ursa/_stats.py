@@ -19,7 +19,7 @@ def describe(edges: EdgeFrame, full: bool = False) -> NodeFrame:
     ``full=True`` computes the expensive members (e.g. ``n_components``); whether
     those are default or opt-in is an open question (spec §Open questions #4).
     """
-    return NodeFrame(id_col="stat", plan=(_PlanStep("describe", {"full": full}),))
+    return NodeFrame(id_col="stat", plan=(_PlanStep("describe", {"full": full, "edges": edges}),))
 
 
 def density(edges: EdgeFrame) -> float:

@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use datafusion::common::{DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
-use ursa_core::{IdMap, Topology};
+use ursa_core::{Direction, IdMap, Topology};
 
-use crate::result::{query_schema, OutputColumn};
+use crate::result::{hop_schema, query_schema, OutputColumn};
 
 #[derive(Clone)]
 pub struct GraphAlgorithmNode {
@@ -97,6 +97,112 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let names: Vec<&str> = self.columns.iter().map(|c| c.name()).collect();
         write!(f, "GraphAlgorithm: columns=[{}]", names.join(", "))
+    }
+
+    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, _inputs: Vec<LogicalPlan>) -> Result<Self> {
+        Ok(self.clone())
+    }
+}
+
+/// The custom logical node for a `hop` traversal.
+///
+/// Like [`GraphAlgorithmNode`] it is a *leaf* — the topology is a side data
+/// structure — but where the algorithm node emits a per-node `(id, values...)`
+/// frame, `HopNode` emits an **edge** frame `(src, dst)` of reached pairs. The
+/// seed set is carried as baked-in dense indices (`.from_(...)`), the smallest
+/// faithful form of a seed-input traversal node: it stays a leaf `ExecutionPlan`
+/// while still being a first-class citizen of the plan, so filter/sort/limit
+/// compose after it. `crate::planner` lowers it to `crate::physical::HopExec`.
+#[derive(Clone)]
+pub struct HopNode {
+    pub topology: Arc<Topology>,
+    pub ids: Arc<IdMap>,
+    pub seeds: Arc<Vec<u32>>,
+    pub n: u32,
+    pub direction: Direction,
+    schema: DFSchemaRef,
+}
+
+impl HopNode {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        seeds: Vec<u32>,
+        n: u32,
+        direction: Direction,
+    ) -> Self {
+        let schema = Arc::new(
+            DFSchema::try_from(hop_schema().as_ref().clone())
+                .expect("hop schema converts to a DFSchema"),
+        );
+        HopNode {
+            topology,
+            ids,
+            seeds: Arc::new(seeds),
+            n,
+            direction,
+            schema,
+        }
+    }
+}
+
+impl PartialEq for HopNode {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.topology, &other.topology)
+            && self.seeds == other.seeds
+            && self.n == other.n
+            && self.direction == other.direction
+    }
+}
+
+impl Eq for HopNode {}
+
+impl PartialOrd for HopNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Order by the scalar params only (topology identity is not orderable).
+        (self.n, self.seeds.len()).partial_cmp(&(other.n, other.seeds.len()))
+    }
+}
+
+impl Hash for HopNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.topology) as usize).hash(state);
+        self.n.hash(state);
+        self.seeds.hash(state);
+    }
+}
+
+impl fmt::Debug for HopNode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.fmt_for_explain(f)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for HopNode {
+    fn name(&self) -> &str {
+        "Hop"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Hop: n={}, direction={:?}, seeds={}",
+            self.n,
+            self.direction,
+            self.seeds.len()
+        )
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, _inputs: Vec<LogicalPlan>) -> Result<Self> {

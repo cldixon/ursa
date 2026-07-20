@@ -285,6 +285,85 @@ def test_neighbors_agg_mean_over_string_is_honest():
         pipeline.collect()
 
 
+def test_hop_reaches_within_n_from_a_seed():
+    # path 0 -> 1 -> 2 -> 3, plus branch 1 -> 4
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2, 1], "d": [1, 2, 3, 4]}), src="s", dst="d")
+    # two hops from 0: reaches 1 (level 1), then 2 and 4 (level 2)
+    rows = ur.hop(edges, n=2).from_([0]).collect().to_dicts()
+    reached = {r["dst"] for r in rows}
+    assert reached == {1, 2, 4}
+    assert all(r["src"] == 0 for r in rows)
+
+
+def test_hop_direction_in_walks_backwards():
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    rows = ur.hop(edges, n=2, direction="in").from_([3]).collect().to_dicts()
+    assert {r["dst"] for r in rows} == {1, 2}
+
+
+def test_hop_composes_with_filter_sort_and_distinct():
+    # hub: 1,2,3 -> 0 ; from all three seeds, one hop out all reach 0
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3], "d": [0, 0, 0]}), src="s", dst="d")
+    df = (
+        ur.hop(edges, n=1)
+        .from_([1, 2, 3])
+        .filter(ur.col("dst") == 0)
+        .sort("src", descending=True)
+        .collect()
+        .to_polars()
+    )
+    assert df["dst"].to_list() == [0, 0, 0]
+    assert df["src"].to_list() == [3, 2, 1]  # sorted descending by seed
+
+
+def test_hop_seeds_from_a_nodeframe():
+    # seeds provided as a NodeFrame (its id column drives the seed set)
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    seeds = ur.from_arrow(pa.table({"id": [0]}), id="id")
+    rows = ur.hop(edges, n=1).from_(seeds).collect().to_dicts()
+    assert {r["dst"] for r in rows} == {1}
+
+
+def test_hop_requires_seeds():
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    with pytest.raises(NotImplementedError):
+        ur.hop(edges, n=1).collect()
+
+
+def test_plain_edge_frame_collect_is_honest():
+    # A bare EdgeFrame with no traversal step is not collectable on its own.
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    with pytest.raises(NotImplementedError):
+        edges.collect()
+
+
+def test_describe_summarizes_the_graph():
+    # directed triangle: 3 nodes, 3 edges, density 0.5, avg_degree 1
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
+    row = ur.describe(edges).collect().to_dicts()[0]
+    assert row["n_nodes"] == 3
+    assert row["n_edges"] == 3
+    assert abs(row["density"] - 0.5) < 1e-12
+    assert abs(row["avg_degree"] - 1.0) < 1e-12
+    assert row["n_components"] is None  # gated behind full=
+
+
+def test_describe_full_computes_components():
+    # two disjoint edges -> two weakly-connected components
+    edges = ur.from_arrow(pa.table({"s": [0, 2], "d": [1, 3]}), src="s", dst="d")
+    row = ur.describe(edges, full=True).collect().to_dicts()[0]
+    assert row["n_components"] == 2
+
+
+def test_describe_over_scan_source(tmp_path):
+    path = tmp_path / "edges.csv"
+    path.write_text("s,d\n0,1\n1,2\n2,0\n")
+    edges = ur.scan_edges(str(path), src="s", dst="d")
+    row = ur.describe(edges).collect().to_dicts()[0]
+    assert row["n_nodes"] == 3
+    assert row["n_edges"] == 3
+
+
 def test_unsupported_filter_predicate_is_honest():
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
     pipeline = (

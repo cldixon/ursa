@@ -129,7 +129,18 @@ class _Hop:
         return self._materialize().distinct()
 
     def _materialize(self) -> EdgeFrame:
-        step = _PlanStep("hop", {"n": self._n, "direction": self._direction, "seeds": self._seeds})
+        # Carry the parent edges into the step so collect() can resolve (src, dst);
+        # the produced EdgeFrame's own source/scan are empty (its rows are the
+        # hop's reached edges, not the parent graph's).
+        step = _PlanStep(
+            "hop",
+            {
+                "n": self._n,
+                "direction": self._direction,
+                "seeds": self._seeds,
+                "edges": self._edges,
+            },
+        )
         return EdgeFrame(src_col=self._edges.src_col, dst_col=self._edges.dst_col, plan=(step,))
 
     def collect(self):

@@ -225,6 +225,30 @@ class EdgeFrame(_Frame):
             has_index=False,  # transpose becomes the new "out" direction
         )
 
+    # A frame-positioned traversal (ur.hop) executes here, returning the reached
+    # edges as a materialized frame. A plain edge frame with no traversal step is
+    # not collectable on its own (call an algorithm on it) — collect_edge_frame
+    # raises a clear error in that case.
+    def collect(self) -> MaterializedFrame:  # ty: ignore[invalid-method-override]
+        from ._execute import collect_edge_frame
+
+        return collect_edge_frame(self)
+
+    def to_polars(self) -> Any:
+        return self.collect().to_polars()
+
+    def to_arrow(self) -> Any:
+        return self.collect().to_arrow()
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        return self.collect().to_dicts()
+
+    def sink_parquet(self, path: str, **opts: Any) -> None:
+        self.collect().sink_parquet(path, **opts)
+
+    def sink_csv(self, path: str, **opts: Any) -> None:
+        self.collect().sink_csv(path)
+
     def __repr__(self) -> str:
         return (
             f"<EdgeFrame src={self._src_col!r} dst={self._dst_col!r} "

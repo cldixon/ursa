@@ -28,9 +28,9 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use ursa_core::{IdMap, Topology};
+use ursa_core::{Direction, IdMap, Topology};
 
-use crate::result::{query_batch, query_schema, OutputColumn};
+use crate::result::{hop_batch, hop_schema, query_batch, query_schema, OutputColumn};
 
 /// A leaf `ExecutionPlan` that runs a graph query's algorithms and emits a
 /// single `(id, values...)` `RecordBatch`.
@@ -115,10 +115,110 @@ impl ExecutionPlan for GraphAlgorithmExec {
     }
 }
 
+/// A leaf `ExecutionPlan` that runs a `hop` traversal and emits a single
+/// `(src, dst)` edge `RecordBatch` of reached pairs. Produced from a
+/// [`crate::node::HopNode`] by [`crate::planner::GraphExtensionPlanner`].
+#[derive(Debug)]
+pub struct HopExec {
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    seeds: Arc<Vec<u32>>,
+    n: u32,
+    direction: Direction,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl HopExec {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        seeds: Arc<Vec<u32>>,
+        n: u32,
+        direction: Direction,
+    ) -> Self {
+        let schema = hop_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        HopExec {
+            topology,
+            ids,
+            seeds,
+            n,
+            direction,
+            schema,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for HopExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "HopExec: n={}, direction={:?}, seeds={}",
+            self.n,
+            self.direction,
+            self.seeds.len()
+        )
+    }
+}
+
+impl ExecutionPlan for HopExec {
+    fn name(&self) -> &str {
+        "HopExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.schema.clone();
+        let topo = self.topology.clone();
+        let ids = self.ids.clone();
+        let seeds = self.seeds.clone();
+        let (n, direction) = (self.n, self.direction);
+
+        // CPU-bound frontier walk — keep it off the tokio worker.
+        let fut = async move {
+            tokio::task::spawn_blocking(move || hop_batch(&topo, &ids, &seeds, n, direction))
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("hop kernel panicked: {e}")))
+        };
+
+        let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
+        Ok(Box::pin(stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical::{Direction, GraphAlgo};
+    use crate::logical::{Direction as PlanDirection, GraphAlgo};
     use crate::topology::build_topology;
     use arrow::array::Int64Array;
 
@@ -130,7 +230,7 @@ mod tests {
         let columns = Arc::new(vec![OutputColumn::Algo {
             name: "deg".to_string(),
             algo: GraphAlgo::Degree {
-                direction: Direction::Out,
+                direction: PlanDirection::Out,
             },
         }]);
         let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns));
@@ -142,5 +242,31 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
         assert_eq!(batches[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn hop_exec_streams_reached_edges() {
+        // path 0 -> 1 -> 2 -> 3
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        let (topo, ids) = build_topology(&src, &dst).unwrap();
+        // seed dense index of user id 0
+        let seed = ids.dense(0).unwrap();
+        let exec = Arc::new(HopExec::new(
+            topo,
+            ids,
+            Arc::new(vec![seed]),
+            2,
+            Direction::Out,
+        ));
+        let ctx = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, ctx).unwrap();
+        let batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        // from 0 within 2 hops: reaches 1 and 2 -> 2 rows, (src, dst)
+        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(batches[0].num_rows(), 2);
     }
 }

@@ -27,7 +27,7 @@ use ursa_core::algo::AggKind;
 use ursa_core::IdMap;
 
 use crate::logical::{Direction, GraphAlgo};
-use crate::node::GraphAlgorithmNode;
+use crate::node::{GraphAlgorithmNode, HopNode};
 use crate::planner::graph_session;
 use crate::result::{is_executable, OutputColumn};
 use crate::topology::build_topology;
@@ -324,6 +324,65 @@ pub fn execute_node_query(
     })
 }
 
+/// Build and execute one `hop` traversal as a single DataFusion plan.
+///
+/// A [`HopNode`] emits the reached `(src, dst)` edge frame; the optional
+/// relational tail (`filter` / `sort` / `limit` / `distinct`) runs as stock
+/// DataFusion operations on top, so a hop composes exactly like a node query.
+/// `seeds` are user ids; unknown seeds contribute nothing (matching the kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_hop_query(
+    src: &Int64Array,
+    dst: &Int64Array,
+    seeds: &Int64Array,
+    n: u32,
+    direction: &str,
+    filters: &[Comparison],
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> Result<RecordBatch> {
+    let (topology, ids) =
+        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+
+    // Resolve user-id seeds to dense indices; drop unknowns (kernel-consistent).
+    let seeds_dense: Vec<u32> = (0..seeds.len())
+        .filter(|&i| !seeds.is_null(i))
+        .filter_map(|i| ids.dense(seeds.value(i)))
+        .collect();
+
+    let hop_plan = LogicalPlan::Extension(Extension {
+        node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
+    runtime.block_on(async move {
+        let ctx = graph_session();
+        let mut df = ctx.execute_logical_plan(hop_plan).await?;
+
+        for f in filters {
+            df = df.filter(comparison_expr(f)?)?;
+        }
+        if distinct {
+            df = df.distinct()?;
+        }
+        if let Some((column, descending)) = sort {
+            df = df.sort(vec![col(&column).sort(!descending, false)])?;
+        }
+        if let Some(n) = limit {
+            df = df.limit(0, Some(n))?;
+        }
+
+        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +592,55 @@ mod tests {
             .unwrap();
         let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
         assert!((vals.value(row0) - 2.0).abs() < 1e-12); // {us, eu}
+    }
+
+    #[test]
+    fn hop_query_returns_reached_edges() {
+        // path 0 -> 1 -> 2 -> 3
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        let seeds = Int64Array::from(vec![0]);
+        let batch =
+            execute_hop_query(&src, &dst, &seeds, 2, "out", &[], None, None, false).unwrap();
+        // from 0 within 2 hops -> reaches 1 and 2
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.schema().field(0).name(), "src");
+        assert_eq!(batch.schema().field(1).name(), "dst");
+        let dsts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut reached: Vec<i64> = dsts.values().to_vec();
+        reached.sort_unstable();
+        assert_eq!(reached, vec![1, 2]);
+    }
+
+    #[test]
+    fn hop_query_tail_filters_and_limits() {
+        // hub: 1->0, 2->0, 3->0, 0->1 ; seed 1,2,3 all reach 0 in one hop
+        let src = Int64Array::from(vec![1, 2, 3, 0]);
+        let dst = Int64Array::from(vec![0, 0, 0, 1]);
+        let seeds = Int64Array::from(vec![1, 2, 3]);
+        // one hop out: (1,0),(2,0),(3,0); keep dst == 0, limit 2
+        let batch = execute_hop_query(
+            &src,
+            &dst,
+            &seeds,
+            1,
+            "out",
+            &[Comparison {
+                column: "dst".into(),
+                op: "==".into(),
+                value: 0.0,
+            }],
+            None,
+            Some(2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), 2);
     }
 
     #[test]
