@@ -95,6 +95,18 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id)
 
 
+def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
+    """The storage_options for a scan spec, after rejecting the unsupported
+    ``store=`` (obstore) parameter. ``s3://``/``gs://``/``az://`` credentials and
+    config flow through storage_options; obstore interop is future work."""
+    if scan.get("store") is not None:
+        raise NotImplementedError(
+            "store= (a pre-configured obstore store) is not supported yet; pass "
+            "storage_options={...} instead."
+        )
+    return scan.get("storage_options")
+
+
 def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
     """The node attribute table as a RecordBatch: an in-memory ``from_arrow`` table
     if present, else a ``scan_nodes`` file source materialized through a DataFusion
@@ -110,7 +122,7 @@ def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
                 "collect() over a scan_nodes source supports a single string path "
                 "(glob included) for now, not a list of paths."
             )
-        return _native().scan_nodes_arrow(path, scan["id"])
+        return _native().scan_nodes_arrow(path, scan["id"], _scan_storage_options(scan))
     return None
 
 
@@ -321,7 +333,9 @@ def _require_edges(edges: EdgeFrame | None) -> tuple[Any, Any]:
                 "collect() over a scan_edges source supports a single string path "
                 "(glob included) for now, not a list of paths."
             )
-        batch = _native().scan_edges_arrow(path, scan["src"], scan["dst"])
+        batch = _native().scan_edges_arrow(
+            path, scan["src"], scan["dst"], _scan_storage_options(scan)
+        )
         return batch.column(0), batch.column(1)
 
     raise NotImplementedError(

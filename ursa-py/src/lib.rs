@@ -19,6 +19,8 @@
 //! - `scan_edges_arrow` — read a Parquet/CSV edge file through a DataFusion scan.
 //! - `_demo_*` — plain-list Python→Rust smoke kernels (no Arrow); kept for tests.
 
+use std::collections::HashMap;
+
 use arrow::array::{make_array, Array, ArrayData, Int64Array, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -244,11 +246,21 @@ fn graph_describe(
 }
 
 /// Read a Parquet/CSV edge file's `src`/`dst` columns through a DataFusion scan
-/// and hand them back as a two-column `(src, dst)` pyarrow `RecordBatch`.
+/// and hand them back as a two-column `(src, dst)` pyarrow `RecordBatch`. `path`
+/// may be local or object storage (`s3://`/`gs://`/`az://`/`file://`);
+/// `storage_options` seeds the backend's credentials/config.
 #[pyfunction]
-fn scan_edges_arrow(py: Python<'_>, path: &str, src: &str, dst: &str) -> PyResult<PyObject> {
+#[pyo3(signature = (path, src, dst, storage_options=None))]
+fn scan_edges_arrow(
+    py: Python<'_>,
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: Option<HashMap<String, String>>,
+) -> PyResult<PyObject> {
+    let opts = storage_options.unwrap_or_default();
     let batch = py.allow_threads(|| {
-        scan_edges_batch(path, src, dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        scan_edges_batch(path, src, dst, &opts).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
     batch.to_pyarrow(py)
 }
@@ -256,10 +268,18 @@ fn scan_edges_arrow(py: Python<'_>, path: &str, src: &str, dst: &str) -> PyResul
 /// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
 /// back as a full `RecordBatch` (all columns; `id` cast to int64). It feeds the
 /// `nodes` attribute slot of `run_node_query`, exactly like an in-memory table.
+/// `path`/`storage_options` support object storage like `scan_edges_arrow`.
 #[pyfunction]
-fn scan_nodes_arrow(py: Python<'_>, path: &str, id: &str) -> PyResult<PyObject> {
+#[pyo3(signature = (path, id, storage_options=None))]
+fn scan_nodes_arrow(
+    py: Python<'_>,
+    path: &str,
+    id: &str,
+    storage_options: Option<HashMap<String, String>>,
+) -> PyResult<PyObject> {
+    let opts = storage_options.unwrap_or_default();
     let batch = py.allow_threads(|| {
-        scan_nodes_batch(path, id).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        scan_nodes_batch(path, id, &opts).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
     batch.to_pyarrow(py)
 }
