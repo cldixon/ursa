@@ -14,6 +14,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: Lint (ruff, ty)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Static analysis only — install the dev tools but NOT the native extension.
+      # `--no-install-project` skips the maturin/DataFusion build, so this job
+      # returns in seconds instead of waiting on a full Rust compile. ruff and ty
+      # read the source (and the ursa._ursa stub), never the compiled module.
+      - name: Sync dev tools (no native build)
+        run: uv sync --locked --no-install-project
+
+      - name: ruff check
+        run: uv run --no-sync ruff check .
+
+      - name: ruff format
+        run: uv run --no-sync ruff format --check .
+
+      - name: ty
+        run: uv run --no-sync ty check
+
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
@@ -42,13 +69,13 @@ jobs:
       - name: check workspace
         run: cargo check --workspace --locked
 
-  python:
-    name: Python (ruff, ty, pytest)
+  pytest:
+    name: Python (pytest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # uv sync builds the maturin extension, so the Rust toolchain is needed here too.
+      # uv sync builds the maturin extension, so the Rust toolchain is needed here.
       # Pinned to match rust-toolchain.toml (single source of truth for the version).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
@@ -64,14 +91,5 @@ jobs:
       - name: Sync (build extension + dev group)
         run: uv sync --locked
 
-      - name: ruff check
-        run: uv run ruff check .
-
-      - name: ruff format
-        run: uv run ruff format --check .
-
-      - name: ty
-        run: uv run ty check
-
       - name: pytest
-        run: uv run pytest
+        run: uv run --no-sync pytest
