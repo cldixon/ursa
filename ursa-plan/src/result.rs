@@ -13,8 +13,9 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
-    clustering_coefficient, connected_components_weak, degree, k_hop, neighbor_aggregate, pagerank,
-    shortest_path, triangle_count, AggKind, PageRankParams,
+    betweenness, closeness, clustering_coefficient, connected_components_weak, degree, k_hop,
+    label_propagation, louvain, neighbor_aggregate, pagerank, shortest_path, triangle_count,
+    AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -44,7 +45,10 @@ impl OutputColumn {
     fn value_type(&self) -> DataType {
         match self {
             OutputColumn::Algo { algo, .. } => match algo {
-                GraphAlgo::PageRank { .. } | GraphAlgo::ClusteringCoefficient => DataType::Float64,
+                GraphAlgo::PageRank { .. }
+                | GraphAlgo::ClusteringCoefficient
+                | GraphAlgo::Closeness
+                | GraphAlgo::Betweenness { .. } => DataType::Float64,
                 _ => DataType::UInt32,
             },
             OutputColumn::NeighborAgg { .. } => DataType::Float64,
@@ -75,6 +79,10 @@ pub fn is_executable(algo: &GraphAlgo) -> bool {
             | GraphAlgo::ConnectedComponents { .. }
             | GraphAlgo::TriangleCount
             | GraphAlgo::ClusteringCoefficient
+            | GraphAlgo::Closeness
+            | GraphAlgo::Betweenness { .. }
+            | GraphAlgo::LabelPropagation { .. }
+            | GraphAlgo::Louvain { .. }
     )
 }
 
@@ -102,7 +110,16 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
         GraphAlgo::ClusteringCoefficient => {
             Arc::new(Float64Array::from(clustering_coefficient(topo)))
         }
-        other => unreachable!("non-executable algorithm reached algo_array: {other:?}"),
+        GraphAlgo::Closeness => Arc::new(Float64Array::from(closeness(topo))),
+        GraphAlgo::Betweenness { sample } => {
+            Arc::new(Float64Array::from(betweenness(topo, *sample)))
+        }
+        GraphAlgo::LabelPropagation { max_iter, seed } => {
+            Arc::new(UInt32Array::from(label_propagation(topo, *max_iter, *seed)))
+        }
+        GraphAlgo::Louvain { resolution, seed } => {
+            Arc::new(UInt32Array::from(louvain(topo, *resolution, *seed)))
+        }
     }
 }
 

@@ -35,6 +35,12 @@ def main() -> None:
     print("triangles:      ", ur.triangle_count(edges).collect().to_dicts())
     print("clustering:     ", ur.clustering_coefficient(edges).collect().to_dicts())
 
+    # Centrality and community detection over the same topology.
+    print("closeness:      ", ur.closeness(edges).collect().to_dicts())
+    print("betweenness:    ", ur.betweenness(edges).collect().to_dicts())
+    print("communities:    ", ur.louvain(edges, seed=1).collect().to_dicts())
+    print("labels (LPA):   ", ur.label_propagation(edges, seed=1).collect().to_dicts())
+
     # -- 2. A composed pipeline (one lazy plan) -----------------------------
     # Several metrics computed together, then filtered / sorted / truncated.
     top = (

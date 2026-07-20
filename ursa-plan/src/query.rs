@@ -52,6 +52,13 @@ struct ColumnSpec {
     tol: Option<f64>,
     #[serde(default)]
     direction: Option<String>,
+    // community / centrality fields
+    #[serde(default)]
+    sample: Option<f64>,
+    #[serde(default)]
+    resolution: Option<f64>,
+    #[serde(default)]
+    seed: Option<u64>,
     // neighbours().agg(...) fields
     #[serde(default)]
     agg_fn: Option<String>,
@@ -73,6 +80,18 @@ impl ColumnSpec {
             "connected_components" => GraphAlgo::ConnectedComponents { strong: false },
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
+            "closeness" => GraphAlgo::Closeness,
+            "betweenness" => GraphAlgo::Betweenness {
+                sample: self.sample,
+            },
+            "label_propagation" => GraphAlgo::LabelPropagation {
+                max_iter: self.max_iter.unwrap_or(20),
+                seed: self.seed,
+            },
+            "louvain" => GraphAlgo::Louvain {
+                resolution: self.resolution.unwrap_or(1.0),
+                seed: self.seed,
+            },
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "graph algorithm {other:?} is not wired into the execution path"
@@ -523,7 +542,7 @@ mod tests {
         let err = execute_node_query(
             t,
             ids,
-            r#"[{"name":"c","kind":"closeness"}]"#,
+            r#"[{"name":"x","kind":"no_such_algorithm"}]"#,
             &[],
             None,
             None,
@@ -531,6 +550,27 @@ mod tests {
             None,
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn runs_the_new_node_algorithms() {
+        // A directed triangle with a pendant, exercised through each new verb to
+        // confirm they lower, execute, and return a well-typed column.
+        let src = Int64Array::from(vec![0, 1, 2, 2]);
+        let dst = Int64Array::from(vec![1, 2, 0, 3]);
+        for (kind, want) in [
+            ("closeness", DataType::Float64),
+            ("betweenness", DataType::Float64),
+            ("label_propagation", DataType::UInt32),
+            ("louvain", DataType::UInt32),
+        ] {
+            let (t, ids) = build(&src, &dst);
+            let spec = format!(r#"[{{"name":"v","kind":"{kind}"}}]"#);
+            let batch = execute_node_query(t, ids, &spec, &[], None, None, None, None)
+                .unwrap_or_else(|e| panic!("{kind} failed: {e}"));
+            assert_eq!(batch.num_rows(), 4, "{kind}");
+            assert_eq!(batch.schema().field(1).data_type(), &want, "{kind}");
+        }
     }
 
     #[test]

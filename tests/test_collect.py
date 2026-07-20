@@ -69,6 +69,11 @@ def test_collect_over_unsupported_scan_format_errors_clearly():
 
 
 def test_unwired_algorithm_errors_clearly():
+    # A verb with no kernel behind it still fails clearly (the `_EXECUTABLE`
+    # guard). Built directly since every public node verb is now wired.
+    from ursa._graph import _graph_expr
+
     edges = diamond_edges()
+    future = _graph_expr("some_future_algorithm", edges=edges)
     with pytest.raises(NotImplementedError, match="not wired"):
-        ur.betweenness(edges).collect()
+        future.collect()

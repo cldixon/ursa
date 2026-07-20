@@ -16,20 +16,29 @@
 //! Every kernel takes a `&Topology` and returns dense, `u32`-indexed results;
 //! translation back to user ids happens at the Arrow boundary in `ursa-plan`.
 
+mod betweenness;
 mod bfs;
+mod closeness;
 mod clustering;
 mod components;
 mod degree;
 mod hop;
+mod label_prop;
+mod louvain;
 mod neighbor_agg;
 mod pagerank;
+mod rng;
 mod triangle;
 
+pub use betweenness::betweenness;
 pub use bfs::{bfs_distances, shortest_path};
+pub use closeness::closeness;
 pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
 pub use degree::degree;
 pub use hop::k_hop;
+pub use label_prop::label_propagation;
+pub use louvain::louvain;
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, PageRankParams};
 pub use triangle::triangle_count;
