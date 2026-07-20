@@ -33,6 +33,7 @@ _EXECUTABLE = {
     "connected_components",
     "triangle_count",
     "clustering_coefficient",
+    "neighbors_agg",
 }
 
 # Comparison operators supported in filters, with the operator that results from
@@ -40,20 +41,9 @@ _EXECUTABLE = {
 _FLIP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
 
 
-# --- standalone node-valued algorithm --------------------------------------
-def collect_graph_expr(expr: Expr) -> MaterializedFrame:
-    """Execute a standalone node-valued graph expression and materialize it."""
-    if expr.kind != "graph":
-        raise NotImplementedError(
-            "collect() on a bare expression is wired only for standalone node-valued "
-            "graph algorithms (e.g. ur.pagerank(edges).collect())."
-        )
-    # A single column named after the algorithm, no relational tail.
-    column = _algo_column(expr.payload["verb"], expr)
-    return _run_query(expr.payload.get("edges"), [column], [], None, None)
-
-
 # --- composed with_columns pipeline ----------------------------------------
+# (Standalone `ur.pagerank(edges).collect()` promotes to a NodeFrame via
+# GraphExpr and also lands here — see ursa._graph.GraphExpr.)
 def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     """Execute a composed ``edges.nodes().with_columns(...).filter/sort/head``."""
     graph_exprs: dict[str, Expr] | None = None
@@ -132,6 +122,19 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         )
     elif verb == "degree":
         column["direction"] = p.get("direction", "out")
+    elif verb == "neighbors_agg":
+        agg = p["agg"]
+        operand = agg.payload.get("operand") if agg.kind == "agg" else None
+        if agg.kind != "agg" or operand is None or operand.kind != "col":
+            raise NotImplementedError(
+                "neighbors().agg() supports ur.col(<name>).<fn>() with fn in "
+                "mean/sum/min/max/count/n_unique over a numeric attribute column."
+            )
+        column.update(
+            agg_fn=agg.payload["fn"],
+            agg_column=operand.payload["name"],
+            direction=p.get("direction", "out"),
+        )
     return column
 
 

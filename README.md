@@ -108,8 +108,10 @@ uv run ty check                   # type-check
 ```
 
 `uv run` rebuilds the native extension as needed, so editing Rust and re-running
-`uv run pytest` picks up the change. Requirements: Rust ≥ 1.80, Python ≥ 3.10,
-and [uv](https://docs.astral.sh/uv/#installation).
+`uv run pytest` picks up the change. Requirements: Python ≥ 3.10 and
+[uv](https://docs.astral.sh/uv/#installation); the Rust toolchain is pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml) (rustup installs it automatically),
+so local `cargo clippy` uses the exact same lint set as CI.
 
 ## Roadmap
 
@@ -122,8 +124,8 @@ eager `density` stat, and `sink_parquet`/`sink_csv` egress.
 
 Next, in rough priority order:
 
-1. **Finish the enrichment story** — `ur.neighbors(edges).agg(...)` (a segmented
-   CSR reduction), `scan_nodes` file-backed attribute tables, and weighted
+1. **Finish the enrichment story** — `scan_nodes` file-backed attribute tables,
+   string/non-numeric `neighbors().agg()` (numeric is done), and weighted
    algorithms (`weight=`, using the `edge_ids` permutation already in place).
 2. **Traversals** — `hop` / `shortest_path` / `random_walk` on new frontier/BFS
    kernels (their own logical nodes with a seed input); this also unblocks the

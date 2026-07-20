@@ -56,8 +56,8 @@ impl Eq for GraphAlgorithmNode {}
 impl PartialOrd for GraphAlgorithmNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         // Order by column names only (topology identity is not orderable).
-        let a: Vec<&String> = self.columns.iter().map(|(n, _)| n).collect();
-        let b: Vec<&String> = other.columns.iter().map(|(n, _)| n).collect();
+        let a: Vec<&str> = self.columns.iter().map(|c| c.name()).collect();
+        let b: Vec<&str> = other.columns.iter().map(|c| c.name()).collect();
         a.partial_cmp(&b)
     }
 }
@@ -65,9 +65,8 @@ impl PartialOrd for GraphAlgorithmNode {
 impl Hash for GraphAlgorithmNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.topology) as usize).hash(state);
-        for (name, algo) in self.columns.iter() {
-            name.hash(state);
-            format!("{algo:?}").hash(state);
+        for col in self.columns.iter() {
+            col.name().hash(state);
         }
     }
 }
@@ -96,7 +95,7 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let names: Vec<&str> = self.columns.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = self.columns.iter().map(|c| c.name()).collect();
         write!(f, "GraphAlgorithm: columns=[{}]", names.join(", "))
     }
 

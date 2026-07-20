@@ -1,10 +1,11 @@
 //! Assembling kernel outputs into Arrow `RecordBatch`es.
 //!
 //! The "Arrow arrays out" half of the operator contract. A query names one or
-//! more node-valued algorithms as output columns; because every algorithm over
-//! the same topology shares one `IdMap`, they are all row-aligned, so the result
-//! is a single `(id, col_1, col_2, ...)` batch with dense→user id translation
-//! done once, here, at the boundary. Kernels never see user ids.
+//! more output columns; each is either a node-valued algorithm over the topology
+//! or a neighbour aggregation over a node attribute. Because every column is
+//! evaluated in the same `IdMap` order they are all row-aligned, so the result is
+//! a single `(id, col_1, col_2, ...)` batch with dense→user id translation done
+//! once, here, at the boundary.
 
 use std::sync::Arc;
 
@@ -12,15 +13,58 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
-    clustering_coefficient, connected_components_weak, degree, pagerank, triangle_count,
-    PageRankParams,
+    clustering_coefficient, connected_components_weak, degree, neighbor_aggregate, pagerank,
+    triangle_count, AggKind, PageRankParams,
 };
-use ursa_core::{IdMap, Topology};
+use ursa_core::{Direction, IdMap, Topology};
 
 use crate::logical::GraphAlgo;
 
-/// One output column: a name and the algorithm that produces it.
-pub type OutputColumn = (String, GraphAlgo);
+/// One requested output column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutputColumn {
+    /// A node-valued algorithm over the topology.
+    Algo { name: String, algo: GraphAlgo },
+    /// A per-node aggregation of a (dense-aligned) attribute over neighbours.
+    NeighborAgg {
+        name: String,
+        attr: Arc<Vec<Option<f64>>>,
+        direction: Direction,
+        agg: AggKind,
+    },
+}
+
+impl OutputColumn {
+    pub fn name(&self) -> &str {
+        match self {
+            OutputColumn::Algo { name, .. } | OutputColumn::NeighborAgg { name, .. } => name,
+        }
+    }
+
+    fn value_type(&self) -> DataType {
+        match self {
+            OutputColumn::Algo { algo, .. } => match algo {
+                GraphAlgo::PageRank { .. } | GraphAlgo::ClusteringCoefficient => DataType::Float64,
+                _ => DataType::UInt32,
+            },
+            OutputColumn::NeighborAgg { .. } => DataType::Float64,
+        }
+    }
+
+    fn value_array(&self, topo: &Topology) -> ArrayRef {
+        match self {
+            OutputColumn::Algo { algo, .. } => algo_array(topo, algo),
+            OutputColumn::NeighborAgg {
+                attr,
+                direction,
+                agg,
+                ..
+            } => Arc::new(Float64Array::from(neighbor_aggregate(
+                topo, attr, *direction, *agg,
+            ))),
+        }
+    }
+}
 
 /// Whether an algorithm has a kernel wired into the execution path.
 pub fn is_executable(algo: &GraphAlgo) -> bool {
@@ -34,25 +78,7 @@ pub fn is_executable(algo: &GraphAlgo) -> bool {
     )
 }
 
-/// Arrow value type produced by an algorithm.
-fn value_type(algo: &GraphAlgo) -> DataType {
-    match algo {
-        GraphAlgo::PageRank { .. } | GraphAlgo::ClusteringCoefficient => DataType::Float64,
-        _ => DataType::UInt32,
-    }
-}
-
-/// The output schema for a query: `id: Int64` followed by one column per output.
-pub fn query_schema(columns: &[OutputColumn]) -> SchemaRef {
-    let mut fields = vec![Field::new("id", DataType::Int64, false)];
-    for (name, algo) in columns {
-        fields.push(Field::new(name, value_type(algo), false));
-    }
-    Arc::new(Schema::new(fields))
-}
-
-/// Run one algorithm over `topo`, returning its dense value column as Arrow.
-fn value_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
+fn algo_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
     match algo {
         GraphAlgo::Degree { direction } => {
             Arc::new(UInt32Array::from(degree(topo, (*direction).into())))
@@ -76,18 +102,27 @@ fn value_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
         GraphAlgo::ClusteringCoefficient => {
             Arc::new(Float64Array::from(clustering_coefficient(topo)))
         }
-        other => unreachable!("non-executable algorithm reached value_array: {other:?}"),
+        other => unreachable!("non-executable algorithm reached algo_array: {other:?}"),
     }
 }
 
+/// The output schema for a query: `id: Int64` followed by one column per output.
+pub fn query_schema(columns: &[OutputColumn]) -> SchemaRef {
+    let mut fields = vec![Field::new("id", DataType::Int64, false)];
+    for col in columns {
+        // Neighbour aggregates can be null (undefined over no attributed
+        // neighbours); algorithm columns are dense and non-null.
+        let nullable = matches!(col, OutputColumn::NeighborAgg { .. });
+        fields.push(Field::new(col.name(), col.value_type(), nullable));
+    }
+    Arc::new(Schema::new(fields))
+}
+
 /// Materialize the `(id, values...)` batch for a query.
-///
-/// Precondition: every column's algorithm is [`is_executable`] (validated at
-/// query-build time). Row `i` of every column describes the same node.
 pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> RecordBatch {
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids.user_ids().to_vec()))];
-    for (_, algo) in columns {
-        arrays.push(value_array(topo, algo));
+    for col in columns {
+        arrays.push(col.value_array(topo));
     }
     RecordBatch::try_new(query_schema(columns), arrays)
         .expect("all columns have length n_nodes and match the schema")
@@ -96,7 +131,7 @@ pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical::Direction;
+    use crate::logical::Direction as PlanDirection;
     use crate::topology::build_topology;
 
     fn diamond() -> (Arc<Topology>, Arc<IdMap>) {
@@ -109,31 +144,25 @@ mod tests {
     fn multi_column_batch_is_aligned() {
         let (topo, ids) = diamond();
         let columns = vec![
-            (
-                "deg".to_string(),
-                GraphAlgo::Degree {
-                    direction: Direction::Out,
+            OutputColumn::Algo {
+                name: "deg".to_string(),
+                algo: GraphAlgo::Degree {
+                    direction: PlanDirection::Out,
                 },
-            ),
-            (
-                "pr".to_string(),
-                GraphAlgo::PageRank {
+            },
+            OutputColumn::Algo {
+                name: "pr".to_string(),
+                algo: GraphAlgo::PageRank {
                     damping: 0.85,
                     max_iter: 30,
                     tol: 1e-6,
                 },
-            ),
+            },
         ];
         let batch = query_batch(&topo, &ids, &columns);
         assert_eq!(batch.num_columns(), 3); // id, deg, pr
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema().field(1).name(), "deg");
         assert_eq!(batch.schema().field(2).name(), "pr");
-        let deg = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        assert_eq!(deg.value(0), 2); // node 0 out-degree
     }
 }

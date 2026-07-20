@@ -64,7 +64,7 @@ impl GraphAlgorithmExec {
 
 impl DisplayAs for GraphAlgorithmExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        let names: Vec<&str> = self.columns.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = self.columns.iter().map(|c| c.name()).collect();
         write!(f, "GraphAlgorithmExec: columns=[{}]", names.join(", "))
     }
 }
@@ -127,12 +127,12 @@ mod tests {
         let src = Int64Array::from(vec![0, 0, 1, 2]);
         let dst = Int64Array::from(vec![1, 2, 2, 0]);
         let (topo, ids) = build_topology(&src, &dst).unwrap();
-        let columns = Arc::new(vec![(
-            "deg".to_string(),
-            GraphAlgo::Degree {
+        let columns = Arc::new(vec![OutputColumn::Algo {
+            name: "deg".to_string(),
+            algo: GraphAlgo::Degree {
                 direction: Direction::Out,
             },
-        )]);
+        }]);
         let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns));
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();

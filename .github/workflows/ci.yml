@@ -20,8 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to match rust-toolchain.toml so clippy's lint set never drifts.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
 
@@ -48,8 +49,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # uv sync builds the maturin extension, so the Rust toolchain is needed here too.
+      # Pinned to match rust-toolchain.toml (single source of truth for the version).
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2

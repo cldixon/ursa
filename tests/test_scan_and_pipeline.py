@@ -134,6 +134,26 @@ def test_nodeframe_sink_collects_then_writes(tmp_path):
     assert set(pq.read_table(str(out)).column_names) == {"id", "deg"}
 
 
+def test_standalone_algorithm_composes_as_a_nodeframe():
+    # ur.pagerank(edges) is dual-positioned: a with_columns expression AND a lazy
+    # NodeFrame you can filter/sort/head/collect directly.
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+    df = (
+        ur.pagerank(edges)
+        .filter(ur.col("pagerank") > 0.05)
+        .sort("pagerank", descending=True)
+        .head(2)
+        .collect()
+        .to_polars()
+    )
+    assert df.columns == ["id", "pagerank"]
+    assert len(df) == 2
+    assert df["id"].to_list()[0] == 0  # the hub ranks first
+    # and the same expression still works inside with_columns
+    both = edges.nodes().with_columns(pr=ur.pagerank(edges), deg=ur.degree(edges)).collect()
+    assert set(both.columns) == {"id", "pr", "deg"}
+
+
 def test_attribute_frame_enrichment():
     # A node attribute table (id + region + capacity), enriched with graph metrics
     # and filtered/sorted on both attribute and computed columns.
@@ -167,6 +187,34 @@ def test_attribute_frame_enrichment():
     # node 1 (in-degree 1 from 0->1) sorts first
     assert df["id"].to_list()[0] == 1
     assert df["region"].to_list()[0] == "us"
+
+
+def test_neighbors_agg_mean_over_attribute():
+    # node 0 is a hub: 1,2,3 all point at it; aggregate a node attribute over
+    # each node's in-neighbours.
+    nodes = ur.from_arrow(
+        pa.table({"id": [0, 1, 2, 3], "capacity": [0.0, 10.0, 20.0, 30.0]}), id="id"
+    )
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3], "d": [0, 0, 0]}), src="s", dst="d")
+    out = {
+        r["id"]: r["nbr_cap"]
+        for r in nodes.with_columns(
+            nbr_cap=ur.neighbors(edges, direction="in").agg(ur.col("capacity").mean())
+        )
+        .collect()
+        .to_dicts()
+    }
+    assert abs(out[0] - 20.0) < 1e-9  # mean(10, 20, 30)
+    assert out[1] is None  # node 1 has no in-neighbours -> undefined
+
+
+def test_neighbors_agg_needs_attribute_table():
+    # Without a node attribute table (edges.nodes()), there is no attribute to
+    # aggregate -> a clear error.
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    pipeline = edges.nodes().with_columns(x=ur.neighbors(edges).agg(ur.col("capacity").mean()))
+    with pytest.raises((NotImplementedError, RuntimeError)):
+        pipeline.collect()
 
 
 def test_attribute_frame_preserves_all_node_rows():
