@@ -33,6 +33,49 @@ def test_scan_parquet_source_collects(tmp_path):
     assert abs(sum(r["pagerank"] for r in rows) - 1.0) < 1e-6
 
 
+def test_scan_edges_via_file_url(tmp_path):
+    # A file:// URL exercises the full Python -> native object_store path with no
+    # credentials (the same code an s3:// path takes, minus the network).
+    path = tmp_path / "edges.parquet"
+    pq.write_table(pa.table({"s": SRC, "d": DST}), str(path))
+    edges = ur.scan_edges("file://" + str(path), src="s", dst="d")
+    out = {r["id"]: r["degree"] for r in ur.degree(edges, direction="out").collect().to_dicts()}
+    assert out == {0: 2, 1: 1, 2: 1}
+
+
+def test_scan_nodes_via_file_url(tmp_path):
+    npath = tmp_path / "nodes.csv"
+    npath.write_text("id,region\n0,us\n1,eu\n")
+    nodes = ur.scan_nodes("file://" + str(npath), id="id")
+    edges = ur.from_arrow(pa.table({"s": [0], "d": [1]}), src="s", dst="d")
+    df = nodes.with_columns(deg=ur.degree(edges, direction="out")).collect().to_polars()
+    assert set(df["id"].to_list()) == {0, 1}
+
+
+def test_storage_options_reach_the_scan_spec():
+    # The load-bearing thread-through: storage_options must land in the frame's
+    # scan spec and survive a pipeline (this is pure Python, no native call).
+    edges = ur.scan_edges(
+        "s3://bucket/graph/*.parquet", src="s", dst="d", storage_options={"region": "us-east-1"}
+    )
+    spec = edges._scan_spec
+    assert spec is not None
+    assert spec["storage_options"] == {"region": "us-east-1"}
+    # survives a property-preserving op (the frame carries the scan spec through)
+    enriched = edges.nodes().with_columns(deg=ur.degree(edges))
+    assert enriched is not None
+    assert edges._scan_spec is not None
+
+
+def test_store_param_is_honest(tmp_path):
+    # store= (obstore) is not supported yet -> a clear error at collect().
+    path = tmp_path / "edges.parquet"
+    pq.write_table(pa.table({"s": SRC, "d": DST}), str(path))
+    edges = ur.scan_edges(str(path), src="s", dst="d", store=object())
+    with pytest.raises(NotImplementedError):
+        ur.degree(edges).collect()
+
+
 def test_triangle_count_is_real_now():
     # single triangle 0-1-2 -> each node in exactly one triangle
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")

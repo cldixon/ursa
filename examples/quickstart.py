@@ -119,6 +119,19 @@ def main() -> None:
 
         print(pq.read_table(str(out)).to_pydict())
 
+    # The same scans read from object storage — s3://, gs://, az:// (and file://).
+    # Credentials/config come from storage_options, layered over the backend's
+    # default credential chain (env vars / instance profile). Not run here (needs
+    # a bucket), but the call is identical to the local scans above:
+    #
+    #     edges = ur.scan_edges(
+    #         "s3://telco-lake/graph/links/*.parquet",
+    #         src="tower_a", dst="tower_b",
+    #         storage_options={"region": "us-east-1"},
+    #     )
+    #     nodes = ur.scan_nodes("s3://telco-lake/graph/towers/*.parquet", id="tower_id")
+    #     ur.pagerank(edges).collect().to_polars()   # projection pushed into Parquet
+
     # -- 7. The expression dialect is Polars-shaped (pure Python) -----------
     predicate = (ur.col("pr") * ur.lit(100) > ur.lit(5)) & (ur.col("indeg") >= ur.lit(2))
     print("\n== expression dialect ==\n", repr(predicate))

@@ -50,7 +50,13 @@ def scan_edges(
         src_col=src,
         dst_col=dst,
         plan=(step,),
-        scan={"path": path, "src": src, "dst": dst},
+        scan={
+            "path": path,
+            "src": src,
+            "dst": dst,
+            "storage_options": storage_options,
+            "store": store,
+        },
     )
 
 
@@ -73,7 +79,11 @@ def scan_nodes(
             "format_opts": format_opts,
         },
     )
-    return NodeFrame(id_col=id, plan=(step,), scan={"path": path, "id": id})
+    return NodeFrame(
+        id_col=id,
+        plan=(step,),
+        scan={"path": path, "id": id, "storage_options": storage_options, "store": store},
+    )
 
 
 def read_edges(path: str | list[str], **kwargs: Any) -> MaterializedFrame:

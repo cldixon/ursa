@@ -24,8 +24,11 @@ authors = ["Ursa contributors"]
 arrow = "54"
 rayon = "1.10"
 datafusion = "45"
-object_store = "0.11"
+# Cloud backends (S3/GCS/Azure) are enabled here so scan_edges/scan_nodes can read
+# from object storage. These features pull in an HTTP client + TLS (rustls) + XML.
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 pyo3 = "0.23"
+url = "2"
 
 [profile.release]
 opt-level = 3

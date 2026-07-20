@@ -36,9 +36,9 @@ the parts that prove the design is sound are real and tested end-to-end.
 | Layer | State |
 |---|---|
 | **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) kernels. Remaining frontier/BFS kernels are documented stubs. |
-| **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge files. |
+| **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge/node files, local or from object storage (`s3://` / `gs://` / `az://`), with the column projection pushed into the file. |
 | **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
-| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort), **`neighbors().agg()`** over numeric *and* string attributes, two **traversals** (`hop()` and `shortest_path()`, first-class `HopNode`/`ShortestPathNode` returning EdgeFrames), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources. |
+| **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort), **`neighbors().agg()`** over numeric *and* string attributes, two **traversals** (`hop()` and `shortest_path()`, first-class `HopNode`/`ShortestPathNode` returning EdgeFrames), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources — local files **or object storage** (`s3://` / `gs://` / `az://`, with `storage_options={...}`). |
 
 ```python
 import ursa as ur, pyarrow as pa
@@ -124,13 +124,14 @@ clustering_coefficient), composed pipelines, `scan_edges`/`scan_nodes` sources,
 (`hop()` and `shortest_path()`, each its own first-class logical node returning an
 EdgeFrame, on a shared single-source BFS kernel family), the eager whole-graph
 stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
-**`describe`**, and `sink_parquet`/`sink_csv` egress.
+**`describe`**, **object-storage scans** (`s3://` / `gs://` / `az://` via
+`object_store`, with `storage_options`), and `sink_parquet`/`sink_csv` egress.
 
 Next, in rough priority order:
 
 1. **Weighted algorithms** (`weight=` for pagerank/degree and weighted SSSP via
-   delta-stepping, using the `edge_ids` permutation already in place) and object
-   storage (`s3://`) to complete the enrichment/IO story.
+   delta-stepping, using the `edge_ids` permutation already in place) to complete
+   the algorithm story.
 2. **`random_walk`** on the same frontier-kernel family, and the direction-
    optimizing (top-down/bottom-up) BFS switch for scale.
 3. **Optimizer rules** — push node-set filters before traversal, fuse
