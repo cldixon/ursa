@@ -212,9 +212,7 @@ def test_neighbors_agg_needs_attribute_table():
     # Without a node attribute table (edges.nodes()), there is no attribute to
     # aggregate -> a clear error.
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
-    pipeline = edges.nodes().with_columns(
-        x=ur.neighbors(edges).agg(ur.col("capacity").mean())
-    )
+    pipeline = edges.nodes().with_columns(x=ur.neighbors(edges).agg(ur.col("capacity").mean()))
     with pytest.raises((NotImplementedError, RuntimeError)):
         pipeline.collect()
 

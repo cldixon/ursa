@@ -93,7 +93,7 @@ impl Fold {
         if x > self.max {
             self.max = x;
         }
-        if self.agg == AggKind::NUnique && !self.seen.iter().any(|&s| s == x) {
+        if self.agg == AggKind::NUnique && !self.seen.contains(&x) {
             self.seen.push(x);
         }
     }
