@@ -85,10 +85,16 @@ def main() -> None:
     reach = ur.hop(edges, n=2).from_([0]).sort("dst").collect().to_polars()
     print(reach)
 
-    # -- 5. Whole-graph summary + density -----------------------------------
+    # ur.shortest_path returns the path as an EdgeFrame (src, dst, hop-in-order).
+    print("\n== shortest path 0 -> 5 ==")
+    print(ur.shortest_path(edges, 0, 5).collect().to_polars())
+
+    # -- 5. Whole-graph summary + path stats --------------------------------
     print("\n== describe ==")
     print(ur.describe(edges, full=True).collect().to_polars())
-    print("density:", ur.density(edges))
+    print("density:         ", ur.density(edges))
+    print("avg_path_length: ", ur.avg_path_length(edges))
+    print("diameter (exact):", ur.diameter(edges, approximate=False))
 
     # -- 6. Read from files, write results back -----------------------------
     # scan_edges / scan_nodes read Parquet/CSV through a DataFusion scan; the node
