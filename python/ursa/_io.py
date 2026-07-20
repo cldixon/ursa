@@ -139,11 +139,27 @@ def _from_inmemory(op: str, data: Any, src, dst, id):
     raise ValueError("provide either src= and dst= (EdgeFrame) or id= (NodeFrame)")
 
 
+def _canonical_id_array(arr: Any) -> Any:
+    """Canonicalize a node-id array to a supported id type: any integer type to
+    int64 (the fast path), any string type to string (covering UUID-as-string).
+    Raises ``TypeError`` for anything else — Ursa node ids are int64 or string."""
+    import pyarrow as pa
+    import pyarrow.types as pat
+
+    if pat.is_integer(arr.type):
+        return arr.cast(pa.int64())
+    if pat.is_string(arr.type) or pat.is_large_string(arr.type):
+        return arr.cast(pa.string())
+    raise TypeError(f"node ids must be an integer or string column; got {arr.type}")
+
+
 def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:
-    """The node attribute table as a single pyarrow RecordBatch (id cast to int64).
+    """The node attribute table as a single pyarrow RecordBatch (id canonicalized
+    to int64 or string).
 
     Returns None if pyarrow isn't importable — ``collect()`` then surfaces a clear
-    error at execution time rather than at construction.
+    error at execution time rather than at construction. An unsupported id type
+    raises immediately.
     """
     try:
         import pyarrow as pa
@@ -152,20 +168,23 @@ def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:
         idx = tbl.schema.get_field_index(id)
         id_col = tbl.column(id)
         chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
-        id_arr = pa.concat_arrays(chunks).cast(pa.int64())
+        id_arr = _canonical_id_array(pa.concat_arrays(chunks))
         tbl = tbl.set_column(idx, id, id_arr)
         batches = tbl.combine_chunks().to_batches()
         return batches[0] if batches else None
+    except TypeError:
+        raise
     except Exception:
         return None
 
 
 def _extract_edge_arrays(op: str, data: Any, src: str, dst: str) -> tuple[Any, Any] | None:
-    """Pull the src/dst columns out as contiguous int64 pyarrow arrays.
+    """Pull the src/dst columns out as contiguous pyarrow arrays, canonicalized to
+    a supported node-id type (int64 or string).
 
     Returns None (rather than raising) if pyarrow isn't importable or the columns
     can't be resolved — `collect()` then surfaces a clear error at execution time
-    instead of at construction. Node ids are cast to int64 (the v0.1 node-id type).
+    instead of at construction. An unsupported id type raises immediately.
     """
     try:
         import pyarrow as pa
@@ -175,7 +194,9 @@ def _extract_edge_arrays(op: str, data: Any, src: str, dst: str) -> tuple[Any, A
         for name in (src, dst):
             column = tbl.column(name)
             chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-            arrays.append(pa.concat_arrays(chunks).cast(pa.int64()))
+            arrays.append(_canonical_id_array(pa.concat_arrays(chunks)))
         return (arrays[0], arrays[1])
+    except TypeError:
+        raise
     except Exception:
         return None

@@ -58,6 +58,11 @@ edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s",
 
 # ...or straight from a file (Parquet/CSV, projection pushed into the scan):
 ur.pagerank(ur.scan_edges("edges.parquet", src="s", dst="d")).collect().to_polars()
+
+# Node ids may be int64 (the fast path) or strings (e.g. UUIDs) — auto-detected
+# from the column type; results come back keyed by the original ids:
+str_edges = ur.from_arrow(pa.table({"s": ["u1", "u1", "u2"], "d": ["u2", "u3", "u3"]}), src="s", dst="d")
+ur.pagerank(str_edges).collect().to_polars()   # id column is Utf8
 ```
 
 ## Architecture
@@ -139,8 +144,9 @@ Next, in rough priority order:
    `neighbors().agg` into a segmented CSR reduction. (The topology index is now
    built once and shared across ops over a frame — the index-preservation
    contract — which is the seam these rules register on.)
-4. **Breadth** — string/UUID node ids, benchmarks vs NetworkX/rustworkx/igraph,
-   a published docs site.
+4. **Breadth** — benchmarks vs NetworkX/rustworkx/igraph, a published docs site.
+   (String/UUID node ids alongside int64 are already supported, auto-detected
+   from the column type.)
 
 ## License
 

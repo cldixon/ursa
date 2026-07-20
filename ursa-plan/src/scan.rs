@@ -79,11 +79,26 @@ fn register_object_store(
     Ok(())
 }
 
-/// Read the `src`/`dst` columns of an edge file into one `(src, dst)` Int64 batch.
+/// The canonical Arrow type for a node-id column: any integer type collapses to
+/// `Int64` (the fast path), `Utf8`/`LargeUtf8` to `Utf8` (string ids, covering
+/// UUID-as-string). Any other type is not a supported node-id type.
+fn canonical_id_type(dt: &DataType) -> Result<DataType> {
+    use DataType::*;
+    match dt {
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ok(Int64),
+        Utf8 | LargeUtf8 => Ok(Utf8),
+        other => Err(DataFusionError::NotImplemented(format!(
+            "node ids must be an integer or string column; {other:?} is not a supported id type"
+        ))),
+    }
+}
+
+/// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch.
 ///
 /// Format is chosen by extension (`.parquet` / `.csv`), the two forms Ursa v0.1
-/// supports. The projection is pushed down, so only the endpoint columns are read;
-/// they are cast to Int64 (the v0.1 node-id type).
+/// supports. The projection is pushed down, so only the endpoint columns are read.
+/// The endpoints are canonicalized to a supported node-id type — `Int64` (the fast
+/// path) or `Utf8` strings; `src` and `dst` must be the same family.
 pub fn scan_edges_batch(
     path: &str,
     src: &str,
@@ -120,16 +135,24 @@ pub fn scan_edges_batch(
 
         let read_schema = batches[0].schema();
         let merged = concat_batches(&read_schema, &batches)?;
-        let src_i64 = cast(merged.column(0), &DataType::Int64)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-        let dst_i64 = cast(merged.column(1), &DataType::Int64)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+        let src_type = canonical_id_type(merged.column(0).data_type())?;
+        let dst_type = canonical_id_type(merged.column(1).data_type())?;
+        if src_type != dst_type {
+            return Err(DataFusionError::NotImplemented(format!(
+                "src and dst node-id columns must be the same type (both int or both string); \
+                 got {src_type:?} and {dst_type:?} in {path:?}"
+            )));
+        }
+        let src_c =
+            cast(merged.column(0), &src_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
+        let dst_c =
+            cast(merged.column(1), &dst_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("src", DataType::Int64, true),
-            Field::new("dst", DataType::Int64, true),
+            Field::new("src", src_type, true),
+            Field::new("dst", dst_type, true),
         ]));
-        RecordBatch::try_new(schema, vec![src_i64, dst_i64])
+        RecordBatch::try_new(schema, vec![src_c, dst_c])
             .map_err(|e| DataFusionError::ArrowError(e, None))
     })
 }
@@ -138,8 +161,9 @@ pub fn scan_edges_batch(
 ///
 /// Unlike [`scan_edges_batch`], there is no projection: a node table is an
 /// attribute table, so all columns are carried through. Only the `id` column is
-/// cast to Int64 (the v0.1 node-id type); attribute columns keep their file
-/// types. The result feeds `execute_node_query`'s `nodes` slot, where algorithm
+/// canonicalized to a supported node-id type (integer -> Int64, string -> Utf8);
+/// attribute columns keep their file types. The result feeds
+/// `execute_node_query`'s `nodes` slot, where algorithm
 /// outputs are LEFT-joined onto it by id — exactly like an in-memory
 /// `from_arrow(..., id=...)` table.
 pub fn scan_nodes_batch(
@@ -182,17 +206,19 @@ pub fn scan_nodes_batch(
             ))
         })?;
 
-        // Cast only the id column to Int64; attribute columns keep their types.
+        // Canonicalize only the id column (integer -> Int64, string -> Utf8);
+        // attribute columns keep their file types.
+        let id_type = canonical_id_type(merged.column(id_idx).data_type())?;
         let mut columns = merged.columns().to_vec();
-        columns[id_idx] = cast(&columns[id_idx], &DataType::Int64)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+        columns[id_idx] =
+            cast(&columns[id_idx], &id_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
         let fields: Vec<Field> = read_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(i, f)| {
                 if i == id_idx {
-                    Field::new(f.name(), DataType::Int64, f.is_nullable())
+                    Field::new(f.name(), id_type.clone(), f.is_nullable())
                 } else {
                     f.as_ref().clone()
                 }

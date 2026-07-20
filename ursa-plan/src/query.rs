@@ -152,9 +152,11 @@ fn dense_attr_column(
         ))
     })?;
 
-    let id_arr = cast(nodes.column(id_idx), &DataType::Int64)
-        .map_err(|e| DataFusionError::ArrowError(e, None))?;
-    let id_arr = id_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    // Resolve each attribute row's id to a dense index (its type must match the
+    // graph's id type — dense_from_array errors on a mismatch, e.g. string attr
+    // ids against an int64 graph). Rows whose id is null or absent from the graph
+    // resolve to `None` and are skipped.
+    let dense_of_row = resolve_dense(ids, nodes.column(id_idx))?;
 
     // Branch on the column's declared type, not on cast success: Arrow casts
     // Utf8 -> Float64 by producing nulls for unparseable strings rather than
@@ -165,9 +167,10 @@ fn dense_attr_column(
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     );
 
-    // Build id -> f64 key. Numeric columns pass values through; string columns
-    // (n_unique/count only) intern each distinct value to a stable code.
-    let mut map: HashMap<i64, f64> = HashMap::with_capacity(nodes.num_rows());
+    // Scatter attribute values into a dense-indexed vector. Numeric columns pass
+    // values through; string columns (n_unique/count only) intern each distinct
+    // value to a stable code.
+    let mut out: Vec<Option<f64>> = vec![None; ids.len()];
     if is_string {
         if !matches!(agg, AggKind::NUnique | AggKind::Count) {
             return Err(DataFusionError::NotImplemented(format!(
@@ -179,13 +182,13 @@ fn dense_attr_column(
             .map_err(|e| DataFusionError::ArrowError(e, None))?;
         let attr_arr = attr_arr.as_any().downcast_ref::<StringArray>().unwrap();
         let mut codes: HashMap<&str, f64> = HashMap::new();
-        for i in 0..nodes.num_rows() {
-            if id_arr.is_null(i) || attr_arr.is_null(i) {
+        for (i, dense) in dense_of_row.iter().enumerate() {
+            let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
                 continue;
-            }
+            };
             let next = codes.len() as f64;
             let code = *codes.entry(attr_arr.value(i)).or_insert(next);
-            map.insert(id_arr.value(i), code);
+            out[d as usize] = Some(code);
         }
     } else {
         let attr_arr = cast(nodes.column(attr_idx), &DataType::Float64).map_err(|_| {
@@ -195,19 +198,15 @@ fn dense_attr_column(
             ))
         })?;
         let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
-        for i in 0..nodes.num_rows() {
-            if id_arr.is_null(i) || attr_arr.is_null(i) {
+        for (i, dense) in dense_of_row.iter().enumerate() {
+            let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
                 continue;
-            }
-            map.insert(id_arr.value(i), attr_arr.value(i));
+            };
+            out[d as usize] = Some(attr_arr.value(i));
         }
     }
 
-    Ok(ids
-        .user_ids()
-        .iter()
-        .map(|uid| map.get(uid).copied())
-        .collect())
+    Ok(out)
 }
 
 fn comparison_expr(c: &Comparison) -> Result<Expr> {
@@ -349,7 +348,7 @@ pub fn execute_node_query(
 pub fn execute_hop_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
-    seeds: &Int64Array,
+    seeds: &dyn Array,
     n: u32,
     direction: &str,
     filters: &[Comparison],
@@ -359,11 +358,8 @@ pub fn execute_hop_query(
 ) -> Result<RecordBatch> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
-    // Resolve user-id seeds to dense indices; drop unknowns (kernel-consistent).
-    let seeds_dense: Vec<u32> = (0..seeds.len())
-        .filter(|&i| !seeds.is_null(i))
-        .filter_map(|i| ids.dense(seeds.value(i)))
-        .collect();
+    // Resolve user-id seeds to dense indices; drop unknowns/nulls (kernel-consistent).
+    let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
 
     let hop_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
@@ -406,8 +402,8 @@ pub fn execute_hop_query(
 pub fn execute_path_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
-    source: i64,
-    target: i64,
+    source: &dyn Array,
+    target: &dyn Array,
     direction: &str,
     weighted: bool,
     filters: &[Comparison],
@@ -422,10 +418,21 @@ pub fn execute_path_query(
     }
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
-    // Unknown endpoint -> no path (an empty edge frame), short-circuiting the plan.
-    let (Some(source), Some(target)) = (ids.dense(source), ids.dense(target)) else {
-        return RecordBatch::try_new(path_schema(), empty_path_columns())
-            .map_err(|e| DataFusionError::ArrowError(e, None));
+    // source/target arrive as 1-element user-id arrays; resolve each to a dense
+    // index. An unknown (or absent) endpoint -> no path (an empty edge frame),
+    // short-circuiting the plan.
+    let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
+    let target = resolve_dense(&ids, target)?.into_iter().next().flatten();
+    let (Some(source), Some(target)) = (source, target) else {
+        return RecordBatch::try_new(
+            path_schema(ids.user_type()),
+            vec![
+                ids.gather_user(&[]),
+                ids.gather_user(&[]),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(e, None));
     };
 
     let path_plan = LogicalPlan::Extension(Extension {
@@ -471,7 +478,7 @@ pub fn execute_path_query(
 pub fn execute_walk_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
-    starts: &Int64Array,
+    starts: &dyn Array,
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
@@ -480,10 +487,7 @@ pub fn execute_walk_query(
     limit: Option<usize>,
     distinct: bool,
 ) -> Result<RecordBatch> {
-    let starts_dense: Vec<u32> = (0..starts.len())
-        .filter(|&i| !starts.is_null(i))
-        .filter_map(|i| ids.dense(starts.value(i)))
-        .collect();
+    let starts_dense: Vec<u32> = resolve_dense(&ids, starts)?.into_iter().flatten().collect();
 
     let walk_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(RandomWalkNode::new(
@@ -523,13 +527,12 @@ pub fn execute_walk_query(
     })
 }
 
-/// Three empty Int64 columns matching [`path_schema`] — the no-path result.
-fn empty_path_columns() -> Vec<Arc<dyn Array>> {
-    vec![
-        Arc::new(Int64Array::from(Vec::<i64>::new())),
-        Arc::new(Int64Array::from(Vec::<i64>::new())),
-        Arc::new(Int64Array::from(Vec::<i64>::new())),
-    ]
+/// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping
+/// an id-type mismatch to a clear execution error. The shared seam for every
+/// traversal's seed/source/target/start resolution.
+fn resolve_dense(ids: &IdMap, arr: &dyn Array) -> Result<Vec<Option<u32>>, DataFusionError> {
+    ids.dense_from_array(arr)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 #[cfg(test)]
@@ -804,7 +807,9 @@ mod tests {
         let src = Int64Array::from(vec![0, 1, 2]);
         let dst = Int64Array::from(vec![1, 2, 3]);
         let (t, ids) = build(&src, &dst);
-        let batch = execute_path_query(t, ids, 0, 3, "out", false, &[], None, None, false).unwrap();
+        let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![3]));
+        let batch =
+            execute_path_query(t, ids, &s, &tg, "out", false, &[], None, None, false).unwrap();
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
@@ -824,8 +829,9 @@ mod tests {
         let dst = Int64Array::from(vec![1, 2, 3]);
         // 99 is not a node
         let (t, ids) = build(&src, &dst);
+        let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![99]));
         let batch =
-            execute_path_query(t, ids, 0, 99, "out", false, &[], None, None, false).unwrap();
+            execute_path_query(t, ids, &s, &tg, "out", false, &[], None, None, false).unwrap();
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 0);
     }
@@ -835,7 +841,8 @@ mod tests {
         let src = Int64Array::from(vec![0, 1]);
         let dst = Int64Array::from(vec![1, 2]);
         let (t, ids) = build(&src, &dst);
-        let err = execute_path_query(t, ids, 0, 2, "out", true, &[], None, None, false);
+        let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![2]));
+        let err = execute_path_query(t, ids, &s, &tg, "out", true, &[], None, None, false);
         assert!(err.is_err());
     }
 

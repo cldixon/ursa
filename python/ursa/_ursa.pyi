@@ -43,12 +43,13 @@ def run_hop_query(
     distinct: bool = ...,
 ) -> Any: ...
 
-# A shortest_path traversal: a built index + int64 source/target + direction +
-# relational tail -> (src, dst, hop) pyarrow.RecordBatch of the path edges.
+# A shortest_path traversal: a built index + 1-element source/target user-id
+# arrays (int64 or string) + direction + relational tail -> (src, dst, hop)
+# pyarrow.RecordBatch of the path edges.
 def run_path_query(
     index: GraphIndex,
-    source: int,
-    target: int,
+    source: Any,
+    target: Any,
     direction: str,
     weighted: bool = ...,
     filters: list[tuple[str, str, float]] = ...,

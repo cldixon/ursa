@@ -244,10 +244,12 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             raise NotImplementedError(
                 "weighted shortest_path is not supported yet; omit weight= for unweighted BFS."
             )
+        # source/target cross as 1-element user-id arrays (int64 or string),
+        # resolved to dense indices in Rust — the same path as hop seeds.
         batch = _native().run_path_query(
             index,
-            int(traversal.args["source"]),
-            int(traversal.args["target"]),
+            _resolve_seeds([traversal.args["source"]]),
+            _resolve_seeds([traversal.args["target"]]),
             traversal.args["direction"],
             False,  # weighted
             filters,
@@ -264,10 +266,11 @@ _SEED_PASSTHROUGH = {"from_arrow", "from_polars", "scan_nodes", "nodes"}
 
 
 def _resolve_seeds(seeds: Any) -> Any:
-    """Resolve a hop's seed set to an int64 pyarrow array: an iterable of node ids,
-    or a NodeFrame's id column (read from its source when unmodified, else
-    collected)."""
+    """Resolve a seed set to a pyarrow array of user ids (int64 or string, matching
+    the graph): an iterable of node ids, or a NodeFrame's id column (read from its
+    source when unmodified, else collected)."""
     from ._frames import NodeFrame
+    from ._io import _canonical_id_array
 
     if seeds is None:
         raise NotImplementedError(
@@ -286,15 +289,22 @@ def _resolve_seeds(seeds: Any) -> Any:
         name = seeds.id_col if seeds.id_col in tbl.column_names else "id"
         column = tbl.column(name)
         chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-        return pa.concat_arrays(chunks).cast(pa.int64())
+        return _canonical_id_array(pa.concat_arrays(chunks))
 
     try:
-        ids = [int(x) for x in seeds]
+        vals = list(seeds)
     except TypeError as exc:
         raise NotImplementedError(
-            "ur.hop(...).from_(seeds) accepts an iterable of node ids or a NodeFrame."
+            "seed ids must be an iterable of node ids or a NodeFrame."
         ) from exc
-    return pa.array(ids, type=pa.int64())
+    # Infer the id type from the values: all strings -> string, otherwise int64.
+    # (bool is an int subclass, so exclude it from the integer path.)
+    if vals and all(isinstance(v, str) for v in vals):
+        return pa.array(vals, type=pa.string())
+    try:
+        return pa.array([int(v) for v in vals], type=pa.int64())
+    except (TypeError, ValueError) as exc:
+        raise NotImplementedError("seed ids must be all integers or all strings.") from exc
 
 
 # --- the one execution entry ------------------------------------------------

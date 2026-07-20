@@ -48,7 +48,7 @@ pub struct GraphAlgorithmExec {
 
 impl GraphAlgorithmExec {
     pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>, columns: Arc<Vec<OutputColumn>>) -> Self {
-        let schema = query_schema(&columns);
+        let schema = query_schema(&columns, ids.user_type());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -140,7 +140,7 @@ impl HopExec {
         n: u32,
         direction: Direction,
     ) -> Self {
-        let schema = hop_schema();
+        let schema = hop_schema(ids.user_type());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -240,7 +240,7 @@ impl ShortestPathExec {
         target: u32,
         direction: Direction,
     ) -> Self {
-        let schema = path_schema();
+        let schema = path_schema(ids.user_type());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -341,7 +341,7 @@ impl RandomWalkExec {
         walks_per_node: u32,
         seed: Option<u64>,
     ) -> Self {
-        let schema = walk_schema();
+        let schema = walk_schema(ids.user_type());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -459,7 +459,7 @@ mod tests {
         let dst = Int64Array::from(vec![1, 2, 3]);
         let (topo, ids) = build_topology(&src, &dst).unwrap();
         // seed dense index of user id 0
-        let seed = ids.dense(0).unwrap();
+        let seed = ids.dense_from_array(&Int64Array::from(vec![0])).unwrap()[0].unwrap();
         let exec = Arc::new(HopExec::new(
             topo,
             ids,
