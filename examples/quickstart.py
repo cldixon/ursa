@@ -78,30 +78,42 @@ def main() -> None:
     print("\n== attribute enrichment + neighbour aggregation ==")
     print(enriched.collect().to_polars())
 
-    # -- 4. Whole-graph stat (eager) ----------------------------------------
-    print("\n== density ==", ur.density(edges))
+    # -- 4. Traversal: k-hop reachability -----------------------------------
+    # ur.hop returns an EdgeFrame (src = seed, dst = reached). Here: everything
+    # reachable within 2 hops from node 0, then compose a relational tail on it.
+    print("\n== 2-hop reachability from node 0 ==")
+    reach = ur.hop(edges, n=2).from_([0]).sort("dst").collect().to_polars()
+    print(reach)
 
-    # -- 5. Read from a file, write results back ----------------------------
-    # scan_edges reads Parquet/CSV through a DataFusion scan (projection pushed
-    # down); sink_* writes the materialized result.
+    # -- 5. Whole-graph summary + density -----------------------------------
+    print("\n== describe ==")
+    print(ur.describe(edges, full=True).collect().to_polars())
+    print("density:", ur.density(edges))
+
+    # -- 6. Read from files, write results back -----------------------------
+    # scan_edges / scan_nodes read Parquet/CSV through a DataFusion scan; the node
+    # file is joined to the computed metrics by id. sink_* writes the result.
     import tempfile
     from pathlib import Path
 
     with tempfile.TemporaryDirectory() as tmp:
         csv = Path(tmp) / "links.csv"
         csv.write_text("from,to,latency_ms\n0,1,5\n1,2,7\n2,0,3\n2,3,9\n3,4,2\n4,3,4\n")
+        ncsv = Path(tmp) / "towers.csv"
+        ncsv.write_text("id,site\n0,a\n1,a\n2,b\n3,b\n4,c\n")
 
         scanned = ur.scan_edges(str(csv), src="from", dst="to")
-        result = scanned.nodes().with_columns(pr=ur.pagerank(scanned)).sort("pr", descending=True)
+        towers = ur.scan_nodes(str(ncsv), id="id")
+        result = towers.with_columns(pr=ur.pagerank(scanned)).sort("pr", descending=True)
 
         out = Path(tmp) / "metrics.parquet"
         result.collect().sink_parquet(str(out))
-        print("\n== scan CSV -> compute -> sink Parquet ==")
+        print("\n== scan CSV edges + nodes -> compute -> sink Parquet ==")
         import pyarrow.parquet as pq
 
         print(pq.read_table(str(out)).to_pydict())
 
-    # -- 6. The expression dialect is Polars-shaped (pure Python) -----------
+    # -- 7. The expression dialect is Polars-shaped (pure Python) -----------
     predicate = (ur.col("pr") * ur.lit(100) > ur.lit(5)) & (ur.col("indeg") >= ur.lit(2))
     print("\n== expression dialect ==\n", repr(predicate))
 
