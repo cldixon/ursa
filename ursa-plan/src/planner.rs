@@ -21,8 +21,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
 
-use crate::node::{GraphAlgorithmNode, HopNode};
-use crate::physical::{GraphAlgorithmExec, HopExec};
+use crate::node::{GraphAlgorithmNode, HopNode, ShortestPathNode};
+use crate::physical::{GraphAlgorithmExec, HopExec, ShortestPathExec};
 
 /// Maps each Ursa graph logical node to its `ExecutionPlan`.
 #[derive(Debug)]
@@ -52,6 +52,15 @@ impl ExtensionPlanner for GraphExtensionPlanner {
                 n.ids.clone(),
                 n.seeds.clone(),
                 n.n,
+                n.direction,
+            )) as Arc<dyn ExecutionPlan>));
+        }
+        if let Some(n) = any.downcast_ref::<ShortestPathNode>() {
+            return Ok(Some(Arc::new(ShortestPathExec::new(
+                n.topology.clone(),
+                n.ids.clone(),
+                n.source,
+                n.target,
                 n.direction,
             )) as Arc<dyn ExecutionPlan>));
         }

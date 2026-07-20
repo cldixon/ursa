@@ -27,8 +27,8 @@ use pyo3::prelude::*;
 use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
 use ursa_core::topology::{Direction as CoreDirection, Topology};
 use ursa_plan::{
-    density, describe, execute_hop_query, execute_node_query, scan_edges_batch, scan_nodes_batch,
-    Comparison,
+    avg_path_length, density, describe, diameter, execute_hop_query, execute_node_query,
+    execute_path_query, scan_edges_batch, scan_nodes_batch, Comparison,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,6 +138,51 @@ fn run_hop_query(
     batch.to_pyarrow(py)
 }
 
+/// Execute a `shortest_path` traversal and return its `(src, dst, hop)` path batch
+/// as pyarrow. `source`/`target` are int64 user ids; `direction` is out/in/both.
+/// `weighted` is reserved (errors for now — v0.1 is unweighted BFS). The
+/// `filters`/`sort`/`limit`/`distinct` tail applies to the path edges.
+#[pyfunction]
+#[pyo3(signature = (src, dst, source, target, direction, weighted=false, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[allow(clippy::too_many_arguments)]
+fn run_path_query(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    dst: &Bound<'_, PyAny>,
+    source: i64,
+    target: i64,
+    direction: &str,
+    weighted: bool,
+    filters: Vec<(String, String, f64)>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> PyResult<PyObject> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    let direction = direction.to_string();
+    let comparisons: Vec<Comparison> = filters
+        .into_iter()
+        .map(|(column, op, value)| Comparison { column, op, value })
+        .collect();
+    let batch = py.allow_threads(move || {
+        execute_path_query(
+            &src,
+            &dst,
+            source,
+            target,
+            &direction,
+            weighted,
+            &comparisons,
+            sort,
+            limit,
+            distinct,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
+}
+
 /// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
 fn graph_density(py: Python<'_>, src: &Bound<'_, PyAny>, dst: &Bound<'_, PyAny>) -> PyResult<f64> {
@@ -145,6 +190,39 @@ fn graph_density(py: Python<'_>, src: &Bound<'_, PyAny>, dst: &Bound<'_, PyAny>)
     let dst = int64_from_pyarrow(dst)?;
     py.allow_threads(move || {
         density(&src, &dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
+}
+
+/// Average shortest-path length over reachable ordered pairs (eager scalar).
+/// `sample` (a fraction) estimates from a subset of sources; omit for exact.
+#[pyfunction]
+#[pyo3(signature = (src, dst, sample=None))]
+fn graph_avg_path_length(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    dst: &Bound<'_, PyAny>,
+    sample: Option<f64>,
+) -> PyResult<f64> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    py.allow_threads(move || {
+        avg_path_length(&src, &dst, sample).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
+}
+
+/// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
+/// estimate; pass false for exact.
+#[pyfunction]
+fn graph_diameter(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    dst: &Bound<'_, PyAny>,
+    approximate: bool,
+) -> PyResult<i64> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    py.allow_threads(move || {
+        diameter(&src, &dst, approximate).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })
 }
 
@@ -264,7 +342,10 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // real execution path
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
+    m.add_function(wrap_pyfunction!(run_path_query, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;
     m.add_function(wrap_pyfunction!(graph_describe, m)?)?;
     m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(scan_nodes_arrow, m)?)?;

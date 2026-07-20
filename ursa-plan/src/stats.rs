@@ -1,8 +1,8 @@
 //! Whole-graph scalar statistics.
 //!
 //! These are the spec's deliberate *eager* exceptions to laziness: they build the
-//! topology and return a plain number. `density` is unblocked (it needs only node
-//! and edge counts); `diameter` / `avg_path_length` await the frontier/BFS kernels.
+//! topology and return a plain number. `density` needs only node and edge counts;
+//! `diameter` / `avg_path_length` run BFS from a set of source nodes.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
-use ursa_core::algo::connected_components_weak;
-use ursa_core::Topology;
+use ursa_core::algo::{bfs_distances, connected_components_weak};
+use ursa_core::{Direction, Topology};
 
 use crate::topology::build_topology;
 
@@ -80,6 +80,81 @@ pub fn describe(src: &Int64Array, dst: &Int64Array, full: bool) -> Result<Record
     .map_err(|e| DataFusionError::ArrowError(e, None))
 }
 
+/// Pick the source nodes for a BFS-based stat. `None` → every node (exact);
+/// `Some(frac)` → a deterministic evenly-strided subsample of ~`frac * n` nodes
+/// (reproducible, no RNG). At least one source when `n > 0`.
+fn sample_sources(n: usize, frac: Option<f64>) -> Vec<u32> {
+    match frac {
+        None => (0..n as u32).collect(),
+        Some(f) => {
+            let f = f.clamp(0.0, 1.0);
+            let k = ((n as f64) * f).round().max(1.0) as usize;
+            let k = k.min(n);
+            if k == 0 {
+                return Vec::new();
+            }
+            // Evenly strided across 0..n so the sample isn't a biased prefix.
+            let step = (n as f64 / k as f64).max(1.0);
+            (0..k)
+                .map(|i| ((i as f64 * step).floor() as usize).min(n - 1) as u32)
+                .collect()
+        }
+    }
+}
+
+/// Run BFS from each source and fold the finite distances (`>= 1`, i.e. reachable
+/// and not the source itself). Returns `(sum, count, max)` over all reachable
+/// ordered pairs from the sampled sources — the shared core of both path stats.
+fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u64, i32) {
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    let mut max = 0i32;
+    for &s in sources {
+        for d in bfs_distances(topo, s, dir) {
+            if d >= 1 {
+                sum += d as f64;
+                count += 1;
+                if d > max {
+                    max = d;
+                }
+            }
+        }
+    }
+    (sum, count, max)
+}
+
+/// Average shortest-path length over reachable ordered pairs (directed, following
+/// out-edges). `sample=None` is exact (BFS from every node); `Some(frac)` estimates
+/// from a deterministic strided subsample of sources. Disconnected graphs count
+/// only their reachable pairs; a graph with no reachable pair returns `0.0`.
+pub fn avg_path_length(src: &Int64Array, dst: &Int64Array, sample: Option<f64>) -> Result<f64> {
+    let (topology, _ids) =
+        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let sources = sample_sources(topology.n_nodes(), sample);
+    let (sum, count, _max) = bfs_source_scan(&topology, &sources, Direction::Out);
+    Ok(if count == 0 { 0.0 } else { sum / count as f64 })
+}
+
+/// Graph diameter — the longest shortest path, over reachable ordered pairs
+/// (directed, following out-edges). `approximate=false` is exact (max eccentricity
+/// over every source); `approximate=true` (the default) is a lower-bound estimate
+/// from a bounded deterministic sample of sources. Returns `0` when no pair is
+/// reachable.
+pub fn diameter(src: &Int64Array, dst: &Int64Array, approximate: bool) -> Result<i64> {
+    let (topology, _ids) =
+        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let n = topology.n_nodes();
+    // Approximate: sample a bounded number of sources (deterministic stride).
+    let sources = if approximate && n > 0 {
+        let frac = (128.0 / n as f64).min(1.0);
+        sample_sources(n, Some(frac))
+    } else {
+        sample_sources(n, None)
+    };
+    let (_sum, _count, max) = bfs_source_scan(&topology, &sources, Direction::Out);
+    Ok(max as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +214,35 @@ mod tests {
         let i = batch.schema().index_of("n_components").unwrap();
         // null unless full=true
         assert!(batch.column(i).is_null(0));
+    }
+
+    #[test]
+    fn avg_path_length_of_a_directed_triangle() {
+        // 0->1->2->0: 6 reachable ordered pairs, distances {1,2} x3 -> mean 1.5
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 0]);
+        assert!((avg_path_length(&src, &dst, None).unwrap() - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn diameter_of_a_directed_triangle() {
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 0]);
+        assert_eq!(diameter(&src, &dst, false).unwrap(), 2); // exact
+                                                             // approximate is a lower bound on the exact diameter
+        assert!(diameter(&src, &dst, true).unwrap() <= 2);
+    }
+
+    #[test]
+    fn path_stats_on_a_line_and_when_disconnected() {
+        // line 0->1->2->3: longest shortest path is 0->3 (dist 3)
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        assert_eq!(diameter(&src, &dst, false).unwrap(), 3);
+        // two disjoint edges: only within-component pairs are reachable
+        let src = Int64Array::from(vec![0, 2]);
+        let dst = Int64Array::from(vec![1, 3]);
+        assert!((avg_path_length(&src, &dst, None).unwrap() - 1.0).abs() < 1e-12);
+        assert_eq!(diameter(&src, &dst, false).unwrap(), 1);
     }
 }
