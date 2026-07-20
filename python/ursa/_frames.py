@@ -160,7 +160,12 @@ class EdgeFrame(_Frame):
     # built via `from_arrow`/`from_polars`. `_scan` carries a file-source spec
     # ({path, src, dst}) for frames built via `scan_edges`; `collect()` resolves
     # it through a DataFusion scan. A frame has at most one of them.
-    __slots__ = ("_dst_col", "_scan", "_source", "_src_col")
+    #
+    # `_index` is the built native topology index (a `GraphIndex` handle), lazily
+    # cached on first graph op and shared by every subsequent op over this frame
+    # (the spec's index-preservation contract). It rides the same preserve/drop
+    # rail as `_source`/`_scan`: property-only ops keep it, structural ops drop it.
+    __slots__ = ("_dst_col", "_index", "_scan", "_source", "_src_col")
 
     def __init__(
         self,
@@ -170,12 +175,14 @@ class EdgeFrame(_Frame):
         has_index: bool = True,
         source: tuple[Any, Any] | None = None,
         scan: dict[str, Any] | None = None,
+        index: Any | None = None,
     ) -> None:
         super().__init__(plan, has_index)
         self._src_col = src_col
         self._dst_col = dst_col
         self._source = source
         self._scan = scan
+        self._index = index
 
     @property
     def _edge_arrays(self) -> tuple[Any, Any] | None:
@@ -198,8 +205,9 @@ class EdgeFrame(_Frame):
         return self._dst_col
 
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> EdgeFrame:
-        # A row-changing op invalidates the in-memory source / scan spec (they no
-        # longer match the frame); property-only ops keep them.
+        # A row-changing op invalidates the in-memory source / scan spec and the
+        # cached topology index (they no longer match the frame); property-only
+        # ops keep them.
         return EdgeFrame(
             self._src_col,
             self._dst_col,
@@ -207,6 +215,7 @@ class EdgeFrame(_Frame):
             has_index=self._has_index and not drops_index,
             source=None if drops_index else self._source,
             scan=None if drops_index else self._scan,
+            index=None if drops_index else self._index,
         )
 
     def nodes(self) -> NodeFrame:

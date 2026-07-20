@@ -24,13 +24,12 @@ use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{col, lit};
 use serde::Deserialize;
 use ursa_core::algo::AggKind;
-use ursa_core::IdMap;
+use ursa_core::{IdMap, Topology};
 
 use crate::logical::{Direction, GraphAlgo};
 use crate::node::{GraphAlgorithmNode, HopNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{is_executable, path_schema, OutputColumn};
-use crate::topology::build_topology;
 
 /// A single `column <op> literal` comparison (`op` in `> >= < <= == !=`).
 #[derive(Debug, Clone)]
@@ -219,8 +218,8 @@ fn comparison_expr(c: &Comparison) -> Result<Expr> {
 /// either. Filters/sort/limit are stock DataFusion `DataFrame` operations.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_node_query(
-    src: &Int64Array,
-    dst: &Int64Array,
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
     columns_json: &str,
     filters: &[Comparison],
     sort: Option<(String, bool)>,
@@ -228,9 +227,6 @@ pub fn execute_node_query(
     nodes: Option<RecordBatch>,
     nodes_id: Option<String>,
 ) -> Result<RecordBatch> {
-    let (topology, ids) =
-        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
     if specs.is_empty() {
@@ -332,8 +328,8 @@ pub fn execute_node_query(
 /// `seeds` are user ids; unknown seeds contribute nothing (matching the kernel).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_hop_query(
-    src: &Int64Array,
-    dst: &Int64Array,
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
     seeds: &Int64Array,
     n: u32,
     direction: &str,
@@ -342,8 +338,6 @@ pub fn execute_hop_query(
     limit: Option<usize>,
     distinct: bool,
 ) -> Result<RecordBatch> {
-    let (topology, ids) =
-        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
     // Resolve user-id seeds to dense indices; drop unknowns (kernel-consistent).
@@ -391,8 +385,8 @@ pub fn execute_hop_query(
 /// are not yet supported (`weighted` errors) — v0.1 is unweighted BFS.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_path_query(
-    src: &Int64Array,
-    dst: &Int64Array,
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
     source: i64,
     target: i64,
     direction: &str,
@@ -407,8 +401,6 @@ pub fn execute_path_query(
             "weighted shortest_path is not supported yet; omit weight= for unweighted BFS".into(),
         ));
     }
-    let (topology, ids) =
-        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
     // Unknown endpoint -> no path (an empty edge frame), short-circuiting the plan.
@@ -471,12 +463,18 @@ mod tests {
         )
     }
 
+    /// Build the cached (topology, ids) pair the query fns now take.
+    fn build(src: &Int64Array, dst: &Int64Array) -> (Arc<Topology>, Arc<IdMap>) {
+        crate::topology::build_topology(src, dst).unwrap()
+    }
+
     #[test]
     fn single_column_query() {
         let (src, dst) = diamond();
+        let (t, ids) = build(&src, &dst);
         let batch = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"pagerank","kind":"pagerank"}]"#,
             &[],
             None,
@@ -492,9 +490,10 @@ mod tests {
     #[test]
     fn composed_query_filter_sort_limit() {
         let (src, dst) = diamond();
+        let (t, ids) = build(&src, &dst);
         let batch = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"pr","kind":"pagerank"},{"name":"indeg","kind":"degree","direction":"in"}]"#,
             &[Comparison {
                 column: "indeg".into(),
@@ -520,9 +519,10 @@ mod tests {
     #[test]
     fn unwired_algorithm_errors() {
         let (src, dst) = diamond();
+        let (t, ids) = build(&src, &dst);
         let err = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"c","kind":"closeness"}]"#,
             &[],
             None,
@@ -553,9 +553,10 @@ mod tests {
         )
         .unwrap();
 
+        let (t, ids) = build(&src, &dst);
         let batch = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
             &[],
             Some(("id".into(), false)),
@@ -592,9 +593,10 @@ mod tests {
         )
         .unwrap();
 
+        let (t, ids) = build(&src, &dst);
         let batch = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#,
             &[],
             Some(("id".into(), false)),
@@ -642,9 +644,10 @@ mod tests {
         )
         .unwrap();
 
+        let (t, ids) = build(&src, &dst);
         let batch = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
             &[],
             Some(("id".into(), false)),
@@ -676,8 +679,8 @@ mod tests {
         let src = Int64Array::from(vec![0, 1, 2]);
         let dst = Int64Array::from(vec![1, 2, 3]);
         let seeds = Int64Array::from(vec![0]);
-        let batch =
-            execute_hop_query(&src, &dst, &seeds, 2, "out", &[], None, None, false).unwrap();
+        let (t, ids) = build(&src, &dst);
+        let batch = execute_hop_query(t, ids, &seeds, 2, "out", &[], None, None, false).unwrap();
         // from 0 within 2 hops -> reaches 1 and 2
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 2);
@@ -698,8 +701,8 @@ mod tests {
         // path 0 -> 1 -> 2 -> 3
         let src = Int64Array::from(vec![0, 1, 2]);
         let dst = Int64Array::from(vec![1, 2, 3]);
-        let batch =
-            execute_path_query(&src, &dst, 0, 3, "out", false, &[], None, None, false).unwrap();
+        let (t, ids) = build(&src, &dst);
+        let batch = execute_path_query(t, ids, 0, 3, "out", false, &[], None, None, false).unwrap();
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
@@ -718,8 +721,9 @@ mod tests {
         let src = Int64Array::from(vec![0, 1, 2]);
         let dst = Int64Array::from(vec![1, 2, 3]);
         // 99 is not a node
+        let (t, ids) = build(&src, &dst);
         let batch =
-            execute_path_query(&src, &dst, 0, 99, "out", false, &[], None, None, false).unwrap();
+            execute_path_query(t, ids, 0, 99, "out", false, &[], None, None, false).unwrap();
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 0);
     }
@@ -728,7 +732,8 @@ mod tests {
     fn path_query_weighted_errors() {
         let src = Int64Array::from(vec![0, 1]);
         let dst = Int64Array::from(vec![1, 2]);
-        let err = execute_path_query(&src, &dst, 0, 2, "out", true, &[], None, None, false);
+        let (t, ids) = build(&src, &dst);
+        let err = execute_path_query(t, ids, 0, 2, "out", true, &[], None, None, false);
         assert!(err.is_err());
     }
 
@@ -739,9 +744,10 @@ mod tests {
         let dst = Int64Array::from(vec![0, 0, 0, 1]);
         let seeds = Int64Array::from(vec![1, 2, 3]);
         // one hop out: (1,0),(2,0),(3,0); keep dst == 0, limit 2
+        let (t, ids) = build(&src, &dst);
         let batch = execute_hop_query(
-            &src,
-            &dst,
+            t,
+            ids,
             &seeds,
             1,
             "out",
@@ -777,9 +783,10 @@ mod tests {
         )
         .unwrap();
 
+        let (t, ids) = build(&src, &dst);
         let err = execute_node_query(
-            &src,
-            &dst,
+            t,
+            ids,
             r#"[{"name":"m","kind":"neighbors_agg","agg_fn":"mean","agg_column":"region","direction":"in"}]"#,
             &[],
             None,

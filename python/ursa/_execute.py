@@ -17,6 +17,7 @@ Parquet/CSV file source. Anything outside the wired surface raises a clear error
 from __future__ import annotations
 
 import json
+import threading
 from typing import TYPE_CHECKING, Any
 
 from ._result import MaterializedFrame
@@ -24,6 +25,11 @@ from ._result import MaterializedFrame
 if TYPE_CHECKING:
     from ._expr import Expr
     from ._frames import EdgeFrame, NodeFrame
+
+# Guards the per-frame lazy index build so concurrent first-collects over one
+# frame share a single build (the spec's "concurrent queries share one build");
+# collect() runs GIL-free, so the memo assignment itself needs guarding.
+_INDEX_BUILD_LOCK = threading.Lock()
 
 # Algorithms with a kernel wired into the execution path (mirrors
 # ursa_plan::result::is_executable on the Rust side).
@@ -50,8 +56,8 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # wrapped as a one-row frame (its own branch — not a per-node algorithm).
     for step in frame._plan:
         if step.op == "describe":
-            src, dst = _require_edges(step.args["edges"])
-            batch = _native().graph_describe(src, dst, bool(step.args.get("full", False)))
+            index = _require_index(step.args["edges"])
+            batch = _native().graph_describe(index, bool(step.args.get("full", False)))
             return MaterializedFrame(batch)
 
     graph_exprs: dict[str, Expr] | None = None
@@ -171,12 +177,11 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             "(e.g. ur.pagerank(edges))."
         )
 
-    src, dst = _require_edges(traversal.args["edges"])
+    index = _require_index(traversal.args["edges"])
     if traversal.op == "hop":
         seeds = _resolve_seeds(traversal.args["seeds"])
         batch = _native().run_hop_query(
-            src,
-            dst,
+            index,
             seeds,
             int(traversal.args["n"]),
             traversal.args["direction"],
@@ -191,8 +196,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 "weighted shortest_path is not supported yet; omit weight= for unweighted BFS."
             )
         batch = _native().run_path_query(
-            src,
-            dst,
+            index,
             int(traversal.args["source"]),
             int(traversal.args["target"]),
             traversal.args["direction"],
@@ -254,9 +258,9 @@ def _run_query(
     nodes: Any | None = None,
     nodes_id: str | None = None,
 ) -> MaterializedFrame:
-    src, dst = _require_edges(edges)
+    index = _require_index(edges)
     batch = _native().run_node_query(
-        src, dst, json.dumps(columns), filters, sort, limit, nodes, nodes_id
+        index, json.dumps(columns), filters, sort, limit, nodes, nodes_id
     )
     return MaterializedFrame(batch)
 
@@ -342,6 +346,26 @@ def _require_edges(edges: EdgeFrame | None) -> tuple[Any, Any]:
         "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or "
         "ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source."
     )
+
+
+def _require_index(edges: EdgeFrame | None) -> Any:
+    """The frame's cached native ``GraphIndex`` — the CSR topology built **once**
+    and reused by every graph op over this frame (the index-preservation
+    contract). Built lazily from ``_require_edges`` on first use and memoized on
+    the frame; property-only transforms carry it forward, structural ones drop it
+    (see ``EdgeFrame._extend``). Concurrency-safe via a module lock."""
+    if edges is None:
+        raise NotImplementedError("this expression is not associated with an edge frame.")
+    idx = getattr(edges, "_index", None)
+    if idx is not None:
+        return idx
+    with _INDEX_BUILD_LOCK:
+        idx = getattr(edges, "_index", None)
+        if idx is None:
+            src, dst = _require_edges(edges)
+            idx = _native().build_index(src, dst)
+            edges._index = idx
+    return idx
 
 
 def _parse_filter(predicate: Any) -> tuple[str, str, float]:

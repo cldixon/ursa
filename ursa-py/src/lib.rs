@@ -26,11 +26,15 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
 use ursa_core::topology::{Direction as CoreDirection, Topology};
+use ursa_core::IdMap;
 use ursa_plan::{
-    avg_path_length, density, describe, diameter, execute_hop_query, execute_node_query,
-    execute_path_query, scan_edges_batch, scan_nodes_batch, Comparison,
+    avg_path_length, build_topology, density, describe, diameter, execute_hop_query,
+    execute_node_query, execute_path_query, scan_edges_batch, scan_nodes_batch, Comparison,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,18 +53,55 @@ fn int64_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Int64Array> {
         })
 }
 
+/// Counts topology builds, so tests can prove the index-preservation contract
+/// (a multi-algorithm pipeline over one frame builds the CSR exactly once).
+static TOPOLOGY_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// A built graph index — the CSR `Topology` plus the `IdMap` — cached on the
+/// Python `EdgeFrame` and passed to every graph op over that frame, so the
+/// topology is built once instead of on every `collect()` (spec §index-
+/// preservation contract). Opaque to Python; produced only by [`build_index`].
+#[pyclass]
+struct GraphIndex {
+    topo: Arc<Topology>,
+    ids: Arc<IdMap>,
+}
+
+/// Build the graph index from `(src, dst)` int64 arrays — the one place the CSR
+/// is constructed. The GIL is released for the build; the counter lets tests
+/// assert build-once behaviour.
+#[pyfunction]
+fn build_index(
+    py: Python<'_>,
+    src: &Bound<'_, PyAny>,
+    dst: &Bound<'_, PyAny>,
+) -> PyResult<GraphIndex> {
+    let src = int64_from_pyarrow(src)?;
+    let dst = int64_from_pyarrow(dst)?;
+    let (topo, ids) = py.allow_threads(move || {
+        build_topology(&src, &dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Ok(GraphIndex { topo, ids })
+}
+
+/// Total topology builds so far (test/observability hook for the index contract).
+#[pyfunction]
+fn _topology_build_count() -> usize {
+    TOPOLOGY_BUILDS.load(Ordering::Relaxed)
+}
+
 /// Execute a graph query and return its `(id, values...)` batch as pyarrow.
 ///
 /// `columns_json` is the query's output-column IR (a JSON list of
 /// `{name, kind, ...params}`); `filters` are `(column, op, value)` comparisons;
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (src, dst, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None))]
+#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None))]
 #[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
+    index: PyRef<'_, GraphIndex>,
     columns_json: &str,
     filters: Vec<(String, String, f64)>,
     sort: Option<(String, bool)>,
@@ -68,8 +109,7 @@ fn run_node_query(
     nodes: Option<Bound<'_, PyAny>>,
     nodes_id: Option<String>,
 ) -> PyResult<PyObject> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+    let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
     let comparisons: Vec<Comparison> = filters
         .into_iter()
@@ -81,8 +121,8 @@ fn run_node_query(
     };
     let batch = py.allow_threads(move || {
         execute_node_query(
-            &src,
-            &dst,
+            topo,
+            ids,
             &columns_json,
             &comparisons,
             sort,
@@ -101,12 +141,11 @@ fn run_node_query(
 /// `direction` one of out/in/both. `filters`/`sort`/`limit`/`distinct` are the
 /// optional relational tail applied to the reached edges.
 #[pyfunction]
-#[pyo3(signature = (src, dst, seeds, n, direction, filters, sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, seeds, n, direction, filters, sort=None, limit=None, distinct=false))]
 #[allow(clippy::too_many_arguments)]
 fn run_hop_query(
     py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
+    index: PyRef<'_, GraphIndex>,
     seeds: &Bound<'_, PyAny>,
     n: u32,
     direction: &str,
@@ -115,8 +154,7 @@ fn run_hop_query(
     limit: Option<usize>,
     distinct: bool,
 ) -> PyResult<PyObject> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+    let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let seeds = int64_from_pyarrow(seeds)?;
     let direction = direction.to_string();
     let comparisons: Vec<Comparison> = filters
@@ -125,8 +163,8 @@ fn run_hop_query(
         .collect();
     let batch = py.allow_threads(move || {
         execute_hop_query(
-            &src,
-            &dst,
+            topo,
+            ids,
             &seeds,
             n,
             &direction,
@@ -145,12 +183,11 @@ fn run_hop_query(
 /// `weighted` is reserved (errors for now — v0.1 is unweighted BFS). The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the path edges.
 #[pyfunction]
-#[pyo3(signature = (src, dst, source, target, direction, weighted=false, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, source, target, direction, weighted=false, filters=Vec::new(), sort=None, limit=None, distinct=false))]
 #[allow(clippy::too_many_arguments)]
 fn run_path_query(
     py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
+    index: PyRef<'_, GraphIndex>,
     source: i64,
     target: i64,
     direction: &str,
@@ -160,8 +197,7 @@ fn run_path_query(
     limit: Option<usize>,
     distinct: bool,
 ) -> PyResult<PyObject> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+    let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let direction = direction.to_string();
     let comparisons: Vec<Comparison> = filters
         .into_iter()
@@ -169,8 +205,8 @@ fn run_path_query(
         .collect();
     let batch = py.allow_threads(move || {
         execute_path_query(
-            &src,
-            &dst,
+            topo,
+            ids,
             source,
             target,
             &direction,
@@ -187,28 +223,23 @@ fn run_path_query(
 
 /// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
-fn graph_density(py: Python<'_>, src: &Bound<'_, PyAny>, dst: &Bound<'_, PyAny>) -> PyResult<f64> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
-    py.allow_threads(move || {
-        density(&src, &dst).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    })
+fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>) -> PyResult<f64> {
+    let topo = index.topo.clone();
+    py.allow_threads(move || density(&topo).map_err(|e| PyRuntimeError::new_err(e.to_string())))
 }
 
 /// Average shortest-path length over reachable ordered pairs (eager scalar).
 /// `sample` (a fraction) estimates from a subset of sources; omit for exact.
 #[pyfunction]
-#[pyo3(signature = (src, dst, sample=None))]
+#[pyo3(signature = (index, sample=None))]
 fn graph_avg_path_length(
     py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
+    index: PyRef<'_, GraphIndex>,
     sample: Option<f64>,
 ) -> PyResult<f64> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+    let topo = index.topo.clone();
     py.allow_threads(move || {
-        avg_path_length(&src, &dst, sample).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        avg_path_length(&topo, sample).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })
 }
 
@@ -217,30 +248,22 @@ fn graph_avg_path_length(
 #[pyfunction]
 fn graph_diameter(
     py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
+    index: PyRef<'_, GraphIndex>,
     approximate: bool,
 ) -> PyResult<i64> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+    let topo = index.topo.clone();
     py.allow_threads(move || {
-        diameter(&src, &dst, approximate).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        diameter(&topo, approximate).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })
 }
 
 /// Whole-graph one-row summary (`n_nodes, n_edges, density, avg_degree,
 /// n_components`) as a pyarrow `RecordBatch`. `full` computes `n_components`.
 #[pyfunction]
-fn graph_describe(
-    py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
-    full: bool,
-) -> PyResult<PyObject> {
-    let src = int64_from_pyarrow(src)?;
-    let dst = int64_from_pyarrow(dst)?;
+fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<PyObject> {
+    let topo = index.topo.clone();
     let batch = py.allow_threads(move || {
-        describe(&src, &dst, full).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        describe(&topo, full).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
     batch.to_pyarrow(py)
 }
@@ -359,6 +382,10 @@ fn _demo_connected_components(src: Vec<i64>, dst: Vec<i64>) -> Vec<(i64, u32)> {
 #[pymodule]
 fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(__core_version, m)?)?;
+    // the cached graph index (built once per frame)
+    m.add_class::<GraphIndex>()?;
+    m.add_function(wrap_pyfunction!(build_index, m)?)?;
+    m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
     // real execution path
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
