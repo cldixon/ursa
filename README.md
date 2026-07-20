@@ -108,8 +108,10 @@ uv run ty check                   # type-check
 ```
 
 `uv run` rebuilds the native extension as needed, so editing Rust and re-running
-`uv run pytest` picks up the change. Requirements: Rust ≥ 1.80, Python ≥ 3.10,
-and [uv](https://docs.astral.sh/uv/#installation).
+`uv run pytest` picks up the change. Requirements: Python ≥ 3.10 and
+[uv](https://docs.astral.sh/uv/#installation); the Rust toolchain is pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml) (rustup installs it automatically),
+so local `cargo clippy` uses the exact same lint set as CI.
 
 ## Roadmap
 

@@ -1,0 +1,5 @@
+[toolchain]
+# Pin one Rust version across local dev and CI so lint sets never drift
+# (clippy gains lints between releases; "stable" silently moving broke us before).
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
