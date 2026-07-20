@@ -39,6 +39,10 @@ _EXECUTABLE = {
     "connected_components",
     "triangle_count",
     "clustering_coefficient",
+    "closeness",
+    "betweenness",
+    "label_propagation",
+    "louvain",
     "neighbors_agg",
 }
 
@@ -265,6 +269,16 @@ def _run_query(
     return MaterializedFrame(batch)
 
 
+def _reject_weight(verb: str, payload: dict[str, Any]) -> None:
+    """Weighted algorithms are deferred (issue #17). Fail clearly rather than
+    silently ignoring a ``weight=`` the caller supplied."""
+    if payload.get("weight") is not None:
+        raise NotImplementedError(
+            f"weighted '{verb}' is not supported yet; only the unweighted form is "
+            "wired for v0.1 (weighted algorithms are tracked separately)."
+        )
+
+
 def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     """Build the JSON IR for one output column from a graph expression."""
     verb = expr.payload["verb"]
@@ -283,6 +297,16 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         )
     elif verb == "degree":
         column["direction"] = p.get("direction", "out")
+    elif verb == "closeness":
+        _reject_weight(verb, p)
+    elif verb == "betweenness":
+        _reject_weight(verb, p)
+        column["sample"] = p.get("sample")
+    elif verb == "label_propagation":
+        column.update(max_iter=p.get("max_iter", 20), seed=p.get("seed"))
+    elif verb == "louvain":
+        _reject_weight(verb, p)
+        column.update(resolution=p.get("resolution", 1.0), seed=p.get("seed"))
     elif verb == "neighbors_agg":
         agg = p["agg"]
         operand = agg.payload.get("operand") if agg.kind == "agg" else None

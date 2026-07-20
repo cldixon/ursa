@@ -35,7 +35,7 @@ the parts that prove the design is sound are real and tested end-to-end.
 
 | Layer | State |
 |---|---|
-| **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) kernels. Remaining frontier/BFS kernels are documented stubs. |
+| **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) / `bfs` (frontier) / `closeness` / `betweenness` (Brandes, with source sampling) / `label_propagation` / `louvain` (modularity) kernels. Weighted variants are the remaining kernel work. |
 | **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge/node files, local or from object storage (`s3://` / `gs://` / `az://`), with the column projection pushed into the file. |
 | **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
 | **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort), **`neighbors().agg()`** over numeric *and* string attributes, two **traversals** (`hop()` and `shortest_path()`, first-class `HopNode`/`ShortestPathNode` returning EdgeFrames), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources — local files **or object storage** (`s3://` / `gs://` / `az://`, with `storage_options={...}`). |
@@ -129,16 +129,17 @@ stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
 
 Next, in rough priority order:
 
-1. **Weighted algorithms** (`weight=` for pagerank/degree and weighted SSSP via
-   delta-stepping, using the `edge_ids` permutation already in place) to complete
-   the algorithm story.
+1. **Weighted algorithms** (`weight=` for pagerank/degree, weighted closeness /
+   betweenness / louvain, and weighted SSSP via delta-stepping, using the
+   `edge_ids` permutation already in place) to complete the algorithm story.
 2. **`random_walk`** on the same frontier-kernel family, and the direction-
    optimizing (top-down/bottom-up) BFS switch for scale.
 3. **Optimizer rules** — push node-set filters before traversal, fuse
-   `neighbors().agg` into a segmented CSR reduction, share one topology build.
-4. **Breadth** — remaining algorithms (closeness, betweenness, louvain,
-   label_propagation), string/UUID node ids, caching the topology index on the
-   frame, benchmarks.
+   `neighbors().agg` into a segmented CSR reduction. (The topology index is now
+   built once and shared across ops over a frame — the index-preservation
+   contract — which is the seam these rules register on.)
+4. **Breadth** — string/UUID node ids, benchmarks vs NetworkX/rustworkx/igraph,
+   a published docs site.
 
 ## License
 
