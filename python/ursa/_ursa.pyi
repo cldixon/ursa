@@ -8,11 +8,20 @@ from typing import Any
 
 def __core_version() -> str: ...
 
-# The one execution entry point: pyarrow edge arrays + a JSON column IR +
+# The CSR topology + IdMap, built once and cached on the EdgeFrame. Opaque handle;
+# built by build_index and passed to every graph op over the frame.
+class GraphIndex: ...
+
+# Build the graph index from (src, dst) int64 arrays (the one CSR build site).
+def build_index(src: Any, dst: Any) -> GraphIndex: ...
+
+# Total topology builds so far (test/observability hook for the index contract).
+def _topology_build_count() -> int: ...
+
+# The one execution entry point: a built index + a JSON column IR +
 # filter/sort/limit -> pyarrow.RecordBatch.
 def run_node_query(
-    src: Any,
-    dst: Any,
+    index: GraphIndex,
     columns_json: str,
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None = ...,
@@ -21,11 +30,10 @@ def run_node_query(
     nodes_id: str | None = ...,
 ) -> Any: ...
 
-# A hop traversal: edge arrays + int64 seed array + n/direction + relational
+# A hop traversal: a built index + int64 seed array + n/direction + relational
 # tail -> (src, dst) pyarrow.RecordBatch of reached pairs.
 def run_hop_query(
-    src: Any,
-    dst: Any,
+    index: GraphIndex,
     seeds: Any,
     n: int,
     direction: str,
@@ -35,11 +43,10 @@ def run_hop_query(
     distinct: bool = ...,
 ) -> Any: ...
 
-# A shortest_path traversal: edge arrays + int64 source/target + direction +
+# A shortest_path traversal: a built index + int64 source/target + direction +
 # relational tail -> (src, dst, hop) pyarrow.RecordBatch of the path edges.
 def run_path_query(
-    src: Any,
-    dst: Any,
+    index: GraphIndex,
     source: int,
     target: int,
     direction: str,
@@ -51,16 +58,16 @@ def run_path_query(
 ) -> Any: ...
 
 # Whole-graph directed edge density (eager scalar).
-def graph_density(src: Any, dst: Any) -> float: ...
+def graph_density(index: GraphIndex) -> float: ...
 
 # Average shortest-path length over reachable ordered pairs (eager scalar).
-def graph_avg_path_length(src: Any, dst: Any, sample: float | None = ...) -> float: ...
+def graph_avg_path_length(index: GraphIndex, sample: float | None = ...) -> float: ...
 
 # Graph diameter (eager scalar); approximate is a lower-bound estimate.
-def graph_diameter(src: Any, dst: Any, approximate: bool) -> int: ...
+def graph_diameter(index: GraphIndex, approximate: bool) -> int: ...
 
 # Whole-graph one-row summary -> pyarrow.RecordBatch.
-def graph_describe(src: Any, dst: Any, full: bool) -> Any: ...
+def graph_describe(index: GraphIndex, full: bool) -> Any: ...
 
 # Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> (src, dst)
 # pyarrow.RecordBatch. storage_options seeds the object-store backend.
