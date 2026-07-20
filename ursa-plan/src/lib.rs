@@ -38,7 +38,7 @@ pub use node::GraphAlgorithmNode;
 pub use physical::GraphAlgorithmExec;
 pub use planner::graph_session;
 pub use query::{execute_node_query, Comparison};
-pub use scan::scan_edges_batch;
+pub use scan::{scan_edges_batch, scan_nodes_batch};
 pub use session::ursa_session;
 pub use stats::density;
 pub use topology::build_topology;

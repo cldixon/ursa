@@ -27,6 +27,9 @@ def graph_density(src: Any, dst: Any) -> float: ...
 # Scan a Parquet/CSV edge file -> (src, dst) pyarrow.RecordBatch.
 def scan_edges_arrow(path: str, src: str, dst: str) -> Any: ...
 
+# Scan a Parquet/CSV node file -> full attribute pyarrow.RecordBatch (id cast int64).
+def scan_nodes_arrow(path: str, id: str) -> Any: ...
+
 # Demo path: plain lists in and out (pure Python->Rust smoke tests).
 def _demo_pagerank(
     src: list[int],

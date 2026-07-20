@@ -237,22 +237,26 @@ class NodeFrame(_Frame):
     carries no topology index.
 
     ``_source`` holds the in-memory Arrow attribute table (id + attribute columns)
-    for frames built via ``from_arrow``/``from_polars`` with ``id=``; ``collect()``
-    left-joins algorithm outputs onto it by id. NodeFrames derived from
-    ``edges.nodes()`` carry no attributes (``_source is None``).
+    for frames built via ``from_arrow``/``from_polars`` with ``id=``; ``_scan``
+    holds a file-source spec (``{path, id}``) for frames built via ``scan_nodes``,
+    which ``collect()`` materializes through a DataFusion scan. A frame has at most
+    one of them. ``collect()`` left-joins algorithm outputs onto the attribute
+    table by id. NodeFrames derived from ``edges.nodes()`` carry neither.
     """
 
-    __slots__ = ("_id_col", "_source")
+    __slots__ = ("_id_col", "_scan", "_source")
 
     def __init__(
         self,
         id_col: str,
         plan: tuple[_PlanStep, ...] = (),
         source: Any | None = None,
+        scan: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(plan, has_index=False)
         self._id_col = id_col
         self._source = source
+        self._scan = scan
 
     @property
     def id_col(self) -> str:
@@ -264,8 +268,13 @@ class NodeFrame(_Frame):
         """The in-memory Arrow attribute table, if this frame has one."""
         return self._source
 
+    @property
+    def _scan_spec(self) -> dict[str, Any] | None:
+        """The file-source spec if this frame was built via ``scan_nodes``."""
+        return self._scan
+
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
-        return NodeFrame(self._id_col, (*self._plan, step), source=self._source)
+        return NodeFrame(self._id_col, (*self._plan, step), source=self._source, scan=self._scan)
 
     # Composed pipelines (with_columns of graph algorithms + filter/sort/head)
     # execute here. Returns the materialized result rather than another lazy

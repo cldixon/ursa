@@ -26,7 +26,7 @@ use pyo3::prelude::*;
 
 use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
 use ursa_core::topology::{Direction as CoreDirection, Topology};
-use ursa_plan::{density, execute_node_query, scan_edges_batch, Comparison};
+use ursa_plan::{density, execute_node_query, scan_edges_batch, scan_nodes_batch, Comparison};
 
 // ---------------------------------------------------------------------------
 // Real execution path: pyarrow in -> one DataFusion plan -> pyarrow out.
@@ -110,6 +110,17 @@ fn scan_edges_arrow(py: Python<'_>, path: &str, src: &str, dst: &str) -> PyResul
     batch.to_pyarrow(py)
 }
 
+/// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
+/// back as a full `RecordBatch` (all columns; `id` cast to int64). It feeds the
+/// `nodes` attribute slot of `run_node_query`, exactly like an in-memory table.
+#[pyfunction]
+fn scan_nodes_arrow(py: Python<'_>, path: &str, id: &str) -> PyResult<PyObject> {
+    let batch = py.allow_threads(|| {
+        scan_nodes_batch(path, id).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+    batch.to_pyarrow(py)
+}
+
 // ---------------------------------------------------------------------------
 // Demo kernels (plain lists, no Arrow) — the pure Python->PyO3->ursa-core proof.
 // ---------------------------------------------------------------------------
@@ -189,6 +200,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
     m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_nodes_arrow, m)?)?;
     // demo path
     m.add_function(wrap_pyfunction!(_demo_pagerank, m)?)?;
     m.add_function(wrap_pyfunction!(_demo_degree, m)?)?;

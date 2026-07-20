@@ -82,9 +82,28 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
-    nodes = getattr(frame, "_attr_table", None)
+    nodes = _resolve_node_attr_table(frame)
     nodes_id = frame.id_col if nodes is not None else None
     return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id)
+
+
+def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
+    """The node attribute table as a RecordBatch: an in-memory ``from_arrow`` table
+    if present, else a ``scan_nodes`` file source materialized through a DataFusion
+    scan. ``edges.nodes()``-derived frames have neither and return ``None``."""
+    inmem = getattr(frame, "_attr_table", None)
+    if inmem is not None:
+        return inmem
+    scan = getattr(frame, "_scan_spec", None)
+    if scan is not None:
+        path = scan["path"]
+        if not isinstance(path, str):
+            raise NotImplementedError(
+                "collect() over a scan_nodes source supports a single string path "
+                "(glob included) for now, not a list of paths."
+            )
+        return _native().scan_nodes_arrow(path, scan["id"])
+    return None
 
 
 # --- the one execution entry ------------------------------------------------
@@ -128,7 +147,8 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         if agg.kind != "agg" or operand is None or operand.kind != "col":
             raise NotImplementedError(
                 "neighbors().agg() supports ur.col(<name>).<fn>() with fn in "
-                "mean/sum/min/max/count/n_unique over a numeric attribute column."
+                "mean/sum/min/max/count/n_unique (mean/sum/min/max need a numeric "
+                "attribute column; count/n_unique also accept strings)."
             )
         column.update(
             agg_fn=agg.payload["fn"],
