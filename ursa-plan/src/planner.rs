@@ -21,10 +21,10 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
 
-use crate::node::GraphAlgorithmNode;
-use crate::physical::GraphAlgorithmExec;
+use crate::node::{GraphAlgorithmNode, HopNode};
+use crate::physical::{GraphAlgorithmExec, HopExec};
 
-/// Maps the graph logical node to its `ExecutionPlan`.
+/// Maps each Ursa graph logical node to its `ExecutionPlan`.
 #[derive(Debug)]
 pub struct GraphExtensionPlanner;
 
@@ -38,13 +38,24 @@ impl ExtensionPlanner for GraphExtensionPlanner {
         _physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(node.as_any().downcast_ref::<GraphAlgorithmNode>().map(|n| {
-            Arc::new(GraphAlgorithmExec::new(
+        let any = node.as_any();
+        if let Some(n) = any.downcast_ref::<GraphAlgorithmNode>() {
+            return Ok(Some(Arc::new(GraphAlgorithmExec::new(
                 n.topology.clone(),
                 n.ids.clone(),
                 n.columns.clone(),
-            )) as Arc<dyn ExecutionPlan>
-        }))
+            )) as Arc<dyn ExecutionPlan>));
+        }
+        if let Some(n) = any.downcast_ref::<HopNode>() {
+            return Ok(Some(Arc::new(HopExec::new(
+                n.topology.clone(),
+                n.ids.clone(),
+                n.seeds.clone(),
+                n.n,
+                n.direction,
+            )) as Arc<dyn ExecutionPlan>));
+        }
+        Ok(None)
     }
 }
 

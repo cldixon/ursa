@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
@@ -27,7 +27,7 @@ use ursa_core::algo::AggKind;
 use ursa_core::IdMap;
 
 use crate::logical::{Direction, GraphAlgo};
-use crate::node::GraphAlgorithmNode;
+use crate::node::{GraphAlgorithmNode, HopNode};
 use crate::planner::graph_session;
 use crate::result::{is_executable, OutputColumn};
 use crate::topology::build_topology;
@@ -108,14 +108,21 @@ fn parse_agg(name: &str) -> Result<AggKind> {
     }
 }
 
-/// Gather a numeric node-attribute column into a dense, IdMap-aligned vector:
-/// `result[d]` is the attribute of the node at dense index `d`, or `None` if that
-/// node has no attribute row (or a null value).
+/// Gather a node-attribute column into a dense, IdMap-aligned vector of `f64`
+/// keys: `result[d]` is the attribute of the node at dense index `d`, or `None`
+/// if that node has no attribute row (or a null value).
+///
+/// Numeric columns pass their values straight through. For `n_unique`/`count`,
+/// which need only distinctness and presence (never numeric magnitude), a
+/// **string** column is accepted too: each distinct string is interned to a
+/// stable `f64` code, so the segmented reduction counts distinct strings
+/// correctly. `mean`/`sum`/`min`/`max` still require a numeric column.
 fn dense_attr_column(
     nodes: &RecordBatch,
     id_col: &str,
     attr_col: &str,
     ids: &IdMap,
+    agg: AggKind,
 ) -> Result<Vec<Option<f64>>> {
     let schema = nodes.schema();
     let id_idx = schema
@@ -130,20 +137,54 @@ fn dense_attr_column(
     let id_arr = cast(nodes.column(id_idx), &DataType::Int64)
         .map_err(|e| DataFusionError::ArrowError(e, None))?;
     let id_arr = id_arr.as_any().downcast_ref::<Int64Array>().unwrap();
-    let attr_arr = cast(nodes.column(attr_idx), &DataType::Float64).map_err(|_| {
-        DataFusionError::NotImplemented(format!(
-            "neighbors().agg() supports numeric attribute columns in v0.1; {attr_col:?} is not numeric"
-        ))
-    })?;
-    let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
 
+    // Branch on the column's declared type, not on cast success: Arrow casts
+    // Utf8 -> Float64 by producing nulls for unparseable strings rather than
+    // erroring, which would silently swallow a real string column.
+    let attr_dtype = schema.field(attr_idx).data_type();
+    let is_string = matches!(
+        attr_dtype,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    );
+
+    // Build id -> f64 key. Numeric columns pass values through; string columns
+    // (n_unique/count only) intern each distinct value to a stable code.
     let mut map: HashMap<i64, f64> = HashMap::with_capacity(nodes.num_rows());
-    for i in 0..nodes.num_rows() {
-        if id_arr.is_null(i) || attr_arr.is_null(i) {
-            continue;
+    if is_string {
+        if !matches!(agg, AggKind::NUnique | AggKind::Count) {
+            return Err(DataFusionError::NotImplemented(format!(
+                "neighbors().agg() with mean/sum/min/max needs a numeric attribute column; \
+                 {attr_col:?} is a string column (only n_unique/count accept strings)"
+            )));
         }
-        map.insert(id_arr.value(i), attr_arr.value(i));
+        let attr_arr = cast(nodes.column(attr_idx), &DataType::Utf8)
+            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+        let attr_arr = attr_arr.as_any().downcast_ref::<StringArray>().unwrap();
+        let mut codes: HashMap<&str, f64> = HashMap::new();
+        for i in 0..nodes.num_rows() {
+            if id_arr.is_null(i) || attr_arr.is_null(i) {
+                continue;
+            }
+            let next = codes.len() as f64;
+            let code = *codes.entry(attr_arr.value(i)).or_insert(next);
+            map.insert(id_arr.value(i), code);
+        }
+    } else {
+        let attr_arr = cast(nodes.column(attr_idx), &DataType::Float64).map_err(|_| {
+            DataFusionError::NotImplemented(format!(
+                "neighbors().agg() supports numeric or string attribute columns in v0.1; \
+                 {attr_col:?} ({attr_dtype:?}) is neither"
+            ))
+        })?;
+        let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..nodes.num_rows() {
+            if id_arr.is_null(i) || attr_arr.is_null(i) {
+                continue;
+            }
+            map.insert(id_arr.value(i), attr_arr.value(i));
+        }
     }
+
     Ok(ids
         .user_ids()
         .iter()
@@ -211,9 +252,9 @@ pub fn execute_node_query(
             let attr_col = spec.agg_column.as_deref().ok_or_else(|| {
                 DataFusionError::Execution("neighbors().agg() is missing its column".into())
             })?;
-            let attr = dense_attr_column(nodes_ref, &nodes_id_name, attr_col, &ids)?;
             let direction = parse_direction(spec.direction.as_deref().unwrap_or("out"))?;
             let agg = parse_agg(spec.agg_fn.as_deref().unwrap_or("mean"))?;
+            let attr = dense_attr_column(nodes_ref, &nodes_id_name, attr_col, &ids, agg)?;
             columns.push(OutputColumn::NeighborAgg {
                 name: spec.name.clone(),
                 attr: Arc::new(attr),
@@ -269,6 +310,65 @@ pub fn execute_node_query(
 
         for f in filters {
             df = df.filter(comparison_expr(f)?)?;
+        }
+        if let Some((column, descending)) = sort {
+            df = df.sort(vec![col(&column).sort(!descending, false)])?;
+        }
+        if let Some(n) = limit {
+            df = df.limit(0, Some(n))?;
+        }
+
+        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+    })
+}
+
+/// Build and execute one `hop` traversal as a single DataFusion plan.
+///
+/// A [`HopNode`] emits the reached `(src, dst)` edge frame; the optional
+/// relational tail (`filter` / `sort` / `limit` / `distinct`) runs as stock
+/// DataFusion operations on top, so a hop composes exactly like a node query.
+/// `seeds` are user ids; unknown seeds contribute nothing (matching the kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_hop_query(
+    src: &Int64Array,
+    dst: &Int64Array,
+    seeds: &Int64Array,
+    n: u32,
+    direction: &str,
+    filters: &[Comparison],
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> Result<RecordBatch> {
+    let (topology, ids) =
+        build_topology(src, dst).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+
+    // Resolve user-id seeds to dense indices; drop unknowns (kernel-consistent).
+    let seeds_dense: Vec<u32> = (0..seeds.len())
+        .filter(|&i| !seeds.is_null(i))
+        .filter_map(|i| ids.dense(seeds.value(i)))
+        .collect();
+
+    let hop_plan = LogicalPlan::Extension(Extension {
+        node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
+    runtime.block_on(async move {
+        let ctx = graph_session();
+        let mut df = ctx.execute_logical_plan(hop_plan).await?;
+
+        for f in filters {
+            df = df.filter(comparison_expr(f)?)?;
+        }
+        if distinct {
+            df = df.distinct()?;
         }
         if let Some((column, descending)) = sort {
             df = df.sort(vec![col(&column).sort(!descending, false)])?;
@@ -443,5 +543,135 @@ mod tests {
             .unwrap();
         let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
         assert!((nbr.value(row0) - 20.0).abs() < 1e-12); // mean(10, 20, 30)
+    }
+
+    #[test]
+    fn neighbor_n_unique_over_a_string_attribute() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // hub: 1->0, 2->0, 3->0. In-neighbours of 0 are 1,2,3 with regions
+        // us/us/eu -> 2 distinct.
+        let src = Int64Array::from(vec![1, 2, 3]);
+        let dst = Int64Array::from(vec![0, 0, 0]);
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("region", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+                Arc::new(StringArray::from(vec!["x", "us", "us", "eu"])),
+            ],
+        )
+        .unwrap();
+
+        let batch = execute_node_query(
+            &src,
+            &dst,
+            r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
+            &[],
+            Some(("id".into(), false)),
+            None,
+            Some(nodes),
+            Some("id".into()),
+        )
+        .unwrap();
+
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let schema = batch.schema();
+        let idx = schema.index_of("nbr_regions").unwrap();
+        let vals = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
+        assert!((vals.value(row0) - 2.0).abs() < 1e-12); // {us, eu}
+    }
+
+    #[test]
+    fn hop_query_returns_reached_edges() {
+        // path 0 -> 1 -> 2 -> 3
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        let seeds = Int64Array::from(vec![0]);
+        let batch =
+            execute_hop_query(&src, &dst, &seeds, 2, "out", &[], None, None, false).unwrap();
+        // from 0 within 2 hops -> reaches 1 and 2
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.schema().field(0).name(), "src");
+        assert_eq!(batch.schema().field(1).name(), "dst");
+        let dsts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut reached: Vec<i64> = dsts.values().to_vec();
+        reached.sort_unstable();
+        assert_eq!(reached, vec![1, 2]);
+    }
+
+    #[test]
+    fn hop_query_tail_filters_and_limits() {
+        // hub: 1->0, 2->0, 3->0, 0->1 ; seed 1,2,3 all reach 0 in one hop
+        let src = Int64Array::from(vec![1, 2, 3, 0]);
+        let dst = Int64Array::from(vec![0, 0, 0, 1]);
+        let seeds = Int64Array::from(vec![1, 2, 3]);
+        // one hop out: (1,0),(2,0),(3,0); keep dst == 0, limit 2
+        let batch = execute_hop_query(
+            &src,
+            &dst,
+            &seeds,
+            1,
+            "out",
+            &[Comparison {
+                column: "dst".into(),
+                op: "==".into(),
+                value: 0.0,
+            }],
+            None,
+            Some(2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn neighbor_mean_over_a_string_attribute_errors() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let src = Int64Array::from(vec![1]);
+        let dst = Int64Array::from(vec![0]);
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("region", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
+        let err = execute_node_query(
+            &src,
+            &dst,
+            r#"[{"name":"m","kind":"neighbors_agg","agg_fn":"mean","agg_column":"region","direction":"in"}]"#,
+            &[],
+            None,
+            None,
+            Some(nodes),
+            Some("id".into()),
+        );
+        assert!(err.is_err()); // mean over strings is not supported
     }
 }

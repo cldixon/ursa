@@ -73,10 +73,10 @@ def scan_nodes(
             "format_opts": format_opts,
         },
     )
-    return NodeFrame(id_col=id, plan=(step,))
+    return NodeFrame(id_col=id, plan=(step,), scan={"path": path, "id": id})
 
 
-def read_edges(path: str | list[str], **kwargs: Any) -> EdgeFrame:
+def read_edges(path: str | list[str], **kwargs: Any) -> MaterializedFrame:
     """Eager convenience: ``scan_edges(...).collect()``."""
     return scan_edges(path, **kwargs).collect()
 

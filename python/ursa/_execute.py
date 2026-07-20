@@ -46,6 +46,14 @@ _FLIP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
 # GraphExpr and also lands here — see ursa._graph.GraphExpr.)
 def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     """Execute a composed ``edges.nodes().with_columns(...).filter/sort/head``."""
+    # describe() is a whole-graph summary, computed eagerly off the topology and
+    # wrapped as a one-row frame (its own branch — not a per-node algorithm).
+    for step in frame._plan:
+        if step.op == "describe":
+            src, dst = _require_edges(step.args["edges"])
+            batch = _native().graph_describe(src, dst, bool(step.args.get("full", False)))
+            return MaterializedFrame(batch)
+
     graph_exprs: dict[str, Expr] | None = None
     filters: list[tuple[str, str, float]] = []
     sort: tuple[str, bool] | None = None
@@ -82,9 +90,118 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
-    nodes = getattr(frame, "_attr_table", None)
+    nodes = _resolve_node_attr_table(frame)
     nodes_id = frame.id_col if nodes is not None else None
     return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id)
+
+
+def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
+    """The node attribute table as a RecordBatch: an in-memory ``from_arrow`` table
+    if present, else a ``scan_nodes`` file source materialized through a DataFusion
+    scan. ``edges.nodes()``-derived frames have neither and return ``None``."""
+    inmem = getattr(frame, "_attr_table", None)
+    if inmem is not None:
+        return inmem
+    scan = getattr(frame, "_scan_spec", None)
+    if scan is not None:
+        path = scan["path"]
+        if not isinstance(path, str):
+            raise NotImplementedError(
+                "collect() over a scan_nodes source supports a single string path "
+                "(glob included) for now, not a list of paths."
+            )
+        return _native().scan_nodes_arrow(path, scan["id"])
+    return None
+
+
+# --- frame-positioned traversal (ur.hop) ------------------------------------
+def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
+    """Execute a traversal EdgeFrame (``ur.hop(edges, n).from_(seeds)`` plus an
+    optional ``filter``/``sort``/``head``/``distinct`` tail)."""
+    hop = None
+    filters: list[tuple[str, str, float]] = []
+    sort: tuple[str, bool] | None = None
+    limit: int | None = None
+    distinct = False
+
+    for step in frame._plan:
+        op = step.op
+        if op == "hop":
+            hop = step
+        elif op in (
+            "scan_edges",
+            "from_arrow",
+            "from_polars",
+            "nodes",
+            "reverse",
+            "select",
+            "rename",
+        ):
+            continue  # source / metadata steps
+        elif op == "filter":
+            filters.append(_parse_filter(step.args["predicate"]))
+        elif op == "sort":
+            sort = _parse_sort(step.args)
+        elif op == "head":
+            limit = int(step.args["n"])
+        elif op == "distinct":
+            distinct = True
+        else:
+            raise NotImplementedError(
+                f"collect() does not yet support the '{op}' step after a hop."
+            )
+
+    if hop is None:
+        raise NotImplementedError(
+            "collect() on an EdgeFrame is supported for traversals (ur.hop) in v0.1; "
+            "to compute metrics, call an algorithm on it (e.g. ur.pagerank(edges))."
+        )
+
+    src, dst = _require_edges(hop.args["edges"])
+    seeds = _resolve_seeds(hop.args["seeds"])
+    batch = _native().run_hop_query(
+        src, dst, seeds, int(hop.args["n"]), hop.args["direction"], filters, sort, limit, distinct
+    )
+    return MaterializedFrame(batch)
+
+
+# Steps that don't change a NodeFrame's row set, so its id column can be read
+# straight from the source without executing anything.
+_SEED_PASSTHROUGH = {"from_arrow", "from_polars", "scan_nodes", "nodes"}
+
+
+def _resolve_seeds(seeds: Any) -> Any:
+    """Resolve a hop's seed set to an int64 pyarrow array: an iterable of node ids,
+    or a NodeFrame's id column (read from its source when unmodified, else
+    collected)."""
+    from ._frames import NodeFrame
+
+    if seeds is None:
+        raise NotImplementedError(
+            "ur.hop(...) needs a seed set: call .from_(ids) with an iterable of node "
+            "ids or a NodeFrame."
+        )
+
+    import pyarrow as pa
+
+    if isinstance(seeds, NodeFrame):
+        plain = all(step.op in _SEED_PASSTHROUGH for step in seeds._plan)
+        attr = _resolve_node_attr_table(seeds) if plain else None
+        # A plain attribute table yields its ids directly; a derived frame
+        # (filtered / computed) must be executed to get them.
+        tbl = pa.Table.from_batches([attr]) if attr is not None else seeds.collect().to_arrow()
+        name = seeds.id_col if seeds.id_col in tbl.column_names else "id"
+        column = tbl.column(name)
+        chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
+        return pa.concat_arrays(chunks).cast(pa.int64())
+
+    try:
+        ids = [int(x) for x in seeds]
+    except TypeError as exc:
+        raise NotImplementedError(
+            "ur.hop(...).from_(seeds) accepts an iterable of node ids or a NodeFrame."
+        ) from exc
+    return pa.array(ids, type=pa.int64())
 
 
 # --- the one execution entry ------------------------------------------------
@@ -128,7 +245,8 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         if agg.kind != "agg" or operand is None or operand.kind != "col":
             raise NotImplementedError(
                 "neighbors().agg() supports ur.col(<name>).<fn>() with fn in "
-                "mean/sum/min/max/count/n_unique over a numeric attribute column."
+                "mean/sum/min/max/count/n_unique (mean/sum/min/max need a numeric "
+                "attribute column; count/n_unique also accept strings)."
             )
         column.update(
             agg_fn=agg.payload["fn"],

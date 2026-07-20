@@ -19,6 +19,7 @@
 mod clustering;
 mod components;
 mod degree;
+mod hop;
 mod neighbor_agg;
 mod pagerank;
 mod triangle;
@@ -26,19 +27,15 @@ mod triangle;
 pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
 pub use degree::degree;
+pub use hop::k_hop;
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, PageRankParams};
 pub use triangle::triangle_count;
 
 // ---------------------------------------------------------------------------
-// Frontier kernels (BFS / k-hop / unweighted shortest path) — SKELETON.
+// Frontier kernels (BFS / k-hop / unweighted shortest path).
 // ---------------------------------------------------------------------------
-// These back `ur.hop`, `ur.shortest_path` (unweighted), and BFS-derived stats.
-// Port the direction-optimizing BFS (top-down/bottom-up switch, Beamer et al.)
-// from the GAP suite. Signature sketch, intentionally not yet implemented:
-//
-//   pub fn bfs(topo: &Topology, source: u32, dir: Direction) -> Vec<i32> /* dist */
-//   pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction)
-//         -> (Vec<u32> /* reached */, Vec<u32> /* via edge_id */)
-//
-// Left as documented future work so the skeleton compiles and the seam is visible.
+// `k_hop` (above) is the first, backing `ur.hop`. Still to come: a distance-
+// returning `bfs` and the direction-optimizing top-down/bottom-up switch
+// (Beamer et al.) ported from the GAP suite, which will back `ur.shortest_path`
+// (unweighted) and BFS-derived stats (diameter, avg_path_length).
