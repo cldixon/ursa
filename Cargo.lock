@@ -3210,6 +3210,8 @@ name = "ursa-core"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "rand 0.8.7",
+ "rand_chacha",
  "rayon",
 ]
 

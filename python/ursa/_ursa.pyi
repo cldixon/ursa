@@ -57,6 +57,20 @@ def run_path_query(
     distinct: bool = ...,
 ) -> Any: ...
 
+# A random_walk: a built index + int64 start ids + walk params + relational tail
+# -> (walk_id, step, node) pyarrow.RecordBatch of the walk rows.
+def run_walk_query(
+    index: GraphIndex,
+    starts: Any,
+    steps: int,
+    walks_per_node: int,
+    seed: int | None = ...,
+    filters: list[tuple[str, str, float]] = ...,
+    sort: tuple[str, bool] | None = ...,
+    limit: int | None = ...,
+    distinct: bool = ...,
+) -> Any: ...
+
 # Whole-graph directed edge density (eager scalar).
 def graph_density(index: GraphIndex) -> float: ...
 

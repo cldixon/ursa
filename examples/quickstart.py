@@ -95,6 +95,11 @@ def main() -> None:
     print("\n== shortest path 0 -> 5 ==")
     print(ur.shortest_path(edges, 0, 5).collect().to_polars())
 
+    # ur.random_walk returns a (walk_id, step, node) frame — two seeded walks of
+    # up to 4 steps from node 0, ready to feed a node2vec-style pipeline.
+    print("\n== random walks from node 0 ==")
+    print(ur.random_walk(edges, start=[0], steps=4, walks_per_node=2, seed=7).collect().to_polars())
+
     # -- 5. Whole-graph summary + path stats --------------------------------
     print("\n== describe ==")
     print(ur.describe(edges, full=True).collect().to_polars())

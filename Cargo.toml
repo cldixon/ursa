@@ -29,6 +29,10 @@ datafusion = "45"
 object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 pyo3 = "0.23"
 url = "2"
+# Seeded PRNG for the stochastic kernels (random_walk). ChaCha gives a portable,
+# reproducible stream so a fixed seed yields identical walks across runs/machines.
+rand = "0.8"
+rand_chacha = "0.3"
 
 [profile.release]
 opt-level = 3

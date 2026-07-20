@@ -189,7 +189,13 @@ def random_walk(
     embedding pipelines directly."""
     step = _PlanStep(
         "random_walk",
-        {"start": start, "steps": steps, "walks_per_node": walks_per_node, "seed": seed},
+        {
+            "start": start,
+            "steps": steps,
+            "walks_per_node": walks_per_node,
+            "seed": seed,
+            "edges": edges,
+        },
     )
     return NodeFrame(id_col="node", plan=(step,))
 

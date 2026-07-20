@@ -24,7 +24,7 @@ from ._result import MaterializedFrame
 
 if TYPE_CHECKING:
     from ._expr import Expr
-    from ._frames import EdgeFrame, NodeFrame
+    from ._frames import EdgeFrame, NodeFrame, _PlanStep
 
 # Guards the per-frame lazy index build so concurrent first-collects over one
 # frame share a single build (the spec's "concurrent queries share one build");
@@ -63,6 +63,8 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             index = _require_index(step.args["edges"])
             batch = _native().graph_describe(index, bool(step.args.get("full", False)))
             return MaterializedFrame(batch)
+        if step.op == "random_walk":
+            return _collect_random_walk(frame, step)
 
     graph_exprs: dict[str, Expr] | None = None
     filters: list[tuple[str, str, float]] = []
@@ -103,6 +105,49 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     nodes = _resolve_node_attr_table(frame)
     nodes_id = frame.id_col if nodes is not None else None
     return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id)
+
+
+def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame:
+    """Execute a ``random_walk`` node frame plus an optional
+    ``filter``/``sort``/``head``/``distinct`` tail. Its ``(walk_id, step, node)``
+    rows are produced by the native walk kernel over the frame's shared index."""
+    filters: list[tuple[str, str, float]] = []
+    sort: tuple[str, bool] | None = None
+    limit: int | None = None
+    distinct = False
+
+    _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes", "rename"}
+    for s in frame._plan:
+        op = s.op
+        if op in _passthrough:
+            continue  # the walk step itself / source / metadata
+        elif op == "filter":
+            filters.append(_parse_filter(s.args["predicate"]))
+        elif op == "sort":
+            sort = _parse_sort(s.args)
+        elif op == "head":
+            limit = int(s.args["n"])
+        elif op == "distinct":
+            distinct = True
+        else:
+            raise NotImplementedError(
+                f"collect() does not yet support the '{op}' step after a random_walk."
+            )
+
+    index = _require_index(step.args["edges"])
+    starts = _resolve_seeds(step.args["start"])
+    batch = _native().run_walk_query(
+        index,
+        starts,
+        int(step.args["steps"]),
+        int(step.args["walks_per_node"]),
+        step.args.get("seed"),
+        filters,
+        sort,
+        limit,
+        distinct,
+    )
+    return MaterializedFrame(batch)
 
 
 def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
@@ -226,8 +271,8 @@ def _resolve_seeds(seeds: Any) -> Any:
 
     if seeds is None:
         raise NotImplementedError(
-            "ur.hop(...) needs a seed set: call .from_(ids) with an iterable of node "
-            "ids or a NodeFrame."
+            "a seed set is required: pass an iterable of node ids or a NodeFrame "
+            "(ur.hop(...).from_(ids); ur.random_walk(..., start=ids))."
         )
 
     import pyarrow as pa

@@ -15,7 +15,7 @@ use datafusion::common::{DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use ursa_core::{Direction, IdMap, Topology};
 
-use crate::result::{hop_schema, path_schema, query_schema, OutputColumn};
+use crate::result::{hop_schema, path_schema, query_schema, walk_schema, OutputColumn};
 
 #[derive(Clone)]
 pub struct GraphAlgorithmNode {
@@ -307,6 +307,121 @@ impl UserDefinedLogicalNodeCore for ShortestPathNode {
             f,
             "ShortestPath: source={}, target={}, direction={:?}",
             self.source, self.target, self.direction
+        )
+    }
+
+    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, _inputs: Vec<LogicalPlan>) -> Result<Self> {
+        Ok(self.clone())
+    }
+}
+
+/// The custom logical node for a `random_walk`.
+///
+/// Another leaf sibling of [`HopNode`]: it carries a baked-in start set (dense
+/// indices) plus the walk parameters, and emits a **node** frame
+/// `(walk_id, step, node)` — the flat walk stream that feeds node2vec-style
+/// pipelines. `seed` makes the walk reproducible. Lowered to
+/// `crate::physical::RandomWalkExec`.
+#[derive(Clone)]
+pub struct RandomWalkNode {
+    pub topology: Arc<Topology>,
+    pub ids: Arc<IdMap>,
+    pub starts: Arc<Vec<u32>>,
+    pub steps: u32,
+    pub walks_per_node: u32,
+    pub seed: Option<u64>,
+    schema: DFSchemaRef,
+}
+
+impl RandomWalkNode {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        starts: Vec<u32>,
+        steps: u32,
+        walks_per_node: u32,
+        seed: Option<u64>,
+    ) -> Self {
+        let schema = Arc::new(
+            DFSchema::try_from(walk_schema().as_ref().clone())
+                .expect("walk schema converts to a DFSchema"),
+        );
+        RandomWalkNode {
+            topology,
+            ids,
+            starts: Arc::new(starts),
+            steps,
+            walks_per_node,
+            seed,
+            schema,
+        }
+    }
+}
+
+impl PartialEq for RandomWalkNode {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.topology, &other.topology)
+            && self.starts == other.starts
+            && self.steps == other.steps
+            && self.walks_per_node == other.walks_per_node
+            && self.seed == other.seed
+    }
+}
+
+impl Eq for RandomWalkNode {}
+
+impl PartialOrd for RandomWalkNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Order by the scalar params only (topology identity is not orderable).
+        (self.steps, self.walks_per_node, self.starts.len()).partial_cmp(&(
+            other.steps,
+            other.walks_per_node,
+            other.starts.len(),
+        ))
+    }
+}
+
+impl Hash for RandomWalkNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.topology) as usize).hash(state);
+        self.steps.hash(state);
+        self.walks_per_node.hash(state);
+        self.seed.hash(state);
+        self.starts.hash(state);
+    }
+}
+
+impl fmt::Debug for RandomWalkNode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.fmt_for_explain(f)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for RandomWalkNode {
+    fn name(&self) -> &str {
+        "RandomWalk"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "RandomWalk: steps={}, walks_per_node={}, starts={}, seed={:?}",
+            self.steps,
+            self.walks_per_node,
+            self.starts.len(),
+            self.seed
         )
     }
 

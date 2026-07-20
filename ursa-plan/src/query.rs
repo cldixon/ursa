@@ -27,7 +27,7 @@ use ursa_core::algo::AggKind;
 use ursa_core::{IdMap, Topology};
 
 use crate::logical::{Direction, GraphAlgo};
-use crate::node::{GraphAlgorithmNode, HopNode, ShortestPathNode};
+use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{is_executable, path_schema, OutputColumn};
 
@@ -441,6 +441,68 @@ pub fn execute_path_query(
     runtime.block_on(async move {
         let ctx = graph_session();
         let mut df = ctx.execute_logical_plan(path_plan).await?;
+
+        for f in filters {
+            df = df.filter(comparison_expr(f)?)?;
+        }
+        if distinct {
+            df = df.distinct()?;
+        }
+        if let Some((column, descending)) = sort {
+            df = df.sort(vec![col(&column).sort(!descending, false)])?;
+        }
+        if let Some(n) = limit {
+            df = df.limit(0, Some(n))?;
+        }
+
+        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+    })
+}
+
+/// Build and execute one `random_walk` as a single DataFusion plan.
+///
+/// A [`RandomWalkNode`] emits the `(walk_id, step, node)` node frame; the same
+/// optional relational tail as [`execute_hop_query`] runs on top. `starts` are
+/// user ids (unknown ids are dropped, kernel-consistent). `seed` makes the walk
+/// reproducible.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_walk_query(
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    starts: &Int64Array,
+    steps: u32,
+    walks_per_node: u32,
+    seed: Option<u64>,
+    filters: &[Comparison],
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+) -> Result<RecordBatch> {
+    let starts_dense: Vec<u32> = (0..starts.len())
+        .filter(|&i| !starts.is_null(i))
+        .filter_map(|i| ids.dense(starts.value(i)))
+        .collect();
+
+    let walk_plan = LogicalPlan::Extension(Extension {
+        node: Arc::new(RandomWalkNode::new(
+            topology,
+            ids,
+            starts_dense,
+            steps,
+            walks_per_node,
+            seed,
+        )),
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
+    runtime.block_on(async move {
+        let ctx = graph_session();
+        let mut df = ctx.execute_logical_plan(walk_plan).await?;
 
         for f in filters {
             df = df.filter(comparison_expr(f)?)?;
