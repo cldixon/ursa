@@ -93,17 +93,21 @@ fn canonical_id_type(dt: &DataType) -> Result<DataType> {
     }
 }
 
-/// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch.
+/// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch, plus
+/// any `weight_columns` needed to evaluate a `weight=` expression.
 ///
 /// Format is chosen by extension (`.parquet` / `.csv`), the two forms Ursa v0.1
-/// supports. The projection is pushed down, so only the endpoint columns are read.
-/// The endpoints are canonicalized to a supported node-id type — `Int64` (the fast
-/// path) or `Utf8` strings; `src` and `dst` must be the same family.
+/// supports. The projection is pushed down, so only the endpoint columns (and any
+/// requested weight columns) are read. The endpoints are canonicalized to a
+/// supported node-id type — `Int64` (the fast path) or `Utf8` strings; `src` and
+/// `dst` must be the same family. Weight columns keep their file types and appear
+/// after `dst`, so a caller can evaluate the weight over the same rows.
 pub fn scan_edges_batch(
     path: &str,
     src: &str,
     dst: &str,
     storage_options: &HashMap<String, String>,
+    weight_columns: &[String],
 ) -> Result<RecordBatch> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -125,7 +129,14 @@ pub fn scan_edges_batch(
             )));
         };
 
-        let df = df.select_columns(&[src, dst])?;
+        // Project src, dst, then any weight columns not already among them.
+        let mut proj: Vec<&str> = vec![src, dst];
+        for c in weight_columns {
+            if c != src && c != dst && !proj.contains(&c.as_str()) {
+                proj.push(c.as_str());
+            }
+        }
+        let df = df.select_columns(&proj)?;
         let batches = df.collect().await?;
         if batches.is_empty() {
             return Err(DataFusionError::Execution(format!(
@@ -148,11 +159,17 @@ pub fn scan_edges_batch(
         let dst_c =
             cast(merged.column(1), &dst_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
 
-        let schema = Arc::new(Schema::new(vec![
+        // src/dst canonicalized; weight columns (positions 2..) passed through.
+        let mut fields = vec![
             Field::new("src", src_type, true),
             Field::new("dst", dst_type, true),
-        ]));
-        RecordBatch::try_new(schema, vec![src_c, dst_c])
+        ];
+        let mut columns = vec![src_c, dst_c];
+        for i in 2..merged.num_columns() {
+            fields.push(read_schema.field(i).clone());
+            columns.push(merged.column(i).clone());
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|e| DataFusionError::ArrowError(e, None))
     })
 }
@@ -250,7 +267,8 @@ mod tests {
             writeln!(f, "10,20,0.5").unwrap();
             writeln!(f, "20,30,0.9").unwrap();
         }
-        let batch = scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts()).unwrap();
+        let batch =
+            scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 2);
         let src = batch
@@ -303,7 +321,7 @@ mod tests {
             writeln!(f, "2,3").unwrap();
         }
         let url = format!("file://{}", path.to_str().unwrap());
-        let batch = scan_edges_batch(&url, "from", "to", &no_opts()).unwrap();
+        let batch = scan_edges_batch(&url, "from", "to", &no_opts(), &[]).unwrap();
         assert_eq!(batch.num_rows(), 2);
         std::fs::remove_file(&path).ok();
     }

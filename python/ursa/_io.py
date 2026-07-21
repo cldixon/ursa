@@ -124,11 +124,19 @@ def from_arrow(
 def _from_inmemory(op: str, data: Any, src, dst, id):
     if src is not None and dst is not None:
         source = _extract_edge_arrays(op, data, src, dst)
+        # Retain the full edge table (all columns, same row order as src/dst) so a
+        # weight= expression over edge columns can be evaluated later.
+        edge_table = None
+        try:
+            edge_table = data.to_arrow() if op == "from_polars" else data
+        except Exception:
+            edge_table = None
         return EdgeFrame(
             src_col=src,
             dst_col=dst,
             plan=(_PlanStep(op, {"src": src, "dst": dst}),),
             source=source,
+            edge_table=edge_table,
         )
     if id is not None:
         return NodeFrame(

@@ -14,8 +14,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
     betweenness, closeness, clustering_coefficient, connected_components_weak, degree, k_hop,
-    label_propagation, louvain, neighbor_aggregate, pagerank, random_walk, shortest_path,
-    triangle_count, AggKind, PageRankParams,
+    label_propagation, louvain, neighbor_aggregate, pagerank, pagerank_weighted, random_walk,
+    shortest_path, shortest_path_weighted, triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -24,8 +24,13 @@ use crate::logical::GraphAlgo;
 /// One requested output column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputColumn {
-    /// A node-valued algorithm over the topology.
-    Algo { name: String, algo: GraphAlgo },
+    /// A node-valued algorithm over the topology. `weights` (an `f64` per edge
+    /// row, gathered via `edge_ids`) is present for a weighted algorithm.
+    Algo {
+        name: String,
+        algo: GraphAlgo,
+        weights: Option<Arc<Vec<f64>>>,
+    },
     /// A per-node aggregation of a (dense-aligned) attribute over neighbours.
     NeighborAgg {
         name: String,
@@ -57,7 +62,9 @@ impl OutputColumn {
 
     fn value_array(&self, topo: &Topology) -> ArrayRef {
         match self {
-            OutputColumn::Algo { algo, .. } => algo_array(topo, algo),
+            OutputColumn::Algo { algo, weights, .. } => {
+                algo_array(topo, algo, weights.as_deref().map(Vec::as_slice))
+            }
             OutputColumn::NeighborAgg {
                 attr,
                 direction,
@@ -86,7 +93,7 @@ pub fn is_executable(algo: &GraphAlgo) -> bool {
     )
 }
 
-fn algo_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
+fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> ArrayRef {
     match algo {
         GraphAlgo::Degree { direction } => {
             Arc::new(UInt32Array::from(degree(topo, (*direction).into())))
@@ -95,14 +102,18 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo) -> ArrayRef {
             damping,
             max_iter,
             tol,
-        } => Arc::new(Float64Array::from(pagerank(
-            topo,
-            PageRankParams {
+        } => {
+            let params = PageRankParams {
                 damping: *damping,
                 max_iter: *max_iter,
                 tol: *tol,
-            },
-        ))),
+            };
+            let scores = match weights {
+                Some(w) => pagerank_weighted(topo, w, params),
+                None => pagerank(topo, params),
+            };
+            Arc::new(Float64Array::from(scores))
+        }
         GraphAlgo::ConnectedComponents { .. } => {
             Arc::new(UInt32Array::from(connected_components_weak(topo)))
         }
@@ -186,21 +197,26 @@ pub fn path_schema(id_type: DataType) -> SchemaRef {
     ]))
 }
 
-/// Materialize a `shortest_path`'s `(src, dst, hop)` batch: run the unweighted BFS
-/// path kernel and zip the dense node sequence into consecutive edges (translated
-/// back to user ids). An unreachable target (or a trivial one-node path) yields an
-/// empty batch.
+/// Materialize a `shortest_path`'s `(src, dst, hop)` batch: run the path kernel
+/// (unweighted BFS, or weighted Dijkstra when `weights` is present) and zip the
+/// dense node sequence into consecutive edges (translated back to user ids). An
+/// unreachable target (or a trivial one-node path) yields an empty batch.
 pub fn path_batch(
     topo: &Topology,
     ids: &IdMap,
     source: u32,
     target: u32,
     direction: Direction,
+    weights: Option<&[f64]>,
 ) -> RecordBatch {
     let mut src_dense = Vec::new();
     let mut dst_dense = Vec::new();
     let mut hop = Vec::new();
-    if let Some(nodes) = shortest_path(topo, source, target, direction) {
+    let route = match weights {
+        Some(w) => shortest_path_weighted(topo, w, source, target, direction),
+        None => shortest_path(topo, source, target, direction),
+    };
+    if let Some(nodes) = route {
         for (i, window) in nodes.windows(2).enumerate() {
             src_dense.push(window[0]);
             dst_dense.push(window[1]);
@@ -274,6 +290,7 @@ mod tests {
                 algo: GraphAlgo::Degree {
                     direction: PlanDirection::Out,
                 },
+                weights: None,
             },
             OutputColumn::Algo {
                 name: "pr".to_string(),
@@ -282,6 +299,7 @@ mod tests {
                     max_iter: 30,
                     tol: 1e-6,
                 },
+                weights: None,
             },
         ];
         let batch = query_batch(&topo, &ids, &columns);

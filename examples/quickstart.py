@@ -100,6 +100,16 @@ def main() -> None:
     print("\n== random walks from node 0 ==")
     print(ur.random_walk(edges, start=[0], steps=4, walks_per_node=2, seed=7).collect().to_polars())
 
+    # weight= is a per-op expression over edge columns. Weighted PageRank splits a
+    # node's rank by edge weight; weighted shortest_path is Dijkstra over the cost.
+    weighted_edges = ur.from_arrow(
+        pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 0, 0], "amount": [1.0, 9.0, 1.0, 1.0]}),
+        src="s",
+        dst="d",
+    )
+    print("\n== weighted pagerank (weight=amount) ==")
+    print(ur.pagerank(weighted_edges, weight=ur.col("amount")).collect().to_polars())
+
     # -- 5. Whole-graph summary + path stats --------------------------------
     print("\n== describe ==")
     print(ur.describe(edges, full=True).collect().to_polars())

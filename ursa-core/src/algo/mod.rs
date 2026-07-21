@@ -32,7 +32,7 @@ mod rng;
 mod triangle;
 
 pub use betweenness::betweenness;
-pub use bfs::{bfs_distances, shortest_path};
+pub use bfs::{bfs_distances, shortest_path, shortest_path_weighted};
 pub use closeness::closeness;
 pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
@@ -41,7 +41,7 @@ pub use hop::k_hop;
 pub use label_prop::label_propagation;
 pub use louvain::louvain;
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
-pub use pagerank::{pagerank, PageRankParams};
+pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, Walks};
 pub use triangle::triangle_count;
 

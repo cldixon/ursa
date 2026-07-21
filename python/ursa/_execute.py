@@ -51,6 +51,67 @@ _EXECUTABLE = {
 _FLIP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
 
 
+# --- weight expressions (over edge columns) --------------------------------
+def _expr_to_json(expr: Any) -> dict[str, Any]:
+    """Serialize an ``Expr`` tree to the JSON the Rust weight seam parses
+    (``ursa_plan::expr::parse_ursa_expr``): ``col`` / ``lit`` / ``binary``. Other
+    node kinds are emitted by kind so the Rust side reports a clear error."""
+    kind, p = expr.kind, expr.payload
+    if kind == "col":
+        return {"kind": "col", "name": p["name"]}
+    if kind == "lit":
+        return {"kind": "lit", "value": p["value"]}
+    if kind == "binary":
+        return {
+            "kind": "binary",
+            "op": p["op"],
+            "left": _expr_to_json(p["left"]),
+            "right": _expr_to_json(p["right"]),
+        }
+    return {"kind": kind}
+
+
+def _expr_columns(expr: Any) -> set[str]:
+    """The edge column names a weight expression references."""
+    kind, p = expr.kind, expr.payload
+    if kind == "col":
+        return {p["name"]}
+    if kind == "binary":
+        return _expr_columns(p["left"]) | _expr_columns(p["right"])
+    return set()
+
+
+def _edge_attr_batch(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
+    """The edge attribute batch (a pyarrow RecordBatch) needed to evaluate a
+    weight expression, aligned to the graph's edge-row order. In-memory frames
+    subset their retained table; ``scan_edges`` frames re-read the referenced
+    columns from the file (same row order as the src/dst scan)."""
+    if not weight_columns:
+        return None
+    cols = sorted(weight_columns)
+    table = getattr(edges, "_edge_attr_table", None)
+    if table is not None:
+        missing = [c for c in cols if c not in table.column_names]
+        if missing:
+            raise ValueError(f"weight expression references unknown edge column(s): {missing}")
+        batches = table.select(cols).combine_chunks().to_batches()
+        return batches[0] if batches else None
+    scan = getattr(edges, "_scan_spec", None)
+    if scan is not None:
+        path = scan["path"]
+        if not isinstance(path, str):
+            raise NotImplementedError(
+                "weighted algorithms over a multi-path scan_edges source are not supported yet."
+            )
+        return _native().scan_edges_arrow(
+            path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
+        )
+    raise NotImplementedError(
+        "a weighted algorithm needs an in-memory or scan_edges source so the weight "
+        "columns can be read."
+    )
+
+
 # --- composed with_columns pipeline ----------------------------------------
 # (Standalone `ur.pagerank(edges).collect()` promotes to a NodeFrame via
 # GraphExpr and also lands here — see ursa._graph.GraphExpr.)
@@ -104,7 +165,14 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
     nodes = _resolve_node_attr_table(frame)
     nodes_id = frame.id_col if nodes is not None else None
-    return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id)
+    # A weighted algorithm needs the edge columns its weight expression references.
+    weight_cols: set[str] = set()
+    for expr in graph_exprs.values():
+        w = expr.payload.get("weight") if expr.kind == "graph" else None
+        if w is not None:
+            weight_cols |= _expr_columns(w)
+    edge_attr = _edge_attr_batch(edges, weight_cols) if weight_cols else None
+    return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id, edge_attr)
 
 
 def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame:
@@ -240,10 +308,14 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             distinct,
         )
     else:  # shortest_path
-        if traversal.args.get("weight") is not None:
-            raise NotImplementedError(
-                "weighted shortest_path is not supported yet; omit weight= for unweighted BFS."
-            )
+        # A weight= expression (over edge columns) selects weighted Dijkstra: it's
+        # serialized and evaluated in Rust against the edge attribute batch.
+        weight = traversal.args.get("weight")
+        weight_json = None
+        edge_attr = None
+        if weight is not None:
+            weight_json = json.dumps(_expr_to_json(weight))
+            edge_attr = _edge_attr_batch(traversal.args["edges"], _expr_columns(weight))
         # source/target cross as 1-element user-id arrays (int64 or string),
         # resolved to dense indices in Rust — the same path as hop seeds.
         batch = _native().run_path_query(
@@ -251,7 +323,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             _resolve_seeds([traversal.args["source"]]),
             _resolve_seeds([traversal.args["target"]]),
             traversal.args["direction"],
-            False,  # weighted
+            weight_json,
+            edge_attr,
             filters,
             sort,
             limit,
@@ -316,10 +389,11 @@ def _run_query(
     limit: int | None,
     nodes: Any | None = None,
     nodes_id: str | None = None,
+    edge_attr: Any | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
     batch = _native().run_node_query(
-        index, json.dumps(columns), filters, sort, limit, nodes, nodes_id
+        index, json.dumps(columns), filters, sort, limit, nodes, nodes_id, edge_attr
     )
     return MaterializedFrame(batch)
 
@@ -350,6 +424,9 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
             max_iter=p.get("max_iter", 30),
             tol=p.get("tol", 1e-6),
         )
+        weight = p.get("weight")
+        if weight is not None:
+            column["weight"] = _expr_to_json(weight)
     elif verb == "degree":
         column["direction"] = p.get("direction", "out")
     elif verb == "closeness":

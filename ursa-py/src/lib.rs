@@ -95,7 +95,7 @@ fn _topology_build_count() -> usize {
 /// `{name, kind, ...params}`); `filters` are `(column, op, value)` comparisons;
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None))]
+#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None))]
 #[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
@@ -106,6 +106,7 @@ fn run_node_query(
     limit: Option<usize>,
     nodes: Option<Bound<'_, PyAny>>,
     nodes_id: Option<String>,
+    edges: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
@@ -114,6 +115,11 @@ fn run_node_query(
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
     let nodes = match nodes {
+        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        None => None,
+    };
+    // Edge attribute batch for evaluating weight expressions (weighted algorithms).
+    let edges = match edges {
         Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
         None => None,
     };
@@ -127,6 +133,7 @@ fn run_node_query(
             limit,
             nodes,
             nodes_id,
+            edges,
         )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
@@ -179,11 +186,12 @@ fn run_hop_query(
 
 /// Execute a `shortest_path` traversal and return its `(src, dst, hop)` path batch
 /// as pyarrow. `source`/`target` are 1-element pyarrow arrays of user ids (int64
-/// or string, matching the graph); `direction` is out/in/both. `weighted` is
-/// reserved (errors for now — v0.1 is unweighted BFS). The
+/// or string, matching the graph); `direction` is out/in/both. `weight` (an
+/// optional serialized weight expression over edge columns) + `edges` (the edge
+/// attribute batch) select weighted Dijkstra; omit both for unweighted BFS. The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the path edges.
 #[pyfunction]
-#[pyo3(signature = (index, source, target, direction, weighted=false, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, source, target, direction, weight=None, edges=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
 #[allow(clippy::too_many_arguments)]
 fn run_path_query(
     py: Python<'_>,
@@ -191,7 +199,8 @@ fn run_path_query(
     source: &Bound<'_, PyAny>,
     target: &Bound<'_, PyAny>,
     direction: &str,
-    weighted: bool,
+    weight: Option<String>,
+    edges: Option<Bound<'_, PyAny>>,
     filters: Vec<(String, String, f64)>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
@@ -201,6 +210,10 @@ fn run_path_query(
     let source = array_from_pyarrow(source)?;
     let target = array_from_pyarrow(target)?;
     let direction = direction.to_string();
+    let edges = match edges {
+        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        None => None,
+    };
     let comparisons: Vec<Comparison> = filters
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
@@ -212,7 +225,8 @@ fn run_path_query(
             source.as_ref(),
             target.as_ref(),
             &direction,
-            weighted,
+            weight.as_deref(),
+            edges,
             &comparisons,
             sort,
             limit,
@@ -313,22 +327,25 @@ fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> P
     batch.to_pyarrow(py)
 }
 
-/// Read a Parquet/CSV edge file's `src`/`dst` columns through a DataFusion scan
-/// and hand them back as a two-column `(src, dst)` pyarrow `RecordBatch`. `path`
-/// may be local or object storage (`s3://`/`gs://`/`az://`/`file://`);
-/// `storage_options` seeds the backend's credentials/config.
+/// Read a Parquet/CSV edge file's `src`/`dst` columns (plus any `weight_columns`
+/// needed to evaluate a `weight=` expression) through a DataFusion scan and hand
+/// them back as a pyarrow `RecordBatch`. `path` may be local or object storage
+/// (`s3://`/`gs://`/`az://`/`file://`); `storage_options` seeds the backend's
+/// credentials/config.
 #[pyfunction]
-#[pyo3(signature = (path, src, dst, storage_options=None))]
+#[pyo3(signature = (path, src, dst, storage_options=None, weight_columns=Vec::new()))]
 fn scan_edges_arrow(
     py: Python<'_>,
     path: &str,
     src: &str,
     dst: &str,
     storage_options: Option<HashMap<String, String>>,
+    weight_columns: Vec<String>,
 ) -> PyResult<PyObject> {
     let opts = storage_options.unwrap_or_default();
     let batch = py.allow_threads(|| {
-        scan_edges_batch(path, src, dst, &opts).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        scan_edges_batch(path, src, dst, &opts, &weight_columns)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     })?;
     batch.to_pyarrow(py)
 }

@@ -32,6 +32,7 @@ pub mod scan;
 pub mod session;
 pub mod stats;
 pub mod topology;
+pub mod weight;
 
 pub use logical::{Direction, GraphAlgo};
 pub use node::GraphAlgorithmNode;

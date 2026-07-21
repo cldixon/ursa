@@ -224,7 +224,8 @@ pub struct ShortestPathNode {
     pub source: u32,
     pub target: u32,
     pub direction: Direction,
-    pub weighted: bool,
+    /// Per-edge-row weights for a weighted (Dijkstra) path; `None` is unweighted BFS.
+    pub weights: Option<Arc<Vec<f64>>>,
     schema: DFSchemaRef,
 }
 
@@ -235,7 +236,7 @@ impl ShortestPathNode {
         source: u32,
         target: u32,
         direction: Direction,
-        weighted: bool,
+        weights: Option<Arc<Vec<f64>>>,
     ) -> Self {
         let schema = Arc::new(
             DFSchema::try_from(path_schema(ids.user_type()).as_ref().clone())
@@ -247,7 +248,7 @@ impl ShortestPathNode {
             source,
             target,
             direction,
-            weighted,
+            weights,
             schema,
         }
     }
@@ -259,7 +260,7 @@ impl PartialEq for ShortestPathNode {
             && self.source == other.source
             && self.target == other.target
             && self.direction == other.direction
-            && self.weighted == other.weighted
+            && self.weights.is_some() == other.weights.is_some()
     }
 }
 
