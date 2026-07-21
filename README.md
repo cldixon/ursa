@@ -133,13 +133,17 @@ stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
 **`describe`**, **object-storage scans** (`s3://` / `gs://` / `az://` via
 `object_store`, with `storage_options`), and `sink_parquet`/`sink_csv` egress.
 
+**Weighted algorithms** are live: `weight=` is a per-operation *expression* over
+edge columns (`weight=ur.col("amount") * ur.col("fx")`), evaluated to an f64 per
+edge and gathered per CSR slot via the `edge_ids` permutation. **Weighted
+PageRank** and **weighted `shortest_path`** (Dijkstra) ship; weighted closeness /
+betweenness / louvain are the remaining kernel follow-up on the same seam.
+
 Next, in rough priority order:
 
-1. **Weighted algorithms** (`weight=` for pagerank/degree, weighted closeness /
-   betweenness / louvain, and weighted SSSP via delta-stepping, using the
-   `edge_ids` permutation already in place) to complete the algorithm story.
-2. The direction-optimizing (top-down/bottom-up) BFS switch for scale, and
-   weighted SSSP (delta-stepping) on the same frontier-kernel family.
+1. **Weighted closeness / betweenness / louvain** on the weight-evaluation seam,
+   plus weighted SSSP via delta-stepping for scale.
+2. The direction-optimizing (top-down/bottom-up) BFS switch for scale.
 3. **Optimizer rules** — push node-set filters before traversal, fuse
    `neighbors().agg` into a segmented CSR reduction. (The topology index is now
    built once and shared across ops over a frame — the index-preservation

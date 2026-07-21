@@ -165,7 +165,10 @@ class EdgeFrame(_Frame):
     # cached on first graph op and shared by every subsequent op over this frame
     # (the spec's index-preservation contract). It rides the same preserve/drop
     # rail as `_source`/`_scan`: property-only ops keep it, structural ops drop it.
-    __slots__ = ("_dst_col", "_index", "_scan", "_source", "_src_col")
+    # `_edge_table` retains the full in-memory edge table (all columns) for a
+    # `from_arrow`/`from_polars` frame, so a `weight=` expression over edge columns
+    # can be evaluated. It rides the same preserve/drop rail; scan frames have None.
+    __slots__ = ("_dst_col", "_edge_table", "_index", "_scan", "_source", "_src_col")
 
     def __init__(
         self,
@@ -176,6 +179,7 @@ class EdgeFrame(_Frame):
         source: tuple[Any, Any] | None = None,
         scan: dict[str, Any] | None = None,
         index: Any | None = None,
+        edge_table: Any | None = None,
     ) -> None:
         super().__init__(plan, has_index)
         self._src_col = src_col
@@ -183,11 +187,17 @@ class EdgeFrame(_Frame):
         self._source = source
         self._scan = scan
         self._index = index
+        self._edge_table = edge_table
 
     @property
     def _edge_arrays(self) -> tuple[Any, Any] | None:
         """The (src, dst) Arrow arrays if this frame has an in-memory source."""
         return self._source
+
+    @property
+    def _edge_attr_table(self) -> Any | None:
+        """The full in-memory edge table (all columns), for weight evaluation."""
+        return self._edge_table
 
     @property
     def _scan_spec(self) -> dict[str, Any] | None:
@@ -216,6 +226,7 @@ class EdgeFrame(_Frame):
             source=None if drops_index else self._source,
             scan=None if drops_index else self._scan,
             index=None if drops_index else self._index,
+            edge_table=None if drops_index else self._edge_table,
         )
 
     def nodes(self) -> NodeFrame:

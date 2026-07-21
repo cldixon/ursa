@@ -407,10 +407,14 @@ def test_shortest_path_over_scan_source(tmp_path):
     assert len(rows) == 3
 
 
-def test_shortest_path_weighted_is_honest():
-    edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 2]}), src="s", dst="d")
-    with pytest.raises(NotImplementedError):
-        ur.shortest_path(edges, 0, 2, weight=ur.col("w")).collect()
+def test_shortest_path_weighted_takes_the_cheaper_route():
+    # 0->1->2 (cost 1+1) vs direct 0->2 (cost 5): weighted Dijkstra picks the
+    # cheaper two-hop path, unlike unweighted BFS (see tests/test_weighted.py).
+    edges = ur.from_arrow(
+        pa.table({"s": [0, 1, 0], "d": [1, 2, 2], "cost": [1.0, 1.0, 5.0]}), src="s", dst="d"
+    )
+    path = ur.shortest_path(edges, 0, 2, weight=ur.col("cost")).collect().to_dicts()
+    assert [r["src"] for r in path] == [0, 1]
 
 
 def test_describe_summarizes_the_graph():
