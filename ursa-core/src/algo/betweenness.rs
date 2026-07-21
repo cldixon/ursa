@@ -12,10 +12,12 @@
 //! are processed in parallel with Rayon; each contributes a local vector that is
 //! summed at the end.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 
 use rayon::prelude::*;
 
+use super::bfs::TotalF64;
 use crate::topology::Topology;
 
 /// Betweenness centrality per node (directed, following out-edges). See the
@@ -103,6 +105,105 @@ fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64]) {
     }
 }
 
+/// Weighted betweenness centrality (Dijkstra-based Brandes). As [`betweenness`],
+/// but shortest paths are minimum total edge weight; `weights[e]` is the weight of
+/// edge row `e` (non-negative; `len == n_edges`). Ties (equal-cost alternate
+/// paths) are counted when their total costs are exactly equal.
+pub fn betweenness_weighted(topo: &Topology, weights: &[f64], sample: Option<f64>) -> Vec<f64> {
+    let n = topo.n_nodes();
+    if n == 0 {
+        return Vec::new();
+    }
+    let sources = sample_sources(n, sample);
+    let k = sources.len();
+    if k == 0 {
+        return vec![0.0; n];
+    }
+
+    let bc = sources
+        .par_iter()
+        .fold(
+            || vec![0.0f64; n],
+            |mut acc, &s| {
+                brandes_from_weighted(topo, weights, s, &mut acc);
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f64; n],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+                a
+            },
+        );
+
+    if sample.is_some() {
+        let scale = n as f64 / k as f64;
+        bc.into_iter().map(|x| x * scale).collect()
+    } else {
+        bc
+    }
+}
+
+/// One weighted Brandes single-source pass: Dijkstra settles nodes in
+/// non-decreasing distance, recording shortest-path counts (`sigma`) and
+/// predecessors, then a reverse pass over the settle order accumulates
+/// dependencies into `bc`.
+fn brandes_from_weighted(topo: &Topology, weights: &[f64], s: u32, bc: &mut [f64]) {
+    let n = topo.n_nodes();
+    let out = topo.out();
+
+    let mut dist = vec![f64::INFINITY; n];
+    let mut sigma = vec![0.0f64; n];
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut order: Vec<u32> = Vec::new(); // settle order (non-decreasing distance)
+    let mut settled = vec![false; n];
+
+    dist[s as usize] = 0.0;
+    sigma[s as usize] = 1.0;
+    let mut heap = BinaryHeap::new();
+    heap.push(Reverse((TotalF64(0.0), s)));
+
+    while let Some(Reverse((TotalF64(du), u))) = heap.pop() {
+        if settled[u as usize] {
+            continue;
+        }
+        settled[u as usize] = true;
+        order.push(u);
+        for (&w_node, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+            if settled[w_node as usize] {
+                continue;
+            }
+            let nd = du + weights[e as usize];
+            if nd < dist[w_node as usize] {
+                // Strictly shorter: reset counts and predecessors.
+                dist[w_node as usize] = nd;
+                sigma[w_node as usize] = sigma[u as usize];
+                preds[w_node as usize].clear();
+                preds[w_node as usize].push(u);
+                heap.push(Reverse((TotalF64(nd), w_node)));
+            } else if nd == dist[w_node as usize] {
+                // Equal-cost alternate path: accumulate.
+                sigma[w_node as usize] += sigma[u as usize];
+                preds[w_node as usize].push(u);
+            }
+        }
+    }
+
+    let mut delta = vec![0.0f64; n];
+    while let Some(w) = order.pop() {
+        let coeff = (1.0 + delta[w as usize]) / sigma[w as usize];
+        for &v in &preds[w as usize] {
+            delta[v as usize] += sigma[v as usize] * coeff;
+        }
+        if w != s {
+            bc[w as usize] += delta[w as usize];
+        }
+    }
+}
+
 /// `None` → every node; `Some(frac)` → a deterministic evenly-strided subsample
 /// of `⌈frac · n⌉` sources (reproducible, no RNG), at least one when `n > 0`.
 fn sample_sources(n: usize, frac: Option<f64>) -> Vec<u32> {
@@ -146,6 +247,21 @@ mod tests {
         assert_eq!(bc[3], 0.0);
         assert!((bc[1] - 0.5).abs() < 1e-12, "got {}", bc[1]);
         assert!((bc[2] - 0.5).abs() < 1e-12, "got {}", bc[2]);
+    }
+
+    #[test]
+    fn weighted_routes_dependency_through_the_cheap_node() {
+        // Diamond 0->1->3 and 0->2->3. Equal weights split the (0,3) pair evenly
+        // (0.5 each). Make the 0->1->3 route strictly cheaper and all of it flows
+        // through node 1; node 2 carries none.
+        // edge rows: 0=(0->1),1=(0->2),2=(1->3),3=(2->3)
+        let t = Topology::build(4, vec![0, 0, 1, 2], vec![1, 2, 3, 3]);
+        let even = betweenness_weighted(&t, &[1.0, 1.0, 1.0, 1.0], None);
+        assert!((even[1] - 0.5).abs() < 1e-12 && (even[2] - 0.5).abs() < 1e-12);
+
+        let cheap_left = betweenness_weighted(&t, &[1.0, 5.0, 1.0, 5.0], None);
+        assert!((cheap_left[1] - 1.0).abs() < 1e-12, "got {}", cheap_left[1]);
+        assert!(cheap_left[2].abs() < 1e-12, "got {}", cheap_left[2]);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use rayon::prelude::*;
 
-use super::bfs_distances;
+use super::{bfs_distances, dijkstra_distances};
 use crate::topology::{Direction, Topology};
 
 /// Closeness centrality per node, directed (following out-edges): for each node
@@ -33,6 +33,33 @@ pub fn closeness(topo: &Topology) -> Vec<f64> {
             }
             if sum > 0 {
                 reachable as f64 / sum as f64
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Weighted closeness centrality: as [`closeness`], but distances are minimum
+/// total edge weight (Dijkstra) rather than hop count. `reachable / Σ dist(u, v)`
+/// over the reachable nodes at finite positive distance. `weights[e]` is the
+/// weight of edge row `e` (non-negative; `len == n_edges`).
+pub fn closeness_weighted(topo: &Topology, weights: &[f64]) -> Vec<f64> {
+    let n = topo.n_nodes();
+    (0..n)
+        .into_par_iter()
+        .map(|u| {
+            let dist = dijkstra_distances(topo, weights, u as u32, Direction::Out);
+            let mut sum = 0.0f64;
+            let mut reachable = 0i64;
+            for (v, d) in dist.into_iter().enumerate() {
+                if v != u && d.is_finite() && d > 0.0 {
+                    sum += d;
+                    reachable += 1;
+                }
+            }
+            if sum > 0.0 {
+                reachable as f64 / sum
             } else {
                 0.0
             }
@@ -71,5 +98,16 @@ mod tests {
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
         assert!(closeness(&t).is_empty());
+    }
+
+    #[test]
+    fn weighted_uses_edge_costs() {
+        // 0->1 (cost 1), 1->2 (cost 1), 0->2 (cost 5). From node 0: dist to 1 is 1,
+        // to 2 is 2 (via 1, cheaper than the direct 5). reachable 2, Σ 3 -> 2/3.
+        let t = Topology::build(3, vec![0, 1, 0], vec![1, 2, 2]);
+        let c = closeness_weighted(&t, &[1.0, 1.0, 5.0]);
+        assert!((c[0] - 2.0 / 3.0).abs() < 1e-12, "got {}", c[0]);
+        // From node 1: only 2 reachable at cost 1 -> 1/1 = 1.
+        assert!((c[1] - 1.0).abs() < 1e-12, "got {}", c[1]);
     }
 }
