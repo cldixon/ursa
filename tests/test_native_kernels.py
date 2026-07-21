@@ -24,6 +24,13 @@ def test_core_version_loads():
     assert re.fullmatch(r"\d+\.\d+\.\d+", version)
 
 
+def test_version_matches_core():
+    # __version__ (installed distribution metadata) and __core_version__ (from the
+    # native crate) are both single-sourced from the Cargo workspace version, so an
+    # installed build must agree on both. This makes a future drift impossible.
+    assert ur.__version__ == ur.__core_version__
+
+
 def test_demo_degree():
     # 0->1, 0->2, 1->2, 2->0
     src, dst = [0, 0, 1, 2], [1, 2, 2, 0]

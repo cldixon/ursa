@@ -22,4 +22,14 @@ arrow = { workspace = true, features = ["pyarrow"] }
 # wheel per platform (`cp310-abi3`) loads on every Python >= 3.10 — matching our
 # `requires-python`. This is the same strategy Polars and Daft ship. Only the C
 # data interface (PyCapsule) is used across the boundary, which is abi3-safe.
-pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }
+# `extension-module` is NOT enabled here: it tells pyo3 not to link libpython,
+# which is right for the wheel but breaks `cargo test -p ursa-py` (a test binary
+# needs a real interpreter to link against). It's behind the feature below, which
+# maturin turns on when building the extension.
+pyo3 = { workspace = true, features = ["abi3-py310"] }
+
+[features]
+# Enabled by maturin (see [tool.maturin] features in pyproject.toml) when building
+# the Python extension; left off for `cargo test`/`cargo check` so ursa-py's rlib
+# links a normal interpreter.
+extension-module = ["pyo3/extension-module"]

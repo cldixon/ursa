@@ -24,6 +24,10 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
+    # Arrow is the interchange format on every path: from_arrow/from_polars ingress,
+    # the collect() result (the Rust FFI boundary imports the `pyarrow` module), and
+    # the sinks. Not optional in practice — a fresh install is unusable without it.
+    "pyarrow>=15.0",
     # typing.Self backport for the 3.10 floor (used only in type annotations).
     "typing-extensions>=4.0; python_version < '3.11'",
 ]
@@ -63,7 +67,9 @@ package = true
 manifest-path = "ursa-py/Cargo.toml"
 module-name = "ursa._ursa"
 python-source = "python"
-features = ["pyo3/extension-module"]
+# ursa-py's own `extension-module` feature (forwards to pyo3/extension-module).
+# Kept off by default so `cargo test -p ursa-py` links; maturin turns it on here.
+features = ["extension-module"]
 # The workspace-root LICENSE files land in each wheel's dist-info, but the sdist is
 # built around ursa-py/ and would otherwise omit them — even though maturin still
 # writes `License-File:` metadata for them, which PyPI then rejects. Force them into

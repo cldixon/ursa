@@ -165,46 +165,45 @@ def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:
     """The node attribute table as a single pyarrow RecordBatch (id canonicalized
     to int64 or string).
 
-    Returns None if pyarrow isn't importable — ``collect()`` then surfaces a clear
-    error at execution time rather than at construction. An unsupported id type
-    raises immediately.
+    Returns None only if pyarrow isn't importable (a source checkout without the
+    dependency installed) — ``collect()`` then surfaces a clear error at execution
+    time. An unsupported id type or a missing ``id`` column raises immediately at
+    construction, so a typo'd column name is reported where the user made it.
     """
     try:
         import pyarrow as pa
-
-        tbl = data.to_arrow() if op == "from_polars" else data
-        idx = tbl.schema.get_field_index(id)
-        id_col = tbl.column(id)
-        chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
-        id_arr = _canonical_id_array(pa.concat_arrays(chunks))
-        tbl = tbl.set_column(idx, id, id_arr)
-        batches = tbl.combine_chunks().to_batches()
-        return batches[0] if batches else None
-    except TypeError:
-        raise
-    except Exception:
+    except ImportError:  # pragma: no cover - pyarrow is a hard runtime dependency
         return None
+
+    tbl = data.to_arrow() if op == "from_polars" else data
+    idx = tbl.schema.get_field_index(id)
+    id_col = tbl.column(id)
+    chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
+    id_arr = _canonical_id_array(pa.concat_arrays(chunks))
+    tbl = tbl.set_column(idx, id, id_arr)
+    batches = tbl.combine_chunks().to_batches()
+    return batches[0] if batches else None
 
 
 def _extract_edge_arrays(op: str, data: Any, src: str, dst: str) -> tuple[Any, Any] | None:
     """Pull the src/dst columns out as contiguous pyarrow arrays, canonicalized to
     a supported node-id type (int64 or string).
 
-    Returns None (rather than raising) if pyarrow isn't importable or the columns
-    can't be resolved — `collect()` then surfaces a clear error at execution time
-    instead of at construction. An unsupported id type raises immediately.
+    Returns None only if pyarrow isn't importable (a source checkout without the
+    dependency installed) — `collect()` then surfaces a clear error at execution
+    time. An unsupported id type or a missing ``src``/``dst`` column raises
+    immediately at construction, so a typo'd column name is reported where the
+    user made it.
     """
     try:
         import pyarrow as pa
-
-        tbl = data.to_arrow() if op == "from_polars" else data
-        arrays = []
-        for name in (src, dst):
-            column = tbl.column(name)
-            chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-            arrays.append(_canonical_id_array(pa.concat_arrays(chunks)))
-        return (arrays[0], arrays[1])
-    except TypeError:
-        raise
-    except Exception:
+    except ImportError:  # pragma: no cover - pyarrow is a hard runtime dependency
         return None
+
+    tbl = data.to_arrow() if op == "from_polars" else data
+    arrays = []
+    for name in (src, dst):
+        column = tbl.column(name)
+        chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
+        arrays.append(_canonical_id_array(pa.concat_arrays(chunks)))
+    return (arrays[0], arrays[1])
