@@ -87,12 +87,19 @@ def test_algorithms_compose_in_one_pipeline():
     assert len(df) == 8
 
 
-def test_weighted_variants_error_clearly():
-    edges = _two_cliques()
-    for expr in (
-        ur.closeness(edges, weight=ur.col("w")),
-        ur.betweenness(edges, weight=ur.col("w")),
-        ur.louvain(edges, weight=ur.col("w")),
-    ):
-        with pytest.raises(NotImplementedError):
-            edges.nodes().with_columns(x=expr).collect()
+def test_weighted_variants_run():
+    # closeness/betweenness/louvain accept weight= (see tests/test_weighted.py for
+    # the value assertions); here just confirm they execute over a weighted frame.
+    edges = ur.from_arrow(
+        pa.table({"src": [0, 1, 2], "dst": [1, 2, 0], "w": [1.0, 1.0, 1.0]}), src="src", dst="dst"
+    )
+    df = (
+        edges.nodes()
+        .with_columns(
+            c=ur.closeness(edges, weight=ur.col("w")),
+            bc=ur.betweenness(edges, weight=ur.col("w")),
+            lv=ur.louvain(edges, weight=ur.col("w"), seed=1),
+        )
+        .collect()
+    )
+    assert set(df.columns) == {"id", "c", "bc", "lv"}

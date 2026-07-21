@@ -109,13 +109,64 @@ def test_unknown_weight_column_errors():
         edges.nodes().with_columns(pr=ur.pagerank(edges, weight=ur.col("nope"))).collect()
 
 
-def test_weight_still_rejected_for_deferred_algorithms():
+def test_weighted_closeness_uses_edge_costs():
+    # 0->1 (1), 1->2 (1), 0->2 (5): from 0, reach 1 at 1 and 2 at 2 -> 2/3.
+    tbl = pa.table({"src": [0, 1, 0], "dst": [1, 2, 2], "cost": [1.0, 1.0, 5.0]})
+    edges = _edges(tbl)
+    rows = {
+        r["id"]: r["c"]
+        for r in edges.nodes()
+        .with_columns(c=ur.closeness(edges, weight=ur.col("cost")))
+        .collect()
+        .to_dicts()
+    }
+    assert abs(rows[0] - 2.0 / 3.0) < 1e-12
+    assert abs(rows[1] - 1.0) < 1e-12
+
+
+def test_weighted_betweenness_routes_through_the_cheap_node():
+    # Diamond 0->1->3 / 0->2->3; make the left route strictly cheaper so all of
+    # the (0,3) dependency flows through node 1, none through node 2.
+    tbl = pa.table({"src": [0, 0, 1, 2], "dst": [1, 2, 3, 3], "cost": [1.0, 5.0, 1.0, 5.0]})
+    edges = _edges(tbl)
+    rows = {
+        r["id"]: r["bc"]
+        for r in edges.nodes()
+        .with_columns(bc=ur.betweenness(edges, weight=ur.col("cost")))
+        .collect()
+        .to_dicts()
+    }
+    assert abs(rows[1] - 1.0) < 1e-12
+    assert abs(rows[2]) < 1e-12
+
+
+def test_weighted_louvain_binds_a_heavy_bridge():
+    # Two triangles joined by 2-3; a heavy bridge pulls 2 and 3 together.
+    tbl = pa.table(
+        {
+            "src": [0, 1, 2, 3, 4, 5, 2],
+            "dst": [1, 2, 0, 4, 5, 3, 3],
+            "w": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0],
+        }
+    )
+    edges = _edges(tbl)
+    comm = {
+        r["id"]: r["lv"]
+        for r in edges.nodes()
+        .with_columns(lv=ur.louvain(edges, weight=ur.col("w"), seed=1))
+        .collect()
+        .to_dicts()
+    }
+    assert comm[2] == comm[3]
+
+
+def test_weight_still_rejected_for_label_propagation():
+    # label_propagation has no weighted kernel; weight= must still error clearly.
+    # (It takes no weight= param, so build the payload directly.)
+    from ursa._graph import _graph_expr
+
     tbl = pa.table({"src": [0, 1], "dst": [1, 0], "w": [1.0, 2.0]})
     edges = _edges(tbl)
-    for expr in (
-        ur.closeness(edges, weight=ur.col("w")),
-        ur.betweenness(edges, weight=ur.col("w")),
-        ur.louvain(edges, weight=ur.col("w")),
-    ):
-        with pytest.raises(NotImplementedError):
-            edges.nodes().with_columns(x=expr).collect()
+    expr = _graph_expr("label_propagation", edges=edges, weight=ur.col("w"))
+    with pytest.raises(Exception, match="weight="):
+        edges.nodes().with_columns(x=expr).collect()

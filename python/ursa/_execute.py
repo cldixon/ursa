@@ -398,14 +398,12 @@ def _run_query(
     return MaterializedFrame(batch)
 
 
-def _reject_weight(verb: str, payload: dict[str, Any]) -> None:
-    """Weighted algorithms are deferred (issue #17). Fail clearly rather than
-    silently ignoring a ``weight=`` the caller supplied."""
-    if payload.get("weight") is not None:
-        raise NotImplementedError(
-            f"weighted '{verb}' is not supported yet; only the unweighted form is "
-            "wired for v0.1 (weighted algorithms are tracked separately)."
-        )
+def _add_weight(column: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Attach a serialized weight expression to a column spec, if one was given.
+    Supported on pagerank / closeness / betweenness / louvain."""
+    weight = payload.get("weight")
+    if weight is not None:
+        column["weight"] = _expr_to_json(weight)
 
 
 def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
@@ -424,21 +422,19 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
             max_iter=p.get("max_iter", 30),
             tol=p.get("tol", 1e-6),
         )
-        weight = p.get("weight")
-        if weight is not None:
-            column["weight"] = _expr_to_json(weight)
+        _add_weight(column, p)
     elif verb == "degree":
         column["direction"] = p.get("direction", "out")
     elif verb == "closeness":
-        _reject_weight(verb, p)
+        _add_weight(column, p)
     elif verb == "betweenness":
-        _reject_weight(verb, p)
         column["sample"] = p.get("sample")
+        _add_weight(column, p)
     elif verb == "label_propagation":
         column.update(max_iter=p.get("max_iter", 20), seed=p.get("seed"))
     elif verb == "louvain":
-        _reject_weight(verb, p)
         column.update(resolution=p.get("resolution", 1.0), seed=p.get("seed"))
+        _add_weight(column, p)
     elif verb == "neighbors_agg":
         agg = p["agg"]
         operand = agg.payload.get("operand") if agg.kind == "agg" else None
@@ -453,6 +449,10 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
             agg_column=operand.payload["name"],
             direction=p.get("direction", "out"),
         )
+    # A weight= on a verb that doesn't consume it (e.g. label_propagation) would be
+    # silently ignored otherwise — fail clearly instead.
+    if p.get("weight") is not None and "weight" not in column:
+        raise NotImplementedError(f"weight= is not supported for '{verb}'.")
     return column
 
 

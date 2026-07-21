@@ -133,22 +133,21 @@ stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
 **`describe`**, **object-storage scans** (`s3://` / `gs://` / `az://` via
 `object_store`, with `storage_options`), and `sink_parquet`/`sink_csv` egress.
 
-**Weighted algorithms** are live: `weight=` is a per-operation *expression* over
-edge columns (`weight=ur.col("amount") * ur.col("fx")`), evaluated to an f64 per
-edge and gathered per CSR slot via the `edge_ids` permutation. **Weighted
-PageRank** and **weighted `shortest_path`** (Dijkstra) ship; weighted closeness /
-betweenness / louvain are the remaining kernel follow-up on the same seam.
+**Weighted algorithms** are live across the board: `weight=` is a per-operation
+*expression* over edge columns (`weight=ur.col("amount") * ur.col("fx")`),
+evaluated to an f64 per edge and gathered per CSR slot via the `edge_ids`
+permutation. Weighted **PageRank**, **`shortest_path`** (Dijkstra), **closeness**,
+**betweenness** (Dijkstra-Brandes), and **louvain** all ship.
 
 Next, in rough priority order:
 
-1. **Weighted closeness / betweenness / louvain** on the weight-evaluation seam,
-   plus weighted SSSP via delta-stepping for scale.
-2. The direction-optimizing (top-down/bottom-up) BFS switch for scale.
-3. **Optimizer rules** — push node-set filters before traversal, fuse
+1. The direction-optimizing (top-down/bottom-up) BFS switch and weighted SSSP via
+   delta-stepping, for scale.
+2. **Optimizer rules** — push node-set filters before traversal, fuse
    `neighbors().agg` into a segmented CSR reduction. (The topology index is now
    built once and shared across ops over a frame — the index-preservation
    contract — which is the seam these rules register on.)
-4. **Breadth** — benchmarks vs NetworkX/rustworkx/igraph, a published docs site.
+3. **Breadth** — benchmarks vs NetworkX/rustworkx/igraph, a published docs site.
    (String/UUID node ids alongside int64 are already supported, auto-detected
    from the column type.)
 
