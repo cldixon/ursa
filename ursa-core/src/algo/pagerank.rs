@@ -86,6 +86,76 @@ pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
     rank
 }
 
+/// Weighted PageRank (pull-based). Identical to [`pagerank`] except a node's rank
+/// is split among its out-edges in proportion to the edge weights rather than
+/// uniformly: each in-neighbour `v` contributes `w * rank[v] / out_strength[v]`,
+/// where `w` is the weight of the `v -> u` edge and `out_strength[v]` is `v`'s
+/// total outgoing weight. A node with zero out-strength is dangling and its rank
+/// is redistributed uniformly, as in the unweighted kernel.
+///
+/// `weights[e]` is the weight of original edge row `e`; `weights.len()` must equal
+/// `topo.n_edges()`. Weights are gathered per CSR slot via `Adjacency::edge_ids`.
+pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParams) -> Vec<f64> {
+    let n = topo.n_nodes();
+    if n == 0 {
+        return Vec::new();
+    }
+    assert_eq!(
+        weights.len(),
+        topo.n_edges(),
+        "weights length must equal the edge count"
+    );
+    let nf = n as f64;
+    let d = params.damping;
+
+    // Precompute weighted out-strength: the total outgoing weight of each node.
+    let out = topo.out();
+    let out_str: Vec<f64> = (0..n as u32)
+        .map(|v| out.edge_ids(v).iter().map(|&e| weights[e as usize]).sum())
+        .collect();
+    let inc = topo.incoming();
+
+    let mut rank = vec![1.0 / nf; n];
+    let mut next = vec![0.0f64; n];
+
+    for _iter in 0..params.max_iter {
+        // Rank stranded on dangling nodes (zero out-strength), spread uniformly.
+        let dangling: f64 = (0..n)
+            .into_par_iter()
+            .filter(|&u| out_str[u] <= 0.0)
+            .map(|u| rank[u])
+            .sum();
+        let base = (1.0 - d) / nf + d * dangling / nf;
+
+        next.par_iter_mut().enumerate().for_each(|(u, slot)| {
+            let mut acc = 0.0;
+            // In-neighbours and their edge rows are aligned element-for-element.
+            let nbrs = inc.neighbors(u as u32);
+            let edges = inc.edge_ids(u as u32);
+            for (&v, &e) in nbrs.iter().zip(edges) {
+                let os = out_str[v as usize];
+                if os > 0.0 {
+                    acc += weights[e as usize] * rank[v as usize] / os;
+                }
+            }
+            *slot = base + d * acc;
+        });
+
+        let delta: f64 = next
+            .par_iter()
+            .zip(rank.par_iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        std::mem::swap(&mut rank, &mut next);
+        if delta < params.tol {
+            break;
+        }
+    }
+
+    rank
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +176,33 @@ mod tests {
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
         assert!(pagerank(&t, PageRankParams::default()).is_empty());
+    }
+
+    #[test]
+    fn weight_shifts_rank_toward_the_heavier_target() {
+        // Node 0 splits between 1 and 2 (edge rows 0 and 1); 1 and 2 are sinks
+        // pointing back at 0 so mass recirculates. Weighting the 0->2 edge far
+        // heavier should make node 2 outrank node 1.
+        let t = Topology::build(3, vec![0, 0, 1, 2], vec![1, 2, 0, 0]);
+        let uniform = pagerank_weighted(&t, &[1.0, 1.0, 1.0, 1.0], PageRankParams::default());
+        assert!(
+            (uniform[1] - uniform[2]).abs() < 1e-9,
+            "uniform ties 1 and 2"
+        );
+
+        // rows: 0=(0->1), 1=(0->2), 2=(1->0), 3=(2->0). Make 0->2 heavy.
+        let weighted = pagerank_weighted(&t, &[1.0, 9.0, 1.0, 1.0], PageRankParams::default());
+        assert!(weighted[2] > weighted[1], "heavier 0->2 lifts node 2");
+        let sum: f64 = weighted.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "sum was {sum}");
+    }
+
+    #[test]
+    fn zero_weight_out_edges_are_dangling() {
+        // 0 -> 1 with weight 0 makes node 0 effectively dangling (no out-strength).
+        let t = Topology::build(2, vec![0], vec![1]);
+        let pr = pagerank_weighted(&t, &[0.0], PageRankParams::default());
+        let sum: f64 = pr.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "sum was {sum}");
     }
 }
