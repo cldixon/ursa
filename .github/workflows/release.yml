@@ -1,0 +1,122 @@
+name: Release
+
+# Build native wheels for every platform + an sdist, then publish to PyPI via
+# Trusted Publishing (OIDC — no stored API token). Runs when a GitHub Release is
+# published; `workflow_dispatch` builds the full matrix as a dry run WITHOUT
+# publishing, so the wheel build can be validated before cutting a real release.
+#
+# Wheels are abi3 (`abi3-py310`, set in ursa-py/Cargo.toml): one wheel per
+# platform (`cp310-abi3`) loads on every Python >= 3.10, so the matrix is over
+# platforms only — not platform x Python version.
+#
+# First-release setup (maintainer, one-time, on PyPI — cannot be done from CI):
+#   PyPI -> account -> Publishing -> add a pending publisher:
+#     Project name:      ursa-graph
+#     Owner:             cldixon
+#     Repository:        ursa
+#     Workflow filename: release.yml
+#     Environment:       pypi
+#   plus create the `pypi` environment under repo Settings -> Environments.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: wheels (linux ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    name: wheels (macos ${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    name: wheels (windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # Only publish for a real release; workflow_dispatch stops at building.
+    if: github.event_name == 'release'
+    needs: [linux, macos, windows, sdist]
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for PyPI Trusted Publishing
+    steps:
+      - name: Collect all wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

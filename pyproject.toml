@@ -3,8 +3,14 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "ursa"
-version = "0.1.0"
+# Distribution name is `ursa-graph` (the bare `ursa` is an abandoned, file-less
+# reservation on PyPI). The *import* name is unaffected — `import ursa` — because
+# it is set by the module layout below (`module-name`/`python-source`), not by the
+# distribution name. So: `pip install ursa-graph`, then `import ursa`.
+name = "ursa-graph"
+# Version is single-sourced from the Cargo workspace (`[workspace.package] version`
+# in the root Cargo.toml, inherited by ursa-py). maturin reads it at build time.
+dynamic = ["version"]
 description = "Polars-shaped dataframes for graph data — a Rust/Arrow/DataFusion graph analytics library."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +34,9 @@ dependencies = [
 polars = ["polars>=1.0"]
 
 [project.urls]
+Homepage = "https://github.com/cldixon/ursa"
 Repository = "https://github.com/cldixon/ursa"
+Issues = "https://github.com/cldixon/ursa/issues"
 
 # --- uv-managed development tooling (PEP 735 dependency groups) --------------
 # Installed by `uv sync`; not part of the published wheel's dependencies.

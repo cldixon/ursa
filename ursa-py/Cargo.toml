@@ -18,4 +18,8 @@ ursa-plan = { path = "../ursa-plan" }
 # `pyarrow` feature gives zero-copy Arrow interchange with Python (FromPyArrow /
 # ToPyArrow via the C data interface). It pins pyo3, so it must match ours.
 arrow = { workspace = true, features = ["pyarrow"] }
-pyo3 = { workspace = true, features = ["extension-module"] }
+# `abi3-py310` builds against CPython's stable ABI (limited API), so a single
+# wheel per platform (`cp310-abi3`) loads on every Python >= 3.10 — matching our
+# `requires-python`. This is the same strategy Polars and Daft ship. Only the C
+# data interface (PyCapsule) is used across the boundary, which is abi3-safe.
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }
