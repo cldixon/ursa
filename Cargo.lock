@@ -3207,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "rand 0.8.7",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-plan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3233,7 +3233,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-py"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "pyo3",

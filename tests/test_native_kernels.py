@@ -5,6 +5,8 @@ Skipped automatically if the native extension has not been built
 return correct answers through the Python boundary.
 """
 
+import re
+
 import pytest
 
 import ursa as ur
@@ -15,7 +17,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_core_version_loads():
-    assert ur.__core_version__ == "0.1.0"
+    # Version is single-sourced from the Cargo workspace, so assert its shape
+    # (a semver string) rather than a literal that breaks on every bump.
+    version = ur.__core_version__
+    assert isinstance(version, str)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version)
 
 
 def test_demo_degree():
