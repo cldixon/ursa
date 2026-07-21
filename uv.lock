@@ -293,8 +293,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ursa"
-version = "0.1.0"
+name = "ursa-graph"
 source = { editable = "." }
 dependencies = [
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
