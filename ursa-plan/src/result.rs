@@ -13,9 +13,10 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use ursa_core::algo::{
-    betweenness, closeness, clustering_coefficient, connected_components_weak, degree, k_hop,
-    label_propagation, louvain, neighbor_aggregate, pagerank, pagerank_weighted, random_walk,
-    shortest_path, shortest_path_weighted, triangle_count, AggKind, PageRankParams,
+    betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_coefficient,
+    connected_components_weak, degree, k_hop, label_propagation, louvain, louvain_weighted,
+    neighbor_aggregate, pagerank, pagerank_weighted, random_walk, shortest_path,
+    shortest_path_weighted, triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -121,15 +122,29 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> Arr
         GraphAlgo::ClusteringCoefficient => {
             Arc::new(Float64Array::from(clustering_coefficient(topo)))
         }
-        GraphAlgo::Closeness => Arc::new(Float64Array::from(closeness(topo))),
+        GraphAlgo::Closeness => {
+            let scores = match weights {
+                Some(w) => closeness_weighted(topo, w),
+                None => closeness(topo),
+            };
+            Arc::new(Float64Array::from(scores))
+        }
         GraphAlgo::Betweenness { sample } => {
-            Arc::new(Float64Array::from(betweenness(topo, *sample)))
+            let scores = match weights {
+                Some(w) => betweenness_weighted(topo, w, *sample),
+                None => betweenness(topo, *sample),
+            };
+            Arc::new(Float64Array::from(scores))
         }
         GraphAlgo::LabelPropagation { max_iter, seed } => {
             Arc::new(UInt32Array::from(label_propagation(topo, *max_iter, *seed)))
         }
         GraphAlgo::Louvain { resolution, seed } => {
-            Arc::new(UInt32Array::from(louvain(topo, *resolution, *seed)))
+            let labels = match weights {
+                Some(w) => louvain_weighted(topo, w, *resolution, *seed),
+                None => louvain(topo, *resolution, *seed),
+            };
+            Arc::new(UInt32Array::from(labels))
         }
     }
 }

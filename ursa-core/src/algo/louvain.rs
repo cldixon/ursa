@@ -26,6 +26,26 @@ use crate::topology::Topology;
 /// Community label per node (contiguous `0..k`). Deterministic given `seed`
 /// (defaulting to a fixed seed when `None`, so an unseeded run is reproducible).
 pub fn louvain(topo: &Topology, resolution: f64, seed: Option<u64>) -> Vec<u32> {
+    louvain_impl(topo, None, resolution, seed)
+}
+
+/// Weighted Louvain: as [`louvain`], but edge weights come from `weights` (per
+/// edge row via `edge_ids`; non-negative, `len == n_edges`) instead of unity.
+pub fn louvain_weighted(
+    topo: &Topology,
+    weights: &[f64],
+    resolution: f64,
+    seed: Option<u64>,
+) -> Vec<u32> {
+    louvain_impl(topo, Some(weights), resolution, seed)
+}
+
+fn louvain_impl(
+    topo: &Topology,
+    weights: Option<&[f64]>,
+    resolution: f64,
+    seed: Option<u64>,
+) -> Vec<u32> {
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();
@@ -36,7 +56,7 @@ pub fn louvain(topo: &Topology, resolution: f64, seed: Option<u64>) -> Vec<u32> 
     }
 
     let seed = seed.unwrap_or(DEFAULT_SEED);
-    let mut graph = Graph::from_topology(topo);
+    let mut graph = Graph::from_topology(topo, weights);
     // Community of each *original* node, expressed in the current graph's node
     // space; updated (composed) at every level.
     let mut node_comm: Vec<u32> = (0..n as u32).collect();
@@ -139,18 +159,21 @@ impl Graph {
         self.adj.len()
     }
 
-    fn from_topology(topo: &Topology) -> Graph {
+    /// Build the initial undirected working graph. `weights` (per edge row, gathered
+    /// via `edge_ids`) sets each edge's weight; `None` uses unit weights.
+    fn from_topology(topo: &Topology, weights: Option<&[f64]>) -> Graph {
         let n = topo.n_nodes();
         let mut nbr: Vec<HashMap<u32, f64>> = vec![HashMap::new(); n];
         let mut self_loop = vec![0.0f64; n];
         let out = topo.out();
         for u in 0..n as u32 {
-            for &v in out.neighbors(u) {
+            for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                let w = weights.map_or(1.0, |ws| ws[e as usize]);
                 if u == v {
-                    self_loop[u as usize] += 1.0;
+                    self_loop[u as usize] += w;
                 } else {
-                    *nbr[u as usize].entry(v).or_insert(0.0) += 1.0;
-                    *nbr[v as usize].entry(u).or_insert(0.0) += 1.0;
+                    *nbr[u as usize].entry(v).or_insert(0.0) += w;
+                    *nbr[v as usize].entry(u).or_insert(0.0) += w;
                 }
             }
         }
@@ -269,5 +292,29 @@ mod tests {
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
         assert!(louvain(&t, 1.0, None).is_empty());
+    }
+
+    #[test]
+    fn weighted_uniform_matches_unweighted() {
+        // Unit weights on every edge reproduce the unweighted partition.
+        let t = two_cliques();
+        let ones = vec![1.0; t.n_edges()];
+        assert_eq!(
+            louvain_weighted(&t, &ones, 1.0, Some(1)),
+            louvain(&t, 1.0, Some(1))
+        );
+    }
+
+    #[test]
+    fn weighted_can_reassign_the_bridge_endpoints() {
+        // Two triangles {0,1,2} and {3,4,5} joined by 2-3. With the bridge weighted
+        // far heavier than the intra-triangle edges, 2 and 3 bind together.
+        // edges: 0-1,1-2,2-0 (triangle A), 3-4,4-5,5-3 (triangle B), 2-3 (bridge)
+        let src = vec![0, 1, 2, 3, 4, 5, 2];
+        let dst = vec![1, 2, 0, 4, 5, 3, 3];
+        let t = Topology::build(6, src, dst);
+        let heavy_bridge = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0];
+        let comm = louvain_weighted(&t, &heavy_bridge, 1.0, Some(1));
+        assert_eq!(comm[2], comm[3], "a heavy bridge binds its endpoints");
     }
 }

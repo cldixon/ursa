@@ -293,9 +293,15 @@ pub fn execute_node_query(
             let weights = match &spec.weight {
                 None => None,
                 Some(weight_json) => {
-                    if !matches!(algo, GraphAlgo::PageRank { .. }) {
+                    if !matches!(
+                        algo,
+                        GraphAlgo::PageRank { .. }
+                            | GraphAlgo::Closeness
+                            | GraphAlgo::Betweenness { .. }
+                            | GraphAlgo::Louvain { .. }
+                    ) {
                         return Err(DataFusionError::NotImplemented(format!(
-                            "weight= is not supported for {:?} yet (v0.1: pagerank, shortest_path)",
+                            "weight= is not supported for {:?}",
                             spec.kind
                         )));
                     }

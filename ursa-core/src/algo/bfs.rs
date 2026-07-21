@@ -154,9 +154,10 @@ fn visit_weighted_neighbors<F: FnMut(u32, f64)>(
 
 /// Total order over `f64` (only `PartialOrd` by default) so distances can key a
 /// `BinaryHeap`. Uses `total_cmp`, which orders NaN consistently; real distances
-/// here are non-negative and finite.
+/// here are non-negative and finite. Shared by the weighted kernels (Dijkstra
+/// distances, weighted Brandes).
 #[derive(PartialEq)]
-struct TotalF64(f64);
+pub(crate) struct TotalF64(pub(crate) f64);
 impl Eq for TotalF64 {}
 impl PartialOrd for TotalF64 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -167,6 +168,47 @@ impl Ord for TotalF64 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&other.0)
     }
+}
+
+/// Weighted single-source distances (Dijkstra): `dist[v]` is the minimum total
+/// edge weight from `source` to `v`, `+INFINITY` if unreachable, `0.0` for the
+/// source. The weighted analogue of [`bfs_distances`], reused by weighted
+/// closeness. `weights` must be non-negative (validated by the caller).
+pub fn dijkstra_distances(
+    topo: &Topology,
+    weights: &[f64],
+    source: u32,
+    dir: Direction,
+) -> Vec<f64> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = topo.n_nodes();
+    let mut dist = vec![f64::INFINITY; n];
+    if (source as usize) >= n {
+        return dist;
+    }
+    let mut settled = vec![false; n];
+    dist[source as usize] = 0.0;
+    let mut heap = BinaryHeap::new();
+    heap.push(Reverse((TotalF64(0.0), source)));
+
+    while let Some(Reverse((TotalF64(du), u))) = heap.pop() {
+        if settled[u as usize] {
+            continue;
+        }
+        settled[u as usize] = true;
+        visit_weighted_neighbors(topo, u, weights, dir, |v, w| {
+            if !settled[v as usize] {
+                let nd = du + w;
+                if nd < dist[v as usize] {
+                    dist[v as usize] = nd;
+                    heap.push(Reverse((TotalF64(nd), v)));
+                }
+            }
+        });
+    }
+    dist
 }
 
 /// Weighted single-pair shortest path (Dijkstra). Returns the inclusive dense node
