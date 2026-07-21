@@ -31,6 +31,8 @@ jobs:
     name: wheels (linux ${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
+      # Don't let one arch failing cancel the others — we want full signal.
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
@@ -42,7 +44,12 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          # `ring` (pulled in by object_store's cloud TLS: aws/gcp/azure -> rustls)
+          # ships hand-written ARM assembly the manylinux cross-gcc can't build
+          # ("ARM assembler must define __ARM_ARCH"). Build the aarch64 leg with
+          # zig, which cross-compiles that assembly cleanly. maturin-action installs
+          # zig automatically when `--zig` is present and builds on the host.
+          args: --release --out dist ${{ matrix.target == 'aarch64' && '--zig' || '' }}
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
@@ -53,6 +60,7 @@ jobs:
     name: wheels (macos ${{ matrix.target }})
     runs-on: macos-latest
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
