@@ -64,6 +64,14 @@ manifest-path = "ursa-py/Cargo.toml"
 module-name = "ursa._ursa"
 python-source = "python"
 features = ["pyo3/extension-module"]
+# The workspace-root LICENSE files land in each wheel's dist-info, but the sdist is
+# built around ursa-py/ and would otherwise omit them — even though maturin still
+# writes `License-File:` metadata for them, which PyPI then rejects. Force them into
+# the sdist so the declared license files actually exist in the distribution.
+include = [
+    { path = "LICENSE-MIT", format = "sdist" },
+    { path = "LICENSE-APACHE", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

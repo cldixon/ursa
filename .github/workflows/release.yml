@@ -128,3 +128,8 @@ jobs:
           path: dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Uploads are per-file, not transactional: if one artifact is rejected
+          # after others uploaded, a re-run would otherwise hard-fail on the
+          # already-published files. Skip those and upload only what's missing.
+          skip-existing: true
