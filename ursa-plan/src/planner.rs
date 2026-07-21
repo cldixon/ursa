@@ -62,6 +62,7 @@ impl ExtensionPlanner for GraphExtensionPlanner {
                 n.source,
                 n.target,
                 n.direction,
+                n.weights.clone(),
             )) as Arc<dyn ExecutionPlan>));
         }
         if let Some(n) = any.downcast_ref::<RandomWalkNode>() {

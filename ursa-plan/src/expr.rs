@@ -17,7 +17,10 @@
 //! `ursa-py`); [`lower`] walks it to a `datafusion::logical_expr::Expr`, emitting
 //! the graph verbs as the custom logical nodes in [`crate::logical`] instead.
 
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr as DfExpr;
+use datafusion::logical_expr::{binary_expr, Operator};
+use serde_json::Value;
 
 /// A node in Ursa's expression dialect. This is the stable, engine-independent
 /// representation the Python bindings construct; `ursa-plan` owns its translation.
@@ -54,8 +57,115 @@ pub fn lower(expr: &UrsaExpr) -> DfExpr {
         UrsaExpr::LitI64(v) => lit(*v),
         UrsaExpr::LitF64(v) => lit(*v),
         UrsaExpr::LitStr(v) => lit(v.clone()),
+        UrsaExpr::Binary { op, left, right } => {
+            let operator = match op.as_str() {
+                "+" => Operator::Plus,
+                "-" => Operator::Minus,
+                "*" => Operator::Multiply,
+                "/" => Operator::Divide,
+                // parse_ursa_expr rejects any other op before lowering.
+                other => todo!("lower binary op {other:?} — see module docs"),
+            };
+            binary_expr(lower(left), operator, lower(right))
+        }
         // TODO(v0.1): Src/Dst/Id resolve against the frame's role mapping;
-        // Binary maps to df binary_expr; graph verbs -> custom logical nodes.
+        // graph verbs -> custom logical nodes.
         other => todo!("lower {other:?} — see module docs"),
+    }
+}
+
+/// Parse the JSON an Ursa `Expr` tree serializes to (from `ursa-py`'s Python
+/// layer) into an [`UrsaExpr`]. Supports the subset a v0.1 **weight** expression
+/// needs — `ur.col`, numeric/string literals, and `+ - * /` — erroring clearly on
+/// anything else (role refs, comparisons, boolean ops, graph verbs).
+pub fn parse_ursa_expr(v: &Value) -> Result<UrsaExpr> {
+    let err = |m: &str| DataFusionError::Execution(m.to_string());
+    let kind = v
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| err("expression node missing 'kind'"))?;
+    match kind {
+        "col" => {
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err("col node missing 'name'"))?;
+            Ok(UrsaExpr::Column(name.to_string()))
+        }
+        "lit" => {
+            let value = v
+                .get("value")
+                .ok_or_else(|| err("lit node missing 'value'"))?;
+            if let Some(i) = value.as_i64() {
+                Ok(UrsaExpr::LitI64(i))
+            } else if let Some(f) = value.as_f64() {
+                Ok(UrsaExpr::LitF64(f))
+            } else if let Some(s) = value.as_str() {
+                Ok(UrsaExpr::LitStr(s.to_string()))
+            } else {
+                Err(err("unsupported literal type in weight expression"))
+            }
+        }
+        "binary" => {
+            let op = v
+                .get("op")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err("binary node missing 'op'"))?;
+            if !matches!(op, "+" | "-" | "*" | "/") {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "weight expression supports + - * / over columns and literals; \
+                     operator {op:?} is not supported"
+                )));
+            }
+            let left = parse_ursa_expr(
+                v.get("left")
+                    .ok_or_else(|| err("binary node missing 'left'"))?,
+            )?;
+            let right = parse_ursa_expr(
+                v.get("right")
+                    .ok_or_else(|| err("binary node missing 'right'"))?,
+            )?;
+            Ok(UrsaExpr::Binary {
+                op: op.to_string(),
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        other => Err(DataFusionError::NotImplemented(format!(
+            "weight expression node {other:?} is not supported \
+             (use ur.col, numeric literals, and + - * /)"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_lowers_col_times_col() {
+        let json = serde_json::json!({
+            "kind": "binary", "op": "*",
+            "left": {"kind": "col", "name": "amount"},
+            "right": {"kind": "col", "name": "fx_rate"},
+        });
+        let expr = parse_ursa_expr(&json).unwrap();
+        // lowers without panicking to a DataFusion binary expr
+        let _df = lower(&expr);
+        assert!(matches!(expr, UrsaExpr::Binary { .. }));
+    }
+
+    #[test]
+    fn rejects_unsupported_nodes_and_ops() {
+        // a comparison op is not a valid weight expression
+        let cmp = serde_json::json!({
+            "kind": "binary", "op": ">",
+            "left": {"kind": "col", "name": "a"},
+            "right": {"kind": "lit", "value": 1},
+        });
+        assert!(parse_ursa_expr(&cmp).is_err());
+        // a role reference is not supported
+        let role = serde_json::json!({"kind": "src"});
+        assert!(parse_ursa_expr(&role).is_err());
     }
 }

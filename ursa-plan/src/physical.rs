@@ -228,6 +228,7 @@ pub struct ShortestPathExec {
     source: u32,
     target: u32,
     direction: Direction,
+    weights: Option<Arc<Vec<f64>>>,
     schema: SchemaRef,
     properties: PlanProperties,
 }
@@ -239,6 +240,7 @@ impl ShortestPathExec {
         source: u32,
         target: u32,
         direction: Direction,
+        weights: Option<Arc<Vec<f64>>>,
     ) -> Self {
         let schema = path_schema(ids.user_type());
         let properties = PlanProperties::new(
@@ -253,6 +255,7 @@ impl ShortestPathExec {
             source,
             target,
             direction,
+            weights,
             schema,
             properties,
         }
@@ -301,15 +304,23 @@ impl ExecutionPlan for ShortestPathExec {
         let schema = self.schema.clone();
         let topo = self.topology.clone();
         let ids = self.ids.clone();
+        let weights = self.weights.clone();
         let (source, target, direction) = (self.source, self.target, self.direction);
 
         // CPU-bound frontier walk — keep it off the tokio worker.
         let fut = async move {
-            tokio::task::spawn_blocking(move || path_batch(&topo, &ids, source, target, direction))
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("shortest_path kernel panicked: {e}"))
-                })
+            tokio::task::spawn_blocking(move || {
+                path_batch(
+                    &topo,
+                    &ids,
+                    source,
+                    target,
+                    direction,
+                    weights.as_deref().map(Vec::as_slice),
+                )
+            })
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("shortest_path kernel panicked: {e}")))
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
@@ -440,6 +451,7 @@ mod tests {
             algo: GraphAlgo::Degree {
                 direction: PlanDirection::Out,
             },
+            weights: None,
         }]);
         let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns));
         let ctx = Arc::new(TaskContext::default());

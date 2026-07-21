@@ -28,6 +28,7 @@ def run_node_query(
     limit: int | None = ...,
     nodes: Any | None = ...,
     nodes_id: str | None = ...,
+    edges: Any | None = ...,
 ) -> Any: ...
 
 # A hop traversal: a built index + int64 seed array + n/direction + relational
@@ -51,7 +52,8 @@ def run_path_query(
     source: Any,
     target: Any,
     direction: str,
-    weighted: bool = ...,
+    weight: str | None = ...,
+    edges: Any | None = ...,
     filters: list[tuple[str, str, float]] = ...,
     sort: tuple[str, bool] | None = ...,
     limit: int | None = ...,
@@ -87,7 +89,11 @@ def graph_describe(index: GraphIndex, full: bool) -> Any: ...
 # Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> (src, dst)
 # pyarrow.RecordBatch. storage_options seeds the object-store backend.
 def scan_edges_arrow(
-    path: str, src: str, dst: str, storage_options: dict[str, str] | None = ...
+    path: str,
+    src: str,
+    dst: str,
+    storage_options: dict[str, str] | None = ...,
+    weight_columns: list[str] = ...,
 ) -> Any: ...
 
 # Scan a Parquet/CSV node file -> full attribute pyarrow.RecordBatch (id cast int64).

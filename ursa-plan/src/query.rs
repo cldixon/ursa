@@ -30,6 +30,7 @@ use crate::logical::{Direction, GraphAlgo};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{is_executable, path_schema, OutputColumn};
+use crate::weight::evaluate_weight;
 
 /// A single `column <op> literal` comparison (`op` in `> >= < <= == !=`).
 #[derive(Debug, Clone)]
@@ -64,6 +65,9 @@ struct ColumnSpec {
     agg_fn: Option<String>,
     #[serde(default)]
     agg_column: Option<String>,
+    // weighted-algorithm field: the serialized weight expression (over edge cols).
+    #[serde(default)]
+    weight: Option<serde_json::Value>,
 }
 
 impl ColumnSpec {
@@ -244,6 +248,7 @@ pub fn execute_node_query(
     limit: Option<usize>,
     nodes: Option<RecordBatch>,
     nodes_id: Option<String>,
+    edges: Option<RecordBatch>,
 ) -> Result<RecordBatch> {
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
@@ -282,9 +287,40 @@ pub fn execute_node_query(
                     "graph algorithm {algo:?} is not wired into the execution path"
                 )));
             }
+            // A weight expression (over edge columns) is evaluated to one f64 per
+            // edge row against the edge attribute batch; the kernel gathers it via
+            // edge_ids. v0.1 supports it only on pagerank.
+            let weights = match &spec.weight {
+                None => None,
+                Some(weight_json) => {
+                    if !matches!(algo, GraphAlgo::PageRank { .. }) {
+                        return Err(DataFusionError::NotImplemented(format!(
+                            "weight= is not supported for {:?} yet (v0.1: pagerank, shortest_path)",
+                            spec.kind
+                        )));
+                    }
+                    let edges_ref = edges.as_ref().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "a weighted algorithm needs the edge table, but none was provided"
+                                .into(),
+                        )
+                    })?;
+                    let w = evaluate_weight(edges_ref, &weight_json.to_string())?;
+                    if w.len() != topology.n_edges() {
+                        return Err(DataFusionError::Execution(format!(
+                            "weight array length ({}) does not match the edge count ({}); the edge \
+                             table and the graph are misaligned",
+                            w.len(),
+                            topology.n_edges()
+                        )));
+                    }
+                    Some(Arc::new(w))
+                }
+            };
             columns.push(OutputColumn::Algo {
                 name: spec.name.clone(),
                 algo,
+                weights,
             });
         }
     }
@@ -405,18 +441,36 @@ pub fn execute_path_query(
     source: &dyn Array,
     target: &dyn Array,
     direction: &str,
-    weighted: bool,
+    weight: Option<&str>,
+    edges: Option<RecordBatch>,
     filters: &[Comparison],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
 ) -> Result<RecordBatch> {
-    if weighted {
-        return Err(DataFusionError::NotImplemented(
-            "weighted shortest_path is not supported yet; omit weight= for unweighted BFS".into(),
-        ));
-    }
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
+
+    // A weight expression (over edge columns) becomes one non-negative f64 per
+    // edge row; Dijkstra gathers it via edge_ids. Omit for unweighted BFS.
+    let weights = match weight {
+        None => None,
+        Some(weight_json) => {
+            let edges_ref = edges.as_ref().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "weighted shortest_path needs the edge table, but none was provided".into(),
+                )
+            })?;
+            let w = evaluate_weight(edges_ref, weight_json)?;
+            if w.len() != topology.n_edges() {
+                return Err(DataFusionError::Execution(format!(
+                    "weight array length ({}) does not match the edge count ({})",
+                    w.len(),
+                    topology.n_edges()
+                )));
+            }
+            Some(Arc::new(w))
+        }
+    };
 
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
     // index. An unknown (or absent) endpoint -> no path (an empty edge frame),
@@ -437,7 +491,7 @@ pub fn execute_path_query(
 
     let path_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(ShortestPathNode::new(
-            topology, ids, source, target, direction, false,
+            topology, ids, source, target, direction, weights,
         )),
     });
 
@@ -565,6 +619,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(batch.num_columns(), 2);
@@ -586,6 +641,7 @@ mod tests {
             }],
             Some(("pr".into(), true)),
             Some(1),
+            None,
             None,
             None,
         )
@@ -613,6 +669,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(err.is_err());
     }
@@ -631,7 +688,7 @@ mod tests {
         ] {
             let (t, ids) = build(&src, &dst);
             let spec = format!(r#"[{{"name":"v","kind":"{kind}"}}]"#);
-            let batch = execute_node_query(t, ids, &spec, &[], None, None, None, None)
+            let batch = execute_node_query(t, ids, &spec, &[], None, None, None, None, None)
                 .unwrap_or_else(|e| panic!("{kind} failed: {e}"));
             assert_eq!(batch.num_rows(), 4, "{kind}");
             assert_eq!(batch.schema().field(1).data_type(), &want, "{kind}");
@@ -668,6 +725,7 @@ mod tests {
             None,
             Some(nodes),
             Some("id".into()),
+            None,
         )
         .unwrap();
 
@@ -708,6 +766,7 @@ mod tests {
             None,
             Some(nodes),
             Some("id".into()),
+            None,
         )
         .unwrap();
 
@@ -759,6 +818,7 @@ mod tests {
             None,
             Some(nodes),
             Some("id".into()),
+            None,
         )
         .unwrap();
 
@@ -809,7 +869,7 @@ mod tests {
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![3]));
         let batch =
-            execute_path_query(t, ids, &s, &tg, "out", false, &[], None, None, false).unwrap();
+            execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false).unwrap();
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
@@ -831,7 +891,7 @@ mod tests {
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![99]));
         let batch =
-            execute_path_query(t, ids, &s, &tg, "out", false, &[], None, None, false).unwrap();
+            execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false).unwrap();
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 0);
     }
@@ -842,7 +902,20 @@ mod tests {
         let dst = Int64Array::from(vec![1, 2]);
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![2]));
-        let err = execute_path_query(t, ids, &s, &tg, "out", true, &[], None, None, false);
+        // A weighted path without the edge table cannot resolve the weight.
+        let err = execute_path_query(
+            t,
+            ids,
+            &s,
+            &tg,
+            "out",
+            Some(r#"{"kind":"col","name":"w"}"#),
+            None,
+            &[],
+            None,
+            None,
+            false,
+        );
         assert!(err.is_err());
     }
 
@@ -902,6 +975,7 @@ mod tests {
             None,
             Some(nodes),
             Some("id".into()),
+            None,
         );
         assert!(err.is_err()); // mean over strings is not supported
     }
