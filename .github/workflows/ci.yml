@@ -62,8 +62,11 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: test core + plan
-        run: cargo test -p ursa-core -p ursa-plan --locked
+      # ursa-py is included here (not just core+plan): with `extension-module`
+      # behind a feature, ursa-py's rlib now links a normal interpreter, so its
+      # test binary builds. This guards the fix against regressing.
+      - name: test core + plan + py
+        run: cargo test -p ursa-core -p ursa-plan -p ursa-py --locked
 
       # Ensures ursa-py (PyO3 extension) also compiles.
       - name: check workspace

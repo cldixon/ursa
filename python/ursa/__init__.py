@@ -25,6 +25,7 @@ path.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
 
 # --- Expression dialect (pure Python, always available) ---------------------
@@ -78,7 +79,12 @@ except ImportError:  # pragma: no cover - native module not yet built
     __core_version__ = None
     _NATIVE_AVAILABLE = False
 
-__version__ = "0.1.0"
+# Single-sourced from the installed distribution metadata (which maturin fills
+# from the Cargo workspace version), so it never drifts from __core_version__.
+try:
+    __version__ = version("ursa-graph")
+except PackageNotFoundError:  # source checkout without an install
+    __version__ = "0.0.0+dev"
 
 __all__ = [
     "EdgeFrame",

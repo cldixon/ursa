@@ -296,6 +296,7 @@ wheels = [
 name = "ursa-graph"
 source = { editable = "." }
 dependencies = [
+    { name = "pyarrow" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 
@@ -318,6 +319,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0" },
+    { name = "pyarrow", specifier = ">=15.0" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4.0" },
 ]
 provides-extras = ["polars"]
