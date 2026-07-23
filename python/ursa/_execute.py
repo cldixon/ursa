@@ -119,13 +119,20 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     """Execute a composed ``edges.nodes().with_columns(...).filter/sort/head``."""
     # describe() is a whole-graph summary, computed eagerly off the topology and
     # wrapped as a one-row frame (its own branch — not a per-node algorithm).
-    for step in frame._plan:
-        if step.op == "describe":
-            index = _require_index(step.args["edges"])
-            batch = _native().graph_describe(index, bool(step.args.get("full", False)))
-            return MaterializedFrame(batch)
-        if step.op == "random_walk":
-            return _collect_random_walk(frame, step)
+    describe_step = next((s for s in frame._plan if s.op == "describe"), None)
+    if describe_step is not None:
+        if any(s.op != "describe" for s in frame._plan):
+            raise NotImplementedError(
+                "describe() output does not support a filter/sort/head tail yet; "
+                "call describe() as the final step of the pipeline."
+            )
+        index = _require_index(describe_step.args["edges"])
+        batch = _native().graph_describe(index, bool(describe_step.args.get("full", False)))
+        return MaterializedFrame(batch)
+
+    walk_step = next((s for s in frame._plan if s.op == "random_walk"), None)
+    if walk_step is not None:
+        return _collect_random_walk(frame, walk_step)
 
     graph_exprs: dict[str, Expr] | None = None
     filters: list[tuple[str, str, float]] = []
@@ -134,7 +141,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
 
     for step in frame._plan:
         op = step.op
-        if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "rename"):
+        # `reverse` is metadata: the reversed edges ride on the edges frame (source
+        # swapped), so a graph op over them builds the transpose. `rename` is NOT a
+        # passthrough — it must reach the else and raise rather than be dropped.
+        if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
             continue  # source / metadata steps
         if op == "with_columns":
             if graph_exprs is not None:
@@ -154,10 +164,9 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             )
 
     if not graph_exprs:
-        raise NotImplementedError(
-            "collect() on a NodeFrame needs a with_columns of graph algorithms "
-            "(e.g. edges.nodes().with_columns(pr=ur.pagerank(edges)).collect())."
-        )
+        # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
+        # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
+        return _collect_plain_nodes(frame, filters, sort, limit)
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
@@ -184,7 +193,7 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
     limit: int | None = None
     distinct = False
 
-    _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes", "rename"}
+    _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes"}
     for s in frame._plan:
         op = s.op
         if op in _passthrough:
@@ -264,16 +273,19 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         op = step.op
         if op in ("hop", "shortest_path"):
             traversal = step
-        elif op in (
-            "scan_edges",
-            "from_arrow",
-            "from_polars",
-            "nodes",
-            "reverse",
-            "select",
-            "rename",
-        ):
+        elif op in ("scan_edges", "from_arrow", "from_polars", "nodes"):
             continue  # source / metadata steps
+        elif op == "reverse":
+            # Metadata on a plain frame (the swapped source rides on the frame).
+            # After a traversal its semantics are undesigned -> reject rather than
+            # silently ignore. `select`/`rename` are not passthroughs: they fall to
+            # the else and raise instead of being dropped.
+            if traversal is not None:
+                raise NotImplementedError(
+                    "reverse() after a traversal (hop/shortest_path) is not supported; "
+                    "reverse the edges before the traversal."
+                )
+            continue
         elif op == "filter":
             filters.append(_parse_filter(step.args["predicate"]))
         elif op == "sort":
@@ -284,15 +296,15 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             distinct = True
         else:
             raise NotImplementedError(
-                f"collect() does not yet support the '{op}' step after a traversal."
+                f"collect() does not yet support the '{op}' step on an edge frame."
             )
 
     if traversal is None:
-        raise NotImplementedError(
-            "collect() on an EdgeFrame is supported for traversals (ur.hop, "
-            "ur.shortest_path) in v0.1; to compute metrics, call an algorithm on it "
-            "(e.g. ur.pagerank(edges))."
-        )
+        # No traversal: a plain edge frame (scan_edges / from_arrow / read_edges,
+        # or a reversed frame). Materialize its edge rows + filter/sort/head tail.
+        if distinct:
+            raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
+        return _collect_plain_edges(frame, filters, sort, limit)
 
     index = _require_index(traversal.args["edges"])
     if traversal.op == "hop":
@@ -358,7 +370,19 @@ def _resolve_seeds(seeds: Any) -> Any:
         attr = _resolve_node_attr_table(seeds) if plain else None
         # A plain attribute table yields its ids directly; a derived frame
         # (filtered / computed) must be executed to get them.
-        tbl = pa.Table.from_batches([attr]) if attr is not None else seeds.collect().to_arrow()
+        if attr is not None:
+            tbl = pa.Table.from_batches([attr])
+        else:
+            try:
+                tbl = seeds.collect().to_arrow()
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    "the seed NodeFrame could not be materialized. Seeding a traversal / "
+                    "walk from a derived node frame (filtered, or with computed columns) "
+                    "needs that frame to be collectable; pass an explicit id iterable, a "
+                    "plain scan_nodes/from_arrow(id=...) frame, or precompute the ids. "
+                    f"(underlying: {exc})"
+                ) from exc
         name = seeds.id_col if seeds.id_col in tbl.column_names else "id"
         column = tbl.column(name)
         chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
@@ -416,6 +440,16 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         )
     p = expr.payload
     column: dict[str, Any] = {"name": name, "kind": verb}
+    if verb == "connected_components":
+        # Only weak components are wired; strong is a later release (SPEC). The
+        # Rust side hardcodes weak, so a non-weak mode must raise here rather than
+        # be silently computed as weak.
+        mode = p.get("mode", "weak")
+        if mode != "weak":
+            raise NotImplementedError(
+                f"connected_components(mode={mode!r}) is not supported yet; "
+                "only mode='weak' is wired."
+            )
     if verb == "pagerank":
         column.update(
             damping=p.get("damping", 0.85),
@@ -436,6 +470,13 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         column.update(resolution=p.get("resolution", 1.0), seed=p.get("seed"))
         _add_weight(column, p)
     elif verb == "neighbors_agg":
+        # from_= (resolve the aggregation against a different node frame) isn't
+        # wired: it would otherwise be recorded and silently ignored.
+        if p.get("from_") is not None:
+            raise NotImplementedError(
+                "neighbors(from_=...) is not supported yet; the aggregation resolves "
+                "against the frame it runs in."
+            )
         agg = p["agg"]
         operand = agg.payload.get("operand") if agg.kind == "agg" else None
         if agg.kind != "agg" or operand is None or operand.kind != "col":
@@ -498,6 +539,21 @@ def _require_edges(edges: EdgeFrame | None) -> tuple[Any, Any]:
         )
         return batch.column(0), batch.column(1)
 
+    # No source: give a message matched to *why* it's missing, not a generic one.
+    ops = {step.op for step in getattr(edges, "_plan", ())}
+    if ops & {"hop", "shortest_path"}:
+        raise NotImplementedError(
+            "chaining a graph op off a traversal result (hop/shortest_path) isn't "
+            "wired yet — a traversal result is a set of reached edges with no rebuildable "
+            "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
+            "further ops on it. (v0.2: child-plan seeding.)"
+        )
+    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
+        raise NotImplementedError(
+            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
+            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
+            "the source frame, or collect and re-ingest the filtered edges."
+        )
     raise NotImplementedError(
         "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or "
         "ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source."
@@ -555,6 +611,104 @@ def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
             "(e.g. .sort('pagerank', descending=True))."
         )
     return (by, bool(args.get("descending", False)))
+
+
+# --- plain-source collection (no algorithm/traversal) ----------------------
+# Materialize a frame's own rows and apply the filter/sort/head tail in pyarrow.
+# Used by read_edges/read_nodes and scan_*/from_* frames collected without a
+# graph op (e.g. scan_edges(...).to_polars()).
+def _apply_pyarrow_tail(
+    table: Any,
+    filters: list[tuple[str, str, float]],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+) -> Any:
+    import pyarrow.compute as pc
+
+    # pyarrow.compute's comparison kernels, by op (looked up by name so the type
+    # checker — which lacks pyarrow.compute stubs — doesn't flag each one).
+    cmp = {
+        ">": "greater",
+        ">=": "greater_equal",
+        "<": "less",
+        "<=": "less_equal",
+        "==": "equal",
+        "!=": "not_equal",
+    }
+    for column, op, value in filters:
+        if column not in table.column_names:
+            raise ValueError(f"filter references unknown column '{column}'.")
+        table = table.filter(getattr(pc, cmp[op])(table.column(column), value))
+    if sort is not None:
+        by, descending = sort
+        if by not in table.column_names:
+            raise ValueError(f"sort references unknown column '{by}'.")
+        table = table.sort_by([(by, "descending" if descending else "ascending")])
+    if limit is not None:
+        table = table.slice(0, limit)
+    return table
+
+
+def _table_to_batch(table: Any) -> Any:
+    """A single pyarrow RecordBatch for a (possibly multi-chunk or empty) Table."""
+    import pyarrow as pa
+
+    table = table.combine_chunks()
+    batches = table.to_batches()
+    if batches:
+        return batches[0]
+    # zero-row result: an empty batch that still carries the schema
+    return pa.RecordBatch.from_arrays(
+        [pa.array([], type=field.type) for field in table.schema], schema=table.schema
+    )
+
+
+def _collect_plain_nodes(
+    frame: NodeFrame,
+    filters: list[tuple[str, str, float]],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+) -> MaterializedFrame:
+    import pyarrow as pa
+
+    attr = _resolve_node_attr_table(frame)
+    if attr is None:
+        raise NotImplementedError(
+            "collect() on this NodeFrame needs a source (scan_nodes / from_arrow(id=...)) "
+            "or a with_columns of graph algorithms; a bare edges.nodes() has no "
+            "materializable node set yet."
+        )
+    table = _apply_pyarrow_tail(pa.Table.from_batches([attr]), filters, sort, limit)
+    return MaterializedFrame(_table_to_batch(table))
+
+
+def _collect_plain_edges(
+    frame: EdgeFrame,
+    filters: list[tuple[str, str, float]],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+) -> MaterializedFrame:
+    import pyarrow as pa
+
+    table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
+    if table is None:
+        scan = getattr(frame, "_scan_spec", None)
+        if scan is not None:
+            path = scan["path"]
+            if not isinstance(path, str):
+                raise NotImplementedError(
+                    "collect() over a scan_edges source supports a single string path "
+                    "(glob included) for now, not a list of paths."
+                )
+            batch = _native().scan_edges_arrow(
+                path, scan["src"], scan["dst"], _scan_storage_options(scan), []
+            )
+            table = pa.Table.from_batches([batch]).rename_columns([scan["src"], scan["dst"]])
+        else:
+            # No source: a filtered/derived (or traversal-result) edge frame.
+            _require_edges(frame)  # raises the precise, plan-aware message
+    table = _apply_pyarrow_tail(table, filters, sort, limit)
+    return MaterializedFrame(_table_to_batch(table))
 
 
 def _native() -> Any:

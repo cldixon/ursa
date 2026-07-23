@@ -128,7 +128,9 @@ class _Frame:
     def sink_parquet(self, path: str, **opts: Any) -> None:
         raise NotImplementedError(f"sink_parquet() {_ENGINE_TODO}")
 
-    def sink_csv(self, path: str, **opts: Any) -> None:
+    # No **opts: CSV write options aren't threaded through, so accepting them
+    # would silently drop them (sink_parquet does forward its opts to pyarrow).
+    def sink_csv(self, path: str) -> None:
         raise NotImplementedError(f"sink_csv() {_ENGINE_TODO}")
 
     def __repr__(self) -> str:
@@ -237,12 +239,23 @@ class EdgeFrame(_Frame):
         )
 
     def reverse(self) -> EdgeFrame:
-        """Swap the src/dst roles. Metadata-only — no data movement."""
+        """Swap the src/dst roles. Metadata-only — no data movement.
+
+        The in-memory source arrays / scan spec are carried through with src and
+        dst swapped, so graph ops on the reversed frame build the transpose CSR
+        (``degree(edges.reverse(), 'out') == degree(edges, 'in')``). The index is
+        dropped and rebuilt on the swapped edges rather than reused (reusing the
+        parent topology with flipped direction is a future optimization)."""
+        src = self._source
+        scan = self._scan
         return EdgeFrame(
             self._dst_col,
             self._src_col,
             (*self._plan, _PlanStep("reverse", {})),
             has_index=False,  # transpose becomes the new "out" direction
+            source=(src[1], src[0]) if src is not None else None,
+            scan={**scan, "src": scan["dst"], "dst": scan["src"]} if scan is not None else None,
+            edge_table=self._edge_table,
         )
 
     # A frame-positioned traversal (ur.hop) executes here, returning the reached
@@ -266,7 +279,7 @@ class EdgeFrame(_Frame):
     def sink_parquet(self, path: str, **opts: Any) -> None:
         self.collect().sink_parquet(path, **opts)
 
-    def sink_csv(self, path: str, **opts: Any) -> None:
+    def sink_csv(self, path: str) -> None:
         self.collect().sink_csv(path)
 
     def __repr__(self) -> str:
@@ -340,7 +353,7 @@ class NodeFrame(_Frame):
     def sink_parquet(self, path: str, **opts: Any) -> None:
         self.collect().sink_parquet(path, **opts)
 
-    def sink_csv(self, path: str, **opts: Any) -> None:
+    def sink_csv(self, path: str) -> None:
         self.collect().sink_csv(path)
 
     def __repr__(self) -> str:
