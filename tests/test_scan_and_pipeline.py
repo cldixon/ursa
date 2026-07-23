@@ -373,11 +373,13 @@ def test_hop_requires_seeds():
         ur.hop(edges, n=1).collect()
 
 
-def test_plain_edge_frame_collect_is_honest():
-    # A bare EdgeFrame with no traversal step is not collectable on its own.
+def test_plain_edge_frame_collect_returns_the_edges():
+    # A bare EdgeFrame (no traversal/algorithm) now materializes its own edge rows
+    # rather than raising (the plain-source collect path).
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
-    with pytest.raises(NotImplementedError):
-        edges.collect()
+    got = edges.collect()
+    assert set(got.columns) == {"s", "d"}
+    assert sorted((r["s"], r["d"]) for r in got.to_dicts()) == sorted(zip(SRC, DST, strict=True))
 
 
 def test_shortest_path_returns_ordered_edges():

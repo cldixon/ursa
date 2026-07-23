@@ -72,8 +72,8 @@ class GraphExpr(Expr):
     def sink_parquet(self, path: str, **opts: Any) -> None:
         self._frame().sink_parquet(path, **opts)
 
-    def sink_csv(self, path: str, **opts: Any) -> None:
-        self._frame().sink_csv(path, **opts)
+    def sink_csv(self, path: str) -> None:
+        self._frame().sink_csv(path)
 
     def explain(self) -> str:
         return self._frame().explain()
@@ -141,7 +141,11 @@ class _Hop:
                 "edges": self._edges,
             },
         )
-        return EdgeFrame(src_col=self._edges.src_col, dst_col=self._edges.dst_col, plan=(step,))
+        # The collected batch has literal ``src``/``dst`` columns (seed -> reached),
+        # so the frame advertises those names — a tail filter references ``src``/
+        # ``dst``, matching what it actually gets. (The parent's role names aren't
+        # carried through a traversal.)
+        return EdgeFrame(src_col="src", dst_col="dst", plan=(step,))
 
     def collect(self):
         return self._materialize().collect()
@@ -175,7 +179,9 @@ def shortest_path(
             "edges": edges,
         },
     )
-    return EdgeFrame(src_col=edges.src_col, dst_col=edges.dst_col, plan=(step,))
+    # Result columns are literal ``src``/``dst`` (one row per edge on the path);
+    # advertise those names so a tail filter matches (see _Hop._materialize).
+    return EdgeFrame(src_col="src", dst_col="dst", plan=(step,))
 
 
 def random_walk(

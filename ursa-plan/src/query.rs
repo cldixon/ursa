@@ -41,7 +41,12 @@ pub struct Comparison {
 }
 
 /// One requested output column, deserialized from the Python query IR.
+///
+/// `deny_unknown_fields` makes an unrecognized JSON key a hard error rather than
+/// a silent drop — so a parameter added on the Python side that isn't wired here
+/// fails loudly instead of being ignored (the review's silent-drop class).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ColumnSpec {
     name: String,
     kind: String,

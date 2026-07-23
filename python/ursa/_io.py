@@ -20,6 +20,18 @@ if TYPE_CHECKING:
     from ._result import MaterializedFrame
 
 
+def _reject_format_opts(format_opts: dict[str, Any]) -> None:
+    """Format options (e.g. a CSV ``delimiter=``) are not plumbed into the scan
+    yet, so accepting and dropping them would silently ignore the caller. Raise
+    instead until they are threaded through to the Rust scan."""
+    if format_opts:
+        keys = ", ".join(sorted(format_opts))
+        raise NotImplementedError(
+            f"scan format options ({keys}) are not supported yet; they would be "
+            "silently ignored. Only Parquet/CSV with default parsing is wired."
+        )
+
+
 def scan_edges(
     path: str | list[str],
     *,
@@ -35,6 +47,7 @@ def scan_edges(
     pre-configured ``obstore`` store in place of ``storage_options`` (both bind
     the same underlying Rust ``object_store`` crate).
     """
+    _reject_format_opts(format_opts)
     step = _PlanStep(
         "scan_edges",
         {
@@ -69,6 +82,7 @@ def scan_nodes(
     **format_opts: Any,
 ) -> NodeFrame:
     """Lazily scan a node/attribute table; ``id`` is the id-role mapping."""
+    _reject_format_opts(format_opts)
     step = _PlanStep(
         "scan_nodes",
         {
