@@ -129,10 +129,10 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> Arr
             };
             Arc::new(Float64Array::from(scores))
         }
-        GraphAlgo::Betweenness { sample } => {
+        GraphAlgo::Betweenness { sample, seed } => {
             let scores = match weights {
-                Some(w) => betweenness_weighted(topo, w, *sample),
-                None => betweenness(topo, *sample),
+                Some(w) => betweenness_weighted(topo, w, *sample, *seed),
+                None => betweenness(topo, *sample, *seed),
             };
             Arc::new(Float64Array::from(scores))
         }

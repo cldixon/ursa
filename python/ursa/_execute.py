@@ -81,11 +81,17 @@ def _expr_columns(expr: Any) -> set[str]:
     return set()
 
 
-def _edge_attr_batch(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
-    """The edge attribute batch (a pyarrow RecordBatch) needed to evaluate a
-    weight expression, aligned to the graph's edge-row order. In-memory frames
-    subset their retained table; ``scan_edges`` frames re-read the referenced
-    columns from the file (same row order as the src/dst scan)."""
+def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
+    """The edge attribute batch (a pyarrow RecordBatch) for evaluating a weight
+    expression, aligned to the graph's edge-row order.
+
+    For a ``scan_edges`` frame this does **one** scan projecting ``src``, ``dst``
+    and the weight columns together, and builds (memoizes) the frame's topology
+    index from that same batch's endpoints. Reading endpoints and weights in the
+    same scan is what makes ``weights[edge_ids[k]]`` correct: a second, independent
+    scan could order partitions differently (globs/multi-partition listing order is
+    not a DataFusion contract), silently misaligning every weighted result (#37).
+    In-memory frames already share one retained table, so they just subset it."""
     if not weight_columns:
         return None
     cols = sorted(weight_columns)
@@ -103,9 +109,15 @@ def _edge_attr_batch(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
             raise NotImplementedError(
                 "weighted algorithms over a multi-path scan_edges source are not supported yet."
             )
-        return _native().scan_edges_arrow(
+        # One scan → [src, dst, *cols]. Build the index from THIS batch's endpoints
+        # so weights and edge_ids share a single, self-consistent edge order,
+        # overwriting any index memoized from an earlier endpoints-only scan.
+        combined = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
         )
+        with _INDEX_BUILD_LOCK:
+            edges._index = _native().build_index(combined.column(0), combined.column(1))
+        return combined
     raise NotImplementedError(
         "a weighted algorithm needs an in-memory or scan_edges source so the weight "
         "columns can be read."
@@ -180,7 +192,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         w = expr.payload.get("weight") if expr.kind == "graph" else None
         if w is not None:
             weight_cols |= _expr_columns(w)
-    edge_attr = _edge_attr_batch(edges, weight_cols) if weight_cols else None
+    # _prepare_weighted (for a scan source) also (re)builds the frame's index from
+    # the same scan, so _run_query's _require_index reuses it — endpoints and
+    # weights share one edge order.
+    edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
     return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id, edge_attr)
 
 
@@ -306,8 +321,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
         return _collect_plain_edges(frame, filters, sort, limit)
 
-    index = _require_index(traversal.args["edges"])
     if traversal.op == "hop":
+        index = _require_index(traversal.args["edges"])
         seeds = _resolve_seeds(traversal.args["seeds"])
         batch = _native().run_hop_query(
             index,
@@ -327,7 +342,10 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         edge_attr = None
         if weight is not None:
             weight_json = json.dumps(_expr_to_json(weight))
-            edge_attr = _edge_attr_batch(traversal.args["edges"], _expr_columns(weight))
+            # Prepare weights first: for a scan source this rebuilds the index from
+            # the same scan, so _require_index (below) reuses the aligned index.
+            edge_attr = _prepare_weighted(traversal.args["edges"], _expr_columns(weight))
+        index = _require_index(traversal.args["edges"])
         # source/target cross as 1-element user-id arrays (int64 or string),
         # resolved to dense indices in Rust — the same path as hop seeds.
         batch = _native().run_path_query(
@@ -463,6 +481,7 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         _add_weight(column, p)
     elif verb == "betweenness":
         column["sample"] = p.get("sample")
+        column["seed"] = p.get("seed")
         _add_weight(column, p)
     elif verb == "label_propagation":
         column.update(max_iter=p.get("max_iter", 20), seed=p.get("seed"))

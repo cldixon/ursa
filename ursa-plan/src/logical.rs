@@ -51,6 +51,7 @@ pub enum GraphAlgo {
     ClusteringCoefficient,
     Betweenness {
         sample: Option<f64>,
+        seed: Option<u64>,
     },
     Closeness,
     LabelPropagation {

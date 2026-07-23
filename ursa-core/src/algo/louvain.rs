@@ -107,20 +107,22 @@ fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
             // Gain of staying in ci (the baseline every move must strictly beat).
             let stay = weight_to.get(&ci).copied().unwrap_or(0.0)
                 - resolution * tot[ci as usize] * ku / graph.m2;
+            // Scan neighbour communities in ascending-id order, not `HashMap`
+            // iteration order (which varies per instance/run): with the epsilon,
+            // "tie" is non-transitive, so map order could change the partition on a
+            // same-seed rerun. Sorting makes it order-independent, and requiring a
+            // strict improvement (> best + eps) keeps the smallest id on a tie
+            // (it's seen first) without letting chained near-ties drag the anchor.
+            let mut candidates: Vec<(u32, f64)> = weight_to.iter().map(|(&c, &w)| (c, w)).collect();
+            candidates.sort_unstable_by_key(|&(c, _)| c);
             let mut best_c = ci;
             let mut best_gain = stay;
-            for (&c, &w_in) in &weight_to {
+            for (c, w_in) in candidates {
                 if c == ci {
                     continue;
                 }
                 let gain = w_in - resolution * tot[c as usize] * ku / graph.m2;
-                // Strictly better wins; equal gains break toward the smallest id
-                // (deterministic regardless of map order). Never tie into a move
-                // away from ci, so every accepted move strictly raises modularity
-                // and the loop terminates.
-                if gain > best_gain + 1e-12
-                    || ((gain - best_gain).abs() <= 1e-12 && best_c != ci && c < best_c)
-                {
+                if gain > best_gain + 1e-12 {
                     best_gain = gain;
                     best_c = c;
                 }
