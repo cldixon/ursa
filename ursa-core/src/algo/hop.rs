@@ -12,7 +12,29 @@
 //! Direction-optimizing BFS (Beamer top-down/bottom-up) is deferred — correctness
 //! first, per the spec's "naive placement first" stance.
 
+use rayon::prelude::*;
+
 use crate::topology::{Direction, Topology};
+
+/// Per-worker reusable BFS scratch, so a parallel seed sweep allocates the
+/// `n`-sized `visited` bitmap once per thread instead of once per seed.
+struct Scratch {
+    visited: Vec<bool>,
+    frontier: Vec<u32>,
+    next: Vec<u32>,
+    touched: Vec<u32>,
+}
+
+impl Scratch {
+    fn new(n: usize) -> Self {
+        Scratch {
+            visited: vec![false; n],
+            frontier: Vec::new(),
+            next: Vec::new(),
+            touched: Vec::new(),
+        }
+    }
+}
 
 /// For each seed, gather the nodes reachable within `k` hops (`k >= 1`).
 ///
@@ -21,54 +43,87 @@ use crate::topology::{Direction, Topology};
 /// `(seed, reached)` pair appears once. Unknown/out-of-range seeds and `k == 0`
 /// contribute nothing. `Both` walks out- and in-neighbours together (an
 /// undirected hop).
+///
+/// Each seed's BFS is independent, so the seed set is swept in parallel (rayon)
+/// with a per-worker reusable [`Scratch`]. Per-seed outputs are concatenated in
+/// seed order, so the result is byte-for-byte identical to a serial sweep.
 pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32>, Vec<u32>) {
+    let n = topo.n_nodes();
+    if k == 0 || n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    // One (src, dst) pair-list per seed, in seed order.
+    let per_seed: Vec<(Vec<u32>, Vec<u32>)> = seeds
+        .par_iter()
+        .map_init(
+            || Scratch::new(n),
+            |scratch, &seed| bfs_seed(topo, seed, k, dir, scratch),
+        )
+        .collect();
+
+    let total: usize = per_seed.iter().map(|(s, _)| s.len()).sum();
+    let mut src_out = Vec::with_capacity(total);
+    let mut dst_out = Vec::with_capacity(total);
+    for (s, d) in per_seed {
+        src_out.extend(s);
+        dst_out.extend(d);
+    }
+    (src_out, dst_out)
+}
+
+/// BFS from a single seed to depth `k`, returning its `(seed, reached)` pairs.
+/// Uses and restores `scratch` (only the touched nodes are reset) so it is reusable
+/// across seeds handled by the same worker.
+fn bfs_seed(
+    topo: &Topology,
+    seed: u32,
+    k: u32,
+    dir: Direction,
+    scratch: &mut Scratch,
+) -> (Vec<u32>, Vec<u32>) {
     let n = topo.n_nodes();
     let mut src_out: Vec<u32> = Vec::new();
     let mut dst_out: Vec<u32> = Vec::new();
-    if k == 0 || n == 0 {
-        return (src_out, dst_out);
+    if (seed as usize) >= n {
+        return (src_out, dst_out); // unknown seed
     }
 
-    let mut visited = vec![false; n];
-    let mut frontier: Vec<u32> = Vec::new();
-    let mut next: Vec<u32> = Vec::new();
+    let Scratch {
+        visited,
+        frontier,
+        next,
+        touched,
+    } = scratch;
+    visited[seed as usize] = true;
+    frontier.clear();
+    frontier.push(seed);
+    touched.clear();
+    touched.push(seed);
 
-    for &seed in seeds {
-        if (seed as usize) >= n {
-            continue; // unknown seed
+    for _level in 0..k {
+        next.clear();
+        for &u in frontier.iter() {
+            push_neighbors(topo, u, dir, |v| {
+                if !visited[v as usize] {
+                    visited[v as usize] = true;
+                    touched.push(v);
+                    next.push(v);
+                    src_out.push(seed);
+                    dst_out.push(v);
+                }
+            });
         }
-        // Reset only the nodes touched by the previous seed's search.
-        visited[seed as usize] = true;
-        frontier.clear();
-        frontier.push(seed);
-        let mut touched: Vec<u32> = vec![seed];
-
-        for _level in 0..k {
-            next.clear();
-            for &u in &frontier {
-                push_neighbors(topo, u, dir, |v| {
-                    if !visited[v as usize] {
-                        visited[v as usize] = true;
-                        touched.push(v);
-                        next.push(v);
-                        src_out.push(seed);
-                        dst_out.push(v);
-                    }
-                });
-            }
-            if next.is_empty() {
-                break;
-            }
-            std::mem::swap(&mut frontier, &mut next);
+        if next.is_empty() {
+            break;
         }
-
-        // Clear the visited marks for the next seed (cheaper than a full reset
-        // when seeds reach only a small part of a large graph).
-        for &t in &touched {
-            visited[t as usize] = false;
-        }
+        std::mem::swap(frontier, next);
     }
 
+    // Restore visited for the next seed on this worker.
+    for &t in touched.iter() {
+        visited[t as usize] = false;
+    }
     (src_out, dst_out)
 }
 

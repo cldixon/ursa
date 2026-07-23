@@ -49,11 +49,7 @@ pub fn evaluate_weight(edges: &RecordBatch, weight_json: &str) -> Result<Vec<f64
     let expr = parse_ursa_expr(&value)?;
     let df_expr = lower(&expr)?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-    let column = runtime.block_on(async move {
+    let column = crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         let df = ctx
             .read_batch(edges.clone())?
@@ -97,7 +93,7 @@ pub fn evaluate_weight(edges: &RecordBatch, weight_json: &str) -> Result<Vec<f64
             }
         }
         Ok::<Vec<f64>, DataFusionError>(out)
-    })?;
+    })??;
     Ok(column)
 }
 

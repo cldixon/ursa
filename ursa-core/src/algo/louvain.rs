@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use super::rng::{shuffled_order, DEFAULT_SEED};
 use crate::topology::Topology;
 
@@ -168,23 +170,77 @@ impl Graph {
 
     /// Build the initial undirected working graph. `weights` (per edge row, gathered
     /// via `edge_ids`) sets each edge's weight; `None` uses unit weights.
+    ///
+    /// The dominant (level-0) graph is built by counting sort rather than one
+    /// `HashMap` per node: each non-self edge `(u, v, w)` scatters `(v, w)` into
+    /// `u`'s segment and `(u, w)` into `v`'s, then each segment is sorted by
+    /// neighbour id and parallel edges coalesced (weights summed). This drops the
+    /// per-node hashing and n allocator round-trips that dominated at the
+    /// 100M–500M-edge target. Sorted segments are also *more* deterministic than
+    /// the former `HashMap`-iteration order; `one_level` already sorts candidate
+    /// communities and requires a strict epsilon improvement (see there), so the
+    /// partition is unaffected.
     fn from_topology(topo: &Topology, weights: Option<&[f64]>) -> Graph {
         let n = topo.n_nodes();
-        let mut nbr: Vec<HashMap<u32, f64>> = vec![HashMap::new(); n];
-        let mut self_loop = vec![0.0f64; n];
         let out = topo.out();
+        let mut self_loop = vec![0.0f64; n];
+
+        // Degree histogram: every non-self edge contributes to both endpoints.
+        let mut offsets = vec![0u64; n + 1];
+        for u in 0..n as u32 {
+            for &v in out.neighbors(u) {
+                if u != v {
+                    offsets[u as usize + 1] += 1;
+                    offsets[v as usize + 1] += 1;
+                }
+            }
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+
+        // Scatter each edge into both endpoints' segments.
+        let total = offsets[n] as usize;
+        let mut nbr = vec![0u32; total];
+        let mut wbuf = vec![0.0f64; total];
+        let mut cursor: Vec<u64> = offsets[..n].to_vec();
         for u in 0..n as u32 {
             for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
                 let w = weights.map_or(1.0, |ws| ws[e as usize]);
                 if u == v {
                     self_loop[u as usize] += w;
                 } else {
-                    *nbr[u as usize].entry(v).or_insert(0.0) += w;
-                    *nbr[v as usize].entry(u).or_insert(0.0) += w;
+                    let pu = cursor[u as usize] as usize;
+                    nbr[pu] = v;
+                    wbuf[pu] = w;
+                    cursor[u as usize] += 1;
+                    let pv = cursor[v as usize] as usize;
+                    nbr[pv] = u;
+                    wbuf[pv] = w;
+                    cursor[v as usize] += 1;
                 }
             }
         }
-        Graph::finalize(maps_to_adj(nbr), self_loop)
+
+        // Sort each segment by neighbour id and coalesce parallel edges.
+        let adj: Vec<Vec<(u32, f64)>> = (0..n)
+            .into_par_iter()
+            .map(|u| {
+                let s = offsets[u] as usize;
+                let e = offsets[u + 1] as usize;
+                let mut pairs: Vec<(u32, f64)> = (s..e).map(|k| (nbr[k], wbuf[k])).collect();
+                pairs.sort_unstable_by_key(|&(v, _)| v);
+                let mut coalesced: Vec<(u32, f64)> = Vec::with_capacity(pairs.len());
+                for (v, w) in pairs {
+                    match coalesced.last_mut() {
+                        Some(last) if last.0 == v => last.1 += w,
+                        _ => coalesced.push((v, w)),
+                    }
+                }
+                coalesced
+            })
+            .collect();
+        Graph::finalize(adj, self_loop)
     }
 
     /// Collapse each community into a super-node.

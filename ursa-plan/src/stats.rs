@@ -7,6 +7,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
@@ -99,19 +101,39 @@ fn sample_sources(n: usize, frac: Option<f64>) -> Vec<u32> {
 /// Run BFS from each source and fold the finite distances (`>= 1`, i.e. reachable
 /// and not the source itself). Returns `(sum, count, max)` over all reachable
 /// ordered pairs from the sampled sources — the shared core of both path stats.
+///
+/// Each source's BFS is independent (O(n·m) overall), so they run in parallel
+/// (rayon). Per-source partials are collected in source order and then folded
+/// sequentially, so the `sum` is reduced in a fixed order — the total is
+/// deterministic run to run regardless of thread scheduling.
 fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u64, i32) {
+    let partials: Vec<(f64, u64, i32)> = sources
+        .par_iter()
+        .map(|&s| {
+            let mut sum = 0.0f64;
+            let mut count = 0u64;
+            let mut max = 0i32;
+            for d in bfs_distances(topo, s, dir) {
+                if d >= 1 {
+                    sum += d as f64;
+                    count += 1;
+                    if d > max {
+                        max = d;
+                    }
+                }
+            }
+            (sum, count, max)
+        })
+        .collect();
+
     let mut sum = 0.0f64;
     let mut count = 0u64;
     let mut max = 0i32;
-    for &s in sources {
-        for d in bfs_distances(topo, s, dir) {
-            if d >= 1 {
-                sum += d as f64;
-                count += 1;
-                if d > max {
-                    max = d;
-                }
-            }
+    for (s, c, m) in partials {
+        sum += s;
+        count += c;
+        if m > max {
+            max = m;
         }
     }
     (sum, count, max)

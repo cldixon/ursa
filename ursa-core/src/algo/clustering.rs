@@ -14,7 +14,7 @@
 
 use rayon::prelude::*;
 
-use super::triangle::{per_node_triangles, undirected_adjacency};
+use super::triangle::per_node_triangles;
 use crate::topology::Topology;
 
 /// Per-node local clustering coefficient, dense-indexed (`0.0..=1.0`).
@@ -23,13 +23,13 @@ pub fn clustering_coefficient(topo: &Topology) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
-    let adj = undirected_adjacency(topo);
-    let triangles = per_node_triangles(&adj);
+    let adj = topo.undirected();
+    let triangles = per_node_triangles(adj);
 
     (0..n)
         .into_par_iter()
         .map(|u| {
-            let k = adj[u].len() as f64;
+            let k = adj.degree(u as u32) as f64;
             if k < 2.0 {
                 0.0
             } else {

@@ -500,16 +500,19 @@ def test_topology_built_once_per_frame():
 
 
 def test_index_rides_the_preserve_drop_rail():
-    # The cached handle is preserved by property-only ops and dropped by
-    # structural ones (matching the source/scan invalidation).
+    # The cached index is preserved by property-only ops and dropped by structural
+    # ones (matching the source/scan invalidation). The built index lives in a
+    # shared cell; property-only ops share the same cell, structural ops get a
+    # fresh one.
     edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 2]}), src="s", dst="d")
     ur.degree(edges).collect()  # force a build
-    built = edges._index
-    assert built is not None
-    # property-only op (rename) carries the same handle forward
-    assert edges.rename({})._index is built
-    # structural op (distinct) drops it
-    assert edges.distinct()._index is None
+    cell = edges._index_build_cell
+    assert cell.value is not None
+    # property-only op (rename) carries the same cell (and its built value) forward
+    assert edges.rename({})._index_build_cell is cell
+    # structural op (distinct) drops it: a fresh, unbuilt cell
+    assert edges.distinct()._index_build_cell is not cell
+    assert edges.distinct()._index_build_cell.value is None
 
 
 def test_unsupported_filter_predicate_is_honest():

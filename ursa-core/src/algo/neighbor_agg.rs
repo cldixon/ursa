@@ -7,6 +7,8 @@
 //! adjacency and folds the present neighbour values. No neighbour list is ever
 //! materialized — this is a segmented reduction straight over the adjacency.
 
+use rayon::prelude::*;
+
 use crate::topology::{Direction, Topology};
 
 /// The supported neighbour aggregations.
@@ -26,6 +28,12 @@ pub enum AggKind {
 /// node with no attributed neighbours); `sum`/`count`/`n_unique` return `0` in
 /// that case. `Both` unions out- and in-neighbours (a neighbour reachable via
 /// both directions is folded twice, matching multiplicity-is-rows).
+///
+/// Each node's reduction is independent, so the outer loop runs in parallel
+/// (rayon); results collect positionally, so the output order is identical to a
+/// serial run. `n_unique` sorts the gathered values (O(d log d)) instead of the
+/// former O(d²) linear-scan dedup — decisive on the power-law hubs that are the
+/// target workload. The sort scratch buffer is reused per worker via `map_init`.
 pub fn neighbor_aggregate(
     topo: &Topology,
     attr: &[Option<f64>],
@@ -39,81 +47,105 @@ pub fn neighbor_aggregate(
     );
     let n = topo.n_nodes();
     (0..n as u32)
-        .map(|u| {
-            let mut fold = Fold::new(agg);
-            match direction {
-                Direction::Out => {
-                    for &v in topo.out().neighbors(u) {
-                        fold.push(attr[v as usize]);
-                    }
-                }
-                Direction::In => {
-                    for &v in topo.incoming().neighbors(u) {
-                        fold.push(attr[v as usize]);
-                    }
-                }
-                Direction::Both => {
-                    for &v in topo.out().neighbors(u) {
-                        fold.push(attr[v as usize]);
-                    }
-                    for &v in topo.incoming().neighbors(u) {
-                        fold.push(attr[v as usize]);
-                    }
-                }
-            }
-            fold.finish()
+        .into_par_iter()
+        .map_init(Vec::<f64>::new, |scratch, u| {
+            aggregate_node(topo, attr, direction, agg, u, scratch)
         })
         .collect()
 }
 
-/// Running accumulator for one node's reduction.
-struct Fold {
+/// Aggregate one node's neighbour attribute values. `scratch` is a reusable
+/// buffer (only `NUnique` fills it) so the hot path allocates nothing per node.
+fn aggregate_node(
+    topo: &Topology,
+    attr: &[Option<f64>],
+    direction: Direction,
     agg: AggKind,
-    count: u64,
-    sum: f64,
-    min: f64,
-    max: f64,
-    seen: Vec<f64>, // only populated for NUnique
+    u: u32,
+    scratch: &mut Vec<f64>,
+) -> Option<f64> {
+    match direction {
+        Direction::Out => fold_neighbors(topo.out().neighbors(u).iter(), attr, agg, scratch),
+        Direction::In => fold_neighbors(topo.incoming().neighbors(u).iter(), attr, agg, scratch),
+        Direction::Both => fold_neighbors(
+            topo.out()
+                .neighbors(u)
+                .iter()
+                .chain(topo.incoming().neighbors(u).iter()),
+            attr,
+            agg,
+            scratch,
+        ),
+    }
 }
 
-impl Fold {
-    fn new(agg: AggKind) -> Self {
-        Fold {
-            agg,
-            count: 0,
-            sum: 0.0,
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
-            seen: Vec::new(),
+/// Fold the present attribute values of a neighbour-index iterator into one
+/// aggregate. Generic over the iterator so `Out`/`In` (a slice iter) and `Both`
+/// (a chained iter) monomorphize without boxing.
+fn fold_neighbors<'a, I: Iterator<Item = &'a u32>>(
+    neighbors: I,
+    attr: &[Option<f64>],
+    agg: AggKind,
+    scratch: &mut Vec<f64>,
+) -> Option<f64> {
+    let mut count: u64 = 0;
+    let mut sum = 0.0;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    if agg == AggKind::NUnique {
+        scratch.clear();
+    }
+    for &v in neighbors {
+        let Some(x) = attr[v as usize] else { continue };
+        count += 1;
+        sum += x;
+        if x < min {
+            min = x;
+        }
+        if x > max {
+            max = x;
+        }
+        if agg == AggKind::NUnique {
+            scratch.push(x);
         }
     }
+    match agg {
+        AggKind::Count => Some(count as f64),
+        AggKind::NUnique => Some(count_distinct(scratch) as f64),
+        AggKind::Sum => Some(sum),
+        _ if count == 0 => None,
+        AggKind::Mean => Some(sum / count as f64),
+        AggKind::Min => Some(min),
+        AggKind::Max => Some(max),
+    }
+}
 
-    fn push(&mut self, value: Option<f64>) {
-        let Some(x) = value else { return };
-        self.count += 1;
-        self.sum += x;
-        if x < self.min {
-            self.min = x;
-        }
-        if x > self.max {
-            self.max = x;
-        }
-        if self.agg == AggKind::NUnique && !self.seen.contains(&x) {
-            self.seen.push(x);
-        }
-    }
-
-    fn finish(self) -> Option<f64> {
-        match self.agg {
-            AggKind::Count => Some(self.count as f64),
-            AggKind::NUnique => Some(self.seen.len() as f64),
-            AggKind::Sum => Some(self.sum),
-            _ if self.count == 0 => None,
-            AggKind::Mean => Some(self.sum / self.count as f64),
-            AggKind::Min => Some(self.min),
-            AggKind::Max => Some(self.max),
+/// Count distinct values by sorting and counting runs — O(d log d) and cache
+/// friendly, replacing the former O(d²) `Vec::contains` scan.
+///
+/// Values are canonicalized first so `-0.0` counts as `0.0` and every NaN
+/// collapses to one, matching SQL `COUNT(DISTINCT)` (and fixing the old
+/// `==`-dedup, which — since `NaN != NaN` — counted each NaN separately). After
+/// canonicalization, bit-equality on the `total_cmp`-sorted values is exact.
+fn count_distinct(values: &mut [f64]) -> u64 {
+    for x in values.iter_mut() {
+        if x.is_nan() {
+            *x = f64::NAN;
+        } else if *x == 0.0 {
+            *x = 0.0; // normalize -0.0 to +0.0
         }
     }
+    values.sort_unstable_by(f64::total_cmp);
+    let mut distinct: u64 = 0;
+    let mut prev_bits: Option<u64> = None;
+    for &x in values.iter() {
+        let bits = x.to_bits();
+        if prev_bits != Some(bits) {
+            distinct += 1;
+            prev_bits = Some(bits);
+        }
+    }
+    distinct
 }
 
 #[cfg(test)]
@@ -161,5 +193,36 @@ mod tests {
         let attr = vec![None, Some(5.0), Some(5.0), Some(9.0)];
         let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::NUnique);
         assert_eq!(out[0], Some(2.0)); // {5, 9}
+    }
+
+    #[test]
+    fn n_unique_canonicalizes_zero_and_nan() {
+        // -0.0 counts as 0.0, and every NaN collapses to one (SQL COUNT(DISTINCT)).
+        // hub: 1,2,3 -> 0. Give node 0 four in-neighbours (extend the hub).
+        let t = Topology::build(5, vec![1, 2, 3, 4], vec![0, 0, 0, 0]);
+        let attr = vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::NAN),
+            Some(f64::NAN),
+        ];
+        // in-neighbours of 0 carry {-0.0, 0.0, NaN, NaN} -> distinct {0.0, NaN} = 2
+        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::NUnique);
+        assert_eq!(out[0], Some(2.0));
+    }
+
+    #[test]
+    fn parallel_matches_serial_on_a_larger_hub() {
+        // A wider hub with repeats exercises the sort-based n_unique path.
+        let src: Vec<u32> = (1..50).collect();
+        let dst: Vec<u32> = vec![0; 49];
+        let t = Topology::build(50, src, dst);
+        let mut attr = vec![Some(0.0); 50];
+        for (i, a) in attr.iter_mut().enumerate().skip(1) {
+            *a = Some((i % 7) as f64); // 7 distinct values among the 49 neighbours
+        }
+        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::NUnique);
+        assert_eq!(out[0], Some(7.0));
     }
 }

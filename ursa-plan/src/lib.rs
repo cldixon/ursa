@@ -28,6 +28,7 @@ pub mod physical;
 pub mod planner;
 pub mod query;
 pub mod result;
+pub mod runtime;
 pub mod scan;
 pub mod session;
 pub mod stats;

@@ -17,7 +17,7 @@
 
 use rayon::prelude::*;
 
-use crate::topology::Topology;
+use crate::topology::{Topology, UndirectedCsr};
 
 /// Count of elements common to two sorted, deduplicated `u32` slices.
 fn intersection_count(a: &[u32], b: &[u32]) -> u32 {
@@ -36,41 +36,18 @@ fn intersection_count(a: &[u32], b: &[u32]) -> u32 {
     count
 }
 
-/// The undirected, sorted, deduplicated adjacency (out ∪ in neighbours, self-loops
-/// dropped). Shared by triangle counting and clustering coefficient — the
-/// undirected degree of node `u` is `adjacency[u].len()`.
-pub(crate) fn undirected_adjacency(topo: &Topology) -> Vec<Vec<u32>> {
-    let n = topo.n_nodes();
-    let out = topo.out();
-    let inc = topo.incoming();
-    (0..n)
+/// Per-node triangle count over the topology's cached undirected adjacency.
+pub(crate) fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
+    let n = adj.offsets.len().saturating_sub(1);
+    (0..n as u32)
         .into_par_iter()
         .map(|u| {
-            let mut nbrs: Vec<u32> = out
-                .neighbors(u as u32)
-                .iter()
-                .chain(inc.neighbors(u as u32))
-                .copied()
-                .filter(|&w| w != u as u32)
-                .collect();
-            nbrs.sort_unstable();
-            nbrs.dedup();
-            nbrs
-        })
-        .collect()
-}
-
-/// Per-node triangle count over a prebuilt undirected adjacency.
-pub(crate) fn per_node_triangles(adj: &[Vec<u32>]) -> Vec<u32> {
-    (0..adj.len())
-        .into_par_iter()
-        .map(|u| {
-            let nu = &adj[u];
+            let nu = adj.neighbors(u);
             let mut count = 0u32;
             for (i, &a) in nu.iter().enumerate() {
                 // nu[i + 1..] are all > a (nu is sorted & unique), so the
                 // intersection with a's adjacency counts triangles {u, a, b}, b > a.
-                count += intersection_count(&nu[i + 1..], &adj[a as usize]);
+                count += intersection_count(&nu[i + 1..], adj.neighbors(a));
             }
             count
         })
@@ -82,7 +59,7 @@ pub fn triangle_count(topo: &Topology) -> Vec<u32> {
     if topo.n_nodes() == 0 {
         return Vec::new();
     }
-    per_node_triangles(&undirected_adjacency(topo))
+    per_node_triangles(topo.undirected())
 }
 
 #[cfg(test)]

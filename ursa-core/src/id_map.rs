@@ -14,7 +14,7 @@
 //! needs to know which variant it is.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
@@ -23,17 +23,25 @@ use arrow::datatypes::DataType;
 ///
 /// `u32` caps the node space at ~4.29B nodes — the correct trade for cache
 /// behaviour at the v0.1 target scale. A `u64` node space is a future feature flag.
+///
+/// String ids are stored as `Arc<str>` shared between the `to_user` vector and the
+/// `to_dense` map, so each distinct id is heap-allocated **once** (not twice, as a
+/// `Vec<String>` + `HashMap<String, _>` would). The user-id Arrow array is built
+/// lazily and cached (`id_array`): it is immutable once built, so the per-collect
+/// `user_id_array()` call is an `Arc` clone instead of a full deep copy of every id.
 #[derive(Debug, Clone)]
 pub enum IdMap {
     /// Integer user ids (the fast path).
     Int64 {
         to_user: Vec<i64>,
         to_dense: HashMap<i64, u32>,
+        id_array: OnceLock<ArrayRef>,
     },
     /// String user ids (also covers UUID-as-string).
     Utf8 {
-        to_user: Vec<String>,
-        to_dense: HashMap<String, u32>,
+        to_user: Vec<Arc<str>>,
+        to_dense: HashMap<Arc<str>, u32>,
+        id_array: OnceLock<ArrayRef>,
     },
 }
 
@@ -153,6 +161,7 @@ impl IdMap {
         IdMap::Int64 {
             to_user: Vec::new(),
             to_dense: HashMap::new(),
+            id_array: OnceLock::new(),
         }
     }
 
@@ -160,6 +169,7 @@ impl IdMap {
         IdMap::Utf8 {
             to_user: Vec::new(),
             to_dense: HashMap::new(),
+            id_array: OnceLock::new(),
         }
     }
 
@@ -223,7 +233,9 @@ impl IdMap {
 
     fn intern_i64(&mut self, user: i64) -> Result<u32, IdError> {
         match self {
-            IdMap::Int64 { to_user, to_dense } => {
+            IdMap::Int64 {
+                to_user, to_dense, ..
+            } => {
                 if let Some(&idx) = to_dense.get(&user) {
                     return Ok(idx);
                 }
@@ -241,7 +253,9 @@ impl IdMap {
 
     fn intern_str(&mut self, user: &str) -> Result<u32, IdError> {
         match self {
-            IdMap::Utf8 { to_user, to_dense } => {
+            IdMap::Utf8 {
+                to_user, to_dense, ..
+            } => {
                 if let Some(&idx) = to_dense.get(user) {
                     return Ok(idx);
                 }
@@ -249,8 +263,10 @@ impl IdMap {
                     return Err(IdError::TooManyNodes);
                 }
                 let idx = to_user.len() as u32;
-                to_user.push(user.to_string());
-                to_dense.insert(user.to_string(), idx);
+                // One heap allocation for the id, shared (Arc) between both maps.
+                let key: Arc<str> = Arc::from(user);
+                to_user.push(Arc::clone(&key));
+                to_dense.insert(key, idx);
                 Ok(idx)
             }
             IdMap::Int64 { .. } => unreachable!("intern_str on an Int64 IdMap"),
@@ -269,11 +285,25 @@ impl IdMap {
 
     /// All user ids in dense-index order, as an Arrow array (`Int64Array` |
     /// `StringArray`) — the id column of a per-node result.
+    ///
+    /// Built once and cached: the id set is immutable after construction, so
+    /// repeated collects over one frame return an `Arc` clone rather than deep-
+    /// copying every id (for string ids, every byte) into a fresh array each time.
     pub fn user_id_array(&self) -> ArrayRef {
+        let cache = match self {
+            IdMap::Int64 { id_array, .. } => id_array,
+            IdMap::Utf8 { id_array, .. } => id_array,
+        };
+        cache.get_or_init(|| self.build_user_id_array()).clone()
+    }
+
+    /// Materialize the user-id column afresh (the cache-miss path of
+    /// [`Self::user_id_array`]).
+    fn build_user_id_array(&self) -> ArrayRef {
         match self {
             IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(to_user.clone())),
             IdMap::Utf8 { to_user, .. } => Arc::new(StringArray::from(
-                to_user.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                to_user.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
             )),
         }
     }
@@ -292,7 +322,7 @@ impl IdMap {
             IdMap::Utf8 { to_user, .. } => Arc::new(StringArray::from(
                 dense
                     .iter()
-                    .map(|&d| to_user[d as usize].as_str())
+                    .map(|&d| to_user[d as usize].as_ref())
                     .collect::<Vec<_>>(),
             )),
         }

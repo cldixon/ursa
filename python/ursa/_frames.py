@@ -15,6 +15,7 @@ metadata are modelled here so the shape is exercisable now.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,34 @@ _ENGINE_TODO = (
     "skeleton. The topology index + kernels (ursa-core) and the plan builder "
     "(this module) are in place; collect() is the next integration step."
 )
+
+
+class _BuildCell:
+    """A shared, mutable holder for a lazily-built, memoized artifact — an
+    EdgeFrame's topology index, or a NodeFrame's scanned attribute batch.
+
+    Two problems it solves (both from the perf review):
+
+    * **Forward-propagating the memo.** A frame and its property-preserving
+      derivations share *one* cell by reference, so an index (or scan) built via
+      any of them is visible to all — including derivations made *before* the
+      build. Snapshotting the value at derivation time (the old behaviour) missed
+      this direction, so ``e2 = edges.with_columns(...)`` then a collect on
+      ``edges`` then a collect on ``e2`` rebuilt an identical CSR.
+    * **Per-graph locking.** Each cell carries its own lock, so first-collect of
+      unrelated frames from different threads build concurrently instead of
+      serializing on a single module-global lock (the build releases the GIL and
+      can include a full file scan).
+
+    Structural ops that invalidate the source (filter/distinct on an EdgeFrame)
+    create a *fresh* cell, so the stale index is not carried across.
+    """
+
+    __slots__ = ("lock", "value")
+
+    def __init__(self, value: Any | None = None) -> None:
+        self.value = value
+        self.lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -170,7 +199,7 @@ class EdgeFrame(_Frame):
     # `_edge_table` retains the full in-memory edge table (all columns) for a
     # `from_arrow`/`from_polars` frame, so a `weight=` expression over edge columns
     # can be evaluated. It rides the same preserve/drop rail; scan frames have None.
-    __slots__ = ("_dst_col", "_edge_table", "_index", "_scan", "_source", "_src_col")
+    __slots__ = ("_dst_col", "_edge_table", "_index_cell", "_scan", "_source", "_src_col")
 
     def __init__(
         self,
@@ -180,7 +209,7 @@ class EdgeFrame(_Frame):
         has_index: bool = True,
         source: tuple[Any, Any] | None = None,
         scan: dict[str, Any] | None = None,
-        index: Any | None = None,
+        index_cell: _BuildCell | None = None,
         edge_table: Any | None = None,
     ) -> None:
         super().__init__(plan, has_index)
@@ -188,8 +217,15 @@ class EdgeFrame(_Frame):
         self._dst_col = dst_col
         self._source = source
         self._scan = scan
-        self._index = index
+        # Property-preserving derivations pass the same cell (shared build);
+        # structural ones pass None so a fresh cell is created here.
+        self._index_cell = index_cell if index_cell is not None else _BuildCell()
         self._edge_table = edge_table
+
+    @property
+    def _index_build_cell(self) -> _BuildCell:
+        """The shared cell holding this frame's built topology index."""
+        return self._index_cell
 
     @property
     def _edge_arrays(self) -> tuple[Any, Any] | None:
@@ -227,7 +263,7 @@ class EdgeFrame(_Frame):
             has_index=self._has_index and not drops_index,
             source=None if drops_index else self._source,
             scan=None if drops_index else self._scan,
-            index=None if drops_index else self._index,
+            index_cell=None if drops_index else self._index_cell,
             edge_table=None if drops_index else self._edge_table,
         )
 
@@ -301,7 +337,7 @@ class NodeFrame(_Frame):
     table by id. NodeFrames derived from ``edges.nodes()`` carry neither.
     """
 
-    __slots__ = ("_id_col", "_scan", "_source")
+    __slots__ = ("_attr_cell", "_id_col", "_scan", "_source")
 
     def __init__(
         self,
@@ -309,11 +345,20 @@ class NodeFrame(_Frame):
         plan: tuple[_PlanStep, ...] = (),
         source: Any | None = None,
         scan: dict[str, Any] | None = None,
+        attr_cell: _BuildCell | None = None,
     ) -> None:
         super().__init__(plan, has_index=False)
         self._id_col = id_col
         self._source = source
         self._scan = scan
+        # Shared memo for a scan_nodes attribute batch (see _BuildCell); carried
+        # across derivations so a scan-backed node file is read from disk once.
+        self._attr_cell = attr_cell if attr_cell is not None else _BuildCell()
+
+    @property
+    def _attr_build_cell(self) -> _BuildCell:
+        """The shared cell memoizing this frame's scanned attribute batch."""
+        return self._attr_cell
 
     @property
     def id_col(self) -> str:
@@ -331,7 +376,15 @@ class NodeFrame(_Frame):
         return self._scan
 
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
-        return NodeFrame(self._id_col, (*self._plan, step), source=self._source, scan=self._scan)
+        # Derivations preserve the source/scan, so they share the attr memo too:
+        # a filter/sort applies to the query, not to the raw scanned file.
+        return NodeFrame(
+            self._id_col,
+            (*self._plan, step),
+            source=self._source,
+            scan=self._scan,
+            attr_cell=self._attr_cell,
+        )
 
     # Composed pipelines (with_columns of graph algorithms + filter/sort/head)
     # execute here. Returns the materialized result rather than another lazy
