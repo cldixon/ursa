@@ -131,6 +131,11 @@ pub fn betweenness_weighted(
     sample: Option<f64>,
     seed: Option<u64>,
 ) -> Vec<f64> {
+    assert_eq!(
+        weights.len(),
+        topo.n_edges(),
+        "weights length must equal the edge count"
+    );
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();

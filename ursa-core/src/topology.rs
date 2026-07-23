@@ -50,6 +50,14 @@ impl Adjacency {
     fn build(n_nodes: usize, keys: &[u32], other: &[u32]) -> Adjacency {
         debug_assert_eq!(keys.len(), other.len());
         let m = keys.len();
+        // `edge_ids` stores the original row index as u32, so more than u32::MAX
+        // edges would wrap silently and corrupt every weighted gather. A `u64` edge
+        // space is a future feature flag; until then this is a clear, immediate
+        // failure rather than silent corruption.
+        assert!(
+            m <= u32::MAX as usize,
+            "more than u32::MAX (~4.29B) edges is beyond the v0.1 edge-id cap"
+        );
 
         // Pass 1: degree histogram, written into offsets[k + 1].
         let mut offsets = vec![0u64; n_nodes + 1];
@@ -126,9 +134,23 @@ impl Topology {
     /// (see [`IdMap::from_edge_arrays`]). Out-adjacency is built eagerly; the
     /// transpose is deferred.
     ///
+    /// # Panics
+    ///
+    /// If `src_dense`/`dst_dense` differ in length, or (debug builds) if any dense
+    /// endpoint is `>= n_nodes`. Endpoints must already be interned into `0..n_nodes`
+    /// (which [`IdMap::from_edge_arrays`] guarantees); an out-of-range id would
+    /// otherwise index past the CSR offset array.
+    ///
     /// [`IdMap::from_edge_arrays`]: crate::id_map::IdMap::from_edge_arrays
     pub fn build(n_nodes: usize, src_dense: Vec<u32>, dst_dense: Vec<u32>) -> Topology {
         assert_eq!(src_dense.len(), dst_dense.len(), "src/dst length mismatch");
+        debug_assert!(
+            src_dense
+                .iter()
+                .chain(&dst_dense)
+                .all(|&d| (d as usize) < n_nodes),
+            "dense endpoint id out of range (>= n_nodes)"
+        );
         let n_edges = src_dense.len();
         let out = Adjacency::build(n_nodes, &src_dense, &dst_dense);
         Topology {

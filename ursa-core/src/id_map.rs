@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
 
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
@@ -47,6 +47,12 @@ pub enum IdError {
     MixedTypes,
     /// The id column's Arrow type is not a supported node-id type.
     Unsupported(String),
+    /// `src` and `dst` columns had different lengths.
+    LengthMismatch,
+    /// More than `u32::MAX` distinct nodes — beyond the `u32` dense-index cap (a
+    /// `u64` node space is a future feature flag). Better a clear error than the
+    /// silent index wraparound it would otherwise cause.
+    TooManyNodes,
 }
 
 impl std::fmt::Display for IdError {
@@ -63,6 +69,13 @@ impl std::fmt::Display for IdError {
             IdError::Unsupported(t) => write!(
                 f,
                 "unsupported node-id type {t}; node ids must be int64 or string (Utf8)"
+            ),
+            IdError::LengthMismatch => {
+                write!(f, "src and dst columns must have the same length")
+            }
+            IdError::TooManyNodes => write!(
+                f,
+                "more than u32::MAX (~4.29B) distinct nodes; exceeds the dense-index cap"
             ),
         }
     }
@@ -92,16 +105,46 @@ fn as_int64(arr: &dyn Array) -> &Int64Array {
         .expect("id column confirmed Int64")
 }
 
-/// View any Utf8/LargeUtf8 id array as `StringArray` (casting LargeUtf8 if needed).
-fn as_utf8(arr: &dyn Array) -> StringArray {
-    if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
-        s.clone()
-    } else {
-        let cast = arrow::compute::cast(arr, &DataType::Utf8).expect("Utf8-family casts to Utf8");
-        cast.as_any()
-            .downcast_ref::<StringArray>()
-            .expect("cast to Utf8 yields StringArray")
-            .clone()
+/// A borrowing view over a `Utf8` or `LargeUtf8` id array, reading either offset
+/// width natively. This replaces a `LargeUtf8 -> Utf8` cast, which (a) **fails**
+/// once the concatenated string data exceeds `i32::MAX` bytes — exactly what
+/// engines emit for large string columns, so a valid big id column would panic
+/// across PyO3 — and (b) copies the whole column before interning even on success.
+enum StrView<'a> {
+    Utf8(&'a StringArray),
+    Large(&'a LargeStringArray),
+}
+
+impl<'a> StrView<'a> {
+    /// The caller has already confirmed the array is `Utf8`/`LargeUtf8` (`id_kind`).
+    fn new(arr: &'a dyn Array) -> Self {
+        if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+            StrView::Utf8(s)
+        } else {
+            StrView::Large(
+                arr.as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("id kind confirmed Utf8/LargeUtf8"),
+            )
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            StrView::Utf8(a) => a.len(),
+            StrView::Large(a) => a.len(),
+        }
+    }
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            StrView::Utf8(a) => a.is_null(i),
+            StrView::Large(a) => a.is_null(i),
+        }
+    }
+    fn value(&self, i: usize) -> &str {
+        match self {
+            StrView::Utf8(a) => a.value(i),
+            StrView::Large(a) => a.value(i),
+        }
     }
 }
 
@@ -125,7 +168,8 @@ impl IdMap {
     pub fn from_ids<I: IntoIterator<Item = i64>>(ids: I) -> Self {
         let mut map = IdMap::new_int64();
         for id in ids {
-            map.intern_i64(id);
+            map.intern_i64(id)
+                .expect("from_ids is a small-input convenience; node count is within the u32 cap");
         }
         map
     }
@@ -142,7 +186,9 @@ impl IdMap {
         src: &dyn Array,
         dst: &dyn Array,
     ) -> Result<(Self, Vec<u32>, Vec<u32>), IdError> {
-        assert_eq!(src.len(), dst.len(), "src/dst length mismatch");
+        if src.len() != dst.len() {
+            return Err(IdError::LengthMismatch);
+        }
         let (sk, dk) = (id_kind(src.data_type())?, id_kind(dst.data_type())?);
         match (sk, dk) {
             (IdKind::Int64, IdKind::Int64) => {
@@ -153,21 +199,21 @@ impl IdMap {
                     if s.is_null(i) || d.is_null(i) {
                         return Err(IdError::Null);
                     }
-                    sd.push(map.intern_i64(s.value(i)));
-                    dd.push(map.intern_i64(d.value(i)));
+                    sd.push(map.intern_i64(s.value(i))?);
+                    dd.push(map.intern_i64(d.value(i))?);
                 }
                 Ok((map, sd, dd))
             }
             (IdKind::Utf8, IdKind::Utf8) => {
-                let (s, d) = (as_utf8(src), as_utf8(dst));
+                let (s, d) = (StrView::new(src), StrView::new(dst));
                 let mut map = IdMap::new_utf8();
                 let (mut sd, mut dd) = (Vec::with_capacity(s.len()), Vec::with_capacity(s.len()));
                 for i in 0..s.len() {
                     if s.is_null(i) || d.is_null(i) {
                         return Err(IdError::Null);
                     }
-                    sd.push(map.intern_str(s.value(i)));
-                    dd.push(map.intern_str(d.value(i)));
+                    sd.push(map.intern_str(s.value(i))?);
+                    dd.push(map.intern_str(d.value(i))?);
                 }
                 Ok((map, sd, dd))
             }
@@ -175,31 +221,37 @@ impl IdMap {
         }
     }
 
-    fn intern_i64(&mut self, user: i64) -> u32 {
+    fn intern_i64(&mut self, user: i64) -> Result<u32, IdError> {
         match self {
             IdMap::Int64 { to_user, to_dense } => {
                 if let Some(&idx) = to_dense.get(&user) {
-                    return idx;
+                    return Ok(idx);
+                }
+                if to_user.len() >= u32::MAX as usize {
+                    return Err(IdError::TooManyNodes);
                 }
                 let idx = to_user.len() as u32;
                 to_user.push(user);
                 to_dense.insert(user, idx);
-                idx
+                Ok(idx)
             }
             IdMap::Utf8 { .. } => unreachable!("intern_i64 on a Utf8 IdMap"),
         }
     }
 
-    fn intern_str(&mut self, user: &str) -> u32 {
+    fn intern_str(&mut self, user: &str) -> Result<u32, IdError> {
         match self {
             IdMap::Utf8 { to_user, to_dense } => {
                 if let Some(&idx) = to_dense.get(user) {
-                    return idx;
+                    return Ok(idx);
+                }
+                if to_user.len() >= u32::MAX as usize {
+                    return Err(IdError::TooManyNodes);
                 }
                 let idx = to_user.len() as u32;
                 to_user.push(user.to_string());
                 to_dense.insert(user.to_string(), idx);
-                idx
+                Ok(idx)
             }
             IdMap::Int64 { .. } => unreachable!("intern_str on an Int64 IdMap"),
         }
@@ -276,7 +328,7 @@ impl IdMap {
                 if !matches!(id_kind(arr.data_type())?, IdKind::Utf8) {
                     return Err(IdError::MixedTypes);
                 }
-                let a = as_utf8(arr);
+                let a = StrView::new(arr);
                 Ok((0..a.len())
                     .map(|i| {
                         if a.is_null(i) {
@@ -357,13 +409,33 @@ mod tests {
     }
 
     #[test]
-    fn large_utf8_is_accepted() {
+    fn large_utf8_is_handled_natively_and_round_trips() {
+        // LargeUtf8 is read directly (no LargeUtf8->Utf8 cast, which would panic
+        // past the 2 GiB Utf8 offset limit). Values round-trip through the map.
         use arrow::array::LargeStringArray;
-        let src = LargeStringArray::from(vec!["x", "y"]);
-        let dst = LargeStringArray::from(vec!["y", "x"]);
-        let (map, _sd, _dd) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        let src = LargeStringArray::from(vec!["x", "x", "y"]);
+        let dst = LargeStringArray::from(vec!["y", "z", "z"]);
+        let (map, sd, dd) = IdMap::from_edge_arrays(&src, &dst).unwrap();
         assert_eq!(map.user_type(), DataType::Utf8);
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.len(), 3);
+        assert_eq!(sd, vec![0, 0, 1]);
+        assert_eq!(dd, vec![1, 2, 2]);
+        // dense -> user, and a LargeUtf8 lookup array resolves too
+        let ids = map.user_id_array();
+        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!((ids.value(0), ids.value(1), ids.value(2)), ("x", "y", "z"));
+        let query = LargeStringArray::from(vec![Some("z"), Some("nope")]);
+        assert_eq!(map.dense_from_array(&query).unwrap(), vec![Some(2), None]);
+    }
+
+    #[test]
+    fn length_mismatch_is_a_typed_error() {
+        let src = Int64Array::from(vec![1, 2, 3]);
+        let dst = Int64Array::from(vec![1, 2]);
+        assert_eq!(
+            IdMap::from_edge_arrays(&src, &dst).err(),
+            Some(IdError::LengthMismatch)
+        );
     }
 
     #[test]

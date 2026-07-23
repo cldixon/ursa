@@ -32,6 +32,11 @@ pub fn neighbor_aggregate(
     direction: Direction,
     agg: AggKind,
 ) -> Vec<Option<f64>> {
+    assert_eq!(
+        attr.len(),
+        topo.n_nodes(),
+        "attr length must equal the node count"
+    );
     let n = topo.n_nodes();
     (0..n as u32)
         .map(|u| {

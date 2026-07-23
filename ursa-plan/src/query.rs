@@ -263,6 +263,25 @@ pub fn execute_node_query(
             "graph query has no output columns".into(),
         ));
     }
+    // Validate output names up front: the result schema prepends the reserved `id`
+    // column and DataFusion rejects duplicate unqualified fields, so a collision
+    // would otherwise panic inside the node constructor's DFSchema conversion.
+    let mut seen = std::collections::HashSet::new();
+    for spec in &specs {
+        if spec.name == "id" {
+            return Err(DataFusionError::Execution(
+                "output column name 'id' is reserved (it is the node id column); \
+                 give the with_columns output a different name"
+                    .into(),
+            ));
+        }
+        if !seen.insert(spec.name.as_str()) {
+            return Err(DataFusionError::Execution(format!(
+                "duplicate output column name {:?}; each with_columns output needs a unique name",
+                spec.name
+            )));
+        }
+    }
     let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
     for spec in &specs {

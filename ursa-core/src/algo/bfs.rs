@@ -180,6 +180,11 @@ pub fn dijkstra_distances(
     source: u32,
     dir: Direction,
 ) -> Vec<f64> {
+    assert_eq!(
+        weights.len(),
+        topo.n_edges(),
+        "weights length must equal the edge count"
+    );
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -226,6 +231,11 @@ pub fn shortest_path_weighted(
     target: u32,
     dir: Direction,
 ) -> Option<Vec<u32>> {
+    assert_eq!(
+        weights.len(),
+        topo.n_edges(),
+        "weights length must equal the edge count"
+    );
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 

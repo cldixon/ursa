@@ -47,12 +47,13 @@ pub enum UrsaExpr {
     // lower to custom logical nodes rather than DfExpr — added during impl.
 }
 
-/// Lower an [`UrsaExpr`] to a DataFusion expression. Skeleton: covers the trivial
-/// leaf cases so the seam compiles and is exercisable; the rest is the first
-/// implementation task for this module.
-pub fn lower(expr: &UrsaExpr) -> DfExpr {
+/// Lower an [`UrsaExpr`] to a DataFusion expression. Covers the subset a weight
+/// expression uses (columns, numeric/string literals, `+ - * /`); anything else
+/// returns a `NotImplemented` error rather than panicking, so widening the parser
+/// without widening this function can never ship a process panic.
+pub fn lower(expr: &UrsaExpr) -> Result<DfExpr> {
     use datafusion::logical_expr::{col, lit};
-    match expr {
+    Ok(match expr {
         UrsaExpr::Column(name) => col(name),
         UrsaExpr::LitI64(v) => lit(*v),
         UrsaExpr::LitF64(v) => lit(*v),
@@ -63,15 +64,20 @@ pub fn lower(expr: &UrsaExpr) -> DfExpr {
                 "-" => Operator::Minus,
                 "*" => Operator::Multiply,
                 "/" => Operator::Divide,
-                // parse_ursa_expr rejects any other op before lowering.
-                other => todo!("lower binary op {other:?} — see module docs"),
+                other => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "weight expression operator {other:?} is not supported (use + - * /)"
+                    )))
+                }
             };
-            binary_expr(lower(left), operator, lower(right))
+            binary_expr(lower(left)?, operator, lower(right)?)
         }
-        // TODO(v0.1): Src/Dst/Id resolve against the frame's role mapping;
-        // graph verbs -> custom logical nodes.
-        other => todo!("lower {other:?} — see module docs"),
-    }
+        UrsaExpr::Src | UrsaExpr::Dst | UrsaExpr::Id => {
+            return Err(DataFusionError::NotImplemented(
+                "role references (src/dst/id) are not supported in a weight expression".to_string(),
+            ))
+        }
+    })
 }
 
 /// Parse the JSON an Ursa `Expr` tree serializes to (from `ursa-py`'s Python
@@ -150,8 +156,8 @@ mod tests {
             "right": {"kind": "col", "name": "fx_rate"},
         });
         let expr = parse_ursa_expr(&json).unwrap();
-        // lowers without panicking to a DataFusion binary expr
-        let _df = lower(&expr);
+        // lowers to a DataFusion binary expr
+        let _df = lower(&expr).unwrap();
         assert!(matches!(expr, UrsaExpr::Binary { .. }));
     }
 
@@ -167,5 +173,18 @@ mod tests {
         // a role reference is not supported
         let role = serde_json::json!({"kind": "src"});
         assert!(parse_ursa_expr(&role).is_err());
+    }
+
+    #[test]
+    fn lower_returns_err_instead_of_panicking() {
+        // lower must not todo!()/panic on a variant the parser would normally reject;
+        // it returns a NotImplemented error so widening the parser can't ship a panic.
+        assert!(lower(&UrsaExpr::Src).is_err());
+        assert!(lower(&UrsaExpr::Binary {
+            op: ">".to_string(),
+            left: Box::new(UrsaExpr::Column("a".into())),
+            right: Box::new(UrsaExpr::LitI64(1)),
+        })
+        .is_err());
     }
 }
