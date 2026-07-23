@@ -241,10 +241,15 @@ def clustering_coefficient(edges: EdgeFrame) -> GraphExpr:
 
 
 def betweenness(
-    edges: EdgeFrame, sample: float | None = None, weight: Expr | None = None
+    edges: EdgeFrame,
+    sample: float | None = None,
+    weight: Expr | None = None,
+    seed: int | None = None,
 ) -> GraphExpr:
-    """Betweenness centrality (Brandes). ``sample=`` approximates; exact is O(nm)."""
-    return _graph_expr("betweenness", edges=edges, sample=sample, weight=weight)
+    """Betweenness centrality (Brandes). ``sample=`` approximates from a
+    ``seed``-shuffled subset of sources (exact is O(nm)); ``seed`` makes the
+    sampled estimate reproducible."""
+    return _graph_expr("betweenness", edges=edges, sample=sample, weight=weight, seed=seed)
 
 
 def closeness(edges: EdgeFrame, weight: Expr | None = None) -> GraphExpr:

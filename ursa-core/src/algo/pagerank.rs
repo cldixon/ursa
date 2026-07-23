@@ -32,6 +32,22 @@ impl Default for PageRankParams {
     }
 }
 
+/// Deterministic L1 delta `Σ |a[i] - b[i]|`. Rayon's default `sum()` reduces in a
+/// work-stealing-dependent order, so its result varies at the ULP level run to
+/// run — which can flip `delta < tol` near threshold and change the iteration
+/// count (and thus the output). Fixed-size chunks summed sequentially and combined
+/// in order give the same value every run at any thread count, while staying
+/// parallel across chunks.
+fn l1_delta(a: &[f64], b: &[f64]) -> f64 {
+    const CHUNK: usize = 8192;
+    a.par_chunks(CHUNK)
+        .zip(b.par_chunks(CHUNK))
+        .map(|(ac, bc)| ac.iter().zip(bc).map(|(x, y)| (x - y).abs()).sum::<f64>())
+        .collect::<Vec<f64>>()
+        .iter()
+        .sum()
+}
+
 /// Dense PageRank vector; `result[u]` is the score of dense node `u`. Scores sum
 /// to ~1.0 (up to dangling redistribution and early convergence).
 pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
@@ -47,16 +63,17 @@ pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
     let out_deg: Vec<u32> = (0..n as u32).map(|u| out.degree(u)).collect();
     let inc = topo.incoming();
 
+    // Dangling nodes (out-degree 0), listed once. Summing their rank over this
+    // fixed ascending-index list each iteration is deterministic (a parallel
+    // filter-sum is not) and O(#dangling) instead of an O(n) scan per iteration.
+    let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_deg[u] == 0).collect();
+
     let mut rank = vec![1.0 / nf; n];
     let mut next = vec![0.0f64; n];
 
     for _iter in 0..params.max_iter {
         // Rank stranded on dangling nodes, spread uniformly to everyone.
-        let dangling: f64 = (0..n)
-            .into_par_iter()
-            .filter(|&u| out_deg[u] == 0)
-            .map(|u| rank[u])
-            .sum();
+        let dangling: f64 = dangling_nodes.iter().map(|&u| rank[u]).sum();
         let base = (1.0 - d) / nf + d * dangling / nf;
 
         next.par_iter_mut().enumerate().for_each(|(u, slot)| {
@@ -71,11 +88,7 @@ pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
             *slot = base + d * acc;
         });
 
-        let delta: f64 = next
-            .par_iter()
-            .zip(rank.par_iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
+        let delta = l1_delta(&next, &rank);
 
         std::mem::swap(&mut rank, &mut next);
         if delta < params.tol {
@@ -115,16 +128,16 @@ pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParam
         .collect();
     let inc = topo.incoming();
 
+    // Dangling nodes (zero out-strength), listed once — summed deterministically
+    // over this fixed ascending-index list each iteration (see the unweighted kernel).
+    let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_str[u] <= 0.0).collect();
+
     let mut rank = vec![1.0 / nf; n];
     let mut next = vec![0.0f64; n];
 
     for _iter in 0..params.max_iter {
         // Rank stranded on dangling nodes (zero out-strength), spread uniformly.
-        let dangling: f64 = (0..n)
-            .into_par_iter()
-            .filter(|&u| out_str[u] <= 0.0)
-            .map(|u| rank[u])
-            .sum();
+        let dangling: f64 = dangling_nodes.iter().map(|&u| rank[u]).sum();
         let base = (1.0 - d) / nf + d * dangling / nf;
 
         next.par_iter_mut().enumerate().for_each(|(u, slot)| {
@@ -141,11 +154,7 @@ pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParam
             *slot = base + d * acc;
         });
 
-        let delta: f64 = next
-            .par_iter()
-            .zip(rank.par_iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
+        let delta = l1_delta(&next, &rank);
 
         std::mem::swap(&mut rank, &mut next);
         if delta < params.tol {

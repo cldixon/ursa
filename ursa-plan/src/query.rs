@@ -92,6 +92,7 @@ impl ColumnSpec {
             "closeness" => GraphAlgo::Closeness,
             "betweenness" => GraphAlgo::Betweenness {
                 sample: self.sample,
+                seed: self.seed,
             },
             "label_propagation" => GraphAlgo::LabelPropagation {
                 max_iter: self.max_iter.unwrap_or(20),
