@@ -105,7 +105,7 @@ def test_negative_weight_errors():
 def test_unknown_weight_column_errors():
     tbl = pa.table({"src": [0, 1], "dst": [1, 0], "w": [1.0, 2.0]})
     edges = _edges(tbl)
-    with pytest.raises(ValueError, match="unknown edge column"):
+    with pytest.raises(ur.ColumnNotFoundError, match="unknown edge column"):
         edges.nodes().with_columns(pr=ur.pagerank(edges, weight=ur.col("nope"))).collect()
 
 

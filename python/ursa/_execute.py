@@ -99,7 +99,11 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     if table is not None:
         missing = [c for c in cols if c not in table.column_names]
         if missing:
-            raise ValueError(f"weight expression references unknown edge column(s): {missing}")
+            from . import ColumnNotFoundError
+
+            raise ColumnNotFoundError(
+                f"weight expression references unknown edge column(s): {missing}"
+            )
         batches = table.select(cols).combine_chunks().to_batches()
         return batches[0] if batches else None
     scan = getattr(edges, "_scan_spec", None)

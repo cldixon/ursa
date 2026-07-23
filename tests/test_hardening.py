@@ -36,3 +36,24 @@ def test_string_weight_column_reports_numeric_not_null():
     )
     with pytest.raises(Exception, match="numeric"):
         edges.nodes().with_columns(pr=ur.pagerank(edges, weight=ur.col("region"))).collect()
+
+
+def test_engine_errors_are_catchable_ursa_errors():
+    # #39.8: engine errors surface as the typed UrsaError hierarchy — ordinary
+    # exceptions, so `except ursa.UrsaError` (and `except Exception`) catches them.
+    # A Rust panic would be a BaseException and escape both.
+    edges = ur.from_arrow(
+        pa.table({"s": [0, 1], "d": [1, 0], "region": ["us", "eu"]}), src="s", dst="d"
+    )
+    with pytest.raises(ur.UrsaError):
+        edges.nodes().with_columns(pr=ur.pagerank(edges, weight=ur.col("region"))).collect()
+
+
+def test_unknown_weight_column_raises_column_not_found():
+    # A weight expression over a non-existent edge column is a ColumnNotFoundError,
+    # which is a UrsaError (and a plain Exception).
+    edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 0]}), src="s", dst="d")
+    with pytest.raises(ur.ColumnNotFoundError):
+        edges.nodes().with_columns(pr=ur.pagerank(edges, weight=ur.col("nope"))).collect()
+    assert issubclass(ur.ColumnNotFoundError, ur.UrsaError)
+    assert issubclass(ur.UrsaError, Exception)

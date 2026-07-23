@@ -12,6 +12,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
     betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_coefficient,
     connected_components_weak, degree, k_hop, label_propagation, louvain, louvain_weighted,
@@ -162,14 +163,18 @@ pub fn query_schema(columns: &[OutputColumn], id_type: DataType) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// Materialize the `(id, values...)` batch for a query.
-pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> RecordBatch {
+/// Materialize the `(id, values...)` batch for a query. The columns are all
+/// `n_nodes` long and match the schema by construction, so `try_new` is expected
+/// to succeed; it returns `Result` rather than `expect`-panicking so a future
+/// column-length regression surfaces as a catchable engine error, not a process
+/// abort across the FFI.
+pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = vec![ids.user_id_array()];
     for col in columns {
         arrays.push(col.value_array(topo));
     }
     RecordBatch::try_new(query_schema(columns, ids.user_type()), arrays)
-        .expect("all columns have length n_nodes and match the schema")
+        .map_err(|e| DataFusionError::ArrowError(e, None))
 }
 
 /// The output schema for a `hop`: an edge frame `(src, dst)` (of the graph's
@@ -189,7 +194,7 @@ pub fn hop_batch(
     seeds: &[u32],
     n: u32,
     direction: Direction,
-) -> RecordBatch {
+) -> Result<RecordBatch> {
     let (seed_dense, reached_dense) = k_hop(topo, seeds, n, direction);
     RecordBatch::try_new(
         hop_schema(ids.user_type()),
@@ -198,7 +203,7 @@ pub fn hop_batch(
             ids.gather_user(&reached_dense),
         ],
     )
-    .expect("src and dst are equal-length id columns matching the hop schema")
+    .map_err(|e| DataFusionError::ArrowError(e, None))
 }
 
 /// The output schema for a `shortest_path`: an edge frame `(src, dst, hop)` — one
@@ -223,7 +228,7 @@ pub fn path_batch(
     target: u32,
     direction: Direction,
     weights: Option<&[f64]>,
-) -> RecordBatch {
+) -> Result<RecordBatch> {
     let mut src_dense = Vec::new();
     let mut dst_dense = Vec::new();
     let mut hop = Vec::new();
@@ -246,7 +251,7 @@ pub fn path_batch(
             Arc::new(Int64Array::from(hop)),
         ],
     )
-    .expect("src, dst, hop are equal-length columns matching the path schema")
+    .map_err(|e| DataFusionError::ArrowError(e, None))
 }
 
 /// The output schema for a `random_walk`: a node frame `(walk_id, step, node)` —
@@ -270,7 +275,7 @@ pub fn walk_batch(
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
-) -> RecordBatch {
+) -> Result<RecordBatch> {
     let walks = random_walk(topo, starts, steps, walks_per_node, seed);
     let node = ids.gather_user(&walks.node);
     RecordBatch::try_new(
@@ -281,7 +286,7 @@ pub fn walk_batch(
             node,
         ],
     )
-    .expect("walk_id, step, node are equal-length columns matching the walk schema")
+    .map_err(|e| DataFusionError::ArrowError(e, None))
 }
 
 #[cfg(test)]
@@ -317,7 +322,7 @@ mod tests {
                 weights: None,
             },
         ];
-        let batch = query_batch(&topo, &ids, &columns);
+        let batch = query_batch(&topo, &ids, &columns).unwrap();
         assert_eq!(batch.num_columns(), 3); // id, deg, pr
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema().field(1).name(), "deg");
