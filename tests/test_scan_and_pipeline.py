@@ -256,7 +256,7 @@ def test_neighbors_agg_needs_attribute_table():
     # aggregate -> a clear error.
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
     pipeline = edges.nodes().with_columns(x=ur.neighbors(edges).agg(ur.col("capacity").mean()))
-    with pytest.raises((NotImplementedError, RuntimeError)):
+    with pytest.raises((NotImplementedError, ur.UrsaError)):
         pipeline.collect()
 
 
@@ -324,7 +324,7 @@ def test_neighbors_agg_mean_over_string_is_honest():
     pipeline = nodes.with_columns(
         x=ur.neighbors(edges, direction="in").agg(ur.col("region").mean())
     )
-    with pytest.raises((NotImplementedError, RuntimeError)):
+    with pytest.raises((NotImplementedError, ur.UrsaError)):
         pipeline.collect()
 
 

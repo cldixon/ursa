@@ -110,7 +110,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let fut = async move {
             tokio::task::spawn_blocking(move || query_batch(&topo, &ids, &columns))
                 .await
-                .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))
+                .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))?
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
@@ -210,7 +210,7 @@ impl ExecutionPlan for HopExec {
         let fut = async move {
             tokio::task::spawn_blocking(move || hop_batch(&topo, &ids, &seeds, n, direction))
                 .await
-                .map_err(|e| DataFusionError::Execution(format!("hop kernel panicked: {e}")))
+                .map_err(|e| DataFusionError::Execution(format!("hop kernel panicked: {e}")))?
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
@@ -320,7 +320,9 @@ impl ExecutionPlan for ShortestPathExec {
                 )
             })
             .await
-            .map_err(|e| DataFusionError::Execution(format!("shortest_path kernel panicked: {e}")))
+            .map_err(|e| {
+                DataFusionError::Execution(format!("shortest_path kernel panicked: {e}"))
+            })?
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
@@ -426,7 +428,7 @@ impl ExecutionPlan for RandomWalkExec {
                 walk_batch(&topo, &ids, &starts, steps, walks_per_node, seed)
             })
             .await
-            .map_err(|e| DataFusionError::Execution(format!("random_walk kernel panicked: {e}")))
+            .map_err(|e| DataFusionError::Execution(format!("random_walk kernel panicked: {e}")))?
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));

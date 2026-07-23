@@ -74,10 +74,29 @@ try:
     __core_version__ = _ursa.__core_version()
     from . import demo  # noqa: F401  (thin wrappers over the native demo kernels)
 
+    # The exception hierarchy the native engine raises. Re-exported so user code
+    # can `except ursa.UrsaError` (or the narrower subclasses) regardless of
+    # whether the extension is built.
+    from ._ursa import ColumnNotFoundError, ComputeError, UrsaError
+
     _NATIVE_AVAILABLE = True
 except ImportError:  # pragma: no cover - native module not yet built
     __core_version__ = None
     _NATIVE_AVAILABLE = False
+
+    # Pure-Python stand-ins so `ursa.UrsaError` exists (and `except ursa.UrsaError`
+    # is valid) even without the compiled engine. Once the extension is built the
+    # native classes above replace these; identity does not matter because only
+    # the native path ever raises them.
+    class UrsaError(Exception):
+        """Base class for every error Ursa raises from native execution."""
+
+    class ColumnNotFoundError(UrsaError):
+        """A query referenced a column that does not exist in the frame."""
+
+    class ComputeError(UrsaError):
+        """A graph computation failed (invalid parameter, unsupported op, kernel error)."""
+
 
 # Single-sourced from the installed distribution metadata (which maturin fills
 # from the Cargo workspace version), so it never drifts from __core_version__.
@@ -87,10 +106,13 @@ except PackageNotFoundError:  # source checkout without an install
     __version__ = "0.0.0+dev"
 
 __all__ = [
+    "ColumnNotFoundError",
+    "ComputeError",
     "EdgeFrame",
     "Expr",
     "MaterializedFrame",
     "NodeFrame",
+    "UrsaError",
     "avg_path_length",
     "betweenness",
     "closeness",

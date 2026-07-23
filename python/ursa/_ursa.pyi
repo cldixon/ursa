@@ -6,6 +6,13 @@ stub declares its surface. Keep it in sync with ``ursa-py/src/lib.rs``.
 
 from typing import Any
 
+# The exception hierarchy (defined in Rust via create_exception!). Every engine
+# error reaches Python as one of these — ordinary exceptions, so `except Exception`
+# catches them (a Rust panic would escape as a BaseException instead).
+class UrsaError(Exception): ...
+class ColumnNotFoundError(UrsaError): ...
+class ComputeError(UrsaError): ...
+
 def __core_version() -> str: ...
 
 # The CSR topology + IdMap, built once and cached on the EdgeFrame. Opaque handle;

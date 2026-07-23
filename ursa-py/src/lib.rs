@@ -23,7 +23,8 @@ use std::collections::HashMap;
 
 use arrow::array::{make_array, Array, ArrayData, ArrayRef, Int64Array, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::create_exception;
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,6 +38,56 @@ use ursa_plan::{
     execute_node_query, execute_path_query, execute_walk_query, scan_edges_batch, scan_nodes_batch,
     Comparison,
 };
+
+// ---------------------------------------------------------------------------
+// The Python exception hierarchy (#39.8).
+//
+// Every error the engine raises reaches Python as a member of this hierarchy, so
+// `except ursa.UrsaError` catches the whole native surface and, crucially, so
+// does a plain `except Exception` — unlike the `PanicException` (a
+// `BaseException`) a Rust panic would raise. The runtime-hardening work (#38/#39)
+// removed the panics; this gives what remains a typed, catchable shape.
+// ---------------------------------------------------------------------------
+
+create_exception!(
+    _ursa,
+    UrsaError,
+    PyException,
+    "Base class for every error Ursa raises from native execution."
+);
+create_exception!(
+    _ursa,
+    ColumnNotFoundError,
+    UrsaError,
+    "A query referenced a column that does not exist in the frame."
+);
+create_exception!(
+    _ursa,
+    ComputeError,
+    UrsaError,
+    "A graph computation failed: an invalid parameter or weight, an unsupported \
+     operation, or a kernel/engine error."
+);
+
+/// Map an engine error (a `DataFusionError`, or any other `Display` error the
+/// plan layer surfaces) to a typed, catchable exception in the Ursa hierarchy. A
+/// missing-column error becomes [`ColumnNotFoundError`]; everything else becomes
+/// [`ComputeError`]. Both subclass `UrsaError`. The classification is by rendered
+/// message rather than by matching internal `DataFusionError`/`SchemaError`
+/// variants, so it stays stable across engine version bumps (and lets this layer
+/// avoid a direct `datafusion` dependency).
+fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
+    let msg = e.to_string();
+    let lower = msg.to_lowercase();
+    if lower.contains("no field named")
+        || (lower.contains("column") && lower.contains("not found"))
+        || lower.contains("schema error")
+    {
+        ColumnNotFoundError::new_err(msg)
+    } else {
+        ComputeError::new_err(msg)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Real execution path: pyarrow in -> one DataFusion plan -> pyarrow out.
@@ -135,7 +186,7 @@ fn run_node_query(
             nodes_id,
             edges,
         )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        .map_err(to_pyerr)
     })?;
     batch.to_pyarrow(py)
 }
@@ -179,7 +230,7 @@ fn run_hop_query(
             limit,
             distinct,
         )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        .map_err(to_pyerr)
     })?;
     batch.to_pyarrow(py)
 }
@@ -232,7 +283,7 @@ fn run_path_query(
             limit,
             distinct,
         )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        .map_err(to_pyerr)
     })?;
     batch.to_pyarrow(py)
 }
@@ -275,7 +326,7 @@ fn run_walk_query(
             limit,
             distinct,
         )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        .map_err(to_pyerr)
     })?;
     batch.to_pyarrow(py)
 }
@@ -284,7 +335,7 @@ fn run_walk_query(
 #[pyfunction]
 fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>) -> PyResult<f64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || density(&topo).map_err(|e| PyRuntimeError::new_err(e.to_string())))
+    py.allow_threads(move || density(&topo).map_err(to_pyerr))
 }
 
 /// Average shortest-path length over reachable ordered pairs (eager scalar).
@@ -297,9 +348,7 @@ fn graph_avg_path_length(
     sample: Option<f64>,
 ) -> PyResult<f64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || {
-        avg_path_length(&topo, sample).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    })
+    py.allow_threads(move || avg_path_length(&topo, sample).map_err(to_pyerr))
 }
 
 /// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
@@ -311,9 +360,7 @@ fn graph_diameter(
     approximate: bool,
 ) -> PyResult<i64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || {
-        diameter(&topo, approximate).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    })
+    py.allow_threads(move || diameter(&topo, approximate).map_err(to_pyerr))
 }
 
 /// Whole-graph one-row summary (`n_nodes, n_edges, density, avg_degree,
@@ -321,9 +368,7 @@ fn graph_diameter(
 #[pyfunction]
 fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<PyObject> {
     let topo = index.topo.clone();
-    let batch = py.allow_threads(move || {
-        describe(&topo, full).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    })?;
+    let batch = py.allow_threads(move || describe(&topo, full).map_err(to_pyerr))?;
     batch.to_pyarrow(py)
 }
 
@@ -344,8 +389,7 @@ fn scan_edges_arrow(
 ) -> PyResult<PyObject> {
     let opts = storage_options.unwrap_or_default();
     let batch = py.allow_threads(|| {
-        scan_edges_batch(path, src, dst, &opts, &weight_columns)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr)
     })?;
     batch.to_pyarrow(py)
 }
@@ -363,9 +407,7 @@ fn scan_nodes_arrow(
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<PyObject> {
     let opts = storage_options.unwrap_or_default();
-    let batch = py.allow_threads(|| {
-        scan_nodes_batch(path, id, &opts).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    })?;
+    let batch = py.allow_threads(|| scan_nodes_batch(path, id, &opts).map_err(to_pyerr))?;
     batch.to_pyarrow(py)
 }
 
@@ -448,6 +490,13 @@ fn _demo_connected_components(src: Vec<i64>, dst: Vec<i64>) -> Vec<(i64, u32)> {
 /// The native extension module, imported by Python as `ursa._ursa`.
 #[pymodule]
 fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // the exception hierarchy (see the `create_exception!` block above)
+    m.add("UrsaError", m.py().get_type::<UrsaError>())?;
+    m.add(
+        "ColumnNotFoundError",
+        m.py().get_type::<ColumnNotFoundError>(),
+    )?;
+    m.add("ComputeError", m.py().get_type::<ComputeError>())?;
     m.add_function(wrap_pyfunction!(__core_version, m)?)?;
     // the cached graph index (built once per frame)
     m.add_class::<GraphIndex>()?;

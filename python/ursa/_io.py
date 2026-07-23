@@ -163,15 +163,22 @@ def _from_inmemory(op: str, data: Any, src, dst, id):
 
 def _canonical_id_array(arr: Any) -> Any:
     """Canonicalize a node-id array to a supported id type: any integer type to
-    int64 (the fast path), any string type to string (covering UUID-as-string).
-    Raises ``TypeError`` for anything else — Ursa node ids are int64 or string."""
+    int64 (the fast path), string ids passed through unchanged (covering
+    UUID-as-string). Raises ``TypeError`` for anything else — Ursa node ids are
+    int64 or string.
+
+    ``Utf8`` and ``LargeUtf8`` are both handled natively by the Rust id map (via
+    its ``StrView``), so neither is cast here. A ``LargeUtf8 -> Utf8`` cast in
+    particular would *panic* rather than error once the string data exceeds the
+    2 GiB that ``Utf8``'s i32 offsets can address — the exact input a large_string
+    column exists to carry — so the cast is removed, not just skipped."""
     import pyarrow as pa
     import pyarrow.types as pat
 
     if pat.is_integer(arr.type):
         return arr.cast(pa.int64())
     if pat.is_string(arr.type) or pat.is_large_string(arr.type):
-        return arr.cast(pa.string())
+        return arr
     raise TypeError(f"node ids must be an integer or string column; got {arr.type}")
 
 
