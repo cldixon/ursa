@@ -37,6 +37,11 @@ pub fn louvain_weighted(
     resolution: f64,
     seed: Option<u64>,
 ) -> Vec<u32> {
+    assert_eq!(
+        weights.len(),
+        topo.n_edges(),
+        "weights length must equal the edge count"
+    );
     louvain_impl(topo, Some(weights), resolution, seed)
 }
 

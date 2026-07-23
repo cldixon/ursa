@@ -45,6 +45,11 @@ pub fn closeness(topo: &Topology) -> Vec<f64> {
 /// over the reachable nodes at finite positive distance. `weights[e]` is the
 /// weight of edge row `e` (non-negative; `len == n_edges`).
 pub fn closeness_weighted(topo: &Topology, weights: &[f64]) -> Vec<f64> {
+    assert_eq!(
+        weights.len(),
+        topo.n_edges(),
+        "weights length must equal the edge count"
+    );
     let n = topo.n_nodes();
     (0..n)
         .into_par_iter()
