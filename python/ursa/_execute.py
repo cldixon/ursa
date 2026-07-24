@@ -17,7 +17,6 @@ Parquet/CSV file source. Anything outside the wired surface raises a clear error
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from ._result import MaterializedFrame
@@ -26,10 +25,11 @@ if TYPE_CHECKING:
     from ._expr import Expr
     from ._frames import EdgeFrame, NodeFrame, _PlanStep
 
-# Guards the per-frame lazy index build so concurrent first-collects over one
-# frame share a single build (the spec's "concurrent queries share one build");
-# collect() runs GIL-free, so the memo assignment itself needs guarding.
-_INDEX_BUILD_LOCK = threading.Lock()
+# The lazy index build is guarded per-frame by the lock on each frame's shared
+# `_BuildCell` (see `_frames._BuildCell`), so first-collects of *unrelated* frames
+# from different threads build concurrently instead of serializing on one global
+# lock. collect() runs GIL-free, so the memo assignment itself still needs the
+# cell's lock.
 
 # Algorithms with a kernel wired into the execution path (mirrors
 # ursa_plan::result::is_executable on the Rust side).
@@ -119,8 +119,9 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
         combined = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
         )
-        with _INDEX_BUILD_LOCK:
-            edges._index = _native().build_index(combined.column(0), combined.column(1))
+        cell = edges._index_build_cell
+        with cell.lock:
+            cell.value = _native().build_index(combined.column(0), combined.column(1))
         return combined
     raise NotImplementedError(
         "a weighted algorithm needs an in-memory or scan_edges source so the weight "
@@ -261,7 +262,11 @@ def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
 def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
     """The node attribute table as a RecordBatch: an in-memory ``from_arrow`` table
     if present, else a ``scan_nodes`` file source materialized through a DataFusion
-    scan. ``edges.nodes()``-derived frames have neither and return ``None``."""
+    scan. ``edges.nodes()``-derived frames have neither and return ``None``.
+
+    A scan-backed source is read from disk **once** and memoized on the frame's
+    shared attribute cell, so repeated collects (and ``_resolve_seeds``) over one
+    node file don't re-scan it each time."""
     inmem = getattr(frame, "_attr_table", None)
     if inmem is not None:
         return inmem
@@ -273,7 +278,16 @@ def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
                 "collect() over a scan_nodes source supports a single string path "
                 "(glob included) for now, not a list of paths."
             )
-        return _native().scan_nodes_arrow(path, scan["id"], _scan_storage_options(scan))
+        cell = frame._attr_build_cell
+        batch = cell.value
+        if batch is not None:
+            return batch
+        with cell.lock:
+            batch = cell.value
+            if batch is None:
+                batch = _native().scan_nodes_arrow(path, scan["id"], _scan_storage_options(scan))
+                cell.value = batch
+        return batch
     return None
 
 
@@ -591,15 +605,16 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     (see ``EdgeFrame._extend``). Concurrency-safe via a module lock."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
-    idx = getattr(edges, "_index", None)
+    cell = edges._index_build_cell
+    idx = cell.value
     if idx is not None:
         return idx
-    with _INDEX_BUILD_LOCK:
-        idx = getattr(edges, "_index", None)
+    with cell.lock:
+        idx = cell.value
         if idx is None:
             src, dst = _require_edges(edges)
             idx = _native().build_index(src, dst)
-            edges._index = idx
+            cell.value = idx
     return idx
 
 

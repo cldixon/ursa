@@ -109,12 +109,7 @@ pub fn scan_edges_batch(
     storage_options: &HashMap<String, String>,
     weight_columns: &[String],
 ) -> Result<RecordBatch> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-
-    runtime.block_on(async move {
+    crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
         let lower = path.to_ascii_lowercase();
@@ -138,9 +133,11 @@ pub fn scan_edges_batch(
         }
         let df = df.select_columns(&proj)?;
         let batches = df.collect().await?;
-        if batches.is_empty() {
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
-                "edge file {path:?} produced no rows"
+                "edge source {path:?} resolved but contained no rows; an empty edge set \
+                 is not a graph in v0.1 (check the path/glob points at data with the \
+                 given src/dst columns)"
             )));
         }
 
@@ -171,7 +168,7 @@ pub fn scan_edges_batch(
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|e| DataFusionError::ArrowError(e, None))
-    })
+    })?
 }
 
 /// Read a node/attribute file into one `RecordBatch`, keeping **every** column.
@@ -188,12 +185,7 @@ pub fn scan_nodes_batch(
     id: &str,
     storage_options: &HashMap<String, String>,
 ) -> Result<RecordBatch> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-
-    runtime.block_on(async move {
+    crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
         let lower = path.to_ascii_lowercase();
@@ -209,9 +201,10 @@ pub fn scan_nodes_batch(
         };
 
         let batches = df.collect().await?;
-        if batches.is_empty() {
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
-                "node file {path:?} produced no rows"
+                "node source {path:?} resolved but contained no rows (check the path/glob \
+                 points at data with the given id column)"
             )));
         }
 
@@ -243,7 +236,7 @@ pub fn scan_nodes_batch(
             .collect();
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|e| DataFusionError::ArrowError(e, None))
-    })
+    })?
 }
 
 #[cfg(test)]

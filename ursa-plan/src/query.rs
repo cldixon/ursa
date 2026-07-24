@@ -360,11 +360,7 @@ pub fn execute_node_query(
         node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns)),
     });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-    runtime.block_on(async move {
+    crate::runtime::block_on(async move {
         let ctx = graph_session();
         let graph_df = ctx.execute_logical_plan(graph_plan).await?;
 
@@ -402,7 +398,7 @@ pub fn execute_node_query(
         let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await?;
         concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
-    })
+    })?
 }
 
 /// Build and execute one `hop` traversal as a single DataFusion plan.
@@ -432,11 +428,7 @@ pub fn execute_hop_query(
         node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
     });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-    runtime.block_on(async move {
+    crate::runtime::block_on(async move {
         let ctx = graph_session();
         let mut df = ctx.execute_logical_plan(hop_plan).await?;
 
@@ -456,7 +448,7 @@ pub fn execute_hop_query(
         let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await?;
         concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
-    })
+    })?
 }
 
 /// Build and execute one `shortest_path` traversal as a single DataFusion plan.
@@ -526,11 +518,7 @@ pub fn execute_path_query(
         )),
     });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-    runtime.block_on(async move {
+    crate::runtime::block_on(async move {
         let ctx = graph_session();
         let mut df = ctx.execute_logical_plan(path_plan).await?;
 
@@ -550,7 +538,7 @@ pub fn execute_path_query(
         let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await?;
         concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
-    })
+    })?
 }
 
 /// Build and execute one `random_walk` as a single DataFusion plan.
@@ -585,11 +573,7 @@ pub fn execute_walk_query(
         )),
     });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("failed to build runtime: {e}")))?;
-    runtime.block_on(async move {
+    crate::runtime::block_on(async move {
         let ctx = graph_session();
         let mut df = ctx.execute_logical_plan(walk_plan).await?;
 
@@ -609,7 +593,7 @@ pub fn execute_walk_query(
         let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await?;
         concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
-    })
+    })?
 }
 
 /// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping

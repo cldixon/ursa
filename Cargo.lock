@@ -3224,6 +3224,7 @@ dependencies = [
  "datafusion",
  "futures",
  "object_store",
+ "rayon",
  "serde",
  "serde_json",
  "tokio",
