@@ -1,9 +1,15 @@
 name: Release
 
-# Build native wheels for every platform + an sdist, then publish to PyPI via
-# Trusted Publishing (OIDC — no stored API token). Runs when a GitHub Release is
-# published; `workflow_dispatch` builds the full matrix as a dry run WITHOUT
-# publishing, so the wheel build can be validated before cutting a real release.
+# Build native wheels for every platform + an sdist, smoke-test every artifact,
+# then publish to PyPI via Trusted Publishing (OIDC — no stored API token). Runs
+# when a GitHub Release is published; `workflow_dispatch` builds + smoke-tests the
+# full matrix as a dry run WITHOUT publishing, so a release can be validated first.
+#
+# Each build leg gates publish: `abi3audit` checks every wheel uses only the stable
+# ABI (the classic cross-compile failure, caught even on the arch it can't run), a
+# native-arch leg installs the wheel and runs a real kernel through the FFI, and the
+# sdist is built from source and imported. A wheel that builds but can't load never
+# reaches PyPI (publish `needs` all four build jobs, so any smoke failure blocks it).
 #
 # Wheels are abi3 (`abi3-py310`, set in ursa-py/Cargo.toml): one wheel per
 # platform (`cp310-abi3`) loads on every Python >= 3.10, so the matrix is over
@@ -22,6 +28,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  # Weekly dry run: build + smoke-test the whole matrix (incl. Windows and the
+  # cross-compiled aarch64 legs) so build breakage is caught between releases, not
+  # while cutting one. Publish is gated on a real release, so this never uploads.
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -55,6 +66,30 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.target }}
           path: dist
+      # Verify the wheel only uses the stable (abi3) ABI — the classic abi3 /
+      # cross-compile failure mode, and the one most likely on the zig-built
+      # aarch64 leg. Runs on any host (static check, no execution).
+      - name: abi3 audit
+        shell: bash
+        run: pipx run abi3audit --strict dist/*.whl
+      # Install the built wheel into a clean env and run a real kernel through the
+      # FFI. Only on the native arch (x86_64 here); the aarch64 wheel can't execute
+      # on this x86_64 runner, so abi3audit above is its gate.
+      - name: Smoke-import the wheel
+        if: matrix.target == 'x86_64'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyarrow
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import ursa as ur, pyarrow as pa
+          assert ur._NATIVE_AVAILABLE, "native extension did not load"
+          edges = ur.from_arrow(pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 2, 0]}), src="s", dst="d")
+          rows = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
+          assert abs(sum(rows.values()) - 1.0) < 1e-6, rows
+          print("smoke OK", ur.__version__, rows)
+          PY
 
   macos:
     name: wheels (macos ${{ matrix.target }})
@@ -77,6 +112,25 @@ jobs:
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
+      - name: abi3 audit
+        shell: bash
+        run: pipx run abi3audit --strict dist/*.whl
+      # macos-latest runners are arm64, so aarch64 is the native arch here.
+      - name: Smoke-import the wheel
+        if: matrix.target == 'aarch64'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyarrow
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import ursa as ur, pyarrow as pa
+          assert ur._NATIVE_AVAILABLE, "native extension did not load"
+          edges = ur.from_arrow(pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 2, 0]}), src="s", dst="d")
+          rows = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
+          assert abs(sum(rows.values()) - 1.0) < 1e-6, rows
+          print("smoke OK", ur.__version__, rows)
+          PY
 
   windows:
     name: wheels (windows x64)
@@ -94,6 +148,23 @@ jobs:
         with:
           name: wheels-windows-x64
           path: dist
+      - name: abi3 audit
+        shell: bash
+        run: pipx run abi3audit --strict dist/*.whl
+      - name: Smoke-import the wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyarrow
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import ursa as ur, pyarrow as pa
+          assert ur._NATIVE_AVAILABLE, "native extension did not load"
+          edges = ur.from_arrow(pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 2, 0]}), src="s", dst="d")
+          rows = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
+          assert abs(sum(rows.values()) - 1.0) < 1e-6, rows
+          print("smoke OK", ur.__version__, rows)
+          PY
 
   sdist:
     name: sdist
@@ -109,6 +180,26 @@ jobs:
         with:
           name: wheels-sdist
           path: dist
+      # The sdist is the artifact that broke in 0.1.1 (a metadata/packaging bug).
+      # Build it from source into a clean env and import — proving the sdist is
+      # self-contained and compiles, not just that it was produced.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Build & smoke-import from sdist
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyarrow
+          python -m pip install dist/*.tar.gz
+          python - <<'PY'
+          import ursa as ur, pyarrow as pa
+          assert ur._NATIVE_AVAILABLE, "native extension did not load from sdist"
+          edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 0]}), src="s", dst="d")
+          print("sdist smoke OK", ur.__version__, ur.degree(edges).collect().to_dicts())
+          PY
 
   publish:
     name: Publish to PyPI
