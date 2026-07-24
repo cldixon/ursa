@@ -15,12 +15,16 @@
         .collect()
     )
 
-This is the v0.1 **skeleton**. The public surface below mirrors the design spec;
-most of it raises ``NotImplementedError`` pending the DataFusion plan-building
-layer. What *is* live: the expression dialect (``ur.col`` & friends, pure Python)
-and — when the native extension is built — a ``ur.demo`` namespace that runs the
-real Rust kernels over in-memory edge lists, proving the full Python→Rust→kernel
-path.
+The primary surface is live: the algorithms (pagerank, degree, connected
+components, triangle count, clustering, closeness, betweenness, label propagation,
+louvain — with weighted variants), neighbour aggregation, the traversals (hop,
+shortest_path, random_walk), the whole-graph stats (density, avg_path_length,
+diameter, describe), and both in-memory (``from_arrow``/``from_polars``) and
+scan-backed (``scan_edges``/``scan_nodes``, Parquet/CSV, local or object storage)
+sources all execute end to end through the DataFusion plan and the ``ursa-core``
+kernels. A few relational verbs are still plan-only and raise a clear error when
+collected (``sample``, ``group_by().agg``, ``join``, ``schema``); ``ur.col`` & the
+expression dialect are pure Python and always available.
 """
 
 from __future__ import annotations

@@ -13,13 +13,15 @@
 //! that lowering here (see [`expr`]) keeps it a bounded surface rather than a
 //! concern smeared across the codebase.
 //!
-//! ## Status: skeleton
+//! ## Status
 //!
-//! The module structure and type surface are laid out; the DataFusion trait
-//! implementations (`UserDefinedLogicalNodeCore`, `ExecutionPlan`, `OptimizerRule`)
-//! are documented stubs. The first implementation task is [`physical`]: run one
-//! kernel (`degree` or `pagerank`) as a real pipeline-breaking `ExecutionPlan`
-//! that streams Arrow `RecordBatch`es, proving the operator contract end-to-end.
+//! The custom logical nodes ([`node`]), their pipeline-breaking `ExecutionPlan`s
+//! ([`physical`]), the extension planner ([`planner`]), and the query builders
+//! ([`query`]) are implemented: every graph verb — algorithms (weighted and
+//! unweighted), neighbour aggregation, and the hop/shortest_path/random_walk
+//! traversals — runs end to end, streaming Arrow `RecordBatch`es. The graph
+//! `OptimizerRule`s (filter-before-traversal, segmented-reduction fusion) are the
+//! remaining planned work; execution is correct without them.
 
 pub mod expr;
 pub mod logical;

@@ -12,11 +12,10 @@
 //!    super-edges. Local moving then runs on the smaller weighted graph.
 //!
 //! Edges are treated as **undirected**: a directed input is symmetrised (each
-//! directed edge contributes weight 1 in both directions; parallel/opposite edges
-//! accumulate). The input is unweighted for v0.1 — the aggregation phase is where
-//! weights first appear — so `weight=` is deferred to the weighted-algorithms
-//! work. `resolution` (γ) scales the null-model term: larger γ favours smaller
-//! communities.
+//! directed edge contributes its weight in both directions; parallel/opposite
+//! edges accumulate). [`louvain`] uses unit edge weights; [`louvain_weighted`]
+//! takes a per-edge weight (gathered via `edge_ids`). `resolution` (γ) scales the
+//! null-model term: larger γ favours smaller communities.
 
 use std::collections::HashMap;
 

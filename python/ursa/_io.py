@@ -3,11 +3,13 @@
 ``scan_*`` is lazy (returns a frame that is a plan); ``read_*`` is the eager
 convenience (scan + collect). ``from_polars`` / ``from_arrow`` are zero-copy via
 Arrow. Object storage is first-class: ``s3://``, ``gs://``, ``az://`` and globs
-are accepted, and scans push projections/predicates into Parquet.
+are accepted. Edge scans push their column projection (``src``/``dst`` plus any
+weight columns) into Parquet; node-column projection and predicate pushdown are
+not yet wired.
 
-Skeleton: constructors build correctly-typed lazy frames with the role mapping
-recorded (so ``.src_col`` etc. and ``.explain()`` work now); the actual read is
-performed by the engine at ``collect()``.
+Constructors build correctly-typed lazy frames with the role mapping recorded (so
+``.src_col`` etc. and ``.explain()`` work eagerly); the file read runs in the
+engine at ``collect()``.
 """
 
 from __future__ import annotations

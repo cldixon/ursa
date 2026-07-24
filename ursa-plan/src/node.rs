@@ -214,9 +214,9 @@ impl UserDefinedLogicalNodeCore for HopNode {
 ///
 /// A sibling of [`HopNode`]: another leaf node with a baked-in source/target
 /// (dense indices) that emits an **edge** frame — here `(src, dst, hop)`, the
-/// edges of the single source→target path in order. `weighted` is carried for the
-/// future weighted SSSP; v0.1 is unweighted BFS. Lowered to
-/// `crate::physical::ShortestPathExec`.
+/// edges of the single source→target path in order. `weights` (per edge row,
+/// gathered via `edge_ids`) selects weighted Dijkstra; `None` is unweighted BFS.
+/// Lowered to `crate::physical::ShortestPathExec`.
 #[derive(Clone)]
 pub struct ShortestPathNode {
     pub topology: Arc<Topology>,

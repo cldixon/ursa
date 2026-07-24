@@ -13,8 +13,9 @@ Topology is always threaded explicitly as the ``edges`` argument — there is no
 ambient graph. Direction is a per-op parameter; weight is any expression over
 edge columns.
 
-Skeleton: these build ``Expr("graph", ...)`` / frame plan nodes. Their execution
-is the ``ursa-plan`` physical operators (``ursa-core`` kernels behind them).
+These build ``Expr("graph", ...)`` / frame plan nodes; ``collect()`` executes
+them through the ``ursa-plan`` physical operators (``ursa-core`` kernels behind
+them).
 """
 
 from __future__ import annotations
@@ -166,9 +167,10 @@ def shortest_path(
     weight: Expr | None = None,
     direction: str = "out",
 ) -> EdgeFrame:
-    """Single-pair shortest path. Returns an EdgeFrame: one row per edge on the
-    path, in order, with a ``hop`` column (and a cost column when weighted).
-    Omit ``weight`` for unweighted BFS."""
+    """Single-pair shortest path. Returns an EdgeFrame ``(src, dst, hop)``: one row
+    per edge on the path, in order, with ``hop`` the 0-based position. ``weight``
+    selects minimum-cost (Dijkstra) over the edge-weight expression; omit it for
+    unweighted BFS. (The per-edge cost is not yet returned as a column.)"""
     step = _PlanStep(
         "shortest_path",
         {
@@ -208,8 +210,8 @@ def random_walk(
 
 # --- node-valued algorithms (dual-positioned) ------------------------------
 # In `with_columns(...)` they read as expressions; called bare they return a
-# NodeFrame of (id, value). The skeleton returns the Expr form; the standalone
-# NodeFrame spelling is produced by the same node at plan-build time.
+# NodeFrame of (id, value) — the standalone spelling promotes the Expr to
+# `edges.nodes().with_columns(<verb>=self)` (see GraphExpr._frame).
 
 
 def pagerank(
@@ -246,9 +248,11 @@ def betweenness(
     weight: Expr | None = None,
     seed: int | None = None,
 ) -> GraphExpr:
-    """Betweenness centrality (Brandes). ``sample=`` approximates from a
-    ``seed``-shuffled subset of sources (exact is O(nm)); ``seed`` makes the
-    sampled estimate reproducible."""
+    """Betweenness centrality (Brandes), directed and unnormalized. ``sample=``
+    approximates from a ``seed``-shuffled subset of sources (exact is O(nm));
+    ``seed`` makes the sampled estimate reproducible. Parallel edges count as
+    distinct shortest paths (so a multigraph diverges from a simple-graph
+    reference like NetworkX); weighted, only *exactly* float-equal path costs tie."""
     return _graph_expr("betweenness", edges=edges, sample=sample, weight=weight, seed=seed)
 
 

@@ -4,11 +4,14 @@
 //! the kernel consults the transpose (CSC). Dangling nodes (out-degree 0) would
 //! leak rank, so their mass is redistributed uniformly each iteration.
 //!
-//! This is a real, if straightforward, implementation. The Rayon parallel sweep
-//! over vertex ranges is the shape every fixpoint kernel shares; wiring it here
-//! establishes the pattern. Weights are not yet threaded (unweighted PageRank);
-//! the weighted variant gathers `weight[edge_ids[k]]` per in-edge — the seam is
-//! `Adjacency::edge_ids`.
+//! The Rayon parallel sweep over vertex ranges is the shape every fixpoint kernel
+//! shares. [`pagerank`] uses unit edge weights; [`pagerank_weighted`] gathers
+//! `weight[edge_ids[k]]` per in-edge (the seam is `Adjacency::edge_ids`) and pulls
+//! rank in proportion to weighted out-strength.
+//!
+//! **Multiplicity:** parallel `(u, v)` edges are kept as distinct CSR slots, so an
+//! unweighted run pulls rank once per parallel edge (multiplicity-is-rows) — a
+//! multigraph's scores differ from collapsing parallels to one edge.
 
 use rayon::prelude::*;
 

@@ -39,9 +39,11 @@ impl Scratch {
 /// For each seed, gather the nodes reachable within `k` hops (`k >= 1`).
 ///
 /// Returns two parallel dense-index vectors `(seeds_out, reached)` of equal
-/// length: `reached[i]` is reachable from `seeds_out[i]` within `k` hops. Each
-/// `(seed, reached)` pair appears once. Unknown/out-of-range seeds and `k == 0`
-/// contribute nothing. `Both` walks out- and in-neighbours together (an
+/// length: `reached[i]` is reachable from `seeds_out[i]` within `k` hops. Within
+/// a single seed's search each reached node appears once; a **repeated** seed in
+/// `seeds` runs its BFS again and emits the same pairs again (multiplicity-is-
+/// rows — dedup with `.distinct()` if unwanted). Unknown/out-of-range seeds and
+/// `k == 0` contribute nothing. `Both` walks out- and in-neighbours together (an
 /// undirected hop).
 ///
 /// Each seed's BFS is independent, so the seed set is swept in parallel (rayon)

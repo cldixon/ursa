@@ -1,11 +1,10 @@
 """The Ursa expression dialect — deliberately Polars-shaped.
 
-This module is pure Python and fully live in the skeleton: it builds an
-expression *tree* that the native layer (``ursa-plan::expr``) lowers to a
-DataFusion expression. What transfers from Polars is the muscle memory and mental
-model — not the import. ``pl.Expr`` objects are **not** accepted, and no
-translator between the two dialects will be built (see the spec's Architecture
-section for why).
+This module is pure Python and always available: it builds an expression *tree*
+that the native layer (``ursa-plan::expr``) lowers to a DataFusion expression.
+What transfers from Polars is the muscle memory and mental model — not the
+import. ``pl.Expr`` objects are **not** accepted, and no translator between the
+two dialects will be built (see the spec's Architecture section for why).
 
     ur.col("amount") * ur.col("fx_rate") > ur.lit(1000)
 

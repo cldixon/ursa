@@ -44,7 +44,7 @@ Ursa Minor is the constellation that contains **Polaris**, the North Star. A con
 ## Installation
 
 ```bash
-pip install ursa        # or: uv add ursa
+pip install ursa-graph  # or: uv add ursa-graph   (the import name is `ursa`)
 ```
 
 Wheels bundle the Rust core; no Rust toolchain is required. Python ≥ 3.10. `polars` is an optional (but recommended) dependency, used only for `.to_polars()` / `ur.from_polars()` interop.
@@ -150,7 +150,7 @@ nodes = ur.scan_nodes(
 )
 ```
 
-Object storage is first-class: scans push projections and predicates down into Parquet in S3/GCS/Azure. `scan_*` also accepts a pre-configured [`obstore`](https://github.com/developmentseed/obstore) store object in place of `storage_options` — obstore and Ursa's engine bind the *same* underlying Rust `object_store` crate.
+Object storage is first-class: edge scans push their column projection down into Parquet in S3/GCS/Azure (predicate pushdown and node-column projection are planned). `scan_*` also reserves a `store=` parameter for a pre-configured [`obstore`](https://github.com/developmentseed/obstore) store object in place of `storage_options` — obstore and Ursa's engine bind the *same* underlying Rust `object_store` crate — though `store=` is **not yet supported** and currently raises; use `storage_options=` for now.
 
 Neighbor aggregation pulls attributes across the topology:
 
@@ -260,7 +260,7 @@ ur.from_arrow(tbl, ...)                                                    # zer
 ur.read_edges(...) / ur.read_nodes(...)   # eager conveniences: scan + collect
 ```
 
-Formats: Parquet and CSV in v0.1 (Parquet with projection/predicate pushdown; JSON/NDJSON later). Paths: local, `s3://`, `gs://`, `az://`, plus glob patterns. `store=` accepts an obstore store.
+Formats: Parquet and CSV in v0.1 (Parquet with edge-column projection pushdown; predicate pushdown and JSON/NDJSON later). Paths: local, `s3://`, `gs://`, `az://`, plus glob patterns. `store=` (a pre-configured obstore store) and `**format_opts` (e.g. a CSV `delimiter=`) are accepted by the signature but not yet wired — passing them raises rather than being silently ignored.
 
 ### Frame methods (both types, relational)
 
@@ -428,8 +428,8 @@ Determinism: every stochastic algorithm (`random_walk`, `label_propagation`, `lo
 
 1. Exact `.str`/`.dt`/`.list` expression coverage for v0.1 — scope pragmatically during implementation.
 2. `hop()` result multiplicity: distinct-by-default vs. one row per path (current lean: keep duplicates, user calls `.distinct()` — consistent with multiplicity philosophy) — confirm with real usage.
-3. Null handling in `src`/`dst` (error vs. drop-with-warning at index build). Lean: error by default, `on_null="drop"` opt-in.
-4. Whether `describe` computes expensive members (`n_components`) by default or behind `full=True`.
+3. Null handling in `src`/`dst` (error vs. drop-with-warning at index build). Lean: error by default, `on_null="drop"` opt-in. (Implemented: a null endpoint errors by default; `on_null="drop"` is not yet wired.)
+4. ~~Whether `describe` computes expensive members (`n_components`) by default or behind `full=True`.~~ **Resolved:** the expensive `n_components` is gated behind `describe(edges, full=True)`; the default one-row summary omits it.
 
 ---
 

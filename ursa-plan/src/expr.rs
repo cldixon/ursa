@@ -36,15 +36,16 @@ pub enum UrsaExpr {
     Src,
     Dst,
     Id,
-    /// binary ops (arithmetic / comparison / boolean) — op kept as a string in
-    /// the skeleton; becomes an enum during implementation.
+    /// binary ops — the op is kept as a string and validated in `lower`/
+    /// `parse_ursa_expr` (weight expressions use `+ - * /`).
     Binary {
         op: String,
         left: Box<UrsaExpr>,
         right: Box<UrsaExpr>,
     },
-    // graph verbs (`ur.degree`, `ur.pagerank`, `ur.neighbors(..).agg(..)`, ...)
-    // lower to custom logical nodes rather than DfExpr — added during impl.
+    // Graph verbs (`ur.degree`, `ur.pagerank`, `ur.neighbors(..).agg(..)`, ...) are
+    // not part of this weight-expression enum; they lower to the custom logical
+    // nodes in `crate::logical`/`crate::node` at plan-build time.
 }
 
 /// Lower an [`UrsaExpr`] to a DataFusion expression. Covers the subset a weight

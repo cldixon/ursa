@@ -19,7 +19,8 @@ def __core_version() -> str: ...
 # built by build_index and passed to every graph op over the frame.
 class GraphIndex: ...
 
-# Build the graph index from (src, dst) int64 arrays (the one CSR build site).
+# Build the graph index from (src, dst) id arrays (int64 or string; the one CSR
+# build site — the id type is auto-detected from the Arrow columns).
 def build_index(src: Any, dst: Any) -> GraphIndex: ...
 
 # Total topology builds so far (test/observability hook for the index contract).
@@ -38,7 +39,8 @@ def run_node_query(
     edges: Any | None = ...,
 ) -> Any: ...
 
-# A hop traversal: a built index + int64 seed array + n/direction + relational
+# A hop traversal: a built index + user-id seed array (int64 or string) +
+# n/direction + relational
 # tail -> (src, dst) pyarrow.RecordBatch of reached pairs.
 def run_hop_query(
     index: GraphIndex,
@@ -67,7 +69,8 @@ def run_path_query(
     distinct: bool = ...,
 ) -> Any: ...
 
-# A random_walk: a built index + int64 start ids + walk params + relational tail
+# A random_walk: a built index + user-id start ids (int64 or string) + walk params
+# + relational tail
 # -> (walk_id, step, node) pyarrow.RecordBatch of the walk rows.
 def run_walk_query(
     index: GraphIndex,
