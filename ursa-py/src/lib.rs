@@ -12,11 +12,18 @@
 //!
 //! ## Surface
 //!
-//! - `run_node_query` — the one execution entry point: pyarrow edge arrays plus a
-//!   JSON column IR and a relational tail (filter/sort/limit) in, one pyarrow
-//!   `RecordBatch` out. Both `ur.pagerank(edges).collect()` and composed
-//!   `with_columns(...)` pipelines funnel through it.
-//! - `scan_edges_arrow` — read a Parquet/CSV edge file through a DataFusion scan.
+//! - `build_index` — build (and cache on the Python frame) the CSR topology from
+//!   the `(src, dst)` arrays; every graph op over the frame reuses it.
+//! - `run_node_query` — node-valued execution: a built index plus a JSON column IR
+//!   and a relational tail (filter/sort/limit) in, one pyarrow `RecordBatch` out.
+//!   Both `ur.pagerank(edges).collect()` and composed `with_columns(...)`
+//!   pipelines funnel through it (weighted algorithms carry an edge batch).
+//! - `run_hop_query` / `run_path_query` / `run_walk_query` — the traversals
+//!   (`hop`, `shortest_path` incl. weighted Dijkstra, `random_walk`).
+//! - `graph_density` / `graph_avg_path_length` / `graph_diameter` /
+//!   `graph_describe` — eager whole-graph statistics.
+//! - `scan_edges_arrow` / `scan_nodes_arrow` — read a Parquet/CSV edge or node
+//!   file (local or object storage) through a DataFusion scan.
 //! - `_demo_*` — plain-list Python→Rust smoke kernels (no Arrow); kept for tests.
 
 use std::collections::HashMap;

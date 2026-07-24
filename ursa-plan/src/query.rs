@@ -455,8 +455,9 @@ pub fn execute_hop_query(
 ///
 /// A [`ShortestPathNode`] emits the path's `(src, dst, hop)` edge frame; the same
 /// optional relational tail as [`execute_hop_query`] runs on top. `source`/`target`
-/// are user ids; if either is unknown the result is an empty path. Weighted paths
-/// are not yet supported (`weighted` errors) — v0.1 is unweighted BFS.
+/// are user ids; if either is unknown the result is an empty path. Pass `weight`
+/// (a serialized edge-weight expression) with the edge table for a minimum-cost
+/// Dijkstra path; omit both for unweighted BFS.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_path_query(
     topology: Arc<Topology>,

@@ -12,12 +12,17 @@ from ._frames import EdgeFrame, NodeFrame, _PlanStep
 
 
 def describe(edges: EdgeFrame, full: bool = False) -> NodeFrame:
-    """A lazy one-row summary frame (n_nodes, n_edges, density, avg_degree, ...).
+    """A lazy one-row summary frame with columns ``n_nodes``, ``n_edges``,
+    ``density``, ``avg_degree`` (and ``n_components`` when ``full=True``, which is
+    the expensive member — gated behind the flag by default).
 
-    ``full=True`` computes the expensive members (e.g. ``n_components``); whether
-    those are default or opt-in is an open question (spec §Open questions #4).
+    This is a whole-graph summary, not a node-keyed frame: it has no ``id`` column,
+    so the carried ``id_col`` is an unused placeholder (you collect the summary
+    rather than derive node-keyed frames from it).
     """
-    return NodeFrame(id_col="stat", plan=(_PlanStep("describe", {"full": full, "edges": edges}),))
+    return NodeFrame(
+        id_col="__summary__", plan=(_PlanStep("describe", {"full": full, "edges": edges}),)
+    )
 
 
 def density(edges: EdgeFrame) -> float:

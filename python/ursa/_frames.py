@@ -5,12 +5,12 @@ There is no ``Graph`` object. The EdgeFrame *is* the graph (designated ``src`` /
 attribute table with a designated ``id`` role that relates to it by join
 convention. A frame *is* a logical plan until ``.collect()``.
 
-Skeleton behaviour: relational transformations accumulate onto an in-Python
-logical-plan chain (inspectable via ``.explain()``); the operations that require
-the engine — ``collect``, the ``to_*`` egress, ``sink_*`` — raise
-``NotImplementedError`` until the ``ursa-plan`` / DataFusion layer is wired.
-Role tracking, ``.nodes()``, ``.reverse()``, and the index-preservation contract
-metadata are modelled here so the shape is exercisable now.
+Relational transformations accumulate onto an in-Python logical-plan chain
+(inspectable via ``.explain()``); ``collect`` and the ``to_*`` / ``sink_*`` egress
+execute it through the ``ursa-plan`` / DataFusion layer. Role tracking,
+``.nodes()``, ``.reverse()``, and the index-preservation contract are modelled
+here. A few relational verbs are still plan-only and raise a clear error when
+collected: ``schema()``, ``sample``, ``group_by().agg``, and ``join``.
 """
 
 from __future__ import annotations
@@ -26,9 +26,9 @@ if TYPE_CHECKING:
     from ._result import MaterializedFrame
 
 _ENGINE_TODO = (
-    "requires the DataFusion execution engine (ursa-plan), not yet wired in this "
-    "skeleton. The topology index + kernels (ursa-core) and the plan builder "
-    "(this module) are in place; collect() is the next integration step."
+    "is not executable yet: it is modelled in the plan (so it composes and shows in "
+    ".explain()) but has no engine lowering. collect() and the to_*/sink_* egress "
+    "are wired; this particular verb is still plan-only."
 )
 
 

@@ -35,7 +35,7 @@ the parts that prove the design is sound are real and tested end-to-end.
 
 | Layer | State |
 |---|---|
-| **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) / `bfs` (frontier) / `closeness` / `betweenness` (Brandes, with source sampling) / `label_propagation` / `louvain` (modularity) kernels. Weighted variants are the remaining kernel work. |
+| **`ursa-core`** — CSR topology index + kernels | ✅ **Real & unit-tested.** Dense `u32` indexing, lazy-transpose CSR with the `edge_ids` permutation, and working `degree` / `pagerank` (pull-based) / `connected_components` (union-find) / `triangle_count` / `clustering_coefficient` (sorted-adjacency intersection) / `bfs` (frontier) / `closeness` / `betweenness` (Brandes, with source sampling) / `label_propagation` / `louvain` (modularity) kernels, each with a weighted variant. |
 | **`ursa-plan`** — DataFusion engine | ✅ **Unified plan.** Each `collect()` is **one** DataFusion `LogicalPlan` — `Limit → Sort → Filter → GraphAlgorithmNode` — where `GraphAlgorithmNode` is a real `UserDefinedLogicalNode` lowered to `GraphAlgorithmExec` by our own `ExtensionPlanner`. Graph ops are first-class citizens of the plan (not orchestrated from outside), which is where future optimizer rules register. A DataFusion scan reads Parquet/CSV edge/node files, local or from object storage (`s3://` / `gs://` / `az://`), with the column projection pushed into the file. |
 | **`ursa-py`** — PyO3 bindings | ✅ **Wired.** Arrow in/out zero-copy (PyCapsule), GIL released during compute. |
 | **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort), **`neighbors().agg()`** over numeric *and* string attributes, the **traversals** `hop()` and `shortest_path()` (first-class `HopNode`/`ShortestPathNode` returning EdgeFrames) plus `random_walk()` (a `RandomWalkNode` returning a `(walk_id, step, node)` frame), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources — local files **or object storage** (`s3://` / `gs://` / `az://`, with `storage_options={...}`). |
@@ -139,10 +139,15 @@ evaluated to an f64 per edge and gathered per CSR slot via the `edge_ids`
 permutation. Weighted **PageRank**, **`shortest_path`** (Dijkstra), **closeness**,
 **betweenness** (Dijkstra-Brandes), and **louvain** all ship.
 
+A few relational verbs are modelled in the plan (so they compose and show in
+`.explain()`) but are **not yet executable** and raise a clear error when
+collected: `sample`, `group_by().agg`, `join`, and `schema`.
+
 Next, in rough priority order:
 
-1. The direction-optimizing (top-down/bottom-up) BFS switch and weighted SSSP via
-   delta-stepping, for scale.
+1. Scale-oriented kernel refinements: the direction-optimizing (top-down/bottom-up)
+   BFS switch, and delta-stepping for the (already shipping, Dijkstra-based)
+   weighted SSSP.
 2. **Optimizer rules** — push node-set filters before traversal, fuse
    `neighbors().agg` into a segmented CSR reduction. (The topology index is now
    built once and shared across ops over a frame — the index-preservation

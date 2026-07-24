@@ -15,10 +15,12 @@
 //!
 //! ## Status
 //!
-//! This is the v0.1 *skeleton*. [`Topology`], [`IdMap`], and the `degree`,
-//! `pagerank`, and `connected_components` kernels are real and unit-tested.
-//! `triangle_count` and the BFS/frontier kernels are stubbed with `todo!`-shaped
-//! documentation and a clear porting target (the GAP Benchmark Suite).
+//! [`Topology`], [`IdMap`], and the full kernel set are implemented and
+//! unit-tested: `degree`, `pagerank` (+ weighted), `connected_components`,
+//! `triangle_count`, `clustering_coefficient`, `closeness` (+ weighted),
+//! `betweenness` (+ weighted Dijkstra-Brandes), `label_propagation`, `louvain`
+//! (+ weighted), the BFS/frontier kernels (`bfs_distances`, `shortest_path` +
+//! weighted, `k_hop`), neighbour aggregation, and `random_walk`.
 
 pub mod algo;
 pub mod id_map;

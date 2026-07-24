@@ -1,6 +1,6 @@
 //! The CSR topology index.
 //!
-//! Three load-bearing design details, all present here in skeleton form:
+//! Three load-bearing design details:
 //!
 //! 1. **Dense internal indexing** — handled upstream by [`IdMap`]; this struct
 //!    only ever sees `u32` node indices.

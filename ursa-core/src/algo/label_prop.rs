@@ -7,6 +7,10 @@
 //! fully-synchronous update suffers on bipartite structure. Ties are broken
 //! toward the smallest label id so the result is deterministic regardless of hash
 //! iteration order.
+//!
+//! **Multiplicity:** votes are tallied per CSR slot, so parallel edges cast
+//! parallel votes (multiplicity-is-rows) — a heavily-parallel neighbour pulls
+//! proportionally harder.
 
 use std::collections::HashMap;
 

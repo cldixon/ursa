@@ -6,6 +6,12 @@
 //! kernels — "do not invent these"). Directed: paths follow out-edges and ordered
 //! pairs `(s, t)` are counted once, so there is no final halving.
 //!
+//! **Multiplicity:** `sigma` is incremented per CSR slot, so parallel edges count
+//! as distinct shortest paths — a multigraph's scores therefore differ from a
+//! simple-graph reference (e.g. NetworkX). The weighted variant
+//! ([`betweenness_weighted`]) counts equal-cost alternate paths as ties only when
+//! their total costs are *exactly* float-equal.
+//!
 //! Exact is `O(n · m)`. `sample = Some(frac)` runs Brandes from a `seed`-shuffled
 //! subset of `⌈frac · n⌉` sources and scales the result by `n / k` (the
 //! Brandes–Pich estimator); a shuffled subset (not a layout-correlated stride) is
