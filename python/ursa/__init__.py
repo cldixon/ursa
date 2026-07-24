@@ -76,7 +76,6 @@ try:
 
     _native = _ursa
     __core_version__ = _ursa.__core_version()
-    from . import demo  # noqa: F401  (thin wrappers over the native demo kernels)
 
     # The exception hierarchy the native engine raises. Re-exported so user code
     # can `except ursa.UrsaError` (or the narrower subclasses) regardless of

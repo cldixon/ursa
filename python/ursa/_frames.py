@@ -141,26 +141,28 @@ class _Frame:
     def schema(self) -> dict[str, str]:
         raise NotImplementedError(f"schema() {_ENGINE_TODO}")
 
-    # -- materialization / egress (engine required) --------------------------
-    def collect(self) -> Self:
-        raise NotImplementedError(f"collect() {_ENGINE_TODO}")
+    # -- materialization / egress --------------------------------------------
+    # `collect()` is the one method each frame type implements; every egress form
+    # below routes through it, so EdgeFrame/NodeFrame need only override collect().
+    def collect(self) -> MaterializedFrame:
+        raise NotImplementedError("collect() must be implemented by the frame subclass")
 
     def to_polars(self):  # -> polars.DataFrame
-        raise NotImplementedError(f"to_polars() {_ENGINE_TODO}")
+        return self.collect().to_polars()
 
     def to_arrow(self):  # -> pyarrow.Table
-        raise NotImplementedError(f"to_arrow() {_ENGINE_TODO}")
+        return self.collect().to_arrow()
 
     def to_dicts(self) -> list[dict[str, Any]]:
-        raise NotImplementedError(f"to_dicts() {_ENGINE_TODO}")
+        return self.collect().to_dicts()
 
     def sink_parquet(self, path: str, **opts: Any) -> None:
-        raise NotImplementedError(f"sink_parquet() {_ENGINE_TODO}")
+        self.collect().sink_parquet(path, **opts)
 
     # No **opts: CSV write options aren't threaded through, so accepting them
     # would silently drop them (sink_parquet does forward its opts to pyarrow).
     def sink_csv(self, path: str) -> None:
-        raise NotImplementedError(f"sink_csv() {_ENGINE_TODO}")
+        self.collect().sink_csv(path)
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} lazy; {len(self._plan)} step(s)>"
@@ -298,25 +300,13 @@ class EdgeFrame(_Frame):
     # edges as a materialized frame. A plain edge frame with no traversal step is
     # not collectable on its own (call an algorithm on it) — collect_edge_frame
     # raises a clear error in that case.
-    def collect(self) -> MaterializedFrame:  # ty: ignore[invalid-method-override]
+    def collect(self) -> MaterializedFrame:
         from ._execute import collect_edge_frame
 
         return collect_edge_frame(self)
 
-    def to_polars(self) -> Any:
-        return self.collect().to_polars()
-
-    def to_arrow(self) -> Any:
-        return self.collect().to_arrow()
-
-    def to_dicts(self) -> list[dict[str, Any]]:
-        return self.collect().to_dicts()
-
-    def sink_parquet(self, path: str, **opts: Any) -> None:
-        self.collect().sink_parquet(path, **opts)
-
-    def sink_csv(self, path: str) -> None:
-        self.collect().sink_csv(path)
+    # to_polars / to_arrow / to_dicts / sink_* are inherited from _Frame (they
+    # route through collect()).
 
     def __repr__(self) -> str:
         return (
@@ -387,27 +377,12 @@ class NodeFrame(_Frame):
         )
 
     # Composed pipelines (with_columns of graph algorithms + filter/sort/head)
-    # execute here. Returns the materialized result rather than another lazy
-    # frame, so the override signature intentionally differs from the base.
-    def collect(self) -> MaterializedFrame:  # ty: ignore[invalid-method-override]
+    # execute here, returning the materialized result. to_polars / to_arrow /
+    # to_dicts / sink_* are inherited from _Frame (they route through collect()).
+    def collect(self) -> MaterializedFrame:
         from ._execute import collect_node_frame
 
         return collect_node_frame(self)
-
-    def to_polars(self) -> Any:
-        return self.collect().to_polars()
-
-    def to_arrow(self) -> Any:
-        return self.collect().to_arrow()
-
-    def to_dicts(self) -> list[dict[str, Any]]:
-        return self.collect().to_dicts()
-
-    def sink_parquet(self, path: str, **opts: Any) -> None:
-        self.collect().sink_parquet(path, **opts)
-
-    def sink_csv(self, path: str) -> None:
-        self.collect().sink_csv(path)
 
     def __repr__(self) -> str:
         return f"<NodeFrame id={self._id_col!r} lazy; {len(self._plan)} step(s)>"

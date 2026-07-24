@@ -1,15 +1,15 @@
-//! Custom logical plan nodes for graph operations.
+//! Shared plan-layer enums: traversal [`Direction`] and the node-valued
+//! algorithm descriptor [`GraphAlgo`].
 //!
-//! Each graph verb becomes a `UserDefinedLogicalNodeCore` so it participates in
-//! DataFusion's logical plan, optimization, and display. This module defines the
-//! node *data* (params); the trait implementations that make them real logical
-//! nodes are the next implementation step (they are verbose and version-coupled,
-//! so the skeleton keeps them as plain types with a documented TODO).
+//! The custom logical plan *nodes* themselves (with their full
+//! `UserDefinedLogicalNodeCore` implementations) live in [`crate::node`]; this
+//! module holds only the small parameter types they share, kept here so logical
+//! nodes don't leak `ursa_core` types into the plan surface.
 //!
-//! The **v0.1 planner ambition** (decided): ship these nodes with *naive*
-//! placement first — execute in written order, correctness over cleverness — and
-//! land the optimizer rules incrementally in v0.1.x/v0.2. The public API is
-//! identical either way.
+//! The **v0.1 planner ambition** (decided): the nodes execute with *naive*
+//! placement — in written order, correctness over cleverness — with the optimizer
+//! rules landing incrementally in v0.1.x/v0.2. The public API is identical either
+//! way.
 
 /// Traversal direction, mirrored from [`ursa_core::Direction`] at this layer so
 /// logical nodes don't leak the core type into the plan surface.
@@ -64,50 +64,6 @@ pub enum GraphAlgo {
     },
 }
 
-/// `HopNode` — one/`n`-hop expansion; lowers to a frontier `ExecutionPlan`.
-/// EdgeFrame -> EdgeFrame, so traversal composes.
-#[derive(Debug, Clone)]
-pub struct HopNode {
-    pub n: u32,
-    pub direction: Direction,
-    // seed restriction (`.from_(...)`) is a child plan feeding this node.
-}
-
-/// `NeighborAggNode` — neighbour aggregation, fused into a segmented reduction
-/// over CSR by the optimizer (never materializes neighbour lists).
-#[derive(Debug, Clone)]
-pub struct NeighborAggNode {
-    pub direction: Direction,
-    // the aggregate expression is a child DataFusion expr resolved against the
-    // ambient frame (the attribute-resolution rule).
-}
-
-/// `GraphAlgorithmNode` — a node-valued algorithm over the topology.
-#[derive(Debug, Clone)]
-pub struct GraphAlgorithmNode {
-    pub algo: GraphAlgo,
-    // weight is an optional child expr over edge columns, evaluated to an Arrow
-    // array before the kernel runs (gathered via Topology::edge_ids).
-}
-
-/// `ShortestPathNode` — single-pair (v0.1) shortest path; EdgeFrame with `hop`
-/// (and, weighted, cost) columns.
-#[derive(Debug, Clone)]
-pub struct ShortestPathNode {
-    pub source: i64,
-    pub target: i64,
-    pub direction: Direction,
-    pub weighted: bool,
-}
-
-/// `RandomWalkNode` — `(walk_id, step, node)` frame; feeds node2vec-style pipelines.
-#[derive(Debug, Clone)]
-pub struct RandomWalkNode {
-    pub steps: u32,
-    pub walks_per_node: u32,
-    pub seed: Option<u64>,
-}
-
-// TODO(v0.1): impl `UserDefinedLogicalNodeCore` for each node above
-// (name/inputs/schema/expressions/fmt_for_explain/with_exprs_and_inputs), then
-// register `ExecutionPlan` builders in `crate::physical`.
+// The concrete logical nodes (`GraphAlgorithmNode`, `HopNode`, `ShortestPathNode`,
+// `RandomWalkNode`) and their `UserDefinedLogicalNodeCore` impls live in
+// `crate::node`; this module intentionally holds only the shared enums above.

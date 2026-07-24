@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Direction {
     Out,
     In,
@@ -289,13 +289,44 @@ impl Topology {
         UndirectedCsr { offsets, targets }
     }
 
-    /// Adjacency for a given direction. `Both` returns `out` here; kernels that
-    /// need a true undirected view consult both and merge (see `triangle_count`).
+    /// Apply `f` to each neighbour of `u` in `dir` — out-neighbours, in-neighbours,
+    /// or both adjacencies concatenated for `Both`. The one canonical directional
+    /// neighbour walk shared by the frontier kernels (`bfs`, `k_hop`).
     #[inline]
-    pub fn adjacency(&self, dir: Direction) -> &Adjacency {
+    pub fn for_each_neighbor<F: FnMut(u32)>(&self, u: u32, dir: Direction, mut f: F) {
         match dir {
-            Direction::Out | Direction::Both => &self.out,
-            Direction::In => self.incoming(),
+            Direction::Out => self.out.neighbors(u).iter().for_each(|&v| f(v)),
+            Direction::In => self.incoming().neighbors(u).iter().for_each(|&v| f(v)),
+            Direction::Both => {
+                self.out.neighbors(u).iter().for_each(|&v| f(v));
+                self.incoming().neighbors(u).iter().for_each(|&v| f(v));
+            }
+        }
+    }
+
+    /// Apply `f(v, w)` to each neighbour of `u` in `dir` and the weight `w` of the
+    /// connecting edge, gathered per CSR slot via `edge_ids` (both adjacencies
+    /// merged for `Both`). `weights` is indexed by original edge row.
+    #[inline]
+    pub fn for_each_weighted_neighbor<F: FnMut(u32, f64)>(
+        &self,
+        u: u32,
+        weights: &[f64],
+        dir: Direction,
+        mut f: F,
+    ) {
+        let mut visit = |adj: &Adjacency| {
+            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                f(v, weights[e as usize]);
+            }
+        };
+        match dir {
+            Direction::Out => visit(&self.out),
+            Direction::In => visit(self.incoming()),
+            Direction::Both => {
+                visit(&self.out);
+                visit(self.incoming());
+            }
         }
     }
 }

@@ -6,9 +6,9 @@
 //! keeps predecessor pointers so a single source→target path can be
 //! reconstructed. Both run to exhaustion (no `k` cap, unlike `k_hop`).
 //!
-//! Direction is a per-operation parameter. `Both` is a true undirected walk:
-//! `Topology::adjacency(Both)` returns out-adjacency only, so `Both` explicitly
-//! visits out- and in-neighbours (mirroring `hop::push_neighbors`).
+//! Direction is a per-operation parameter. `Both` is a true undirected walk over
+//! out- and in-neighbours, via the shared [`Topology::for_each_neighbor`] /
+//! [`Topology::for_each_weighted_neighbor`] helpers.
 
 use crate::topology::{Direction, Topology};
 
@@ -28,7 +28,7 @@ pub fn bfs_distances(topo: &Topology, source: u32, dir: Direction) -> Vec<i32> {
     while !frontier.is_empty() {
         next.clear();
         for &u in &frontier {
-            visit_neighbors(topo, u, dir, |v| {
+            topo.for_each_neighbor(u, dir, |v| {
                 if dist[v as usize] < 0 {
                     dist[v as usize] = level;
                     next.push(v);
@@ -70,7 +70,7 @@ pub fn shortest_path(
         next.clear();
         for &u in &frontier {
             let mut hit = false;
-            visit_neighbors(topo, u, dir, |v| {
+            topo.for_each_neighbor(u, dir, |v| {
                 if parent[v as usize] < 0 {
                     parent[v as usize] = u as i64;
                     if v == target {
@@ -99,57 +99,6 @@ pub fn shortest_path(
     }
     path.reverse();
     Some(path)
-}
-
-/// Apply `f` to each neighbour of `u` in `dir` (both adjacencies for `Both`).
-#[inline]
-fn visit_neighbors<F: FnMut(u32)>(topo: &Topology, u: u32, dir: Direction, mut f: F) {
-    match dir {
-        Direction::Out => {
-            for &v in topo.out().neighbors(u) {
-                f(v);
-            }
-        }
-        Direction::In => {
-            for &v in topo.incoming().neighbors(u) {
-                f(v);
-            }
-        }
-        Direction::Both => {
-            for &v in topo.out().neighbors(u) {
-                f(v);
-            }
-            for &v in topo.incoming().neighbors(u) {
-                f(v);
-            }
-        }
-    }
-}
-
-/// Apply `f(v, w)` to each neighbour of `u` in `dir` and the weight of the
-/// connecting edge, gathered per CSR slot via `edge_ids` (both adjacencies merged
-/// for `Both`). `neighbors(u)` and `edge_ids(u)` are aligned element-for-element.
-#[inline]
-fn visit_weighted_neighbors<F: FnMut(u32, f64)>(
-    topo: &Topology,
-    u: u32,
-    weights: &[f64],
-    dir: Direction,
-    mut f: F,
-) {
-    let mut visit = |adj: &crate::topology::Adjacency| {
-        for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
-            f(v, weights[e as usize]);
-        }
-    };
-    match dir {
-        Direction::Out => visit(topo.out()),
-        Direction::In => visit(topo.incoming()),
-        Direction::Both => {
-            visit(topo.out());
-            visit(topo.incoming());
-        }
-    }
 }
 
 /// Total order over `f64` (only `PartialOrd` by default) so distances can key a
@@ -203,7 +152,7 @@ pub fn dijkstra_distances(
             continue;
         }
         settled[u as usize] = true;
-        visit_weighted_neighbors(topo, u, weights, dir, |v, w| {
+        topo.for_each_weighted_neighbor(u, weights, dir, |v, w| {
             if !settled[v as usize] {
                 let nd = du + w;
                 if nd < dist[v as usize] {
@@ -265,7 +214,7 @@ pub fn shortest_path_weighted(
         if u == target {
             break; // settled the target — its distance is final
         }
-        visit_weighted_neighbors(topo, u, weights, dir, |v, w| {
+        topo.for_each_weighted_neighbor(u, weights, dir, |v, w| {
             if !settled[v as usize] {
                 let nd = du + w;
                 if nd < dist[v as usize] {

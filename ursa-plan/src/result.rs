@@ -79,22 +79,6 @@ impl OutputColumn {
     }
 }
 
-/// Whether an algorithm has a kernel wired into the execution path.
-pub fn is_executable(algo: &GraphAlgo) -> bool {
-    matches!(
-        algo,
-        GraphAlgo::Degree { .. }
-            | GraphAlgo::PageRank { .. }
-            | GraphAlgo::ConnectedComponents { .. }
-            | GraphAlgo::TriangleCount
-            | GraphAlgo::ClusteringCoefficient
-            | GraphAlgo::Closeness
-            | GraphAlgo::Betweenness { .. }
-            | GraphAlgo::LabelPropagation { .. }
-            | GraphAlgo::Louvain { .. }
-    )
-}
-
 fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> ArrayRef {
     match algo {
         GraphAlgo::Degree { direction } => {

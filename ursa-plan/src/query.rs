@@ -29,7 +29,7 @@ use ursa_core::{IdMap, Topology};
 use crate::logical::{Direction, GraphAlgo};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
-use crate::result::{is_executable, path_schema, OutputColumn};
+use crate::result::{path_schema, OutputColumn};
 use crate::weight::evaluate_weight;
 
 /// A single `column <op> literal` comparison (`op` in `> >= < <= == !=`).
@@ -306,15 +306,12 @@ pub fn execute_node_query(
                 agg,
             });
         } else {
+            // `to_algo` is the single place an unknown algorithm kind is rejected.
             let algo = spec.to_algo()?;
-            if !is_executable(&algo) {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "graph algorithm {algo:?} is not wired into the execution path"
-                )));
-            }
             // A weight expression (over edge columns) is evaluated to one f64 per
             // edge row against the edge attribute batch; the kernel gathers it via
-            // edge_ids. v0.1 supports it only on pagerank.
+            // edge_ids. Weighting is supported on pagerank/closeness/betweenness/
+            // louvain (checked below).
             let weights = match &spec.weight {
                 None => None,
                 Some(weight_json) => {

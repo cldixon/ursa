@@ -32,7 +32,6 @@ pub mod query;
 pub mod result;
 pub mod runtime;
 pub mod scan;
-pub mod session;
 pub mod stats;
 pub mod topology;
 pub mod weight;
@@ -45,6 +44,5 @@ pub use query::{
     execute_hop_query, execute_node_query, execute_path_query, execute_walk_query, Comparison,
 };
 pub use scan::{scan_edges_batch, scan_nodes_batch};
-pub use session::ursa_session;
 pub use stats::{avg_path_length, density, describe, diameter};
 pub use topology::build_topology;
