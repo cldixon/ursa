@@ -24,11 +24,10 @@
 //!   `graph_describe` — eager whole-graph statistics.
 //! - `scan_edges_arrow` / `scan_nodes_arrow` — read a Parquet/CSV edge or node
 //!   file (local or object storage) through a DataFusion scan.
-//! - `_demo_*` — plain-list Python→Rust smoke kernels (no Arrow); kept for tests.
 
 use std::collections::HashMap;
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef, Int64Array, RecordBatch};
+use arrow::array::{make_array, ArrayData, ArrayRef, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
@@ -37,8 +36,7 @@ use pyo3::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ursa_core::algo::{connected_components_weak, degree, pagerank, PageRankParams};
-use ursa_core::topology::{Direction as CoreDirection, Topology};
+use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 use ursa_plan::{
     avg_path_length, build_topology, density, describe, diameter, execute_hop_query,
@@ -418,80 +416,10 @@ fn scan_nodes_arrow(
     batch.to_pyarrow(py)
 }
 
-// ---------------------------------------------------------------------------
-// Demo kernels (plain lists, no Arrow) — the pure Python->PyO3->ursa-core proof.
-// ---------------------------------------------------------------------------
-
-fn build_demo_topology(src: &[i64], dst: &[i64]) -> (Topology, Vec<i64>) {
-    use ursa_core::IdMap;
-    let (map, src_dense, dst_dense) = IdMap::from_edge_arrays(
-        &Int64Array::from(src.to_vec()),
-        &Int64Array::from(dst.to_vec()),
-    )
-    .expect("demo edges have no null endpoints");
-    let user = map
-        .user_id_array()
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("demo ids are int64")
-        .values()
-        .to_vec();
-    (Topology::build(map.len(), src_dense, dst_dense), user)
-}
-
 /// The `ursa-core` version — the simplest possible proof the native module loaded.
 #[pyfunction]
 fn __core_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
-}
-
-#[pyfunction]
-#[pyo3(signature = (src, dst, damping=0.85, max_iter=30, tol=1e-6))]
-fn _demo_pagerank(
-    py: Python<'_>,
-    src: Vec<i64>,
-    dst: Vec<i64>,
-    damping: f64,
-    max_iter: u32,
-    tol: f64,
-) -> Vec<(i64, f64)> {
-    let (topo, ids) = build_demo_topology(&src, &dst);
-    let scores = py.allow_threads(|| {
-        pagerank(
-            &topo,
-            PageRankParams {
-                damping,
-                max_iter,
-                tol,
-            },
-        )
-    });
-    ids.into_iter().zip(scores).collect()
-}
-
-#[pyfunction]
-#[pyo3(signature = (src, dst, direction="out"))]
-fn _demo_degree(src: Vec<i64>, dst: Vec<i64>, direction: &str) -> PyResult<Vec<(i64, u32)>> {
-    let dir = match direction {
-        "out" => CoreDirection::Out,
-        "in" => CoreDirection::In,
-        "both" => CoreDirection::Both,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "direction must be 'out', 'in', or 'both'; got {other:?}"
-            )))
-        }
-    };
-    let (topo, ids) = build_demo_topology(&src, &dst);
-    let deg = degree(&topo, dir);
-    Ok(ids.into_iter().zip(deg).collect())
-}
-
-#[pyfunction]
-fn _demo_connected_components(src: Vec<i64>, dst: Vec<i64>) -> Vec<(i64, u32)> {
-    let (topo, ids) = build_demo_topology(&src, &dst);
-    let cc = connected_components_weak(&topo);
-    ids.into_iter().zip(cc).collect()
 }
 
 /// The native extension module, imported by Python as `ursa._ursa`.
@@ -520,9 +448,5 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(graph_describe, m)?)?;
     m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(scan_nodes_arrow, m)?)?;
-    // demo path
-    m.add_function(wrap_pyfunction!(_demo_pagerank, m)?)?;
-    m.add_function(wrap_pyfunction!(_demo_degree, m)?)?;
-    m.add_function(wrap_pyfunction!(_demo_connected_components, m)?)?;
     Ok(())
 }

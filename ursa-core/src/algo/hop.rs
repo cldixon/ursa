@@ -106,7 +106,7 @@ fn bfs_seed(
     for _level in 0..k {
         next.clear();
         for &u in frontier.iter() {
-            push_neighbors(topo, u, dir, |v| {
+            topo.for_each_neighbor(u, dir, |v| {
                 if !visited[v as usize] {
                     visited[v as usize] = true;
                     touched.push(v);
@@ -127,31 +127,6 @@ fn bfs_seed(
         visited[t as usize] = false;
     }
     (src_out, dst_out)
-}
-
-/// Apply `f` to each neighbour of `u` in `dir` (both adjacencies for `Both`).
-#[inline]
-fn push_neighbors<F: FnMut(u32)>(topo: &Topology, u: u32, dir: Direction, mut f: F) {
-    match dir {
-        Direction::Out => {
-            for &v in topo.out().neighbors(u) {
-                f(v);
-            }
-        }
-        Direction::In => {
-            for &v in topo.incoming().neighbors(u) {
-                f(v);
-            }
-        }
-        Direction::Both => {
-            for &v in topo.out().neighbors(u) {
-                f(v);
-            }
-            for &v in topo.incoming().neighbors(u) {
-                f(v);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

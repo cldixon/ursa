@@ -55,16 +55,28 @@ impl Eq for GraphAlgorithmNode {}
 
 impl PartialOrd for GraphAlgorithmNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // Order by column names only (topology identity is not orderable).
+        // Consistent with `eq`: order by column names (unique within a valid node —
+        // duplicate output names are rejected upstream), then the graph-identity
+        // pointers, so two nodes never compare Equal unless `eq` holds.
         let a: Vec<&str> = self.columns.iter().map(|c| c.name()).collect();
         let b: Vec<&str> = other.columns.iter().map(|c| c.name()).collect();
-        a.partial_cmp(&b)
+        (
+            a,
+            Arc::as_ptr(&self.topology) as usize,
+            Arc::as_ptr(&self.ids) as usize,
+        )
+            .partial_cmp(&(
+                b,
+                Arc::as_ptr(&other.topology) as usize,
+                Arc::as_ptr(&other.ids) as usize,
+            ))
     }
 }
 
 impl Hash for GraphAlgorithmNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.topology) as usize).hash(state);
+        (Arc::as_ptr(&self.ids) as usize).hash(state);
         for col in self.columns.iter() {
             col.name().hash(state);
         }
@@ -159,8 +171,20 @@ impl Eq for HopNode {}
 
 impl PartialOrd for HopNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // Order by the scalar params only (topology identity is not orderable).
-        (self.n, self.seeds.len()).partial_cmp(&(other.n, other.seeds.len()))
+        // Consistent with `eq`: order over every field it compares (topology by
+        // pointer, since it is not otherwise orderable).
+        (
+            self.n,
+            self.direction,
+            &*self.seeds,
+            Arc::as_ptr(&self.topology) as usize,
+        )
+            .partial_cmp(&(
+                other.n,
+                other.direction,
+                &*other.seeds,
+                Arc::as_ptr(&other.topology) as usize,
+            ))
     }
 }
 
@@ -168,6 +192,7 @@ impl Hash for HopNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.topology) as usize).hash(state);
         self.n.hash(state);
+        self.direction.hash(state);
         self.seeds.hash(state);
     }
 }
@@ -254,13 +279,20 @@ impl ShortestPathNode {
     }
 }
 
+/// The weight array's identity as a comparable/ordered pointer (`None` for an
+/// unweighted path). Weights compare by `Arc` identity, not by value — a distinct
+/// weight array is a distinct node.
+fn weights_key(weights: &Option<Arc<Vec<f64>>>) -> Option<usize> {
+    weights.as_ref().map(|w| Arc::as_ptr(w) as usize)
+}
+
 impl PartialEq for ShortestPathNode {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.topology, &other.topology)
             && self.source == other.source
             && self.target == other.target
             && self.direction == other.direction
-            && self.weights.is_some() == other.weights.is_some()
+            && weights_key(&self.weights) == weights_key(&other.weights)
     }
 }
 
@@ -268,7 +300,21 @@ impl Eq for ShortestPathNode {}
 
 impl PartialOrd for ShortestPathNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        (self.source, self.target).partial_cmp(&(other.source, other.target))
+        // Consistent with `eq`: order over every field it compares.
+        (
+            self.source,
+            self.target,
+            self.direction,
+            weights_key(&self.weights),
+            Arc::as_ptr(&self.topology) as usize,
+        )
+            .partial_cmp(&(
+                other.source,
+                other.target,
+                other.direction,
+                weights_key(&other.weights),
+                Arc::as_ptr(&other.topology) as usize,
+            ))
     }
 }
 
@@ -277,6 +323,8 @@ impl Hash for ShortestPathNode {
         (Arc::as_ptr(&self.topology) as usize).hash(state);
         self.source.hash(state);
         self.target.hash(state);
+        self.direction.hash(state);
+        weights_key(&self.weights).hash(state);
     }
 }
 
@@ -373,12 +421,21 @@ impl Eq for RandomWalkNode {}
 
 impl PartialOrd for RandomWalkNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // Order by the scalar params only (topology identity is not orderable).
-        (self.steps, self.walks_per_node, self.starts.len()).partial_cmp(&(
-            other.steps,
-            other.walks_per_node,
-            other.starts.len(),
-        ))
+        // Consistent with `eq`: order over every field it compares.
+        (
+            self.steps,
+            self.walks_per_node,
+            self.seed,
+            &*self.starts,
+            Arc::as_ptr(&self.topology) as usize,
+        )
+            .partial_cmp(&(
+                other.steps,
+                other.walks_per_node,
+                other.seed,
+                &*other.starts,
+                Arc::as_ptr(&other.topology) as usize,
+            ))
     }
 }
 
