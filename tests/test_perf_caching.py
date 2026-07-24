@@ -6,6 +6,8 @@ The native ``_topology_build_count()`` hook makes the index-build count
 observable.
 """
 
+import threading
+
 import pyarrow as pa
 import pytest
 
@@ -56,3 +58,27 @@ def test_distinct_graphs_build_separate_indexes():
     ur.degree(a).collect()
     ur.degree(b).collect()
     assert _native()._topology_build_count() - before == 2
+
+
+def test_concurrent_first_collects_build_once_and_agree():
+    # #53.3: N threads racing to first-collect one fresh frame must build the CSR
+    # exactly once (the double-checked per-cell lock) and all agree — the
+    # concurrency guarantee behind the index-preservation contract, GIL released.
+    edges = _edges()
+    n_threads = 8
+    before = _native()._topology_build_count()
+    results: list = [None] * n_threads
+    barrier = threading.Barrier(n_threads)
+
+    def worker(i: int) -> None:
+        barrier.wait()  # release all threads together to maximize the race
+        results[i] = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert _native()._topology_build_count() - before == 1
+    assert all(r == results[0] for r in results[1:])
