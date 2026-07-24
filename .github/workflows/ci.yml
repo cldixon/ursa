@@ -73,8 +73,24 @@ jobs:
         run: cargo check --workspace --locked
 
   pytest:
-    name: Python (pytest)
-    runs-on: ubuntu-latest
+    name: Python (pytest, ${{ matrix.os }} py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    # Exercise both ends of the supported range and a second OS: the 3.10 floor
+    # (requires-python / typing-extensions gate) and the newest 3.13 must both load
+    # the single abi3-py310 wheel, and macOS must compile + import (it was never
+    # built outside release before). Windows stays release-only (its first build of
+    # a change is the release build; a dry run covers it).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+    env:
+      # uv builds/tests against this interpreter (auto-provisioned if absent), so
+      # both steps below share one venv on the pinned version.
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@v4
 
