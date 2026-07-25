@@ -161,17 +161,21 @@ def smoke(
     target = out or Path(tempfile.mkdtemp(prefix="ursa-bench-smoke-")) / "smoke.parquet"
     cfg = RunConfig(
         libraries=known_libraries(),
-        # One of each shape: iterative (pagerank), adjacency (triangle_count),
-        # union-find (connected_components), trivial (degree), and the two
-        # all-pairs shortest-path centralities (betweenness, closeness) whose
-        # direction/normalisation conventions are the easiest to get subtly wrong.
+        # One of each shape: iterative (pagerank), adjacency (triangle_count,
+        # clustering_coefficient), union-find (connected_components), trivial
+        # (degree), the two all-pairs centralities whose direction/normalisation
+        # conventions are easiest to get subtly wrong (betweenness, closeness),
+        # and community detection scored by modularity (louvain, label_propagation).
         algorithms=[
             "pagerank",
             "triangle_count",
+            "clustering_coefficient",
             "connected_components",
             "degree",
             "betweenness",
             "closeness",
+            "louvain",
+            "label_propagation",
         ],
         datasets=[ds_mod.SMOKE],
         iters=2,

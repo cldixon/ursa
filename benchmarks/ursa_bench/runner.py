@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import algorithms, correctness, datasets
-from .adapters import get_adapter, read_result
+from .adapters import get_adapter, load_edges, read_result
 from .measure import measure_cell
 from .results import (
     SCHEMA_VERSION,
@@ -91,6 +91,15 @@ def run_matrix(cfg: RunConfig, out_path: str | Path, run_id: str) -> list[Result
             n_nodes, n_edges = datasets.graph_shape(path)
             want_result = n_nodes <= cfg.reference_max_nodes
 
+            # Community-detection correctness scores modularity, which needs the
+            # edge list. Load it once per dataset, only when actually required.
+            mod_edges = None
+            if want_result and any(
+                algorithms.get(a).compare == "modularity" for a in cfg.algorithms
+            ):
+                src, dst = load_edges(path)
+                mod_edges = list(zip(src, dst, strict=True))
+
             ds_rows: list[ResultRow] = []
             for algo_name in cfg.algorithms:
                 algo = algorithms.get(algo_name)
@@ -129,7 +138,16 @@ def run_matrix(cfg: RunConfig, out_path: str | Path, run_id: str) -> list[Result
                 for lib in cfg.libraries:
                     ds_rows.append(
                         _build_row(
-                            prov, cfg, spec, n_nodes, n_edges, algo, lib, measured[lib], reference
+                            prov,
+                            cfg,
+                            spec,
+                            n_nodes,
+                            n_edges,
+                            algo,
+                            lib,
+                            measured[lib],
+                            reference,
+                            mod_edges,
                         )
                     )
 
@@ -156,7 +174,9 @@ def _reference(measured: dict, algo, path, want_result: bool):
         return None
 
 
-def _build_row(prov, cfg, spec, n_nodes, n_edges, algo, lib, measured, reference) -> ResultRow:
+def _build_row(
+    prov, cfg, spec, n_nodes, n_edges, algo, lib, measured, reference, mod_edges=None
+) -> ResultRow:
     m, res = measured
     common = dict(
         **prov,
@@ -207,7 +227,7 @@ def _build_row(prov, cfg, spec, n_nodes, n_edges, algo, lib, measured, reference
 
     median, smallest, std = _warm_stats(m.warm_samples)
     if res is not None:
-        correct, detail = correctness.compare(reference, res, algo)
+        correct, detail = correctness.compare(reference, res, algo, mod_edges)
     else:
         correct, detail = None, "result not captured (graph above reference size)"
     status = STATUS_INCORRECT if correct is False else STATUS_OK

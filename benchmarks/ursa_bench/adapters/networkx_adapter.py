@@ -35,6 +35,9 @@ class NetworkxAdapter(Adapter):
             "triangle_count",
             "connected_components",
             "degree",
+            "clustering_coefficient",
+            "louvain",
+            "label_propagation",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
@@ -78,4 +81,23 @@ class NetworkxAdapter(Adapter):
             return labels
         if name == "degree":
             return {n: int(d) for n, d in g.degree()}
+        if name == "clustering_coefficient":
+            return dict(nx.clustering(g))
+        if name == "louvain":
+            p = algo.params
+            comms = nx.community.louvain_communities(
+                g, resolution=p.get("resolution", 1.0), seed=p.get("seed", 1)
+            )
+            return _labels_from_communities(comms)
+        if name == "label_propagation":
+            return _labels_from_communities(nx.community.label_propagation_communities(g))
         raise NotImplementedError(name)  # pragma: no cover - guarded by supports()
+
+
+def _labels_from_communities(communities) -> dict[int, float]:
+    """Turn an iterable of node-sets into a {node: community_label} mapping."""
+    labels: dict[int, float] = {}
+    for label, comm in enumerate(communities):
+        for node in comm:
+            labels[node] = label
+    return labels

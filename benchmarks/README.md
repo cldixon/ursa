@@ -11,7 +11,7 @@ the comparison libraries live in their own dependency group so the core dev
 environment stays lean.
 
 ```bash
-uv sync --group bench          # installs typer, rich, rustworkx, networkx
+uv sync --group bench          # installs typer, rich, rustworkx, igraph, networkx
 
 # from the repo root:
 uv run --group bench python benchmarks --help
@@ -62,6 +62,19 @@ scored — as loud a signal as a slow one.
 `unsupported` row; a crash/OOM produces an `error` row. Those cells are the whole
 point — they're the gaps the flywheel surfaces.
 
+### Comparison libraries
+
+**NetworkX** (pure-Python oracle / floor), **rustworkx** (a mature Rust core), and
+**igraph** (a mature C core). Each library's per-algorithm conventions are pinned
+to the canonical definition and *verified empirically by the correctness gate* —
+so a convention slip shows up as an `incorrect` row, never a silent pass. Two that
+were caught this way: rustworkx closeness needs the graph **reversed** (it measures
+incoming distance), and igraph closeness is `mode="out", normalized=True`; both then
+match Ursa's out-edge form exactly. Neither rustworkx nor igraph exposes a per-node
+triangle count, so `triangle_count` is `unsupported` for both. Community detection
+(`louvain`, `label_propagation`) is scored by **modularity**, not by labels — a
+heuristic partition passes if its Q is within a small slack of the oracle's.
+
 ## Commands
 
 ```bash
@@ -86,15 +99,19 @@ uv run --group bench python benchmarks report --metric warm --markdown  # commit
 uv run --group bench python benchmarks smoke
 ```
 
-Example leaderboard (warm kernel, single-thread; `n/a` = library lacks the algo):
+Example warm-kernel leaderboard (single-thread, er-1k; `n/a` = library lacks the
+algo). No single library wins everything — igraph leads the centralities, Ursa
+leads triangle_count and louvain, rustworkx leads pagerank:
 
-```
- dataset   algorithm             ursa      networkx        rustworkx
- er-1k     pagerank              3.9ms     11.2ms (2.8×)   1.4ms (0.4×)
- er-1k     triangle_count        5.3ms     13.7ms (2.6×)   n/a
- ba-10k    pagerank              19.3ms    103.1ms (5.3×)  8.9ms (0.5×)
- ba-10k    triangle_count        24.2ms    98.8ms (4.1×)   n/a
-```
+| algorithm | ursa | igraph | networkx | rustworkx |
+|---|---|---|---|---|
+| pagerank | 2.8ms | 2.0ms | 35.2ms | **1.5ms** |
+| betweenness | 177ms | **103ms** | 3.40s | 213ms |
+| closeness | **38ms** | 41ms | 564ms | 140ms |
+| triangle_count | **4.6ms** | n/a | 14.1ms | n/a |
+| clustering_coefficient | 5.9ms | **0.6ms** | 69.9ms | n/a |
+| louvain | **15.8ms** | 28.5ms | 243ms | n/a |
+| connected_components | 1.8ms | **0.1ms** | 0.5ms | 0.3ms |
 
 ## Datasets
 

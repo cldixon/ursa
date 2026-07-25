@@ -155,11 +155,11 @@ Next, in rough priority order:
 3. **Breadth** — a published docs site, and broadening the benchmark coverage.
    The cross-library **benchmark flywheel** is live in
    [`benchmarks/`](benchmarks/) — a `typer`/`rich` CLI that races Ursa against
-   NetworkX and rustworkx (igraph next), separates cold end-to-end from warm
-   kernel time, cross-checks every result against the NetworkX oracle, and writes
-   raw rows to Parquet so leaderboards and gap-hunting are re-renderable downstream
-   steps. (String/UUID node ids alongside int64 are already supported,
-   auto-detected from the column type.)
+   NetworkX, rustworkx, and igraph across nine algorithms, separates cold
+   end-to-end from warm kernel time, cross-checks every result against the
+   NetworkX oracle, and writes raw rows to Parquet so leaderboards and gap-hunting
+   are re-renderable downstream steps. (String/UUID node ids alongside int64 are
+   already supported, auto-detected from the column type.)
 
 ## License
 

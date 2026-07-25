@@ -39,6 +39,9 @@ class UrsaAdapter(Adapter):
             "triangle_count",
             "connected_components",
             "degree",
+            "clustering_coefficient",
+            "louvain",
+            "label_propagation",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
@@ -70,6 +73,13 @@ class UrsaAdapter(Adapter):
             expr = ur.connected_components(edges, mode="weak")
         elif name == "degree":
             expr = ur.degree(edges, direction=algo.params.get("direction", "both"))
+        elif name == "clustering_coefficient":
+            expr = ur.clustering_coefficient(edges)
+        elif name == "louvain":
+            p = algo.params
+            expr = ur.louvain(edges, resolution=p.get("resolution", 1.0), seed=p.get("seed"))
+        elif name == "label_propagation":
+            expr = ur.label_propagation(edges, seed=algo.params.get("seed"))
         else:  # pragma: no cover - guarded by supports()
             raise NotImplementedError(name)
 

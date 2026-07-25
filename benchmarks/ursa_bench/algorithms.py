@@ -84,6 +84,28 @@ REGISTRY: dict[str, Algorithm] = {
         compare="int_map",
         params={"direction": "both"},
     ),
+    "clustering_coefficient": Algorithm(
+        name="clustering_coefficient",
+        description="Local clustering coefficient per node, on the undirected view.",
+        view="undirected",
+        compare="value_map",
+        params={},
+        tol=1e-9,
+    ),
+    "louvain": Algorithm(
+        name="louvain",
+        description="Louvain community detection (undirected); compared by modularity.",
+        view="undirected",
+        compare="modularity",
+        params={"resolution": 1.0, "seed": 1},
+    ),
+    "label_propagation": Algorithm(
+        name="label_propagation",
+        description="Label-propagation communities (undirected); compared by modularity.",
+        view="undirected",
+        compare="modularity",
+        params={"seed": 1},
+    ),
 }
 
 

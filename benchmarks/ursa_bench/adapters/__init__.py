@@ -24,6 +24,7 @@ _ADAPTERS = {
     "ursa": "ursa_bench.adapters.ursa_adapter:UrsaAdapter",
     "networkx": "ursa_bench.adapters.networkx_adapter:NetworkxAdapter",
     "rustworkx": "ursa_bench.adapters.rustworkx_adapter:RustworkxAdapter",
+    "igraph": "ursa_bench.adapters.igraph_adapter:IgraphAdapter",
 }
 
 

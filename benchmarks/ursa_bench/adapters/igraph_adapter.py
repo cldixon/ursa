@@ -1,0 +1,82 @@
+"""igraph adapter — a mature C graph core (often the perf king on centralities).
+
+igraph assigns contiguous integer vertex ids 0..n-1 as the graph is built, so the
+adapter maps the original ids to indices (via `ids[i]`) and back on the way out,
+exactly like the rustworkx adapter.
+
+Convention notes (each verified empirically against the NetworkX oracle — a
+mismatch shows up as an `incorrect` row, never a silent pass):
+* **closeness** — igraph `mode="out", normalized=True` gives (reachable-1)/Σdist,
+  which matches Ursa's out-edge form (`nx.closeness_centrality(reverse,
+  wf_improved=False)`).
+* **betweenness** — igraph is raw (unnormalised) by default, matching Ursa.
+* **triangle_count** — igraph has no per-vertex triangle count (only local
+  transitivity), so it is reported unsupported.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from ..algorithms import Algorithm
+from .base import Adapter, load_edges
+
+
+class IgraphAdapter(Adapter):
+    NAME = "igraph"
+
+    def version(self) -> str:
+        import igraph
+
+        return igraph.__version__
+
+    def supports(self, algo: str) -> bool:
+        # No per-vertex triangle count in igraph (only global/local transitivity).
+        return algo in {
+            "pagerank",
+            "betweenness",
+            "closeness",
+            "connected_components",
+            "degree",
+            "clustering_coefficient",
+            "louvain",
+            "label_propagation",
+        }
+
+    def ingest(self, dataset_path: str | Path, algo: Algorithm):
+        import igraph
+
+        src, dst = load_edges(dataset_path)
+        node_ids = sorted(set(src) | set(dst))
+        id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
+        edges = [(id_to_idx[s], id_to_idx[d]) for s, d in zip(src, dst, strict=True)]
+        graph = igraph.Graph(n=len(node_ids), edges=edges, directed=(algo.view == "directed"))
+        return {"graph": graph, "ids": node_ids}
+
+    def run(self, handle, algo: Algorithm) -> dict[int, float]:
+        graph = handle["graph"]
+        ids = handle["ids"]
+        name = algo.name
+
+        def remap(values) -> dict[int, float]:
+            return {ids[i]: v for i, v in enumerate(values)}
+
+        if name == "pagerank":
+            p = algo.params
+            return remap(graph.pagerank(damping=p.get("damping", 0.85)))
+        if name == "betweenness":
+            return remap(graph.betweenness(directed=True))
+        if name == "closeness":
+            return remap(graph.closeness(mode="out", normalized=True))
+        if name == "degree":
+            return remap(graph.degree(mode="all"))
+        if name == "clustering_coefficient":
+            return remap(graph.transitivity_local_undirected(mode="zero"))
+        if name == "connected_components":
+            membership = graph.connected_components(mode="weak").membership
+            return remap(membership)
+        if name == "louvain":
+            return remap(graph.community_multilevel().membership)
+        if name == "label_propagation":
+            return remap(graph.community_label_propagation().membership)
+        raise NotImplementedError(name)  # pragma: no cover - guarded by supports()

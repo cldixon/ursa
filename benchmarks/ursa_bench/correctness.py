@@ -22,8 +22,13 @@ def compare(
     reference: dict[int, float] | None,
     candidate: dict[int, float],
     algo: Algorithm,
+    edges: list[tuple[int, int]] | None = None,
 ) -> tuple[bool | None, str]:
-    """Return ``(correct, detail)``. ``correct is None`` when not checkable."""
+    """Return ``(correct, detail)``. ``correct is None`` when not checkable.
+
+    ``edges`` is only needed by the ``modularity`` mode (community detection),
+    which scores the partition against the graph rather than comparing labels.
+    """
     if reference is None:
         return None, "no reference (dataset too large for the oracle, or oracle skipped)"
 
@@ -39,10 +44,7 @@ def compare(
     if algo.compare == "partition":
         return _partition(reference, candidate)
     if algo.compare == "modularity":
-        # Heuristic community detection: identical partitions aren't expected, so
-        # a value/label comparison is meaningless. Left for a modularity-scoring
-        # check (needs the graph, not just the labels) — reported as not-checkable.
-        return None, "modularity comparison not wired (needs graph-aware scoring)"
+        return _modularity(reference, candidate, algo, edges)
     return None, f"unknown compare mode {algo.compare!r}"
 
 
@@ -80,3 +82,41 @@ def _groups(labels: dict[int, float]) -> set[frozenset[int]]:
     for node, label in labels.items():
         by_label.setdefault(label, set()).add(node)
     return {frozenset(members) for members in by_label.values()}
+
+
+# Slack allowed on the modularity objective: a heuristic partition need only be
+# *competitive* with the oracle's, not identical. A real bug (a degenerate or
+# scrambled partition) loses far more than this.
+_MODULARITY_SLACK = 0.05
+
+
+def _modularity(
+    reference: dict[int, float],
+    candidate: dict[int, float],
+    algo: Algorithm,
+    edges: list[tuple[int, int]] | None,
+) -> tuple[bool | None, str]:
+    """Score community detection by the objective it optimises, not by labels.
+
+    Two heuristics never return identical partitions, so we compare the modularity
+    each achieves on the same undirected graph: the candidate passes if its Q is no
+    worse than the oracle's by more than a small slack.
+    """
+    if edges is None:
+        return None, "no edges available for modularity scoring"
+    import networkx as nx
+
+    graph = nx.Graph()
+    graph.add_nodes_from(reference)
+    graph.add_edges_from(edges)
+    resolution = float(algo.params.get("resolution", 1.0))
+
+    def q(labels: dict[int, float]) -> float:
+        communities = [set(g) for g in _groups(labels)]
+        return nx.community.modularity(graph, communities, resolution=resolution)
+
+    q_cand = q(candidate)
+    q_ref = q(reference)
+    ok = q_cand >= q_ref - _MODULARITY_SLACK
+    detail = f"Q={q_cand:.4f} vs oracle {q_ref:.4f} (slack {_MODULARITY_SLACK})"
+    return ok, detail
