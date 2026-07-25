@@ -94,7 +94,12 @@ def run(
     dataset: list[str] = typer.Option(None, "--dataset", "-d", help="Datasets (default: er-1k)."),
     iters: int = typer.Option(5, help="Timed warm iterations."),
     warmup: int = typer.Option(1, help="Discarded warm iterations."),
-    threads: int = typer.Option(1, help="Thread cap (1 = apples-to-apples)."),
+    threads: list[int] = typer.Option(
+        [1],
+        "--threads",
+        "-t",
+        help="Thread cap(s). Repeat to sweep, e.g. -t 1 -t 2 -t 4. 1 = apples-to-apples.",
+    ),
     reference_max_nodes: int = typer.Option(
         50_000, help="Above this node count the oracle is skipped; correctness = n/a."
     ),
@@ -103,27 +108,35 @@ def run(
     cache_dir: Path = typer.Option(ds_mod.DEFAULT_CACHE, help="Dataset cache dir."),
     show: bool = typer.Option(True, help="Print the leaderboard after the run."),
 ) -> None:
-    """Measure a (library × algorithm × dataset) slice; write raw rows to Parquet."""
+    """Measure a (library × algorithm × dataset [× threads]) slice; write raw rows to Parquet.
+
+    Every library is given the *same* thread budget at each level — those that
+    parallelise (Ursa, rustworkx) speed up; those that don't (igraph's C core,
+    NetworkX under the GIL) stay flat. That's a fair, generous comparison: the
+    thread count is recorded on every row so a sweep becomes its own dimension.
+    """
     cfg = RunConfig(
         libraries=library or known_libraries(),
         algorithms=algo or algos_mod.names(),
         datasets=dataset or ["er-1k"],
         iters=iters,
         warmup=warmup,
-        threads=threads,
+        threads=threads[0],
         reference_max_nodes=reference_max_nodes,
         timeout_s=timeout,
         cache_dir=cache_dir,
     )
     run_id = _run_id()
-    total = len(cfg.libraries) * len(cfg.algorithms) * len(cfg.datasets)
+    per_level = len(cfg.libraries) * len(cfg.algorithms) * len(cfg.datasets)
     console.print(
-        f"[bold]{run_id}[/bold]: {total} cells "
+        f"[bold]{run_id}[/bold]: {per_level * len(threads)} cells "
         f"({len(cfg.libraries)} libs × {len(cfg.algorithms)} algos × "
-        f"{len(cfg.datasets)} datasets), threads={threads}, iters={iters}"
+        f"{len(cfg.datasets)} datasets × threads {threads}), iters={iters}"
     )
-    with console.status("measuring …"):
-        run_matrix(cfg, out, run_id)
+    for t in threads:
+        cfg.threads = t
+        with console.status(f"measuring … threads={t}"):
+            run_matrix(cfg, out, run_id)
     console.print(f"[green]done[/green] → {out}")
     if show:
         report_mod.print_report(out, "warm", console)

@@ -52,6 +52,16 @@ and warm state are never polluted by another library imported in the same
 interpreter, and the thread cap (`--threads`, default `1` for apples-to-apples)
 is pinned before any library initialises its pools.
 
+**Parallelism is its own dimension — and fair.** `--threads` can be *swept*
+(`-t 1 -t 2 -t 4`), and every library is given the **same** budget at each level,
+with *all* the relevant knobs set (`RAYON_NUM_THREADS` for Ursa/rustworkx,
+`OMP_NUM_THREADS`, and the BLAS vars `OPENBLAS`/`MKL`/… so NetworkX's scipy-backed
+kernels can use threads too). Those that parallelise speed up; those that don't —
+igraph's C core (single-threaded in the standard wheel) and NetworkX under the GIL
+— stay flat. That's a true property of each library, measured generously, not a
+thumb on the scale. Single-thread stays the apples-to-apples baseline; the sweep
+shows what more cores buy. The thread count is recorded on every row.
+
 Every cell is also **correctness-checked** against the NetworkX reference (the
 oracle), using the exact definitional alignments pinned in
 `tests/test_networkx_reference.py` (out-edge closeness, raw betweenness,
