@@ -48,9 +48,13 @@ class RustworkxAdapter(Adapter):
         graph = rx.PyDiGraph() if algo.view == "directed" else rx.PyGraph()
         # Payload == original id; indices come back 0..n-1 in this order.
         graph.add_nodes_from(node_ids)
-        graph.add_edges_from_no_data(
-            [(id_to_idx[s], id_to_idx[d]) for s, d in zip(src, dst, strict=True)]
-        )
+        edges = [(id_to_idx[s], id_to_idx[d]) for s, d in zip(src, dst, strict=True)]
+        # rustworkx closeness measures *incoming* distance (like un-reversed
+        # NetworkX), so to match Ursa's out-edge form we feed it the reversed
+        # graph — the same reversal the NetworkX oracle applies.
+        if algo.name == "closeness":
+            edges = [(d, s) for s, d in edges]
+        graph.add_edges_from_no_data(edges)
         return {"graph": graph, "ids": node_ids}
 
     def run(self, handle, algo: Algorithm) -> dict[int, float]:
