@@ -9,8 +9,8 @@
     "preview": "astro preview",
     "check": "astro check",
     "build:cf": "astro build --config astro.config.cloudflare.mjs",
-    "preview:cf": "npm run build:cf && wrangler dev",
-    "deploy": "npm run build:cf && wrangler deploy"
+    "preview:cf": "bun run build:cf && wrangler dev",
+    "deploy": "bun run build:cf && wrangler deploy"
   },
   "dependencies": {
     "@astrojs/mdx": "^7.0.3",

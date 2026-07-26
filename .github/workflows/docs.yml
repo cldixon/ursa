@@ -34,20 +34,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: site/package-lock.json
+          bun-version: latest
 
+      # --frozen-lockfile is the CI equivalent of `npm ci`: fail if bun.lock
+      # disagrees with package.json rather than silently resolving something new.
       - name: Install
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Type-check
-        run: npm run check
+        run: bun run check
 
       - name: Build
-        run: npm run build
+        run: bun run build
 
       # Uploaded on every run, so a pull request proves the site still builds
       # before it can break the published one.

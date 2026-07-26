@@ -1,16 +1,17 @@
 # The Ursa site
 
-The landing page and documentation, built with [Astro](https://astro.build).
+The landing page and documentation, built with [Astro](https://astro.build) and managed with
+[bun](https://bun.com).
 
 Nothing here needs the native extension — the site is static, built from markdown and Astro
 components — so the docs build never waits on a Rust compile.
 
 ```bash
 cd site
-npm install
-npm run dev      # http://localhost:4321/ursa
-npm run build    # -> site/dist
-npm run check    # astro check (type-checks .astro and the content schema)
+bun install
+bun run dev      # http://localhost:4321/ursa
+bun run build    # -> site/dist
+bun run check    # astro check (type-checks .astro and the content schema)
 ```
 
 ## Deploying
@@ -22,8 +23,8 @@ parameter rather than a constant, and each target picks it with its own config f
 
 | Target | Build | Base |
 |---|---|---|
-| GitHub Pages | `npm run build` (`astro.config.mjs`) | `/ursa` |
-| Cloudflare Workers | `npm run build:cf` (`astro.config.cloudflare.mjs`) | `/` |
+| GitHub Pages | `bun run build` (`astro.config.mjs`) | `/ursa` |
+| Cloudflare Workers | `bun run build:cf` (`astro.config.cloudflare.mjs`) | `/` |
 
 ### Cloudflare Workers
 
@@ -32,8 +33,8 @@ supported way to host a build output there. Pages still works — it is just no 
 platform adds features.
 
 ```bash
-npm run preview:cf   # build for the root path, serve it with a local workerd
-npm run deploy       # build, then publish
+bun run preview:cf   # build for the root path, serve it with a local workerd
+bun run deploy       # build, then publish
 ```
 
 `wrangler.jsonc` configures an **assets-only** Worker: no `main`, no server-side code, `dist/`
@@ -47,7 +48,7 @@ Deploying needs a Cloudflare credential — `wrangler login` locally, or `CLOUDF
 tags and the sitemap point at it:
 
 ```bash
-SITE_URL=https://ursa.example.com npm run deploy
+SITE_URL=https://ursa.example.com bun run deploy
 ```
 
 ### GitHub Pages
@@ -76,8 +77,9 @@ site/
 2. Add it to `DOCS_NAV` in `src/lib/site.ts` — that one list drives the sidebar, the footer, the
    docs index and the previous/next links.
 
-Internal links are written root-relative (`/docs/concepts`) so they read correctly in the
-repository; a rehype plugin adds the Pages base path at build time.
+Internal links are written root-relative and unslashed (`/docs/concepts`) so they read correctly
+in the repository. The base prefix for the target being built is added at build time — by
+`src/lib/url.ts` in components, and by a rehype plugin in markdown.
 
 ## The design system
 

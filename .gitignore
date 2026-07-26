@@ -16,8 +16,9 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Docs site (Astro). package-lock.json IS committed so the Pages build is
-# reproducible and `npm ci` has something to resolve against.
+# Docs site (Astro, managed with bun). bun.lock IS committed so the deploy build
+# is reproducible and `bun install --frozen-lockfile` has something to check
+# against.
 /site/node_modules/
 /site/dist/
 /site/.astro/
