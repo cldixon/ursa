@@ -242,12 +242,24 @@ impl IdMap {
                         return Err(IdError::MixedTypes);
                     }
                     let (s, d) = (as_int64(*src), as_int64(*dst));
-                    for i in 0..s.len() {
-                        if s.is_null(i) || d.is_null(i) {
-                            return Err(IdError::Null);
+                    // Fast path: when neither column has nulls (the common case,
+                    // e.g. every scanned/canonicalized edge list), intern straight
+                    // over the raw `&[i64]` value slices — skipping the per-row
+                    // `is_null`/`value` bounds+validity checks that dominate the
+                    // loop once the hasher is fast.
+                    if s.null_count() == 0 && d.null_count() == 0 {
+                        for (&sv, &dv) in s.values().iter().zip(d.values()) {
+                            sd.push(map.intern_i64(sv)?);
+                            dd.push(map.intern_i64(dv)?);
                         }
-                        sd.push(map.intern_i64(s.value(i))?);
-                        dd.push(map.intern_i64(d.value(i))?);
+                    } else {
+                        for i in 0..s.len() {
+                            if s.is_null(i) || d.is_null(i) {
+                                return Err(IdError::Null);
+                            }
+                            sd.push(map.intern_i64(s.value(i))?);
+                            dd.push(map.intern_i64(d.value(i))?);
+                        }
                     }
                 }
                 Ok((map, sd, dd))
