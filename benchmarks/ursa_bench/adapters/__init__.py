@@ -8,13 +8,14 @@ peak-RSS reading honest.
 
 from __future__ import annotations
 
-from .base import Adapter, load_edges, read_result, serialize_result
+from .base import Adapter, load_edges, load_weighted_edges, read_result, serialize_result
 
 __all__ = [
     "Adapter",
     "get_adapter",
     "known_libraries",
     "load_edges",
+    "load_weighted_edges",
     "read_result",
     "serialize_result",
 ]

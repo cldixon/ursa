@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..algorithms import Algorithm
-from .base import Adapter, load_edges
+from .base import Adapter, load_edges, load_weighted_edges
 
 
 class NetworkxAdapter(Adapter):
@@ -39,16 +39,25 @@ class NetworkxAdapter(Adapter):
             "louvain",
             "label_propagation",
             "pipeline_influencers",
+            "degree_in",
+            "degree_out",
+            "pagerank_weighted",
+            "closeness_weighted",
+            "betweenness_weighted",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
         import networkx as nx
 
-        src, dst = load_edges(dataset_path)
         # Build the view the algorithm reads: directed for centralities, the
         # undirected projection for triangles / weak components.
         graph = nx.DiGraph() if algo.view == "directed" else nx.Graph()
-        graph.add_edges_from(zip(src, dst, strict=True))
+        if algo.weighted:
+            src, dst, w = load_weighted_edges(dataset_path)
+            graph.add_weighted_edges_from(zip(src, dst, w, strict=True))
+        else:
+            src, dst = load_edges(dataset_path)
+            graph.add_edges_from(zip(src, dst, strict=True))
         return graph
 
     def run(self, handle, algo: Algorithm) -> dict[int, float]:
@@ -72,6 +81,29 @@ class NetworkxAdapter(Adapter):
             eligible = [n for n in pr if indeg.get(n, 0) >= min_in]
             top = sorted(eligible, key=lambda n: pr[n], reverse=True)[: p.get("top_k", 20)]
             return {n: rank for rank, n in enumerate(top)}
+
+        if name == "degree_in":
+            return {n: int(d) for n, d in g.in_degree()}
+        if name == "degree_out":
+            return {n: int(d) for n, d in g.out_degree()}
+        if name == "pagerank_weighted":
+            p = algo.params
+            return dict(
+                nx.pagerank(
+                    g,
+                    alpha=p.get("damping", 0.85),
+                    max_iter=max(p.get("max_iter", 100), 100),
+                    tol=p.get("tol", 1e-6),
+                    weight="weight",
+                )
+            )
+        if name == "closeness_weighted":
+            # weight is edge distance; reverse for the out-edge form (as unweighted).
+            return dict(nx.closeness_centrality(g.reverse(), distance="weight", wf_improved=False))
+        if name == "betweenness_weighted":
+            return dict(
+                nx.betweenness_centrality(g, weight="weight", normalized=False, endpoints=False)
+            )
 
         if name == "pagerank":
             p = algo.params

@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..algorithms import Algorithm
-from .base import Adapter, load_edges
+from .base import Adapter, load_edges, load_weighted_edges
 
 
 class IgraphAdapter(Adapter):
@@ -42,16 +42,27 @@ class IgraphAdapter(Adapter):
             "louvain",
             "label_propagation",
             "pipeline_influencers",
+            "degree_in",
+            "degree_out",
+            "pagerank_weighted",
+            "closeness_weighted",
+            "betweenness_weighted",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
         import igraph
 
-        src, dst = load_edges(dataset_path)
+        if algo.weighted:
+            src, dst, weights = load_weighted_edges(dataset_path)
+        else:
+            src, dst = load_edges(dataset_path)
+            weights = None
         node_ids = sorted(set(src) | set(dst))
         id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
         edges = [(id_to_idx[s], id_to_idx[d]) for s, d in zip(src, dst, strict=True)]
         graph = igraph.Graph(n=len(node_ids), edges=edges, directed=(algo.view == "directed"))
+        if weights is not None:
+            graph.es["weight"] = weights
         return {"graph": graph, "ids": node_ids}
 
     def run(self, handle, algo: Algorithm) -> dict[int, float]:
@@ -75,12 +86,23 @@ class IgraphAdapter(Adapter):
         if name == "pagerank":
             p = algo.params
             return remap(graph.pagerank(damping=p.get("damping", 0.85)))
+        if name == "pagerank_weighted":
+            p = algo.params
+            return remap(graph.pagerank(damping=p.get("damping", 0.85), weights="weight"))
         if name == "betweenness":
             return remap(graph.betweenness(directed=True))
+        if name == "betweenness_weighted":
+            return remap(graph.betweenness(directed=True, weights="weight"))
         if name == "closeness":
             return remap(graph.closeness(mode="out", normalized=True))
+        if name == "closeness_weighted":
+            return remap(graph.closeness(mode="out", normalized=True, weights="weight"))
         if name == "degree":
             return remap(graph.degree(mode="all"))
+        if name == "degree_in":
+            return remap(graph.degree(mode="in"))
+        if name == "degree_out":
+            return remap(graph.degree(mode="out"))
         if name == "clustering_coefficient":
             return remap(graph.transitivity_local_undirected(mode="zero"))
         if name == "connected_components":

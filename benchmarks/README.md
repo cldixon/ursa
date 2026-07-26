@@ -53,6 +53,19 @@ interpreter/import baseline and leaves the graph + compute footprint. That numbe
 below ~10⁵ edges it's dominated by import cost, so small/negative deltas render as
 `—`.
 
+### Weighted & directed
+
+- **Weighted** (`pagerank_weighted`, `closeness_weighted`, `betweenness_weighted`) —
+  synthetic datasets carry a seeded `weight` column (in the Parquet, so every
+  library reads the *same* values). Ursa takes weight as an **expression** over edge
+  columns (`weight=ur.col("weight")`); NetworkX/igraph take an edge weight;
+  **rustworkx** weights only PageRank, so weighted closeness/betweenness surface as
+  honest `unsupported` gaps. Continuous weights make exact-cost path ties vanish, so
+  the weighted shortest-path algorithms agree to floating-point precision.
+- **Directed** — every centrality already runs on the directed view; `degree_in` /
+  `degree_out` add the in/out split. (Directed-only algorithms like strong
+  components and HITS await the corresponding Ursa kernels — tracked upstream.)
+
 ### End-to-end pipelines, not just kernels
 
 Single kernels are the *competition's* home turf. Ursa's thesis is **composition**,

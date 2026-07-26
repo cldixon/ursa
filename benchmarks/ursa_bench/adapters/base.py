@@ -64,6 +64,25 @@ def load_edges(dataset_path: str | Path) -> tuple[list[int], list[int]]:
     return src, dst
 
 
+def load_weighted_edges(dataset_path: str | Path) -> tuple[list[int], list[int], list[float]]:
+    """Read a Parquet edge list with a ``weight`` column as (src, dst, weight).
+
+    The weight lives in the Parquet, so every library reads the *same* values —
+    the only way a weighted cross-library comparison can be apples-to-apples.
+    A dataset without a weight column can't back a weighted algorithm.
+    """
+    table = pq.read_table(dataset_path)
+    if "weight" not in table.column_names:
+        raise ValueError(
+            f"{dataset_path} has no 'weight' column; weighted algorithms need a weighted dataset"
+        )
+    return (
+        table.column("src").to_pylist(),
+        table.column("dst").to_pylist(),
+        table.column("weight").to_pylist(),
+    )
+
+
 def serialize_result(mapping: dict[int, float], path: str | Path, *, integral: bool) -> None:
     """Write a ``{id: value}`` result to Parquet (columns ``id``, ``value``).
 

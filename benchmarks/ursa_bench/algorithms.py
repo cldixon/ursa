@@ -29,9 +29,12 @@ class Algorithm:
     name: str
     description: str
     view: str  # "directed" | "undirected" — how the reference reads the edge list
-    compare: str  # correctness check tag: "value_map" | "int_map" | "partition" | "modularity"
+    compare: (
+        str  # correctness check tag: "value_map" | "int_map" | "partition" | "modularity" | "topk"
+    )
     params: dict = field(default_factory=dict)
     tol: float = 1e-6  # absolute tolerance for value_map comparisons
+    weighted: bool = False  # reads the dataset's `weight` column as edge cost/strength
 
 
 REGISTRY: dict[str, Algorithm] = {
@@ -84,6 +87,21 @@ REGISTRY: dict[str, Algorithm] = {
         compare="int_map",
         params={"direction": "both"},
     ),
+    # directed degree variants — in/out matter only on a directed graph
+    "degree_in": Algorithm(
+        name="degree_in",
+        description="In-degree per node (directed).",
+        view="directed",
+        compare="int_map",
+        params={"direction": "in"},
+    ),
+    "degree_out": Algorithm(
+        name="degree_out",
+        description="Out-degree per node (directed).",
+        view="directed",
+        compare="int_map",
+        params={"direction": "out"},
+    ),
     "clustering_coefficient": Algorithm(
         name="clustering_coefficient",
         description="Local clustering coefficient per node, on the undirected view.",
@@ -105,6 +123,37 @@ REGISTRY: dict[str, Algorithm] = {
         view="undirected",
         compare="modularity",
         params={"seed": 1},
+    ),
+    # --- weighted variants (read the dataset's `weight` column) --------------
+    # Ursa's differentiator: weight is a per-op *expression* over edge columns.
+    # networkx/igraph take an edge weight; rustworkx weights only PageRank, so
+    # weighted closeness/betweenness surface as honest `unsupported` gaps there.
+    "pagerank_weighted": Algorithm(
+        name="pagerank_weighted",
+        description="PageRank with edge weights as transition strength.",
+        view="directed",
+        compare="value_map",
+        params={"damping": 0.85, "max_iter": 100, "tol": 1e-6},
+        tol=1e-4,
+        weighted=True,
+    ),
+    "closeness_weighted": Algorithm(
+        name="closeness_weighted",
+        description="Out-edge closeness with edge weights as distance (Dijkstra).",
+        view="directed",
+        compare="value_map",
+        params={},
+        tol=1e-6,
+        weighted=True,
+    ),
+    "betweenness_weighted": Algorithm(
+        name="betweenness_weighted",
+        description="Raw betweenness with edge weights as distance (Dijkstra-Brandes).",
+        view="directed",
+        compare="value_map",
+        params={},
+        tol=1e-6,
+        weighted=True,
     ),
     # --- end-to-end pipeline workloads ---------------------------------------
     # Not a single kernel: a realistic *composed* query. Ursa runs it as one

@@ -17,17 +17,33 @@ reproducible across machines.
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-def _write_edges(src: list[int], dst: list[int], path: str | Path) -> Path:
+def _weights(m: int, seed: int) -> list[float]:
+    """A seeded positive weight per edge (decorrelated from the graph's own seed).
+
+    Continuous weights in [0.1, 10) make exact-cost path ties vanishingly unlikely,
+    so weighted shortest-path algorithms have a unique answer to agree on across
+    libraries — the one place weighted correctness would otherwise get murky.
+    """
+    rng = random.Random((seed * 2654435761) & 0xFFFFFFFF)
+    return [rng.uniform(0.1, 10.0) for _ in range(m)]
+
+
+def _write_edges(
+    src: list[int], dst: list[int], path: str | Path, weights: list[float] | None = None
+) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.table({"src": pa.array(src, pa.int64()), "dst": pa.array(dst, pa.int64())})
-    pq.write_table(table, path)
+    cols = {"src": pa.array(src, pa.int64()), "dst": pa.array(dst, pa.int64())}
+    if weights is not None:
+        cols["weight"] = pa.array(weights, pa.float64())
+    pq.write_table(pa.table(cols), path)
     return path
 
 
@@ -39,7 +55,7 @@ def er(n: int, avg_degree: float, seed: int, path: str | Path) -> Path:
     g = nx.gnp_random_graph(n, p, seed=seed, directed=True)
     src = [int(u) for u, _ in g.edges()]
     dst = [int(v) for _, v in g.edges()]
-    return _write_edges(src, dst, path)
+    return _write_edges(src, dst, path, _weights(len(src), seed))
 
 
 def ba(n: int, m: int, seed: int, path: str | Path) -> Path:
@@ -54,7 +70,7 @@ def ba(n: int, m: int, seed: int, path: str | Path) -> Path:
     g = nx.barabasi_albert_graph(n, m, seed=seed)
     src = [int(u) for u, v in g.edges()]
     dst = [int(v) for u, v in g.edges()]
-    return _write_edges(src, dst, path)
+    return _write_edges(src, dst, path, _weights(len(src), seed))
 
 
 def grid(side: int, path: str | Path) -> Path:
@@ -65,7 +81,7 @@ def grid(side: int, path: str | Path) -> Path:
     g = nx.convert_node_labels_to_integers(g, ordering="sorted")
     src = [int(u) for u, v in g.edges()]
     dst = [int(v) for u, v in g.edges()]
-    return _write_edges(src, dst, path)
+    return _write_edges(src, dst, path, _weights(len(src), side))
 
 
 def sbm(n: int, blocks: int, p_in: float, p_out: float, seed: int, path: str | Path) -> Path:
@@ -83,4 +99,4 @@ def sbm(n: int, blocks: int, p_in: float, p_out: float, seed: int, path: str | P
     g = nx.stochastic_block_model(sizes, probs, seed=seed)
     src = [int(u) for u, v in g.edges()]
     dst = [int(v) for u, v in g.edges()]
-    return _write_edges(src, dst, path)
+    return _write_edges(src, dst, path, _weights(len(src), seed))
