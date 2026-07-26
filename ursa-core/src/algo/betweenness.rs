@@ -34,18 +34,28 @@ use crate::topology::Topology;
 /// accumulated sequentially (in source order), the chunks run in parallel, and the
 /// chunk partials are combined in fixed order — identical result every run at any
 /// thread count.
-fn accumulate_sources(
+///
+/// Each chunk allocates its per-source scratch **once** (via `make_scratch`) and
+/// reuses it across the chunk's sources; `per_source` resets only the nodes it
+/// touched, so the five n-sized buffers (and the per-node predecessor lists) are
+/// allocated once per rayon split instead of once per source — turning the
+/// exact-betweenness `O(n)` allocations-per-source into `O(1)` while producing
+/// byte-identical results (buffers are reset to the same clean state a fresh
+/// allocation would have).
+fn accumulate_sources<S>(
     n: usize,
     sources: &[u32],
-    per_source: impl Fn(u32, &mut [f64]) + Sync,
+    make_scratch: impl Fn() -> S + Sync,
+    per_source: impl Fn(u32, &mut [f64], &mut S) + Sync,
 ) -> Vec<f64> {
     const SRC_CHUNK: usize = 64;
     let partials: Vec<Vec<f64>> = sources
         .par_chunks(SRC_CHUNK)
         .map(|chunk| {
             let mut acc = vec![0.0f64; n];
+            let mut scratch = make_scratch();
             for &s in chunk {
-                per_source(s, &mut acc);
+                per_source(s, &mut acc, &mut scratch);
             }
             acc
         })
@@ -57,6 +67,57 @@ fn accumulate_sources(
         }
     }
     bc
+}
+
+/// Reusable per-source scratch for unweighted Brandes. Held clean between sources:
+/// every source resets exactly the nodes it visited (recorded in `order`) back to
+/// the initial state, so the next source sees the same buffers a fresh allocation
+/// would give — no re-zeroing of untouched nodes, no re-allocation.
+struct BrandesScratch {
+    dist: Vec<i64>,
+    sigma: Vec<f64>,
+    delta: Vec<f64>,
+    preds: Vec<Vec<u32>>,
+    order: Vec<u32>,
+    queue: VecDeque<u32>,
+}
+
+impl BrandesScratch {
+    fn new(n: usize) -> Self {
+        BrandesScratch {
+            dist: vec![-1i64; n],
+            sigma: vec![0.0f64; n],
+            delta: vec![0.0f64; n],
+            preds: vec![Vec::new(); n],
+            order: Vec::new(),
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+/// Reusable per-source scratch for weighted (Dijkstra) Brandes.
+struct BrandesWeightedScratch {
+    dist: Vec<f64>,
+    sigma: Vec<f64>,
+    delta: Vec<f64>,
+    preds: Vec<Vec<u32>>,
+    order: Vec<u32>,
+    settled: Vec<bool>,
+    heap: BinaryHeap<Reverse<(TotalF64, u32)>>,
+}
+
+impl BrandesWeightedScratch {
+    fn new(n: usize) -> Self {
+        BrandesWeightedScratch {
+            dist: vec![f64::INFINITY; n],
+            sigma: vec![0.0f64; n],
+            delta: vec![0.0f64; n],
+            preds: vec![Vec::new(); n],
+            order: Vec::new(),
+            settled: vec![false; n],
+            heap: BinaryHeap::new(),
+        }
+    }
 }
 
 /// Betweenness centrality per node (directed, following out-edges). See the
@@ -72,7 +133,12 @@ pub fn betweenness(topo: &Topology, sample: Option<f64>, seed: Option<u64>) -> V
         return vec![0.0; n];
     }
 
-    let bc = accumulate_sources(n, &sources, |s, acc| brandes_from(topo, s, acc));
+    let bc = accumulate_sources(
+        n,
+        &sources,
+        || BrandesScratch::new(n),
+        |s, acc, sc| brandes_from(topo, s, acc, sc),
+    );
 
     if sample.is_some() {
         let scale = n as f64 / k as f64;
@@ -82,19 +148,25 @@ pub fn betweenness(topo: &Topology, sample: Option<f64>, seed: Option<u64>) -> V
     }
 }
 
-/// One Brandes single-source pass, accumulating dependencies into `bc`.
-fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64]) {
-    let n = topo.n_nodes();
+/// One Brandes single-source pass, accumulating dependencies into `bc`. `sc` is
+/// reusable scratch, clean on entry; on exit exactly the visited nodes are reset
+/// to clean so the next source can reuse it. The traversal order, predecessor
+/// insertion order, and reverse-accumulation sum order are unchanged from the
+/// allocate-per-source version, so the result is byte-identical (the determinism
+/// guarantee this kernel is held to).
+fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64], sc: &mut BrandesScratch) {
     let out = topo.out();
-
-    let mut dist = vec![-1i64; n];
-    let mut sigma = vec![0.0f64; n];
-    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut order: Vec<u32> = Vec::new(); // BFS discovery order (non-decreasing distance)
+    let BrandesScratch {
+        dist,
+        sigma,
+        delta,
+        preds,
+        order,
+        queue,
+    } = sc;
 
     dist[s as usize] = 0;
     sigma[s as usize] = 1.0;
-    let mut queue = VecDeque::new();
     queue.push_back(s);
 
     while let Some(v) = queue.pop_front() {
@@ -114,9 +186,9 @@ fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64]) {
         }
     }
 
-    // Reverse accumulation of dependencies.
-    let mut delta = vec![0.0f64; n];
-    while let Some(w) = order.pop() {
+    // Reverse accumulation of dependencies. Iterate `order` in reverse without
+    // draining it, so it still lists the visited nodes for the reset below.
+    for &w in order.iter().rev() {
         let coeff = (1.0 + delta[w as usize]) / sigma[w as usize];
         for &v in &preds[w as usize] {
             delta[v as usize] += sigma[v as usize] * coeff;
@@ -125,6 +197,17 @@ fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64]) {
             bc[w as usize] += delta[w as usize];
         }
     }
+
+    // Reset exactly the touched nodes back to the clean initial state (queue is
+    // already drained), leaving `sc` ready for the next source with no reallocation.
+    for &w in order.iter() {
+        let wi = w as usize;
+        dist[wi] = -1;
+        sigma[wi] = 0.0;
+        delta[wi] = 0.0;
+        preds[wi].clear();
+    }
+    order.clear();
 }
 
 /// Weighted betweenness centrality (Dijkstra-based Brandes). As [`betweenness`],
@@ -152,9 +235,12 @@ pub fn betweenness_weighted(
         return vec![0.0; n];
     }
 
-    let bc = accumulate_sources(n, &sources, |s, acc| {
-        brandes_from_weighted(topo, weights, s, acc)
-    });
+    let bc = accumulate_sources(
+        n,
+        &sources,
+        || BrandesWeightedScratch::new(n),
+        |s, acc, sc| brandes_from_weighted(topo, weights, s, acc, sc),
+    );
 
     if sample.is_some() {
         let scale = n as f64 / k as f64;
@@ -167,20 +253,29 @@ pub fn betweenness_weighted(
 /// One weighted Brandes single-source pass: Dijkstra settles nodes in
 /// non-decreasing distance, recording shortest-path counts (`sigma`) and
 /// predecessors, then a reverse pass over the settle order accumulates
-/// dependencies into `bc`.
-fn brandes_from_weighted(topo: &Topology, weights: &[f64], s: u32, bc: &mut [f64]) {
-    let n = topo.n_nodes();
+/// dependencies into `bc`. `sc` is reusable scratch, clean on entry and reset to
+/// clean (only its touched nodes) on exit — byte-identical to the
+/// allocate-per-source version.
+fn brandes_from_weighted(
+    topo: &Topology,
+    weights: &[f64],
+    s: u32,
+    bc: &mut [f64],
+    sc: &mut BrandesWeightedScratch,
+) {
     let out = topo.out();
-
-    let mut dist = vec![f64::INFINITY; n];
-    let mut sigma = vec![0.0f64; n];
-    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut order: Vec<u32> = Vec::new(); // settle order (non-decreasing distance)
-    let mut settled = vec![false; n];
+    let BrandesWeightedScratch {
+        dist,
+        sigma,
+        delta,
+        preds,
+        order,
+        settled,
+        heap,
+    } = sc;
 
     dist[s as usize] = 0.0;
     sigma[s as usize] = 1.0;
-    let mut heap = BinaryHeap::new();
     heap.push(Reverse((TotalF64(0.0), s)));
 
     while let Some(Reverse((TotalF64(du), u))) = heap.pop() {
@@ -209,8 +304,9 @@ fn brandes_from_weighted(topo: &Topology, weights: &[f64], s: u32, bc: &mut [f64
         }
     }
 
-    let mut delta = vec![0.0f64; n];
-    while let Some(w) = order.pop() {
+    // Reverse accumulation over the settle order (iterated without draining, so it
+    // still lists the visited nodes for the reset below).
+    for &w in order.iter().rev() {
         let coeff = (1.0 + delta[w as usize]) / sigma[w as usize];
         for &v in &preds[w as usize] {
             delta[v as usize] += sigma[v as usize] * coeff;
@@ -219,6 +315,17 @@ fn brandes_from_weighted(topo: &Topology, weights: &[f64], s: u32, bc: &mut [f64
             bc[w as usize] += delta[w as usize];
         }
     }
+
+    // Reset exactly the touched nodes; the heap is already drained by the loop.
+    for &w in order.iter() {
+        let wi = w as usize;
+        dist[wi] = f64::INFINITY;
+        sigma[wi] = 0.0;
+        delta[wi] = 0.0;
+        settled[wi] = false;
+        preds[wi].clear();
+    }
+    order.clear();
 }
 
 /// `None` → every node; `Some(frac)` → a deterministic, seed-derived random subset
@@ -298,6 +405,27 @@ mod tests {
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
         assert!(betweenness(&t, None, None).is_empty());
+    }
+
+    #[test]
+    fn directed_cycle_is_vertex_symmetric_across_chunks() {
+        // An 80-node directed cycle is vertex-transitive, so every node has the
+        // *same* betweenness. 80 > the 64-source accumulation chunk, so this
+        // exercises per-source scratch reuse both within and across chunks; a
+        // missed reset between sources would make the values diverge.
+        let n = 80u32;
+        let src: Vec<u32> = (0..n).collect();
+        let dst: Vec<u32> = (0..n).map(|i| (i + 1) % n).collect();
+        let t = Topology::build(n as usize, src, dst);
+        let bc = betweenness(&t, None, None);
+        assert_eq!(bc.len(), n as usize);
+        for &x in &bc {
+            assert!(
+                (x - bc[0]).abs() < 1e-9,
+                "cycle betweenness must be uniform"
+            );
+        }
+        assert!(bc[0] > 0.0);
     }
 
     #[test]
