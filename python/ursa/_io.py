@@ -1,11 +1,22 @@
 """Ingress: scan/read/from constructors.
 
+The primary in-memory constructors are ``EdgeFrame(data, src=, dst=)`` and
+``NodeFrame(data, id=)`` (see ``_frames.py``): they accept native Python data —
+row dicts, a dict of columns, a polars / pandas DataFrame, or a pyarrow
+Table/RecordBatch — normalized to one canonical Arrow source by
+``_to_arrow_table`` so the user never touches pyarrow directly. ``from_arrow`` /
+``from_polars`` / ``from_pandas`` here are thin, typed aliases over those
+constructors.
+
 ``scan_*`` is lazy (returns a frame that is a plan); ``read_*`` is the eager
-convenience (scan + collect). ``from_polars`` / ``from_arrow`` are zero-copy via
-Arrow. Object storage is first-class: ``s3://``, ``gs://``, ``az://`` and globs
-are accepted. Edge scans push their column projection (``src``/``dst`` plus any
-weight columns) into Parquet; node-column projection and predicate pushdown are
-not yet wired.
+convenience (scan + collect). Object storage is first-class: ``s3://``, ``gs://``,
+``az://`` and globs are accepted. Edge scans push their column projection
+(``src``/``dst`` plus any weight columns) into Parquet; node-column projection and
+predicate pushdown are not yet wired.
+
+However data arrives — scan/read from Parquet, the in-memory constructors, or the
+aliases — once it is inside an EdgeFrame/NodeFrame nothing downstream can tell how
+it was built; execution is identical from that point on.
 
 Constructors build correctly-typed lazy frames with the role mapping recorded (so
 ``.src_col`` etc. and ``.explain()`` work eagerly); the file read runs in the
@@ -61,7 +72,7 @@ def scan_edges(
             "format_opts": format_opts,
         },
     )
-    return EdgeFrame(
+    return EdgeFrame._construct(
         src_col=src,
         dst_col=dst,
         plan=(step,),
@@ -95,7 +106,7 @@ def scan_nodes(
             "format_opts": format_opts,
         },
     )
-    return NodeFrame(
+    return NodeFrame._construct(
         id_col=id,
         plan=(step,),
         scan={"path": path, "id": id, "storage_options": storage_options, "store": store},
@@ -121,9 +132,11 @@ def from_polars(
 ) -> EdgeFrame | NodeFrame:
     """Build a frame from an in-memory ``polars.DataFrame``, zero-copy via Arrow.
 
-    Pass ``src``/``dst`` for an EdgeFrame or ``id`` for a NodeFrame.
+    A thin, typed alias for the primary constructors ``EdgeFrame(df, src=, dst=)``
+    / ``NodeFrame(df, id=)``. Pass ``src``/``dst`` for an EdgeFrame or ``id`` for a
+    NodeFrame.
     """
-    return _from_inmemory("from_polars", df, src, dst, id)
+    return _from_inmemory(df, src, dst, id)
 
 
 @overload
@@ -133,34 +146,84 @@ def from_arrow(tbl: Any, *, id: str) -> NodeFrame: ...
 def from_arrow(
     tbl: Any, *, src: str | None = None, dst: str | None = None, id: str | None = None
 ) -> EdgeFrame | NodeFrame:
-    """Build a frame from a ``pyarrow.Table``, zero-copy."""
-    return _from_inmemory("from_arrow", tbl, src, dst, id)
+    """Build a frame from a ``pyarrow.Table`` / ``RecordBatch``, zero-copy.
+
+    A thin, typed alias for ``EdgeFrame(tbl, src=, dst=)`` / ``NodeFrame(tbl, id=)``.
+    """
+    return _from_inmemory(tbl, src, dst, id)
 
 
-def _from_inmemory(op: str, data: Any, src, dst, id):
+@overload
+def from_pandas(df: Any, *, src: str, dst: str) -> EdgeFrame: ...
+@overload
+def from_pandas(df: Any, *, id: str) -> NodeFrame: ...
+def from_pandas(
+    df: Any, *, src: str | None = None, dst: str | None = None, id: str | None = None
+) -> EdgeFrame | NodeFrame:
+    """Build a frame from an in-memory ``pandas.DataFrame`` via Arrow.
+
+    A thin, typed alias for ``EdgeFrame(df, src=, dst=)`` / ``NodeFrame(df, id=)``.
+    The pandas index is dropped (``preserve_index=False``) so it never leaks in as
+    a stray column. pandas is detected at runtime and never imported by Ursa unless
+    the caller already has it.
+    """
+    return _from_inmemory(df, src, dst, id)
+
+
+def _from_inmemory(data: Any, src, dst, id):
+    """Dispatch an in-memory input to the right primary constructor. The public
+    ``from_arrow`` / ``from_polars`` / ``from_pandas`` aliases all funnel here; the
+    constructors normalize any supported flavour to one canonical Arrow source."""
     if src is not None and dst is not None:
-        source = _extract_edge_arrays(op, data, src, dst)
-        # Retain the full edge table (all columns, same row order as src/dst) so a
-        # weight= expression over edge columns can be evaluated later.
-        edge_table = None
-        try:
-            edge_table = data.to_arrow() if op == "from_polars" else data
-        except Exception:
-            edge_table = None
-        return EdgeFrame(
-            src_col=src,
-            dst_col=dst,
-            plan=(_PlanStep(op, {"src": src, "dst": dst}),),
-            source=source,
-            edge_table=edge_table,
-        )
+        return EdgeFrame(data, src=src, dst=dst)
     if id is not None:
-        return NodeFrame(
-            id_col=id,
-            plan=(_PlanStep(op, {"id": id}),),
-            source=_node_attr_batch(op, data, id),
-        )
+        return NodeFrame(data, id=id)
     raise ValueError("provide either src= and dst= (EdgeFrame) or id= (NodeFrame)")
+
+
+def _to_arrow_table(data: Any) -> Any:
+    """Normalize any supported in-memory input to a single ``pyarrow.Table``.
+
+    This is the one funnel every in-memory constructor passes through, so once data
+    is inside a frame nothing downstream can tell which flavour it came from — the
+    "same from here on" guarantee. Detection is dependency-safe: polars / pandas are
+    recognized only if already imported (via ``sys.modules``), so neither becomes an
+    import-time requirement of Ursa.
+
+    Supported: ``pyarrow.Table`` (as-is), ``pyarrow.RecordBatch``, a list of row
+    dicts, a dict of equal-length columns, a ``polars.DataFrame``, a
+    ``pandas.DataFrame``, or any object exposing the Arrow C-stream capsule.
+    """
+    import sys
+
+    import pyarrow as pa
+
+    if isinstance(data, pa.Table):
+        return data
+    if isinstance(data, pa.RecordBatch):
+        return pa.Table.from_batches([data])
+    if isinstance(data, list):
+        if data and not isinstance(data[0], dict):
+            raise TypeError(
+                "list input must be a list of row dicts (e.g. "
+                "[{'src': 0, 'dst': 1}, ...]); bare tuples/rows are not supported."
+            )
+        return pa.Table.from_pylist(data)
+    if isinstance(data, dict):
+        return pa.table(data)
+    pl = sys.modules.get("polars")
+    if pl is not None and isinstance(data, pl.DataFrame):
+        return data.to_arrow()
+    pd = sys.modules.get("pandas")
+    if pd is not None and isinstance(data, pd.DataFrame):
+        return pa.Table.from_pandas(data, preserve_index=False)
+    if hasattr(data, "__arrow_c_stream__"):
+        return pa.table(data)
+    raise TypeError(
+        f"cannot build a frame from {type(data).__name__!r}; supported inputs are a "
+        "list of row dicts, a dict of columns, a polars.DataFrame, a pandas.DataFrame, "
+        "or a pyarrow.Table/RecordBatch."
+    )
 
 
 def _canonical_id_array(arr: Any) -> Any:
@@ -184,21 +247,15 @@ def _canonical_id_array(arr: Any) -> Any:
     raise TypeError(f"node ids must be an integer or string column; got {arr.type}")
 
 
-def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:
-    """The node attribute table as a single pyarrow RecordBatch (id canonicalized
-    to int64 or string).
+def _node_attr_batch(tbl: Any, id: str) -> Any | None:
+    """The node attribute table (an already-normalized ``pyarrow.Table``) as a
+    single pyarrow RecordBatch, id canonicalized to int64 or string.
 
-    Returns None only if pyarrow isn't importable (a source checkout without the
-    dependency installed) — ``collect()`` then surfaces a clear error at execution
-    time. An unsupported id type or a missing ``id`` column raises immediately at
+    An unsupported id type or a missing ``id`` column raises immediately at
     construction, so a typo'd column name is reported where the user made it.
     """
-    try:
-        import pyarrow as pa
-    except ImportError:  # pragma: no cover - pyarrow is a hard runtime dependency
-        return None
+    import pyarrow as pa
 
-    tbl = data.to_arrow() if op == "from_polars" else data
     idx = tbl.schema.get_field_index(id)
     id_col = tbl.column(id)
     chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
@@ -208,22 +265,15 @@ def _node_attr_batch(op: str, data: Any, id: str) -> Any | None:
     return batches[0] if batches else None
 
 
-def _extract_edge_arrays(op: str, data: Any, src: str, dst: str) -> tuple[Any, Any] | None:
-    """Pull the src/dst columns out as contiguous pyarrow arrays, canonicalized to
-    a supported node-id type (int64 or string).
+def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None:
+    """Pull the src/dst columns out of an already-normalized ``pyarrow.Table`` as
+    contiguous arrays, canonicalized to a supported node-id type (int64 or string).
 
-    Returns None only if pyarrow isn't importable (a source checkout without the
-    dependency installed) — `collect()` then surfaces a clear error at execution
-    time. An unsupported id type or a missing ``src``/``dst`` column raises
-    immediately at construction, so a typo'd column name is reported where the
-    user made it.
+    An unsupported id type or a missing ``src``/``dst`` column raises immediately at
+    construction, so a typo'd column name is reported where the user made it.
     """
-    try:
-        import pyarrow as pa
-    except ImportError:  # pragma: no cover - pyarrow is a hard runtime dependency
-        return None
+    import pyarrow as pa
 
-    tbl = data.to_arrow() if op == "from_polars" else data
     arrays = []
     for name in (src, dst):
         column = tbl.column(name)

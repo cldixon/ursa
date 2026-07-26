@@ -146,7 +146,7 @@ class _Hop:
         # so the frame advertises those names — a tail filter references ``src``/
         # ``dst``, matching what it actually gets. (The parent's role names aren't
         # carried through a traversal.)
-        return EdgeFrame(src_col="src", dst_col="dst", plan=(step,))
+        return EdgeFrame._construct(src_col="src", dst_col="dst", plan=(step,))
 
     def collect(self):
         return self._materialize().collect()
@@ -183,7 +183,7 @@ def shortest_path(
     )
     # Result columns are literal ``src``/``dst`` (one row per edge on the path);
     # advertise those names so a tail filter matches (see _Hop._materialize).
-    return EdgeFrame(src_col="src", dst_col="dst", plan=(step,))
+    return EdgeFrame._construct(src_col="src", dst_col="dst", plan=(step,))
 
 
 def random_walk(
@@ -205,7 +205,7 @@ def random_walk(
             "edges": edges,
         },
     )
-    return NodeFrame(id_col="node", plan=(step,))
+    return NodeFrame._construct(id_col="node", plan=(step,))
 
 
 # --- node-valued algorithms (dual-positioned) ------------------------------

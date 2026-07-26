@@ -41,9 +41,17 @@ the parts that prove the design is sound are real and tested end-to-end.
 | **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n).select(...)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort; `with_columns` stays additive and **`select(...)`** narrows the output Polars-faithfully — which drives a **projection pushdown** so a `scan_nodes` file reads only the columns the plan proves it needs), **`neighbors().agg()`** over numeric *and* string attributes, the **traversals** `hop()` and `shortest_path()` (first-class `HopNode`/`ShortestPathNode` returning EdgeFrames) plus `random_walk()` (a `RandomWalkNode` returning a `(walk_id, step, node)` frame), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources — local files **or object storage** (`s3://` / `gs://` / `az://`, with `storage_options={...}`). |
 
 ```python
-import ursa as ur, pyarrow as pa
+import ursa as ur
 
-edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+# The EdgeFrame *is* the graph. Build one from native Python data — a list of
+# row dicts, a dict of columns, a polars/pandas DataFrame, or pyarrow. No
+# `import pyarrow` required; `src`/`dst` name the endpoint columns:
+edges = ur.EdgeFrame(
+    [{"s": 1, "d": 0}, {"s": 2, "d": 0}, {"s": 3, "d": 0}, {"s": 0, "d": 1}],
+    src="s",
+    dst="d",
+)
+# equivalently: ur.EdgeFrame({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}, src="s", dst="d")
 
 # Composed pipeline — runs through DataFusion end to end:
 (
@@ -59,11 +67,19 @@ edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s",
 # ...or straight from a file (Parquet/CSV, projection pushed into the scan):
 ur.pagerank(ur.scan_edges("edges.parquet", src="s", dst="d")).collect().to_polars()
 
+# However the frame is built — constructor, from_polars/from_pandas/from_arrow,
+# or scan_edges — it behaves identically from here on.
+
 # Node ids may be int64 (the fast path) or strings (e.g. UUIDs) — auto-detected
 # from the column type; results come back keyed by the original ids:
-str_edges = ur.from_arrow(pa.table({"s": ["u1", "u1", "u2"], "d": ["u2", "u3", "u3"]}), src="s", dst="d")
+str_edges = ur.EdgeFrame({"s": ["u1", "u1", "u2"], "d": ["u2", "u3", "u3"]}, src="s", dst="d")
 ur.pagerank(str_edges).collect().to_polars()   # id column is Utf8
 ```
+
+`NodeFrame(data, id=...)` is the matching constructor for an attribute table
+(joined to the graph by `id`); a `NodeFrame` is optional — nodes are implicit in
+the edges (`edges.nodes()`), and attributes are a *separate* table you attach when
+you have them.
 
 ## Architecture
 
