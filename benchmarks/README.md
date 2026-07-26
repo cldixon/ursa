@@ -52,6 +52,16 @@ and warm state are never polluted by another library imported in the same
 interpreter, and the thread cap (`--threads`, default `1` for apples-to-apples)
 is pinned before any library initialises its pools.
 
+**Interleaving for fairness under drift** (`--rounds`, default `1`). Within a
+cell, the timed iterations run back-to-back; but with `--rounds N` the *whole
+matrix* is measured N times, **rotating the library order each round** and pooling
+each cell's samples across the rounds. So no library is pinned to the same slot or
+time window, and a mid-run host slowdown is shared across all of them rather than
+skewing whichever library happened to run next to it. (Repetitions cut *variance*,
+not *bias* — reducing with median/min over the pooled samples, never mean, is what
+keeps a right-skewed timing distribution honest. Systematic host bias needs this
+interleaving plus, ideally, dedicated hardware — see issue #80.)
+
 **Parallelism is its own dimension — and fair.** `--threads` can be *swept*
 (`-t 1 -t 2 -t 4`), and every library is given the **same** budget at each level,
 with *all* the relevant knobs set (`RAYON_NUM_THREADS` for Ursa/rustworkx,

@@ -92,8 +92,13 @@ def run(
     library: list[str] = typer.Option(None, "--library", "-l", help="Libraries (default: all)."),
     algo: list[str] = typer.Option(None, "--algo", "-a", help="Algorithms (default: all)."),
     dataset: list[str] = typer.Option(None, "--dataset", "-d", help="Datasets (default: er-1k)."),
-    iters: int = typer.Option(5, help="Timed warm iterations."),
+    iters: int = typer.Option(5, help="Timed warm iterations (per round, per cell)."),
     warmup: int = typer.Option(1, help="Discarded warm iterations."),
+    rounds: int = typer.Option(
+        1,
+        help="Interleaved measurement rounds. >1 rotates library order and pools "
+        "samples across rounds to spread host drift fairly (mitigates VM noise).",
+    ),
     threads: list[int] = typer.Option(
         [1],
         "--threads",
@@ -121,6 +126,7 @@ def run(
         datasets=dataset or ["er-1k"],
         iters=iters,
         warmup=warmup,
+        rounds=rounds,
         threads=threads[0],
         reference_max_nodes=reference_max_nodes,
         timeout_s=timeout,
@@ -131,7 +137,7 @@ def run(
     console.print(
         f"[bold]{run_id}[/bold]: {per_level * len(threads)} cells "
         f"({len(cfg.libraries)} libs × {len(cfg.algorithms)} algos × "
-        f"{len(cfg.datasets)} datasets × threads {threads}), iters={iters}"
+        f"{len(cfg.datasets)} datasets × threads {threads}), iters={iters}, rounds={rounds}"
     )
     for t in threads:
         cfg.threads = t
