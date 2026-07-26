@@ -24,6 +24,13 @@ __pycache__/
 /site/.astro/
 /site/.wrangler/
 
+# Credentials. Wrangler reads `.env` from the project directory, so a Cloudflare
+# API token can land here by accident — never commit one.
+.env
+.env.*
+!.env.example
+.dev.vars
+
 # Editors / OS
 .DS_Store
 .idea/
