@@ -188,12 +188,24 @@ def critical():
     return result.sort("betweenness", descending=True).head(100).to_dicts()
 ```
 
-And ingress from an existing in-memory frame is symmetric:
+And ingress from data already in the Python runtime is symmetric. The primary
+constructors take native data directly — row dicts, a column dict, a polars/pandas
+DataFrame, or pyarrow — so the user never has to touch pyarrow:
 
 ```python
+edges = ur.EdgeFrame([{"a": 0, "b": 1}, {"a": 1, "b": 2}], src="a", dst="b")
+edges = ur.EdgeFrame({"a": [0, 1], "b": [1, 2]}, src="a", dst="b")
+nodes = ur.NodeFrame(df, id="node_id")                # attribute table
+
+# ...with from_polars / from_pandas / from_arrow as thin, typed aliases:
 edges = ur.from_polars(df, src="a", dst="b")     # zero-copy
 edges = ur.from_arrow(tbl, src="a", dst="b")
 ```
+
+However a frame is built — these constructors, the aliases, or `scan_edges` /
+`scan_nodes` from a file — the data normalizes to one canonical Arrow source, so
+nothing downstream can tell how it was constructed; execution is identical from
+that point on.
 
 ## Core concepts and object model
 

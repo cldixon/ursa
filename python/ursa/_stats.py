@@ -20,7 +20,7 @@ def describe(edges: EdgeFrame, full: bool = False) -> NodeFrame:
     so the carried ``id_col`` is an unused placeholder (you collect the summary
     rather than derive node-keyed frames from it).
     """
-    return NodeFrame(
+    return NodeFrame._construct(
         id_col="__summary__", plan=(_PlanStep("describe", {"full": full, "edges": edges}),)
     )
 

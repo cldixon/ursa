@@ -203,18 +203,51 @@ class EdgeFrame(_Frame):
     # can be evaluated. It rides the same preserve/drop rail; scan frames have None.
     __slots__ = ("_dst_col", "_edge_table", "_index_cell", "_scan", "_source", "_src_col")
 
-    def __init__(
+    def __init__(self, data: Any, *, src: str, dst: str) -> None:
+        """Build an EdgeFrame from in-memory data, inferring the Arrow schema.
+
+        ``data`` may be a list of row dicts, a dict of equal-length columns, a
+        ``polars.DataFrame``, a ``pandas.DataFrame``, or a ``pyarrow.Table`` /
+        ``RecordBatch`` — whatever ``_to_arrow_table`` normalizes. ``src`` / ``dst``
+        are *role mappings* naming the endpoint columns, not renames.
+
+        Whatever the input flavour, the data is stored as one canonical Arrow
+        source, so a frame built here is indistinguishable downstream from one
+        built via ``from_arrow`` / ``from_polars`` / ``from_pandas`` or a
+        ``scan_edges`` file — the load-bearing "same from here on" guarantee.
+        """
+        from ._io import _extract_edge_arrays, _to_arrow_table
+
+        table = _to_arrow_table(data)
+        source = _extract_edge_arrays(table, src, dst)
+        self._fill(
+            src_col=src,
+            dst_col=dst,
+            plan=(_PlanStep("from_arrow", {"src": src, "dst": dst}),),
+            has_index=True,
+            source=source,
+            scan=None,
+            index_cell=None,
+            edge_table=table,
+        )
+
+    def _fill(
         self,
         src_col: str,
         dst_col: str,
-        plan: tuple[_PlanStep, ...] = (),
-        has_index: bool = True,
-        source: tuple[Any, Any] | None = None,
-        scan: dict[str, Any] | None = None,
-        index_cell: _BuildCell | None = None,
-        edge_table: Any | None = None,
+        plan: tuple[_PlanStep, ...],
+        has_index: bool,
+        source: tuple[Any, Any] | None,
+        scan: dict[str, Any] | None,
+        index_cell: _BuildCell | None,
+        edge_table: Any | None,
     ) -> None:
-        super().__init__(plan, has_index)
+        """Assign every slot — the single place the layout is defined, shared by the
+        public ``__init__`` and the internal ``_construct`` factory so the two can
+        never drift. (A ``__new__``-built frame must set *all* slots or a later
+        access raises ``AttributeError`` rather than reading ``None``.)"""
+        self._plan = plan
+        self._has_index = has_index
         self._src_col = src_col
         self._dst_col = dst_col
         self._source = source
@@ -223,6 +256,26 @@ class EdgeFrame(_Frame):
         # structural ones pass None so a fresh cell is created here.
         self._index_cell = index_cell if index_cell is not None else _BuildCell()
         self._edge_table = edge_table
+
+    @classmethod
+    def _construct(
+        cls,
+        src_col: str,
+        dst_col: str,
+        plan: tuple[_PlanStep, ...] = (),
+        has_index: bool = True,
+        source: tuple[Any, Any] | None = None,
+        scan: dict[str, Any] | None = None,
+        index_cell: _BuildCell | None = None,
+        edge_table: Any | None = None,
+    ) -> EdgeFrame:
+        """Internal factory: build a frame directly from plumbing (plan, source,
+        scan, cells) without the public data-normalizing ``__init__``. Every
+        non-user construction site — ingress (``scan_edges``), derivations
+        (``_extend`` / ``reverse``), traversals — goes through here."""
+        obj = cls.__new__(cls)
+        obj._fill(src_col, dst_col, plan, has_index, source, scan, index_cell, edge_table)
+        return obj
 
     @property
     def _index_build_cell(self) -> _BuildCell:
@@ -258,7 +311,7 @@ class EdgeFrame(_Frame):
         # A row-changing op invalidates the in-memory source / scan spec and the
         # cached topology index (they no longer match the frame); property-only
         # ops keep them.
-        return EdgeFrame(
+        return EdgeFrame._construct(
             self._src_col,
             self._dst_col,
             (*self._plan, step),
@@ -271,7 +324,7 @@ class EdgeFrame(_Frame):
 
     def nodes(self) -> NodeFrame:
         """The distinct union of ``src`` and ``dst`` values, as a lazy NodeFrame."""
-        return NodeFrame(
+        return NodeFrame._construct(
             id_col="id",
             plan=(*self._plan, _PlanStep("nodes", {"from": (self._src_col, self._dst_col)})),
         )
@@ -286,7 +339,7 @@ class EdgeFrame(_Frame):
         parent topology with flipped direction is a future optimization)."""
         src = self._source
         scan = self._scan
-        return EdgeFrame(
+        return EdgeFrame._construct(
             self._dst_col,
             self._src_col,
             (*self._plan, _PlanStep("reverse", {})),
@@ -329,21 +382,58 @@ class NodeFrame(_Frame):
 
     __slots__ = ("_attr_cell", "_id_col", "_scan", "_source")
 
-    def __init__(
+    def __init__(self, data: Any, *, id: str) -> None:
+        """Build a NodeFrame (attribute table) from in-memory data.
+
+        ``data`` accepts the same flavours as ``EdgeFrame`` (row dicts, column
+        dict, polars / pandas DataFrame, pyarrow Table/RecordBatch); ``id`` is the
+        id-role mapping. Stored as one canonical Arrow attribute batch, so it is
+        indistinguishable downstream from a ``from_arrow(..., id=)`` frame."""
+        from ._io import _node_attr_batch, _to_arrow_table
+
+        table = _to_arrow_table(data)
+        source = _node_attr_batch(table, id)
+        self._fill(
+            id_col=id,
+            plan=(_PlanStep("from_arrow", {"id": id}),),
+            source=source,
+            scan=None,
+            attr_cell=None,
+        )
+
+    def _fill(
         self,
         id_col: str,
-        plan: tuple[_PlanStep, ...] = (),
-        source: Any | None = None,
-        scan: dict[str, Any] | None = None,
-        attr_cell: _BuildCell | None = None,
+        plan: tuple[_PlanStep, ...],
+        source: Any | None,
+        scan: dict[str, Any] | None,
+        attr_cell: _BuildCell | None,
     ) -> None:
-        super().__init__(plan, has_index=False)
+        """Assign every slot; shared by ``__init__`` and ``_construct`` so the
+        layout can never drift (see ``EdgeFrame._fill``)."""
+        self._plan = plan
+        self._has_index = False
         self._id_col = id_col
         self._source = source
         self._scan = scan
         # Shared memo for a scan_nodes attribute batch (see _BuildCell); carried
         # across derivations so a scan-backed node file is read from disk once.
         self._attr_cell = attr_cell if attr_cell is not None else _BuildCell()
+
+    @classmethod
+    def _construct(
+        cls,
+        id_col: str,
+        plan: tuple[_PlanStep, ...] = (),
+        source: Any | None = None,
+        scan: dict[str, Any] | None = None,
+        attr_cell: _BuildCell | None = None,
+    ) -> NodeFrame:
+        """Internal factory building a frame from plumbing without the public
+        data-normalizing ``__init__`` (see ``EdgeFrame._construct``)."""
+        obj = cls.__new__(cls)
+        obj._fill(id_col, plan, source, scan, attr_cell)
+        return obj
 
     @property
     def _attr_build_cell(self) -> _BuildCell:
@@ -368,7 +458,7 @@ class NodeFrame(_Frame):
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
         # Derivations preserve the source/scan, so they share the attr memo too:
         # a filter/sort applies to the query, not to the raw scanned file.
-        return NodeFrame(
+        return NodeFrame._construct(
             self._id_col,
             (*self._plan, step),
             source=self._source,
