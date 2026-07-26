@@ -17,11 +17,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
-use datafusion::prelude::{col, lit};
+use datafusion::prelude::{col, lit, DataFrame};
 use serde::Deserialize;
 use ursa_core::algo::AggKind;
 use ursa_core::{IdMap, Topology};
@@ -146,13 +146,16 @@ fn parse_agg(name: &str) -> Result<AggKind> {
 /// stable `f64` code, so the segmented reduction counts distinct strings
 /// correctly. `mean`/`sum`/`min`/`max` still require a numeric column.
 fn dense_attr_column(
-    nodes: &RecordBatch,
+    nodes: &[RecordBatch],
     id_col: &str,
     attr_col: &str,
     ids: &IdMap,
     agg: AggKind,
 ) -> Result<Vec<Option<f64>>> {
-    let schema = nodes.schema();
+    let Some(first) = nodes.first() else {
+        return Ok(vec![None; ids.len()]);
+    };
+    let schema = first.schema();
     let id_idx = schema
         .index_of(id_col)
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -162,12 +165,6 @@ fn dense_attr_column(
         ))
     })?;
 
-    // Resolve each attribute row's id to a dense index (its type must match the
-    // graph's id type — dense_from_array errors on a mismatch, e.g. string attr
-    // ids against an int64 graph). Rows whose id is null or absent from the graph
-    // resolve to `None` and are skipped.
-    let dense_of_row = resolve_dense(ids, nodes.column(id_idx))?;
-
     // Branch on the column's declared type, not on cast success: Arrow casts
     // Utf8 -> Float64 by producing nulls for unparseable strings rather than
     // erroring, which would silently swallow a real string column.
@@ -176,43 +173,52 @@ fn dense_attr_column(
         attr_dtype,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     );
+    if is_string && !matches!(agg, AggKind::NUnique | AggKind::Count) {
+        return Err(DataFusionError::NotImplemented(format!(
+            "neighbors().agg() with mean/sum/min/max needs a numeric attribute column; \
+             {attr_col:?} is a string column (only n_unique/count accept strings)"
+        )));
+    }
 
-    // Scatter attribute values into a dense-indexed vector. Numeric columns pass
-    // values through; string columns (n_unique/count only) intern each distinct
-    // value to a stable code.
+    // Scatter attribute values into a dense-indexed vector, streaming the attribute
+    // batches one at a time (never concatenating them). Numeric columns pass values
+    // through; string columns (n_unique/count only) intern each distinct value to a
+    // stable code — the `codes` map is shared across batches so a value's code is
+    // stable regardless of which batch it first appears in.
     let mut out: Vec<Option<f64>> = vec![None; ids.len()];
-    if is_string {
-        if !matches!(agg, AggKind::NUnique | AggKind::Count) {
-            return Err(DataFusionError::NotImplemented(format!(
-                "neighbors().agg() with mean/sum/min/max needs a numeric attribute column; \
-                 {attr_col:?} is a string column (only n_unique/count accept strings)"
-            )));
-        }
-        let attr_arr = cast(nodes.column(attr_idx), &DataType::Utf8)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-        let attr_arr = attr_arr.as_any().downcast_ref::<StringArray>().unwrap();
-        let mut codes: HashMap<&str, f64> = HashMap::new();
-        for (i, dense) in dense_of_row.iter().enumerate() {
-            let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
-                continue;
-            };
-            let next = codes.len() as f64;
-            let code = *codes.entry(attr_arr.value(i)).or_insert(next);
-            out[d as usize] = Some(code);
-        }
-    } else {
-        let attr_arr = cast(nodes.column(attr_idx), &DataType::Float64).map_err(|_| {
-            DataFusionError::NotImplemented(format!(
-                "neighbors().agg() supports numeric or string attribute columns in v0.1; \
-                 {attr_col:?} ({attr_dtype:?}) is neither"
-            ))
-        })?;
-        let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
-        for (i, dense) in dense_of_row.iter().enumerate() {
-            let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
-                continue;
-            };
-            out[d as usize] = Some(attr_arr.value(i));
+    let mut codes: HashMap<String, f64> = HashMap::new();
+    for batch in nodes {
+        // Resolve each attribute row's id to a dense index (its type must match the
+        // graph's id type — dense_from_array errors on a mismatch, e.g. string attr
+        // ids against an int64 graph). Rows whose id is null or absent from the
+        // graph resolve to `None` and are skipped.
+        let dense_of_row = resolve_dense(ids, batch.column(id_idx))?;
+        if is_string {
+            let attr_arr = cast(batch.column(attr_idx), &DataType::Utf8)
+                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            let attr_arr = attr_arr.as_any().downcast_ref::<StringArray>().unwrap();
+            for (i, dense) in dense_of_row.iter().enumerate() {
+                let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
+                    continue;
+                };
+                let next = codes.len() as f64;
+                let code = *codes.entry(attr_arr.value(i).to_string()).or_insert(next);
+                out[d as usize] = Some(code);
+            }
+        } else {
+            let attr_arr = cast(batch.column(attr_idx), &DataType::Float64).map_err(|_| {
+                DataFusionError::NotImplemented(format!(
+                    "neighbors().agg() supports numeric or string attribute columns in v0.1; \
+                     {attr_col:?} ({attr_dtype:?}) is neither"
+                ))
+            })?;
+            let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
+            for (i, dense) in dense_of_row.iter().enumerate() {
+                let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
+                    continue;
+                };
+                out[d as usize] = Some(attr_arr.value(i));
+            }
         }
     }
 
@@ -252,10 +258,10 @@ pub fn execute_node_query(
     filters: &[Comparison],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
-    nodes: Option<RecordBatch>,
+    nodes: Option<Vec<RecordBatch>>,
     nodes_id: Option<String>,
-    edges: Option<RecordBatch>,
-) -> Result<RecordBatch> {
+    edges: Option<Vec<RecordBatch>>,
+) -> Result<Vec<RecordBatch>> {
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
     if specs.is_empty() {
@@ -364,9 +370,9 @@ pub fn execute_node_query(
         // Base frame: either the graph output alone, or a node attribute table
         // with the graph output left-joined onto it by id.
         let mut df = match nodes {
-            Some(batch) => {
+            Some(batches) => {
                 let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
-                let nodes_df = ctx.read_batch(batch)?;
+                let nodes_df = ctx.read_batches(batches)?;
                 // Rename the graph id so the join keys don't collide, then drop it.
                 let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
                 nodes_df
@@ -392,9 +398,7 @@ pub fn execute_node_query(
             df = df.limit(0, Some(n))?;
         }
 
-        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let batches = df.collect().await?;
-        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+        collect_batches(df).await
     })?
 }
 
@@ -415,7 +419,7 @@ pub fn execute_hop_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
     // Resolve user-id seeds to dense indices; drop unknowns/nulls (kernel-consistent).
@@ -442,9 +446,7 @@ pub fn execute_hop_query(
             df = df.limit(0, Some(n))?;
         }
 
-        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let batches = df.collect().await?;
-        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+        collect_batches(df).await
     })?
 }
 
@@ -463,12 +465,12 @@ pub fn execute_path_query(
     target: &dyn Array,
     direction: &str,
     weight: Option<&str>,
-    edges: Option<RecordBatch>,
+    edges: Option<Vec<RecordBatch>>,
     filters: &[Comparison],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
     // A weight expression (over edge columns) becomes one non-negative f64 per
@@ -499,7 +501,7 @@ pub fn execute_path_query(
     let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
     let target = resolve_dense(&ids, target)?.into_iter().next().flatten();
     let (Some(source), Some(target)) = (source, target) else {
-        return RecordBatch::try_new(
+        let empty = RecordBatch::try_new(
             path_schema(ids.user_type()),
             vec![
                 ids.gather_user(&[]),
@@ -507,7 +509,8 @@ pub fn execute_path_query(
                 Arc::new(Int64Array::from(Vec::<i64>::new())),
             ],
         )
-        .map_err(|e| DataFusionError::ArrowError(e, None));
+        .map_err(|e| DataFusionError::ArrowError(e, None))?;
+        return Ok(vec![empty]);
     };
 
     let path_plan = LogicalPlan::Extension(Extension {
@@ -533,9 +536,7 @@ pub fn execute_path_query(
             df = df.limit(0, Some(n))?;
         }
 
-        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let batches = df.collect().await?;
-        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+        collect_batches(df).await
     })?
 }
 
@@ -557,7 +558,7 @@ pub fn execute_walk_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     let starts_dense: Vec<u32> = resolve_dense(&ids, starts)?.into_iter().flatten().collect();
 
     let walk_plan = LogicalPlan::Extension(Extension {
@@ -588,9 +589,7 @@ pub fn execute_walk_query(
             df = df.limit(0, Some(n))?;
         }
 
-        let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let batches = df.collect().await?;
-        concat_batches(&out_schema, &batches).map_err(|e| DataFusionError::ArrowError(e, None))
+        collect_batches(df).await
     })?
 }
 
@@ -602,9 +601,31 @@ fn resolve_dense(ids: &IdMap, arr: &dyn Array) -> Result<Vec<Option<u32>>, DataF
         .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
+/// Collect a `DataFrame` to a **batch list** that always carries the schema (an
+/// empty result becomes a single zero-row batch), so a query's columns transport
+/// across the FFI even when no rows match. Returning the list — rather than
+/// `concat_batches`-ing it into one contiguous batch — is what keeps peak result
+/// memory flat for a large hop/walk/collect output (#60).
+async fn collect_batches(df: DataFrame) -> Result<Vec<RecordBatch>> {
+    let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+    let mut batches = df.collect().await?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(out_schema));
+    }
+    Ok(batches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::compute::concat_batches;
+
+    /// Concatenate a query's batch-list result into one batch for assertions (the
+    /// FFI now returns the list; tests still check a single materialized batch).
+    fn one(batches: Vec<RecordBatch>) -> RecordBatch {
+        let schema = batches[0].schema();
+        concat_batches(&schema, &batches).unwrap()
+    }
 
     fn diamond() -> (Int64Array, Int64Array) {
         // node 0 is a hub: 1->0, 2->0, 3->0, 0->1
@@ -623,7 +644,7 @@ mod tests {
     fn single_column_query() {
         let (src, dst) = diamond();
         let (t, ids) = build(&src, &dst);
-        let batch = execute_node_query(
+        let batch = one(execute_node_query(
             t,
             ids,
             r#"[{"name":"pagerank","kind":"pagerank"}]"#,
@@ -634,7 +655,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .unwrap());
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.schema().field(1).name(), "pagerank");
     }
@@ -643,22 +664,24 @@ mod tests {
     fn composed_query_filter_sort_limit() {
         let (src, dst) = diamond();
         let (t, ids) = build(&src, &dst);
-        let batch = execute_node_query(
-            t,
-            ids,
-            r#"[{"name":"pr","kind":"pagerank"},{"name":"indeg","kind":"degree","direction":"in"}]"#,
-            &[Comparison {
-                column: "indeg".into(),
-                op: ">".into(),
-                value: 0.0,
-            }],
-            Some(("pr".into(), true)),
-            Some(1),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let batch = one(
+            execute_node_query(
+                t,
+                ids,
+                r#"[{"name":"pr","kind":"pagerank"},{"name":"indeg","kind":"degree","direction":"in"}]"#,
+                &[Comparison {
+                    column: "indeg".into(),
+                    op: ">".into(),
+                    value: 0.0,
+                }],
+                Some(("pr".into(), true)),
+                Some(1),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
         // Only node 0 has in-degree > 0 among the hub set; it also ranks highest.
         assert_eq!(batch.num_rows(), 1);
         let ids = batch
@@ -701,8 +724,10 @@ mod tests {
         ] {
             let (t, ids) = build(&src, &dst);
             let spec = format!(r#"[{{"name":"v","kind":"{kind}"}}]"#);
-            let batch = execute_node_query(t, ids, &spec, &[], None, None, None, None, None)
-                .unwrap_or_else(|e| panic!("{kind} failed: {e}"));
+            let batch = one(
+                execute_node_query(t, ids, &spec, &[], None, None, None, None, None)
+                    .unwrap_or_else(|e| panic!("{kind} failed: {e}")),
+            );
             assert_eq!(batch.num_rows(), 4, "{kind}");
             assert_eq!(batch.schema().field(1).data_type(), &want, "{kind}");
         }
@@ -729,18 +754,18 @@ mod tests {
         .unwrap();
 
         let (t, ids) = build(&src, &dst);
-        let batch = execute_node_query(
+        let batch = one(execute_node_query(
             t,
             ids,
             r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
             &[],
             Some(("id".into(), false)),
             None,
-            Some(nodes),
+            Some(vec![nodes]),
             Some("id".into()),
             None,
         )
-        .unwrap();
+        .unwrap());
 
         // Columns: id, region (attr), indeg (algo)
         let schema = batch.schema();
@@ -770,18 +795,20 @@ mod tests {
         .unwrap();
 
         let (t, ids) = build(&src, &dst);
-        let batch = execute_node_query(
-            t,
-            ids,
-            r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#,
-            &[],
-            Some(("id".into(), false)),
-            None,
-            Some(nodes),
-            Some("id".into()),
-            None,
-        )
-        .unwrap();
+        let batch = one(
+            execute_node_query(
+                t,
+                ids,
+                r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#,
+                &[],
+                Some(("id".into(), false)),
+                None,
+                Some(vec![nodes]),
+                Some("id".into()),
+                None,
+            )
+            .unwrap(),
+        );
 
         // Find node 0's row and check the mean of its in-neighbours' capacities.
         let ids = batch
@@ -822,18 +849,20 @@ mod tests {
         .unwrap();
 
         let (t, ids) = build(&src, &dst);
-        let batch = execute_node_query(
-            t,
-            ids,
-            r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
-            &[],
-            Some(("id".into(), false)),
-            None,
-            Some(nodes),
-            Some("id".into()),
-            None,
-        )
-        .unwrap();
+        let batch = one(
+            execute_node_query(
+                t,
+                ids,
+                r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
+                &[],
+                Some(("id".into(), false)),
+                None,
+                Some(vec![nodes]),
+                Some("id".into()),
+                None,
+            )
+            .unwrap(),
+        );
 
         let ids = batch
             .column(0)
@@ -858,7 +887,8 @@ mod tests {
         let dst = Int64Array::from(vec![1, 2, 3]);
         let seeds = Int64Array::from(vec![0]);
         let (t, ids) = build(&src, &dst);
-        let batch = execute_hop_query(t, ids, &seeds, 2, "out", &[], None, None, false).unwrap();
+        let batch =
+            one(execute_hop_query(t, ids, &seeds, 2, "out", &[], None, None, false).unwrap());
         // from 0 within 2 hops -> reaches 1 and 2
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 2);
@@ -882,7 +912,10 @@ mod tests {
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![3]));
         let batch =
-            execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false).unwrap();
+            one(
+                execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false)
+                    .unwrap(),
+            );
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
@@ -904,7 +937,10 @@ mod tests {
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![99]));
         let batch =
-            execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false).unwrap();
+            one(
+                execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false)
+                    .unwrap(),
+            );
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.num_rows(), 0);
     }
@@ -940,7 +976,7 @@ mod tests {
         let seeds = Int64Array::from(vec![1, 2, 3]);
         // one hop out: (1,0),(2,0),(3,0); keep dst == 0, limit 2
         let (t, ids) = build(&src, &dst);
-        let batch = execute_hop_query(
+        let batch = one(execute_hop_query(
             t,
             ids,
             &seeds,
@@ -955,7 +991,7 @@ mod tests {
             Some(2),
             false,
         )
-        .unwrap();
+        .unwrap());
         assert_eq!(batch.num_rows(), 2);
     }
 
@@ -986,7 +1022,7 @@ mod tests {
             &[],
             None,
             None,
-            Some(nodes),
+            Some(vec![nodes]),
             Some("id".into()),
             None,
         );

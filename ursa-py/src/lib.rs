@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{make_array, ArrayData, ArrayRef, RecordBatch};
+use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
@@ -39,7 +39,7 @@ use std::sync::Arc;
 use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 use ursa_plan::{
-    avg_path_length, build_topology, density, describe, diameter, execute_hop_query,
+    avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_node_query, execute_path_query, execute_walk_query, scan_edges_batch, scan_nodes_batch,
     Comparison,
 };
@@ -120,20 +120,23 @@ struct GraphIndex {
     ids: Arc<IdMap>,
 }
 
-/// Build the graph index from `(src, dst)` arrays (int64 or string ids) — the one
-/// place the CSR is constructed. The id type is auto-detected from the Arrow
-/// columns. The GIL is released for the build; the counter lets tests assert
-/// build-once behaviour.
+/// Build the graph index from an **edge batch list** — a pyarrow list of
+/// `RecordBatch`es whose first two columns are the (canonicalized) `src`/`dst`
+/// endpoints (int64 or string ids); any further columns are ignored. This is the
+/// one place the CSR is constructed. The batches are interned as a *stream* (via
+/// [`build_topology_batches`]), so an edge table that arrives in many chunks never
+/// has to be concatenated into one contiguous batch first (#60). The id type is
+/// auto-detected from the columns; the GIL is released for the build; the counter
+/// lets tests assert build-once behaviour.
 #[pyfunction]
-fn build_index(
-    py: Python<'_>,
-    src: &Bound<'_, PyAny>,
-    dst: &Bound<'_, PyAny>,
-) -> PyResult<GraphIndex> {
-    let src = array_from_pyarrow(src)?;
-    let dst = array_from_pyarrow(dst)?;
+fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex> {
+    let batches = Vec::<RecordBatch>::from_pyarrow_bound(edges)?;
     let (topo, ids) = py.allow_threads(move || {
-        build_topology(src.as_ref(), dst.as_ref()).map_err(|e| PyValueError::new_err(e.to_string()))
+        let pairs: Vec<(&dyn Array, &dyn Array)> = batches
+            .iter()
+            .map(|b| (b.column(0).as_ref(), b.column(1).as_ref()))
+            .collect();
+        build_topology_batches(&pairs).map_err(|e| PyValueError::new_err(e.to_string()))
     })?;
     TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
     Ok(GraphIndex { topo, ids })
@@ -170,16 +173,18 @@ fn run_node_query(
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
+    // The node attribute table and the edge attribute table (for weight
+    // expressions) each cross the FFI as a *list* of RecordBatches, so a large
+    // attribute table is never concatenated into one batch (#60).
     let nodes = match nodes {
-        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
-    // Edge attribute batch for evaluating weight expressions (weighted algorithms).
     let edges = match edges {
-        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
-    let batch = py.allow_threads(move || {
+    let batches = py.allow_threads(move || {
         execute_node_query(
             topo,
             ids,
@@ -193,7 +198,7 @@ fn run_node_query(
         )
         .map_err(to_pyerr)
     })?;
-    batch.to_pyarrow(py)
+    batches.to_pyarrow(py)
 }
 
 /// Execute a `hop` traversal and return its `(src, dst)` edge batch as pyarrow.
@@ -223,7 +228,7 @@ fn run_hop_query(
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
-    let batch = py.allow_threads(move || {
+    let batches = py.allow_threads(move || {
         execute_hop_query(
             topo,
             ids,
@@ -237,7 +242,7 @@ fn run_hop_query(
         )
         .map_err(to_pyerr)
     })?;
-    batch.to_pyarrow(py)
+    batches.to_pyarrow(py)
 }
 
 /// Execute a `shortest_path` traversal and return its `(src, dst, hop)` path batch
@@ -266,15 +271,16 @@ fn run_path_query(
     let source = array_from_pyarrow(source)?;
     let target = array_from_pyarrow(target)?;
     let direction = direction.to_string();
+    // The edge attribute table (for a weighted path) crosses as a batch list.
     let edges = match edges {
-        Some(obj) => Some(RecordBatch::from_pyarrow_bound(&obj)?),
+        Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
     let comparisons: Vec<Comparison> = filters
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
-    let batch = py.allow_threads(move || {
+    let batches = py.allow_threads(move || {
         execute_path_query(
             topo,
             ids,
@@ -290,7 +296,7 @@ fn run_path_query(
         )
         .map_err(to_pyerr)
     })?;
-    batch.to_pyarrow(py)
+    batches.to_pyarrow(py)
 }
 
 /// Execute a `random_walk` and return its `(walk_id, step, node)` node batch as
@@ -318,7 +324,7 @@ fn run_walk_query(
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
-    let batch = py.allow_threads(move || {
+    let batches = py.allow_threads(move || {
         execute_walk_query(
             topo,
             ids,
@@ -333,7 +339,7 @@ fn run_walk_query(
         )
         .map_err(to_pyerr)
     })?;
-    batch.to_pyarrow(py)
+    batches.to_pyarrow(py)
 }
 
 /// Whole-graph directed edge density (eager scalar).
@@ -393,10 +399,10 @@ fn scan_edges_arrow(
     weight_columns: Vec<String>,
 ) -> PyResult<PyObject> {
     let opts = storage_options.unwrap_or_default();
-    let batch = py.allow_threads(|| {
+    let batches = py.allow_threads(|| {
         scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr)
     })?;
-    batch.to_pyarrow(py)
+    batches.to_pyarrow(py)
 }
 
 /// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
@@ -412,8 +418,8 @@ fn scan_nodes_arrow(
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<PyObject> {
     let opts = storage_options.unwrap_or_default();
-    let batch = py.allow_threads(|| scan_nodes_batch(path, id, &opts).map_err(to_pyerr))?;
-    batch.to_pyarrow(py)
+    let batches = py.allow_threads(|| scan_nodes_batch(path, id, &opts).map_err(to_pyerr))?;
+    batches.to_pyarrow(py)
 }
 
 /// The `ursa-core` version — the simplest possible proof the native module loaded.

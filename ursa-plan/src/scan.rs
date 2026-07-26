@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
@@ -108,7 +108,7 @@ pub fn scan_edges_batch(
     dst: &str,
     storage_options: &HashMap<String, String>,
     weight_columns: &[String],
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
@@ -132,6 +132,9 @@ pub fn scan_edges_batch(
             }
         }
         let df = df.select_columns(&proj)?;
+        // Keep the scan's batches separate (no `concat_batches` into one contiguous
+        // batch) so the transient ingest footprint stays ~1×, not ~2×, at the
+        // 500M-edge target; the topology build consumes them as a stream (#60).
         let batches = df.collect().await?;
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
@@ -141,33 +144,46 @@ pub fn scan_edges_batch(
             )));
         }
 
+        // The canonical id type is taken once from the read schema (identical across
+        // the scan's batches) and every batch is canonicalized to it independently.
         let read_schema = batches[0].schema();
-        let merged = concat_batches(&read_schema, &batches)?;
-        let src_type = canonical_id_type(merged.column(0).data_type())?;
-        let dst_type = canonical_id_type(merged.column(1).data_type())?;
+        let src_type = canonical_id_type(read_schema.field(0).data_type())?;
+        let dst_type = canonical_id_type(read_schema.field(1).data_type())?;
         if src_type != dst_type {
             return Err(DataFusionError::NotImplemented(format!(
                 "src and dst node-id columns must be the same type (both int or both string); \
                  got {src_type:?} and {dst_type:?} in {path:?}"
             )));
         }
-        let src_c =
-            cast(merged.column(0), &src_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
-        let dst_c =
-            cast(merged.column(1), &dst_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
-
         // src/dst canonicalized; weight columns (positions 2..) passed through.
         let mut fields = vec![
-            Field::new("src", src_type, true),
-            Field::new("dst", dst_type, true),
+            Field::new("src", src_type.clone(), true),
+            Field::new("dst", dst_type.clone(), true),
         ];
-        let mut columns = vec![src_c, dst_c];
-        for i in 2..merged.num_columns() {
+        for i in 2..read_schema.fields().len() {
             fields.push(read_schema.field(i).clone());
-            columns.push(merged.column(i).clone());
         }
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .map_err(|e| DataFusionError::ArrowError(e, None))
+        let out_schema = Arc::new(Schema::new(fields));
+
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue; // drop empty batches; the non-empty guard above ensures ≥1 remains
+            }
+            let src_c = cast(batch.column(0), &src_type)
+                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            let dst_c = cast(batch.column(1), &dst_type)
+                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            let mut columns = vec![src_c, dst_c];
+            for i in 2..batch.num_columns() {
+                columns.push(batch.column(i).clone());
+            }
+            out.push(
+                RecordBatch::try_new(out_schema.clone(), columns)
+                    .map_err(|e| DataFusionError::ArrowError(e, None))?,
+            );
+        }
+        Ok(out)
     })?
 }
 
@@ -184,7 +200,7 @@ pub fn scan_nodes_batch(
     path: &str,
     id: &str,
     storage_options: &HashMap<String, String>,
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
@@ -200,6 +216,8 @@ pub fn scan_nodes_batch(
             )));
         };
 
+        // Keep the batches separate (no `concat_batches`); the attribute table
+        // crosses the FFI as a batch list and is consumed as a stream (#60).
         let batches = df.collect().await?;
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
@@ -209,7 +227,6 @@ pub fn scan_nodes_batch(
         }
 
         let read_schema = batches[0].schema();
-        let merged = concat_batches(&read_schema, &batches)?;
         let id_idx = read_schema.index_of(id).map_err(|_| {
             DataFusionError::Execution(format!(
                 "scan_nodes: id column {id:?} not found in node file {path:?}"
@@ -217,11 +234,9 @@ pub fn scan_nodes_batch(
         })?;
 
         // Canonicalize only the id column (integer -> Int64, string -> Utf8);
-        // attribute columns keep their file types.
-        let id_type = canonical_id_type(merged.column(id_idx).data_type())?;
-        let mut columns = merged.columns().to_vec();
-        columns[id_idx] =
-            cast(&columns[id_idx], &id_type).map_err(|e| DataFusionError::ArrowError(e, None))?;
+        // attribute columns keep their file types. The out schema is built once and
+        // shared across batches so they stay concat-compatible on the Python side.
+        let id_type = canonical_id_type(read_schema.field(id_idx).data_type())?;
         let fields: Vec<Field> = read_schema
             .fields()
             .iter()
@@ -234,8 +249,22 @@ pub fn scan_nodes_batch(
                 }
             })
             .collect();
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .map_err(|e| DataFusionError::ArrowError(e, None))
+        let out_schema = Arc::new(Schema::new(fields));
+
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let mut columns = batch.columns().to_vec();
+            columns[id_idx] = cast(&columns[id_idx], &id_type)
+                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            out.push(
+                RecordBatch::try_new(out_schema.clone(), columns)
+                    .map_err(|e| DataFusionError::ArrowError(e, None))?,
+            );
+        }
+        Ok(out)
     })?
 }
 
@@ -260,10 +289,12 @@ mod tests {
             writeln!(f, "10,20,0.5").unwrap();
             writeln!(f, "20,30,0.9").unwrap();
         }
-        let batch =
+        let batches =
             scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+        let batch = &batches[0];
         assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.num_rows(), 2);
+        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 2);
         let src = batch
             .column(0)
             .as_any()
@@ -283,8 +314,10 @@ mod tests {
             writeln!(f, "1,us,10").unwrap();
             writeln!(f, "2,eu,20").unwrap();
         }
-        let batch = scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts()).unwrap();
-        assert_eq!(batch.num_rows(), 2);
+        let batches = scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts()).unwrap();
+        let batch = &batches[0];
+        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 2);
         // All three columns kept; id cast to Int64.
         assert_eq!(batch.num_columns(), 3);
         let schema = batch.schema();
@@ -314,8 +347,9 @@ mod tests {
             writeln!(f, "2,3").unwrap();
         }
         let url = format!("file://{}", path.to_str().unwrap());
-        let batch = scan_edges_batch(&url, "from", "to", &no_opts(), &[]).unwrap();
-        assert_eq!(batch.num_rows(), 2);
+        let batches = scan_edges_batch(&url, "from", "to", &no_opts(), &[]).unwrap();
+        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 2);
         std::fs::remove_file(&path).ok();
     }
 

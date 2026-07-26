@@ -191,6 +191,8 @@ impl IdMap {
     /// `Int64` first) or `Utf8`/`LargeUtf8`. Errors on a null endpoint, mixed
     /// src/dst types, or an unsupported id type.
     ///
+    /// A thin wrapper over [`Self::from_edge_batches`] for the single-chunk case.
+    ///
     /// [`Topology::build`]: crate::topology::Topology::build
     pub fn from_edge_arrays(
         src: &dyn Array,
@@ -199,31 +201,77 @@ impl IdMap {
         if src.len() != dst.len() {
             return Err(IdError::LengthMismatch);
         }
-        let (sk, dk) = (id_kind(src.data_type())?, id_kind(dst.data_type())?);
-        match (sk, dk) {
+        Self::from_edge_batches(&[(src, dst)])
+    }
+
+    /// Build the id map from a **stream of `(src, dst)` chunk pairs**, interning
+    /// incrementally across all chunks, and return the edges re-expressed in dense
+    /// `u32` space. This is the streaming ingress path: a scan's collected batches
+    /// (or an in-memory table's chunks) are consumed one at a time, so the caller
+    /// never has to `concat_batches` the whole edge table into one contiguous batch
+    /// first — halving the transient ingest memory at the 500M-edge target.
+    ///
+    /// The id type is taken from the first chunk pair and must be consistent across
+    /// all chunks (they come from one typed column pair, so they are — a mismatch is
+    /// a defensive [`IdError::MixedTypes`]). An empty chunk list yields an empty
+    /// `Int64` map (callers guard against a truly empty edge set upstream). Errors
+    /// on a null endpoint, mixed src/dst types, unequal chunk lengths, or an
+    /// unsupported id type — exactly like [`Self::from_edge_arrays`].
+    pub fn from_edge_batches(
+        chunks: &[(&dyn Array, &dyn Array)],
+    ) -> Result<(Self, Vec<u32>, Vec<u32>), IdError> {
+        let Some((first_src, first_dst)) = chunks.first() else {
+            return Ok((IdMap::new_int64(), Vec::new(), Vec::new()));
+        };
+        let total: usize = chunks.iter().map(|(s, _)| s.len()).sum();
+        match (
+            id_kind(first_src.data_type())?,
+            id_kind(first_dst.data_type())?,
+        ) {
             (IdKind::Int64, IdKind::Int64) => {
-                let (s, d) = (as_int64(src), as_int64(dst));
                 let mut map = IdMap::new_int64();
-                let (mut sd, mut dd) = (Vec::with_capacity(s.len()), Vec::with_capacity(s.len()));
-                for i in 0..s.len() {
-                    if s.is_null(i) || d.is_null(i) {
-                        return Err(IdError::Null);
+                let (mut sd, mut dd) = (Vec::with_capacity(total), Vec::with_capacity(total));
+                for (src, dst) in chunks {
+                    if src.len() != dst.len() {
+                        return Err(IdError::LengthMismatch);
                     }
-                    sd.push(map.intern_i64(s.value(i))?);
-                    dd.push(map.intern_i64(d.value(i))?);
+                    // Each chunk must share the leading pair's id kind.
+                    if !matches!(id_kind(src.data_type())?, IdKind::Int64)
+                        || !matches!(id_kind(dst.data_type())?, IdKind::Int64)
+                    {
+                        return Err(IdError::MixedTypes);
+                    }
+                    let (s, d) = (as_int64(*src), as_int64(*dst));
+                    for i in 0..s.len() {
+                        if s.is_null(i) || d.is_null(i) {
+                            return Err(IdError::Null);
+                        }
+                        sd.push(map.intern_i64(s.value(i))?);
+                        dd.push(map.intern_i64(d.value(i))?);
+                    }
                 }
                 Ok((map, sd, dd))
             }
             (IdKind::Utf8, IdKind::Utf8) => {
-                let (s, d) = (StrView::new(src), StrView::new(dst));
                 let mut map = IdMap::new_utf8();
-                let (mut sd, mut dd) = (Vec::with_capacity(s.len()), Vec::with_capacity(s.len()));
-                for i in 0..s.len() {
-                    if s.is_null(i) || d.is_null(i) {
-                        return Err(IdError::Null);
+                let (mut sd, mut dd) = (Vec::with_capacity(total), Vec::with_capacity(total));
+                for (src, dst) in chunks {
+                    if src.len() != dst.len() {
+                        return Err(IdError::LengthMismatch);
                     }
-                    sd.push(map.intern_str(s.value(i))?);
-                    dd.push(map.intern_str(d.value(i))?);
+                    if !matches!(id_kind(src.data_type())?, IdKind::Utf8)
+                        || !matches!(id_kind(dst.data_type())?, IdKind::Utf8)
+                    {
+                        return Err(IdError::MixedTypes);
+                    }
+                    let (s, d) = (StrView::new(*src), StrView::new(*dst));
+                    for i in 0..s.len() {
+                        if s.is_null(i) || d.is_null(i) {
+                            return Err(IdError::Null);
+                        }
+                        sd.push(map.intern_str(s.value(i))?);
+                        dd.push(map.intern_str(d.value(i))?);
+                    }
                 }
                 Ok((map, sd, dd))
             }
@@ -456,6 +504,53 @@ mod tests {
         assert_eq!((ids.value(0), ids.value(1), ids.value(2)), ("x", "y", "z"));
         let query = LargeStringArray::from(vec![Some("z"), Some("nope")]);
         assert_eq!(map.dense_from_array(&query).unwrap(), vec![Some(2), None]);
+    }
+
+    #[test]
+    fn from_edge_batches_interns_across_chunks() {
+        // The same 0->1,0->2,1->2,2->0 graph split across two chunks must intern
+        // identically to the single-array path — ids are global, not per-chunk.
+        let s0 = Int64Array::from(vec![10, 10]);
+        let d0 = Int64Array::from(vec![20, 30]);
+        let s1 = Int64Array::from(vec![20, 30]);
+        let d1 = Int64Array::from(vec![30, 10]);
+        let (map, sd, dd) = IdMap::from_edge_batches(&[
+            (&s0 as &dyn Array, &d0 as &dyn Array),
+            (&s1 as &dyn Array, &d1 as &dyn Array),
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(sd, vec![0, 0, 1, 2]);
+        assert_eq!(dd, vec![1, 2, 2, 0]);
+
+        // Identical to the single contiguous build.
+        let src = Int64Array::from(vec![10, 10, 20, 30]);
+        let dst = Int64Array::from(vec![20, 30, 30, 10]);
+        let (_, sd1, dd1) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        assert_eq!((sd, dd), (sd1, dd1));
+    }
+
+    #[test]
+    fn from_edge_batches_strings_across_chunks() {
+        let s0 = StringArray::from(vec!["a", "a"]);
+        let d0 = StringArray::from(vec!["b", "c"]);
+        let s1 = StringArray::from(vec!["b", "c"]);
+        let d1 = StringArray::from(vec!["c", "a"]);
+        let (map, sd, dd) = IdMap::from_edge_batches(&[
+            (&s0 as &dyn Array, &d0 as &dyn Array),
+            (&s1 as &dyn Array, &d1 as &dyn Array),
+        ])
+        .unwrap();
+        assert_eq!(map.user_type(), DataType::Utf8);
+        assert_eq!(sd, vec![0, 0, 1, 2]);
+        assert_eq!(dd, vec![1, 2, 2, 0]);
+    }
+
+    #[test]
+    fn from_empty_edge_batches_is_an_empty_map() {
+        let (map, sd, dd) = IdMap::from_edge_batches(&[]).unwrap();
+        assert!(map.is_empty());
+        assert!(sd.is_empty() && dd.is_empty());
     }
 
     #[test]

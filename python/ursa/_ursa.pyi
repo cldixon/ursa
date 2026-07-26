@@ -19,15 +19,17 @@ def __core_version() -> str: ...
 # built by build_index and passed to every graph op over the frame.
 class GraphIndex: ...
 
-# Build the graph index from (src, dst) id arrays (int64 or string; the one CSR
-# build site — the id type is auto-detected from the Arrow columns).
-def build_index(src: Any, dst: Any) -> GraphIndex: ...
+# Build the graph index from an edge batch list — a list of pyarrow RecordBatches
+# whose first two columns are the (canonicalized) src/dst id columns (int64 or
+# string; the one CSR build site). The batches are interned as a stream, so a large
+# edge table never has to be concatenated into one contiguous batch first.
+def build_index(edges: Any) -> GraphIndex: ...
 
 # Total topology builds so far (test/observability hook for the index contract).
 def _topology_build_count() -> int: ...
 
 # The one execution entry point: a built index + a JSON column IR +
-# filter/sort/limit -> pyarrow.RecordBatch.
+# filter/sort/limit -> list[pyarrow.RecordBatch] (a chunked result).
 def run_node_query(
     index: GraphIndex,
     columns_json: str,
@@ -41,7 +43,7 @@ def run_node_query(
 
 # A hop traversal: a built index + user-id seed array (int64 or string) +
 # n/direction + relational
-# tail -> (src, dst) pyarrow.RecordBatch of reached pairs.
+# tail -> list[pyarrow.RecordBatch] of reached (src, dst) pairs.
 def run_hop_query(
     index: GraphIndex,
     seeds: Any,
@@ -55,7 +57,7 @@ def run_hop_query(
 
 # A shortest_path traversal: a built index + 1-element source/target user-id
 # arrays (int64 or string) + direction + relational tail -> (src, dst, hop)
-# pyarrow.RecordBatch of the path edges.
+# list[pyarrow.RecordBatch] of the path edges.
 def run_path_query(
     index: GraphIndex,
     source: Any,
@@ -71,7 +73,7 @@ def run_path_query(
 
 # A random_walk: a built index + user-id start ids (int64 or string) + walk params
 # + relational tail
-# -> (walk_id, step, node) pyarrow.RecordBatch of the walk rows.
+# -> list[pyarrow.RecordBatch] of the (walk_id, step, node) walk rows.
 def run_walk_query(
     index: GraphIndex,
     starts: Any,
@@ -96,8 +98,9 @@ def graph_diameter(index: GraphIndex, approximate: bool) -> int: ...
 # Whole-graph one-row summary -> pyarrow.RecordBatch.
 def graph_describe(index: GraphIndex, full: bool) -> Any: ...
 
-# Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> (src, dst)
-# pyarrow.RecordBatch. storage_options seeds the object-store backend.
+# Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> a
+# list[pyarrow.RecordBatch] of (src, dst[, weight cols]). storage_options seeds
+# the object-store backend.
 def scan_edges_arrow(
     path: str,
     src: str,
@@ -106,7 +109,8 @@ def scan_edges_arrow(
     weight_columns: list[str] = ...,
 ) -> Any: ...
 
-# Scan a Parquet/CSV node file -> full attribute pyarrow.RecordBatch (id cast int64).
+# Scan a Parquet/CSV node file -> list[pyarrow.RecordBatch] of the full
+# attribute table (id cast int64).
 def scan_nodes_arrow(path: str, id: str, storage_options: dict[str, str] | None = ...) -> Any: ...
 
 # Demo path: plain lists in and out (pure Python->Rust smoke tests).

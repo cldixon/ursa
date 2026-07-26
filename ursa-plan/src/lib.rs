@@ -45,4 +45,4 @@ pub use query::{
 };
 pub use scan::{scan_edges_batch, scan_nodes_batch};
 pub use stats::{avg_path_length, density, describe, diameter};
-pub use topology::build_topology;
+pub use topology::{build_topology, build_topology_batches};
