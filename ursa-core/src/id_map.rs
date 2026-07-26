@@ -13,11 +13,11 @@
 //! user ids goes through this module's Arrow-array methods, so nothing downstream
 //! needs to know which variant it is.
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
+use rustc_hash::FxHashMap;
 
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
 ///
@@ -34,13 +34,13 @@ pub enum IdMap {
     /// Integer user ids (the fast path).
     Int64 {
         to_user: Vec<i64>,
-        to_dense: HashMap<i64, u32>,
+        to_dense: FxHashMap<i64, u32>,
         id_array: OnceLock<ArrayRef>,
     },
     /// String user ids (also covers UUID-as-string).
     Utf8 {
         to_user: Vec<Arc<str>>,
-        to_dense: HashMap<Arc<str>, u32>,
+        to_dense: FxHashMap<Arc<str>, u32>,
         id_array: OnceLock<ArrayRef>,
     },
 }
@@ -160,7 +160,7 @@ impl IdMap {
     fn new_int64() -> Self {
         IdMap::Int64 {
             to_user: Vec::new(),
-            to_dense: HashMap::new(),
+            to_dense: FxHashMap::default(),
             id_array: OnceLock::new(),
         }
     }
@@ -168,7 +168,7 @@ impl IdMap {
     fn new_utf8() -> Self {
         IdMap::Utf8 {
             to_user: Vec::new(),
-            to_dense: HashMap::new(),
+            to_dense: FxHashMap::default(),
             id_array: OnceLock::new(),
         }
     }
