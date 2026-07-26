@@ -14,7 +14,9 @@
 //!    transpose (CSC). The transpose is built on first demand and cached, so a
 //!    pull-based-PageRank-only pipeline never pays for the direction it never uses.
 //!
-//! Construction is a parallel-ready counting sort over the endpoint columns.
+//! Construction is a counting sort over the endpoint columns — serial for small
+//! graphs, and a byte-identical parallel counting sort (per-chunk histograms + a
+//! disjoint parallel scatter) above a size threshold.
 //!
 //! [`IdMap`]: crate::id_map::IdMap
 
@@ -46,7 +48,9 @@ pub struct Adjacency {
 
 impl Adjacency {
     /// Counting sort grouping edges by `keys` (the grouping endpoint), recording
-    /// the paired `other` endpoint and the original row index per slot.
+    /// the paired `other` endpoint and the original row index per slot. Dispatches
+    /// to a parallel build above a size threshold; the parallel and serial builds
+    /// produce **byte-identical** output (same within-segment row order).
     fn build(n_nodes: usize, keys: &[u32], other: &[u32]) -> Adjacency {
         debug_assert_eq!(keys.len(), other.len());
         let m = keys.len();
@@ -59,6 +63,21 @@ impl Adjacency {
             "more than u32::MAX (~4.29B) edges is beyond the v0.1 edge-id cap"
         );
 
+        // Below the threshold (or single-worker), the serial two-pass sort wins —
+        // the parallel path's per-chunk histograms aren't worth their overhead.
+        const PARALLEL_MIN_EDGES: usize = 1 << 16;
+        let n_chunks = rayon::current_num_threads();
+        if m < PARALLEL_MIN_EDGES || n_chunks <= 1 || n_nodes == 0 {
+            Self::build_serial(n_nodes, keys, other)
+        } else {
+            Self::build_parallel(n_nodes, keys, other, n_chunks)
+        }
+    }
+
+    /// The serial two-pass counting sort: a degree histogram (prefix-summed into
+    /// `offsets`) then a scatter into each node's segment, in original row order.
+    fn build_serial(n_nodes: usize, keys: &[u32], other: &[u32]) -> Adjacency {
+        let m = keys.len();
         // Pass 1: degree histogram, written into offsets[k + 1].
         let mut offsets = vec![0u64; n_nodes + 1];
         for &k in keys {
@@ -79,6 +98,86 @@ impl Adjacency {
             edge_ids[pos] = row as u32;
             cursor[k as usize] += 1;
         }
+
+        Adjacency {
+            offsets,
+            targets,
+            edge_ids,
+        }
+    }
+
+    /// The parallel counting sort: per-chunk degree histograms, a global prefix sum,
+    /// then a **disjoint** parallel scatter. Each contiguous row-chunk `c` places
+    /// its node-`k` edges into `[base_c[k], base_c[k] + count_c[k])`, positioned
+    /// after every earlier chunk's node-`k` edges — so within each node's segment the
+    /// edges remain in original row order, byte-identical to [`Self::build_serial`].
+    /// The scatter writes are provably non-overlapping, so it runs lock-free.
+    fn build_parallel(n_nodes: usize, keys: &[u32], other: &[u32], n_chunks: usize) -> Adjacency {
+        use rayon::prelude::*;
+        let m = keys.len();
+        let chunk_size = m.div_ceil(n_chunks);
+
+        // Pass 1 (parallel): a degree histogram per contiguous row-chunk.
+        let mut hists: Vec<Vec<u32>> = keys
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut h = vec![0u32; n_nodes];
+                for &k in chunk {
+                    h[k as usize] += 1;
+                }
+                h
+            })
+            .collect();
+
+        // Global degree -> offsets (each node's segment start), prefix-summed.
+        let mut offsets = vec![0u64; n_nodes + 1];
+        for h in &hists {
+            for (k, &c) in h.iter().enumerate() {
+                offsets[k + 1] += c as u64;
+            }
+        }
+        for i in 0..n_nodes {
+            offsets[i + 1] += offsets[i];
+        }
+
+        // Convert each chunk's histogram into its per-node **base cursor**, in place:
+        // running[k] walks from the segment start, handing each chunk (in order) its
+        // slice of node k's segment. Bases fit in u32 (<= m <= u32::MAX).
+        let mut running: Vec<u32> = (0..n_nodes).map(|k| offsets[k] as u32).collect();
+        for h in hists.iter_mut() {
+            for (k, slot) in h.iter_mut().enumerate() {
+                let cnt = *slot;
+                *slot = running[k];
+                running[k] += cnt;
+            }
+        }
+
+        // Pass 2 (parallel scatter): each chunk owns disjoint output slots (its base
+        // cursors), so the writes never overlap. The output pointers cross the
+        // thread boundary as plain `usize` addresses (trivially `Send`), cast back
+        // inside — the Vecs outlive the scatter and are untouched until it returns.
+        let mut targets = vec![0u32; m];
+        let mut edge_ids = vec![0u32; m];
+        let targets_addr = targets.as_mut_ptr() as usize;
+        let edge_ids_addr = edge_ids.as_mut_ptr() as usize;
+        hists.into_par_iter().enumerate().for_each(|(c, mut base)| {
+            let targets_ptr = targets_addr as *mut u32;
+            let edge_ids_ptr = edge_ids_addr as *mut u32;
+            let start = c * chunk_size;
+            let end = (start + chunk_size).min(m);
+            for row in start..end {
+                let k = keys[row] as usize;
+                let pos = base[k] as usize;
+                base[k] += 1;
+                // SAFETY: `pos` is unique across all (chunk, row) — the base-cursor
+                // partition claims each slot for exactly one chunk, written once —
+                // and `pos < m` is within both allocations.
+                unsafe {
+                    *targets_ptr.add(pos) = other[row];
+                    *edge_ids_ptr.add(pos) = row as u32;
+                }
+            }
+        });
 
         Adjacency {
             offsets,
@@ -338,6 +437,35 @@ mod tests {
     /// 0 -> 1, 0 -> 2, 1 -> 2, 2 -> 0
     fn diamond() -> Topology {
         Topology::build(3, vec![0, 0, 1, 2], vec![1, 2, 2, 0])
+    }
+
+    #[test]
+    fn parallel_build_is_byte_identical_to_serial() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        let mut rng = ChaCha8Rng::seed_from_u64(0xC0FFEE);
+        // Sizes that cross the parallel threshold, plus a skewed one (few nodes,
+        // many edges) that stresses the per-chunk base-cursor partition.
+        for &(n, m) in &[(2000usize, 100_000usize), (50_000, 300_000), (16, 80_000)] {
+            let keys: Vec<u32> = (0..m).map(|_| rng.gen_range(0..n as u32)).collect();
+            let other: Vec<u32> = (0..m).map(|_| rng.gen_range(0..n as u32)).collect();
+            let serial = Adjacency::build_serial(n, &keys, &other);
+            for n_chunks in [2usize, 3, 8] {
+                let par = Adjacency::build_parallel(n, &keys, &other, n_chunks);
+                assert_eq!(
+                    serial.offsets, par.offsets,
+                    "offsets (n={n}, chunks={n_chunks})"
+                );
+                assert_eq!(
+                    serial.targets, par.targets,
+                    "targets (n={n}, chunks={n_chunks})"
+                );
+                assert_eq!(
+                    serial.edge_ids, par.edge_ids,
+                    "edge_ids (n={n}, chunks={n_chunks})"
+                );
+            }
+        }
     }
 
     #[test]

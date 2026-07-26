@@ -292,20 +292,27 @@ impl IdMap {
     }
 
     fn intern_i64(&mut self, user: i64) -> Result<u32, IdError> {
+        use std::collections::hash_map::Entry;
         match self {
             IdMap::Int64 {
                 to_user, to_dense, ..
             } => {
-                if let Some(&idx) = to_dense.get(&user) {
-                    return Ok(idx);
+                // One hash probe via `entry` (vs a `get` miss followed by an
+                // `insert` re-hash): interning is a hot inner loop, and every new
+                // node is a miss, so halving the miss-path hashing matters.
+                let next = to_user.len();
+                match to_dense.entry(user) {
+                    Entry::Occupied(e) => Ok(*e.get()),
+                    Entry::Vacant(e) => {
+                        if next >= u32::MAX as usize {
+                            return Err(IdError::TooManyNodes);
+                        }
+                        let idx = next as u32;
+                        e.insert(idx);
+                        to_user.push(user);
+                        Ok(idx)
+                    }
                 }
-                if to_user.len() >= u32::MAX as usize {
-                    return Err(IdError::TooManyNodes);
-                }
-                let idx = to_user.len() as u32;
-                to_user.push(user);
-                to_dense.insert(user, idx);
-                Ok(idx)
             }
             IdMap::Utf8 { .. } => unreachable!("intern_i64 on a Utf8 IdMap"),
         }
