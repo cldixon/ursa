@@ -195,6 +195,7 @@ def smoke(
             "closeness",
             "louvain",
             "label_propagation",
+            "pipeline_influencers",
         ],
         datasets=[ds_mod.SMOKE],
         iters=2,

@@ -45,7 +45,24 @@ tabular data. So two clocks are always separated:
 - **warm kernel** (`--metric warm`) — the algorithm on an already-built handle.
   The kernel-vs-kernel bar, isolated from ingest.
 
-Plus **peak RSS** (`--metric mem`) and **ingest** (`--metric ingest`).
+Plus **graph memory** (`--metric mem`) and **memory/edge** (`--metric memedge`)
+and **ingest** (`--metric ingest`). Memory is *isolated*: the child records its
+RSS floor before the library-under-test loads, so `peak − baseline` strips the
+interpreter/import baseline and leaves the graph + compute footprint. That number
+(and bytes/edge — a CSR vs a dict-of-dicts) is only meaningful at **large** graphs;
+below ~10⁵ edges it's dominated by import cost, so small/negative deltas render as
+`—`.
+
+### End-to-end pipelines, not just kernels
+
+Single kernels are the *competition's* home turf. Ursa's thesis is **composition**,
+so the suite also races a realistic composed query as one workload:
+
+- **`pipeline_influencers`** — top-K nodes by PageRank among those with in-degree ≥ k.
+  Ursa runs it as **one** `collect()` (`nodes().with_columns(pagerank, in_degree)
+  .filter(…).sort(…).head(K)`); NetworkX/rustworkx/igraph build the graph, compute,
+  then filter/sort/top in Python — the tax Ursa fuses away. Correctness compares the
+  selected top-K set (allowing minor boundary churn from PageRank ties).
 
 Every measured cell runs in its **own subprocess**, so a library's peak memory
 and warm state are never polluted by another library imported in the same
@@ -138,10 +155,16 @@ leads triangle_count and louvain, rustworkx leads pagerank:
 Two kinds, both needed:
 
 - **Synthetic** (seeded, reproducible) — Erdős–Rényi, Barabási–Albert
-  (power-law), and grid, swept across sizes so an accidental O(d²) shows up as a
-  bending curve before a user hits it.
+  (power-law), grid, and **stochastic block model** (`sbm-*`, planted communities —
+  the honest test for Louvain / label propagation, which have a ground-truth
+  partition to recover rather than a lucky modularity), swept across sizes so an
+  accidental O(d²) shows up as a bending curve before a user hits it.
 - **Real** (SNAP edge lists) — real degree skew and credibility; downloaded,
   checksummed, and cached as Parquet on first use. Never run in CI.
+
+Every result row carries the graph's **structural metadata** — `density`,
+`avg_degree`, `max_degree` — so a win can be correlated with graph *shape* (skew,
+density) instead of just a dataset name.
 
 Materialised Parquet lands under `benchmarks/data/` (git-ignored — reproducible
 from the catalog). Raw results land under `benchmarks/results/` (git-ignored —

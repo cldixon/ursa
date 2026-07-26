@@ -42,6 +42,7 @@ class UrsaAdapter(Adapter):
             "clustering_coefficient",
             "louvain",
             "label_propagation",
+            "pipeline_influencers",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
@@ -55,6 +56,28 @@ class UrsaAdapter(Adapter):
 
         edges = handle
         name = algo.name
+
+        if name == "pipeline_influencers":
+            # The whole point: one composed query, executed as a single plan.
+            p = algo.params
+            frame = (
+                edges.nodes()
+                .with_columns(
+                    pr=ur.pagerank(
+                        edges,
+                        damping=p.get("damping", 0.85),
+                        max_iter=p.get("max_iter", 100),
+                        tol=p.get("tol", 1e-6),
+                    ),
+                    indeg=ur.degree(edges, direction="in"),
+                )
+                .filter(ur.col("indeg") >= p.get("min_in_degree", 3))
+                .sort("pr", descending=True)
+                .head(p.get("top_k", 20))
+                .collect()
+            )
+            return {r["id"]: rank for rank, r in enumerate(frame.to_dicts())}
+
         if name == "pagerank":
             p = algo.params
             expr = ur.pagerank(

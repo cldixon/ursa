@@ -26,13 +26,40 @@ from .results import read_results
 
 BASELINE = "ursa"  # the library everything is measured relative to
 
-# metric key -> (column, human label, lower_is_better, formatter name)
+# metric key -> (human label, lower_is_better, formatter name). The value for a
+# row is produced by _metric_value (some metrics are derived, not raw columns).
 METRICS = {
-    "warm": ("compute_warm_median_s", "warm kernel (median)", True, "secs"),
-    "cold": ("end_to_end_cold_s", "cold end-to-end", True, "secs"),
-    "ingest": ("ingest_s", "ingest", True, "secs"),
-    "mem": ("peak_rss_bytes", "peak RSS", True, "bytes"),
+    "warm": ("warm kernel (median)", True, "secs"),
+    "cold": ("cold end-to-end", True, "secs"),
+    "ingest": ("ingest", True, "secs"),
+    "mem": ("graph memory (peak − baseline)", True, "bytes"),
+    "memedge": ("memory / edge", True, "bytes"),
 }
+
+
+def _metric_value(row: dict, metric: str) -> float:
+    """Extract a metric's value from a result row, deriving where needed.
+
+    ``mem`` isolates the graph+compute footprint (peak RSS minus the interpreter
+    baseline captured before the library loaded); ``memedge`` divides that by edge
+    count — the number that actually distinguishes a CSR from a dict-of-dicts.
+    """
+    if metric == "warm":
+        return row["compute_warm_median_s"]
+    if metric == "cold":
+        return row["end_to_end_cold_s"]
+    if metric == "ingest":
+        return row["ingest_s"]
+    if metric in ("mem", "memedge"):
+        peak, base = row.get("peak_rss_bytes"), row.get("baseline_rss_bytes")
+        if peak is None or base is None or peak < 0 or base < 0:
+            return float("nan")
+        graph_mem = peak - base
+        if metric == "memedge":
+            e = row.get("n_edges") or 0
+            return graph_mem / e if e else float("nan")
+        return graph_mem
+    return float("nan")
 
 
 def _fmt_secs(x: float) -> str:
@@ -68,13 +95,13 @@ def _pivot(rows: list[dict]) -> dict[tuple[str, str], dict[str, dict]]:
     return grid
 
 
-def _cell(row: dict, column: str, formatter: str, baseline_val: float | None) -> str:
+def _cell(row: dict, metric: str, formatter: str, baseline_val: float | None) -> str:
     status = row["status"]
     if status == "unsupported":
         return "[dim]n/a[/dim]"
     if status == "error":
         return "[red]err[/red]"
-    val = row[column]
+    val = _metric_value(row, metric)
     missing = val is None or (isinstance(val, float) and math.isnan(val))
     if missing or (formatter == "bytes" and val < 0):
         return "—"
@@ -90,7 +117,7 @@ def _cell(row: dict, column: str, formatter: str, baseline_val: float | None) ->
 
 
 def leaderboard_table(path: str | Path, metric: str) -> Table:
-    column, label, _lower, formatter = METRICS[metric]
+    label, _lower, formatter = METRICS[metric]
     rows = _load(path)
     grid = _pivot(rows)
     libraries = sorted({r["library"] for r in rows}, key=lambda x: (x != BASELINE, x))
@@ -106,12 +133,12 @@ def leaderboard_table(path: str | Path, metric: str) -> Table:
         base_row = cells.get(BASELINE)
         base_val = None
         if base_row is not None and base_row["status"] in {"ok", "incorrect"}:
-            bv = base_row[column]
+            bv = _metric_value(base_row, metric)
             base_val = bv if not (isinstance(bv, float) and math.isnan(bv)) else None
         line = [dataset, algo]
         for lib in libraries:
             row = cells.get(lib)
-            line.append(_cell(row, column, formatter, base_val) if row else "—")
+            line.append(_cell(row, metric, formatter, base_val) if row else "—")
         table.add_row(*line)
     return table
 
@@ -174,7 +201,7 @@ def gaps(path: str | Path, slow_factor: float = 3.0) -> list[str]:
 
 def markdown_leaderboard(path: str | Path, metric: str) -> str:
     """A committable Markdown table for the docs/leaderboard page."""
-    column, label, _lower, formatter = METRICS[metric]
+    label, _lower, formatter = METRICS[metric]
     rows = _load(path)
     grid = _pivot(rows)
     libraries = sorted({r["library"] for r in rows}, key=lambda x: (x != BASELINE, x))
@@ -186,7 +213,7 @@ def markdown_leaderboard(path: str | Path, metric: str) -> str:
             return "n/a"
         if row["status"] == "error":
             return "err"
-        val = row[column]
+        val = _metric_value(row, metric)
         if val is None or (isinstance(val, float) and math.isnan(val)):
             return "—"
         text = _fmt_bytes(val) if formatter == "bytes" else _fmt_secs(val)

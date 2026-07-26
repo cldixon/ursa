@@ -32,6 +32,11 @@ def compare(
     if reference is None:
         return None, "no reference (dataset too large for the oracle, or oracle skipped)"
 
+    # top-K compares the *selected set*, which legitimately differs from the full
+    # node set — check it before the whole-node-set guard below.
+    if algo.compare == "topk":
+        return _topk(reference, candidate)
+
     if set(reference) != set(candidate):
         missing = len(set(reference) - set(candidate))
         extra = len(set(candidate) - set(reference))
@@ -75,6 +80,22 @@ def _partition(ref: dict, cand: dict) -> tuple[bool, str]:
     if ref_groups == cand_groups:
         return True, f"{len(ref_groups)} components match"
     return False, f"partition differs ({len(cand_groups)} vs {len(ref_groups)} components)"
+
+
+# A pipeline's top-K set may churn slightly at the boundary because PageRank
+# values tie or differ by convergence noise across libraries; require most of the
+# set to agree rather than an exact match.
+_TOPK_MIN_OVERLAP = 0.8
+
+
+def _topk(reference: dict[int, float], candidate: dict[int, float]) -> tuple[bool, str]:
+    """Compare two pipeline results by the overlap of their selected node sets."""
+    ref_ids, cand_ids = set(reference), set(candidate)
+    if not ref_ids:
+        return None, "empty reference selection"
+    overlap = len(ref_ids & cand_ids) / len(ref_ids)
+    ok = overlap >= _TOPK_MIN_OVERLAP
+    return ok, f"top-{len(ref_ids)} overlap {overlap:.0%} (need {_TOPK_MIN_OVERLAP:.0%})"
 
 
 def _groups(labels: dict[int, float]) -> set[frozenset[int]]:

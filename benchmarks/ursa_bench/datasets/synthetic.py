@@ -66,3 +66,21 @@ def grid(side: int, path: str | Path) -> Path:
     src = [int(u) for u, v in g.edges()]
     dst = [int(v) for u, v in g.edges()]
     return _write_edges(src, dst, path)
+
+
+def sbm(n: int, blocks: int, p_in: float, p_out: float, seed: int, path: str | Path) -> Path:
+    """Stochastic block model — ``blocks`` equal-size communities, dense within
+    (``p_in``) and sparse between (``p_out``), oriented as a directed edge list.
+
+    This is the *honest* test for community detection (Louvain, label propagation):
+    ER/BA graphs have no planted community structure, so a high modularity there is
+    partly luck; an SBM has a ground-truth partition to recover.
+    """
+    import networkx as nx
+
+    sizes = [n // blocks] * blocks
+    probs = [[p_in if i == j else p_out for j in range(blocks)] for i in range(blocks)]
+    g = nx.stochastic_block_model(sizes, probs, seed=seed)
+    src = [int(u) for u, v in g.edges()]
+    dst = [int(v) for u, v in g.edges()]
+    return _write_edges(src, dst, path)

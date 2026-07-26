@@ -41,6 +41,7 @@ class IgraphAdapter(Adapter):
             "clustering_coefficient",
             "louvain",
             "label_propagation",
+            "pipeline_influencers",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
@@ -60,6 +61,16 @@ class IgraphAdapter(Adapter):
 
         def remap(values) -> dict[int, float]:
             return {ids[i]: v for i, v in enumerate(values)}
+
+        if name == "pipeline_influencers":
+            p = algo.params
+            pr = graph.pagerank(damping=p.get("damping", 0.85))
+            indeg = graph.degree(mode="in")
+            min_in = p.get("min_in_degree", 3)
+            eligible = [i for i in range(len(pr)) if indeg[i] >= min_in]
+            eligible.sort(key=lambda i: pr[i], reverse=True)
+            top = eligible[: p.get("top_k", 20)]
+            return {ids[i]: rank for rank, i in enumerate(top)}
 
         if name == "pagerank":
             p = algo.params

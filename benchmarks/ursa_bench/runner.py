@@ -113,6 +113,7 @@ def _pool(measurements: list[CellMeasurement]) -> CellMeasurement:
         compute_cold_s=min(m.compute_cold_s for m in ok),
         warm_samples=warm,
         peak_rss_bytes=max(m.peak_rss_bytes for m in ok),
+        baseline_rss_bytes=min(m.baseline_rss_bytes for m in ok),
         result_path=result_path,
     )
 
@@ -127,7 +128,8 @@ def run_matrix(cfg: RunConfig, out_path: str | Path, run_id: str) -> list[Result
         for ds_name in cfg.datasets:
             spec = datasets.resolve(ds_name)
             path = spec.materialize(cfg.cache_dir)
-            n_nodes, n_edges = datasets.graph_shape(path)
+            stats = datasets.graph_stats(path)
+            n_nodes = stats["n_nodes"]
             want_result = n_nodes <= cfg.reference_max_nodes
 
             # Community-detection correctness scores modularity, which needs the
@@ -196,16 +198,7 @@ def run_matrix(cfg: RunConfig, out_path: str | Path, run_id: str) -> list[Result
                 for lib in cfg.libraries:
                     ds_rows.append(
                         _build_row(
-                            prov,
-                            cfg,
-                            spec,
-                            n_nodes,
-                            n_edges,
-                            algo,
-                            lib,
-                            measured[lib],
-                            reference,
-                            mod_edges,
+                            prov, cfg, spec, stats, algo, lib, measured[lib], reference, mod_edges
                         )
                     )
 
@@ -232,9 +225,7 @@ def _reference(measured: dict, algo, path, want_result: bool):
         return None
 
 
-def _build_row(
-    prov, cfg, spec, n_nodes, n_edges, algo, lib, measured, reference, mod_edges=None
-) -> ResultRow:
+def _build_row(prov, cfg, spec, stats, algo, lib, measured, reference, mod_edges=None) -> ResultRow:
     m, res = measured
     common = dict(
         **prov,
@@ -245,9 +236,12 @@ def _build_row(
         threads=cfg.threads,
         dataset=spec.name,
         dataset_kind=spec.kind,
-        n_nodes=n_nodes,
-        n_edges=n_edges,
+        n_nodes=stats["n_nodes"],
+        n_edges=stats["n_edges"],
         directed=spec.directed,
+        density=stats["density"],
+        avg_degree=stats["avg_degree"],
+        max_degree=stats["max_degree"],
         iters=cfg.iters,
         warmup=cfg.warmup,
     )
@@ -262,6 +256,7 @@ def _build_row(
             compute_warm_min_s=nan,
             compute_warm_std_s=nan,
             peak_rss_bytes=-1,
+            baseline_rss_bytes=-1,
             status="unsupported",
             correct=None,
             correctness_detail="",
@@ -277,6 +272,7 @@ def _build_row(
             compute_warm_min_s=nan,
             compute_warm_std_s=nan,
             peak_rss_bytes=m.peak_rss_bytes,
+            baseline_rss_bytes=m.baseline_rss_bytes,
             status=m.status,
             correct=None,
             correctness_detail="",
@@ -298,6 +294,7 @@ def _build_row(
         compute_warm_min_s=smallest,
         compute_warm_std_s=std,
         peak_rss_bytes=m.peak_rss_bytes,
+        baseline_rss_bytes=m.baseline_rss_bytes,
         status=status,
         correct=correct,
         correctness_detail=detail,

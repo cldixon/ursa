@@ -50,6 +50,7 @@ class CellMeasurement:
     compute_cold_s: float
     warm_samples: list[float]  # per-iteration warm compute times
     peak_rss_bytes: int
+    baseline_rss_bytes: int  # RSS at child start, before the library/graph is loaded
     result_path: str  # where the child serialised its result (for correctness), or ""
 
 
@@ -107,6 +108,7 @@ def measure_cell(
             compute_cold_s=float("nan"),
             warm_samples=[],
             peak_rss_bytes=-1,
+            baseline_rss_bytes=-1,
             result_path="",
         )
 
@@ -121,6 +123,7 @@ def measure_cell(
             compute_cold_s=float("nan"),
             warm_samples=[],
             peak_rss_bytes=-1,
+            baseline_rss_bytes=-1,
             result_path="",
         )
 
@@ -135,6 +138,7 @@ def measure_cell(
             compute_cold_s=float("nan"),
             warm_samples=[],
             peak_rss_bytes=-1,
+            baseline_rss_bytes=-1,
             result_path="",
         )
 
@@ -145,6 +149,7 @@ def measure_cell(
         compute_cold_s=payload.get("compute_cold_s", float("nan")),
         warm_samples=payload.get("warm_samples", []),
         peak_rss_bytes=payload.get("peak_rss_bytes", -1),
+        baseline_rss_bytes=payload.get("baseline_rss_bytes", -1),
         result_path=payload.get("result_path", ""),
     )
 

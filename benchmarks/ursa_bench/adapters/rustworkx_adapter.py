@@ -36,6 +36,7 @@ class RustworkxAdapter(Adapter):
             "closeness",
             "connected_components",
             "degree",
+            "pipeline_influencers",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
@@ -66,6 +67,22 @@ class RustworkxAdapter(Adapter):
 
         def remap(mapping) -> dict[int, float]:
             return {ids[idx]: val for idx, val in dict(mapping).items()}
+
+        if name == "pipeline_influencers":
+            p = algo.params
+            pr = dict(
+                rx.pagerank(
+                    graph,
+                    alpha=p.get("damping", 0.85),
+                    tol=p.get("tol", 1e-6),
+                    max_iter=max(p.get("max_iter", 100), 100),
+                )
+            )
+            min_in = p.get("min_in_degree", 3)
+            eligible = [i for i in graph.node_indices() if graph.in_degree(i) >= min_in]
+            eligible.sort(key=lambda i: pr[i], reverse=True)
+            top = eligible[: p.get("top_k", 20)]
+            return {ids[i]: rank for rank, i in enumerate(top)}
 
         if name == "pagerank":
             p = algo.params

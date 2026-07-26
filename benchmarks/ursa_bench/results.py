@@ -29,7 +29,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Bump when the ResultRow columns change in a way old readers must notice.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # The status of a measured cell. `ok` alone is a scored comparison; the rest are
 # the flywheel's signal.
@@ -64,6 +64,10 @@ class ResultRow:
     n_nodes: int
     n_edges: int
     directed: bool
+    # structural metadata, recorded so results correlate with graph shape
+    density: float  # n_edges / (n_nodes * (n_nodes - 1)) for the directed edge list
+    avg_degree: float  # total (in+out) degree averaged over nodes = 2*n_edges/n_nodes
+    max_degree: int  # the single busiest node's total degree (skew indicator)
 
     # --- measurement config ---------------------------------------------------
     iters: int  # timed warm iterations
@@ -76,6 +80,7 @@ class ResultRow:
     compute_warm_min_s: float
     compute_warm_std_s: float
     peak_rss_bytes: int  # peak RSS of the isolated child process (-1 if unknown)
+    baseline_rss_bytes: int  # RSS at child start (before ingest); peak-baseline ~ graph+compute mem
 
     # --- outcome --------------------------------------------------------------
     status: str  # one of STATUS_*
@@ -111,6 +116,9 @@ _PA_TYPES: dict[str, pa.DataType] = {
     "n_nodes": pa.int64(),
     "n_edges": pa.int64(),
     "directed": pa.bool_(),
+    "density": pa.float64(),
+    "avg_degree": pa.float64(),
+    "max_degree": pa.int64(),
     "iters": pa.int32(),
     "warmup": pa.int32(),
     "ingest_s": pa.float64(),
@@ -119,6 +127,7 @@ _PA_TYPES: dict[str, pa.DataType] = {
     "compute_warm_min_s": pa.float64(),
     "compute_warm_std_s": pa.float64(),
     "peak_rss_bytes": pa.int64(),
+    "baseline_rss_bytes": pa.int64(),
     "status": pa.string(),
     "correct": pa.bool_(),
     "correctness_detail": pa.string(),

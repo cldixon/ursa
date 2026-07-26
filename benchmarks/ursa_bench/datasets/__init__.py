@@ -63,6 +63,15 @@ def _catalog() -> dict[str, DatasetSpec]:
         )
     syn("grid-128", lambda p: synthetic.grid(128, p), "128x128 lattice (16,384 nodes)")
 
+    # Stochastic block model — planted community structure (the honest test for
+    # Louvain / label propagation). 8 blocks, dense-in / sparse-out.
+    for n, label in ((1_000, "1k"), (10_000, "10k")):
+        syn(
+            f"sbm-{label}",
+            lambda p, n=n: synthetic.sbm(n, 8, 0.06, 0.001, seed, p),
+            f"Stochastic block model n={n}, 8 communities",
+        )
+
     # Real graphs (never run in CI; downloaded + cached on first use).
     specs["snap-email-eu-core"] = DatasetSpec(
         "snap-email-eu-core",
@@ -109,3 +118,33 @@ def graph_shape(parquet_path: str | Path) -> tuple[int, int]:
     n_edges = table.num_rows
     nodes = set(table.column("src").to_pylist()) | set(table.column("dst").to_pylist())
     return len(nodes), n_edges
+
+
+def graph_stats(parquet_path: str | Path) -> dict:
+    """Structural summary of an edge list: node/edge counts, density, degree.
+
+    Recorded on every result row so a win can be correlated with graph shape
+    (skew, density) rather than just a dataset name. Degree is *total* (in+out).
+    """
+    from collections import Counter
+
+    table = pq.read_table(parquet_path, columns=["src", "dst"])
+    src = table.column("src").to_pylist()
+    dst = table.column("dst").to_pylist()
+    n_edges = len(src)
+    deg: Counter = Counter()
+    for u in src:
+        deg[u] += 1
+    for v in dst:
+        deg[v] += 1
+    n_nodes = len(deg)
+    density = n_edges / (n_nodes * (n_nodes - 1)) if n_nodes > 1 else 0.0
+    avg_degree = (2 * n_edges / n_nodes) if n_nodes else 0.0
+    max_degree = max(deg.values()) if deg else 0
+    return {
+        "n_nodes": n_nodes,
+        "n_edges": n_edges,
+        "density": density,
+        "avg_degree": avg_degree,
+        "max_degree": max_degree,
+    }

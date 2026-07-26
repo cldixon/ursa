@@ -38,6 +38,7 @@ class NetworkxAdapter(Adapter):
             "clustering_coefficient",
             "louvain",
             "label_propagation",
+            "pipeline_influencers",
         }
 
     def ingest(self, dataset_path: str | Path, algo: Algorithm):
@@ -55,6 +56,23 @@ class NetworkxAdapter(Adapter):
 
         g = handle
         name = algo.name
+
+        if name == "pipeline_influencers":
+            # The idiomatic hand-written equivalent: compute, then filter/sort/top
+            # in Python — the tax Ursa avoids by fusing it into one plan.
+            p = algo.params
+            pr = nx.pagerank(
+                g,
+                alpha=p.get("damping", 0.85),
+                max_iter=max(p.get("max_iter", 100), 100),
+                tol=p.get("tol", 1e-6),
+            )
+            indeg = dict(g.in_degree())
+            min_in = p.get("min_in_degree", 3)
+            eligible = [n for n in pr if indeg.get(n, 0) >= min_in]
+            top = sorted(eligible, key=lambda n: pr[n], reverse=True)[: p.get("top_k", 20)]
+            return {n: rank for rank, n in enumerate(top)}
+
         if name == "pagerank":
             p = algo.params
             return dict(

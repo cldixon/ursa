@@ -106,6 +106,18 @@ REGISTRY: dict[str, Algorithm] = {
         compare="modularity",
         params={"seed": 1},
     ),
+    # --- end-to-end pipeline workloads ---------------------------------------
+    # Not a single kernel: a realistic *composed* query. Ursa runs it as one
+    # `collect()` over Arrow; the others build the graph, compute, then filter /
+    # sort / top-K in Python. This is the workload Ursa is actually designed for —
+    # single-kernel benchmarks measure it on the competition's turf, not its own.
+    "pipeline_influencers": Algorithm(
+        name="pipeline_influencers",
+        description="Top-K nodes by PageRank among those with in-degree >= threshold.",
+        view="directed",
+        compare="topk",
+        params={"damping": 0.85, "max_iter": 100, "tol": 1e-6, "min_in_degree": 3, "top_k": 20},
+    ),
 }
 
 

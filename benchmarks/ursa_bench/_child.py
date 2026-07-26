@@ -32,6 +32,11 @@ def main() -> None:
     from ursa_bench.adapters import get_adapter, serialize_result
     from ursa_bench.measure import self_peak_rss_bytes
 
+    # RSS before the library-under-test is imported or any graph is built — the
+    # interpreter + bench + pyarrow floor. peak - baseline isolates the memory the
+    # graph and computation actually added (bytes/edge at scale).
+    baseline_rss = self_peak_rss_bytes()
+
     library = req["library"]
     algo_name = req["algorithm"]
     result_out = req.get("result_out") or ""
@@ -73,7 +78,7 @@ def main() -> None:
             warm_samples.append(time.perf_counter() - t0)
 
         if result_out:
-            integral = base.compare in {"int_map", "partition"}
+            integral = base.compare in {"int_map", "partition", "topk"}
             serialize_result(result, result_out, integral=integral)
     except Exception:
         _fail("error", "".join(traceback.format_exc().splitlines(keepends=True)[-6:]))
@@ -87,6 +92,7 @@ def main() -> None:
                 "compute_cold_s": compute_cold_s,
                 "warm_samples": warm_samples,
                 "peak_rss_bytes": self_peak_rss_bytes(),
+                "baseline_rss_bytes": baseline_rss,
                 "result_path": result_out,
             }
         )
