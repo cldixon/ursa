@@ -187,19 +187,26 @@ pub fn scan_edges_batch(
     })?
 }
 
-/// Read a node/attribute file into one `RecordBatch`, keeping **every** column.
+/// Read a node/attribute file into a batch list.
 ///
-/// Unlike [`scan_edges_batch`], there is no projection: a node table is an
-/// attribute table, so all columns are carried through. Only the `id` column is
-/// canonicalized to a supported node-id type (integer -> Int64, string -> Utf8);
-/// attribute columns keep their file types. The result feeds
-/// `execute_node_query`'s `nodes` slot, where algorithm
-/// outputs are LEFT-joined onto it by id — exactly like an in-memory
-/// `from_arrow(..., id=...)` table.
+/// When `columns` is empty every column is read (the attribute-table default).
+/// When non-empty it is a **projection pushdown**: only those columns are read
+/// from the file (DataFusion pushes the projection into Parquet, so unread
+/// columns' byte ranges are never fetched). The projection must include the `id`
+/// column; the Python layer computes the needed set from the whole plan — the join
+/// `id`, plus every column any `filter`/`sort`/`agg`/`select` references — so the
+/// scan reads only what the output provably needs and never under-projects.
+///
+/// Only the `id` column is canonicalized to a supported node-id type (integer ->
+/// Int64, string -> Utf8); attribute columns keep their file types. The result
+/// feeds `execute_node_query`'s `nodes` slot, where algorithm outputs are
+/// LEFT-joined onto it by id — exactly like an in-memory `from_arrow(..., id=...)`
+/// table.
 pub fn scan_nodes_batch(
     path: &str,
     id: &str,
     storage_options: &HashMap<String, String>,
+    columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
@@ -214,6 +221,15 @@ pub fn scan_nodes_batch(
             return Err(DataFusionError::NotImplemented(format!(
                 "scan_nodes supports .parquet and .csv in v0.1; got path {path:?}"
             )));
+        };
+
+        // Projection pushdown: read only the requested columns (must include id).
+        // Empty means "all columns" (the attribute-table default).
+        let df = if columns.is_empty() {
+            df
+        } else {
+            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+            df.select_columns(&refs)?
         };
 
         // Keep the batches separate (no `concat_batches`); the attribute table
@@ -314,7 +330,8 @@ mod tests {
             writeln!(f, "1,us,10").unwrap();
             writeln!(f, "2,eu,20").unwrap();
         }
-        let batches = scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts()).unwrap();
+        let batches =
+            scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts(), &[]).unwrap();
         let batch = &batches[0];
         let n: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(n, 2);
@@ -331,6 +348,28 @@ mod tests {
         assert_eq!(ids.values(), &[1, 2]);
         assert!(schema.index_of("region").is_ok());
         assert!(schema.index_of("capacity").is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn projects_only_requested_node_columns() {
+        // Projection pushdown: ask for id + capacity only; region is not read.
+        let dir = std::env::temp_dir();
+        let path = dir.join("ursa_scan_test_nodes_proj.csv");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "tower_id,region,capacity").unwrap();
+            writeln!(f, "1,us,10").unwrap();
+            writeln!(f, "2,eu,20").unwrap();
+        }
+        let cols = vec!["tower_id".to_string(), "capacity".to_string()];
+        let batches =
+            scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts(), &cols).unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.index_of("tower_id").is_ok());
+        assert!(schema.index_of("capacity").is_ok());
+        assert!(schema.index_of("region").is_err()); // not projected -> not read
         std::fs::remove_file(&path).ok();
     }
 

@@ -31,10 +31,12 @@ def test_rename_raises_not_silently_dropped():
 
 
 @native
-def test_select_on_traversal_raises():
+def test_select_on_traversal_narrows_output():
+    # select() is now implemented (Polars-faithful output projection); on a
+    # traversal it narrows the (src, dst) result to the chosen columns.
     edges = _edges()
-    with pytest.raises(NotImplementedError, match="select"):
-        ur.hop(edges, 2).from_([0]).select("dst").collect()
+    df = ur.hop(edges, 2).from_([0]).select("dst").collect().to_polars()
+    assert df.columns == ["dst"]
 
 
 # --- #34: parameters accepted-and-ignored now raise ------------------------

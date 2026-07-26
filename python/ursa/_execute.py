@@ -81,6 +81,39 @@ def _expr_columns(expr: Any) -> set[str]:
     return set()
 
 
+# --- select (column projection) --------------------------------------------
+def _parse_select(columns: Any) -> list[str]:
+    """The output column names for a ``select(...)`` step. Accepts bare names or
+    ``ur.col(name)`` (Polars-shaped); richer select expressions are future work."""
+    names: list[str] = []
+    for c in columns:
+        if isinstance(c, str):
+            names.append(c)
+        elif getattr(c, "kind", None) == "col":
+            names.append(c.payload["name"])
+        else:
+            raise NotImplementedError(
+                "select() supports column names or ur.col(<name>) for now "
+                "(e.g. .select('id', ur.col('pagerank')))."
+            )
+    return names
+
+
+def _apply_select(mf: MaterializedFrame, select: list[str] | None) -> MaterializedFrame:
+    """Narrow a materialized result to the selected columns (the ``select`` output
+    projection). ``select`` never changes rows, only which columns are kept and in
+    what order — the Polars-faithful counterpart to additive ``with_columns``."""
+    if select is None:
+        return mf
+    table = mf.to_arrow()
+    missing = [c for c in select if c not in table.column_names]
+    if missing:
+        from . import ColumnNotFoundError
+
+        raise ColumnNotFoundError(f"select() references unknown column(s): {missing}")
+    return MaterializedFrame(table.select(select))
+
+
 def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     """The edge attribute table (a **list** of pyarrow RecordBatches) for evaluating
     a weight expression, aligned to the graph's edge-row order.
@@ -161,6 +194,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     filters: list[tuple[str, str, float]] = []
     sort: tuple[str, bool] | None = None
     limit: int | None = None
+    select: list[str] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -170,6 +204,13 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
             continue  # source / metadata steps
         if op == "with_columns":
+            # select() defines the output columns; computing more columns after it
+            # is ambiguous (which survive?), so require with_columns before select.
+            if select is not None:
+                raise NotImplementedError(
+                    "with_columns() after select() is not supported; compute columns "
+                    "first, then select() to narrow the output."
+                )
             if graph_exprs is not None:
                 raise NotImplementedError(
                     "collect() supports a single with_columns step in a composed pipeline for now."
@@ -181,6 +222,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             sort = _parse_sort(step.args)
         elif op == "head":
             limit = int(step.args["n"])
+        elif op == "select":
+            if select is not None:
+                raise NotImplementedError("collect() supports a single select() step for now.")
+            select = _parse_select(step.args["columns"])
         else:
             raise NotImplementedError(
                 f"collect() does not yet support the '{op}' step in a composed pipeline."
@@ -189,13 +234,30 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
         # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
-        return _collect_plain_nodes(frame, filters, sort, limit)
+        return _collect_plain_nodes(frame, filters, sort, limit, select)
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
+    # Column-need analysis for scan projection pushdown (transparent — never changes
+    # the output). The computed columns come from the graph node; the file must
+    # supply the join id, every column a filter/sort/agg reads, and any *file*
+    # column the select keeps. With no select the output is additive (all
+    # attributes), so nothing is droppable and the whole file is read.
+    computed = set(graph_exprs.keys())
+    referenced = {c for (c, _op, _v) in filters}
+    if sort is not None:
+        referenced.add(sort[0])
+    for c in columns:
+        if c.get("agg_column") is not None:
+            referenced.add(c["agg_column"])
+    id_name = frame.id_col
+    file_needed: list[str] | None = None
+    if select is not None:
+        needed = {id_name} | (referenced - computed) | (set(select) - computed)
+        file_needed = sorted(needed)
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
-    nodes = _resolve_node_attr_table(frame)
+    nodes = _resolve_node_attr_table(frame, file_needed)
     nodes_id = frame.id_col if nodes is not None else None
     # A weighted algorithm needs the edge columns its weight expression references.
     weight_cols: set[str] = set()
@@ -207,7 +269,8 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # the same scan, so _run_query's _require_index reuses it — endpoints and
     # weights share one edge order.
     edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
-    return _run_query(edges, columns, filters, sort, limit, nodes, nodes_id, edge_attr)
+    result = _run_query(edges, columns, filters, sort, limit, nodes, nodes_id, edge_attr)
+    return _apply_select(result, select)
 
 
 def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame:
@@ -218,6 +281,7 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     distinct = False
+    select: list[str] | None = None
 
     _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes"}
     for s in frame._plan:
@@ -232,6 +296,10 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
             limit = int(s.args["n"])
         elif op == "distinct":
             distinct = True
+        elif op == "select":
+            if select is not None:
+                raise NotImplementedError("collect() supports a single select() step for now.")
+            select = _parse_select(s.args["columns"])
         else:
             raise NotImplementedError(
                 f"collect() does not yet support the '{op}' step after a random_walk."
@@ -250,7 +318,7 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
         limit,
         distinct,
     )
-    return MaterializedFrame(batch)
+    return _apply_select(MaterializedFrame(batch), select)
 
 
 def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
@@ -265,16 +333,22 @@ def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
     return scan.get("storage_options")
 
 
-def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
+def _resolve_node_attr_table(frame: NodeFrame, columns: list[str] | None = None) -> Any | None:
     """The node attribute table as a chunked ``pyarrow.Table``: an in-memory
     ``from_arrow`` table if present, else a ``scan_nodes`` file source materialized
     through a DataFusion scan. ``edges.nodes()``-derived frames have neither and
     return ``None``.
 
+    ``columns`` is a scan **projection pushdown**: when given, only those columns
+    are read from the node file (the join id plus whatever the plan proves it
+    needs); ``None`` reads all columns. It is ignored for an in-memory source
+    (already resident) — a later ``select`` narrows the output there.
+
     The scan returns a **list** of RecordBatches (never concatenated, #60); this
-    assembles them into one chunked Table. A scan-backed source is read from disk
-    **once** and the Table memoized on the frame's shared attribute cell, so
-    repeated collects (and ``_resolve_seeds``) over one node file don't re-scan it."""
+    assembles them into one chunked Table. Scan results are memoized on the frame's
+    shared attribute cell **keyed by the projected column set**, so repeated
+    collects reuse a prior read while a different projection (e.g. a seeds-only
+    ``[id]`` read) gets its own cache slot rather than a wrong subset."""
     import pyarrow as pa
 
     inmem = getattr(frame, "_attr_table", None)
@@ -289,17 +363,20 @@ def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
                 "collect() over a scan_nodes source supports a single string path "
                 "(glob included) for now, not a list of paths."
             )
+        key = tuple(columns) if columns is not None else None
         cell = frame._attr_build_cell
-        table = cell.value
-        if table is not None:
-            return table
+        cache = cell.value
+        if cache is not None and key in cache:
+            return cache[key]
         with cell.lock:
-            table = cell.value
-            if table is None:
-                batches = _native().scan_nodes_arrow(path, scan["id"], _scan_storage_options(scan))
-                table = pa.Table.from_batches(batches)
-                cell.value = table
-        return table
+            cache = cell.value if cell.value is not None else {}
+            if key not in cache:
+                batches = _native().scan_nodes_arrow(
+                    path, scan["id"], _scan_storage_options(scan), columns or []
+                )
+                cache[key] = pa.Table.from_batches(batches)
+                cell.value = cache
+            return cache[key]
     return None
 
 
@@ -313,6 +390,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     distinct = False
+    select: list[str] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -323,8 +401,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         elif op == "reverse":
             # Metadata on a plain frame (the swapped source rides on the frame).
             # After a traversal its semantics are undesigned -> reject rather than
-            # silently ignore. `select`/`rename` are not passthroughs: they fall to
-            # the else and raise instead of being dropped.
+            # silently ignore. `rename` is not a passthrough: it falls to the else
+            # and raises instead of being dropped.
             if traversal is not None:
                 raise NotImplementedError(
                     "reverse() after a traversal (hop/shortest_path) is not supported; "
@@ -339,6 +417,10 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             limit = int(step.args["n"])
         elif op == "distinct":
             distinct = True
+        elif op == "select":
+            if select is not None:
+                raise NotImplementedError("collect() supports a single select() step for now.")
+            select = _parse_select(step.args["columns"])
         else:
             raise NotImplementedError(
                 f"collect() does not yet support the '{op}' step on an edge frame."
@@ -349,7 +431,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         # or a reversed frame). Materialize its edge rows + filter/sort/head tail.
         if distinct:
             raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
-        return _collect_plain_edges(frame, filters, sort, limit)
+        return _collect_plain_edges(frame, filters, sort, limit, select)
 
     if traversal.op == "hop":
         index = _require_index(traversal.args["edges"])
@@ -390,7 +472,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             limit,
             distinct,
         )
-    return MaterializedFrame(batch)
+    return _apply_select(MaterializedFrame(batch), select)
 
 
 # Steps that don't change a NodeFrame's row set, so its id column can be read
@@ -415,7 +497,10 @@ def _resolve_seeds(seeds: Any) -> Any:
 
     if isinstance(seeds, NodeFrame):
         plain = all(step.op in _SEED_PASSTHROUGH for step in seeds._plan)
-        attr = _resolve_node_attr_table(seeds) if plain else None
+        # As seeds, only the id column is needed — project the scan to just [id]
+        # (a real, non-lossy projection-pushdown win; a 50-column node file used
+        # only for seeds reads one column).
+        attr = _resolve_node_attr_table(seeds, [seeds.id_col]) if plain else None
         # A plain attribute table yields its ids directly; a derived frame
         # (filtered / computed) must be executed to get them.
         if attr is not None:
@@ -713,8 +798,17 @@ def _collect_plain_nodes(
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None,
     limit: int | None,
+    select: list[str] | None = None,
 ) -> MaterializedFrame:
-    attr = _resolve_node_attr_table(frame)
+    # With no computed columns, the scan need only read the id, whatever the
+    # filter/sort touch, and (if a select narrows the output) the selected columns.
+    file_needed: list[str] | None = None
+    if select is not None:
+        referenced = {c for (c, _op, _v) in filters}
+        if sort is not None:
+            referenced.add(sort[0])
+        file_needed = sorted({frame.id_col} | referenced | set(select))
+    attr = _resolve_node_attr_table(frame, file_needed)
     if attr is None:
         raise NotImplementedError(
             "collect() on this NodeFrame needs a source (scan_nodes / from_arrow(id=...)) "
@@ -723,7 +817,7 @@ def _collect_plain_nodes(
         )
     # `attr` is a (chunked) pyarrow.Table.
     table = _apply_pyarrow_tail(attr, filters, sort, limit)
-    return MaterializedFrame(table)
+    return _apply_select(MaterializedFrame(table), select)
 
 
 def _collect_plain_edges(
@@ -731,6 +825,7 @@ def _collect_plain_edges(
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None,
     limit: int | None,
+    select: list[str] | None = None,
 ) -> MaterializedFrame:
     import pyarrow as pa
 
@@ -752,7 +847,7 @@ def _collect_plain_edges(
             # No source: a filtered/derived (or traversal-result) edge frame.
             _require_edges(frame)  # raises the precise, plan-aware message
     table = _apply_pyarrow_tail(table, filters, sort, limit)
-    return MaterializedFrame(table)
+    return _apply_select(MaterializedFrame(table), select)
 
 
 def _native() -> Any:
