@@ -3213,6 +3213,7 @@ dependencies = [
  "rand 0.8.7",
  "rand_chacha",
  "rayon",
+ "rustc-hash",
 ]
 
 [[package]]

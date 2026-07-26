@@ -13,11 +13,11 @@
 //! user ids goes through this module's Arrow-array methods, so nothing downstream
 //! needs to know which variant it is.
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
+use rustc_hash::FxHashMap;
 
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
 ///
@@ -34,13 +34,13 @@ pub enum IdMap {
     /// Integer user ids (the fast path).
     Int64 {
         to_user: Vec<i64>,
-        to_dense: HashMap<i64, u32>,
+        to_dense: FxHashMap<i64, u32>,
         id_array: OnceLock<ArrayRef>,
     },
     /// String user ids (also covers UUID-as-string).
     Utf8 {
         to_user: Vec<Arc<str>>,
-        to_dense: HashMap<Arc<str>, u32>,
+        to_dense: FxHashMap<Arc<str>, u32>,
         id_array: OnceLock<ArrayRef>,
     },
 }
@@ -160,7 +160,7 @@ impl IdMap {
     fn new_int64() -> Self {
         IdMap::Int64 {
             to_user: Vec::new(),
-            to_dense: HashMap::new(),
+            to_dense: FxHashMap::default(),
             id_array: OnceLock::new(),
         }
     }
@@ -168,7 +168,7 @@ impl IdMap {
     fn new_utf8() -> Self {
         IdMap::Utf8 {
             to_user: Vec::new(),
-            to_dense: HashMap::new(),
+            to_dense: FxHashMap::default(),
             id_array: OnceLock::new(),
         }
     }
@@ -242,12 +242,24 @@ impl IdMap {
                         return Err(IdError::MixedTypes);
                     }
                     let (s, d) = (as_int64(*src), as_int64(*dst));
-                    for i in 0..s.len() {
-                        if s.is_null(i) || d.is_null(i) {
-                            return Err(IdError::Null);
+                    // Fast path: when neither column has nulls (the common case,
+                    // e.g. every scanned/canonicalized edge list), intern straight
+                    // over the raw `&[i64]` value slices — skipping the per-row
+                    // `is_null`/`value` bounds+validity checks that dominate the
+                    // loop once the hasher is fast.
+                    if s.null_count() == 0 && d.null_count() == 0 {
+                        for (&sv, &dv) in s.values().iter().zip(d.values()) {
+                            sd.push(map.intern_i64(sv)?);
+                            dd.push(map.intern_i64(dv)?);
                         }
-                        sd.push(map.intern_i64(s.value(i))?);
-                        dd.push(map.intern_i64(d.value(i))?);
+                    } else {
+                        for i in 0..s.len() {
+                            if s.is_null(i) || d.is_null(i) {
+                                return Err(IdError::Null);
+                            }
+                            sd.push(map.intern_i64(s.value(i))?);
+                            dd.push(map.intern_i64(d.value(i))?);
+                        }
                     }
                 }
                 Ok((map, sd, dd))
