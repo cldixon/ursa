@@ -1,0 +1,118 @@
+---
+/**
+ * The sky — the same tokens, inverted.
+ *
+ * You cannot read a negative on a live instrument, so where the plate is paper
+ * the visualizer is sky: black ground, bright sources, colour throughout,
+ * because everything on screen has been measured. Radius, opacity and spike
+ * length are one stretched score; hue is the temperature scale.
+ *
+ * The graph is generated and measured at build time (preferential attachment,
+ * then PageRank), so the overlay and the caption carry real numbers.
+ */
+import { spikes } from '../lib/field';
+import { logStretch, sampleRamp, SKY_RAMP } from '../lib/stretch';
+import { SKY } from '../lib/figures';
+
+const { width: W, height: H, limit, graph } = SKY;
+
+const rendered = graph.nodes.map((node) => {
+  // Degree is a count, so it takes the log stretch — asinh is for the power-law
+  // continuous scores (pagerank, betweenness).
+  const t = logStretch(node.degree / graph.maxDegree, 0.08);
+  return {
+    ...node,
+    t,
+    r: 1.6 + 5.2 * t,
+    fill: sampleRamp(1 - t, SKY_RAMP),
+    bright: node.degree / graph.maxDegree >= limit,
+  };
+});
+
+const byIndex = new Map(rendered.map((r) => [r.i, r]));
+// The detection: an ellipse around a found object, tagged with its catalog id
+// and its measurements. Here, the highest-PageRank source in the frame.
+const detected = rendered.reduce((a, b) => (b.pagerank > a.pagerank ? b : a));
+const catalogId = `SRC-${String(detected.i).padStart(4, '0')}`;
+const RX = 26;
+const RY = 19;
+// The label sits off the detection on a short leader, on whichever side has room.
+const flip = detected.x > W * 0.62;
+const leaderFrom = flip ? detected.x - RX : detected.x + RX;
+const leaderTo = flip ? detected.x - RX - 22 : detected.x + RX + 22;
+const labelX = flip ? leaderTo - 6 : leaderTo + 6;
+const labelY = detected.y - RY - 4;
+---
+
+<svg
+  viewBox={`0 0 ${W} ${H}`}
+  role="img"
+  aria-label="The visualizer: a dark field of measured sources, the brightest carrying diffraction spikes, one tagged with its catalog id."
+>
+  <g class="edges">
+    {
+      graph.edges.map(({ s, d }) => (
+        <line
+          x1={byIndex.get(s)!.x}
+          y1={byIndex.get(s)!.y}
+          x2={byIndex.get(d)!.x}
+          y2={byIndex.get(d)!.y}
+        />
+      ))
+    }
+  </g>
+
+  {
+    rendered.map((node) => (
+      <g>
+        {node.bright &&
+          spikes(node.x, node.y, node.r, 4.2).map((points) => (
+            <polygon points={points} fill="#DCE9F5" opacity={0.18 + 0.24 * node.t} />
+          ))}
+        <circle cx={node.x} cy={node.y} r={node.r} fill={node.fill} opacity={0.52 + 0.48 * node.t} />
+      </g>
+    ))
+  }
+
+  <g class="detection">
+    <ellipse cx={detected.x} cy={detected.y} rx={RX} ry={RY}></ellipse>
+    <line x1={leaderFrom} y1={detected.y} x2={leaderTo} y2={detected.y} class="leader"></line>
+    <line x1={leaderTo} y1={detected.y} x2={leaderTo} y2={labelY + 4} class="leader"></line>
+    <text x={labelX} y={labelY - 8} text-anchor={flip ? 'end' : 'start'}>{catalogId}</text>
+    <text x={labelX} y={labelY + 3} text-anchor={flip ? 'end' : 'start'} class="meas">
+      deg {detected.degree} · pr {detected.pagerank.toFixed(4)}
+    </text>
+  </g>
+</svg>
+
+<style>
+  svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .edges line {
+    stroke: #7cc5f0;
+    stroke-width: 0.6;
+    opacity: 0.18;
+  }
+  .detection ellipse,
+  .detection .leader {
+    fill: none;
+    stroke: #e8a33d;
+    stroke-width: 1;
+  }
+  .detection text {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    fill: #e8a33d;
+    /* Knocked out of the field so the annotation stays readable over sources —
+       legibility, not chrome. */
+    stroke: #0b0b0a;
+    stroke-width: 2.4px;
+    paint-order: stroke fill;
+  }
+  .detection text.meas {
+    fill: #7cc5f0;
+  }
+</style>

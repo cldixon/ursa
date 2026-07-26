@@ -16,6 +16,12 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
+# Docs site (Astro). package-lock.json IS committed so the Pages build is
+# reproducible and `npm ci` has something to resolve against.
+/site/node_modules/
+/site/dist/
+/site/.astro/
+
 # Editors / OS
 .DS_Store
 .idea/

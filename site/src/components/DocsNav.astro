@@ -1,0 +1,61 @@
+---
+import { DOCS_NAV } from '../lib/site';
+import { url, isCurrent } from '../lib/url';
+
+const path = Astro.url.pathname;
+---
+
+<nav class="docsnav" aria-label="Documentation">
+  {
+    DOCS_NAV.map((section) => (
+      <div class="group">
+        <p class="label">{section.title}</p>
+        <ul>
+          {section.items.map((item) => {
+            const current = isCurrent(item.href, path);
+            return (
+              <li>
+                <a href={url(item.href)} aria-current={current ? 'page' : undefined}>
+                  {item.title}
+                </a>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    ))
+  }
+</nav>
+
+<style>
+  .docsnav {
+    font-size: 15.5px;
+  }
+  .group + .group {
+    margin-top: 24px;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+    margin-top: 9px;
+  }
+  li + li {
+    margin-top: 4px;
+  }
+  a {
+    display: block;
+    color: var(--ink-2);
+    border-bottom: 0;
+    padding: 1px 0 1px 11px;
+    border-left: 1px solid var(--rule);
+    line-height: 1.35;
+  }
+  a:hover {
+    color: var(--ink);
+  }
+  /* The current page is marked by weight of rule, not by a highlight colour. */
+  a[aria-current='page'] {
+    color: var(--ink);
+    border-left-color: var(--ink);
+  }
+</style>

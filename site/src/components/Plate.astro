@@ -1,0 +1,96 @@
+---
+/**
+ * The plate — a deep field, read as a negative.
+ *
+ * Astronomers read photographic plates as negatives: black sources on a white
+ * sky. So the site is paper and the sources are ink. The field is generated at
+ * build time from a fixed seed; the seven brightest sources are the asterism,
+ * found in the field rather than placed on it, because radius comes from the
+ * same stretched score for every object in the frame.
+ */
+import { spikes, URSA_MAJOR, URSA_MAJOR_LINES } from '../lib/field';
+import { PLATE } from '../lib/figures';
+
+const { width: W, height: H, sources } = PLATE;
+const hubs = URSA_MAJOR.map((h) => ({ ...h, flare: spikes(h.x, h.y, h.r) }));
+---
+
+{/* The frame crops the field rather than shrinking it — a plate is a window on
+    something larger, and the asterism stays inside the crop at every size. */}
+<svg
+  viewBox={`0 0 ${W} ${H}`}
+  preserveAspectRatio="xMidYMid slice"
+  role="img"
+  aria-label="A deep field of graph sources. The seven brightest form the Ursa Major asterism."
+>
+  <g class="field">
+    {sources.map((s) => <circle cx={s.x} cy={s.y} r={s.r} opacity={s.o} />)}
+  </g>
+
+  <g class="hubs">
+    <g class="asterism">
+      {
+        URSA_MAJOR_LINES.map(([a, b]) => (
+          <line
+            x1={URSA_MAJOR[a]!.x}
+            y1={URSA_MAJOR[a]!.y}
+            x2={URSA_MAJOR[b]!.x}
+            y2={URSA_MAJOR[b]!.y}
+          />
+        ))
+      }
+    </g>
+    {
+      hubs.map((h) => (
+        <g>
+          <title>{`${h.name} — score ${h.score.toFixed(2)}`}</title>
+          {h.flare.map((points) => (
+            <polygon points={points} opacity={0.26 + 0.28 * h.score} />
+          ))}
+          <circle cx={h.x} cy={h.y} r={h.r} />
+        </g>
+      ))
+    }
+  </g>
+</svg>
+
+<style>
+  svg {
+    display: block;
+    width: 100%;
+    height: min(60vh, 60vw);
+  }
+  .field circle,
+  .hubs circle,
+  .hubs polygon {
+    fill: var(--ink);
+  }
+  .asterism line {
+    stroke: var(--ink);
+    stroke-width: 0.8;
+    opacity: 0.28;
+    fill: none;
+  }
+
+  /* Exposure: the field resolves first, then the catalogued sources. */
+  .field,
+  .hubs {
+    opacity: 0;
+    animation: expose 1.4s ease forwards;
+  }
+  .hubs {
+    animation-delay: 0.55s;
+  }
+  @keyframes expose {
+    to {
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .field,
+    .hubs {
+      opacity: 1;
+      animation: none;
+    }
+  }
+</style>

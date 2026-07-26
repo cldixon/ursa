@@ -1,0 +1,281 @@
+/* Source Serif 4 with its optical-size axis, so display sizes get the display
+ * cut and body copy gets the text cut from one file. Self-hosted: no external
+ * request on any page. */
+@import '@fontsource-variable/source-serif-4/opsz.css';
+@import '@fontsource-variable/source-serif-4/opsz-italic.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@import './tokens.css';
+
+/* ------------------------------------------------------------------------- *
+ * Base
+ * ------------------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-radius: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+}
+
+p,
+ul,
+ol {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px solid var(--rule);
+}
+
+a:hover {
+  border-bottom-color: currentColor;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--rule);
+  margin: 0;
+}
+
+::selection {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 3px;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Layout primitives
+ * ------------------------------------------------------------------------- */
+
+.w {
+  max-width: var(--w-page);
+  margin: 0 auto;
+  padding-inline: var(--pad-x);
+}
+
+.sec {
+  padding-block: clamp(46px, 7vw, 86px);
+}
+
+/* Grid and flex children default to min-width:auto, which refuses to shrink
+ * below their content — so one wide code listing would push the whole page
+ * sideways. Overflow belongs to the listing, never to the document. */
+.w > *,
+.doc > *,
+.split > *,
+.shell > * {
+  min-width: 0;
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+}
+
+.skip:focus {
+  left: var(--pad-x);
+  top: 10px;
+  z-index: 10;
+  background: var(--paper);
+  padding: 8px 12px;
+  border: 1px solid var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Mono utility — captions, signatures, labels, tables
+ * ------------------------------------------------------------------------- */
+
+.cap {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  letter-spacing: 0.01em;
+}
+
+.label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Buttons — bordered ink, never filled with colour
+ * ------------------------------------------------------------------------- */
+
+.b {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 11px 18px;
+  border: 1px solid var(--ink);
+  color: var(--ink);
+  background: none;
+  display: inline-block;
+  text-decoration: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.b:hover {
+  background: var(--ink);
+  color: var(--paper);
+  border-bottom-color: var(--ink);
+}
+
+.b.f {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.b.f:hover {
+  background: none;
+  color: var(--ink);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Code — ink on paper, one rule around it, no syntax palette
+ * ------------------------------------------------------------------------- */
+
+code {
+  font-family: var(--mono);
+  font-size: 0.86em;
+}
+
+pre {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.8;
+  margin: 0;
+  padding: 19px 20px;
+  border: 1px solid var(--rule);
+  overflow-x: auto;
+  color: var(--ink-2);
+  white-space: pre;
+  tab-size: 2;
+}
+
+pre code {
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  padding: 0;
+  border: 0;
+}
+
+/* Emphasis inside a listing marks the line that matters — weight, not colour. */
+pre b,
+pre strong {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Results table — a catalog: numbered records, one per object
+ * ------------------------------------------------------------------------- */
+
+.res {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.res th {
+  text-align: left;
+  font-weight: 400;
+  color: var(--ink-2);
+  padding: 0 14px 8px 0;
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+}
+
+.res td {
+  padding: 8px 14px 8px 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+
+.res td:last-child,
+.res th:last-child.num {
+  padding-right: 0;
+}
+
+.res .num {
+  text-align: right;
+}
+
+/* The measured-value swatch: the one place colour is allowed on paper. */
+.res i.sw {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+.scroll-x {
+  overflow-x: auto;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Figures — one mono caption, no other chrome
+ * ------------------------------------------------------------------------- */
+
+figure {
+  margin: 0;
+}
+
+figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+figcaption {
+  padding-top: 12px;
+  margin-top: 14px;
+  border-top: 1px solid var(--rule);
+}
