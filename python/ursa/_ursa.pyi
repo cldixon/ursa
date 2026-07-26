@@ -109,9 +109,15 @@ def scan_edges_arrow(
     weight_columns: list[str] = ...,
 ) -> Any: ...
 
-# Scan a Parquet/CSV node file -> list[pyarrow.RecordBatch] of the full
-# attribute table (id cast int64).
-def scan_nodes_arrow(path: str, id: str, storage_options: dict[str, str] | None = ...) -> Any: ...
+# Scan a Parquet/CSV node file -> list[pyarrow.RecordBatch] of the attribute
+# table (id cast int64). `columns` is a projection pushdown: non-empty reads only
+# those columns (must include id); empty reads all.
+def scan_nodes_arrow(
+    path: str,
+    id: str,
+    storage_options: dict[str, str] | None = ...,
+    columns: list[str] = ...,
+) -> Any: ...
 
 # Demo path: plain lists in and out (pure Python->Rust smoke tests).
 def _demo_pagerank(

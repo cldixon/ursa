@@ -406,19 +406,23 @@ fn scan_edges_arrow(
 }
 
 /// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
-/// back as a full `RecordBatch` (all columns; `id` cast to int64). It feeds the
-/// `nodes` attribute slot of `run_node_query`, exactly like an in-memory table.
-/// `path`/`storage_options` support object storage like `scan_edges_arrow`.
+/// back as a batch list (`id` cast to int64). It feeds the `nodes` attribute slot
+/// of `run_node_query`, exactly like an in-memory table. `columns` is a projection
+/// pushdown: when non-empty only those columns are read from the file (it must
+/// include the `id` column); empty reads all columns. `path`/`storage_options`
+/// support object storage like `scan_edges_arrow`.
 #[pyfunction]
-#[pyo3(signature = (path, id, storage_options=None))]
+#[pyo3(signature = (path, id, storage_options=None, columns=Vec::new()))]
 fn scan_nodes_arrow(
     py: Python<'_>,
     path: &str,
     id: &str,
     storage_options: Option<HashMap<String, String>>,
+    columns: Vec<String>,
 ) -> PyResult<PyObject> {
     let opts = storage_options.unwrap_or_default();
-    let batches = py.allow_threads(|| scan_nodes_batch(path, id, &opts).map_err(to_pyerr))?;
+    let batches =
+        py.allow_threads(|| scan_nodes_batch(path, id, &opts, &columns).map_err(to_pyerr))?;
     batches.to_pyarrow(py)
 }
 
