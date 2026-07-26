@@ -1,7 +1,6 @@
 # The Ursa site
 
-The landing page and documentation, built with [Astro](https://astro.build). Deployed to GitHub
-Pages by `.github/workflows/docs.yml` on every push to `main` that touches this directory.
+The landing page and documentation, built with [Astro](https://astro.build).
 
 Nothing here needs the native extension — the site is static, built from markdown and Astro
 components — so the docs build never waits on a Rust compile.
@@ -13,6 +12,48 @@ npm run dev      # http://localhost:4321/ursa
 npm run build    # -> site/dist
 npm run check    # astro check (type-checks .astro and the content schema)
 ```
+
+## Deploying
+
+Two targets, which disagree about where the root is. A GitHub Pages project site is served under
+`/ursa`; a Cloudflare Worker is served from `/`. That prefix reaches links in three places —
+components (`src/lib/url.ts`), markdown (the rehype plugin) and the sitemap — so it is a build
+parameter rather than a constant, and each target picks it with its own config file.
+
+| Target | Build | Base |
+|---|---|---|
+| GitHub Pages | `npm run build` (`astro.config.mjs`) | `/ursa` |
+| Cloudflare Workers | `npm run build:cf` (`astro.config.cloudflare.mjs`) | `/` |
+
+### Cloudflare Workers
+
+Workers rather than Pages: Cloudflare now points new projects at Workers, and Static Assets is the
+supported way to host a build output there. Pages still works — it is just no longer where the
+platform adds features.
+
+```bash
+npm run preview:cf   # build for the root path, serve it with a local workerd
+npm run deploy       # build, then publish
+```
+
+`wrangler.jsonc` configures an **assets-only** Worker: no `main`, no server-side code, `dist/`
+served straight from the edge. `html_handling: "drop-trailing-slash"` matches the unslashed form
+every internal link uses, so navigation costs no redirects; `not_found_handling: "404-page"`
+serves the built 404 rather than falling through to `index.html` and returning 200 for a URL that
+does not exist.
+
+Deploying needs a Cloudflare credential — `wrangler login` locally, or `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` in CI. Once the worker has a real hostname, set `SITE_URL` so canonical
+tags and the sitemap point at it:
+
+```bash
+SITE_URL=https://ursa.example.com npm run deploy
+```
+
+### GitHub Pages
+
+`.github/workflows/docs.yml` builds on every pull request touching this directory and deploys
+`main` to Pages. It needs Pages enabled with **source: GitHub Actions** in repository settings.
 
 ## Layout
 

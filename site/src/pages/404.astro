@@ -1,0 +1,80 @@
+---
+import Base from '../layouts/Base.astro';
+import { DOCS_NAV } from '../lib/site';
+import { url } from '../lib/url';
+---
+
+<Base
+  title="Not found"
+  description="No page at this address."
+>
+  <div class="w sec wrap">
+    <p class="cap code">404</p>
+    <h1>Below the limiting magnitude.</h1>
+    <p class="sub">
+      There is no page at this address. It may have moved, or it may never have been catalogued.
+    </p>
+
+    <div class="nav">
+      {
+        DOCS_NAV.map((section) => (
+          <div>
+            <p class="label">{section.title}</p>
+            <ul>
+              {section.items.map((item) => (
+                <li>
+                  <a href={url(item.href)}>{item.title}</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</Base>
+
+<style>
+  .wrap {
+    max-width: 900px;
+  }
+  .code {
+    color: var(--ink);
+  }
+  h1 {
+    font-size: clamp(30px, 5vw, 48px);
+    margin-top: 14px;
+    max-width: 18ch;
+  }
+  .sub {
+    margin-top: 18px;
+    font-size: 18px;
+    color: var(--ink-2);
+    max-width: 46ch;
+  }
+  .nav {
+    display: grid;
+    gap: 26px clamp(20px, 3vw, 44px);
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    margin-top: 46px;
+    padding-top: 26px;
+    border-top: 1px solid var(--rule);
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+    margin-top: 10px;
+  }
+  li + li {
+    margin-top: 5px;
+  }
+  li a {
+    font-size: 15.5px;
+    border-bottom: 0;
+    color: var(--ink-2);
+  }
+  li a:hover {
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+</style>

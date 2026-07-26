@@ -7,7 +7,10 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "check": "astro check"
+    "check": "astro check",
+    "build:cf": "astro build --config astro.config.cloudflare.mjs",
+    "preview:cf": "npm run build:cf && wrangler dev",
+    "deploy": "npm run build:cf && wrangler deploy"
   },
   "dependencies": {
     "@astrojs/mdx": "^7.0.3",
@@ -20,6 +23,7 @@
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.9",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "wrangler": "^4.114.0"
   }
 }
