@@ -1,0 +1,183 @@
+"""The canonical algorithm registry.
+
+Each entry fixes *one* definition of an algorithm — the same one every adapter
+must produce — so a cross-library disagreement is a real bug, never a config
+mismatch. The definitions are the ones already pinned against NetworkX in
+``tests/test_networkx_reference.py``:
+
+* **closeness** — out-edge ``reachable / Σ dist``, no Wasserman–Faust scaling
+  (``nx.closeness_centrality(G.reverse(), wf_improved=False)``);
+* **betweenness** — raw, unnormalised, no endpoints (``normalized=False``);
+* **triangle_count / clustering** — the *undirected* view of the edge list;
+* **pagerank** — damping 0.85, summing to 1;
+* **connected_components** — weak components (labels arbitrary; compared as a
+  partition, not by value).
+
+``compare`` names the correctness check in :mod:`ursa_bench.correctness`. ``view``
+tells reference builders whether the algorithm reads the graph as directed or as
+its undirected projection. ``params`` are the canonical parameters every adapter
+passes through (translated to each library's spelling inside its adapter).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class Algorithm:
+    name: str
+    description: str
+    view: str  # "directed" | "undirected" — how the reference reads the edge list
+    compare: (
+        str  # correctness check tag: "value_map" | "int_map" | "partition" | "modularity" | "topk"
+    )
+    params: dict = field(default_factory=dict)
+    tol: float = 1e-6  # absolute tolerance for value_map comparisons
+    weighted: bool = False  # reads the dataset's `weight` column as edge cost/strength
+
+
+REGISTRY: dict[str, Algorithm] = {
+    "pagerank": Algorithm(
+        name="pagerank",
+        description="PageRank (damping 0.85), stationary distribution summing to 1.",
+        view="directed",
+        compare="value_map",
+        params={"damping": 0.85, "max_iter": 100, "tol": 1e-6},
+        # Timing uses a realistic fixed iteration budget (max_iter=100), so three
+        # implementations converge to *slightly* different points — cross-library
+        # drift is ~5e-5 here. 1e-4 accommodates that while still catching a real
+        # bug (wrong damping/normalisation shifts values by 1e-3 or more).
+        tol=1e-4,
+    ),
+    "betweenness": Algorithm(
+        name="betweenness",
+        description="Raw (unnormalised) shortest-path betweenness centrality, no endpoints.",
+        view="directed",
+        compare="value_map",
+        params={},
+        tol=1e-6,
+    ),
+    "closeness": Algorithm(
+        name="closeness",
+        description="Out-edge closeness, reachable/Σdist, no Wasserman-Faust scaling.",
+        view="directed",
+        compare="value_map",
+        params={},
+        tol=1e-9,
+    ),
+    "triangle_count": Algorithm(
+        name="triangle_count",
+        description="Per-node triangle count on the undirected view.",
+        view="undirected",
+        compare="int_map",
+        params={},
+    ),
+    "connected_components": Algorithm(
+        name="connected_components",
+        description="Weak connected components (component id per node; labels arbitrary).",
+        view="undirected",
+        compare="partition",
+        params={},
+    ),
+    "degree": Algorithm(
+        name="degree",
+        description="Total degree per node.",
+        view="directed",
+        compare="int_map",
+        params={"direction": "both"},
+    ),
+    # directed degree variants — in/out matter only on a directed graph
+    "degree_in": Algorithm(
+        name="degree_in",
+        description="In-degree per node (directed).",
+        view="directed",
+        compare="int_map",
+        params={"direction": "in"},
+    ),
+    "degree_out": Algorithm(
+        name="degree_out",
+        description="Out-degree per node (directed).",
+        view="directed",
+        compare="int_map",
+        params={"direction": "out"},
+    ),
+    "clustering_coefficient": Algorithm(
+        name="clustering_coefficient",
+        description="Local clustering coefficient per node, on the undirected view.",
+        view="undirected",
+        compare="value_map",
+        params={},
+        tol=1e-9,
+    ),
+    "louvain": Algorithm(
+        name="louvain",
+        description="Louvain community detection (undirected); compared by modularity.",
+        view="undirected",
+        compare="modularity",
+        params={"resolution": 1.0, "seed": 1},
+    ),
+    "label_propagation": Algorithm(
+        name="label_propagation",
+        description="Label-propagation communities (undirected); compared by modularity.",
+        view="undirected",
+        compare="modularity",
+        params={"seed": 1},
+    ),
+    # --- weighted variants (read the dataset's `weight` column) --------------
+    # Ursa's differentiator: weight is a per-op *expression* over edge columns.
+    # networkx/igraph take an edge weight; rustworkx weights only PageRank, so
+    # weighted closeness/betweenness surface as honest `unsupported` gaps there.
+    "pagerank_weighted": Algorithm(
+        name="pagerank_weighted",
+        description="PageRank with edge weights as transition strength.",
+        view="directed",
+        compare="value_map",
+        params={"damping": 0.85, "max_iter": 100, "tol": 1e-6},
+        tol=1e-4,
+        weighted=True,
+    ),
+    "closeness_weighted": Algorithm(
+        name="closeness_weighted",
+        description="Out-edge closeness with edge weights as distance (Dijkstra).",
+        view="directed",
+        compare="value_map",
+        params={},
+        tol=1e-6,
+        weighted=True,
+    ),
+    "betweenness_weighted": Algorithm(
+        name="betweenness_weighted",
+        description="Raw betweenness with edge weights as distance (Dijkstra-Brandes).",
+        view="directed",
+        compare="value_map",
+        params={},
+        tol=1e-6,
+        weighted=True,
+    ),
+    # --- end-to-end pipeline workloads ---------------------------------------
+    # Not a single kernel: a realistic *composed* query. Ursa runs it as one
+    # `collect()` over Arrow; the others build the graph, compute, then filter /
+    # sort / top-K in Python. This is the workload Ursa is actually designed for —
+    # single-kernel benchmarks measure it on the competition's turf, not its own.
+    "pipeline_influencers": Algorithm(
+        name="pipeline_influencers",
+        description="Top-K nodes by PageRank among those with in-degree >= threshold.",
+        view="directed",
+        compare="topk",
+        params={"damping": 0.85, "max_iter": 100, "tol": 1e-6, "min_in_degree": 3, "top_k": 20},
+    ),
+}
+
+
+def get(name: str) -> Algorithm:
+    try:
+        return REGISTRY[name]
+    except KeyError:
+        raise KeyError(
+            f"unknown algorithm {name!r}; known: {', '.join(sorted(REGISTRY))}"
+        ) from None
+
+
+def names() -> list[str]:
+    return list(REGISTRY)

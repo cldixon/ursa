@@ -1,0 +1,9 @@
+# Materialised datasets (synthetic builds + downloaded real graphs) — large,
+# reproducible from the catalog, never committed.
+data/
+
+# Raw results are machine-specific; a run writes them here. Commit curated
+# leaderboards (Markdown), not per-box Parquet.
+results/*.parquet
+
+__pycache__/

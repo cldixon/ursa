@@ -152,9 +152,14 @@ Next, in rough priority order:
    `neighbors().agg` into a segmented CSR reduction. (The topology index is now
    built once and shared across ops over a frame — the index-preservation
    contract — which is the seam these rules register on.)
-3. **Breadth** — benchmarks vs NetworkX/rustworkx/igraph, a published docs site.
-   (String/UUID node ids alongside int64 are already supported, auto-detected
-   from the column type.)
+3. **Breadth** — a published docs site, and broadening the benchmark coverage.
+   The cross-library **benchmark flywheel** is live in
+   [`benchmarks/`](benchmarks/) — a `typer`/`rich` CLI that races Ursa against
+   NetworkX, rustworkx, and igraph across nine algorithms, separates cold
+   end-to-end from warm kernel time, cross-checks every result against the
+   NetworkX oracle, and writes raw rows to Parquet so leaderboards and gap-hunting
+   are re-renderable downstream steps. (String/UUID node ids alongside int64 are
+   already supported, auto-detected from the column type.)
 
 ## License
 

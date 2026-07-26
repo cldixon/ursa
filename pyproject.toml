@@ -61,6 +61,19 @@ dev = [
     # marker below would otherwise exclude it.
     "typing-extensions>=4.0",
 ]
+# The cross-library benchmark harness (benchmarks/ursa_bench) and the comparison
+# libraries it races Ursa against. Kept OUT of the default dev env on purpose —
+# `uv sync --group bench` opts in, so a plain `uv sync` (and CI's core jobs) stay
+# lean. rustworkx (a Rust/PyO3 core) is the honest "real bar"; networkx is the
+# correctness oracle / floor; typer+rich back the CLI.
+bench = [
+    "typer>=0.12",
+    "rich>=13.0",
+    "rustworkx>=0.15",
+    "igraph>=0.11",
+    "networkx>=3.0",
+    "pyarrow>=15.0",
+]
 
 [tool.uv]
 # Build/install the maturin extension in editable mode on `uv sync` so the native
@@ -106,6 +119,13 @@ select = [
 # The public API deliberately mirrors the spec's names, which shadow builtins:
 # `ur.id()`, `scan_nodes(id=...)`, `from_polars(id=...)`. Allowed by design.
 ignore = ["A001", "A002", "A004"]
+
+[tool.ruff.lint.per-file-ignores]
+# The benchmark tool (a separate, opt-in package) intentionally uses:
+#  - B008: typer's `param = typer.Option(...)` default-value idiom;
+#  - RUF001/002/003: unicode in human-facing text (× ≈ µs ✗ and accented graph-
+#    model names like Erdős–Rényi / Barabási–Albert) that reads better than ASCII.
+"benchmarks/**" = ["B008", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["ursa"]

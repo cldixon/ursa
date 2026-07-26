@@ -112,3 +112,14 @@ jobs:
 
       - name: pytest
         run: uv run --no-sync pytest
+
+      # Benchmark-harness smoke: prove the cross-library flywheel still runs and
+      # Ursa agrees with the NetworkX oracle on a tiny graph. Only on one leg —
+      # it reuses the extension already built above and just adds the bench group
+      # (typer/rich/rustworkx/networkx). Full benchmark runs happen off-CI on a
+      # real box; this only guards the harness from bit-rotting.
+      - name: Benchmark harness smoke
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: |
+          uv sync --locked --group bench
+          uv run --no-sync --group bench python benchmarks smoke
