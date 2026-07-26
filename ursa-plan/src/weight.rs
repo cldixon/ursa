@@ -38,58 +38,66 @@ fn is_numeric(dt: &DataType) -> bool {
     )
 }
 
-/// Evaluate the JSON-serialized weight expression against the edge batch, returning
-/// one `f64` per edge row (in the batch's row order). Errors if the expression is
-/// unsupported, references an unknown column, produces a non-numeric result, or
-/// yields any null or negative weight (weights must be non-negative — Dijkstra's
-/// requirement, and negatives are meaningless for weighted PageRank too).
-pub fn evaluate_weight(edges: &RecordBatch, weight_json: &str) -> Result<Vec<f64>> {
+/// Evaluate the JSON-serialized weight expression against the edge **batch stream**,
+/// returning one `f64` per edge row, concatenated in the input batch order. The
+/// edge table crosses the FFI as a list of batches (never concatenated into one),
+/// so each is evaluated in turn and its weights appended — the `f64` output aligns
+/// with the CSR's `edge_ids` because that same batch order built the topology.
+///
+/// Errors if the expression is unsupported, references an unknown column, produces
+/// a non-numeric result, or yields any null or negative weight (weights must be
+/// non-negative — Dijkstra's requirement, and negatives are meaningless for
+/// weighted PageRank too).
+pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f64>> {
     let value: serde_json::Value = serde_json::from_str(weight_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid weight expression JSON: {e}")))?;
     let expr = parse_ursa_expr(&value)?;
     let df_expr = lower(&expr)?;
 
     let column = crate::runtime::block_on(async move {
+        let total: usize = edges.iter().map(|b| b.num_rows()).sum();
+        let mut out = Vec::with_capacity(total);
         let ctx = SessionContext::new();
-        let df = ctx
-            .read_batch(edges.clone())?
-            .select(vec![df_expr.alias("__ursa_weight")])?;
-        let batches = df.collect().await?;
-        // Branch on the *declared* result type, not on cast success: casting a
-        // non-numeric column (e.g. a string weight= ur.col("region")) to Float64
-        // silently yields nulls, which would misreport as "produced a null value".
-        if let Some(first) = batches.first() {
-            let dt = first.column(0).data_type();
-            if !is_numeric(dt) {
-                return Err(DataFusionError::Execution(format!(
-                    "weight expression must be numeric; it produced a column of type {dt:?} \
-                     (a string or other non-numeric column cannot be a weight)"
-                )));
-            }
-        }
-        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let mut out = Vec::with_capacity(n);
-        for batch in &batches {
-            let col = cast(batch.column(0), &DataType::Float64)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            let col = col
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("cast to Float64 yields Float64Array");
-            for i in 0..col.len() {
-                if col.is_null(i) {
-                    return Err(DataFusionError::Execution(
-                        "weight expression produced a null value; weights must be non-null".into(),
-                    ));
-                }
-                let w = col.value(i);
-                if w < 0.0 {
+        for edge_batch in edges {
+            let df = ctx
+                .read_batch(edge_batch.clone())?
+                .select(vec![df_expr.clone().alias("__ursa_weight")])?;
+            let result = df.collect().await?;
+            // Branch on the *declared* result type, not on cast success: casting a
+            // non-numeric column (e.g. a string weight= ur.col("region")) to Float64
+            // silently yields nulls, which would misreport as "produced a null value".
+            if let Some(first) = result.first() {
+                let dt = first.column(0).data_type();
+                if !is_numeric(dt) {
                     return Err(DataFusionError::Execution(format!(
-                        "weight expression produced a negative value ({w}); weights must be \
-                         non-negative"
+                        "weight expression must be numeric; it produced a column of type {dt:?} \
+                         (a string or other non-numeric column cannot be a weight)"
                     )));
                 }
-                out.push(w);
+            }
+            for batch in &result {
+                let col = cast(batch.column(0), &DataType::Float64)
+                    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                let col = col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("cast to Float64 yields Float64Array");
+                for i in 0..col.len() {
+                    if col.is_null(i) {
+                        return Err(DataFusionError::Execution(
+                            "weight expression produced a null value; weights must be non-null"
+                                .into(),
+                        ));
+                    }
+                    let w = col.value(i);
+                    if w < 0.0 {
+                        return Err(DataFusionError::Execution(format!(
+                            "weight expression produced a negative value ({w}); weights must be \
+                             non-negative"
+                        )));
+                    }
+                    out.push(w);
+                }
             }
         }
         Ok::<Vec<f64>, DataFusionError>(out)
@@ -124,7 +132,7 @@ mod tests {
         let json = r#"{"kind":"binary","op":"*",
             "left":{"kind":"col","name":"amount"},
             "right":{"kind":"col","name":"fx"}}"#;
-        let w = evaluate_weight(&edge_batch(), json).unwrap();
+        let w = evaluate_weight(&[edge_batch()], json).unwrap();
         assert_eq!(w, vec![3.0, 6.0, 5.0]);
     }
 
@@ -133,8 +141,42 @@ mod tests {
         let json = r#"{"kind":"binary","op":"+",
             "left":{"kind":"col","name":"amount"},
             "right":{"kind":"lit","value":10}}"#;
-        let w = evaluate_weight(&edge_batch(), json).unwrap();
+        let w = evaluate_weight(&[edge_batch()], json).unwrap();
         assert_eq!(w, vec![12.0, 13.0, 15.0]);
+    }
+
+    #[test]
+    fn evaluates_across_multiple_batches_in_order() {
+        // The same three edges split across two batches must produce the same
+        // per-row weights, concatenated in batch order (the alignment the CSR's
+        // edge_ids relies on).
+        let b0 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Int64, false),
+                Field::new("fx", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 3])),
+                Arc::new(Float64Array::from(vec![1.5, 2.0])),
+            ],
+        )
+        .unwrap();
+        let b1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Int64, false),
+                Field::new("fx", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![5])),
+                Arc::new(Float64Array::from(vec![1.0])),
+            ],
+        )
+        .unwrap();
+        let json = r#"{"kind":"binary","op":"*",
+            "left":{"kind":"col","name":"amount"},
+            "right":{"kind":"col","name":"fx"}}"#;
+        let w = evaluate_weight(&[b0, b1], json).unwrap();
+        assert_eq!(w, vec![3.0, 6.0, 5.0]);
     }
 
     #[test]
@@ -142,13 +184,13 @@ mod tests {
         let json = r#"{"kind":"binary","op":"-",
             "left":{"kind":"col","name":"amount"},
             "right":{"kind":"lit","value":10}}"#;
-        assert!(evaluate_weight(&edge_batch(), json).is_err());
+        assert!(evaluate_weight(&[edge_batch()], json).is_err());
     }
 
     #[test]
     fn errors_on_unknown_column() {
         let json = r#"{"kind":"col","name":"nope"}"#;
-        assert!(evaluate_weight(&edge_batch(), json).is_err());
+        assert!(evaluate_weight(&[edge_batch()], json).is_err());
     }
 
     #[test]
@@ -165,7 +207,7 @@ mod tests {
             vec![Arc::new(arrow::array::StringArray::from(vec!["us", "eu"]))],
         )
         .unwrap();
-        let err = evaluate_weight(&batch, r#"{"kind":"col","name":"region"}"#).unwrap_err();
+        let err = evaluate_weight(&[batch], r#"{"kind":"col","name":"region"}"#).unwrap_err();
         assert!(err.to_string().contains("must be numeric"), "got: {err}");
     }
 }

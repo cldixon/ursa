@@ -29,6 +29,21 @@ pub fn build_topology(
     Ok((Arc::new(topo), Arc::new(ids)))
 }
 
+/// Build the topology from a **stream of `(src, dst)` chunk pairs**, interning
+/// across all chunks without first concatenating them into one contiguous batch.
+/// This is the streaming ingress path used across the FFI: a scan's collected
+/// batches (or an in-memory table's chunks) feed the CSR one at a time, so the
+/// ingest never pays the transient ~2× spike that a `concat_batches` of the whole
+/// edge table would cost at the 500M-edge target. Semantics are otherwise
+/// identical to [`build_topology`] (same errors, same dense ordering).
+pub fn build_topology_batches(
+    chunks: &[(&dyn Array, &dyn Array)],
+) -> Result<(Arc<Topology>, Arc<IdMap>), IdError> {
+    let (ids, src_dense, dst_dense) = IdMap::from_edge_batches(chunks)?;
+    let topo = Topology::build(ids.len(), src_dense, dst_dense);
+    Ok((Arc::new(topo), Arc::new(ids)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

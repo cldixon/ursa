@@ -82,12 +82,17 @@ def _expr_columns(expr: Any) -> set[str]:
 
 
 def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
-    """The edge attribute batch (a pyarrow RecordBatch) for evaluating a weight
-    expression, aligned to the graph's edge-row order.
+    """The edge attribute table (a **list** of pyarrow RecordBatches) for evaluating
+    a weight expression, aligned to the graph's edge-row order.
+
+    The edge table crosses the FFI as a batch list (never concatenated into one
+    contiguous batch, #60); ``evaluate_weight`` streams the batches in order, and
+    that order matches the topology's ``edge_ids`` because the *same* batch order
+    built the index.
 
     For a ``scan_edges`` frame this does **one** scan projecting ``src``, ``dst``
     and the weight columns together, and builds (memoizes) the frame's topology
-    index from that same batch's endpoints. Reading endpoints and weights in the
+    index from those same batches' endpoints. Reading endpoints and weights in the
     same scan is what makes ``weights[edge_ids[k]]`` correct: a second, independent
     scan could order partitions differently (globs/multi-partition listing order is
     not a DataFusion contract), silently misaligning every weighted result (#37).
@@ -104,8 +109,9 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
             raise ColumnNotFoundError(
                 f"weight expression references unknown edge column(s): {missing}"
             )
-        batches = table.select(cols).combine_chunks().to_batches()
-        return batches[0] if batches else None
+        # The full in-memory edge table shares its row order with the endpoints the
+        # index was built from, so its chunks (in order) align with edge_ids.
+        return table.select(cols).to_batches()
     scan = getattr(edges, "_scan_spec", None)
     if scan is not None:
         path = scan["path"]
@@ -113,15 +119,15 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
             raise NotImplementedError(
                 "weighted algorithms over a multi-path scan_edges source are not supported yet."
             )
-        # One scan → [src, dst, *cols]. Build the index from THIS batch's endpoints
-        # so weights and edge_ids share a single, self-consistent edge order,
-        # overwriting any index memoized from an earlier endpoints-only scan.
+        # One scan → a batch list of [src, dst, *cols]. Build the index from THESE
+        # batches' endpoints so weights and edge_ids share a single, self-consistent
+        # edge order, overwriting any index memoized from an earlier scan.
         combined = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
         )
         cell = edges._index_build_cell
         with cell.lock:
-            cell.value = _native().build_index(combined.column(0), combined.column(1))
+            cell.value = _native().build_index(combined)
         return combined
     raise NotImplementedError(
         "a weighted algorithm needs an in-memory or scan_edges source so the weight "
@@ -260,16 +266,21 @@ def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
 
 
 def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
-    """The node attribute table as a RecordBatch: an in-memory ``from_arrow`` table
-    if present, else a ``scan_nodes`` file source materialized through a DataFusion
-    scan. ``edges.nodes()``-derived frames have neither and return ``None``.
+    """The node attribute table as a chunked ``pyarrow.Table``: an in-memory
+    ``from_arrow`` table if present, else a ``scan_nodes`` file source materialized
+    through a DataFusion scan. ``edges.nodes()``-derived frames have neither and
+    return ``None``.
 
-    A scan-backed source is read from disk **once** and memoized on the frame's
-    shared attribute cell, so repeated collects (and ``_resolve_seeds``) over one
-    node file don't re-scan it each time."""
+    The scan returns a **list** of RecordBatches (never concatenated, #60); this
+    assembles them into one chunked Table. A scan-backed source is read from disk
+    **once** and the Table memoized on the frame's shared attribute cell, so
+    repeated collects (and ``_resolve_seeds``) over one node file don't re-scan it."""
+    import pyarrow as pa
+
     inmem = getattr(frame, "_attr_table", None)
     if inmem is not None:
-        return inmem
+        # In-memory source is a single RecordBatch; wrap as a one-chunk Table.
+        return pa.Table.from_batches([inmem])
     scan = getattr(frame, "_scan_spec", None)
     if scan is not None:
         path = scan["path"]
@@ -279,15 +290,16 @@ def _resolve_node_attr_table(frame: NodeFrame) -> Any | None:
                 "(glob included) for now, not a list of paths."
             )
         cell = frame._attr_build_cell
-        batch = cell.value
-        if batch is not None:
-            return batch
+        table = cell.value
+        if table is not None:
+            return table
         with cell.lock:
-            batch = cell.value
-            if batch is None:
-                batch = _native().scan_nodes_arrow(path, scan["id"], _scan_storage_options(scan))
-                cell.value = batch
-        return batch
+            table = cell.value
+            if table is None:
+                batches = _native().scan_nodes_arrow(path, scan["id"], _scan_storage_options(scan))
+                table = pa.Table.from_batches(batches)
+                cell.value = table
+        return table
     return None
 
 
@@ -407,7 +419,7 @@ def _resolve_seeds(seeds: Any) -> Any:
         # A plain attribute table yields its ids directly; a derived frame
         # (filtered / computed) must be executed to get them.
         if attr is not None:
-            tbl = pa.Table.from_batches([attr])
+            tbl = attr  # a (chunked) pyarrow.Table
         else:
             try:
                 tbl = seeds.collect().to_arrow()
@@ -452,10 +464,12 @@ def _run_query(
     edge_attr: Any | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
-    batch = _native().run_node_query(
-        index, json.dumps(columns), filters, sort, limit, nodes, nodes_id, edge_attr
+    # The node attribute table crosses the FFI as a batch list (not one batch).
+    nodes_batches = nodes.to_batches() if nodes is not None else None
+    batches = _native().run_node_query(
+        index, json.dumps(columns), filters, sort, limit, nodes_batches, nodes_id, edge_attr
     )
-    return MaterializedFrame(batch)
+    return MaterializedFrame(batches)
 
 
 def _add_weight(column: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -554,14 +568,20 @@ def _single_edges(exprs: Any) -> Any:
     return edges
 
 
-def _require_edges(edges: EdgeFrame | None) -> tuple[Any, Any]:
-    """Resolve an EdgeFrame to (src, dst) int64 Arrow arrays, or raise clearly."""
+def _require_edges(edges: EdgeFrame | None) -> list[Any]:
+    """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
+    (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
+    clearly. The list is fed to the CSR build as a stream — never concatenated into
+    one contiguous batch first (#60)."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
 
     arrays = getattr(edges, "_edge_arrays", None)
     if arrays is not None:
-        return arrays
+        import pyarrow as pa
+
+        src, dst = arrays
+        return [pa.RecordBatch.from_arrays([src, dst], ["src", "dst"])]
 
     scan = getattr(edges, "_scan_spec", None)
     if scan is not None:
@@ -571,10 +591,11 @@ def _require_edges(edges: EdgeFrame | None) -> tuple[Any, Any]:
                 "collect() over a scan_edges source supports a single string path "
                 "(glob included) for now, not a list of paths."
             )
-        batch = _native().scan_edges_arrow(
+        # The scan returns a list of [src, dst] batches; build_index reads columns
+        # 0/1 of each, so it is passed straight through.
+        return _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan)
         )
-        return batch.column(0), batch.column(1)
 
     # No source: give a message matched to *why* it's missing, not a generic one.
     ops = {step.op for step in getattr(edges, "_plan", ())}
@@ -612,8 +633,8 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     with cell.lock:
         idx = cell.value
         if idx is None:
-            src, dst = _require_edges(edges)
-            idx = _native().build_index(src, dst)
+            edge_batches = _require_edges(edges)
+            idx = _native().build_index(edge_batches)
             cell.value = idx
     return idx
 
@@ -687,28 +708,12 @@ def _apply_pyarrow_tail(
     return table
 
 
-def _table_to_batch(table: Any) -> Any:
-    """A single pyarrow RecordBatch for a (possibly multi-chunk or empty) Table."""
-    import pyarrow as pa
-
-    table = table.combine_chunks()
-    batches = table.to_batches()
-    if batches:
-        return batches[0]
-    # zero-row result: an empty batch that still carries the schema
-    return pa.RecordBatch.from_arrays(
-        [pa.array([], type=field.type) for field in table.schema], schema=table.schema
-    )
-
-
 def _collect_plain_nodes(
     frame: NodeFrame,
     filters: list[tuple[str, str, float]],
     sort: tuple[str, bool] | None,
     limit: int | None,
 ) -> MaterializedFrame:
-    import pyarrow as pa
-
     attr = _resolve_node_attr_table(frame)
     if attr is None:
         raise NotImplementedError(
@@ -716,8 +721,9 @@ def _collect_plain_nodes(
             "or a with_columns of graph algorithms; a bare edges.nodes() has no "
             "materializable node set yet."
         )
-    table = _apply_pyarrow_tail(pa.Table.from_batches([attr]), filters, sort, limit)
-    return MaterializedFrame(_table_to_batch(table))
+    # `attr` is a (chunked) pyarrow.Table.
+    table = _apply_pyarrow_tail(attr, filters, sort, limit)
+    return MaterializedFrame(table)
 
 
 def _collect_plain_edges(
@@ -738,15 +744,15 @@ def _collect_plain_edges(
                     "collect() over a scan_edges source supports a single string path "
                     "(glob included) for now, not a list of paths."
                 )
-            batch = _native().scan_edges_arrow(
+            batches = _native().scan_edges_arrow(
                 path, scan["src"], scan["dst"], _scan_storage_options(scan), []
             )
-            table = pa.Table.from_batches([batch]).rename_columns([scan["src"], scan["dst"]])
+            table = pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
         else:
             # No source: a filtered/derived (or traversal-result) edge frame.
             _require_edges(frame)  # raises the precise, plan-aware message
     table = _apply_pyarrow_tail(table, filters, sort, limit)
-    return MaterializedFrame(_table_to_batch(table))
+    return MaterializedFrame(table)
 
 
 def _native() -> Any:
