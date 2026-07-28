@@ -219,7 +219,7 @@ impl ExecutionPlan for HopExec {
 }
 
 /// A leaf `ExecutionPlan` that runs a `shortest_path` traversal and emits a single
-/// `(src, dst, hop)` edge `RecordBatch` of the path edges in order. Produced from a
+/// `(src, dst, hop, cost)` edge `RecordBatch` of the path edges in order. Produced from a
 /// [`crate::node::ShortestPathNode`] by [`crate::planner::GraphExtensionPlanner`].
 #[derive(Debug)]
 pub struct ShortestPathExec {

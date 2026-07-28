@@ -167,10 +167,13 @@ def shortest_path(
     weight: Expr | None = None,
     direction: str = "out",
 ) -> EdgeFrame:
-    """Single-pair shortest path. Returns an EdgeFrame ``(src, dst, hop)``: one row
-    per edge on the path, in order, with ``hop`` the 0-based position. ``weight``
+    """Single-pair shortest path. Returns an EdgeFrame ``(src, dst, hop, cost)``: one
+    row per edge on the path, in order, with ``hop`` the 0-based position and ``cost``
+    the cumulative path cost from ``source`` to that edge's destination. ``weight``
     selects minimum-cost (Dijkstra) over the edge-weight expression; omit it for
-    unweighted BFS. (The per-edge cost is not yet returned as a column.)"""
+    unweighted BFS. For a weighted path ``cost`` is the summed edge weight (so the
+    final row's ``cost`` is the total path cost); for an unweighted path it is the
+    hop count (``hop + 1``), kept for schema uniformity."""
     step = _PlanStep(
         "shortest_path",
         {

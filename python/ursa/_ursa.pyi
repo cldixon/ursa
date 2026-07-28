@@ -56,7 +56,7 @@ def run_hop_query(
 ) -> Any: ...
 
 # A shortest_path traversal: a built index + 1-element source/target user-id
-# arrays (int64 or string) + direction + relational tail -> (src, dst, hop)
+# arrays (int64 or string) + direction + relational tail -> (src, dst, hop, cost)
 # list[pyarrow.RecordBatch] of the path edges.
 def run_path_query(
     index: GraphIndex,

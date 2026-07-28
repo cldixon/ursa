@@ -17,7 +17,7 @@ use ursa_core::algo::{
     betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_coefficient,
     connected_components_weak, degree, k_hop, label_propagation, louvain, louvain_weighted,
     neighbor_aggregate, pagerank, pagerank_weighted, random_walk, shortest_path,
-    shortest_path_weighted, triangle_count, AggKind, PageRankParams,
+    shortest_path_weighted_with_cost, triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -190,18 +190,21 @@ pub fn hop_batch(
     .map_err(|e| DataFusionError::ArrowError(e, None))
 }
 
-/// The output schema for a `shortest_path`: an edge frame `(src, dst, hop)` — one
-/// row per edge on the path, in order, with `hop` the 0-based position. `src`/`dst`
-/// carry the graph's user-id type; `hop` is Int64. All non-null.
+/// The output schema for a `shortest_path`: an edge frame `(src, dst, hop, cost)` —
+/// one row per edge on the path, in order, with `hop` the 0-based position and
+/// `cost` the cumulative path cost from the path source to that edge's destination.
+/// `src`/`dst` carry the graph's user-id type; `hop` is Int64; `cost` is Float64
+/// (weighted: summed edge weight; unweighted: the hop count `hop + 1`). All non-null.
 pub fn path_schema(id_type: DataType) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("src", id_type.clone(), false),
         Field::new("dst", id_type, false),
         Field::new("hop", DataType::Int64, false),
+        Field::new("cost", DataType::Float64, false),
     ]))
 }
 
-/// Materialize a `shortest_path`'s `(src, dst, hop)` batch: run the path kernel
+/// Materialize a `shortest_path`'s `(src, dst, hop, cost)` batch: run the path kernel
 /// (unweighted BFS, or weighted Dijkstra when `weights` is present) and zip the
 /// dense node sequence into consecutive edges (translated back to user ids). An
 /// unreachable target (or a trivial one-node path) yields an empty batch.
@@ -216,15 +219,28 @@ pub fn path_batch(
     let mut src_dense = Vec::new();
     let mut dst_dense = Vec::new();
     let mut hop = Vec::new();
-    let route = match weights {
-        Some(w) => shortest_path_weighted(topo, w, source, target, direction),
-        None => shortest_path(topo, source, target, direction),
+    let mut cost = Vec::new();
+    // Weighted paths carry per-node cumulative costs (Dijkstra's settled distances);
+    // unweighted paths derive the cost as the hop count (`hop + 1`) for schema
+    // uniformity, so `cost` is always present and downstream never special-cases it.
+    let (route, node_costs) = match weights {
+        Some(w) => match shortest_path_weighted_with_cost(topo, w, source, target, direction) {
+            Some((path, costs)) => (Some(path), Some(costs)),
+            None => (None, None),
+        },
+        None => (shortest_path(topo, source, target, direction), None),
     };
     if let Some(nodes) = route {
         for (i, window) in nodes.windows(2).enumerate() {
             src_dense.push(window[0]);
             dst_dense.push(window[1]);
             hop.push(i as i64);
+            // Cost to reach this edge's destination (`window[1]`, node index `i + 1`
+            // on the route). Weighted: the settled distance; unweighted: `i + 1`.
+            cost.push(match &node_costs {
+                Some(costs) => costs[i + 1],
+                None => (i + 1) as f64,
+            });
         }
     }
     RecordBatch::try_new(
@@ -233,6 +249,7 @@ pub fn path_batch(
             ids.gather_user(&src_dense),
             ids.gather_user(&dst_dense),
             Arc::new(Int64Array::from(hop)),
+            Arc::new(Float64Array::from(cost)),
         ],
     )
     .map_err(|e| DataFusionError::ArrowError(e, None))

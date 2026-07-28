@@ -32,7 +32,10 @@ mod rng;
 mod triangle;
 
 pub use betweenness::{betweenness, betweenness_weighted};
-pub use bfs::{bfs_distances, dijkstra_distances, shortest_path, shortest_path_weighted};
+pub use bfs::{
+    bfs_distances, dijkstra_distances, shortest_path, shortest_path_weighted,
+    shortest_path_weighted_with_cost,
+};
 pub use closeness::{closeness, closeness_weighted};
 pub use clustering::clustering_coefficient;
 pub use components::connected_components_weak;
