@@ -1,0 +1,33 @@
+name: Audit
+
+# Supply-chain gate for the Rust dependency tree: cargo-deny checks RUSTSEC
+# advisories, the license allow-list, and crate sources against Cargo.lock (config
+# in deny.toml). Kept in its own workflow — separate from the code gate in ci.yml —
+# so it stays fast and its weekly schedule doesn't drag the whole CI matrix along.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly run so a newly-published advisory against an unchanged Cargo.lock is
+  # caught between releases, not only when the lockfile next changes. Mondays 07:00
+  # UTC (mirrors the release.yml dry-run cadence).
+  schedule:
+    - cron: "0 7 * * 1"
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources bans
