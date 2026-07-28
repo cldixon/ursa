@@ -231,7 +231,13 @@ def pagerank(
 
 
 def connected_components(edges: EdgeFrame, mode: str = "weak") -> GraphExpr:
-    """Connected components. ``mode='weak'`` for v0.1 (``'strong'`` later)."""
+    """Connected components, one integer component label per node.
+
+    ``mode='weak'`` (default) treats edges as undirected: two nodes share a label if
+    a path connects them ignoring direction. ``mode='strong'`` returns strongly
+    connected components: two nodes share a label only if each is reachable from the
+    other following edge direction. Labels are arbitrary but stable ids (group nodes
+    by label to get the components)."""
     return _graph_expr("connected_components", edges=edges, mode=mode)
 
 

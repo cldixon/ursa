@@ -39,12 +39,21 @@ def test_select_on_traversal_narrows_output():
     assert df.columns == ["dst"]
 
 
-# --- #34: parameters accepted-and-ignored now raise ------------------------
 @native
-def test_connected_components_strong_raises():
-    edges = _edges()
-    with pytest.raises(NotImplementedError, match="strong"):
-        ur.connected_components(edges, mode="strong").collect()
+def test_connected_components_strong_partitions_by_reachability():
+    # cycle {0,1,2} plus a one-way edge 2->3: weakly one component, but strongly
+    # two — {0,1,2} are mutually reachable, {3} is a sink of its own.
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2, 2], "d": [1, 2, 0, 3]}), src="s", dst="d")
+    strong = {
+        r["id"]: r["connected_components"]
+        for r in ur.connected_components(edges, mode="strong").collect().to_dicts()
+    }
+    assert strong[0] == strong[1] == strong[2]
+    assert strong[3] != strong[0]
+    assert len(set(strong.values())) == 2
+    # ...whereas weak lumps all four together.
+    weak = {r["connected_components"] for r in ur.connected_components(edges).collect().to_dicts()}
+    assert len(weak) == 1
 
 
 @native

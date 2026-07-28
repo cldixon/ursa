@@ -15,9 +15,9 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
     betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_coefficient,
-    connected_components_weak, degree, k_hop, label_propagation, louvain, louvain_weighted,
-    neighbor_aggregate, pagerank, pagerank_weighted, random_walk, shortest_path,
-    shortest_path_weighted_with_cost, triangle_count, AggKind, PageRankParams,
+    connected_components_strong, connected_components_weak, degree, k_hop, label_propagation,
+    louvain, louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, random_walk,
+    shortest_path, shortest_path_weighted_with_cost, triangle_count, AggKind, PageRankParams,
 };
 use ursa_core::{Direction, IdMap, Topology};
 
@@ -100,8 +100,13 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> Arr
             };
             Arc::new(Float64Array::from(scores))
         }
-        GraphAlgo::ConnectedComponents { .. } => {
-            Arc::new(UInt32Array::from(connected_components_weak(topo)))
+        GraphAlgo::ConnectedComponents { strong } => {
+            let labels = if *strong {
+                connected_components_strong(topo)
+            } else {
+                connected_components_weak(topo)
+            };
+            Arc::new(UInt32Array::from(labels))
         }
         GraphAlgo::TriangleCount => Arc::new(UInt32Array::from(triangle_count(topo))),
         GraphAlgo::ClusteringCoefficient => {

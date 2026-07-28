@@ -41,7 +41,7 @@ pub enum GraphAlgo {
         tol: f64,
     },
     ConnectedComponents {
-        // "weak" for v0.1; "strong" later.
+        // false = weak (undirected union-find); true = strong (Tarjan SCC).
         strong: bool,
     },
     Degree {

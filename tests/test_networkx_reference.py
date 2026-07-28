@@ -112,6 +112,16 @@ def test_louvain_modularity_is_competitive_with_networkx():
     assert q_ours >= q_ref - 0.05, f"ours={q_ours:.4f} nx={q_ref:.4f}"
 
 
+def test_strong_components_match_networkx():
+    # SCC labels are arbitrary ids, so compare the induced partition (set of node
+    # sets) against NetworkX's strongly_connected_components on the same digraph.
+    gd, _, edges = _graph()
+    got = _rows(ur.connected_components(edges, mode="strong"), "connected_components")
+    ours = {frozenset(group) for group in _partition_communities(got)}
+    ref = {frozenset(int(n) for n in comp) for comp in nx.strongly_connected_components(gd)}
+    assert ours == ref
+
+
 def _partition_communities(labels: dict) -> list[set]:
     groups: dict = {}
     for node, label in labels.items():
