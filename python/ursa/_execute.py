@@ -576,15 +576,15 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     p = expr.payload
     column: dict[str, Any] = {"name": name, "kind": verb}
     if verb == "connected_components":
-        # Only weak components are wired; strong is a later release (SPEC). The
-        # Rust side hardcodes weak, so a non-weak mode must raise here rather than
-        # be silently computed as weak.
+        # weak = undirected union-find; strong = Tarjan SCC. Any other mode is a
+        # typo — raise rather than silently computing weak.
         mode = p.get("mode", "weak")
-        if mode != "weak":
+        if mode not in ("weak", "strong"):
             raise NotImplementedError(
-                f"connected_components(mode={mode!r}) is not supported yet; "
-                "only mode='weak' is wired."
+                f"connected_components(mode={mode!r}) is not supported; "
+                "use mode='weak' or mode='strong'."
             )
+        column["mode"] = mode
     if verb == "pagerank":
         column.update(
             damping=p.get("damping", 0.85),

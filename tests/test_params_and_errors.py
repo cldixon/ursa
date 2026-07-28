@@ -110,11 +110,12 @@ def test_empty_edge_frame_collects_to_an_empty_result():
     assert df.num_rows == 0
 
 
-def test_connected_components_strong_mode_is_rejected_not_ignored():
-    # honor-or-raise: only weak is wired; strong must raise, not silently run weak.
+def test_connected_components_unknown_mode_is_rejected_not_ignored():
+    # honor-or-raise: weak and strong are wired; any other mode must raise, not
+    # silently fall back to weak.
     edges = _edges([0, 1], [1, 0])
     with pytest.raises((NotImplementedError, ur.UrsaError, ValueError)):
-        ur.connected_components(edges, mode="strong").collect()
+        ur.connected_components(edges, mode="bogus").collect()
 
 
 # --- glob-path scans (#53.6) ------------------------------------------------

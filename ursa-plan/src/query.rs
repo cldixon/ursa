@@ -73,6 +73,9 @@ struct ColumnSpec {
     // weighted-algorithm field: the serialized weight expression (over edge cols).
     #[serde(default)]
     weight: Option<serde_json::Value>,
+    // connected_components mode: "weak" (default) or "strong".
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 impl ColumnSpec {
@@ -86,7 +89,9 @@ impl ColumnSpec {
             "degree" => GraphAlgo::Degree {
                 direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
             },
-            "connected_components" => GraphAlgo::ConnectedComponents { strong: false },
+            "connected_components" => GraphAlgo::ConnectedComponents {
+                strong: parse_cc_strong(self.mode.as_deref())?,
+            },
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
             "closeness" => GraphAlgo::Closeness,
@@ -108,6 +113,19 @@ impl ColumnSpec {
                 )))
             }
         })
+    }
+}
+
+/// `connected_components` mode → the `strong` flag. `None`/`"weak"` → weak
+/// (undirected) components; `"strong"` → strongly-connected components. The Python
+/// layer already validates the mode, so an unexpected value here is a hard error.
+fn parse_cc_strong(mode: Option<&str>) -> Result<bool> {
+    match mode.unwrap_or("weak") {
+        "weak" => Ok(false),
+        "strong" => Ok(true),
+        other => Err(DataFusionError::NotImplemented(format!(
+            "connected_components mode must be 'weak' or 'strong'; got {other:?}"
+        ))),
     }
 }
 

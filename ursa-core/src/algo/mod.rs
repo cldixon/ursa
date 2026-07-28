@@ -38,7 +38,7 @@ pub use bfs::{
 };
 pub use closeness::{closeness, closeness_weighted};
 pub use clustering::clustering_coefficient;
-pub use components::connected_components_weak;
+pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
 pub use hop::k_hop;
 pub use label_prop::label_propagation;
