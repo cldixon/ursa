@@ -76,6 +76,8 @@ def test_weighted_shortest_path_picks_cheaper_route():
     path = ur.shortest_path(edges, 0, 3, weight=ur.col("cost")).collect().to_dicts()
     assert [r["src"] for r in path] == [0, 1]
     assert [r["dst"] for r in path] == [1, 3]
+    # Cumulative cost to each edge's destination; total path cost is 2.0 (< direct 5).
+    assert [r["cost"] for r in path] == [1.0, 2.0]
 
 
 def test_weighted_pagerank_over_a_scan_source(tmp_path):

@@ -387,6 +387,8 @@ def test_shortest_path_returns_ordered_edges():
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
     rows = ur.shortest_path(edges, 0, 3).collect().to_dicts()
     assert [(r["src"], r["dst"], r["hop"]) for r in rows] == [(0, 1, 0), (1, 2, 1), (2, 3, 2)]
+    # Unweighted cost is the cumulative hop count (hop + 1), for schema uniformity.
+    assert [r["cost"] for r in rows] == [1.0, 2.0, 3.0]
 
 
 def test_shortest_path_unreachable_is_empty():
@@ -417,6 +419,9 @@ def test_shortest_path_weighted_takes_the_cheaper_route():
     )
     path = ur.shortest_path(edges, 0, 2, weight=ur.col("cost")).collect().to_dicts()
     assert [r["src"] for r in path] == [0, 1]
+    # cost is the cumulative Dijkstra distance to each edge's destination; the final
+    # row carries the total path cost (1 + 1 = 2), cheaper than the direct edge (5).
+    assert [r["cost"] for r in path] == [1.0, 2.0]
 
 
 def test_describe_summarizes_the_graph():

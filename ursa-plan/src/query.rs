@@ -452,7 +452,7 @@ pub fn execute_hop_query(
 
 /// Build and execute one `shortest_path` traversal as a single DataFusion plan.
 ///
-/// A [`ShortestPathNode`] emits the path's `(src, dst, hop)` edge frame; the same
+/// A [`ShortestPathNode`] emits the path's `(src, dst, hop, cost)` edge frame; the same
 /// optional relational tail as [`execute_hop_query`] runs on top. `source`/`target`
 /// are user ids; if either is unknown the result is an empty path. Pass `weight`
 /// (a serialized edge-weight expression) with the edge table for a minimum-cost
@@ -507,6 +507,7 @@ pub fn execute_path_query(
                 ids.gather_user(&[]),
                 ids.gather_user(&[]),
                 Arc::new(Int64Array::from(Vec::<i64>::new())),
+                Arc::new(Float64Array::from(Vec::<f64>::new())),
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(e, None))?;
@@ -916,17 +917,24 @@ mod tests {
                 execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false)
                     .unwrap(),
             );
-        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["src", "dst", "hop"]);
+        assert_eq!(names, vec!["src", "dst", "hop", "cost"]);
         let hop = batch
             .column(2)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(hop.values(), &[0, 1, 2]);
+        // Unweighted path: cost is the cumulative hop count (hop + 1).
+        let cost = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(cost.values(), &[1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -941,7 +949,7 @@ mod tests {
                 execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false)
                     .unwrap(),
             );
-        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 0);
     }
 

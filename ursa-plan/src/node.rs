@@ -238,7 +238,7 @@ impl UserDefinedLogicalNodeCore for HopNode {
 /// The custom logical node for a `shortest_path` traversal.
 ///
 /// A sibling of [`HopNode`]: another leaf node with a baked-in source/target
-/// (dense indices) that emits an **edge** frame — here `(src, dst, hop)`, the
+/// (dense indices) that emits an **edge** frame — here `(src, dst, hop, cost)`, the
 /// edges of the single source→target path in order. `weights` (per edge row,
 /// gathered via `edge_ids`) selects weighted Dijkstra; `None` is unweighted BFS.
 /// Lowered to `crate::physical::ShortestPathExec`.
