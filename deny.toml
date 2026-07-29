@@ -46,6 +46,11 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "CC0-1.0",
+    # Permissive compression/hasher backends pulled transitively by parquet/
+    # DataFusion's codecs and hashbrown: zlib-rs + miniz_oxide (Zlib), libbz2-rs-sys
+    # (bzip2-1.0.6), foldhash (Zlib). Both are OSI/FSF-approved permissive licenses.
+    "Zlib",
+    "bzip2-1.0.6",
 ]
 
 [bans]
