@@ -171,16 +171,16 @@ pub fn scan_edges_batch(
                 continue; // drop empty batches; the non-empty guard above ensures ≥1 remains
             }
             let src_c = cast(batch.column(0), &src_type)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             let dst_c = cast(batch.column(1), &dst_type)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             let mut columns = vec![src_c, dst_c];
             for i in 2..batch.num_columns() {
                 columns.push(batch.column(i).clone());
             }
             out.push(
                 RecordBatch::try_new(out_schema.clone(), columns)
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?,
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
             );
         }
         Ok(out)
@@ -274,10 +274,10 @@ pub fn scan_nodes_batch(
             }
             let mut columns = batch.columns().to_vec();
             columns[id_idx] = cast(&columns[id_idx], &id_type)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             out.push(
                 RecordBatch::try_new(out_schema.clone(), columns)
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?,
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
             );
         }
         Ok(out)

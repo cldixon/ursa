@@ -77,7 +77,7 @@ pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f
             }
             for batch in &result {
                 let col = cast(batch.column(0), &DataType::Float64)
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 let col = col
                     .as_any()
                     .downcast_ref::<Float64Array>()

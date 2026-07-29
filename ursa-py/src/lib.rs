@@ -6,7 +6,7 @@
 //!
 //! ## Two rules this layer enforces (spec §Runtime integration)
 //!
-//! 1. **Release the GIL** for the duration of execution (`py.allow_threads`).
+//! 1. **Release the GIL** for the duration of execution (`py.detach`).
 //! 2. **Arrow FFI via the PyCapsule interface** for zero-copy exchange with
 //!    polars/pyarrow — ingress (`FromPyArrow`) and egress (`ToPyArrow`).
 //!
@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch};
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow_pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
@@ -131,7 +131,7 @@ struct GraphIndex {
 #[pyfunction]
 fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex> {
     let batches = Vec::<RecordBatch>::from_pyarrow_bound(edges)?;
-    let (topo, ids) = py.allow_threads(move || {
+    let (topo, ids) = py.detach(move || {
         let pairs: Vec<(&dyn Array, &dyn Array)> = batches
             .iter()
             .map(|b| (b.column(0).as_ref(), b.column(1).as_ref()))
@@ -166,7 +166,7 @@ fn run_node_query(
     nodes: Option<Bound<'_, PyAny>>,
     nodes_id: Option<String>,
     edges: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
     let comparisons: Vec<Comparison> = filters
@@ -184,7 +184,7 @@ fn run_node_query(
         Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_node_query(
             topo,
             ids,
@@ -198,7 +198,7 @@ fn run_node_query(
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Execute a `hop` traversal and return its `(src, dst)` edge batch as pyarrow.
@@ -220,7 +220,7 @@ fn run_hop_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let seeds = array_from_pyarrow(seeds)?;
     let direction = direction.to_string();
@@ -228,7 +228,7 @@ fn run_hop_query(
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_hop_query(
             topo,
             ids,
@@ -242,7 +242,7 @@ fn run_hop_query(
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Execute a `shortest_path` traversal and return its `(src, dst, hop)` path batch
@@ -266,7 +266,7 @@ fn run_path_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let source = array_from_pyarrow(source)?;
     let target = array_from_pyarrow(target)?;
@@ -280,7 +280,7 @@ fn run_path_query(
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_path_query(
             topo,
             ids,
@@ -296,7 +296,7 @@ fn run_path_query(
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Execute a `random_walk` and return its `(walk_id, step, node)` node batch as
@@ -317,14 +317,14 @@ fn run_walk_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let starts = array_from_pyarrow(starts)?;
     let comparisons: Vec<Comparison> = filters
         .into_iter()
         .map(|(column, op, value)| Comparison { column, op, value })
         .collect();
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_walk_query(
             topo,
             ids,
@@ -339,14 +339,14 @@ fn run_walk_query(
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
 fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>) -> PyResult<f64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || density(&topo).map_err(to_pyerr))
+    py.detach(move || density(&topo).map_err(to_pyerr))
 }
 
 /// Average shortest-path length over reachable ordered pairs (eager scalar).
@@ -359,7 +359,7 @@ fn graph_avg_path_length(
     sample: Option<f64>,
 ) -> PyResult<f64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || avg_path_length(&topo, sample).map_err(to_pyerr))
+    py.detach(move || avg_path_length(&topo, sample).map_err(to_pyerr))
 }
 
 /// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
@@ -371,16 +371,16 @@ fn graph_diameter(
     approximate: bool,
 ) -> PyResult<i64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || diameter(&topo, approximate).map_err(to_pyerr))
+    py.detach(move || diameter(&topo, approximate).map_err(to_pyerr))
 }
 
 /// Whole-graph one-row summary (`n_nodes, n_edges, density, avg_degree,
 /// n_components`) as a pyarrow `RecordBatch`. `full` computes `n_components`.
 #[pyfunction]
-fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<PyObject> {
+fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<Py<PyAny>> {
     let topo = index.topo.clone();
-    let batch = py.allow_threads(move || describe(&topo, full).map_err(to_pyerr))?;
-    batch.to_pyarrow(py)
+    let batch = py.detach(move || describe(&topo, full).map_err(to_pyerr))?;
+    batch.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Read a Parquet/CSV edge file's `src`/`dst` columns (plus any `weight_columns`
@@ -397,12 +397,11 @@ fn scan_edges_arrow(
     dst: &str,
     storage_options: Option<HashMap<String, String>>,
     weight_columns: Vec<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let opts = storage_options.unwrap_or_default();
-    let batches = py.allow_threads(|| {
-        scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr)
-    })?;
-    batches.to_pyarrow(py)
+    let batches =
+        py.detach(|| scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr))?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
@@ -419,11 +418,10 @@ fn scan_nodes_arrow(
     id: &str,
     storage_options: Option<HashMap<String, String>>,
     columns: Vec<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let opts = storage_options.unwrap_or_default();
-    let batches =
-        py.allow_threads(|| scan_nodes_batch(path, id, &opts, &columns).map_err(to_pyerr))?;
-    batches.to_pyarrow(py)
+    let batches = py.detach(|| scan_nodes_batch(path, id, &opts, &columns).map_err(to_pyerr))?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// The `ursa-core` version — the simplest possible proof the native module loaded.

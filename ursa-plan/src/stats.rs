@@ -73,7 +73,7 @@ pub fn describe(topology: &Topology, full: bool) -> Result<RecordBatch> {
             Arc::new(Int64Array::from(vec![n_components])),
         ],
     )
-    .map_err(|e| DataFusionError::ArrowError(e, None))
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Pick the source nodes for a BFS-based stat. `None` → every node (exact);

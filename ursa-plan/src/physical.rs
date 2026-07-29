@@ -14,7 +14,6 @@
 //! runtime, so [`GraphAlgorithmExec::execute`] dispatches the compute via
 //! `spawn_blocking` and streams the batch back.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -43,18 +42,18 @@ pub struct GraphAlgorithmExec {
     ids: Arc<IdMap>,
     columns: Arc<Vec<OutputColumn>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl GraphAlgorithmExec {
     pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>, columns: Arc<Vec<OutputColumn>>) -> Self {
         let schema = query_schema(&columns, ids.user_type());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         GraphAlgorithmExec {
             topology,
             ids,
@@ -77,11 +76,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
         "GraphAlgorithmExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -129,7 +124,7 @@ pub struct HopExec {
     n: u32,
     direction: Direction,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl HopExec {
@@ -141,12 +136,12 @@ impl HopExec {
         direction: Direction,
     ) -> Self {
         let schema = hop_schema(ids.user_type());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         HopExec {
             topology,
             ids,
@@ -176,11 +171,7 @@ impl ExecutionPlan for HopExec {
         "HopExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -230,7 +221,7 @@ pub struct ShortestPathExec {
     direction: Direction,
     weights: Option<Arc<Vec<f64>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ShortestPathExec {
@@ -243,12 +234,12 @@ impl ShortestPathExec {
         weights: Option<Arc<Vec<f64>>>,
     ) -> Self {
         let schema = path_schema(ids.user_type());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         ShortestPathExec {
             topology,
             ids,
@@ -277,11 +268,7 @@ impl ExecutionPlan for ShortestPathExec {
         "ShortestPathExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -342,7 +329,7 @@ pub struct RandomWalkExec {
     walks_per_node: u32,
     seed: Option<u64>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl RandomWalkExec {
@@ -355,12 +342,12 @@ impl RandomWalkExec {
         seed: Option<u64>,
     ) -> Self {
         let schema = walk_schema(ids.user_type());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         RandomWalkExec {
             topology,
             ids,
@@ -392,11 +379,7 @@ impl ExecutionPlan for RandomWalkExec {
         "RandomWalkExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
