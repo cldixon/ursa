@@ -8,24 +8,27 @@
 # crate in Cargo.lock. The ignore list below waives only *pre-existing transitive*
 # advisories that we cannot act on today — every one is pulled by the
 # DataFusion → arrow → object_store → pyo3 chain, whose versions are cross-pinned
-# (the workspace pins `pyo3 = "0.23"` because arrow's `pyarrow` feature pins it),
-# so clearing them requires a coordinated DataFusion/arrow/pyo3 upgrade tracked
+# (the workspace pins `pyo3 = "0.28"`, the newest that arrow-pyarrow 58 builds
+# against; pyo3 0.29 — which patches the two pyo3 advisories below — requires
+# arrow-pyarrow 59, only reachable via DataFusion 55, not yet released), so
+# clearing them requires a coordinated DataFusion/arrow/pyo3 upgrade tracked
 # separately, not a change we can make in isolation. `cargo update` confirms no
 # in-semver patched version is reachable. Nothing first-party is waived, and any
 # NEW advisory in a crate we control still fails the gate.
 version = 2
 ignore = [
-    # pyo3 0.23.5 — pinned by arrow 54's `pyarrow` feature; neither affected API
-    # (`PyString::from_object`, `PyCFunction::new_closure`) is used by ursa-py.
-    { id = "RUSTSEC-2025-0020", reason = "pyo3 pinned by arrow/pyarrow; PyString::from_object not used" },
-    { id = "RUSTSEC-2026-0177", reason = "pyo3 pinned by arrow/pyarrow; PyCFunction::new_closure not used" },
+    # pyo3 0.28.3 — pinned by arrow-pyarrow 58; patched only in pyo3 0.29 (blocked
+    # upstream, see above). Neither affected API is reached by ursa-py, which only
+    # crosses the Arrow C data interface (PyCapsule) — no PyCFunction closures and
+    # no PyList/PyTuple iterator `nth`/`nth_back`.
+    { id = "RUSTSEC-2026-0176", reason = "pyo3 pinned by arrow-pyarrow; PyList/PyTuple nth OOB read not reached (Arrow FFI only)" },
+    { id = "RUSTSEC-2026-0177", reason = "pyo3 pinned by arrow-pyarrow; PyCFunction::new_closure not used" },
     # quick-xml 0.37.5 — transitive via object_store's Azure XML path (DoS only,
     # and only on the cloud object-store code path); no in-semver fix available.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store (Azure); no compatible fix yet" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store (Azure); no compatible fix yet" },
-    # Unmaintained transitive crates with no available replacement version.
+    # Unmaintained transitive crate with no available replacement version.
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled transitively by pyo3/datafusion, no fork/fix" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; pulled transitively by object_store" },
 ]
 
 [licenses]

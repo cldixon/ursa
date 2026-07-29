@@ -163,7 +163,7 @@ pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> Re
         arrays.push(col.value_array(topo));
     }
     RecordBatch::try_new(query_schema(columns, ids.user_type()), arrays)
-        .map_err(|e| DataFusionError::ArrowError(e, None))
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// The output schema for a `hop`: an edge frame `(src, dst)` (of the graph's
@@ -192,7 +192,7 @@ pub fn hop_batch(
             ids.gather_user(&reached_dense),
         ],
     )
-    .map_err(|e| DataFusionError::ArrowError(e, None))
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// The output schema for a `shortest_path`: an edge frame `(src, dst, hop, cost)` —
@@ -257,7 +257,7 @@ pub fn path_batch(
             Arc::new(Float64Array::from(cost)),
         ],
     )
-    .map_err(|e| DataFusionError::ArrowError(e, None))
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// The output schema for a `random_walk`: a node frame `(walk_id, step, node)` —
@@ -292,7 +292,7 @@ pub fn walk_batch(
             node,
         ],
     )
-    .map_err(|e| DataFusionError::ArrowError(e, None))
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 #[cfg(test)]

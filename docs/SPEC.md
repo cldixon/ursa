@@ -413,7 +413,7 @@ Determinism: every stochastic algorithm (`random_walk`, `label_propagation`, `lo
 ### Runtime integration **[IMPL]** — two known traps, decided handling
 
 1. **Thread pools.** DataFusion executes on tokio (async, IO-oriented); kernels want Rayon (data-parallel compute). Running Rayon loops on tokio workers starves the runtime. Graph `ExecutionPlan`s must dispatch compute via `spawn_blocking` (or a dedicated compute pool) and stream results back. State this in code comments; it otherwise becomes a mysterious deadlock in month two.
-2. **The GIL.** `collect()` releases the GIL for the duration of execution (`py.allow_threads`), so Ursa behaves inside threaded Python servers. Arrow FFI via the Arrow PyCapsule interface for zero-copy exchange with polars/pyarrow.
+2. **The GIL.** `collect()` releases the GIL for the duration of execution (`py.detach`, formerly `py.allow_threads`), so Ursa behaves inside threaded Python servers. Arrow FFI via the Arrow PyCapsule interface for zero-copy exchange with polars/pyarrow.
 
 ### Version and interop policy
 

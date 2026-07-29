@@ -213,7 +213,7 @@ fn dense_attr_column(
         let dense_of_row = resolve_dense(ids, batch.column(id_idx))?;
         if is_string {
             let attr_arr = cast(batch.column(attr_idx), &DataType::Utf8)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             let attr_arr = attr_arr.as_any().downcast_ref::<StringArray>().unwrap();
             for (i, dense) in dense_of_row.iter().enumerate() {
                 let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
@@ -528,7 +528,7 @@ pub fn execute_path_query(
                 Arc::new(Float64Array::from(Vec::<f64>::new())),
             ],
         )
-        .map_err(|e| DataFusionError::ArrowError(e, None))?;
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         return Ok(vec![empty]);
     };
 
