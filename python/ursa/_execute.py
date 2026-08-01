@@ -270,7 +270,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
         # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
-        return _collect_plain_nodes(frame, filters, sort, limit, select, sample, rename)
+        return _collect_plain_nodes(frame, filters, sort, limit, select, sample, rename, distinct)
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
@@ -294,7 +294,11 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     id_name = frame.id_col
     file_needed: list[str] | None = None
     if select is not None:
-        needed = {id_name} | (referenced - computed) | (set(select) - computed)
+        # A rename *target* is a new output label, neither a file nor a computed
+        # column, so exclude it from the file projection (else the scan errors on a
+        # column the file doesn't have).
+        selected_file = set(select) - computed - set(rename.values())
+        needed = {id_name} | (referenced - computed) | selected_file
         file_needed = sorted(needed)
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
@@ -496,10 +500,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
 
     if traversal is None:
         # No traversal: a plain edge frame (scan_edges / from_arrow / read_edges,
-        # or a reversed frame). Materialize its edge rows + filter/sort/head tail.
-        if distinct:
-            raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
-        return _collect_plain_edges(frame, filters, sort, limit, select, sample, rename)
+        # or a reversed frame). Materialize its edge rows + tail (distinct included).
+        return _collect_plain_edges(frame, filters, sort, limit, select, sample, rename, distinct)
 
     # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
     # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
@@ -956,11 +958,17 @@ def _apply_pyarrow_tail(
     roles: dict[str, str],
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
+    distinct: bool = False,
 ) -> Any:
-    # Same canonical order as the engine tail: filters → sample → sort → limit → rename.
+    # Same canonical order as the engine tail:
+    # filters → distinct → sample → sort → limit → rename.
     for predicate in filters:
         _require_predicate(predicate)  # same top-of-predicate check as the graph path
         table = table.filter(_eval_pyarrow(predicate, table, roles))
+    if distinct:
+        # Distinct rows over all columns (group-by with no aggregations); row order
+        # is unspecified for distinct, as on the engine path.
+        table = table.combine_chunks().group_by(table.column_names).aggregate([])
     if sample is not None:
         table = _sample_pyarrow(table, sample[0], sample[1])
     if sort is not None:
@@ -983,20 +991,24 @@ def _collect_plain_nodes(
     select: list[str] | None = None,
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
+    distinct: bool = False,
 ) -> MaterializedFrame:
     # On a plain node table, ur.id() resolves to the frame's real id column.
     roles = {"id": frame.id_col}
     # With no computed columns, the scan need only read the id, whatever the
     # filter/sort touch, any rename source column, and (if a select narrows the
-    # output) the selected columns.
+    # output) the selected columns. A rename *target* is a new label, not a file
+    # column, so it must not leak into the projection.
     file_needed: list[str] | None = None
     if select is not None:
-        referenced: set[str] = set(rename or ())
+        rename = rename or {}
+        referenced: set[str] = set(rename)
         for p in filters:
             referenced |= _expr_columns(p, roles)
         if sort is not None:
             referenced.add(sort[0])
-        file_needed = sorted({frame.id_col} | referenced | set(select))
+        selected_file = set(select) - set(rename.values())
+        file_needed = sorted({frame.id_col} | referenced | selected_file)
     attr = _resolve_node_attr_table(frame, file_needed)
     if attr is None:
         raise NotImplementedError(
@@ -1005,7 +1017,7 @@ def _collect_plain_nodes(
             "materializable node set yet."
         )
     # `attr` is a (chunked) pyarrow.Table.
-    table = _apply_pyarrow_tail(attr, filters, sort, limit, roles, sample, rename)
+    table = _apply_pyarrow_tail(attr, filters, sort, limit, roles, sample, rename, distinct)
     return _apply_select(MaterializedFrame(table), select)
 
 
@@ -1017,6 +1029,7 @@ def _collect_plain_edges(
     select: list[str] | None = None,
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
+    distinct: bool = False,
 ) -> MaterializedFrame:
     import pyarrow as pa
 
@@ -1039,7 +1052,7 @@ def _collect_plain_edges(
         else:
             # No source: a filtered/derived (or traversal-result) edge frame.
             _require_edges(frame)  # raises the precise, plan-aware message
-    table = _apply_pyarrow_tail(table, filters, sort, limit, roles, sample, rename)
+    table = _apply_pyarrow_tail(table, filters, sort, limit, roles, sample, rename, distinct)
     return _apply_select(MaterializedFrame(table), select)
 
 

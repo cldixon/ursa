@@ -120,6 +120,43 @@ def test_distinct_on_node_query_executes():
     assert sorted(ids) == [0, 1, 2, 3]
 
 
+def test_distinct_on_plain_node_frame(tmp_path):
+    # A plain (scan-backed) node frame with a genuinely duplicated row: distinct
+    # collapses it. (Regression guard: distinct must not be silently dropped here.)
+    path = tmp_path / "dupe_nodes.csv"
+    path.write_text("id,region\n0,us\n0,us\n1,eu\n")
+    out = ur.scan_nodes(str(path), id="id").distinct().collect().to_arrow()
+    assert out.num_rows == 2
+    assert sorted(out.column("id").to_pylist()) == [0, 1]
+
+
+def test_rename_then_select_over_scan_source(tmp_path):
+    # rename target must not leak into scan projection pushdown (it's a new label,
+    # not a file column). Plain path.
+    out = (
+        ur.scan_nodes(_nodes_file(tmp_path), id="id")
+        .rename({"region": "r"})
+        .select("id", "r")
+        .collect()
+        .to_arrow()
+    )
+    assert out.column_names == ["id", "r"]
+
+
+def test_rename_then_select_over_graph_scan_source(tmp_path):
+    # Same, on the graph path with a file-backed node source: rename a computed
+    # column, then select it by its new name.
+    out = (
+        ur.scan_nodes(_nodes_file(tmp_path), id="id")
+        .with_columns(indeg=ur.degree(EDGES, direction="in"))
+        .rename({"indeg": "d"})
+        .select("id", "d")
+        .collect()
+        .to_arrow()
+    )
+    assert out.column_names == ["id", "d"]
+
+
 def test_distinct_collapses_duplicate_rows_via_traversal():
     # A traversal output can have genuinely duplicate rows: two seeds reaching the
     # same node produce identical (src, dst) pairs after projecting to dst.
