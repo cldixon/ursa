@@ -39,6 +39,9 @@ def run_node_query(
     nodes: Any | None = ...,
     nodes_id: str | None = ...,
     edges: Any | None = ...,
+    distinct: bool = ...,
+    sample: tuple[int, int | None] | None = ...,
+    rename: list[tuple[str, str]] = ...,
 ) -> Any: ...
 
 # A hop traversal: a built index + user-id seed array (int64 or string) +
@@ -53,6 +56,8 @@ def run_hop_query(
     sort: tuple[str, bool] | None = ...,
     limit: int | None = ...,
     distinct: bool = ...,
+    sample: tuple[int, int | None] | None = ...,
+    rename: list[tuple[str, str]] = ...,
 ) -> Any: ...
 
 # A shortest_path traversal: a built index + 1-element source/target user-id
@@ -69,6 +74,8 @@ def run_path_query(
     sort: tuple[str, bool] | None = ...,
     limit: int | None = ...,
     distinct: bool = ...,
+    sample: tuple[int, int | None] | None = ...,
+    rename: list[tuple[str, str]] = ...,
 ) -> Any: ...
 
 # A random_walk: a built index + user-id start ids (int64 or string) + walk params
@@ -84,6 +91,8 @@ def run_walk_query(
     sort: tuple[str, bool] | None = ...,
     limit: int | None = ...,
     distinct: bool = ...,
+    sample: tuple[int, int | None] | None = ...,
+    rename: list[tuple[str, str]] = ...,
 ) -> Any: ...
 
 # Whole-graph directed edge density (eager scalar).

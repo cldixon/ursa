@@ -18,12 +18,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
-use datafusion::prelude::{col, DataFrame};
+use datafusion::prelude::{col, DataFrame, SessionContext};
 use serde::Deserialize;
 use ursa_core::algo::AggKind;
 use ursa_core::{IdMap, Topology};
@@ -245,6 +245,119 @@ fn filter_expr(json: &str) -> Result<Expr> {
     crate::expr::lower(&crate::expr::parse_ursa_expr(&value)?)
 }
 
+/// The relational tail shared by all four graph executors — the stock DataFusion
+/// operations that run on top of the graph/traversal output. Applied in a fixed
+/// canonical order (see [`apply_tail`]); extensible — a future `group_by`/`join`
+/// adds a field here instead of touching the four call sites.
+struct Tail<'a> {
+    filters: &'a [String],
+    distinct: bool,
+    /// `(n, seed)` for a row sample; `seed = None` uses the default (reproducible).
+    sample: Option<(usize, Option<u64>)>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    /// `(old, new)` output-column relabels, applied last.
+    rename: &'a [(String, String)],
+}
+
+/// Apply the relational tail to the base frame. Canonical order:
+/// `filters → distinct → sample → sort → limit → rename`.
+///
+/// - `sample` runs before `sort`/`limit`, so a following `.sort().head()` re-imposes
+///   a deterministic order and `head` is honored on the sampled rows.
+/// - `rename` runs last and only relabels output columns; `filter`/`sort` therefore
+///   reference the pre-rename (computed/source) names.
+async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> Result<DataFrame> {
+    for f in tail.filters {
+        df = df.filter(filter_expr(f)?)?;
+    }
+    if tail.distinct {
+        df = df.distinct()?;
+    }
+    if let Some((n, seed)) = tail.sample {
+        let batches = df.collect().await?;
+        df = ctx.read_batches(sample_rows(batches, n, seed)?)?;
+    }
+    if let Some((column, descending)) = tail.sort {
+        df = df.sort(vec![col(&column).sort(!descending, false)])?;
+    }
+    if let Some(n) = tail.limit {
+        df = df.limit(0, Some(n))?;
+    }
+    for (old, new) in tail.rename {
+        // with_column_renamed silently no-ops on an absent column; check first so a
+        // rename of a column that doesn't exist is a clear error, not a silent drop.
+        if !df.schema().fields().iter().any(|f| f.name() == old) {
+            return Err(DataFusionError::Execution(format!(
+                "rename() references unknown column {old:?}"
+            )));
+        }
+        df = df.with_column_renamed(old, new)?;
+    }
+    Ok(df)
+}
+
+/// Deterministically sample `n` rows (without replacement) from a collected batch
+/// list, returned as a single batch in a stable order.
+///
+/// The engine may split the input across partitions/threads, and cross-partition
+/// row order is not a DataFusion contract — so a position-based sample would vary
+/// by thread count. To be partition-independent, rows are put in a **content-
+/// canonical** order (arrow's `RowConverter` encodes each full row tuple to
+/// comparable bytes) before a seeded PRNG ([`ursa_core::algo::sample_indices`])
+/// selects positions. The selected set is thus a pure function of
+/// `(row contents, n, seed)` — identical across thread counts and repeated runs,
+/// mirroring the `random_walk` determinism guarantee. `seed = None` uses the
+/// default seed; `n >= row_count` returns all rows.
+fn sample_rows(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Result<Vec<RecordBatch>> {
+    use arrow::row::{RowConverter, SortField};
+
+    let Some(first) = batches.first() else {
+        return Ok(batches);
+    };
+    let schema = first.schema();
+    let batch = arrow::compute::concat_batches(&schema, &batches)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let r = batch.num_rows();
+    if n >= r {
+        return Ok(vec![batch]);
+    }
+    // Canonical, partition-independent order: sort row indices by the full-tuple
+    // byte encoding. Depends only on values, so it is identical regardless of how
+    // the rows were partitioned. Duplicate rows encode equal (interchangeable).
+    let fields: Vec<SortField> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| SortField::new(f.data_type().clone()))
+        .collect();
+    let converter =
+        RowConverter::new(fields).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let rows = converter
+        .convert_columns(batch.columns())
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let mut canonical: Vec<usize> = (0..r).collect();
+    canonical.sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
+    // Seed-deterministic selection over canonical positions (already sorted
+    // ascending), mapped back to original row indices; emitted in canonical order.
+    let picks = ursa_core::algo::sample_indices(r, n, seed);
+    let indices = UInt32Array::from(
+        picks
+            .into_iter()
+            .map(|p| canonical[p] as u32)
+            .collect::<Vec<u32>>(),
+    );
+    let cols = batch
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c, &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let sampled = RecordBatch::try_new(schema, cols)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    Ok(vec![sampled])
+}
+
 /// Build and execute one graph query as a single DataFusion plan.
 ///
 /// The base is a [`GraphAlgorithmNode`] emitting `(id, values...)`. When `nodes`
@@ -263,6 +376,9 @@ pub fn execute_node_query(
     nodes: Option<Vec<RecordBatch>>,
     nodes_id: Option<String>,
     edges: Option<Vec<RecordBatch>>,
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> Result<Vec<RecordBatch>> {
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
@@ -390,16 +506,19 @@ pub fn execute_node_query(
             None => graph_df,
         };
 
-        for f in filters {
-            df = df.filter(filter_expr(f)?)?;
-        }
-        if let Some((column, descending)) = sort {
-            df = df.sort(vec![col(&column).sort(!descending, false)])?;
-        }
-        if let Some(n) = limit {
-            df = df.limit(0, Some(n))?;
-        }
-
+        df = apply_tail(
+            &ctx,
+            df,
+            Tail {
+                filters,
+                distinct,
+                sample,
+                sort,
+                limit,
+                rename: &rename,
+            },
+        )
+        .await?;
         collect_batches(df).await
     })?
 }
@@ -421,6 +540,8 @@ pub fn execute_hop_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> Result<Vec<RecordBatch>> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
@@ -433,21 +554,20 @@ pub fn execute_hop_query(
 
     crate::runtime::block_on(async move {
         let ctx = graph_session();
-        let mut df = ctx.execute_logical_plan(hop_plan).await?;
-
-        for f in filters {
-            df = df.filter(filter_expr(f)?)?;
-        }
-        if distinct {
-            df = df.distinct()?;
-        }
-        if let Some((column, descending)) = sort {
-            df = df.sort(vec![col(&column).sort(!descending, false)])?;
-        }
-        if let Some(n) = limit {
-            df = df.limit(0, Some(n))?;
-        }
-
+        let df = ctx.execute_logical_plan(hop_plan).await?;
+        let df = apply_tail(
+            &ctx,
+            df,
+            Tail {
+                filters,
+                distinct,
+                sample,
+                sort,
+                limit,
+                rename: &rename,
+            },
+        )
+        .await?;
         collect_batches(df).await
     })?
 }
@@ -472,6 +592,8 @@ pub fn execute_path_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> Result<Vec<RecordBatch>> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
@@ -524,21 +646,20 @@ pub fn execute_path_query(
 
     crate::runtime::block_on(async move {
         let ctx = graph_session();
-        let mut df = ctx.execute_logical_plan(path_plan).await?;
-
-        for f in filters {
-            df = df.filter(filter_expr(f)?)?;
-        }
-        if distinct {
-            df = df.distinct()?;
-        }
-        if let Some((column, descending)) = sort {
-            df = df.sort(vec![col(&column).sort(!descending, false)])?;
-        }
-        if let Some(n) = limit {
-            df = df.limit(0, Some(n))?;
-        }
-
+        let df = ctx.execute_logical_plan(path_plan).await?;
+        let df = apply_tail(
+            &ctx,
+            df,
+            Tail {
+                filters,
+                distinct,
+                sample,
+                sort,
+                limit,
+                rename: &rename,
+            },
+        )
+        .await?;
         collect_batches(df).await
     })?
 }
@@ -561,6 +682,8 @@ pub fn execute_walk_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> Result<Vec<RecordBatch>> {
     let starts_dense: Vec<u32> = resolve_dense(&ids, starts)?.into_iter().flatten().collect();
 
@@ -577,21 +700,20 @@ pub fn execute_walk_query(
 
     crate::runtime::block_on(async move {
         let ctx = graph_session();
-        let mut df = ctx.execute_logical_plan(walk_plan).await?;
-
-        for f in filters {
-            df = df.filter(filter_expr(f)?)?;
-        }
-        if distinct {
-            df = df.distinct()?;
-        }
-        if let Some((column, descending)) = sort {
-            df = df.sort(vec![col(&column).sort(!descending, false)])?;
-        }
-        if let Some(n) = limit {
-            df = df.limit(0, Some(n))?;
-        }
-
+        let df = ctx.execute_logical_plan(walk_plan).await?;
+        let df = apply_tail(
+            &ctx,
+            df,
+            Tail {
+                filters,
+                distinct,
+                sample,
+                sort,
+                limit,
+                rename: &rename,
+            },
+        )
+        .await?;
         collect_batches(df).await
     })?
 }
@@ -643,6 +765,42 @@ mod tests {
         crate::topology::build_topology(src, dst).unwrap()
     }
 
+    fn ints(vals: &[i64]) -> RecordBatch {
+        use arrow::datatypes::{Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    }
+
+    fn sampled_vals(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Vec<i64> {
+        let out = sample_rows(batches, n, seed).unwrap();
+        let b = &out[0];
+        b.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn sample_rows_is_partition_independent_and_seeded() {
+        // The same 6 rows arriving in different batch splits (as different partition
+        // layouts would produce) must yield the identical sample for a given seed —
+        // the content-canonical order removes all dependence on arrival order.
+        let split_a = vec![ints(&[5, 1, 4, 2, 6, 3])]; // one batch
+        let split_b = vec![ints(&[3, 6, 2]), ints(&[4, 1, 5])]; // two batches, reordered
+        let a = sampled_vals(split_a, 3, Some(9));
+        let b = sampled_vals(split_b, 3, Some(9));
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 3);
+        // n >= row count returns all rows.
+        assert_eq!(sampled_vals(vec![ints(&[7, 8])], 5, Some(1)).len(), 2);
+        // a different seed can pick a different subset.
+        let s9 = sampled_vals(vec![ints(&[1, 2, 3, 4, 5, 6, 7, 8])], 3, Some(9));
+        let s10 = sampled_vals(vec![ints(&[1, 2, 3, 4, 5, 6, 7, 8])], 3, Some(10));
+        assert_ne!(s9, s10);
+    }
+
     #[test]
     fn single_column_query() {
         let (src, dst) = diamond();
@@ -657,6 +815,9 @@ mod tests {
             None,
             None,
             None,
+            false,
+            None,
+            vec![],
         )
         .unwrap());
         assert_eq!(batch.num_columns(), 2);
@@ -681,7 +842,7 @@ mod tests {
                 None,
                 None,
                 None,
-            )
+             false, None, vec![],)
             .unwrap(),
         );
         // Only node 0 has in-degree > 0 among the hub set; it also ranks highest.
@@ -708,6 +869,9 @@ mod tests {
             None,
             None,
             None,
+            false,
+            None,
+            vec![],
         );
         assert!(err.is_err());
     }
@@ -726,10 +890,21 @@ mod tests {
         ] {
             let (t, ids) = build(&src, &dst);
             let spec = format!(r#"[{{"name":"v","kind":"{kind}"}}]"#);
-            let batch = one(
-                execute_node_query(t, ids, &spec, &[], None, None, None, None, None)
-                    .unwrap_or_else(|e| panic!("{kind} failed: {e}")),
-            );
+            let batch = one(execute_node_query(
+                t,
+                ids,
+                &spec,
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                vec![],
+            )
+            .unwrap_or_else(|e| panic!("{kind} failed: {e}")));
             assert_eq!(batch.num_rows(), 4, "{kind}");
             assert_eq!(batch.schema().field(1).data_type(), &want, "{kind}");
         }
@@ -766,6 +941,9 @@ mod tests {
             Some(vec![nodes]),
             Some("id".into()),
             None,
+            false,
+            None,
+            vec![],
         )
         .unwrap());
 
@@ -808,7 +986,7 @@ mod tests {
                 Some(vec![nodes]),
                 Some("id".into()),
                 None,
-            )
+             false, None, vec![],)
             .unwrap(),
         );
 
@@ -862,7 +1040,7 @@ mod tests {
                 Some(vec![nodes]),
                 Some("id".into()),
                 None,
-            )
+             false, None, vec![],)
             .unwrap(),
         );
 
@@ -889,8 +1067,20 @@ mod tests {
         let dst = Int64Array::from(vec![1, 2, 3]);
         let seeds = Int64Array::from(vec![0]);
         let (t, ids) = build(&src, &dst);
-        let batch =
-            one(execute_hop_query(t, ids, &seeds, 2, "out", &[], None, None, false).unwrap());
+        let batch = one(execute_hop_query(
+            t,
+            ids,
+            &seeds,
+            2,
+            "out",
+            &[],
+            None,
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
         // from 0 within 2 hops -> reaches 1 and 2
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 2);
@@ -913,11 +1103,22 @@ mod tests {
         let dst = Int64Array::from(vec![1, 2, 3]);
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![3]));
-        let batch =
-            one(
-                execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false)
-                    .unwrap(),
-            );
+        let batch = one(execute_path_query(
+            t,
+            ids,
+            &s,
+            &tg,
+            "out",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
         assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
@@ -945,11 +1146,22 @@ mod tests {
         // 99 is not a node
         let (t, ids) = build(&src, &dst);
         let (s, tg) = (Int64Array::from(vec![0]), Int64Array::from(vec![99]));
-        let batch =
-            one(
-                execute_path_query(t, ids, &s, &tg, "out", None, None, &[], None, None, false)
-                    .unwrap(),
-            );
+        let batch = one(execute_path_query(
+            t,
+            ids,
+            &s,
+            &tg,
+            "out",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
         assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 0);
     }
@@ -973,6 +1185,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            vec![],
         );
         assert!(err.is_err());
     }
@@ -998,6 +1212,8 @@ mod tests {
             None,
             Some(2),
             false,
+            None,
+            vec![],
         )
         .unwrap());
         assert_eq!(batch.num_rows(), 2);
@@ -1033,6 +1249,9 @@ mod tests {
             Some(vec![nodes]),
             Some("id".into()),
             None,
+            false,
+            None,
+            vec![],
         );
         assert!(err.is_err()); // mean over strings is not supported
     }

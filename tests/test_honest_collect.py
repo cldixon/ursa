@@ -21,12 +21,26 @@ def _edges():
     return ur.from_arrow(tbl, src="s", dst="d")
 
 
-# --- #33: dropped plan steps now raise instead of lying --------------------
+# --- #18: rename now executes (was a dropped/raising step) -----------------
 @native
-def test_rename_raises_not_silently_dropped():
+def test_rename_relabels_output_column():
     edges = _edges()
-    frame = edges.nodes().with_columns(pr=ur.pagerank(edges)).rename({"pr": "score"})
-    with pytest.raises(NotImplementedError, match="rename"):
+    out = (
+        edges.nodes()
+        .with_columns(pr=ur.pagerank(edges))
+        .rename({"pr": "score"})
+        .collect()
+        .to_arrow()
+    )
+    assert "score" in out.column_names
+    assert "pr" not in out.column_names
+
+
+@native
+def test_rename_unknown_column_raises():
+    edges = _edges()
+    frame = edges.nodes().with_columns(pr=ur.pagerank(edges)).rename({"nope": "x"})
+    with pytest.raises(Exception, match="rename"):
         frame.collect()
 
 

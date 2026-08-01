@@ -121,7 +121,9 @@ class _Frame:
     limit = head
 
     def sample(self, n: int, *, seed: int | None = None) -> Self:
-        return self._extend(_PlanStep("sample", {"n": n, "seed": seed}))
+        # sample changes the row set, so the cached topology index no longer matches
+        # (like distinct) — drop it so a later graph op rebuilds from the sample.
+        return self._extend(_PlanStep("sample", {"n": n, "seed": seed}), drops_index=True)
 
     def distinct(self) -> Self:
         return self._extend(_PlanStep("distinct", {}), drops_index=True)

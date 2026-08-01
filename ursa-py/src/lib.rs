@@ -154,7 +154,7 @@ fn _topology_build_count() -> usize {
 /// expression JSON string (lowered through the shared `crate::expr` seam);
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None))]
+#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
@@ -166,6 +166,9 @@ fn run_node_query(
     nodes: Option<Bound<'_, PyAny>>,
     nodes_id: Option<String>,
     edges: Option<Bound<'_, PyAny>>,
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
@@ -191,6 +194,9 @@ fn run_node_query(
             nodes,
             nodes_id,
             edges,
+            distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
@@ -204,7 +210,7 @@ fn run_node_query(
 /// `filters`/`sort`/`limit`/`distinct` are the optional relational tail applied to
 /// the reached edges.
 #[pyfunction]
-#[pyo3(signature = (index, seeds, n, direction, filters, sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, seeds, n, direction, filters, sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_hop_query(
     py: Python<'_>,
@@ -216,6 +222,8 @@ fn run_hop_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let seeds = array_from_pyarrow(seeds)?;
@@ -231,6 +239,8 @@ fn run_hop_query(
             sort,
             limit,
             distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
@@ -244,7 +254,7 @@ fn run_hop_query(
 /// attribute batch) select weighted Dijkstra; omit both for unweighted BFS. The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the path edges.
 #[pyfunction]
-#[pyo3(signature = (index, source, target, direction, weight=None, edges=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, source, target, direction, weight=None, edges=None, filters=Vec::new(), sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_path_query(
     py: Python<'_>,
@@ -258,6 +268,8 @@ fn run_path_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let source = array_from_pyarrow(source)?;
@@ -281,6 +293,8 @@ fn run_path_query(
             sort,
             limit,
             distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
@@ -292,7 +306,7 @@ fn run_path_query(
 /// graph); `seed` (optional) makes the walk reproducible. The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the walk rows.
 #[pyfunction]
-#[pyo3(signature = (index, starts, steps, walks_per_node, seed=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, starts, steps, walks_per_node, seed=None, filters=Vec::new(), sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_walk_query(
     py: Python<'_>,
@@ -305,6 +319,8 @@ fn run_walk_query(
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let starts = array_from_pyarrow(starts)?;
@@ -320,6 +336,8 @@ fn run_walk_query(
             sort,
             limit,
             distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
