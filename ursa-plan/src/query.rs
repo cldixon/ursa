@@ -9,9 +9,11 @@
 //! graph-aware session. Filters/sort/limit are stock DataFusion logical nodes, so
 //! DataFusion optimizes and executes them; the graph node is ours.
 //!
-//! The filter surface is deliberately small (a conjunction of `column <op>
-//! literal`); widening it is expression-lowering work that also belongs at this
-//! seam (`crate::expr`).
+//! Each `filter` crosses as a serialized predicate-expression JSON string and is
+//! lowered through [`crate::expr`] — the same seam a `weight=` expression uses — so
+//! the full predicate algebra (comparisons, boolean combinators, arithmetic, `col
+//! <op> col`, string/bool equality) is available. Multiple `.filter()` calls arrive
+//! as separate strings and are conjoined by DataFusion's per-filter application.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
-use datafusion::prelude::{col, lit, DataFrame};
+use datafusion::prelude::{col, DataFrame};
 use serde::Deserialize;
 use ursa_core::algo::AggKind;
 use ursa_core::{IdMap, Topology};
@@ -31,14 +33,6 @@ use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode}
 use crate::planner::graph_session;
 use crate::result::{path_schema, OutputColumn};
 use crate::weight::evaluate_weight;
-
-/// A single `column <op> literal` comparison (`op` in `> >= < <= == !=`).
-#[derive(Debug, Clone)]
-pub struct Comparison {
-    pub column: String,
-    pub op: String,
-    pub value: f64,
-}
 
 /// One requested output column, deserialized from the Python query IR.
 ///
@@ -243,22 +237,12 @@ fn dense_attr_column(
     Ok(out)
 }
 
-fn comparison_expr(c: &Comparison) -> Result<Expr> {
-    let column = col(&c.column);
-    let v = lit(c.value);
-    Ok(match c.op.as_str() {
-        ">" => column.gt(v),
-        ">=" => column.gt_eq(v),
-        "<" => column.lt(v),
-        "<=" => column.lt_eq(v),
-        "==" => column.eq(v),
-        "!=" => column.not_eq(v),
-        other => {
-            return Err(DataFusionError::NotImplemented(format!(
-                "comparison operator {other:?} is not supported in collect() filters"
-            )))
-        }
-    })
+/// Lower one serialized predicate-expression JSON string to a DataFusion filter
+/// expression via the shared `crate::expr` seam.
+fn filter_expr(json: &str) -> Result<Expr> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| DataFusionError::Execution(format!("invalid filter expression JSON: {e}")))?;
+    crate::expr::lower(&crate::expr::parse_ursa_expr(&value)?)
 }
 
 /// Build and execute one graph query as a single DataFusion plan.
@@ -273,7 +257,7 @@ pub fn execute_node_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
     columns_json: &str,
-    filters: &[Comparison],
+    filters: &[String],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     nodes: Option<Vec<RecordBatch>>,
@@ -407,7 +391,7 @@ pub fn execute_node_query(
         };
 
         for f in filters {
-            df = df.filter(comparison_expr(f)?)?;
+            df = df.filter(filter_expr(f)?)?;
         }
         if let Some((column, descending)) = sort {
             df = df.sort(vec![col(&column).sort(!descending, false)])?;
@@ -433,7 +417,7 @@ pub fn execute_hop_query(
     seeds: &dyn Array,
     n: u32,
     direction: &str,
-    filters: &[Comparison],
+    filters: &[String],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
@@ -452,7 +436,7 @@ pub fn execute_hop_query(
         let mut df = ctx.execute_logical_plan(hop_plan).await?;
 
         for f in filters {
-            df = df.filter(comparison_expr(f)?)?;
+            df = df.filter(filter_expr(f)?)?;
         }
         if distinct {
             df = df.distinct()?;
@@ -484,7 +468,7 @@ pub fn execute_path_query(
     direction: &str,
     weight: Option<&str>,
     edges: Option<Vec<RecordBatch>>,
-    filters: &[Comparison],
+    filters: &[String],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
@@ -543,7 +527,7 @@ pub fn execute_path_query(
         let mut df = ctx.execute_logical_plan(path_plan).await?;
 
         for f in filters {
-            df = df.filter(comparison_expr(f)?)?;
+            df = df.filter(filter_expr(f)?)?;
         }
         if distinct {
             df = df.distinct()?;
@@ -573,7 +557,7 @@ pub fn execute_walk_query(
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
-    filters: &[Comparison],
+    filters: &[String],
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
@@ -596,7 +580,7 @@ pub fn execute_walk_query(
         let mut df = ctx.execute_logical_plan(walk_plan).await?;
 
         for f in filters {
-            df = df.filter(comparison_expr(f)?)?;
+            df = df.filter(filter_expr(f)?)?;
         }
         if distinct {
             df = df.distinct()?;
@@ -688,11 +672,10 @@ mod tests {
                 t,
                 ids,
                 r#"[{"name":"pr","kind":"pagerank"},{"name":"indeg","kind":"degree","direction":"in"}]"#,
-                &[Comparison {
-                    column: "indeg".into(),
-                    op: ">".into(),
-                    value: 0.0,
-                }],
+                &[r#"{"kind":"binary","op":">",
+                    "left":{"kind":"col","name":"indeg"},
+                    "right":{"kind":"lit","value":0.0}}"#
+                    .to_string()],
                 Some(("pr".into(), true)),
                 Some(1),
                 None,
@@ -1008,11 +991,10 @@ mod tests {
             &seeds,
             1,
             "out",
-            &[Comparison {
-                column: "dst".into(),
-                op: "==".into(),
-                value: 0.0,
-            }],
+            &[r#"{"kind":"binary","op":"==",
+                "left":{"kind":"col","name":"dst"},
+                "right":{"kind":"lit","value":0}}"#
+                .to_string()],
             None,
             Some(2),
             false,

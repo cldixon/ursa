@@ -46,16 +46,25 @@ _EXECUTABLE = {
     "neighbors_agg",
 }
 
-# Comparison operators supported in filters, with the operator that results from
-# writing the comparison the other way round (literal on the left).
-_FLIP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
+# Operators valid at the *top* of a filter predicate — comparisons and boolean
+# combinators. (Arithmetic ops may appear deeper, e.g. `(a + b) > 3`, but a bare
+# arithmetic or column expression is not itself a boolean predicate.)
+_PREDICATE_OPS = {">", "<", ">=", "<=", "==", "!=", "&", "|"}
 
 
-# --- weight expressions (over edge columns) --------------------------------
-def _expr_to_json(expr: Any) -> dict[str, Any]:
-    """Serialize an ``Expr`` tree to the JSON the Rust weight seam parses
-    (``ursa_plan::expr::parse_ursa_expr``): ``col`` / ``lit`` / ``binary``. Other
-    node kinds are emitted by kind so the Rust side reports a clear error."""
+# --- expression serialization (weights + filter predicates) ----------------
+def _expr_to_json(expr: Any, roles: dict[str, str] | None = None) -> dict[str, Any]:
+    """Serialize an ``Expr`` tree to the JSON the Rust expr seam parses
+    (``ursa_plan::expr::parse_ursa_expr``): ``col`` / ``lit`` / ``binary`` /
+    ``unary``. Comparison and boolean ops ride the generic ``binary`` shape.
+
+    ``roles`` maps the abstract role kinds ``src`` / ``dst`` / ``id`` to concrete
+    column names in the table the expression will run against. In a **filter**
+    context the caller supplies it (the frame is in scope), so a role reference
+    lowers to a plain ``col``; a role not present in this context raises. In the
+    **weight** context ``roles`` is ``None`` and role/other nodes fall through to a
+    ``{"kind": kind}`` stub so the Rust side reports a clear error, exactly as
+    before."""
     kind, p = expr.kind, expr.payload
     if kind == "col":
         return {"kind": "col", "name": p["name"]}
@@ -65,19 +74,38 @@ def _expr_to_json(expr: Any) -> dict[str, Any]:
         return {
             "kind": "binary",
             "op": p["op"],
-            "left": _expr_to_json(p["left"]),
-            "right": _expr_to_json(p["right"]),
+            "left": _expr_to_json(p["left"], roles),
+            "right": _expr_to_json(p["right"], roles),
         }
+    if kind == "unary":
+        return {"kind": "unary", "op": p["op"], "operand": _expr_to_json(p["operand"], roles)}
+    if kind in ("src", "dst", "id"):
+        if roles is not None:
+            if kind in roles:
+                return {"kind": "col", "name": roles[kind]}
+            raise NotImplementedError(
+                f"ur.{kind}() is not available in this context "
+                f"(resolvable roles here: {sorted(roles)})."
+            )
+        # weight context: let Rust reject role refs with its clear message.
+        return {"kind": kind}
     return {"kind": kind}
 
 
-def _expr_columns(expr: Any) -> set[str]:
-    """The edge column names a weight expression references."""
+def _expr_columns(expr: Any, roles: dict[str, str] | None = None) -> set[str]:
+    """The (original) column names an expression references — for scan projection
+    pushdown. Role refs resolve through ``roles`` to the frame's real columns."""
     kind, p = expr.kind, expr.payload
     if kind == "col":
         return {p["name"]}
     if kind == "binary":
-        return _expr_columns(p["left"]) | _expr_columns(p["right"])
+        return _expr_columns(p["left"], roles) | _expr_columns(p["right"], roles)
+    if kind == "unary":
+        return _expr_columns(p["operand"], roles)
+    if kind in ("src", "dst", "id") and roles is not None and kind in roles:
+        return {roles[kind]}
+    if kind in ("agg", "alias") and "operand" in p:
+        return _expr_columns(p["operand"], roles)
     return set()
 
 
@@ -191,7 +219,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         return _collect_random_walk(frame, walk_step)
 
     graph_exprs: dict[str, Expr] | None = None
-    filters: list[tuple[str, str, float]] = []
+    filters: list[Any] = []  # predicate Exprs, serialized at the FFI boundary
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     select: list[str] | None = None
@@ -217,7 +245,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 )
             graph_exprs = step.args["exprs"]
         elif op == "filter":
-            filters.append(_parse_filter(step.args["predicate"]))
+            filters.append(step.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(step.args)
         elif op == "head":
@@ -244,7 +272,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # column the select keeps. With no select the output is additive (all
     # attributes), so nothing is droppable and the whole file is read.
     computed = set(graph_exprs.keys())
-    referenced = {c for (c, _op, _v) in filters}
+    # Role refs in a filter resolve to the frame's real id column for pushdown.
+    referenced: set[str] = set()
+    for p in filters:
+        referenced |= _expr_columns(p, {"id": frame.id_col})
     if sort is not None:
         referenced.add(sort[0])
     for c in columns:
@@ -277,7 +308,7 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
     """Execute a ``random_walk`` node frame plus an optional
     ``filter``/``sort``/``head``/``distinct`` tail. Its ``(walk_id, step, node)``
     rows are produced by the native walk kernel over the frame's shared index."""
-    filters: list[tuple[str, str, float]] = []
+    filters: list[Any] = []
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     distinct = False
@@ -289,7 +320,7 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
         if op in _passthrough:
             continue  # the walk step itself / source / metadata
         elif op == "filter":
-            filters.append(_parse_filter(s.args["predicate"]))
+            filters.append(s.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(s.args)
         elif op == "head":
@@ -307,13 +338,15 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
 
     index = _require_index(step.args["edges"])
     starts = _resolve_seeds(step.args["start"])
+    # walk output columns are (walk_id, step, node); no src/dst/id role applies.
+    filter_json = [_filter_json(p, {}) for p in filters]
     batch = _native().run_walk_query(
         index,
         starts,
         int(step.args["steps"]),
         int(step.args["walks_per_node"]),
         step.args.get("seed"),
-        filters,
+        filter_json,
         sort,
         limit,
         distinct,
@@ -386,7 +419,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     ``ur.shortest_path(edges, s, t)`` — plus an optional
     ``filter``/``sort``/``head``/``distinct`` tail."""
     traversal = None
-    filters: list[tuple[str, str, float]] = []
+    filters: list[Any] = []
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     distinct = False
@@ -410,7 +443,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 )
             continue
         elif op == "filter":
-            filters.append(_parse_filter(step.args["predicate"]))
+            filters.append(step.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(step.args)
         elif op == "head":
@@ -433,6 +466,9 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
         return _collect_plain_edges(frame, filters, sort, limit, select)
 
+    # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
+    # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
+    filter_json = [_filter_json(p, {"src": "src", "dst": "dst"}) for p in filters]
     if traversal.op == "hop":
         index = _require_index(traversal.args["edges"])
         seeds = _resolve_seeds(traversal.args["seeds"])
@@ -441,7 +477,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             seeds,
             int(traversal.args["n"]),
             traversal.args["direction"],
-            filters,
+            filter_json,
             sort,
             limit,
             distinct,
@@ -467,7 +503,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             traversal.args["direction"],
             weight_json,
             edge_attr,
-            filters,
+            filter_json,
             sort,
             limit,
             distinct,
@@ -541,7 +577,7 @@ def _resolve_seeds(seeds: Any) -> Any:
 def _run_query(
     edges: EdgeFrame | None,
     columns: list[dict[str, Any]],
-    filters: list[tuple[str, str, float]],
+    filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     nodes: Any | None = None,
@@ -551,8 +587,11 @@ def _run_query(
     index = _require_index(edges)
     # The node attribute table crosses the FFI as a batch list (not one batch).
     nodes_batches = nodes.to_batches() if nodes is not None else None
+    # A node-query result carries the reserved `id` column plus the computed/joined
+    # columns; `ur.id()` in a filter resolves to it. (src/dst have no role here.)
+    filter_json = [_filter_json(p, {"id": "id"}) for p in filters]
     batches = _native().run_node_query(
-        index, json.dumps(columns), filters, sort, limit, nodes_batches, nodes_id, edge_attr
+        index, json.dumps(columns), filter_json, sort, limit, nodes_batches, nodes_id, edge_attr
     )
     return MaterializedFrame(batches)
 
@@ -724,27 +763,23 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     return idx
 
 
-def _parse_filter(predicate: Any) -> tuple[str, str, float]:
-    """Lower a ``col <op> literal`` predicate to (column, op, value)."""
-    unsupported = NotImplementedError(
-        "collect() filters currently support a single `ur.col(name) <op> <number>` "
-        "comparison (op in > >= < <= == !=); richer predicates are future work."
-    )
-    if predicate.kind != "binary" or predicate.payload["op"] not in _FLIP:
-        raise unsupported
-
-    op = predicate.payload["op"]
-    left, right = predicate.payload["left"], predicate.payload["right"]
-    if left.kind == "col" and right.kind == "lit":
-        column, value = left.payload["name"], right.payload["value"]
-    elif left.kind == "lit" and right.kind == "col":
-        column, value, op = right.payload["name"], left.payload["value"], _FLIP[op]
-    else:
-        raise unsupported
-
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise unsupported
-    return (column, op, float(value))
+def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
+    """Serialize a filter ``predicate`` (an ``Expr``) to the JSON string the Rust
+    expr seam lowers to a DataFusion filter. The predicate may use the full algebra
+    — comparisons, boolean ``& | ~``, arithmetic, ``col <op> col``, string/bool
+    equality, and role refs (``ur.src()``/``dst()``/``id()``, resolved via
+    ``roles``). The top node must be a comparison/boolean ``binary`` or a ``~``
+    ``unary`` — a bare ``col`` or arithmetic expression is not a predicate."""
+    kind = predicate.kind
+    top_binary_ok = kind == "binary" and predicate.payload["op"] in _PREDICATE_OPS
+    top_unary_ok = kind == "unary" and predicate.payload["op"] == "~"
+    if not (top_binary_ok or top_unary_ok):
+        raise NotImplementedError(
+            "filter() expects a boolean predicate — a comparison (>, >=, <, <=, ==, !=), "
+            "a boolean combination (&, |, ~), e.g. .filter(ur.col('deg') > 2) or "
+            ".filter((ur.col('a') > 1) & (ur.col('b') == 'x'))."
+        )
+    return json.dumps(_expr_to_json(predicate, roles))
 
 
 def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
@@ -761,28 +796,75 @@ def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
 # Materialize a frame's own rows and apply the filter/sort/head tail in pyarrow.
 # Used by read_edges/read_nodes and scan_*/from_* frames collected without a
 # graph op (e.g. scan_edges(...).to_polars()).
-def _apply_pyarrow_tail(
-    table: Any,
-    filters: list[tuple[str, str, float]],
-    sort: tuple[str, bool] | None,
-    limit: int | None,
-) -> Any:
+# pyarrow.compute kernel names by op (looked up by name so the type checker —
+# which lacks pyarrow.compute stubs — doesn't flag each one).
+_PC_BINARY = {
+    "+": "add",
+    "-": "subtract",
+    "*": "multiply",
+    "/": "divide",
+    ">": "greater",
+    ">=": "greater_equal",
+    "<": "less",
+    "<=": "less_equal",
+    "==": "equal",
+    "!=": "not_equal",
+    "&": "and_kleene",
+    "|": "or_kleene",
+}
+
+
+def _eval_pyarrow(expr: Any, table: Any, roles: dict[str, str]) -> Any:
+    """Evaluate an ``Expr`` predicate tree over a pyarrow ``table``, mirroring the
+    Rust ``expr::lower`` semantics for the plain-frame path (which never touches the
+    engine). Returns a pyarrow Array/scalar; the top-level result is a boolean mask."""
+    import pyarrow as pa
     import pyarrow.compute as pc
 
-    # pyarrow.compute's comparison kernels, by op (looked up by name so the type
-    # checker — which lacks pyarrow.compute stubs — doesn't flag each one).
-    cmp = {
-        ">": "greater",
-        ">=": "greater_equal",
-        "<": "less",
-        "<=": "less_equal",
-        "==": "equal",
-        "!=": "not_equal",
-    }
-    for column, op, value in filters:
-        if column not in table.column_names:
-            raise ValueError(f"filter references unknown column '{column}'.")
-        table = table.filter(getattr(pc, cmp[op])(table.column(column), value))
+    kind, p = expr.kind, expr.payload
+    if kind == "col":
+        name = p["name"]
+        if name not in table.column_names:
+            raise ValueError(f"filter references unknown column '{name}'.")
+        return table.column(name)
+    if kind == "lit":
+        return pa.scalar(p["value"])
+    if kind in ("src", "dst", "id"):
+        if kind not in roles:
+            raise NotImplementedError(
+                f"ur.{kind}() is not available in this context "
+                f"(resolvable roles here: {sorted(roles)})."
+            )
+        name = roles[kind]
+        if name not in table.column_names:
+            raise ValueError(f"filter references unknown column '{name}'.")
+        return table.column(name)
+    if kind == "binary":
+        op = p["op"]
+        if op not in _PC_BINARY:
+            raise NotImplementedError(f"filter operator {op!r} is not supported.")
+        left = _eval_pyarrow(p["left"], table, roles)
+        right = _eval_pyarrow(p["right"], table, roles)
+        return getattr(pc, _PC_BINARY[op])(left, right)
+    if kind == "unary":
+        if p["op"] != "~":
+            raise NotImplementedError(f"unary filter operator {p['op']!r} is not supported.")
+        # getattr so the type checker (no pyarrow.compute stubs) doesn't flag it.
+        return getattr(pc, "invert")(_eval_pyarrow(p["operand"], table, roles))
+    raise NotImplementedError(
+        f"filter expression node {kind!r} is not supported (aggregations belong in group_by)."
+    )
+
+
+def _apply_pyarrow_tail(
+    table: Any,
+    filters: list[Any],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+    roles: dict[str, str],
+) -> Any:
+    for predicate in filters:
+        table = table.filter(_eval_pyarrow(predicate, table, roles))
     if sort is not None:
         by, descending = sort
         if by not in table.column_names:
@@ -795,16 +877,20 @@ def _apply_pyarrow_tail(
 
 def _collect_plain_nodes(
     frame: NodeFrame,
-    filters: list[tuple[str, str, float]],
+    filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     select: list[str] | None = None,
 ) -> MaterializedFrame:
+    # On a plain node table, ur.id() resolves to the frame's real id column.
+    roles = {"id": frame.id_col}
     # With no computed columns, the scan need only read the id, whatever the
     # filter/sort touch, and (if a select narrows the output) the selected columns.
     file_needed: list[str] | None = None
     if select is not None:
-        referenced = {c for (c, _op, _v) in filters}
+        referenced: set[str] = set()
+        for p in filters:
+            referenced |= _expr_columns(p, roles)
         if sort is not None:
             referenced.add(sort[0])
         file_needed = sorted({frame.id_col} | referenced | set(select))
@@ -816,19 +902,21 @@ def _collect_plain_nodes(
             "materializable node set yet."
         )
     # `attr` is a (chunked) pyarrow.Table.
-    table = _apply_pyarrow_tail(attr, filters, sort, limit)
+    table = _apply_pyarrow_tail(attr, filters, sort, limit, roles)
     return _apply_select(MaterializedFrame(table), select)
 
 
 def _collect_plain_edges(
     frame: EdgeFrame,
-    filters: list[tuple[str, str, float]],
+    filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     select: list[str] | None = None,
 ) -> MaterializedFrame:
     import pyarrow as pa
 
+    # On a plain edge table, ur.src()/dst() resolve to the frame's real endpoint cols.
+    roles = {"src": frame.src_col, "dst": frame.dst_col}
     table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
     if table is None:
         scan = getattr(frame, "_scan_spec", None)
@@ -846,7 +934,7 @@ def _collect_plain_edges(
         else:
             # No source: a filtered/derived (or traversal-result) edge frame.
             _require_edges(frame)  # raises the precise, plan-aware message
-    table = _apply_pyarrow_tail(table, filters, sort, limit)
+    table = _apply_pyarrow_tail(table, filters, sort, limit, roles)
     return _apply_select(MaterializedFrame(table), select)
 
 

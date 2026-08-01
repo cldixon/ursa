@@ -41,7 +41,6 @@ use ursa_core::IdMap;
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_node_query, execute_path_query, execute_walk_query, scan_edges_batch, scan_nodes_batch,
-    Comparison,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,7 +150,8 @@ fn _topology_build_count() -> usize {
 /// Execute a graph query and return its `(id, values...)` batch as pyarrow.
 ///
 /// `columns_json` is the query's output-column IR (a JSON list of
-/// `{name, kind, ...params}`); `filters` are `(column, op, value)` comparisons;
+/// `{name, kind, ...params}`); each `filters` entry is a serialized predicate-
+/// expression JSON string (lowered through the shared `crate::expr` seam);
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
 #[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None))]
@@ -160,7 +160,7 @@ fn run_node_query(
     py: Python<'_>,
     index: PyRef<'_, GraphIndex>,
     columns_json: &str,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     nodes: Option<Bound<'_, PyAny>>,
@@ -169,10 +169,6 @@ fn run_node_query(
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
     // The node attribute table and the edge attribute table (for weight
     // expressions) each cross the FFI as a *list* of RecordBatches, so a large
     // attribute table is never concatenated into one batch (#60).
@@ -189,7 +185,7 @@ fn run_node_query(
             topo,
             ids,
             &columns_json,
-            &comparisons,
+            &filters,
             sort,
             limit,
             nodes,
@@ -216,7 +212,7 @@ fn run_hop_query(
     seeds: &Bound<'_, PyAny>,
     n: u32,
     direction: &str,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
@@ -224,10 +220,6 @@ fn run_hop_query(
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let seeds = array_from_pyarrow(seeds)?;
     let direction = direction.to_string();
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
     let batches = py.detach(move || {
         execute_hop_query(
             topo,
@@ -235,7 +227,7 @@ fn run_hop_query(
             seeds.as_ref(),
             n,
             &direction,
-            &comparisons,
+            &filters,
             sort,
             limit,
             distinct,
@@ -262,7 +254,7 @@ fn run_path_query(
     direction: &str,
     weight: Option<String>,
     edges: Option<Bound<'_, PyAny>>,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
@@ -276,10 +268,6 @@ fn run_path_query(
         Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
     let batches = py.detach(move || {
         execute_path_query(
             topo,
@@ -289,7 +277,7 @@ fn run_path_query(
             &direction,
             weight.as_deref(),
             edges,
-            &comparisons,
+            &filters,
             sort,
             limit,
             distinct,
@@ -313,17 +301,13 @@ fn run_walk_query(
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let starts = array_from_pyarrow(starts)?;
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
     let batches = py.detach(move || {
         execute_walk_query(
             topo,
@@ -332,7 +316,7 @@ fn run_walk_query(
             steps,
             walks_per_node,
             seed,
-            &comparisons,
+            &filters,
             sort,
             limit,
             distinct,
