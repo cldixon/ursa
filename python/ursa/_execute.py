@@ -763,22 +763,29 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     return idx
 
 
-def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
-    """Serialize a filter ``predicate`` (an ``Expr``) to the JSON string the Rust
-    expr seam lowers to a DataFusion filter. The predicate may use the full algebra
-    — comparisons, boolean ``& | ~``, arithmetic, ``col <op> col``, string/bool
-    equality, and role refs (``ur.src()``/``dst()``/``id()``, resolved via
-    ``roles``). The top node must be a comparison/boolean ``binary`` or a ``~``
-    ``unary`` — a bare ``col`` or arithmetic expression is not a predicate."""
+def _require_predicate(predicate: Any) -> None:
+    """Reject a ``filter()`` argument that isn't a boolean predicate at its top node
+    — a bare ``col`` or an arithmetic expression is not a filter. Enforced
+    identically on both the graph-op (Rust) and plain-frame (pyarrow) paths, so the
+    same input is accepted or rejected the same way regardless of the source."""
     kind = predicate.kind
     top_binary_ok = kind == "binary" and predicate.payload["op"] in _PREDICATE_OPS
     top_unary_ok = kind == "unary" and predicate.payload["op"] == "~"
     if not (top_binary_ok or top_unary_ok):
         raise NotImplementedError(
-            "filter() expects a boolean predicate — a comparison (>, >=, <, <=, ==, !=), "
-            "a boolean combination (&, |, ~), e.g. .filter(ur.col('deg') > 2) or "
+            "filter() expects a boolean predicate — a comparison (>, >=, <, <=, ==, !=) "
+            "or a boolean combination (&, |, ~), e.g. .filter(ur.col('deg') > 2) or "
             ".filter((ur.col('a') > 1) & (ur.col('b') == 'x'))."
         )
+
+
+def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
+    """Serialize a filter ``predicate`` (an ``Expr``) to the JSON string the Rust
+    expr seam lowers to a DataFusion filter. The predicate may use the full algebra
+    — comparisons, boolean ``& | ~``, arithmetic, ``col <op> col``, string/bool
+    equality, and role refs (``ur.src()``/``dst()``/``id()``, resolved via
+    ``roles``). The top node must be a boolean predicate (see ``_require_predicate``)."""
+    _require_predicate(predicate)
     return json.dumps(_expr_to_json(predicate, roles))
 
 
@@ -812,6 +819,7 @@ _PC_BINARY = {
     "&": "and_kleene",
     "|": "or_kleene",
 }
+_PC_UNARY = {"~": "invert"}
 
 
 def _eval_pyarrow(expr: Any, table: Any, roles: dict[str, str]) -> Any:
@@ -847,10 +855,9 @@ def _eval_pyarrow(expr: Any, table: Any, roles: dict[str, str]) -> Any:
         right = _eval_pyarrow(p["right"], table, roles)
         return getattr(pc, _PC_BINARY[op])(left, right)
     if kind == "unary":
-        if p["op"] != "~":
+        if p["op"] not in _PC_UNARY:
             raise NotImplementedError(f"unary filter operator {p['op']!r} is not supported.")
-        # getattr so the type checker (no pyarrow.compute stubs) doesn't flag it.
-        return getattr(pc, "invert")(_eval_pyarrow(p["operand"], table, roles))
+        return getattr(pc, _PC_UNARY[p["op"]])(_eval_pyarrow(p["operand"], table, roles))
     raise NotImplementedError(
         f"filter expression node {kind!r} is not supported (aggregations belong in group_by)."
     )
@@ -864,6 +871,7 @@ def _apply_pyarrow_tail(
     roles: dict[str, str],
 ) -> Any:
     for predicate in filters:
+        _require_predicate(predicate)  # same top-of-predicate check as the graph path
         table = table.filter(_eval_pyarrow(predicate, table, roles))
     if sort is not None:
         by, descending = sort
