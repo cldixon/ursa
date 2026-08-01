@@ -210,4 +210,16 @@ mod tests {
         let err = evaluate_weight(&[batch], r#"{"kind":"col","name":"region"}"#).unwrap_err();
         assert!(err.to_string().contains("must be numeric"), "got: {err}");
     }
+
+    #[test]
+    fn comparison_weight_expression_is_rejected_as_non_numeric() {
+        // The expr seam now parses/lowers comparisons (for filters), so a weight
+        // written as a predicate lowers to a Boolean column — the numeric guard must
+        // still reject it rather than treating true/false as 1.0/0.0.
+        let json = r#"{"kind":"binary","op":">",
+            "left":{"kind":"col","name":"amount"},
+            "right":{"kind":"lit","value":2}}"#;
+        let err = evaluate_weight(&[edge_batch()], json).unwrap_err();
+        assert!(err.to_string().contains("must be numeric"), "got: {err}");
+    }
 }

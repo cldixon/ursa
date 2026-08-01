@@ -520,14 +520,30 @@ def test_index_rides_the_preserve_drop_rail():
     assert edges.distinct()._index_build_cell.value is None
 
 
-def test_unsupported_filter_predicate_is_honest():
+def test_col_op_col_predicate_executes():
+    # `col <op> col` is now part of the predicate algebra (issue #19); it executes
+    # rather than raising. `pr > pr` is never true, so the result is empty.
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
-    pipeline = (
+    out = (
         edges.nodes()
         .with_columns(pr=ur.pagerank(edges))
-        .filter(
-            ur.col("pr") > ur.col("pr")  # col op col: not a simple col-op-literal
-        )
+        .filter(ur.col("pr") > ur.col("pr"))
+        .collect()
+        .to_arrow()
     )
+    assert out.num_rows == 0
+
+
+def test_non_predicate_filter_argument_is_honest():
+    # A bare column (or an arithmetic expression) is not a boolean predicate; filter
+    # must reject it with a clear error rather than silently coercing — identically
+    # on the graph-op path and the plain-frame (pyarrow) path.
+    edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
+    graph = edges.nodes().with_columns(pr=ur.pagerank(edges)).filter(ur.col("pr"))
     with pytest.raises(NotImplementedError):
-        pipeline.collect()
+        graph.collect()
+    # plain-frame path: a bare boolean column must be rejected here too, not silently
+    # accepted (the graph and plain paths share the same predicate-shape check).
+    plain = ur.from_arrow(pa.table({"id": [0, 1, 2], "flag": [True, False, True]}), id="id")
+    with pytest.raises(NotImplementedError):
+        plain.filter(ur.col("flag")).collect()
