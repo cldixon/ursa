@@ -63,7 +63,11 @@ def from_networkx(graph: Any, *, weight: str = "weight") -> EdgeFrame:
             weights.append(attrs[weight])
         else:
             all_weighted = False
-    data = {"src": pa.array(srcs), "dst": pa.array(dsts)}
+    # An empty graph gives empty id lists; pyarrow would infer a *null*-typed
+    # column, which the id canonicalizer rejects. Default empty ids to int64 so an
+    # empty graph yields an empty (int-id) frame instead of erroring.
+    id_type = pa.int64() if not srcs else None
+    data = {"src": pa.array(srcs, type=id_type), "dst": pa.array(dsts, type=id_type)}
     if all_weighted and srcs:
         data["weight"] = pa.array(weights, type=pa.float64())
     return EdgeFrame(pa.table(data), src="src", dst="dst")
@@ -91,7 +95,9 @@ def nodes_from_networkx(graph: Any, *, id: str = "id") -> NodeFrame:
         ids.append(node)
         for k in keys:
             columns[k].append(attrs.get(k))
-    data: dict[str, Any] = {id: pa.array(ids)}
+    # Empty graph -> default the id column to int64 (see from_networkx) so the
+    # canonicalizer accepts it instead of rejecting an inferred null column.
+    data: dict[str, Any] = {id: pa.array(ids, type=pa.int64() if not ids else None)}
     for k in keys:
         data[k] = pa.array(columns[k])
     return NodeFrame(pa.table(data), id=id)
@@ -153,6 +159,13 @@ def from_numpy(array: Any, *, kind: str = "auto", weighted: bool = False) -> Edg
             raise ValueError(
                 f"edge array must have 2 or 3 columns (src, dst[, weight]); got shape {arr.shape}."
             )
+        # For an edge array the weight *is* the third column, so `weighted=` is
+        # redundant — but a caller who passes weighted=True on a 2-column array
+        # expects a weight that isn't there. Reject that rather than silently drop it.
+        if weighted and arr.shape[1] == 2:
+            raise ValueError(
+                "weighted=True needs a 3-column edge array (src, dst, weight); got 2 columns."
+            )
         data = {"src": arr[:, 0].astype("int64"), "dst": arr[:, 1].astype("int64")}
         if arr.shape[1] == 3:
             data["weight"] = arr[:, 2].astype("float64")
@@ -171,7 +184,10 @@ def from_scipy_sparse(matrix: Any, *, weighted: bool = False) -> EdgeFrame:
     """
     import pyarrow as pa
 
-    _require("scipy", pip="scipy")
+    # A real scipy.sparse matrix already implies scipy is imported, and `.tocoo()`
+    # lives on the matrix itself — so validate the input shape first (a clear
+    # TypeError for a non-sparse arg) rather than demanding a scipy import that a
+    # wrong-typed input would never need.
     if not hasattr(matrix, "tocoo"):
         raise TypeError(
             f"from_scipy_sparse() expects a scipy.sparse matrix; got {type(matrix).__name__!r}."

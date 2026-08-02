@@ -221,6 +221,42 @@ def test_from_scipy_sparse_wrong_type_errors():
         ur.from_scipy_sparse([[0, 1], [1, 0]])  # a plain list, not sparse
 
 
+def test_from_scipy_sparse_wrong_type_errors_even_without_scipy(monkeypatch):
+    # The non-sparse TypeError must fire before any scipy import — a wrong-typed
+    # arg never needs scipy, so it should not demand it be installed.
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "scipy" or name.startswith("scipy."):
+            raise ImportError("No module named 'scipy'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(TypeError):
+        ur.from_scipy_sparse([[0, 1], [1, 0]])
+
+
+# --- empty-graph and argument-consistency edge cases -----------------------
+
+
+def test_from_networkx_empty_graph_yields_empty_frame():
+    nx = pytest.importorskip("networkx")
+    edges = ur.from_networkx(nx.DiGraph())
+    assert edges.collect().to_arrow().num_rows == 0
+
+
+def test_nodes_from_networkx_empty_graph_yields_empty_frame():
+    nx = pytest.importorskip("networkx")
+    nodes = ur.nodes_from_networkx(nx.Graph())
+    assert nodes.collect().to_arrow().num_rows == 0
+
+
+def test_from_numpy_edges_weighted_true_two_columns_errors():
+    np = pytest.importorskip("numpy")
+    with pytest.raises(ValueError, match="3-column"):
+        ur.from_numpy(np.array([[0, 1], [1, 2]]), kind="edges", weighted=True)
+
+
 # --- optional-dependency isolation -----------------------------------------
 
 
