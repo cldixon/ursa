@@ -35,6 +35,9 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
 
+# --- Public datasets (bundled + downloadable) -------------------------------
+from . import datasets
+
 # --- Expression dialect (pure Python, always available) ---------------------
 from ._expr import Expr, col, dst, id, lit, src
 
@@ -133,6 +136,7 @@ __all__ = [
     "clustering_coefficient",
     "col",
     "connected_components",
+    "datasets",
     "degree",
     "density",
     "describe",
