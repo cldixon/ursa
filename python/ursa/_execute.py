@@ -242,6 +242,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         if op == "group_by_agg":
             if group_by is not None:
                 raise NotImplementedError("collect() supports a single group_by().agg() for now.")
+            _reject_pre_group_tail(sort, limit, rename)
             group_by = _parse_group_agg(step)
             saw_group_by = True
             continue
@@ -498,6 +499,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         elif op == "group_by_agg":
             if group_by is not None:
                 raise NotImplementedError("collect() supports a single group_by().agg() for now.")
+            _reject_pre_group_tail(sort, limit, rename)
             group_by = _parse_group_agg(step)
             saw_group_by = True
         elif op == "reverse":
@@ -903,6 +905,30 @@ def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
 _AGG_FNS = {"mean", "sum", "min", "max", "count", "n_unique"}
 
 
+def _reject_pre_group_tail(
+    sort: tuple[str, bool] | None, limit: int | None, rename: dict[str, str]
+) -> None:
+    """The canonical tail applies sort/head/rename *after* the grouping, so a
+    sort/head/rename written *before* group_by().agg() would be silently
+    reordered (e.g. ``.head(10).group_by(...)`` would truncate groups, not rows).
+    Reject it rather than execute a different query than the one written; these
+    verbs are supported *after* the group."""
+    offenders = [
+        name
+        for name, present in (
+            ("sort", sort is not None),
+            ("head", limit is not None),
+            ("rename", bool(rename)),
+        )
+        if present
+    ]
+    if offenders:
+        raise NotImplementedError(
+            f"{'/'.join(offenders)}() before group_by().agg() is not supported "
+            "(the tail applies them after the group); move them after the group_by."
+        )
+
+
 def _parse_group_keys(keys: Any) -> list[str]:
     """The group key column names. Accepts bare strings or ``ur.col(name)``."""
     out: list[str] = []
@@ -1112,18 +1138,28 @@ def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, st
     for a in aggs:
         if a["column"] not in table.column_names:
             raise ValueError(f"agg() references unknown column '{a['column']}'.")
-    # pyarrow names an aggregate output "{column}_{pcfn}"; map to our resolved names.
-    specs = [(a["column"], _PC_AGG[a["fn"]]) for a in aggs]
+    # Deduplicate the (column, pcfn) computations: two aggregations with distinct
+    # output names but the same column+fn (e.g. .agg(a=col('x').sum(), b=col('x')
+    # .sum())) share one pyarrow aggregate, and the engine path likewise emits two
+    # aliases of one sum — so both paths stay consistent. pyarrow names an
+    # aggregate output "{column}_{pcfn}"; each is mapped back to *every* output
+    # that requested it.
+    specs = []
+    seen_specs: set[tuple[str, str]] = set()
+    for a in aggs:
+        spec = (a["column"], _PC_AGG[a["fn"]])
+        if spec not in seen_specs:
+            seen_specs.add(spec)
+            specs.append(spec)
     grouped = table.combine_chunks().group_by(keys).aggregate(specs)
-    pc_names = [f"{a['column']}_{_PC_AGG[a['fn']]}" for a in aggs]
-    outputs = [a["output"] for a in aggs]
-    # group_by output is [aggregations..., keys...]; reorder to [keys..., outputs...]
-    # and relabel the aggregate columns to our output names.
     cols = {name: grouped.column(name) for name in grouped.column_names}
     import pyarrow as pa
 
-    ordered_names = keys + outputs
-    ordered_cols = [cols[k] for k in keys] + [cols[pc] for pc in pc_names]
+    ordered_names = list(keys)
+    ordered_cols = [cols[k] for k in keys]
+    for a in aggs:
+        ordered_names.append(a["output"])
+        ordered_cols.append(cols[f"{a['column']}_{_PC_AGG[a['fn']]}"])
     return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
 
 

@@ -301,3 +301,46 @@ def test_group_by_on_traversal_result_is_rejected():
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
     with pytest.raises(NotImplementedError):
         ur.hop(edges, 1).from_([0]).group_by("src").agg(n=ur.col("dst").count()).collect()
+
+
+def test_unknown_agg_column_errors_on_engine_path():
+    # Engine path (graph-derived frame): aggregating a column that doesn't exist
+    # must raise a clear error, not an opaque DataFusion schema error — matching
+    # the plain path's guard.
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 0], "d": [0, 0, 1]}), src="s", dst="d")
+    nodes = ur.from_arrow(pa.table({"id": [0, 1, 2], "region": ["us", "us", "eu"]}), id="id")
+    with pytest.raises((ValueError, Exception)) as exc:
+        nodes.with_columns(deg=ur.degree(edges, direction="in")).group_by("region").agg(
+            total=ur.col("missing").sum()
+        ).collect()
+    assert "missing" in str(exc.value)
+
+
+@pytest.mark.parametrize("verb", ["sort", "head", "rename"])
+def test_pre_group_sort_head_rename_is_rejected(verb):
+    # A sort/head/rename written *before* the group_by would be silently reordered
+    # to after it (the canonical tail order), executing a different query. Reject.
+    base = ur.from_arrow(NODES, id="id")
+    if verb == "sort":
+        pre = base.sort("capacity")
+    elif verb == "head":
+        pre = base.head(2)
+    else:
+        pre = base.rename({"capacity": "cap"})
+    with pytest.raises(NotImplementedError):
+        pre.group_by("region").agg(total=ur.col("capacity").sum()).collect()
+
+
+def test_duplicate_column_and_fn_distinct_output_names_agree():
+    # Two aggregations sharing the same column+fn but distinct output names must
+    # work (both paths emit two labels of one computation).
+    out = (
+        ur.from_arrow(NODES, id="id")
+        .group_by("region")
+        .agg(a=ur.col("capacity").sum(), b=ur.col("capacity").sum())
+        .collect()
+        .to_arrow()
+    )
+    rows = _rows_by_key(out, "region")
+    assert rows["us"]["a"] == rows["us"]["b"] == 60
+    assert rows["eu"]["a"] == rows["eu"]["b"] == 90

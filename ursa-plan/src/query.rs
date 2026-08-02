@@ -294,7 +294,19 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
             let v: serde_json::Value = serde_json::from_str(a).map_err(|e| {
                 DataFusionError::Execution(format!("invalid agg expression JSON: {e}"))
             })?;
-            agg_exprs.push(crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?);
+            let expr = crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?;
+            // Clear error for an aggregation over an unknown column (df.aggregate
+            // would otherwise fail with an opaque schema error) — mirrors the
+            // group-key check above and the pyarrow plain path's guard.
+            for c in expr.column_refs() {
+                if !df.schema().fields().iter().any(|f| f.name() == &c.name) {
+                    return Err(DataFusionError::Execution(format!(
+                        "agg() references unknown column {:?}",
+                        c.name
+                    )));
+                }
+            }
+            agg_exprs.push(expr);
         }
         df = df.aggregate(group_exprs, agg_exprs)?;
     }
