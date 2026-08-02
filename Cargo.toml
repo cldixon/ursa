@@ -32,7 +32,7 @@ rayon = "1.10"
 datafusion = "54"
 # Cloud backends (S3/GCS/Azure) are enabled here so scan_edges/scan_nodes can read
 # from object storage. These features pull in an HTTP client + TLS (rustls) + XML.
-object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
 pyo3 = "0.28"
 url = "2"
 # Seeded PRNG for the stochastic kernels (random_walk). ChaCha gives a portable,
