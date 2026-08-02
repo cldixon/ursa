@@ -155,9 +155,19 @@ evaluated to an f64 per edge and gathered per CSR slot via the `edge_ids`
 permutation. Weighted **PageRank**, **`shortest_path`** (Dijkstra), **closeness**,
 **betweenness** (Dijkstra-Brandes), and **louvain** all ship.
 
-A few relational verbs are modelled in the plan (so they compose and show in
-`.explain()`) but are **not yet executable** and raise a clear error when
-collected: `sample`, `group_by().agg`, `join`, and `schema`.
+The **relational tail** — `filter`, `sort`, `head`, `rename`, `distinct`,
+`sample`, and now **`group_by(keys...).agg(...)`** — composes on top of any
+graph/traversal/plain output through one shared canonical pipeline
+(`filter → group_by → distinct → sample → sort → limit → rename`). A grouped
+aggregation replaces the schema with `[keys..., outputs...]`; aggregations are
+written `ur.col(c).mean()` (also `sum`/`min`/`max`/`count`/`n_unique`),
+optionally `.alias(name)` or named via `.agg(name=...)`. It runs on the engine
+(DataFusion) for graph-derived frames and in pyarrow for source-backed ones,
+with both paths resolving to identical output columns.
+
+A couple of relational verbs are modelled in the plan (so they compose and show
+in `.explain()`) but are **not yet executable** and raise a clear error when
+collected: `join` and `schema`.
 
 Next, in rough priority order:
 
