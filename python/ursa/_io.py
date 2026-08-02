@@ -62,6 +62,12 @@ def scan_edges(
     ``dst`` are role mappings, not renames. ``store`` accepts a pre-configured
     ``obstore`` store in place of ``storage_options`` (both bind the same
     underlying Rust ``object_store`` crate).
+
+    HTTP note: a URL must point directly at the file (no query string — the scan
+    drops it before fetching, so presigned/token URLs will not authenticate; use
+    the ``s3://`` / ``gs://`` / ``az://`` backends with ``storage_options`` for
+    signed access). Over plain ``http://`` the request and data are unencrypted;
+    treat the URL as untrusted input if it is ever caller-controlled.
     """
     _reject_format_opts(format_opts)
     step = _PlanStep(

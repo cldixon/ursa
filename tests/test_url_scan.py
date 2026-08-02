@@ -134,13 +134,15 @@ def test_read_edges_over_http_then_pagerank(http_root):
     assert ranked.num_rows == 4
 
 
-def test_http_url_with_query_string_resolves_format(http_root):
-    # A presigned-style URL (trailing ?query) must still resolve its .csv format —
-    # the extension check strips the query string.
-    tmp_path, base = http_root
-    name = _write_csv(tmp_path)
-    edges = ur.scan_edges(f"{base}/{name}?token=abc123", src="s", dst="d")
-    assert _out_degrees(edges) == EXPECTED
+def test_http_url_with_query_string_is_rejected(http_root):
+    # A query string on an http(s) URL is rejected clearly: the scan engine drops
+    # the query before fetching, so a presigned/token URL would silently fetch the
+    # unsigned path and fail. The error must point the user at the right tool.
+    _, base = http_root
+    edges = ur.scan_edges(f"{base}/edges.csv?token=abc123", src="s", dst="d")
+    with pytest.raises(Exception) as exc:
+        edges.collect()
+    assert "query string" in str(exc.value)
 
 
 def test_scan_nodes_over_http(http_root):

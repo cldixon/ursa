@@ -99,28 +99,42 @@ fn register_object_store(
     Ok(())
 }
 
-/// The path portion of a scan target, lowercased, for extension matching. For a
-/// URL this strips the query/fragment (`.../edges.csv?token=…` → `/edges.csv`) so
-/// a presigned/parameterized URL still resolves its format; a bare local path is
-/// returned lowercased as-is.
-fn ext_path(path: &str) -> String {
-    match Url::parse(path) {
-        Ok(u) => u.path().to_ascii_lowercase(),
-        Err(_) => path.to_ascii_lowercase(),
-    }
+/// The Parquet/CSV file format of a scan target, from its extension. Matches on
+/// the raw lowercased path so an object-store glob wildcard (`part-?.parquet`,
+/// `*.csv`) is preserved — `?`/`*` are glob metacharacters here, not URL syntax.
+///
+/// A query string on an `http(s)` URL (`…/edges.csv?token=…`) is a special,
+/// clearly-rejected case: the scan engine derives the object location from the
+/// URL *path* and drops the query before fetching, so a presigned/tokened URL
+/// would silently fetch the unsigned path and fail — better to reject it with a
+/// pointer to the object-store backends, which do sign requests.
+#[derive(Debug)]
+enum ScanFormat {
+    Parquet,
+    Csv,
 }
 
-/// The `file_extension` to hand DataFusion's reader. Normally the format's own
-/// extension (so a directory/glob read still filters correctly), but a URL with a
-/// query string (`edges.csv?token=…`) does not literally end in the extension, so
-/// return `""` (no filter) — `ext_path` already proved the format for the single
-/// file the caller named.
-fn read_ext<'a>(path: &str, default: &'a str) -> &'a str {
-    if path.contains('?') {
-        ""
-    } else {
-        default
+fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".parquet") {
+        return Ok(ScanFormat::Parquet);
     }
+    if lower.ends_with(".csv") {
+        return Ok(ScanFormat::Csv);
+    }
+    if let Ok(u) = Url::parse(path) {
+        if matches!(u.scheme(), "http" | "https") && u.query().is_some() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{verb}: an http(s) URL with a query string is not supported — the scan \
+                 drops the query before fetching, so a presigned/token URL would fetch the \
+                 unsigned path and fail. Point at a direct .parquet/.csv URL, or use \
+                 s3://gs://az:// with storage_options for signed access. got {path:?}"
+            )));
+        }
+    }
+    Err(DataFusionError::NotImplemented(format!(
+        "{verb} supports .parquet and .csv in v0.1; got path {path:?}"
+    )))
 }
 
 /// The canonical Arrow type for a node-id column: any integer type collapses to
@@ -156,21 +170,12 @@ pub fn scan_edges_batch(
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
-        let lower = ext_path(path);
-        // A URL query string (`edges.csv?token=…`) defeats DataFusion's own
-        // end-of-path extension check even though `ext_path` already resolved the
-        // format; `read_ext` clears the extension filter in that case so the read
-        // proceeds.
-        let df = if lower.ends_with(".parquet") {
-            let opts = ParquetReadOptions::default().file_extension(read_ext(path, ".parquet"));
-            ctx.read_parquet(path, opts).await?
-        } else if lower.ends_with(".csv") {
-            let opts = CsvReadOptions::default().file_extension(read_ext(path, ".csv"));
-            ctx.read_csv(path, opts).await?
-        } else {
-            return Err(DataFusionError::NotImplemented(format!(
-                "scan_edges supports .parquet and .csv in v0.1; got path {path:?}"
-            )));
+        let df = match detect_format(path, "scan_edges")? {
+            ScanFormat::Parquet => {
+                ctx.read_parquet(path, ParquetReadOptions::default())
+                    .await?
+            }
+            ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
         };
 
         // Project src, dst, then any weight columns not already among them.
@@ -260,17 +265,12 @@ pub fn scan_nodes_batch(
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
-        let lower = ext_path(path);
-        let df = if lower.ends_with(".parquet") {
-            let opts = ParquetReadOptions::default().file_extension(read_ext(path, ".parquet"));
-            ctx.read_parquet(path, opts).await?
-        } else if lower.ends_with(".csv") {
-            let opts = CsvReadOptions::default().file_extension(read_ext(path, ".csv"));
-            ctx.read_csv(path, opts).await?
-        } else {
-            return Err(DataFusionError::NotImplemented(format!(
-                "scan_nodes supports .parquet and .csv in v0.1; got path {path:?}"
-            )));
+        let df = match detect_format(path, "scan_nodes")? {
+            ScanFormat::Parquet => {
+                ctx.read_parquet(path, ParquetReadOptions::default())
+                    .await?
+            }
+            ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
         };
 
         // Projection pushdown: read only the requested columns (must include id).
@@ -475,13 +475,35 @@ mod tests {
     }
 
     #[test]
-    fn ext_path_strips_query_string() {
-        // A presigned/parameterized URL keeps its format resolvable: the query is
-        // stripped before the extension check. Bare local paths pass through.
-        assert!(ext_path("https://host/data/edges.csv?token=abc123").ends_with(".csv"));
-        assert!(ext_path("s3://bucket/g.parquet?versionId=9").ends_with(".parquet"));
-        assert!(ext_path("/tmp/local/edges.CSV").ends_with(".csv"));
-        assert!(ext_path("edges.parquet").ends_with(".parquet"));
+    fn detect_format_matches_extension_and_globs() {
+        // Plain files + case-insensitive.
+        assert!(matches!(
+            detect_format("edges.parquet", "scan_edges").unwrap(),
+            ScanFormat::Parquet
+        ));
+        assert!(matches!(
+            detect_format("/tmp/local/edges.CSV", "scan_edges").unwrap(),
+            ScanFormat::Csv
+        ));
+        // An object-store glob keeps `?`/`*` as glob metacharacters (regression
+        // guard: the query-stripping approach broke `part-?.parquet`).
+        assert!(matches!(
+            detect_format("s3://bucket/part-?.parquet", "scan_edges").unwrap(),
+            ScanFormat::Parquet
+        ));
+        assert!(matches!(
+            detect_format("gs://bucket/*.csv", "scan_nodes").unwrap(),
+            ScanFormat::Csv
+        ));
+    }
+
+    #[test]
+    fn detect_format_rejects_http_query_string_clearly() {
+        // The engine drops the query before fetching, so a presigned/token URL
+        // would silently fetch the unsigned path — reject it with a clear message.
+        let err = detect_format("https://host/data/edges.csv?token=abc123", "scan_edges");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("query string"));
     }
 
     #[test]
