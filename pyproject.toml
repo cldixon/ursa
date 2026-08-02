@@ -33,9 +33,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# polars is a real *runtime* optional dependency, used ONLY by the interop shims
-# (.to_polars / ur.from_polars). Installed by users who want the interop.
+# Real *runtime* optionals, each used ONLY by the matching interop constructor —
+# never imported at `import ursa` time. Installed by users who want that interop.
+# `ur.to_polars` / `ur.from_polars`:
 polars = ["polars>=1.0"]
+# `ur.from_networkx` / `ur.nodes_from_networkx`:
+networkx = ["networkx>=3.0"]
+# `ur.from_numpy`:
+numpy = ["numpy>=1.24"]
+# `ur.from_scipy_sparse` (pulls numpy transitively):
+scipy = ["scipy>=1.10"]
+# Everything at once, for a batteries-included install.
+all = ["polars>=1.0", "networkx>=3.0", "numpy>=1.24", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/cldixon/ursa"

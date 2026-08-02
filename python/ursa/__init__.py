@@ -59,8 +59,15 @@ from ._graph import (
 )
 
 # --- IO constructors --------------------------------------------------------
+from ._interop import (
+    from_networkx,
+    from_numpy,
+    from_scipy_sparse,
+    nodes_from_networkx,
+)
 from ._io import (
     from_arrow,
+    from_edgelist,
     from_pandas,
     from_polars,
     read_edges,
@@ -132,14 +139,19 @@ __all__ = [
     "diameter",
     "dst",
     "from_arrow",
+    "from_edgelist",
+    "from_networkx",
+    "from_numpy",
     "from_pandas",
     "from_polars",
+    "from_scipy_sparse",
     "hop",
     "id",
     "label_propagation",
     "lit",
     "louvain",
     "neighbors",
+    "nodes_from_networkx",
     "pagerank",
     "random_walk",
     "read_edges",
