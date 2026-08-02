@@ -13,6 +13,7 @@ network. Assertions target stable structural properties, not brittle floats.
 from __future__ import annotations
 
 import http.server
+import itertools
 import threading
 from functools import partial
 
@@ -60,6 +61,18 @@ def test_journey_dataset_to_ranking_and_parquet_roundtrip(tmp_path):
     assert back.num_rows == 10
     assert back.column("id").to_pylist() == tbl.column("id").to_pylist()
 
+    # ...and the same graph filtered by a computed column: .filter() keeps only the
+    # rows matching the predicate (a core relational verb, end to end).
+    hubs = (
+        edges.nodes()
+        .with_columns(deg=ur.degree(edges, direction="out"))
+        .filter(ur.col("deg") > 5)
+        .collect()
+        .to_arrow()
+    )
+    assert hubs.num_rows > 0
+    assert all(d > 5 for d in hubs.column("deg").to_pylist())
+
 
 # --- Journey 2: networkx interop -> community detection -> nx cross-check ---
 
@@ -82,6 +95,26 @@ def test_journey_networkx_to_communities():
     # clustering coefficient is a ratio in [0, 1].
     assert all(0.0 <= c <= 1.0 for c in out.column("cc").to_pylist())
 
+    # The node-attribute interop path: pull the graph's node labels as a NodeFrame
+    # and group the louvain result by faction using group_by on the joined labels.
+    labels = ur.nodes_from_networkx(g)
+    by_faction = (
+        labels.with_columns(comm=ur.louvain(edges))
+        .group_by("club")
+        .agg(members=ur.col("comm").count())
+        .collect()
+        .to_arrow()
+    )
+    counts = dict(
+        zip(
+            by_faction.column("club").to_pylist(),
+            by_faction.column("members").to_pylist(),
+            strict=True,
+        )
+    )
+    assert set(counts) == {"Mr. Hi", "Officer"}
+    assert sum(counts.values()) == g.number_of_nodes()
+
 
 # --- Journey 3: scipy adjacency -> structure -> polars egress --------------
 
@@ -89,6 +122,7 @@ def test_journey_networkx_to_communities():
 def test_journey_scipy_adjacency_to_polars():
     sp = pytest.importorskip("scipy.sparse")
     np = pytest.importorskip("numpy")
+    pytest.importorskip("polars")  # to_polars() egress is optional-dep-gated
     # A directed 4-cycle 0->1->2->3->0 as a sparse adjacency matrix.
     rows = np.array([0, 1, 2, 3])
     cols = np.array([1, 2, 3, 0])
@@ -232,11 +266,16 @@ def test_journey_labels_centrality_grouped():
 def test_journey_traversal_and_shortest_path():
     # Reachability + a shortest path on a real graph, ending in to_dicts egress.
     edges = datasets.load_karate()
-    # Two-hop neighbourhood of node 0 (the instructor) — non-empty and bounded.
+    # Node 33 (the president) sits two hops from node 0 (the instructor), so it
+    # must appear in 0's two-hop neighbourhood.
     reach = ur.hop(edges, n=2).from_([0]).collect().to_arrow()
-    assert reach.num_rows > 0
     assert set(reach.column_names) >= {"src", "dst"}
-    # A shortest path between two nodes returns the path edges as (src, dst) rows.
-    path = ur.shortest_path(edges, 0, 33).collect().to_dicts()
-    assert len(path) >= 1
-    assert all("src" in row and "dst" in row for row in path)
+    assert 33 in reach.column("dst").to_pylist()
+    # The shortest path 0 -> 33 is returned as ordered edge rows; verify it is a
+    # real path: anchored at both ends and hop-contiguous (each edge's dst is the
+    # next edge's src).
+    path = sorted(ur.shortest_path(edges, 0, 33).collect().to_dicts(), key=lambda r: r["hop"])
+    assert path[0]["src"] == 0
+    assert path[-1]["dst"] == 33
+    for a, b in itertools.pairwise(path):
+        assert a["dst"] == b["src"]
