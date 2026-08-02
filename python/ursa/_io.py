@@ -170,6 +170,61 @@ def from_pandas(
     return _from_inmemory(df, src, dst, id)
 
 
+def from_edgelist(edges: Any, *, weighted: bool | None = None) -> EdgeFrame:
+    """Build an EdgeFrame from an iterable of edge tuples — the most direct way to
+    hand-write a small graph.
+
+    Each edge is a 2-tuple ``(src, dst)`` or, for a weighted graph, a 3-tuple
+    ``(src, dst, weight)``. Endpoints may be ints or strings (Ursa supports both id
+    kinds); the third element, if present, becomes a ``weight`` column. By default
+    the arity is auto-detected from the first edge and every edge must match it;
+    pass ``weighted=True``/``False`` to require 3-/2-tuples explicitly.
+
+    Bare tuples carry no column names, so they cannot flow through the generic
+    in-memory constructor (which needs ``src=``/``dst=`` to name endpoints) — this
+    is their sanctioned entry point. The resulting frame is indistinguishable
+    downstream from one built any other way.
+    """
+    import pyarrow as pa
+
+    rows = list(edges)
+    if not rows:
+        raise ValueError("from_edgelist() needs at least one edge.")
+    first = rows[0]
+    try:
+        arity = len(first)
+    except TypeError:
+        raise TypeError(
+            "each edge must be a 2-tuple (src, dst) or 3-tuple (src, dst, weight); "
+            f"got {type(first).__name__!r}."
+        ) from None
+    if weighted is True:
+        arity = 3
+    elif weighted is False:
+        arity = 2
+    if arity not in (2, 3):
+        raise ValueError(
+            "each edge must be a 2-tuple (src, dst) or 3-tuple (src, dst, weight); "
+            f"got a {arity}-tuple."
+        )
+    srcs, dsts, weights = [], [], []
+    for e in rows:
+        if len(e) != arity:
+            raise ValueError(
+                "every edge must have the same arity; expected "
+                f"{arity}-tuples but got a {len(e)}-tuple ({e!r}). Pass weighted= to "
+                "fix the shape explicitly."
+            )
+        srcs.append(e[0])
+        dsts.append(e[1])
+        if arity == 3:
+            weights.append(e[2])
+    data = {"src": pa.array(srcs), "dst": pa.array(dsts)}
+    if arity == 3:
+        data["weight"] = pa.array(weights, type=pa.float64())
+    return EdgeFrame(pa.table(data), src="src", dst="dst")
+
+
 def _from_inmemory(data: Any, src, dst, id):
     """Dispatch an in-memory input to the right primary constructor. The public
     ``from_arrow`` / ``from_polars`` / ``from_pandas`` aliases all funnel here; the

@@ -141,6 +141,11 @@ custom graph logical nodes — and many features have fanned out on top of it:
 node-valued algorithms (pagerank, degree, connected_components, triangle_count,
 clustering_coefficient, closeness, betweenness, label_propagation, louvain),
 composed pipelines, `scan_edges`/`scan_nodes` sources,
+**bring-your-own-format ingress** — beyond pyarrow / polars / pandas / row-dicts,
+the interop constructors `from_edgelist` (edge tuples), `from_networkx`
+(+ `nodes_from_networkx` for node attributes), `from_numpy` (adjacency matrix or
+edge array), and `from_scipy_sparse` (any sparse format); networkx / numpy / scipy
+stay optional and are never imported unless you call the matching constructor —
 **node-attribute enrichment** (in-memory or file-backed tables joined by id),
 **`neighbors().agg()`** over numeric and string attributes, the **traversals**
 `hop()` and `shortest_path()` (each its own first-class logical node returning an
