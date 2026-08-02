@@ -184,6 +184,10 @@ def _fetch_cached(url: str, filename: str, *, sha256: str | None = None) -> Path
     dest = _cache_dir() / filename
     if dest.exists():
         return dest
+    # Only http(s): never let a dataset URL become a file://, ftp://, etc. read
+    # (defensive — every caller here passes a hardcoded https:// constant).
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(f"dataset URLs must be http(s); got {url!r}.")
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:

@@ -86,15 +86,18 @@ def test_bundled_runs_an_algorithm_end_to_end():
     assert "pr" in top.column_names
 
 
-def test_karate_matches_networkx_degrees():
+def test_karate_matches_networkx_edge_set():
+    # Structural check: the bundled karate edge set must equal NetworkX's, not just
+    # have the same count. Compare undirected edges (frozenset endpoints).
     nx = pytest.importorskip("networkx")
     edges = datasets.load_karate()
-    deg = edges.nodes().with_columns(d=ur.degree(edges, direction="out")).collect().to_arrow()
-    # Undirected graph loaded as directed rows: out-degree here == nx degree for
-    # the endpoints as stored. Compare the total edge count instead (robust to
-    # direction convention): sum of out-degrees == number of edges.
-    assert sum(deg.column("d").to_pylist()) == 78
-    assert nx.karate_club_graph().number_of_edges() == 78
+    tbl = edges.collect().to_arrow()
+    ours = {
+        frozenset((s, d))
+        for s, d in zip(tbl.column("src").to_pylist(), tbl.column("dst").to_pylist(), strict=True)
+    }
+    theirs = {frozenset(e) for e in nx.karate_club_graph().edges()}
+    assert ours == theirs
 
 
 # --- registry --------------------------------------------------------------
