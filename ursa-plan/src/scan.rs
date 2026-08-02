@@ -4,12 +4,13 @@
 //! Parquet or CSV path is read through DataFusion — which pushes the projection
 //! into the file — and comes back as a `RecordBatch` ready for `build_topology`.
 //!
-//! Paths may be local, or object storage: `s3://`, `gs://`, `az://` (and
-//! `file://`). For a remote scheme the matching `object_store` backend is
-//! registered on the context before the read, seeded with the caller's
-//! `storage_options` layered over the backend's default credential chain
-//! (`from_env`). Projection pushdown still applies over the network — only the
-//! selected columns' byte ranges are fetched via ranged GETs.
+//! Paths may be local, object storage (`s3://`, `gs://`, `az://`, and `file://`),
+//! or a plain `http(s)://` URL (a single hosted file). For a remote scheme the
+//! matching `object_store` backend is registered on the context before the read,
+//! seeded with the caller's `storage_options` layered over the backend's default
+//! credential chain (`from_env`). Projection pushdown still applies over the
+//! network — only the selected columns' byte ranges are fetched via ranged GETs
+//! (for an HTTP store, when the server honors range requests).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,9 +23,10 @@ use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
+use object_store::http::HttpBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use url::Url;
+use url::{Position, Url};
 
 /// Register the object store for a scan `path` on `ctx`, keyed by the URL's
 /// `scheme://authority`. A schemeless (bare local) path parses as an error and is
@@ -65,18 +67,60 @@ fn register_object_store(
             }
             Arc::new(b.build().map_err(opt_err)?)
         }
+        // A plain HTTP(S) URL is a single-file read over an object_store `http`
+        // backend (WebDAV-style). No credentials/globbing — one file at one URL —
+        // but it lets a user point `scan_edges` straight at a hosted Parquet/CSV.
+        // `allow_http(true)` is required for a plain `http://` URL (object_store
+        // rejects non-TLS by default); the user opted into HTTP by using the scheme.
+        "http" | "https" => {
+            let base = &url[..Position::BeforePath]; // scheme://host[:port]
+            let client_opts = object_store::ClientOptions::new().with_allow_http(true);
+            Arc::new(
+                HttpBuilder::new()
+                    .with_url(base)
+                    .with_client_options(client_opts)
+                    .build()
+                    .map_err(opt_err)?,
+            )
+        }
         other => {
             return Err(DataFusionError::NotImplemented(format!(
-                "scan: unsupported URL scheme {other:?} (supported: file, s3, gs, az)"
+                "scan: unsupported URL scheme {other:?} (supported: file, s3, gs, az, http, https)"
             )))
         }
     };
-    // DataFusion routes by scheme + authority (bucket/container/host).
-    let host = url.host_str().unwrap_or_default();
-    let base = Url::parse(&format!("{scheme}://{host}"))
+    // DataFusion routes by scheme + authority. Include the port (`Position::
+    // BeforePath` yields `scheme://host[:port]`) so an `http://host:PORT/...` URL
+    // registers under the exact authority the read will look up — cloud buckets
+    // have no port, so this is identical to the old `scheme://host` for them.
+    let base = Url::parse(&url[..Position::BeforePath])
         .map_err(|e| DataFusionError::Execution(format!("scan: bad object-store url: {e}")))?;
     ctx.register_object_store(&base, store);
     Ok(())
+}
+
+/// The path portion of a scan target, lowercased, for extension matching. For a
+/// URL this strips the query/fragment (`.../edges.csv?token=…` → `/edges.csv`) so
+/// a presigned/parameterized URL still resolves its format; a bare local path is
+/// returned lowercased as-is.
+fn ext_path(path: &str) -> String {
+    match Url::parse(path) {
+        Ok(u) => u.path().to_ascii_lowercase(),
+        Err(_) => path.to_ascii_lowercase(),
+    }
+}
+
+/// The `file_extension` to hand DataFusion's reader. Normally the format's own
+/// extension (so a directory/glob read still filters correctly), but a URL with a
+/// query string (`edges.csv?token=…`) does not literally end in the extension, so
+/// return `""` (no filter) — `ext_path` already proved the format for the single
+/// file the caller named.
+fn read_ext<'a>(path: &str, default: &'a str) -> &'a str {
+    if path.contains('?') {
+        ""
+    } else {
+        default
+    }
 }
 
 /// The canonical Arrow type for a node-id column: any integer type collapses to
@@ -112,12 +156,17 @@ pub fn scan_edges_batch(
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
-        let lower = path.to_ascii_lowercase();
+        let lower = ext_path(path);
+        // A URL query string (`edges.csv?token=…`) defeats DataFusion's own
+        // end-of-path extension check even though `ext_path` already resolved the
+        // format; `read_ext` clears the extension filter in that case so the read
+        // proceeds.
         let df = if lower.ends_with(".parquet") {
-            ctx.read_parquet(path, ParquetReadOptions::default())
-                .await?
+            let opts = ParquetReadOptions::default().file_extension(read_ext(path, ".parquet"));
+            ctx.read_parquet(path, opts).await?
         } else if lower.ends_with(".csv") {
-            ctx.read_csv(path, CsvReadOptions::default()).await?
+            let opts = CsvReadOptions::default().file_extension(read_ext(path, ".csv"));
+            ctx.read_csv(path, opts).await?
         } else {
             return Err(DataFusionError::NotImplemented(format!(
                 "scan_edges supports .parquet and .csv in v0.1; got path {path:?}"
@@ -211,12 +260,13 @@ pub fn scan_nodes_batch(
     crate::runtime::block_on(async move {
         let ctx = SessionContext::new();
         register_object_store(&ctx, path, storage_options)?;
-        let lower = path.to_ascii_lowercase();
+        let lower = ext_path(path);
         let df = if lower.ends_with(".parquet") {
-            ctx.read_parquet(path, ParquetReadOptions::default())
-                .await?
+            let opts = ParquetReadOptions::default().file_extension(read_ext(path, ".parquet"));
+            ctx.read_parquet(path, opts).await?
         } else if lower.ends_with(".csv") {
-            ctx.read_csv(path, CsvReadOptions::default()).await?
+            let opts = CsvReadOptions::default().file_extension(read_ext(path, ".csv"));
+            ctx.read_csv(path, opts).await?
         } else {
             return Err(DataFusionError::NotImplemented(format!(
                 "scan_nodes supports .parquet and .csv in v0.1; got path {path:?}"
@@ -412,6 +462,26 @@ mod tests {
         let ctx = SessionContext::new();
         let err = register_object_store(&ctx, "ftp://host/graph.parquet", &no_opts());
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn registers_an_http_store_with_port() {
+        // The `http` feature is enabled: an http(s) URL registers a store, keyed by
+        // the full authority including the port (so localhost:PORT reads route
+        // correctly). Credential-free and lazy — no request is made here.
+        let ctx = SessionContext::new();
+        register_object_store(&ctx, "http://127.0.0.1:8080/graph/edges.csv", &no_opts()).unwrap();
+        register_object_store(&ctx, "https://example.com/edges.parquet", &no_opts()).unwrap();
+    }
+
+    #[test]
+    fn ext_path_strips_query_string() {
+        // A presigned/parameterized URL keeps its format resolvable: the query is
+        // stripped before the extension check. Bare local paths pass through.
+        assert!(ext_path("https://host/data/edges.csv?token=abc123").ends_with(".csv"));
+        assert!(ext_path("s3://bucket/g.parquet?versionId=9").ends_with(".parquet"));
+        assert!(ext_path("/tmp/local/edges.CSV").ends_with(".csv"));
+        assert!(ext_path("edges.parquet").ends_with(".parquet"));
     }
 
     #[test]

@@ -10,9 +10,10 @@ constructors.
 
 ``scan_*`` is lazy (returns a frame that is a plan); ``read_*`` is the eager
 convenience (scan + collect). Object storage is first-class: ``s3://``, ``gs://``,
-``az://`` and globs are accepted. Edge scans push their column projection
-(``src``/``dst`` plus any weight columns) into Parquet; node-column projection and
-predicate pushdown are not yet wired.
+``az://`` and globs are accepted, as is a plain ``http(s)://`` URL for a single
+hosted Parquet/CSV file (no globbing over HTTP). Edge scans push their column
+projection (``src``/``dst`` plus any weight columns) into Parquet; node-column
+projection and predicate pushdown are not yet wired.
 
 However data arrives — scan/read from Parquet, the in-memory constructors, or the
 aliases — once it is inside an EdgeFrame/NodeFrame nothing downstream can tell how
@@ -54,11 +55,13 @@ def scan_edges(
     store: Any | None = None,
     **format_opts: Any,
 ) -> EdgeFrame:
-    """Lazily scan an edge list from Parquet/CSV (local or object storage).
+    """Lazily scan an edge list from Parquet/CSV.
 
-    ``src`` / ``dst`` are role mappings, not renames. ``store`` accepts a
-    pre-configured ``obstore`` store in place of ``storage_options`` (both bind
-    the same underlying Rust ``object_store`` crate).
+    ``path`` may be local, object storage (``s3://`` / ``gs://`` / ``az://``, globs
+    allowed), or a plain ``http(s)://`` URL for a single hosted file. ``src`` /
+    ``dst`` are role mappings, not renames. ``store`` accepts a pre-configured
+    ``obstore`` store in place of ``storage_options`` (both bind the same
+    underlying Rust ``object_store`` crate).
     """
     _reject_format_opts(format_opts)
     step = _PlanStep(
@@ -94,7 +97,8 @@ def scan_nodes(
     store: Any | None = None,
     **format_opts: Any,
 ) -> NodeFrame:
-    """Lazily scan a node/attribute table; ``id`` is the id-role mapping."""
+    """Lazily scan a node/attribute table (local, object storage, or an
+    ``http(s)://`` URL); ``id`` is the id-role mapping."""
     _reject_format_opts(format_opts)
     step = _PlanStep(
         "scan_nodes",

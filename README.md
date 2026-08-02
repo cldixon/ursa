@@ -152,7 +152,8 @@ stay optional and are never imported unless you call the matching constructor â€
 EdgeFrame, on a shared single-source BFS kernel family) plus `random_walk()`, the eager whole-graph
 stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
 **`describe`**, **object-storage scans** (`s3://` / `gs://` / `az://` via
-`object_store`, with `storage_options`), and `sink_parquet`/`sink_csv` egress.
+`object_store`, with `storage_options`) plus **`http(s)://` URL reads** for a
+single hosted Parquet/CSV file, and `sink_parquet`/`sink_csv` egress.
 
 **Weighted algorithms** are live across the board: `weight=` is a per-operation
 *expression* over edge columns (`weight=ur.col("amount") * ur.col("fx")`),
