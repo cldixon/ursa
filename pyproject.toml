@@ -108,6 +108,12 @@ features = ["extension-module"]
 include = [
     { path = "LICENSE-MIT", format = "sdist" },
     { path = "LICENSE-APACHE", format = "sdist" },
+    # Bundled datasets: non-.py data must be listed explicitly (maturin's
+    # python-source picks up .py only), for BOTH the sdist and the wheel, or
+    # ur.datasets.load_* would find no data at runtime. Glob the whole data dir
+    # (not just *.csv) so a future non-CSV asset isn't silently left unpackaged.
+    { path = "python/ursa/datasets/data/*", format = ["sdist", "wheel"] },
+    { path = "python/ursa/datasets/LICENSES.md", format = ["sdist", "wheel"] },
 ]
 
 [tool.pytest.ini_options]
