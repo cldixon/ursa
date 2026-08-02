@@ -154,7 +154,7 @@ fn _topology_build_count() -> usize {
 /// expression JSON string (lowered through the shared `crate::expr` seam);
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new()))]
+#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new(), group_keys=Vec::new(), aggs=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
@@ -169,6 +169,8 @@ fn run_node_query(
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
     rename: Vec<(String, String)>,
+    group_keys: Vec<String>,
+    aggs: Vec<String>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
@@ -197,6 +199,8 @@ fn run_node_query(
             distinct,
             sample,
             rename,
+            group_keys,
+            aggs,
         )
         .map_err(to_pyerr)
     })?;
