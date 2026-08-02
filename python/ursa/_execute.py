@@ -79,6 +79,10 @@ def _expr_to_json(expr: Any, roles: dict[str, str] | None = None) -> dict[str, A
         }
     if kind == "unary":
         return {"kind": "unary", "op": p["op"], "operand": _expr_to_json(p["operand"], roles)}
+    if kind == "agg":
+        return {"kind": "agg", "fn": p["fn"], "operand": _expr_to_json(p["operand"], roles)}
+    if kind == "alias":
+        return {"kind": "alias", "name": p["name"], "operand": _expr_to_json(p["operand"], roles)}
     if kind in ("src", "dst", "id"):
         if roles is not None:
             if kind in roles:
@@ -226,6 +230,8 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     distinct = False
     sample: tuple[int, int | None] | None = None
     rename: dict[str, str] = {}
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
+    saw_group_by = False
 
     for step in frame._plan:
         op = step.op
@@ -233,6 +239,12 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         # swapped), so a graph op over them builds the transpose.
         if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
             continue  # source / metadata steps
+        if op == "group_by_agg":
+            if group_by is not None:
+                raise NotImplementedError("collect() supports a single group_by().agg() for now.")
+            group_by = _parse_group_agg(step)
+            saw_group_by = True
+            continue
         if op == "with_columns":
             # select() defines the output columns; computing more columns after it
             # is ambiguous (which survive?), so require with_columns before select.
@@ -247,6 +259,11 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 )
             graph_exprs = step.args["exprs"]
         elif op == "filter":
+            if saw_group_by:
+                raise NotImplementedError(
+                    "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
+                    "filter before the group_by."
+                )
             filters.append(step.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(step.args)
@@ -267,10 +284,18 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 f"collect() does not yet support the '{op}' step in a composed pipeline."
             )
 
+    if group_by is not None and (distinct or sample is not None or select is not None):
+        raise NotImplementedError(
+            "group_by().agg() does not compose with distinct/sample/select yet; "
+            "sort/head/rename on the grouped result are supported."
+        )
+
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
         # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
-        return _collect_plain_nodes(frame, filters, sort, limit, select, sample, rename, distinct)
+        return _collect_plain_nodes(
+            frame, filters, sort, limit, select, sample, rename, distinct, group_by
+        )
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
@@ -326,6 +351,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         distinct=distinct,
         sample=sample,
         rename=rename,
+        group_by=group_by,
     )
     return _apply_select(result, select)
 
@@ -460,6 +486,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     select: list[str] | None = None
     sample: tuple[int, int | None] | None = None
     rename: dict[str, str] = {}
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
+    saw_group_by = False
 
     for step in frame._plan:
         op = step.op
@@ -467,6 +495,11 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             traversal = step
         elif op in ("scan_edges", "from_arrow", "from_polars", "nodes"):
             continue  # source / metadata steps
+        elif op == "group_by_agg":
+            if group_by is not None:
+                raise NotImplementedError("collect() supports a single group_by().agg() for now.")
+            group_by = _parse_group_agg(step)
+            saw_group_by = True
         elif op == "reverse":
             # Metadata on a plain frame (the swapped source rides on the frame).
             # After a traversal its semantics are undesigned -> reject rather than
@@ -478,6 +511,11 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 )
             continue
         elif op == "filter":
+            if saw_group_by:
+                raise NotImplementedError(
+                    "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
+                    "filter before the group_by."
+                )
             filters.append(step.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(step.args)
@@ -498,10 +536,23 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 f"collect() does not yet support the '{op}' step on an edge frame."
             )
 
+    if group_by is not None and (distinct or sample is not None or select is not None):
+        raise NotImplementedError(
+            "group_by().agg() does not compose with distinct/sample/select yet; "
+            "sort/head/rename on the grouped result are supported."
+        )
+
     if traversal is None:
         # No traversal: a plain edge frame (scan_edges / from_arrow / read_edges,
         # or a reversed frame). Materialize its edge rows + tail (distinct included).
-        return _collect_plain_edges(frame, filters, sort, limit, select, sample, rename, distinct)
+        return _collect_plain_edges(
+            frame, filters, sort, limit, select, sample, rename, distinct, group_by
+        )
+    if group_by is not None:
+        raise NotImplementedError(
+            "group_by().agg() on a traversal result (hop/shortest_path) is not "
+            "supported yet; group_by is available on plain edge/node frames."
+        )
 
     # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
     # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
@@ -628,6 +679,7 @@ def _run_query(
     distinct: bool = False,
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
     # The node attribute table crosses the FFI as a batch list (not one batch).
@@ -635,6 +687,7 @@ def _run_query(
     # A node-query result carries the reserved `id` column plus the computed/joined
     # columns; `ur.id()` in a filter resolves to it. (src/dst have no role here.)
     filter_json = [_filter_json(p, {"id": "id"}) for p in filters]
+    group_keys, engine_aggs = ([], []) if group_by is None else (group_by[0], group_by[1])
     batches = _native().run_node_query(
         index,
         json.dumps(columns),
@@ -647,6 +700,8 @@ def _run_query(
         distinct,
         sample,
         list((rename or {}).items()),
+        group_keys,
+        engine_aggs,
     )
     return MaterializedFrame(batches)
 
@@ -844,6 +899,92 @@ def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
     return json.dumps(_expr_to_json(predicate, roles))
 
 
+# --- group_by().agg() ------------------------------------------------------
+_AGG_FNS = {"mean", "sum", "min", "max", "count", "n_unique"}
+
+
+def _parse_group_keys(keys: Any) -> list[str]:
+    """The group key column names. Accepts bare strings or ``ur.col(name)``."""
+    out: list[str] = []
+    for k in keys:
+        if isinstance(k, str):
+            out.append(k)
+        elif getattr(k, "kind", None) == "col":
+            out.append(k.payload["name"])
+        else:
+            raise NotImplementedError("group_by() supports column names or ur.col(<name>) as keys.")
+    if not out:
+        raise NotImplementedError("group_by() needs at least one key column.")
+    return out
+
+
+def _parse_agg_expr(name: str | None, expr: Any) -> tuple[str, str, str]:
+    """Resolve one aggregation to ``(output_name, fn, column)``.
+
+    Accepts ``ur.col(c).<fn>()`` optionally wrapped in ``.alias(x)``; the output
+    name is (highest precedence first) the ``.agg(name=...)`` keyword, then a
+    ``.alias()``, then the default ``{column}_{fn}``. An arithmetic or non-``col``
+    aggregand, or a non-aggregation expression, is a clear error (deferred)."""
+    alias_name: str | None = None
+    node = expr
+    if getattr(node, "kind", None) == "alias":
+        alias_name = node.payload["name"]
+        node = node.payload["operand"]
+    if getattr(node, "kind", None) != "agg":
+        raise NotImplementedError(
+            "agg() expects an aggregation like ur.col('x').mean() "
+            "(fns: mean/sum/min/max/count/n_unique)."
+        )
+    fn = node.payload["fn"]
+    if fn not in _AGG_FNS:
+        raise NotImplementedError(
+            f"aggregation {fn!r} is not supported (use {', '.join(sorted(_AGG_FNS))})."
+        )
+    operand = node.payload["operand"]
+    if getattr(operand, "kind", None) != "col":
+        raise NotImplementedError(
+            "agg() supports aggregating a single ur.col(<name>) for now "
+            "(aggregating an expression like col('a') * col('b') is future work)."
+        )
+    column = operand.payload["name"]
+    output = name or alias_name or f"{column}_{fn}"
+    return (output, fn, column)
+
+
+def _parse_group_agg(step: _PlanStep) -> tuple[list[str], list[str], list[dict[str, str]]]:
+    """Parse a ``group_by_agg`` step into ``(keys, engine_aggs, plain_aggs)`` — the
+    group keys, the serialized ``alias(agg(col))`` JSON per aggregation (engine
+    path), and ``{fn, column, output}`` dicts (pyarrow plain path). The two agg
+    encodings resolve to the *same* output column names, so both paths agree."""
+    keys = _parse_group_keys(step.args["keys"])
+    resolved: list[tuple[str, str, str]] = []
+    for expr in step.args["exprs"]:  # positional aggregations
+        resolved.append(_parse_agg_expr(None, expr))
+    for out_name, expr in step.args["named"].items():  # .agg(name=...)
+        resolved.append(_parse_agg_expr(out_name, expr))
+    if not resolved:
+        raise NotImplementedError("group_by().agg() needs at least one aggregation.")
+    seen: set[str] = set()
+    for output, _fn, _col in resolved:
+        if output in keys:
+            raise ValueError(f"aggregation output name {output!r} collides with a group key.")
+        if output in seen:
+            raise ValueError(f"duplicate aggregation output name {output!r}.")
+        seen.add(output)
+    engine_aggs = [
+        json.dumps(
+            {
+                "kind": "alias",
+                "name": output,
+                "operand": {"kind": "agg", "fn": fn, "operand": {"kind": "col", "name": col}},
+            }
+        )
+        for (output, fn, col) in resolved
+    ]
+    plain_aggs = [{"fn": fn, "column": col, "output": output} for (output, fn, col) in resolved]
+    return keys, engine_aggs, plain_aggs
+
+
 def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
     by = args["by"]
     if not isinstance(by, str):
@@ -950,6 +1091,42 @@ def _apply_pyarrow_rename(table: Any, rename: dict[str, str]) -> Any:
     return table.rename_columns([rename.get(c, c) for c in table.column_names])
 
 
+# pyarrow.compute aggregate function names by our fn name.
+_PC_AGG = {
+    "mean": "mean",
+    "sum": "sum",
+    "min": "min",
+    "max": "max",
+    "count": "count",
+    "n_unique": "count_distinct",
+}
+
+
+def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, str]]) -> Any:
+    """Group ``table`` by ``keys`` and aggregate, producing `[keys..., outputs...]`
+    with the same output column names as the engine path. Mirrors the engine's
+    unknown-key error."""
+    for k in keys:
+        if k not in table.column_names:
+            raise ValueError(f"group_by() references unknown column '{k}'.")
+    for a in aggs:
+        if a["column"] not in table.column_names:
+            raise ValueError(f"agg() references unknown column '{a['column']}'.")
+    # pyarrow names an aggregate output "{column}_{pcfn}"; map to our resolved names.
+    specs = [(a["column"], _PC_AGG[a["fn"]]) for a in aggs]
+    grouped = table.combine_chunks().group_by(keys).aggregate(specs)
+    pc_names = [f"{a['column']}_{_PC_AGG[a['fn']]}" for a in aggs]
+    outputs = [a["output"] for a in aggs]
+    # group_by output is [aggregations..., keys...]; reorder to [keys..., outputs...]
+    # and relabel the aggregate columns to our output names.
+    cols = {name: grouped.column(name) for name in grouped.column_names}
+    import pyarrow as pa
+
+    ordered_names = keys + outputs
+    ordered_cols = [cols[k] for k in keys] + [cols[pc] for pc in pc_names]
+    return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
+
+
 def _apply_pyarrow_tail(
     table: Any,
     filters: list[Any],
@@ -959,12 +1136,15 @@ def _apply_pyarrow_tail(
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
     distinct: bool = False,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> Any:
     # Same canonical order as the engine tail:
-    # filters → distinct → sample → sort → limit → rename.
+    # filters → group_by → distinct → sample → sort → limit → rename.
     for predicate in filters:
         _require_predicate(predicate)  # same top-of-predicate check as the graph path
         table = table.filter(_eval_pyarrow(predicate, table, roles))
+    if group_by is not None:
+        table = _apply_pyarrow_group_by(table, group_by[0], group_by[2])
     if distinct:
         # Distinct rows over all columns (group-by with no aggregations); row order
         # is unspecified for distinct, as on the engine path.
@@ -992,15 +1172,17 @@ def _collect_plain_nodes(
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
     distinct: bool = False,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
     # On a plain node table, ur.id() resolves to the frame's real id column.
     roles = {"id": frame.id_col}
     # With no computed columns, the scan need only read the id, whatever the
     # filter/sort touch, any rename source column, and (if a select narrows the
     # output) the selected columns. A rename *target* is a new label, not a file
-    # column, so it must not leak into the projection.
+    # column, so it must not leak into the projection. When group_by is present the
+    # whole file is read (keys + agg columns must be available; select is disallowed).
     file_needed: list[str] | None = None
-    if select is not None:
+    if select is not None and group_by is None:
         rename = rename or {}
         referenced: set[str] = set(rename)
         for p in filters:
@@ -1017,7 +1199,9 @@ def _collect_plain_nodes(
             "materializable node set yet."
         )
     # `attr` is a (chunked) pyarrow.Table.
-    table = _apply_pyarrow_tail(attr, filters, sort, limit, roles, sample, rename, distinct)
+    table = _apply_pyarrow_tail(
+        attr, filters, sort, limit, roles, sample, rename, distinct, group_by
+    )
     return _apply_select(MaterializedFrame(table), select)
 
 
@@ -1030,6 +1214,7 @@ def _collect_plain_edges(
     sample: tuple[int, int | None] | None = None,
     rename: dict[str, str] | None = None,
     distinct: bool = False,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
     import pyarrow as pa
 
@@ -1052,7 +1237,9 @@ def _collect_plain_edges(
         else:
             # No source: a filtered/derived (or traversal-result) edge frame.
             _require_edges(frame)  # raises the precise, plan-aware message
-    table = _apply_pyarrow_tail(table, filters, sort, limit, roles, sample, rename, distinct)
+    table = _apply_pyarrow_tail(
+        table, filters, sort, limit, roles, sample, rename, distinct, group_by
+    )
     return _apply_select(MaterializedFrame(table), select)
 
 

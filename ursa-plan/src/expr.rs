@@ -52,6 +52,17 @@ pub enum UrsaExpr {
         op: String,
         operand: Box<UrsaExpr>,
     },
+    /// an aggregation over its operand — `ur.col("x").mean()` etc. Only valid inside
+    /// a `group_by().agg()`; `func` is one of mean/sum/min/max/count/n_unique.
+    Agg {
+        func: String,
+        operand: Box<UrsaExpr>,
+    },
+    /// `expr.alias("name")` — renames the (aggregation) output column.
+    Alias {
+        name: String,
+        operand: Box<UrsaExpr>,
+    },
     // Graph verbs (`ur.degree`, `ur.pagerank`, `ur.neighbors(..).agg(..)`, ...) are
     // not part of this expression enum; they lower to the custom logical nodes in
     // `crate::logical`/`crate::node` at plan-build time.
@@ -102,6 +113,27 @@ pub fn lower(expr: &UrsaExpr) -> Result<DfExpr> {
                 )))
             }
         },
+        UrsaExpr::Agg { func, operand } => {
+            use datafusion::functions_aggregate::expr_fn::{
+                avg, count, count_distinct, max, min, sum,
+            };
+            let inner = lower(operand)?;
+            match func.as_str() {
+                "mean" => avg(inner),
+                "sum" => sum(inner),
+                "min" => min(inner),
+                "max" => max(inner),
+                "count" => count(inner),
+                "n_unique" => count_distinct(inner),
+                other => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "aggregation {other:?} is not supported \
+                         (use mean/sum/min/max/count/n_unique)"
+                    )))
+                }
+            }
+        }
+        UrsaExpr::Alias { name, operand } => lower(operand)?.alias(name),
         UrsaExpr::Src | UrsaExpr::Dst | UrsaExpr::Id => {
             return Err(DataFusionError::NotImplemented(
                 "role references (src/dst/id) are not supported in a weight expression; \
@@ -182,9 +214,37 @@ pub fn parse_ursa_expr(v: &Value) -> Result<UrsaExpr> {
                 operand: Box::new(operand),
             })
         }
+        "agg" => {
+            let func = v
+                .get("fn")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err("agg node missing 'fn'"))?;
+            let operand = parse_ursa_expr(
+                v.get("operand")
+                    .ok_or_else(|| err("agg node missing 'operand'"))?,
+            )?;
+            Ok(UrsaExpr::Agg {
+                func: func.to_string(),
+                operand: Box::new(operand),
+            })
+        }
+        "alias" => {
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err("alias node missing 'name'"))?;
+            let operand = parse_ursa_expr(
+                v.get("operand")
+                    .ok_or_else(|| err("alias node missing 'operand'"))?,
+            )?;
+            Ok(UrsaExpr::Alias {
+                name: name.to_string(),
+                operand: Box::new(operand),
+            })
+        }
         other => Err(DataFusionError::NotImplemented(format!(
             "expression node {other:?} is not supported here \
-             (use ur.col, literals, arithmetic/comparison/boolean ops, and ~)"
+             (use ur.col, literals, arithmetic/comparison/boolean ops, ~, and aggregations)"
         ))),
     }
 }
@@ -263,8 +323,11 @@ mod tests {
         // role references are only reachable in a weight expr and stay unsupported;
         // filters resolve them to columns in Python before serializing.
         assert!(parse_ursa_expr(&serde_json::json!({"kind": "src"})).is_err());
-        // an aggregation node is out of scope here (deferred to group_by).
-        assert!(parse_ursa_expr(&serde_json::json!({"kind": "agg", "fn": "sum"})).is_err());
+        // an unknown aggregation fn parses (fn carried through) but fails to lower.
+        let bad_agg = serde_json::json!({
+            "kind": "agg", "fn": "median", "operand": {"kind": "col", "name": "x"},
+        });
+        assert!(lower(&parse_ursa_expr(&bad_agg).unwrap()).is_err());
         // an unknown binary op parses (op carried through) but fails to lower.
         let bad = UrsaExpr::Binary {
             op: "^".to_string(),
@@ -272,6 +335,19 @@ mod tests {
             right: Box::new(UrsaExpr::LitI64(1)),
         };
         assert!(lower(&bad).is_err());
+    }
+
+    #[test]
+    fn parses_and_lowers_aliased_aggregation() {
+        // group_by().agg() serializes alias(agg(col)); it must parse and lower.
+        for func in ["mean", "sum", "min", "max", "count", "n_unique"] {
+            let json = serde_json::json!({
+                "kind": "alias", "name": "out",
+                "operand": {"kind": "agg", "fn": func,
+                            "operand": {"kind": "col", "name": "amount"}},
+            });
+            lower(&parse_ursa_expr(&json).unwrap()).unwrap();
+        }
     }
 
     #[test]

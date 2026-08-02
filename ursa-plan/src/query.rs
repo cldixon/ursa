@@ -251,6 +251,12 @@ fn filter_expr(json: &str) -> Result<Expr> {
 /// adds a field here instead of touching the four call sites.
 struct Tail<'a> {
     filters: &'a [String],
+    /// `(group_keys, aggs)`: group by the key columns and aggregate. Each `agg` is a
+    /// serialized `alias(agg(col))` JSON. Applied right after `filters` (so `filter`
+    /// is a pre-group WHERE), and it *replaces* the schema with `[keys..., aggs...]`
+    /// — the later `sort`/`limit`/`rename` then reference the grouped columns.
+    group_keys: &'a [String],
+    aggs: &'a [String],
     distinct: bool,
     /// `(n, seed)` for a row sample; `seed = None` uses the default (reproducible).
     sample: Option<(usize, Option<u64>)>,
@@ -261,15 +267,36 @@ struct Tail<'a> {
 }
 
 /// Apply the relational tail to the base frame. Canonical order:
-/// `filters → distinct → sample → sort → limit → rename`.
+/// `filters → group_by → distinct → sample → sort → limit → rename`.
 ///
+/// - `group_by` runs right after `filters` (pre-group WHERE) and replaces the output
+///   schema, so `sort`/`limit`/`rename` see the grouped columns.
 /// - `sample` runs before `sort`/`limit`, so a following `.sort().head()` re-imposes
 ///   a deterministic order and `head` is honored on the sampled rows.
-/// - `rename` runs last and only relabels output columns; `filter`/`sort` therefore
-///   reference the pre-rename (computed/source) names.
+/// - `rename` runs last and only relabels output columns.
 async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> Result<DataFrame> {
     for f in tail.filters {
         df = df.filter(filter_expr(f)?)?;
+    }
+    if !tail.group_keys.is_empty() {
+        // Clear error for an unknown group key (df.aggregate would otherwise fail
+        // with an opaque schema error).
+        for k in tail.group_keys {
+            if !df.schema().fields().iter().any(|f| f.name() == k) {
+                return Err(DataFusionError::Execution(format!(
+                    "group_by() references unknown column {k:?}"
+                )));
+            }
+        }
+        let group_exprs: Vec<Expr> = tail.group_keys.iter().map(col).collect();
+        let mut agg_exprs = Vec::with_capacity(tail.aggs.len());
+        for a in tail.aggs {
+            let v: serde_json::Value = serde_json::from_str(a).map_err(|e| {
+                DataFusionError::Execution(format!("invalid agg expression JSON: {e}"))
+            })?;
+            agg_exprs.push(crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?);
+        }
+        df = df.aggregate(group_exprs, agg_exprs)?;
     }
     if tail.distinct {
         df = df.distinct()?;
@@ -379,6 +406,8 @@ pub fn execute_node_query(
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
     rename: Vec<(String, String)>,
+    group_keys: Vec<String>,
+    aggs: Vec<String>,
 ) -> Result<Vec<RecordBatch>> {
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
@@ -511,6 +540,8 @@ pub fn execute_node_query(
             df,
             Tail {
                 filters,
+                group_keys: &group_keys,
+                aggs: &aggs,
                 distinct,
                 sample,
                 sort,
@@ -560,6 +591,8 @@ pub fn execute_hop_query(
             df,
             Tail {
                 filters,
+                group_keys: &[],
+                aggs: &[],
                 distinct,
                 sample,
                 sort,
@@ -652,6 +685,8 @@ pub fn execute_path_query(
             df,
             Tail {
                 filters,
+                group_keys: &[],
+                aggs: &[],
                 distinct,
                 sample,
                 sort,
@@ -706,6 +741,8 @@ pub fn execute_walk_query(
             df,
             Tail {
                 filters,
+                group_keys: &[],
+                aggs: &[],
                 distinct,
                 sample,
                 sort,
@@ -818,6 +855,8 @@ mod tests {
             false,
             None,
             vec![],
+            vec![],
+            vec![],
         )
         .unwrap());
         assert_eq!(batch.num_columns(), 2);
@@ -842,7 +881,7 @@ mod tests {
                 None,
                 None,
                 None,
-             false, None, vec![],)
+             false, None, vec![], vec![], vec![],)
             .unwrap(),
         );
         // Only node 0 has in-degree > 0 among the hub set; it also ranks highest.
@@ -871,6 +910,8 @@ mod tests {
             None,
             false,
             None,
+            vec![],
+            vec![],
             vec![],
         );
         assert!(err.is_err());
@@ -902,6 +943,8 @@ mod tests {
                 None,
                 false,
                 None,
+                vec![],
+                vec![],
                 vec![],
             )
             .unwrap_or_else(|e| panic!("{kind} failed: {e}")));
@@ -943,6 +986,8 @@ mod tests {
             None,
             false,
             None,
+            vec![],
+            vec![],
             vec![],
         )
         .unwrap());
@@ -986,7 +1031,7 @@ mod tests {
                 Some(vec![nodes]),
                 Some("id".into()),
                 None,
-             false, None, vec![],)
+             false, None, vec![], vec![], vec![],)
             .unwrap(),
         );
 
@@ -1040,7 +1085,7 @@ mod tests {
                 Some(vec![nodes]),
                 Some("id".into()),
                 None,
-             false, None, vec![],)
+             false, None, vec![], vec![], vec![],)
             .unwrap(),
         );
 
@@ -1252,7 +1297,108 @@ mod tests {
             false,
             None,
             vec![],
+            vec![],
+            vec![],
         );
         assert!(err.is_err()); // mean over strings is not supported
+    }
+
+    #[test]
+    fn node_query_group_by_aggregates_over_a_category() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // in-degrees: 0<-{1,2,3}=3, 1<-{0}=1, 2=0, 3=0
+        let src = Int64Array::from(vec![1, 2, 3, 0]);
+        let dst = Int64Array::from(vec![0, 0, 0, 1]);
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("region", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "us", "us", "eu", "eu",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let (t, ids) = build(&src, &dst);
+        // Compute in-degree per node, then group by region: sum(indeg), count.
+        let batch = one(
+            execute_node_query(
+                t,
+                ids,
+                r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
+                &[],
+                Some(("region".into(), false)),
+                None,
+                Some(vec![nodes]),
+                Some("id".into()),
+                None,
+                false,
+                None,
+                vec![],
+                vec!["region".to_string()],
+                vec![
+                    r#"{"kind":"alias","name":"total","operand":{"kind":"agg","fn":"sum","operand":{"kind":"col","name":"indeg"}}}"#.to_string(),
+                    r#"{"kind":"alias","name":"n","operand":{"kind":"agg","fn":"count","operand":{"kind":"col","name":"indeg"}}}"#.to_string(),
+                ],
+            )
+            .unwrap(),
+        );
+
+        // Output schema is [region, total, n] — the group replaces the node schema.
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "region");
+        assert!(schema.index_of("total").is_ok());
+        assert!(schema.index_of("n").is_ok());
+        assert_eq!(batch.num_rows(), 2); // us, eu
+
+        let region = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let total = batch
+            .column(schema.index_of("total").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        let us = (0..region.len())
+            .find(|&i| region.value(i) == "us")
+            .unwrap();
+        let eu = (0..region.len())
+            .find(|&i| region.value(i) == "eu")
+            .unwrap();
+        assert_eq!(total.value(us), 4); // indeg 3 + 1
+        assert_eq!(total.value(eu), 0); // indeg 0 + 0
+    }
+
+    #[test]
+    fn node_query_group_by_unknown_key_errors() {
+        let src = Int64Array::from(vec![0, 1]);
+        let dst = Int64Array::from(vec![1, 2]);
+        let (t, ids) = build(&src, &dst);
+        let err = execute_node_query(
+            t,
+            ids,
+            r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            vec![],
+            vec!["nope".to_string()],
+            vec![
+                r#"{"kind":"alias","name":"n","operand":{"kind":"agg","fn":"count","operand":{"kind":"col","name":"deg"}}}"#.to_string(),
+            ],
+        );
+        assert!(err.is_err()); // group_by references an unknown column
     }
 }

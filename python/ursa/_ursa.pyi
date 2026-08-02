@@ -42,6 +42,8 @@ def run_node_query(
     distinct: bool = ...,
     sample: tuple[int, int | None] | None = ...,
     rename: list[tuple[str, str]] = ...,
+    group_keys: list[str] = ...,
+    aggs: list[str] = ...,
 ) -> Any: ...
 
 # A hop traversal: a built index + user-id seed array (int64 or string) +
