@@ -29,6 +29,7 @@ mod neighbor_agg;
 mod pagerank;
 mod random_walk;
 mod rng;
+pub use rng::sample_indices;
 mod triangle;
 
 pub use betweenness::{betweenness, betweenness_weighted};

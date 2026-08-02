@@ -223,12 +223,14 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     select: list[str] | None = None
+    distinct = False
+    sample: tuple[int, int | None] | None = None
+    rename: dict[str, str] = {}
 
     for step in frame._plan:
         op = step.op
         # `reverse` is metadata: the reversed edges ride on the edges frame (source
-        # swapped), so a graph op over them builds the transpose. `rename` is NOT a
-        # passthrough — it must reach the else and raise rather than be dropped.
+        # swapped), so a graph op over them builds the transpose.
         if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
             continue  # source / metadata steps
         if op == "with_columns":
@@ -250,6 +252,12 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             sort = _parse_sort(step.args)
         elif op == "head":
             limit = int(step.args["n"])
+        elif op == "distinct":
+            distinct = True
+        elif op == "sample":
+            sample = (int(step.args["n"]), step.args.get("seed"))
+        elif op == "rename":
+            rename.update(step.args["mapping"])
         elif op == "select":
             if select is not None:
                 raise NotImplementedError("collect() supports a single select() step for now.")
@@ -262,7 +270,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
         # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
-        return _collect_plain_nodes(frame, filters, sort, limit, select)
+        return _collect_plain_nodes(frame, filters, sort, limit, select, sample, rename, distinct)
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
@@ -281,10 +289,16 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     for c in columns:
         if c.get("agg_column") is not None:
             referenced.add(c["agg_column"])
+    # A rename reads its source (old) columns; keep any that are file columns.
+    referenced |= set(rename)
     id_name = frame.id_col
     file_needed: list[str] | None = None
     if select is not None:
-        needed = {id_name} | (referenced - computed) | (set(select) - computed)
+        # A rename *target* is a new output label, neither a file nor a computed
+        # column, so exclude it from the file projection (else the scan errors on a
+        # column the file doesn't have).
+        selected_file = set(select) - computed - set(rename.values())
+        needed = {id_name} | (referenced - computed) | selected_file
         file_needed = sorted(needed)
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
@@ -300,7 +314,19 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # the same scan, so _run_query's _require_index reuses it — endpoints and
     # weights share one edge order.
     edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
-    result = _run_query(edges, columns, filters, sort, limit, nodes, nodes_id, edge_attr)
+    result = _run_query(
+        edges,
+        columns,
+        filters,
+        sort,
+        limit,
+        nodes,
+        nodes_id,
+        edge_attr,
+        distinct=distinct,
+        sample=sample,
+        rename=rename,
+    )
     return _apply_select(result, select)
 
 
@@ -313,6 +339,8 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
     limit: int | None = None
     distinct = False
     select: list[str] | None = None
+    sample: tuple[int, int | None] | None = None
+    rename: dict[str, str] = {}
 
     _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes"}
     for s in frame._plan:
@@ -327,6 +355,10 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
             limit = int(s.args["n"])
         elif op == "distinct":
             distinct = True
+        elif op == "sample":
+            sample = (int(s.args["n"]), s.args.get("seed"))
+        elif op == "rename":
+            rename.update(s.args["mapping"])
         elif op == "select":
             if select is not None:
                 raise NotImplementedError("collect() supports a single select() step for now.")
@@ -350,6 +382,8 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
         sort,
         limit,
         distinct,
+        sample,
+        list(rename.items()),
     )
     return _apply_select(MaterializedFrame(batch), select)
 
@@ -424,6 +458,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     limit: int | None = None
     distinct = False
     select: list[str] | None = None
+    sample: tuple[int, int | None] | None = None
+    rename: dict[str, str] = {}
 
     for step in frame._plan:
         op = step.op
@@ -434,8 +470,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         elif op == "reverse":
             # Metadata on a plain frame (the swapped source rides on the frame).
             # After a traversal its semantics are undesigned -> reject rather than
-            # silently ignore. `rename` is not a passthrough: it falls to the else
-            # and raises instead of being dropped.
+            # silently ignore.
             if traversal is not None:
                 raise NotImplementedError(
                     "reverse() after a traversal (hop/shortest_path) is not supported; "
@@ -450,6 +485,10 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             limit = int(step.args["n"])
         elif op == "distinct":
             distinct = True
+        elif op == "sample":
+            sample = (int(step.args["n"]), step.args.get("seed"))
+        elif op == "rename":
+            rename.update(step.args["mapping"])
         elif op == "select":
             if select is not None:
                 raise NotImplementedError("collect() supports a single select() step for now.")
@@ -461,14 +500,13 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
 
     if traversal is None:
         # No traversal: a plain edge frame (scan_edges / from_arrow / read_edges,
-        # or a reversed frame). Materialize its edge rows + filter/sort/head tail.
-        if distinct:
-            raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
-        return _collect_plain_edges(frame, filters, sort, limit, select)
+        # or a reversed frame). Materialize its edge rows + tail (distinct included).
+        return _collect_plain_edges(frame, filters, sort, limit, select, sample, rename, distinct)
 
     # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
     # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
     filter_json = [_filter_json(p, {"src": "src", "dst": "dst"}) for p in filters]
+    rename_pairs = list(rename.items())
     if traversal.op == "hop":
         index = _require_index(traversal.args["edges"])
         seeds = _resolve_seeds(traversal.args["seeds"])
@@ -481,6 +519,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             sort,
             limit,
             distinct,
+            sample,
+            rename_pairs,
         )
     else:  # shortest_path
         # A weight= expression (over edge columns) selects weighted Dijkstra: it's
@@ -507,6 +547,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             sort,
             limit,
             distinct,
+            sample,
+            rename_pairs,
         )
     return _apply_select(MaterializedFrame(batch), select)
 
@@ -583,6 +625,9 @@ def _run_query(
     nodes: Any | None = None,
     nodes_id: str | None = None,
     edge_attr: Any | None = None,
+    distinct: bool = False,
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
     # The node attribute table crosses the FFI as a batch list (not one batch).
@@ -591,7 +636,17 @@ def _run_query(
     # columns; `ur.id()` in a filter resolves to it. (src/dst have no role here.)
     filter_json = [_filter_json(p, {"id": "id"}) for p in filters]
     batches = _native().run_node_query(
-        index, json.dumps(columns), filter_json, sort, limit, nodes_batches, nodes_id, edge_attr
+        index,
+        json.dumps(columns),
+        filter_json,
+        sort,
+        limit,
+        nodes_batches,
+        nodes_id,
+        edge_attr,
+        distinct,
+        sample,
+        list((rename or {}).items()),
     )
     return MaterializedFrame(batches)
 
@@ -863,16 +918,59 @@ def _eval_pyarrow(expr: Any, table: Any, roles: dict[str, str]) -> Any:
     )
 
 
+# A plain frame takes exactly one deterministic sampling policy, distinct from the
+# engine's (both reproducible, not byte-identical to each other): a stable stdlib
+# PRNG over the single in-memory table's row order (which, unlike the engine, is
+# unpartitioned, so no content-canonical ordering is needed for thread-invariance).
+_DEFAULT_SAMPLE_SEED = 0x5EED5EED
+
+
+def _sample_pyarrow(table: Any, n: int, seed: int | None) -> Any:
+    """Deterministically take ``n`` rows (without replacement) from a pyarrow table.
+    ``n >= row_count`` returns all rows; ``seed=None`` uses the default seed."""
+    import random
+
+    r = table.num_rows
+    if n >= r:
+        return table
+    idx = random.Random(seed if seed is not None else _DEFAULT_SAMPLE_SEED).sample(range(r), n)
+    return table.take(sorted(idx))
+
+
+def _apply_pyarrow_rename(table: Any, rename: dict[str, str]) -> Any:
+    """Relabel output columns of a pyarrow table. An unknown source column is an
+    error (no silent no-op), matching the engine path's ``rename`` check."""
+    if not rename:
+        return table
+    missing = [old for old in rename if old not in table.column_names]
+    if missing:
+        from . import ColumnNotFoundError
+
+        raise ColumnNotFoundError(f"rename() references unknown column(s): {missing}")
+    return table.rename_columns([rename.get(c, c) for c in table.column_names])
+
+
 def _apply_pyarrow_tail(
     table: Any,
     filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     roles: dict[str, str],
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    distinct: bool = False,
 ) -> Any:
+    # Same canonical order as the engine tail:
+    # filters → distinct → sample → sort → limit → rename.
     for predicate in filters:
         _require_predicate(predicate)  # same top-of-predicate check as the graph path
         table = table.filter(_eval_pyarrow(predicate, table, roles))
+    if distinct:
+        # Distinct rows over all columns (group-by with no aggregations); row order
+        # is unspecified for distinct, as on the engine path.
+        table = table.combine_chunks().group_by(table.column_names).aggregate([])
+    if sample is not None:
+        table = _sample_pyarrow(table, sample[0], sample[1])
     if sort is not None:
         by, descending = sort
         if by not in table.column_names:
@@ -880,6 +978,8 @@ def _apply_pyarrow_tail(
         table = table.sort_by([(by, "descending" if descending else "ascending")])
     if limit is not None:
         table = table.slice(0, limit)
+    if rename:
+        table = _apply_pyarrow_rename(table, rename)
     return table
 
 
@@ -889,19 +989,26 @@ def _collect_plain_nodes(
     sort: tuple[str, bool] | None,
     limit: int | None,
     select: list[str] | None = None,
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    distinct: bool = False,
 ) -> MaterializedFrame:
     # On a plain node table, ur.id() resolves to the frame's real id column.
     roles = {"id": frame.id_col}
     # With no computed columns, the scan need only read the id, whatever the
-    # filter/sort touch, and (if a select narrows the output) the selected columns.
+    # filter/sort touch, any rename source column, and (if a select narrows the
+    # output) the selected columns. A rename *target* is a new label, not a file
+    # column, so it must not leak into the projection.
     file_needed: list[str] | None = None
     if select is not None:
-        referenced: set[str] = set()
+        rename = rename or {}
+        referenced: set[str] = set(rename)
         for p in filters:
             referenced |= _expr_columns(p, roles)
         if sort is not None:
             referenced.add(sort[0])
-        file_needed = sorted({frame.id_col} | referenced | set(select))
+        selected_file = set(select) - set(rename.values())
+        file_needed = sorted({frame.id_col} | referenced | selected_file)
     attr = _resolve_node_attr_table(frame, file_needed)
     if attr is None:
         raise NotImplementedError(
@@ -910,7 +1017,7 @@ def _collect_plain_nodes(
             "materializable node set yet."
         )
     # `attr` is a (chunked) pyarrow.Table.
-    table = _apply_pyarrow_tail(attr, filters, sort, limit, roles)
+    table = _apply_pyarrow_tail(attr, filters, sort, limit, roles, sample, rename, distinct)
     return _apply_select(MaterializedFrame(table), select)
 
 
@@ -920,6 +1027,9 @@ def _collect_plain_edges(
     sort: tuple[str, bool] | None,
     limit: int | None,
     select: list[str] | None = None,
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    distinct: bool = False,
 ) -> MaterializedFrame:
     import pyarrow as pa
 
@@ -942,7 +1052,7 @@ def _collect_plain_edges(
         else:
             # No source: a filtered/derived (or traversal-result) edge frame.
             _require_edges(frame)  # raises the precise, plan-aware message
-    table = _apply_pyarrow_tail(table, filters, sort, limit, roles)
+    table = _apply_pyarrow_tail(table, filters, sort, limit, roles, sample, rename, distinct)
     return _apply_select(MaterializedFrame(table), select)
 
 
