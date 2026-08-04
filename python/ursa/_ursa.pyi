@@ -46,6 +46,22 @@ def run_node_query(
     aggs: list[str] = ...,
 ) -> Any: ...
 
+# Equi-join two materialized frames (pyarrow batch lists) on the `on` key columns,
+# apply the relational tail, and return the joined list[pyarrow.RecordBatch].
+# `how` is "inner" or "left". User-facing frame.join(other, ...).
+def run_join_query(
+    left: Any,
+    right: Any,
+    on: list[str],
+    how: str,
+    filters: list[str] = ...,
+    sort: tuple[str, bool] | None = ...,
+    limit: int | None = ...,
+    distinct: bool = ...,
+    sample: tuple[int, int | None] | None = ...,
+    rename: list[tuple[str, str]] = ...,
+) -> Any: ...
+
 # A hop traversal: a built index + user-id seed array (int64 or string) +
 # n/direction + relational
 # tail -> list[pyarrow.RecordBatch] of reached (src, dst) pairs.

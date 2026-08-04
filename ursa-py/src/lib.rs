@@ -40,7 +40,8 @@ use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
-    execute_node_query, execute_path_query, execute_walk_query, scan_edges_batch, scan_nodes_batch,
+    execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
+    scan_edges_batch, scan_nodes_batch,
 };
 
 // ---------------------------------------------------------------------------
@@ -201,6 +202,39 @@ fn run_node_query(
             rename,
             group_keys,
             aggs,
+        )
+        .map_err(to_pyerr)
+    })?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
+}
+
+/// Equi-join two materialized frames (`left`/`right` pyarrow batch lists) on the
+/// `on` key columns, then apply the relational tail. `how` is "inner" or "left".
+/// Distinct from the internal attribute-attach join — this is the user-facing
+/// `frame.join(other, ...)`. The GIL is released across the join + compute.
+#[pyfunction]
+#[pyo3(signature = (left, right, on, how, filters=Vec::new(), sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
+#[allow(clippy::too_many_arguments)]
+fn run_join_query(
+    py: Python<'_>,
+    left: Bound<'_, PyAny>,
+    right: Bound<'_, PyAny>,
+    on: Vec<String>,
+    how: String,
+    filters: Vec<String>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+) -> PyResult<Py<PyAny>> {
+    // Each frame's rows cross the FFI as a *list* of RecordBatches (never
+    // concatenated into one), consistent with the node-attribute path (#60).
+    let left = Vec::<RecordBatch>::from_pyarrow_bound(&left)?;
+    let right = Vec::<RecordBatch>::from_pyarrow_bound(&right)?;
+    let batches = py.detach(move || {
+        execute_join_query(
+            left, right, on, how, &filters, sort, limit, distinct, sample, rename,
         )
         .map_err(to_pyerr)
     })?;
@@ -453,6 +487,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
     // real execution path
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
+    m.add_function(wrap_pyfunction!(run_join_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_path_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_walk_query, m)?)?;

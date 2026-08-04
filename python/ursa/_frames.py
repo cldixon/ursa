@@ -132,7 +132,20 @@ class _Frame:
         return _GroupBy(self, keys)
 
     def join(self, other: _Frame, *, on: Any = None, how: str = "inner") -> Self:
-        return self._extend(_PlanStep("join", {"on": on, "how": how}))
+        """Equi-join this frame with ``other`` on the shared key column(s) ``on``.
+
+        ``on`` is a column name (or ``ur.col(name)``), or a list of them, present in
+        both frames; ``how`` is ``"inner"`` or ``"left"``. The result keeps this
+        frame's type (a NodeFrame stays a NodeFrame). This is a join between two
+        arbitrary frames — distinct from the automatic attribute attach that
+        ``edges.nodes().with_columns(...)`` does. A join changes the row/column set,
+        so the cached topology no longer matches (``drops_index=True``); a graph
+        algorithm after a join therefore errors clearly rather than using a stale
+        topology.
+        """
+        return self._extend(
+            _PlanStep("join", {"other": other, "on": on, "how": how}), drops_index=True
+        )
 
     # -- inspection ----------------------------------------------------------
     def explain(self) -> str:
@@ -310,18 +323,25 @@ class EdgeFrame(_Frame):
         return self._dst_col
 
     def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> EdgeFrame:
-        # A row-changing op invalidates the in-memory source / scan spec and the
-        # cached topology index (they no longer match the frame); property-only
-        # ops keep them.
+        # A row-changing op (filter/sample/distinct/join) invalidates the cached
+        # *topology index* — the CSR no longer matches the frame — so `drops_index`
+        # forces a fresh index cell (`has_index=False`, `index_cell=None`). A graph
+        # op on such a frame then rebuilds, and `_require_edges` rejects it via its
+        # plan check (a graph op on a derived edge frame isn't wired). The in-memory
+        # source / scan spec / edge table are **kept** regardless, so the plain
+        # (non-graph) collect path can still materialize the derived edge rows —
+        # e.g. `edges.filter(...).collect()` and `edges.join(...).collect()` work
+        # (closes #100). Dropping the *source* would defeat that without adding any
+        # safety the plan-based guard doesn't already provide.
         return EdgeFrame._construct(
             self._src_col,
             self._dst_col,
             (*self._plan, step),
             has_index=self._has_index and not drops_index,
-            source=None if drops_index else self._source,
-            scan=None if drops_index else self._scan,
+            source=self._source,
+            scan=self._scan,
             index_cell=None if drops_index else self._index_cell,
-            edge_table=None if drops_index else self._edge_table,
+            edge_table=self._edge_table,
         )
 
     def nodes(self) -> NodeFrame:
