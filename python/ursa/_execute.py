@@ -164,6 +164,10 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     In-memory frames already share one retained table, so they just subset it."""
     if not weight_columns:
         return None
+    # A weighted algorithm on a derived edge frame must be rejected here too: this
+    # function builds the index directly (scan branch) and would otherwise populate
+    # the cell with a wrong topology before `_require_index`'s guard could run.
+    _reject_derived_edge_graph_op(edges)
     cols = sorted(weight_columns)
     table = getattr(edges, "_edge_attr_table", None)
     if table is not None:
@@ -884,20 +888,19 @@ def _single_edges(exprs: Any) -> Any:
     return edges
 
 
-def _require_edges(edges: EdgeFrame | None) -> list[Any]:
-    """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
-    (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
-    clearly. The list is fed to the CSR build as a stream — never concatenated into
-    one contiguous batch first (#60)."""
-    if edges is None:
-        raise NotImplementedError("this expression is not associated with an edge frame.")
+def _reject_derived_edge_graph_op(edges: Any) -> None:
+    """Reject a graph op on a *derived* edge frame — one whose plan contains a
+    row-changing op (filter/sample/distinct/join/group_by) or is a traversal result
+    (hop/shortest_path). Such a frame carries no topology that matches its rows (its
+    retained source is the *pre*-derivation edges), so building a CSR from it would
+    be silently wrong.
 
-    # A *derived* edge frame (filter/join/sample/distinct/group_by, or a traversal
-    # result) carries no topology that matches its rows — its retained source is the
-    # *pre*-derivation edges, so building a CSR from it would be silently wrong.
-    # Reject a graph op on such a frame up front, before touching the source. (The
-    # plain-collect path materializes these frames' derived rows separately, via
-    # `_edge_source_table`, so `edges.filter(...).collect()` still works — #100.)
+    This is the single **authoritative** guard: it inspects only the plan, so it
+    must be called *before* the frame's index cell is read or (re)built — a cell
+    populated by another path (a weighted scan's pre-build, or a stale shared cell)
+    would otherwise smuggle a wrong topology past a build-time-only check. The
+    plain-collect path materializes a derived frame's rows separately (via
+    `_edge_source_table`), so `edges.filter(...).collect()` still works (#100)."""
     ops = {step.op for step in getattr(edges, "_plan", ())}
     if ops & {"hop", "shortest_path"}:
         raise NotImplementedError(
@@ -912,6 +915,16 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
             "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
             "the source frame, or collect and re-ingest the filtered edges."
         )
+
+
+def _require_edges(edges: EdgeFrame | None) -> list[Any]:
+    """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
+    (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
+    clearly. The list is fed to the CSR build as a stream — never concatenated into
+    one contiguous batch first (#60)."""
+    if edges is None:
+        raise NotImplementedError("this expression is not associated with an edge frame.")
+    _reject_derived_edge_graph_op(edges)
 
     arrays = getattr(edges, "_edge_arrays", None)
     if arrays is not None:
@@ -948,6 +961,10 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     (see ``EdgeFrame._extend``). Concurrency-safe via a module lock."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
+    # Guard *before* touching the cell: a graph op on a derived frame must raise even
+    # if the cell was pre-populated elsewhere (Bug: a weighted scan builds the index
+    # directly; a grouped frame may share a parent's built cell).
+    _reject_derived_edge_graph_op(edges)
     cell = edges._index_build_cell
     idx = cell.value
     if idx is not None:

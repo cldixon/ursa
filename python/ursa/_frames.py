@@ -191,8 +191,13 @@ class _GroupBy:
         self._keys = keys
 
     def agg(self, *exprs: Any, **named: Any) -> _Frame:
+        # A grouped result replaces the schema, so (like filter/sample/distinct/join)
+        # it drops the topology index — forcing a fresh cell so a graph op on the
+        # grouped frame re-runs the derived-frame guard instead of reusing a parent's
+        # already-built index.
         return self._frame._extend(
-            _PlanStep("group_by_agg", {"keys": self._keys, "exprs": exprs, "named": named})
+            _PlanStep("group_by_agg", {"keys": self._keys, "exprs": exprs, "named": named}),
+            drops_index=True,
         )
 
 

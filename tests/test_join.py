@@ -241,6 +241,35 @@ def test_sampled_edge_frame_collects():
     assert out.num_rows == 2
 
 
+# --- the derived-frame guard is authoritative (must fire even when the index
+#     cell was pre-populated by another path) ---------------------------------
+
+
+def test_weighted_algo_on_derived_scan_frame_still_guards(tmp_path):
+    # A weighted algorithm builds the index directly from the scan; on a *derived*
+    # frame that must still raise the guard, not silently use the pre-derivation
+    # topology (regression: the source-retention change made this path reachable).
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "e.parquet"
+    pq.write_table(
+        pa.table({"s": [0, 1, 2, 0], "d": [1, 2, 0, 1], "w": [1.0, 1.0, 1.0, 2.0]}), path
+    )
+    derived = ur.scan_edges(str(path), src="s", dst="d").distinct()
+    with pytest.raises(NotImplementedError, match="filtered/derived"):
+        derived.nodes().with_columns(pr=ur.pagerank(derived, weight=ur.col("w"))).collect()
+
+
+def test_graph_op_on_grouped_edge_frame_guards():
+    # A grouped edge frame drops the index (fresh cell), so a graph op on it hits
+    # the guard even after the parent frame's index was already built.
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
+    edges.nodes().with_columns(deg=ur.degree(edges)).collect()  # build parent index
+    grouped = edges.group_by("s").agg(c=ur.col("d").count())
+    with pytest.raises(NotImplementedError, match="filtered/derived"):
+        ur.pagerank(grouped).collect()  # ty: ignore[invalid-argument-type]
+
+
 # --- oracle ----------------------------------------------------------------
 
 
