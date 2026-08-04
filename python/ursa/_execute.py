@@ -164,6 +164,10 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     In-memory frames already share one retained table, so they just subset it."""
     if not weight_columns:
         return None
+    # A weighted algorithm on a derived edge frame must be rejected here too: this
+    # function builds the index directly (scan branch) and would otherwise populate
+    # the cell with a wrong topology before `_require_index`'s guard could run.
+    _reject_derived_edge_graph_op(edges)
     cols = sorted(weight_columns)
     table = getattr(edges, "_edge_attr_table", None)
     if table is not None:
@@ -232,6 +236,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     rename: dict[str, str] = {}
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     saw_group_by = False
+    join: tuple[Any, list[str], str] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -239,6 +244,11 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         # swapped), so a graph op over them builds the transpose.
         if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
             continue  # source / metadata steps
+        if op == "join":
+            if join is not None:
+                raise NotImplementedError("collect() supports a single join() for now.")
+            join = _parse_join(step)
+            continue
         if op == "group_by_agg":
             if group_by is not None:
                 raise NotImplementedError("collect() supports a single group_by().agg() for now.")
@@ -289,6 +299,50 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         raise NotImplementedError(
             "group_by().agg() does not compose with distinct/sample/select yet; "
             "sort/head/rename on the grouped result are supported."
+        )
+
+    if join is not None:
+        if group_by is not None:
+            raise NotImplementedError(
+                "join() does not compose with group_by().agg() yet; do them in "
+                "separate collect() steps."
+            )
+        # The left table is the raw base (empty tail — the tail applies post-join):
+        # a graph-derived NodeFrame runs its algorithms first, a plain one uses its
+        # attribute table. ur.id() in a post-join filter resolves to the real id.
+        if graph_exprs:
+            edges = _single_edges(graph_exprs.values())
+            columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
+            nodes = _resolve_node_attr_table(frame, None)
+            nodes_id = frame.id_col if nodes is not None else None
+            weight_cols: set[str] = set()
+            for expr in graph_exprs.values():
+                w = expr.payload.get("weight") if expr.kind == "graph" else None
+                if w is not None:
+                    weight_cols |= _expr_columns(w)
+            edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
+            left_table = _run_query(
+                edges, columns, [], None, None, nodes, nodes_id, edge_attr
+            ).to_arrow()
+        else:
+            attr = _resolve_node_attr_table(frame, None)
+            if attr is None:
+                raise NotImplementedError(
+                    "join() on this NodeFrame needs a source (scan_nodes / "
+                    "from_arrow(id=...)) or a with_columns of graph algorithms."
+                )
+            left_table = attr
+        return _run_join(
+            left_table,
+            join,
+            filters,
+            sort,
+            limit,
+            select,
+            sample,
+            rename,
+            distinct,
+            {"id": frame.id_col},
         )
 
     if not graph_exprs:
@@ -489,6 +543,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     rename: dict[str, str] = {}
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     saw_group_by = False
+    join: tuple[Any, list[str], str] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -496,6 +551,10 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             traversal = step
         elif op in ("scan_edges", "from_arrow", "from_polars", "nodes"):
             continue  # source / metadata steps
+        elif op == "join":
+            if join is not None:
+                raise NotImplementedError("collect() supports a single join() for now.")
+            join = _parse_join(step)
         elif op == "group_by_agg":
             if group_by is not None:
                 raise NotImplementedError("collect() supports a single group_by().agg() for now.")
@@ -542,6 +601,31 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         raise NotImplementedError(
             "group_by().agg() does not compose with distinct/sample/select yet; "
             "sort/head/rename on the grouped result are supported."
+        )
+
+    if join is not None:
+        if traversal is not None:
+            raise NotImplementedError(
+                "join() on a traversal result (hop/shortest_path) is not supported yet; "
+                "join is available on plain edge/node frames."
+            )
+        if group_by is not None:
+            raise NotImplementedError(
+                "join() does not compose with group_by().agg() yet; do them in "
+                "separate collect() steps."
+            )
+        left_table = _edge_source_table(frame)
+        return _run_join(
+            left_table,
+            join,
+            filters,
+            sort,
+            limit,
+            select,
+            sample,
+            rename,
+            distinct,
+            {"src": frame.src_col, "dst": frame.dst_col},
         )
 
     if traversal is None:
@@ -804,6 +888,35 @@ def _single_edges(exprs: Any) -> Any:
     return edges
 
 
+def _reject_derived_edge_graph_op(edges: Any) -> None:
+    """Reject a graph op on a *derived* edge frame — one whose plan contains a
+    row-changing op (filter/sample/distinct/join/group_by) or is a traversal result
+    (hop/shortest_path). Such a frame carries no topology that matches its rows (its
+    retained source is the *pre*-derivation edges), so building a CSR from it would
+    be silently wrong.
+
+    This is the single **authoritative** guard: it inspects only the plan, so it
+    must be called *before* the frame's index cell is read or (re)built — a cell
+    populated by another path (a weighted scan's pre-build, or a stale shared cell)
+    would otherwise smuggle a wrong topology past a build-time-only check. The
+    plain-collect path materializes a derived frame's rows separately (via
+    `_edge_source_table`), so `edges.filter(...).collect()` still works (#100)."""
+    ops = {step.op for step in getattr(edges, "_plan", ())}
+    if ops & {"hop", "shortest_path"}:
+        raise NotImplementedError(
+            "chaining a graph op off a traversal result (hop/shortest_path) isn't "
+            "wired yet — a traversal result is a set of reached edges with no rebuildable "
+            "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
+            "further ops on it. (v0.2: child-plan seeding.)"
+        )
+    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
+        raise NotImplementedError(
+            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
+            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
+            "the source frame, or collect and re-ingest the filtered edges."
+        )
+
+
 def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
     (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
@@ -811,6 +924,7 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     one contiguous batch first (#60)."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
+    _reject_derived_edge_graph_op(edges)
 
     arrays = getattr(edges, "_edge_arrays", None)
     if arrays is not None:
@@ -833,21 +947,6 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
             path, scan["src"], scan["dst"], _scan_storage_options(scan)
         )
 
-    # No source: give a message matched to *why* it's missing, not a generic one.
-    ops = {step.op for step in getattr(edges, "_plan", ())}
-    if ops & {"hop", "shortest_path"}:
-        raise NotImplementedError(
-            "chaining a graph op off a traversal result (hop/shortest_path) isn't "
-            "wired yet — a traversal result is a set of reached edges with no rebuildable "
-            "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
-            "further ops on it. (v0.2: child-plan seeding.)"
-        )
-    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
-        raise NotImplementedError(
-            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
-            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
-            "the source frame, or collect and re-ingest the filtered edges."
-        )
     raise NotImplementedError(
         "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or "
         "ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source."
@@ -862,6 +961,10 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     (see ``EdgeFrame._extend``). Concurrency-safe via a module lock."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
+    # Guard *before* touching the cell: a graph op on a derived frame must raise even
+    # if the cell was pre-populated elsewhere (Bug: a weighted scan builds the index
+    # directly; a grouped frame may share a parent's built cell).
+    _reject_derived_edge_graph_op(edges)
     cell = edges._index_build_cell
     idx = cell.value
     if idx is not None:
@@ -1019,6 +1122,108 @@ def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
             "(e.g. .sort('pagerank', descending=True))."
         )
     return (by, bool(args.get("descending", False)))
+
+
+# --- join ------------------------------------------------------------------
+_JOIN_HOWS = {"inner", "left"}
+
+
+def _parse_join_keys(on: Any) -> list[str]:
+    """The join key column name(s). Accepts a bare string, ``ur.col(name)``, or a
+    list of either. ``on=None`` (key inference) is deferred with a clear error."""
+    if on is None:
+        raise NotImplementedError(
+            "join() needs on= (key inference is not supported yet); pass on='id' or on=['a', 'b']."
+        )
+    items = on if isinstance(on, (list, tuple)) else [on]
+    keys: list[str] = []
+    for k in items:
+        if isinstance(k, str):
+            keys.append(k)
+        elif getattr(k, "kind", None) == "col":
+            keys.append(k.payload["name"])
+        else:
+            raise NotImplementedError("join(on=): keys must be column names or ur.col(<name>).")
+    if not keys:
+        raise NotImplementedError("join() needs at least one key column.")
+    return keys
+
+
+def _parse_join(step: _PlanStep) -> tuple[Any, list[str], str]:
+    """Parse a ``join`` step into ``(other, on_keys, how)``. ``other`` must be an
+    ursa frame; ``how`` is restricted to the supported set."""
+    from ._frames import _Frame
+
+    other = step.args["other"]
+    if not isinstance(other, _Frame):
+        raise TypeError(
+            "join(other): other must be an ursa frame (EdgeFrame/NodeFrame); "
+            f"got {type(other).__name__!r}."
+        )
+    how = step.args["how"]
+    if how not in _JOIN_HOWS:
+        raise NotImplementedError(
+            f"join how={how!r} is not supported yet (use {sorted(_JOIN_HOWS)}); "
+            "'right'/'outer' are a follow-up."
+        )
+    return other, _parse_join_keys(step.args["on"]), how
+
+
+def _run_join(
+    left_table: Any,
+    join: tuple[Any, list[str], str],
+    filters: list[Any],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+    select: list[str] | None,
+    sample: tuple[int, int | None] | None,
+    rename: dict[str, str],
+    distinct: bool,
+    roles: dict[str, str],
+) -> MaterializedFrame:
+    """Materialize the right frame, validate keys/collisions, and run the native
+    join + relational tail. The whole tail (filter/sort/head/distinct/sample/
+    rename) applies *after* the join; ``roles`` resolves ur.id()/src()/dst() in a
+    filter to the left frame's real columns."""
+    other, on_keys, how = join
+    try:
+        right_table = other.collect().to_arrow()
+    except NotImplementedError as exc:
+        raise NotImplementedError(
+            f"join(other): could not materialize the right-hand frame ({exc})."
+        ) from exc
+    left_cols, right_cols = left_table.column_names, right_table.column_names
+    for k in on_keys:
+        if k not in left_cols:
+            from . import ColumnNotFoundError
+
+            raise ColumnNotFoundError(f"join(on=): key {k!r} not in the left frame {left_cols}.")
+        if k not in right_cols:
+            from . import ColumnNotFoundError
+
+            raise ColumnNotFoundError(f"join(on=): key {k!r} not in the right frame {right_cols}.")
+    # A same-named non-key column on both sides would collide in the output; reject
+    # it (a polars-style `_right` suffix is a follow-up).
+    collide = (set(left_cols) - set(on_keys)) & (set(right_cols) - set(on_keys))
+    if collide:
+        raise ValueError(
+            f"join produces duplicate column name(s) {sorted(collide)}; "
+            "rename() one side before joining."
+        )
+    filter_json = [_filter_json(p, roles) for p in filters]
+    batches = _native().run_join_query(
+        left_table.to_batches(),
+        right_table.to_batches(),
+        on_keys,
+        how,
+        filter_json,
+        sort,
+        limit,
+        distinct,
+        sample,
+        list((rename or {}).items()),
+    )
+    return _apply_select(MaterializedFrame(batches), select)
 
 
 # --- plain-source collection (no algorithm/traversal) ----------------------
@@ -1252,31 +1457,39 @@ def _collect_plain_edges(
     distinct: bool = False,
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
-    import pyarrow as pa
-
     # On a plain edge table, ur.src()/dst() resolve to the frame's real endpoint cols.
     roles = {"src": frame.src_col, "dst": frame.dst_col}
-    table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
-    if table is None:
-        scan = getattr(frame, "_scan_spec", None)
-        if scan is not None:
-            path = scan["path"]
-            if not isinstance(path, str):
-                raise NotImplementedError(
-                    "collect() over a scan_edges source supports a single string path "
-                    "(glob included) for now, not a list of paths."
-                )
-            batches = _native().scan_edges_arrow(
-                path, scan["src"], scan["dst"], _scan_storage_options(scan), []
-            )
-            table = pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
-        else:
-            # No source: a filtered/derived (or traversal-result) edge frame.
-            _require_edges(frame)  # raises the precise, plan-aware message
+    table = _edge_source_table(frame)
     table = _apply_pyarrow_tail(
         table, filters, sort, limit, roles, sample, rename, distinct, group_by
     )
     return _apply_select(MaterializedFrame(table), select)
+
+
+def _edge_source_table(frame: EdgeFrame) -> Any:
+    """The raw edge rows of a plain (non-traversal) edge frame as a pyarrow.Table —
+    the full in-memory edge table, or a fresh scan of its ``scan_edges`` source.
+    Raises the precise plan-aware error for a frame with no materializable source."""
+    import pyarrow as pa
+
+    table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
+    if table is not None:
+        return table
+    scan = getattr(frame, "_scan_spec", None)
+    if scan is not None:
+        path = scan["path"]
+        if not isinstance(path, str):
+            raise NotImplementedError(
+                "collect() over a scan_edges source supports a single string path "
+                "(glob included) for now, not a list of paths."
+            )
+        batches = _native().scan_edges_arrow(
+            path, scan["src"], scan["dst"], _scan_storage_options(scan), []
+        )
+        return pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
+    # No source: a filtered/derived (or traversal-result) edge frame.
+    _require_edges(frame)  # raises the precise, plan-aware message
+    raise AssertionError("unreachable")  # _require_edges always raises here
 
 
 def _native() -> Any:

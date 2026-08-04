@@ -25,9 +25,10 @@ or pandas DataFrame, or pyarrow — with ``from_arrow``/``from_polars``/``from_p
 as typed aliases) and scan-backed ones (``scan_edges``/``scan_nodes``, Parquet/CSV,
 local or object storage) all execute end to end through the DataFusion plan and the
 ``ursa-core`` kernels. However a frame is built, it behaves identically thereafter.
-A few relational verbs are still plan-only and raise a clear error when collected
-(``sample``, ``group_by().agg``, ``join``, ``schema``); ``ur.col`` & the expression
-dialect are pure Python and always available.
+The relational surface — ``filter``/``sort``/``head``/``rename``/``distinct``/
+``sample``/``group_by().agg()``/``join`` — executes; only ``schema`` remains
+plan-only. ``ur.col`` & the expression dialect are pure Python and always
+available.
 """
 
 from __future__ import annotations

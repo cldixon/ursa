@@ -566,6 +566,91 @@ pub fn execute_node_query(
     })?
 }
 
+/// Equi-join two already-materialized frames on shared key column(s), then apply
+/// the standard relational tail to the joined frame.
+///
+/// This is the user-facing `frame.join(other, on=, how=)` — a join between two
+/// arbitrary frames, distinct from the internal LEFT join that attaches node
+/// attributes to algorithm outputs (in [`execute_node_query`]). It is
+/// topology-independent: both operands are just Arrow tables, so no `GraphIndex`
+/// is involved.
+///
+/// `on` names key columns present in **both** frames (a same-name equi-join). The
+/// right side's key columns are renamed to private sentinels for the join and then
+/// dropped, so each key appears once (the left copy) in the output — mirroring the
+/// attribute-attach join. Non-key column-name collisions are rejected by the caller
+/// before we get here. `how` is `inner` or `left`; the whole tail
+/// (`filters → group_by → distinct → sample → sort → limit → rename`) then runs on
+/// the joined frame.
+///
+/// v1 supports `inner`/`left` only. `right`/`outer` are deferred deliberately: for
+/// a right-only or unmatched row the left key is null, so simply dropping the
+/// right key (as we do for `inner`/`left`, where the left key always survives)
+/// would lose the key value — a correct `right`/`outer` needs `coalesce(left_key,
+/// right_key)`, a follow-up.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_join_query(
+    left: Vec<RecordBatch>,
+    right: Vec<RecordBatch>,
+    on: Vec<String>,
+    how: String,
+    filters: &[String],
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+) -> Result<Vec<RecordBatch>> {
+    if on.is_empty() {
+        return Err(DataFusionError::Execution(
+            "join() needs at least one key column (on=)".into(),
+        ));
+    }
+    let join_type = match how.as_str() {
+        "inner" => JoinType::Inner,
+        "left" => JoinType::Left,
+        other => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "join how={other:?} is not supported yet (use 'inner' or 'left'; \
+                 'right'/'outer' are a follow-up)"
+            )));
+        }
+    };
+    crate::runtime::block_on(async move {
+        let ctx = graph_session();
+        let left_df = ctx.read_batches(left)?;
+        let mut right_df = ctx.read_batches(right)?;
+        // Rename each right key to a private sentinel so the join keys don't
+        // collide, then drop the sentinels after the join — the left key survives.
+        let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
+        for (k, s) in on.iter().zip(sentinels.iter()) {
+            right_df = right_df.with_column_renamed(k, s)?;
+        }
+        let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
+        let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+        let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+        let df = left_df
+            .join(right_df, join_type, &left_keys, &right_keys, None)?
+            .drop_columns(&sentinel_refs)?;
+        let df = apply_tail(
+            &ctx,
+            df,
+            Tail {
+                filters,
+                group_keys: &[],
+                aggs: &[],
+                distinct,
+                sample,
+                sort,
+                limit,
+                rename: &rename,
+            },
+        )
+        .await?;
+        collect_batches(df).await
+    })?
+}
+
 /// Build and execute one `hop` traversal as a single DataFusion plan.
 ///
 /// A [`HopNode`] emits the reached `(src, dst)` edge frame; the optional
@@ -1412,5 +1497,106 @@ mod tests {
             ],
         );
         assert!(err.is_err()); // group_by references an unknown column
+    }
+
+    fn id_attr_batch(ids: Vec<i64>, attr_name: &str, attr: Vec<i64>) -> RecordBatch {
+        use arrow::datatypes::{DataType, Field, Schema};
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(attr_name, DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(attr)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn join_inner_by_id() {
+        // left: id 0,1,2 with a; right: id 1,2,3 with b. inner -> ids 1,2 only.
+        let left = id_attr_batch(vec![0, 1, 2], "a", vec![10, 11, 12]);
+        let right = id_attr_batch(vec![1, 2, 3], "b", vec![21, 22, 23]);
+        let batch = one(execute_join_query(
+            vec![left],
+            vec![right],
+            vec!["id".into()],
+            "inner".into(),
+            &[],
+            Some(("id".into(), false)),
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
+        // Output columns: id, a, b (the right key is dropped) — one id column.
+        let schema = batch.schema();
+        assert_eq!(schema.index_of("id").unwrap(), 0);
+        assert!(schema.index_of("a").is_ok() && schema.index_of("b").is_ok());
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(batch.num_rows(), 2); // ids 1, 2
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+    }
+
+    #[test]
+    fn join_left_keeps_all_left_rows() {
+        // left ids 0,1,2; right ids 1,2 -> left join keeps 0 with null b.
+        let left = id_attr_batch(vec![0, 1, 2], "a", vec![10, 11, 12]);
+        let right = id_attr_batch(vec![1, 2], "b", vec![21, 22]);
+        let batch = one(execute_join_query(
+            vec![left],
+            vec![right],
+            vec!["id".into()],
+            "left".into(),
+            &[],
+            Some(("id".into(), false)),
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
+        assert_eq!(batch.num_rows(), 3); // all left rows
+        let b = batch
+            .column(batch.schema().index_of("b").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // id 0 has no right match -> null b.
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
+        assert!(b.is_null(row0));
+    }
+
+    #[test]
+    fn join_unsupported_how_errors() {
+        let left = id_attr_batch(vec![0], "a", vec![1]);
+        let right = id_attr_batch(vec![0], "b", vec![2]);
+        let err = execute_join_query(
+            vec![left],
+            vec![right],
+            vec!["id".into()],
+            "outer".into(),
+            &[],
+            None,
+            None,
+            false,
+            None,
+            vec![],
+        );
+        assert!(err.is_err()); // right/outer deferred
     }
 }

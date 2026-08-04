@@ -174,9 +174,10 @@ optionally `.alias(name)` or named via `.agg(name=...)`. It runs on the engine
 (DataFusion) for graph-derived frames and in pyarrow for source-backed ones,
 with both paths resolving to identical output columns.
 
-A couple of relational verbs are modelled in the plan (so they compose and show
-in `.explain()`) but are **not yet executable** and raise a clear error when
-collected: `join` and `schema`.
+**`join(other, on=, how=)`** executes too — an equi-join of two frames on shared
+key column(s) (`inner`/`left`), distinct from the automatic attribute attach;
+the relational tail applies to the joined result. Only `schema` remains modelled
+in the plan (shows in `.explain()`) but **not yet executable**.
 
 Next, in rough priority order:
 
