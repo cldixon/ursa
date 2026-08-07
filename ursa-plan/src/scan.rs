@@ -19,7 +19,7 @@ use arrow::array::RecordBatch;
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+use datafusion::prelude::{CsvReadOptions, DataFrame, ParquetReadOptions, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -151,6 +151,31 @@ fn canonical_id_type(dt: &DataType) -> Result<DataType> {
     }
 }
 
+/// Open a scan source into an unprojected `DataFrame`: create a fresh session,
+/// register the matching object store for the path's scheme, and read the file in
+/// the format its extension names. The shared prologue of `scan_edges_batch` and
+/// `scan_nodes_batch` — each then applies its own projection and id canonicalization.
+///
+/// `kind` (`"scan_edges"`/`"scan_nodes"`) only tunes the error message from
+/// [`detect_format`]. The returned `DataFrame` carries its own `Arc`-shared session
+/// state (including the registered store), so the local `SessionContext` need not
+/// outlive this call.
+async fn open_scan(
+    path: &str,
+    storage_options: &HashMap<String, String>,
+    kind: &str,
+) -> Result<DataFrame> {
+    let ctx = SessionContext::new();
+    register_object_store(&ctx, path, storage_options)?;
+    Ok(match detect_format(path, kind)? {
+        ScanFormat::Parquet => {
+            ctx.read_parquet(path, ParquetReadOptions::default())
+                .await?
+        }
+        ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
+    })
+}
+
 /// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch, plus
 /// any `weight_columns` needed to evaluate a `weight=` expression.
 ///
@@ -168,15 +193,7 @@ pub fn scan_edges_batch(
     weight_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     crate::runtime::block_on(async move {
-        let ctx = SessionContext::new();
-        register_object_store(&ctx, path, storage_options)?;
-        let df = match detect_format(path, "scan_edges")? {
-            ScanFormat::Parquet => {
-                ctx.read_parquet(path, ParquetReadOptions::default())
-                    .await?
-            }
-            ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
-        };
+        let df = open_scan(path, storage_options, "scan_edges").await?;
 
         // Project src, dst, then any weight columns not already among them.
         let mut proj: Vec<&str> = vec![src, dst];
@@ -263,15 +280,7 @@ pub fn scan_nodes_batch(
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     crate::runtime::block_on(async move {
-        let ctx = SessionContext::new();
-        register_object_store(&ctx, path, storage_options)?;
-        let df = match detect_format(path, "scan_nodes")? {
-            ScanFormat::Parquet => {
-                ctx.read_parquet(path, ParquetReadOptions::default())
-                    .await?
-            }
-            ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
-        };
+        let df = open_scan(path, storage_options, "scan_nodes").await?;
 
         // Projection pushdown: read only the requested columns (must include id).
         // Empty means "all columns" (the attribute-table default).

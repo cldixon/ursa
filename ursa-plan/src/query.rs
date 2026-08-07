@@ -16,6 +16,8 @@
 //! as separate strings and are conjoined by DataFusion's per-filter application.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array};
@@ -336,6 +338,27 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
     Ok(df)
 }
 
+/// The shared execution spine of every query executor. Build the graph session,
+/// let `build` produce the base `DataFrame` — the one part that differs per
+/// executor (a traversal/graph `Extension` plan, the node-attribute join, or a
+/// join of two materialized frames) — then apply the relational tail in canonical
+/// order and collect. Runs on the shared runtime; the caller has released the GIL.
+///
+/// Each executor thus reduces to *plan/base construction*: the block-on, session
+/// setup, [`apply_tail`], and [`collect_batches`] live here once instead of being
+/// copy-pasted at every call site.
+fn run_query<F>(build: F, tail: Tail<'_>) -> Result<Vec<RecordBatch>>
+where
+    F: for<'c> FnOnce(&'c SessionContext) -> Pin<Box<dyn Future<Output = Result<DataFrame>> + 'c>>,
+{
+    crate::runtime::block_on(async move {
+        let ctx = graph_session();
+        let base = build(&ctx).await?;
+        let df = apply_tail(&ctx, base, tail).await?;
+        collect_batches(df).await
+    })?
+}
+
 /// Deterministically sample `n` rows (without replacement) from a collected batch
 /// list, returned as a single batch in a stable order.
 ///
@@ -522,48 +545,43 @@ pub fn execute_node_query(
         node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns)),
     });
 
-    crate::runtime::block_on(async move {
-        let ctx = graph_session();
-        let graph_df = ctx.execute_logical_plan(graph_plan).await?;
-
-        // Base frame: either the graph output alone, or a node attribute table
-        // with the graph output left-joined onto it by id.
-        let mut df = match nodes {
-            Some(batches) => {
-                let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
-                let nodes_df = ctx.read_batches(batches)?;
-                // Rename the graph id so the join keys don't collide, then drop it.
-                let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
-                nodes_df
-                    .join(
-                        graph_df,
-                        JoinType::Left,
-                        &[id_col.as_str()],
-                        &["__ursa_gid"],
-                        None,
-                    )?
-                    .drop_columns(&["__ursa_gid"])?
-            }
-            None => graph_df,
-        };
-
-        df = apply_tail(
-            &ctx,
-            df,
-            Tail {
-                filters,
-                group_keys: &group_keys,
-                aggs: &aggs,
-                distinct,
-                sample,
-                sort,
-                limit,
-                rename: &rename,
-            },
-        )
-        .await?;
-        collect_batches(df).await
-    })?
+    run_query(
+        move |ctx| {
+            Box::pin(async move {
+                let graph_df = ctx.execute_logical_plan(graph_plan).await?;
+                // Base frame: either the graph output alone, or a node attribute
+                // table with the graph output left-joined onto it by id.
+                Ok(match nodes {
+                    Some(batches) => {
+                        let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
+                        let nodes_df = ctx.read_batches(batches)?;
+                        // Rename the graph id so the join keys don't collide, then drop it.
+                        let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
+                        nodes_df
+                            .join(
+                                graph_df,
+                                JoinType::Left,
+                                &[id_col.as_str()],
+                                &["__ursa_gid"],
+                                None,
+                            )?
+                            .drop_columns(&["__ursa_gid"])?
+                    }
+                    None => graph_df,
+                })
+            })
+        },
+        Tail {
+            filters,
+            group_keys: &group_keys,
+            aggs: &aggs,
+            distinct,
+            sample,
+            sort,
+            limit,
+            rename: &rename,
+        },
+    )
 }
 
 /// Equi-join two already-materialized frames on shared key column(s), then apply
@@ -616,39 +634,36 @@ pub fn execute_join_query(
             )));
         }
     };
-    crate::runtime::block_on(async move {
-        let ctx = graph_session();
-        let left_df = ctx.read_batches(left)?;
-        let mut right_df = ctx.read_batches(right)?;
-        // Rename each right key to a private sentinel so the join keys don't
-        // collide, then drop the sentinels after the join — the left key survives.
-        let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
-        for (k, s) in on.iter().zip(sentinels.iter()) {
-            right_df = right_df.with_column_renamed(k, s)?;
-        }
-        let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
-        let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-        let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-        let df = left_df
-            .join(right_df, join_type, &left_keys, &right_keys, None)?
-            .drop_columns(&sentinel_refs)?;
-        let df = apply_tail(
-            &ctx,
-            df,
-            Tail {
-                filters,
-                group_keys: &[],
-                aggs: &[],
-                distinct,
-                sample,
-                sort,
-                limit,
-                rename: &rename,
-            },
-        )
-        .await?;
-        collect_batches(df).await
-    })?
+    run_query(
+        move |ctx| {
+            Box::pin(async move {
+                let left_df = ctx.read_batches(left)?;
+                let mut right_df = ctx.read_batches(right)?;
+                // Rename each right key to a private sentinel so the join keys don't
+                // collide, then drop the sentinels after the join — the left key survives.
+                let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
+                for (k, s) in on.iter().zip(sentinels.iter()) {
+                    right_df = right_df.with_column_renamed(k, s)?;
+                }
+                let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
+                let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+                let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+                Ok(left_df
+                    .join(right_df, join_type, &left_keys, &right_keys, None)?
+                    .drop_columns(&sentinel_refs)?)
+            })
+        },
+        Tail {
+            filters,
+            group_keys: &[],
+            aggs: &[],
+            distinct,
+            sample,
+            sort,
+            limit,
+            rename: &rename,
+        },
+    )
 }
 
 /// Build and execute one `hop` traversal as a single DataFusion plan.
@@ -680,26 +695,19 @@ pub fn execute_hop_query(
         node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
     });
 
-    crate::runtime::block_on(async move {
-        let ctx = graph_session();
-        let df = ctx.execute_logical_plan(hop_plan).await?;
-        let df = apply_tail(
-            &ctx,
-            df,
-            Tail {
-                filters,
-                group_keys: &[],
-                aggs: &[],
-                distinct,
-                sample,
-                sort,
-                limit,
-                rename: &rename,
-            },
-        )
-        .await?;
-        collect_batches(df).await
-    })?
+    run_query(
+        move |ctx| Box::pin(async move { ctx.execute_logical_plan(hop_plan).await }),
+        Tail {
+            filters,
+            group_keys: &[],
+            aggs: &[],
+            distinct,
+            sample,
+            sort,
+            limit,
+            rename: &rename,
+        },
+    )
 }
 
 /// Build and execute one `shortest_path` traversal as a single DataFusion plan.
@@ -774,26 +782,19 @@ pub fn execute_path_query(
         )),
     });
 
-    crate::runtime::block_on(async move {
-        let ctx = graph_session();
-        let df = ctx.execute_logical_plan(path_plan).await?;
-        let df = apply_tail(
-            &ctx,
-            df,
-            Tail {
-                filters,
-                group_keys: &[],
-                aggs: &[],
-                distinct,
-                sample,
-                sort,
-                limit,
-                rename: &rename,
-            },
-        )
-        .await?;
-        collect_batches(df).await
-    })?
+    run_query(
+        move |ctx| Box::pin(async move { ctx.execute_logical_plan(path_plan).await }),
+        Tail {
+            filters,
+            group_keys: &[],
+            aggs: &[],
+            distinct,
+            sample,
+            sort,
+            limit,
+            rename: &rename,
+        },
+    )
 }
 
 /// Build and execute one `random_walk` as a single DataFusion plan.
@@ -830,26 +831,19 @@ pub fn execute_walk_query(
         )),
     });
 
-    crate::runtime::block_on(async move {
-        let ctx = graph_session();
-        let df = ctx.execute_logical_plan(walk_plan).await?;
-        let df = apply_tail(
-            &ctx,
-            df,
-            Tail {
-                filters,
-                group_keys: &[],
-                aggs: &[],
-                distinct,
-                sample,
-                sort,
-                limit,
-                rename: &rename,
-            },
-        )
-        .await?;
-        collect_batches(df).await
-    })?
+    run_query(
+        move |ctx| Box::pin(async move { ctx.execute_logical_plan(walk_plan).await }),
+        Tail {
+            filters,
+            group_keys: &[],
+            aggs: &[],
+            distinct,
+            sample,
+            sort,
+            limit,
+            rename: &rename,
+        },
+    )
 }
 
 /// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping
