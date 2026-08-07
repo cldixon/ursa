@@ -648,9 +648,10 @@ pub fn execute_join_query(
                 let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
                 let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
                 let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-                Ok(left_df
+                let joined = left_df
                     .join(right_df, join_type, &left_keys, &right_keys, None)?
-                    .drop_columns(&sentinel_refs)?)
+                    .drop_columns(&sentinel_refs)?;
+                Ok(joined)
             })
         },
         Tail {

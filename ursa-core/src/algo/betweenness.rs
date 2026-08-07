@@ -69,6 +69,34 @@ fn accumulate_sources<S>(
     bc
 }
 
+/// Brandes' reverse dependency accumulation, shared verbatim by the unweighted and
+/// weighted single-source passes. Walking the BFS/Dijkstra discovery `order` in
+/// reverse, each node folds `(1 + delta[w]) / sigma[w]` back onto its predecessors
+/// and (unless it is the source) adds its dependency into `bc`. Both variants build
+/// `order`/`sigma`/`delta`/`preds` differently but accumulate identically, so this
+/// is one function — the summation order is unchanged, keeping results byte-identical.
+///
+/// `order` is iterated without draining, so it still lists the visited nodes for the
+/// caller's per-source scratch reset.
+fn reverse_accumulate(
+    s: u32,
+    order: &[u32],
+    sigma: &[f64],
+    delta: &mut [f64],
+    preds: &[Vec<u32>],
+    bc: &mut [f64],
+) {
+    for &w in order.iter().rev() {
+        let coeff = (1.0 + delta[w as usize]) / sigma[w as usize];
+        for &v in &preds[w as usize] {
+            delta[v as usize] += sigma[v as usize] * coeff;
+        }
+        if w != s {
+            bc[w as usize] += delta[w as usize];
+        }
+    }
+}
+
 /// Reusable per-source scratch for unweighted Brandes. Held clean between sources:
 /// every source resets exactly the nodes it visited (recorded in `order`) back to
 /// the initial state, so the next source sees the same buffers a fresh allocation
@@ -186,17 +214,8 @@ fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64], sc: &mut BrandesScratch
         }
     }
 
-    // Reverse accumulation of dependencies. Iterate `order` in reverse without
-    // draining it, so it still lists the visited nodes for the reset below.
-    for &w in order.iter().rev() {
-        let coeff = (1.0 + delta[w as usize]) / sigma[w as usize];
-        for &v in &preds[w as usize] {
-            delta[v as usize] += sigma[v as usize] * coeff;
-        }
-        if w != s {
-            bc[w as usize] += delta[w as usize];
-        }
-    }
+    // Reverse accumulation of dependencies (shared with the weighted pass).
+    reverse_accumulate(s, order, sigma, delta, preds, bc);
 
     // Reset exactly the touched nodes back to the clean initial state (queue is
     // already drained), leaving `sc` ready for the next source with no reallocation.
@@ -304,17 +323,8 @@ fn brandes_from_weighted(
         }
     }
 
-    // Reverse accumulation over the settle order (iterated without draining, so it
-    // still lists the visited nodes for the reset below).
-    for &w in order.iter().rev() {
-        let coeff = (1.0 + delta[w as usize]) / sigma[w as usize];
-        for &v in &preds[w as usize] {
-            delta[v as usize] += sigma[v as usize] * coeff;
-        }
-        if w != s {
-            bc[w as usize] += delta[w as usize];
-        }
-    }
+    // Reverse accumulation over the settle order (shared with the unweighted pass).
+    reverse_accumulate(s, order, sigma, delta, preds, bc);
 
     // Reset exactly the touched nodes; the heap is already drained by the loop.
     for &w in order.iter() {

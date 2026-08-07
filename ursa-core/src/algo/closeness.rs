@@ -195,8 +195,17 @@ fn closeness_weighted_one(
     let mut reachable = 0i64;
     // Node-order (0..n) scan — the exact summation order of the original, so the
     // f64 total is bit-for-bit unchanged.
+    //
+    // Count every reachable non-source node — the same rule the unweighted kernel
+    // applies (`d >= 1` there excludes only the source). A node reachable at total
+    // cost *exactly* 0.0 (via zero-weight edges) is a reachable non-source node, so
+    // it is counted: `+1` to `reachable`, `+0.0` to `sum` (a no-op on the f64 total,
+    // so the bit-identical-sum guarantee holds). This matches NetworkX, which counts
+    // it in the path total and guards `totsp > 0` for the divide — as the `sum > 0.0`
+    // check below does. (Previously an extra `d > 0.0` here dropped such nodes from
+    // the count, diverging from the unweighted kernel on zero-weight graphs.)
     for (v, &d) in dist.iter().enumerate() {
-        if v != u as usize && d.is_finite() && d > 0.0 {
+        if v != u as usize && d.is_finite() {
             sum += d;
             reachable += 1;
         }
@@ -275,5 +284,28 @@ mod tests {
         assert!((c[0] - 2.0 / 3.0).abs() < 1e-12, "got {}", c[0]);
         // From node 1: only 2 reachable at cost 1 -> 1/1 = 1.
         assert!((c[1] - 1.0).abs() < 1e-12, "got {}", c[1]);
+    }
+
+    #[test]
+    fn zero_weight_reachable_node_is_counted() {
+        // 0 ->(0.0) 1 ->(1.0) 2. From node 0, node 1 is reachable at total cost
+        // exactly 0.0. It must be counted like any reachable non-source node (as the
+        // unweighted kernel counts it): reachable = 2 (nodes 1 and 2), Σ dist = 0 + 1
+        // = 1  ->  2/1 = 2.0. (A stray `d > 0.0` guard would drop node 1 and give
+        // 1/1 = 1.0 — the divergence this reconciles.)
+        let t = Topology::build(3, vec![0, 1], vec![1, 2]);
+        let c = closeness_weighted(&t, &[0.0, 1.0]);
+        assert!((c[0] - 2.0).abs() < 1e-12, "got {}", c[0]);
+        // From node 1: only node 2 reachable at cost 1 -> 1/1 = 1.
+        assert!((c[1] - 1.0).abs() < 1e-12, "got {}", c[1]);
+    }
+
+    #[test]
+    fn all_zero_cost_reachable_falls_back_to_zero() {
+        // Both out-edges weight 0: from node 0 the reachable set has total cost 0,
+        // so the `sum > 0.0` guard returns 0.0 rather than dividing by zero.
+        let t = Topology::build(3, vec![0, 0], vec![1, 2]);
+        let c = closeness_weighted(&t, &[0.0, 0.0]);
+        assert_eq!(c[0], 0.0);
     }
 }

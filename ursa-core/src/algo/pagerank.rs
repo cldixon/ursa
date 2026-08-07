@@ -51,44 +51,35 @@ fn l1_delta(a: &[f64], b: &[f64]) -> f64 {
         .sum()
 }
 
-/// Dense PageRank vector; `result[u]` is the score of dense node `u`. Scores sum
-/// to ~1.0 (up to dangling redistribution and early convergence).
-pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
-    let n = topo.n_nodes();
-    if n == 0 {
-        return Vec::new();
-    }
+/// The pull-based PageRank fixpoint, shared by the unweighted and weighted kernels.
+///
+/// `dangling` lists the zero-out-degree (or zero-out-strength) nodes, whose rank is
+/// redistributed uniformly each iteration. `contrib(u, rank)` returns node `u`'s
+/// pulled contribution — the sum over `u`'s in-edges of each in-neighbour's rank
+/// share — which is the only part that differs between the variants. Everything
+/// else (the uniform init, the `base + d * contrib` update, the deterministic L1
+/// convergence check, the buffer swap, and the early break) lives here once, so
+/// both kernels iterate through byte-identical float operations.
+fn power_iterate(
+    n: usize,
+    params: PageRankParams,
+    dangling: &[usize],
+    contrib: impl Fn(usize, &[f64]) -> f64 + Sync,
+) -> Vec<f64> {
     let nf = n as f64;
     let d = params.damping;
-
-    // Precompute out-degrees (rank is divided by them when pushed forward).
-    let out = topo.out();
-    let out_deg: Vec<u32> = (0..n as u32).map(|u| out.degree(u)).collect();
-    let inc = topo.incoming();
-
-    // Dangling nodes (out-degree 0), listed once. Summing their rank over this
-    // fixed ascending-index list each iteration is deterministic (a parallel
-    // filter-sum is not) and O(#dangling) instead of an O(n) scan per iteration.
-    let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_deg[u] == 0).collect();
 
     let mut rank = vec![1.0 / nf; n];
     let mut next = vec![0.0f64; n];
 
     for _iter in 0..params.max_iter {
-        // Rank stranded on dangling nodes, spread uniformly to everyone.
-        let dangling: f64 = dangling_nodes.iter().map(|&u| rank[u]).sum();
-        let base = (1.0 - d) / nf + d * dangling / nf;
+        // Rank stranded on dangling nodes, spread uniformly to everyone. Summed over
+        // this fixed ascending-index list (a parallel filter-sum is not deterministic).
+        let dangling_mass: f64 = dangling.iter().map(|&u| rank[u]).sum();
+        let base = (1.0 - d) / nf + d * dangling_mass / nf;
 
         next.par_iter_mut().enumerate().for_each(|(u, slot)| {
-            let mut acc = 0.0;
-            for &v in inc.neighbors(u as u32) {
-                // v is an in-neighbour of u; it contributes rank[v] / outdeg[v].
-                let od = out_deg[v as usize];
-                if od > 0 {
-                    acc += rank[v as usize] / od as f64;
-                }
-            }
-            *slot = base + d * acc;
+            *slot = base + d * contrib(u, &rank);
         });
 
         let delta = l1_delta(&next, &rank);
@@ -100,6 +91,36 @@ pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
     }
 
     rank
+}
+
+/// Dense PageRank vector; `result[u]` is the score of dense node `u`. Scores sum
+/// to ~1.0 (up to dangling redistribution and early convergence).
+pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
+    let n = topo.n_nodes();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Precompute out-degrees (rank is divided by them when pushed forward).
+    let out = topo.out();
+    let out_deg: Vec<u32> = (0..n as u32).map(|u| out.degree(u)).collect();
+    let inc = topo.incoming();
+
+    // Dangling nodes (out-degree 0), listed once — O(#dangling) rather than an O(n)
+    // scan per iteration.
+    let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_deg[u] == 0).collect();
+
+    power_iterate(n, params, &dangling_nodes, |u, rank| {
+        let mut acc = 0.0;
+        for &v in inc.neighbors(u as u32) {
+            // v is an in-neighbour of u; it contributes rank[v] / outdeg[v].
+            let od = out_deg[v as usize];
+            if od > 0 {
+                acc += rank[v as usize] / od as f64;
+            }
+        }
+        acc
+    })
 }
 
 /// Weighted PageRank (pull-based). Identical to [`pagerank`] except a node's rank
@@ -121,8 +142,6 @@ pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParam
         topo.n_edges(),
         "weights length must equal the edge count"
     );
-    let nf = n as f64;
-    let d = params.damping;
 
     // Precompute weighted out-strength: the total outgoing weight of each node.
     let out = topo.out();
@@ -131,41 +150,22 @@ pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParam
         .collect();
     let inc = topo.incoming();
 
-    // Dangling nodes (zero out-strength), listed once — summed deterministically
-    // over this fixed ascending-index list each iteration (see the unweighted kernel).
+    // Dangling nodes (zero out-strength), listed once — see the unweighted kernel.
     let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_str[u] <= 0.0).collect();
 
-    let mut rank = vec![1.0 / nf; n];
-    let mut next = vec![0.0f64; n];
-
-    for _iter in 0..params.max_iter {
-        // Rank stranded on dangling nodes (zero out-strength), spread uniformly.
-        let dangling: f64 = dangling_nodes.iter().map(|&u| rank[u]).sum();
-        let base = (1.0 - d) / nf + d * dangling / nf;
-
-        next.par_iter_mut().enumerate().for_each(|(u, slot)| {
-            let mut acc = 0.0;
-            // In-neighbours and their edge rows are aligned element-for-element.
-            let nbrs = inc.neighbors(u as u32);
-            let edges = inc.edge_ids(u as u32);
-            for (&v, &e) in nbrs.iter().zip(edges) {
-                let os = out_str[v as usize];
-                if os > 0.0 {
-                    acc += weights[e as usize] * rank[v as usize] / os;
-                }
+    power_iterate(n, params, &dangling_nodes, |u, rank| {
+        let mut acc = 0.0;
+        // In-neighbours and their edge rows are aligned element-for-element.
+        let nbrs = inc.neighbors(u as u32);
+        let edges = inc.edge_ids(u as u32);
+        for (&v, &e) in nbrs.iter().zip(edges) {
+            let os = out_str[v as usize];
+            if os > 0.0 {
+                acc += weights[e as usize] * rank[v as usize] / os;
             }
-            *slot = base + d * acc;
-        });
-
-        let delta = l1_delta(&next, &rank);
-
-        std::mem::swap(&mut rank, &mut next);
-        if delta < params.tol {
-            break;
         }
-    }
-
-    rank
+        acc
+    })
 }
 
 #[cfg(test)]
