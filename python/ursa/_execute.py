@@ -194,6 +194,8 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
         combined = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
         )
+        if scan.get("on_null") == "drop":
+            combined = _drop_null_endpoint_batches(combined)
         cell = edges._index_build_cell
         with cell.lock:
             cell.value = _native().build_index(combined)
@@ -917,6 +919,29 @@ def _reject_derived_edge_graph_op(edges: Any) -> None:
         )
 
 
+def _drop_null_endpoint_batches(batches: list[Any]) -> list[Any]:
+    """Filter scan batches to rows with a non-null src (column 0) and dst (column 1),
+    emitting a count — the scan half of the ``on_null="drop"`` opt-in. Endpoints are
+    always columns 0/1 whether or not weight columns follow, so this serves the
+    unweighted, weighted, and plain-collect scan paths identically. Filtering here
+    (rather than in a second pass) keeps the topology and any co-scanned weights
+    row-aligned, since they come from the same filtered batches."""
+    import pyarrow.compute as pc
+
+    from ._io import _warn_dropped_endpoints
+
+    # pyarrow.compute members are looked up by name (the type checker lacks its stubs).
+    is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
+    out, dropped = [], 0
+    for b in batches:
+        mask = and_(is_valid(b.column(0)), is_valid(b.column(1)))
+        kept = b.filter(mask)
+        dropped += b.num_rows - kept.num_rows
+        out.append(kept)
+    _warn_dropped_endpoints(dropped)
+    return out
+
+
 def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
     (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
@@ -942,10 +967,14 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
                 "(glob included) for now, not a list of paths."
             )
         # The scan returns a list of [src, dst] batches; build_index reads columns
-        # 0/1 of each, so it is passed straight through.
-        return _native().scan_edges_arrow(
+        # 0/1 of each, so it is passed straight through (minus null-endpoint rows
+        # when on_null="drop").
+        batches = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan)
         )
+        if scan.get("on_null") == "drop":
+            batches = _drop_null_endpoint_batches(batches)
+        return batches
 
     raise NotImplementedError(
         "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or "
@@ -1486,6 +1515,8 @@ def _edge_source_table(frame: EdgeFrame) -> Any:
         batches = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), []
         )
+        if scan.get("on_null") == "drop":
+            batches = _drop_null_endpoint_batches(batches)
         return pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
     # No source: a filtered/derived (or traversal-result) edge frame.
     _require_edges(frame)  # raises the precise, plan-aware message

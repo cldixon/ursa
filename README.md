@@ -156,7 +156,10 @@ EdgeFrame, on a shared single-source BFS kernel family) plus `random_walk()`, th
 stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
 **`describe`**, **object-storage scans** (`s3://` / `gs://` / `az://` via
 `object_store`, with `storage_options`) plus **`http(s)://` URL reads** for a
-single hosted Parquet/CSV file, and `sink_parquet`/`sink_csv` egress.
+single hosted Parquet/CSV file, and `sink_parquet`/`sink_csv` egress. A null
+`src`/`dst` endpoint errors by default; pass **`on_null="drop"`** to the edge
+constructors (`from_arrow` / `from_edgelist` / `scan_edges` / `read_edges`) to
+filter those rows out instead (with a logged count).
 
 **Weighted algorithms** are live across the board: `weight=` is a per-operation
 *expression* over edge columns (`weight=ur.col("amount") * ur.col("fx")`),
