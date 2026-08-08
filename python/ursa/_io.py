@@ -53,6 +53,7 @@ def scan_edges(
     dst: str,
     storage_options: dict[str, Any] | None = None,
     store: Any | None = None,
+    on_null: str = "error",
     **format_opts: Any,
 ) -> EdgeFrame:
     """Lazily scan an edge list from Parquet/CSV.
@@ -63,6 +64,10 @@ def scan_edges(
     ``obstore`` store in place of ``storage_options`` (both bind the same
     underlying Rust ``object_store`` crate).
 
+    ``on_null`` controls what happens to a row whose ``src`` or ``dst`` endpoint is
+    null: ``"error"`` (default) raises, ``"drop"`` filters the row out (emitting a
+    count) instead of failing the whole scan.
+
     HTTP note: a URL must point directly at the file (no query string — the scan
     drops it before fetching, so presigned/token URLs will not authenticate; use
     the ``s3://`` / ``gs://`` / ``az://`` backends with ``storage_options`` for
@@ -70,6 +75,7 @@ def scan_edges(
     treat the URL as untrusted input if it is ever caller-controlled.
     """
     _reject_format_opts(format_opts)
+    _validate_on_null(on_null)
     step = _PlanStep(
         "scan_edges",
         {
@@ -78,6 +84,7 @@ def scan_edges(
             "dst": dst,
             "storage_options": storage_options,
             "store": store,
+            "on_null": on_null,
             "format_opts": format_opts,
         },
     )
@@ -91,6 +98,7 @@ def scan_edges(
             "dst": dst,
             "storage_options": storage_options,
             "store": store,
+            "on_null": on_null,
         },
     )
 
@@ -150,17 +158,24 @@ def from_polars(
 
 
 @overload
-def from_arrow(tbl: Any, *, src: str, dst: str) -> EdgeFrame: ...
+def from_arrow(tbl: Any, *, src: str, dst: str, on_null: str = ...) -> EdgeFrame: ...
 @overload
 def from_arrow(tbl: Any, *, id: str) -> NodeFrame: ...
 def from_arrow(
-    tbl: Any, *, src: str | None = None, dst: str | None = None, id: str | None = None
+    tbl: Any,
+    *,
+    src: str | None = None,
+    dst: str | None = None,
+    id: str | None = None,
+    on_null: str = "error",
 ) -> EdgeFrame | NodeFrame:
     """Build a frame from a ``pyarrow.Table`` / ``RecordBatch``, zero-copy.
 
     A thin, typed alias for ``EdgeFrame(tbl, src=, dst=)`` / ``NodeFrame(tbl, id=)``.
+    ``on_null`` (EdgeFrame only) is ``"error"`` (default) or ``"drop"`` — see
+    ``EdgeFrame``.
     """
-    return _from_inmemory(tbl, src, dst, id)
+    return _from_inmemory(tbl, src, dst, id, on_null)
 
 
 @overload
@@ -180,7 +195,7 @@ def from_pandas(
     return _from_inmemory(df, src, dst, id)
 
 
-def from_edgelist(edges: Any, *, weighted: bool | None = None) -> EdgeFrame:
+def from_edgelist(edges: Any, *, weighted: bool | None = None, on_null: str = "error") -> EdgeFrame:
     """Build an EdgeFrame from an iterable of edge tuples — the most direct way to
     hand-write a small graph.
 
@@ -232,15 +247,16 @@ def from_edgelist(edges: Any, *, weighted: bool | None = None) -> EdgeFrame:
     data = {"src": pa.array(srcs), "dst": pa.array(dsts)}
     if arity == 3:
         data["weight"] = pa.array(weights, type=pa.float64())
-    return EdgeFrame(pa.table(data), src="src", dst="dst")
+    return EdgeFrame(pa.table(data), src="src", dst="dst", on_null=on_null)
 
 
-def _from_inmemory(data: Any, src, dst, id):
+def _from_inmemory(data: Any, src, dst, id, on_null: str = "error"):
     """Dispatch an in-memory input to the right primary constructor. The public
     ``from_arrow`` / ``from_polars`` / ``from_pandas`` aliases all funnel here; the
-    constructors normalize any supported flavour to one canonical Arrow source."""
+    constructors normalize any supported flavour to one canonical Arrow source.
+    ``on_null`` applies only to the EdgeFrame path (endpoint null policy)."""
     if src is not None and dst is not None:
-        return EdgeFrame(data, src=src, dst=dst)
+        return EdgeFrame(data, src=src, dst=dst, on_null=on_null)
     if id is not None:
         return NodeFrame(data, id=id)
     raise ValueError("provide either src= and dst= (EdgeFrame) or id= (NodeFrame)")
@@ -331,6 +347,42 @@ def _node_attr_batch(tbl: Any, id: str) -> Any | None:
     # node set is still a materializable frame. None is reserved for "no table at
     # all" (the bare edges.nodes() path, which never reaches here).
     return batches[0] if batches else pa.RecordBatch.from_pylist([], schema=tbl.schema)
+
+
+_ON_NULL_MODES = ("error", "drop")
+
+
+def _validate_on_null(on_null: str) -> None:
+    """``on_null`` accepts only ``"error"`` (the safe default — a null endpoint
+    raises) or ``"drop"`` (rows with a null src/dst are filtered out)."""
+    if on_null not in _ON_NULL_MODES:
+        raise ValueError(f"on_null must be one of {_ON_NULL_MODES}; got {on_null!r}.")
+
+
+def _warn_dropped_endpoints(n: int) -> None:
+    """Announce how many edge rows ``on_null="drop"`` removed, so a silent drop can
+    never masquerade as 'all rows ingested' (the honesty policy, #55)."""
+    if n:
+        import warnings
+
+        warnings.warn(
+            f"on_null='drop': dropped {n} edge row(s) with a null src or dst endpoint.",
+            stacklevel=2,
+        )
+
+
+def _drop_null_endpoint_rows(tbl: Any, src: str, dst: str) -> tuple[Any, int]:
+    """Return ``(filtered_table, n_dropped)`` — rows whose ``src`` or ``dst``
+    endpoint is null are removed. The in-memory half of the ``on_null="drop"``
+    opt-in; filtering the whole table here keeps the endpoint arrays and the
+    retained edge table (for weights) row-aligned automatically."""
+    import pyarrow.compute as pc
+
+    # pyarrow.compute members are looked up by name (the type checker lacks its stubs).
+    is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
+    mask = and_(is_valid(tbl.column(src)), is_valid(tbl.column(dst)))
+    kept = tbl.filter(mask)
+    return kept, tbl.num_rows - kept.num_rows
 
 
 def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None:

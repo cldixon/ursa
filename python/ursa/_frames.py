@@ -223,7 +223,7 @@ class EdgeFrame(_Frame):
     # can be evaluated. It rides the same preserve/drop rail; scan frames have None.
     __slots__ = ("_dst_col", "_edge_table", "_index_cell", "_scan", "_source", "_src_col")
 
-    def __init__(self, data: Any, *, src: str, dst: str) -> None:
+    def __init__(self, data: Any, *, src: str, dst: str, on_null: str = "error") -> None:
         """Build an EdgeFrame from in-memory data, inferring the Arrow schema.
 
         ``data`` may be a list of row dicts, a dict of equal-length columns, a
@@ -231,14 +231,29 @@ class EdgeFrame(_Frame):
         ``RecordBatch`` — whatever ``_to_arrow_table`` normalizes. ``src`` / ``dst``
         are *role mappings* naming the endpoint columns, not renames.
 
+        ``on_null`` sets the null-endpoint policy: ``"error"`` (default) leaves any
+        null ``src``/``dst`` in place so the topology build raises; ``"drop"``
+        filters those rows out here (emitting a count), before the endpoint arrays
+        and the retained edge table are derived — so both stay row-aligned.
+
         Whatever the input flavour, the data is stored as one canonical Arrow
         source, so a frame built here is indistinguishable downstream from one
         built via ``from_arrow`` / ``from_polars`` / ``from_pandas`` or a
         ``scan_edges`` file — the load-bearing "same from here on" guarantee.
         """
-        from ._io import _extract_edge_arrays, _to_arrow_table
+        from ._io import (
+            _drop_null_endpoint_rows,
+            _extract_edge_arrays,
+            _to_arrow_table,
+            _validate_on_null,
+            _warn_dropped_endpoints,
+        )
 
+        _validate_on_null(on_null)
         table = _to_arrow_table(data)
+        if on_null == "drop":
+            table, dropped = _drop_null_endpoint_rows(table, src, dst)
+            _warn_dropped_endpoints(dropped)
         source = _extract_edge_arrays(table, src, dst)
         self._fill(
             src_col=src,
