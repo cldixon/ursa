@@ -5,7 +5,8 @@
 > The engine foundation is in place: real algorithm kernels, and `collect()`
 > executing as one DataFusion plan with graph ops as first-class logical nodes.
 > The full design lives in [`docs/SPEC.md`](docs/SPEC.md); this README describes
-> what is *actually built right now* and how the pieces fit.
+> what is *actually built right now* and how the pieces fit. Coming from
+> NetworkX? See [how Ursa's algorithm semantics differ](docs/networkx-semantics.md).
 
 Ursa is a Rust core (Apache Arrow throughout), a DataFusion query engine with
 graph operators as first-class plan nodes, and a fluent, Polars-shaped Python
