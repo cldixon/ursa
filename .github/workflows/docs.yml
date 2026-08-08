@@ -1,0 +1,74 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'site/**'
+      - '.github/workflows/docs.yml'
+  # Lets a maintainer republish without pushing (e.g. after enabling Pages).
+  workflow_dispatch:
+
+# Deliberately separate from `ci.yml` so the docs never gate the code, and the
+# code build never gates the docs. Nothing here needs the native extension: the
+# site is static, built from markdown and Astro components only.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: site
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # --frozen-lockfile is the CI equivalent of `npm ci`: fail if bun.lock
+      # disagrees with package.json rather than silently resolving something new.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bun run check
+
+      - name: Build
+        run: bun run build
+
+      # Uploaded on every run, so a pull request proves the site still builds
+      # before it can break the published one.
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  deploy:
+    name: Deploy
+    # Only `main` publishes; pull requests stop after a green build.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

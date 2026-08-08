@@ -1,0 +1,73 @@
+/* Ursa design tokens.
+ *
+ * Two grounds, one system. The site and docs are the plate — a negative, ink on
+ * paper. The visualizer (and the sections that stand in for it) are the sky, the
+ * same tokens inverted. Nothing else exists: there is no brand accent and no
+ * highlight colour, because colour is reserved for measured values.
+ */
+
+:root {
+  /* --- paper (the plate: site + docs) ------------------------------------ */
+  --paper: #f4f1ea;
+  --ink: #12120f;
+  --ink-2: #5a5852;
+  --rule: #dad4c6;
+
+  /* --- sky (the instrument: visualizer + inverted sections) -------------- */
+  --sky: #0b0b0a;
+  --sky-ink: #f4f1ea;
+  --sky-ink-2: #8a877f;
+  --sky-rule: #2a2a26;
+
+  /* --- temperature scale, hot -> cool -----------------------------------
+   * Star colour follows temperature: blue-white hot, orange-red cool. The
+   * sequential scale for any continuous measure, and the only colour in the
+   * system. Categorical data (components, communities) must NOT use it — order
+   * is implied where none exists; use flat greys instead.
+   */
+  --paper-ramp-0: #c4491b;
+  --paper-ramp-1: #b07728;
+  --paper-ramp-2: #6e6e72;
+  --paper-ramp-3: #4b6cb0;
+  --paper-ramp-4: #1f3e8c;
+
+  --sky-ramp-0: #ff9f51;
+  --sky-ramp-1: #ffd2a1;
+  --sky-ramp-2: #f4f3ff;
+  --sky-ramp-3: #aabfff;
+  --sky-ramp-4: #9bb0ff;
+
+  /* Flat greys for categorical channels — no order implied. */
+  --cat-0: #3d3c38;
+  --cat-1: #6b6963;
+  --cat-2: #8f8c84;
+  --cat-3: #b3afa5;
+
+  /* --- type: two faces, a text serif and a mono. No sans, anywhere. ------ */
+  --serif: 'Source Serif 4 Variable', 'Source Serif 4', Georgia, serif;
+  --mono: 'IBM Plex Mono', Menlo, Consolas, monospace;
+
+  /* --- measure ------------------------------------------------------------ */
+  --w-page: 1240px;
+  --w-docs: 1180px;
+  --pad-x: clamp(20px, 4vw, 52px);
+}
+
+/* The sky is a scope, not a theme toggle: any element carrying [data-ground="sky"]
+ * re-points the semantic tokens at the inverted set, so components below it need
+ * no knowledge of which ground they are on. */
+[data-ground='sky'] {
+  --paper: var(--sky);
+  --ink: var(--sky-ink);
+  --ink-2: var(--sky-ink-2);
+  --rule: var(--sky-rule);
+
+  --paper-ramp-0: var(--sky-ramp-0);
+  --paper-ramp-1: var(--sky-ramp-1);
+  --paper-ramp-2: var(--sky-ramp-2);
+  --paper-ramp-3: var(--sky-ramp-3);
+  --paper-ramp-4: var(--sky-ramp-4);
+
+  background: var(--sky);
+  color: var(--sky-ink);
+}

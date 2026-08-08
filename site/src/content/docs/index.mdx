@@ -1,0 +1,86 @@
+---
+title: Introduction
+description: Ursa is an in-memory, single-machine graph analytics library with a dataframe-first API — what Polars is to tabular data, for graphs.
+subtitle: v0.1, in progress. This documentation describes what executes today; the roadmap says what does not.
+---
+
+import DocsIndex from '../../components/DocsIndex.astro';
+
+Ursa is an in-memory, single-machine graph analytics library with a dataframe-first API. It is
+to graph data what Polars is to tabular data: a Rust core, a lazy query engine, Apache Arrow
+throughout, and a fluent Python expression API — with graph traversals and graph algorithms as
+first-class citizens of the query plan.
+
+```python
+import ursa as ur
+
+edges = ur.scan_edges("s3://lake/links/*.parquet", src="tower_a", dst="tower_b")
+nodes = ur.scan_nodes("s3://lake/towers/*.parquet", id="tower_id")
+
+result = (
+    nodes
+    .with_columns(
+        pagerank  = ur.pagerank(edges, damping=0.85),
+        component = ur.connected_components(edges),
+        nbr_cap   = ur.neighbors(edges).agg(ur.col("capacity_gbps").mean()),
+    )
+    .filter(ur.col("pagerank") > 0.001)
+    .sort("pagerank", descending=True)
+    .collect()
+)
+
+result.to_polars()   # zero-copy, it's all Arrow
+```
+
+## Why Ursa
+
+The modern data stack settled on a set of primitives: Apache Arrow as the in-memory format,
+columnar single-machine engines (Polars, DuckDB, DataFusion) as the compute layer, and object
+storage as the persistence layer. Graph analytics never joined this world.
+
+The de facto tool, NetworkX, is object-per-node pure Python — orders of magnitude too slow past a
+few million edges. The fast alternatives are either object-graph libraries with dated ergonomics
+(igraph, graph-tool, rustworkx) or embedded graph *databases* with query languages (Kùzu,
+DuckPGQ). Spark's GraphFrames proved that "a graph is just two dataframes" is the right mental
+model, but it is trapped in the JVM.
+
+Ursa's position: **graph analytics as a library, not a database; frames, not objects; expressions,
+not query languages.** If you know Polars, you already know most of Ursa.
+
+The target user is a data engineer or analyst with a graph of roughly 1M–500M edges — fraud rings,
+entity resolution, data lineage, infrastructure topology, web and social graphs — that fits in
+workstation RAM but makes NetworkX unusable. The target workflow is: scan from Parquet or CSV
+(local or object storage), compute graph metrics and traversals inside a lazy dataframe pipeline,
+and flow results back out through Arrow to Polars, Parquet, Iceberg, or an API response.
+
+## The shape of it
+
+Three ideas carry most of the design, and they are worth reading before the guides.
+
+**There is no `Graph` object.** An `EdgeFrame` *is* the graph. A `NodeFrame` is an attribute table
+that relates to it the way two database tables with a foreign key relate — by join semantics, by
+key convention. Nothing registers nodes with edges; when an operation needs both topology and node
+attributes, the EdgeFrame appears as an explicit argument.
+
+**The algebra is closed over frames.** No operation in the public API returns anything that is not
+a frame — except a documented handful of eager scalar statistics. One hop is EdgeFrame →
+EdgeFrame, so traversal composes by chaining. A path is an EdgeFrame with a `hop` column.
+Node-valued algorithms are either NodeFrames of `(id, value)` or expressions inside
+`with_columns` — two spellings of one kernel.
+
+**Everything is lazy.** A frame *is* a logical plan until `.collect()`, and each `collect()`
+executes as one DataFusion plan in which the graph operators are real logical nodes, not steps
+orchestrated from outside.
+
+## The name
+
+Ursa Minor is the constellation that contains **Polaris**, the North Star. A constellation is
+literally a graph — stars for nodes, asterism lines for edges. The name continues the
+data-ecosystem lineage of bears (pandas, Polars) and arctic references, and nods to Ursa Labs, the
+original home of Apache Arrow development.
+
+The distribution is `ursa-graph` on PyPI; the import name is `ursa`, conventionally aliased `ur`.
+
+## Where to go next
+
+<DocsIndex />

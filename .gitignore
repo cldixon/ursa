@@ -16,6 +16,21 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
+# Docs site (Astro, managed with bun). bun.lock IS committed so the deploy build
+# is reproducible and `bun install --frozen-lockfile` has something to check
+# against.
+/site/node_modules/
+/site/dist/
+/site/.astro/
+/site/.wrangler/
+
+# Credentials. Wrangler reads `.env` from the project directory, so a Cloudflare
+# API token can land here by accident — never commit one.
+.env
+.env.*
+!.env.example
+.dev.vars
+
 # Editors / OS
 .DS_Store
 .idea/
