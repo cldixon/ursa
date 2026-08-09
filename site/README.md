@@ -9,33 +9,18 @@ components — so the docs build never waits on a Rust compile.
 ```bash
 cd site
 bun install
-bun run dev      # http://localhost:4321/ursa
-bun run build    # -> site/dist
-bun run check    # astro check (type-checks .astro and the content schema)
+bun run dev              # http://localhost:4321
+bun run build            # -> site/dist
+bun run check            # astro check (type-checks .astro and the content schema)
+bun run preview:worker   # the production build, served by a local workerd
 ```
 
 ## Deploying
 
-Two targets, which disagree about where the root is. A GitHub Pages project site is served under
-`/ursa`; a Cloudflare Worker is served from `/`. That prefix reaches links in three places —
-components (`src/lib/url.ts`), markdown (the rehype plugin) and the sitemap — so it is a build
-parameter rather than a constant, and each target picks it with its own config file.
-
-| Target | Build | Base |
-|---|---|---|
-| GitHub Pages | `bun run build` (`astro.config.mjs`) | `/ursa` |
-| Cloudflare Workers | `bun run build:cf` (`astro.config.cloudflare.mjs`) | `/` |
-
-### Cloudflare Workers
-
-Workers rather than Pages: Cloudflare now points new projects at Workers, and Static Assets is the
-supported way to host a build output there. Pages still works — it is just no longer where the
-platform adds features.
-
-```bash
-bun run preview:cf   # build for the root path, serve it with a local workerd
-bun run deploy       # build, then publish
-```
+The site deploys to a Cloudflare Worker — `ursa-docs`, live at
+<https://ursa-docs.cl-dixon.workers.dev> — as static assets. Workers rather than Pages:
+Cloudflare now points new projects at Workers, and Static Assets is the supported way to host a
+build output there.
 
 `wrangler.jsonc` configures an **assets-only** Worker: no `main`, no server-side code, `dist/`
 served straight from the edge. `html_handling: "drop-trailing-slash"` matches the unslashed form
@@ -43,18 +28,32 @@ every internal link uses, so navigation costs no redirects; `not_found_handling:
 serves the built 404 rather than falling through to `index.html` and returning 200 for a URL that
 does not exist.
 
-Deploying needs a Cloudflare credential — `wrangler login` locally, or `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` in CI. Once the worker has a real hostname, set `SITE_URL` so canonical
-tags and the sitemap point at it:
+### CI/CD — Workers Builds
+
+Deployment is Cloudflare's git integration (**Workers Builds**), configured on the Worker in the
+dashboard rather than in this repository:
+
+- Pushes to `main` that touch `site/` build and **deploy production**.
+- Every other branch runs `wrangler versions upload` instead, which produces **preview URLs** —
+  one per commit, plus a stable per-branch alias
+  (`<branch>-ursa-docs.cl-dixon.workers.dev`) — posted to the pull request as a comment. The
+  branch URL follows the branch as commits land, like a Pages preview deployment.
+
+`.github/workflows/docs.yml` is a build check only (install, `astro check`, build); it proves a
+docs PR builds from a clean checkout independent of the Cloudflare account.
+
+### Manual deploy
+
+```bash
+bun run deploy   # build, then wrangler deploy (needs `wrangler login`)
+```
+
+If the worker moves to a custom domain, set `SITE_URL` so canonical tags and the sitemap point at
+it — as an override locally, or as a build variable in Workers Builds:
 
 ```bash
 SITE_URL=https://ursa.example.com bun run deploy
 ```
-
-### GitHub Pages
-
-`.github/workflows/docs.yml` builds on every pull request touching this directory and deploys
-`main` to Pages. It needs Pages enabled with **source: GitHub Actions** in repository settings.
 
 ## Layout
 

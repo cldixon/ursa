@@ -10,12 +10,15 @@ on:
     paths:
       - 'site/**'
       - '.github/workflows/docs.yml'
-  # Lets a maintainer republish without pushing (e.g. after enabling Pages).
-  workflow_dispatch:
 
+# Build check only — deployment is Workers Builds (Cloudflare's git integration
+# on the ursa-docs Worker): pushes to main build and deploy production there,
+# and non-production branches get preview URLs posted to the PR. This job stays
+# so a docs PR still gets a type-check and a build proof from a clean checkout,
+# independent of the Cloudflare account.
+#
 # Deliberately separate from `ci.yml` so the docs never gate the code, and the
-# code build never gates the docs. Nothing here needs the native extension: the
-# site is static, built from markdown and Astro components only.
+# code build never gates the docs. Nothing here needs the native extension.
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
@@ -48,27 +51,3 @@ jobs:
 
       - name: Build
         run: bun run build
-
-      # Uploaded on every run, so a pull request proves the site still builds
-      # before it can break the published one.
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site/dist
-
-  deploy:
-    name: Deploy
-    # Only `main` publishes; pull requests stop after a green build.
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deploy
-        uses: actions/deploy-pages@v4

@@ -1,6 +1,8 @@
 /**
- * Base-aware URLs. The site is published under a repository path on GitHub
- * Pages, so nothing links to a bare `/…` path directly.
+ * Internal URLs. The site is served from the root of its Worker, so `url()` is
+ * currently a pass-through — it stays as the single seam every component link
+ * goes through, so a future prefix (or host move) is one change here rather
+ * than a sweep of the components.
  */
 
 const BASE = import.meta.env.BASE_URL.replace(/\/+$/, '');

@@ -8,13 +8,19 @@
   // and Static Assets is the supported way to host a build output there. Pages
   // still works, but it is where the platform is no longer adding features.
   //
-  //   npm run deploy       # build for the root path, then publish
-  //   npm run preview:cf   # the same build, served by a local workerd
+  //   bun run deploy           # build, then publish (needs `wrangler login`)
+  //   bun run preview:worker   # the same build, served by a local workerd
   //
-  // Deploying needs `wrangler login` (or CLOUDFLARE_API_TOKEN +
-  // CLOUDFLARE_ACCOUNT_ID in CI) — an account credential, not a repo one.
+  // CI/CD is Workers Builds (the git integration configured on the Worker in
+  // the Cloudflare dashboard): pushes to main build + deploy production, and
+  // non-production branches run `wrangler versions upload` for preview URLs.
   "name": "ursa-docs",
   "compatibility_date": "2026-07-01",
+
+  // Preview URLs for non-production versions: `wrangler versions upload` (which
+  // Workers Builds runs for non-production branches) gets a per-version URL and
+  // a stable per-branch alias, posted to the PR as a comment.
+  "preview_urls": true,
 
   "assets": {
     "directory": "./dist",

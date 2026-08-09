@@ -7,8 +7,8 @@
 > The full design lives in [`docs/SPEC.md`](docs/SPEC.md); this README describes
 > what is *actually built right now* and how the pieces fit.
 >
-> **Documentation: <https://cldixon.github.io/ursa>** — landing page, guides and
-> API reference. Source in [`site/`](site/).
+> **Documentation: <https://ursa-docs.cl-dixon.workers.dev>** — landing page,
+> guides and API reference. Source in [`site/`](site/).
 
 Ursa is a Rust core (Apache Arrow throughout), a DataFusion query engine with
 graph operators as first-class plan nodes, and a fluent, Polars-shaped Python
@@ -156,7 +156,7 @@ Next, in rough priority order:
    built once and shared across ops over a frame — the index-preservation
    contract — which is the seam these rules register on.)
 3. **Breadth** — broadening the benchmark coverage. (The docs site now lives in
-   [`site/`](site/) and publishes to GitHub Pages from `docs.yml`.)
+   [`site/`](site/) and deploys to Cloudflare Workers via Workers Builds.)
    The cross-library **benchmark flywheel** is live in
    [`benchmarks/`](benchmarks/) — a `typer`/`rich` CLI that races Ursa against
    NetworkX, rustworkx, and igraph across nine algorithms, separates cold
