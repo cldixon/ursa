@@ -283,13 +283,60 @@ than the one being displayed. Prefer the former; check status before scoping.
   space — user IDs stay server-side except labels/tooltips fetched on hover),
   JSON only for control messages. Version the protocol from day one.
 
-- **Renderer stack.** Undecided in the vision doc (open question 1); the
-  protocol is stack-agnostic. Lean: hand-rolled WebGL2 or regl for v0 — the
-  render needs (instanced points + lines + text sprites) are small; wgpu-in-
-  WASM buys little until Tier 3 wants shared Rust rendering code. The
-  renderer must render acceptably from a plain 2D-canvas fallback for tiny
-  graphs if that meaningfully simplifies v0 — but don't build two render
-  paths without need.
+- **Renderer stack — settled: regl.** The render needs (instanced points +
+  lines + text sprites) are small, and regl removes the WebGL boilerplate
+  without becoming a framework. wgpu-in-WASM buys little until Tier 3 wants
+  shared Rust rendering code, and it would drag WASM into step 1 for nothing.
+  The protocol stays stack-agnostic, so this is reversible. The renderer must
+  render acceptably from a plain 2D-canvas fallback for tiny graphs if that
+  meaningfully simplifies v0 — but don't build two render paths without need.
+
+## JS workspace and toolchain **[settled]**
+
+**One bun workspace at the repo root.** Today there is no root `package.json`
+and the lockfile lives at `site/bun.lock`. That becomes a root `package.json`
+with `workspaces: ["viz", "site"]` and a single root `bun.lock`.
+
+**`viz/` is a top-level directory, not a subdirectory of `site/`.** It owns the
+design tokens, the stretch/ramp machinery, and the renderer; `site/` becomes a
+*consumer* of it. The site is the first consumer but will not be the main one —
+the notebook widget and the exported HTML both need the tokens and the renderer
+with no Astro anywhere in sight. Nesting the shared package under `site/` would
+invert the eventual dependency direction.
+
+This resolves open questions 4 and 5 together: `tokens.css` and `stretch.ts`
+move from `site/src/` into `viz/`, and the site imports them through the
+workspace rather than owning them. Moving them (rather than re-exporting from
+where they are) is the point — the requirement was one source of truth, and a
+package that re-exports from its consumer isn't one.
+
+**bun for everything JS**: package management, workspaces, bundling
+(`bun build --target browser --format esm` for the anywidget ESM bundle), and
+tests (`bun test`). Two caveats, neither a problem:
+
+- **bun does not type-check.** `tsc --noEmit` (and `astro check`, which wraps
+  it) stays in CI. bun strips types, it does not verify them.
+- **Astro's own build uses Vite internally** regardless of bun being the
+  runtime and package manager. That is already true today and is invisible —
+  it does not make Vite a second toolchain to maintain.
+
+**Two deploy-path consequences of moving to a workspace — both easy to miss:**
+
+1. `.github/workflows/docs.yml` runs with `working-directory: site` and does
+   `bun install --frozen-lockfile` there. Install has to move to the repo root
+   once the lockfile does; the build step stays scoped to `site`.
+2. **Cloudflare Workers Builds is configured in the Cloudflare dashboard, not
+   in this repo.** Its root directory and build command need updating in the
+   same change, or the docs deploy breaks on the first push after the
+   restructure — and it breaks in a place that no amount of reading the repo
+   explains. `site/wrangler.jsonc` itself needs no change.
+
+**Shipping the bundle into the wheel.** Build the JS bundle once in a dedicated
+CI job, upload it as an artifact, and have each wheel leg download it before
+maturin runs — rather than installing bun on all five platform legs. Include
+the built assets in the sdist too (via `[tool.maturin] include`, the same
+mechanism the bundled datasets already use), so `pip install` from source does
+not require a JS toolchain.
 
 ## Design-system pointers (for step 1)
 
@@ -329,14 +376,21 @@ decision rather than shipping an ad-hoc palette.
 
 ## Open questions (carry forward, decide in-flight)
 
-1. Renderer stack final call (WebGL2 vs regl vs wgpu) — decide at step 1
-   start; keep the protocol stack-agnostic.
+1. ~~Renderer stack final call (WebGL2 vs regl vs wgpu).~~ **Settled: regl.**
+   See §Technical guidance; the protocol stays stack-agnostic.
 2. Live-layout tick streaming rate control (server-paced vs client-requested)
-   — decide at step 4.
-3. Categorical color at instrument scale — see above; owner decision needed.
-4. Exact shape of the shared token package (npm workspace package in `site/`?
-   a `viz/` top-level dir owning it with the site importing from it?) — decide
-   at step 1; the requirement is only *one source of truth consumed by both*.
-5. Where the frontend source lives (`site/` toolchain family vs. a new
-   top-level `viz-frontend/`) — the constraint is that the wheel ships
-   prebuilt assets and the site can import the renderer as a component.
+   — decide at step 4, against a real frame budget rather than in advance.
+3. **Categorical color at instrument scale — still open; owner decision.** The
+   only one of the five that needs a design call rather than a default. Bites
+   at step 4. See §Design-system pointers for the k ≤ 12 reframing.
+4. ~~Exact shape of the shared token package.~~ **Settled:** a top-level `viz/`
+   package in a root bun workspace, owning tokens + stretch + renderer, with
+   `site/` importing from it. See §JS workspace and toolchain.
+5. ~~Where the frontend source lives.~~ **Settled with 4:** `viz/`. CI builds
+   the bundle once and fans it out to the wheel legs and the site build.
+
+Resolved elsewhere in this document: position dtype (`f32`, tracked as #117),
+`ur.plot` as widget rather than matplotlib-first (§Deliberate revisions, with
+matplotlib retained as the v0 static path), docs-figure generation (committed
+Arrow fixtures from the code CI, no Python in the site build), and packaging
+(no second wheel matrix).
