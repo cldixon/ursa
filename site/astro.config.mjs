@@ -5,9 +5,9 @@ import sitemap from '@astrojs/sitemap';
 
 // One deploy target: a Cloudflare Worker serving static assets from the root,
 // so there is no base-path prefix anywhere. `SITE_URL` only affects canonical
-// tags and the sitemap — override it when the worker moves to a custom domain.
+// tags and the sitemap; the default is the custom domain the worker serves.
 export default defineConfig({
-  site: process.env.SITE_URL ?? 'https://ursa-docs.cl-dixon.workers.dev',
+  site: process.env.SITE_URL ?? 'https://ursa.cldixon.dev',
   base: '/',
   trailingSlash: 'ignore',
   integrations: [

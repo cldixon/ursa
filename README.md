@@ -8,7 +8,7 @@
 > what is *actually built right now* and how the pieces fit. Coming from
 > NetworkX? See [how Ursa's algorithm semantics differ](docs/networkx-semantics.md).
 >
-> **Documentation: <https://ursa-docs.cl-dixon.workers.dev>** — landing page,
+> **Documentation: <https://ursa.cldixon.dev>** — landing page,
 > guides and API reference. Source in [`site/`](site/).
 
 Ursa is a Rust core (Apache Arrow throughout), a DataFusion query engine with
