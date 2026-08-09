@@ -10,9 +10,17 @@ them the first time a number does not match something you computed elsewhere. Th
 here rather than left in test comments.
 
 The right-hand column is the exact NetworkX call Ursa is pinned against, so you can reproduce the
-comparison yourself.
+comparison yourself. The repository carries the same alignments as
+[`docs/networkx-semantics.md`](https://github.com/cldixon/ursa/blob/main/docs/networkx-semantics.md),
+with `tests/test_networkx_reference.py` as the executable source of truth.
 
 ## Centralities
+
+**PageRank** — dangling mass is redistributed uniformly, matching the reference.
+
+```python
+nx.pagerank(G, alpha=0.85)
+```
 
 **Closeness** — out-edge closeness with the Wasserman–Faust correction **off**.
 
@@ -24,14 +32,15 @@ The `reverse()` is not a mistake: NetworkX's closeness measures distance *to* a 
 in-edges, and Ursa's follows out-edges like every other directed operation in the library.
 Reversing the graph makes the two agree.
 
-**Betweenness** — raw, un-normalized, directed.
+**Betweenness** — raw, un-normalized, directed, without endpoint counting.
 
 ```python
-nx.betweenness_centrality(G, normalized=False)
+nx.betweenness_centrality(G, normalized=False, endpoints=False)
 ```
 
-Sampled betweenness (`sample=`) is seeded and deterministic; the sample is a `seed`-shuffled
-subset of sources, so a given `(sample, seed)` pair always selects the same sources.
+Sampled betweenness (`sample=`) is the Brandes–Pich estimator: a `seed`-shuffled subset of
+sources, scaled by `n/k`, so a given `(sample, seed)` pair always selects the same sources and
+the estimate is unbiased.
 
 One genuine divergence: **parallel edges count as distinct shortest paths** in Ursa, because
 multiplicity is just rows. A multigraph therefore diverges from a simple-graph reference like
@@ -55,8 +64,9 @@ direction is *not* a parameter of the operation.
 Comparing two runs means comparing the partition (which nodes share a label), not the label values
 themselves. The same is true of `label_propagation` and of `connected_components`.
 
-**Connected components** — weak by default. `mode="strong"` raises; strongly connected components
-are a later release rather than a silently-weak fallback.
+**Connected components** — weak by default, over the undirected view. `mode="strong"` runs
+Tarjan's SCC over the directed graph, matching `nx.strongly_connected_components` as a partition.
+Any other mode raises rather than silently falling back to weak.
 
 ## Multiplicity, self-loops and direction
 
@@ -79,7 +89,8 @@ takes `seed=`, and the guarantee is stronger than the usual one:
 That is not free. Floating-point addition is not associative, so a parallel reduction that sums in
 whatever order the threads finish gives different answers at different thread counts. Ursa uses
 fixed-order f64 reductions, order-independent tie-breaks in Louvain, and a single serial RNG
-stream for walks, specifically to hold the guarantee.
+stream for walks, specifically to hold the guarantee — and a test pins it, asserting bit-identical
+results for the determinism-sensitive kernels across thread pools of 1 to 8 workers.
 
 The practical consequence: a result you commit to a test, or a walk you feed to an embedding
 pipeline, is reproducible on a different machine with a different core count.

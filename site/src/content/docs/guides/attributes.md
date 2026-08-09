@@ -73,33 +73,36 @@ the designed surface but is not wired yet, and raises rather than being silently
 
 ## Why the EdgeFrame is an argument
 
-Because topology is threaded explicitly rather than bound to an object, one query can use more
-than one graph:
+Because topology is threaded explicitly rather than bound to an object, "there is no graph, only
+frames" composes in principle: degree in the full graph beside degree in a subgraph, each
+threading its own edge frame.
+
+Two current limits shape how you write that today, and both raise clearly rather than
+mis-executing:
+
+- Within a single `with_columns`, every graph algorithm must run over the **same** edge frame.
+  Compute over different graphs in separate steps or separate collects.
+- A graph op over a *filtered* edge frame raises — subgraph views over a parent index are
+  deferred. Materialize the filtered edges and construct a new frame:
 
 ```python
-active = edges.filter(ur.col("last_seen") > cutoff)
-
-nodes.with_columns(
-    deg_all    = ur.degree(edges,  direction="both"),
-    deg_active = ur.degree(active, direction="both"),
+active = ur.EdgeFrame(
+    edges.filter(ur.col("last_seen") > cutoff).collect().to_arrow(),
+    src=edges.src_col, dst=edges.dst_col,
 )
+
+nodes.with_columns(deg_all=ur.degree(edges, direction="both")).collect()
+ur.degree(active, direction="both").collect()   # the subgraph's answer, separately
 ```
-
-Two topologies, side by side, in one pipeline. Note that `active` is a *different* frame with its
-own index: filtering an EdgeFrame drops the cached topology, and the filtered frame builds its own
-on first use.
-
-Within a single `with_columns`, every graph algorithm must currently run over the **same** edge
-frame; mixing frames in one `with_columns` raises. Compute them in separate steps, or separate
-collects, until that lands.
 
 ## Multiplicity
 
 Duplicate `(src, dst)` rows are parallel edges, and every kernel sees them. If your source data
-has repeated edges and you want simple-graph semantics, say so:
+has repeated edges and you want simple-graph semantics, deduplicate at the source — a
+materialize-and-reconstruct, since `distinct()` is row-changing and the derived frame refuses
+graph ops:
 
 ```python
-simple = edges.distinct()
+simple = ur.EdgeFrame(edges.distinct().collect().to_arrow(),
+                      src=edges.src_col, dst=edges.dst_col)
 ```
-
-That is a row-changing operation, so it drops the cached index and the next graph op rebuilds it.

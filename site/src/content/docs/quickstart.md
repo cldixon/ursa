@@ -1,19 +1,21 @@
 ---
 title: Quickstart
-description: A tour of what Ursa v0.1 does today — algorithms, composed pipelines, attribute enrichment, traversals, statistics and egress.
+description: A tour of what Ursa does today — algorithms, composed pipelines, attribute enrichment, traversals, relational verbs, statistics and egress.
 subtitle: Every listing here is runnable. The same tour lives in examples/quickstart.py.
 ---
 
 The graph for this tour: two triangles (`0-1-2` and `3-4-5`) joined by the bridge `2 → 3`, plus
-two extra nodes `6` and `7` that both point at hub `0`. Small enough to check by hand.
+two extra nodes `6` and `7` that both point at hub `0`. Small enough to check by hand. The
+`EdgeFrame` constructor takes plain Python data — no `pyarrow` import required:
 
 ```python
-import pyarrow as pa
 import ursa as ur
 
-src = [0, 1, 2, 3, 4, 5, 2, 6, 7]
-dst = [1, 2, 0, 4, 5, 3, 3, 0, 0]
-edges = ur.from_arrow(pa.table({"s": src, "d": dst}), src="s", dst="d")
+edges = ur.EdgeFrame(
+    {"s": [0, 1, 2, 3, 4, 5, 2, 6, 7],
+     "d": [1, 2, 0, 4, 5, 3, 3, 0, 0]},
+    src="s", dst="d",
+)
 ```
 
 `src=` and `dst=` are **role mappings**, not renames. The frame remembers which columns play the
@@ -72,12 +74,12 @@ A node attribute table joins to the computed metrics by id. Filter on an attribu
 a computed one — they are all just columns by the time the tail runs.
 
 ```python
-nodes = ur.from_arrow(
-    pa.table({
+nodes = ur.NodeFrame(
+    {
         "id":        [0, 1, 2, 3, 4, 5, 6, 7],
         "team":      ["red", "red", "red", "blue", "blue", "blue", "red", "blue"],
         "seniority": [5, 2, 4, 1, 3, 2, 1, 5],
-    }),
+    },
     id="id",
 )
 
@@ -106,11 +108,35 @@ Traversal results are frames too, which is why they compose.
 # k-hop reachability: an EdgeFrame whose src is the seed and dst the reached node
 ur.hop(edges, n=2).from_([0]).sort("dst").collect().to_polars()
 
-# a path: one row per edge, in order, with a `hop` column
+# a path: one row per edge, in order, with `hop` and cumulative `cost` columns
 ur.shortest_path(edges, 0, 5).collect().to_polars()
 
 # random walks: a (walk_id, step, node) frame, ready for node2vec-style pipelines
 ur.random_walk(edges, start=[0], steps=4, walks_per_node=2, seed=7).collect().to_polars()
+```
+
+## Relational verbs
+
+Frames are frames, so the tabular verbs work on them — grouping over an attribute, or joining
+two frames by key:
+
+```python
+# mean pagerank per team — group_by().agg() with named and derived columns
+(nodes
+ .with_columns(pr=ur.pagerank(edges))
+ .group_by("team")
+ .agg(ur.col("pr").mean(), size=ur.col("id").count())
+ .sort("pr_mean", descending=True)
+ .collect()
+ .to_polars())
+
+# join a second attribute table by key — how="inner" or "left"; on= is required
+regions = ur.NodeFrame({"id": [0, 1, 2, 3], "region": ["n", "n", "s", "s"]}, id="id")
+(nodes
+ .with_columns(pr=ur.pagerank(edges))
+ .join(regions, on="id", how="left")
+ .collect()
+ .to_polars())
 ```
 
 ## Weights
@@ -119,8 +145,8 @@ Weight is never a blessed column. It is a per-operation **expression** over edge
 evaluated to one f64 per edge.
 
 ```python
-weighted = ur.from_arrow(
-    pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 0, 0], "amount": [1.0, 9.0, 1.0, 1.0]}),
+weighted = ur.EdgeFrame(
+    {"s": [0, 0, 1, 2], "d": [1, 2, 0, 0], "amount": [1.0, 9.0, 1.0, 1.0]},
     src="s", dst="d",
 )
 
@@ -169,5 +195,6 @@ The dialect is deliberately Polars-*shaped*: what transfers is the muscle memory
 `pl.Expr` objects are not accepted, and no translator between the two dialects will be built —
 interop is Arrow, and Arrow interop is zero-copy anyway.
 
-Today the executable filter surface is narrower than the dialect you can build: predicates lower
-as `col <op> literal`. Richer predicates raise a clear error rather than silently mis-executing.
+Predicates lower as a full algebra — comparisons, boolean `&`/`|`/`~`, arithmetic, and
+column-to-column comparisons all execute. The top of a filter must be a boolean predicate; a bare
+column raises rather than being coerced. There are no `.str`/`.dt` namespaces yet.

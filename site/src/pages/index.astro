@@ -48,8 +48,8 @@ const brightSources = SKY.graph.nodes.filter(
         <a class="b" href={SITE.repo} rel="noopener">Source</a>
       </div>
       <p class="cap note">
-        v0.1, in progress. The engine, the kernels and the composed pipeline execute end to end;
-        the <a href={url('/docs/roadmap')}>roadmap</a> says what does not.
+        v0.2.0, on PyPI. The kernels, the composed pipeline and the relational surface execute
+        end to end; the <a href={url('/docs/roadmap')}>roadmap</a> says what does not.
       </p>
     </div>
   </div>
@@ -180,24 +180,32 @@ edges = ur.scan_edges("links.parquet",
       <div class="record">
         <p class="rec-k">Algorithms</p>
         <p class="rec-v">
-          pagerank · degree · connected_components (weak) · triangle_count ·
+          pagerank · degree · connected_components (weak and strong) · triangle_count ·
           clustering_coefficient · closeness · betweenness (Brandes, sampled) · label_propagation ·
-          louvain — each with a weighted variant.
+          louvain — each with a weighted variant, deterministic across thread counts.
         </p>
       </div>
       <div class="record">
         <p class="rec-k">Traversals</p>
         <p class="rec-v">
-          hop().from_() · shortest_path (BFS, or Dijkstra when weighted) · random_walk — each its
-          own first-class logical node, each returning a frame.
+          hop().from_() · shortest_path (BFS, or Dijkstra when weighted, with a cumulative cost
+          column) · random_walk — each its own first-class logical node, each returning a frame.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Relational verbs</p>
+        <p class="rec-v">
+          filter (a full predicate algebra) · select · with_columns · sort · head · distinct ·
+          sample · rename · group_by().agg() · join — the same frame, both vocabularies.
         </p>
       </div>
       <div class="record">
         <p class="rec-k">Sources</p>
         <p class="rec-v">
-          Parquet and CSV, local or object storage (s3:// · gs:// · az://), with the column
-          projection pushed into the file. Or from_arrow / from_polars, zero-copy. Node ids may be
-          int64 or strings.
+          Parquet and CSV — local, object storage (s3:// · gs:// · az://) or https:// — with the
+          column projection pushed into the file. Or straight from data: EdgeFrame(dict | rows |
+          polars | pandas | pyarrow), from_edgelist, from_networkx, from_numpy, from_scipy_sparse,
+          and ur.datasets for canonical graphs. Node ids may be int64 or strings.
         </p>
       </div>
       <div class="record">
@@ -217,8 +225,9 @@ edges = ur.scan_edges("links.parquet",
       <div class="record">
         <p class="rec-k">Not yet</p>
         <p class="rec-v">
-          group_by().agg · join · sample · schema are modelled in the plan and raise a clear error
-          when collected. Strong components, motif finding and the optimizer rules are ahead.
+          schema() · store= · CSV format options · neighbors(from_=) — each raises a clear error
+          rather than mis-executing, as do the stated composition limits. Motif finding and the
+          optimizer rules are ahead.
         </p>
       </div>
     </div>

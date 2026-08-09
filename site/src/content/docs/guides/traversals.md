@@ -38,10 +38,12 @@ being rows rather than a set.
 route = ur.shortest_path(edges, source=17, target=42).collect()
 ```
 
-Returns an EdgeFrame of `(src, dst, hop)` — one row per edge on the path, in order, with `hop` the
-zero-based position. Unweighted, this is BFS.
+Returns an EdgeFrame of `(src, dst, hop, cost)` — one row per edge on the path, in order, with
+`hop` the zero-based position. Unweighted, this is BFS, and `cost` is the hop count so the schema
+stays uniform.
 
-Pass `weight=` and it becomes Dijkstra over the edge-cost expression:
+Pass `weight=` and it becomes Dijkstra over the edge-cost expression, with `cost` the cumulative
+cost from the source — the final row carries the total path cost:
 
 ```python
 route = ur.shortest_path(
@@ -49,11 +51,11 @@ route = ur.shortest_path(
     source=17, target=42,
     weight=ur.col("latency_ms"),
 ).collect()
+
+total = route.to_dicts()[-1]["cost"]   # what the cheapest path actually costs
 ```
 
-The accumulated path cost is not yet returned as a column — the weighted call gives you the
-minimum-cost path, but you would have to re-join the weights to total it. That is a known gap, not
-a design position.
+An unreachable target returns an empty frame rather than raising.
 
 ## Random walks
 
@@ -94,4 +96,5 @@ pipeline rather than needing to be unpacked into Python objects first.
 
 Motif finding — `ur.find("(a)-[e]->(b); ...")`, GraphFrames-style — is the first post-v0.1
 feature, not a v0.1 omission. Subgraph *views* over a filtered frame (a bitmask over the parent
-CSR instead of a rebuild) are planned; today a filtered EdgeFrame rebuilds its index.
+CSR instead of a rebuild) are planned; today a graph op over a filtered EdgeFrame raises, and the
+workaround is to materialize the filtered edges into a new frame.

@@ -67,12 +67,24 @@ is written down rather than left to be discovered.
 | Operation | Effect on the cached topology index |
 |---|---|
 | `with_columns(...)` on property columns | **preserved** (shared by cheap reference) |
-| `filter(...)`, `distinct()`, row-changing ops on an EdgeFrame | **dropped** (rebuilt lazily on next graph op) |
+| `filter(...)`, `distinct()`, row-changing ops on an EdgeFrame | **dropped** |
 | `select(...)` that drops `src` or `dst` | frame **demotes** to a plain tabular frame |
 | any operation on a NodeFrame | no effect (NodeFrames carry no index) |
 
 The index is built lazily on the first operation that needs it, cached, and shared by every
 subsequent graph operation over that frame — including concurrent ones.
+
+One honest caveat on the dropped case: today a *graph op* over a filtered or otherwise
+row-changed EdgeFrame **raises** rather than transparently rebuilding — subgraph views over a
+parent index are deferred work. The relational tail on the filtered frame executes fine
+(`edges.filter(...).collect()`); to run algorithms on the subgraph, materialize it and construct
+a new frame:
+
+```python
+sub = ur.EdgeFrame(edges.filter(ur.col("kind") == "road").collect().to_arrow(),
+                   src=edges.src_col, dst=edges.dst_col)
+ur.pagerank(sub).collect()
+```
 
 `edges.reverse()` is a metadata-only swap of the `src` and `dst` roles: no data moves, and a graph
 op over the reversed frame builds the transpose, so `degree(edges.reverse(), "out")` equals

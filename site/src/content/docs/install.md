@@ -60,18 +60,23 @@ picks the change up.
 
 ## Type checking
 
-The package ships a hand-written stub for the native extension and fully typed Python source. If
-your type-checker reports `ursa` as untyped, check that you are on a release that includes the
-PEP 561 `py.typed` marker.
+The package ships fully typed Python source, a hand-written stub for the native extension, and
+the PEP 561 `py.typed` marker (guarded by the release smoke tests, so it is in every wheel and
+the sdist). mypy, pyright and ty resolve `ursa` types out of the box.
 
 ## Verifying the install
 
 ```python
 import ursa as ur
-import pyarrow as pa
 
-edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
+edges = ur.EdgeFrame({"s": [0, 1, 2], "d": [1, 2, 0]}, src="s", dst="d")
 print(ur.pagerank(edges).collect().to_dicts())
 ```
 
-A three-node cycle: every node should come back with the same score.
+A three-node cycle: every node should come back with the same score. Or start from a bundled
+dataset — no files, no network:
+
+```python
+edges = ur.datasets.load_karate()
+ur.describe(edges).collect().to_polars()
+```

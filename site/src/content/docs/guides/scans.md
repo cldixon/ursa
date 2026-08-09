@@ -30,29 +30,69 @@ A separate node table is a second scan, keyed by id:
 nodes = ur.scan_nodes("towers.parquet", id="tower_id")
 ```
 
-Formats in v0.1 are **Parquet and CSV**. Glob patterns work; a list of paths works.
+Formats are **Parquet and CSV**. Glob patterns work; a *list* of paths is accepted by the
+signature but raises at collect — one path or glob per scan for now.
 
 ```python
 ur.scan_edges("data/part-*.parquet", src="s", dst="d")
-ur.scan_edges(["a.parquet", "b.parquet"], src="s", dst="d")
 ```
+
+A single hosted file also reads over plain **HTTP(S)**:
+
+```python
+edges = ur.scan_edges("https://example.com/data/edges.parquet", src="s", dst="d")
+```
+
+No globbing over HTTP, and query strings are dropped before fetching — so a presigned or
+token-bearing URL will not authenticate; use the object-store scheme and `storage_options` for
+that.
 
 ## From memory
 
-Ingress from an existing frame is symmetric and zero-copy — it is all Arrow underneath.
+The frame types are public, data-first constructors — a list of row dicts, a dict of columns, a
+polars or pandas DataFrame, or anything Arrow-backed. No `pyarrow` import required:
 
 ```python
-edges = ur.from_polars(df, src="a", dst="b")
-edges = ur.from_arrow(tbl, src="a", dst="b")
-
-nodes = ur.from_polars(df, id="node_id")
-nodes = ur.from_arrow(tbl, id="node_id")
+edges = ur.EdgeFrame({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}, src="s", dst="d")
+nodes = ur.NodeFrame([{"id": 0, "team": "red"}, {"id": 1, "team": "blue"}], id="id")
 ```
 
-The same functions build a `NodeFrame` when you pass `id=` instead of `src=`/`dst=`.
+Typed aliases exist for each source, zero-copy where the source is Arrow-backed, and the wider
+ecosystem has direct entry points — networkx, numpy and scipy are imported lazily, never
+depended on:
 
-Node ids may be int64 (the fast path) or strings such as UUIDs. The type is auto-detected from the
-column, and results come back keyed by the original ids.
+```python
+edges = ur.from_polars(df, src="a", dst="b")     # or id= for a NodeFrame
+edges = ur.from_pandas(df, src="a", dst="b")
+edges = ur.from_arrow(tbl, src="a", dst="b")
+
+edges = ur.from_edgelist([(0, 1), (1, 2), (2, 0)])
+edges = ur.from_edgelist([(0, 1, 0.5), (1, 2, 2.0)], weighted="w")
+edges = ur.from_networkx(G, weight="weight")
+nodes = ur.nodes_from_networkx(G)                # node attributes as a NodeFrame
+edges = ur.from_numpy(adjacency)                 # dense adjacency or an edge array
+edges = ur.from_scipy_sparse(matrix)
+```
+
+However the frame was built, it behaves identically from there on. Node ids may be int64 (the
+fast path) or strings such as UUIDs — auto-detected, with results keyed by the original ids.
+
+## Bundled datasets
+
+`ur.datasets` ships small canonical graphs, so examples and tests need no files at all:
+
+```python
+edges = ur.datasets.load_karate()                  # 34 nodes, 78 edges, offline
+edges, clubs = ur.datasets.load_karate(with_nodes=True)
+edges = ur.datasets.load_lesmis()                  # weighted
+edges = ur.datasets.load_facebook()                # SNAP ego-Facebook; downloaded once, cached
+
+ur.datasets.list_datasets()
+```
+
+The bundled sets (`karate`, `lesmis`, `florentine`, `kite`) load offline from the wheel;
+`facebook` downloads on first use and caches under `$URSA_DATA_HOME`
+(default `~/.cache/ursa/datasets`).
 
 ## Eager conveniences
 
@@ -132,6 +172,15 @@ raises, rather than being accepted and quietly dropped.
 
 ## Null endpoints
 
-A null `src` or `dst` in the edge input **raises** at index build. That is the safe default: a
-silently dropped row is a silently wrong answer. An opt-in `on_null="drop"` is planned, and will
-report how many rows it dropped when it lands.
+A null `src` or `dst` in the edge input **raises** by default: a silently dropped row is a
+silently wrong answer. When dropping is what you want, say so:
+
+```python
+edges = ur.scan_edges("links.parquet", src="s", dst="d", on_null="drop")
+```
+
+`on_null="drop"` filters out edge rows with a null endpoint and reports the count as a Python
+warning — `on_null='drop': dropped N edge row(s)` — so a drop can never masquerade as "all rows
+ingested". It is accepted everywhere edges come in: `scan_edges`, `read_edges`, the `EdgeFrame`
+constructor, `from_arrow` and `from_edgelist`. Node scans have no `on_null` — the policy is about
+edge endpoints.
