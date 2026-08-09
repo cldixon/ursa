@@ -15,4 +15,8 @@ rand_chacha = { workspace = true }
 rustc-hash = "2"
 
 [dev-dependencies]
+# The determinism-across-thread-counts test (tests/determinism_threads.rs) pins
+# the rayon pool size per run; rayon is a normal dep but integration-test crates
+# only see dev-deps, so it is declared here too.
+rayon = { workspace = true }
 # criterion micro-benches land here (see benches/ in the v0.1 checklist).

@@ -5,7 +5,8 @@
 > The engine foundation is in place: real algorithm kernels, and `collect()`
 > executing as one DataFusion plan with graph ops as first-class logical nodes.
 > The full design lives in [`docs/SPEC.md`](docs/SPEC.md); this README describes
-> what is *actually built right now* and how the pieces fit.
+> what is *actually built right now* and how the pieces fit. Coming from
+> NetworkX? See [how Ursa's algorithm semantics differ](docs/networkx-semantics.md).
 >
 > **Documentation: <https://ursa-docs.cl-dixon.workers.dev>** — landing page,
 > guides and API reference. Source in [`site/`](site/).
@@ -44,9 +45,17 @@ the parts that prove the design is sound are real and tested end-to-end.
 | **Python dialect + `collect()`** | ✅ **Live & executing.** The Polars-shaped expression/plan builder, plus `collect()` for a standalone algorithm, a composed `with_columns(...).filter(...).sort(...).head(n).select(...)` pipeline, **node-attribute enrichment** (in-memory *or* `scan_nodes` file-backed tables joined by id, `ur.col("attr")` usable in filter/sort; `with_columns` stays additive and **`select(...)`** narrows the output Polars-faithfully — which drives a **projection pushdown** so a `scan_nodes` file reads only the columns the plan proves it needs), **`neighbors().agg()`** over numeric *and* string attributes, the **traversals** `hop()` and `shortest_path()` (first-class `HopNode`/`ShortestPathNode` returning EdgeFrames) plus `random_walk()` (a `RandomWalkNode` returning a `(walk_id, step, node)` frame), and the whole-graph stats **`describe()`** / **`density()`** / **`avg_path_length()`** / **`diameter()`**. Over in-memory or `scan_edges`/`scan_nodes` sources — local files **or object storage** (`s3://` / `gs://` / `az://`, with `storage_options={...}`). |
 
 ```python
-import ursa as ur, pyarrow as pa
+import ursa as ur
 
-edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+# The EdgeFrame *is* the graph. Build one from native Python data — a list of
+# row dicts, a dict of columns, a polars/pandas DataFrame, or pyarrow. No
+# `import pyarrow` required; `src`/`dst` name the endpoint columns:
+edges = ur.EdgeFrame(
+    [{"s": 1, "d": 0}, {"s": 2, "d": 0}, {"s": 3, "d": 0}, {"s": 0, "d": 1}],
+    src="s",
+    dst="d",
+)
+# equivalently: ur.EdgeFrame({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}, src="s", dst="d")
 
 # Composed pipeline — runs through DataFusion end to end:
 (
@@ -62,11 +71,19 @@ edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s",
 # ...or straight from a file (Parquet/CSV, projection pushed into the scan):
 ur.pagerank(ur.scan_edges("edges.parquet", src="s", dst="d")).collect().to_polars()
 
+# However the frame is built — constructor, from_polars/from_pandas/from_arrow,
+# or scan_edges — it behaves identically from here on.
+
 # Node ids may be int64 (the fast path) or strings (e.g. UUIDs) — auto-detected
 # from the column type; results come back keyed by the original ids:
-str_edges = ur.from_arrow(pa.table({"s": ["u1", "u1", "u2"], "d": ["u2", "u3", "u3"]}), src="s", dst="d")
+str_edges = ur.EdgeFrame({"s": ["u1", "u1", "u2"], "d": ["u2", "u3", "u3"]}, src="s", dst="d")
 ur.pagerank(str_edges).collect().to_polars()   # id column is Utf8
 ```
+
+`NodeFrame(data, id=...)` is the matching constructor for an attribute table
+(joined to the graph by `id`); a `NodeFrame` is optional — nodes are implicit in
+the edges (`edges.nodes()`), and attributes are a *separate* table you attach when
+you have them.
 
 ## Architecture
 
@@ -128,13 +145,25 @@ custom graph logical nodes — and many features have fanned out on top of it:
 node-valued algorithms (pagerank, degree, connected_components, triangle_count,
 clustering_coefficient, closeness, betweenness, label_propagation, louvain),
 composed pipelines, `scan_edges`/`scan_nodes` sources,
+**bring-your-own-format ingress** — beyond pyarrow / polars / pandas / row-dicts,
+the interop constructors `from_edgelist` (edge tuples), `from_networkx`
+(+ `nodes_from_networkx` for node attributes), `from_numpy` (adjacency matrix or
+edge array), and `from_scipy_sparse` (any sparse format); networkx / numpy / scipy
+stay optional and are never imported unless you call the matching constructor —
+**bundled example datasets** via `ur.datasets` (`load_karate` with faction labels,
+`load_lesmis` weighted, `load_florentine`, `load_kite` — offline, in the wheel;
+plus `load_facebook`, downloaded and cached on first use) —
 **node-attribute enrichment** (in-memory or file-backed tables joined by id),
 **`neighbors().agg()`** over numeric and string attributes, the **traversals**
 `hop()` and `shortest_path()` (each its own first-class logical node returning an
 EdgeFrame, on a shared single-source BFS kernel family) plus `random_walk()`, the eager whole-graph
 stats **`density`** / **`avg_path_length`** / **`diameter`** and the one-row
 **`describe`**, **object-storage scans** (`s3://` / `gs://` / `az://` via
-`object_store`, with `storage_options`), and `sink_parquet`/`sink_csv` egress.
+`object_store`, with `storage_options`) plus **`http(s)://` URL reads** for a
+single hosted Parquet/CSV file, and `sink_parquet`/`sink_csv` egress. A null
+`src`/`dst` endpoint errors by default; pass **`on_null="drop"`** to the edge
+constructors (`from_arrow` / `from_edgelist` / `scan_edges` / `read_edges`) to
+filter those rows out instead (with a logged count).
 
 **Weighted algorithms** are live across the board: `weight=` is a per-operation
 *expression* over edge columns (`weight=ur.col("amount") * ur.col("fx")`),
@@ -142,9 +171,20 @@ evaluated to an f64 per edge and gathered per CSR slot via the `edge_ids`
 permutation. Weighted **PageRank**, **`shortest_path`** (Dijkstra), **closeness**,
 **betweenness** (Dijkstra-Brandes), and **louvain** all ship.
 
-A few relational verbs are modelled in the plan (so they compose and show in
-`.explain()`) but are **not yet executable** and raise a clear error when
-collected: `sample`, `group_by().agg`, `join`, and `schema`.
+The **relational tail** — `filter`, `sort`, `head`, `rename`, `distinct`,
+`sample`, and now **`group_by(keys...).agg(...)`** — composes on top of any
+graph/traversal/plain output through one shared canonical pipeline
+(`filter → group_by → distinct → sample → sort → limit → rename`). A grouped
+aggregation replaces the schema with `[keys..., outputs...]`; aggregations are
+written `ur.col(c).mean()` (also `sum`/`min`/`max`/`count`/`n_unique`),
+optionally `.alias(name)` or named via `.agg(name=...)`. It runs on the engine
+(DataFusion) for graph-derived frames and in pyarrow for source-backed ones,
+with both paths resolving to identical output columns.
+
+**`join(other, on=, how=)`** executes too — an equi-join of two frames on shared
+key column(s) (`inner`/`left`), distinct from the automatic attribute attach;
+the relational tail applies to the joined result. Only `schema` remains modelled
+in the plan (shows in `.explain()`) but **not yet executable**.
 
 Next, in rough priority order:
 

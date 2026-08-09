@@ -9,25 +9,31 @@ resolver = "2"
 members = ["ursa-core", "ursa-plan", "ursa-py"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cldixon/ursa"
 authors = ["Ursa contributors"]
 
-# NOTE: these versions are a *coherence target* for the first full build. arrow,
-# datafusion, object_store and pyo3 are cross-coupled (datafusion re-exports a
-# specific arrow; arrow's `pyarrow` feature pins a specific pyo3). If the first
-# `cargo update` surfaces a conflict, bump the whole set together, not piecemeal.
+# NOTE: these versions are a *coherence target* and cross-coupled — bump the whole
+# set together, not piecemeal. datafusion re-exports a specific arrow, and
+# `arrow-pyarrow` (the standalone Arrow<->Python interop crate, see below) pins the
+# pyo3 it was built against, so arrow/datafusion/object_store/pyo3 move in lockstep.
+# The current ceiling: pyo3 0.29 (which patches the residual pyo3 advisories waived
+# in deny.toml) needs arrow-pyarrow 59, only reachable via datafusion 55 — unreleased.
 [workspace.dependencies]
-arrow = "54"
+arrow = "58"
+# Arrow<->Python (pyarrow) interop moved out of the `arrow` crate's `pyarrow`
+# feature into this standalone crate as of arrow 56; its version tracks `arrow`
+# and it pins the pyo3 it was built against.
+arrow-pyarrow = "58"
 rayon = "1.10"
-datafusion = "45"
+datafusion = "54"
 # Cloud backends (S3/GCS/Azure) are enabled here so scan_edges/scan_nodes can read
 # from object storage. These features pull in an HTTP client + TLS (rustls) + XML.
-object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
-pyo3 = "0.23"
+object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+pyo3 = "0.28"
 url = "2"
 # Seeded PRNG for the stochastic kernels (random_walk). ChaCha gives a portable,
 # reproducible stream so a fixed seed yields identical walks across runs/machines.

@@ -77,7 +77,7 @@ pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f
             }
             for batch in &result {
                 let col = cast(batch.column(0), &DataType::Float64)
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 let col = col
                     .as_any()
                     .downcast_ref::<Float64Array>()
@@ -208,6 +208,18 @@ mod tests {
         )
         .unwrap();
         let err = evaluate_weight(&[batch], r#"{"kind":"col","name":"region"}"#).unwrap_err();
+        assert!(err.to_string().contains("must be numeric"), "got: {err}");
+    }
+
+    #[test]
+    fn comparison_weight_expression_is_rejected_as_non_numeric() {
+        // The expr seam now parses/lowers comparisons (for filters), so a weight
+        // written as a predicate lowers to a Boolean column — the numeric guard must
+        // still reject it rather than treating true/false as 1.0/0.0.
+        let json = r#"{"kind":"binary","op":">",
+            "left":{"kind":"col","name":"amount"},
+            "right":{"kind":"lit","value":2}}"#;
+        let err = evaluate_weight(&[edge_batch()], json).unwrap_err();
         assert!(err.to_string().contains("must be numeric"), "got: {err}");
     }
 }

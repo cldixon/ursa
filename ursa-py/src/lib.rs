@@ -6,7 +6,7 @@
 //!
 //! ## Two rules this layer enforces (spec §Runtime integration)
 //!
-//! 1. **Release the GIL** for the duration of execution (`py.allow_threads`).
+//! 1. **Release the GIL** for the duration of execution (`py.detach`).
 //! 2. **Arrow FFI via the PyCapsule interface** for zero-copy exchange with
 //!    polars/pyarrow — ingress (`FromPyArrow`) and egress (`ToPyArrow`).
 //!
@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch};
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow_pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
@@ -40,8 +40,8 @@ use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
-    execute_node_query, execute_path_query, execute_walk_query, scan_edges_batch, scan_nodes_batch,
-    Comparison,
+    execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
+    scan_edges_batch, scan_nodes_batch,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ struct GraphIndex {
 #[pyfunction]
 fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex> {
     let batches = Vec::<RecordBatch>::from_pyarrow_bound(edges)?;
-    let (topo, ids) = py.allow_threads(move || {
+    let (topo, ids) = py.detach(move || {
         let pairs: Vec<(&dyn Array, &dyn Array)> = batches
             .iter()
             .map(|b| (b.column(0).as_ref(), b.column(1).as_ref()))
@@ -151,28 +151,30 @@ fn _topology_build_count() -> usize {
 /// Execute a graph query and return its `(id, values...)` batch as pyarrow.
 ///
 /// `columns_json` is the query's output-column IR (a JSON list of
-/// `{name, kind, ...params}`); `filters` are `(column, op, value)` comparisons;
+/// `{name, kind, ...params}`); each `filters` entry is a serialized predicate-
+/// expression JSON string (lowered through the shared `crate::expr` seam);
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None))]
+#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new(), group_keys=Vec::new(), aggs=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
     index: PyRef<'_, GraphIndex>,
     columns_json: &str,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     nodes: Option<Bound<'_, PyAny>>,
     nodes_id: Option<String>,
     edges: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+    group_keys: Vec<String>,
+    aggs: Vec<String>,
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
     // The node attribute table and the edge attribute table (for weight
     // expressions) each cross the FFI as a *list* of RecordBatches, so a large
     // attribute table is never concatenated into one batch (#60).
@@ -184,21 +186,59 @@ fn run_node_query(
         Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_node_query(
             topo,
             ids,
             &columns_json,
-            &comparisons,
+            &filters,
             sort,
             limit,
             nodes,
             nodes_id,
             edges,
+            distinct,
+            sample,
+            rename,
+            group_keys,
+            aggs,
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
+}
+
+/// Equi-join two materialized frames (`left`/`right` pyarrow batch lists) on the
+/// `on` key columns, then apply the relational tail. `how` is "inner" or "left".
+/// Distinct from the internal attribute-attach join — this is the user-facing
+/// `frame.join(other, ...)`. The GIL is released across the join + compute.
+#[pyfunction]
+#[pyo3(signature = (left, right, on, how, filters=Vec::new(), sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
+#[allow(clippy::too_many_arguments)]
+fn run_join_query(
+    py: Python<'_>,
+    left: Bound<'_, PyAny>,
+    right: Bound<'_, PyAny>,
+    on: Vec<String>,
+    how: String,
+    filters: Vec<String>,
+    sort: Option<(String, bool)>,
+    limit: Option<usize>,
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+) -> PyResult<Py<PyAny>> {
+    // Each frame's rows cross the FFI as a *list* of RecordBatches (never
+    // concatenated into one), consistent with the node-attribute path (#60).
+    let left = Vec::<RecordBatch>::from_pyarrow_bound(&left)?;
+    let right = Vec::<RecordBatch>::from_pyarrow_bound(&right)?;
+    let batches = py.detach(move || {
+        execute_join_query(
+            left, right, on, how, &filters, sort, limit, distinct, sample, rename,
+        )
+        .map_err(to_pyerr)
+    })?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Execute a `hop` traversal and return its `(src, dst)` edge batch as pyarrow.
@@ -208,7 +248,7 @@ fn run_node_query(
 /// `filters`/`sort`/`limit`/`distinct` are the optional relational tail applied to
 /// the reached edges.
 #[pyfunction]
-#[pyo3(signature = (index, seeds, n, direction, filters, sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, seeds, n, direction, filters, sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_hop_query(
     py: Python<'_>,
@@ -216,33 +256,33 @@ fn run_hop_query(
     seeds: &Bound<'_, PyAny>,
     n: u32,
     direction: &str,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> PyResult<PyObject> {
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let seeds = array_from_pyarrow(seeds)?;
     let direction = direction.to_string();
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_hop_query(
             topo,
             ids,
             seeds.as_ref(),
             n,
             &direction,
-            &comparisons,
+            &filters,
             sort,
             limit,
             distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Execute a `shortest_path` traversal and return its `(src, dst, hop)` path batch
@@ -252,7 +292,7 @@ fn run_hop_query(
 /// attribute batch) select weighted Dijkstra; omit both for unweighted BFS. The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the path edges.
 #[pyfunction]
-#[pyo3(signature = (index, source, target, direction, weight=None, edges=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, source, target, direction, weight=None, edges=None, filters=Vec::new(), sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_path_query(
     py: Python<'_>,
@@ -262,11 +302,13 @@ fn run_path_query(
     direction: &str,
     weight: Option<String>,
     edges: Option<Bound<'_, PyAny>>,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> PyResult<PyObject> {
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let source = array_from_pyarrow(source)?;
     let target = array_from_pyarrow(target)?;
@@ -276,11 +318,7 @@ fn run_path_query(
         Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
         None => None,
     };
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_path_query(
             topo,
             ids,
@@ -289,14 +327,16 @@ fn run_path_query(
             &direction,
             weight.as_deref(),
             edges,
-            &comparisons,
+            &filters,
             sort,
             limit,
             distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Execute a `random_walk` and return its `(walk_id, step, node)` node batch as
@@ -304,7 +344,7 @@ fn run_path_query(
 /// graph); `seed` (optional) makes the walk reproducible. The
 /// `filters`/`sort`/`limit`/`distinct` tail applies to the walk rows.
 #[pyfunction]
-#[pyo3(signature = (index, starts, steps, walks_per_node, seed=None, filters=Vec::new(), sort=None, limit=None, distinct=false))]
+#[pyo3(signature = (index, starts, steps, walks_per_node, seed=None, filters=Vec::new(), sort=None, limit=None, distinct=false, sample=None, rename=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run_walk_query(
     py: Python<'_>,
@@ -313,18 +353,16 @@ fn run_walk_query(
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
-    filters: Vec<(String, String, f64)>,
+    filters: Vec<String>,
     sort: Option<(String, bool)>,
     limit: Option<usize>,
     distinct: bool,
-) -> PyResult<PyObject> {
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let starts = array_from_pyarrow(starts)?;
-    let comparisons: Vec<Comparison> = filters
-        .into_iter()
-        .map(|(column, op, value)| Comparison { column, op, value })
-        .collect();
-    let batches = py.allow_threads(move || {
+    let batches = py.detach(move || {
         execute_walk_query(
             topo,
             ids,
@@ -332,21 +370,23 @@ fn run_walk_query(
             steps,
             walks_per_node,
             seed,
-            &comparisons,
+            &filters,
             sort,
             limit,
             distinct,
+            sample,
+            rename,
         )
         .map_err(to_pyerr)
     })?;
-    batches.to_pyarrow(py)
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Whole-graph directed edge density (eager scalar).
 #[pyfunction]
 fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>) -> PyResult<f64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || density(&topo).map_err(to_pyerr))
+    py.detach(move || density(&topo).map_err(to_pyerr))
 }
 
 /// Average shortest-path length over reachable ordered pairs (eager scalar).
@@ -359,7 +399,7 @@ fn graph_avg_path_length(
     sample: Option<f64>,
 ) -> PyResult<f64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || avg_path_length(&topo, sample).map_err(to_pyerr))
+    py.detach(move || avg_path_length(&topo, sample).map_err(to_pyerr))
 }
 
 /// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
@@ -371,16 +411,16 @@ fn graph_diameter(
     approximate: bool,
 ) -> PyResult<i64> {
     let topo = index.topo.clone();
-    py.allow_threads(move || diameter(&topo, approximate).map_err(to_pyerr))
+    py.detach(move || diameter(&topo, approximate).map_err(to_pyerr))
 }
 
 /// Whole-graph one-row summary (`n_nodes, n_edges, density, avg_degree,
 /// n_components`) as a pyarrow `RecordBatch`. `full` computes `n_components`.
 #[pyfunction]
-fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<PyObject> {
+fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<Py<PyAny>> {
     let topo = index.topo.clone();
-    let batch = py.allow_threads(move || describe(&topo, full).map_err(to_pyerr))?;
-    batch.to_pyarrow(py)
+    let batch = py.detach(move || describe(&topo, full).map_err(to_pyerr))?;
+    batch.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Read a Parquet/CSV edge file's `src`/`dst` columns (plus any `weight_columns`
@@ -397,12 +437,11 @@ fn scan_edges_arrow(
     dst: &str,
     storage_options: Option<HashMap<String, String>>,
     weight_columns: Vec<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let opts = storage_options.unwrap_or_default();
-    let batches = py.allow_threads(|| {
-        scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr)
-    })?;
-    batches.to_pyarrow(py)
+    let batches =
+        py.detach(|| scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr))?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
@@ -419,11 +458,10 @@ fn scan_nodes_arrow(
     id: &str,
     storage_options: Option<HashMap<String, String>>,
     columns: Vec<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let opts = storage_options.unwrap_or_default();
-    let batches =
-        py.allow_threads(|| scan_nodes_batch(path, id, &opts, &columns).map_err(to_pyerr))?;
-    batches.to_pyarrow(py)
+    let batches = py.detach(|| scan_nodes_batch(path, id, &opts, &columns).map_err(to_pyerr))?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
 /// The `ursa-core` version — the simplest possible proof the native module loaded.
@@ -449,6 +487,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
     // real execution path
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;
+    m.add_function(wrap_pyfunction!(run_join_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_path_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_walk_query, m)?)?;

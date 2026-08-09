@@ -46,16 +46,25 @@ _EXECUTABLE = {
     "neighbors_agg",
 }
 
-# Comparison operators supported in filters, with the operator that results from
-# writing the comparison the other way round (literal on the left).
-_FLIP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!="}
+# Operators valid at the *top* of a filter predicate — comparisons and boolean
+# combinators. (Arithmetic ops may appear deeper, e.g. `(a + b) > 3`, but a bare
+# arithmetic or column expression is not itself a boolean predicate.)
+_PREDICATE_OPS = {">", "<", ">=", "<=", "==", "!=", "&", "|"}
 
 
-# --- weight expressions (over edge columns) --------------------------------
-def _expr_to_json(expr: Any) -> dict[str, Any]:
-    """Serialize an ``Expr`` tree to the JSON the Rust weight seam parses
-    (``ursa_plan::expr::parse_ursa_expr``): ``col`` / ``lit`` / ``binary``. Other
-    node kinds are emitted by kind so the Rust side reports a clear error."""
+# --- expression serialization (weights + filter predicates) ----------------
+def _expr_to_json(expr: Any, roles: dict[str, str] | None = None) -> dict[str, Any]:
+    """Serialize an ``Expr`` tree to the JSON the Rust expr seam parses
+    (``ursa_plan::expr::parse_ursa_expr``): ``col`` / ``lit`` / ``binary`` /
+    ``unary``. Comparison and boolean ops ride the generic ``binary`` shape.
+
+    ``roles`` maps the abstract role kinds ``src`` / ``dst`` / ``id`` to concrete
+    column names in the table the expression will run against. In a **filter**
+    context the caller supplies it (the frame is in scope), so a role reference
+    lowers to a plain ``col``; a role not present in this context raises. In the
+    **weight** context ``roles`` is ``None`` and role/other nodes fall through to a
+    ``{"kind": kind}`` stub so the Rust side reports a clear error, exactly as
+    before."""
     kind, p = expr.kind, expr.payload
     if kind == "col":
         return {"kind": "col", "name": p["name"]}
@@ -65,19 +74,42 @@ def _expr_to_json(expr: Any) -> dict[str, Any]:
         return {
             "kind": "binary",
             "op": p["op"],
-            "left": _expr_to_json(p["left"]),
-            "right": _expr_to_json(p["right"]),
+            "left": _expr_to_json(p["left"], roles),
+            "right": _expr_to_json(p["right"], roles),
         }
+    if kind == "unary":
+        return {"kind": "unary", "op": p["op"], "operand": _expr_to_json(p["operand"], roles)}
+    if kind == "agg":
+        return {"kind": "agg", "fn": p["fn"], "operand": _expr_to_json(p["operand"], roles)}
+    if kind == "alias":
+        return {"kind": "alias", "name": p["name"], "operand": _expr_to_json(p["operand"], roles)}
+    if kind in ("src", "dst", "id"):
+        if roles is not None:
+            if kind in roles:
+                return {"kind": "col", "name": roles[kind]}
+            raise NotImplementedError(
+                f"ur.{kind}() is not available in this context "
+                f"(resolvable roles here: {sorted(roles)})."
+            )
+        # weight context: let Rust reject role refs with its clear message.
+        return {"kind": kind}
     return {"kind": kind}
 
 
-def _expr_columns(expr: Any) -> set[str]:
-    """The edge column names a weight expression references."""
+def _expr_columns(expr: Any, roles: dict[str, str] | None = None) -> set[str]:
+    """The (original) column names an expression references — for scan projection
+    pushdown. Role refs resolve through ``roles`` to the frame's real columns."""
     kind, p = expr.kind, expr.payload
     if kind == "col":
         return {p["name"]}
     if kind == "binary":
-        return _expr_columns(p["left"]) | _expr_columns(p["right"])
+        return _expr_columns(p["left"], roles) | _expr_columns(p["right"], roles)
+    if kind == "unary":
+        return _expr_columns(p["operand"], roles)
+    if kind in ("src", "dst", "id") and roles is not None and kind in roles:
+        return {roles[kind]}
+    if kind in ("agg", "alias") and "operand" in p:
+        return _expr_columns(p["operand"], roles)
     return set()
 
 
@@ -132,6 +164,10 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     In-memory frames already share one retained table, so they just subset it."""
     if not weight_columns:
         return None
+    # A weighted algorithm on a derived edge frame must be rejected here too: this
+    # function builds the index directly (scan branch) and would otherwise populate
+    # the cell with a wrong topology before `_require_index`'s guard could run.
+    _reject_derived_edge_graph_op(edges)
     cols = sorted(weight_columns)
     table = getattr(edges, "_edge_attr_table", None)
     if table is not None:
@@ -158,6 +194,8 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
         combined = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
         )
+        if scan.get("on_null") == "drop":
+            combined = _drop_null_endpoint_batches(combined)
         cell = edges._index_build_cell
         with cell.lock:
             cell.value = _native().build_index(combined)
@@ -191,18 +229,35 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         return _collect_random_walk(frame, walk_step)
 
     graph_exprs: dict[str, Expr] | None = None
-    filters: list[tuple[str, str, float]] = []
+    filters: list[Any] = []  # predicate Exprs, serialized at the FFI boundary
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     select: list[str] | None = None
+    distinct = False
+    sample: tuple[int, int | None] | None = None
+    rename: dict[str, str] = {}
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
+    saw_group_by = False
+    join: tuple[Any, list[str], str] | None = None
 
     for step in frame._plan:
         op = step.op
         # `reverse` is metadata: the reversed edges ride on the edges frame (source
-        # swapped), so a graph op over them builds the transpose. `rename` is NOT a
-        # passthrough — it must reach the else and raise rather than be dropped.
+        # swapped), so a graph op over them builds the transpose.
         if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
             continue  # source / metadata steps
+        if op == "join":
+            if join is not None:
+                raise NotImplementedError("collect() supports a single join() for now.")
+            join = _parse_join(step)
+            continue
+        if op == "group_by_agg":
+            if group_by is not None:
+                raise NotImplementedError("collect() supports a single group_by().agg() for now.")
+            _reject_pre_group_tail(sort, limit, rename)
+            group_by = _parse_group_agg(step)
+            saw_group_by = True
+            continue
         if op == "with_columns":
             # select() defines the output columns; computing more columns after it
             # is ambiguous (which survive?), so require with_columns before select.
@@ -217,11 +272,22 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 )
             graph_exprs = step.args["exprs"]
         elif op == "filter":
-            filters.append(_parse_filter(step.args["predicate"]))
+            if saw_group_by:
+                raise NotImplementedError(
+                    "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
+                    "filter before the group_by."
+                )
+            filters.append(step.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(step.args)
         elif op == "head":
             limit = int(step.args["n"])
+        elif op == "distinct":
+            distinct = True
+        elif op == "sample":
+            sample = (int(step.args["n"]), step.args.get("seed"))
+        elif op == "rename":
+            rename.update(step.args["mapping"])
         elif op == "select":
             if select is not None:
                 raise NotImplementedError("collect() supports a single select() step for now.")
@@ -231,10 +297,62 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 f"collect() does not yet support the '{op}' step in a composed pipeline."
             )
 
+    if group_by is not None and (distinct or sample is not None or select is not None):
+        raise NotImplementedError(
+            "group_by().agg() does not compose with distinct/sample/select yet; "
+            "sort/head/rename on the grouped result are supported."
+        )
+
+    if join is not None:
+        if group_by is not None:
+            raise NotImplementedError(
+                "join() does not compose with group_by().agg() yet; do them in "
+                "separate collect() steps."
+            )
+        # The left table is the raw base (empty tail — the tail applies post-join):
+        # a graph-derived NodeFrame runs its algorithms first, a plain one uses its
+        # attribute table. ur.id() in a post-join filter resolves to the real id.
+        if graph_exprs:
+            edges = _single_edges(graph_exprs.values())
+            columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
+            nodes = _resolve_node_attr_table(frame, None)
+            nodes_id = frame.id_col if nodes is not None else None
+            weight_cols: set[str] = set()
+            for expr in graph_exprs.values():
+                w = expr.payload.get("weight") if expr.kind == "graph" else None
+                if w is not None:
+                    weight_cols |= _expr_columns(w)
+            edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
+            left_table = _run_query(
+                edges, columns, [], None, None, nodes, nodes_id, edge_attr
+            ).to_arrow()
+        else:
+            attr = _resolve_node_attr_table(frame, None)
+            if attr is None:
+                raise NotImplementedError(
+                    "join() on this NodeFrame needs a source (scan_nodes / "
+                    "from_arrow(id=...)) or a with_columns of graph algorithms."
+                )
+            left_table = attr
+        return _run_join(
+            left_table,
+            join,
+            filters,
+            sort,
+            limit,
+            select,
+            sample,
+            rename,
+            distinct,
+            {"id": frame.id_col},
+        )
+
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
         # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
-        return _collect_plain_nodes(frame, filters, sort, limit, select)
+        return _collect_plain_nodes(
+            frame, filters, sort, limit, select, sample, rename, distinct, group_by
+        )
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
@@ -244,16 +362,25 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # column the select keeps. With no select the output is additive (all
     # attributes), so nothing is droppable and the whole file is read.
     computed = set(graph_exprs.keys())
-    referenced = {c for (c, _op, _v) in filters}
+    # Role refs in a filter resolve to the frame's real id column for pushdown.
+    referenced: set[str] = set()
+    for p in filters:
+        referenced |= _expr_columns(p, {"id": frame.id_col})
     if sort is not None:
         referenced.add(sort[0])
     for c in columns:
         if c.get("agg_column") is not None:
             referenced.add(c["agg_column"])
+    # A rename reads its source (old) columns; keep any that are file columns.
+    referenced |= set(rename)
     id_name = frame.id_col
     file_needed: list[str] | None = None
     if select is not None:
-        needed = {id_name} | (referenced - computed) | (set(select) - computed)
+        # A rename *target* is a new output label, neither a file nor a computed
+        # column, so exclude it from the file projection (else the scan errors on a
+        # column the file doesn't have).
+        selected_file = set(select) - computed - set(rename.values())
+        needed = {id_name} | (referenced - computed) | selected_file
         file_needed = sorted(needed)
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
@@ -269,7 +396,20 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     # the same scan, so _run_query's _require_index reuses it — endpoints and
     # weights share one edge order.
     edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
-    result = _run_query(edges, columns, filters, sort, limit, nodes, nodes_id, edge_attr)
+    result = _run_query(
+        edges,
+        columns,
+        filters,
+        sort,
+        limit,
+        nodes,
+        nodes_id,
+        edge_attr,
+        distinct=distinct,
+        sample=sample,
+        rename=rename,
+        group_by=group_by,
+    )
     return _apply_select(result, select)
 
 
@@ -277,11 +417,13 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
     """Execute a ``random_walk`` node frame plus an optional
     ``filter``/``sort``/``head``/``distinct`` tail. Its ``(walk_id, step, node)``
     rows are produced by the native walk kernel over the frame's shared index."""
-    filters: list[tuple[str, str, float]] = []
+    filters: list[Any] = []
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     distinct = False
     select: list[str] | None = None
+    sample: tuple[int, int | None] | None = None
+    rename: dict[str, str] = {}
 
     _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes"}
     for s in frame._plan:
@@ -289,13 +431,17 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
         if op in _passthrough:
             continue  # the walk step itself / source / metadata
         elif op == "filter":
-            filters.append(_parse_filter(s.args["predicate"]))
+            filters.append(s.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(s.args)
         elif op == "head":
             limit = int(s.args["n"])
         elif op == "distinct":
             distinct = True
+        elif op == "sample":
+            sample = (int(s.args["n"]), s.args.get("seed"))
+        elif op == "rename":
+            rename.update(s.args["mapping"])
         elif op == "select":
             if select is not None:
                 raise NotImplementedError("collect() supports a single select() step for now.")
@@ -307,16 +453,20 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
 
     index = _require_index(step.args["edges"])
     starts = _resolve_seeds(step.args["start"])
+    # walk output columns are (walk_id, step, node); no src/dst/id role applies.
+    filter_json = [_filter_json(p, {}) for p in filters]
     batch = _native().run_walk_query(
         index,
         starts,
         int(step.args["steps"]),
         int(step.args["walks_per_node"]),
         step.args.get("seed"),
-        filters,
+        filter_json,
         sort,
         limit,
         distinct,
+        sample,
+        list(rename.items()),
     )
     return _apply_select(MaterializedFrame(batch), select)
 
@@ -386,11 +536,16 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     ``ur.shortest_path(edges, s, t)`` — plus an optional
     ``filter``/``sort``/``head``/``distinct`` tail."""
     traversal = None
-    filters: list[tuple[str, str, float]] = []
+    filters: list[Any] = []
     sort: tuple[str, bool] | None = None
     limit: int | None = None
     distinct = False
     select: list[str] | None = None
+    sample: tuple[int, int | None] | None = None
+    rename: dict[str, str] = {}
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
+    saw_group_by = False
+    join: tuple[Any, list[str], str] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -398,11 +553,20 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             traversal = step
         elif op in ("scan_edges", "from_arrow", "from_polars", "nodes"):
             continue  # source / metadata steps
+        elif op == "join":
+            if join is not None:
+                raise NotImplementedError("collect() supports a single join() for now.")
+            join = _parse_join(step)
+        elif op == "group_by_agg":
+            if group_by is not None:
+                raise NotImplementedError("collect() supports a single group_by().agg() for now.")
+            _reject_pre_group_tail(sort, limit, rename)
+            group_by = _parse_group_agg(step)
+            saw_group_by = True
         elif op == "reverse":
             # Metadata on a plain frame (the swapped source rides on the frame).
             # After a traversal its semantics are undesigned -> reject rather than
-            # silently ignore. `rename` is not a passthrough: it falls to the else
-            # and raises instead of being dropped.
+            # silently ignore.
             if traversal is not None:
                 raise NotImplementedError(
                     "reverse() after a traversal (hop/shortest_path) is not supported; "
@@ -410,13 +574,22 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 )
             continue
         elif op == "filter":
-            filters.append(_parse_filter(step.args["predicate"]))
+            if saw_group_by:
+                raise NotImplementedError(
+                    "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
+                    "filter before the group_by."
+                )
+            filters.append(step.args["predicate"])
         elif op == "sort":
             sort = _parse_sort(step.args)
         elif op == "head":
             limit = int(step.args["n"])
         elif op == "distinct":
             distinct = True
+        elif op == "sample":
+            sample = (int(step.args["n"]), step.args.get("seed"))
+        elif op == "rename":
+            rename.update(step.args["mapping"])
         elif op == "select":
             if select is not None:
                 raise NotImplementedError("collect() supports a single select() step for now.")
@@ -426,13 +599,53 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 f"collect() does not yet support the '{op}' step on an edge frame."
             )
 
+    if group_by is not None and (distinct or sample is not None or select is not None):
+        raise NotImplementedError(
+            "group_by().agg() does not compose with distinct/sample/select yet; "
+            "sort/head/rename on the grouped result are supported."
+        )
+
+    if join is not None:
+        if traversal is not None:
+            raise NotImplementedError(
+                "join() on a traversal result (hop/shortest_path) is not supported yet; "
+                "join is available on plain edge/node frames."
+            )
+        if group_by is not None:
+            raise NotImplementedError(
+                "join() does not compose with group_by().agg() yet; do them in "
+                "separate collect() steps."
+            )
+        left_table = _edge_source_table(frame)
+        return _run_join(
+            left_table,
+            join,
+            filters,
+            sort,
+            limit,
+            select,
+            sample,
+            rename,
+            distinct,
+            {"src": frame.src_col, "dst": frame.dst_col},
+        )
+
     if traversal is None:
         # No traversal: a plain edge frame (scan_edges / from_arrow / read_edges,
-        # or a reversed frame). Materialize its edge rows + filter/sort/head tail.
-        if distinct:
-            raise NotImplementedError("collect() distinct on a plain edge frame is not wired yet.")
-        return _collect_plain_edges(frame, filters, sort, limit, select)
+        # or a reversed frame). Materialize its edge rows + tail (distinct included).
+        return _collect_plain_edges(
+            frame, filters, sort, limit, select, sample, rename, distinct, group_by
+        )
+    if group_by is not None:
+        raise NotImplementedError(
+            "group_by().agg() on a traversal result (hop/shortest_path) is not "
+            "supported yet; group_by is available on plain edge/node frames."
+        )
 
+    # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
+    # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
+    filter_json = [_filter_json(p, {"src": "src", "dst": "dst"}) for p in filters]
+    rename_pairs = list(rename.items())
     if traversal.op == "hop":
         index = _require_index(traversal.args["edges"])
         seeds = _resolve_seeds(traversal.args["seeds"])
@@ -441,10 +654,12 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             seeds,
             int(traversal.args["n"]),
             traversal.args["direction"],
-            filters,
+            filter_json,
             sort,
             limit,
             distinct,
+            sample,
+            rename_pairs,
         )
     else:  # shortest_path
         # A weight= expression (over edge columns) selects weighted Dijkstra: it's
@@ -467,10 +682,12 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             traversal.args["direction"],
             weight_json,
             edge_attr,
-            filters,
+            filter_json,
             sort,
             limit,
             distinct,
+            sample,
+            rename_pairs,
         )
     return _apply_select(MaterializedFrame(batch), select)
 
@@ -541,18 +758,38 @@ def _resolve_seeds(seeds: Any) -> Any:
 def _run_query(
     edges: EdgeFrame | None,
     columns: list[dict[str, Any]],
-    filters: list[tuple[str, str, float]],
+    filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     nodes: Any | None = None,
     nodes_id: str | None = None,
     edge_attr: Any | None = None,
+    distinct: bool = False,
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
     # The node attribute table crosses the FFI as a batch list (not one batch).
     nodes_batches = nodes.to_batches() if nodes is not None else None
+    # A node-query result carries the reserved `id` column plus the computed/joined
+    # columns; `ur.id()` in a filter resolves to it. (src/dst have no role here.)
+    filter_json = [_filter_json(p, {"id": "id"}) for p in filters]
+    group_keys, engine_aggs = ([], []) if group_by is None else (group_by[0], group_by[1])
     batches = _native().run_node_query(
-        index, json.dumps(columns), filters, sort, limit, nodes_batches, nodes_id, edge_attr
+        index,
+        json.dumps(columns),
+        filter_json,
+        sort,
+        limit,
+        nodes_batches,
+        nodes_id,
+        edge_attr,
+        distinct,
+        sample,
+        list((rename or {}).items()),
+        group_keys,
+        engine_aggs,
     )
     return MaterializedFrame(batches)
 
@@ -576,15 +813,15 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     p = expr.payload
     column: dict[str, Any] = {"name": name, "kind": verb}
     if verb == "connected_components":
-        # Only weak components are wired; strong is a later release (SPEC). The
-        # Rust side hardcodes weak, so a non-weak mode must raise here rather than
-        # be silently computed as weak.
+        # weak = undirected union-find; strong = Tarjan SCC. Any other mode is a
+        # typo — raise rather than silently computing weak.
         mode = p.get("mode", "weak")
-        if mode != "weak":
+        if mode not in ("weak", "strong"):
             raise NotImplementedError(
-                f"connected_components(mode={mode!r}) is not supported yet; "
-                "only mode='weak' is wired."
+                f"connected_components(mode={mode!r}) is not supported; "
+                "use mode='weak' or mode='strong'."
             )
+        column["mode"] = mode
     if verb == "pagerank":
         column.update(
             damping=p.get("damping", 0.85),
@@ -653,6 +890,58 @@ def _single_edges(exprs: Any) -> Any:
     return edges
 
 
+def _reject_derived_edge_graph_op(edges: Any) -> None:
+    """Reject a graph op on a *derived* edge frame — one whose plan contains a
+    row-changing op (filter/sample/distinct/join/group_by) or is a traversal result
+    (hop/shortest_path). Such a frame carries no topology that matches its rows (its
+    retained source is the *pre*-derivation edges), so building a CSR from it would
+    be silently wrong.
+
+    This is the single **authoritative** guard: it inspects only the plan, so it
+    must be called *before* the frame's index cell is read or (re)built — a cell
+    populated by another path (a weighted scan's pre-build, or a stale shared cell)
+    would otherwise smuggle a wrong topology past a build-time-only check. The
+    plain-collect path materializes a derived frame's rows separately (via
+    `_edge_source_table`), so `edges.filter(...).collect()` still works (#100)."""
+    ops = {step.op for step in getattr(edges, "_plan", ())}
+    if ops & {"hop", "shortest_path"}:
+        raise NotImplementedError(
+            "chaining a graph op off a traversal result (hop/shortest_path) isn't "
+            "wired yet — a traversal result is a set of reached edges with no rebuildable "
+            "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
+            "further ops on it. (v0.2: child-plan seeding.)"
+        )
+    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
+        raise NotImplementedError(
+            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
+            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
+            "the source frame, or collect and re-ingest the filtered edges."
+        )
+
+
+def _drop_null_endpoint_batches(batches: list[Any]) -> list[Any]:
+    """Filter scan batches to rows with a non-null src (column 0) and dst (column 1),
+    emitting a count — the scan half of the ``on_null="drop"`` opt-in. Endpoints are
+    always columns 0/1 whether or not weight columns follow, so this serves the
+    unweighted, weighted, and plain-collect scan paths identically. Filtering here
+    (rather than in a second pass) keeps the topology and any co-scanned weights
+    row-aligned, since they come from the same filtered batches."""
+    import pyarrow.compute as pc
+
+    from ._io import _warn_dropped_endpoints
+
+    # pyarrow.compute members are looked up by name (the type checker lacks its stubs).
+    is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
+    out, dropped = [], 0
+    for b in batches:
+        mask = and_(is_valid(b.column(0)), is_valid(b.column(1)))
+        kept = b.filter(mask)
+        dropped += b.num_rows - kept.num_rows
+        out.append(kept)
+    _warn_dropped_endpoints(dropped)
+    return out
+
+
 def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
     (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
@@ -660,6 +949,7 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     one contiguous batch first (#60)."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
+    _reject_derived_edge_graph_op(edges)
 
     arrays = getattr(edges, "_edge_arrays", None)
     if arrays is not None:
@@ -677,26 +967,15 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
                 "(glob included) for now, not a list of paths."
             )
         # The scan returns a list of [src, dst] batches; build_index reads columns
-        # 0/1 of each, so it is passed straight through.
-        return _native().scan_edges_arrow(
+        # 0/1 of each, so it is passed straight through (minus null-endpoint rows
+        # when on_null="drop").
+        batches = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan)
         )
+        if scan.get("on_null") == "drop":
+            batches = _drop_null_endpoint_batches(batches)
+        return batches
 
-    # No source: give a message matched to *why* it's missing, not a generic one.
-    ops = {step.op for step in getattr(edges, "_plan", ())}
-    if ops & {"hop", "shortest_path"}:
-        raise NotImplementedError(
-            "chaining a graph op off a traversal result (hop/shortest_path) isn't "
-            "wired yet — a traversal result is a set of reached edges with no rebuildable "
-            "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
-            "further ops on it. (v0.2: child-plan seeding.)"
-        )
-    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
-        raise NotImplementedError(
-            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
-            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
-            "the source frame, or collect and re-ingest the filtered edges."
-        )
     raise NotImplementedError(
         "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or "
         "ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source."
@@ -711,6 +990,10 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     (see ``EdgeFrame._extend``). Concurrency-safe via a module lock."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
+    # Guard *before* touching the cell: a graph op on a derived frame must raise even
+    # if the cell was pre-populated elsewhere (Bug: a weighted scan builds the index
+    # directly; a grouped frame may share a parent's built cell).
+    _reject_derived_edge_graph_op(edges)
     cell = edges._index_build_cell
     idx = cell.value
     if idx is not None:
@@ -724,27 +1007,140 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     return idx
 
 
-def _parse_filter(predicate: Any) -> tuple[str, str, float]:
-    """Lower a ``col <op> literal`` predicate to (column, op, value)."""
-    unsupported = NotImplementedError(
-        "collect() filters currently support a single `ur.col(name) <op> <number>` "
-        "comparison (op in > >= < <= == !=); richer predicates are future work."
-    )
-    if predicate.kind != "binary" or predicate.payload["op"] not in _FLIP:
-        raise unsupported
+def _require_predicate(predicate: Any) -> None:
+    """Reject a ``filter()`` argument that isn't a boolean predicate at its top node
+    — a bare ``col`` or an arithmetic expression is not a filter. Enforced
+    identically on both the graph-op (Rust) and plain-frame (pyarrow) paths, so the
+    same input is accepted or rejected the same way regardless of the source."""
+    kind = predicate.kind
+    top_binary_ok = kind == "binary" and predicate.payload["op"] in _PREDICATE_OPS
+    top_unary_ok = kind == "unary" and predicate.payload["op"] == "~"
+    if not (top_binary_ok or top_unary_ok):
+        raise NotImplementedError(
+            "filter() expects a boolean predicate — a comparison (>, >=, <, <=, ==, !=) "
+            "or a boolean combination (&, |, ~), e.g. .filter(ur.col('deg') > 2) or "
+            ".filter((ur.col('a') > 1) & (ur.col('b') == 'x'))."
+        )
 
-    op = predicate.payload["op"]
-    left, right = predicate.payload["left"], predicate.payload["right"]
-    if left.kind == "col" and right.kind == "lit":
-        column, value = left.payload["name"], right.payload["value"]
-    elif left.kind == "lit" and right.kind == "col":
-        column, value, op = right.payload["name"], left.payload["value"], _FLIP[op]
-    else:
-        raise unsupported
 
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise unsupported
-    return (column, op, float(value))
+def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
+    """Serialize a filter ``predicate`` (an ``Expr``) to the JSON string the Rust
+    expr seam lowers to a DataFusion filter. The predicate may use the full algebra
+    — comparisons, boolean ``& | ~``, arithmetic, ``col <op> col``, string/bool
+    equality, and role refs (``ur.src()``/``dst()``/``id()``, resolved via
+    ``roles``). The top node must be a boolean predicate (see ``_require_predicate``)."""
+    _require_predicate(predicate)
+    return json.dumps(_expr_to_json(predicate, roles))
+
+
+# --- group_by().agg() ------------------------------------------------------
+_AGG_FNS = {"mean", "sum", "min", "max", "count", "n_unique"}
+
+
+def _reject_pre_group_tail(
+    sort: tuple[str, bool] | None, limit: int | None, rename: dict[str, str]
+) -> None:
+    """The canonical tail applies sort/head/rename *after* the grouping, so a
+    sort/head/rename written *before* group_by().agg() would be silently
+    reordered (e.g. ``.head(10).group_by(...)`` would truncate groups, not rows).
+    Reject it rather than execute a different query than the one written; these
+    verbs are supported *after* the group."""
+    offenders = [
+        name
+        for name, present in (
+            ("sort", sort is not None),
+            ("head", limit is not None),
+            ("rename", bool(rename)),
+        )
+        if present
+    ]
+    if offenders:
+        raise NotImplementedError(
+            f"{'/'.join(offenders)}() before group_by().agg() is not supported "
+            "(the tail applies them after the group); move them after the group_by."
+        )
+
+
+def _parse_group_keys(keys: Any) -> list[str]:
+    """The group key column names. Accepts bare strings or ``ur.col(name)``."""
+    out: list[str] = []
+    for k in keys:
+        if isinstance(k, str):
+            out.append(k)
+        elif getattr(k, "kind", None) == "col":
+            out.append(k.payload["name"])
+        else:
+            raise NotImplementedError("group_by() supports column names or ur.col(<name>) as keys.")
+    if not out:
+        raise NotImplementedError("group_by() needs at least one key column.")
+    return out
+
+
+def _parse_agg_expr(name: str | None, expr: Any) -> tuple[str, str, str]:
+    """Resolve one aggregation to ``(output_name, fn, column)``.
+
+    Accepts ``ur.col(c).<fn>()`` optionally wrapped in ``.alias(x)``; the output
+    name is (highest precedence first) the ``.agg(name=...)`` keyword, then a
+    ``.alias()``, then the default ``{column}_{fn}``. An arithmetic or non-``col``
+    aggregand, or a non-aggregation expression, is a clear error (deferred)."""
+    alias_name: str | None = None
+    node = expr
+    if getattr(node, "kind", None) == "alias":
+        alias_name = node.payload["name"]
+        node = node.payload["operand"]
+    if getattr(node, "kind", None) != "agg":
+        raise NotImplementedError(
+            "agg() expects an aggregation like ur.col('x').mean() "
+            "(fns: mean/sum/min/max/count/n_unique)."
+        )
+    fn = node.payload["fn"]
+    if fn not in _AGG_FNS:
+        raise NotImplementedError(
+            f"aggregation {fn!r} is not supported (use {', '.join(sorted(_AGG_FNS))})."
+        )
+    operand = node.payload["operand"]
+    if getattr(operand, "kind", None) != "col":
+        raise NotImplementedError(
+            "agg() supports aggregating a single ur.col(<name>) for now "
+            "(aggregating an expression like col('a') * col('b') is future work)."
+        )
+    column = operand.payload["name"]
+    output = name or alias_name or f"{column}_{fn}"
+    return (output, fn, column)
+
+
+def _parse_group_agg(step: _PlanStep) -> tuple[list[str], list[str], list[dict[str, str]]]:
+    """Parse a ``group_by_agg`` step into ``(keys, engine_aggs, plain_aggs)`` — the
+    group keys, the serialized ``alias(agg(col))`` JSON per aggregation (engine
+    path), and ``{fn, column, output}`` dicts (pyarrow plain path). The two agg
+    encodings resolve to the *same* output column names, so both paths agree."""
+    keys = _parse_group_keys(step.args["keys"])
+    resolved: list[tuple[str, str, str]] = []
+    for expr in step.args["exprs"]:  # positional aggregations
+        resolved.append(_parse_agg_expr(None, expr))
+    for out_name, expr in step.args["named"].items():  # .agg(name=...)
+        resolved.append(_parse_agg_expr(out_name, expr))
+    if not resolved:
+        raise NotImplementedError("group_by().agg() needs at least one aggregation.")
+    seen: set[str] = set()
+    for output, _fn, _col in resolved:
+        if output in keys:
+            raise ValueError(f"aggregation output name {output!r} collides with a group key.")
+        if output in seen:
+            raise ValueError(f"duplicate aggregation output name {output!r}.")
+        seen.add(output)
+    engine_aggs = [
+        json.dumps(
+            {
+                "kind": "alias",
+                "name": output,
+                "operand": {"kind": "agg", "fn": fn, "operand": {"kind": "col", "name": col}},
+            }
+        )
+        for (output, fn, col) in resolved
+    ]
+    plain_aggs = [{"fn": fn, "column": col, "output": output} for (output, fn, col) in resolved]
+    return keys, engine_aggs, plain_aggs
 
 
 def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
@@ -757,32 +1153,274 @@ def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
     return (by, bool(args.get("descending", False)))
 
 
+# --- join ------------------------------------------------------------------
+_JOIN_HOWS = {"inner", "left"}
+
+
+def _parse_join_keys(on: Any) -> list[str]:
+    """The join key column name(s). Accepts a bare string, ``ur.col(name)``, or a
+    list of either. ``on=None`` (key inference) is deferred with a clear error."""
+    if on is None:
+        raise NotImplementedError(
+            "join() needs on= (key inference is not supported yet); pass on='id' or on=['a', 'b']."
+        )
+    items = on if isinstance(on, (list, tuple)) else [on]
+    keys: list[str] = []
+    for k in items:
+        if isinstance(k, str):
+            keys.append(k)
+        elif getattr(k, "kind", None) == "col":
+            keys.append(k.payload["name"])
+        else:
+            raise NotImplementedError("join(on=): keys must be column names or ur.col(<name>).")
+    if not keys:
+        raise NotImplementedError("join() needs at least one key column.")
+    return keys
+
+
+def _parse_join(step: _PlanStep) -> tuple[Any, list[str], str]:
+    """Parse a ``join`` step into ``(other, on_keys, how)``. ``other`` must be an
+    ursa frame; ``how`` is restricted to the supported set."""
+    from ._frames import _Frame
+
+    other = step.args["other"]
+    if not isinstance(other, _Frame):
+        raise TypeError(
+            "join(other): other must be an ursa frame (EdgeFrame/NodeFrame); "
+            f"got {type(other).__name__!r}."
+        )
+    how = step.args["how"]
+    if how not in _JOIN_HOWS:
+        raise NotImplementedError(
+            f"join how={how!r} is not supported yet (use {sorted(_JOIN_HOWS)}); "
+            "'right'/'outer' are a follow-up."
+        )
+    return other, _parse_join_keys(step.args["on"]), how
+
+
+def _run_join(
+    left_table: Any,
+    join: tuple[Any, list[str], str],
+    filters: list[Any],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+    select: list[str] | None,
+    sample: tuple[int, int | None] | None,
+    rename: dict[str, str],
+    distinct: bool,
+    roles: dict[str, str],
+) -> MaterializedFrame:
+    """Materialize the right frame, validate keys/collisions, and run the native
+    join + relational tail. The whole tail (filter/sort/head/distinct/sample/
+    rename) applies *after* the join; ``roles`` resolves ur.id()/src()/dst() in a
+    filter to the left frame's real columns."""
+    other, on_keys, how = join
+    try:
+        right_table = other.collect().to_arrow()
+    except NotImplementedError as exc:
+        raise NotImplementedError(
+            f"join(other): could not materialize the right-hand frame ({exc})."
+        ) from exc
+    left_cols, right_cols = left_table.column_names, right_table.column_names
+    for k in on_keys:
+        if k not in left_cols:
+            from . import ColumnNotFoundError
+
+            raise ColumnNotFoundError(f"join(on=): key {k!r} not in the left frame {left_cols}.")
+        if k not in right_cols:
+            from . import ColumnNotFoundError
+
+            raise ColumnNotFoundError(f"join(on=): key {k!r} not in the right frame {right_cols}.")
+    # A same-named non-key column on both sides would collide in the output; reject
+    # it (a polars-style `_right` suffix is a follow-up).
+    collide = (set(left_cols) - set(on_keys)) & (set(right_cols) - set(on_keys))
+    if collide:
+        raise ValueError(
+            f"join produces duplicate column name(s) {sorted(collide)}; "
+            "rename() one side before joining."
+        )
+    filter_json = [_filter_json(p, roles) for p in filters]
+    batches = _native().run_join_query(
+        left_table.to_batches(),
+        right_table.to_batches(),
+        on_keys,
+        how,
+        filter_json,
+        sort,
+        limit,
+        distinct,
+        sample,
+        list((rename or {}).items()),
+    )
+    return _apply_select(MaterializedFrame(batches), select)
+
+
 # --- plain-source collection (no algorithm/traversal) ----------------------
 # Materialize a frame's own rows and apply the filter/sort/head tail in pyarrow.
 # Used by read_edges/read_nodes and scan_*/from_* frames collected without a
 # graph op (e.g. scan_edges(...).to_polars()).
-def _apply_pyarrow_tail(
-    table: Any,
-    filters: list[tuple[str, str, float]],
-    sort: tuple[str, bool] | None,
-    limit: int | None,
-) -> Any:
+# pyarrow.compute kernel names by op (looked up by name so the type checker —
+# which lacks pyarrow.compute stubs — doesn't flag each one).
+_PC_BINARY = {
+    "+": "add",
+    "-": "subtract",
+    "*": "multiply",
+    "/": "divide",
+    ">": "greater",
+    ">=": "greater_equal",
+    "<": "less",
+    "<=": "less_equal",
+    "==": "equal",
+    "!=": "not_equal",
+    "&": "and_kleene",
+    "|": "or_kleene",
+}
+_PC_UNARY = {"~": "invert"}
+
+
+def _eval_pyarrow(expr: Any, table: Any, roles: dict[str, str]) -> Any:
+    """Evaluate an ``Expr`` predicate tree over a pyarrow ``table``, mirroring the
+    Rust ``expr::lower`` semantics for the plain-frame path (which never touches the
+    engine). Returns a pyarrow Array/scalar; the top-level result is a boolean mask."""
+    import pyarrow as pa
     import pyarrow.compute as pc
 
-    # pyarrow.compute's comparison kernels, by op (looked up by name so the type
-    # checker — which lacks pyarrow.compute stubs — doesn't flag each one).
-    cmp = {
-        ">": "greater",
-        ">=": "greater_equal",
-        "<": "less",
-        "<=": "less_equal",
-        "==": "equal",
-        "!=": "not_equal",
-    }
-    for column, op, value in filters:
-        if column not in table.column_names:
-            raise ValueError(f"filter references unknown column '{column}'.")
-        table = table.filter(getattr(pc, cmp[op])(table.column(column), value))
+    kind, p = expr.kind, expr.payload
+    if kind == "col":
+        name = p["name"]
+        if name not in table.column_names:
+            raise ValueError(f"filter references unknown column '{name}'.")
+        return table.column(name)
+    if kind == "lit":
+        return pa.scalar(p["value"])
+    if kind in ("src", "dst", "id"):
+        if kind not in roles:
+            raise NotImplementedError(
+                f"ur.{kind}() is not available in this context "
+                f"(resolvable roles here: {sorted(roles)})."
+            )
+        name = roles[kind]
+        if name not in table.column_names:
+            raise ValueError(f"filter references unknown column '{name}'.")
+        return table.column(name)
+    if kind == "binary":
+        op = p["op"]
+        if op not in _PC_BINARY:
+            raise NotImplementedError(f"filter operator {op!r} is not supported.")
+        left = _eval_pyarrow(p["left"], table, roles)
+        right = _eval_pyarrow(p["right"], table, roles)
+        return getattr(pc, _PC_BINARY[op])(left, right)
+    if kind == "unary":
+        if p["op"] not in _PC_UNARY:
+            raise NotImplementedError(f"unary filter operator {p['op']!r} is not supported.")
+        return getattr(pc, _PC_UNARY[p["op"]])(_eval_pyarrow(p["operand"], table, roles))
+    raise NotImplementedError(
+        f"filter expression node {kind!r} is not supported (aggregations belong in group_by)."
+    )
+
+
+# A plain frame takes exactly one deterministic sampling policy, distinct from the
+# engine's (both reproducible, not byte-identical to each other): a stable stdlib
+# PRNG over the single in-memory table's row order (which, unlike the engine, is
+# unpartitioned, so no content-canonical ordering is needed for thread-invariance).
+_DEFAULT_SAMPLE_SEED = 0x5EED5EED
+
+
+def _sample_pyarrow(table: Any, n: int, seed: int | None) -> Any:
+    """Deterministically take ``n`` rows (without replacement) from a pyarrow table.
+    ``n >= row_count`` returns all rows; ``seed=None`` uses the default seed."""
+    import random
+
+    r = table.num_rows
+    if n >= r:
+        return table
+    idx = random.Random(seed if seed is not None else _DEFAULT_SAMPLE_SEED).sample(range(r), n)
+    return table.take(sorted(idx))
+
+
+def _apply_pyarrow_rename(table: Any, rename: dict[str, str]) -> Any:
+    """Relabel output columns of a pyarrow table. An unknown source column is an
+    error (no silent no-op), matching the engine path's ``rename`` check."""
+    if not rename:
+        return table
+    missing = [old for old in rename if old not in table.column_names]
+    if missing:
+        from . import ColumnNotFoundError
+
+        raise ColumnNotFoundError(f"rename() references unknown column(s): {missing}")
+    return table.rename_columns([rename.get(c, c) for c in table.column_names])
+
+
+# pyarrow.compute aggregate function names by our fn name.
+_PC_AGG = {
+    "mean": "mean",
+    "sum": "sum",
+    "min": "min",
+    "max": "max",
+    "count": "count",
+    "n_unique": "count_distinct",
+}
+
+
+def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, str]]) -> Any:
+    """Group ``table`` by ``keys`` and aggregate, producing `[keys..., outputs...]`
+    with the same output column names as the engine path. Mirrors the engine's
+    unknown-key error."""
+    for k in keys:
+        if k not in table.column_names:
+            raise ValueError(f"group_by() references unknown column '{k}'.")
+    for a in aggs:
+        if a["column"] not in table.column_names:
+            raise ValueError(f"agg() references unknown column '{a['column']}'.")
+    # Deduplicate the (column, pcfn) computations: two aggregations with distinct
+    # output names but the same column+fn (e.g. .agg(a=col('x').sum(), b=col('x')
+    # .sum())) share one pyarrow aggregate, and the engine path likewise emits two
+    # aliases of one sum — so both paths stay consistent. pyarrow names an
+    # aggregate output "{column}_{pcfn}"; each is mapped back to *every* output
+    # that requested it.
+    specs = []
+    seen_specs: set[tuple[str, str]] = set()
+    for a in aggs:
+        spec = (a["column"], _PC_AGG[a["fn"]])
+        if spec not in seen_specs:
+            seen_specs.add(spec)
+            specs.append(spec)
+    grouped = table.combine_chunks().group_by(keys).aggregate(specs)
+    cols = {name: grouped.column(name) for name in grouped.column_names}
+    import pyarrow as pa
+
+    ordered_names = list(keys)
+    ordered_cols = [cols[k] for k in keys]
+    for a in aggs:
+        ordered_names.append(a["output"])
+        ordered_cols.append(cols[f"{a['column']}_{_PC_AGG[a['fn']]}"])
+    return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
+
+
+def _apply_pyarrow_tail(
+    table: Any,
+    filters: list[Any],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+    roles: dict[str, str],
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    distinct: bool = False,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
+) -> Any:
+    # Same canonical order as the engine tail:
+    # filters → group_by → distinct → sample → sort → limit → rename.
+    for predicate in filters:
+        _require_predicate(predicate)  # same top-of-predicate check as the graph path
+        table = table.filter(_eval_pyarrow(predicate, table, roles))
+    if group_by is not None:
+        table = _apply_pyarrow_group_by(table, group_by[0], group_by[2])
+    if distinct:
+        # Distinct rows over all columns (group-by with no aggregations); row order
+        # is unspecified for distinct, as on the engine path.
+        table = table.combine_chunks().group_by(table.column_names).aggregate([])
+    if sample is not None:
+        table = _sample_pyarrow(table, sample[0], sample[1])
     if sort is not None:
         by, descending = sort
         if by not in table.column_names:
@@ -790,24 +1428,39 @@ def _apply_pyarrow_tail(
         table = table.sort_by([(by, "descending" if descending else "ascending")])
     if limit is not None:
         table = table.slice(0, limit)
+    if rename:
+        table = _apply_pyarrow_rename(table, rename)
     return table
 
 
 def _collect_plain_nodes(
     frame: NodeFrame,
-    filters: list[tuple[str, str, float]],
+    filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     select: list[str] | None = None,
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    distinct: bool = False,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
+    # On a plain node table, ur.id() resolves to the frame's real id column.
+    roles = {"id": frame.id_col}
     # With no computed columns, the scan need only read the id, whatever the
-    # filter/sort touch, and (if a select narrows the output) the selected columns.
+    # filter/sort touch, any rename source column, and (if a select narrows the
+    # output) the selected columns. A rename *target* is a new label, not a file
+    # column, so it must not leak into the projection. When group_by is present the
+    # whole file is read (keys + agg columns must be available; select is disallowed).
     file_needed: list[str] | None = None
-    if select is not None:
-        referenced = {c for (c, _op, _v) in filters}
+    if select is not None and group_by is None:
+        rename = rename or {}
+        referenced: set[str] = set(rename)
+        for p in filters:
+            referenced |= _expr_columns(p, roles)
         if sort is not None:
             referenced.add(sort[0])
-        file_needed = sorted({frame.id_col} | referenced | set(select))
+        selected_file = set(select) - set(rename.values())
+        file_needed = sorted({frame.id_col} | referenced | selected_file)
     attr = _resolve_node_attr_table(frame, file_needed)
     if attr is None:
         raise NotImplementedError(
@@ -816,38 +1469,58 @@ def _collect_plain_nodes(
             "materializable node set yet."
         )
     # `attr` is a (chunked) pyarrow.Table.
-    table = _apply_pyarrow_tail(attr, filters, sort, limit)
+    table = _apply_pyarrow_tail(
+        attr, filters, sort, limit, roles, sample, rename, distinct, group_by
+    )
     return _apply_select(MaterializedFrame(table), select)
 
 
 def _collect_plain_edges(
     frame: EdgeFrame,
-    filters: list[tuple[str, str, float]],
+    filters: list[Any],
     sort: tuple[str, bool] | None,
     limit: int | None,
     select: list[str] | None = None,
+    sample: tuple[int, int | None] | None = None,
+    rename: dict[str, str] | None = None,
+    distinct: bool = False,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
+    # On a plain edge table, ur.src()/dst() resolve to the frame's real endpoint cols.
+    roles = {"src": frame.src_col, "dst": frame.dst_col}
+    table = _edge_source_table(frame)
+    table = _apply_pyarrow_tail(
+        table, filters, sort, limit, roles, sample, rename, distinct, group_by
+    )
+    return _apply_select(MaterializedFrame(table), select)
+
+
+def _edge_source_table(frame: EdgeFrame) -> Any:
+    """The raw edge rows of a plain (non-traversal) edge frame as a pyarrow.Table —
+    the full in-memory edge table, or a fresh scan of its ``scan_edges`` source.
+    Raises the precise plan-aware error for a frame with no materializable source."""
     import pyarrow as pa
 
     table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
-    if table is None:
-        scan = getattr(frame, "_scan_spec", None)
-        if scan is not None:
-            path = scan["path"]
-            if not isinstance(path, str):
-                raise NotImplementedError(
-                    "collect() over a scan_edges source supports a single string path "
-                    "(glob included) for now, not a list of paths."
-                )
-            batches = _native().scan_edges_arrow(
-                path, scan["src"], scan["dst"], _scan_storage_options(scan), []
+    if table is not None:
+        return table
+    scan = getattr(frame, "_scan_spec", None)
+    if scan is not None:
+        path = scan["path"]
+        if not isinstance(path, str):
+            raise NotImplementedError(
+                "collect() over a scan_edges source supports a single string path "
+                "(glob included) for now, not a list of paths."
             )
-            table = pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
-        else:
-            # No source: a filtered/derived (or traversal-result) edge frame.
-            _require_edges(frame)  # raises the precise, plan-aware message
-    table = _apply_pyarrow_tail(table, filters, sort, limit)
-    return _apply_select(MaterializedFrame(table), select)
+        batches = _native().scan_edges_arrow(
+            path, scan["src"], scan["dst"], _scan_storage_options(scan), []
+        )
+        if scan.get("on_null") == "drop":
+            batches = _drop_null_endpoint_batches(batches)
+        return pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
+    # No source: a filtered/derived (or traversal-result) edge frame.
+    _require_edges(frame)  # raises the precise, plan-aware message
+    raise AssertionError("unreachable")  # _require_edges always raises here
 
 
 def _native() -> Any:

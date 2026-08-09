@@ -29,13 +29,17 @@ mod neighbor_agg;
 mod pagerank;
 mod random_walk;
 mod rng;
+pub use rng::sample_indices;
 mod triangle;
 
 pub use betweenness::{betweenness, betweenness_weighted};
-pub use bfs::{bfs_distances, dijkstra_distances, shortest_path, shortest_path_weighted};
+pub use bfs::{
+    bfs_distances, dijkstra_distances, shortest_path, shortest_path_weighted,
+    shortest_path_weighted_with_cost,
+};
 pub use closeness::{closeness, closeness_weighted};
 pub use clustering::clustering_coefficient;
-pub use components::connected_components_weak;
+pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
 pub use hop::k_hop;
 pub use label_prop::label_propagation;

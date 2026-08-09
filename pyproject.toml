@@ -33,9 +33,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# polars is a real *runtime* optional dependency, used ONLY by the interop shims
-# (.to_polars / ur.from_polars). Installed by users who want the interop.
+# Real *runtime* optionals, each used ONLY by the matching interop constructor —
+# never imported at `import ursa` time. Installed by users who want that interop.
+# `ur.to_polars` / `ur.from_polars`:
 polars = ["polars>=1.0"]
+# `ur.from_networkx` / `ur.nodes_from_networkx`:
+networkx = ["networkx>=3.0"]
+# `ur.from_numpy`:
+numpy = ["numpy>=1.24"]
+# `ur.from_scipy_sparse` (pulls numpy transitively):
+scipy = ["scipy>=1.10"]
+# Everything at once, for a batteries-included install.
+all = ["polars>=1.0", "networkx>=3.0", "numpy>=1.24", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/cldixon/ursa"
@@ -50,6 +59,10 @@ dev = [
     "pytest>=8.0",
     "polars>=1.0",
     "pyarrow>=15.0",
+    # pandas is NOT a runtime dependency — the constructors detect it via
+    # sys.modules and never import it themselves. It is here only so the tests can
+    # exercise the pandas.DataFrame ingress path.
+    "pandas>=2.0",
     # Reference implementation for cross-checking the graph kernels (tests only).
     # numpy/scipy back NetworkX's pagerank (its other algorithms are pure-Python).
     "networkx>=3.0",
@@ -95,6 +108,12 @@ features = ["extension-module"]
 include = [
     { path = "LICENSE-MIT", format = "sdist" },
     { path = "LICENSE-APACHE", format = "sdist" },
+    # Bundled datasets: non-.py data must be listed explicitly (maturin's
+    # python-source picks up .py only), for BOTH the sdist and the wheel, or
+    # ur.datasets.load_* would find no data at runtime. Glob the whole data dir
+    # (not just *.csv) so a future non-CSV asset isn't silently left unpackaged.
+    { path = "python/ursa/datasets/data/*", format = ["sdist", "wheel"] },
+    { path = "python/ursa/datasets/LICENSES.md", format = ["sdist", "wheel"] },
 ]
 
 [tool.pytest.ini_options]

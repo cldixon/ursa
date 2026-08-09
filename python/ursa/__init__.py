@@ -19,18 +19,25 @@ The primary surface is live: the algorithms (pagerank, degree, connected
 components, triangle count, clustering, closeness, betweenness, label propagation,
 louvain — with weighted variants), neighbour aggregation, the traversals (hop,
 shortest_path, random_walk), the whole-graph stats (density, avg_path_length,
-diameter, describe), and both in-memory (``from_arrow``/``from_polars``) and
-scan-backed (``scan_edges``/``scan_nodes``, Parquet/CSV, local or object storage)
-sources all execute end to end through the DataFusion plan and the ``ursa-core``
-kernels. A few relational verbs are still plan-only and raise a clear error when
-collected (``sample``, ``group_by().agg``, ``join``, ``schema``); ``ur.col`` & the
-expression dialect are pure Python and always available.
+diameter, describe), and both in-memory sources (the ``EdgeFrame(data, src=, dst=)``
+/ ``NodeFrame(data, id=)`` constructors, taking row dicts, a column dict, a polars
+or pandas DataFrame, or pyarrow — with ``from_arrow``/``from_polars``/``from_pandas``
+as typed aliases) and scan-backed ones (``scan_edges``/``scan_nodes``, Parquet/CSV,
+local or object storage) all execute end to end through the DataFusion plan and the
+``ursa-core`` kernels. However a frame is built, it behaves identically thereafter.
+The relational surface — ``filter``/``sort``/``head``/``rename``/``distinct``/
+``sample``/``group_by().agg()``/``join`` — executes; only ``schema`` remains
+plan-only. ``ur.col`` & the expression dialect are pure Python and always
+available.
 """
 
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
+
+# --- Public datasets (bundled + downloadable) -------------------------------
+from . import datasets
 
 # --- Expression dialect (pure Python, always available) ---------------------
 from ._expr import Expr, col, dst, id, lit, src
@@ -56,8 +63,16 @@ from ._graph import (
 )
 
 # --- IO constructors --------------------------------------------------------
+from ._interop import (
+    from_networkx,
+    from_numpy,
+    from_scipy_sparse,
+    nodes_from_networkx,
+)
 from ._io import (
     from_arrow,
+    from_edgelist,
+    from_pandas,
     from_polars,
     read_edges,
     read_nodes,
@@ -122,19 +137,26 @@ __all__ = [
     "clustering_coefficient",
     "col",
     "connected_components",
+    "datasets",
     "degree",
     "density",
     "describe",
     "diameter",
     "dst",
     "from_arrow",
+    "from_edgelist",
+    "from_networkx",
+    "from_numpy",
+    "from_pandas",
     "from_polars",
+    "from_scipy_sparse",
     "hop",
     "id",
     "label_propagation",
     "lit",
     "louvain",
     "neighbors",
+    "nodes_from_networkx",
     "pagerank",
     "random_walk",
     "read_edges",

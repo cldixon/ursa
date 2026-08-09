@@ -180,6 +180,22 @@ pub fn shortest_path_weighted(
     target: u32,
     dir: Direction,
 ) -> Option<Vec<u32>> {
+    shortest_path_weighted_with_cost(topo, weights, source, target, dir).map(|(path, _)| path)
+}
+
+/// Like [`shortest_path_weighted`], but also returns the cumulative cost to each
+/// node on the route: `costs[i]` is the minimum total edge weight from `source` to
+/// `path[i]`, so `costs[0] == 0.0` and `costs.last()` is the whole path's cost.
+/// These are the exact `dist[]` values Dijkstra already settled (correct even when
+/// parallel edges connect two nodes — the settled distance reflects the minimum),
+/// read off for free during backtrack rather than recomputed.
+pub fn shortest_path_weighted_with_cost(
+    topo: &Topology,
+    weights: &[f64],
+    source: u32,
+    target: u32,
+    dir: Direction,
+) -> Option<(Vec<u32>, Vec<f64>)> {
     assert_eq!(
         weights.len(),
         topo.n_edges(),
@@ -193,7 +209,7 @@ pub fn shortest_path_weighted(
         return None;
     }
     if source == target {
-        return Some(vec![source]);
+        return Some((vec![source], vec![0.0]));
     }
 
     let mut dist = vec![f64::INFINITY; n];
@@ -237,7 +253,9 @@ pub fn shortest_path_weighted(
         path.push(cur);
     }
     path.reverse();
-    Some(path)
+    // Cumulative cost to each node on the route, in the same forward order.
+    let costs: Vec<f64> = path.iter().map(|&v| dist[v as usize]).collect();
+    Some((path, costs))
 }
 
 #[cfg(test)]
@@ -343,5 +361,28 @@ mod tests {
             shortest_path_weighted(&t, &[1.0, 1.0, 5.0], 0, 2, Direction::Out),
             None
         );
+    }
+
+    #[test]
+    fn weighted_with_cost_reports_cumulative_distance() {
+        // 0->1 (1), 1->3 (1), 0->3 (5). Cheapest 0->3 is via 1 at total cost 2.
+        let t = Topology::build(4, vec![0, 1, 0], vec![1, 3, 3]);
+        let (path, costs) =
+            shortest_path_weighted_with_cost(&t, &[1.0, 1.0, 5.0], 0, 3, Direction::Out).unwrap();
+        assert_eq!(path, vec![0, 1, 3]);
+        // Cumulative cost to each node on the route: source 0.0, then 1.0, then 2.0.
+        assert_eq!(costs, vec![0.0, 1.0, 2.0]);
+        // source == target: single node, zero cost.
+        assert_eq!(
+            shortest_path_weighted_with_cost(&t, &[1.0, 1.0, 5.0], 0, 0, Direction::Out),
+            Some((vec![0], vec![0.0]))
+        );
+        // A parallel cheaper edge is honored: add a second 0->3 at cost 0.5.
+        let t2 = Topology::build(4, vec![0, 1, 0, 0], vec![1, 3, 3, 3]);
+        let (p2, c2) =
+            shortest_path_weighted_with_cost(&t2, &[1.0, 1.0, 5.0, 0.5], 0, 3, Direction::Out)
+                .unwrap();
+        assert_eq!(p2, vec![0, 3]);
+        assert_eq!(c2, vec![0.0, 0.5]);
     }
 }

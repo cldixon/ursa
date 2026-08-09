@@ -83,8 +83,14 @@ jobs:
           python -m pip install pyarrow
           python -m pip install dist/*.whl
           python - <<'PY'
+          import os
           import ursa as ur, pyarrow as pa
           assert ur._NATIVE_AVAILABLE, "native extension did not load"
+          # PEP 561: the installed package must carry the py.typed marker, else
+          # downstream type-checkers ignore the shipped stubs and treat ursa as
+          # untyped. Assert it survived packaging into the wheel.
+          pkg_dir = os.path.dirname(ur.__file__)
+          assert os.path.exists(os.path.join(pkg_dir, "py.typed")), "py.typed missing from installed wheel"
           edges = ur.from_arrow(pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 2, 0]}), src="s", dst="d")
           rows = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
           assert abs(sum(rows.values()) - 1.0) < 1e-6, rows
@@ -124,8 +130,14 @@ jobs:
           python -m pip install pyarrow
           python -m pip install dist/*.whl
           python - <<'PY'
+          import os
           import ursa as ur, pyarrow as pa
           assert ur._NATIVE_AVAILABLE, "native extension did not load"
+          # PEP 561: the installed package must carry the py.typed marker, else
+          # downstream type-checkers ignore the shipped stubs and treat ursa as
+          # untyped. Assert it survived packaging into the wheel.
+          pkg_dir = os.path.dirname(ur.__file__)
+          assert os.path.exists(os.path.join(pkg_dir, "py.typed")), "py.typed missing from installed wheel"
           edges = ur.from_arrow(pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 2, 0]}), src="s", dst="d")
           rows = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
           assert abs(sum(rows.values()) - 1.0) < 1e-6, rows
@@ -158,8 +170,14 @@ jobs:
           python -m pip install pyarrow
           python -m pip install dist/*.whl
           python - <<'PY'
+          import os
           import ursa as ur, pyarrow as pa
           assert ur._NATIVE_AVAILABLE, "native extension did not load"
+          # PEP 561: the installed package must carry the py.typed marker, else
+          # downstream type-checkers ignore the shipped stubs and treat ursa as
+          # untyped. Assert it survived packaging into the wheel.
+          pkg_dir = os.path.dirname(ur.__file__)
+          assert os.path.exists(os.path.join(pkg_dir, "py.typed")), "py.typed missing from installed wheel"
           edges = ur.from_arrow(pa.table({"s": [0, 0, 1, 2], "d": [1, 2, 2, 0]}), src="s", dst="d")
           rows = {r["id"]: r["pagerank"] for r in ur.pagerank(edges).collect().to_dicts()}
           assert abs(sum(rows.values()) - 1.0) < 1e-6, rows
@@ -195,8 +213,12 @@ jobs:
           python -m pip install pyarrow
           python -m pip install dist/*.tar.gz
           python - <<'PY'
+          import os
           import ursa as ur, pyarrow as pa
           assert ur._NATIVE_AVAILABLE, "native extension did not load from sdist"
+          # PEP 561 marker must survive the sdist -> build path too (source installs).
+          pkg_dir = os.path.dirname(ur.__file__)
+          assert os.path.exists(os.path.join(pkg_dir, "py.typed")), "py.typed missing from sdist install"
           edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 0]}), src="s", dst="d")
           print("sdist smoke OK", ur.__version__, ur.degree(edges).collect().to_dicts())
           PY

@@ -146,7 +146,7 @@ class _Hop:
         # so the frame advertises those names — a tail filter references ``src``/
         # ``dst``, matching what it actually gets. (The parent's role names aren't
         # carried through a traversal.)
-        return EdgeFrame(src_col="src", dst_col="dst", plan=(step,))
+        return EdgeFrame._construct(src_col="src", dst_col="dst", plan=(step,))
 
     def collect(self):
         return self._materialize().collect()
@@ -167,10 +167,13 @@ def shortest_path(
     weight: Expr | None = None,
     direction: str = "out",
 ) -> EdgeFrame:
-    """Single-pair shortest path. Returns an EdgeFrame ``(src, dst, hop)``: one row
-    per edge on the path, in order, with ``hop`` the 0-based position. ``weight``
+    """Single-pair shortest path. Returns an EdgeFrame ``(src, dst, hop, cost)``: one
+    row per edge on the path, in order, with ``hop`` the 0-based position and ``cost``
+    the cumulative path cost from ``source`` to that edge's destination. ``weight``
     selects minimum-cost (Dijkstra) over the edge-weight expression; omit it for
-    unweighted BFS. (The per-edge cost is not yet returned as a column.)"""
+    unweighted BFS. For a weighted path ``cost`` is the summed edge weight (so the
+    final row's ``cost`` is the total path cost); for an unweighted path it is the
+    hop count (``hop + 1``), kept for schema uniformity."""
     step = _PlanStep(
         "shortest_path",
         {
@@ -183,7 +186,7 @@ def shortest_path(
     )
     # Result columns are literal ``src``/``dst`` (one row per edge on the path);
     # advertise those names so a tail filter matches (see _Hop._materialize).
-    return EdgeFrame(src_col="src", dst_col="dst", plan=(step,))
+    return EdgeFrame._construct(src_col="src", dst_col="dst", plan=(step,))
 
 
 def random_walk(
@@ -205,7 +208,7 @@ def random_walk(
             "edges": edges,
         },
     )
-    return NodeFrame(id_col="node", plan=(step,))
+    return NodeFrame._construct(id_col="node", plan=(step,))
 
 
 # --- node-valued algorithms (dual-positioned) ------------------------------
@@ -228,7 +231,13 @@ def pagerank(
 
 
 def connected_components(edges: EdgeFrame, mode: str = "weak") -> GraphExpr:
-    """Connected components. ``mode='weak'`` for v0.1 (``'strong'`` later)."""
+    """Connected components, one integer component label per node.
+
+    ``mode='weak'`` (default) treats edges as undirected: two nodes share a label if
+    a path connects them ignoring direction. ``mode='strong'`` returns strongly
+    connected components: two nodes share a label only if each is reachable from the
+    other following edge direction. Labels are arbitrary but stable ids (group nodes
+    by label to get the components)."""
     return _graph_expr("connected_components", edges=edges, mode=mode)
 
 

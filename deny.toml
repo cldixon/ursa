@@ -1,0 +1,66 @@
+# cargo-deny configuration — supply-chain gate for the Rust dependency tree
+# (advisories + licenses + sources). Run in CI by .github/workflows/audit.yml on
+# every PR/push and weekly, so a new RUSTSEC advisory against an unchanged
+# Cargo.lock is caught between releases.
+
+[advisories]
+# Fail on any RUSTSEC advisory (vulnerability / unmaintained / unsound) or yanked
+# crate in Cargo.lock. The ignore list below waives only *pre-existing transitive*
+# advisories that we cannot act on today — every one is pulled by the
+# DataFusion → arrow → object_store → pyo3 chain, whose versions are cross-pinned
+# (the workspace pins `pyo3 = "0.28"`, the newest that arrow-pyarrow 58 builds
+# against; pyo3 0.29 — which patches the two pyo3 advisories below — requires
+# arrow-pyarrow 59, only reachable via DataFusion 55, not yet released), so
+# clearing them requires a coordinated DataFusion/arrow/pyo3 upgrade tracked
+# separately, not a change we can make in isolation. `cargo update` confirms no
+# in-semver patched version is reachable. Nothing first-party is waived, and any
+# NEW advisory in a crate we control still fails the gate.
+version = 2
+ignore = [
+    # pyo3 0.28.3 — pinned by arrow-pyarrow 58; patched only in pyo3 0.29 (blocked
+    # upstream, see above). Neither affected API is reached by ursa-py, which only
+    # crosses the Arrow C data interface (PyCapsule) — no PyCFunction closures and
+    # no PyList/PyTuple iterator `nth`/`nth_back`.
+    { id = "RUSTSEC-2026-0176", reason = "pyo3 pinned by arrow-pyarrow; PyList/PyTuple nth OOB read not reached (Arrow FFI only)" },
+    { id = "RUSTSEC-2026-0177", reason = "pyo3 pinned by arrow-pyarrow; PyCFunction::new_closure not used" },
+    # quick-xml 0.37.5 — transitive via object_store's Azure XML path (DoS only,
+    # and only on the cloud object-store code path); no in-semver fix available.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store (Azure); no compatible fix yet" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store (Azure); no compatible fix yet" },
+    # Unmaintained transitive crate with no available replacement version.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled transitively by pyo3/datafusion, no fork/fix" },
+]
+
+[licenses]
+# Allow-list is exactly the SPDX identifiers present in the current tree (every
+# `A OR B` expression resolves to one of these). Anything outside this set fails
+# the build, so a new dependency with an unvetted license is a conscious decision.
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # Permissive compression/hasher backends pulled transitively by parquet/
+    # DataFusion's codecs and hashbrown: zlib-rs + miniz_oxide (Zlib), libbz2-rs-sys
+    # (bzip2-1.0.6), foldhash (Zlib). Both are OSI/FSF-approved permissive licenses.
+    "Zlib",
+    "bzip2-1.0.6",
+]
+
+[bans]
+# A large transitive tree (DataFusion / Arrow) legitimately pulls duplicate
+# versions of some crates; flag them for visibility but don't fail the build.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io (and any explicitly allowed git sources) — an unknown registry or
+# git source is a supply-chain red flag.
+unknown-registry = "deny"
+unknown-git = "deny"
