@@ -22,12 +22,18 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use super::rng::{shuffled_order, DEFAULT_SEED};
-use crate::topology::Topology;
+use crate::topology::{EdgeMask, Topology};
 
 /// Community label per node (contiguous `0..k`). Deterministic given `seed`
 /// (defaulting to a fixed seed when `None`, so an unseeded run is reproducible).
-pub fn louvain(topo: &Topology, resolution: f64, seed: Option<u64>) -> Vec<u32> {
-    louvain_impl(topo, None, resolution, seed)
+/// A subgraph `mask` restricts the working graph to kept edges only.
+pub fn louvain(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    resolution: f64,
+    seed: Option<u64>,
+) -> Vec<u32> {
+    louvain_impl(topo, None, mask, resolution, seed)
 }
 
 /// Weighted Louvain: as [`louvain`], but edge weights come from `weights` (per
@@ -35,6 +41,7 @@ pub fn louvain(topo: &Topology, resolution: f64, seed: Option<u64>) -> Vec<u32> 
 pub fn louvain_weighted(
     topo: &Topology,
     weights: &[f64],
+    mask: Option<&EdgeMask>,
     resolution: f64,
     seed: Option<u64>,
 ) -> Vec<u32> {
@@ -43,12 +50,13 @@ pub fn louvain_weighted(
         topo.n_edges(),
         "weights length must equal the edge count"
     );
-    louvain_impl(topo, Some(weights), resolution, seed)
+    louvain_impl(topo, Some(weights), mask, resolution, seed)
 }
 
 fn louvain_impl(
     topo: &Topology,
     weights: Option<&[f64]>,
+    mask: Option<&EdgeMask>,
     resolution: f64,
     seed: Option<u64>,
 ) -> Vec<u32> {
@@ -62,7 +70,7 @@ fn louvain_impl(
     }
 
     let seed = seed.unwrap_or(DEFAULT_SEED);
-    let mut graph = Graph::from_topology(topo, weights);
+    let mut graph = Graph::from_topology(topo, weights, mask);
     // Community of each *original* node, expressed in the current graph's node
     // space; updated (composed) at every level.
     let mut node_comm: Vec<u32> = (0..n as u32).collect();
@@ -179,16 +187,19 @@ impl Graph {
     /// the former `HashMap`-iteration order; `one_level` already sorts candidate
     /// communities and requires a strict epsilon improvement (see there), so the
     /// partition is unaffected.
-    fn from_topology(topo: &Topology, weights: Option<&[f64]>) -> Graph {
+    fn from_topology(topo: &Topology, weights: Option<&[f64]>, mask: Option<&EdgeMask>) -> Graph {
         let n = topo.n_nodes();
         let out = topo.out();
         let mut self_loop = vec![0.0f64; n];
+        // Under a subgraph mask, only kept edges enter the working graph. The
+        // histogram and scatter below share this predicate so segment sizes match.
+        let keep = |e: u32| mask.is_none_or(|m| m.keep(e));
 
         // Degree histogram: every non-self edge contributes to both endpoints.
         let mut offsets = vec![0u64; n + 1];
         for u in 0..n as u32 {
-            for &v in out.neighbors(u) {
-                if u != v {
+            for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                if keep(e) && u != v {
                     offsets[u as usize + 1] += 1;
                     offsets[v as usize + 1] += 1;
                 }
@@ -205,6 +216,9 @@ impl Graph {
         let mut cursor: Vec<u64> = offsets[..n].to_vec();
         for u in 0..n as u32 {
             for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                if !keep(e) {
+                    continue;
+                }
                 let w = weights.map_or(1.0, |ws| ws[e as usize]);
                 if u == v {
                     self_loop[u as usize] += w;
@@ -329,7 +343,7 @@ mod tests {
     #[test]
     fn recovers_two_communities() {
         let t = two_cliques();
-        let comm = louvain(&t, 1.0, Some(1));
+        let comm = louvain(&t, None, 1.0, Some(1));
         assert!(comm[0] == comm[1] && comm[1] == comm[2] && comm[2] == comm[3]);
         assert!(comm[4] == comm[5] && comm[5] == comm[6] && comm[6] == comm[7]);
         assert_ne!(comm[0], comm[4]);
@@ -341,19 +355,22 @@ mod tests {
     #[test]
     fn deterministic_given_a_seed() {
         let t = two_cliques();
-        assert_eq!(louvain(&t, 1.0, Some(5)), louvain(&t, 1.0, Some(5)));
+        assert_eq!(
+            louvain(&t, None, 1.0, Some(5)),
+            louvain(&t, None, 1.0, Some(5))
+        );
     }
 
     #[test]
     fn no_edges_is_all_singletons() {
         let t = Topology::build(3, vec![], vec![]);
-        assert_eq!(louvain(&t, 1.0, None), vec![0, 1, 2]);
+        assert_eq!(louvain(&t, None, 1.0, None), vec![0, 1, 2]);
     }
 
     #[test]
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
-        assert!(louvain(&t, 1.0, None).is_empty());
+        assert!(louvain(&t, None, 1.0, None).is_empty());
     }
 
     #[test]
@@ -362,8 +379,8 @@ mod tests {
         let t = two_cliques();
         let ones = vec![1.0; t.n_edges()];
         assert_eq!(
-            louvain_weighted(&t, &ones, 1.0, Some(1)),
-            louvain(&t, 1.0, Some(1))
+            louvain_weighted(&t, &ones, None, 1.0, Some(1)),
+            louvain(&t, None, 1.0, Some(1))
         );
     }
 
@@ -376,7 +393,7 @@ mod tests {
         let dst = vec![1, 2, 0, 4, 5, 3, 3];
         let t = Topology::build(6, src, dst);
         let heavy_bridge = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0];
-        let comm = louvain_weighted(&t, &heavy_bridge, 1.0, Some(1));
+        let comm = louvain_weighted(&t, &heavy_bridge, None, 1.0, Some(1));
         assert_eq!(comm[2], comm[3], "a heavy bridge binds its endpoints");
     }
 }

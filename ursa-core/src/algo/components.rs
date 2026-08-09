@@ -9,7 +9,7 @@
 //! are mutually reachable, computed by iterative Tarjan (an explicit DFS stack, so
 //! deep graphs don't overflow the native call stack).
 
-use crate::topology::Topology;
+use crate::topology::{EdgeMask, Topology};
 
 struct DisjointSet {
     parent: Vec<u32>,
@@ -55,13 +55,25 @@ impl DisjointSet {
 /// Weak connected component label per node, dense-indexed. Labels are the dense
 /// index of each component's representative (not necessarily contiguous `0..k`);
 /// callers that want canonical small ids can densify the output.
-pub fn connected_components_weak(topo: &Topology) -> Vec<u32> {
+pub fn connected_components_weak(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
     let n = topo.n_nodes();
     let mut ds = DisjointSet::new(n);
     let out = topo.out();
     for u in 0..n as u32 {
-        for &v in out.neighbors(u) {
-            ds.union(u, v);
+        match mask {
+            None => {
+                for &v in out.neighbors(u) {
+                    ds.union(u, v);
+                }
+            }
+            // Subgraph: only kept edges connect their endpoints.
+            Some(m) => {
+                for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                    if m.keep(e) {
+                        ds.union(u, v);
+                    }
+                }
+            }
         }
     }
     (0..n as u32).map(|u| ds.find(u)).collect()
@@ -73,7 +85,7 @@ pub fn connected_components_weak(topo: &Topology) -> Vec<u32> {
 /// label iff each is reachable from the other. Labels are the dense index of each
 /// SCC's Tarjan root: an arbitrary but stable representative, matching the
 /// weak-component labeling convention. `O(n + m)`.
-pub fn connected_components_strong(topo: &Topology) -> Vec<u32> {
+pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
     const UNVISITED: i64 = -1;
 
     let n = topo.n_nodes();
@@ -108,6 +120,10 @@ pub fn connected_components_strong(topo: &Topology) -> Vec<u32> {
             if cursor < neighbors.len() {
                 let w = neighbors[cursor];
                 call_stack.last_mut().unwrap().1 = cursor + 1;
+                // Subgraph: an edge masked out is not traversed (advance past it).
+                if mask.is_some_and(|m| !m.keep(out.edge_ids(v)[cursor])) {
+                    continue;
+                }
                 if index[w as usize] == UNVISITED {
                     call_stack.push((w, 0)); // descend into w
                 } else if on_stack[w as usize] {
@@ -145,7 +161,7 @@ mod tests {
     fn two_components() {
         // {0,1,2} connected; {3,4} connected; edges directed but weak conn.
         let t = Topology::build(5, vec![0, 1, 3], vec![1, 2, 4]);
-        let cc = connected_components_weak(&t);
+        let cc = connected_components_weak(&t, None);
         assert_eq!(cc[0], cc[1]);
         assert_eq!(cc[1], cc[2]);
         assert_eq!(cc[3], cc[4]);
@@ -157,7 +173,7 @@ mod tests {
         // SCCs: {0,1,2} (a 3-cycle), {3,4} (a 2-cycle), {5} (isolated).
         // 2->3 links the first two but only one way, so they stay distinct.
         let t = Topology::build(6, vec![0, 1, 2, 2, 3, 4], vec![1, 2, 0, 3, 4, 3]);
-        let scc = connected_components_strong(&t);
+        let scc = connected_components_strong(&t, None);
         assert_eq!(scc[0], scc[1]);
         assert_eq!(scc[1], scc[2]);
         assert_eq!(scc[3], scc[4]);
@@ -171,10 +187,10 @@ mod tests {
     fn strong_differs_from_weak_on_a_directed_chain() {
         // 0->1->2: weakly one component, but strongly three singletons (no cycle).
         let t = Topology::build(3, vec![0, 1], vec![1, 2]);
-        let weak = connected_components_weak(&t);
+        let weak = connected_components_weak(&t, None);
         assert_eq!(weak[0], weak[1]);
         assert_eq!(weak[1], weak[2]);
-        let strong = connected_components_strong(&t);
+        let strong = connected_components_strong(&t, None);
         assert_ne!(strong[0], strong[1]);
         assert_ne!(strong[1], strong[2]);
         assert_ne!(strong[0], strong[2]);

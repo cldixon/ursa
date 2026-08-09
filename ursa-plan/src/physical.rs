@@ -103,7 +103,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
 
         // CPU-bound (Rayon-parallel inside) — keep it off the tokio worker.
         let fut = async move {
-            tokio::task::spawn_blocking(move || query_batch(&topo, &ids, &columns))
+            tokio::task::spawn_blocking(move || query_batch(&topo, &ids, &columns, None))
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))?
         };

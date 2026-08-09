@@ -19,7 +19,7 @@ use ursa_core::algo::{
     louvain, louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, random_walk,
     shortest_path, shortest_path_weighted_with_cost, triangle_count, AggKind, PageRankParams,
 };
-use ursa_core::{Direction, IdMap, Topology};
+use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
 use crate::logical::GraphAlgo;
 
@@ -62,10 +62,10 @@ impl OutputColumn {
         }
     }
 
-    fn value_array(&self, topo: &Topology) -> ArrayRef {
+    fn value_array(&self, topo: &Topology, mask: Option<&EdgeMask>) -> ArrayRef {
         match self {
             OutputColumn::Algo { algo, weights, .. } => {
-                algo_array(topo, algo, weights.as_deref().map(Vec::as_slice))
+                algo_array(topo, algo, weights.as_deref().map(Vec::as_slice), mask)
             }
             OutputColumn::NeighborAgg {
                 attr,
@@ -73,16 +73,21 @@ impl OutputColumn {
                 agg,
                 ..
             } => Arc::new(Float64Array::from(neighbor_aggregate(
-                topo, attr, *direction, *agg,
+                topo, attr, mask, *direction, *agg,
             ))),
         }
     }
 }
 
-fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> ArrayRef {
+fn algo_array(
+    topo: &Topology,
+    algo: &GraphAlgo,
+    weights: Option<&[f64]>,
+    mask: Option<&EdgeMask>,
+) -> ArrayRef {
     match algo {
         GraphAlgo::Degree { direction } => {
-            Arc::new(UInt32Array::from(degree(topo, None, (*direction).into())))
+            Arc::new(UInt32Array::from(degree(topo, mask, (*direction).into())))
         }
         GraphAlgo::PageRank {
             damping,
@@ -95,44 +100,44 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> Arr
                 tol: *tol,
             };
             let scores = match weights {
-                Some(w) => pagerank_weighted(topo, w, None, params),
-                None => pagerank(topo, None, params),
+                Some(w) => pagerank_weighted(topo, w, mask, params),
+                None => pagerank(topo, mask, params),
             };
             Arc::new(Float64Array::from(scores))
         }
         GraphAlgo::ConnectedComponents { strong } => {
             let labels = if *strong {
-                connected_components_strong(topo)
+                connected_components_strong(topo, mask)
             } else {
-                connected_components_weak(topo)
+                connected_components_weak(topo, mask)
             };
             Arc::new(UInt32Array::from(labels))
         }
-        GraphAlgo::TriangleCount => Arc::new(UInt32Array::from(triangle_count(topo))),
+        GraphAlgo::TriangleCount => Arc::new(UInt32Array::from(triangle_count(topo, mask))),
         GraphAlgo::ClusteringCoefficient => {
-            Arc::new(Float64Array::from(clustering_coefficient(topo)))
+            Arc::new(Float64Array::from(clustering_coefficient(topo, mask)))
         }
         GraphAlgo::Closeness => {
             let scores = match weights {
-                Some(w) => closeness_weighted(topo, w, None),
-                None => closeness(topo, None),
+                Some(w) => closeness_weighted(topo, w, mask),
+                None => closeness(topo, mask),
             };
             Arc::new(Float64Array::from(scores))
         }
         GraphAlgo::Betweenness { sample, seed } => {
             let scores = match weights {
-                Some(w) => betweenness_weighted(topo, w, *sample, *seed),
-                None => betweenness(topo, *sample, *seed),
+                Some(w) => betweenness_weighted(topo, w, mask, *sample, *seed),
+                None => betweenness(topo, mask, *sample, *seed),
             };
             Arc::new(Float64Array::from(scores))
         }
-        GraphAlgo::LabelPropagation { max_iter, seed } => {
-            Arc::new(UInt32Array::from(label_propagation(topo, *max_iter, *seed)))
-        }
+        GraphAlgo::LabelPropagation { max_iter, seed } => Arc::new(UInt32Array::from(
+            label_propagation(topo, mask, *max_iter, *seed),
+        )),
         GraphAlgo::Louvain { resolution, seed } => {
             let labels = match weights {
-                Some(w) => louvain_weighted(topo, w, *resolution, *seed),
-                None => louvain(topo, *resolution, *seed),
+                Some(w) => louvain_weighted(topo, w, mask, *resolution, *seed),
+                None => louvain(topo, mask, *resolution, *seed),
             };
             Arc::new(UInt32Array::from(labels))
         }
@@ -157,10 +162,15 @@ pub fn query_schema(columns: &[OutputColumn], id_type: DataType) -> SchemaRef {
 /// to succeed; it returns `Result` rather than `expect`-panicking so a future
 /// column-length regression surfaces as a catchable engine error, not a process
 /// abort across the FFI.
-pub fn query_batch(topo: &Topology, ids: &IdMap, columns: &[OutputColumn]) -> Result<RecordBatch> {
+pub fn query_batch(
+    topo: &Topology,
+    ids: &IdMap,
+    columns: &[OutputColumn],
+    mask: Option<&EdgeMask>,
+) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = vec![ids.user_id_array()];
     for col in columns {
-        arrays.push(col.value_array(topo));
+        arrays.push(col.value_array(topo, mask));
     }
     RecordBatch::try_new(query_schema(columns, ids.user_type()), arrays)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -328,7 +338,7 @@ mod tests {
                 weights: None,
             },
         ];
-        let batch = query_batch(&topo, &ids, &columns).unwrap();
+        let batch = query_batch(&topo, &ids, &columns, None).unwrap();
         assert_eq!(batch.num_columns(), 3); // id, deg, pr
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema().field(1).name(), "deg");

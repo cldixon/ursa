@@ -17,7 +17,7 @@
 
 use rayon::prelude::*;
 
-use crate::topology::{Topology, UndirectedCsr};
+use crate::topology::{EdgeMask, Topology, UndirectedCsr};
 
 /// Count of elements common to two sorted, deduplicated `u32` slices.
 fn intersection_count(a: &[u32], b: &[u32]) -> u32 {
@@ -54,12 +54,17 @@ pub(crate) fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
         .collect()
 }
 
-/// Per-node triangle count, dense-indexed.
-pub fn triangle_count(topo: &Topology) -> Vec<u32> {
+/// Per-node triangle count, dense-indexed. A subgraph `mask` restricts triangles
+/// to kept edges — computed over the masked undirected view (built per subgraph;
+/// no CSR/id rebuild).
+pub fn triangle_count(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
     if topo.n_nodes() == 0 {
         return Vec::new();
     }
-    per_node_triangles(topo.undirected())
+    match mask {
+        None => per_node_triangles(topo.undirected()),
+        Some(m) => per_node_triangles(&topo.undirected_masked(m)),
+    }
 }
 
 #[cfg(test)]
@@ -70,14 +75,14 @@ mod tests {
     fn single_triangle_counts_once_per_node() {
         // 0->1, 0->2, 1->2, 2->0  (undirected: the triangle 0-1-2)
         let t = Topology::build(3, vec![0, 0, 1, 2], vec![1, 2, 2, 0]);
-        assert_eq!(triangle_count(&t), vec![1, 1, 1]);
+        assert_eq!(triangle_count(&t, None), vec![1, 1, 1]);
     }
 
     #[test]
     fn path_has_no_triangles() {
         // 0->1->2 : no triangle
         let t = Topology::build(3, vec![0, 1], vec![1, 2]);
-        assert_eq!(triangle_count(&t), vec![0, 0, 0]);
+        assert_eq!(triangle_count(&t, None), vec![0, 0, 0]);
     }
 
     #[test]
@@ -86,7 +91,7 @@ mod tests {
         let src = vec![0, 0, 0, 1, 1, 2];
         let dst = vec![1, 2, 3, 2, 3, 3];
         let t = Topology::build(4, src, dst);
-        assert_eq!(triangle_count(&t), vec![3, 3, 3, 3]);
+        assert_eq!(triangle_count(&t, None), vec![3, 3, 3, 3]);
     }
 
     #[test]
@@ -95,6 +100,6 @@ mod tests {
         let src = vec![0, 0, 1, 2, 0, 0];
         let dst = vec![1, 2, 2, 0, 0, 1];
         let t = Topology::build(3, src, dst);
-        assert_eq!(triangle_count(&t), vec![1, 1, 1]);
+        assert_eq!(triangle_count(&t, None), vec![1, 1, 1]);
     }
 }

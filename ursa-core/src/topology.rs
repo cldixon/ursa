@@ -94,10 +94,9 @@ impl EdgeMask {
         );
         let mut words = vec![0u64; self.words.len()];
         let mut n_kept = 0usize;
-        for i in 0..words.len() {
-            let w = self.words[i] & other.words[i];
-            words[i] = w;
-            n_kept += w.count_ones() as usize;
+        for ((out, &a), &b) in words.iter_mut().zip(&self.words).zip(&other.words) {
+            *out = a & b;
+            n_kept += out.count_ones() as usize;
         }
         EdgeMask {
             words,
