@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://ursa-docs.cl-dixon.workers.dev/sitemap-index.xml
