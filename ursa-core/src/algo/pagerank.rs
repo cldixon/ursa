@@ -15,7 +15,7 @@
 
 use rayon::prelude::*;
 
-use crate::topology::Topology;
+use crate::topology::{EdgeMask, Topology};
 
 /// PageRank parameters, mirroring `ur.pagerank(...)`.
 #[derive(Debug, Clone, Copy)]
@@ -95,15 +95,22 @@ fn power_iterate(
 
 /// Dense PageRank vector; `result[u]` is the score of dense node `u`. Scores sum
 /// to ~1.0 (up to dangling redistribution and early convergence).
-pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
+pub fn pagerank(topo: &Topology, mask: Option<&EdgeMask>, params: PageRankParams) -> Vec<f64> {
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();
     }
 
-    // Precompute out-degrees (rank is divided by them when pushed forward).
+    // Precompute out-degrees (rank is divided by them when pushed forward). Under a
+    // subgraph mask, a node's out-degree counts only its *kept* out-edges — rank
+    // splits among the edges present in the subgraph.
     let out = topo.out();
-    let out_deg: Vec<u32> = (0..n as u32).map(|u| out.degree(u)).collect();
+    let out_deg: Vec<u32> = match mask {
+        None => (0..n as u32).map(|u| out.degree(u)).collect(),
+        Some(m) => (0..n as u32)
+            .map(|u| out.edge_ids(u).iter().filter(|&&e| m.keep(e)).count() as u32)
+            .collect(),
+    };
     let inc = topo.incoming();
 
     // Dangling nodes (out-degree 0), listed once — O(#dangling) rather than an O(n)
@@ -112,11 +119,28 @@ pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
 
     power_iterate(n, params, &dangling_nodes, |u, rank| {
         let mut acc = 0.0;
-        for &v in inc.neighbors(u as u32) {
-            // v is an in-neighbour of u; it contributes rank[v] / outdeg[v].
-            let od = out_deg[v as usize];
-            if od > 0 {
-                acc += rank[v as usize] / od as f64;
+        match mask {
+            // Fast path: unmasked full-graph pull (byte-identical to the original).
+            None => {
+                for &v in inc.neighbors(u as u32) {
+                    // v is an in-neighbour of u; it contributes rank[v] / outdeg[v].
+                    let od = out_deg[v as usize];
+                    if od > 0 {
+                        acc += rank[v as usize] / od as f64;
+                    }
+                }
+            }
+            // Subgraph pull: skip in-edges whose original row is masked out.
+            Some(m) => {
+                for (&v, &e) in inc.neighbors(u as u32).iter().zip(inc.edge_ids(u as u32)) {
+                    if !m.keep(e) {
+                        continue;
+                    }
+                    let od = out_deg[v as usize];
+                    if od > 0 {
+                        acc += rank[v as usize] / od as f64;
+                    }
+                }
             }
         }
         acc
@@ -132,7 +156,12 @@ pub fn pagerank(topo: &Topology, params: PageRankParams) -> Vec<f64> {
 ///
 /// `weights[e]` is the weight of original edge row `e`; `weights.len()` must equal
 /// `topo.n_edges()`. Weights are gathered per CSR slot via `Adjacency::edge_ids`.
-pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParams) -> Vec<f64> {
+pub fn pagerank_weighted(
+    topo: &Topology,
+    weights: &[f64],
+    mask: Option<&EdgeMask>,
+    params: PageRankParams,
+) -> Vec<f64> {
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();
@@ -143,10 +172,17 @@ pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParam
         "weights length must equal the edge count"
     );
 
-    // Precompute weighted out-strength: the total outgoing weight of each node.
+    // Precompute weighted out-strength: the total outgoing weight of each node. Under
+    // a mask, only kept out-edges contribute to the strength.
     let out = topo.out();
     let out_str: Vec<f64> = (0..n as u32)
-        .map(|v| out.edge_ids(v).iter().map(|&e| weights[e as usize]).sum())
+        .map(|v| {
+            out.edge_ids(v)
+                .iter()
+                .filter(|&&e| mask.is_none_or(|m| m.keep(e)))
+                .map(|&e| weights[e as usize])
+                .sum()
+        })
         .collect();
     let inc = topo.incoming();
 
@@ -159,6 +195,9 @@ pub fn pagerank_weighted(topo: &Topology, weights: &[f64], params: PageRankParam
         let nbrs = inc.neighbors(u as u32);
         let edges = inc.edge_ids(u as u32);
         for (&v, &e) in nbrs.iter().zip(edges) {
+            if !mask.is_none_or(|m| m.keep(e)) {
+                continue;
+            }
             let os = out_str[v as usize];
             if os > 0.0 {
                 acc += weights[e as usize] * rank[v as usize] / os;
@@ -176,7 +215,7 @@ mod tests {
     fn scores_sum_to_one_and_rank_hub_highest() {
         // A small graph where node 2 is a sink hub: 0->2, 1->2, 3->2, 2->0
         let t = Topology::build(4, vec![0, 1, 3, 2], vec![2, 2, 2, 0]);
-        let pr = pagerank(&t, PageRankParams::default());
+        let pr = pagerank(&t, None, PageRankParams::default());
         let sum: f64 = pr.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "sum was {sum}");
         // The hub everyone points at should outrank every other node.
@@ -187,7 +226,7 @@ mod tests {
     #[test]
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
-        assert!(pagerank(&t, PageRankParams::default()).is_empty());
+        assert!(pagerank(&t, None, PageRankParams::default()).is_empty());
     }
 
     #[test]
@@ -196,14 +235,15 @@ mod tests {
         // pointing back at 0 so mass recirculates. Weighting the 0->2 edge far
         // heavier should make node 2 outrank node 1.
         let t = Topology::build(3, vec![0, 0, 1, 2], vec![1, 2, 0, 0]);
-        let uniform = pagerank_weighted(&t, &[1.0, 1.0, 1.0, 1.0], PageRankParams::default());
+        let uniform = pagerank_weighted(&t, &[1.0, 1.0, 1.0, 1.0], None, PageRankParams::default());
         assert!(
             (uniform[1] - uniform[2]).abs() < 1e-9,
             "uniform ties 1 and 2"
         );
 
         // rows: 0=(0->1), 1=(0->2), 2=(1->0), 3=(2->0). Make 0->2 heavy.
-        let weighted = pagerank_weighted(&t, &[1.0, 9.0, 1.0, 1.0], PageRankParams::default());
+        let weighted =
+            pagerank_weighted(&t, &[1.0, 9.0, 1.0, 1.0], None, PageRankParams::default());
         assert!(weighted[2] > weighted[1], "heavier 0->2 lifts node 2");
         let sum: f64 = weighted.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "sum was {sum}");
@@ -213,7 +253,7 @@ mod tests {
     fn zero_weight_out_edges_are_dangling() {
         // 0 -> 1 with weight 0 makes node 0 effectively dangling (no out-strength).
         let t = Topology::build(2, vec![0], vec![1]);
-        let pr = pagerank_weighted(&t, &[0.0], PageRankParams::default());
+        let pr = pagerank_weighted(&t, &[0.0], None, PageRankParams::default());
         let sum: f64 = pr.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "sum was {sum}");
     }

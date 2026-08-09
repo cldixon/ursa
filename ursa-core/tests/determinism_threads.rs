@@ -55,10 +55,10 @@ fn pagerank_is_thread_count_independent() {
         max_iter: 100,
         tol: 1e-12,
     };
-    let reference = on_pool(1, || pagerank(&t, params));
+    let reference = on_pool(1, || pagerank(&t, None, params));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || pagerank(&t, params)),
+            on_pool(threads, || pagerank(&t, None, params)),
             reference,
             "pagerank diverged at {threads} threads"
         );

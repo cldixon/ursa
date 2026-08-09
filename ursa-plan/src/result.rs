@@ -82,7 +82,7 @@ impl OutputColumn {
 fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> ArrayRef {
     match algo {
         GraphAlgo::Degree { direction } => {
-            Arc::new(UInt32Array::from(degree(topo, (*direction).into())))
+            Arc::new(UInt32Array::from(degree(topo, None, (*direction).into())))
         }
         GraphAlgo::PageRank {
             damping,
@@ -95,8 +95,8 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> Arr
                 tol: *tol,
             };
             let scores = match weights {
-                Some(w) => pagerank_weighted(topo, w, params),
-                None => pagerank(topo, params),
+                Some(w) => pagerank_weighted(topo, w, None, params),
+                None => pagerank(topo, None, params),
             };
             Arc::new(Float64Array::from(scores))
         }
@@ -114,8 +114,8 @@ fn algo_array(topo: &Topology, algo: &GraphAlgo, weights: Option<&[f64]>) -> Arr
         }
         GraphAlgo::Closeness => {
             let scores = match weights {
-                Some(w) => closeness_weighted(topo, w),
-                None => closeness(topo),
+                Some(w) => closeness_weighted(topo, w, None),
+                None => closeness(topo, None),
             };
             Arc::new(Float64Array::from(scores))
         }
