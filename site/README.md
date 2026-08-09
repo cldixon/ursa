@@ -18,7 +18,7 @@ bun run preview:worker   # the production build, served by a local workerd
 ## Deploying
 
 The site deploys to a Cloudflare Worker — `ursa-docs`, live at
-<https://ursa-docs.cl-dixon.workers.dev> — as static assets. Workers rather than Pages:
+<https://ursa.cldixon.dev> — as static assets. Workers rather than Pages:
 Cloudflare now points new projects at Workers, and Static Assets is the supported way to host a
 build output there.
 
@@ -48,11 +48,12 @@ docs PR builds from a clean checkout independent of the Cloudflare account.
 bun run deploy   # build, then wrangler deploy (needs `wrangler login`)
 ```
 
-If the worker moves to a custom domain, set `SITE_URL` so canonical tags and the sitemap point at
-it — as an override locally, or as a build variable in Workers Builds:
+The custom domain is one line in `wrangler.jsonc` (`routes` with `custom_domain: true`) —
+Cloudflare provisions the DNS record and certificate on deploy. Canonical tags and the sitemap
+default to that domain; `SITE_URL` overrides them if the host ever changes:
 
 ```bash
-SITE_URL=https://ursa.example.com bun run deploy
+SITE_URL=https://elsewhere.example.com bun run deploy
 ```
 
 ## Layout

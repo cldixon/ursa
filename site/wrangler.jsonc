@@ -22,6 +22,15 @@
   // a stable per-branch alias, posted to the PR as a comment.
   "preview_urls": true,
 
+  // The site's home. A Custom Domain (not a route): Cloudflare creates the DNS
+  // record and certificate itself, so this line is the whole setup.
+  "routes": [{ "pattern": "ursa.cldixon.dev", "custom_domain": true }],
+
+  // Declaring routes flips the workers.dev default to off; keep it on so links
+  // to the old ursa-docs.cl-dixon.workers.dev URL never break. Canonical tags
+  // point every crawler at the custom domain regardless.
+  "workers_dev": true,
+
   "assets": {
     "directory": "./dist",
 
