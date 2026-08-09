@@ -1,0 +1,34 @@
+---
+/**
+ * A figure carries exactly one line: what it is, how big, how it was processed.
+ * That is the whole convention — no corner ticks, no metadata rail, no status
+ * bar. It also means a figure cannot be captioned without real numbers.
+ */
+interface Props {
+  /** e.g. "Fig. 1" or "Tab. 2" */
+  id: string;
+  caption: string;
+  ground?: 'paper' | 'sky';
+}
+const { id, caption, ground = 'paper' } = Astro.props;
+---
+
+<figure data-ground={ground === 'sky' ? 'sky' : undefined}>
+  <slot />
+  <figcaption class="cap">
+    <span class="id">{id}</span> — {caption}
+  </figcaption>
+</figure>
+
+<style>
+  figure[data-ground='sky'] figcaption {
+    border-top-color: var(--sky-rule);
+    color: var(--sky-ink-2);
+  }
+  .id {
+    color: var(--ink);
+  }
+  figure[data-ground='sky'] .id {
+    color: var(--sky-ink);
+  }
+</style>

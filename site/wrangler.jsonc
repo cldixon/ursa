@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // A static-assets-only Worker: there is no `main` entry point, because there
+  // is no server-side code. Cloudflare serves `dist/` straight from the edge.
+  //
+  // Workers rather than Pages: Cloudflare now points new projects at Workers,
+  // and Static Assets is the supported way to host a build output there. Pages
+  // still works, but it is where the platform is no longer adding features.
+  //
+  //   bun run deploy           # build, then publish (needs `wrangler login`)
+  //   bun run preview:worker   # the same build, served by a local workerd
+  //
+  // CI/CD is Workers Builds (the git integration configured on the Worker in
+  // the Cloudflare dashboard): pushes to main build + deploy production, and
+  // non-production branches run `wrangler versions upload` for preview URLs.
+  "name": "ursa-docs",
+  "compatibility_date": "2026-07-01",
+
+  // Preview URLs for non-production versions: `wrangler versions upload` (which
+  // Workers Builds runs for non-production branches) gets a per-version URL and
+  // a stable per-branch alias, posted to the PR as a comment.
+  "preview_urls": true,
+
+  "assets": {
+    "directory": "./dist",
+
+    // Every internal link is written without a trailing slash, so serve those
+    // URLs directly from `docs/concepts/index.html` instead of bouncing each one
+    // through a 307 to the slashed form (which "auto-trailing-slash" does).
+    "html_handling": "drop-trailing-slash",
+
+    // Serve the built 404 page rather than a bare Cloudflare error. This is a
+    // fully static site, so a miss is a miss — never fall through to index.html,
+    // which would return 200 for a URL that does not exist.
+    "not_found_handling": "404-page"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,58 @@
+---
+/**
+ * The legend is our scale bar. Every published astronomical image states what a
+ * unit of size means; ours states what the colour and the radius mean. Declaring
+ * the mapping is the whole defence of using false colour at all.
+ */
+import { PAPER_RAMP, SKY_RAMP } from '../lib/stretch';
+
+interface Props {
+  /** What has been measured — the colour channel's meaning. */
+  measure: string;
+  hot: string;
+  cool: string;
+  /** The size channel, e.g. "⌀ ≈ pagerank 0.001". */
+  scale?: string;
+  ground?: 'paper' | 'sky';
+}
+const { measure, hot, cool, scale, ground = 'paper' } = Astro.props;
+const ramp = ground === 'sky' ? SKY_RAMP : PAPER_RAMP;
+---
+
+<div class="legend cap">
+  <span class="measure">{measure}</span>
+  <span class="ramp" aria-hidden="true">
+    {ramp.map((c) => <i style={`background:${c}`} />)}
+  </span>
+  <span class="ends">{hot} → {cool}</span>
+  {scale && <span class="scale">{scale}</span>}
+</div>
+
+<style>
+  .legend {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .measure {
+    color: var(--ink);
+  }
+  .ramp {
+    display: inline-flex;
+    flex: none;
+  }
+  .ramp i {
+    display: block;
+    width: 22px;
+    height: 7px;
+  }
+  .ends,
+  .scale {
+    white-space: nowrap;
+  }
+  .scale {
+    padding-left: 12px;
+    border-left: 1px solid var(--rule);
+  }
+</style>

@@ -1,0 +1,309 @@
+---
+import type { MarkdownHeading } from 'astro';
+import Base from './Base.astro';
+import DocsNav from '../components/DocsNav.astro';
+import { FLAT_NAV } from '../lib/site';
+import { url, isCurrent } from '../lib/url';
+
+interface Props {
+  title: string;
+  description: string;
+  subtitle?: string;
+  headings?: MarkdownHeading[];
+}
+
+const { title, description, subtitle, headings = [] } = Astro.props;
+
+const path = Astro.url.pathname;
+const index = FLAT_NAV.findIndex((item) => isCurrent(item.href, path));
+const prev = index > 0 ? FLAT_NAV[index - 1] : undefined;
+const next = index >= 0 && index < FLAT_NAV.length - 1 ? FLAT_NAV[index + 1] : undefined;
+
+const toc = headings.filter((h) => h.depth === 2);
+---
+
+<Base title={title} description={description}>
+  <div class="w shell">
+    <aside class="side">
+      <DocsNav />
+    </aside>
+
+    <div class="col">
+      <header class="pagehead">
+        <h1>{title}</h1>
+        {subtitle && <p class="cap sub">{subtitle}</p>}
+      </header>
+
+      <article class="prose">
+        <slot />
+      </article>
+
+      {
+        (prev || next) && (
+          <nav class="seq" aria-label="Sequential">
+            <div>
+              {prev && (
+                <a href={url(prev.href)}>
+                  <span class="cap dir">← previous</span>
+                  <span class="ttl">{prev.title}</span>
+                </a>
+              )}
+            </div>
+            <div class="next">
+              {next && (
+                <a href={url(next.href)}>
+                  <span class="cap dir">next →</span>
+                  <span class="ttl">{next.title}</span>
+                </a>
+              )}
+            </div>
+          </nav>
+        )
+      }
+    </div>
+
+    {
+      toc.length > 1 && (
+        <aside class="toc" aria-label="On this page">
+          <p class="label">On this page</p>
+          <ul>
+            {toc.map((h) => (
+              <li>
+                <a href={`#${h.slug}`}>{h.text}</a>
+              </li>
+            ))}
+          </ul>
+        </aside>
+      )
+    }
+  </div>
+</Base>
+
+<style>
+  .shell {
+    display: grid;
+    gap: clamp(26px, 3.5vw, 52px);
+    padding-top: clamp(28px, 4vw, 46px);
+    max-width: var(--w-docs);
+    align-items: start;
+  }
+  @media (min-width: 900px) {
+    .shell {
+      grid-template-columns: 190px minmax(0, 1fr);
+    }
+  }
+  @media (min-width: 1180px) {
+    .shell {
+      grid-template-columns: 190px minmax(0, 1fr) 170px;
+    }
+  }
+
+  .side,
+  .toc {
+    position: sticky;
+    top: 26px;
+  }
+  @media (max-width: 899px) {
+    .side {
+      position: static;
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--rule);
+    }
+  }
+  @media (max-width: 1179px) {
+    .toc {
+      display: none;
+    }
+  }
+
+  .pagehead {
+    padding-bottom: 22px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .pagehead h1 {
+    font-size: clamp(30px, 4vw, 44px);
+    max-width: 22ch;
+  }
+  .sub {
+    margin-top: 12px;
+    max-width: 62ch;
+  }
+
+  /* --- sequential nav ---------------------------------------------------- */
+  .seq {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-top: 56px;
+    padding-top: 22px;
+    border-top: 1px solid var(--rule);
+  }
+  .seq .next {
+    text-align: right;
+  }
+  .seq a {
+    border-bottom: 0;
+    display: block;
+  }
+  .seq .dir {
+    display: block;
+  }
+  .seq .ttl {
+    display: block;
+    margin-top: 4px;
+    font-size: 17px;
+  }
+  .seq a:hover .ttl {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  /* --- on this page ------------------------------------------------------ */
+  .toc ul {
+    list-style: none;
+    padding: 0;
+    margin-top: 10px;
+  }
+  .toc li + li {
+    margin-top: 5px;
+  }
+  .toc a {
+    font-size: 13.5px;
+    line-height: 1.35;
+    color: var(--ink-2);
+    border-bottom: 0;
+    display: block;
+  }
+  .toc a:hover {
+    color: var(--ink);
+  }
+</style>
+
+<style is:global>
+  /* ----------------------------------------------------------------------- *
+   * Prose — the docs are the plate: paper, ink, two faces, no chrome.
+   * ----------------------------------------------------------------------- */
+  /* Prose is measured for reading; listings and catalogs take the full column,
+     because a wrapped signature is harder to read than a wide one. */
+  .prose {
+    padding-top: 30px;
+  }
+  .prose > * + * {
+    margin-top: 20px;
+  }
+  .prose p,
+  .prose li {
+    font-size: 17px;
+    line-height: 1.62;
+  }
+  .prose > p,
+  .prose > ul,
+  .prose > ol,
+  .prose > blockquote,
+  .prose > h1,
+  .prose > h2,
+  .prose > h3,
+  .prose > h4 {
+    max-width: 68ch;
+  }
+
+  .prose h2 {
+    font-size: clamp(23px, 2.6vw, 28px);
+    margin-top: 52px;
+    padding-top: 18px;
+    border-top: 1px solid var(--rule);
+  }
+  /* A page that opens on a heading already has the page-header rule above it. */
+  .prose > h2:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: 0;
+  }
+  .prose h3 {
+    font-size: 20px;
+    margin-top: 36px;
+  }
+  .prose h4 {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    color: var(--ink-2);
+    margin-top: 30px;
+  }
+  .prose h2 a,
+  .prose h3 a,
+  .prose h4 a {
+    border-bottom: 0;
+  }
+
+  .prose ul,
+  .prose ol {
+    padding-left: 1.15em;
+  }
+  .prose li + li {
+    margin-top: 7px;
+  }
+  .prose li::marker {
+    color: var(--ink-2);
+  }
+
+  .prose a {
+    text-underline-offset: 3px;
+  }
+
+  .prose code {
+    background: rgba(18, 18, 15, 0.045);
+    padding: 1px 4px;
+  }
+  .prose pre {
+    margin-top: 20px;
+  }
+  .prose pre code {
+    background: none;
+    padding: 0;
+  }
+
+  .prose blockquote {
+    margin: 24px 0;
+    padding-left: 18px;
+    border-left: 1px solid var(--rule);
+    color: var(--ink-2);
+  }
+
+  /* Tables are catalogs: numbered records, one per object. */
+  .prose table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    margin-top: 22px;
+    display: block;
+    overflow-x: auto;
+  }
+  .prose th {
+    text-align: left;
+    font-weight: 400;
+    color: var(--ink-2);
+    padding: 0 16px 8px 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  .prose td {
+    padding: 9px 16px 9px 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  .prose td code,
+  .prose th code {
+    background: none;
+    padding: 0;
+    font-size: 1em;
+  }
+  .prose td strong {
+    font-weight: 500;
+  }
+
+  .prose hr {
+    margin: 40px 0;
+  }
+</style>

@@ -1,0 +1,504 @@
+---
+import Base from '../layouts/Base.astro';
+import Plate from '../components/Plate.astro';
+import SkyField from '../components/SkyField.astro';
+import Figure from '../components/Figure.astro';
+import Legend from '../components/Legend.astro';
+import Threshold from '../components/Threshold.astro';
+import { PLATE, SKY, EXAMPLE } from '../lib/figures';
+import { sampleRamp } from '../lib/stretch';
+import { SITE } from '../lib/site';
+import { url } from '../lib/url';
+
+// Colour appears only where something has been measured, and it means the value
+// it is standing next to: pagerank, normalized across the rows shown.
+const ramped = EXAMPLE.top.map((row) => ({
+  ...row,
+  swatch: sampleRamp((EXAMPLE.max - row.pagerank) / (EXAMPLE.max - EXAMPLE.min)),
+}));
+
+const brightSources = SKY.graph.nodes.filter(
+  (n) => n.degree / SKY.graph.maxDegree >= SKY.limit,
+).length;
+---
+
+<Base bare>
+  {/* ===== THE PLATE ===== */}
+  <div class="w plate">
+    <Figure
+      id="Fig. 1"
+      caption={`generated field, ${PLATE.sources.length} sources, seed ${PLATE.seed}. Radius ∝ asinh-stretched score, β = ${PLATE.beta}. The seven brightest are Ursa Major.`}
+    >
+      <Plate />
+    </Figure>
+  </div>
+
+  {/* ===== THE TITLE ===== */}
+  <div class="w title split">
+    <h1>An edge list looks like nothing. <i>It is dense with structure.</i></h1>
+    <div>
+      <p class="sub">
+        Ursa is a dataframe API for graph analytics. PageRank, centralities, components and
+        traversals over edges in Parquet or CSV — in memory, on one machine. Rust and Apache Arrow
+        underneath.
+      </p>
+      <div class="cta">
+        <code class="b f">pip install {SITE.pkg}</code>
+        <a class="b" href={url('/docs')}>Documentation</a>
+        <a class="b" href={SITE.repo} rel="noopener">Source</a>
+      </div>
+      <p class="cap note">
+        v0.2.0, on PyPI. The kernels, the composed pipeline and the relational surface execute
+        end to end; the <a href={url('/docs/roadmap')}>roadmap</a> says what does not.
+      </p>
+    </div>
+  </div>
+
+  <div class="w"><hr /></div>
+
+  {/* ===== THE CATALOG ===== */}
+  <section class="w sec doc">
+    <div>
+      <h2>pagerank</h2>
+      <p class="sig">
+        ur.pagerank(edges, damping=0.85, max_iter=30, tol=1e-6, weight=None) → NodeFrame
+      </p>
+      <p>
+        Returns a lazy frame of <code>id</code> and <code>pagerank</code>. Nothing runs until{' '}
+        <code>.collect()</code>, so the scan, the algorithm and the sort are planned and executed as
+        a single DataFusion query — with the graph operator as a first-class node in that plan,
+        not a step orchestrated around it.
+      </p>
+      <p>
+        The colour in the table is the only colour on this page. It is a temperature scale, and it
+        appears because there is finally something measured to show.
+      </p>
+    </div>
+
+    <div>
+      <pre><code>{`import ursa as ur
+import pyarrow as pa
+
+edges = ur.from_arrow(
+    pa.table({"s": [0, 1, 2, 3, 4, 5, 2, 6, 7],
+              "d": [1, 2, 0, 4, 5, 3, 3, 0, 0]}),
+    src="s", dst="d",
+)
+
+(ur.pagerank(edges, damping=0.85)
+   .sort("pagerank", descending=True)
+   .head(5)
+   .collect()
+   .to_polars())`}</code></pre>
+
+      <div class="scroll-x">
+        <table class="res">
+          <thead>
+            <tr>
+              <th>id</th>
+              <th class="num">in_degree</th>
+              <th class="num">pagerank</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              ramped.map((row) => (
+                <tr>
+                  <td>{String(row.id).padStart(7, '0')}</td>
+                  <td class="num">{row.in_degree}</td>
+                  <td class="num">
+                    <i class="sw" style={`background:${row.swatch}`} />
+                    {row.pagerank.toFixed(6)}
+                  </td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+
+      <p class="cap tabcap">
+        <span class="figid">Tab. 1</span> — top 5 of {EXAMPLE.n_nodes} by pagerank over the {
+          EXAMPLE.n_edges
+        } edges above, damping 0.85, iterated to convergence. Computed, not illustrated.
+      </p>
+      <div class="legendwrap">
+        <Legend measure="pagerank" hot="hot" cool="cool" scale={`⌀ ≈ pagerank ${EXAMPLE.max.toFixed(3)}`} />
+      </div>
+    </div>
+  </section>
+
+  {/* ===== COMPOSITION ===== */}
+  <section class="w sec doc">
+    <div>
+      <h2>One plan, not two engines.</h2>
+      <p>
+        There is no <code>Graph</code> object. An <code>EdgeFrame</code> <i>is</i> the graph, a{' '}
+        <code>NodeFrame</code> is an attribute table, and every operation returns a frame — so
+        metrics, attributes, filters and top-<i>k</i> compose into one lazy pipeline instead of a
+        script that hands results between libraries.
+      </p>
+      <p>
+        The topology index is built once on first use and shared by every graph operation over that
+        frame. Property-only transformations keep it; row-changing ones drop it. That contract is
+        the performance model, and it is written down rather than guessed at.
+      </p>
+      <p class="more">
+        <a href={url('/docs/concepts')}>Core concepts</a> ·
+        <a href={url('/docs/quickstart')}>Quickstart</a>
+      </p>
+    </div>
+
+    <div>
+      <pre><code>{`nodes = ur.scan_nodes("towers.parquet", id="tower_id")
+edges = ur.scan_edges("links.parquet",
+                      src="tower_a", dst="tower_b")
+
+(nodes
+ .with_columns(
+     pagerank  = ur.pagerank(edges, damping=0.85),
+     component = ur.connected_components(edges),
+     nbr_cap   = ur.neighbors(edges).agg(
+                     ur.col("capacity_gbps").mean()),
+ )
+ .filter(ur.col("pagerank") > 0.001)
+ .sort("pagerank", descending=True)
+ .head(20)
+ .collect())`}</code></pre>
+      <p class="cap tabcap">
+        One <code>collect()</code>. Three kernels over one shared topology index, joined to the
+        node attributes, filtered and ranked inside the engine — and the node file is read for
+        only the columns the plan proves it needs.
+      </p>
+    </div>
+  </section>
+
+  {/* ===== THE SURVEY ===== */}
+  <section class="w sec">
+    <h2 class="wide">What the instrument does today.</h2>
+    <div class="records">
+      <div class="record">
+        <p class="rec-k">Algorithms</p>
+        <p class="rec-v">
+          pagerank · degree · connected_components (weak and strong) · triangle_count ·
+          clustering_coefficient · closeness · betweenness (Brandes, sampled) · label_propagation ·
+          louvain — each with a weighted variant, deterministic across thread counts.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Traversals</p>
+        <p class="rec-v">
+          hop().from_() · shortest_path (BFS, or Dijkstra when weighted, with a cumulative cost
+          column) · random_walk — each its own first-class logical node, each returning a frame.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Relational verbs</p>
+        <p class="rec-v">
+          filter (a full predicate algebra) · select · with_columns · sort · head · distinct ·
+          sample · rename · group_by().agg() · join — the same frame, both vocabularies.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Sources</p>
+        <p class="rec-v">
+          Parquet and CSV — local, object storage (s3:// · gs:// · az://) or https:// — with the
+          column projection pushed into the file. Or straight from data: EdgeFrame(dict | rows |
+          polars | pandas | pyarrow), from_edgelist, from_networkx, from_numpy, from_scipy_sparse,
+          and ur.datasets for canonical graphs. Node ids may be int64 or strings.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Statistics</p>
+        <p class="rec-v">
+          describe (one-row summary frame) · density · avg_path_length · diameter — the eager
+          scalars are the one deliberate exception to laziness.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Egress</p>
+        <p class="rec-v">
+          to_polars · to_arrow · to_dicts · sink_parquet · sink_csv. Arrow is the boundary in both
+          directions, so leaving Ursa costs nothing.
+        </p>
+      </div>
+      <div class="record">
+        <p class="rec-k">Not yet</p>
+        <p class="rec-v">
+          schema() · store= · CSV format options · neighbors(from_=) — each raises a clear error
+          rather than mis-executing, as do the stated composition limits. Motif finding and the
+          optimizer rules are ahead.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  {/* ===== THE SKY ===== */}
+  <section class="sky" data-ground="sky">
+    <div class="w sec">
+      <div class="doc endalign">
+        <div>
+          <h2>The visualizer inverts.</h2>
+          <p class="sub sky-sub">
+            You cannot read a negative on a live instrument. So where the site is paper, the
+            visualizer is sky: black ground, bright sources, colour throughout — because
+            everything on screen has been measured. Same tokens, flipped.
+          </p>
+          <p class="cap disclaimer">
+            In design, not shipped. The figure below is a specimen of the rendering conventions,
+            generated and measured at build time like every other figure here.
+          </p>
+        </div>
+        <div class="controls">
+          <Threshold value={SKY.limit.toFixed(2)} at={SKY.limit} ground="sky" />
+          <Legend measure="degree" hot="high" cool="low" scale="log stretch" ground="sky" />
+        </div>
+      </div>
+
+      <div class="skyfig">
+        <Figure
+          id="Fig. 2"
+          ground="sky"
+          caption={`preferential-attachment graph, ${SKY.graph.nodes.length} nodes, ${SKY.graph.edges.length} edges, seed ${SKY.seed}. Degree, log stretch. Spikes mark the ${brightSources} sources above the limiting magnitude; they stay legible when radius has collapsed at low zoom.`}
+        >
+          <SkyField />
+        </Figure>
+      </div>
+    </div>
+  </section>
+
+  {/* ===== THE RULES ===== */}
+  <section class="w sec">
+    <h2 class="wide">Five rules, and nothing else.</h2>
+    <div class="rules">
+      <div class="rule">
+        <b>The ground is a negative</b>
+        <p>
+          Astronomers read plates as negatives — black sources on a white sky. So the site is paper
+          and the instrument is sky. It also puts Ursa on the opposite side of every dark dev-tool
+          launch.
+        </p>
+      </div>
+      <div class="rule">
+        <b>Colour only where there is data</b>
+        <p>
+          The page is ink until something has been measured. Then the temperature scale appears,
+          and only ever means a value. No brand accent, no coloured buttons, no highlight colour.
+        </p>
+      </div>
+      <div class="rule">
+        <b>Magnitude is centrality</b>
+        <p>
+          Radius, weight and spike length all encode score, on one stretch, across the mark, the
+          hero, the docs and the app — which is why the asterism is found in the field rather than
+          placed on it.
+        </p>
+      </div>
+      <div class="rule">
+        <b>One caption, no chrome</b>
+        <p>
+          Figures carry a single mono line: what it is, how big, how it was processed. No corner
+          ticks, no metadata rails, no status bars — and no figure that cannot state real numbers.
+        </p>
+      </div>
+      <div class="rule">
+        <b>Two faces</b>
+        <p>
+          A text serif and a mono. No sans anywhere, which is the whole reason it reads as
+          published rather than shipped.
+        </p>
+      </div>
+    </div>
+  </section>
+</Base>
+
+<style>
+  /* --- the plate ---------------------------------------------------------- */
+  .plate {
+    padding-top: clamp(20px, 3vw, 40px);
+  }
+
+  /* --- title -------------------------------------------------------------- */
+  /* padding-block, not the shorthand — the shorthand would zero the horizontal
+     page padding that `.w` sets. */
+  .title {
+    padding-top: clamp(26px, 4vw, 44px);
+    padding-bottom: clamp(20px, 3vw, 30px);
+  }
+  .title h1 {
+    font-size: clamp(34px, 6.4vw, 68px);
+    line-height: 1.02;
+    max-width: 16ch;
+  }
+  .title h1 i {
+    font-style: italic;
+  }
+  .sub {
+    font-size: clamp(17px, 1.9vw, 20px);
+    color: var(--ink-2);
+    max-width: 46ch;
+    line-height: 1.5;
+  }
+  .cta {
+    margin-top: 26px;
+    display: flex;
+    gap: 9px;
+    flex-wrap: wrap;
+  }
+  .cta code.b {
+    font-size: 12px;
+  }
+  .note {
+    margin-top: 18px;
+    max-width: 52ch;
+  }
+  .split {
+    display: grid;
+    gap: clamp(24px, 4vw, 60px);
+  }
+  @media (min-width: 880px) {
+    .split {
+      grid-template-columns: 1.1fr 0.9fr;
+      align-items: end;
+    }
+  }
+
+  /* --- two-column document sections --------------------------------------- */
+  .doc {
+    display: grid;
+    gap: clamp(22px, 4vw, 54px);
+  }
+  @media (min-width: 880px) {
+    .doc {
+      grid-template-columns: 1fr 1fr;
+      align-items: start;
+    }
+    .doc.endalign {
+      align-items: end;
+    }
+  }
+  .doc h2,
+  h2.wide {
+    font-size: clamp(27px, 3.4vw, 38px);
+  }
+  h2.wide {
+    margin-bottom: 30px;
+  }
+  .sig {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: var(--ink-2);
+    margin-top: 10px;
+    overflow-wrap: anywhere;
+  }
+  .doc p:not(.sig):not(.cap):not(.sub) {
+    margin-top: 18px;
+    font-size: 17px;
+    max-width: 52ch;
+  }
+  .more {
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .res {
+    margin-top: 22px;
+  }
+  .tabcap {
+    margin-top: 12px;
+    max-width: 62ch;
+  }
+  .figid {
+    color: var(--ink);
+  }
+  .legendwrap {
+    margin-top: 18px;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+  }
+
+  /* --- the survey --------------------------------------------------------- */
+  .records {
+    border-top: 1px solid var(--rule);
+  }
+  .record {
+    display: grid;
+    gap: 6px 26px;
+    padding: 20px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  @media (min-width: 760px) {
+    .record {
+      grid-template-columns: 15.5rem 1fr;
+      align-items: baseline;
+      gap: 26px;
+    }
+  }
+  .rec-k {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-2);
+    letter-spacing: 0.02em;
+  }
+  .rec-v {
+    font-size: 16.5px;
+    line-height: 1.55;
+    max-width: 64ch;
+  }
+
+  /* --- the sky ------------------------------------------------------------ */
+  .sky {
+    background: var(--sky);
+    color: var(--sky-ink);
+  }
+  .sky-sub {
+    max-width: 44ch;
+    margin-top: 16px;
+  }
+  .disclaimer {
+    margin-top: 18px;
+    max-width: 50ch;
+  }
+  .controls {
+    display: grid;
+    gap: 16px;
+  }
+  .skyfig {
+    margin-top: 34px;
+  }
+
+  /* --- the rules ---------------------------------------------------------- */
+  .rules {
+    counter-reset: r;
+    border-top: 1px solid var(--rule);
+  }
+  .rule {
+    counter-increment: r;
+    display: grid;
+    gap: 6px 26px;
+    padding: 22px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  @media (min-width: 760px) {
+    .rule {
+      grid-template-columns: 60px 15.5rem 1fr;
+      align-items: baseline;
+      gap: 26px;
+    }
+  }
+  .rule::before {
+    content: counter(r, decimal-leading-zero);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-2);
+  }
+  .rule b {
+    font-weight: 500;
+    font-size: 19px;
+  }
+  .rule p {
+    font-size: 16px;
+    color: var(--ink-2);
+    line-height: 1.55;
+    max-width: 56ch;
+  }
+</style>

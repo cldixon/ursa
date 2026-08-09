@@ -1,0 +1,53 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'site/**'
+      - '.github/workflows/docs.yml'
+
+# Build check only — deployment is Workers Builds (Cloudflare's git integration
+# on the ursa-docs Worker): pushes to main build and deploy production there,
+# and non-production branches get preview URLs posted to the PR. This job stays
+# so a docs PR still gets a type-check and a build proof from a clean checkout,
+# independent of the Cloudflare account.
+#
+# Deliberately separate from `ci.yml` so the docs never gate the code, and the
+# code build never gates the docs. Nothing here needs the native extension.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: site
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # --frozen-lockfile is the CI equivalent of `npm ci`: fail if bun.lock
+      # disagrees with package.json rather than silently resolving something new.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bun run check
+
+      - name: Build
+        run: bun run build

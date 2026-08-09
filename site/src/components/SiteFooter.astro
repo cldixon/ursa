@@ -1,0 +1,74 @@
+---
+import { SITE, DOCS_NAV } from '../lib/site';
+import { url } from '../lib/url';
+---
+
+<footer>
+  <div class="w">
+    <hr />
+    <div class="cols">
+      {
+        DOCS_NAV.map((section) => (
+          <div>
+            <p class="label">{section.title}</p>
+            <ul>
+              {section.items.map((item) => (
+                <li>
+                  <a href={url(item.href)}>{item.title}</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+      <div>
+        <p class="label">Elsewhere</p>
+        <ul>
+          <li><a href={SITE.repo} rel="noopener">Source</a></li>
+          <li><a href={SITE.pypi} rel="noopener">PyPI</a></li>
+          <li><a href={`${SITE.repo}/issues`} rel="noopener">Issues</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="cap colophon">
+      Ursa · MIT or Apache-2.0 · Set in Source Serif 4 and IBM Plex Mono. Figures are generated
+      from fixed seeds; every caption states its parameters.
+    </p>
+  </div>
+</footer>
+
+<style>
+  footer {
+    padding-bottom: 60px;
+    margin-top: clamp(46px, 7vw, 86px);
+  }
+  .cols {
+    display: grid;
+    gap: 26px clamp(20px, 3vw, 44px);
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    padding-top: 30px;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+    margin-top: 10px;
+  }
+  li + li {
+    margin-top: 5px;
+  }
+  li a {
+    font-size: 15px;
+    border-bottom: 0;
+    color: var(--ink-2);
+  }
+  li a:hover {
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .colophon {
+    margin-top: 40px;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+    max-width: 76ch;
+  }
+</style>

@@ -1,0 +1,46 @@
+---
+/**
+ * Limiting magnitude — the faintest object an observation can detect. In the
+ * visualizer it is the threshold control: show everything above this score.
+ * Rendered here as the readout it will be, not as a working input.
+ */
+interface Props {
+  label?: string;
+  value: string;
+  /** Position of the tick along the bar, 0–1. */
+  at?: number;
+  ground?: 'paper' | 'sky';
+}
+const { label = 'limiting magnitude', value, at = 0.58, ground = 'paper' } = Astro.props;
+---
+
+<div class="mag cap" data-ground={ground === 'sky' ? 'sky' : undefined}>
+  <span>{label}</span>
+  <span class="track"><i style={`left:${(at * 100).toFixed(1)}%`}></i></span>
+  <span class="value">{value}</span>
+</div>
+
+<style>
+  .mag {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .track {
+    flex: 1;
+    height: 1px;
+    background: var(--rule);
+    position: relative;
+    max-width: 340px;
+  }
+  .track i {
+    position: absolute;
+    top: -4px;
+    width: 1px;
+    height: 9px;
+    background: var(--paper-ramp-0);
+  }
+  .value {
+    color: var(--paper-ramp-0);
+  }
+</style>
