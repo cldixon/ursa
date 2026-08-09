@@ -56,10 +56,23 @@ These came out of design discussion and are not up for re-derivation:
 
 3. **Docs snippets get live visualization tabs.** Where a code example carries
    graph data, the docs page offers a tab that renders it — interactive, in the
-   page. The figures' numbers should be *real*: the site build runs Ursa on the
-   snippet's data and bakes the resulting Arrow buffers into the page. This is
-   both a demo of the library and dogfooding of the renderer. (The site build
-   gaining a Python step is accepted.)
+   page. The figures' numbers should be *real*: Ursa itself computes them. This
+   is both a demo of the library and dogfooding of the renderer.
+
+   **The site build does *not* gain a Python step.** `docs.yml` is deliberately
+   decoupled from `ci.yml` ("the docs never gate the code, and the code build
+   never gates the docs. Nothing here needs the native extension"), and the
+   production deploy is not that workflow at all — it is Cloudflare Workers
+   Builds, whose build image would have to grow Python and an installed Ursa.
+   Instead: a job in the **code** CI runs Ursa over the snippet data and emits
+   Arrow fixtures committed under `site/`, with a staleness check that fails if
+   the committed fixtures disagree with freshly generated ones. The site build
+   stays pure bun; the figures are still real Ursa output.
+
+   Note what this deletes: `site/src/lib/graph.ts` currently generates a
+   Barabási–Albert graph *and computes PageRank in TypeScript* to caption the
+   existing figures — a second implementation of the library's own math living
+   in the docs. Removing it is worth more than the demo value.
 
 4. **Design tokens: adopt what exists, don't over-index on it.** The owner is
    *not* sold on the current design system's specifics, but wants every
@@ -75,12 +88,34 @@ These came out of design discussion and are not up for re-derivation:
 
 5. **Packaging follows the vision doc.** Core stays lean (only `ur.layout_*`
    kernels belong in core — they're just algorithms). Everything else is
-   `ursa-viz` / `pip install ursa[viz]`: the server crate, the prebuilt
+   `ursa-viz` / `pip install ursa-graph[viz]`: the server crate, the prebuilt
    frontend assets (built in CI; users never touch a Node toolchain),
    `ur.plot`, `ur.explore`, `export_html`, the anywidget wrapper. A standalone
    CLI (`ursa explore edges.parquet`) is a later, cheap byproduct — design the
    server so nothing assumes a Python session exists, but don't build the CLI
    first.
+
+   (Note the install line: the distribution is **`ursa-graph`**, not `ursa` —
+   the bare `ursa` is an abandoned reservation on PyPI. The vision doc's
+   `pip install ursa[viz]` would install the wrong project.)
+
+   **Where the Rust lives, and when.** All the heavy compute is Rust; that is
+   not in question. But the *artifacts* arrive on different schedules, and the
+   wheel matrix should follow rather than lead:
+
+   | Component | Language | Ships in |
+   |---|---|---|
+   | `layout_fa2` / `layout_fr` kernels (step 3) | Rust | the existing `ursa-graph` wheel — they are ordinary `ursa-core` algorithms |
+   | The instrument: renderer, spring sim, LOD front end (steps 1–2) | TypeScript + WebGL | a prebuilt asset bundle — no compilation |
+   | anywidget wrapper, `ur.plot`, `export_html` (steps 1–3) | Python | pure-Python |
+   | The explorer server (step 4) | Rust (axum) | see below |
+
+   So steps 1–2 add **no new compiled artifact**: `ursa-viz` is pure Python plus
+   a JS bundle, one universal wheel, no build matrix. Step 3's Rust goes into
+   the wheel that already exists. Only step 4 introduces new Rust needing
+   distribution — and it should go into the **existing `ursa-py` extension
+   module** (behind a Cargo feature) rather than spawning a second abi3 wheel
+   matrix across five platform legs. There is likely never a second matrix.
 
 ## Deliberate revisions to `VIZ_VISION.md`
 
@@ -119,11 +154,35 @@ These came out of design discussion and are not up for re-derivation:
 | 1 | **The instrument v0 + anywidget wrapper.** TS renderer: pan/zoom/hover/drag, small-graph spring sim, plate+sky theming, stretch/ramp via the shared token package. `ur.plot` returns it in notebooks. | No server, no Rust changes beyond plumbing data out. Daily-touch surface lands first. |
 | 2 | **Docs snippet tabs.** Instantiate the renderer in the Astro site with build-time-computed (real Ursa) Arrow data. | Small, hugely visible, dogfoods library + renderer. |
 | 3 | **Rust layout kernels.** `layout_fa2` (Barnes–Hut, LinLog, gravity, weight influence), `layout_fr`, `layout_random`/`layout_circle`; positions as columns; static export path. | The benchmark story ("million-node layout in seconds"). Feeds precomputed positions to every surface. |
-| 4 | **The explorer.** axum server, Arrow IPC over websocket, expand/filter/select compiled to expressions, Python round-trip (`session.selection()` / `.highlight()`), then the LOD ladder (sampling → metagraph → drill-down). | The flagship; wire protocol per `VIZ_VISION.md` §Tier 2 architecture. |
+| 4 | **The explorer.** axum server, Arrow IPC over websocket, expand/filter/select compiled to expressions, Python round-trip (`session.selection()` / `.highlight()`), then the LOD ladder (sampling → metagraph → drill-down). | The flagship; wire protocol per `VIZ_VISION.md` §Tier 2 architecture. **Depends on #114 and #116** — see §Engine dependencies. |
 | 5 | **WASM / publish.** Per `VIZ_VISION.md` §Tier 3, sober notes included there. | |
 
 Steps 1–2 are modest engineering with outsized visibility, and everything they
 produce is load-bearing for 3–5.
+
+## Engine dependencies — tracked separately, built in parallel
+
+Design review against the repo surfaced five places where the viz work needs
+something the core engine does not do yet. Each is filed as a standalone core
+issue and worked in a separate session; **none of them blocks steps 1–2**, so
+viz work proceeds concurrently. This is the intended feedback loop — the
+visualization layer is the forcing function for engine capability, not a
+consumer bolted on the side.
+
+| Issue | What | Blocks | Notes |
+|---|---|---|---|
+| [#114](https://github.com/cldixon/ursa/issues/114) | **Subgraph views** — graph ops over a filtered edge frame, as a bitmask over the parent CSR | step 4 | The big one. "Drag a filter slider then recolor" *is* a graph op on a filtered edge frame; `_reject_derived_edge_graph_op` rejects it today, and collect-and-re-ingest rebuilds the CSR per tick. Promoted out of "deferred, deliberately" on the roadmap. |
+| [#115](https://github.com/cldixon/ursa/issues/115) | **Multi-output kernels + per-query kernel memo** | step 3 | `OutputColumn::Algo` emits exactly one array with no memoization, so `layout_fa2` producing `(x, y)` would run ForceAtlas2 twice. Also fixes the live triangle/clustering double-compute. |
+| [#116](https://github.com/cldixon/ursa/issues/116) | **Graph ops on traversal results** (child-plan seeding) | step 4 | The explorer's expand-then-compute loop. Sequenced after #114; may reduce to it. |
+| [#117](https://github.com/cldixon/ursa/issues/117) | **`f32` output columns** | step 3 | No kernel can emit `f32` today. Small and self-contained. |
+| [#118](https://github.com/cldixon/ursa/issues/118) | **rayon behind a feature flag + wasm32 / `--no-default-features` CI legs** | Tier 3 | Pulled to step 0 — costs nothing now, nothing depends on it, and the cost grows with every kernel added. The CI legs are the real deliverable; the flag rots without them. |
+
+Practical consequence for step 4's scope: if #114 and #116 land first, the
+explorer's filter and expand interactions are genuine subgraph queries. If they
+have not, step 4's v0 falls back to "algorithms always run on the full graph;
+filtering only changes what is rendered" — workable, but the UI then has to say
+so, because otherwise the numbers on screen silently describe a different graph
+than the one being displayed. Prefer the former; check status before scoping.
 
 ## Technical guidance and pre-work guards
 
@@ -144,13 +203,67 @@ produce is load-bearing for 3–5.
   screen space); kernels may accumulate in `f64` internally.
 
 - **Layout determinism.** `seed=` at fixed thread count is the standing policy,
-  but parallel force accumulation is FP-order-sensitive in a way counting
-  sorts aren't. Decide explicitly per kernel: byte-identical (per-thread
-  partial sums reduced in fixed order — costs some speed) or a documented
-  per-seed-at-fixed-parallelism guarantee. Positions get cached to Parquet as
-  a workflow, so reproducibility is more than cosmetic. The repo's existing
-  determinism tests (`ursa-core/tests/determinism_threads.rs`) are the
-  pattern to extend.
+  but parallel force accumulation is FP-order-sensitive in a way counting sorts
+  aren't. Positions get cached to Parquet as a workflow, so reproducibility is
+  more than cosmetic. The repo's existing determinism tests
+  (`ursa-core/tests/determinism_threads.rs`, exact `==` across pools of 1–8
+  workers) are the pattern to extend. Three separable guarantees — decide each:
+
+  1. **Bit-identical across thread counts, same binary.** *Achievable at little
+     or no cost, and the recommendation* — provided two implementation
+     constraints are taken from day one rather than retrofitted:
+     - **Gather, never scatter.** Parallelize attraction over *nodes* (each node
+       sums forces from its own incident edges via CSR) rather than over
+       *edges* (each edge pushing force to both endpoints). The scatter form is
+       order-dependent; the gather form is not, and it is what every existing
+       kernel already does.
+     - **Deterministic quadtree.** Parallel point insertion produces an
+       order-dependent tree. Build it from a Morton-code sort instead
+       (deterministic, and more cache-friendly — plausibly a net speedup), with
+       centre-of-mass reductions in fixed child order.
+
+     Given both, repulsion is a per-node sequential traversal of a fixed tree —
+     deterministic by construction. FA2 runs a fixed iteration count, so there
+     is no convergence-based early exit to introduce ambiguity either.
+
+  2. **Bit-identical across platforms (x86 / aarch64).** *Do not promise this
+     for LinLog mode.* Plain FA2 is `+ - * /` and `sqrt`, all IEEE-exact, so it
+     can likely hold. LinLog introduces `ln`, which is not exactly specified by
+     IEEE-754 and differs across libm implementations — it would be the first
+     transcendental inside a determinism-tested kernel. Note this was never
+     guaranteed for any kernel (the existing test varies thread count on one
+     machine), but shared Parquet position caches make it newly visible.
+
+  3. **Perceptual stability.** Worth adding regardless of 1 and 2, because it
+     catches what bit-equality on a small test graph cannot: that a refactor
+     didn't quietly change what the layout *looks like*. Test as Procrustes-
+     aligned RMS position error below a threshold — layouts are invariant under
+     rotation, reflection and translation, so raw coordinate comparison between
+     two runs is meaningless without alignment.
+
+- **The query compiler lives in Python, not Rust.** `python/ursa/_execute.py` is
+  ~1500 lines of IR construction; the PyO3 entry points (`run_node_query` and
+  friends) take *already-lowered* JSON IR plus parameters. So "the server
+  compiles interaction messages → Ursa expressions → engine" and "design the
+  server so nothing assumes a Python session exists" are in tension with where
+  the compiler currently sits. Three options: reimplement lowering in Rust
+  (duplication, guaranteed drift); have axum call back into Python (GIL
+  contention on the tokio runtime — directly undercuts the GIL-released-during-
+  compute property); or have the Rust server serve a small **closed vocabulary**
+  of interaction shapes built directly against `ursa-plan`. Take the third, and
+  state the consequence plainly: at step 4 the sidebar's knobs are a fixed
+  vocabulary, not arbitrary user expressions. "Every knob is an expression" is
+  true of the architecture well before it is true of the product.
+
+- **The two force models will not agree.** Revision 1 above asks the TS spring
+  integrator and the Rust FA2 kernel to "share force-model parameters so a graph
+  does not visibly re-organize." FA2 with LinLog and Barnes–Hut approximation
+  and a D3-style Verlet integrator will not converge to the same configuration
+  no matter how the constants are matched. The achievable form of the same
+  invariant: when kernel positions exist, the browser sim **never re-lays-out**
+  — it runs constrained, global positions pinned, with a local reheat confined
+  to a neighbourhood around the dragged node. Same user-visible property, and
+  it is actually buildable.
 
 - **Barnes–Hut is the one genuinely new computational shape.** Every existing
   kernel is a CSR sweep in one of the spec's four shapes; FA2 repulsion adds a
@@ -193,14 +306,26 @@ The existing system to adopt (and factor into the shared package):
 - `site/src/components/SkyField.astro` — the "detection" affordance (ellipse +
   catalog id + leader line) that hover/selection should echo.
 
+Also worth knowing before step 1: **the site ships zero client-side JavaScript
+today.** No framework integration in `astro.config.mjs`, no `<script>` blocks,
+no `client:` directives, `syntaxHighlight: false`. Step 2 adds the first
+hydrated island to a site whose entire character is static ink on paper. Not a
+blocker, but every docs page must still read completely if the tab never loads.
+
 **Known open design problem — categorical color.** The token system mandates
 flat greys for categorical channels (correct: the ramp implies order) but has
-only four greys, and "color by community" needs dozens of distinguishable
-categories. Unresolved by design — surface it when it bites (explorer work,
-step 4), propose options through the token layer (categorical palette designed
-for the sky ground; communities as spatial regions/contours; hue-only-with-
-legend in the live instrument), and get an owner decision rather than shipping
-an ad-hoc palette.
+only four greys, and "color by community" appears to need dozens of
+distinguishable categories.
+
+Reframe before solving: a legible view never shows dozens of categories. It
+shows the top-k communities by size plus an "other" bucket — k of roughly 8–12.
+So the tractable version of the ask is *"a categorical palette of k ≤ 12
+designed for the sky ground, with everything past k collapsing to a neutral,"*
+which is an ordinary design problem rather than an open-ended one. Surface it
+when it bites (explorer work, step 4), propose through the token layer
+(categorical palette for the sky ground; communities as spatial
+regions/contours; hue-only-with-legend in the live instrument), and get an owner
+decision rather than shipping an ad-hoc palette.
 
 ## Open questions (carry forward, decide in-flight)
 
