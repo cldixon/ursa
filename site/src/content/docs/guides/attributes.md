@@ -93,9 +93,12 @@ ur.degree(active, direction="both").collect()   # the subgraph's answer, over th
 ```
 
 Repeated `.filter()` calls **intersect** (logical AND), and a node left with no unmasked incident
-edge stays present at degree 0. What still raises: a graph op over a `distinct`/`sample`/`join`/
-`group_by`-derived edge frame (those reshape the edge set beyond what a mask can express) —
-materialize and re-ingest those via `ur.EdgeFrame(...)` to run further ops on them.
+edge stays present at degree 0. A graph op over a **traversal result** works the same way — the
+reached nodes of `ur.hop(...)` / `ur.shortest_path(...)` induce the subgraph a kernel runs over
+(see the [traversals guide](/docs/guides/traversals)). What still raises: a graph op over a
+`distinct`/`sample`/`join`/`group_by`-derived edge frame (those reshape the edge set beyond what a
+mask can express) — materialize and re-ingest those via `ur.EdgeFrame(...)` to run further ops on
+them.
 
 ## Multiplicity
 

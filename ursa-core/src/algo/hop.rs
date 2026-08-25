@@ -129,6 +129,51 @@ fn bfs_seed(
     (src_out, dst_out)
 }
 
+/// The set of nodes reachable within `k` hops from **any** seed, including the
+/// seeds themselves — a multi-source BFS over the whole seed set at once.
+///
+/// Returned as dense node indices in ascending order (a set: a node reachable from
+/// several seeds appears once). This backs "graph op over a traversal result"
+/// (#116): the reached set induces a subgraph of the parent CSR (keep an edge iff
+/// both endpoints are reached), which the node-valued kernels then run over via the
+/// #114 edge mask. The seeds are included because the reached *region* contains its
+/// origin. `k == 0` yields exactly the (known) seeds; unknown/out-of-range seeds
+/// contribute nothing. `Both` walks out- and in-neighbours together.
+pub fn k_hop_reached_set(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> Vec<u32> {
+    let n = topo.n_nodes();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut visited = vec![false; n];
+    let mut frontier: Vec<u32> = Vec::new();
+    for &s in seeds {
+        if (s as usize) < n && !visited[s as usize] {
+            visited[s as usize] = true;
+            frontier.push(s);
+        }
+    }
+
+    let mut next: Vec<u32> = Vec::new();
+    for _level in 0..k {
+        next.clear();
+        for &u in frontier.iter() {
+            topo.for_each_neighbor(u, dir, None, |v| {
+                if !visited[v as usize] {
+                    visited[v as usize] = true;
+                    next.push(v);
+                }
+            });
+        }
+        if next.is_empty() {
+            break;
+        }
+        std::mem::swap(&mut frontier, &mut next);
+    }
+
+    // Ascending dense order — a deterministic set independent of BFS visit order.
+    (0..n as u32).filter(|&v| visited[v as usize]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +234,48 @@ mod tests {
         assert!(s.is_empty() && d.is_empty());
         let (s, d) = k_hop(&t, &[0], 0, Direction::Out);
         assert!(s.is_empty() && d.is_empty());
+    }
+
+    #[test]
+    fn reached_set_includes_seed_and_all_within_k() {
+        let t = path();
+        // from 0, depth 2: seed 0 + level1 {1} + level2 {2,4}
+        assert_eq!(
+            k_hop_reached_set(&t, &[0], 2, Direction::Out),
+            vec![0, 1, 2, 4]
+        );
+    }
+
+    #[test]
+    fn reached_set_k_zero_is_just_the_seeds() {
+        let t = path();
+        assert_eq!(
+            k_hop_reached_set(&t, &[2, 0], 0, Direction::Out),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn reached_set_unions_multiple_seeds_without_duplicates() {
+        let t = path();
+        // 0 reaches {0,1}; 2 reaches {2,3} at depth 1 -> union {0,1,2,3}, each once.
+        assert_eq!(
+            k_hop_reached_set(&t, &[0, 2], 1, Direction::Out),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn reached_set_drops_unknown_seeds() {
+        let t = path();
+        assert_eq!(
+            k_hop_reached_set(&t, &[99], 3, Direction::Out),
+            Vec::<u32>::new()
+        );
+        // a known seed alongside an unknown one still expands from the known one.
+        assert_eq!(
+            k_hop_reached_set(&t, &[3, 99], 1, Direction::In),
+            vec![2, 3]
+        );
     }
 }

@@ -41,7 +41,7 @@ use ursa_core::{EdgeMask, IdMap};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
-    scan_edges_batch, scan_nodes_batch,
+    hop_reached_nodes, scan_edges_batch, scan_nodes_batch, shortest_path_nodes,
 };
 
 // ---------------------------------------------------------------------------
@@ -360,6 +360,63 @@ fn run_path_query(
     batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
+/// The set of nodes reached within `n` hops of `seeds` (seeds included), as a
+/// pyarrow array of user ids. Backs graph ops over a `hop` result (#116): the
+/// reached region induces the subgraph mask a node-valued kernel runs over.
+#[pyfunction]
+fn hop_reached_nodes_query(
+    py: Python<'_>,
+    index: PyRef<'_, GraphIndex>,
+    seeds: &Bound<'_, PyAny>,
+    n: u32,
+    direction: &str,
+) -> PyResult<Py<PyAny>> {
+    let (topo, ids) = (index.topo.clone(), index.ids.clone());
+    let seeds = array_from_pyarrow(seeds)?;
+    let direction = direction.to_string();
+    let arr = py.detach(move || {
+        hop_reached_nodes(topo, ids, seeds.as_ref(), n, &direction).map_err(to_pyerr)
+    })?;
+    arr.into_data().to_pyarrow(py).map(|obj| obj.unbind())
+}
+
+/// The nodes on the shortest path from `source` to `target` (inclusive), as a
+/// pyarrow array of user ids (empty when there is no path). Backs graph ops over a
+/// `shortest_path` result (#116). `weight` + `edges` select weighted Dijkstra.
+#[pyfunction]
+#[pyo3(signature = (index, source, target, direction, weight=None, edges=None))]
+fn shortest_path_nodes_query(
+    py: Python<'_>,
+    index: PyRef<'_, GraphIndex>,
+    source: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
+    direction: &str,
+    weight: Option<String>,
+    edges: Option<Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let (topo, ids) = (index.topo.clone(), index.ids.clone());
+    let source = array_from_pyarrow(source)?;
+    let target = array_from_pyarrow(target)?;
+    let direction = direction.to_string();
+    let edges = match edges {
+        Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
+        None => None,
+    };
+    let arr = py.detach(move || {
+        shortest_path_nodes(
+            topo,
+            ids,
+            source.as_ref(),
+            target.as_ref(),
+            &direction,
+            weight.as_deref(),
+            edges,
+        )
+        .map_err(to_pyerr)
+    })?;
+    arr.into_data().to_pyarrow(py).map(|obj| obj.unbind())
+}
+
 /// Execute a `random_walk` and return its `(walk_id, step, node)` node batch as
 /// pyarrow. `starts` is a pyarrow array of user ids (int64 or string, matching the
 /// graph); `seed` (optional) makes the walk reproducible. The
@@ -511,6 +568,8 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_join_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_hop_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_path_query, m)?)?;
+    m.add_function(wrap_pyfunction!(hop_reached_nodes_query, m)?)?;
+    m.add_function(wrap_pyfunction!(shortest_path_nodes_query, m)?)?;
     m.add_function(wrap_pyfunction!(run_walk_query, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
     m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;

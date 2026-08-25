@@ -41,7 +41,7 @@ pub use closeness::{closeness, closeness_weighted};
 pub use clustering::clustering_coefficient;
 pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
-pub use hop::k_hop;
+pub use hop::{k_hop, k_hop_reached_set};
 pub use label_prop::label_propagation;
 pub use louvain::{louvain, louvain_weighted};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
