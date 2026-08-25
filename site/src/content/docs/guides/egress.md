@@ -20,6 +20,23 @@ tbl  = result.to_arrow()     # pyarrow.Table
 rows = result.to_dicts()     # list[dict], for small results and API responses
 ```
 
+A materialized frame previews itself, so a bare `collect()` in a REPL shows the head rather than a
+summary line. `len(result)` is the row count and `result.columns` the column names — neither needs
+polars:
+
+```python
+>>> edges.nodes().with_columns(pr=ur.pagerank(edges)).head(2).collect()
+shape: (2, 2)
+┌─────┬──────────┐
+│ id  ┆ pr       │
+│ --- ┆ ---      │
+│ i64 ┆ f64      │
+╞═════╪══════════╡
+│ 0   ┆ 0.477977 │
+│ 1   ┆ 0.447023 │
+└─────┴──────────┘
+```
+
 `to_arrow()` is the general exit. Anything that speaks Arrow takes it directly — for example
 appending to an Iceberg table:
 
