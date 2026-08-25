@@ -26,7 +26,7 @@ use rayon::prelude::*;
 
 use super::bfs::TotalF64;
 use super::rng::{shuffled_order, DEFAULT_SEED};
-use crate::topology::Topology;
+use crate::topology::{EdgeMask, Topology};
 
 /// Sum per-source Brandes contributions deterministically. Rayon's `fold`/`reduce`
 /// combines partials in a work-stealing-dependent order, so the f64 total varies
@@ -150,7 +150,12 @@ impl BrandesWeightedScratch {
 
 /// Betweenness centrality per node (directed, following out-edges). See the
 /// module docs for the exact-vs-`sample` behaviour and scaling.
-pub fn betweenness(topo: &Topology, sample: Option<f64>, seed: Option<u64>) -> Vec<f64> {
+pub fn betweenness(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    sample: Option<f64>,
+    seed: Option<u64>,
+) -> Vec<f64> {
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();
@@ -165,7 +170,7 @@ pub fn betweenness(topo: &Topology, sample: Option<f64>, seed: Option<u64>) -> V
         n,
         &sources,
         || BrandesScratch::new(n),
-        |s, acc, sc| brandes_from(topo, s, acc, sc),
+        |s, acc, sc| brandes_from(topo, mask, s, acc, sc),
     );
 
     if sample.is_some() {
@@ -182,7 +187,13 @@ pub fn betweenness(topo: &Topology, sample: Option<f64>, seed: Option<u64>) -> V
 /// insertion order, and reverse-accumulation sum order are unchanged from the
 /// allocate-per-source version, so the result is byte-identical (the determinism
 /// guarantee this kernel is held to).
-fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64], sc: &mut BrandesScratch) {
+fn brandes_from(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    s: u32,
+    bc: &mut [f64],
+    sc: &mut BrandesScratch,
+) {
     let out = topo.out();
     let BrandesScratch {
         dist,
@@ -200,7 +211,12 @@ fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64], sc: &mut BrandesScratch
     while let Some(v) = queue.pop_front() {
         order.push(v);
         let dv = dist[v as usize];
-        for &w in out.neighbors(v) {
+        // Visit each out-neighbour `w` reached via edge row `e`; under a mask, skip
+        // slots whose row is masked out (the subgraph's shortest-path counts).
+        for (&w, &e) in out.neighbors(v).iter().zip(out.edge_ids(v)) {
+            if !mask.is_none_or(|m| m.keep(e)) {
+                continue;
+            }
             // First time we reach w: set its distance and enqueue.
             if dist[w as usize] < 0 {
                 dist[w as usize] = dv + 1;
@@ -236,6 +252,7 @@ fn brandes_from(topo: &Topology, s: u32, bc: &mut [f64], sc: &mut BrandesScratch
 pub fn betweenness_weighted(
     topo: &Topology,
     weights: &[f64],
+    mask: Option<&EdgeMask>,
     sample: Option<f64>,
     seed: Option<u64>,
 ) -> Vec<f64> {
@@ -258,7 +275,7 @@ pub fn betweenness_weighted(
         n,
         &sources,
         || BrandesWeightedScratch::new(n),
-        |s, acc, sc| brandes_from_weighted(topo, weights, s, acc, sc),
+        |s, acc, sc| brandes_from_weighted(topo, weights, mask, s, acc, sc),
     );
 
     if sample.is_some() {
@@ -278,6 +295,7 @@ pub fn betweenness_weighted(
 fn brandes_from_weighted(
     topo: &Topology,
     weights: &[f64],
+    mask: Option<&EdgeMask>,
     s: u32,
     bc: &mut [f64],
     sc: &mut BrandesWeightedScratch,
@@ -304,6 +322,9 @@ fn brandes_from_weighted(
         settled[u as usize] = true;
         order.push(u);
         for (&w_node, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+            if !mask.is_none_or(|m| m.keep(e)) {
+                continue; // edge not in the subgraph
+            }
             if settled[w_node as usize] {
                 continue;
             }
@@ -370,7 +391,7 @@ mod tests {
         // 0->1->2->3->4. Node v lies between every ordered pair (s, t) with
         // s < v < t: bc = [0, 3, 4, 3, 0].
         let t = Topology::build(5, vec![0, 1, 2, 3], vec![1, 2, 3, 4]);
-        let bc = betweenness(&t, None, None);
+        let bc = betweenness(&t, None, None, None);
         assert_eq!(bc, vec![0.0, 3.0, 4.0, 3.0, 0.0]);
     }
 
@@ -379,7 +400,7 @@ mod tests {
         // 0->1, 0->2, 1->3, 2->3: two shortest 0->3 paths, so nodes 1 and 2 each
         // carry half the (0,3) pair -> 0.5 apiece; endpoints 0 and 3 carry none.
         let t = Topology::build(4, vec![0, 0, 1, 2], vec![1, 2, 3, 3]);
-        let bc = betweenness(&t, None, None);
+        let bc = betweenness(&t, None, None, None);
         assert_eq!(bc[0], 0.0);
         assert_eq!(bc[3], 0.0);
         assert!((bc[1] - 0.5).abs() < 1e-12, "got {}", bc[1]);
@@ -393,10 +414,10 @@ mod tests {
         // through node 1; node 2 carries none.
         // edge rows: 0=(0->1),1=(0->2),2=(1->3),3=(2->3)
         let t = Topology::build(4, vec![0, 0, 1, 2], vec![1, 2, 3, 3]);
-        let even = betweenness_weighted(&t, &[1.0, 1.0, 1.0, 1.0], None, None);
+        let even = betweenness_weighted(&t, &[1.0, 1.0, 1.0, 1.0], None, None, None);
         assert!((even[1] - 0.5).abs() < 1e-12 && (even[2] - 0.5).abs() < 1e-12);
 
-        let cheap_left = betweenness_weighted(&t, &[1.0, 5.0, 1.0, 5.0], None, None);
+        let cheap_left = betweenness_weighted(&t, &[1.0, 5.0, 1.0, 5.0], None, None, None);
         assert!((cheap_left[1] - 1.0).abs() < 1e-12, "got {}", cheap_left[1]);
         assert!(cheap_left[2].abs() < 1e-12, "got {}", cheap_left[2]);
     }
@@ -406,7 +427,7 @@ mod tests {
         let t = Topology::build(5, vec![0, 1, 2, 3], vec![1, 2, 3, 4]);
         // A partial-source estimate is non-negative and finite; the middle node
         // still ranks at or above the endpoints.
-        let bc = betweenness(&t, Some(0.5), Some(7));
+        let bc = betweenness(&t, None, Some(0.5), Some(7));
         assert!(bc.iter().all(|&x| x >= 0.0 && x.is_finite()));
         assert!(bc[2] >= bc[0]);
     }
@@ -414,7 +435,7 @@ mod tests {
     #[test]
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
-        assert!(betweenness(&t, None, None).is_empty());
+        assert!(betweenness(&t, None, None, None).is_empty());
     }
 
     #[test]
@@ -427,7 +448,7 @@ mod tests {
         let src: Vec<u32> = (0..n).collect();
         let dst: Vec<u32> = (0..n).map(|i| (i + 1) % n).collect();
         let t = Topology::build(n as usize, src, dst);
-        let bc = betweenness(&t, None, None);
+        let bc = betweenness(&t, None, None, None);
         assert_eq!(bc.len(), n as usize);
         for &x in &bc {
             assert!(
@@ -447,8 +468,8 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 0, 3, 5],
         );
         assert_eq!(
-            betweenness(&t, Some(0.5), Some(7)),
-            betweenness(&t, Some(0.5), Some(7)),
+            betweenness(&t, None, Some(0.5), Some(7)),
+            betweenness(&t, None, Some(0.5), Some(7)),
             "same seed must give the same sampled estimate"
         );
         // sample_sources picks a seed-shuffled subset, so different seeds generally

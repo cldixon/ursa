@@ -28,7 +28,7 @@ pub fn bfs_distances(topo: &Topology, source: u32, dir: Direction) -> Vec<i32> {
     while !frontier.is_empty() {
         next.clear();
         for &u in &frontier {
-            topo.for_each_neighbor(u, dir, |v| {
+            topo.for_each_neighbor(u, dir, None, |v| {
                 if dist[v as usize] < 0 {
                     dist[v as usize] = level;
                     next.push(v);
@@ -70,7 +70,7 @@ pub fn shortest_path(
         next.clear();
         for &u in &frontier {
             let mut hit = false;
-            topo.for_each_neighbor(u, dir, |v| {
+            topo.for_each_neighbor(u, dir, None, |v| {
                 if parent[v as usize] < 0 {
                     parent[v as usize] = u as i64;
                     if v == target {
@@ -152,7 +152,7 @@ pub fn dijkstra_distances(
             continue;
         }
         settled[u as usize] = true;
-        topo.for_each_weighted_neighbor(u, weights, dir, |v, w| {
+        topo.for_each_weighted_neighbor(u, weights, dir, None, |v, w| {
             if !settled[v as usize] {
                 let nd = du + w;
                 if nd < dist[v as usize] {
@@ -230,7 +230,7 @@ pub fn shortest_path_weighted_with_cost(
         if u == target {
             break; // settled the target — its distance is final
         }
-        topo.for_each_weighted_neighbor(u, weights, dir, |v, w| {
+        topo.for_each_weighted_neighbor(u, weights, dir, None, |v, w| {
             if !settled[v as usize] {
                 let nd = du + w;
                 if nd < dist[v as usize] {

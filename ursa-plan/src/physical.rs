@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use ursa_core::{Direction, IdMap, Topology};
+use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
 use crate::result::{
     hop_batch, hop_schema, path_batch, path_schema, query_batch, query_schema, walk_batch,
@@ -41,12 +41,19 @@ pub struct GraphAlgorithmExec {
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
     columns: Arc<Vec<OutputColumn>>,
+    /// Optional subgraph view (#114), forwarded to the kernels via `query_batch`.
+    mask: Option<Arc<EdgeMask>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
 impl GraphAlgorithmExec {
-    pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>, columns: Arc<Vec<OutputColumn>>) -> Self {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        columns: Arc<Vec<OutputColumn>>,
+        mask: Option<Arc<EdgeMask>>,
+    ) -> Self {
         let schema = query_schema(&columns, ids.user_type());
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -58,6 +65,7 @@ impl GraphAlgorithmExec {
             topology,
             ids,
             columns,
+            mask,
             schema,
             properties,
         }
@@ -100,10 +108,11 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let topo = self.topology.clone();
         let ids = self.ids.clone();
         let columns = self.columns.clone();
+        let mask = self.mask.clone();
 
         // CPU-bound (Rayon-parallel inside) — keep it off the tokio worker.
         let fut = async move {
-            tokio::task::spawn_blocking(move || query_batch(&topo, &ids, &columns))
+            tokio::task::spawn_blocking(move || query_batch(&topo, &ids, &columns, mask.as_deref()))
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))?
         };
@@ -438,7 +447,7 @@ mod tests {
             },
             weights: None,
         }]);
-        let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns));
+        let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns, None));
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
         let batches = datafusion::physical_plan::common::collect(stream)

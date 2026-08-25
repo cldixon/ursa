@@ -44,6 +44,7 @@ impl ExtensionPlanner for GraphExtensionPlanner {
                 n.topology.clone(),
                 n.ids.clone(),
                 n.columns.clone(),
+                n.mask.clone(),
             )) as Arc<dyn ExecutionPlan>));
         }
         if let Some(n) = any.downcast_ref::<HopNode>() {

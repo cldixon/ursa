@@ -31,6 +31,81 @@ pub enum Direction {
     Both,
 }
 
+/// A per-edge-row presence mask — the "subgraph view" over a parent CSR (#114).
+///
+/// `keep(e)` is true when original edge row `e` is in the subgraph. It is indexed
+/// by the **same original-row space** as [`Adjacency::edge_ids`], so a kernel
+/// consults `mask.keep(edge_ids(u)[k])` at each CSR slot to skip masked-out edges —
+/// no rebuild of the CSR, the dense id space and the `edge_ids` permutation are the
+/// parent's. Stored as a bitset (1 bit/edge) so a 500M-edge mask is ~60 MB, not the
+/// ~500 MB a `Vec<bool>` would cost — the viz WASM target cares.
+#[derive(Debug, Clone)]
+pub struct EdgeMask {
+    words: Vec<u64>,
+    n_edges: usize,
+    n_kept: usize,
+}
+
+impl EdgeMask {
+    /// Build from a per-row boolean slice (`keep[e]` = row `e` retained). The slice
+    /// is in original edge-row order — the order the topology was built from.
+    pub fn from_bools(keep: &[bool]) -> Self {
+        let n_edges = keep.len();
+        let mut words = vec![0u64; n_edges.div_ceil(64)];
+        let mut n_kept = 0usize;
+        for (e, &k) in keep.iter().enumerate() {
+            if k {
+                words[e >> 6] |= 1u64 << (e & 63);
+                n_kept += 1;
+            }
+        }
+        EdgeMask {
+            words,
+            n_edges,
+            n_kept,
+        }
+    }
+
+    /// Is original edge row `e` in the subgraph? Rows `>= n_edges` are not kept.
+    #[inline]
+    pub fn keep(&self, e: u32) -> bool {
+        let e = e as usize;
+        e < self.n_edges && (self.words[e >> 6] >> (e & 63)) & 1 == 1
+    }
+
+    /// The parent edge-row count this mask is defined over.
+    #[inline]
+    pub fn n_edges(&self) -> usize {
+        self.n_edges
+    }
+
+    /// How many rows are kept (popcount) — the subgraph's edge count.
+    #[inline]
+    pub fn n_kept(&self) -> usize {
+        self.n_kept
+    }
+
+    /// Intersect two masks over the same row space (a second `.filter()` narrows the
+    /// subgraph — presence requires *both* predicates). Panics on a size mismatch.
+    pub fn intersect(&self, other: &EdgeMask) -> EdgeMask {
+        assert_eq!(
+            self.n_edges, other.n_edges,
+            "intersecting masks over different edge-row spaces"
+        );
+        let mut words = vec![0u64; self.words.len()];
+        let mut n_kept = 0usize;
+        for ((out, &a), &b) in words.iter_mut().zip(&self.words).zip(&other.words) {
+            *out = a & b;
+            n_kept += out.count_ones() as usize;
+        }
+        EdgeMask {
+            words,
+            n_edges: self.n_edges,
+            n_kept,
+        }
+    }
+}
+
 /// One direction's adjacency in CSR form.
 #[derive(Debug, Clone)]
 pub struct Adjacency {
@@ -391,32 +466,27 @@ impl Topology {
     /// Apply `f` to each neighbour of `u` in `dir` — out-neighbours, in-neighbours,
     /// or both adjacencies concatenated for `Both`. The one canonical directional
     /// neighbour walk shared by the frontier kernels (`bfs`, `k_hop`).
+    ///
+    /// With `mask = Some(m)` this is a **subgraph view**: a neighbour is visited only
+    /// if its original edge row is kept (`m.keep(edge_ids[k])`), skipping masked-out
+    /// edges without touching the CSR. `mask = None` is the full-graph fast path (no
+    /// `edge_ids` gather).
     #[inline]
-    pub fn for_each_neighbor<F: FnMut(u32)>(&self, u: u32, dir: Direction, mut f: F) {
-        match dir {
-            Direction::Out => self.out.neighbors(u).iter().for_each(|&v| f(v)),
-            Direction::In => self.incoming().neighbors(u).iter().for_each(|&v| f(v)),
-            Direction::Both => {
-                self.out.neighbors(u).iter().for_each(|&v| f(v));
-                self.incoming().neighbors(u).iter().for_each(|&v| f(v));
-            }
-        }
-    }
-
-    /// Apply `f(v, w)` to each neighbour of `u` in `dir` and the weight `w` of the
-    /// connecting edge, gathered per CSR slot via `edge_ids` (both adjacencies
-    /// merged for `Both`). `weights` is indexed by original edge row.
-    #[inline]
-    pub fn for_each_weighted_neighbor<F: FnMut(u32, f64)>(
+    pub fn for_each_neighbor<F: FnMut(u32)>(
         &self,
         u: u32,
-        weights: &[f64],
         dir: Direction,
+        mask: Option<&EdgeMask>,
         mut f: F,
     ) {
-        let mut visit = |adj: &Adjacency| {
-            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
-                f(v, weights[e as usize]);
+        let mut visit = |adj: &Adjacency| match mask {
+            None => adj.neighbors(u).iter().for_each(|&v| f(v)),
+            Some(m) => {
+                for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                    if m.keep(e) {
+                        f(v);
+                    }
+                }
             }
         };
         match dir {
@@ -427,6 +497,76 @@ impl Topology {
                 visit(self.incoming());
             }
         }
+    }
+
+    /// Apply `f(v, w)` to each neighbour of `u` in `dir` and the weight `w` of the
+    /// connecting edge, gathered per CSR slot via `edge_ids` (both adjacencies
+    /// merged for `Both`). `weights` is indexed by original edge row. With
+    /// `mask = Some(m)`, masked-out edges are skipped (subgraph view).
+    #[inline]
+    pub fn for_each_weighted_neighbor<F: FnMut(u32, f64)>(
+        &self,
+        u: u32,
+        weights: &[f64],
+        dir: Direction,
+        mask: Option<&EdgeMask>,
+        mut f: F,
+    ) {
+        let mut visit = |adj: &Adjacency| {
+            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                if mask.is_none_or(|m| m.keep(e)) {
+                    f(v, weights[e as usize]);
+                }
+            }
+        };
+        match dir {
+            Direction::Out => visit(&self.out),
+            Direction::In => visit(self.incoming()),
+            Direction::Both => {
+                visit(&self.out);
+                visit(self.incoming());
+            }
+        }
+    }
+
+    /// The undirected view honoring an edge mask (`out ∪ in` over kept edges only,
+    /// self-loops dropped, deduplicated) — the subgraph-view input for the
+    /// intersection kernels (`triangle_count`, `clustering_coefficient`). Unlike
+    /// [`Topology::undirected`] this is **not cached**: it is specific to one mask,
+    /// rebuilt per subgraph. It rebuilds only the undirected adjacency, not the
+    /// directed CSR or the id map, so the parent index and dense id space are
+    /// unchanged (no `build_index`).
+    pub fn undirected_masked(&self, mask: &EdgeMask) -> UndirectedCsr {
+        use rayon::prelude::*;
+        let n = self.n_nodes;
+        let out = &self.out;
+        let inc = self.incoming();
+        let kept = |adj: &Adjacency, u: u32| -> Vec<u32> {
+            adj.neighbors(u)
+                .iter()
+                .zip(adj.edge_ids(u))
+                .filter_map(|(&v, &e)| (mask.keep(e) && v != u).then_some(v))
+                .collect()
+        };
+        let lists: Vec<Vec<u32>> = (0..n as u32)
+            .into_par_iter()
+            .map(|u| {
+                let mut nbrs = kept(out, u);
+                nbrs.extend(kept(inc, u));
+                nbrs.sort_unstable();
+                nbrs.dedup();
+                nbrs
+            })
+            .collect();
+        let mut offsets = vec![0u64; n + 1];
+        for u in 0..n {
+            offsets[u + 1] = offsets[u] + lists[u].len() as u64;
+        }
+        let mut targets = Vec::with_capacity(offsets[n] as usize);
+        for list in &lists {
+            targets.extend_from_slice(list);
+        }
+        UndirectedCsr { offsets, targets }
     }
 }
 

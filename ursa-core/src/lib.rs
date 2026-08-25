@@ -27,4 +27,4 @@ pub mod id_map;
 pub mod topology;
 
 pub use id_map::{IdError, IdMap};
-pub use topology::{Adjacency, Direction, Topology};
+pub use topology::{Adjacency, Direction, EdgeMask, Topology};

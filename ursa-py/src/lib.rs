@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch};
+use arrow::array::{make_array, Array, ArrayData, ArrayRef, BooleanArray, RecordBatch};
 use arrow_pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ursa_core::topology::Topology;
-use ursa_core::IdMap;
+use ursa_core::{EdgeMask, IdMap};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
@@ -106,6 +106,20 @@ fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
     Ok(make_array(ArrayData::from_pyarrow_bound(obj)?))
 }
 
+/// Build a subgraph [`EdgeMask`] from a pyarrow **boolean** array whose element `e`
+/// says whether original edge row `e` is in the subgraph (#114). The array is in
+/// original edge-row order — the order the topology was built from — so `mask.keep`
+/// aligns with the CSR's `edge_ids`. A null is treated as *not kept*.
+fn edge_mask_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Arc<EdgeMask>> {
+    let arr = array_from_pyarrow(obj)?;
+    let b = arr
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| PyValueError::new_err("edge_mask must be a pyarrow boolean array"))?;
+    let bools: Vec<bool> = (0..b.len()).map(|i| b.is_valid(i) && b.value(i)).collect();
+    Ok(Arc::new(EdgeMask::from_bools(&bools)))
+}
+
 /// Counts topology builds, so tests can prove the index-preservation contract
 /// (a multi-algorithm pipeline over one frame builds the CSR exactly once).
 static TOPOLOGY_BUILDS: AtomicUsize = AtomicUsize::new(0);
@@ -155,7 +169,7 @@ fn _topology_build_count() -> usize {
 /// expression JSON string (lowered through the shared `crate::expr` seam);
 /// `sort` is `(column, descending)`. The GIL is released across build + compute.
 #[pyfunction]
-#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new(), group_keys=Vec::new(), aggs=Vec::new()))]
+#[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new(), group_keys=Vec::new(), aggs=Vec::new(), edge_mask=None))]
 #[allow(clippy::too_many_arguments)]
 fn run_node_query(
     py: Python<'_>,
@@ -172,9 +186,15 @@ fn run_node_query(
     rename: Vec<(String, String)>,
     group_keys: Vec<String>,
     aggs: Vec<String>,
+    edge_mask: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
     let columns_json = columns_json.to_string();
+    // A subgraph view (#114): a per-edge-row boolean mask over the shared parent CSR.
+    let mask = match edge_mask {
+        Some(obj) => Some(edge_mask_from_pyarrow(&obj)?),
+        None => None,
+    };
     // The node attribute table and the edge attribute table (for weight
     // expressions) each cross the FFI as a *list* of RecordBatches, so a large
     // attribute table is never concatenated into one batch (#60).
@@ -202,6 +222,7 @@ fn run_node_query(
             rename,
             group_keys,
             aggs,
+            mask,
         )
         .map_err(to_pyerr)
     })?;

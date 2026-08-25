@@ -60,10 +60,17 @@ single-shot limits are implementation stages, not design positions.
 **Motif finding** — `ur.find("(a)-[e]->(b); ...")`, GraphFrames-style — is the first post-v0.1
 feature, not an omission.
 
-Also deferred: subgraph views over filtered frames (a bitmask over the parent CSR instead of a
-rebuild — today a graph op over a filtered edge frame raises, and rebuilding from the filtered
-rows is the workaround), `ur.sql()` over registered tables, heterogeneous graphs, a `u64` node
+Also deferred: `ur.sql()` over registered tables, heterogeneous graphs, a `u64` node
 space, streaming and out-of-core execution, and temporal semantics.
+
+Subgraph views over filtered frames have **shipped**: a `filter` on an EdgeFrame is now a view
+over the parent CSR — the dropped rows ride along as an edge-row bitmask, so every node-valued
+kernel (pagerank, degree, closeness, betweenness, components, louvain, label propagation,
+triangle count, clustering) runs restricted to the kept edges with no rebuild. Repeated filters
+intersect, and a node left with no unmasked incident edge stays present at degree 0. Still
+deferred here: traversals (`hop`/`shortest_path`) *over* a subgraph view, and graph ops on
+`distinct`/`sample`/`join`/`group_by`-derived frames, which reshape the edge set beyond what a
+mask can express.
 
 ## Permanent non-goals
 

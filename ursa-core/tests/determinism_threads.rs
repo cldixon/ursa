@@ -55,10 +55,10 @@ fn pagerank_is_thread_count_independent() {
         max_iter: 100,
         tol: 1e-12,
     };
-    let reference = on_pool(1, || pagerank(&t, params));
+    let reference = on_pool(1, || pagerank(&t, None, params));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || pagerank(&t, params)),
+            on_pool(threads, || pagerank(&t, None, params)),
             reference,
             "pagerank diverged at {threads} threads"
         );
@@ -68,10 +68,10 @@ fn pagerank_is_thread_count_independent() {
 #[test]
 fn betweenness_full_is_thread_count_independent() {
     let t = seeded_graph(300, 2500);
-    let reference = on_pool(1, || betweenness(&t, None, None));
+    let reference = on_pool(1, || betweenness(&t, None, None, None));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || betweenness(&t, None, None)),
+            on_pool(threads, || betweenness(&t, None, None, None)),
             reference,
             "full betweenness diverged at {threads} threads"
         );
@@ -83,10 +83,10 @@ fn betweenness_sampled_is_thread_count_independent() {
     // Sampled + seeded: the #54 guarantee is that a fixed seed pins the sampled
     // source set and the result regardless of how many threads process it.
     let t = seeded_graph(400, 4000);
-    let reference = on_pool(1, || betweenness(&t, Some(0.25), Some(42)));
+    let reference = on_pool(1, || betweenness(&t, None, Some(0.25), Some(42)));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || betweenness(&t, Some(0.25), Some(42))),
+            on_pool(threads, || betweenness(&t, None, Some(0.25), Some(42))),
             reference,
             "sampled betweenness diverged at {threads} threads"
         );
@@ -96,10 +96,10 @@ fn betweenness_sampled_is_thread_count_independent() {
 #[test]
 fn louvain_is_thread_count_independent() {
     let t = seeded_graph(400, 4000);
-    let reference = on_pool(1, || louvain(&t, 1.0, Some(7)));
+    let reference = on_pool(1, || louvain(&t, None, 1.0, Some(7)));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || louvain(&t, 1.0, Some(7))),
+            on_pool(threads, || louvain(&t, None, 1.0, Some(7))),
             reference,
             "louvain diverged at {threads} threads"
         );
@@ -109,10 +109,10 @@ fn louvain_is_thread_count_independent() {
 #[test]
 fn label_propagation_is_thread_count_independent() {
     let t = seeded_graph(400, 4000);
-    let reference = on_pool(1, || label_propagation(&t, 20, Some(7)));
+    let reference = on_pool(1, || label_propagation(&t, None, 20, Some(7)));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || label_propagation(&t, 20, Some(7))),
+            on_pool(threads, || label_propagation(&t, None, 20, Some(7))),
             reference,
             "label propagation diverged at {threads} threads"
         );

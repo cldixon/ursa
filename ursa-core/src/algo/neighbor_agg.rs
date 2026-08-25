@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-use crate::topology::{Direction, Topology};
+use crate::topology::{Direction, EdgeMask, Topology};
 
 /// The supported neighbour aggregations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,7 @@ pub enum AggKind {
 pub fn neighbor_aggregate(
     topo: &Topology,
     attr: &[Option<f64>],
+    mask: Option<&EdgeMask>,
     direction: Direction,
     agg: AggKind,
 ) -> Vec<Option<f64>> {
@@ -49,42 +50,58 @@ pub fn neighbor_aggregate(
     (0..n as u32)
         .into_par_iter()
         .map_init(Vec::<f64>::new, |scratch, u| {
-            aggregate_node(topo, attr, direction, agg, u, scratch)
+            aggregate_node(topo, attr, mask, direction, agg, u, scratch)
         })
         .collect()
 }
 
 /// Aggregate one node's neighbour attribute values. `scratch` is a reusable
 /// buffer (only `NUnique` fills it) so the hot path allocates nothing per node.
+/// Iterates `(neighbour, edge_row)` pairs so a subgraph `mask` can drop masked-out
+/// incident edges.
 fn aggregate_node(
     topo: &Topology,
     attr: &[Option<f64>],
+    mask: Option<&EdgeMask>,
     direction: Direction,
     agg: AggKind,
     u: u32,
     scratch: &mut Vec<f64>,
 ) -> Option<f64> {
+    let out = topo.out();
+    let out_pairs = || out.neighbors(u).iter().zip(out.edge_ids(u));
     match direction {
-        Direction::Out => fold_neighbors(topo.out().neighbors(u).iter(), attr, agg, scratch),
-        Direction::In => fold_neighbors(topo.incoming().neighbors(u).iter(), attr, agg, scratch),
-        Direction::Both => fold_neighbors(
-            topo.out()
-                .neighbors(u)
-                .iter()
-                .chain(topo.incoming().neighbors(u).iter()),
-            attr,
-            agg,
-            scratch,
-        ),
+        Direction::Out => fold_neighbors(out_pairs(), attr, mask, agg, scratch),
+        Direction::In => {
+            let inc = topo.incoming();
+            fold_neighbors(
+                inc.neighbors(u).iter().zip(inc.edge_ids(u)),
+                attr,
+                mask,
+                agg,
+                scratch,
+            )
+        }
+        Direction::Both => {
+            let inc = topo.incoming();
+            fold_neighbors(
+                out_pairs().chain(inc.neighbors(u).iter().zip(inc.edge_ids(u))),
+                attr,
+                mask,
+                agg,
+                scratch,
+            )
+        }
     }
 }
 
-/// Fold the present attribute values of a neighbour-index iterator into one
-/// aggregate. Generic over the iterator so `Out`/`In` (a slice iter) and `Both`
-/// (a chained iter) monomorphize without boxing.
-fn fold_neighbors<'a, I: Iterator<Item = &'a u32>>(
+/// Fold the present attribute values of a `(neighbour, edge_row)` iterator into one
+/// aggregate. Generic over the iterator so `Out`/`In` (a slice zip) and `Both`
+/// (a chained zip) monomorphize without boxing. A masked-out edge row is skipped.
+fn fold_neighbors<'a, I: Iterator<Item = (&'a u32, &'a u32)>>(
     neighbors: I,
     attr: &[Option<f64>],
+    mask: Option<&EdgeMask>,
     agg: AggKind,
     scratch: &mut Vec<f64>,
 ) -> Option<f64> {
@@ -95,7 +112,10 @@ fn fold_neighbors<'a, I: Iterator<Item = &'a u32>>(
     if agg == AggKind::NUnique {
         scratch.clear();
     }
-    for &v in neighbors {
+    for (&v, &e) in neighbors {
+        if !mask.is_none_or(|m| m.keep(e)) {
+            continue;
+        }
         let Some(x) = attr[v as usize] else { continue };
         count += 1;
         sum += x;
@@ -161,7 +181,7 @@ mod tests {
     fn mean_over_in_neighbours() {
         let t = hub();
         let attr = vec![Some(0.0), Some(10.0), Some(20.0), Some(30.0)];
-        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::Mean);
+        let out = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::Mean);
         assert_eq!(out[0], Some(20.0)); // mean(10,20,30)
         assert_eq!(out[1], None); // node 1 has no in-neighbours
     }
@@ -170,10 +190,10 @@ mod tests {
     fn sum_and_count_default_to_zero_when_empty() {
         let t = hub();
         let attr = vec![Some(1.0); 4];
-        let s = neighbor_aggregate(&t, &attr, Direction::In, AggKind::Sum);
+        let s = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::Sum);
         assert_eq!(s[0], Some(3.0));
         assert_eq!(s[1], Some(0.0)); // empty sum -> 0
-        let c = neighbor_aggregate(&t, &attr, Direction::In, AggKind::Count);
+        let c = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::Count);
         assert_eq!(c[0], Some(3.0));
         assert_eq!(c[1], Some(0.0));
     }
@@ -183,7 +203,7 @@ mod tests {
         let t = hub();
         // node 2 has no attribute value
         let attr = vec![None, Some(10.0), None, Some(30.0)];
-        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::Mean);
+        let out = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::Mean);
         assert_eq!(out[0], Some(20.0)); // mean(10, 30), 2 skipped
     }
 
@@ -191,7 +211,7 @@ mod tests {
     fn n_unique_counts_distinct() {
         let t = hub();
         let attr = vec![None, Some(5.0), Some(5.0), Some(9.0)];
-        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::NUnique);
+        let out = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::NUnique);
         assert_eq!(out[0], Some(2.0)); // {5, 9}
     }
 
@@ -208,7 +228,7 @@ mod tests {
             Some(f64::NAN),
         ];
         // in-neighbours of 0 carry {-0.0, 0.0, NaN, NaN} -> distinct {0.0, NaN} = 2
-        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::NUnique);
+        let out = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::NUnique);
         assert_eq!(out[0], Some(2.0));
     }
 
@@ -222,7 +242,7 @@ mod tests {
         for (i, a) in attr.iter_mut().enumerate().skip(1) {
             *a = Some((i % 7) as f64); // 7 distinct values among the 49 neighbours
         }
-        let out = neighbor_aggregate(&t, &attr, Direction::In, AggKind::NUnique);
+        let out = neighbor_aggregate(&t, &attr, None, Direction::In, AggKind::NUnique);
         assert_eq!(out[0], Some(7.0));
     }
 }

@@ -15,7 +15,7 @@ use std::collections::BinaryHeap;
 use rayon::prelude::*;
 
 use super::bfs::TotalF64;
-use crate::topology::{Direction, Topology};
+use crate::topology::{Direction, EdgeMask, Topology};
 
 /// Reusable per-source scratch for the unweighted (hop-count) BFS. `touched` lists
 /// the nodes reached from the current source so they can be reset in `O(reached)`
@@ -66,7 +66,7 @@ impl ClosenessWeightedScratch {
 /// the classic `(n − 1) / Σ dist`, which is undefined when some `v` is
 /// unreachable. `O(n · (n + m))` — document the cost; use `sample`-based stats
 /// for very large graphs.
-pub fn closeness(topo: &Topology) -> Vec<f64> {
+pub fn closeness(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f64> {
     let n = topo.n_nodes();
     // `map_init` keeps the per-source work-stealing parallelism (each node writes
     // its own output slot, so there is no cross-source ordering to preserve) while
@@ -76,7 +76,7 @@ pub fn closeness(topo: &Topology) -> Vec<f64> {
         .into_par_iter()
         .map_init(
             || ClosenessScratch::new(n),
-            |sc, u| closeness_one(topo, u, sc),
+            |sc, u| closeness_one(topo, mask, u, sc),
         )
         .collect()
 }
@@ -85,7 +85,12 @@ pub fn closeness(topo: &Topology) -> Vec<f64> {
 /// touched nodes are reset to clean on exit). The `i64` distance sum is exact, so
 /// summing the reached set (rather than scanning all `n` in node order) gives an
 /// identical result.
-fn closeness_one(topo: &Topology, u: u32, sc: &mut ClosenessScratch) -> f64 {
+fn closeness_one(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    u: u32,
+    sc: &mut ClosenessScratch,
+) -> f64 {
     let ClosenessScratch {
         dist,
         frontier,
@@ -100,7 +105,7 @@ fn closeness_one(topo: &Topology, u: u32, sc: &mut ClosenessScratch) -> f64 {
     while !frontier.is_empty() {
         next.clear();
         for &v in frontier.iter() {
-            topo.for_each_neighbor(v, Direction::Out, |w| {
+            topo.for_each_neighbor(v, Direction::Out, mask, |w| {
                 if dist[w as usize] < 0 {
                     dist[w as usize] = level;
                     next.push(w);
@@ -140,7 +145,7 @@ fn closeness_one(topo: &Topology, u: u32, sc: &mut ClosenessScratch) -> f64 {
 /// total edge weight (Dijkstra) rather than hop count. `reachable / Σ dist(u, v)`
 /// over the reachable nodes at finite positive distance. `weights[e]` is the
 /// weight of edge row `e` (non-negative; `len == n_edges`).
-pub fn closeness_weighted(topo: &Topology, weights: &[f64]) -> Vec<f64> {
+pub fn closeness_weighted(topo: &Topology, weights: &[f64], mask: Option<&EdgeMask>) -> Vec<f64> {
     assert_eq!(
         weights.len(),
         topo.n_edges(),
@@ -151,7 +156,7 @@ pub fn closeness_weighted(topo: &Topology, weights: &[f64]) -> Vec<f64> {
         .into_par_iter()
         .map_init(
             || ClosenessWeightedScratch::new(n),
-            |sc, u| closeness_weighted_one(topo, weights, u, sc),
+            |sc, u| closeness_weighted_one(topo, weights, mask, u, sc),
         )
         .collect()
 }
@@ -162,6 +167,7 @@ pub fn closeness_weighted(topo: &Topology, weights: &[f64]) -> Vec<f64> {
 fn closeness_weighted_one(
     topo: &Topology,
     weights: &[f64],
+    mask: Option<&EdgeMask>,
     u: u32,
     sc: &mut ClosenessWeightedScratch,
 ) -> f64 {
@@ -180,7 +186,7 @@ fn closeness_weighted_one(
         }
         settled[v as usize] = true;
         touched.push(v);
-        topo.for_each_weighted_neighbor(v, weights, Direction::Out, |w, wt| {
+        topo.for_each_weighted_neighbor(v, weights, Direction::Out, mask, |w, wt| {
             if !settled[w as usize] {
                 let nd = du + wt;
                 if nd < dist[w as usize] {
@@ -234,7 +240,7 @@ mod tests {
         // 0->1->2->0: from each node, distances {1, 2} to the other two.
         // reachable = 2, Σ dist = 3  ->  2/3.
         let t = Topology::build(3, vec![0, 1, 2], vec![1, 2, 0]);
-        let c = closeness(&t);
+        let c = closeness(&t, None);
         for &x in &c {
             assert!((x - 2.0 / 3.0).abs() < 1e-12, "got {x}");
         }
@@ -245,7 +251,7 @@ mod tests {
         // 0->1->2->3. Node 0 reaches {1,2,3} at {1,2,3}: 3/6 = 0.5.
         // Node 2 reaches {3} at {1}: 1/1 = 1.0. Node 3 reaches nothing: 0.0.
         let t = Topology::build(4, vec![0, 1, 2], vec![1, 2, 3]);
-        let c = closeness(&t);
+        let c = closeness(&t, None);
         assert!((c[0] - 0.5).abs() < 1e-12, "got {}", c[0]);
         assert!((c[1] - 2.0 / 3.0).abs() < 1e-12, "got {}", c[1]);
         assert!((c[2] - 1.0).abs() < 1e-12, "got {}", c[2]);
@@ -255,7 +261,7 @@ mod tests {
     #[test]
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
-        assert!(closeness(&t).is_empty());
+        assert!(closeness(&t, None).is_empty());
     }
 
     #[test]
@@ -268,7 +274,7 @@ mod tests {
         let src: Vec<u32> = (0..n).collect();
         let dst: Vec<u32> = (0..n).map(|i| (i + 1) % n).collect();
         let t = Topology::build(n as usize, src, dst);
-        let c = closeness(&t);
+        let c = closeness(&t, None);
         for &x in &c {
             assert!((x - c[0]).abs() < 1e-12, "cycle closeness must be uniform");
         }
@@ -280,7 +286,7 @@ mod tests {
         // 0->1 (cost 1), 1->2 (cost 1), 0->2 (cost 5). From node 0: dist to 1 is 1,
         // to 2 is 2 (via 1, cheaper than the direct 5). reachable 2, Σ 3 -> 2/3.
         let t = Topology::build(3, vec![0, 1, 0], vec![1, 2, 2]);
-        let c = closeness_weighted(&t, &[1.0, 1.0, 5.0]);
+        let c = closeness_weighted(&t, &[1.0, 1.0, 5.0], None);
         assert!((c[0] - 2.0 / 3.0).abs() < 1e-12, "got {}", c[0]);
         // From node 1: only 2 reachable at cost 1 -> 1/1 = 1.
         assert!((c[1] - 1.0).abs() < 1e-12, "got {}", c[1]);
@@ -294,7 +300,7 @@ mod tests {
         // = 1  ->  2/1 = 2.0. (A stray `d > 0.0` guard would drop node 1 and give
         // 1/1 = 1.0 — the divergence this reconciles.)
         let t = Topology::build(3, vec![0, 1], vec![1, 2]);
-        let c = closeness_weighted(&t, &[0.0, 1.0]);
+        let c = closeness_weighted(&t, &[0.0, 1.0], None);
         assert!((c[0] - 2.0).abs() < 1e-12, "got {}", c[0]);
         // From node 1: only node 2 reachable at cost 1 -> 1/1 = 1.
         assert!((c[1] - 1.0).abs() < 1e-12, "got {}", c[1]);
@@ -305,7 +311,7 @@ mod tests {
         // Both out-edges weight 0: from node 0 the reachable set has total cost 0,
         // so the `sum > 0.0` guard returns 0.0 rather than dividing by zero.
         let t = Topology::build(3, vec![0, 0], vec![1, 2]);
-        let c = closeness_weighted(&t, &[0.0, 0.0]);
+        let c = closeness_weighted(&t, &[0.0, 0.0], None);
         assert_eq!(c[0], 0.0);
     }
 }

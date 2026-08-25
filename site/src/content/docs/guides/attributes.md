@@ -77,23 +77,25 @@ Because topology is threaded explicitly rather than bound to an object, "there i
 frames" composes in principle: degree in the full graph beside degree in a subgraph, each
 threading its own edge frame.
 
-Two current limits shape how you write that today, and both raise clearly rather than
-mis-executing:
+One current limit shapes how you write that today, and it raises clearly rather than
+mis-executing: within a single `with_columns`, every graph algorithm must run over the **same**
+edge frame. Compute over different graphs in separate steps or separate collects.
 
-- Within a single `with_columns`, every graph algorithm must run over the **same** edge frame.
-  Compute over different graphs in separate steps or separate collects.
-- A graph op over a *filtered* edge frame raises — subgraph views over a parent index are
-  deferred. Materialize the filtered edges and construct a new frame:
+A graph op over a *filtered* edge frame is a **subgraph view**: the parent topology runs
+restricted by an edge mask (the filter predicate over the parent rows), with no rebuild. Filter,
+then run the op directly — the full-graph and subgraph answers sit side by side:
 
 ```python
-active = ur.EdgeFrame(
-    edges.filter(ur.col("last_seen") > cutoff).collect().to_arrow(),
-    src=edges.src_col, dst=edges.dst_col,
-)
+active = edges.filter(ur.col("last_seen") > cutoff)   # a view, not a rebuild
 
 nodes.with_columns(deg_all=ur.degree(edges, direction="both")).collect()
-ur.degree(active, direction="both").collect()   # the subgraph's answer, separately
+ur.degree(active, direction="both").collect()   # the subgraph's answer, over the same parent CSR
 ```
+
+Repeated `.filter()` calls **intersect** (logical AND), and a node left with no unmasked incident
+edge stays present at degree 0. What still raises: a graph op over a `distinct`/`sample`/`join`/
+`group_by`-derived edge frame (those reshape the edge set beyond what a mask can express) —
+materialize and re-ingest those via `ur.EdgeFrame(...)` to run further ops on them.
 
 ## Multiplicity
 

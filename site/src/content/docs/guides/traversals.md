@@ -96,5 +96,9 @@ pipeline rather than needing to be unpacked into Python objects first.
 
 Motif finding — `ur.find("(a)-[e]->(b); ...")`, GraphFrames-style — is the first post-v0.1
 feature, not a v0.1 omission. Subgraph *views* over a filtered frame (a bitmask over the parent
-CSR instead of a rebuild) are planned; today a graph op over a filtered EdgeFrame raises, and the
-workaround is to materialize the filtered edges into a new frame.
+CSR instead of a rebuild) have **shipped** for node-valued kernels: `ur.degree`, `ur.pagerank`,
+`ur.closeness`, `ur.betweenness`, `ur.connected_components`, `ur.louvain`,
+`ur.label_propagation`, `ur.triangle_count` and `ur.clustering_coefficient` all run over a
+`edges.filter(...)` view directly. Still deferred: a **traversal** (`hop`/`shortest_path`) *over*
+a subgraph view — for now, run traversals over the unfiltered frame, or materialize the filtered
+edges into a new frame first.

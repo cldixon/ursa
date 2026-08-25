@@ -106,7 +106,7 @@ fn bfs_seed(
     for _level in 0..k {
         next.clear();
         for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, |v| {
+            topo.for_each_neighbor(u, dir, None, |v| {
                 if !visited[v as usize] {
                     visited[v as usize] = true;
                     touched.push(v);

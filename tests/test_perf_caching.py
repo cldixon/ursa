@@ -44,11 +44,22 @@ def test_property_preserving_derivation_shares_the_index_cell():
 
 
 def test_structural_op_gets_a_fresh_index_cell():
-    # A row-changing op (filter) drops the index: the derived frame gets its own
-    # fresh cell, so a stale CSR is never carried across.
+    # A row-reshaping op (distinct/sample/join/group_by) drops the index: the derived
+    # frame gets its own fresh cell, so a stale CSR is never carried across. (filter is
+    # NOT such an op anymore — it is a subgraph view that shares the parent cell; see
+    # test_subgraph_filter_shares_the_parent_index_cell.)
     edges = _edges()
-    filtered = edges.filter(ur.col("s") >= 0)
-    assert filtered._index_build_cell is not edges._index_build_cell
+    reshaped = edges.distinct()
+    assert reshaped._index_build_cell is not edges._index_build_cell
+
+
+def test_subgraph_filter_shares_the_parent_index_cell():
+    # #114: filter is a subgraph view over the parent topology, so it shares the
+    # parent's index cell (no fresh CSR) — a build via either frame is visible to the
+    # other, and a graph op on the filtered frame reuses the parent CSR.
+    edges = _edges()
+    viewed = edges.filter(ur.col("s") >= 0)
+    assert viewed._index_build_cell is edges._index_build_cell
 
 
 def test_distinct_graphs_build_separate_indexes():
