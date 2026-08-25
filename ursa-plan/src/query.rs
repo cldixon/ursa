@@ -20,7 +20,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
@@ -797,6 +799,72 @@ pub fn execute_path_query(
             rename: &rename,
         },
     )
+}
+
+/// The node set reached within `n` hops of `seeds` (seeds included), as a user-id
+/// array — the reached region behind "graph op over a hop result" (#116).
+///
+/// Backs the subgraph mask that a node-valued kernel runs over: the reached nodes
+/// induce a subgraph of the parent CSR. Runs the same multi-source BFS as `ur.hop`
+/// but returns the reached node *set* instead of `(seed, reached)` pairs. Unknown
+/// seeds are dropped (kernel-consistent).
+pub fn hop_reached_nodes(
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    seeds: &dyn Array,
+    n: u32,
+    direction: &str,
+) -> Result<ArrayRef> {
+    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+    let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
+    let reached = ursa_core::algo::k_hop_reached_set(&topology, &seeds_dense, n, direction);
+    Ok(ids.gather_user(&reached))
+}
+
+/// The nodes on the shortest path from `source` to `target` (inclusive), as a
+/// user-id array — the reached region behind "graph op over a shortest_path result"
+/// (#116). An unknown/unreachable endpoint yields an empty array (no path).
+///
+/// Mirrors [`execute_path_query`]'s weighting: pass `weight` (a serialized edge
+/// expression) with the edge table for minimum-cost Dijkstra; omit both for
+/// unweighted BFS.
+#[allow(clippy::too_many_arguments)]
+pub fn shortest_path_nodes(
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    source: &dyn Array,
+    target: &dyn Array,
+    direction: &str,
+    weight: Option<&str>,
+    edges: Option<Vec<RecordBatch>>,
+) -> Result<ArrayRef> {
+    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+    let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
+    let target = resolve_dense(&ids, target)?.into_iter().next().flatten();
+    let (Some(source), Some(target)) = (source, target) else {
+        return Ok(ids.gather_user(&[]));
+    };
+
+    let path = match weight {
+        None => ursa_core::algo::shortest_path(&topology, source, target, direction),
+        Some(weight_json) => {
+            let edges_ref = edges.as_ref().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "weighted shortest_path needs the edge table, but none was provided".into(),
+                )
+            })?;
+            let w = evaluate_weight(edges_ref, weight_json)?;
+            if w.len() != topology.n_edges() {
+                return Err(DataFusionError::Execution(format!(
+                    "weight array length ({}) does not match the edge count ({})",
+                    w.len(),
+                    topology.n_edges()
+                )));
+            }
+            ursa_core::algo::shortest_path_weighted(&topology, &w, source, target, direction)
+        }
+    };
+    Ok(ids.gather_user(&path.unwrap_or_default()))
 }
 
 /// Build and execute one `random_walk` as a single DataFusion plan.

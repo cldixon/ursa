@@ -97,6 +97,27 @@ def run_path_query(
     rename: list[tuple[str, str]] = ...,
 ) -> Any: ...
 
+# The node set reached within `n` hops of `seeds` (seeds included) as a pyarrow
+# array of user ids — the reached region behind a graph op over a hop result (#116).
+def hop_reached_nodes_query(
+    index: GraphIndex,
+    seeds: Any,
+    n: int,
+    direction: str,
+) -> Any: ...
+
+# The nodes on the shortest path from source to target (inclusive) as a pyarrow
+# array of user ids (empty when there is no path) — the region behind a graph op
+# over a shortest_path result (#116). weight + edges select weighted Dijkstra.
+def shortest_path_nodes_query(
+    index: GraphIndex,
+    source: Any,
+    target: Any,
+    direction: str,
+    weight: str | None = ...,
+    edges: Any | None = ...,
+) -> Any: ...
+
 # A random_walk: a built index + user-id start ids (int64 or string) + walk params
 # + relational tail
 # -> list[pyarrow.RecordBatch] of the (walk_id, step, node) walk rows.

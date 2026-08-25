@@ -67,8 +67,15 @@ Subgraph views over filtered frames have **shipped**: a `filter` on an EdgeFrame
 over the parent CSR — the dropped rows ride along as an edge-row bitmask, so every node-valued
 kernel (pagerank, degree, closeness, betweenness, components, louvain, label propagation,
 triangle count, clustering) runs restricted to the kept edges with no rebuild. Repeated filters
-intersect, and a node left with no unmasked incident edge stays present at degree 0. Still
-deferred here: traversals (`hop`/`shortest_path`) *over* a subgraph view, and graph ops on
+intersect, and a node left with no unmasked incident edge stays present at degree 0.
+
+Node-valued graph ops over a **traversal result** have shipped on the same machinery: a kernel
+over `ur.hop(...)` / `ur.shortest_path(...)` runs over the *induced subgraph of the reached nodes*
+— the reached region masks the parent CSR, no rebuild — so the explorer's "expand from here, then
+rank what I reached" loop composes directly.
+
+Still deferred here: traversals (`hop`/`shortest_path`) *over* a subgraph view or another
+traversal; a relational verb *between* a traversal and a graph op; and graph ops on
 `distinct`/`sample`/`join`/`group_by`-derived frames, which reshape the edge set beyond what a
 mask can express.
 

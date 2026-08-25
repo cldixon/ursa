@@ -95,10 +95,22 @@ pipeline rather than needing to be unpacked into Python objects first.
 ## What is not here yet
 
 Motif finding — `ur.find("(a)-[e]->(b); ...")`, GraphFrames-style — is the first post-v0.1
-feature, not a v0.1 omission. Subgraph *views* over a filtered frame (a bitmask over the parent
-CSR instead of a rebuild) have **shipped** for node-valued kernels: `ur.degree`, `ur.pagerank`,
-`ur.closeness`, `ur.betweenness`, `ur.connected_components`, `ur.louvain`,
-`ur.label_propagation`, `ur.triangle_count` and `ur.clustering_coefficient` all run over a
-`edges.filter(...)` view directly. Still deferred: a **traversal** (`hop`/`shortest_path`) *over*
-a subgraph view — for now, run traversals over the unfiltered frame, or materialize the filtered
-edges into a new frame first.
+feature, not a v0.1 omission.
+
+Subgraph *views* over a filtered frame (a bitmask over the parent CSR instead of a rebuild) have
+**shipped** for node-valued kernels: `ur.degree`, `ur.pagerank`, `ur.closeness`,
+`ur.betweenness`, `ur.connected_components`, `ur.louvain`, `ur.label_propagation`,
+`ur.triangle_count` and `ur.clustering_coefficient` all run over a `edges.filter(...)` view
+directly.
+
+A node-valued kernel over a **traversal result** has shipped too: `ur.pagerank(ur.hop(edges,
+n=2).from_(seeds))` (and the `.nodes().with_columns(...)` form) runs over the *induced subgraph of
+the reached nodes* — the seeds' k-hop region, or a `shortest_path`'s nodes — with no rebuild. This
+is the explorer's "expand from here, then rank what I reached" loop. Repeated seeds and both
+directions are supported; a node reached but left with no incident edge in the region stays
+present at degree 0.
+
+Still deferred: a **traversal** (`hop`/`shortest_path`) *over* a subgraph view or over another
+traversal, and a **relational verb** (`filter`/`sort`/`join`/`group_by`/`distinct`) *between* a
+traversal and a graph op. For those, run the traversal over the unfiltered frame, or materialize
+the result into a new frame first (`ur.EdgeFrame(frontier.collect().to_arrow(), ...)`).
