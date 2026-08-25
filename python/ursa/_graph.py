@@ -123,8 +123,13 @@ class _Hop:
     def __init__(self, edges: EdgeFrame, n: int, direction: str, seeds: Any = None) -> None:
         self._edges, self._n, self._direction, self._seeds = edges, n, direction, seeds
 
-    def from_(self, seeds: Any) -> _Hop:
-        return _Hop(self._edges, self._n, self._direction, seeds)
+    def from_(self, seeds: Any) -> EdgeFrame:
+        # Binding the seed set completes the traversal, so return the materialized
+        # lazy EdgeFrame directly (not another `_Hop`). This is the frame every verb
+        # composes on — a relational tail (`.filter`/`.collect`/...) and, since #116,
+        # a node-valued graph op (`ur.pagerank(ur.hop(e, n).from_(seeds))`), which
+        # needs a real `EdgeFrame` rather than the `__getattr__`-delegating builder.
+        return _Hop(self._edges, self._n, self._direction, seeds)._materialize()
 
     def distinct(self) -> EdgeFrame:
         return self._materialize().distinct()

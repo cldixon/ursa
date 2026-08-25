@@ -155,11 +155,11 @@ def test_relational_tail_between_traversal_and_kernel_raises():
     e = _graph()
     frontier = ur.hop(e, n=2).from_([0]).distinct()
     with pytest.raises(NotImplementedError, match="bare hop/shortest_path"):
-        ur.pagerank(frontier).collect()  # ty: ignore[invalid-argument-type]
+        ur.pagerank(frontier).collect()
 
 
 def test_traversal_of_a_traversal_still_raises():
     e = _graph()
     inner = ur.hop(e, n=1).from_([0])
     with pytest.raises(NotImplementedError, match="traversal result"):
-        ur.hop(inner, n=1).from_([0]).collect()  # ty: ignore[invalid-argument-type]
+        ur.hop(inner, n=1).from_([0]).collect()

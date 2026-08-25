@@ -211,7 +211,7 @@ def test_hop_of_hop_raises_traversal_message():
     edges = _edges()
     inner = ur.hop(edges, 1).from_([0])
     with pytest.raises(NotImplementedError, match="traversal result"):
-        ur.hop(inner, 1).from_([0]).collect()  # ty: ignore[invalid-argument-type]
+        ur.hop(inner, 1).from_([0]).collect()
 
 
 @native
