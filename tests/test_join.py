@@ -256,7 +256,7 @@ def test_weighted_algo_on_derived_scan_frame_still_guards(tmp_path):
         pa.table({"s": [0, 1, 2, 0], "d": [1, 2, 0, 1], "w": [1.0, 1.0, 1.0, 2.0]}), path
     )
     derived = ur.scan_edges(str(path), src="s", dst="d").distinct()
-    with pytest.raises(NotImplementedError, match="filtered/derived"):
+    with pytest.raises(NotImplementedError, match="distinct/sample/join/group_by"):
         derived.nodes().with_columns(pr=ur.pagerank(derived, weight=ur.col("w"))).collect()
 
 
@@ -266,7 +266,7 @@ def test_graph_op_on_grouped_edge_frame_guards():
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
     edges.nodes().with_columns(deg=ur.degree(edges)).collect()  # build parent index
     grouped = edges.group_by("s").agg(c=ur.col("d").count())
-    with pytest.raises(NotImplementedError, match="filtered/derived"):
+    with pytest.raises(NotImplementedError, match="distinct/sample/join/group_by"):
         ur.pagerank(grouped).collect()  # ty: ignore[invalid-argument-type]
 
 

@@ -139,10 +139,20 @@ def test_reverse_scan_source(tmp_path):
 
 
 @native
-def test_filtered_edge_frame_message():
+def test_filtered_edge_frame_is_a_subgraph_view():
+    # #114: a graph op over a *filtered* edge frame is a subgraph view — the parent
+    # topology runs restricted by an edge mask (dropped rows ride along), not a
+    # rebuild and not a raise. Here `s > 0` drops both edges leaving node 0, so 0
+    # keeps its incoming edges (in-degree 2) but has out-degree 0.
     edges = _edges()
-    with pytest.raises(NotImplementedError, match="filtered/derived"):
-        ur.pagerank(edges.filter(ur.col("s") > 0)).collect()
+    full = {r["id"]: r["degree"] for r in ur.degree(edges, direction="out").collect().to_dicts()}
+    assert full == {0: 2, 1: 1, 2: 1}
+    sub = {
+        r["id"]: r["degree"]
+        for r in ur.degree(edges.filter(ur.col("s") > 0), direction="out").collect().to_dicts()
+    }
+    # Node 0 loses its two outgoing edges; every node stays present (degree 0).
+    assert sub == {0: 0, 1: 1, 2: 1}
 
 
 # --- #36: plain-source collect (read_*/scan->to_*) --------------------------

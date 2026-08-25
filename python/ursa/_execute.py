@@ -239,12 +239,23 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     saw_group_by = False
     join: tuple[Any, list[str], str] | None = None
+    # A `nodes()`-derived NodeFrame inherits the parent edge frame's plan, so its
+    # steps before the `nodes` boundary are *edge*-plan steps (source + any subgraph
+    # `filter`), not node-result operators. A pre-boundary filter is a subgraph view
+    # (#114) and is consumed as an edge mask via `_edge_mask_for` on the reconstructed
+    # edge frame — it must NOT be collected as a node-result filter (whose predicate
+    # resolves against the id/computed columns, not the edge src/dst columns). A plain
+    # node source (scan_nodes / from_arrow(id=)) has no `nodes` step, so every filter
+    # on it is a node-result filter from the start.
+    past_nodes_boundary = not any(step.op == "nodes" for step in frame._plan)
 
     for step in frame._plan:
         op = step.op
         # `reverse` is metadata: the reversed edges ride on the edges frame (source
         # swapped), so a graph op over them builds the transpose.
         if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
+            if op == "nodes":
+                past_nodes_boundary = True
             continue  # source / metadata steps
         if op == "join":
             if join is not None:
@@ -272,6 +283,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 )
             graph_exprs = step.args["exprs"]
         elif op == "filter":
+            if not past_nodes_boundary:
+                # An edge-frame subgraph filter (before `nodes()`): handled as the
+                # edge mask, not a node-result filter.
+                continue
             if saw_group_by:
                 raise NotImplementedError(
                     "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
@@ -770,6 +785,9 @@ def _run_query(
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
+    # A subgraph view (#114): a filtered edge frame runs the parent CSR restricted by
+    # a per-edge-row boolean mask (predicate over the parent rows), no rebuild.
+    edge_mask = _edge_mask_for(edges)
     # The node attribute table crosses the FFI as a batch list (not one batch).
     nodes_batches = nodes.to_batches() if nodes is not None else None
     # A node-query result carries the reserved `id` column plus the computed/joined
@@ -790,6 +808,7 @@ def _run_query(
         list((rename or {}).items()),
         group_keys,
         engine_aggs,
+        edge_mask,
     )
     return MaterializedFrame(batches)
 
@@ -891,18 +910,21 @@ def _single_edges(exprs: Any) -> Any:
 
 
 def _reject_derived_edge_graph_op(edges: Any) -> None:
-    """Reject a graph op on a *derived* edge frame — one whose plan contains a
-    row-changing op (filter/sample/distinct/join/group_by) or is a traversal result
-    (hop/shortest_path). Such a frame carries no topology that matches its rows (its
-    retained source is the *pre*-derivation edges), so building a CSR from it would
-    be silently wrong.
+    """Reject a graph op on a *derived* edge frame whose derivation is **not** a
+    subgraph view — i.e. one that changes the row↔topology correspondence in a way
+    a mask can't express, or a traversal result.
 
-    This is the single **authoritative** guard: it inspects only the plan, so it
-    must be called *before* the frame's index cell is read or (re)built — a cell
-    populated by another path (a weighted scan's pre-build, or a stale shared cell)
-    would otherwise smuggle a wrong topology past a build-time-only check. The
-    plain-collect path materializes a derived frame's rows separately (via
-    `_edge_source_table`), so `edges.filter(...).collect()` still works (#100)."""
+    A ``filter`` is now allowed: it is a subgraph view (#114) over the *unchanged*
+    parent topology — the dropped rows ride along as an edge mask (see
+    ``_edge_mask_for``), so the parent CSR runs directly with no rebuild. But
+    ``distinct``/``sample``/``join``/``group_by`` genuinely reshape the edge set (a
+    mask over the parent rows can't represent them yet), and ``hop``/``shortest_path``
+    results carry no rebuildable topology source — those still raise.
+
+    This inspects only the plan, so it must be called *before* the frame's index cell
+    is read or (re)built. The plain-collect path materializes a derived frame's rows
+    separately (via ``_edge_source_table``), so ``edges.distinct().collect()`` etc.
+    still work (#100)."""
     ops = {step.op for step in getattr(edges, "_plan", ())}
     if ops & {"hop", "shortest_path"}:
         raise NotImplementedError(
@@ -911,11 +933,12 @@ def _reject_derived_edge_graph_op(edges: Any) -> None:
             "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
             "further ops on it. (v0.2: child-plan seeding.)"
         )
-    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
+    if ops & {"distinct", "sample", "join", "group_by_agg"}:
         raise NotImplementedError(
-            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
-            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
-            "the source frame, or collect and re-ingest the filtered edges."
+            "graph ops on a distinct/sample/join/group_by-derived edge frame aren't "
+            "wired yet — unlike filter (a subgraph view over the parent topology), "
+            "these reshape the edge set in a way an edge mask can't express. Run the op "
+            "on the source frame, or collect and re-ingest the derived edges."
         )
 
 
@@ -1521,6 +1544,45 @@ def _edge_source_table(frame: EdgeFrame) -> Any:
     # No source: a filtered/derived (or traversal-result) edge frame.
     _require_edges(frame)  # raises the precise, plan-aware message
     raise AssertionError("unreachable")  # _require_edges always raises here
+
+
+def _edge_mask_for(edges: EdgeFrame | None) -> Any | None:
+    """The subgraph-view edge mask (#114) for a filter-derived edge frame, or ``None``.
+
+    A ``filter`` on an EdgeFrame keeps the parent topology; the dropped rows are
+    expressed here as a boolean pyarrow array aligned with the CSR's ``edge_ids``.
+    Each filter predicate is evaluated over the *parent* edge rows (the same rows,
+    in the same order, that the topology was built from — via ``_edge_source_table``)
+    and repeated ``.filter()`` calls **intersect** (logical AND, so a row survives
+    only if every predicate holds). Returns ``None`` when the frame carries no
+    filters (the full graph).
+
+    Endpoint predicates (``ur.src()``/``ur.dst()``) and, for in-memory frames,
+    edge-attribute columns are supported; a scan frame's mask can reference only the
+    endpoint columns (the scan projects just ``src``/``dst``), matching the plain-
+    collect scan limitation.
+    """
+    if edges is None:
+        return None
+    predicates = [s.args["predicate"] for s in getattr(edges, "_plan", ()) if s.op == "filter"]
+    if not predicates:
+        return None
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    table = _edge_source_table(edges)  # parent edge rows, topology row order
+    roles = {"src": edges.src_col, "dst": edges.dst_col}
+    and_ = pc.and_  # ty: ignore[unresolved-attribute]
+    mask = None
+    for predicate in predicates:
+        _require_predicate(predicate)  # same top-of-predicate check as every path
+        m = _eval_pyarrow(predicate, table, roles)
+        mask = m if mask is None else and_(mask, m)
+    # The FFI takes a single contiguous boolean Array (not a ChunkedArray).
+    if isinstance(mask, pa.ChunkedArray):
+        mask = mask.combine_chunks()
+    return mask
 
 
 def _native() -> Any:

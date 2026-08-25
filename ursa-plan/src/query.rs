@@ -28,7 +28,7 @@ use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{col, DataFrame, SessionContext};
 use serde::Deserialize;
 use ursa_core::algo::AggKind;
-use ursa_core::{IdMap, Topology};
+use ursa_core::{EdgeMask, IdMap, Topology};
 
 use crate::logical::{Direction, GraphAlgo};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
@@ -443,6 +443,7 @@ pub fn execute_node_query(
     rename: Vec<(String, String)>,
     group_keys: Vec<String>,
     aggs: Vec<String>,
+    mask: Option<Arc<EdgeMask>>,
 ) -> Result<Vec<RecordBatch>> {
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
@@ -542,7 +543,7 @@ pub fn execute_node_query(
     }
 
     let graph_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns)),
+        node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
     });
 
     run_query(
@@ -949,6 +950,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            None,
         )
         .unwrap());
         assert_eq!(batch.num_columns(), 2);
@@ -973,7 +975,7 @@ mod tests {
                 None,
                 None,
                 None,
-             false, None, vec![], vec![], vec![],)
+             false, None, vec![], vec![], vec![], None)
             .unwrap(),
         );
         // Only node 0 has in-degree > 0 among the hub set; it also ranks highest.
@@ -1005,6 +1007,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            None,
         );
         assert!(err.is_err());
     }
@@ -1038,6 +1041,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                None,
             )
             .unwrap_or_else(|e| panic!("{kind} failed: {e}")));
             assert_eq!(batch.num_rows(), 4, "{kind}");
@@ -1081,6 +1085,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            None,
         )
         .unwrap());
 
@@ -1123,7 +1128,7 @@ mod tests {
                 Some(vec![nodes]),
                 Some("id".into()),
                 None,
-             false, None, vec![], vec![], vec![],)
+             false, None, vec![], vec![], vec![], None)
             .unwrap(),
         );
 
@@ -1177,7 +1182,7 @@ mod tests {
                 Some(vec![nodes]),
                 Some("id".into()),
                 None,
-             false, None, vec![], vec![], vec![],)
+             false, None, vec![], vec![], vec![], None)
             .unwrap(),
         );
 
@@ -1391,6 +1396,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            None,
         );
         assert!(err.is_err()); // mean over strings is not supported
     }
@@ -1437,7 +1443,7 @@ mod tests {
                     r#"{"kind":"alias","name":"total","operand":{"kind":"agg","fn":"sum","operand":{"kind":"col","name":"indeg"}}}"#.to_string(),
                     r#"{"kind":"alias","name":"n","operand":{"kind":"agg","fn":"count","operand":{"kind":"col","name":"indeg"}}}"#.to_string(),
                 ],
-            )
+             None)
             .unwrap(),
         );
 
@@ -1490,7 +1496,7 @@ mod tests {
             vec![
                 r#"{"kind":"alias","name":"n","operand":{"kind":"agg","fn":"count","operand":{"kind":"col","name":"deg"}}}"#.to_string(),
             ],
-        );
+         None);
         assert!(err.is_err()); // group_by references an unknown column
     }
 

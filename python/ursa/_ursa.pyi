@@ -44,6 +44,7 @@ def run_node_query(
     rename: list[tuple[str, str]] = ...,
     group_keys: list[str] = ...,
     aggs: list[str] = ...,
+    edge_mask: Any | None = ...,
 ) -> Any: ...
 
 # Equi-join two materialized frames (pyarrow batch lists) on the `on` key columns,

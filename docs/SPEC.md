@@ -244,7 +244,8 @@ Frames are immutable; transformations return new frames. This makes the topology
 | Operation | Effect on cached topology index |
 |---|---|
 | `with_columns(...)` on property columns | **preserved** (shared via cheap reference) |
-| `filter(...)`, `distinct()`, row-changing ops on an EdgeFrame | **dropped** (rebuilt lazily on next graph op) |
+| `filter(...)` on an EdgeFrame | **preserved** as a *subgraph view* — the dropped rows ride along as an edge mask over the parent CSR, so a graph op runs restricted with **no rebuild** |
+| `distinct()`, `sample()`, `join()`, `group_by().agg()` on an EdgeFrame | **dropped** (these reshape the edge set in a way a mask can't express; rebuilt lazily on next graph op) |
 | `select(...)` that drops `src` or `dst` | frame **demotes** to a plain tabular frame |
 | any operation on a NodeFrame | no effect (NodeFrames carry no index) |
 
@@ -434,7 +435,9 @@ Determinism: every stochastic algorithm (`random_walk`, `label_propagation`, `lo
 - [ ] Egress: `collect`, `to_polars`, `to_arrow`, `to_dicts`, `sink_parquet`, `sink_csv`, `explain`
 - [ ] Benchmarks vs NetworkX / rustworkx / igraph on GAP-style datasets; criterion micro-benches in `ursa-core`
 
-**Out (deferred):** motif finding (`ur.find("(a)-[e]->(b); ...")` — GraphFrames-style, the first post-v0.1 feature), strong components, subgraph views over filtered frames, `ur.sql()`, heterogeneous graphs, u64 node space, streaming/out-of-core, temporal semantics.
+**Out (deferred):** motif finding (`ur.find("(a)-[e]->(b); ...")` — GraphFrames-style, the first post-v0.1 feature), `ur.sql()`, heterogeneous graphs, u64 node space, streaming/out-of-core, temporal semantics.
+
+*Shipped since the original plan:* strong components (`connected_components(mode="strong")`); subgraph views over filtered frames — a `filter` on an EdgeFrame is now an edge-mask view over the parent CSR (no rebuild), and every node-valued kernel runs over the masked edge set.
 
 ## Open questions (deliberately unresolved)
 
