@@ -1,6 +1,6 @@
 # Ursa — Polars-shaped dataframes for graph data
 
-> **Status: v0.1 in progress.** An in-memory, single-machine graph analytics
+> **Status: v0.2, in active development.** An in-memory, single-machine graph analytics
 > library with a dataframe-first API — what Polars is to tabular data, for graphs.
 > The engine foundation is in place: real algorithm kernels, and `collect()`
 > executing as one DataFusion plan with graph ops as first-class logical nodes.
@@ -16,21 +16,56 @@ graph operators as first-class plan nodes, and a fluent, Polars-shaped Python
 expression API. There is no `Graph` object — an `EdgeFrame` *is* the graph, and
 every operation returns a frame.
 
+## Install
+
+```bash
+pip install ursa-graph
+# or
+uv add ursa-graph
+```
+
+The distribution is named **`ursa-graph`**; the import name is **`ursa`**. Wheels
+bundle the compiled Rust core, so **no Rust toolchain is required**. Python ≥ 3.10.
+
+`polars` is optional — install it with `pip install 'ursa-graph[polars]'` if you
+want `.to_polars()` and `ur.from_polars()`. Everything crosses the boundary as
+Arrow either way.
+
+## Try it
+
+Paste this into a REPL; it needs no files and no network:
+
 ```python
 import ursa as ur
 
-edges = ur.scan_edges("web-google.csv", src="FromNodeId", dst="ToNodeId")
+edges = ur.datasets.load_karate()      # 34 nodes, 78 edges, bundled in the wheel
 top = (
     edges.nodes()
     .with_columns(
+        degree    = ur.degree(edges, direction="both"),
+        triangles = ur.triangle_count(edges),
         pagerank  = ur.pagerank(edges, damping=0.85),
-        in_degree = ur.degree(edges, direction="in"),
     )
-    .sort("pagerank", descending=True)
-    .head(20)
+    .sort("degree", descending=True)
+    .head(5)
     .collect()          # runs as one DataFusion plan; results are Arrow
 )
+print(top)
 ```
+
+The same pipeline over your own data is one line different — swap the first line
+for `ur.scan_edges("edges.csv", src="FromNodeId", dst="ToNodeId")` (Parquet/CSV,
+local or `s3://`) and nothing downstream changes.
+
+> **On `direction=`.** Ursa has no `Graph`/`DiGraph` split — every edge row is
+> directed, and direction is a parameter of each *operation*, defaulting to
+> `"out"`. Karate is an undirected graph stored as one row per edge, so
+> `direction="both"` is the call that matches what NetworkX reports. `pagerank`
+> takes no `direction=`, so it reads those rows as directed and will not match a
+> published undirected PageRank for this graph — that is the documented
+> behaviour, not a discrepancy. See
+> [Semantics vs NetworkX](https://ursa.cldixon.dev/docs/semantics), which pins
+> every kernel to the exact NetworkX call it matches.
 
 ## What works today
 

@@ -277,6 +277,20 @@ exception to laziness. See [Whole-graph statistics](/docs/guides/statistics).
 | `ur.Expr` | an expression-tree node |
 | `ur.datasets.DatasetInfo` | the record `list_datasets()` returns |
 
+### MaterializedFrame
+
+What `collect()` returns. Egress methods are listed under [Frame methods](#frame-methods); these
+are the ones that only exist on a materialized result:
+
+| Member | What it does |
+|---|---|
+| `len(result)` | row count |
+| `result.columns` | column names, in order |
+| `repr(result)` | a shape line, the column names and dtypes, and up to 10 rows; the rest elide behind `…` |
+
+`repr` reads the head only, so previewing a large result costs the same as previewing a small one,
+and it needs no optional dependencies.
+
 ## Errors
 
 ```python
