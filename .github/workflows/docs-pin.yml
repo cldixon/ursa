@@ -1,0 +1,63 @@
+name: Pin docs
+
+# Move the `docs-release` branch to the commit a release was cut from, so the
+# published documentation describes the version people can actually install.
+#
+# The problem this solves: Workers Builds deploys production from a branch, and
+# pointing that at `main` publishes documentation for unreleased code. A reader
+# then follows an example for a feature that is not in the wheel yet — which is
+# exactly what happened between 0.2.0 and 0.3.0.
+#
+# `docs-release` is machine-owned: nobody commits to it, and it only ever moves
+# here, to a released tag. The force-push is the point — the branch is a pointer
+# at the current release, not a line of development.
+#
+# ONE MANUAL STEP, once, in the Cloudflare dashboard: set the ursa-docs Worker's
+# Workers Builds *production* branch to `docs-release`. Until that is done this
+# workflow maintains the branch and changes nothing about what is served, and
+# `main` keeps deploying production as before.
+#
+# After the switch, `main` still gets preview URLs on every docs PR, so unreleased
+# documentation stays reviewable — it just is not what ursa.cldixon.dev serves.
+
+on:
+  release:
+    types: [published]
+  # Re-pin by hand: useful to point the docs at an older release, or to recover
+  # if a release was published before this workflow existed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to pin the docs to (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-pin
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    name: Point docs-release at the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag ref, not the default branch: this is the commit the release
+          # was built from, which is what the docs should describe.
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Move docs-release to ${{ inputs.tag || github.event.release.tag_name }}
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "Pinning docs-release to $TAG ($sha)"
+          # Force: the branch is a pointer at the current release, so it moves
+          # wherever the newest release is — including backwards for a re-pin.
+          git push --force origin "$sha:refs/heads/docs-release"
+          echo "docs-release -> $TAG ($sha)" >> "$GITHUB_STEP_SUMMARY"

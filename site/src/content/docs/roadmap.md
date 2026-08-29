@@ -6,7 +6,7 @@ subtitle: Difference imaging. Subtract the spec from the build; what remains is 
 
 ## Where things stand
 
-**0.2.0 is on PyPI.** The release closed most of the v0.1 spec: the full relational surface,
+**The current release is on PyPI** (the footer names it). It closed most of the v0.1 spec: the full relational surface,
 strong components, the shortest-path cost column, a full predicate algebra, native ingest from
 Python data structures and the scientific-Python ecosystem, and bundled datasets — on top of the
 engine that was already there.
