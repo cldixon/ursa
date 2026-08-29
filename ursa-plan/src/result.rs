@@ -23,15 +23,29 @@ use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
 use crate::logical::GraphAlgo;
 
+/// The Arrow dtype a float-valued output column is emitted as (#117). Kernels
+/// always accumulate in `f64`; `F32` narrows the *emitted* column to halve wire and
+/// on-disk size (e.g. cached layout positions), where screen-space precision is far
+/// below `f64`'s 53 bits. Only legal on float-valued columns — validated where the
+/// column is built (`query.rs`); integer columns keep their `u32` type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputDtype {
+    #[default]
+    F64,
+    F32,
+}
+
 /// One requested output column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputColumn {
     /// A node-valued algorithm over the topology. `weights` (an `f64` per edge
-    /// row, gathered via `edge_ids`) is present for a weighted algorithm.
+    /// row, gathered via `edge_ids`) is present for a weighted algorithm. `dtype`
+    /// narrows a float-valued result to `f32` on emit (#117).
     Algo {
         name: String,
         algo: GraphAlgo,
         weights: Option<Arc<Vec<f64>>>,
+        dtype: OutputDtype,
     },
     /// A per-node aggregation of a (dense-aligned) attribute over neighbours.
     NeighborAgg {
@@ -39,6 +53,7 @@ pub enum OutputColumn {
         attr: Arc<Vec<Option<f64>>>,
         direction: Direction,
         agg: AggKind,
+        dtype: OutputDtype,
     },
 }
 
@@ -49,7 +64,16 @@ impl OutputColumn {
         }
     }
 
-    fn value_type(&self) -> DataType {
+    fn dtype(&self) -> OutputDtype {
+        match self {
+            OutputColumn::Algo { dtype, .. } | OutputColumn::NeighborAgg { dtype, .. } => *dtype,
+        }
+    }
+
+    /// The column's Arrow type *before* any `dtype` narrowing — `Float64` for a
+    /// float-valued kernel, `UInt32` for an integer-valued one. Public so `query.rs`
+    /// can reject a nonsensical `f32` request on an integer column at build time.
+    pub fn base_value_type(&self) -> DataType {
         match self {
             OutputColumn::Algo { algo, .. } => match algo {
                 GraphAlgo::PageRank { .. }
@@ -62,8 +86,23 @@ impl OutputColumn {
         }
     }
 
+    /// Whether this column emits a floating-point value (the only kind `f32` narrowing
+    /// applies to).
+    pub fn is_float_valued(&self) -> bool {
+        self.base_value_type() == DataType::Float64
+    }
+
+    fn value_type(&self) -> DataType {
+        match self.dtype() {
+            // `F32` is only ever set on a float-valued column (query.rs validates), so
+            // narrowing the base `Float64` to `Float32` is always well-typed.
+            OutputDtype::F32 => DataType::Float32,
+            OutputDtype::F64 => self.base_value_type(),
+        }
+    }
+
     fn value_array(&self, topo: &Topology, mask: Option<&EdgeMask>) -> ArrayRef {
-        match self {
+        let base = match self {
             OutputColumn::Algo { algo, weights, .. } => {
                 algo_array(topo, algo, weights.as_deref().map(Vec::as_slice), mask)
             }
@@ -75,6 +114,14 @@ impl OutputColumn {
             } => Arc::new(Float64Array::from(neighbor_aggregate(
                 topo, attr, mask, *direction, *agg,
             ))),
+        };
+        match self.dtype() {
+            // Narrow the f64 kernel output to f32 (#117). Casting Float64 -> Float32 is
+            // infallible; the `expect` can only fire on a validation bug (f32 requested
+            // for a non-float column), which query.rs rejects before we get here.
+            OutputDtype::F32 => arrow::compute::cast(&base, &DataType::Float32)
+                .expect("narrowing a float column to f32 is infallible"),
+            OutputDtype::F64 => base,
         }
     }
 }
@@ -327,6 +374,7 @@ mod tests {
                     direction: PlanDirection::Out,
                 },
                 weights: None,
+                dtype: OutputDtype::F64,
             },
             OutputColumn::Algo {
                 name: "pr".to_string(),
@@ -336,6 +384,7 @@ mod tests {
                     tol: 1e-6,
                 },
                 weights: None,
+                dtype: OutputDtype::F64,
             },
         ];
         let batch = query_batch(&topo, &ids, &columns, None).unwrap();
@@ -343,5 +392,70 @@ mod tests {
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema().field(1).name(), "deg");
         assert_eq!(batch.schema().field(2).name(), "pr");
+    }
+
+    #[test]
+    fn f32_dtype_narrows_a_float_column_to_float32_and_matches_f64() {
+        use arrow::array::{Float32Array, Float64Array};
+
+        let (topo, ids) = diamond();
+        let pr = |dtype| OutputColumn::Algo {
+            name: "pr".to_string(),
+            algo: GraphAlgo::PageRank {
+                damping: 0.85,
+                max_iter: 30,
+                tol: 1e-6,
+            },
+            weights: None,
+            dtype,
+        };
+        let f64_batch = query_batch(&topo, &ids, &[pr(OutputDtype::F64)], None).unwrap();
+        let f32_batch = query_batch(&topo, &ids, &[pr(OutputDtype::F32)], None).unwrap();
+
+        assert_eq!(f64_batch.schema().field(1).data_type(), &DataType::Float64);
+        assert_eq!(f32_batch.schema().field(1).data_type(), &DataType::Float32);
+
+        // Same values, just narrowed: each f32 score is the f64 score cast down.
+        let wide = f64_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let narrow = f32_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(wide.len(), narrow.len());
+        for i in 0..wide.len() {
+            assert_eq!(narrow.value(i), wide.value(i) as f32);
+        }
+    }
+
+    #[test]
+    fn f32_on_an_integer_column_is_rejected_at_query_build() {
+        // The JSON path (execute_node_query) is where the float-only rule is enforced;
+        // a degree column asking for f32 must error, not silently emit a lossy float.
+        let (topo, ids) = diamond();
+        let json = r#"[{"name":"deg","kind":"degree","direction":"out","dtype":"f32"}]"#;
+        let err = crate::query::execute_node_query(
+            topo,
+            ids,
+            json,
+            &[],        // filters
+            None,       // sort
+            None,       // limit
+            None,       // nodes
+            None,       // nodes_id
+            None,       // edges
+            false,      // distinct
+            None,       // sample
+            Vec::new(), // rename
+            Vec::new(), // group_keys
+            Vec::new(), // aggs
+            None,       // mask
+        );
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("f32"), "unexpected error: {msg}");
     }
 }
