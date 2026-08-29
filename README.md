@@ -1,6 +1,6 @@
 # Ursa — Polars-shaped dataframes for graph data
 
-> **Status: v0.2, in active development.** An in-memory, single-machine graph analytics
+> **Status: v0.3, in active development.** An in-memory, single-machine graph analytics
 > library with a dataframe-first API — what Polars is to tabular data, for graphs.
 > The engine foundation is in place: real algorithm kernels, and `collect()`
 > executing as one DataFusion plan with graph ops as first-class logical nodes.

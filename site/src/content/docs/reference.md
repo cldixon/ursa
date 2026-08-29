@@ -306,6 +306,6 @@ not yet wired, or a composition limit was hit; the message names which.
 ## Module attributes
 
 ```python
-ur.__version__        # the installed distribution version (0.2.0 on PyPI)
+ur.__version__        # the installed distribution version
 ur.__core_version__   # the native core version, or None without the extension
 ```
