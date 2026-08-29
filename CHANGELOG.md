@@ -44,6 +44,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- `rayon` is now an on-by-default feature of the `ursa-core` crate. With it
+  disabled the crate compiles for `wasm32-unknown-unknown`, single-threaded, and
+  `rand`'s default features — and so `getrandom` — are dropped, since the
+  stochastic kernels use only seeded ChaCha streams. Serial and parallel outputs
+  are bit-identical. This affects Rust consumers of `ursa-core` only: the Python
+  wheels build with default features and are unchanged.
 - `repr()` of a collected frame renders the head as a table with the shape,
   column names and dtypes, capped at 10 rows. It previously showed only a
   shape and a column list, which left results opaque in a REPL. The preview
