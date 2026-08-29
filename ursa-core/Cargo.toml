@@ -9,10 +9,23 @@ repository.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
+# Kernels use only *seeded* ChaCha streams (never OS entropy), so `rand` is pinned
+# without default features at the workspace root — keeping `getrandom` out of the tree
+# is what lets this crate target `wasm32-unknown-unknown`. rand_chacha supplies the
+# PRNG; rand supplies only the `Rng`/`SeedableRng` traits.
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rustc-hash = "2"
+
+[features]
+# `rayon` is on by default: the normal build is multi-threaded. Turning it off
+# (`--no-default-features`) drops the thread pool and every kernel falls back to an
+# ordered serial path (see `src/parallel.rs`) — the build that targets
+# `wasm32-unknown-unknown`, where threads need SharedArrayBuffer + COOP/COEP headers
+# that a static host can't assume. The serial and parallel outputs are bit-identical.
+default = ["rayon"]
+rayon = ["dep:rayon"]
 
 [dev-dependencies]
 # The determinism-across-thread-counts test (tests/determinism_threads.rs) pins

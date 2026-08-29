@@ -12,7 +12,7 @@
 //! Direction-optimizing BFS (Beamer top-down/bottom-up) is deferred — correctness
 //! first, per the spec's "naive placement first" stance.
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use crate::topology::{Direction, Topology};
 

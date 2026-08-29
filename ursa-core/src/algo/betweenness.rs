@@ -22,7 +22,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use super::bfs::TotalF64;
 use super::rng::{shuffled_order, DEFAULT_SEED};

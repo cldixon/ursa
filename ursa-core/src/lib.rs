@@ -24,6 +24,7 @@
 
 pub mod algo;
 pub mod id_map;
+pub(crate) mod parallel;
 pub mod topology;
 
 pub use id_map::{IdError, IdMap};

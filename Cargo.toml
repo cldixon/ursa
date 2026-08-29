@@ -37,7 +37,9 @@ pyo3 = "0.28"
 url = "2"
 # Seeded PRNG for the stochastic kernels (random_walk). ChaCha gives a portable,
 # reproducible stream so a fixed seed yields identical walks across runs/machines.
-rand = "0.8"
+# default-features off drops `getrandom` (OS entropy) — unused, since every stream is
+# seeded — which is what keeps ursa-core compiling for wasm32-unknown-unknown.
+rand = { version = "0.8", default-features = false }
 rand_chacha = "0.3"
 
 [profile.release]
