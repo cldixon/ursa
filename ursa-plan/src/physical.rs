@@ -432,6 +432,7 @@ impl ExecutionPlan for RandomWalkExec {
 mod tests {
     use super::*;
     use crate::logical::{Direction as PlanDirection, GraphAlgo};
+    use crate::result::OutputDtype;
     use crate::topology::build_topology;
     use arrow::array::Int64Array;
 
@@ -446,6 +447,7 @@ mod tests {
                 direction: PlanDirection::Out,
             },
             weights: None,
+            dtype: OutputDtype::F64,
         }]);
         let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns, None));
         let ctx = Arc::new(TaskContext::default());

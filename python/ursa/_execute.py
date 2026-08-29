@@ -915,7 +915,28 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     # silently ignored otherwise — fail clearly instead.
     if p.get("weight") is not None and "weight" not in column:
         raise NotImplementedError(f"weight= is not supported for '{verb}'.")
+    # Output dtype narrowing (#117): a float-valued kernel may emit f32 (half the wire
+    # and on-disk size — e.g. cached layout positions). Only the emitted column
+    # narrows; the kernel still accumulates in f64. Integer kernels have no f32 form.
+    dtype = p.get("dtype")
+    if dtype is not None and dtype != "f64":
+        if dtype != "f32":
+            raise NotImplementedError(f"dtype must be 'f32' or 'f64'; got {dtype!r}.")
+        if verb not in _FLOAT_VALUED_VERBS:
+            raise NotImplementedError(
+                f"dtype='f32' is only supported for float-valued kernels "
+                f"({', '.join(sorted(_FLOAT_VALUED_VERBS))}); '{verb}' emits integers."
+            )
+        column["dtype"] = "f32"
     return column
+
+
+# The kernels whose output column is floating-point — the only ones an `f32` output
+# dtype (#117) applies to. Integer kernels (degree, connected_components,
+# triangle_count, label_propagation, louvain) keep their native u32.
+_FLOAT_VALUED_VERBS = frozenset(
+    {"pagerank", "closeness", "betweenness", "clustering_coefficient", "neighbors_agg"}
+)
 
 
 def _single_edges(exprs: Any) -> Any:

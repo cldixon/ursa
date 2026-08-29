@@ -437,7 +437,7 @@ Determinism: every stochastic algorithm (`random_walk`, `label_propagation`, `lo
 
 **Out (deferred):** motif finding (`ur.find("(a)-[e]->(b); ...")` — GraphFrames-style, the first post-v0.1 feature), `ur.sql()`, heterogeneous graphs, u64 node space, streaming/out-of-core, temporal semantics.
 
-*Shipped since the original plan:* strong components (`connected_components(mode="strong")`); subgraph views over filtered frames — a `filter` on an EdgeFrame is now an edge-mask view over the parent CSR (no rebuild), and every node-valued kernel runs over the masked edge set; and node-valued graph ops over a **traversal result** — `ur.pagerank(ur.hop(edges, n).from_(seeds))` runs over the induced subgraph of the reached nodes via the same mask, no rebuild.
+*Shipped since the original plan:* strong components (`connected_components(mode="strong")`); subgraph views over filtered frames — a `filter` on an EdgeFrame is now an edge-mask view over the parent CSR (no rebuild), and every node-valued kernel runs over the masked edge set; and node-valued graph ops over a **traversal result** — `ur.pagerank(ur.hop(edges, n).from_(seeds))` runs over the induced subgraph of the reached nodes via the same mask, no rebuild; and an **`f32` output dtype** (`dtype="f32"`) on the float-valued kernels, narrowing the emitted column to halve its wire/on-disk size while the kernel still accumulates in `f64`.
 
 ## Open questions (deliberately unresolved)
 

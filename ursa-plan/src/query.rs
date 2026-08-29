@@ -35,7 +35,7 @@ use ursa_core::{EdgeMask, IdMap, Topology};
 use crate::logical::{Direction, GraphAlgo};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
-use crate::result::{path_schema, OutputColumn};
+use crate::result::{path_schema, OutputColumn, OutputDtype};
 use crate::weight::evaluate_weight;
 
 /// One requested output column, deserialized from the Python query IR.
@@ -74,6 +74,10 @@ struct ColumnSpec {
     // connected_components mode: "weak" (default) or "strong".
     #[serde(default)]
     mode: Option<String>,
+    // output dtype narrowing (#117): "f32" emits a float-valued column as Float32;
+    // None / "f64" keeps the native type. Only valid on float-valued columns.
+    #[serde(default)]
+    dtype: Option<String>,
 }
 
 impl ColumnSpec {
@@ -123,6 +127,19 @@ fn parse_cc_strong(mode: Option<&str>) -> Result<bool> {
         "strong" => Ok(true),
         other => Err(DataFusionError::NotImplemented(format!(
             "connected_components mode must be 'weak' or 'strong'; got {other:?}"
+        ))),
+    }
+}
+
+/// Parse the optional per-column output dtype (#117). `None`/`"f64"` keep the native
+/// type; `"f32"` narrows a float-valued column on emit. An unknown value is a hard
+/// error (a typo shouldn't silently keep f64).
+fn parse_output_dtype(dtype: Option<&str>) -> Result<OutputDtype> {
+    match dtype {
+        None | Some("f64") => Ok(OutputDtype::F64),
+        Some("f32") => Ok(OutputDtype::F32),
+        Some(other) => Err(DataFusionError::NotImplemented(format!(
+            "output dtype must be 'f32' or 'f64'; got {other:?}"
         ))),
     }
 }
@@ -476,6 +493,7 @@ pub fn execute_node_query(
     let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
     for spec in &specs {
+        let dtype = parse_output_dtype(spec.dtype.as_deref())?;
         if spec.kind == "neighbors_agg" {
             let nodes_ref = nodes.as_ref().ok_or_else(|| {
                 DataFusionError::NotImplemented(
@@ -495,6 +513,7 @@ pub fn execute_node_query(
                 attr: Arc::new(attr),
                 direction: direction.into(),
                 agg,
+                dtype, // neighbour aggregation is always float-valued
             });
         } else {
             // `to_algo` is the single place an unknown algorithm kind is rejected.
@@ -536,11 +555,22 @@ pub fn execute_node_query(
                     Some(Arc::new(w))
                 }
             };
-            columns.push(OutputColumn::Algo {
+            let column = OutputColumn::Algo {
                 name: spec.name.clone(),
                 algo,
                 weights,
-            });
+                dtype,
+            };
+            // f32 narrowing is only meaningful for a float-valued column; requesting it
+            // on an integer kernel (degree, components, triangle_count, ...) is a type
+            // error, not a silent cast to a lossy float.
+            if dtype == OutputDtype::F32 && !column.is_float_valued() {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "dtype='f32' is only supported for float-valued kernels; {:?} emits integers",
+                    spec.kind
+                )));
+            }
+            columns.push(column);
         }
     }
 

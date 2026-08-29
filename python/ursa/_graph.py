@@ -96,13 +96,16 @@ class _NeighborAgg:
     def __init__(self, edges: EdgeFrame, direction: str, from_: Any) -> None:
         self._edges, self._direction, self._from = edges, direction, from_
 
-    def agg(self, expr: Expr) -> GraphExpr:
+    def agg(self, expr: Expr, dtype: str = "f64") -> GraphExpr:
+        """Close the neighbour aggregation into a graph expression. ``dtype="f32"``
+        emits the aggregated column as 32-bit float."""
         return _graph_expr(
             "neighbors_agg",
             edges=self._edges,
             direction=self._direction,
             from_=self._from,
             agg=expr,
+            dtype=dtype,
         )
 
 
@@ -228,10 +231,18 @@ def pagerank(
     max_iter: int = 30,
     tol: float = 1e-6,
     weight: Expr | None = None,
+    dtype: str = "f64",
 ) -> GraphExpr:
-    """PageRank (pull-based fixpoint)."""
+    """PageRank (pull-based fixpoint). ``dtype="f32"`` emits the score column as
+    32-bit float (half the size; the fixpoint still iterates in f64)."""
     return _graph_expr(
-        "pagerank", edges=edges, damping=damping, max_iter=max_iter, tol=tol, weight=weight
+        "pagerank",
+        edges=edges,
+        damping=damping,
+        max_iter=max_iter,
+        tol=tol,
+        weight=weight,
+        dtype=dtype,
     )
 
 
@@ -251,9 +262,10 @@ def triangle_count(edges: EdgeFrame) -> GraphExpr:
     return _graph_expr("triangle_count", edges=edges)
 
 
-def clustering_coefficient(edges: EdgeFrame) -> GraphExpr:
-    """Local clustering coefficient (derived from triangles)."""
-    return _graph_expr("clustering_coefficient", edges=edges)
+def clustering_coefficient(edges: EdgeFrame, dtype: str = "f64") -> GraphExpr:
+    """Local clustering coefficient (derived from triangles). ``dtype="f32"`` emits
+    the coefficient column as 32-bit float."""
+    return _graph_expr("clustering_coefficient", edges=edges, dtype=dtype)
 
 
 def betweenness(
@@ -261,18 +273,22 @@ def betweenness(
     sample: float | None = None,
     weight: Expr | None = None,
     seed: int | None = None,
+    dtype: str = "f64",
 ) -> GraphExpr:
     """Betweenness centrality (Brandes), directed and unnormalized. ``sample=``
     approximates from a ``seed``-shuffled subset of sources (exact is O(nm));
     ``seed`` makes the sampled estimate reproducible. Parallel edges count as
     distinct shortest paths (so a multigraph diverges from a simple-graph
-    reference like NetworkX); weighted, only *exactly* float-equal path costs tie."""
-    return _graph_expr("betweenness", edges=edges, sample=sample, weight=weight, seed=seed)
+    reference like NetworkX); weighted, only *exactly* float-equal path costs tie.
+    ``dtype="f32"`` emits the centrality column as 32-bit float."""
+    return _graph_expr(
+        "betweenness", edges=edges, sample=sample, weight=weight, seed=seed, dtype=dtype
+    )
 
 
-def closeness(edges: EdgeFrame, weight: Expr | None = None) -> GraphExpr:
-    """Closeness centrality."""
-    return _graph_expr("closeness", edges=edges, weight=weight)
+def closeness(edges: EdgeFrame, weight: Expr | None = None, dtype: str = "f64") -> GraphExpr:
+    """Closeness centrality. ``dtype="f32"`` emits the score column as 32-bit float."""
+    return _graph_expr("closeness", edges=edges, weight=weight, dtype=dtype)
 
 
 def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> GraphExpr:
