@@ -13,7 +13,7 @@
 //! unweighted run pulls rank once per parallel edge (multiplicity-is-rows) — a
 //! multigraph's scores differ from collapsing parallels to one edge.
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use crate::topology::{EdgeMask, Topology};
 

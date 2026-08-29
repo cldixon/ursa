@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use super::rng::{shuffled_order, DEFAULT_SEED};
 use crate::topology::{EdgeMask, Topology};

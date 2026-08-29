@@ -15,7 +15,7 @@
 //! `tc.cc` orders vertices by degree and only intersects "upward" to halve the
 //! work; that optimisation is a drop-in refinement here later.
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use crate::topology::{EdgeMask, Topology, UndirectedCsr};
 

@@ -7,7 +7,7 @@
 //! adjacency and folds the present neighbour values. No neighbour list is ever
 //! materialized — this is a segmented reduction straight over the adjacency.
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use crate::topology::{Direction, EdgeMask, Topology};
 

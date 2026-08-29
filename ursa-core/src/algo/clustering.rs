@@ -12,7 +12,7 @@
 //! adjacency and per-node triangle counts from [`super::triangle`], so it costs
 //! essentially one extra pass over the (already computed) counts.
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use super::triangle::per_node_triangles;
 use crate::topology::{EdgeMask, Topology, UndirectedCsr};

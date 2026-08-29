@@ -12,7 +12,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use rayon::prelude::*;
+use crate::parallel::*;
 
 use super::bfs::TotalF64;
 use crate::topology::{Direction, EdgeMask, Topology};

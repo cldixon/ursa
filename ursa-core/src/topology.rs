@@ -141,7 +141,7 @@ impl Adjacency {
         // Below the threshold (or single-worker), the serial two-pass sort wins —
         // the parallel path's per-chunk histograms aren't worth their overhead.
         const PARALLEL_MIN_EDGES: usize = 1 << 16;
-        let n_chunks = rayon::current_num_threads();
+        let n_chunks = crate::parallel::current_num_threads();
         if m < PARALLEL_MIN_EDGES || n_chunks <= 1 || n_nodes == 0 {
             Self::build_serial(n_nodes, keys, other)
         } else {
@@ -188,7 +188,7 @@ impl Adjacency {
     /// edges remain in original row order, byte-identical to [`Self::build_serial`].
     /// The scatter writes are provably non-overlapping, so it runs lock-free.
     fn build_parallel(n_nodes: usize, keys: &[u32], other: &[u32], n_chunks: usize) -> Adjacency {
-        use rayon::prelude::*;
+        use crate::parallel::*;
         let m = keys.len();
         let chunk_size = m.div_ceil(n_chunks);
 
@@ -433,7 +433,7 @@ impl Topology {
     /// lists (parallel, self-loops filtered), then flattened into one offsets +
     /// targets buffer.
     fn build_undirected(&self) -> UndirectedCsr {
-        use rayon::prelude::*;
+        use crate::parallel::*;
         let n = self.n_nodes;
         let out = &self.out;
         let inc = self.incoming();
@@ -537,7 +537,7 @@ impl Topology {
     /// directed CSR or the id map, so the parent index and dense id space are
     /// unchanged (no `build_index`).
     pub fn undirected_masked(&self, mask: &EdgeMask) -> UndirectedCsr {
-        use rayon::prelude::*;
+        use crate::parallel::*;
         let n = self.n_nodes;
         let out = &self.out;
         let inc = self.incoming();

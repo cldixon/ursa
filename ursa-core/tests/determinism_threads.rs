@@ -9,6 +9,13 @@
 //! (exact `==`, not approximate) to the single-threaded run. This locks the #40
 //! guarantees against future parallelization work silently reintroducing order
 //! dependence.
+//!
+//! Gated on the `rayon` feature: without it there is no thread pool to vary, and the
+//! kernels run through the serial fallback (`ursa-core::parallel`) — whose whole point
+//! is to produce the *same* bytes. The per-kernel unit tests, which assert exact
+//! expected values, cover that serial path when the suite is run with
+//! `--no-default-features`; this cross-pool-size test only has meaning with `rayon` on.
+#![cfg(feature = "rayon")]
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{betweenness, label_propagation, louvain, pagerank, PageRankParams};
