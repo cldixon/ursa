@@ -29,6 +29,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   comparisons. Previously only a single `col <op> number` comparison executed.
 - Graph operations over a filtered edge frame (subgraph views), and over a
   traversal result from `hop` or `shortest_path`.
+- `dtype="f32"` on the float-valued kernels (`pagerank`, `closeness`,
+  `betweenness`, `clustering_coefficient`) and on `neighbors().agg()`, which
+  emits the result column as 32-bit float. The kernel still accumulates in f64
+  and the emitted value is that result cast down, so it agrees within f32
+  precision. The integer-valued kernels take no `dtype`. The default output is
+  unchanged.
 - `http(s)://` reads for a single hosted Parquet or CSV file.
 - `on_null="drop"` on edge inputs (`EdgeFrame`, `from_arrow`, `from_edgelist`,
   `scan_edges`, `read_edges`), which filters rows with a null `src` or `dst`
