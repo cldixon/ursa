@@ -1,6 +1,7 @@
 ---
 import { SITE, DOCS_NAV } from '../lib/site';
 import { url } from '../lib/url';
+import { VERSION, VERSION_TAG } from '../lib/version';
 ---
 
 <footer>
@@ -31,6 +32,13 @@ import { url } from '../lib/url';
       </div>
     </div>
     <p class="cap colophon">
+      Documents <a href={`${SITE.repo}/releases/tag/${VERSION_TAG}`} rel="noopener"
+        >{SITE.pkg} {VERSION}</a
+      > · changes since in the <a href={`${SITE.repo}/blob/main/CHANGELOG.md`} rel="noopener"
+        >changelog</a
+      >.
+    </p>
+    <p class="cap colophon-rule">
       Ursa · MIT or Apache-2.0 · Set in Source Serif 4 and IBM Plex Mono. Figures are generated
       from fixed seeds; every caption states its parameters.
     </p>
@@ -69,6 +77,12 @@ import { url } from '../lib/url';
     margin-top: 40px;
     padding-top: 14px;
     border-top: 1px solid var(--rule);
+    max-width: 76ch;
+  }
+  /* The colophon proper sits under the version line, so it takes the spacing
+     without a second rule. */
+  .colophon-rule {
+    margin-top: 8px;
     max-width: 76ch;
   }
 </style>
