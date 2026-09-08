@@ -4,16 +4,35 @@ The landing page and documentation, built with [Astro](https://astro.build) and 
 [bun](https://bun.com).
 
 Nothing here needs the native extension — the site is static, built from markdown and Astro
-components — so the docs build never waits on a Rust compile.
+components — so the docs build never waits on a Rust compile. (`astro.config.mjs` does read the
+release out of the workspace `Cargo.toml`, but as text: no Rust toolchain involved.)
+
+## The workspace
+
+The JavaScript is **one bun workspace rooted at the repository root**, with two members:
+
+| Member | What it owns |
+|---|---|
+| [`viz/`](../viz) | `@ursa/viz` — the design tokens and the stretch/ramp machinery, and in time the graph renderer |
+| `site/` | this Astro site, a *consumer* of `@ursa/viz` |
+
+`viz/` is top-level rather than nested here because the site will not be its only consumer: the
+notebook widget and the exported HTML need the same tokens with no Astro anywhere in sight. The
+dependency runs site → viz and never the other way.
+
+So there is one `bun.lock`, at the root, and commands run from the root:
 
 ```bash
-cd site
-bun install
+bun install              # resolves the whole workspace
 bun run dev              # http://localhost:4321
 bun run build            # -> site/dist
-bun run check            # astro check (type-checks .astro and the content schema)
+bun run check            # tsc over viz/, then astro check over site/
 bun run preview:worker   # the production build, served by a local workerd
 ```
+
+Each root script delegates into the member that owns it (`bun run --cwd site …`), so running a
+script from inside `site/` still works — only `bun install` must happen at the root, since that is
+where the lockfile lives.
 
 ## Deploying
 
@@ -39,8 +58,49 @@ dashboard rather than in this repository:
   (`<branch>-ursa-docs.cl-dixon.workers.dev`) — posted to the pull request as a comment. The
   branch URL follows the branch as commits land, like a Pages preview deployment.
 
-`.github/workflows/docs.yml` is a build check only (install, `astro check`, build); it proves a
+`.github/workflows/docs.yml` is a build check only (install, type-check, build); it proves a
 docs PR builds from a clean checkout independent of the Cloudflare account.
+
+> **Do not read the `Workers Builds: ursa-docs` check's duration.** Cloudflare posts that check
+> with `started_at` equal to `completed_at`, so the GitHub API and UI report every build as taking
+> zero seconds no matter how long it actually ran — a build whose logs and PR comment landed ten
+> minutes later still shows as instant. It looks exactly like a skipped build, and it is not.
+>
+> The **PR comment** from `cloudflare-workers-and-pages[bot]` is the honest signal: it names the
+> commit it built, links the build logs, and carries the commit and branch preview URLs.
+
+> **The build settings live in the dashboard, so the repository cannot keep them right.**
+> When the JavaScript moved to a root bun workspace, `bun install` stopped working from `site/` —
+> the lockfile is at the repository root now. The Workers Builds settings have to match:
+>
+> | Setting (dashboard label) | Value |
+> |---|---|
+> | Root directory | *(empty — the repository root; was `site`)* |
+> | Build command | `bun run build` |
+> | Deploy command | `bun run cf:deploy` |
+> | **Version command** | `bun run cf:preview` |
+>
+> The last one is what the Cloudflare *documentation* calls the "non-production branch deploy
+> command" (and, elsewhere in the same docs, the "preview deploy command"). The dashboard labels it
+> **Version command**. One field, three names — identify it by its default value,
+> `npx wrangler versions upload`. It runs on every branch that is not the production branch, and it
+> is what produces the per-commit preview URLs and the `<branch>-ursa-docs…` alias posted to pull
+> requests.
+>
+> Those command names are deliberate: each is a one-line script in the root `package.json` that
+> delegates into `site/`. **The dashboard holds names, the repository holds behaviour** — so every
+> future change to how the site deploys is a commit rather than another dashboard visit. This is
+> as close as Workers Builds gets to versioned build config; the four settings above are genuinely
+> dashboard-only.
+>
+> `site/wrangler.jsonc` needs no change, and neither do the paths inside it: `cf:deploy` runs
+> wrangler *with `site/` as its working directory*, exactly as before the workspace existed, so
+> config discovery and the relative `assets.directory` resolve unchanged. (Workers Builds installs
+> dependencies itself before running the build command, so `bun run build` needs no `bun install`
+> in front of it.)
+>
+> If a docs deploy fails right after a restructure, this is the first thing to check: nothing in
+> this repository can tell you the dashboard is stale.
 
 ### Pinning production to the release
 
@@ -91,9 +151,9 @@ site/
 │   ├── content/docs/       # the documentation, as markdown/MDX
 │   ├── components/         # figures, legends, nav, footer
 │   ├── layouts/            # Base (chrome) and Docs (sidebar + TOC + prose)
-│   ├── lib/                # figure generation, stretch functions, nav config
+│   ├── lib/                # figure generation, nav config, version
 │   ├── pages/              # index.astro and the docs route
-│   └── styles/             # tokens.css (the design system) + global.css
+│   └── styles/             # global.css (the tokens live in ../viz)
 └── public/
 ```
 

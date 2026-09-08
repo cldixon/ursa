@@ -11,7 +11,7 @@
  * and forever.
  */
 
-import { stretch, type StretchName } from './stretch';
+import { stretch, type StretchName } from '@ursa/viz';
 
 /** mulberry32 — small, fast, and stable across runs and platforms. */
 export function rng(seed: number): () => number {

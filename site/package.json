@@ -9,9 +9,12 @@
     "preview": "astro preview",
     "check": "astro check",
     "deploy": "bun run build && wrangler deploy",
-    "preview:worker": "bun run build && wrangler dev"
+    "preview:worker": "bun run build && wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "cf:preview": "wrangler versions upload"
   },
   "dependencies": {
+    "@ursa/viz": "workspace:*",
     "@astrojs/mdx": "^7.0.3",
     "@astrojs/sitemap": "^3.7.3",
     "@fontsource-variable/source-serif-4": "^5.3.0",
