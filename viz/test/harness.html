@@ -1,0 +1,63 @@
+<!doctype html>
+<!--
+  Shell for the render harness. `harness.ts` is bundled next to this file as
+  `harness.js` by the render test (or by `bun run harness`); both are gitignored
+  build output.
+
+  Two panels, one per ground, so a single screenshot shows the plate and the sky
+  together — a token that fails to resolve reads as a panel that does not match
+  its neighbour.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Ursa instrument harness</title>
+    <link rel="stylesheet" href="./tokens.css" />
+    <style>
+      body {
+        margin: 0;
+        font-family: var(--mono);
+        background: var(--paper);
+        color: var(--ink);
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        height: 100vh;
+      }
+      .panel {
+        position: relative;
+        background: var(--paper);
+        color: var(--ink);
+      }
+      .mount {
+        position: absolute;
+        inset: 0;
+      }
+      .label {
+        position: absolute;
+        top: 10px;
+        left: 12px;
+        z-index: 1;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        opacity: 0.7;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <div class="panel">
+        <div class="label">plate · size and colour by degree</div>
+        <div class="mount" id="mount-plate"></div>
+      </div>
+      <div class="panel" data-ground="sky">
+        <div class="label">sky · colour by community</div>
+        <div class="mount" id="mount-sky"></div>
+      </div>
+    </div>
+    <script src="./harness.js"></script>
+  </body>
+</html>
