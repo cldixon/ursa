@@ -171,6 +171,35 @@ describe.skipIf(!canRun)('renders in a real browser', () => {
     expect(after).toBeLessThan(before);
   });
 
+  test('hovering a node rings it and reports it', async () => {
+    // Re-frame first so the node positions the harness reports match what is on
+    // screen — the pan and zoom tests above moved the camera.
+    await page.evaluate<void>('window.__ursa.plate.fit(); window.__ursa.plate.drawNow();');
+    const before = await page.evaluate<number>(`window.__ursa.inkCoverage('plate')`);
+
+    // Node 0 is a seed of the preferential-attachment graph, so it is one of the
+    // largest and easiest to land on.
+    const at = await page.evaluate<{ x: number; y: number }>('window.__ursa.screenOf(0)');
+    await page.mouse.move(at.x, at.y);
+    await page.evaluate<void>('new Promise((r) => requestAnimationFrame(() => r()))');
+
+    expect(await page.evaluate<number>('window.__ursa.plate.hovered')).toBe(0);
+    const hover = await page.evaluate<{ node: number } | null>('window.__ursa.lastHover');
+    expect(hover?.node).toBe(0);
+
+    // The ring is real ink: coverage rises because pixels were added that were not
+    // there before.
+    const after = await page.evaluate<number>(`window.__ursa.inkCoverage('plate')`);
+    expect(after).toBeGreaterThan(before);
+  });
+
+  test('leaving the canvas clears the hover', async () => {
+    await page.mouse.move(5, 5);
+    await page.mouse.move(-20, -20);
+    await page.evaluate<void>('new Promise((r) => requestAnimationFrame(() => r()))');
+    expect(await page.evaluate<number>('window.__ursa.plate.hovered')).toBe(-1);
+  });
+
   test('capturing a still', async () => {
     // Not an assertion so much as an artifact: on a failure the PNG is the
     // fastest way to see what the renderer actually produced.

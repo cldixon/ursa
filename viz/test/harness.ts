@@ -22,6 +22,10 @@ interface Harness {
    * produce a clean, plausible, entirely blank canvas.
    */
   inkCoverage(which: 'plate' | 'sky'): number;
+  /** Last hover the plate reported, for the browser test to read. */
+  lastHover: { node: number; screenX: number; screenY: number } | null;
+  /** Screen position of a node, so the test can aim the pointer at one. */
+  screenOf(i: number): { x: number; y: number };
 }
 
 declare global {
@@ -83,11 +87,11 @@ function graph(n: number, m: number, seed: number) {
   return { x, y, edges, degree, edgeCount: src.length };
 }
 
-function mount(id: string) {
+function mount(id: string, onHover?: (e: { node: number; screenX: number; screenY: number }) => void) {
   const el = document.getElementById(id);
   if (el == null) throw new Error(`no mount point #${id}`);
   // Capture needs the buffer preserved; interactive hosts leave it off.
-  return createInstrument(el, { preserveDrawingBuffer: true });
+  return createInstrument(el, { preserveDrawingBuffer: true, onHover });
 }
 
 /** Count pixels that differ from the canvas's corner colour, on a coarse grid. */
@@ -119,7 +123,10 @@ function coverage(canvas: HTMLCanvasElement): number {
 try {
   const g = graph(320, 2, 20260908);
 
-  const plate = mount('mount-plate');
+  let lastHover: Harness['lastHover'] = null;
+  const plate = mount('mount-plate', (e) => {
+    lastHover = { node: e.node, screenX: e.screenX, screenY: e.screenY };
+  });
   plate.setGraph({
     x: g.x,
     y: g.y,
@@ -144,6 +151,18 @@ try {
     sky,
     nodeCount: g.x.length,
     edgeCount: g.edgeCount,
+    get lastHover() {
+      return lastHover;
+    },
+    screenOf(i) {
+      const cam = plate.camera;
+      const el = document.getElementById('mount-plate')!;
+      const rect = el.getBoundingClientRect();
+      // Canvas-relative -> page coordinates, which is what the test's mouse uses.
+      const sx = (g.x[i]! - cam.cx) * cam.scale + cam.width / 2;
+      const sy = (cam.cy - g.y[i]!) * cam.scale + cam.height / 2;
+      return { x: rect.left + sx, y: rect.top + sy };
+    },
     inkCoverage(which) {
       const inst = which === 'plate' ? plate : sky;
       // Draw synchronously so the pixels are in the buffer when we read them.

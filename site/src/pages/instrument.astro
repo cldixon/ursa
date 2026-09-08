@@ -1,0 +1,249 @@
+---
+/**
+ * The instrument, live.
+ *
+ * A working surface for the renderer rather than a documentation page: it exists
+ * so the thing can be looked at and argued with — palettes, stretches, sizes, both
+ * grounds — while the design is still being settled. The controls are the knobs
+ * that decision needs, not a product feature.
+ *
+ * Deliberately not linked from the site navigation yet. It becomes the docs
+ * snippet tabs (`docs/VIZ_HANDOFF.md` step 2) once the figures come from real
+ * Ursa output; today the graph is generated at build time by the site's own
+ * TypeScript — the same generator that draws the landing-page figures.
+ *
+ * That generator is the duplication the handoff wants deleted: it computes
+ * PageRank in TypeScript, which is Ursa's own job. It stays for now because the
+ * fixture pipeline (Ursa runs in CI, Arrow buffers land in `site/`) is its own
+ * change. What is *not* provisional is everything below the data: the component,
+ * the mount, the hydration shape. Those are what step 2 keeps.
+ */
+import Base from '../layouts/Base.astro';
+import { preferentialAttachment } from '../lib/graph';
+
+// Built once, at build time, with a fixed seed: the same graph every deploy, so a
+// visual change between two previews is a change in the renderer and not a
+// reshuffled graph.
+const W = 1000;
+const H = 700;
+const graph = preferentialAttachment({ seed: 20260908, n: 420, m: 2, width: W, height: H });
+
+// Serialized flat, in the shape the instrument consumes: parallel arrays and
+// dense u32 index pairs, matching the wire protocol the explorer will use.
+const payload = {
+  x: graph.nodes.map((n) => n.x - W / 2),
+  // Flip into world space, where y increases upward; the generator lays out in
+  // screen coordinates.
+  y: graph.nodes.map((n) => H / 2 - n.y),
+  degree: graph.nodes.map((n) => n.degree),
+  pagerank: graph.nodes.map((n) => n.pagerank),
+  edges: graph.edges.flatMap((e) => [e.s, e.d]),
+};
+---
+
+<Base
+  title="Instrument"
+  description="The Ursa renderer, live: pan, zoom and hover a graph on either ground."
+>
+  <section class="wrap">
+    <header class="head">
+      <h1>Instrument</h1>
+      <p class="sub">
+        {graph.nodes.length} nodes · {graph.edges.length} edges · drag to pan, scroll to zoom,
+        hover a node
+      </p>
+    </header>
+
+    <div class="controls">
+      <label>
+        Ground
+        <select id="ground">
+          <option value="plate">plate</option>
+          <option value="sky" selected>sky</option>
+        </select>
+      </label>
+      <label>
+        Colour by
+        <select id="colour">
+          <option value="pagerank">pagerank (continuous)</option>
+          <option value="degree">degree (continuous)</option>
+          <option value="community">community (categorical)</option>
+        </select>
+      </label>
+      <label>
+        Stretch
+        <select id="stretch">
+          <option value="asinh">asinh</option>
+          <option value="log">log</option>
+          <option value="linear">linear</option>
+        </select>
+      </label>
+      <button id="fit" type="button">Fit</button>
+      <span class="note" id="note"></span>
+    </div>
+
+    <div class="stage" id="stage" data-ground="sky">
+      <div class="mount" id="mount"></div>
+      <div class="readout" id="readout" hidden></div>
+    </div>
+  </section>
+
+  <script is:inline type="application/json" id="graph-data" set:html={JSON.stringify(payload)} />
+
+  <script>
+    import { createInstrument, type Channel, type StretchName } from '@ursa/viz';
+
+    const raw = document.getElementById('graph-data')?.textContent ?? '{}';
+    const data = JSON.parse(raw) as {
+      x: number[];
+      y: number[];
+      degree: number[];
+      pagerank: number[];
+      edges: number[];
+    };
+
+    const x = Float32Array.from(data.x);
+    const y = Float32Array.from(data.y);
+    const degree = Float32Array.from(data.degree);
+    const pagerank = Float32Array.from(data.pagerank);
+    const edges = Uint32Array.from(data.edges);
+
+    // Stand-in for a real community detection: the point of this control is to
+    // exercise the *categorical* path and make the four-grey palette limit
+    // visible, which a synthetic partition does as well as a real one.
+    const community = Uint32Array.from(x, (_, i) => i % 6);
+
+    const stage = document.getElementById('stage') as HTMLElement;
+    const mount = document.getElementById('mount') as HTMLElement;
+    const readout = document.getElementById('readout') as HTMLElement;
+    const note = document.getElementById('note') as HTMLElement;
+
+    const instrument = createInstrument(mount, {
+      onHover: ({ node, screenX, screenY }) => {
+        if (node < 0) {
+          readout.hidden = true;
+          return;
+        }
+        readout.hidden = false;
+        readout.style.transform = `translate(${screenX}px, ${screenY}px)`;
+        readout.textContent = `node ${node} · deg ${degree[node]} · pr ${pagerank[node]!.toFixed(4)}`;
+      },
+    });
+
+    function currentColour(): Channel {
+      const kind = (document.getElementById('colour') as HTMLSelectElement).value;
+      const stretch = (document.getElementById('stretch') as HTMLSelectElement)
+        .value as StretchName;
+      if (kind === 'community') return { kind: 'categorical', codes: community };
+      return { kind: 'continuous', values: kind === 'degree' ? degree : pagerank, stretch };
+    }
+
+    function apply(): void {
+      instrument.setGraph({
+        x,
+        y,
+        edges,
+        // Degree drives size throughout, so switching the colour channel changes
+        // one variable at a time — which is the point of a page for comparing them.
+        size: { kind: 'continuous', values: degree, stretch: 'log' },
+        color: currentColour(),
+      });
+      // Surface the palette limit rather than letting repeated greys read as a
+      // coincidence. This is the open design question in the handoff.
+      const n = instrument.categoryCount;
+      note.textContent =
+        n > 4 ? `${n} categories, 4 flat greys — colours repeat past the fourth` : '';
+    }
+
+    for (const id of ['colour', 'stretch']) {
+      document.getElementById(id)?.addEventListener('change', apply);
+    }
+    document.getElementById('ground')?.addEventListener('change', (e) => {
+      stage.dataset.ground = (e.target as HTMLSelectElement).value;
+      // Colours are baked into the vertex buffers, so a ground change has to
+      // rebuild them rather than just repaint.
+      instrument.refreshTheme();
+    });
+    document.getElementById('fit')?.addEventListener('click', () => instrument.fit());
+
+    apply();
+  </script>
+</Base>
+
+<style>
+  .wrap {
+    max-width: var(--w-page);
+    margin: 0 auto;
+    padding: 32px var(--pad-x) 64px;
+  }
+  .head h1 {
+    font-family: var(--serif);
+    font-size: 2rem;
+    margin: 0;
+  }
+  .sub {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--ink-2);
+    margin: 6px 0 0;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    align-items: center;
+    margin: 24px 0 12px;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--ink-2);
+  }
+  .controls label {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .controls select,
+  .controls button {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--ink);
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    padding: 4px 8px;
+  }
+  .controls button {
+    cursor: pointer;
+  }
+  .note {
+    color: var(--paper-ramp-0);
+  }
+  .stage {
+    position: relative;
+    height: min(72vh, 720px);
+    border: 1px solid var(--rule);
+    background: var(--paper);
+  }
+  .mount {
+    position: absolute;
+    inset: 0;
+  }
+  /* The label rides above the canvas and must never eat a pointer event, or
+     hovering a node would immediately un-hover it as the label slid under the
+     cursor. */
+  .readout {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    white-space: nowrap;
+    color: var(--ink);
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    padding: 3px 6px;
+    margin: 10px 0 0 12px;
+  }
+</style>

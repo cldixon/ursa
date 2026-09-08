@@ -33,6 +33,8 @@ export interface RenderBuffers {
   readonly colors: Float32Array;
   /** Node index pairs, 2 per edge. */
   readonly edges: Uint32Array;
+  /** Node to ring as the hover affordance, or -1 for none. */
+  readonly highlight: number;
 }
 
 export interface CameraUniforms {
@@ -62,6 +64,10 @@ interface Frame {
   edgeColor: [number, number, number];
   edgeAlpha: number;
   instances: number;
+  /** Hovered node: world position and screen radius, for the ring. */
+  hi: [number, number];
+  hiRadius: number;
+  hiColor: [number, number, number];
 }
 
 /** Screen-space geometry shared by both shaders. */
@@ -147,6 +153,9 @@ export function createRenderer(
     // overlap, not by any one of them.
     edgeAlpha: 0.35,
     instances: 0,
+    hi: [0, 0],
+    hiRadius: 0,
+    hiColor: [0, 0, 0],
   };
   const glViewport = () => ({ x: 0, y: 0, width: frame.buffer[0], height: frame.buffer[1] });
 
@@ -241,6 +250,57 @@ export function createRenderer(
     depth: { enable: false },
   });
 
+  // The hover affordance: a ring standing off the node rather than a fill, so it
+  // marks the node without repainting it — the value the colour encodes stays
+  // readable while hovered. Echoes the detection ellipse the site's SkyField uses.
+  const drawHighlight = regl({
+    vert: `
+      precision highp float;
+      attribute vec2 aCorner;
+      uniform vec2 uNode;
+      uniform float uRadius;
+      varying vec2 vCorner;
+      ${PROJECT}
+      void main() {
+        vCorner = aCorner;
+        vec2 offset = aCorner * uRadius / (uViewport * 0.5);
+        gl_Position = vec4(project(uNode) + offset, 0.0, 1.0);
+      }
+    `,
+    frag: `
+      precision highp float;
+      varying vec2 vCorner;
+      uniform vec3 uColor;
+      void main() {
+        float d = length(vCorner);
+        // An annulus: opaque in a narrow band, transparent inside and out, with
+        // both edges feathered so it does not alias into a polygon.
+        float outer = 1.0 - smoothstep(0.86, 1.0, d);
+        float inner = smoothstep(0.62, 0.76, d);
+        float alpha = outer * inner;
+        if (alpha <= 0.01) discard;
+        gl_FragColor = vec4(uColor, alpha);
+      }
+    `,
+    attributes: { aCorner: { buffer: corners, size: 2 } },
+    uniforms: {
+      uCenter: () => frame.center,
+      uScale: () => frame.scale,
+      uViewport: () => frame.viewport,
+      uNode: () => frame.hi,
+      uRadius: () => frame.hiRadius,
+      uColor: () => frame.hiColor,
+    },
+    count: 4,
+    primitive: 'triangle strip',
+    viewport: glViewport,
+    blend: {
+      enable: true,
+      func: { srcRGB: 'src alpha', srcAlpha: 1, dstRGB: 'one minus src alpha', dstAlpha: 1 },
+    },
+    depth: { enable: false },
+  });
+
   return {
     draw(buffers, cam, theme) {
       positions(buffers.positions);
@@ -267,6 +327,15 @@ export function createRenderer(
       }
       if (buffers.nodeCount > 0) {
         drawNodes();
+      }
+      const h = buffers.highlight;
+      if (h >= 0 && h < buffers.nodeCount) {
+        frame.hi = [buffers.positions[h * 2]!, buffers.positions[h * 2 + 1]!];
+        // Stand off the node so the ring reads as an annotation around it rather
+        // than as a thicker node.
+        frame.hiRadius = buffers.sizes[h]! + 6;
+        frame.hiColor = hexToRgbFloat(normalizeHex(theme.ink));
+        drawHighlight();
       }
     },
     destroy() {

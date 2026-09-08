@@ -16,10 +16,12 @@ import {
   fitBounds,
   panByScreen,
   resize,
+  worldToScreen,
   zoomAt,
   type Camera,
 } from './camera';
 import { distinctCategories, mapColor, mapSize, type Channel } from './channels';
+import { buildPickIndex, pick, type PickIndex } from './picking';
 import {
   createRenderer,
   type RenderBuffers,
@@ -41,11 +43,29 @@ export interface GraphSpec {
   readonly color?: Channel;
 }
 
+/** What the pointer is over, in both the graph's terms and the page's. */
+export interface HoverEvent {
+  /** Dense node index, or -1 when the pointer left every node. */
+  readonly node: number;
+  /** Where the node's centre is, in CSS pixels relative to the canvas. */
+  readonly screenX: number;
+  readonly screenY: number;
+}
+
 export interface InstrumentOptions extends RendererOptions {
   /** Node radius range in screen pixels, smallest to largest. */
   readonly sizeRange?: readonly [number, number];
   /** Override the theme instead of resolving it from the mounted element. */
   readonly theme?: Theme;
+  /**
+   * Called when the hovered node changes — not on every pointer move.
+   *
+   * The instrument draws the ring itself; the label belongs to the host, which
+   * knows what a node *is* (a name, an id, a row) and can lay out real text in
+   * the DOM. Text in WebGL would mean shipping a glyph atlas to draw something
+   * the page can already do better.
+   */
+  readonly onHover?: (e: HoverEvent) => void;
 }
 
 export interface Instrument {
@@ -72,6 +92,8 @@ export interface Instrument {
    * than let the collision read as a coincidence.
    */
   readonly categoryCount: number;
+  /** The currently hovered node index, or -1. */
+  readonly hovered: number;
   destroy(): void;
 }
 
@@ -107,10 +129,13 @@ export function createInstrument(
   let categoryCount = 0;
   let framed = false;
   let frame = 0;
+  let hovered = -1;
+  let pickIndex: PickIndex | null = null;
 
   function emptyBuffers(): RenderBuffers {
     return {
       nodeCount: 0,
+      highlight: -1,
       positions: new Float32Array(0),
       sizes: new Float32Array(0),
       colors: new Float32Array(0),
@@ -133,6 +158,8 @@ export function createInstrument(
       sizes: mapSize(size, count, sizeRange[0], sizeRange[1]),
       colors: mapColor(color, count, theme),
       edges: next.edges ?? new Uint32Array(0),
+      // Preserved across a rebuild so a theme change does not drop the hover.
+      highlight: hovered,
     };
   }
 
@@ -185,11 +212,40 @@ export function createInstrument(
     canvas.setPointerCapture(e.pointerId);
   }
 
+  /** Hit-test at a canvas-relative point and update the hover if it changed. */
+  function updateHover(sx: number, sy: number): void {
+    if (pickIndex == null || buffers.nodeCount === 0) return;
+    const next = pick(pickIndex, spec.x, spec.y, buffers.sizes, sizeRange[1], camera, sx, sy);
+    if (next === hovered) return;
+    hovered = next;
+    buffers = { ...buffers, highlight: hovered };
+    canvas.style.cursor = hovered >= 0 ? 'pointer' : 'default';
+    if (options.onHover) {
+      const [px, py] =
+        hovered >= 0 ? worldToScreen(camera, spec.x[hovered]!, spec.y[hovered]!) : [sx, sy];
+      options.onHover({ node: hovered, screenX: px, screenY: py });
+    }
+    requestDraw();
+  }
+
   function onPointerMove(e: PointerEvent): void {
-    if (!dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    if (!dragging) {
+      updateHover(e.clientX - rect.left, e.clientY - rect.top);
+      return;
+    }
     camera = panByScreen(camera, e.clientX - lastX, e.clientY - lastY);
     lastX = e.clientX;
     lastY = e.clientY;
+    requestDraw();
+  }
+
+  function onPointerLeave(): void {
+    if (hovered === -1) return;
+    hovered = -1;
+    buffers = { ...buffers, highlight: -1 };
+    canvas.style.cursor = 'default';
+    options.onHover?.({ node: -1, screenX: 0, screenY: 0 });
     requestDraw();
   }
 
@@ -215,6 +271,7 @@ export function createInstrument(
   canvas.addEventListener('pointermove', onPointerMove);
   canvas.addEventListener('pointerup', onPointerUp);
   canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('pointerleave', onPointerLeave);
   canvas.addEventListener('wheel', onWheel, { passive: false });
 
   syncSize();
@@ -222,7 +279,10 @@ export function createInstrument(
   const api: Instrument = {
     setGraph(next) {
       spec = next;
+      hovered = -1;
       buffers = build(next);
+      pickIndex =
+        next.x.length > 0 ? buildPickIndex(next.x, next.y, next.x.length, boundsOf(next.x, next.y, next.x.length)) : null;
       categoryCount = distinctCategories(next.color ?? { kind: 'constant', value: 0 }, next.x.length);
       // Frame only the first graph that has anything in it. Re-framing on every
       // update would yank the view out from under someone who had navigated
@@ -257,6 +317,9 @@ export function createInstrument(
     get categoryCount() {
       return categoryCount;
     },
+    get hovered() {
+      return hovered;
+    },
     destroy() {
       if (frame !== 0) cancelAnimationFrame(frame);
       observer.disconnect();
@@ -264,6 +327,7 @@ export function createInstrument(
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointercancel', onPointerUp);
+      canvas.removeEventListener('pointerleave', onPointerLeave);
       canvas.removeEventListener('wheel', onWheel);
       renderer.destroy();
       canvas.remove();

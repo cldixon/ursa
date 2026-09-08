@@ -13,7 +13,11 @@
 
 // The instrument: mount a canvas, hand it a graph.
 export { createInstrument } from './instrument';
-export type { GraphSpec, Instrument, InstrumentOptions } from './instrument';
+export type { GraphSpec, HoverEvent, Instrument, InstrumentOptions } from './instrument';
+
+// Hit-testing, for a host that needs to resolve a pointer to a node itself.
+export { buildPickIndex, pick } from './picking';
+export type { PickIndex } from './picking';
 
 // Value → visual mapping. Exported because a host drawing its own legend must
 // map values the same way the canvas does, or the legend lies.
