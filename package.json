@@ -1,0 +1,18 @@
+{
+  "name": "ursa-workspace",
+  "private": true,
+  "type": "module",
+  "description": "Bun workspace root for Ursa's JavaScript: the shared visual layer (viz/) and the documentation site (site/) that consumes it.",
+  "workspaces": [
+    "viz",
+    "site"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd site dev",
+    "build": "bun run --cwd site build",
+    "preview": "bun run --cwd site preview",
+    "deploy": "bun run --cwd site deploy",
+    "preview:worker": "bun run --cwd site preview:worker",
+    "check": "bun run --cwd viz check && bun run --cwd site check"
+  }
+}

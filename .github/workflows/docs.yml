@@ -5,10 +5,16 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'viz/**'
+      - 'package.json'
+      - 'bun.lock'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'site/**'
+      - 'viz/**'
+      - 'package.json'
+      - 'bun.lock'
       - '.github/workflows/docs.yml'
 
 # Build check only — deployment is Workers Builds (Cloudflare's git integration
@@ -18,17 +24,21 @@ on:
 # independent of the Cloudflare account.
 #
 # Deliberately separate from `ci.yml` so the docs never gate the code, and the
-# code build never gates the docs. Nothing here needs the native extension.
+# code build never gates the docs. Nothing here needs the native extension —
+# `astro.config.mjs` reads the version out of the workspace `Cargo.toml` as text,
+# which needs no Rust toolchain.
+#
+# The JS lives in one bun workspace rooted at the repository root (`viz/` +
+# `site/`), so every step below runs from the root rather than from `site/`:
+# install resolves the whole workspace against the single /bun.lock, and the root
+# scripts delegate into the members. `viz/**` is in the path filters because the
+# site consumes it — a token change there must rebuild the site.
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-
-defaults:
-  run:
-    working-directory: site
 
 jobs:
   build:
@@ -46,6 +56,7 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
+      # Both workspace members: `tsc --noEmit` over viz/, then `astro check`.
       - name: Type-check
         run: bun run check
 

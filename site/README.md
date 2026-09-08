@@ -4,16 +4,35 @@ The landing page and documentation, built with [Astro](https://astro.build) and 
 [bun](https://bun.com).
 
 Nothing here needs the native extension — the site is static, built from markdown and Astro
-components — so the docs build never waits on a Rust compile.
+components — so the docs build never waits on a Rust compile. (`astro.config.mjs` does read the
+release out of the workspace `Cargo.toml`, but as text: no Rust toolchain involved.)
+
+## The workspace
+
+The JavaScript is **one bun workspace rooted at the repository root**, with two members:
+
+| Member | What it owns |
+|---|---|
+| [`viz/`](../viz) | `@ursa/viz` — the design tokens and the stretch/ramp machinery, and in time the graph renderer |
+| `site/` | this Astro site, a *consumer* of `@ursa/viz` |
+
+`viz/` is top-level rather than nested here because the site will not be its only consumer: the
+notebook widget and the exported HTML need the same tokens with no Astro anywhere in sight. The
+dependency runs site → viz and never the other way.
+
+So there is one `bun.lock`, at the root, and commands run from the root:
 
 ```bash
-cd site
-bun install
+bun install              # resolves the whole workspace
 bun run dev              # http://localhost:4321
 bun run build            # -> site/dist
-bun run check            # astro check (type-checks .astro and the content schema)
+bun run check            # tsc over viz/, then astro check over site/
 bun run preview:worker   # the production build, served by a local workerd
 ```
+
+Each root script delegates into the member that owns it (`bun run --cwd site …`), so running a
+script from inside `site/` still works — only `bun install` must happen at the root, since that is
+where the lockfile lives.
 
 ## Deploying
 
@@ -39,8 +58,23 @@ dashboard rather than in this repository:
   (`<branch>-ursa-docs.cl-dixon.workers.dev`) — posted to the pull request as a comment. The
   branch URL follows the branch as commits land, like a Pages preview deployment.
 
-`.github/workflows/docs.yml` is a build check only (install, `astro check`, build); it proves a
+`.github/workflows/docs.yml` is a build check only (install, type-check, build); it proves a
 docs PR builds from a clean checkout independent of the Cloudflare account.
+
+> **The build settings live in the dashboard, so the repository cannot keep them right.**
+> When the JavaScript moved to a root bun workspace, `bun install` stopped working from `site/` —
+> the lockfile is at the repository root now. The Workers Builds configuration has to match:
+>
+> | Setting | Value |
+> |---|---|
+> | Root directory | the repository root (was `site`) |
+> | Build command | `bun install && bun run build` |
+> | Deploy command | `bunx wrangler deploy --config site/wrangler.jsonc` (add `versions upload` for non-production branches, as configured) |
+>
+> `site/wrangler.jsonc` itself needs no change — its `assets.directory` is relative to the config
+> file, so `./dist` still resolves to `site/dist`. If a docs deploy fails right after a
+> restructure, this is the first thing to check: nothing in this repository can tell you the
+> dashboard is stale.
 
 ### Pinning production to the release
 

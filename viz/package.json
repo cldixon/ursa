@@ -1,0 +1,20 @@
+{
+  "name": "@ursa/viz",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ursa's design tokens, value-mapping machinery, and (in time) the graph renderer — the single source both the docs site and the notebook widget consume.",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tokens.css": "./src/tokens.css"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
