@@ -8,6 +8,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Changed
+
+- A query naming several graph algorithms now shares work across its columns
+  instead of recomputing per column. Two columns naming the same kernel with the
+  same parameters run it once — including the same kernel at two output dtypes,
+  since `dtype=` narrows on emit and so is not part of a computation's identity.
+  Separately, `triangle_count` and `clustering_coefficient` in one
+  `with_columns` now share the sorted-adjacency intersection pass they both rest
+  on, where previously each ran its own; over a subgraph view they also share the
+  masked undirected adjacency, which is rebuilt per use rather than cached. Values
+  are unchanged and bit-identical either way.
+
 ## [0.3.0] — 2026-08-29
 
 ### Added
