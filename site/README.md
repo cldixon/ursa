@@ -52,25 +52,22 @@ does not exist.
 Deployment is Cloudflare's git integration (**Workers Builds**), configured on the Worker in the
 dashboard rather than in this repository:
 
-- Pushes to the **production branch** build and deploy production.
-- Other branches build only if **non-production branch builds** are enabled. When they are, each
-  push runs the version command instead of the deploy command, producing **preview URLs** — one
-  per commit, plus a stable per-branch alias (`<branch>-ursa-docs.cl-dixon.workers.dev`) — posted
-  to the pull request as a comment.
-
-> **Non-production branch builds are opt-in, and appear to be off.** Cloudflare posts a
-> `Workers Builds: ursa-docs` check on every pull request regardless, so the setting is easy to
-> misread as working. On #129, #135, #136 and #137 that check completed in **zero seconds** — a
-> build record with no build in it. A real install-and-build takes minutes, so a green check there
-> is not evidence the site builds; it is evidence that nothing ran.
->
-> The toggle is **Settings → Build → Branch control → "Builds for non-production branches"**. Turn
-> it on to get preview URLs and genuine per-PR validation. Until then `.github/workflows/docs.yml`
-> is the only check that actually builds the site on a pull request.
+- Pushes to `main` that touch `site/` build and **deploy production**.
+- Every other branch runs `wrangler versions upload` instead, which produces **preview URLs** —
+  one per commit, plus a stable per-branch alias
+  (`<branch>-ursa-docs.cl-dixon.workers.dev`) — posted to the pull request as a comment. The
+  branch URL follows the branch as commits land, like a Pages preview deployment.
 
 `.github/workflows/docs.yml` is a build check only (install, type-check, build); it proves a
-docs PR builds from a clean checkout independent of the Cloudflare account. Given the above, treat
-it as the authoritative pre-merge signal for the site.
+docs PR builds from a clean checkout independent of the Cloudflare account.
+
+> **Do not read the `Workers Builds: ursa-docs` check's duration.** Cloudflare posts that check
+> with `started_at` equal to `completed_at`, so the GitHub API and UI report every build as taking
+> zero seconds no matter how long it actually ran — a build whose logs and PR comment landed ten
+> minutes later still shows as instant. It looks exactly like a skipped build, and it is not.
+>
+> The **PR comment** from `cloudflare-workers-and-pages[bot]` is the honest signal: it names the
+> commit it built, links the build logs, and carries the commit and branch preview URLs.
 
 > **The build settings live in the dashboard, so the repository cannot keep them right.**
 > When the JavaScript moved to a root bun workspace, `bun install` stopped working from `site/` —
@@ -154,9 +151,9 @@ site/
 │   ├── content/docs/       # the documentation, as markdown/MDX
 │   ├── components/         # figures, legends, nav, footer
 │   ├── layouts/            # Base (chrome) and Docs (sidebar + TOC + prose)
-│   ├── lib/                # figure generation, stretch functions, nav config
+│   ├── lib/                # figure generation, nav config, version
 │   ├── pages/              # index.astro and the docs route
-│   └── styles/             # tokens.css (the design system) + global.css
+│   └── styles/             # global.css (the tokens live in ../viz)
 └── public/
 ```
 
