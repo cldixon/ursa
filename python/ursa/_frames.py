@@ -100,8 +100,13 @@ class _Frame:
 
     # -- relational verbs (property-preserving unless noted) -----------------
     def filter(self, predicate: Any) -> Self:
-        # Row-changing on an EdgeFrame => drops the topology index (rebuilt lazily).
-        return self._extend(_PlanStep("filter", {"predicate": predicate}), drops_index=True)
+        # `filter` is now a **subgraph view** on an EdgeFrame (#114): the parent
+        # topology is unchanged — the dropped rows are expressed as an edge mask at
+        # execution time — so the cached index is *preserved* (drops_index=False,
+        # the default). A graph op on a filtered edge frame runs the parent CSR with
+        # that mask instead of rebuilding. (distinct/sample/join/group_by still drop
+        # the index; they are not mask-expressible in v1.)
+        return self._extend(_PlanStep("filter", {"predicate": predicate}))
 
     def select(self, *columns: Any) -> Self:
         return self._extend(_PlanStep("select", {"columns": columns}))

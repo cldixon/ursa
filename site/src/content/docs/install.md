@@ -27,9 +27,16 @@ Wheels bundle the compiled Rust core, so **no Rust toolchain is required** to in
 `ur.from_polars()` — and Ursa never depends on the Polars Rust crates. Everything crosses the
 boundary as Arrow, so the interop is zero-copy regardless.
 
+Install it through the extra, so the version constraint stays with the package that needs it:
+
 ```bash
-pip install ursa-graph polars
+pip install 'ursa-graph[polars]'
+# or
+uv add 'ursa-graph[polars]'
 ```
+
+Without it, `.to_polars()` raises a `ModuleNotFoundError` naming this extra — nothing else in the
+library is affected.
 
 `pyarrow` is required for the Arrow egress paths (`.to_arrow()`, `sink_parquet`, `from_arrow`).
 

@@ -47,7 +47,8 @@ scipy = ["scipy>=1.10"]
 all = ["polars>=1.0", "networkx>=3.0", "numpy>=1.24", "scipy>=1.10"]
 
 [project.urls]
-Homepage = "https://github.com/cldixon/ursa"
+Homepage = "https://ursa.cldixon.dev"
+Documentation = "https://ursa.cldixon.dev"
 Repository = "https://github.com/cldixon/ursa"
 Issues = "https://github.com/cldixon/ursa/issues"
 

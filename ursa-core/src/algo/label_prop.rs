@@ -15,13 +15,19 @@
 use std::collections::HashMap;
 
 use super::rng::{shuffled_order, DEFAULT_SEED};
-use crate::topology::Topology;
+use crate::topology::{Adjacency, EdgeMask, Topology};
 
 /// Community label per node. Communities are treated as undirected (a node votes
 /// over both its out- and in-neighbours). Iterates until a full sweep changes no
 /// label or `max_iter` sweeps have run. Labels are dense node indices (one
-/// representative per community), not necessarily a contiguous `0..k`.
-pub fn label_propagation(topo: &Topology, max_iter: u32, seed: Option<u64>) -> Vec<u32> {
+/// representative per community), not necessarily a contiguous `0..k`. A subgraph
+/// `mask` restricts voting to kept edges.
+pub fn label_propagation(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    max_iter: u32,
+    seed: Option<u64>,
+) -> Vec<u32> {
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();
@@ -32,16 +38,21 @@ pub fn label_propagation(topo: &Topology, max_iter: u32, seed: Option<u64>) -> V
     let order = shuffled_order(n, seed.unwrap_or(DEFAULT_SEED));
     let mut counts: HashMap<u32, u32> = HashMap::new();
 
+    // Tally each kept-edge neighbour's label for node `u` in one adjacency.
+    let tally = |adj: &Adjacency, u: u32, label: &[u32], counts: &mut HashMap<u32, u32>| {
+        for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+            if mask.is_none_or(|m| m.keep(e)) {
+                *counts.entry(label[v as usize]).or_insert(0) += 1;
+            }
+        }
+    };
+
     for _ in 0..max_iter {
         let mut changed = false;
         for &u in &order {
             counts.clear();
-            for &v in out.neighbors(u) {
-                *counts.entry(label[v as usize]).or_insert(0) += 1;
-            }
-            for &v in inc.neighbors(u) {
-                *counts.entry(label[v as usize]).or_insert(0) += 1;
-            }
+            tally(out, u, &label, &mut counts);
+            tally(inc, u, &label, &mut counts);
             if counts.is_empty() {
                 continue; // isolated node keeps its own label
             }
@@ -100,7 +111,7 @@ mod tests {
     #[test]
     fn recovers_two_communities() {
         let t = two_cliques();
-        let lab = label_propagation(&t, 20, Some(7));
+        let lab = label_propagation(&t, None, 20, Some(7));
         // Each clique collapses to one label; the two labels differ.
         assert!(lab[0] == lab[1] && lab[1] == lab[2] && lab[2] == lab[3]);
         assert!(lab[4] == lab[5] && lab[5] == lab[6] && lab[6] == lab[7]);
@@ -111,14 +122,14 @@ mod tests {
     fn deterministic_given_a_seed() {
         let t = two_cliques();
         assert_eq!(
-            label_propagation(&t, 20, Some(3)),
-            label_propagation(&t, 20, Some(3))
+            label_propagation(&t, None, 20, Some(3)),
+            label_propagation(&t, None, 20, Some(3))
         );
     }
 
     #[test]
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
-        assert!(label_propagation(&t, 20, None).is_empty());
+        assert!(label_propagation(&t, None, 20, None).is_empty());
     }
 }

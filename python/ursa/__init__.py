@@ -2,10 +2,9 @@
 
     import ursa as ur
 
-    edges = ur.scan_edges("web-google.csv", src="FromNodeId", dst="ToNodeId")
-    nodes = edges.nodes()
+    edges = ur.datasets.load_karate()   # or ur.scan_edges("edges.csv", src=..., dst=...)
     top = (
-        nodes
+        edges.nodes()
         .with_columns(
             pagerank  = ur.pagerank(edges, damping=0.85),
             in_degree = ur.degree(edges, direction="in"),
@@ -33,8 +32,12 @@ available.
 
 from __future__ import annotations
 
-from importlib.metadata import PackageNotFoundError, version
-from types import ModuleType
+# Imported under private aliases so they do not surface in `dir(ursa)` /
+# tab-completion as if they were part of the API — `ursa.version` in particular
+# reads like a public accessor when it is really importlib's (#126).
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _version
+from types import ModuleType as _ModuleType
 
 # --- Public datasets (bundled + downloadable) -------------------------------
 from . import datasets
@@ -85,7 +88,7 @@ from ._result import MaterializedFrame
 from ._stats import avg_path_length, density, describe, diameter
 
 # --- Native extension (optional until built) --------------------------------
-_native: ModuleType | None = None
+_native: _ModuleType | None = None
 try:
     from . import _ursa
 
@@ -119,8 +122,8 @@ except ImportError:  # pragma: no cover - native module not yet built
 # Single-sourced from the installed distribution metadata (which maturin fills
 # from the Cargo workspace version), so it never drifts from __core_version__.
 try:
-    __version__ = version("ursa-graph")
-except PackageNotFoundError:  # source checkout without an install
+    __version__ = _version("ursa-graph")
+except _PackageNotFoundError:  # source checkout without an install
     __version__ = "0.0.0+dev"
 
 __all__ = [

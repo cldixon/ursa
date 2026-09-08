@@ -21,6 +21,22 @@ edges = ur.EdgeFrame(
 `src=` and `dst=` are **role mappings**, not renames. The frame remembers which columns play the
 source and destination roles; the original column names survive for round-tripping.
 
+> **Coming from NetworkX with an undirected graph?** Ursa has no `Graph`/`DiGraph` split — every
+> edge row is directed, and `direction=` is a parameter of each operation, defaulting to `"out"`.
+> An `nx.Graph` yields each edge **once**, and `ur.from_networkx` preserves that, so
+> `ur.degree(edges)` gives out-degree rather than the degree NetworkX reports — use
+> `direction="both"`. For the verbs that take no `direction=` (`pagerank`, `closeness`,
+> `betweenness`, `density`, `avg_path_length`, `diameter`), symmetrize the edges first:
+>
+> ```python
+> E = list(G.edges())
+> edges = ur.EdgeFrame({"s": [u for u, v in E] + [v for u, v in E],
+>                       "d": [v for u, v in E] + [u for u, v in E]}, src="s", dst="d")
+> ```
+>
+> Then the numbers line up. [Semantics vs NetworkX](/docs/semantics) pins every kernel to the exact
+> NetworkX call it matches — worth reading before comparing results.
+
 ## Standalone algorithms
 
 Every node-valued algorithm can be called bare. It returns a lazy `NodeFrame` of `(id, value)`,

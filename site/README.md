@@ -42,6 +42,33 @@ dashboard rather than in this repository:
 `.github/workflows/docs.yml` is a build check only (install, `astro check`, build); it proves a
 docs PR builds from a clean checkout independent of the Cloudflare account.
 
+### Pinning production to the release
+
+Deploying production from `main` publishes documentation for unreleased code: a reader follows an
+example for a feature that is not in the wheel yet. That is what happened between 0.2.0 and
+0.3.0, and it is the root of most of the onboarding friction found in that period.
+
+`.github/workflows/docs-pin.yml` moves a **`docs-release`** branch to the commit each release was
+cut from. The branch is machine-owned — nobody commits to it, and it only ever moves to a released
+tag.
+
+**One manual step, once:** set the `ursa-docs` Worker's Workers Builds *production* branch to
+`docs-release` in the Cloudflare dashboard. Until that is done the workflow maintains the branch
+and changes nothing about what is served.
+
+After the switch:
+
+- `ursa.cldixon.dev` serves the documentation for the current release.
+- `main` and every docs PR still get preview URLs, so unreleased documentation stays reviewable —
+  it just is not what the custom domain serves.
+- Re-pin to another release by running the workflow manually with a tag.
+
+The version the site states is derived, not typed: `astro.config.mjs` reads
+`[workspace.package] version` from the workspace `Cargo.toml` and injects it as a compile-time
+constant, which `src/lib/version.ts` re-exports. The landing page and the footer read it from
+there, so a release bump updates the site with no prose to edit. Never hardcode a version in a
+page — it will be wrong one release later.
+
 ### Manual deploy
 
 ```bash

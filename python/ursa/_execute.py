@@ -168,6 +168,10 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     # function builds the index directly (scan branch) and would otherwise populate
     # the cell with a wrong topology before `_require_index`'s guard could run.
     _reject_derived_edge_graph_op(edges)
+    # A traversal-result frame (#116) carries no source of its own — the weight columns
+    # and the topology index both live on the parent, so resolve to it (the parent cell
+    # is the one `_require_index` reads, keeping weights and edge_ids self-consistent).
+    edges = _parent_edges(edges)
     cols = sorted(weight_columns)
     table = getattr(edges, "_edge_attr_table", None)
     if table is not None:
@@ -239,12 +243,35 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     saw_group_by = False
     join: tuple[Any, list[str], str] | None = None
+    # A `nodes()`-derived NodeFrame inherits the parent edge frame's plan, so its
+    # steps before the `nodes` boundary are *edge*-plan steps (source + any subgraph
+    # `filter`), not node-result operators. A pre-boundary filter is a subgraph view
+    # (#114) and is consumed as an edge mask via `_edge_mask_for` on the reconstructed
+    # edge frame — it must NOT be collected as a node-result filter (whose predicate
+    # resolves against the id/computed columns, not the edge src/dst columns). A plain
+    # node source (scan_nodes / from_arrow(id=)) has no `nodes` step, so every filter
+    # on it is a node-result filter from the start.
+    past_nodes_boundary = not any(step.op == "nodes" for step in frame._plan)
 
     for step in frame._plan:
         op = step.op
         # `reverse` is metadata: the reversed edges ride on the edges frame (source
-        # swapped), so a graph op over them builds the transpose.
-        if op in ("scan_edges", "scan_nodes", "nodes", "from_arrow", "from_polars", "reverse"):
+        # swapped), so a graph op over them builds the transpose. `hop`/`shortest_path`
+        # before the `nodes` boundary are the traversal that produces the subgraph mask
+        # (#116) — consumed by `_edge_mask_for` on the reconstructed edge frame, not a
+        # node-result operator.
+        if op in (
+            "scan_edges",
+            "scan_nodes",
+            "nodes",
+            "from_arrow",
+            "from_polars",
+            "reverse",
+            "hop",
+            "shortest_path",
+        ):
+            if op == "nodes":
+                past_nodes_boundary = True
             continue  # source / metadata steps
         if op == "join":
             if join is not None:
@@ -272,6 +299,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 )
             graph_exprs = step.args["exprs"]
         elif op == "filter":
+            if not past_nodes_boundary:
+                # An edge-frame subgraph filter (before `nodes()`): handled as the
+                # edge mask, not a node-result filter.
+                continue
             if saw_group_by:
                 raise NotImplementedError(
                     "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
@@ -642,6 +673,18 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             "supported yet; group_by is available on plain edge/node frames."
         )
 
+    # A traversal *over* a traversal result (hop-of-hop, path-of-hop) has no
+    # rebuildable topology source — the inner result's edges are synthetic
+    # (seed, reached) pairs, not the parent graph. (A node-valued *kernel* over a
+    # traversal result IS supported — the induced-subgraph mask of #116 — but that
+    # runs through collect_node_frame, not here.)
+    if _traversal_step(traversal.args["edges"]) is not None:
+        raise NotImplementedError(
+            "chaining a traversal (hop/shortest_path) off a traversal result isn't "
+            "supported — the inner result's edges are synthetic reached-pairs, not the "
+            "parent graph. Collect it and re-ingest via ur.from_arrow(...) to traverse further."
+        )
+
     # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
     # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
     filter_json = [_filter_json(p, {"src": "src", "dst": "dst"}) for p in filters]
@@ -770,6 +813,10 @@ def _run_query(
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
 ) -> MaterializedFrame:
     index = _require_index(edges)
+    # A subgraph view: a filtered (#114) or traversal-result (#116) edge frame runs the
+    # parent CSR restricted by a per-edge-row boolean mask — a predicate over the parent
+    # rows and/or the induced subgraph of a traversal's reached nodes — with no rebuild.
+    edge_mask = _edge_mask_for(edges, index)
     # The node attribute table crosses the FFI as a batch list (not one batch).
     nodes_batches = nodes.to_batches() if nodes is not None else None
     # A node-query result carries the reserved `id` column plus the computed/joined
@@ -790,6 +837,7 @@ def _run_query(
         list((rename or {}).items()),
         group_keys,
         engine_aggs,
+        edge_mask,
     )
     return MaterializedFrame(batches)
 
@@ -867,7 +915,28 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     # silently ignored otherwise — fail clearly instead.
     if p.get("weight") is not None and "weight" not in column:
         raise NotImplementedError(f"weight= is not supported for '{verb}'.")
+    # Output dtype narrowing (#117): a float-valued kernel may emit f32 (half the wire
+    # and on-disk size — e.g. cached layout positions). Only the emitted column
+    # narrows; the kernel still accumulates in f64. Integer kernels have no f32 form.
+    dtype = p.get("dtype")
+    if dtype is not None and dtype != "f64":
+        if dtype != "f32":
+            raise NotImplementedError(f"dtype must be 'f32' or 'f64'; got {dtype!r}.")
+        if verb not in _FLOAT_VALUED_VERBS:
+            raise NotImplementedError(
+                f"dtype='f32' is only supported for float-valued kernels "
+                f"({', '.join(sorted(_FLOAT_VALUED_VERBS))}); '{verb}' emits integers."
+            )
+        column["dtype"] = "f32"
     return column
+
+
+# The kernels whose output column is floating-point — the only ones an `f32` output
+# dtype (#117) applies to. Integer kernels (degree, connected_components,
+# triangle_count, label_propagation, louvain) keep their native u32.
+_FLOAT_VALUED_VERBS = frozenset(
+    {"pagerank", "closeness", "betweenness", "clustering_coefficient", "neighbors_agg"}
+)
 
 
 def _single_edges(exprs: Any) -> Any:
@@ -890,32 +959,65 @@ def _single_edges(exprs: Any) -> Any:
     return edges
 
 
-def _reject_derived_edge_graph_op(edges: Any) -> None:
-    """Reject a graph op on a *derived* edge frame — one whose plan contains a
-    row-changing op (filter/sample/distinct/join/group_by) or is a traversal result
-    (hop/shortest_path). Such a frame carries no topology that matches its rows (its
-    retained source is the *pre*-derivation edges), so building a CSR from it would
-    be silently wrong.
+_TRAVERSAL_OPS = ("hop", "shortest_path")
 
-    This is the single **authoritative** guard: it inspects only the plan, so it
-    must be called *before* the frame's index cell is read or (re)built — a cell
-    populated by another path (a weighted scan's pre-build, or a stale shared cell)
-    would otherwise smuggle a wrong topology past a build-time-only check. The
-    plain-collect path materializes a derived frame's rows separately (via
-    `_edge_source_table`), so `edges.filter(...).collect()` still works (#100)."""
+
+def _traversal_step(frame: Any) -> Any | None:
+    """The ``hop``/``shortest_path`` step in a traversal EdgeFrame's plan, or ``None``.
+    A traversal frame carries exactly one such step (see ``_graph._Hop`` /
+    ``_graph.shortest_path``); the parent edges ride in ``step.args['edges']``."""
+    for step in getattr(frame, "_plan", ()):
+        if step.op in _TRAVERSAL_OPS:
+            return step
+    return None
+
+
+def _parent_edges(frame: Any) -> Any:
+    """The parent edge frame a graph op actually runs over. For a traversal-result
+    frame (#116) that is the frame the traversal was built from (carried in the
+    step) — its CSR is the topology, and the traversal only *masks* it. For any
+    other frame it is the frame itself."""
+    step = _traversal_step(frame)
+    return step.args["edges"] if step is not None else frame
+
+
+def _reject_derived_edge_graph_op(edges: Any) -> None:
+    """Reject a graph op on a *derived* edge frame whose derivation is **not** a
+    subgraph view — i.e. one that changes the row↔topology correspondence in a way
+    a mask can't express.
+
+    A ``filter`` (#114) and a bare ``hop``/``shortest_path`` (#116) are subgraph
+    views over the *unchanged* parent topology: the kept rows ride as an edge mask
+    (a predicate for filter; the reached node set's induced subgraph for a
+    traversal — see ``_edge_mask_for``), so the parent CSR runs directly with no
+    rebuild. ``distinct``/``sample``/``join``/``group_by`` genuinely reshape the edge
+    set (a mask over the parent rows can't represent them yet) and still raise. A
+    relational tail *between* a traversal and the graph op isn't wired yet either.
+
+    This inspects only the plan, so it must be called *before* the frame's index cell
+    is read or (re)built. The plain-collect path materializes a derived frame's rows
+    separately (via ``_edge_source_table``), so ``edges.distinct().collect()`` etc.
+    still work (#100)."""
     ops = {step.op for step in getattr(edges, "_plan", ())}
-    if ops & {"hop", "shortest_path"}:
+    if ops & set(_TRAVERSAL_OPS):
+        # #116: a node-valued kernel over a traversal result runs over the induced
+        # subgraph of the reached nodes. Supported for a *bare* traversal; a
+        # relational step between the traversal and the kernel isn't wired yet.
+        tail = ops - set(_TRAVERSAL_OPS)
+        if tail:
+            raise NotImplementedError(
+                "a graph op over a traversal result supports a bare hop/shortest_path "
+                f"for now; a relational step ({', '.join(sorted(tail))}) between the "
+                "traversal and the graph op isn't wired yet — collect() the traversal "
+                "and re-ingest via ur.from_arrow(...) to run further ops on it."
+            )
+        return
+    if ops & {"distinct", "sample", "join", "group_by_agg"}:
         raise NotImplementedError(
-            "chaining a graph op off a traversal result (hop/shortest_path) isn't "
-            "wired yet — a traversal result is a set of reached edges with no rebuildable "
-            "topology source. Collect it and re-ingest via ur.from_arrow(...) to run "
-            "further ops on it. (v0.2: child-plan seeding.)"
-        )
-    if ops & {"filter", "distinct", "sample", "join", "group_by_agg"}:
-        raise NotImplementedError(
-            "graph ops on a filtered/derived edge frame aren't wired yet — filtering "
-            "edges before a graph op needs the DataFusion edge pipeline. Run the op on "
-            "the source frame, or collect and re-ingest the filtered edges."
+            "graph ops on a distinct/sample/join/group_by-derived edge frame aren't "
+            "wired yet — unlike filter (a subgraph view over the parent topology), "
+            "these reshape the edge set in a way an edge mask can't express. Run the op "
+            "on the source frame, or collect and re-ingest the derived edges."
         )
 
 
@@ -994,14 +1096,18 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     # if the cell was pre-populated elsewhere (Bug: a weighted scan builds the index
     # directly; a grouped frame may share a parent's built cell).
     _reject_derived_edge_graph_op(edges)
-    cell = edges._index_build_cell
+    # A traversal-result frame (#116) has no source of its own — its CSR is the
+    # parent's, and the traversal only masks it. Resolve to the parent so the parent
+    # CSR is built once and shared with direct ops on that frame (index-preservation).
+    parent = _parent_edges(edges)
+    cell = parent._index_build_cell
     idx = cell.value
     if idx is not None:
         return idx
     with cell.lock:
         idx = cell.value
         if idx is None:
-            edge_batches = _require_edges(edges)
+            edge_batches = _require_edges(parent)
             idx = _native().build_index(edge_batches)
             cell.value = idx
     return idx
@@ -1496,11 +1602,14 @@ def _collect_plain_edges(
 
 
 def _edge_source_table(frame: EdgeFrame) -> Any:
-    """The raw edge rows of a plain (non-traversal) edge frame as a pyarrow.Table —
-    the full in-memory edge table, or a fresh scan of its ``scan_edges`` source.
-    Raises the precise plan-aware error for a frame with no materializable source."""
+    """The raw edge rows of an edge frame as a pyarrow.Table — the full in-memory
+    edge table, or a fresh scan of its ``scan_edges`` source. For a traversal-result
+    frame (#116) this resolves to the *parent* edge rows (the CSR the traversal masks;
+    its own ``src``/``dst`` are the synthetic reached-pair columns). Raises the precise
+    plan-aware error for a frame with no materializable source."""
     import pyarrow as pa
 
+    frame = _parent_edges(frame)  # traversal -> the parent rows the topology is built from
     table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
     if table is not None:
         return table
@@ -1521,6 +1630,85 @@ def _edge_source_table(frame: EdgeFrame) -> Any:
     # No source: a filtered/derived (or traversal-result) edge frame.
     _require_edges(frame)  # raises the precise, plan-aware message
     raise AssertionError("unreachable")  # _require_edges always raises here
+
+
+def _edge_mask_for(edges: EdgeFrame | None, index: Any) -> Any | None:
+    """The subgraph-view edge mask for a derived edge frame, or ``None`` (full graph).
+
+    The parent topology is kept; the surviving rows are expressed as a boolean pyarrow
+    array aligned with the CSR's ``edge_ids``. Two sources of mask, combined by AND:
+
+    * ``filter`` (#114): each predicate is evaluated over the *parent* edge rows (the
+      same rows, in the same order, the topology was built from — via
+      ``_edge_source_table``); repeated ``.filter()`` calls intersect. Endpoint
+      predicates (``ur.src()``/``ur.dst()``) and, for in-memory frames, edge-attribute
+      columns are supported; a scan frame's mask can reference only the endpoints.
+    * ``hop``/``shortest_path`` (#116): the traversal produces a reached node *set*
+      (run over ``index``, the parent CSR); the mask keeps an edge iff **both**
+      endpoints are reached — the induced subgraph of the reached region.
+
+    Returns ``None`` when the frame carries neither (the full graph).
+    """
+    if edges is None:
+        return None
+    traversal = _traversal_step(edges)
+    predicates = [s.args["predicate"] for s in getattr(edges, "_plan", ()) if s.op == "filter"]
+    if traversal is None and not predicates:
+        return None
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    table = _edge_source_table(edges)  # parent edge rows, topology row order
+    parent = _parent_edges(edges)
+    roles = {"src": parent.src_col, "dst": parent.dst_col}
+    and_ = pc.and_  # ty: ignore[unresolved-attribute]
+    mask = None
+
+    if traversal is not None:
+        # The reached node set induces the subgraph: keep e iff both endpoints reached.
+        reached = _traversal_reached_nodes(edges, traversal, index)
+        is_in = pc.is_in  # ty: ignore[unresolved-attribute]
+        src_in = is_in(table.column(parent.src_col), value_set=reached)
+        dst_in = is_in(table.column(parent.dst_col), value_set=reached)
+        mask = and_(src_in, dst_in)
+
+    for predicate in predicates:
+        _require_predicate(predicate)  # same top-of-predicate check as every path
+        m = _eval_pyarrow(predicate, table, roles)
+        mask = m if mask is None else and_(mask, m)
+    # The FFI takes a single contiguous boolean Array (not a ChunkedArray).
+    if isinstance(mask, pa.ChunkedArray):
+        mask = mask.combine_chunks()
+    return mask
+
+
+def _traversal_reached_nodes(edges: EdgeFrame, traversal: Any, index: Any) -> Any:
+    """The reached node set (as a pyarrow array of user ids) behind a graph op over a
+    traversal result (#116) — the seeds' k-hop region, or the shortest path's nodes,
+    computed over ``index`` (the parent CSR). Mirrors ``collect_edge_frame``'s
+    traversal execution so the mask agrees with what the traversal itself would emit."""
+    if traversal.op == "hop":
+        seeds = _resolve_seeds(traversal.args["seeds"])
+        return _native().hop_reached_nodes_query(
+            index, seeds, int(traversal.args["n"]), traversal.args["direction"]
+        )
+    # shortest_path: a weight= expression (over parent edge columns) selects weighted
+    # Dijkstra, serialized and evaluated in Rust against the parent edge attribute batch.
+    weight = traversal.args.get("weight")
+    weight_json = None
+    edge_attr = None
+    if weight is not None:
+        weight_json = json.dumps(_expr_to_json(weight))
+        edge_attr = _prepare_weighted(_parent_edges(edges), _expr_columns(weight))
+    return _native().shortest_path_nodes_query(
+        index,
+        _resolve_seeds([traversal.args["source"]]),
+        _resolve_seeds([traversal.args["target"]]),
+        traversal.args["direction"],
+        weight_json,
+        edge_attr,
+    )
 
 
 def _native() -> Any:

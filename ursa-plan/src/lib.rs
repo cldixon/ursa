@@ -42,7 +42,7 @@ pub use physical::GraphAlgorithmExec;
 pub use planner::graph_session;
 pub use query::{
     execute_hop_query, execute_join_query, execute_node_query, execute_path_query,
-    execute_walk_query,
+    execute_walk_query, hop_reached_nodes, shortest_path_nodes,
 };
 pub use scan::{scan_edges_batch, scan_nodes_batch};
 pub use stats::{avg_path_length, density, describe, diameter};

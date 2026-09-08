@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use datafusion::common::{DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
-use ursa_core::{Direction, IdMap, Topology};
+use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
 use crate::result::{hop_schema, path_schema, query_schema, walk_schema, OutputColumn};
 
@@ -22,11 +22,19 @@ pub struct GraphAlgorithmNode {
     pub topology: Arc<Topology>,
     pub ids: Arc<IdMap>,
     pub columns: Arc<Vec<OutputColumn>>,
+    /// Optional subgraph view (#114): when present, kernels honour it by skipping
+    /// masked-out edge rows over the *shared* parent CSR (no rebuild).
+    pub mask: Option<Arc<EdgeMask>>,
     schema: DFSchemaRef,
 }
 
 impl GraphAlgorithmNode {
-    pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>, columns: Vec<OutputColumn>) -> Self {
+    pub fn new(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        columns: Vec<OutputColumn>,
+        mask: Option<Arc<EdgeMask>>,
+    ) -> Self {
         let arrow_schema = query_schema(&columns, ids.user_type());
         let schema = Arc::new(
             DFSchema::try_from(arrow_schema.as_ref().clone())
@@ -36,9 +44,16 @@ impl GraphAlgorithmNode {
             topology,
             ids,
             columns: Arc::new(columns),
+            mask,
             schema,
         }
     }
+}
+
+/// Pointer identity for the optional mask Arc — two nodes with different subgraph
+/// views must not compare equal (they compute different results).
+fn mask_ptr(mask: &Option<Arc<EdgeMask>>) -> usize {
+    mask.as_ref().map_or(0, |m| Arc::as_ptr(m) as usize)
 }
 
 // Topology / IdMap have no value equality; identity (Arc pointer) is the right
@@ -48,6 +63,7 @@ impl PartialEq for GraphAlgorithmNode {
         Arc::ptr_eq(&self.topology, &other.topology)
             && Arc::ptr_eq(&self.ids, &other.ids)
             && self.columns == other.columns
+            && mask_ptr(&self.mask) == mask_ptr(&other.mask)
     }
 }
 
@@ -64,11 +80,13 @@ impl PartialOrd for GraphAlgorithmNode {
             a,
             Arc::as_ptr(&self.topology) as usize,
             Arc::as_ptr(&self.ids) as usize,
+            mask_ptr(&self.mask),
         )
             .partial_cmp(&(
                 b,
                 Arc::as_ptr(&other.topology) as usize,
                 Arc::as_ptr(&other.ids) as usize,
+                mask_ptr(&other.mask),
             ))
     }
 }
@@ -77,6 +95,7 @@ impl Hash for GraphAlgorithmNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.topology) as usize).hash(state);
         (Arc::as_ptr(&self.ids) as usize).hash(state);
+        mask_ptr(&self.mask).hash(state);
         for col in self.columns.iter() {
             col.name().hash(state);
         }

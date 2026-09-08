@@ -207,8 +207,15 @@ Each is **dual-positioned**: used inside `with_columns(...)` it reads as an expr
 bare it behaves as a lazy `NodeFrame` of `(id, value)`, where the value column takes the
 algorithm's name. Both spellings are the same kernel.
 
+The **float-valued** kernels — `pagerank`, `closeness`, `betweenness`, `clustering_coefficient`,
+and `neighbors().agg(...)` — take `dtype="f32"` to emit the value column as 32-bit float instead
+of 64-bit. The kernel still accumulates in `f64`; only the emitted column narrows, halving its
+wire and on-disk size (`sink_parquet` a precomputed metric at half the bytes). The integer-valued
+kernels (`degree`, `connected_components`, `triangle_count`, `label_propagation`, `louvain`) have
+no `dtype` — their `u32` output has no lossy narrowing.
+
 ```python
-ur.pagerank(edges, damping=0.85, max_iter=30, tol=1e-6, weight=None)
+ur.pagerank(edges, damping=0.85, max_iter=30, tol=1e-6, weight=None, dtype="f64")
 ```
 Pull-based fixpoint PageRank. Dangling mass is redistributed uniformly, matching `nx.pagerank`.
 
@@ -277,6 +284,20 @@ exception to laziness. See [Whole-graph statistics](/docs/guides/statistics).
 | `ur.Expr` | an expression-tree node |
 | `ur.datasets.DatasetInfo` | the record `list_datasets()` returns |
 
+### MaterializedFrame
+
+What `collect()` returns. Egress methods are listed under [Frame methods](#frame-methods); these
+are the ones that only exist on a materialized result:
+
+| Member | What it does |
+|---|---|
+| `len(result)` | row count |
+| `result.columns` | column names, in order |
+| `repr(result)` | a shape line, the column names and dtypes, and up to 10 rows; the rest elide behind `…` |
+
+`repr` reads the head only, so previewing a large result costs the same as previewing a small one,
+and it needs no optional dependencies.
+
 ## Errors
 
 ```python
@@ -292,6 +313,6 @@ not yet wired, or a composition limit was hit; the message names which.
 ## Module attributes
 
 ```python
-ur.__version__        # the installed distribution version (0.2.0 on PyPI)
+ur.__version__        # the installed distribution version
 ur.__core_version__   # the native core version, or None without the extension
 ```

@@ -9,6 +9,7 @@ import { PLATE, SKY, EXAMPLE } from '../lib/figures';
 import { sampleRamp } from '../lib/stretch';
 import { SITE } from '../lib/site';
 import { url } from '../lib/url';
+import { VERSION } from '../lib/version';
 
 // Colour appears only where something has been measured, and it means the value
 // it is standing next to: pagerank, normalized across the rows shown.
@@ -48,7 +49,7 @@ const brightSources = SKY.graph.nodes.filter(
         <a class="b" href={SITE.repo} rel="noopener">Source</a>
       </div>
       <p class="cap note">
-        v0.2.0, on PyPI. The kernels, the composed pipeline and the relational surface execute
+        v{VERSION}, on PyPI. The kernels, the composed pipeline and the relational surface execute
         end to end; the <a href={url('/docs/roadmap')}>roadmap</a> says what does not.
       </p>
     </div>

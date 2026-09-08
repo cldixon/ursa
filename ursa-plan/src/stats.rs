@@ -50,7 +50,9 @@ pub fn describe(topology: &Topology, full: bool) -> Result<RecordBatch> {
         n_edges as f64 / n_nodes as f64
     };
     let n_components: Option<i64> = if full {
-        let distinct: HashSet<u32> = connected_components_weak(topology).into_iter().collect();
+        let distinct: HashSet<u32> = connected_components_weak(topology, None)
+            .into_iter()
+            .collect();
         Some(distinct.len() as i64)
     } else {
         None

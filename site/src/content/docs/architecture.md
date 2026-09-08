@@ -63,8 +63,10 @@ node space at ~4.29 B, which is the correct trade for cache behaviour.
 original Arrow columns, unduplicated. Alongside `offsets` (length `n+1`) and `targets` (length
 `m`), the index keeps `edge_ids` mapping each CSR slot to its original row. A weighted kernel
 evaluates the weight expression into an Arrow array first, then gathers `weight[edge_ids[k]]` on
-the fly. Topology in the index; properties in Arrow; nothing copied twice. It is also the hook for
-future subgraph views — a bitmask over a parent CSR instead of a rebuild after `filter`.
+the fly. Topology in the index; properties in Arrow; nothing copied twice. It is also what powers
+subgraph views — a `filter` on an EdgeFrame rides as an edge-row bitmask over the parent CSR
+(consulted through `edge_ids` at each slot) instead of a rebuild, so a node-valued kernel runs
+restricted to the kept edges with the parent's id space and edge order intact.
 
 **Directional laziness.** CSR gives out-neighbours; in-neighbours need the transpose. Each
 direction is built independently on first demand, so a pull-based PageRank pipeline does not pay

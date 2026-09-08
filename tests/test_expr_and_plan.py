@@ -38,8 +38,13 @@ def test_index_preservation_contract():
     # with_columns preserves the index...
     kept = edges.with_columns(x=ur.col("a"))
     assert kept._has_index is True
-    # ...filter (row-changing on an EdgeFrame) drops it.
-    dropped = edges.filter(ur.col("w") > 0)
+    # ...and so does filter: it is a subgraph view (#114) over the *unchanged* parent
+    # topology — the dropped rows ride along as an edge mask, so no CSR rebuild.
+    viewed = edges.filter(ur.col("w") > 0)
+    assert viewed._has_index is True
+    assert "preserved" in viewed.explain()
+    # A genuinely row-reshaping op (distinct/sample/join/group_by) still drops it.
+    dropped = edges.distinct()
     assert dropped._has_index is False
     assert "dropped" in dropped.explain()
 

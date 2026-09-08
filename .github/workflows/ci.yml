@@ -48,10 +48,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # Pinned to match rust-toolchain.toml so clippy's lint set never drifts.
+      # wasm32 target is added for the ursa-core portability check (#118).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -71,6 +73,17 @@ jobs:
       # Ensures ursa-py (PyO3 extension) also compiles.
       - name: check workspace
         run: cargo check --workspace --locked
+
+      # ursa-core portability (#118): the crate must build without rayon (the serial
+      # fallback in src/parallel.rs) and for wasm32-unknown-unknown — the guard that
+      # keeps the browser (Tier-3 viz) target open. Both are fast compile-only checks;
+      # no test execution, no wasm runtime. They fail the moment a new kernel wires in
+      # rayon (or any non-wasm dep) without a serial path.
+      - name: check ursa-core without rayon (serial fallback)
+        run: cargo check -p ursa-core --no-default-features --locked
+
+      - name: check ursa-core on wasm32 (single-threaded)
+        run: cargo check -p ursa-core --target wasm32-unknown-unknown --no-default-features --locked
 
   pytest:
     name: Python (pytest, ${{ matrix.os }} py${{ matrix.python }})
