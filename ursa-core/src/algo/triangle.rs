@@ -36,8 +36,45 @@ fn intersection_count(a: &[u32], b: &[u32]) -> u32 {
     count
 }
 
-/// Per-node triangle count over the topology's cached undirected adjacency.
-pub(crate) fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
+/// The undirected adjacency a triangle-family kernel runs over: the topology's
+/// cached full view, or a per-subgraph masked one built for this call.
+///
+/// Exposed (with [`undirected_view`]) so a caller running *both* triangle-family
+/// kernels over the same graph can resolve the view once and hand it to each,
+/// rather than each kernel resolving its own. Under a mask that matters twice
+/// over: the masked view is rebuilt per call, never cached on the topology.
+pub enum UndirectedView<'a> {
+    /// The topology's cached full undirected adjacency (no mask).
+    Cached(&'a UndirectedCsr),
+    /// A per-subgraph view, built for one mask and owned by this value.
+    Masked(UndirectedCsr),
+}
+
+impl UndirectedView<'_> {
+    #[inline]
+    pub fn get(&self) -> &UndirectedCsr {
+        match self {
+            UndirectedView::Cached(adj) => adj,
+            UndirectedView::Masked(adj) => adj,
+        }
+    }
+}
+
+/// Resolve the undirected adjacency for `mask` — the topology's cached view when
+/// unmasked, a freshly built subgraph view otherwise.
+pub fn undirected_view<'a>(topo: &'a Topology, mask: Option<&EdgeMask>) -> UndirectedView<'a> {
+    match mask {
+        None => UndirectedView::Cached(topo.undirected()),
+        Some(m) => UndirectedView::Masked(topo.undirected_masked(m)),
+    }
+}
+
+/// Per-node triangle count over a resolved undirected adjacency.
+///
+/// Public so a caller that also wants the clustering coefficient can compute the
+/// (expensive) intersection pass once and pass the counts to
+/// [`super::clustering_from_triangles`]; `triangle_count` is the one-shot form.
+pub fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
     let n = adj.offsets.len().saturating_sub(1);
     (0..n as u32)
         .into_par_iter()
@@ -61,10 +98,7 @@ pub fn triangle_count(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
     if topo.n_nodes() == 0 {
         return Vec::new();
     }
-    match mask {
-        None => per_node_triangles(topo.undirected()),
-        Some(m) => per_node_triangles(&topo.undirected_masked(m)),
-    }
+    per_node_triangles(undirected_view(topo, mask).get())
 }
 
 #[cfg(test)]

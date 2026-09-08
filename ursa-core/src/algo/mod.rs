@@ -38,7 +38,7 @@ pub use bfs::{
     shortest_path_weighted_with_cost,
 };
 pub use closeness::{closeness, closeness_weighted};
-pub use clustering::clustering_coefficient;
+pub use clustering::{clustering_coefficient, clustering_from_triangles};
 pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
 pub use hop::{k_hop, k_hop_reached_set};
@@ -47,7 +47,7 @@ pub use louvain::{louvain, louvain_weighted};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, Walks};
-pub use triangle::triangle_count;
+pub use triangle::{per_node_triangles, triangle_count, undirected_view, UndirectedView};
 
 // ---------------------------------------------------------------------------
 // Frontier kernels (BFS / k-hop / unweighted shortest path).

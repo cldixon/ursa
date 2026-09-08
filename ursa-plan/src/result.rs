@@ -7,6 +7,7 @@
 //! a single `(id, col_1, col_2, ...)` batch with dense→user id translation done
 //! once, here, at the boundary.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, UInt32Array};
@@ -14,14 +15,15 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
-    betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_coefficient,
+    betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_from_triangles,
     connected_components_strong, connected_components_weak, degree, k_hop, label_propagation,
-    louvain, louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, random_walk,
-    shortest_path, shortest_path_weighted_with_cost, triangle_count, AggKind, PageRankParams,
+    louvain, louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles,
+    random_walk, shortest_path, shortest_path_weighted_with_cost, undirected_view, AggKind,
+    PageRankParams, UndirectedView,
 };
 use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
-use crate::logical::GraphAlgo;
+use crate::logical::{Direction as PlanDirection, GraphAlgo};
 
 /// The Arrow dtype a float-valued output column is emitted as (#117). Kernels
 /// always accumulate in `f64`; `F32` narrows the *emitted* column to halve wire and
@@ -100,93 +102,252 @@ impl OutputColumn {
             OutputDtype::F64 => self.base_value_type(),
         }
     }
+}
 
-    fn value_array(&self, topo: &Topology, mask: Option<&EdgeMask>) -> ArrayRef {
-        let base = match self {
-            OutputColumn::Algo { algo, weights, .. } => {
-                algo_array(topo, algo, weights.as_deref().map(Vec::as_slice), mask)
+/// A canonical, hashable identity for one kernel computation (#115).
+///
+/// `GraphAlgo` carries `f64` parameters, so it is neither `Hash` nor `Eq`. Float
+/// fields are keyed on their bit patterns, which is exactly the equality wanted
+/// here: two columns share a computation only if they named literally the same
+/// parameters. Weights compare by `Arc` identity — the same notion
+/// `ShortestPathNode` already uses, and the same one the plan node's cache key
+/// applies to the mask.
+///
+/// The output `dtype` is deliberately **not** part of the key: it narrows on emit,
+/// after the kernel has run, so `f64` and `f32` spellings of one score share a
+/// single computation.
+#[derive(PartialEq, Eq, Hash)]
+struct KernelKey {
+    /// Which `GraphAlgo` variant.
+    tag: u8,
+    /// Bit-encoded scalar parameters, in a fixed per-variant order.
+    params: Vec<u64>,
+    /// The weight array by `Arc` identity; `None` for an unweighted kernel.
+    weights: Option<usize>,
+}
+
+fn kernel_key(algo: &GraphAlgo, weights: Option<&Arc<Vec<f64>>>) -> KernelKey {
+    // Each optional parameter contributes a presence flag alongside its value, so
+    // `None` can never collide with a `Some` that happens to carry the same bits.
+    fn opt_f64(v: &Option<f64>) -> [u64; 2] {
+        match v {
+            Some(x) => [1, x.to_bits()],
+            None => [0, 0],
+        }
+    }
+    fn opt_u64(v: &Option<u64>) -> [u64; 2] {
+        match v {
+            Some(x) => [1, *x],
+            None => [0, 0],
+        }
+    }
+    let (tag, params): (u8, Vec<u64>) = match algo {
+        GraphAlgo::PageRank {
+            damping,
+            max_iter,
+            tol,
+        } => (0, vec![damping.to_bits(), *max_iter as u64, tol.to_bits()]),
+        GraphAlgo::ConnectedComponents { strong } => (1, vec![*strong as u64]),
+        GraphAlgo::Degree { direction } => (
+            2,
+            vec![match direction {
+                PlanDirection::Out => 0,
+                PlanDirection::In => 1,
+                PlanDirection::Both => 2,
+            }],
+        ),
+        GraphAlgo::TriangleCount => (3, Vec::new()),
+        GraphAlgo::ClusteringCoefficient => (4, Vec::new()),
+        GraphAlgo::Betweenness { sample, seed } => {
+            let mut p = Vec::from(opt_f64(sample));
+            p.extend(opt_u64(seed));
+            (5, p)
+        }
+        GraphAlgo::Closeness => (6, Vec::new()),
+        GraphAlgo::LabelPropagation { max_iter, seed } => {
+            let mut p = vec![*max_iter as u64];
+            p.extend(opt_u64(seed));
+            (7, p)
+        }
+        GraphAlgo::Louvain { resolution, seed } => {
+            let mut p = vec![resolution.to_bits()];
+            p.extend(opt_u64(seed));
+            (8, p)
+        }
+    };
+    KernelKey {
+        tag,
+        params,
+        weights: weights.map(|w| Arc::as_ptr(w) as usize),
+    }
+}
+
+/// Per-query kernel evaluation, memoized (#115).
+///
+/// A query can name several output columns that rest on the same work, in two
+/// distinct ways — this handles both:
+///
+/// 1. **The same computation under two names.** `with_columns(a=pagerank(e),
+///    b=pagerank(e, dtype="f32"))` is one kernel run emitted twice; `dtype`
+///    narrows afterwards and so is not part of the key.
+/// 2. **Different kernels over a shared intermediate.** `triangle_count` and
+///    `clustering_coefficient` both rest on one sorted-adjacency intersection pass
+///    over one undirected view — the expensive half of each. Naming both in one
+///    `with_columns` used to do that work twice (and, under a mask, rebuild the
+///    masked undirected view twice as well, since only the *unmasked* view is
+///    cached on the topology).
+///
+/// Lives for exactly one `query_batch` call. That is what makes the keys sound:
+/// the topology and mask are fixed for its lifetime, so a key needs to encode only
+/// the algorithm and its parameters, not the graph they run over.
+struct KernelEval<'a> {
+    topo: &'a Topology,
+    mask: Option<&'a EdgeMask>,
+    /// Kernel results by computation key. A repeat column is an `Arc` clone.
+    memo: HashMap<KernelKey, ArrayRef>,
+    /// The undirected view and its per-node triangle counts — the intermediate the
+    /// triangle-family kernels share. Computed at most once, on first use.
+    triangles: Option<(UndirectedView<'a>, Vec<u32>)>,
+}
+
+impl<'a> KernelEval<'a> {
+    fn new(topo: &'a Topology, mask: Option<&'a EdgeMask>) -> Self {
+        KernelEval {
+            topo,
+            mask,
+            memo: HashMap::new(),
+            triangles: None,
+        }
+    }
+
+    /// The undirected view and per-node triangle counts, computed on first use.
+    fn triangles(&mut self) -> &(UndirectedView<'a>, Vec<u32>) {
+        if self.triangles.is_none() {
+            let view = undirected_view(self.topo, self.mask);
+            let counts = per_node_triangles(view.get());
+            self.triangles = Some((view, counts));
+        }
+        self.triangles
+            .as_ref()
+            .expect("the intermediate was just populated")
+    }
+
+    /// Run one kernel. Callers go through [`Self::column_array`], which memoizes.
+    fn compute(&mut self, algo: &GraphAlgo, weights: Option<&[f64]>) -> ArrayRef {
+        let (topo, mask) = (self.topo, self.mask);
+        match algo {
+            GraphAlgo::Degree { direction } => {
+                Arc::new(UInt32Array::from(degree(topo, mask, (*direction).into())))
             }
+            GraphAlgo::PageRank {
+                damping,
+                max_iter,
+                tol,
+            } => {
+                let params = PageRankParams {
+                    damping: *damping,
+                    max_iter: *max_iter,
+                    tol: *tol,
+                };
+                let scores = match weights {
+                    Some(w) => pagerank_weighted(topo, w, mask, params),
+                    None => pagerank(topo, mask, params),
+                };
+                Arc::new(Float64Array::from(scores))
+            }
+            GraphAlgo::ConnectedComponents { strong } => {
+                let labels = if *strong {
+                    connected_components_strong(topo, mask)
+                } else {
+                    connected_components_weak(topo, mask)
+                };
+                Arc::new(UInt32Array::from(labels))
+            }
+            // The triangle-family pair: both read the shared intermediate, so
+            // whichever is named first pays for the intersection pass and the other
+            // is a cheap derivation of it.
+            GraphAlgo::TriangleCount => {
+                if topo.n_nodes() == 0 {
+                    return Arc::new(UInt32Array::from(Vec::<u32>::new()));
+                }
+                let (_, counts) = self.triangles();
+                Arc::new(UInt32Array::from(counts.clone()))
+            }
+            GraphAlgo::ClusteringCoefficient => {
+                if topo.n_nodes() == 0 {
+                    return Arc::new(Float64Array::from(Vec::<f64>::new()));
+                }
+                let (view, counts) = self.triangles();
+                Arc::new(Float64Array::from(clustering_from_triangles(
+                    view.get(),
+                    counts,
+                )))
+            }
+            GraphAlgo::Closeness => {
+                let scores = match weights {
+                    Some(w) => closeness_weighted(topo, w, mask),
+                    None => closeness(topo, mask),
+                };
+                Arc::new(Float64Array::from(scores))
+            }
+            GraphAlgo::Betweenness { sample, seed } => {
+                let scores = match weights {
+                    Some(w) => betweenness_weighted(topo, w, mask, *sample, *seed),
+                    None => betweenness(topo, mask, *sample, *seed),
+                };
+                Arc::new(Float64Array::from(scores))
+            }
+            GraphAlgo::LabelPropagation { max_iter, seed } => Arc::new(UInt32Array::from(
+                label_propagation(topo, mask, *max_iter, *seed),
+            )),
+            GraphAlgo::Louvain { resolution, seed } => {
+                let labels = match weights {
+                    Some(w) => louvain_weighted(topo, w, mask, *resolution, *seed),
+                    None => louvain(topo, mask, *resolution, *seed),
+                };
+                Arc::new(UInt32Array::from(labels))
+            }
+        }
+    }
+
+    /// The array for one output column, at its requested dtype.
+    ///
+    /// Narrowing happens *after* the memo, so two columns differing only in `dtype`
+    /// share the kernel run and diverge only at the cast.
+    fn column_array(&mut self, col: &OutputColumn) -> ArrayRef {
+        let base = match col {
+            OutputColumn::Algo { algo, weights, .. } => {
+                let key = kernel_key(algo, weights.as_ref());
+                // Clone the hit out before computing: the borrow of `self.memo` must
+                // end before `compute` takes `&mut self`.
+                match self.memo.get(&key).cloned() {
+                    Some(hit) => hit,
+                    None => {
+                        let array = self.compute(algo, weights.as_deref().map(Vec::as_slice));
+                        self.memo.insert(key, Arc::clone(&array));
+                        array
+                    }
+                }
+            }
+            // Not memoized: a neighbour aggregation is a single segmented CSR
+            // reduction — the cheapest column kind there is, so sharing one would
+            // buy less than the key it costs to build.
             OutputColumn::NeighborAgg {
                 attr,
                 direction,
                 agg,
                 ..
             } => Arc::new(Float64Array::from(neighbor_aggregate(
-                topo, attr, mask, *direction, *agg,
+                self.topo, attr, self.mask, *direction, *agg,
             ))),
         };
-        match self.dtype() {
+        match col.dtype() {
             // Narrow the f64 kernel output to f32 (#117). Casting Float64 -> Float32 is
             // infallible; the `expect` can only fire on a validation bug (f32 requested
             // for a non-float column), which query.rs rejects before we get here.
             OutputDtype::F32 => arrow::compute::cast(&base, &DataType::Float32)
                 .expect("narrowing a float column to f32 is infallible"),
             OutputDtype::F64 => base,
-        }
-    }
-}
-
-fn algo_array(
-    topo: &Topology,
-    algo: &GraphAlgo,
-    weights: Option<&[f64]>,
-    mask: Option<&EdgeMask>,
-) -> ArrayRef {
-    match algo {
-        GraphAlgo::Degree { direction } => {
-            Arc::new(UInt32Array::from(degree(topo, mask, (*direction).into())))
-        }
-        GraphAlgo::PageRank {
-            damping,
-            max_iter,
-            tol,
-        } => {
-            let params = PageRankParams {
-                damping: *damping,
-                max_iter: *max_iter,
-                tol: *tol,
-            };
-            let scores = match weights {
-                Some(w) => pagerank_weighted(topo, w, mask, params),
-                None => pagerank(topo, mask, params),
-            };
-            Arc::new(Float64Array::from(scores))
-        }
-        GraphAlgo::ConnectedComponents { strong } => {
-            let labels = if *strong {
-                connected_components_strong(topo, mask)
-            } else {
-                connected_components_weak(topo, mask)
-            };
-            Arc::new(UInt32Array::from(labels))
-        }
-        GraphAlgo::TriangleCount => Arc::new(UInt32Array::from(triangle_count(topo, mask))),
-        GraphAlgo::ClusteringCoefficient => {
-            Arc::new(Float64Array::from(clustering_coefficient(topo, mask)))
-        }
-        GraphAlgo::Closeness => {
-            let scores = match weights {
-                Some(w) => closeness_weighted(topo, w, mask),
-                None => closeness(topo, mask),
-            };
-            Arc::new(Float64Array::from(scores))
-        }
-        GraphAlgo::Betweenness { sample, seed } => {
-            let scores = match weights {
-                Some(w) => betweenness_weighted(topo, w, mask, *sample, *seed),
-                None => betweenness(topo, mask, *sample, *seed),
-            };
-            Arc::new(Float64Array::from(scores))
-        }
-        GraphAlgo::LabelPropagation { max_iter, seed } => Arc::new(UInt32Array::from(
-            label_propagation(topo, mask, *max_iter, *seed),
-        )),
-        GraphAlgo::Louvain { resolution, seed } => {
-            let labels = match weights {
-                Some(w) => louvain_weighted(topo, w, mask, *resolution, *seed),
-                None => louvain(topo, mask, *resolution, *seed),
-            };
-            Arc::new(UInt32Array::from(labels))
         }
     }
 }
@@ -215,9 +376,10 @@ pub fn query_batch(
     columns: &[OutputColumn],
     mask: Option<&EdgeMask>,
 ) -> Result<RecordBatch> {
+    let mut eval = KernelEval::new(topo, mask);
     let mut arrays: Vec<ArrayRef> = vec![ids.user_id_array()];
     for col in columns {
-        arrays.push(col.value_array(topo, mask));
+        arrays.push(eval.column_array(col));
     }
     RecordBatch::try_new(query_schema(columns, ids.user_type()), arrays)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -457,5 +619,190 @@ mod tests {
         );
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("f32"), "unexpected error: {msg}");
+    }
+
+    // --- #115: sharing work across the columns of one query --------------------
+
+    fn algo_col(name: &str, algo: GraphAlgo, dtype: OutputDtype) -> OutputColumn {
+        OutputColumn::Algo {
+            name: name.to_string(),
+            algo,
+            weights: None,
+            dtype,
+        }
+    }
+
+    fn pagerank_algo() -> GraphAlgo {
+        GraphAlgo::PageRank {
+            damping: 0.85,
+            max_iter: 30,
+            tol: 1e-6,
+        }
+    }
+
+    /// A graph with actual triangles, so the triangle-family kernels have work to
+    /// share and non-trivial values to compare: the triangle 0-1-2, plus 3 hanging
+    /// off 0 (degree 1 -> clustering 0) and the chord 1-3.
+    fn triangly() -> (Arc<Topology>, Arc<IdMap>) {
+        let src = Int64Array::from(vec![0, 1, 2, 0, 1]);
+        let dst = Int64Array::from(vec![1, 2, 0, 3, 3]);
+        build_topology(&src, &dst).unwrap()
+    }
+
+    #[test]
+    fn two_columns_naming_one_kernel_share_a_single_run() {
+        let (topo, _ids) = diamond();
+        let mut eval = KernelEval::new(&topo, None);
+        let a = eval.column_array(&algo_col("a", pagerank_algo(), OutputDtype::F64));
+        let b = eval.column_array(&algo_col("b", pagerank_algo(), OutputDtype::F64));
+
+        assert_eq!(eval.memo.len(), 1, "one computation should be cached");
+        // The strongest available proof of sharing: both columns are literally the
+        // same allocation, so the second cannot have re-run the kernel.
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn dtype_is_not_part_of_the_key_so_f64_and_f32_share_the_run() {
+        use arrow::array::{Float32Array, Float64Array};
+
+        let (topo, _ids) = diamond();
+        let mut eval = KernelEval::new(&topo, None);
+        let wide = eval.column_array(&algo_col("a", pagerank_algo(), OutputDtype::F64));
+        let narrow = eval.column_array(&algo_col("b", pagerank_algo(), OutputDtype::F32));
+
+        assert_eq!(eval.memo.len(), 1, "narrowing happens after the memo");
+        assert_eq!(narrow.data_type(), &DataType::Float32);
+
+        let wide = wide.as_any().downcast_ref::<Float64Array>().unwrap();
+        let narrow = narrow.as_any().downcast_ref::<Float32Array>().unwrap();
+        for i in 0..wide.len() {
+            assert_eq!(narrow.value(i), wide.value(i) as f32);
+        }
+    }
+
+    #[test]
+    fn differing_parameters_do_not_share_a_run() {
+        let (topo, _ids) = diamond();
+        let mut eval = KernelEval::new(&topo, None);
+        eval.column_array(&algo_col("a", pagerank_algo(), OutputDtype::F64));
+        eval.column_array(&algo_col(
+            "b",
+            GraphAlgo::PageRank {
+                damping: 0.5, // a different damping is a different computation
+                max_iter: 30,
+                tol: 1e-6,
+            },
+            OutputDtype::F64,
+        ));
+        // Also distinct: a different *variant* entirely.
+        eval.column_array(&algo_col(
+            "c",
+            GraphAlgo::Degree {
+                direction: PlanDirection::Out,
+            },
+            OutputDtype::F64,
+        ));
+        assert_eq!(eval.memo.len(), 3);
+    }
+
+    #[test]
+    fn an_optional_parameter_that_is_absent_never_collides_with_one_that_is_set() {
+        // seed=None and seed=Some(0) must key differently — the presence flag in
+        // `kernel_key` is what stops `None` and a zero-valued `Some` colliding.
+        let none = kernel_key(
+            &GraphAlgo::LabelPropagation {
+                max_iter: 20,
+                seed: None,
+            },
+            None,
+        );
+        let zero = kernel_key(
+            &GraphAlgo::LabelPropagation {
+                max_iter: 20,
+                seed: Some(0),
+            },
+            None,
+        );
+        assert!(none != zero);
+    }
+
+    #[test]
+    fn triangle_family_columns_share_one_intersection_pass() {
+        let (topo, _ids) = triangly();
+        let mut eval = KernelEval::new(&topo, None);
+
+        eval.column_array(&algo_col("tri", GraphAlgo::TriangleCount, OutputDtype::F64));
+        let first = eval.triangles.as_ref().unwrap().1.as_ptr();
+
+        eval.column_array(&algo_col(
+            "cc",
+            GraphAlgo::ClusteringCoefficient,
+            OutputDtype::F64,
+        ));
+        let second = eval.triangles.as_ref().unwrap().1.as_ptr();
+
+        // Same allocation backing both columns' triangle counts: the clustering
+        // column reused the pass the triangle column paid for.
+        assert_eq!(
+            first, second,
+            "clustering_coefficient re-ran the triangle pass"
+        );
+    }
+
+    /// The refactor that enabled the sharing split `clustering_coefficient` into
+    /// `per_node_triangles` + `clustering_from_triangles`. These pin the shared path
+    /// to the standalone kernels, masked and unmasked — the regression that would
+    /// matter most if the split were ever wrong.
+    #[test]
+    fn shared_path_matches_the_standalone_kernels() {
+        use arrow::array::Float64Array;
+        use ursa_core::algo::{clustering_coefficient, triangle_count};
+
+        let (topo, _ids) = triangly();
+        for mask in [
+            None,
+            Some(EdgeMask::from_bools(&[true, true, true, false, true])),
+        ] {
+            let mut eval = KernelEval::new(&topo, mask.as_ref());
+            let tri =
+                eval.column_array(&algo_col("tri", GraphAlgo::TriangleCount, OutputDtype::F64));
+            let cc = eval.column_array(&algo_col(
+                "cc",
+                GraphAlgo::ClusteringCoefficient,
+                OutputDtype::F64,
+            ));
+
+            let want_tri = triangle_count(&topo, mask.as_ref());
+            let want_cc = clustering_coefficient(&topo, mask.as_ref());
+
+            let tri = tri.as_any().downcast_ref::<UInt32Array>().unwrap();
+            let cc = cc.as_any().downcast_ref::<Float64Array>().unwrap();
+            assert_eq!(tri.values(), &want_tri[..], "triangle counts diverged");
+            // Exact equality, not approximate: the shared path must run the identical
+            // float operations, not merely a close approximation of them.
+            assert_eq!(
+                cc.values(),
+                &want_cc[..],
+                "clustering coefficients diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn the_triangle_family_survives_an_empty_graph() {
+        // n_nodes == 0 short-circuits before the undirected view is resolved; both
+        // columns must still produce a well-typed empty array.
+        let src = Int64Array::from(Vec::<i64>::new());
+        let dst = Int64Array::from(Vec::<i64>::new());
+        let (topo, ids) = build_topology(&src, &dst).unwrap();
+        let columns = vec![
+            algo_col("tri", GraphAlgo::TriangleCount, OutputDtype::F64),
+            algo_col("cc", GraphAlgo::ClusteringCoefficient, OutputDtype::F64),
+        ];
+        let batch = query_batch(&topo, &ids, &columns, None).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::UInt32);
+        assert_eq!(batch.schema().field(2).data_type(), &DataType::Float64);
     }
 }

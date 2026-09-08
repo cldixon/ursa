@@ -14,30 +14,19 @@
 
 use crate::parallel::*;
 
-use super::triangle::per_node_triangles;
+use super::triangle::{per_node_triangles, undirected_view};
 use crate::topology::{EdgeMask, Topology, UndirectedCsr};
 
-/// Per-node local clustering coefficient, dense-indexed (`0.0..=1.0`). A subgraph
-/// `mask` restricts both the triangles and the degree to kept edges (computed over
-/// the masked undirected view; no CSR/id rebuild).
-pub fn clustering_coefficient(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f64> {
-    let n = topo.n_nodes();
-    if n == 0 {
-        return Vec::new();
-    }
-    // Bind the undirected view: the cached full view, or a per-subgraph masked one
-    // (the `owned` binding extends the masked view's lifetime across the body).
-    let owned: UndirectedCsr;
-    let adj = match mask {
-        None => topo.undirected(),
-        Some(m) => {
-            owned = topo.undirected_masked(m);
-            &owned
-        }
-    };
-    let triangles = per_node_triangles(adj);
-
-    (0..n)
+/// Local clustering coefficient from per-node triangle counts already computed
+/// over the *same* undirected adjacency.
+///
+/// Split out from [`clustering_coefficient`] because the triangle pass is the
+/// expensive half and `triangle_count` computes exactly the same thing: a query
+/// naming both kernels resolves the view and counts triangles once, then calls
+/// this. `triangles` must be indexed by the same dense node ids as `adj` — pair it
+/// with `per_node_triangles(adj)`, not with counts from a different view.
+pub fn clustering_from_triangles(adj: &UndirectedCsr, triangles: &[u32]) -> Vec<f64> {
+    (0..triangles.len())
         .into_par_iter()
         .map(|u| {
             let k = adj.degree(u as u32) as f64;
@@ -48,6 +37,18 @@ pub fn clustering_coefficient(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f
             }
         })
         .collect()
+}
+
+/// Per-node local clustering coefficient, dense-indexed (`0.0..=1.0`). A subgraph
+/// `mask` restricts both the triangles and the degree to kept edges (computed over
+/// the masked undirected view; no CSR/id rebuild).
+pub fn clustering_coefficient(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f64> {
+    if topo.n_nodes() == 0 {
+        return Vec::new();
+    }
+    let view = undirected_view(topo, mask);
+    let adj = view.get();
+    clustering_from_triangles(adj, &per_node_triangles(adj))
 }
 
 #[cfg(test)]
