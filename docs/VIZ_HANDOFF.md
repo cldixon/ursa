@@ -26,6 +26,16 @@ Milestone 1 (the core library + docs site) is done and faithful to `SPEC.md`:
   Cloudflare Workers) already contains an articulated visual design system —
   see §Design tokens below.
 
+Since this document was first written, **0.3.0 shipped**, and with it four of
+the five engine prerequisites identified below (subgraph views, graph ops over
+traversal results, `f32` output columns, and the rayon/wasm32 guard). See
+§Engine dependencies for what that changes. Two smaller notes that postdate the
+original text: the site now reads the workspace `Cargo.toml` at build time to
+derive the version it states, so `site/` already reaches outside itself; and
+`.github/workflows/docs-pin.yml` maintains a `docs-release` branch whose
+Cloudflare production-branch switch is still an outstanding manual dashboard
+step — worth pairing with the dashboard change the workspace restructure needs.
+
 There is **no viz code anywhere yet**. Clean slate.
 
 ## Product decisions (settled with the project owner)
@@ -153,8 +163,8 @@ These came out of design discussion and are not up for re-derivation:
 |---|---|---|
 | 1 | **The instrument v0 + anywidget wrapper.** TS renderer: pan/zoom/hover/drag, small-graph spring sim, plate+sky theming, stretch/ramp via the shared token package. `ur.plot` returns it in notebooks. | No server, no Rust changes beyond plumbing data out. Daily-touch surface lands first. |
 | 2 | **Docs snippet tabs.** Instantiate the renderer in the Astro site with build-time-computed (real Ursa) Arrow data. | Small, hugely visible, dogfoods library + renderer. |
-| 3 | **Rust layout kernels.** `layout_fa2` (Barnes–Hut, LinLog, gravity, weight influence), `layout_fr`, `layout_random`/`layout_circle`; positions as columns; static export path. | The benchmark story ("million-node layout in seconds"). Feeds precomputed positions to every surface. |
-| 4 | **The explorer.** axum server, Arrow IPC over websocket, expand/filter/select compiled to expressions, Python round-trip (`session.selection()` / `.highlight()`), then the LOD ladder (sampling → metagraph → drill-down). | The flagship; wire protocol per `VIZ_VISION.md` §Tier 2 architecture. **Depends on #114 and #116** — see §Engine dependencies. |
+| 3 | **Rust layout kernels.** `layout_fa2` (Barnes–Hut, LinLog, gravity, weight influence), `layout_fr`, `layout_random`/`layout_circle`; positions as columns; static export path. | The benchmark story ("million-node layout in seconds"). Feeds precomputed positions to every surface. **Blocked on #115** (a kernel cannot yet emit two columns from one invocation). |
+| 4 | **The explorer.** axum server, Arrow IPC over websocket, expand/filter/select compiled to expressions, Python round-trip (`session.selection()` / `.highlight()`), then the LOD ladder (sampling → metagraph → drill-down). | The flagship; wire protocol per `VIZ_VISION.md` §Tier 2 architecture. Its engine prerequisites (#114, #116) have **landed** — see §Engine dependencies. |
 | 5 | **WASM / publish.** Per `VIZ_VISION.md` §Tier 3, sober notes included there. | |
 
 Steps 1–2 are modest engineering with outsized visibility, and everything they
@@ -162,36 +172,46 @@ produce is load-bearing for 3–5.
 
 ## Engine dependencies — tracked separately, built in parallel
 
-Design review against the repo surfaced five places where the viz work needs
-something the core engine does not do yet. Each is filed as a standalone core
-issue and worked in a separate session; **none of them blocks steps 1–2**, so
-viz work proceeds concurrently. This is the intended feedback loop — the
-visualization layer is the forcing function for engine capability, not a
-consumer bolted on the side.
+Design review against the repo surfaced five places where the viz work needed
+something the core engine did not do yet. Each was filed as a standalone core
+issue and worked in a separate session, because **none of them blocks steps
+1–2**. This is the intended feedback loop — the visualization layer is the
+forcing function for engine capability, not a consumer bolted on the side.
 
-| Issue | What | Blocks | Notes |
+**Status as of 0.3.0: four of five have landed.**
+
+| Issue | What | Blocks | Status |
 |---|---|---|---|
-| [#114](https://github.com/cldixon/ursa/issues/114) | **Subgraph views** — graph ops over a filtered edge frame, as a bitmask over the parent CSR | step 4 | The big one. "Drag a filter slider then recolor" *is* a graph op on a filtered edge frame; `_reject_derived_edge_graph_op` rejects it today, and collect-and-re-ingest rebuilds the CSR per tick. Promoted out of "deferred, deliberately" on the roadmap. |
-| [#115](https://github.com/cldixon/ursa/issues/115) | **Multi-output kernels + per-query kernel memo** | step 3 | `OutputColumn::Algo` emits exactly one array with no memoization, so `layout_fa2` producing `(x, y)` would run ForceAtlas2 twice. Also fixes the live triangle/clustering double-compute. |
-| [#116](https://github.com/cldixon/ursa/issues/116) | **Graph ops on traversal results** (child-plan seeding) | step 4 | The explorer's expand-then-compute loop. Sequenced after #114; may reduce to it. |
-| [#117](https://github.com/cldixon/ursa/issues/117) | **`f32` output columns** | step 3 | No kernel can emit `f32` today. Small and self-contained. |
-| [#118](https://github.com/cldixon/ursa/issues/118) | **rayon behind a feature flag + wasm32 / `--no-default-features` CI legs** | Tier 3 | Pulled to step 0 — costs nothing now, nothing depends on it, and the cost grows with every kernel added. The CI legs are the real deliverable; the flag rots without them. |
+| [#114](https://github.com/cldixon/ursa/issues/114) | **Subgraph views** — graph ops over a filtered edge frame, as a bitmask over the parent CSR | step 4 | ✅ **Landed** (#119). `EdgeMask` bitset; all 10 node-valued kernels thread `Option<&EdgeMask>`, byte-identical at `mask=None`. `filter` keeps the topology and shares the parent index cell; repeated filters intersect. A node with no unmasked incident edges stays present at degree 0. |
+| [#115](https://github.com/cldixon/ursa/issues/115) | **Multi-output kernels + per-query kernel memo** | step 3 | ⬜ **Open — the one remaining blocker.** `result.rs::value_array` still returns exactly one `ArrayRef` per column with no memoization, so `layout_fa2` emitting `(x, y)` would run ForceAtlas2 twice. Also still fixes the live triangle/clustering double-compute. |
+| [#116](https://github.com/cldixon/ursa/issues/116) | **Graph ops on traversal results** | step 4 | ✅ **Landed** (#127). Reduced to #114's machinery exactly as anticipated — the mask comes from the traversal's reached-node set instead of a predicate. `ur.pagerank(ur.hop(edges, n=2).from_(seeds))` runs over the induced subgraph, no rebuild. |
+| [#117](https://github.com/cldixon/ursa/issues/117) | **`f32` output columns** | step 3 | ✅ **Landed** (#130). `dtype="f32"` on the float-valued kernels and `neighbors().agg()`; accumulates in `f64`, narrows on emit; survives the relational tail, `to_polars` and `sink_parquet`. |
+| [#118](https://github.com/cldixon/ursa/issues/118) | **rayon behind a feature flag + wasm32 / `--no-default-features` CI legs** | Tier 3 | ✅ **Landed** (#132). `src/parallel.rs` serial shim; `ursa-core` compiles for `wasm32-unknown-unknown` single-threaded; `getrandom` dropped as a second wasm blocker; two compile-only CI legs; 92 kernel tests bit-identical with the feature on and off. |
 
-Practical consequence for step 4's scope: if #114 and #116 land first, the
-explorer's filter and expand interactions are genuine subgraph queries. If they
-have not, step 4's v0 falls back to "algorithms always run on the full graph;
-filtering only changes what is rendered" — workable, but the UI then has to say
-so, because otherwise the numbers on screen silently describe a different graph
-than the one being displayed. Prefer the former; check status before scoping.
+**What this changes for step 4.** The earlier fallback plan — "algorithms always
+run on the full graph, filtering only changes what is rendered, and the UI has
+to admit it" — is off the table. Filter-then-recolor and expand-then-rank are
+both genuine subgraph queries now, at engine speed with no CSR rebuild. Scope
+step 4 accordingly.
+
+**Sharp edges that remain**, worth knowing before step 4 designs its interaction
+vocabulary:
+
+- A relational step *between* a traversal and a graph op still raises (a bare
+  `hop` / `shortest_path` is supported; `hop(...).filter(...)` then a kernel is
+  not).
+- `distinct` / `sample` / `join` / `group_by` derivations still raise — they
+  reshape the edge set in a way an edge mask cannot express. Neither is likely
+  to bite a v0 vocabulary, but "lasso-select → sample down → recolor" would hit
+  the second one.
 
 ## Technical guidance and pre-work guards
 
-- **Take the rayon feature-flag guard before step 3.** The Tier 3 WASM path
-  requires `ursa-core` to stay `wasm32-unknown-unknown`-clean with `rayon`
-  behind an (on-by-default) feature flag. Today rayon is an unconditional dep
-  used across ~9 files. Serial fallbacks largely exist already (the
-  byte-identical serial/parallel CSR builds). Cheap now, painful after more
-  kernels land. Core is otherwise clean (no tokio, no filesystem deps).
+- ~~**Take the rayon feature-flag guard before step 3.**~~ **Done** (#118 /
+  #132). `ursa-core` compiles for `wasm32-unknown-unknown` with the feature off,
+  guarded by two compile-only CI legs. New kernels — the layout kernels included
+  — must go through `crate::parallel::*` rather than `rayon::prelude::*`, or the
+  wasm leg fails. That is the guard working as intended; don't route around it.
 
 - **Positions are two `f32` columns, not a struct.** The vision doc's
   `struct{x,y}` + `.unnest("pos")` example implies struct-valued expressions
@@ -199,8 +219,9 @@ than the one being displayed. Prefer the former; check status before scoping.
   `layout_*` follows the dual-positioning convention the algorithms already
   use — standalone form returns an `(id, x, y)` NodeFrame; expression form
   yields two columns. Add struct/unnest support only when something else also
-  needs it. Dtype: `f32` end-to-end (halves GPU traffic; ample precision for
-  screen space); kernels may accumulate in `f64` internally.
+  needs it. The `f32` half is now available (#117 / #130) via `dtype="f32"`;
+  kernels accumulate in `f64` and narrow on emit. The *two columns from one
+  invocation* half is #115, still open.
 
 - **Layout determinism.** `seed=` at fixed thread count is the standing policy,
   but parallel force accumulation is FP-order-sensitive in a way counting sorts
