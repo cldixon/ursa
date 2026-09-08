@@ -32,7 +32,7 @@ use serde::Deserialize;
 use ursa_core::algo::AggKind;
 use ursa_core::{EdgeMask, IdMap, Topology};
 
-use crate::logical::{Direction, GraphAlgo};
+use crate::logical::{Direction, GraphAlgo, LayoutKind};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{path_schema, OutputColumn, OutputDtype};
@@ -74,6 +74,18 @@ struct ColumnSpec {
     // connected_components mode: "weak" (default) or "strong".
     #[serde(default)]
     mode: Option<String>,
+    // layout fields.
+    #[serde(default)]
+    iterations: Option<u32>,
+    #[serde(default)]
+    k: Option<f64>,
+    #[serde(default)]
+    gravity: Option<f64>,
+    // Which output of a multi-output kernel this column takes (#115): 0 = x,
+    // 1 = y for layout, and 0 for every single-output kernel. Both spellings of a
+    // layout column carry the same parameters and so share one simulation.
+    #[serde(default)]
+    field: Option<usize>,
     // output dtype narrowing (#117): "f32" emits a float-valued column as Float32;
     // None / "f64" keeps the native type. Only valid on float-valued columns.
     #[serde(default)]
@@ -87,6 +99,17 @@ impl ColumnSpec {
                 damping: self.damping.unwrap_or(0.85),
                 max_iter: self.max_iter.unwrap_or(30),
                 tol: self.tol.unwrap_or(1e-6),
+            },
+            "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
+                kind: match self.kind.as_str() {
+                    "layout_fr" => LayoutKind::Fr,
+                    "layout_random" => LayoutKind::Random,
+                    _ => LayoutKind::Circle,
+                },
+                iterations: self.iterations.unwrap_or(300),
+                k: self.k.unwrap_or(1.0),
+                gravity: self.gravity.unwrap_or(0.02),
+                seed: self.seed,
             },
             "degree" => GraphAlgo::Degree {
                 direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
@@ -555,11 +578,26 @@ pub fn execute_node_query(
                     Some(Arc::new(w))
                 }
             };
+            let field = spec.field.unwrap_or(0);
+            // Only layout produces a second output; a field selector on anything
+            // else is a caller mistake worth naming rather than silently ignoring.
+            if field > 0 && !matches!(algo, GraphAlgo::Layout { .. }) {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "{:?} emits a single column; field={field} has nothing to select",
+                    spec.kind
+                )));
+            }
+            if field > 1 {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "a layout emits two columns (x=0, y=1); field={field} is out of range"
+                )));
+            }
             let column = OutputColumn::Algo {
                 name: spec.name.clone(),
                 algo,
                 weights,
                 dtype,
+                field,
             };
             // f32 narrowing is only meaningful for a float-valued column; requesting it
             // on an integer kernel (degree, components, triangle_count, ...) is a type

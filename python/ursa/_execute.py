@@ -44,7 +44,15 @@ _EXECUTABLE = {
     "label_propagation",
     "louvain",
     "neighbors_agg",
+    "layout_fr",
+    "layout_random",
+    "layout_circle",
 }
+
+# Kernels that emit more than one column from a single invocation (#115). A layout
+# produces x and y; both spellings carry identical parameters, so the engine's
+# per-query memo runs the simulation once and hands each column its field.
+_MULTI_OUTPUT_VERBS = {"layout_fr", "layout_random", "layout_circle"}
 
 # Operators valid at the *top* of a filter predicate — comparisons and boolean
 # combinators. (Arithmetic ops may appear deeper, e.g. `(a + b) > 3`, but a bare
@@ -890,6 +898,16 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     elif verb == "louvain":
         column.update(resolution=p.get("resolution", 1.0), seed=p.get("seed"))
         _add_weight(column, p)
+    elif verb in _MULTI_OUTPUT_VERBS:
+        column.update(
+            iterations=p.get("iterations", 300),
+            k=p.get("k", 1.0),
+            gravity=p.get("gravity", 0.02),
+            seed=p.get("seed"),
+            # Which of the kernel's two outputs this column takes. Not part of the
+            # engine's memo key, which is the point: x and y share one simulation.
+            field=p.get("field", 0),
+        )
     elif verb == "neighbors_agg":
         # from_= (resolve the aggregation against a different node frame) isn't
         # wired: it would otherwise be recorded and silently ignored.
@@ -918,7 +936,13 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
     # Output dtype narrowing (#117): a float-valued kernel may emit f32 (half the wire
     # and on-disk size — e.g. cached layout positions). Only the emitted column
     # narrows; the kernel still accumulates in f64. Integer kernels have no f32 form.
+    # Positions are f32 at the source — the kernel computes in f32 — so there is
+    # nothing to narrow and `dtype` has no meaning on a layout column.
     dtype = p.get("dtype")
+    if verb in _MULTI_OUTPUT_VERBS and dtype is not None:
+        raise NotImplementedError(
+            f"'{verb}' already emits f32 positions; dtype= has nothing to narrow."
+        )
     if dtype is not None and dtype != "f64":
         if dtype != "f32":
             raise NotImplementedError(f"dtype must be 'f32' or 'f64'; got {dtype!r}.")

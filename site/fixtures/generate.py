@@ -22,11 +22,10 @@ check becomes noise that everyone learns to ignore. Everything below is seeded,
 and floats are rounded on the way out — full f64 text would make the diff churn
 on the last bit for no visible difference.
 
-**One thing here is not Ursa yet: the layout.** Node positions come from
-NetworkX, because Ursa has no layout kernel — that is `layout_fa2`, blocked on
-the multi-output half of #115. It is deliberately the only such call in the file,
-so replacing it later is a single edit. Everything else — degree, PageRank,
-communities — is Ursa.
+**Everything here is Ursa, including the layout.** `layout_fr` landed with the
+multi-output half of #115, so the positions come from the engine now rather than
+from NetworkX — which means this file has no second implementation of anything
+left in it.
 """
 
 from __future__ import annotations
@@ -45,28 +44,6 @@ LOUVAIN_SEED = 20260908
 LAYOUT_SEED = 20260908
 
 
-def layout(
-    edge_rows: list[tuple[str, str, float]], n_iter: int = 400
-) -> dict[str, tuple[float, float]]:
-    """Force-directed positions.
-
-    The one computation on this page Ursa cannot do yet. `layout_fa2` is a
-    Barnes-Hut fixpoint over the CSR — the same computational shape as PageRank —
-    and lands once a kernel can emit two columns (x and y) from one invocation.
-    Until then NetworkX draws the picture and Ursa supplies everything in it.
-
-    Seeded, and `spring_layout` is deterministic under a fixed seed, so the
-    fixture is stable across runs.
-    """
-    import networkx as nx
-
-    g = nx.Graph()
-    for src, dst, weight in edge_rows:
-        g.add_edge(src, dst, weight=weight)
-    pos = nx.spring_layout(g, seed=LAYOUT_SEED, iterations=n_iter, weight="weight")
-    return {str(k): (float(v[0]), float(v[1])) for k, v in pos.items()}
-
-
 def lesmis() -> dict[str, Any]:
     """Les Misérables co-occurrence: 77 characters, weighted by shared scenes.
 
@@ -77,14 +54,18 @@ def lesmis() -> dict[str, Any]:
     edges = ur.datasets.load_lesmis()
     weight = ur.col("weight")
 
-    # One query, three kernels. Ursa shares the work across the columns of a
-    # single `with_columns` (#115), so this is one pass over the topology.
+    # One query, four kernels, and the layout's two columns come from a single
+    # simulation: Ursa shares work across the columns of one `with_columns` (#115),
+    # so naming x and y does not run the force layout twice.
+    positions = ur.layout_fr(edges, iterations=600, k=1.0, gravity=0.05, seed=LAYOUT_SEED)
     frame = (
         edges.nodes()
         .with_columns(
             degree=ur.degree(edges, direction="both"),
             pagerank=ur.pagerank(edges, weight=weight),
             community=ur.louvain(edges, weight=weight, seed=LOUVAIN_SEED),
+            x=positions.x,
+            y=positions.y,
         )
         .sort("id")
         .collect()
@@ -94,6 +75,8 @@ def lesmis() -> dict[str, Any]:
     degree: list[int] = table.column("degree").to_pylist()
     pagerank: list[float] = table.column("pagerank").to_pylist()
     community: list[int] = table.column("community").to_pylist()
+    xs: list[float] = table.column("x").to_pylist()
+    ys: list[float] = table.column("y").to_pylist()
 
     # Dense render indices: the renderer addresses nodes by position, and so will
     # the wire protocol when the explorer lands. Resolving user ids to indices
@@ -103,18 +86,16 @@ def lesmis() -> dict[str, Any]:
     edge_rows = [
         (str(r["src"]), str(r["dst"]), float(r["weight"])) for r in edges.collect().to_dicts()
     ]
-    pos = layout(edge_rows)
 
     return {
         "name": "lesmis",
         "title": "Les Misérables",
         "description": "Character co-occurrence, weighted by shared scenes.",
         "ids": ids,
-        # Positions are centred on the origin and scaled to a comfortable extent;
-        # the renderer frames whatever it is given, so the absolute scale only
-        # decides how the initial `fit` looks.
-        "x": [round(pos[name][0] * 400, 2) for name in ids],
-        "y": [round(pos[name][1] * 400, 2) for name in ids],
+        # Ursa's own positions. Rounded to two places: the renderer frames whatever
+        # it is given, so trailing precision only makes the diff churn.
+        "x": [round(v, 2) for v in xs],
+        "y": [round(v, 2) for v in ys],
         "degree": degree,
         # Six significant figures: enough that the tooltip reads exactly, few
         # enough that the file does not churn on the last bit of an f64.

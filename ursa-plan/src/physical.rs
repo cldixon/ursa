@@ -448,6 +448,7 @@ mod tests {
             },
             weights: None,
             dtype: OutputDtype::F64,
+            field: 0,
         }]);
         let exec = Arc::new(GraphAlgorithmExec::new(topo, ids, columns, None));
         let ctx = Arc::new(TaskContext::default());
