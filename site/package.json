@@ -9,7 +9,9 @@
     "preview": "astro preview",
     "check": "astro check",
     "deploy": "bun run build && wrangler deploy",
-    "preview:worker": "bun run build && wrangler dev"
+    "preview:worker": "bun run build && wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "cf:preview": "wrangler versions upload"
   },
   "dependencies": {
     "@ursa/viz": "workspace:*",

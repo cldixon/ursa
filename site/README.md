@@ -63,18 +63,29 @@ docs PR builds from a clean checkout independent of the Cloudflare account.
 
 > **The build settings live in the dashboard, so the repository cannot keep them right.**
 > When the JavaScript moved to a root bun workspace, `bun install` stopped working from `site/` —
-> the lockfile is at the repository root now. The Workers Builds configuration has to match:
+> the lockfile is at the repository root now. The Workers Builds settings have to match:
 >
 > | Setting | Value |
 > |---|---|
-> | Root directory | the repository root (was `site`) |
-> | Build command | `bun install && bun run build` |
-> | Deploy command | `bunx wrangler deploy --config site/wrangler.jsonc` (add `versions upload` for non-production branches, as configured) |
+> | Root directory | *(empty — the repository root; was `site`)* |
+> | Build command | `bun run build` |
+> | Deploy command | `bun run cf:deploy` |
+> | Non-production branch deploy command | `bun run cf:preview` |
 >
-> `site/wrangler.jsonc` itself needs no change — its `assets.directory` is relative to the config
-> file, so `./dist` still resolves to `site/dist`. If a docs deploy fails right after a
-> restructure, this is the first thing to check: nothing in this repository can tell you the
-> dashboard is stale.
+> Those command names are deliberate: each is a one-line script in the root `package.json` that
+> delegates into `site/`. **The dashboard holds names, the repository holds behaviour** — so every
+> future change to how the site deploys is a commit rather than another dashboard visit. This is
+> as close as Workers Builds gets to versioned build config; the four settings above are genuinely
+> dashboard-only.
+>
+> `site/wrangler.jsonc` needs no change, and neither do the paths inside it: `cf:deploy` runs
+> wrangler *with `site/` as its working directory*, exactly as before the workspace existed, so
+> config discovery and the relative `assets.directory` resolve unchanged. (Workers Builds installs
+> dependencies itself before running the build command, so `bun run build` needs no `bun install`
+> in front of it.)
+>
+> If a docs deploy fails right after a restructure, this is the first thing to check: nothing in
+> this repository can tell you the dashboard is stale.
 
 ### Pinning production to the release
 
