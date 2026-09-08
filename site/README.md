@@ -65,12 +65,19 @@ docs PR builds from a clean checkout independent of the Cloudflare account.
 > When the JavaScript moved to a root bun workspace, `bun install` stopped working from `site/` —
 > the lockfile is at the repository root now. The Workers Builds settings have to match:
 >
-> | Setting | Value |
+> | Setting (dashboard label) | Value |
 > |---|---|
 > | Root directory | *(empty — the repository root; was `site`)* |
 > | Build command | `bun run build` |
 > | Deploy command | `bun run cf:deploy` |
-> | Non-production branch deploy command | `bun run cf:preview` |
+> | **Version command** | `bun run cf:preview` |
+>
+> The last one is what the Cloudflare *documentation* calls the "non-production branch deploy
+> command" (and, elsewhere in the same docs, the "preview deploy command"). The dashboard labels it
+> **Version command**. One field, three names — identify it by its default value,
+> `npx wrangler versions upload`. It runs on every branch that is not the production branch, and it
+> is what produces the per-commit preview URLs and the `<branch>-ursa-docs…` alias posted to pull
+> requests.
 >
 > Those command names are deliberate: each is a one-line script in the root `package.json` that
 > delegates into `site/`. **The dashboard holds names, the repository holds behaviour** — so every
