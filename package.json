@@ -13,7 +13,7 @@
     "preview": "bun run --cwd site preview",
     "deploy": "bun run --cwd site deploy",
     "preview:worker": "bun run --cwd site preview:worker",
-    "check": "bun run --cwd viz check && bun run --cwd site check",
+    "check": "bun run --cwd viz check && bun run --cwd viz test && bun run --cwd site check",
 
     "//cf": "Entry points for Cloudflare Workers Builds, whose settings live in the dashboard and cannot be versioned here. Keeping the dashboard's commands down to these two names means every future change to how the site deploys is a commit rather than a dashboard visit. They delegate into site/ so wrangler runs with that as its working directory — exactly as it did before the workspace existed, so config discovery and the relative assets.directory resolve unchanged. No build step: Workers Builds has already run the build command by this point.",
     "cf:deploy": "bun run --cwd site cf:deploy",
