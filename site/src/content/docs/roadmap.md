@@ -55,6 +55,25 @@ a published number comes with an image, a machine class and an exact command. Se
 HAVING-style filters on grouped results, relational verbs over traversal results — the current
 single-shot limits are implementation stages, not design positions.
 
+## Visualization
+
+A renderer is being built alongside the engine, on the premise that the interesting problem is not
+*draw the graph* but *render the answer to a query*. A force-directed layout of anything past ten
+thousand nodes is a hairball, and no amount of rendering horsepower fixes a picture that should not
+have been drawn — but a lazy analytical engine sitting directly behind the view can decide what to
+draw before drawing it.
+
+**[Instrument](/instrument)** is that renderer, live: pan, zoom and hover a graph on either ground,
+with the colour channel and the stretch switchable. It is a working surface rather than a
+documentation page — it exists so the design can be argued with while it is still being settled —
+so expect it to change, and expect it to be wrong in places.
+
+What it shows today is real rendering over **placeholder analytics**: the layout and the PageRank
+behind that page are computed in the site's own TypeScript, not by Ursa. Closing that gap is the
+next piece of work, and it has three distinct answers depending on where the engine runs — at
+documentation build time, in a notebook process, or in the browser itself. `docs/VIZ_VISION.md` and
+`docs/VIZ_HANDOFF.md` carry the design.
+
 ## Deferred, deliberately
 
 **Motif finding** — `ur.find("(a)-[e]->(b); ...")`, GraphFrames-style — is the first post-v0.1
