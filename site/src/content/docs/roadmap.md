@@ -68,11 +68,14 @@ with the colour channel and the stretch switchable. It is a working surface rath
 documentation page — it exists so the design can be argued with while it is still being settled —
 so expect it to change, and expect it to be wrong in places.
 
-What it shows today is real rendering over **placeholder analytics**: the layout and the PageRank
-behind that page are computed in the site's own TypeScript, not by Ursa. Closing that gap is the
-next piece of work, and it has three distinct answers depending on where the engine runs — at
-documentation build time, in a notebook process, or in the browser itself. `docs/VIZ_VISION.md` and
-`docs/VIZ_HANDOFF.md` carry the design.
+Every number on that page is **Ursa's** — degree, PageRank, the Louvain communities and the
+force-directed positions are all computed by the engine at documentation build time and committed
+as a fixture, with a CI job that regenerates and fails on any drift. Nothing computes a graph
+statistic in the browser or in the site's TypeScript.
+
+That is one of three ways the engine can reach a view, and the easy one. The other two — an engine
+running in a notebook process behind `ur.plot`, and the engine compiled to WebAssembly in the
+browser — are still ahead. `docs/VIZ_VISION.md` and `docs/VIZ_HANDOFF.md` carry the design.
 
 ## Deferred, deliberately
 
