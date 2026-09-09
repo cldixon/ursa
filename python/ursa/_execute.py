@@ -44,6 +44,7 @@ _EXECUTABLE = {
     "label_propagation",
     "louvain",
     "neighbors_agg",
+    "layout_fa2",
     "layout_fr",
     "layout_random",
     "layout_circle",
@@ -52,7 +53,7 @@ _EXECUTABLE = {
 # Kernels that emit more than one column from a single invocation (#115). A layout
 # produces x and y; both spellings carry identical parameters, so the engine's
 # per-query memo runs the simulation once and hands each column its field.
-_MULTI_OUTPUT_VERBS = {"layout_fr", "layout_random", "layout_circle"}
+_MULTI_OUTPUT_VERBS = {"layout_fa2", "layout_fr", "layout_random", "layout_circle"}
 
 # Operators valid at the *top* of a filter predicate — comparisons and boolean
 # combinators. (Arithmetic ops may appear deeper, e.g. `(a + b) > 3`, but a bare
@@ -902,7 +903,14 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
         column.update(
             iterations=p.get("iterations", 300),
             k=p.get("k", 1.0),
-            gravity=p.get("gravity", 0.02),
+            # The two force models want different gravity — FR's is a spring
+            # coefficient, ForceAtlas2's a force per unit mass — so the default
+            # follows the verb rather than being shared and wrong for one of them.
+            gravity=p.get("gravity", 1.0 if verb == "layout_fa2" else 0.02),
+            theta=p.get("theta", 0.5),
+            strong_gravity=p.get("strong_gravity", False),
+            lin_log=p.get("lin_log", False),
+            jitter_tolerance=p.get("jitter_tolerance", 1.0),
             seed=p.get("seed"),
             # Which of the kernel's two outputs this column takes. Not part of the
             # engine's memo key, which is the point: x and y share one simulation.

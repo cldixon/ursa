@@ -22,10 +22,9 @@ check becomes noise that everyone learns to ignore. Everything below is seeded,
 and floats are rounded on the way out — full f64 text would make the diff churn
 on the last bit for no visible difference.
 
-**Everything here is Ursa, including the layout.** `layout_fr` landed with the
-multi-output half of #115, so the positions come from the engine now rather than
-from NetworkX — which means this file has no second implementation of anything
-left in it.
+**Everything here is Ursa, including the layout.** The positions come from
+`layout_fa2` — ForceAtlas2 over a Barnes-Hut quadtree (#142) — so this file has no
+second implementation of anything left in it.
 """
 
 from __future__ import annotations
@@ -57,7 +56,10 @@ def lesmis() -> dict[str, Any]:
     # One query, four kernels, and the layout's two columns come from a single
     # simulation: Ursa shares work across the columns of one `with_columns` (#115),
     # so naming x and y does not run the force layout twice.
-    positions = ur.layout_fr(edges, iterations=600, k=1.0, gravity=0.05, seed=LAYOUT_SEED)
+    # ForceAtlas2 rather than Fruchterman-Reingold: its repulsion is weighted by
+    # degree, so Valjean and the Bishop get room to be seen as hubs instead of
+    # being buried under the characters that only ever appear with them.
+    positions = ur.layout_fa2(edges, iterations=600, k=1.0, gravity=1.0, seed=LAYOUT_SEED)
     frame = (
         edges.nodes()
         .with_columns(

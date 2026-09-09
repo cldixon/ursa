@@ -81,6 +81,14 @@ struct ColumnSpec {
     k: Option<f64>,
     #[serde(default)]
     gravity: Option<f64>,
+    #[serde(default)]
+    theta: Option<f64>,
+    #[serde(default)]
+    strong_gravity: Option<bool>,
+    #[serde(default)]
+    lin_log: Option<bool>,
+    #[serde(default)]
+    jitter_tolerance: Option<f64>,
     // Which output of a multi-output kernel this column takes (#115): 0 = x,
     // 1 = y for layout, and 0 for every single-output kernel. Both spellings of a
     // layout column carry the same parameters and so share one simulation.
@@ -100,17 +108,32 @@ impl ColumnSpec {
                 max_iter: self.max_iter.unwrap_or(30),
                 tol: self.tol.unwrap_or(1e-6),
             },
-            "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
-                kind: match self.kind.as_str() {
+            "layout_fa2" | "layout_fr" | "layout_random" | "layout_circle" => {
+                let kind = match self.kind.as_str() {
+                    "layout_fa2" => LayoutKind::Fa2,
                     "layout_fr" => LayoutKind::Fr,
                     "layout_random" => LayoutKind::Random,
                     _ => LayoutKind::Circle,
-                },
-                iterations: self.iterations.unwrap_or(300),
-                k: self.k.unwrap_or(1.0),
-                gravity: self.gravity.unwrap_or(0.02),
-                seed: self.seed,
-            },
+                };
+                GraphAlgo::Layout {
+                    kind,
+                    iterations: self.iterations.unwrap_or(300),
+                    k: self.k.unwrap_or(1.0),
+                    // The two force models want genuinely different gravity: FR's
+                    // is a coefficient on a spring-like pull, ForceAtlas2's is a
+                    // force per unit mass. Sharing one default would make one of
+                    // them wrong, so the default follows the kind.
+                    gravity: self.gravity.unwrap_or(match kind {
+                        LayoutKind::Fa2 => 1.0,
+                        _ => 0.02,
+                    }),
+                    theta: self.theta.unwrap_or(0.5),
+                    strong_gravity: self.strong_gravity.unwrap_or(false),
+                    lin_log: self.lin_log.unwrap_or(false),
+                    jitter_tolerance: self.jitter_tolerance.unwrap_or(1.0),
+                    seed: self.seed,
+                }
+            }
             "degree" => GraphAlgo::Degree {
                 direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
             },

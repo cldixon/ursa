@@ -60,9 +60,19 @@ ur.plot(
 )                                       # -> matplotlib Figure / PNG / SVG
 ```
 
-**Why this wins on day one:** D3's force simulation is single-threaded JavaScript; igraph and NetworkX layouts are similarly serial. A Rayon Barnes–Hut kernel over CSR lays out a million-node graph in seconds where the incumbents take minutes or fail. This is a benchmark chart that writes itself, shipped as ordinary algorithm work.
+**Why this wins on day one:** D3's force simulation is single-threaded JavaScript; igraph and NetworkX layouts are similarly serial. A Rayon Barnes–Hut kernel over CSR is parallel and O(n log n), which is a different asymptotic class from what the incumbents offer.
 
-**Algorithms (Tier 1 set):** `layout_fa2` (ForceAtlas2 w/ Barnes–Hut, LinLog mode, gravity, edge-weight influence), `layout_fr` (Fruchterman–Reingold), `layout_random` / `layout_circle` (seeding and trivial cases). Deterministic under `seed=` at fixed thread count, same policy as other stochastic kernels. Later: UMAP-style embedding projection, hierarchical/DAG layouts (Sugiyama) for lineage graphs.
+**What that is actually worth, measured** (`ursa-core/examples/layout_scaling.rs`, #142). This paragraph used to promise "a million-node graph in seconds". It was written before the kernel existed and it was too generous; these are the numbers instead:
+
+| | |
+|---|---|
+| Growth per doubling | **~2.1×** — n log n, out to 128K nodes |
+| 1M nodes, ForceAtlas2 | **~1.3 s per iteration** on 4 cores |
+| 1M nodes, 300 iterations | **~400 s** on 4 cores |
+
+Iteration count is a quality dial rather than a constant, so the per-iteration figure is the honest headline. ~97% of that time is the tree traversal, which is fully parallel — the serial tree build is 2.6% — so the wall clock falls close to linearly with cores: the same work on 32 cores is minutes, not the better part of an hour. "Seconds" at 300 iterations and a million nodes is not a claim this kernel supports on any machine we have measured, and the comparison worth publishing is against NetworkX and igraph in the benchmark harness, not against a round number.
+
+**Algorithms (Tier 1 set):** `layout_fa2` (ForceAtlas2 w/ Barnes–Hut, LinLog mode, gravity) and `layout_fr` (Fruchterman–Reingold) have **landed** (#141, #142), along with `layout_random` / `layout_circle` (seeding and trivial cases). Deterministic under `seed=` and bit-identical across thread counts, same policy as other stochastic kernels — except LinLog mode, whose `ln` is not guaranteed identical across platforms. Still open: **edge-weight influence** on attraction, which needs a weighted undirected adjacency the core does not build yet. Later: UMAP-style embedding projection, hierarchical/DAG layouts (Sugiyama) for lineage graphs.
 
 ---
 

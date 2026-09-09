@@ -17,10 +17,10 @@ use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
     betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_from_triangles,
     connected_components_strong, connected_components_weak, degree, k_hop, label_propagation,
-    layout_circle, layout_fr, layout_random, louvain, louvain_weighted, neighbor_aggregate,
-    pagerank, pagerank_weighted, per_node_triangles, random_walk, shortest_path,
-    shortest_path_weighted_with_cost, undirected_view, AggKind, LayoutParams, PageRankParams,
-    UndirectedView,
+    layout_circle, layout_fa2, layout_fr, layout_random, louvain, louvain_weighted,
+    neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles, random_walk,
+    shortest_path, shortest_path_weighted_with_cost, undirected_view, AggKind, Fa2Params,
+    LayoutParams, PageRankParams, UndirectedView,
 };
 use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
@@ -191,19 +191,34 @@ fn kernel_key(algo: &GraphAlgo, weights: Option<&Arc<Vec<f64>>>) -> KernelKey {
             iterations,
             k,
             gravity,
+            theta,
+            strong_gravity,
+            lin_log,
+            jitter_tolerance,
             seed,
         } => {
             // `field` is deliberately absent: x and y must produce the *same* key,
             // because sharing one simulation between them is the entire point.
+            //
+            // Every *other* parameter must be present, including the ForceAtlas2
+            // ones that FR ignores. A key that omitted them would collide two
+            // genuinely different layouts — `lin_log=true` and `lin_log=false`
+            // would share one memo entry and the second column would silently get
+            // the first's simulation.
             let mut p = vec![
                 match kind {
-                    LayoutKind::Fr => 0,
-                    LayoutKind::Random => 1,
-                    LayoutKind::Circle => 2,
+                    LayoutKind::Fa2 => 0,
+                    LayoutKind::Fr => 1,
+                    LayoutKind::Random => 2,
+                    LayoutKind::Circle => 3,
                 },
                 *iterations as u64,
                 k.to_bits(),
                 gravity.to_bits(),
+                theta.to_bits(),
+                *strong_gravity as u64,
+                *lin_log as u64,
+                jitter_tolerance.to_bits(),
             ];
             p.extend(opt_u64(seed));
             (9, p)
@@ -282,15 +297,34 @@ impl<'a> KernelEval<'a> {
                 iterations,
                 k,
                 gravity,
+                theta,
+                strong_gravity,
+                lin_log,
+                jitter_tolerance,
                 seed,
             } => {
                 let params = LayoutParams {
                     iterations: *iterations,
                     k: *k as f32,
                     gravity: *gravity as f32,
+                    theta: *theta as f32,
                     seed: *seed,
                 };
                 let (x, y) = match kind {
+                    LayoutKind::Fa2 => layout_fa2(
+                        topo,
+                        mask,
+                        Fa2Params {
+                            iterations: *iterations,
+                            k: *k as f32,
+                            gravity: *gravity as f32,
+                            strong_gravity: *strong_gravity,
+                            lin_log: *lin_log,
+                            theta: *theta as f32,
+                            jitter_tolerance: *jitter_tolerance as f32,
+                            seed: *seed,
+                        },
+                    ),
                     LayoutKind::Fr => layout_fr(topo, mask, params),
                     LayoutKind::Random => layout_random(topo, params),
                     LayoutKind::Circle => layout_circle(topo, params),
@@ -809,16 +843,24 @@ mod tests {
         assert!(none != zero);
     }
 
+    fn layout_algo(kind: LayoutKind) -> GraphAlgo {
+        GraphAlgo::Layout {
+            kind,
+            iterations: 20,
+            k: 1.0,
+            gravity: 0.02,
+            theta: 0.5,
+            strong_gravity: false,
+            lin_log: false,
+            jitter_tolerance: 1.0,
+            seed: Some(1),
+        }
+    }
+
     fn layout_col(name: &str, field: usize) -> OutputColumn {
         OutputColumn::Algo {
             name: name.to_string(),
-            algo: GraphAlgo::Layout {
-                kind: LayoutKind::Fr,
-                iterations: 20,
-                k: 1.0,
-                gravity: 0.02,
-                seed: Some(1),
-            },
+            algo: layout_algo(LayoutKind::Fr),
             weights: None,
             dtype: OutputDtype::F64,
             field,
@@ -852,16 +894,49 @@ mod tests {
         eval.column_array(&layout_col("x", 0));
         let mut circle = layout_col("c", 0);
         if let OutputColumn::Algo { algo, .. } = &mut circle {
-            *algo = GraphAlgo::Layout {
-                kind: LayoutKind::Circle,
-                iterations: 20,
-                k: 1.0,
-                gravity: 0.02,
-                seed: Some(1),
-            };
+            *algo = layout_algo(LayoutKind::Circle);
         }
         eval.column_array(&circle);
         assert_eq!(eval.memo.len(), 2, "a different layout is a different run");
+
+        // A ForceAtlas2-only parameter must key separately too. This is the memo
+        // failure that would be invisible: same kind, same seed, same iterations,
+        // and a key that dropped `lin_log` would hand the second column the first
+        // column's simulation while every value still looked like a position.
+        let mut fa2 = layout_col("a", 0);
+        if let OutputColumn::Algo { algo, .. } = &mut fa2 {
+            *algo = layout_algo(LayoutKind::Fa2);
+        }
+        eval.column_array(&fa2);
+        let mut log = layout_col("l", 0);
+        if let OutputColumn::Algo { algo, .. } = &mut log {
+            *algo = match layout_algo(LayoutKind::Fa2) {
+                GraphAlgo::Layout {
+                    kind,
+                    iterations,
+                    k,
+                    gravity,
+                    theta,
+                    strong_gravity,
+                    jitter_tolerance,
+                    seed,
+                    ..
+                } => GraphAlgo::Layout {
+                    kind,
+                    iterations,
+                    k,
+                    gravity,
+                    theta,
+                    strong_gravity,
+                    lin_log: true,
+                    jitter_tolerance,
+                    seed,
+                },
+                other => other,
+            };
+        }
+        eval.column_array(&log);
+        assert_eq!(eval.memo.len(), 4, "lin_log must be part of the memo key");
     }
 
     #[test]

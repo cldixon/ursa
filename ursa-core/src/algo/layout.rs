@@ -17,24 +17,35 @@
 //!   push a force to both endpoints — is a scatter, and its result depends on the
 //!   order threads happen to write in. Every other kernel in this crate gathers
 //!   for the same reason.
-//! - **A grid built by counting sort.** The spatial index is rebuilt per iteration
-//!   from a deterministic bucketing, so the order repulsion is summed in is fixed.
+//! - **A spatial index that is a pure function of the positions.** The quadtree is
+//!   rebuilt per iteration from a Morton sort, so the order repulsion is summed in
+//!   is decided by the tree rather than by thread scheduling. [`super::quadtree`]
+//!   explains why that build was chosen over the textbook insertion one.
+//! - **Global reductions in index order.** ForceAtlas2's adaptive step needs two
+//!   sums over all nodes; both are accumulated serially, because a parallel
+//!   reduction would reintroduce exactly the order dependence the rest avoids.
 //!
-//! Cross-platform bit-identity is *not* claimed: the force law uses only `+ - * /`
-//! and `sqrt`, which are IEEE-exact, but that guarantee would end the moment a
-//! transcendental (a LinLog mode's `ln`) entered the loop.
+//! Cross-platform bit-identity is claimed **only for the non-LinLog force laws**.
+//! `layout_fr` and `layout_fa2`'s default linear attraction use nothing but
+//! `+ - * /` and `sqrt`, all IEEE-exact. LinLog mode introduces `ln`, whose
+//! last-bit result is a libm implementation detail — so `lin_log: true` stays
+//! reproducible on one machine and is not guaranteed to match across platforms.
 //!
-//! # What this is not, yet
+//! # Repulsion is a quadtree
 //!
-//! Repulsion is approximated with a **uniform grid**: near cells exactly,
-//! far cells through their centre of mass. That is O(n) per iteration for graphs
-//! whose density is roughly even, and it is the wrong structure for a graph that
-//! is violently clustered — a uniform grid cannot subdivide where the nodes
-//! actually are. ForceAtlas2 with a Barnes–Hut quadtree is the successor, and the
-//! seam is `repulse`: it is the only function that needs replacing.
+//! Both kernels approximate repulsion with a Barnes–Hut quadtree
+//! ([`super::quadtree`]): a group of nodes far enough away is replaced by its
+//! centre of mass, governed by `theta`. That is O(n log n) per iteration.
+//!
+//! It replaced a uniform grid, which was O(n²) — the grid scanned every cell for
+//! every node, and cell count grows with the graph, so the "far field" saved a
+//! constant factor and not the exponent. `examples/layout_scaling.rs` measures
+//! this; the grid's growth factor was ~3.8× per doubling, which is 4× wearing a
+//! disguise.
 
 use crate::parallel::*;
 
+use super::quadtree::{traversal_stack, unit_weights, QuadTree};
 use super::rng::DEFAULT_SEED;
 use super::triangle::undirected_view;
 use crate::topology::{EdgeMask, Topology, UndirectedCsr};
@@ -53,6 +64,10 @@ pub struct LayoutParams {
     /// components drifting apart forever — repulsion alone would separate them
     /// without bound.
     pub gravity: f32,
+    /// Barnes–Hut opening angle. Smaller is more accurate and slower; `0.0` is
+    /// exact all-pairs. `0.5` is the conventional default and what the accuracy
+    /// test measures against brute force.
+    pub theta: f32,
     pub seed: Option<u64>,
 }
 
@@ -62,6 +77,56 @@ impl Default for LayoutParams {
             iterations: 300,
             k: 1.0,
             gravity: 0.02,
+            theta: 0.5,
+            seed: None,
+        }
+    }
+}
+
+/// Parameters for [`layout_fa2`] — ForceAtlas2, per Jacomy et al. (2014).
+///
+/// The differences from Fruchterman–Reingold are what make it the better default
+/// for a real graph, and each is a separate knob here:
+///
+/// - **Repulsion is degree-weighted.** A hub repels proportionally to its degree,
+///   which stops it being buried inside the neighbourhood it anchors. This is the
+///   single biggest visual difference and it is not optional.
+/// - **Attraction is linear** in distance (FR's is quadratic), so clusters stay
+///   legible instead of collapsing to points.
+/// - **The step size adapts**, per node, from the ratio of "swinging" to useful
+///   motion — rather than FR's fixed cooling schedule, which has to be tuned to
+///   the graph.
+#[derive(Debug, Clone, Copy)]
+pub struct Fa2Params {
+    pub iterations: u32,
+    /// Repulsion strength. Scales the drawing rather than changing its shape.
+    pub k: f32,
+    /// Pull toward the origin, keeping disconnected components in one picture.
+    pub gravity: f32,
+    /// Gravity proportional to distance rather than constant. Pulls sparse
+    /// peripheries in hard, which tightens a drawing that would otherwise sprawl.
+    pub strong_gravity: bool,
+    /// LinLog mode: attraction becomes `ln(1 + d)`, which separates clusters more
+    /// distinctly at the cost of the cross-platform determinism note above.
+    pub lin_log: bool,
+    /// Barnes–Hut opening angle; see [`LayoutParams::theta`].
+    pub theta: f32,
+    /// How much node "swinging" is tolerated before the global step size is cut.
+    /// The paper's `tau`. Larger converges faster and shakes more.
+    pub jitter_tolerance: f32,
+    pub seed: Option<u64>,
+}
+
+impl Default for Fa2Params {
+    fn default() -> Self {
+        Fa2Params {
+            iterations: 300,
+            k: 1.0,
+            gravity: 1.0,
+            strong_gravity: false,
+            lin_log: false,
+            theta: 0.5,
+            jitter_tolerance: 1.0,
             seed: None,
         }
     }
@@ -97,141 +162,6 @@ fn seed_positions(n: usize, k: f32, seed: u64) -> Positions {
     (x, y)
 }
 
-/// A uniform bucketing of the current positions, rebuilt each iteration.
-struct Grid {
-    cols: usize,
-    rows: usize,
-    cell: f32,
-    min_x: f32,
-    min_y: f32,
-    /// Prefix-summed cell offsets into `items`; length `cols * rows + 1`.
-    starts: Vec<u32>,
-    items: Vec<u32>,
-    /// Per-cell centre of mass and population, for the far-field approximation.
-    sum_x: Vec<f32>,
-    sum_y: Vec<f32>,
-    count: Vec<f32>,
-}
-
-impl Grid {
-    /// Counting sort, the same two-pass shape as the CSR build — and, like it,
-    /// chosen partly because a fixed bucket order is what makes the summation
-    /// below reproducible.
-    fn build(x: &[f32], y: &[f32], k: f32) -> Grid {
-        let n = x.len();
-        let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
-        let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for i in 0..n {
-            min_x = min_x.min(x[i]);
-            max_x = max_x.max(x[i]);
-            min_y = min_y.min(y[i]);
-            max_y = max_y.max(y[i]);
-        }
-        // A cell about two ideal edge-lengths across: big enough that most pairs
-        // fall in the far field, small enough that the near field stays local.
-        let cell = (k * 2.0).max(1e-4);
-        let cols = (((max_x - min_x) / cell).ceil() as usize + 1).clamp(1, 4096);
-        let rows = (((max_y - min_y) / cell).ceil() as usize + 1).clamp(1, 4096);
-
-        let cell_of = |i: usize| -> usize {
-            let cx = (((x[i] - min_x) / cell) as usize).min(cols - 1);
-            let cy = (((y[i] - min_y) / cell) as usize).min(rows - 1);
-            cy * cols + cx
-        };
-
-        let mut starts = vec![0u32; cols * rows + 1];
-        for i in 0..n {
-            starts[cell_of(i) + 1] += 1;
-        }
-        for c in 0..cols * rows {
-            starts[c + 1] += starts[c];
-        }
-        let mut cursor = starts[..cols * rows].to_vec();
-        let mut items = vec![0u32; n];
-        let mut sum_x = vec![0.0f32; cols * rows];
-        let mut sum_y = vec![0.0f32; cols * rows];
-        let mut count = vec![0.0f32; cols * rows];
-        for i in 0..n {
-            let c = cell_of(i);
-            items[cursor[c] as usize] = i as u32;
-            cursor[c] += 1;
-            sum_x[c] += x[i];
-            sum_y[c] += y[i];
-            count[c] += 1.0;
-        }
-        Grid {
-            cols,
-            rows,
-            cell,
-            min_x,
-            min_y,
-            starts,
-            items,
-            sum_x,
-            sum_y,
-            count,
-        }
-    }
-
-    #[inline]
-    fn coords(&self, xi: f32, yi: f32) -> (usize, usize) {
-        (
-            (((xi - self.min_x) / self.cell) as usize).min(self.cols - 1),
-            (((yi - self.min_y) / self.cell) as usize).min(self.rows - 1),
-        )
-    }
-}
-
-/// Repulsive force on node `i` from every other node.
-///
-/// Near cells (the 3×3 neighbourhood) contribute exactly, node by node; every
-/// other occupied cell contributes once, through its centre of mass weighted by
-/// its population. That is the Barnes–Hut bargain at a single fixed level of
-/// detail — and the reason a quadtree eventually wins, since it can choose the
-/// level per region instead of taking one for the whole graph.
-///
-/// The order of summation is fixed by the grid's layout, not by thread
-/// scheduling, so the result is reproducible.
-#[inline]
-fn repulse(grid: &Grid, x: &[f32], y: &[f32], i: usize, k2: f32) -> (f32, f32) {
-    let (xi, yi) = (x[i], y[i]);
-    let (cx, cy) = grid.coords(xi, yi);
-    let (mut fx, mut fy) = (0.0f32, 0.0f32);
-
-    for gy in 0..grid.rows {
-        for gx in 0..grid.cols {
-            let c = gy * grid.cols + gx;
-            if grid.count[c] == 0.0 {
-                continue;
-            }
-            let near = gx.abs_diff(cx) <= 1 && gy.abs_diff(cy) <= 1;
-            if near {
-                for s in grid.starts[c]..grid.starts[c + 1] {
-                    let j = grid.items[s as usize] as usize;
-                    if j == i {
-                        continue;
-                    }
-                    let (dx, dy) = (xi - x[j], yi - y[j]);
-                    // Floored so two coincident nodes get a large but finite push
-                    // rather than an infinity that poisons every later iteration.
-                    let d2 = (dx * dx + dy * dy).max(1e-4);
-                    let f = k2 / d2;
-                    fx += dx * f;
-                    fy += dy * f;
-                }
-            } else {
-                let m = grid.count[c];
-                let (dx, dy) = (xi - grid.sum_x[c] / m, yi - grid.sum_y[c] / m);
-                let d2 = (dx * dx + dy * dy).max(1e-4);
-                let f = k2 * m / d2;
-                fx += dx * f;
-                fy += dy * f;
-            }
-        }
-    }
-    (fx, fy)
-}
-
 /// Fruchterman–Reingold layout: `(x, y)` per node, dense-indexed.
 ///
 /// A `mask` restricts the attractive forces to the kept edges, so a subgraph view
@@ -255,18 +185,32 @@ pub fn layout_fr(topo: &Topology, mask: Option<&EdgeMask>, params: LayoutParams)
     let adj: &UndirectedCsr = view.get();
 
     let k2 = k * k;
+    // Mass is population here: FR's repulsion does not care about degree, so a
+    // cell's pull is proportional to how many nodes it holds.
+    let mass = unit_weights(n);
     // Start displacing by a tenth of the drawing's extent and cool linearly to
     // nothing, so early iterations rearrange freely and late ones only settle.
     let t0 = k * (n as f32).sqrt() * 0.1;
 
     for it in 0..params.iterations {
-        let grid = Grid::build(&x, &y, k);
+        let tree = QuadTree::build(&x, &y, &mass);
         let temp = t0 * (1.0 - it as f32 / params.iterations as f32).max(0.0);
 
         let step: Vec<(f32, f32)> = (0..n)
             .into_par_iter()
-            .map(|i| {
-                let (mut fx, mut fy) = repulse(&grid, &x, &y, i, k2);
+            .map_init(traversal_stack, |stack, i| {
+                // Inverse-square repulsion, `m` being either one node's weight or
+                // a whole cell's aggregate — the tree decides which, the law does
+                // not need to know.
+                let (mut fx, mut fy) =
+                    tree.accumulate(&x, &y, &mass, i, params.theta, stack, |dx, dy, m| {
+                        // Floored so two coincident nodes get a large but finite
+                        // push rather than an infinity that poisons every later
+                        // iteration.
+                        let d2 = (dx * dx + dy * dy).max(1e-4);
+                        let f = k2 * m / d2;
+                        (dx * f, dy * f)
+                    });
 
                 // Attraction, gathered: node i walks its own neighbours. The
                 // scatter form (iterate edges, push to both ends) is what makes a
@@ -299,6 +243,151 @@ pub fn layout_fr(topo: &Topology, mask: Option<&EdgeMask>, params: LayoutParams)
             x[i] += step[i].0;
             y[i] += step[i].1;
         }
+    }
+
+    center(&mut x, &mut y);
+    (x, y)
+}
+
+/// ForceAtlas2 layout: `(x, y)` per node, dense-indexed.
+///
+/// The default force-directed layout for a graph you actually want to look at.
+/// See [`Fa2Params`] for what it does differently from [`layout_fr`]; the short
+/// version is that hubs repel by degree and the step size tunes itself.
+///
+/// A `mask` restricts attraction to the kept edges, exactly as in [`layout_fr`] —
+/// note that it also changes the *degrees*, and therefore the repulsion, because
+/// in a subgraph a node's degree is its degree in that subgraph.
+pub fn layout_fa2(topo: &Topology, mask: Option<&EdgeMask>, params: Fa2Params) -> Positions {
+    let n = topo.n_nodes();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let k = params.k.max(1e-4);
+    let (mut x, mut y) = seed_positions(n, k, params.seed.unwrap_or(DEFAULT_SEED));
+    if n == 1 {
+        return (x, y);
+    }
+
+    let view = undirected_view(topo, mask);
+    let adj: &UndirectedCsr = view.get();
+
+    // The mass that makes ForceAtlas2 what it is: `deg + 1`, so a hub pushes
+    // proportionally to what it anchors and an isolated node still pushes a
+    // little. The `+ 1` is not cosmetic — at mass 0 a degree-0 node would neither
+    // repel nor be repelled, and would sit wherever it was seeded, on top of
+    // whatever else is there.
+    let mass: Vec<f32> = (0..n).map(|i| 1.0 + adj.degree(i as u32) as f32).collect();
+
+    // Previous-iteration force per node, for the swing/traction measure below.
+    let mut prev: Vec<(f32, f32)> = vec![(0.0, 0.0); n];
+    // The paper's global speed, carried across iterations and adjusted by at most
+    // 50% per step so one bad iteration cannot destabilise the run.
+    let mut speed = 1.0f32;
+
+    for _ in 0..params.iterations {
+        let tree = QuadTree::build(&x, &y, &mass);
+
+        let forces: Vec<(f32, f32)> = (0..n)
+            .into_par_iter()
+            .map_init(traversal_stack, |stack, i| {
+                let mi = mass[i];
+                // Repulsion: k · mᵢ · mⱼ / d, as a vector k·mᵢ·mⱼ·d⃗/d². Note the
+                // 1/d magnitude, not FR's 1/d² — ForceAtlas2's repulsion decays
+                // more slowly, which is what spreads a large graph out instead of
+                // packing it into a disc.
+                let (mut fx, mut fy) =
+                    tree.accumulate(&x, &y, &mass, i, params.theta, stack, |dx, dy, mj| {
+                        let d2 = (dx * dx + dy * dy).max(1e-4);
+                        let f = k * mi * mj / d2;
+                        (dx * f, dy * f)
+                    });
+
+                // Attraction, gathered — same reason as everywhere else in this
+                // crate. Linear in distance by default: the force vector is just
+                // the displacement, which is why there is no division here.
+                let (xi, yi) = (x[i], y[i]);
+                for &j in adj.neighbors(i as u32) {
+                    let j = j as usize;
+                    let (dx, dy) = (xi - x[j], yi - y[j]);
+                    if params.lin_log {
+                        let d = (dx * dx + dy * dy).sqrt().max(1e-4);
+                        // ln(1+d) magnitude along the unit vector. The one
+                        // transcendental in this file, and the reason LinLog is
+                        // excluded from the cross-platform determinism claim.
+                        let f = (1.0 + d).ln() / d;
+                        fx -= dx * f;
+                        fy -= dy * f;
+                    } else {
+                        fx -= dx;
+                        fy -= dy;
+                    }
+                }
+
+                // Gravity: constant magnitude toward the origin, scaled by mass so
+                // a hub is not dragged around by its periphery. Strong gravity
+                // drops the 1/d and pulls proportionally to distance instead.
+                let dist = (xi * xi + yi * yi).sqrt().max(1e-4);
+                let g = if params.strong_gravity {
+                    params.gravity * mi
+                } else {
+                    params.gravity * mi / dist
+                };
+                fx -= xi * g;
+                fy -= yi * g;
+
+                (fx, fy)
+            })
+            .collect();
+
+        // The adaptive step. "Swing" is how much a node's force reversed since the
+        // last iteration — a node that keeps changing its mind is oscillating, not
+        // converging — and "traction" is how much of the force is doing useful
+        // work. Their ratio sets the global step size.
+        //
+        // Both sums run serially in index order. This is the one place a parallel
+        // reduction would be tempting and it is exactly where it would break
+        // reproducibility, since the result feeds back into every node's step.
+        let (mut swing_total, mut traction_total) = (0.0f32, 0.0f32);
+        for i in 0..n {
+            let (fx, fy) = forces[i];
+            let (px, py) = prev[i];
+            let swing = ((fx - px).powi(2) + (fy - py).powi(2)).sqrt();
+            let traction = (((fx + px) * 0.5).powi(2) + ((fy + py) * 0.5).powi(2)).sqrt();
+            swing_total += mass[i] * swing;
+            traction_total += mass[i] * traction;
+        }
+
+        let target = if swing_total > 0.0 {
+            params.jitter_tolerance * traction_total / swing_total
+        } else {
+            // Nothing swung, which happens on iteration one (prev is zero) and at
+            // convergence. Keep the current speed rather than dividing by zero.
+            speed
+        };
+        // Rise by at most 50% per iteration. Falling is unconstrained: an
+        // unstable layout should be able to slam the brakes immediately.
+        speed = if target > speed * 1.5 {
+            speed * 1.5
+        } else {
+            target.max(1e-6)
+        };
+
+        for i in 0..n {
+            let (fx, fy) = forces[i];
+            let swing = ((fx - prev[i].0).powi(2) + (fy - prev[i].1).powi(2)).sqrt();
+            // Per-node damping: a node that is swinging takes a smaller step than
+            // one moving steadily, even though both see the same global speed.
+            let factor = speed / (1.0 + speed * swing.sqrt());
+            // Cap the displacement so an outlier force cannot fling a node across
+            // the drawing, which FR handles with its cooling schedule instead.
+            let mag = (fx * fx + fy * fy).sqrt().max(1e-6);
+            let capped = (factor * mag).min(10.0 * k) / mag;
+            x[i] += fx * capped;
+            y[i] += fy * capped;
+        }
+
+        prev = forces;
     }
 
     center(&mut x, &mut y);
@@ -478,6 +567,212 @@ mod tests {
         );
         assert!(p.0.iter().all(|v| v.is_finite()));
         assert!(p.1.iter().all(|v| v.is_finite()));
+    }
+
+    // --- ForceAtlas2 -------------------------------------------------------
+
+    #[test]
+    fn fa2_handles_empty_and_singleton_graphs() {
+        let empty = Topology::build(0, vec![], vec![]);
+        assert_eq!(layout_fa2(&empty, None, Fa2Params::default()).0.len(), 0);
+        let one = Topology::build(1, vec![], vec![]);
+        let p = layout_fa2(&one, None, Fa2Params::default());
+        assert_eq!(p.0.len(), 1);
+        assert!(p.0[0].is_finite() && p.1[0].is_finite());
+    }
+
+    #[test]
+    fn fa2_positions_are_all_finite() {
+        // The adaptive step divides by a swing measure and by a force magnitude;
+        // either can be zero at convergence, and one NaN silently voids the
+        // whole drawing.
+        for params in [
+            Fa2Params::default(),
+            Fa2Params {
+                lin_log: true,
+                ..Fa2Params::default()
+            },
+            Fa2Params {
+                strong_gravity: true,
+                ..Fa2Params::default()
+            },
+            Fa2Params {
+                gravity: 0.0,
+                ..Fa2Params::default()
+            },
+        ] {
+            let p = layout_fa2(&barbell(), None, params);
+            assert!(
+                p.0.iter().chain(p.1.iter()).all(|v| v.is_finite()),
+                "non-finite position under {params:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fa2_puts_connected_nodes_closer_than_unconnected_ones() {
+        let p = layout_fa2(&barbell(), None, Fa2Params::default());
+        assert!(
+            dist(&p, 0, 1) < dist(&p, 0, 5),
+            "adjacent {} should be nearer than distant {}",
+            dist(&p, 0, 1),
+            dist(&p, 0, 5)
+        );
+    }
+
+    #[test]
+    fn fa2_reproduces_a_layout_from_a_seed() {
+        let params = Fa2Params {
+            seed: Some(11),
+            ..Fa2Params::default()
+        };
+        let a = layout_fa2(&barbell(), None, params);
+        let b = layout_fa2(&barbell(), None, params);
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+    }
+
+    #[test]
+    fn fa2_pushes_hubs_further_out_than_fr_does() {
+        // The defining behavioural difference, and the reason ForceAtlas2 exists.
+        // A star: one hub, many leaves. Degree-weighted repulsion gives the hub a
+        // mass of `deg+1` and so a wide berth; FR treats it as one more node and
+        // lets the leaves crowd it.
+        //
+        // Measured as the hub's mean distance to its leaves, relative to the
+        // drawing's own scale — otherwise this only compares the two kernels'
+        // arbitrary units.
+        let n = 40usize;
+        let src: Vec<u32> = (1..n as u32).collect();
+        let dst: Vec<u32> = vec![0; n - 1];
+        let topo = Topology::build(n, src, dst);
+
+        let spread = |p: &Positions| -> f32 {
+            let mean_hub: f32 = (1..n).map(|i| dist(p, 0, i)).sum::<f32>() / (n - 1) as f32;
+            // The drawing's radius, as the normaliser.
+            let radius = (1..n)
+                .map(|i| (p.0[i] * p.0[i] + p.1[i] * p.1[i]).sqrt())
+                .fold(0.0f32, f32::max)
+                .max(1e-6);
+            mean_hub / radius
+        };
+
+        let fa2 = layout_fa2(
+            &topo,
+            None,
+            Fa2Params {
+                seed: Some(1),
+                ..Fa2Params::default()
+            },
+        );
+        let fr = layout_fr(
+            &topo,
+            None,
+            LayoutParams {
+                seed: Some(1),
+                ..LayoutParams::default()
+            },
+        );
+        assert!(
+            spread(&fa2) > spread(&fr),
+            "fa2 relative hub distance {} should exceed fr's {}",
+            spread(&fa2),
+            spread(&fr)
+        );
+    }
+
+    #[test]
+    fn fa2_strong_gravity_tightens_the_drawing() {
+        let params = Fa2Params {
+            seed: Some(2),
+            ..Fa2Params::default()
+        };
+        let loose = layout_fa2(&barbell(), None, params);
+        let tight = layout_fa2(
+            &barbell(),
+            None,
+            Fa2Params {
+                strong_gravity: true,
+                ..params
+            },
+        );
+        let extent = |p: &Positions| {
+            p.0.iter()
+                .zip(p.1.iter())
+                .map(|(a, b)| (a * a + b * b).sqrt())
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            extent(&tight) < extent(&loose),
+            "strong gravity extent {} should be under {}",
+            extent(&tight),
+            extent(&loose)
+        );
+    }
+
+    #[test]
+    fn fa2_lin_log_changes_the_drawing() {
+        // Not a quality claim — just that the flag is wired through to the force
+        // law rather than accepted and dropped.
+        let params = Fa2Params {
+            seed: Some(4),
+            ..Fa2Params::default()
+        };
+        let linear = layout_fa2(&barbell(), None, params);
+        let log = layout_fa2(
+            &barbell(),
+            None,
+            Fa2Params {
+                lin_log: true,
+                ..params
+            },
+        );
+        assert_ne!(linear.0, log.0);
+    }
+
+    #[test]
+    fn fa2_honours_an_edge_mask() {
+        let topo = barbell();
+        let full = layout_fa2(&topo, None, Fa2Params::default());
+        let mask = EdgeMask::from_bools(&[true, true, true, false, true, true, true]);
+        let cut = layout_fa2(&topo, Some(&mask), Fa2Params::default());
+        assert_ne!(full.0, cut.0);
+        assert!(cut.0.iter().chain(cut.1.iter()).all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn fa2_result_is_centred() {
+        let p = layout_fa2(&barbell(), None, Fa2Params::default());
+        let mx: f32 = p.0.iter().sum::<f32>() / 6.0;
+        assert!(mx.abs() < 1e-3, "x mean {mx}");
+    }
+
+    #[test]
+    fn theta_changes_the_result_but_not_its_shape() {
+        // theta trades accuracy for speed, so exact positions must differ — but
+        // the layout must still be a layout at the loose end, or the default is
+        // buying speed with nonsense.
+        let topo = barbell();
+        let exact = layout_fa2(
+            &topo,
+            None,
+            Fa2Params {
+                theta: 0.0,
+                seed: Some(5),
+                ..Fa2Params::default()
+            },
+        );
+        let approx = layout_fa2(
+            &topo,
+            None,
+            Fa2Params {
+                theta: 1.2,
+                seed: Some(5),
+                ..Fa2Params::default()
+            },
+        );
+        assert_ne!(exact.0, approx.0);
+        assert!(dist(&approx, 0, 1) < dist(&approx, 0, 5));
     }
 
     #[test]

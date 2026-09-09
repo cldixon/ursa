@@ -163,7 +163,7 @@ These came out of design discussion and are not up for re-derivation:
 |---|---|---|
 | 1 | **The instrument v0 + anywidget wrapper.** TS renderer: pan/zoom/hover/drag, small-graph spring sim, plate+sky theming, stretch/ramp via the shared token package. `ur.plot` returns it in notebooks. | No server, no Rust changes beyond plumbing data out. Daily-touch surface lands first. |
 | 2 | **Docs snippet tabs.** Instantiate the renderer in the Astro site with build-time-computed (real Ursa) Arrow data. | Small, hugely visible, dogfoods library + renderer. |
-| 3 | **Rust layout kernels.** `layout_fa2` (Barnes–Hut, LinLog, gravity, weight influence), `layout_fr`, `layout_random`/`layout_circle`; positions as columns; static export path. | The benchmark story ("million-node layout in seconds"). Feeds precomputed positions to every surface. **Partly landed** (#141): `layout_fr`, `layout_random` and `layout_circle` ship, positions are ordinary columns, and the site's figures are laid out by the engine. `layout_fa2` is what remains, and with it the benchmark claim — `layout_fr`'s repulsion is a uniform grid, which cannot subdivide where the nodes actually are; Barnes–Hut replaces exactly one function, `repulse`. |
+| 3 | **Rust layout kernels.** `layout_fa2` (Barnes–Hut, LinLog, gravity, weight influence), `layout_fr`, `layout_random`/`layout_circle`; positions as columns; static export path. | **Landed** (#141, #142). All four kernels ship, positions are ordinary columns, and both force models run over a Barnes–Hut quadtree at ~2.1× per doubling. The site's figures are laid out by `layout_fa2`. Two things did *not* land: **edge-weight influence** on attraction (needs a weighted undirected adjacency the core does not build), and the benchmark row against NetworkX/igraph. See `VIZ_VISION.md` for what the performance is actually measured at — the original "million nodes in seconds" was too generous and has been corrected. |
 | 4 | **The explorer.** axum server, Arrow IPC over websocket, expand/filter/select compiled to expressions, Python round-trip (`session.selection()` / `.highlight()`), then the LOD ladder (sampling → metagraph → drill-down). | The flagship; wire protocol per `VIZ_VISION.md` §Tier 2 architecture. Its engine prerequisites (#114, #116) have **landed** — see §Engine dependencies. |
 | 5 | **WASM / publish.** Per `VIZ_VISION.md` §Tier 3, sober notes included there. | |
 
@@ -286,11 +286,19 @@ vocabulary:
   to a neighbourhood around the dragged node. Same user-visible property, and
   it is actually buildable.
 
-- **Barnes–Hut is the one genuinely new computational shape.** Every existing
+- **Barnes–Hut was the one genuinely new computational shape.** Every other
   kernel is a CSR sweep in one of the spec's four shapes; FA2 repulsion adds a
-  spatial quadtree rebuilt per iteration. Well-trodden (the FA2 paper, Gephi's
-  implementation, existing Rust crates as prior art) but there is no GAP
-  reference implementation to port — budget accordingly.
+  spatial quadtree rebuilt per iteration, and there was no GAP reference
+  implementation to port. Landed in #142 as `ursa-core/src/algo/quadtree.rs`.
+
+  Two things about it were not obvious going in, and both are worth knowing
+  before touching it. First, **the textbook build is unusable here**: inserting
+  nodes one at a time makes the tree's shape depend on insertion order, which
+  would forfeit the determinism guarantee every other kernel carries. It is built
+  from a Morton sort instead, which makes the shape a pure function of the
+  positions. Second, **the approximation needs an oracle in the tests**: a
+  quadtree that is subtly wrong still draws a plausible picture, so `theta = 0`
+  (accept nothing, degenerate to exact all-pairs) is checked against brute force.
 
 - **Interaction latency (step 4).** The server holds `Arc` refs to live
   frames, so the topology index survives across interactions per the
