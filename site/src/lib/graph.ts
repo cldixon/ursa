@@ -1,6 +1,13 @@
 /**
  * A small graph, generated and measured at build time.
  *
+ * **This is on its way out.** Computing PageRank in TypeScript, in the
+ * documentation of a library whose job is PageRank, means every number here is
+ * plausible rather than true. `site/fixtures/generate.py` runs the real engine and
+ * commits the answer; the instrument page already reads that fixture, and these
+ * landing-page figures are the remaining holdout — they are hand-tuned visuals, so
+ * converting them is its own change rather than a rider on the pipeline.
+ *
  * The sky figure is a specimen of the rendering conventions, not a screenshot of
  * something that does not exist yet — so the numbers in its caption and its
  * detection overlay are computed here, from the graph actually drawn, rather

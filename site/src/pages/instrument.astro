@@ -7,39 +7,22 @@
  * grounds — while the design is still being settled. The controls are the knobs
  * that decision needs, not a product feature.
  *
- * Linked from the roadmap page, not the header navigation: it is a working
- * surface, not documentation. It becomes the docs
- * snippet tabs (`docs/VIZ_HANDOFF.md` step 2) once the figures come from real
- * Ursa output; today the graph is generated at build time by the site's own
- * TypeScript — the same generator that draws the landing-page figures.
+ * Linked from the roadmap, not the header navigation: it is a working surface,
+ * not documentation.
  *
- * That generator is the duplication the handoff wants deleted: it computes
- * PageRank in TypeScript, which is Ursa's own job. It stays for now because the
- * fixture pipeline (Ursa runs in CI, Arrow buffers land in `site/`) is its own
- * change. What is *not* provisional is everything below the data: the component,
- * the mount, the hydration shape. Those are what step 2 keeps.
+ * **Every number here is Ursa's.** Degree, PageRank and the communities are
+ * computed by the engine in `site/fixtures/generate.py` and committed as a
+ * fixture; CI regenerates and fails if the committed file drifts. The one
+ * exception is the layout — Ursa has no layout kernel yet (`layout_fa2`, blocked
+ * on the multi-output half of #115) — and the generator marks the single call
+ * that will change when it lands.
  */
 import Base from '../layouts/Base.astro';
-import { preferentialAttachment } from '../lib/graph';
+import lesmis from '../fixtures/lesmis.json';
 
-// Built once, at build time, with a fixed seed: the same graph every deploy, so a
-// visual change between two previews is a change in the renderer and not a
-// reshuffled graph.
-const W = 1000;
-const H = 700;
-const graph = preferentialAttachment({ seed: 20260908, n: 420, m: 2, width: W, height: H });
-
-// Serialized flat, in the shape the instrument consumes: parallel arrays and
-// dense u32 index pairs, matching the wire protocol the explorer will use.
-const payload = {
-  x: graph.nodes.map((n) => n.x - W / 2),
-  // Flip into world space, where y increases upward; the generator lays out in
-  // screen coordinates.
-  y: graph.nodes.map((n) => H / 2 - n.y),
-  degree: graph.nodes.map((n) => n.degree),
-  pagerank: graph.nodes.map((n) => n.pagerank),
-  edges: graph.edges.flatMap((e) => [e.s, e.d]),
-};
+const nodeCount = lesmis.ids.length;
+const edgeCount = lesmis.edges.length / 2;
+const communityCount = new Set(lesmis.community).size;
 ---
 
 <Base
@@ -50,8 +33,8 @@ const payload = {
     <header class="head">
       <h1>Instrument</h1>
       <p class="sub">
-        {graph.nodes.length} nodes · {graph.edges.length} edges · drag to pan, scroll to zoom,
-        hover a node
+        {lesmis.title} · {nodeCount} characters · {edgeCount} co-occurrences · {communityCount}
+        communities · every value computed by Ursa
       </p>
     </header>
 
@@ -68,7 +51,7 @@ const payload = {
         <select id="colour">
           <option value="pagerank">pagerank (continuous)</option>
           <option value="degree">degree (continuous)</option>
-          <option value="community">community (categorical)</option>
+          <option value="community">louvain community (categorical)</option>
         </select>
       </label>
       <label>
@@ -80,6 +63,7 @@ const payload = {
         </select>
       </label>
       <button id="fit" type="button">Fit</button>
+      <span class="hint">drag to pan · scroll to zoom · hover a node</span>
       <span class="note" id="note"></span>
     </div>
 
@@ -89,30 +73,22 @@ const payload = {
     </div>
   </section>
 
-  <script is:inline type="application/json" id="graph-data" set:html={JSON.stringify(payload)} />
-
   <script>
     import { createInstrument, type Channel, type StretchName } from '@ursa/viz';
+    // The fixture Ursa produced. Imported, not fetched: Astro inlines it into the
+    // page bundle, so the figure needs no request of its own.
+    import data from '../fixtures/lesmis.json';
 
-    const raw = document.getElementById('graph-data')?.textContent ?? '{}';
-    const data = JSON.parse(raw) as {
-      x: number[];
-      y: number[];
-      degree: number[];
-      pagerank: number[];
-      edges: number[];
-    };
-
+    const ids: string[] = data.ids;
     const x = Float32Array.from(data.x);
     const y = Float32Array.from(data.y);
     const degree = Float32Array.from(data.degree);
     const pagerank = Float32Array.from(data.pagerank);
     const edges = Uint32Array.from(data.edges);
-
-    // Stand-in for a real community detection: the point of this control is to
-    // exercise the *categorical* path and make the four-grey palette limit
-    // visible, which a synthetic partition does as well as a real one.
-    const community = Uint32Array.from(x, (_, i) => i % 6);
+    // Real communities, from Ursa's weighted Louvain over the co-occurrence
+    // weights — which is why the palette limit below is a genuine finding about
+    // this graph rather than an artefact of a synthetic partition.
+    const community = Uint32Array.from(data.community);
 
     const stage = document.getElementById('stage') as HTMLElement;
     const mount = document.getElementById('mount') as HTMLElement;
@@ -127,7 +103,7 @@ const payload = {
         }
         readout.hidden = false;
         readout.style.transform = `translate(${screenX}px, ${screenY}px)`;
-        readout.textContent = `node ${node} · deg ${degree[node]} · pr ${pagerank[node]!.toFixed(4)}`;
+        readout.textContent = `${ids[node]} · deg ${degree[node]} · pr ${pagerank[node]!.toFixed(4)}`;
       },
     });
 
@@ -153,7 +129,7 @@ const payload = {
       // coincidence. This is the open design question in the handoff.
       const n = instrument.categoryCount;
       note.textContent =
-        n > 4 ? `${n} categories, 4 flat greys — colours repeat past the fourth` : '';
+        n > 4 ? `${n} communities, 4 flat greys — colours repeat past the fourth` : '';
     }
 
     for (const id of ['colour', 'stretch']) {
@@ -219,6 +195,9 @@ const payload = {
   }
   .note {
     color: var(--paper-ramp-0);
+  }
+  .hint {
+    opacity: 0.65;
   }
   .stage {
     position: relative;
