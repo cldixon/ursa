@@ -70,6 +70,15 @@ pub enum GraphAlgo {
         iterations: u32,
         k: f64,
         gravity: f64,
+        /// Barnes-Hut opening angle. Ignored by `Random` and `Circle`, which have
+        /// no repulsion to approximate.
+        theta: f64,
+        /// ForceAtlas2 only: gravity proportional to distance rather than constant.
+        strong_gravity: bool,
+        /// ForceAtlas2 only: `ln(1 + d)` attraction instead of linear.
+        lin_log: bool,
+        /// ForceAtlas2 only: the paper's swing tolerance, `tau`.
+        jitter_tolerance: f64,
         seed: Option<u64>,
     },
 }
@@ -77,7 +86,11 @@ pub enum GraphAlgo {
 /// Which layout to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutKind {
-    /// Fruchterman–Reingold, grid-accelerated.
+    /// ForceAtlas2 with a Barnes-Hut quadtree — degree-weighted repulsion and an
+    /// adaptive step. The default worth reaching for on a real graph.
+    Fa2,
+    /// Fruchterman–Reingold, also Barnes-Hut accelerated. The simpler force model:
+    /// quadratic attraction, unweighted repulsion, a fixed cooling schedule.
     Fr,
     /// A deterministic spread — the trivial layout, and what the others seed from.
     Random,

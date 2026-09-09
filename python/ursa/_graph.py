@@ -350,30 +350,92 @@ def louvain(
 # lake is a workflow, not a workaround.
 
 
-def layout_fr(
+def layout_fa2(
     edges: EdgeFrame,
     iterations: int = 300,
     k: float = 1.0,
-    gravity: float = 0.02,
+    gravity: float = 1.0,
+    strong_gravity: bool = False,
+    lin_log: bool = False,
+    theta: float = 0.5,
+    jitter_tolerance: float = 1.0,
     seed: int | None = None,
 ) -> LayoutExpr:
-    """Fruchterman-Reingold layout; ``(x, y)`` as two ``f32`` columns.
+    """ForceAtlas2 layout; ``(x, y)`` as two ``f32`` columns.
 
-    ``k`` is the ideal edge length and sets the units the result comes out in;
-    ``gravity`` pulls the drawing toward the origin, which is what keeps
-    disconnected components in one picture instead of repelling forever.
+    The layout to reach for on a real graph. Three things distinguish it from
+    :func:`layout_fr`:
+
+    * **Repulsion is degree-weighted**, so a hub pushes proportionally to what it
+      anchors instead of being buried inside its own neighbourhood.
+    * **Attraction is linear** in distance rather than quadratic, so clusters stay
+      legible instead of collapsing.
+    * **The step size adapts** per node from how much each one is oscillating,
+      rather than following a fixed cooling schedule that has to suit the graph.
+
+    Repulsion is approximated with a Barnes-Hut quadtree, giving O(n log n) per
+    iteration. ``theta`` is the opening angle: smaller is more accurate and slower,
+    and ``0.0`` is exact all-pairs.
+
+    ``gravity`` pulls toward the origin so disconnected components stay in one
+    picture; ``strong_gravity`` makes that pull grow with distance, which tightens a
+    drawing that would otherwise sprawl. ``lin_log`` switches attraction to
+    ``ln(1 + d)``, separating clusters more distinctly.
 
     Deterministic: a given ``seed`` reproduces a layout exactly, and the result is
     bit-identical across thread counts. Select an axis with ``.x`` / ``.y``; both
     share one simulation.
 
-    Repulsion is grid-approximated — near cells exactly, far cells through their
-    centre of mass — which is right for evenly spread graphs and approximate for
-    violently clustered ones. ForceAtlas2 with a Barnes-Hut quadtree is the
-    successor.
+    .. note::
+       ``lin_log=True`` is reproducible on one machine but **not** guaranteed
+       bit-identical across platforms — it is the only mode that uses a
+       transcendental (``ln``), whose last bit is a libm implementation detail.
     """
     return _layout_expr(
-        "layout_fr", edges=edges, iterations=iterations, k=k, gravity=gravity, seed=seed
+        "layout_fa2",
+        edges=edges,
+        iterations=iterations,
+        k=k,
+        gravity=gravity,
+        strong_gravity=strong_gravity,
+        lin_log=lin_log,
+        theta=theta,
+        jitter_tolerance=jitter_tolerance,
+        seed=seed,
+    )
+
+
+def layout_fr(
+    edges: EdgeFrame,
+    iterations: int = 300,
+    k: float = 1.0,
+    gravity: float = 0.02,
+    theta: float = 0.5,
+    seed: int | None = None,
+) -> LayoutExpr:
+    """Fruchterman-Reingold layout; ``(x, y)`` as two ``f32`` columns.
+
+    The simpler force model: quadratic attraction, repulsion that ignores degree,
+    and a fixed cooling schedule. :func:`layout_fa2` is the better default on a real
+    graph; this one is easier to reason about and is the baseline the tests pin.
+
+    ``k`` is the ideal edge length and sets the units the result comes out in;
+    ``gravity`` pulls the drawing toward the origin, which is what keeps
+    disconnected components in one picture instead of repelling forever. ``theta``
+    is the Barnes-Hut opening angle, as in :func:`layout_fa2`.
+
+    Deterministic: a given ``seed`` reproduces a layout exactly, and the result is
+    bit-identical across thread counts. Select an axis with ``.x`` / ``.y``; both
+    share one simulation.
+    """
+    return _layout_expr(
+        "layout_fr",
+        edges=edges,
+        iterations=iterations,
+        k=k,
+        gravity=gravity,
+        theta=theta,
+        seed=seed,
     )
 
 
@@ -390,6 +452,6 @@ def layout_circle(edges: EdgeFrame, k: float = 1.0) -> LayoutExpr:
     """Nodes evenly spaced on a circle in id order; ``(x, y)`` as two columns.
 
     A baseline that is obviously not force-directed: if a figure looks the same
-    under this and under ``layout_fr``, the force layout did not run.
+    under this and under ``layout_fa2``, the force layout did not run.
     """
     return _layout_expr("layout_circle", edges=edges, k=k)

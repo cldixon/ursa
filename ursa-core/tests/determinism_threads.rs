@@ -19,7 +19,8 @@
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
-    betweenness, label_propagation, layout_fr, louvain, pagerank, LayoutParams, PageRankParams,
+    betweenness, label_propagation, layout_fa2, layout_fr, louvain, pagerank, Fa2Params,
+    LayoutParams, PageRankParams,
 };
 use ursa_core::Topology;
 
@@ -130,15 +131,24 @@ fn label_propagation_is_thread_count_independent() {
 
 /// Layout, across thread counts.
 ///
-/// The one kernel where determinism took deliberate design rather than falling
-/// out of the existing shape: the natural force formulation scatters (iterate
-/// edges, push to both endpoints), and a scatter's result depends on the order
-/// threads happen to write in. This kernel gathers instead, and rebuilds its
-/// spatial grid by counting sort so the summation order is fixed too. Exact
-/// equality, like every other kernel here — approximate equality would pass while
-/// the property silently rotted.
+/// The kernels where determinism took deliberate design rather than falling out of
+/// the existing shape. Three things had to be arranged for it, and each one is a
+/// property this test would catch the loss of:
+///
+/// 1. **Attraction gathers.** The natural force formulation scatters (iterate
+///    edges, push to both endpoints), and a scatter's result depends on the order
+///    threads happen to write in.
+/// 2. **The quadtree is a pure function of the positions.** Built from a Morton
+///    sort rather than by insertion, so its shape — and therefore the order
+///    repulsion is summed in — cannot depend on scheduling.
+/// 3. **ForceAtlas2's global reductions run serially**, in index order. They feed
+///    back into every node's step size, so a parallel reduction there would make
+///    the *whole* layout thread-dependent through one shared scalar.
+///
+/// Exact equality, like every other kernel here — approximate equality would pass
+/// while the property silently rotted.
 #[test]
-fn layout_is_thread_count_independent() {
+fn layout_fr_is_thread_count_independent() {
     let topo = seeded_graph(400, 1600);
     let params = LayoutParams {
         // Fewer iterations than the default: enough that any order dependence has
@@ -150,6 +160,46 @@ fn layout_is_thread_count_independent() {
     let baseline = on_pool(1, || layout_fr(&topo, None, params));
     for threads in [2, 3, 4, 8] {
         let got = on_pool(threads, || layout_fr(&topo, None, params));
+        assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
+        assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
+    }
+}
+
+#[test]
+fn layout_fa2_is_thread_count_independent() {
+    let topo = seeded_graph(400, 1600);
+    let params = Fa2Params {
+        iterations: 40,
+        seed: Some(99),
+        ..Fa2Params::default()
+    };
+    let baseline = on_pool(1, || layout_fa2(&topo, None, params));
+    for threads in [2, 3, 4, 8] {
+        let got = on_pool(threads, || layout_fa2(&topo, None, params));
+        assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
+        assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
+    }
+}
+
+/// LinLog mode, across thread counts.
+///
+/// Worth its own case because `ln` is the one transcendental in the force laws.
+/// It is *not* claimed to be bit-identical across platforms — libm's last bit is
+/// an implementation detail — but on one machine it must still be independent of
+/// the pool size, since that is a property of the summation order rather than of
+/// the function being summed.
+#[test]
+fn layout_fa2_lin_log_is_thread_count_independent() {
+    let topo = seeded_graph(300, 1200);
+    let params = Fa2Params {
+        iterations: 30,
+        lin_log: true,
+        seed: Some(3),
+        ..Fa2Params::default()
+    };
+    let baseline = on_pool(1, || layout_fa2(&topo, None, params));
+    for threads in [2, 4, 8] {
+        let got = on_pool(threads, || layout_fa2(&topo, None, params));
         assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
         assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
     }

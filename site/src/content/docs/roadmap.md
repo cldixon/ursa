@@ -77,6 +77,29 @@ That is one of three ways the engine can reach a view, and the easy one. The oth
 running in a notebook process behind `ur.plot`, and the engine compiled to WebAssembly in the
 browser — are still ahead. `docs/VIZ_VISION.md` and `docs/VIZ_HANDOFF.md` carry the design.
 
+### Layout is a kernel
+
+The positions come from `ur.layout_fa2` — ForceAtlas2 over a Barnes–Hut quadtree — because a
+force-directed layout is an iterative fixpoint over the CSR, the same computational shape as
+PageRank. It belongs beside the other kernels rather than in a rendering library, and its output is
+ordinary columns:
+
+```python
+positions = ur.layout_fa2(edges, iterations=300, seed=42)
+nodes.with_columns(x=positions.x, y=positions.y).sink_parquet("layout.parquet")
+```
+
+Naming both axes runs the simulation **once**. Positions filter, sort, join and persist like any
+other value, so caching a layout in the lake is a workflow rather than a workaround.
+
+Repulsion is O(n log n), measured at ~2.1× per doubling out to 128K nodes, and the result is
+bit-identical across thread counts for a given `seed`. `ur.layout_fr` (Fruchterman–Reingold) and the
+trivial `ur.layout_random` / `ur.layout_circle` are there too.
+
+What is not done: **edge-weight influence** on attraction, so a weighted graph does not yet draw its
+weights; and the benchmark row against NetworkX and igraph, which is what would turn the complexity
+claim into a comparison.
+
 ## Deferred, deliberately
 
 **Motif finding** — `ur.find("(a)-[e]->(b); ...")`, GraphFrames-style — is the first post-v0.1
