@@ -84,6 +84,45 @@ def _graph_expr(verb: str, **params: Any) -> GraphExpr:
     return GraphExpr("graph", {"verb": verb, **params})
 
 
+class LayoutExpr(GraphExpr):
+    """A layout — the first kernel that yields *two* columns from one run.
+
+    Positions are two plain ``f32`` columns rather than a struct, because struct
+    values and ``unnest`` do not exist in the dialect and a layout is a poor reason
+    to invent them. So a layout is selected one axis at a time::
+
+        nodes.with_columns(x=ur.layout_fr(edges).x, y=ur.layout_fr(edges).y)
+
+    Both spellings carry identical parameters, so the engine keys them to the same
+    computation and **runs the simulation once** (#115) — the two accessors pick
+    different outputs of one result, not two results.
+
+    Used bare it behaves like the other dual-positioned kernels, promoting to a
+    NodeFrame of ``(id, x, y)``.
+    """
+
+    def _axis(self, field: int) -> GraphExpr:
+        return GraphExpr("graph", {**self.payload, "field": field})
+
+    @property
+    def x(self) -> GraphExpr:
+        """The x column."""
+        return self._axis(0)
+
+    @property
+    def y(self) -> GraphExpr:
+        """The y column."""
+        return self._axis(1)
+
+    def _frame(self) -> NodeFrame:
+        edges = self.payload["edges"]
+        return edges.nodes().with_columns(x=self.x, y=self.y)
+
+
+def _layout_expr(verb: str, **params: Any) -> LayoutExpr:
+    return LayoutExpr("graph", {"verb": verb, **params})
+
+
 # --- traversal verbs (frame-valued) ----------------------------------------
 class _NeighborAgg:
     """Returned by ``ur.neighbors(edges)``; ``.agg(expr)`` closes it into an Expr.
@@ -301,3 +340,56 @@ def louvain(
 ) -> GraphExpr:
     """Community detection via Louvain modularity optimization."""
     return _graph_expr("louvain", edges=edges, weight=weight, resolution=resolution, seed=seed)
+
+
+# --- layout (multi-output) --------------------------------------------------
+# A force-directed layout is an iterative fixpoint over the CSR — the same
+# computational shape as PageRank — so it lives with the kernels rather than in a
+# rendering library, and positions come back as ordinary columns: filter them,
+# join them, `sink_parquet` them. Precomputing a layout once and caching it in the
+# lake is a workflow, not a workaround.
+
+
+def layout_fr(
+    edges: EdgeFrame,
+    iterations: int = 300,
+    k: float = 1.0,
+    gravity: float = 0.02,
+    seed: int | None = None,
+) -> LayoutExpr:
+    """Fruchterman-Reingold layout; ``(x, y)`` as two ``f32`` columns.
+
+    ``k`` is the ideal edge length and sets the units the result comes out in;
+    ``gravity`` pulls the drawing toward the origin, which is what keeps
+    disconnected components in one picture instead of repelling forever.
+
+    Deterministic: a given ``seed`` reproduces a layout exactly, and the result is
+    bit-identical across thread counts. Select an axis with ``.x`` / ``.y``; both
+    share one simulation.
+
+    Repulsion is grid-approximated — near cells exactly, far cells through their
+    centre of mass — which is right for evenly spread graphs and approximate for
+    violently clustered ones. ForceAtlas2 with a Barnes-Hut quadtree is the
+    successor.
+    """
+    return _layout_expr(
+        "layout_fr", edges=edges, iterations=iterations, k=k, gravity=gravity, seed=seed
+    )
+
+
+def layout_random(edges: EdgeFrame, k: float = 1.0, seed: int | None = None) -> LayoutExpr:
+    """A deterministic spread over a phyllotactic spiral; ``(x, y)`` as two columns.
+
+    No two nodes coincide, which is what makes it a safe starting point for a force
+    layout — two nodes at one point feel unbounded repulsion.
+    """
+    return _layout_expr("layout_random", edges=edges, k=k, seed=seed)
+
+
+def layout_circle(edges: EdgeFrame, k: float = 1.0) -> LayoutExpr:
+    """Nodes evenly spaced on a circle in id order; ``(x, y)`` as two columns.
+
+    A baseline that is obviously not force-directed: if a figure looks the same
+    under this and under ``layout_fr``, the force layout did not run.
+    """
+    return _layout_expr("layout_circle", edges=edges, k=k)

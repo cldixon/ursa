@@ -62,6 +62,27 @@ pub enum GraphAlgo {
         resolution: f64,
         seed: Option<u64>,
     },
+    /// Force-directed layout. The first kernel that emits **two** columns from one
+    /// invocation — an output column selects x or y through its `field`, and both
+    /// share a memo entry so the simulation runs once.
+    Layout {
+        kind: LayoutKind,
+        iterations: u32,
+        k: f64,
+        gravity: f64,
+        seed: Option<u64>,
+    },
+}
+
+/// Which layout to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    /// Fruchterman–Reingold, grid-accelerated.
+    Fr,
+    /// A deterministic spread — the trivial layout, and what the others seed from.
+    Random,
+    /// Evenly spaced on a circle, in dense index order.
+    Circle,
 }
 
 // The concrete logical nodes (`GraphAlgorithmNode`, `HopNode`, `ShortestPathNode`,

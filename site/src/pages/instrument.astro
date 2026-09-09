@@ -10,12 +10,11 @@
  * Linked from the roadmap, not the header navigation: it is a working surface,
  * not documentation.
  *
- * **Every number here is Ursa's.** Degree, PageRank and the communities are
- * computed by the engine in `site/fixtures/generate.py` and committed as a
- * fixture; CI regenerates and fails if the committed file drifts. The one
- * exception is the layout — Ursa has no layout kernel yet (`layout_fa2`, blocked
- * on the multi-output half of #115) — and the generator marks the single call
- * that will change when it lands.
+ * **Every number here is Ursa's, layout included.** Degree, PageRank, the
+ * communities and the positions are all computed by the engine in
+ * `site/fixtures/generate.py` and committed as a fixture; CI regenerates and
+ * fails if the committed file drifts. Nothing on this page computes a graph
+ * statistic in TypeScript.
  */
 import Base from '../layouts/Base.astro';
 import lesmis from '../fixtures/lesmis.json';
@@ -33,8 +32,7 @@ const communityCount = new Set(lesmis.community).size;
     <header class="head">
       <h1>Instrument</h1>
       <p class="sub">
-        {lesmis.title} · {nodeCount} characters · {edgeCount} co-occurrences · {communityCount}
-        communities · every value computed by Ursa
+        {`${lesmis.title} · ${nodeCount} characters · ${edgeCount} co-occurrences · ${communityCount} communities · every value computed by Ursa, layout included`}
       </p>
     </header>
 

@@ -18,7 +18,9 @@
 #![cfg(feature = "rayon")]
 
 use rayon::ThreadPoolBuilder;
-use ursa_core::algo::{betweenness, label_propagation, louvain, pagerank, PageRankParams};
+use ursa_core::algo::{
+    betweenness, label_propagation, layout_fr, louvain, pagerank, LayoutParams, PageRankParams,
+};
 use ursa_core::Topology;
 
 /// A deterministic pseudo-random directed graph via a hand-rolled LCG, so the test
@@ -123,5 +125,32 @@ fn label_propagation_is_thread_count_independent() {
             reference,
             "label propagation diverged at {threads} threads"
         );
+    }
+}
+
+/// Layout, across thread counts.
+///
+/// The one kernel where determinism took deliberate design rather than falling
+/// out of the existing shape: the natural force formulation scatters (iterate
+/// edges, push to both endpoints), and a scatter's result depends on the order
+/// threads happen to write in. This kernel gathers instead, and rebuilds its
+/// spatial grid by counting sort so the summation order is fixed too. Exact
+/// equality, like every other kernel here — approximate equality would pass while
+/// the property silently rotted.
+#[test]
+fn layout_is_thread_count_independent() {
+    let topo = seeded_graph(400, 1600);
+    let params = LayoutParams {
+        // Fewer iterations than the default: enough that any order dependence has
+        // compounded well past f32 rounding, few enough to keep the test quick.
+        iterations: 40,
+        seed: Some(99),
+        ..LayoutParams::default()
+    };
+    let baseline = on_pool(1, || layout_fr(&topo, None, params));
+    for threads in [2, 3, 4, 8] {
+        let got = on_pool(threads, || layout_fr(&topo, None, params));
+        assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
+        assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
     }
 }
