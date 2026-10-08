@@ -8,6 +8,7 @@ copyright = "Copyright &copy; 2026 Ursa contributors. MIT OR Apache-2.0."
 repo_url = "https://github.com/cldixon/ursa"
 repo_name = "cldixon/ursa"
 edit_uri = "edit/main/docs/"
+extra_css = ["stylesheets/extra.css"]
 
 nav = [
   { "Home" = "index.md" },
