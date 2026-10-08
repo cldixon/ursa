@@ -1,7 +1,7 @@
 name: Docs
 
 # The documentation site: Zensical builds docs/ into a static site, and GitHub
-# Pages serves it at https://ursa.cldixon.dev.
+# Pages serves it at https://cldixon.github.io/ursa/.
 #
 # Two jobs. `build` runs on every pull request that touches the docs and on every
 # push to main, in strict mode, so a broken link or a page missing from the nav
@@ -13,10 +13,9 @@ name: Docs
 # build never gates the docs. Nothing here needs the native extension; the pages
 # are markdown with their example output committed, so the build is seconds.
 #
-# One-time setup (repository Settings -> Pages): set Source to "GitHub Actions",
-# and set the custom domain to ursa.cldixon.dev (docs/CNAME carries the same
-# name so the setting survives a redeploy). DNS: a CNAME record from `ursa` to
-# `cldixon.github.io`.
+# One-time setup (repository Settings -> Pages): set Source to "GitHub Actions".
+# The site lives under the repository path, so `site_url` in zensical.toml
+# carries the /ursa/ prefix; there is no custom domain.
 
 on:
   push:

@@ -1,6 +1,6 @@
 [project]
 site_name = "Ursa"
-site_url = "https://ursa.cldixon.dev/"
+site_url = "https://cldixon.github.io/ursa/"
 site_description = "Polars-shaped dataframes for graph data. A Rust engine with a Python API."
 site_author = "Ursa contributors"
 copyright = "Copyright &copy; 2026 Ursa contributors. MIT OR Apache-2.0."

@@ -6,7 +6,7 @@ Ursa is a graph analytics library for Python. You write a query the way you writ
 
 There is no `Graph` object. An edge table *is* the graph. Every operation returns a table.
 
-**Documentation: <https://ursa.cldixon.dev>**
+**Documentation: <https://cldixon.github.io/ursa/>**
 
 ## Install
 
@@ -64,16 +64,16 @@ To run the same query over your own data, change the first line:
 edges = ur.scan_edges("edges.parquet", src="from_id", dst="to_id")
 ```
 
-Nothing after that line changes. See the [quickstart](https://ursa.cldixon.dev/quickstart/).
+Nothing after that line changes. See the [quickstart](https://cldixon.github.io/ursa/quickstart/).
 
 ## What it does
 
 - **A dataframe API.** `with_columns`, `filter`, `sort`, `select`, `group_by`, `join`. Lazy until `collect()`. If you know Polars, you know the shape.
 - **The standard algorithms.** Degree, PageRank, connected components, triangle count, clustering coefficient, closeness, betweenness, Louvain, label propagation. Each with a weighted form, where a weight is an expression over edge columns. Neighbour aggregation. Hops, shortest paths, and random walks.
 - **Your data, where it is.** Parquet and CSV, local or on S3, GCS, and Azure. Polars, pandas, pyarrow, NetworkX, NumPy, and SciPy in memory. Arrow in, Arrow out, with no copies.
-- **Results you can check.** Every kernel is deterministic on any thread count. Each one is [pinned to the NetworkX call it matches](https://ursa.cldixon.dev/semantics/), and the test suite checks it.
+- **Results you can check.** Every kernel is deterministic on any thread count. Each one is [pinned to the NetworkX call it matches](https://cldixon.github.io/ursa/semantics/), and the test suite checks it.
 
-Ursa is version 0.3 and in active development. The [Limits](https://ursa.cldixon.dev/limits/) page lists what does not run yet.
+Ursa is version 0.3 and in active development. The [Limits](https://cldixon.github.io/ursa/limits/) page lists what does not run yet.
 
 ## How it is built
 

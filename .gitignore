@@ -16,8 +16,9 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Documentation site build output (zensical build), never committed.
+# Documentation site: build output and zensical's cache, never committed.
 /site/
+/.cache/
 
 # Credentials.
 .env
