@@ -1,7 +1,3 @@
----
-icon: lucide/construction
----
-
 # Limits
 
 Ursa is version 0.3. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, `collect()` raises `NotImplementedError` with a message that says what to change. Nothing is dropped silently.

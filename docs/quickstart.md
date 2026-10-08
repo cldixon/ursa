@@ -1,7 +1,3 @@
----
-icon: lucide/rocket
----
-
 # Quickstart
 
 This page is one Python session. It uses a bundled dataset, so you need no files and no network. Each block runs on its own after the first one.

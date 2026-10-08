@@ -1,7 +1,3 @@
----
-icon: lucide/house
----
-
 # Ursa
 
 **Polars-shaped dataframes for graph data.**

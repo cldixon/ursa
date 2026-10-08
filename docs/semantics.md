@@ -1,7 +1,3 @@
----
-icon: lucide/scale
----
-
 # Semantics vs NetworkX
 
 Ursa's kernels make a small number of definitional choices. Most results match NetworkX exactly once you account for direction and normalization. A few differ by design. This page pins each kernel to the NetworkX call it matches.

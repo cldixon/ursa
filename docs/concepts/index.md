@@ -1,7 +1,3 @@
----
-icon: lucide/lightbulb
----
-
 # Concepts
 
 Ursa has a small model. Three ideas explain almost all of the API.

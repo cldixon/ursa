@@ -1,7 +1,3 @@
----
-icon: lucide/play
----
-
 # Get started
 
 Two pages take you from nothing to a working query.
