@@ -8,24 +8,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
-### Changed
-
-- The documentation site is rebuilt with [Zensical](https://zensical.org/) and
-  served by GitHub Pages at <https://cldixon.github.io/ursa/>, in place of the
-  custom Astro site at ursa.cldixon.dev on Cloudflare Workers. The content is new: a quickstart,
-  one guide per task, a reference, and a limits page. Every example on the site
-  runs in the test suite.
-- A query naming several graph algorithms now shares work across its columns
-  instead of recomputing per column. Two columns naming the same kernel with the
-  same parameters run it once — including the same kernel at two output dtypes,
-  since `dtype=` narrows on emit and so is not part of a computation's identity.
-  Separately, `triangle_count` and `clustering_coefficient` in one
-  `with_columns` now share the sorted-adjacency intersection pass they both rest
-  on, where previously each ran its own; over a subgraph view they also share the
-  masked undirected adjacency, which is rebuilt per use rather than cached. Values
-  are unchanged and bit-identical either way.
-
-## [0.3.0] — 2026-08-29
+## [0.3.0] — 2026-10-08
 
 ### Added
 
@@ -56,11 +39,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - `on_null="drop"` on edge inputs (`EdgeFrame`, `from_arrow`, `from_edgelist`,
   `scan_edges`, `read_edges`), which filters rows with a null `src` or `dst`
   and reports the dropped count as a warning. The default remains `"error"`.
-- Documentation site at <https://ursa.cldixon.dev>, including a semantics
-  reference that pins each kernel to the NetworkX call it is checked against.
+- Documentation site at <https://cldixon.github.io/ursa/>: a quickstart, one
+  guide per task, a reference, a limits page, and a semantics reference that
+  pins each kernel to the NetworkX call it is checked against. Every example
+  on the site runs in the test suite.
 
 ### Changed
 
+- A query naming several graph algorithms now shares work across its columns
+  instead of recomputing per column. Two columns naming the same kernel with the
+  same parameters run it once — including the same kernel at two output dtypes,
+  since `dtype=` narrows on emit and so is not part of a computation's identity.
+  Separately, `triangle_count` and `clustering_coefficient` in one
+  `with_columns` now share the sorted-adjacency intersection pass they both rest
+  on, where previously each ran its own; over a subgraph view they also share the
+  masked undirected adjacency, which is rebuilt per use rather than cached. Values
+  are unchanged and bit-identical either way.
 - `rayon` is now an on-by-default feature of the `ursa-core` crate. With it
   disabled the crate compiles for `wasm32-unknown-unknown`, single-threaded, and
   `rand`'s default features — and so `getrandom` — are dropped, since the
