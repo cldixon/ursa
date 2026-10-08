@@ -1,7 +1,5 @@
 ---
 icon: lucide/house
-hide:
-  - navigation
 ---
 
 # Ursa

@@ -12,6 +12,7 @@ edit_uri = "edit/main/docs/"
 nav = [
   { "Home" = "index.md" },
   { "Get started" = [
+    { "Overview" = "get-started/index.md" },
     { "Install" = "install.md" },
     { "Quickstart" = "quickstart.md" },
   ] },
@@ -20,6 +21,7 @@ nav = [
     { "Frames" = "concepts/frames.md" },
     { "Expressions" = "concepts/expressions.md" },
     { "Direction" = "concepts/direction.md" },
+    { "Semantics vs NetworkX" = "semantics.md" },
   ] },
   { "Guides" = [
     { "Overview" = "guides/index.md" },
@@ -42,10 +44,9 @@ nav = [
     { "Statistics" = "reference/statistics.md" },
     { "Datasets" = "reference/datasets.md" },
     { "Errors" = "reference/errors.md" },
+    { "Limits" = "limits.md" },
+    { "Changelog" = "changelog.md" },
   ] },
-  { "Semantics vs NetworkX" = "semantics.md" },
-  { "Limits" = "limits.md" },
-  { "Changelog" = "changelog.md" },
 ]
 
 [project.theme]
@@ -60,7 +61,6 @@ features = [
   "navigation.instant",
   "navigation.instant.prefetch",
   "navigation.path",
-  "navigation.sections",
   "navigation.top",
   "navigation.tracking",
   "search.highlight",
