@@ -1,7 +1,3 @@
----
-icon: lucide/book-open
----
-
 # Reference
 
 Every public name in `ursa`, grouped by role. The import convention on every page is `import ursa as ur`.

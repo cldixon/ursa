@@ -1,7 +1,3 @@
----
-icon: lucide/compass
----
-
 # Guides
 
 Each guide shows one task, with code that runs and the output it gives. The guides use the bundled datasets, so you can paste the code into a Python session with no files and no network.

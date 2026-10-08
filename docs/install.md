@@ -1,7 +1,3 @@
----
-icon: lucide/download
----
-
 # Install
 
 Ursa is a Python package with a compiled Rust core. The wheels on PyPI include the core, so you do not need a Rust toolchain.

@@ -1,0 +1,15 @@
+/* Sidebar sections: bold text instead of a caret toggle.
+ *
+ * Each section name links to its overview page, and opening any page in a
+ * section expands it, so the caret is redundant on desktop. Below the
+ * breakpoint the sidebar becomes a slide-out drawer that needs the toggle to
+ * open a section, so it stays there. */
+@media screen and (min-width: 76.25em) {
+  .md-nav--primary .md-nav__item--nested > .md-nav__container > label.md-nav__link {
+    display: none;
+  }
+
+  .md-nav--primary .md-nav__item--nested > .md-nav__container > a.md-nav__link {
+    font-weight: 700;
+  }
+}
