@@ -10,6 +10,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- The documentation site at <https://ursa.cldixon.dev> is rebuilt with
+  [Zensical](https://zensical.org/) and served by GitHub Pages, in place of the
+  custom Astro site on Cloudflare Workers. The content is new: a quickstart,
+  one guide per task, a reference, and a limits page. Every example on the site
+  runs in the test suite.
 - A query naming several graph algorithms now shares work across its columns
   instead of recomputing per column. Two columns naming the same kernel with the
   same parameters run it once — including the same kernel at two output dtypes,

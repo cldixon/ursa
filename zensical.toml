@@ -1,0 +1,133 @@
+[project]
+site_name = "Ursa"
+site_url = "https://ursa.cldixon.dev/"
+site_description = "Polars-shaped dataframes for graph data. A Rust engine with a Python API."
+site_author = "Ursa contributors"
+copyright = "Copyright &copy; 2026 Ursa contributors. MIT OR Apache-2.0."
+
+repo_url = "https://github.com/cldixon/ursa"
+repo_name = "cldixon/ursa"
+edit_uri = "edit/main/docs/"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Get started" = [
+    { "Install" = "install.md" },
+    { "Quickstart" = "quickstart.md" },
+  ] },
+  { "Concepts" = [
+    { "Overview" = "concepts/index.md" },
+    { "Frames" = "concepts/frames.md" },
+    { "Expressions" = "concepts/expressions.md" },
+    { "Direction" = "concepts/direction.md" },
+  ] },
+  { "Guides" = [
+    { "Overview" = "guides/index.md" },
+    { "Load data" = "guides/load-data.md" },
+    { "Compute graph metrics" = "guides/metrics.md" },
+    { "Use node attributes" = "guides/attributes.md" },
+    { "Traverse the graph" = "guides/traversals.md" },
+    { "Weight the edges" = "guides/weights.md" },
+    { "Work on a subgraph" = "guides/subgraphs.md" },
+    { "Shape the result" = "guides/relational.md" },
+    { "Summarize the graph" = "guides/statistics.md" },
+    { "Get the result out" = "guides/output.md" },
+  ] },
+  { "Reference" = [
+    { "Overview" = "reference/index.md" },
+    { "Frames" = "reference/frames.md" },
+    { "Input and output" = "reference/io.md" },
+    { "Algorithms" = "reference/algorithms.md" },
+    { "Expressions" = "reference/expressions.md" },
+    { "Statistics" = "reference/statistics.md" },
+    { "Datasets" = "reference/datasets.md" },
+    { "Errors" = "reference/errors.md" },
+  ] },
+  { "Semantics vs NetworkX" = "semantics.md" },
+  { "Limits" = "limits.md" },
+  { "Changelog" = "changelog.md" },
+]
+
+[project.theme]
+language = "en"
+features = [
+  "content.action.edit",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.tabs",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "search.suggest",
+  "toc.follow",
+]
+
+[project.theme.icon]
+logo = "lucide/paw-print"
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "black"
+accent = "amber"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "black"
+accent = "amber"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/cldixon/ursa"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/python"
+link = "https://pypi.org/project/ursa-graph/"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+pymdownx.betterem = {}
+pymdownx.details = {}
+pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
+pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.magiclink = {}
+pymdownx.smartsymbols = {}
+# `--8<--` includes resolve against the repository root, so a page can embed
+# a file that lives outside docs/ (the changelog page embeds ../CHANGELOG.md).
+pymdownx.snippets.base_path = ["."]
+pymdownx.snippets.check_paths = true
+pymdownx.superfences = {}
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true
+pymdownx.tilde = {}

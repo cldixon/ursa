@@ -1,8 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://ursa.cldixon.dev/sitemap-index.xml
-
-# Build artifacts and fonts carry content hashes; no need to crawl them.
-User-agent: *
-Disallow: /_astro/

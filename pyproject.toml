@@ -49,6 +49,7 @@ all = ["polars>=1.0", "networkx>=3.0", "numpy>=1.24", "scipy>=1.10"]
 [project.urls]
 Homepage = "https://ursa.cldixon.dev"
 Documentation = "https://ursa.cldixon.dev"
+Changelog = "https://ursa.cldixon.dev/changelog/"
 Repository = "https://github.com/cldixon/ursa"
 Issues = "https://github.com/cldixon/ursa/issues"
 
@@ -80,6 +81,13 @@ dev = [
 # `uv sync --group bench` opts in, so a plain `uv sync` (and CI's core jobs) stay
 # lean. rustworkx (a Rust/PyO3 core) is the honest "real bar"; networkx is the
 # correctness oracle / floor; typer+rich back the CLI.
+# The documentation site (docs/ + zensical.toml). `uv run zensical serve` previews
+# it; .github/workflows/docs.yml builds and deploys it with this same group.
+docs = [
+    # zensical needs 3.11+; the marker keeps `uv lock` resolvable for the 3.10
+    # floor the package itself supports. The docs workflow pins a newer Python.
+    "zensical>=0.0.68; python_version >= '3.11'",
+]
 bench = [
     "typer>=0.12",
     "rich>=13.0",

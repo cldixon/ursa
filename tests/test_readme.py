@@ -47,4 +47,4 @@ def test_readme_try_it_snippet_runs(capsys):
 
     out = capsys.readouterr().out
     assert "shape: (5," in out, "the snippet prints a 5-row preview"
-    assert "pagerank" in out
+    assert "degree" in out

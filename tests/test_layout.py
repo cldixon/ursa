@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import ursa as ur
+from ursa._graph import layout_circle, layout_fr, layout_random
 
 pytestmark = pytest.mark.skipif(
     not ur._NATIVE_AVAILABLE, reason="native extension not built (run `maturin develop`)"
@@ -35,7 +36,7 @@ def _xy(frame):
 
 
 def _laid_out(edges, **kw):
-    lay = ur.layout_fr(edges, **kw)
+    lay = layout_fr(edges, **kw)
     return edges.nodes().with_columns(x=lay.x, y=lay.y).sort("id")
 
 
@@ -49,7 +50,7 @@ def test_positions_are_two_f32_columns():
 
 
 def test_standalone_form_returns_id_x_y():
-    t = ur.layout_fr(_edges(), iterations=40, seed=1).collect().to_arrow()
+    t = layout_fr(_edges(), iterations=40, seed=1).collect().to_arrow()
     assert t.schema.names == ["id", "x", "y"]
 
 
@@ -64,7 +65,7 @@ def test_x_and_y_come_from_the_same_simulation():
     """
     edges = _edges()
     ax, ay = _xy(_laid_out(edges, iterations=60, seed=7))
-    standalone = ur.layout_fr(edges, iterations=60, seed=7).collect().to_arrow()
+    standalone = layout_fr(edges, iterations=60, seed=7).collect().to_arrow()
     bx = standalone.column("x").to_pylist()
     by = standalone.column("y").to_pylist()
     assert ax == bx
@@ -107,7 +108,7 @@ def test_every_position_is_finite():
 def test_positions_compose_with_the_relational_tail():
     """Positions are columns, so the algebra applies — that is the whole claim."""
     edges = _edges()
-    lay = ur.layout_fr(edges, iterations=40, seed=1)
+    lay = layout_fr(edges, iterations=40, seed=1)
     frame = (
         edges.nodes()
         .with_columns(x=lay.x, y=lay.y, deg=ur.degree(edges, direction="both"))
@@ -131,7 +132,7 @@ def test_layout_over_a_subgraph_view_differs():
 
 
 def test_circle_places_every_node_at_one_radius():
-    lay = ur.layout_circle(_edges())
+    lay = layout_circle(_edges())
     t = _edges().nodes().with_columns(x=lay.x, y=lay.y).sort("id").collect().to_arrow()
     xs, ys = t.column("x").to_pylist(), t.column("y").to_pylist()
     radii = [math.hypot(a, b) for a, b in zip(xs, ys, strict=True)]
@@ -140,9 +141,9 @@ def test_circle_places_every_node_at_one_radius():
 
 def test_random_is_seeded():
     edges = _edges()
-    lay = ur.layout_random(edges, seed=5)
+    lay = layout_random(edges, seed=5)
     a = edges.nodes().with_columns(x=lay.x, y=lay.y).sort("id").collect().to_arrow()
-    lay2 = ur.layout_random(edges, seed=5)
+    lay2 = layout_random(edges, seed=5)
     b = edges.nodes().with_columns(x=lay2.x, y=lay2.y).sort("id").collect().to_arrow()
     assert a.column("x").to_pylist() == b.column("x").to_pylist()
 
@@ -152,6 +153,14 @@ def test_dtype_is_rejected_on_a_layout():
     # parameter and ignoring it would be the worse outcome.
     with pytest.raises(NotImplementedError, match="nothing to narrow"):
         edges = _edges()
-        lay = ur.layout_fr(edges)
+        lay = layout_fr(edges)
         lay.payload["dtype"] = "f32"
         edges.nodes().with_columns(x=lay.x).collect()
+
+
+def test_layouts_are_not_in_the_public_namespace():
+    """The layout kernels are held back from the public API until the
+    visualization work resumes; they must not leak into `ursa.__all__`."""
+    for name in ("layout_fr", "layout_random", "layout_circle"):
+        assert name not in ur.__all__
+        assert not hasattr(ur, name)
