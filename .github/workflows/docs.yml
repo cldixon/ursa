@@ -3,15 +3,19 @@ name: Docs
 # The documentation site: Zensical builds docs/ into a static site, and GitHub
 # Pages serves it at https://cldixon.github.io/ursa/.
 #
-# Two jobs. `build` runs on every pull request that touches the docs and on every
+# Three jobs. `build` runs on every pull request that touches the docs and on every
 # push to main, in strict mode, so a broken link or a page missing from the nav
-# fails the check instead of shipping. `deploy` runs only on main, after a
-# successful build, and publishes through the Pages deployment API — no gh-pages
-# branch, no committed build output.
+# fails the check instead of shipping. `examples` runs the code in the docs pages
+# and the README. `deploy` runs only on main, after a successful build, and
+# publishes through the Pages deployment API — no gh-pages branch, no committed
+# build output.
 #
 # Deliberately separate from ci.yml: the docs never gate the code and the code
-# build never gates the docs. Nothing here needs the native extension; the pages
-# are markdown with their example output committed, so the build is seconds.
+# build never gates the docs. `build` needs no native extension; the pages are
+# markdown with their example output committed, so it takes seconds. `examples`
+# does build the extension, because ci.yml skips docs-only changes and something
+# still has to prove the examples run. A change to both code and docs runs these
+# tests twice (here and in ci.yml's pytest); that is the price of the skip.
 #
 # One-time setup (repository Settings -> Pages): set Source to "GitHub Actions".
 # The site lives under the repository path, so `site_url` in zensical.toml
@@ -24,6 +28,7 @@ on:
       - "docs/**"
       - "zensical.toml"
       - "CHANGELOG.md"
+      - "README.md"
       - "uv.lock"
       - ".github/workflows/docs.yml"
   pull_request:
@@ -31,6 +36,7 @@ on:
       - "docs/**"
       - "zensical.toml"
       - "CHANGELOG.md"
+      - "README.md"
       - "uv.lock"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
@@ -69,6 +75,33 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
+
+  examples:
+    name: Examples (docs pages, README)
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      # uv sync builds the maturin extension, so the Rust toolchain is needed here.
+      # Pinned to match rust-toolchain.toml, as in ci.yml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync (build extension + dev group)
+        run: uv sync --locked
+
+      - name: Run the examples
+        run: uv run --no-sync pytest tests/test_docs_examples.py tests/test_readme.py
 
   deploy:
     name: Deploy to GitHub Pages

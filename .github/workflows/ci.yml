@@ -1,9 +1,26 @@
 name: CI
 
+# Skip the run when every changed file is docs or prose. The code in the docs
+# pages and the README still runs on those changes: docs.yml's `examples` job
+# covers it.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "design/**"
+      - "zensical.toml"
+      - "**/*.md"
+      - "LICENSE-*"
+      - ".github/workflows/docs.yml"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "design/**"
+      - "zensical.toml"
+      - "**/*.md"
+      - "LICENSE-*"
+      - ".github/workflows/docs.yml"
 
 # Cancel superseded runs on the same ref.
 concurrency:
