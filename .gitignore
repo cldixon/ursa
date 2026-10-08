@@ -16,24 +16,11 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# JavaScript: one bun workspace rooted here, with `viz/` (the shared visual
-# layer) and `site/` (the Astro docs site) as members. The single /bun.lock IS
-# committed so the deploy build is reproducible and `bun install
-# --frozen-lockfile` has something to check against.
-#
-# node_modules is unanchored: bun hoists to the workspace root but still places
-# per-member directories, so an anchored /site/node_modules/ rule would leave the
-# root and viz/ copies untracked-but-visible.
-node_modules/
-# Harness bundle: build output from `bun run --cwd viz harness`, and rebuilt into
-# a temp dir by the render test. Never committed.
-/viz/test/harness.js
-/site/dist/
-/site/.astro/
-/site/.wrangler/
+# Documentation site: build output and zensical's cache, never committed.
+/site/
+/.cache/
 
-# Credentials. Wrangler reads `.env` from the project directory, so a Cloudflare
-# API token can land here by accident — never commit one.
+# Credentials.
 .env
 .env.*
 !.env.example

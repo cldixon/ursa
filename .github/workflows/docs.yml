@@ -1,38 +1,40 @@
 name: Docs
 
+# The documentation site: Zensical builds docs/ into a static site, and GitHub
+# Pages serves it at https://cldixon.github.io/ursa/.
+#
+# Two jobs. `build` runs on every pull request that touches the docs and on every
+# push to main, in strict mode, so a broken link or a page missing from the nav
+# fails the check instead of shipping. `deploy` runs only on main, after a
+# successful build, and publishes through the Pages deployment API — no gh-pages
+# branch, no committed build output.
+#
+# Deliberately separate from ci.yml: the docs never gate the code and the code
+# build never gates the docs. Nothing here needs the native extension; the pages
+# are markdown with their example output committed, so the build is seconds.
+#
+# One-time setup (repository Settings -> Pages): set Source to "GitHub Actions".
+# The site lives under the repository path, so `site_url` in zensical.toml
+# carries the /ursa/ prefix; there is no custom domain.
+
 on:
   push:
     branches: [main]
     paths:
-      - 'site/**'
-      - 'viz/**'
-      - 'package.json'
-      - 'bun.lock'
-      - '.github/workflows/docs.yml'
+      - "docs/**"
+      - "zensical.toml"
+      - "CHANGELOG.md"
+      - "uv.lock"
+      - ".github/workflows/docs.yml"
   pull_request:
     paths:
-      - 'site/**'
-      - 'viz/**'
-      - 'package.json'
-      - 'bun.lock'
-      - '.github/workflows/docs.yml'
+      - "docs/**"
+      - "zensical.toml"
+      - "CHANGELOG.md"
+      - "uv.lock"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
 
-# Build check only — deployment is Workers Builds (Cloudflare's git integration
-# on the ursa-docs Worker): pushes to main build and deploy production there,
-# and non-production branches get preview URLs posted to the PR. This job stays
-# so a docs PR still gets a type-check and a build proof from a clean checkout,
-# independent of the Cloudflare account.
-#
-# Deliberately separate from `ci.yml` so the docs never gate the code, and the
-# code build never gates the docs. Nothing here needs the native extension —
-# `astro.config.mjs` reads the version out of the workspace `Cargo.toml` as text,
-# which needs no Rust toolchain.
-#
-# The JS lives in one bun workspace rooted at the repository root (`viz/` +
-# `site/`), so every step below runs from the root rather than from `site/`:
-# install resolves the whole workspace against the single /bun.lock, and the root
-# scripts delegate into the members. `viz/**` is in the path filters because the
-# site consumes it — a token change there must rebuild the site.
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
@@ -47,18 +49,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          bun-version: latest
+          enable-cache: true
+          # zensical needs Python 3.11+ (the package itself supports 3.10).
+          python-version: "3.13"
 
-      # --frozen-lockfile is the CI equivalent of `npm ci`: fail if bun.lock
-      # disagrees with package.json rather than silently resolving something new.
-      - name: Install
-        run: bun install --frozen-lockfile
+      # Only the `docs` dependency group: zensical and nothing else. No native
+      # build, no Rust toolchain.
+      - name: Install zensical
+        run: uv sync --locked --only-group docs
 
-      # Both workspace members: `tsc --noEmit` over viz/, then `astro check`.
-      - name: Type-check
-        run: bun run check
+      - name: Build (strict)
+        run: uv run --no-sync zensical build --clean --strict
 
-      - name: Build
-        run: bun run build
+      - name: Upload the site
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

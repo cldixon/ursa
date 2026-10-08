@@ -49,6 +49,10 @@ from ._expr import Expr, col, dst, id, lit, src
 from ._frames import EdgeFrame, NodeFrame
 
 # --- Graph verbs & algorithms ----------------------------------------------
+# The layout kernels (`layout_fr` / `layout_random` / `layout_circle` in `_graph`)
+# are deliberately NOT exported: they are held back from the public API until
+# the visualization work resumes (see the `viz-parked` tag). The engine support
+# stays so the kernels keep compiling and testing.
 from ._graph import (
     betweenness,
     closeness,
@@ -57,9 +61,6 @@ from ._graph import (
     degree,
     hop,
     label_propagation,
-    layout_circle,
-    layout_fr,
-    layout_random,
     louvain,
     neighbors,
     pagerank,
@@ -159,9 +160,6 @@ __all__ = [
     "hop",
     "id",
     "label_propagation",
-    "layout_circle",
-    "layout_fr",
-    "layout_random",
     "lit",
     "louvain",
     "neighbors",
