@@ -1081,8 +1081,14 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     if arrays is not None:
         import pyarrow as pa
 
-        src, dst = arrays
-        return [pa.RecordBatch.from_arrays([src, dst], ["src", "dst"])]
+        # Zero-copy batches over the chunked endpoints (chunk boundaries that
+        # differ between the two columns are sliced, not copied).
+        table = pa.Table.from_arrays(list(arrays), names=["src", "dst"])
+        return table.to_batches() or [
+            pa.RecordBatch.from_arrays(
+                [col.combine_chunks() for col in table.columns], ["src", "dst"]
+            )
+        ]
 
     scan = getattr(edges, "_scan_spec", None)
     if scan is not None:

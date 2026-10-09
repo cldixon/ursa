@@ -387,7 +387,12 @@ def _drop_null_endpoint_rows(tbl: Any, src: str, dst: str) -> tuple[Any, int]:
 
 def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None:
     """Pull the src/dst columns out of an already-normalized ``pyarrow.Table`` as
-    contiguous arrays, canonicalized to a supported node-id type (int64 or string).
+    chunked arrays, canonicalized to a supported node-id type (int64 or string).
+
+    The chunks are kept as they are, not concatenated: an int64 or string column
+    is then shared with the retained edge table rather than copied, which would
+    double the endpoint memory for the life of the frame. ``_require_edges``
+    slices the build batches out of them.
 
     An unsupported id type or a missing ``src``/``dst`` column raises immediately at
     construction, so a typo'd column name is reported where the user made it.
@@ -398,5 +403,6 @@ def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None
     for name in (src, dst):
         column = tbl.column(name)
         chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-        arrays.append(_canonical_id_array(pa.concat_arrays(chunks)))
+        canonical = [_canonical_id_array(c) for c in chunks]
+        arrays.append(pa.chunked_array(canonical, type=canonical[0].type))
     return (arrays[0], arrays[1])

@@ -38,6 +38,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - Index build: known ids are interned in parallel, and scans read 128K-row
     batches. A 30M-edge Parquet scan and build went from ~2.9s to ~1.65s;
     with 2M string ids, from ~8.5s to ~3.1s.
+  - In-memory frames (`from_arrow`, `from_polars`, `EdgeFrame(...)`, ...)
+    no longer keep a concatenated copy of the `src`/`dst` columns next to the
+    table; they share its chunks. On 30M int edges the build went from 2.7s
+    to 1.6s (27 to 22 B/edge over the table); on 20M string edges, from 6.9s
+    and 71 B/edge to 1.9s and 24 B/edge.
   - String node ids are stored once, in the id column's own buffers, instead
     of about 140 B of per-id overhead. On 20M edges and 2M ids the build peak
     fell from 36 to 27 B/edge.
