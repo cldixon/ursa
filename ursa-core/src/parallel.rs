@@ -108,6 +108,18 @@ mod serial {
         }
     }
     impl<I: Iterator> MapInitExt for I {}
+
+    /// `for_each_init(init, op)` — as `map_init`, for a side-effecting loop.
+    pub trait ForEachInitExt: Iterator + Sized {
+        fn for_each_init<T, F>(self, init: impl FnOnce() -> T, mut op: F)
+        where
+            F: FnMut(&mut T, Self::Item),
+        {
+            let mut scratch = init();
+            self.for_each(|item| op(&mut scratch, item));
+        }
+    }
+    impl<I: Iterator> ForEachInitExt for I {}
 }
 
 #[cfg(not(feature = "rayon"))]

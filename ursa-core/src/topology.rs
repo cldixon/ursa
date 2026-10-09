@@ -292,6 +292,143 @@ impl Adjacency {
         }
     }
 
+    /// The transpose of `out` (grouped by target instead of source), with each
+    /// node's segment in original row order, exactly as [`Self::build`] would
+    /// produce it from the per-row endpoints, but without materializing them.
+    ///
+    /// A counting sort moves each out-slot into its target's segment, carrying
+    /// the slot's owner (the source) and original row (`edge_ids`). Slots arrive
+    /// in source order, so each segment is then sorted by row; for an edge list
+    /// already sorted by source it is already in order, and the sort only checks.
+    /// Peak memory is the two CSRs (the former path also held two per-row endpoint
+    /// arrays, 8 B/edge, at the same time).
+    fn transpose(out: &Adjacency, n_nodes: usize) -> Adjacency {
+        use crate::parallel::*;
+        let m = out.targets.len();
+        if m == 0 || n_nodes == 0 {
+            return Adjacency {
+                offsets: vec![0; n_nodes + 1],
+                targets: Vec::new(),
+                edge_ids: Vec::new(),
+            };
+        }
+        // Same chunking rule as `build` (serial on a rayon worker; see
+        // `parallel::in_worker`).
+        const PARALLEL_MIN_EDGES: usize = 1 << 16;
+        let threads = current_num_threads();
+        let serial = m < PARALLEL_MIN_EDGES || threads <= 1 || in_worker();
+        let n_chunks = if serial {
+            1
+        } else {
+            threads.min((m / n_nodes).max(4))
+        };
+        let chunk_size = m.div_ceil(n_chunks);
+
+        // Pass 1: a target histogram per contiguous chunk of out-slots.
+        let hist = |keys: &[u32]| {
+            let mut h = vec![0u32; n_nodes];
+            for &k in keys {
+                h[k as usize] += 1;
+            }
+            h
+        };
+        let mut hists: Vec<Vec<u32>> = if serial {
+            vec![hist(&out.targets)]
+        } else {
+            out.targets.par_chunks(chunk_size).map(hist).collect()
+        };
+        let mut offsets = vec![0u64; n_nodes + 1];
+        for h in &hists {
+            for (k, &c) in h.iter().enumerate() {
+                offsets[k + 1] += c as u64;
+            }
+        }
+        for i in 0..n_nodes {
+            offsets[i + 1] += offsets[i];
+        }
+        // Each chunk's histogram becomes its base cursor into every segment.
+        let mut running: Vec<u32> = (0..n_nodes).map(|k| offsets[k] as u32).collect();
+        for h in hists.iter_mut() {
+            for (k, slot) in h.iter_mut().enumerate() {
+                let cnt = *slot;
+                *slot = running[k];
+                running[k] += cnt;
+            }
+        }
+        drop(running);
+
+        // Pass 2: scatter (source, row) into each target's segment. Positions are
+        // disjoint across chunks (the base cursors partition each segment), so the
+        // writes never overlap; pointers cross threads as plain addresses, as in
+        // `build_parallel`.
+        let mut targets = vec![0u32; m];
+        let mut edge_ids = vec![0u32; m];
+        let (t_addr, e_addr) = (
+            targets.as_mut_ptr() as usize,
+            edge_ids.as_mut_ptr() as usize,
+        );
+        let scatter = |(c, mut base): (usize, Vec<u32>)| {
+            let (start, end) = (c * chunk_size, ((c + 1) * chunk_size).min(m));
+            // The source owning slot `start`: the last node whose segment starts
+            // at or before it.
+            let mut owner = out.offsets.partition_point(|&o| o as usize <= start) - 1;
+            for k in start..end {
+                while out.offsets[owner + 1] as usize <= k {
+                    owner += 1;
+                }
+                let key = out.targets[k] as usize;
+                let pos = base[key] as usize;
+                base[key] += 1;
+                // SAFETY: `pos < m` and is claimed by exactly one (chunk, slot).
+                unsafe {
+                    *(t_addr as *mut u32).add(pos) = owner as u32;
+                    *(e_addr as *mut u32).add(pos) = out.edge_ids[k];
+                }
+            }
+        };
+        if serial {
+            hists.into_iter().enumerate().for_each(scatter);
+        } else {
+            hists.into_par_iter().enumerate().for_each(scatter);
+        }
+
+        // Pass 3: restore original row order inside each segment.
+        let sort_segment = |scratch: &mut Vec<(u32, u32)>, v: usize| {
+            let (s, e) = (offsets[v] as usize, offsets[v + 1] as usize);
+            // SAFETY: segments are disjoint across nodes and inside both buffers.
+            let (ts, es) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut((t_addr as *mut u32).add(s), e - s),
+                    std::slice::from_raw_parts_mut((e_addr as *mut u32).add(s), e - s),
+                )
+            };
+            if es.windows(2).all(|w| w[0] < w[1]) {
+                return;
+            }
+            scratch.clear();
+            scratch.extend(es.iter().copied().zip(ts.iter().copied()));
+            scratch.sort_unstable_by_key(|&(row, _)| row); // rows are unique
+            for (k, &(row, src)) in scratch.iter().enumerate() {
+                es[k] = row;
+                ts[k] = src;
+            }
+        };
+        if serial {
+            let mut scratch = Vec::new();
+            (0..n_nodes).for_each(|v| sort_segment(&mut scratch, v));
+        } else {
+            (0..n_nodes)
+                .into_par_iter()
+                .for_each_init(Vec::new, sort_segment);
+        }
+
+        Adjacency {
+            offsets,
+            targets,
+            edge_ids,
+        }
+    }
+
     /// Neighbours of dense node `u`.
     #[inline]
     pub fn neighbors(&self, u: u32) -> &[u32] {
@@ -403,45 +540,6 @@ impl Topology {
         }
     }
 
-    /// Reconstruct the original `(src, dst)` endpoint columns, in original row
-    /// order, from the out-CSR. For out-CSR slot `k` owned by node `u`,
-    /// `edge_ids[k]` is the original row, `targets[k]` the destination, and the
-    /// owner `u` the source — so the two columns invert the CSR exactly. Used to
-    /// build the transpose without permanently retaining the dense endpoints;
-    /// scattering by original row reproduces the same within-segment ordering the
-    /// retained-endpoint build produced (so kernel outputs are unchanged).
-    fn reconstruct_endpoints(&self) -> (Vec<u32>, Vec<u32>) {
-        use crate::parallel::*;
-        let m = self.n_edges;
-        let mut src_by_row = vec![0u32; m];
-        let mut dst_by_row = vec![0u32; m];
-        // Every original row sits in exactly one out-CSR slot, so each `row` index
-        // is written once: the parallel scatter over source nodes never collides.
-        // The pointers cross the thread boundary as plain addresses, as in
-        // `Adjacency::build_parallel`.
-        let (src_addr, dst_addr) = (
-            src_by_row.as_mut_ptr() as usize,
-            dst_by_row.as_mut_ptr() as usize,
-        );
-        let scatter = |u: u32| {
-            for (&row, &v) in self.out.edge_ids(u).iter().zip(self.out.neighbors(u)) {
-                // SAFETY: `row < m` (edge ids index original rows) and is unique
-                // across all slots, so no two iterations write the same element.
-                unsafe {
-                    *(src_addr as *mut u32).add(row as usize) = u;
-                    *(dst_addr as *mut u32).add(row as usize) = v;
-                }
-            }
-        };
-        // Serial on a rayon worker: see `parallel::in_worker`.
-        if in_worker() {
-            (0..self.n_nodes as u32).for_each(scatter);
-        } else {
-            (0..self.n_nodes as u32).into_par_iter().for_each(scatter);
-        }
-        (src_by_row, dst_by_row)
-    }
-
     #[inline]
     pub fn n_nodes(&self) -> usize {
         self.n_nodes
@@ -459,14 +557,12 @@ impl Topology {
     }
 
     /// In-adjacency (destination → source). Built and cached on first call by
-    /// reconstructing the original endpoints from the out-CSR and grouping by
-    /// destination — the same result the retained-endpoint build produced, without
-    /// the permanent dense-endpoint storage.
+    /// transposing the out-CSR (see [`Adjacency::transpose`]): the same result the
+    /// retained-endpoint build produced, without the permanent dense-endpoint
+    /// storage.
     pub fn incoming(&self) -> &Adjacency {
-        self.inc.get_or_init(|| {
-            let (src_by_row, dst_by_row) = self.reconstruct_endpoints();
-            Adjacency::build(self.n_nodes, &dst_by_row, &src_by_row)
-        })
+        self.inc
+            .get_or_init(|| Adjacency::transpose(&self.out, self.n_nodes))
     }
 
     /// Undirected sorted adjacency (`out ∪ in`, self-loops dropped, deduplicated),
@@ -691,6 +787,24 @@ mod tests {
             );
             assert_eq!(a.words, b.words, "start={start} len={len}");
             assert_eq!((a.n_edges, a.n_kept), (b.n_edges, b.n_kept));
+        }
+    }
+
+    #[test]
+    fn transpose_matches_building_from_the_endpoints() {
+        // Unsorted random rows (so segments need the row sort), small enough for
+        // the serial path and large enough for the parallel one.
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+        for (n, m) in [(7usize, 40usize), (1_000, 70_000), (50_000, 300_000)] {
+            let src: Vec<u32> = (0..m).map(|_| rng.gen_range(0..n as u32)).collect();
+            let dst: Vec<u32> = (0..m).map(|_| rng.gen_range(0..n as u32)).collect();
+            let expect = Adjacency::build(n, &dst, &src);
+            let t = Topology::build(n, src, dst);
+            let got = t.incoming();
+            assert_eq!(got.offsets, expect.offsets, "n={n} m={m}");
+            assert_eq!(got.targets, expect.targets, "n={n} m={m}");
+            assert_eq!(got.edge_ids, expect.edge_ids, "n={n} m={m}");
         }
     }
 
