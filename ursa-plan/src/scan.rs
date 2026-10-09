@@ -157,6 +157,12 @@ fn canonical_id_type(dt: &DataType) -> Result<DataType> {
     }
 }
 
+/// Rows per scanned batch. DataFusion's default (8,192) makes the index build
+/// intern in small pieces; at 128K rows `EdgeInterner` resolves known ids in
+/// parallel, which more than halves a 30M-edge build. Batches stay small next to
+/// the graph itself (2 MiB of `Int64` endpoints).
+const SCAN_BATCH_ROWS: usize = 1 << 17;
+
 /// Open a scan source into an unprojected `DataFrame`: create a fresh session,
 /// register the matching object store for the path's scheme, and read the file in
 /// the format its extension names. The shared prologue of `scan_edges_batch` and
@@ -174,7 +180,7 @@ async fn open_scan(
     // Work stealing lets an idle partition read byte ranges planned for a sibling,
     // so rows land in a run-dependent partition. Turning it off keeps each
     // partition on its own contiguous range, which `collect_in_file_order` relies on.
-    let mut config = SessionConfig::new();
+    let mut config = SessionConfig::new().with_batch_size(SCAN_BATCH_ROWS);
     config
         .options_mut()
         .execution

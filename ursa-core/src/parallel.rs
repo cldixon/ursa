@@ -80,13 +80,18 @@ mod serial {
         }
     }
 
-    /// `par_iter_mut()` -> `iter_mut()`, on any mutable slice.
+    /// `par_iter_mut()` / `par_chunks_mut(n)` -> `iter_mut()` / `chunks_mut(n)`, on
+    /// any mutable slice.
     pub trait ParSliceMutExt<T> {
         fn par_iter_mut(&mut self) -> std::slice::IterMut<'_, T>;
+        fn par_chunks_mut(&mut self, chunk_size: usize) -> std::slice::ChunksMut<'_, T>;
     }
     impl<T> ParSliceMutExt<T> for [T] {
         fn par_iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
             self.iter_mut()
+        }
+        fn par_chunks_mut(&mut self, chunk_size: usize) -> std::slice::ChunksMut<'_, T> {
+            self.chunks_mut(chunk_size)
         }
     }
 
