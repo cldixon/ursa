@@ -4,7 +4,6 @@
 //! topology and return a plain number. `density` needs only node and edge counts;
 //! `diameter` / `avg_path_length` run BFS from a set of source nodes.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -50,10 +49,16 @@ pub fn describe(topology: &Topology, full: bool) -> Result<RecordBatch> {
         n_edges as f64 / n_nodes as f64
     };
     let n_components: Option<i64> = if full {
-        let distinct: HashSet<u32> = connected_components_weak(topology, None)
-            .into_iter()
-            .collect();
-        Some(distinct.len() as i64)
+        // Labels are dense node ids, so a seen-bitmap counts them without hashing.
+        let labels = connected_components_weak(topology, None);
+        let mut seen = vec![false; labels.len()];
+        let mut distinct = 0i64;
+        for &l in &labels {
+            if !std::mem::replace(&mut seen[l as usize], true) {
+                distinct += 1;
+            }
+        }
+        Some(distinct)
     } else {
         None
     };

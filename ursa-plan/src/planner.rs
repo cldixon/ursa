@@ -3,7 +3,7 @@
 //!
 //! [`GraphExtensionPlanner`] maps [`crate::node::GraphAlgorithmNode`] to
 //! [`crate::physical::GraphAlgorithmExec`] during physical planning;
-//! [`GraphQueryPlanner`] installs it into DataFusion's `DefaultPhysicalPlanner`;
+//! `GraphQueryPlanner` installs it into DataFusion's `DefaultPhysicalPlanner`;
 //! [`graph_session`] builds a `SessionContext` with that planner registered. The
 //! result: `ctx.execute_logical_plan(plan)` optimizes and executes a plan whose
 //! graph nodes are ours, with everything else handled by stock DataFusion. This

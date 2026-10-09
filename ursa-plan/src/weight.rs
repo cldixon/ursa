@@ -2,7 +2,7 @@
 //!
 //! Weight is a per-operation expression over the edge table (e.g.
 //! `ur.col("amount") * ur.col("fx_rate")`), not a blessed column. The Python layer
-//! serializes the expression tree to JSON; here it is parsed to an [`UrsaExpr`]
+//! serializes the expression tree to JSON; here it is parsed to an `UrsaExpr`
 //! ([`crate::expr::parse_ursa_expr`]), lowered to a DataFusion expression
 //! ([`crate::expr::lower`]), and evaluated against the edge `RecordBatch` via a
 //! one-column projection. The result is an `f64` value per **edge row**, which

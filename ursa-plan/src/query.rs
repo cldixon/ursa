@@ -257,8 +257,16 @@ fn dense_attr_column(
                 let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
                     continue;
                 };
-                let next = codes.len() as f64;
-                let code = *codes.entry(attr_arr.value(i).to_string()).or_insert(next);
+                // Look up before inserting, so only a new value allocates a key.
+                let value = attr_arr.value(i);
+                let code = match codes.get(value) {
+                    Some(&code) => code,
+                    None => {
+                        let code = codes.len() as f64;
+                        codes.insert(value.to_owned(), code);
+                        code
+                    }
+                };
                 out[d as usize] = Some(code);
             }
         } else {
