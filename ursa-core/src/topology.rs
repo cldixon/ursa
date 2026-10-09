@@ -165,7 +165,13 @@ impl Adjacency {
         // Below the threshold (or single-worker), the serial two-pass sort wins —
         // the parallel path's per-chunk histograms aren't worth their overhead.
         const PARALLEL_MIN_EDGES: usize = 1 << 16;
-        let n_chunks = crate::parallel::current_num_threads();
+        // Each chunk carries an `n_nodes`-long u32 histogram, so the transient
+        // cost is `chunks · n_nodes · 4` bytes whatever the edge count: on a
+        // many-core machine and a sparse graph it would outgrow the CSR itself.
+        // Chunks are capped at `m / n_nodes` (histograms within about 4 B/edge,
+        // one CSR array's worth), but never below 4, so small machines keep their
+        // full parallelism. The output is identical for any chunk count.
+        let n_chunks = crate::parallel::current_num_threads().min((m / n_nodes.max(1)).max(4));
         // Also serial on a rayon worker: see `parallel::in_worker`.
         if m < PARALLEL_MIN_EDGES || n_chunks <= 1 || n_nodes == 0 || crate::parallel::in_worker() {
             Self::build_serial(n_nodes, keys, other)
