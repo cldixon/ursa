@@ -39,6 +39,22 @@ pub fn current_num_threads() -> usize {
 //
 // Each mirrors the rayon method the kernels call, delegating to the ordered `std`
 // iterator so results are byte-identical to the parallel path.
+/// Whether the calling thread is a rayon worker. A lazily cached structure
+/// (`Topology::incoming`, `Topology::undirected`) first requested from inside a
+/// parallel loop is built serially: a parallel build there would let the waiting
+/// worker steal another iteration of the same loop, which can request the same
+/// `OnceLock` again on the same thread and block on it forever. Without `rayon`
+/// there are no workers.
+#[cfg(feature = "rayon")]
+pub fn in_worker() -> bool {
+    rayon::current_thread_index().is_some()
+}
+
+#[cfg(not(feature = "rayon"))]
+pub fn in_worker() -> bool {
+    false
+}
+
 #[cfg(not(feature = "rayon"))]
 mod serial {
     /// `into_par_iter()` -> `into_iter()`. Covers ranges (`0..n`) and owned

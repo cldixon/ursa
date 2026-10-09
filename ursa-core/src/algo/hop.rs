@@ -55,6 +55,10 @@ pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32
         return (Vec::new(), Vec::new());
     }
 
+    // Resolve the transpose before the parallel loop (see `neighbor_aggregate`).
+    if dir != Direction::Out {
+        topo.incoming();
+    }
     // One (src, dst) pair-list per seed, in seed order.
     let per_seed: Vec<(Vec<u32>, Vec<u32>)> = seeds
         .par_iter()

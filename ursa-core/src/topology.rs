@@ -142,7 +142,8 @@ impl Adjacency {
         // the parallel path's per-chunk histograms aren't worth their overhead.
         const PARALLEL_MIN_EDGES: usize = 1 << 16;
         let n_chunks = crate::parallel::current_num_threads();
-        if m < PARALLEL_MIN_EDGES || n_chunks <= 1 || n_nodes == 0 {
+        // Also serial on a rayon worker: see `parallel::in_worker`.
+        if m < PARALLEL_MIN_EDGES || n_chunks <= 1 || n_nodes == 0 || crate::parallel::in_worker() {
             Self::build_serial(n_nodes, keys, other)
         } else {
             Self::build_parallel(n_nodes, keys, other, n_chunks)
@@ -380,17 +381,33 @@ impl Topology {
     /// scattering by original row reproduces the same within-segment ordering the
     /// retained-endpoint build produced (so kernel outputs are unchanged).
     fn reconstruct_endpoints(&self) -> (Vec<u32>, Vec<u32>) {
+        use crate::parallel::*;
         let m = self.n_edges;
         let mut src_by_row = vec![0u32; m];
         let mut dst_by_row = vec![0u32; m];
-        for u in 0..self.n_nodes as u32 {
-            let s = self.out.offsets[u as usize] as usize;
-            let e = self.out.offsets[u as usize + 1] as usize;
-            for k in s..e {
-                let row = self.out.edge_ids[k] as usize;
-                src_by_row[row] = u;
-                dst_by_row[row] = self.out.targets[k];
+        // Every original row sits in exactly one out-CSR slot, so each `row` index
+        // is written once: the parallel scatter over source nodes never collides.
+        // The pointers cross the thread boundary as plain addresses, as in
+        // `Adjacency::build_parallel`.
+        let (src_addr, dst_addr) = (
+            src_by_row.as_mut_ptr() as usize,
+            dst_by_row.as_mut_ptr() as usize,
+        );
+        let scatter = |u: u32| {
+            for (&row, &v) in self.out.edge_ids(u).iter().zip(self.out.neighbors(u)) {
+                // SAFETY: `row < m` (edge ids index original rows) and is unique
+                // across all slots, so no two iterations write the same element.
+                unsafe {
+                    *(src_addr as *mut u32).add(row as usize) = u;
+                    *(dst_addr as *mut u32).add(row as usize) = v;
+                }
             }
+        };
+        // Serial on a rayon worker: see `parallel::in_worker`.
+        if in_worker() {
+            (0..self.n_nodes as u32).for_each(scatter);
+        } else {
+            (0..self.n_nodes as u32).into_par_iter().for_each(scatter);
         }
         (src_by_row, dst_by_row)
     }
@@ -426,40 +443,77 @@ impl Topology {
     /// built and cached on first call. Shared by `triangle_count` and
     /// `clustering_coefficient` so a pipeline computing both pays the build once.
     pub fn undirected(&self) -> &UndirectedCsr {
-        self.undirected.get_or_init(|| self.build_undirected())
+        self.undirected.get_or_init(|| self.build_undirected(None))
     }
 
     /// Build the flat undirected CSR: per-node sorted/deduped `out ∪ in` neighbour
-    /// lists (parallel, self-loops filtered), then flattened into one offsets +
-    /// targets buffer.
-    fn build_undirected(&self) -> UndirectedCsr {
+    /// lists (self-loops filtered), written straight into one buffer. With a
+    /// `mask`, only kept edges contribute (the per-subgraph view).
+    ///
+    /// Each node first gets an upper-bound segment of `out_deg + in_deg` slots,
+    /// fills it with its neighbours, then sorts and deduplicates it in place
+    /// (parallel, disjoint segments). One serial pass then slides the deduplicated
+    /// prefixes left into a contiguous buffer. There are no per-node allocations,
+    /// and the peak is one `2m`-slot buffer rather than per-node vectors plus their
+    /// flattened copy.
+    fn build_undirected(&self, mask: Option<&EdgeMask>) -> UndirectedCsr {
         use crate::parallel::*;
         let n = self.n_nodes;
         let out = &self.out;
         let inc = self.incoming();
-        let lists: Vec<Vec<u32>> = (0..n as u32)
-            .into_par_iter()
-            .map(|u| {
-                let mut nbrs: Vec<u32> = out
-                    .neighbors(u)
-                    .iter()
-                    .chain(inc.neighbors(u))
-                    .copied()
-                    .filter(|&w| w != u)
-                    .collect();
-                nbrs.sort_unstable();
-                nbrs.dedup();
-                nbrs
-            })
-            .collect();
-        let mut offsets = vec![0u64; n + 1];
+
+        let mut bound = vec![0u64; n + 1];
         for u in 0..n {
-            offsets[u + 1] = offsets[u] + lists[u].len() as u64;
+            let d = out.degree(u as u32) as u64 + inc.degree(u as u32) as u64;
+            bound[u + 1] = bound[u] + d;
         }
-        let mut targets = Vec::with_capacity(offsets[n] as usize);
-        for list in &lists {
-            targets.extend_from_slice(list);
+        let mut targets = vec![0u32; bound[n] as usize];
+        let addr = targets.as_mut_ptr() as usize;
+        let fill = |u: u32| {
+            let start = bound[u as usize] as usize;
+            let cap = (bound[u as usize + 1] - bound[u as usize]) as usize;
+            // SAFETY: segments `bound[u]..bound[u + 1]` are disjoint across
+            // nodes and lie inside `targets`, which outlives the loop.
+            let seg = unsafe { std::slice::from_raw_parts_mut((addr as *mut u32).add(start), cap) };
+            let mut len = 0;
+            for adj in [out, inc] {
+                for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                    if w != u && mask.is_none_or(|m| m.keep(e)) {
+                        seg[len] = w;
+                        len += 1;
+                    }
+                }
+            }
+            let seg = &mut seg[..len];
+            seg.sort_unstable();
+            // In-place dedup of the sorted prefix.
+            let mut kept = 0;
+            for i in 0..seg.len() {
+                if kept == 0 || seg[i] != seg[kept - 1] {
+                    seg[kept] = seg[i];
+                    kept += 1;
+                }
+            }
+            kept as u32
+        };
+        // Serial on a rayon worker: see `parallel::in_worker`.
+        let lens: Vec<u32> = if in_worker() {
+            (0..n as u32).map(fill).collect()
+        } else {
+            (0..n as u32).into_par_iter().map(fill).collect()
+        };
+
+        // Compact: each segment's kept prefix moves left (never right), in order.
+        let mut offsets = vec![0u64; n + 1];
+        let mut write = 0usize;
+        for u in 0..n {
+            let (start, len) = (bound[u] as usize, lens[u] as usize);
+            targets.copy_within(start..start + len, write);
+            write += len;
+            offsets[u + 1] = write as u64;
         }
+        targets.truncate(write);
+        targets.shrink_to_fit();
         UndirectedCsr { offsets, targets }
     }
 
@@ -537,36 +591,7 @@ impl Topology {
     /// directed CSR or the id map, so the parent index and dense id space are
     /// unchanged (no `build_index`).
     pub fn undirected_masked(&self, mask: &EdgeMask) -> UndirectedCsr {
-        use crate::parallel::*;
-        let n = self.n_nodes;
-        let out = &self.out;
-        let inc = self.incoming();
-        let kept = |adj: &Adjacency, u: u32| -> Vec<u32> {
-            adj.neighbors(u)
-                .iter()
-                .zip(adj.edge_ids(u))
-                .filter_map(|(&v, &e)| (mask.keep(e) && v != u).then_some(v))
-                .collect()
-        };
-        let lists: Vec<Vec<u32>> = (0..n as u32)
-            .into_par_iter()
-            .map(|u| {
-                let mut nbrs = kept(out, u);
-                nbrs.extend(kept(inc, u));
-                nbrs.sort_unstable();
-                nbrs.dedup();
-                nbrs
-            })
-            .collect();
-        let mut offsets = vec![0u64; n + 1];
-        for u in 0..n {
-            offsets[u + 1] = offsets[u] + lists[u].len() as u64;
-        }
-        let mut targets = Vec::with_capacity(offsets[n] as usize);
-        for list in &lists {
-            targets.extend_from_slice(list);
-        }
-        UndirectedCsr { offsets, targets }
+        self.build_undirected(Some(mask))
     }
 }
 
@@ -577,6 +602,39 @@ mod tests {
     /// 0 -> 1, 0 -> 2, 1 -> 2, 2 -> 0
     fn diamond() -> Topology {
         Topology::build(3, vec![0, 0, 1, 2], vec![1, 2, 2, 0])
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn lazy_caches_requested_inside_a_parallel_loop_do_not_deadlock() {
+        // Every iteration of a parallel loop requests the lazy transpose and
+        // undirected view. A parallel initializer would let the worker running it
+        // steal another iteration while it waits, re-enter the same OnceLock on the
+        // same thread and hang. Repeated on fresh topologies (small ones and one
+        // big enough for the parallel CSR build) to give the race many chances.
+        use rayon::prelude::*;
+        for (n, m) in [(4u32, 3u32), (64, 500), (5_000, 200_000)] {
+            let src: Vec<u32> = (0..m)
+                .map(|i| (i as u64 * 7919 % n as u64) as u32)
+                .collect();
+            let dst: Vec<u32> = (0..m)
+                .map(|i| (i as u64 * 104_729 % n as u64) as u32)
+                .collect();
+            let eager = Topology::build(n as usize, src.clone(), dst.clone());
+            let expect: Vec<usize> = (0..n)
+                .map(|u| eager.incoming().neighbors(u).len() + eager.undirected().degree(u))
+                .collect();
+            for _ in 0..50 {
+                let lazy = Topology::build(n as usize, src.clone(), dst.clone());
+                let got: Vec<usize> = (0..n)
+                    .into_par_iter()
+                    .with_max_len(1)
+                    .map(|u| lazy.incoming().neighbors(u).len() + lazy.undirected().degree(u))
+                    .collect();
+                assert_eq!(got, expect);
+                assert_eq!(lazy.incoming().edge_ids, eager.incoming().edge_ids);
+            }
+        }
     }
 
     #[test]
