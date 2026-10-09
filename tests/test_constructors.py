@@ -180,3 +180,22 @@ def test_five_ways_identical_pagerank(tmp_path):
     assert baseline  # non-empty
     for name, edges in ways.items():
         assert _pagerank_dict(edges) == baseline, f"{name} disagreed with row_dicts"
+
+
+def test_in_memory_endpoints_share_the_tables_buffers():
+    # The frame keeps the src/dst columns as zero-copy chunks of the user's table
+    # rather than a concatenated copy, and the graph is the same either way.
+    import pyarrow as pa
+
+    tbl = pa.concat_tables(
+        [pa.table({"s": [0, 1], "d": [1, 2]}), pa.table({"s": [2, 0], "d": [0, 2]})]
+    )
+    edges = ur.from_arrow(tbl, src="s", dst="d")
+    arrays = edges._edge_arrays
+    assert arrays is not None
+    src = arrays[0]
+    assert src.num_chunks == 2
+    for ours, theirs in zip(src.chunks, tbl.column("s").chunks, strict=True):
+        assert ours.buffers()[1].address == theirs.buffers()[1].address
+    single = ur.from_arrow(tbl.combine_chunks(), src="s", dst="d")
+    assert ur.degree(edges).collect().to_dicts() == ur.degree(single).collect().to_dicts()

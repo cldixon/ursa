@@ -328,9 +328,14 @@ def _canonical_id_array(arr: Any) -> Any:
     raise TypeError(f"node ids must be an integer or string column; got {arr.type}")
 
 
-def _node_attr_batch(tbl: Any, id: str) -> Any | None:
-    """The node attribute table (an already-normalized ``pyarrow.Table``) as a
-    single pyarrow RecordBatch, id canonicalized to int64 or string.
+def _node_attr_table(tbl: Any, id: str) -> Any:
+    """The node attribute table (an already-normalized ``pyarrow.Table``) with its
+    id column canonicalized to int64 or string, chunk by chunk.
+
+    The table's chunks are kept as they are (no ``combine_chunks``), so attribute
+    columns are shared with the caller's table rather than copied. A 0-row table
+    stays a valid, empty table, so an empty node set is still a materializable
+    frame.
 
     An unsupported id type or a missing ``id`` column raises immediately at
     construction, so a typo'd column name is reported where the user made it.
@@ -340,13 +345,8 @@ def _node_attr_batch(tbl: Any, id: str) -> Any | None:
     idx = tbl.schema.get_field_index(id)
     id_col = tbl.column(id)
     chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
-    id_arr = _canonical_id_array(pa.concat_arrays(chunks))
-    tbl = tbl.set_column(idx, id, id_arr)
-    batches = tbl.combine_chunks().to_batches()
-    # A 0-row table has no batches; return one *empty* batch (not None) so an empty
-    # node set is still a materializable frame. None is reserved for "no table at
-    # all" (the bare edges.nodes() path, which never reaches here).
-    return batches[0] if batches else pa.RecordBatch.from_pylist([], schema=tbl.schema)
+    canonical = [_canonical_id_array(c) for c in chunks]
+    return tbl.set_column(idx, id, pa.chunked_array(canonical, type=canonical[0].type))
 
 
 _ON_NULL_MODES = ("error", "drop")
@@ -387,7 +387,12 @@ def _drop_null_endpoint_rows(tbl: Any, src: str, dst: str) -> tuple[Any, int]:
 
 def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None:
     """Pull the src/dst columns out of an already-normalized ``pyarrow.Table`` as
-    contiguous arrays, canonicalized to a supported node-id type (int64 or string).
+    chunked arrays, canonicalized to a supported node-id type (int64 or string).
+
+    The chunks are kept as they are, not concatenated: an int64 or string column
+    is then shared with the retained edge table rather than copied, which would
+    double the endpoint memory for the life of the frame. ``_require_edges``
+    slices the build batches out of them.
 
     An unsupported id type or a missing ``src``/``dst`` column raises immediately at
     construction, so a typo'd column name is reported where the user made it.
@@ -398,5 +403,6 @@ def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None
     for name in (src, dst):
         column = tbl.column(name)
         chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-        arrays.append(_canonical_id_array(pa.concat_arrays(chunks)))
+        canonical = [_canonical_id_array(c) for c in chunks]
+        arrays.append(pa.chunked_array(canonical, type=canonical[0].type))
     return (arrays[0], arrays[1])

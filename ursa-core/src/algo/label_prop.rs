@@ -12,8 +12,6 @@
 //! parallel votes (multiplicity-is-rows) — a heavily-parallel neighbour pulls
 //! proportionally harder.
 
-use std::collections::HashMap;
-
 use super::rng::{shuffled_order, DEFAULT_SEED};
 use crate::topology::{Adjacency, EdgeMask, Topology};
 
@@ -36,37 +34,49 @@ pub fn label_propagation(
     let out = topo.out();
     let inc = topo.incoming();
     let order = shuffled_order(n, seed.unwrap_or(DEFAULT_SEED));
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    // Vote tally, dense over label ids (labels are node ids, so `< n`), plus the
+    // labels touched for the current node. Counting into an array and resetting
+    // only the touched slots replaces a hash map probe per neighbour; the winner
+    // depends only on the counts, never on the order labels were seen.
+    let mut counts = vec![0u32; n];
+    let mut touched: Vec<u32> = Vec::new();
 
     // Tally each kept-edge neighbour's label for node `u` in one adjacency.
-    let tally = |adj: &Adjacency, u: u32, label: &[u32], counts: &mut HashMap<u32, u32>| {
-        for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
-            if mask.is_none_or(|m| m.keep(e)) {
-                *counts.entry(label[v as usize]).or_insert(0) += 1;
+    let tally =
+        |adj: &Adjacency, u: u32, label: &[u32], counts: &mut [u32], touched: &mut Vec<u32>| {
+            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                if mask.is_none_or(|m| m.keep(e)) {
+                    let lab = label[v as usize];
+                    let c = &mut counts[lab as usize];
+                    if *c == 0 {
+                        touched.push(lab);
+                    }
+                    *c += 1;
+                }
             }
-        }
-    };
+        };
 
     for _ in 0..max_iter {
         let mut changed = false;
         for &u in &order {
-            counts.clear();
-            tally(out, u, &label, &mut counts);
-            tally(inc, u, &label, &mut counts);
-            if counts.is_empty() {
+            tally(out, u, &label, &mut counts, &mut touched);
+            tally(inc, u, &label, &mut counts, &mut touched);
+            if touched.is_empty() {
                 continue; // isolated node keeps its own label
             }
             // Plurality label; ties resolved toward the smallest label id so the
-            // choice does not depend on the map's iteration order.
+            // choice does not depend on the order labels were tallied.
             let cur = label[u as usize];
             let mut best_label = cur;
             let mut best_count = 0u32;
-            for (&lab, &c) in &counts {
+            for &lab in &touched {
+                let c = std::mem::take(&mut counts[lab as usize]);
                 if c > best_count || (c == best_count && lab < best_label) {
                     best_count = c;
                     best_label = lab;
                 }
             }
+            touched.clear();
             if best_label != cur {
                 label[u as usize] = best_label;
                 changed = true;

@@ -20,9 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
@@ -36,7 +34,7 @@ use crate::logical::{Direction, GraphAlgo, LayoutKind};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{path_schema, OutputColumn, OutputDtype};
-use crate::weight::evaluate_weight;
+use crate::weight::edge_weights;
 
 /// One requested output column, deserialized from the Python query IR.
 ///
@@ -257,8 +255,16 @@ fn dense_attr_column(
                 let (Some(d), false) = (*dense, attr_arr.is_null(i)) else {
                     continue;
                 };
-                let next = codes.len() as f64;
-                let code = *codes.entry(attr_arr.value(i).to_string()).or_insert(next);
+                // Look up before inserting, so only a new value allocates a key.
+                let value = attr_arr.value(i);
+                let code = match codes.get(value) {
+                    Some(&code) => code,
+                    None => {
+                        let code = codes.len() as f64;
+                        codes.insert(value.to_owned(), code);
+                        code
+                    }
+                };
                 out[d as usize] = Some(code);
             }
         } else {
@@ -415,50 +421,61 @@ where
 /// default seed; `n >= row_count` returns all rows.
 fn sample_rows(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Result<Vec<RecordBatch>> {
     use arrow::row::{RowConverter, SortField};
+    use rayon::prelude::*;
+    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
 
     let Some(first) = batches.first() else {
         return Ok(batches);
     };
     let schema = first.schema();
-    let batch = arrow::compute::concat_batches(&schema, &batches)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let r = batch.num_rows();
+    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
     if n >= r {
-        return Ok(vec![batch]);
+        return Ok(batches);
     }
     // Canonical, partition-independent order: sort row indices by the full-tuple
     // byte encoding. Depends only on values, so it is identical regardless of how
     // the rows were partitioned. Duplicate rows encode equal (interchangeable).
-    let fields: Vec<SortField> = batch
-        .schema()
+    // Rows are encoded batch by batch (no concatenated copy of the input) and
+    // sorted in parallel; the sort is stable, like the serial one it replaces.
+    let fields: Vec<SortField> = schema
         .fields()
         .iter()
         .map(|f| SortField::new(f.data_type().clone()))
         .collect();
-    let converter =
-        RowConverter::new(fields).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let rows = converter
-        .convert_columns(batch.columns())
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let converter = RowConverter::new(fields).map_err(arrow_err)?;
+    let mut rows = converter.empty_rows(r, 0);
+    for batch in &batches {
+        converter
+            .append(&mut rows, batch.columns())
+            .map_err(arrow_err)?;
+    }
     let mut canonical: Vec<usize> = (0..r).collect();
-    canonical.sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
+    canonical.par_sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
+    drop(rows);
     // Seed-deterministic selection over canonical positions (already sorted
-    // ascending), mapped back to original row indices; emitted in canonical order.
-    let picks = ursa_core::algo::sample_indices(r, n, seed);
-    let indices = UInt32Array::from(
-        picks
-            .into_iter()
-            .map(|p| canonical[p] as u32)
-            .collect::<Vec<u32>>(),
-    );
-    let cols = batch
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c, &indices, None))
+    // ascending), mapped back to (batch, row); emitted in canonical order.
+    let mut starts = Vec::with_capacity(batches.len());
+    let mut acc = 0usize;
+    for b in &batches {
+        starts.push(acc);
+        acc += b.num_rows();
+    }
+    let picks: Vec<(usize, usize)> = ursa_core::algo::sample_indices(r, n, seed)
+        .into_iter()
+        .map(|p| {
+            let g = canonical[p];
+            let b = starts.partition_point(|&s| s <= g) - 1;
+            (b, g - starts[b])
+        })
+        .collect();
+    let cols = (0..schema.fields().len())
+        .map(|c| {
+            let sources: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
+            arrow::compute::interleave(&sources, &picks)
+        })
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let sampled = RecordBatch::try_new(schema, cols)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        .map_err(arrow_err)?;
+    let sampled = RecordBatch::try_new(schema, cols).map_err(arrow_err)?;
     Ok(vec![sampled])
 }
 
@@ -515,6 +532,7 @@ pub fn execute_node_query(
     }
     let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
+    let mut weight_cache: HashMap<String, Arc<Vec<f64>>> = HashMap::new();
     for spec in &specs {
         let dtype = parse_output_dtype(spec.dtype.as_deref())?;
         if spec.kind == "neighbors_agg" {
@@ -560,22 +578,24 @@ pub fn execute_node_query(
                             spec.kind
                         )));
                     }
-                    let edges_ref = edges.as_ref().ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "a weighted algorithm needs the edge table, but none was provided"
-                                .into(),
-                        )
-                    })?;
-                    let w = evaluate_weight(edges_ref, &weight_json.to_string())?;
-                    if w.len() != topology.n_edges() {
-                        return Err(DataFusionError::Execution(format!(
-                            "weight array length ({}) does not match the edge count ({}); the edge \
-                             table and the graph are misaligned",
-                            w.len(),
-                            topology.n_edges()
-                        )));
-                    }
-                    Some(Arc::new(w))
+                    // One evaluation per distinct expression: columns weighted by
+                    // the same expression share its `Arc`, which is also what lets
+                    // the kernel memo (keyed on that `Arc`) share their runs.
+                    let key = weight_json.to_string();
+                    let w = match weight_cache.get(&key) {
+                        Some(w) => w.clone(),
+                        None => {
+                            let w = Arc::new(edge_weights(
+                                edges.as_deref(),
+                                &key,
+                                topology.n_edges(),
+                                "a weighted algorithm",
+                            )?);
+                            weight_cache.insert(key, w.clone());
+                            w
+                        }
+                    };
+                    Some(w)
                 }
             };
             let field = spec.field.unwrap_or(0);
@@ -807,28 +827,6 @@ pub fn execute_path_query(
 ) -> Result<Vec<RecordBatch>> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
-    // A weight expression (over edge columns) becomes one non-negative f64 per
-    // edge row; Dijkstra gathers it via edge_ids. Omit for unweighted BFS.
-    let weights = match weight {
-        None => None,
-        Some(weight_json) => {
-            let edges_ref = edges.as_ref().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "weighted shortest_path needs the edge table, but none was provided".into(),
-                )
-            })?;
-            let w = evaluate_weight(edges_ref, weight_json)?;
-            if w.len() != topology.n_edges() {
-                return Err(DataFusionError::Execution(format!(
-                    "weight array length ({}) does not match the edge count ({})",
-                    w.len(),
-                    topology.n_edges()
-                )));
-            }
-            Some(Arc::new(w))
-        }
-    };
-
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
     // index. An unknown (or absent) endpoint -> no path (an empty edge frame),
     // short-circuiting the plan.
@@ -846,6 +844,19 @@ pub fn execute_path_query(
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         return Ok(vec![empty]);
+    };
+
+    // A weight expression (over edge columns) becomes one non-negative f64 per
+    // edge row; Dijkstra gathers it via edge_ids. Omit for unweighted BFS.
+    // Evaluated only once both endpoints resolve, as in `shortest_path_nodes`.
+    let weights = match weight {
+        None => None,
+        Some(weight_json) => Some(Arc::new(edge_weights(
+            edges.as_deref(),
+            weight_json,
+            topology.n_edges(),
+            "weighted shortest_path",
+        )?)),
     };
 
     let path_plan = LogicalPlan::Extension(Extension {
@@ -916,19 +927,12 @@ pub fn shortest_path_nodes(
     let path = match weight {
         None => ursa_core::algo::shortest_path(&topology, source, target, direction),
         Some(weight_json) => {
-            let edges_ref = edges.as_ref().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "weighted shortest_path needs the edge table, but none was provided".into(),
-                )
-            })?;
-            let w = evaluate_weight(edges_ref, weight_json)?;
-            if w.len() != topology.n_edges() {
-                return Err(DataFusionError::Execution(format!(
-                    "weight array length ({}) does not match the edge count ({})",
-                    w.len(),
-                    topology.n_edges()
-                )));
-            }
+            let w = edge_weights(
+                edges.as_deref(),
+                weight_json,
+                topology.n_edges(),
+                "weighted shortest_path",
+            )?;
             ursa_core::algo::shortest_path_weighted(&topology, &w, source, target, direction)
         }
     };

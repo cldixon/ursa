@@ -122,6 +122,18 @@ def test_scan_default_errors_on_graph_op(tmp_path):
         ur.pagerank(ur.scan_edges(str(path), src="s", dst="d")).collect()
 
 
+def test_scan_drop_graph_op_warns_and_builds_the_clean_graph(tmp_path):
+    # The unweighted scan builds its index natively (#149); the drop count must
+    # still surface, and the graph is the one the clean rows describe.
+    path = tmp_path / "e.parquet"
+    pq.write_table(_edges_with_nulls(), path)
+    ef = ur.scan_edges(str(path), src="s", dst="d", on_null="drop")
+    with pytest.warns(UserWarning, match="dropped 2 edge row"):
+        out = ur.degree(ef).collect().to_arrow()
+    deg = dict(zip(out.column("id").to_pylist(), out.column("degree").to_pylist(), strict=True))
+    assert deg == {0: 1, 1: 1, 3: 0}  # out-degree over 0->1, 1->3
+
+
 def test_scan_weighted_stays_aligned_after_drop(tmp_path):
     t = pa.table({"s": [0, 1, None], "d": [1, 0, 2], "w": [1.0, 1.0, 99.0]})
     path = tmp_path / "w.parquet"

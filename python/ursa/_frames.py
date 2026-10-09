@@ -434,12 +434,12 @@ class NodeFrame(_Frame):
 
         ``data`` accepts the same flavours as ``EdgeFrame`` (row dicts, column
         dict, polars / pandas DataFrame, pyarrow Table/RecordBatch); ``id`` is the
-        id-role mapping. Stored as one canonical Arrow attribute batch, so it is
+        id-role mapping. Stored as one canonical Arrow attribute table, so it is
         indistinguishable downstream from a ``from_arrow(..., id=)`` frame."""
-        from ._io import _node_attr_batch, _to_arrow_table
+        from ._io import _node_attr_table, _to_arrow_table
 
         table = _to_arrow_table(data)
-        source = _node_attr_batch(table, id)
+        source = _node_attr_table(table, id)
         self._fill(
             id_col=id,
             plan=(_PlanStep("from_arrow", {"id": id}),),

@@ -17,6 +17,8 @@ rayon = { workspace = true, optional = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rustc-hash = "2"
+# `HashTable` indexes string ids by dense index without storing a key per entry.
+hashbrown = { version = "0.15", default-features = false }
 
 [features]
 # `rayon` is on by default: the normal build is multi-threaded. Turning it off

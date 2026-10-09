@@ -8,6 +8,61 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `scan_edges` and `scan_nodes` now return rows in file order on every run.
+  A file large enough to be read as several parallel partitions previously
+  came back in a run-dependent order, so dense ids, component labels,
+  `edge_ids` and PageRank's last bits changed between runs over the same
+  file. Output over a scan now matches `from_arrow` over the same table
+  exactly (#148).
+- `scan_edges` and `scan_nodes` over a Parquet file with string ids failed
+  with "Utf8View is not a supported id type". DataFusion reads Parquet
+  strings as `Utf8View`; string ids are now canonicalized to `Utf8` like
+  `LargeUtf8`. CSV and in-memory string ids were not affected.
+- A kernel that asked for the lazily built transpose or undirected view from
+  inside a parallel loop could deadlock, e.g. `neighbors().agg()` or `hop` with
+  `direction="in"`/`"both"` on graphs above 65,536 edges.
+
+### Changed
+
+- Building the graph index over an unweighted `scan_edges` source no longer
+  holds the scanned Arrow endpoints for the whole build. Each batch is interned
+  and freed as it is decoded, inside one native call, so the 16 B/edge input
+  never accumulates. On a 30M-edge Parquet file the build's peak memory fell
+  from about 45 to 24 B/edge, and the footprint after the build from about 33
+  to 17 B/edge, with build time unchanged (#149). Weighted scans keep the
+  previous path, since their weight columns must outlive the build.
+- Faster and leaner throughout; every kernel's output is unchanged unless
+  noted. Timings on a 4-core machine:
+  - Index build: known ids are interned in parallel, and scans read 128K-row
+    batches. A 30M-edge Parquet scan and build went from ~2.9s to ~1.65s;
+    with 2M string ids, from ~8.5s to ~3.1s.
+  - In-memory frames (`from_arrow`, `from_polars`, `EdgeFrame(...)`, ...)
+    no longer keep a concatenated copy of the `src`/`dst` columns next to the
+    table; they share its chunks. On 30M int edges the build went from 2.7s
+    to 1.6s (27 to 22 B/edge over the table); on 20M string edges, from 6.9s
+    and 71 B/edge to 1.9s and 24 B/edge.
+  - String node ids are stored once, in the id column's own buffers, instead
+    of about 140 B of per-id overhead. On 20M edges and 2M ids the build peak
+    fell from 36 to 27 B/edge.
+  - The transpose that in-direction kernels use is built straight from the
+    out-CSR, without per-row endpoint arrays, so it is no longer the peak:
+    35 to 30 B/edge on a 30M-edge graph.
+  - `triangle_count` uses the degree-ordered forward algorithm (6–7× faster
+    on skewed graphs), and `clustering_coefficient` benefits too.
+  - `label_propagation` (6×) and `louvain` (3–4×) count votes and community
+    weights in dense arrays instead of hash maps. Louvain's aggregation now
+    sums in a fixed order rather than a randomly seeded hash map's.
+  - `pagerank` divides by out-degree once per node, not per edge (1.8×).
+  - Weight expressions are compiled once and evaluated per batch, and
+    columns that share an expression share one evaluation.
+  - Smaller items: masks built from packed bits, a bounded CSR-build
+    histogram on many-core machines, and a leaner strongly-connected-components
+    kernel.
+- An edge mask whose length does not match the graph's edge count is rejected
+  instead of silently dropping the edges past its end.
+
 ## [0.3.0] — 2026-10-08
 
 ### Added

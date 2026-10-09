@@ -86,21 +86,24 @@ pub fn connected_components_weak(topo: &Topology, mask: Option<&EdgeMask>) -> Ve
 /// SCC's Tarjan root: an arbitrary but stable representative, matching the
 /// weak-component labeling convention. `O(n + m)`.
 pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
-    const UNVISITED: i64 = -1;
+    // Discovery indices are `< n`, which fits `u32` (dense ids are `u32`), so the
+    // max value is free to mark an unvisited node.
+    const UNVISITED: u32 = u32::MAX;
 
     let n = topo.n_nodes();
     let out = topo.out();
 
     let mut index = vec![UNVISITED; n]; // discovery order per node
-    let mut lowlink = vec![0i64; n];
+    let mut lowlink = vec![0u32; n];
     let mut on_stack = vec![false; n];
     let mut labels = vec![0u32; n];
     let mut scc_stack: Vec<u32> = Vec::new();
-    let mut next_index: i64 = 0;
+    let mut next_index: u32 = 0;
 
     // Explicit DFS: each frame is (node, cursor into its out-neighbours). Replaces
-    // recursion so a long path can't blow the native stack.
-    let mut call_stack: Vec<(u32, usize)> = Vec::new();
+    // recursion so a long path can't blow the native stack. A cursor fits `u32`
+    // because a node's degree is at most the edge count, capped at `u32::MAX`.
+    let mut call_stack: Vec<(u32, u32)> = Vec::new();
 
     for start in 0..n as u32 {
         if index[start as usize] != UNVISITED {
@@ -117,11 +120,11 @@ pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> 
                 on_stack[v as usize] = true;
             }
             let neighbors = out.neighbors(v);
-            if cursor < neighbors.len() {
-                let w = neighbors[cursor];
+            if (cursor as usize) < neighbors.len() {
+                let w = neighbors[cursor as usize];
                 call_stack.last_mut().unwrap().1 = cursor + 1;
                 // Subgraph: an edge masked out is not traversed (advance past it).
-                if mask.is_some_and(|m| !m.keep(out.edge_ids(v)[cursor])) {
+                if mask.is_some_and(|m| !m.keep(out.edge_ids(v)[cursor as usize])) {
                     continue;
                 }
                 if index[w as usize] == UNVISITED {

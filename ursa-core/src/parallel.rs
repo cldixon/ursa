@@ -39,6 +39,22 @@ pub fn current_num_threads() -> usize {
 //
 // Each mirrors the rayon method the kernels call, delegating to the ordered `std`
 // iterator so results are byte-identical to the parallel path.
+/// Whether the calling thread is a rayon worker. A lazily cached structure
+/// (`Topology::incoming`, `Topology::undirected`) first requested from inside a
+/// parallel loop is built serially: a parallel build there would let the waiting
+/// worker steal another iteration of the same loop, which can request the same
+/// `OnceLock` again on the same thread and block on it forever. Without `rayon`
+/// there are no workers.
+#[cfg(feature = "rayon")]
+pub fn in_worker() -> bool {
+    rayon::current_thread_index().is_some()
+}
+
+#[cfg(not(feature = "rayon"))]
+pub fn in_worker() -> bool {
+    false
+}
+
 #[cfg(not(feature = "rayon"))]
 mod serial {
     /// `into_par_iter()` -> `into_iter()`. Covers ranges (`0..n`) and owned
@@ -64,13 +80,18 @@ mod serial {
         }
     }
 
-    /// `par_iter_mut()` -> `iter_mut()`, on any mutable slice.
+    /// `par_iter_mut()` / `par_chunks_mut(n)` -> `iter_mut()` / `chunks_mut(n)`, on
+    /// any mutable slice.
     pub trait ParSliceMutExt<T> {
         fn par_iter_mut(&mut self) -> std::slice::IterMut<'_, T>;
+        fn par_chunks_mut(&mut self, chunk_size: usize) -> std::slice::ChunksMut<'_, T>;
     }
     impl<T> ParSliceMutExt<T> for [T] {
         fn par_iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
             self.iter_mut()
+        }
+        fn par_chunks_mut(&mut self, chunk_size: usize) -> std::slice::ChunksMut<'_, T> {
+            self.chunks_mut(chunk_size)
         }
     }
 
@@ -87,6 +108,18 @@ mod serial {
         }
     }
     impl<I: Iterator> MapInitExt for I {}
+
+    /// `for_each_init(init, op)` — as `map_init`, for a side-effecting loop.
+    pub trait ForEachInitExt: Iterator + Sized {
+        fn for_each_init<T, F>(self, init: impl FnOnce() -> T, mut op: F)
+        where
+            F: FnMut(&mut T, Self::Item),
+        {
+            let mut scratch = init();
+            self.for_each(|item| op(&mut scratch, item));
+        }
+    }
+    impl<I: Iterator> ForEachInitExt for I {}
 }
 
 #[cfg(not(feature = "rayon"))]

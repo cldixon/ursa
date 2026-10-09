@@ -47,7 +47,7 @@ impl Scratch {
 /// undirected hop).
 ///
 /// Each seed's BFS is independent, so the seed set is swept in parallel (rayon)
-/// with a per-worker reusable [`Scratch`]. Per-seed outputs are concatenated in
+/// with a per-worker reusable `Scratch`. Per-seed outputs are concatenated in
 /// seed order, so the result is byte-for-byte identical to a serial sweep.
 pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32>, Vec<u32>) {
     let n = topo.n_nodes();
@@ -55,6 +55,10 @@ pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32
         return (Vec::new(), Vec::new());
     }
 
+    // Resolve the transpose before the parallel loop (see `neighbor_aggregate`).
+    if dir != Direction::Out {
+        topo.incoming();
+    }
     // One (src, dst) pair-list per seed, in seed order.
     let per_seed: Vec<(Vec<u32>, Vec<u32>)> = seeds
         .par_iter()

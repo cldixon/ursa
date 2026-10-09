@@ -15,11 +15,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow::compute::cast;
+use arrow::array::{Array, RecordBatch};
+use arrow::compute::kernels::boolean::{and, is_not_null};
+use arrow::compute::{cast, filter};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::prelude::{CsvReadOptions, DataFrame, ParquetReadOptions, SessionContext};
+use datafusion::physical_plan::execute_stream_partitioned;
+use datafusion::prelude::{
+    CsvReadOptions, DataFrame, ParquetReadOptions, SessionConfig, SessionContext,
+};
+use futures::StreamExt;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -27,6 +32,7 @@ use object_store::http::HttpBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use url::{Position, Url};
+use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
 /// Register the object store for a scan `path` on `ctx`, keyed by the URL's
 /// `scheme://authority`. A schemeless (bare local) path parses as an error and is
@@ -138,18 +144,26 @@ fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
 }
 
 /// The canonical Arrow type for a node-id column: any integer type collapses to
-/// `Int64` (the fast path), `Utf8`/`LargeUtf8` to `Utf8` (string ids, covering
-/// UUID-as-string). Any other type is not a supported node-id type.
+/// `Int64` (the fast path), `Utf8`/`LargeUtf8`/`Utf8View` to `Utf8` (string ids,
+/// covering UUID-as-string). DataFusion reads Parquet strings as `Utf8View` by
+/// default, so that is what a string-id Parquet file arrives as. Any other type
+/// is not a supported node-id type.
 fn canonical_id_type(dt: &DataType) -> Result<DataType> {
     use DataType::*;
     match dt {
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ok(Int64),
-        Utf8 | LargeUtf8 => Ok(Utf8),
+        Utf8 | LargeUtf8 | Utf8View => Ok(Utf8),
         other => Err(DataFusionError::NotImplemented(format!(
             "node ids must be an integer or string column; {other:?} is not a supported id type"
         ))),
     }
 }
+
+/// Rows per scanned batch. DataFusion's default (8,192) makes the index build
+/// intern in small pieces; at 128K rows `EdgeInterner` resolves known ids in
+/// parallel, which more than halves a 30M-edge build. Batches stay small next to
+/// the graph itself (2 MiB of `Int64` endpoints).
+const SCAN_BATCH_ROWS: usize = 1 << 17;
 
 /// Open a scan source into an unprojected `DataFrame`: create a fresh session,
 /// register the matching object store for the path's scheme, and read the file in
@@ -165,7 +179,15 @@ async fn open_scan(
     storage_options: &HashMap<String, String>,
     kind: &str,
 ) -> Result<DataFrame> {
-    let ctx = SessionContext::new();
+    // Work stealing lets an idle partition read byte ranges planned for a sibling,
+    // so rows land in a run-dependent partition. Turning it off keeps each
+    // partition on its own contiguous range, which `collect_in_file_order` relies on.
+    let mut config = SessionConfig::new().with_batch_size(SCAN_BATCH_ROWS);
+    config
+        .options_mut()
+        .execution
+        .enable_file_stream_work_stealing = false;
+    let ctx = SessionContext::new_with_config(config);
     register_object_store(&ctx, path, storage_options)?;
     Ok(match detect_format(path, kind)? {
         ScanFormat::Parquet => {
@@ -174,6 +196,25 @@ async fn open_scan(
         }
         ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
     })
+}
+
+/// Collect a scan's batches in file row order.
+///
+/// DataFusion reads a large or multi-file source as several parallel partitions,
+/// and `DataFrame::collect` merges them in whichever order they finish. Dense node
+/// ids are assigned in first-seen order, so a run-dependent row order changes
+/// component labels, `edge_ids`, and floating-point summation order (#148).
+/// The partition layout itself is deterministic: files are sorted by path and
+/// split into contiguous byte ranges. With work stealing off (see `open_scan`),
+/// each partition reads only its own range, so concatenating partitions in order
+/// gives the file's own row order on every run, whatever the thread count.
+async fn collect_in_file_order(df: DataFrame) -> Result<Vec<RecordBatch>> {
+    Ok(df
+        .collect_partitioned()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch, plus
@@ -206,56 +247,174 @@ pub fn scan_edges_batch(
         // Keep the scan's batches separate (no `concat_batches` into one contiguous
         // batch) so the transient ingest footprint stays ~1×, not ~2×, at the
         // 500M-edge target; the topology build consumes them as a stream (#60).
-        let batches = df.collect().await?;
+        let batches = collect_in_file_order(df).await?;
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-            return Err(DataFusionError::Execution(format!(
-                "edge source {path:?} resolved but contained no rows; an empty edge set \
-                 is not a graph in v0.1 (check the path/glob points at data with the \
-                 given src/dst columns)"
-            )));
+            return Err(empty_edge_source(path));
         }
 
         // The canonical id type is taken once from the read schema (identical across
         // the scan's batches) and every batch is canonicalized to it independently.
         let read_schema = batches[0].schema();
-        let src_type = canonical_id_type(read_schema.field(0).data_type())?;
-        let dst_type = canonical_id_type(read_schema.field(1).data_type())?;
-        if src_type != dst_type {
-            return Err(DataFusionError::NotImplemented(format!(
-                "src and dst node-id columns must be the same type (both int or both string); \
-                 got {src_type:?} and {dst_type:?} in {path:?}"
-            )));
-        }
+        let id_type = endpoint_id_type(&read_schema, path)?;
         // src/dst canonicalized; weight columns (positions 2..) passed through.
         let mut fields = vec![
-            Field::new("src", src_type.clone(), true),
-            Field::new("dst", dst_type.clone(), true),
+            Field::new("src", id_type.clone(), true),
+            Field::new("dst", id_type.clone(), true),
         ];
         for i in 2..read_schema.fields().len() {
             fields.push(read_schema.field(i).clone());
         }
         let out_schema = Arc::new(Schema::new(fields));
 
-        let mut out = Vec::with_capacity(batches.len());
-        for batch in &batches {
-            if batch.num_rows() == 0 {
-                continue; // drop empty batches; the non-empty guard above ensures ≥1 remains
-            }
-            let src_c = cast(batch.column(0), &src_type)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let dst_c = cast(batch.column(1), &dst_type)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let mut columns = vec![src_c, dst_c];
-            for i in 2..batch.num_columns() {
-                columns.push(batch.column(i).clone());
-            }
-            out.push(
-                RecordBatch::try_new(out_schema.clone(), columns)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-            );
-        }
+        // Canonicalize each batch independently, in parallel (rayon's collect keeps
+        // batch order). Consuming the list releases each batch after its cast, so a
+        // narrower integer or a view-typed string id column is converted batch by
+        // batch rather than all at once.
+        use rayon::prelude::*;
+        let out = batches
+            .into_par_iter()
+            .filter(|batch| batch.num_rows() > 0) // the non-empty guard above ensures ≥1 remains
+            .map(|batch| {
+                let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
+                let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
+                let mut columns = vec![src_c, dst_c];
+                for i in 2..batch.num_columns() {
+                    columns.push(batch.column(i).clone());
+                }
+                RecordBatch::try_new(out_schema.clone(), columns).map_err(arrow_err)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(out)
     })?
+}
+
+fn arrow_err(e: arrow::error::ArrowError) -> DataFusionError {
+    DataFusionError::ArrowError(Box::new(e), None)
+}
+
+/// The error for an edge source that resolved to zero rows.
+fn empty_edge_source(path: &str) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "edge source {path:?} resolved but contained no rows; an empty edge set \
+         is not a graph in v0.1 (check the path/glob points at data with the \
+         given src/dst columns)"
+    ))
+}
+
+/// The canonical node-id type shared by the `src` and `dst` columns (fields 0 and
+/// 1 of `schema`). Both must canonicalize to the same family.
+fn endpoint_id_type(schema: &Schema, path: &str) -> Result<DataType> {
+    let src_type = canonical_id_type(schema.field(0).data_type())?;
+    let dst_type = canonical_id_type(schema.field(1).data_type())?;
+    if src_type != dst_type {
+        return Err(DataFusionError::NotImplemented(format!(
+            "src and dst node-id columns must be the same type (both int or both string); \
+             got {src_type:?} and {dst_type:?} in {path:?}"
+        )));
+    }
+    Ok(src_type)
+}
+
+/// Why [`scan_edges_topology`] failed: reading the file, or interning its edges
+/// (a null endpoint, an id type mismatch, too many nodes).
+#[derive(Debug)]
+pub enum ScanBuildError {
+    Scan(DataFusionError),
+    Build(IdError),
+}
+
+impl From<DataFusionError> for ScanBuildError {
+    fn from(e: DataFusionError) -> Self {
+        ScanBuildError::Scan(e)
+    }
+}
+
+impl From<IdError> for ScanBuildError {
+    fn from(e: IdError) -> Self {
+        ScanBuildError::Build(e)
+    }
+}
+
+/// A topology built straight from an edge file by [`scan_edges_topology`].
+pub struct ScannedTopology {
+    pub topo: Arc<Topology>,
+    pub ids: Arc<IdMap>,
+    /// Rows dropped for a null endpoint (always 0 unless `drop_nulls`).
+    pub dropped: usize,
+}
+
+/// Scan an edge file and build its topology, interning each batch as it is
+/// decoded.
+///
+/// This produces the same index as `build_topology_batches(scan_edges_batch(..))`
+/// without ever holding the whole Arrow input: partitions are consumed in order,
+/// and each batch is canonicalized, interned and freed before the next is decoded.
+/// The input (16 B/edge for two `Int64` columns) never accumulates, and the batch
+/// buffers are reused by the decoder rather than left for the allocator to hand
+/// back (#149). Decoding interleaves with interning, which is the slower step, so
+/// this is no slower than collecting first.
+///
+/// With `drop_nulls` (the `on_null="drop"` opt-in), rows with a null endpoint are
+/// filtered out and counted in [`ScannedTopology::dropped`]; without it they reach
+/// the interner, which rejects them. Weighted scans keep using
+/// [`scan_edges_batch`], since their weight columns must outlive the build.
+pub fn scan_edges_topology(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    drop_nulls: bool,
+) -> std::result::Result<ScannedTopology, ScanBuildError> {
+    let (interner, dropped) = crate::runtime::block_on(async move {
+        let df = open_scan(path, storage_options, "scan_edges").await?;
+        let df = df.select_columns(&[src, dst])?;
+        let id_type = endpoint_id_type(df.schema().as_arrow(), path)?;
+        let task_ctx = df.task_ctx();
+        let plan = df.create_physical_plan().await?;
+        // Parquet metadata gives the row count up front, so the dense endpoint
+        // vectors are sized once; a CSV has no count and they grow as needed.
+        let hint = plan
+            .partition_statistics(None)?
+            .num_rows
+            .get_value()
+            .copied()
+            .unwrap_or(0);
+        let mut interner = EdgeInterner::with_capacity(hint);
+        let mut dropped = 0;
+        // Partition by partition, in order: see `collect_in_file_order`.
+        for mut stream in execute_stream_partitioned(plan, Arc::new(task_ctx))? {
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
+                let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
+                drop(batch);
+                if drop_nulls && (src_c.null_count() > 0 || dst_c.null_count() > 0) {
+                    let keep = and(
+                        &is_not_null(&src_c).map_err(arrow_err)?,
+                        &is_not_null(&dst_c).map_err(arrow_err)?,
+                    )
+                    .map_err(arrow_err)?;
+                    let src_c = filter(&src_c, &keep).map_err(arrow_err)?;
+                    let dst_c = filter(&dst_c, &keep).map_err(arrow_err)?;
+                    dropped += keep.len() - src_c.len();
+                    interner.push(&src_c, &dst_c)?;
+                } else {
+                    interner.push(&src_c, &dst_c)?;
+                }
+            }
+        }
+        Ok::<_, ScanBuildError>((interner, dropped))
+    })??;
+    if interner.is_empty() && dropped == 0 {
+        return Err(empty_edge_source(path).into());
+    }
+    let (ids, src_dense, dst_dense) = interner.finish();
+    let topo = Topology::build(ids.len(), src_dense, dst_dense);
+    Ok(ScannedTopology {
+        topo: Arc::new(topo),
+        ids: Arc::new(ids),
+        dropped,
+    })
 }
 
 /// Read a node/attribute file into a batch list.
@@ -293,7 +452,7 @@ pub fn scan_nodes_batch(
 
         // Keep the batches separate (no `concat_batches`); the attribute table
         // crosses the FFI as a batch list and is consumed as a stream (#60).
-        let batches = df.collect().await?;
+        let batches = collect_in_file_order(df).await?;
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
                 "node source {path:?} resolved but contained no rows (check the path/glob \
@@ -351,6 +510,128 @@ mod tests {
 
     fn no_opts() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Write `n` edges `(i, i + 1)` to a Parquet file with many small row groups, so
+    /// DataFusion splits the scan across several partitions.
+    fn write_multi_row_group_parquet(path: &std::path::Path, n: i64) {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from", DataType::Int64, false),
+            Field::new("to", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..n)),
+                Arc::new(Int64Array::from_iter_values(1..n + 1)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4_096))
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn scan_topology_matches_the_collect_then_build_path() {
+        // A multi-partition file: the streamed build must give the same dense ids
+        // and CSR as building from the collected batches.
+        let path = std::env::temp_dir().join("ursa_scan_test_topology.parquet");
+        write_multi_row_group_parquet(&path, 2_000_000);
+        let p = path.to_str().unwrap();
+        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &[]).unwrap();
+        let pairs: Vec<(&dyn Array, &dyn Array)> = batches
+            .iter()
+            .map(|b| (b.column(0).as_ref(), b.column(1).as_ref()))
+            .collect();
+        let (topo, ids) = crate::build_topology_batches(&pairs).unwrap();
+        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
+        assert_eq!(scanned.dropped, 0);
+        assert_eq!(&scanned.ids.user_id_array(), &ids.user_id_array());
+        assert_eq!(scanned.topo.out().offsets, topo.out().offsets);
+        assert_eq!(scanned.topo.out().targets, topo.out().targets);
+        assert_eq!(scanned.topo.out().edge_ids, topo.out().edge_ids);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn scan_topology_drops_null_rows_only_when_asked() {
+        let path = std::env::temp_dir().join("ursa_scan_test_topology_nulls.csv");
+        std::fs::write(&path, "from,to\n1,2\n,3\n3,\n2,3\n").unwrap();
+        let p = path.to_str().unwrap();
+        // Default: the null endpoint is an interning error, not a scan error.
+        assert!(matches!(
+            scan_edges_topology(p, "from", "to", &no_opts(), false),
+            Err(ScanBuildError::Build(IdError::Null))
+        ));
+        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), true).unwrap();
+        assert_eq!(scanned.dropped, 2);
+        assert_eq!(scanned.topo.n_edges(), 2);
+        assert_eq!(scanned.topo.n_nodes(), 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parquet_string_ids_scan_and_build() {
+        // DataFusion reads Parquet strings as Utf8View; string ids must still be
+        // accepted, canonicalized to Utf8, and build the same graph either way.
+        use datafusion::parquet::arrow::ArrowWriter;
+        let path = std::env::temp_dir().join("ursa_scan_test_string_ids.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from", DataType::Utf8, false),
+            Field::new("to", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(arrow::array::StringArray::from(vec!["b", "c", "a"])),
+            ],
+        )
+        .unwrap();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let p = path.to_str().unwrap();
+
+        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &[]).unwrap();
+        assert_eq!(batches[0].column(0).data_type(), &DataType::Utf8);
+        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
+        assert_eq!((scanned.topo.n_nodes(), scanned.topo.n_edges()), (3, 3));
+        let nodes = scan_nodes_batch(p, "from", &no_opts(), &[]).unwrap();
+        assert_eq!(nodes[0].column(0).data_type(), &DataType::Utf8);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parquet_scan_preserves_file_row_order() {
+        // #148: a multi-row-group file is read as several parallel partitions. The
+        // scan must return rows in file order on every run, not in partition
+        // completion order, or dense ids (and so kernel output) change per run.
+        let path = std::env::temp_dir().join("ursa_scan_test_row_order.parquet");
+        let n: i64 = 2_000_000; // ~32 MB: above the 10 MB repartition threshold
+        write_multi_row_group_parquet(&path, n);
+        for _ in 0..5 {
+            let batches =
+                scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+            let mut next = 0i64;
+            for b in &batches {
+                let src = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                for v in src.values() {
+                    assert_eq!(*v, next, "scan returned rows out of file order");
+                    next += 1;
+                }
+            }
+            assert_eq!(next, n);
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

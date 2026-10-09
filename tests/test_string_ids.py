@@ -196,3 +196,27 @@ def test_weighted_algorithms_over_string_ids():
         df = verb(edges).collect().to_arrow()
         assert df.schema.field("id").type == pa.string()
         assert {r["id"] for r in df.to_pylist()} == {"a", "b", "c"}
+
+
+def test_scan_parquet_string_ids_matches_in_memory(tmp_path):
+    # DataFusion reads Parquet strings as string_view; a string-id file must scan
+    # and give the same graph as the same table in memory.
+    import pyarrow.parquet as pq
+
+    tbl = pa.table({"s": ["a", "b", "c", "a"], "d": ["b", "c", "a", "c"]})
+    path = tmp_path / "e.parquet"
+    pq.write_table(tbl, path)
+    nodes = pa.table({"id": ["a", "b", "c"], "w": [1.0, 2.0, 3.0]})
+    npath = tmp_path / "n.parquet"
+    pq.write_table(nodes, npath)
+
+    scanned = ur.scan_edges(str(path), src="s", dst="d")
+    in_mem = ur.from_arrow(tbl, src="s", dst="d")
+    got = ur.pagerank(scanned).collect().to_arrow().sort_by("id")
+    want = ur.pagerank(in_mem).collect().to_arrow().sort_by("id")
+    assert got.equals(want)
+    assert got.column("id").type == pa.string()
+
+    nf = ur.scan_nodes(str(npath), id="id")
+    out = nf.with_columns(pr=ur.pagerank(scanned)).collect().to_arrow()
+    assert sorted(out.column("id").to_pylist()) == ["a", "b", "c"]

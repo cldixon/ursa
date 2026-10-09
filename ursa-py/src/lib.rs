@@ -41,7 +41,8 @@ use ursa_core::{EdgeMask, IdMap};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
-    hop_reached_nodes, scan_edges_batch, scan_nodes_batch, shortest_path_nodes,
+    hop_reached_nodes, scan_edges_batch, scan_edges_topology, scan_nodes_batch,
+    shortest_path_nodes, ScanBuildError, ScannedTopology,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,14 +111,22 @@ fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
 /// says whether original edge row `e` is in the subgraph (#114). The array is in
 /// original edge-row order — the order the topology was built from — so `mask.keep`
 /// aligns with the CSR's `edge_ids`. A null is treated as *not kept*.
-fn edge_mask_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Arc<EdgeMask>> {
+///
+/// The mask must cover exactly the graph's `n_edges` rows: a shorter one would
+/// silently drop every edge past its end (`keep` is false out of range).
+fn edge_mask_from_pyarrow(obj: &Bound<'_, PyAny>, n_edges: usize) -> PyResult<Arc<EdgeMask>> {
     let arr = array_from_pyarrow(obj)?;
     let b = arr
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| PyValueError::new_err("edge_mask must be a pyarrow boolean array"))?;
-    let bools: Vec<bool> = (0..b.len()).map(|i| b.is_valid(i) && b.value(i)).collect();
-    Ok(Arc::new(EdgeMask::from_bools(&bools)))
+    if b.len() != n_edges {
+        return Err(PyValueError::new_err(format!(
+            "edge_mask length ({}) does not match the edge count ({n_edges})",
+            b.len()
+        )));
+    }
+    Ok(Arc::new(EdgeMask::from_boolean_array(b)))
 }
 
 /// Counts topology builds, so tests can prove the index-preservation contract
@@ -156,6 +165,37 @@ fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex>
     Ok(GraphIndex { topo, ids })
 }
 
+/// Scan an edge file and build its graph index in one native call, returning the
+/// index and the number of null-endpoint rows dropped (always 0 unless
+/// `drop_nulls`, the `on_null="drop"` opt-in).
+///
+/// Equivalent to `build_index(scan_edges_arrow(...))` for an unweighted scan, but
+/// the scanned Arrow endpoints never accumulate: each batch is interned and freed
+/// as it is decoded (`scan_edges_topology`), which takes the 16 B/edge input out of
+/// the build's peak (#149). A weighted scan keeps the two-step path, since its
+/// weight columns must outlive the build.
+#[pyfunction]
+#[pyo3(signature = (path, src, dst, storage_options=None, drop_nulls=false))]
+fn scan_build_index(
+    py: Python<'_>,
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: Option<HashMap<String, String>>,
+    drop_nulls: bool,
+) -> PyResult<(GraphIndex, usize)> {
+    let opts = storage_options.unwrap_or_default();
+    let scanned = py.detach(|| {
+        scan_edges_topology(path, src, dst, &opts, drop_nulls).map_err(|e| match e {
+            ScanBuildError::Scan(e) => to_pyerr(e),
+            ScanBuildError::Build(e) => PyValueError::new_err(e.to_string()),
+        })
+    })?;
+    TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    let ScannedTopology { topo, ids, dropped } = scanned;
+    Ok((GraphIndex { topo, ids }, dropped))
+}
+
 /// Total topology builds so far (test/observability hook for the index contract).
 #[pyfunction]
 fn _topology_build_count() -> usize {
@@ -192,7 +232,7 @@ fn run_node_query(
     let columns_json = columns_json.to_string();
     // A subgraph view (#114): a per-edge-row boolean mask over the shared parent CSR.
     let mask = match edge_mask {
-        Some(obj) => Some(edge_mask_from_pyarrow(&obj)?),
+        Some(obj) => Some(edge_mask_from_pyarrow(&obj, topo.n_edges())?),
         None => None,
     };
     // The node attribute table and the edge attribute table (for weight
@@ -562,6 +602,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the cached graph index (built once per frame)
     m.add_class::<GraphIndex>()?;
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_build_index, m)?)?;
     m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
     // real execution path
     m.add_function(wrap_pyfunction!(run_node_query, m)?)?;

@@ -35,8 +35,8 @@ impl SplitMix64 {
 
 /// Deterministically choose `k` distinct indices from `0..r` **without
 /// replacement**, returned sorted ascending. A partial Fisher–Yates: reproducible
-/// from `seed` (and portable/thread-count-independent, like [`shuffled_order`]);
-/// `k` is clamped to `r`. `seed = None` uses [`DEFAULT_SEED`], so an unseeded
+/// from `seed` (and portable/thread-count-independent, like `shuffled_order`);
+/// `k` is clamped to `r`. `seed = None` uses `DEFAULT_SEED`, so an unseeded
 /// `sample` is still fully reproducible (deterministic-by-default, per the spec).
 ///
 /// The caller is responsible for imposing a content-canonical row order *before*

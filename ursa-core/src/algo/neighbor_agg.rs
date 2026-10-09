@@ -47,6 +47,11 @@ pub fn neighbor_aggregate(
         "attr length must equal the node count"
     );
     let n = topo.n_nodes();
+    // Resolve the transpose before the parallel loop, so it is built (in parallel)
+    // here rather than lazily by the first worker that needs it.
+    if direction != Direction::Out {
+        topo.incoming();
+    }
     (0..n as u32)
         .into_par_iter()
         .map_init(Vec::<f64>::new, |scratch, u| {
