@@ -111,14 +111,22 @@ fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
 /// says whether original edge row `e` is in the subgraph (#114). The array is in
 /// original edge-row order — the order the topology was built from — so `mask.keep`
 /// aligns with the CSR's `edge_ids`. A null is treated as *not kept*.
-fn edge_mask_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<Arc<EdgeMask>> {
+///
+/// The mask must cover exactly the graph's `n_edges` rows: a shorter one would
+/// silently drop every edge past its end (`keep` is false out of range).
+fn edge_mask_from_pyarrow(obj: &Bound<'_, PyAny>, n_edges: usize) -> PyResult<Arc<EdgeMask>> {
     let arr = array_from_pyarrow(obj)?;
     let b = arr
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| PyValueError::new_err("edge_mask must be a pyarrow boolean array"))?;
-    let bools: Vec<bool> = (0..b.len()).map(|i| b.is_valid(i) && b.value(i)).collect();
-    Ok(Arc::new(EdgeMask::from_bools(&bools)))
+    if b.len() != n_edges {
+        return Err(PyValueError::new_err(format!(
+            "edge_mask length ({}) does not match the edge count ({n_edges})",
+            b.len()
+        )));
+    }
+    Ok(Arc::new(EdgeMask::from_boolean_array(b)))
 }
 
 /// Counts topology builds, so tests can prove the index-preservation contract
@@ -224,7 +232,7 @@ fn run_node_query(
     let columns_json = columns_json.to_string();
     // A subgraph view (#114): a per-edge-row boolean mask over the shared parent CSR.
     let mask = match edge_mask {
-        Some(obj) => Some(edge_mask_from_pyarrow(&obj)?),
+        Some(obj) => Some(edge_mask_from_pyarrow(&obj, topo.n_edges())?),
         None => None,
     };
     // The node attribute table and the edge attribute table (for weight

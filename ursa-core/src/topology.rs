@@ -22,6 +22,8 @@
 
 use std::sync::OnceLock;
 
+use arrow::array::{Array, BooleanArray};
+
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -63,6 +65,28 @@ impl EdgeMask {
             words,
             n_edges,
             n_kept,
+        }
+    }
+
+    /// Build from an Arrow boolean array (`keep[e]` = row `e` retained), treating a
+    /// null as *not kept*. Works on the packed bits directly: the validity bitmap is
+    /// ANDed in and the 64-bit words are copied across, with no per-row loop.
+    pub fn from_boolean_array(keep: &BooleanArray) -> Self {
+        let bits = match keep.nulls() {
+            Some(nulls) => keep.values() & nulls.inner(),
+            None => keep.values().clone(),
+        };
+        // Arrow and `EdgeMask` both store row `e` at bit `e % 64` of word `e / 64`.
+        let words: Vec<u64> = bits
+            .inner()
+            .bit_chunks(bits.offset(), bits.len())
+            .iter_padded()
+            .take(bits.len().div_ceil(64)) // no trailing word past a 64-bit boundary
+            .collect();
+        EdgeMask {
+            words,
+            n_edges: bits.len(),
+            n_kept: bits.count_set_bits(),
         }
     }
 
@@ -634,6 +658,33 @@ mod tests {
                 assert_eq!(got, expect);
                 assert_eq!(lazy.incoming().edge_ids, eager.incoming().edge_ids);
             }
+        }
+    }
+
+    #[test]
+    fn mask_from_boolean_array_matches_from_bools() {
+        // Nulls are not kept; an offset slice must read its own bits.
+        let vals: Vec<Option<bool>> = (0..200)
+            .map(|i| match i % 5 {
+                0 => None,
+                1 | 3 => Some(true),
+                _ => Some(false),
+            })
+            .collect();
+        let arr = BooleanArray::from(vals.clone());
+        for (start, len) in [(0, 200), (3, 130), (64, 64), (7, 0)] {
+            let slice = arr.slice(start, len);
+            let slice = slice.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let bools: Vec<bool> = vals[start..start + len]
+                .iter()
+                .map(|v| v.unwrap_or(false))
+                .collect();
+            let (a, b) = (
+                EdgeMask::from_boolean_array(slice),
+                EdgeMask::from_bools(&bools),
+            );
+            assert_eq!(a.words, b.words, "start={start} len={len}");
+            assert_eq!((a.n_edges, a.n_kept), (b.n_edges, b.n_kept));
         }
     }
 

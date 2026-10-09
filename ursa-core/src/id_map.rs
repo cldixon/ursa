@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
+use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray, StringBuilder};
 use arrow::datatypes::DataType;
 use rustc_hash::FxHashMap;
 
@@ -119,6 +119,21 @@ impl EdgeInterner {
         let map = self.map.unwrap_or_else(IdMap::new_int64);
         (map, self.src_dense, self.dst_dense)
     }
+}
+
+/// A `StringArray` of `strings[i]` for each index, sized exactly up front (one
+/// pass for the byte total, one to copy), rather than collecting a `Vec<&str>` and
+/// letting the value buffer grow by doubling.
+fn gather_strings(
+    strings: &[Arc<str>],
+    indices: impl Iterator<Item = usize> + Clone,
+) -> StringArray {
+    let bytes: usize = indices.clone().map(|i| strings[i].len()).sum();
+    let mut builder = StringBuilder::with_capacity(indices.size_hint().0, bytes);
+    for i in indices {
+        builder.append_value(&strings[i]);
+    }
+    builder.finish()
 }
 
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
@@ -408,9 +423,7 @@ impl IdMap {
     fn build_user_id_array(&self) -> ArrayRef {
         match self {
             IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(to_user.clone())),
-            IdMap::Utf8 { to_user, .. } => Arc::new(StringArray::from(
-                to_user.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
-            )),
+            IdMap::Utf8 { to_user, .. } => Arc::new(gather_strings(to_user, 0..to_user.len())),
         }
     }
 
@@ -425,12 +438,9 @@ impl IdMap {
                     .map(|&d| to_user[d as usize])
                     .collect::<Vec<_>>(),
             )),
-            IdMap::Utf8 { to_user, .. } => Arc::new(StringArray::from(
-                dense
-                    .iter()
-                    .map(|&d| to_user[d as usize].as_ref())
-                    .collect::<Vec<_>>(),
-            )),
+            IdMap::Utf8 { to_user, .. } => {
+                Arc::new(gather_strings(to_user, dense.iter().map(|&d| d as usize)))
+            }
         }
     }
 
