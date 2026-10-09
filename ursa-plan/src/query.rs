@@ -20,9 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
@@ -423,50 +421,61 @@ where
 /// default seed; `n >= row_count` returns all rows.
 fn sample_rows(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Result<Vec<RecordBatch>> {
     use arrow::row::{RowConverter, SortField};
+    use rayon::prelude::*;
+    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
 
     let Some(first) = batches.first() else {
         return Ok(batches);
     };
     let schema = first.schema();
-    let batch = arrow::compute::concat_batches(&schema, &batches)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let r = batch.num_rows();
+    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
     if n >= r {
-        return Ok(vec![batch]);
+        return Ok(batches);
     }
     // Canonical, partition-independent order: sort row indices by the full-tuple
     // byte encoding. Depends only on values, so it is identical regardless of how
     // the rows were partitioned. Duplicate rows encode equal (interchangeable).
-    let fields: Vec<SortField> = batch
-        .schema()
+    // Rows are encoded batch by batch (no concatenated copy of the input) and
+    // sorted in parallel; the sort is stable, like the serial one it replaces.
+    let fields: Vec<SortField> = schema
         .fields()
         .iter()
         .map(|f| SortField::new(f.data_type().clone()))
         .collect();
-    let converter =
-        RowConverter::new(fields).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let rows = converter
-        .convert_columns(batch.columns())
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let converter = RowConverter::new(fields).map_err(arrow_err)?;
+    let mut rows = converter.empty_rows(r, 0);
+    for batch in &batches {
+        converter
+            .append(&mut rows, batch.columns())
+            .map_err(arrow_err)?;
+    }
     let mut canonical: Vec<usize> = (0..r).collect();
-    canonical.sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
+    canonical.par_sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
+    drop(rows);
     // Seed-deterministic selection over canonical positions (already sorted
-    // ascending), mapped back to original row indices; emitted in canonical order.
-    let picks = ursa_core::algo::sample_indices(r, n, seed);
-    let indices = UInt32Array::from(
-        picks
-            .into_iter()
-            .map(|p| canonical[p] as u32)
-            .collect::<Vec<u32>>(),
-    );
-    let cols = batch
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c, &indices, None))
+    // ascending), mapped back to (batch, row); emitted in canonical order.
+    let mut starts = Vec::with_capacity(batches.len());
+    let mut acc = 0usize;
+    for b in &batches {
+        starts.push(acc);
+        acc += b.num_rows();
+    }
+    let picks: Vec<(usize, usize)> = ursa_core::algo::sample_indices(r, n, seed)
+        .into_iter()
+        .map(|p| {
+            let g = canonical[p];
+            let b = starts.partition_point(|&s| s <= g) - 1;
+            (b, g - starts[b])
+        })
+        .collect();
+    let cols = (0..schema.fields().len())
+        .map(|c| {
+            let sources: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
+            arrow::compute::interleave(&sources, &picks)
+        })
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let sampled = RecordBatch::try_new(schema, cols)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        .map_err(arrow_err)?;
+    let sampled = RecordBatch::try_new(schema, cols).map_err(arrow_err)?;
     Ok(vec![sampled])
 }
 
