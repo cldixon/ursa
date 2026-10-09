@@ -16,8 +16,11 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray, StringBuilder};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
+use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
+use std::hash::BuildHasher;
 
 /// Incremental edge interning: feed `(src, dst)` chunks one at a time with
 /// [`EdgeInterner::push`], then [`EdgeInterner::finish`] for the id map and the
@@ -125,9 +128,7 @@ impl EdgeInterner {
                         sd,
                         dd,
                         |map, is_dst, i| match map {
-                            IdMap::Utf8 { to_dense, .. } => {
-                                to_dense.get(ids(is_dst).value(i)).copied()
-                            }
+                            IdMap::Utf8 { ids: map_ids, .. } => map_ids.get(ids(is_dst).value(i)),
                             IdMap::Int64 { .. } => unreachable!("Utf8 chunk, Int64 map"),
                         },
                         |map, is_dst, i| map.intern_str(ids(is_dst).value(i)),
@@ -150,28 +151,167 @@ impl EdgeInterner {
     /// The id map and the dense `(src, dst)` endpoints, ready for
     /// [`Topology::build`](crate::topology::Topology::build).
     pub fn finish(self) -> (IdMap, Vec<u32>, Vec<u32>) {
-        let map = self.map.unwrap_or_else(IdMap::new_int64);
+        let mut map = self.map.unwrap_or_else(IdMap::new_int64);
+        map.freeze();
         (map, self.src_dense, self.dst_dense)
     }
 }
 
-/// A `StringArray` of `strings[i]` for each index, sized exactly up front (one
-/// pass for the byte total, one to copy), rather than collecting a `Vec<&str>` and
+/// A `StringArray` of `value(i)` for each index, sized exactly up front (one pass
+/// for the byte total, one to copy), rather than collecting a `Vec<&str>` and
 /// letting the value buffer grow by doubling.
-fn gather_strings(
-    strings: &[Arc<str>],
+fn gather_strings<'a>(
+    value: impl Fn(usize) -> &'a str,
     indices: impl Iterator<Item = usize> + Clone,
 ) -> StringArray {
-    let bytes: usize = indices.clone().map(|i| strings[i].len()).sum();
+    let bytes: usize = indices.clone().map(|i| value(i).len()).sum();
     let mut builder = StringBuilder::with_capacity(indices.size_hint().0, bytes);
     for i in indices {
-        builder.append_value(&strings[i]);
+        builder.append_value(value(i));
     }
     builder.finish()
 }
 
+/// The distinct string ids, stored once.
+///
+/// The ids live in two Arrow-shaped buffers, the UTF-8 bytes and `i32` offsets,
+/// and a `HashTable` of dense indices finds an id by hashing the string it
+/// points at. There is no per-id allocation and no key copy in the index: about
+/// `len + 10` bytes per id, against roughly `len + 100` for an `Arc<str>` held by
+/// both a vector and a `HashMap` plus a second copy in the cached id array. Once
+/// interning is done, [`StrIds::freeze`] moves the buffers into a `StringArray`
+/// without copying; that array then serves lookups and is the cached id column.
+#[derive(Debug, Clone)]
+pub struct StrIds {
+    store: StrStore,
+    table: HashTable<u32>,
+}
+
+/// The hash `StrIds` indexes ids by.
+#[inline]
+fn hash_str(id: &str) -> u64 {
+    rustc_hash::FxBuildHasher.hash_one(id)
+}
+
+#[derive(Debug, Clone)]
+enum StrStore {
+    /// Growing while ids are interned.
+    Building { bytes: Vec<u8>, offsets: Vec<i32> },
+    /// Frozen into the id column.
+    Frozen(StringArray),
+}
+
+impl StrStore {
+    #[inline]
+    fn value(&self, i: u32) -> &str {
+        match self {
+            StrStore::Building { bytes, offsets } => {
+                let (lo, hi) = (
+                    offsets[i as usize] as usize,
+                    offsets[i as usize + 1] as usize,
+                );
+                // SAFETY: `bytes` only ever receives whole `&str`s (see `push`), and
+                // `offsets` marks their boundaries, so every slice is valid UTF-8.
+                unsafe { std::str::from_utf8_unchecked(&bytes[lo..hi]) }
+            }
+            StrStore::Frozen(array) => array.value(i as usize),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            StrStore::Building { offsets, .. } => offsets.len() - 1,
+            StrStore::Frozen(array) => array.len(),
+        }
+    }
+}
+
+impl StrIds {
+    fn new() -> Self {
+        StrIds {
+            store: StrStore::Building {
+                bytes: Vec::new(),
+                offsets: vec![0],
+            },
+            table: HashTable::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    #[inline]
+    fn value(&self, i: u32) -> &str {
+        self.store.value(i)
+    }
+
+    /// The dense index of `id`, if interned.
+    #[inline]
+    fn get(&self, id: &str) -> Option<u32> {
+        let hash = hash_str(id);
+        self.table
+            .find(hash, |&i| self.store.value(i) == id)
+            .copied()
+    }
+
+    /// The dense index of `id`, interning it if new. One hash either way.
+    fn intern(&mut self, id: &str) -> Result<u32, IdError> {
+        let hash = hash_str(id);
+        let StrIds { store, table } = self;
+        if let Some(&i) = table.find(hash, |&i| store.value(i) == id) {
+            return Ok(i);
+        }
+        let next = store.len();
+        if next >= u32::MAX as usize {
+            return Err(IdError::TooManyNodes);
+        }
+        if let StrStore::Frozen(array) = store {
+            // Interning after `freeze` (not done by any caller): copy back out.
+            let (offsets, values, _) = array.clone().into_parts();
+            *store = StrStore::Building {
+                bytes: values.to_vec(),
+                offsets: offsets.to_vec(),
+            };
+        }
+        let StrStore::Building { bytes, offsets } = store else {
+            unreachable!("thawed above")
+        };
+        let end = i32::try_from(bytes.len() + id.len()).map_err(|_| IdError::IdBytesOverflow)?;
+        bytes.extend_from_slice(id.as_bytes());
+        offsets.push(end);
+        let i = next as u32;
+        table.insert_unique(hash, i, |&j| hash_str(store.value(j)));
+        Ok(i)
+    }
+
+    /// Move the buffers into a `StringArray` (no copy) and return it.
+    fn freeze(&mut self) -> StringArray {
+        if let StrStore::Building { bytes, offsets } = &mut self.store {
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+            let values = Buffer::from_vec(std::mem::take(bytes));
+            // SAFETY: the offsets start at 0, never decrease, end at `values.len()`
+            // and fall on `&str` boundaries (see `intern`), and there are no nulls.
+            let array = unsafe { StringArray::new_unchecked(offsets, values, None) };
+            self.store = StrStore::Frozen(array);
+        }
+        match &self.store {
+            StrStore::Frozen(array) => array.clone(),
+            StrStore::Building { .. } => unreachable!("frozen above"),
+        }
+    }
+
+    /// The ids as a `StringArray`: a cheap clone once frozen, a copy before.
+    fn to_array(&self) -> StringArray {
+        match &self.store {
+            StrStore::Frozen(array) => array.clone(),
+            StrStore::Building { .. } => gather_strings(|i| self.value(i as u32), 0..self.len()),
+        }
+    }
+}
+
 /// Chunks at least this long intern their known ids in parallel (see
-/// [`intern_i64_parallel`]); shorter ones are not worth the fork.
+/// [`intern_two_phase`]); shorter ones are not worth the fork.
 const PARALLEL_MIN_ROWS: usize = 1 << 15;
 
 /// Marks an endpoint the parallel lookup did not find. Dense ids stay below
@@ -234,11 +374,10 @@ fn intern_in_parallel(len: usize) -> bool {
 /// `u32` caps the node space at ~4.29B nodes — the correct trade for cache
 /// behaviour at the v0.1 target scale. A `u64` node space is a future feature flag.
 ///
-/// String ids are stored as `Arc<str>` shared between the `to_user` vector and the
-/// `to_dense` map, so each distinct id is heap-allocated **once** (not twice, as a
-/// `Vec<String>` + `HashMap<String, _>` would). The user-id Arrow array is built
-/// lazily and cached (`id_array`): it is immutable once built, so the per-collect
-/// `user_id_array()` call is an `Arc` clone instead of a full deep copy of every id.
+/// String ids are stored once, in Arrow-shaped buffers that become the id column
+/// (see [`StrIds`]). The user-id Arrow array is cached (`id_array`): it is
+/// immutable once built, so the per-collect `user_id_array()` call is an `Arc`
+/// clone instead of a full deep copy of every id.
 #[derive(Debug, Clone)]
 pub enum IdMap {
     /// Integer user ids (the fast path).
@@ -249,8 +388,7 @@ pub enum IdMap {
     },
     /// String user ids (also covers UUID-as-string).
     Utf8 {
-        to_user: Vec<Arc<str>>,
-        to_dense: FxHashMap<Arc<str>, u32>,
+        ids: StrIds,
         id_array: OnceLock<ArrayRef>,
     },
 }
@@ -271,6 +409,9 @@ pub enum IdError {
     /// `u64` node space is a future feature flag). Better a clear error than the
     /// silent index wraparound it would otherwise cause.
     TooManyNodes,
+    /// The distinct string ids total more than `i32::MAX` bytes, beyond the `Utf8`
+    /// id column's offset range.
+    IdBytesOverflow,
 }
 
 impl std::fmt::Display for IdError {
@@ -294,6 +435,10 @@ impl std::fmt::Display for IdError {
             IdError::TooManyNodes => write!(
                 f,
                 "more than u32::MAX (~4.29B) distinct nodes; exceeds the dense-index cap"
+            ),
+            IdError::IdBytesOverflow => write!(
+                f,
+                "the distinct string node ids total more than 2 GiB, beyond the Utf8 id column"
             ),
         }
     }
@@ -377,8 +522,7 @@ impl IdMap {
 
     fn new_utf8() -> Self {
         IdMap::Utf8 {
-            to_user: Vec::new(),
-            to_dense: FxHashMap::default(),
+            ids: StrIds::new(),
             id_array: OnceLock::new(),
         }
     }
@@ -467,23 +611,18 @@ impl IdMap {
 
     fn intern_str(&mut self, user: &str) -> Result<u32, IdError> {
         match self {
-            IdMap::Utf8 {
-                to_user, to_dense, ..
-            } => {
-                if let Some(&idx) = to_dense.get(user) {
-                    return Ok(idx);
-                }
-                if to_user.len() >= u32::MAX as usize {
-                    return Err(IdError::TooManyNodes);
-                }
-                let idx = to_user.len() as u32;
-                // One heap allocation for the id, shared (Arc) between both maps.
-                let key: Arc<str> = Arc::from(user);
-                to_user.push(Arc::clone(&key));
-                to_dense.insert(key, idx);
-                Ok(idx)
-            }
+            IdMap::Utf8 { ids, .. } => ids.intern(user),
             IdMap::Int64 { .. } => unreachable!("intern_str on an Int64 IdMap"),
+        }
+    }
+
+    /// Settle the map once interning is done: string ids move into their final
+    /// id column (no copy), which is cached as [`Self::user_id_array`].
+    fn freeze(&mut self) {
+        if let IdMap::Utf8 { ids, id_array } = self {
+            let array = ids.freeze();
+            *id_array = OnceLock::new();
+            let _ = id_array.set(Arc::new(array));
         }
     }
 
@@ -516,7 +655,7 @@ impl IdMap {
     fn build_user_id_array(&self) -> ArrayRef {
         match self {
             IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(to_user.clone())),
-            IdMap::Utf8 { to_user, .. } => Arc::new(gather_strings(to_user, 0..to_user.len())),
+            IdMap::Utf8 { ids, .. } => Arc::new(ids.to_array()),
         }
     }
 
@@ -531,9 +670,10 @@ impl IdMap {
                     .map(|&d| to_user[d as usize])
                     .collect::<Vec<_>>(),
             )),
-            IdMap::Utf8 { to_user, .. } => {
-                Arc::new(gather_strings(to_user, dense.iter().map(|&d| d as usize)))
-            }
+            IdMap::Utf8 { ids, .. } => Arc::new(gather_strings(
+                |i| ids.value(i as u32),
+                dense.iter().map(|&d| d as usize),
+            )),
         }
     }
 
@@ -563,7 +703,7 @@ impl IdMap {
                     })
                     .collect())
             }
-            IdMap::Utf8 { to_dense, .. } => {
+            IdMap::Utf8 { ids, .. } => {
                 if !matches!(id_kind(arr.data_type())?, IdKind::Utf8) {
                     return Err(IdError::MixedTypes);
                 }
@@ -573,7 +713,7 @@ impl IdMap {
                         if a.is_null(i) {
                             None
                         } else {
-                            to_dense.get(a.value(i)).copied()
+                            ids.get(a.value(i))
                         }
                     })
                     .collect())
@@ -585,7 +725,7 @@ impl IdMap {
     pub fn len(&self) -> usize {
         match self {
             IdMap::Int64 { to_user, .. } => to_user.len(),
-            IdMap::Utf8 { to_user, .. } => to_user.len(),
+            IdMap::Utf8 { ids, .. } => ids.len(),
         }
     }
 
@@ -785,6 +925,30 @@ mod tests {
         let (smap, ssd, sdd) = IdMap::from_edge_batches(&pairs).unwrap();
         assert_eq!((bsd, bdd), (ssd, sdd));
         assert_eq!(&bmap.user_id_array(), &smap.user_id_array());
+    }
+
+    #[test]
+    fn str_ids_intern_freeze_and_thaw() {
+        let mut ids = StrIds::new();
+        let words = ["", "a", "héllo", "a", "🦀", "", "zz"];
+        let got: Vec<u32> = words.iter().map(|w| ids.intern(w).unwrap()).collect();
+        assert_eq!(got, vec![0, 1, 2, 1, 3, 0, 4]);
+        // Enough ids to force the table to grow; lookups must survive the rehash.
+        for i in 0..10_000 {
+            ids.intern(&format!("id-{i}")).unwrap();
+        }
+        assert_eq!(ids.get("héllo"), Some(2));
+        assert_eq!(ids.get("id-9999"), Some(10_004));
+        assert_eq!(ids.get("missing"), None);
+
+        let frozen = ids.freeze();
+        assert_eq!(frozen.len(), 10_005);
+        assert_eq!(frozen.value(3), "🦀");
+        assert_eq!(ids.get("id-0"), Some(5)); // lookups read the frozen array
+                                              // Interning after freeze still works (copying back out).
+        assert_eq!(ids.intern("zz").unwrap(), 4);
+        assert_eq!(ids.intern("new").unwrap(), 10_005);
+        assert_eq!(ids.to_array().value(10_005), "new");
     }
 
     #[test]
