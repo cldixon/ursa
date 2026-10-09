@@ -1131,9 +1131,32 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     with cell.lock:
         idx = cell.value
         if idx is None:
-            edge_batches = _require_edges(parent)
-            idx = _native().build_index(edge_batches)
+            idx = _scan_build_index(parent)
+            if idx is None:
+                idx = _native().build_index(_require_edges(parent))
             cell.value = idx
+    return idx
+
+
+def _scan_build_index(edges: EdgeFrame) -> Any:
+    """Build the index for a single-path ``scan_edges`` frame in one native call, or
+    return ``None`` for any other source. The scanned endpoints stay in Rust and are
+    freed batch by batch as they are interned, instead of a Python batch list holding
+    all of them until the CSR is built (#149). Rows are the same as
+    ``_require_edges`` yields, so the index is identical."""
+    scan = getattr(edges, "_scan_spec", None)
+    if scan is None or not isinstance(scan["path"], str):
+        return None
+    from ._io import _warn_dropped_endpoints
+
+    idx, dropped = _native().scan_build_index(
+        scan["path"],
+        scan["src"],
+        scan["dst"],
+        _scan_storage_options(scan),
+        scan.get("on_null") == "drop",
+    )
+    _warn_dropped_endpoints(dropped)
     return idx
 
 

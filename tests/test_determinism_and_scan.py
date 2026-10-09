@@ -8,7 +8,6 @@
 """
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -118,9 +117,8 @@ def test_scan_edges_is_reproducible_and_matches_from_arrow(tmp_path):
     # can't reorder. Dense ids follow first-seen row order, so any reordering
     # shows up as different component labels and PageRank summation order.
     n = 2_500_000
-    i = pa.array(range(n), type=pa.int64())
-    src = pc.bit_wise_and(pc.multiply(i, 7919), 0xFFFFF)
-    dst = pc.bit_wise_and(pc.multiply(i, 104729), 0xFFFFF)
+    src = pa.array([(i * 7919) & 0xFFFFF for i in range(n)], type=pa.int64())
+    dst = pa.array([(i * 104729) & 0xFFFFF for i in range(n)], type=pa.int64())
     path = tmp_path / "edges.parquet"
     pq.write_table(
         pa.table({"from": src, "to": dst}),

@@ -17,6 +17,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   file. Output over a scan now matches `from_arrow` over the same table
   exactly (#148).
 
+### Changed
+
+- Building the graph index over an unweighted `scan_edges` source no longer
+  holds the scanned Arrow endpoints for the whole build. Each batch is interned
+  and freed as it is decoded, inside one native call, so the 16 B/edge input
+  never accumulates. On a 30M-edge Parquet file the build's peak memory fell
+  from about 45 to 24 B/edge, and the footprint after the build from about 33
+  to 17 B/edge, with build time unchanged (#149). Weighted scans keep the
+  previous path, since their weight columns must outlive the build.
+
 ## [0.3.0] — 2026-10-08
 
 ### Added

@@ -19,6 +19,108 @@ use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
 use rustc_hash::FxHashMap;
 
+/// Incremental edge interning: feed `(src, dst)` chunks one at a time with
+/// [`EdgeInterner::push`], then [`EdgeInterner::finish`] for the id map and the
+/// dense endpoints. This is what lets a scan intern each batch as it is decoded and
+/// free it straight away, so the Arrow input never accumulates (#149).
+/// [`IdMap::from_edge_batches`] is the same loop over an in-memory list.
+///
+/// The id type is fixed by the first chunk; later chunks must match it
+/// ([`IdError::MixedTypes`]). Dense ids follow first-seen order across all chunks.
+/// Finishing with no chunks yields an empty `Int64` map.
+#[derive(Debug)]
+pub struct EdgeInterner {
+    map: Option<IdMap>,
+    src_dense: Vec<u32>,
+    dst_dense: Vec<u32>,
+}
+
+impl EdgeInterner {
+    /// An empty interner whose dense endpoint vectors are sized for `n_edges`. The
+    /// count is only a hint: more edges grow the vectors, fewer leave the tail
+    /// unused.
+    pub fn with_capacity(n_edges: usize) -> Self {
+        EdgeInterner {
+            map: None,
+            src_dense: Vec::with_capacity(n_edges),
+            dst_dense: Vec::with_capacity(n_edges),
+        }
+    }
+
+    /// Edges interned so far.
+    pub fn len(&self) -> usize {
+        self.src_dense.len()
+    }
+
+    /// Whether no edge has been interned yet.
+    pub fn is_empty(&self) -> bool {
+        self.src_dense.is_empty()
+    }
+
+    /// Intern one chunk of endpoints, appending its edges in row order. Errors on
+    /// a null endpoint, unequal lengths, mixed src/dst types, a type that differs
+    /// from earlier chunks, or an unsupported id type.
+    pub fn push(&mut self, src: &dyn Array, dst: &dyn Array) -> Result<(), IdError> {
+        if src.len() != dst.len() {
+            return Err(IdError::LengthMismatch);
+        }
+        let kind = match (id_kind(src.data_type())?, id_kind(dst.data_type())?) {
+            (IdKind::Int64, IdKind::Int64) => IdKind::Int64,
+            (IdKind::Utf8, IdKind::Utf8) => IdKind::Utf8,
+            _ => return Err(IdError::MixedTypes),
+        };
+        let map = self.map.get_or_insert_with(|| match kind {
+            IdKind::Int64 => IdMap::new_int64(),
+            IdKind::Utf8 => IdMap::new_utf8(),
+        });
+        let (sd, dd) = (&mut self.src_dense, &mut self.dst_dense);
+        match (kind, &*map) {
+            (IdKind::Int64, IdMap::Int64 { .. }) => {
+                let (s, d) = (as_int64(src), as_int64(dst));
+                // Fast path: when neither column has nulls (the common case,
+                // e.g. every scanned/canonicalized edge list), intern straight
+                // over the raw `&[i64]` value slices — skipping the per-row
+                // `is_null`/`value` bounds+validity checks that dominate the
+                // loop once the hasher is fast.
+                if s.null_count() == 0 && d.null_count() == 0 {
+                    for (&sv, &dv) in s.values().iter().zip(d.values()) {
+                        sd.push(map.intern_i64(sv)?);
+                        dd.push(map.intern_i64(dv)?);
+                    }
+                } else {
+                    for i in 0..s.len() {
+                        if s.is_null(i) || d.is_null(i) {
+                            return Err(IdError::Null);
+                        }
+                        sd.push(map.intern_i64(s.value(i))?);
+                        dd.push(map.intern_i64(d.value(i))?);
+                    }
+                }
+            }
+            (IdKind::Utf8, IdMap::Utf8 { .. }) => {
+                let (s, d) = (StrView::new(src), StrView::new(dst));
+                for i in 0..s.len() {
+                    if s.is_null(i) || d.is_null(i) {
+                        return Err(IdError::Null);
+                    }
+                    sd.push(map.intern_str(s.value(i))?);
+                    dd.push(map.intern_str(d.value(i))?);
+                }
+            }
+            // This chunk's id kind differs from the map's (fixed by the first chunk).
+            _ => return Err(IdError::MixedTypes),
+        }
+        Ok(())
+    }
+
+    /// The id map and the dense `(src, dst)` endpoints, ready for
+    /// [`Topology::build`](crate::topology::Topology::build).
+    pub fn finish(self) -> (IdMap, Vec<u32>, Vec<u32>) {
+        let map = self.map.unwrap_or_else(IdMap::new_int64);
+        (map, self.src_dense, self.dst_dense)
+    }
+}
+
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
 ///
 /// `u32` caps the node space at ~4.29B nodes — the correct trade for cache
@@ -220,75 +322,12 @@ impl IdMap {
     pub fn from_edge_batches(
         chunks: &[(&dyn Array, &dyn Array)],
     ) -> Result<(Self, Vec<u32>, Vec<u32>), IdError> {
-        let Some((first_src, first_dst)) = chunks.first() else {
-            return Ok((IdMap::new_int64(), Vec::new(), Vec::new()));
-        };
-        let total: usize = chunks.iter().map(|(s, _)| s.len()).sum();
-        match (
-            id_kind(first_src.data_type())?,
-            id_kind(first_dst.data_type())?,
-        ) {
-            (IdKind::Int64, IdKind::Int64) => {
-                let mut map = IdMap::new_int64();
-                let (mut sd, mut dd) = (Vec::with_capacity(total), Vec::with_capacity(total));
-                for (src, dst) in chunks {
-                    if src.len() != dst.len() {
-                        return Err(IdError::LengthMismatch);
-                    }
-                    // Each chunk must share the leading pair's id kind.
-                    if !matches!(id_kind(src.data_type())?, IdKind::Int64)
-                        || !matches!(id_kind(dst.data_type())?, IdKind::Int64)
-                    {
-                        return Err(IdError::MixedTypes);
-                    }
-                    let (s, d) = (as_int64(*src), as_int64(*dst));
-                    // Fast path: when neither column has nulls (the common case,
-                    // e.g. every scanned/canonicalized edge list), intern straight
-                    // over the raw `&[i64]` value slices — skipping the per-row
-                    // `is_null`/`value` bounds+validity checks that dominate the
-                    // loop once the hasher is fast.
-                    if s.null_count() == 0 && d.null_count() == 0 {
-                        for (&sv, &dv) in s.values().iter().zip(d.values()) {
-                            sd.push(map.intern_i64(sv)?);
-                            dd.push(map.intern_i64(dv)?);
-                        }
-                    } else {
-                        for i in 0..s.len() {
-                            if s.is_null(i) || d.is_null(i) {
-                                return Err(IdError::Null);
-                            }
-                            sd.push(map.intern_i64(s.value(i))?);
-                            dd.push(map.intern_i64(d.value(i))?);
-                        }
-                    }
-                }
-                Ok((map, sd, dd))
-            }
-            (IdKind::Utf8, IdKind::Utf8) => {
-                let mut map = IdMap::new_utf8();
-                let (mut sd, mut dd) = (Vec::with_capacity(total), Vec::with_capacity(total));
-                for (src, dst) in chunks {
-                    if src.len() != dst.len() {
-                        return Err(IdError::LengthMismatch);
-                    }
-                    if !matches!(id_kind(src.data_type())?, IdKind::Utf8)
-                        || !matches!(id_kind(dst.data_type())?, IdKind::Utf8)
-                    {
-                        return Err(IdError::MixedTypes);
-                    }
-                    let (s, d) = (StrView::new(*src), StrView::new(*dst));
-                    for i in 0..s.len() {
-                        if s.is_null(i) || d.is_null(i) {
-                            return Err(IdError::Null);
-                        }
-                        sd.push(map.intern_str(s.value(i))?);
-                        dd.push(map.intern_str(d.value(i))?);
-                    }
-                }
-                Ok((map, sd, dd))
-            }
-            _ => Err(IdError::MixedTypes),
+        let total = chunks.iter().map(|(s, _)| s.len()).sum();
+        let mut interner = EdgeInterner::with_capacity(total);
+        for (src, dst) in chunks {
+            interner.push(*src, *dst)?;
         }
+        Ok(interner.finish())
     }
 
     fn intern_i64(&mut self, user: i64) -> Result<u32, IdError> {
@@ -570,6 +609,37 @@ mod tests {
         let (map, sd, dd) = IdMap::from_edge_batches(&[]).unwrap();
         assert!(map.is_empty());
         assert!(sd.is_empty() && dd.is_empty());
+    }
+
+    #[test]
+    fn interner_fed_chunk_by_chunk_matches_from_edge_batches() {
+        let (s0, d0) = (
+            Int64Array::from(vec![10, 20]),
+            Int64Array::from(vec![20, 30]),
+        );
+        let (s1, d1) = (
+            Int64Array::from(vec![30, 40]),
+            Int64Array::from(vec![10, 20]),
+        );
+        let (bmap, bsd, bdd) = IdMap::from_edge_batches(&[
+            (&s0 as &dyn Array, &d0 as &dyn Array),
+            (&s1 as &dyn Array, &d1 as &dyn Array),
+        ])
+        .unwrap();
+        // A zero hint must still work: the dense vectors grow as needed.
+        let mut interner = EdgeInterner::with_capacity(0);
+        interner.push(&s0, &d0).unwrap();
+        interner.push(&s1, &d1).unwrap();
+        assert_eq!(interner.len(), 4);
+        let (map, sd, dd) = interner.finish();
+        assert_eq!((sd, dd), (bsd, bdd));
+        assert_eq!(map.len(), bmap.len());
+
+        // A later chunk of a different id type is rejected, not silently mixed.
+        let mut interner = EdgeInterner::with_capacity(0);
+        interner.push(&s0, &d0).unwrap();
+        let (ss, ds) = (StringArray::from(vec!["a"]), StringArray::from(vec!["b"]));
+        assert_eq!(interner.push(&ss, &ds), Err(IdError::MixedTypes));
     }
 
     #[test]
