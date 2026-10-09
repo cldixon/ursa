@@ -144,13 +144,15 @@ fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
 }
 
 /// The canonical Arrow type for a node-id column: any integer type collapses to
-/// `Int64` (the fast path), `Utf8`/`LargeUtf8` to `Utf8` (string ids, covering
-/// UUID-as-string). Any other type is not a supported node-id type.
+/// `Int64` (the fast path), `Utf8`/`LargeUtf8`/`Utf8View` to `Utf8` (string ids,
+/// covering UUID-as-string). DataFusion reads Parquet strings as `Utf8View` by
+/// default, so that is what a string-id Parquet file arrives as. Any other type
+/// is not a supported node-id type.
 fn canonical_id_type(dt: &DataType) -> Result<DataType> {
     use DataType::*;
     match dt {
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ok(Int64),
-        Utf8 | LargeUtf8 => Ok(Utf8),
+        Utf8 | LargeUtf8 | Utf8View => Ok(Utf8),
         other => Err(DataFusionError::NotImplemented(format!(
             "node ids must be an integer or string column; {other:?} is not a supported id type"
         ))),
@@ -572,6 +574,39 @@ mod tests {
         assert_eq!(scanned.dropped, 2);
         assert_eq!(scanned.topo.n_edges(), 2);
         assert_eq!(scanned.topo.n_nodes(), 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parquet_string_ids_scan_and_build() {
+        // DataFusion reads Parquet strings as Utf8View; string ids must still be
+        // accepted, canonicalized to Utf8, and build the same graph either way.
+        use datafusion::parquet::arrow::ArrowWriter;
+        let path = std::env::temp_dir().join("ursa_scan_test_string_ids.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from", DataType::Utf8, false),
+            Field::new("to", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(arrow::array::StringArray::from(vec!["b", "c", "a"])),
+            ],
+        )
+        .unwrap();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let p = path.to_str().unwrap();
+
+        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &[]).unwrap();
+        assert_eq!(batches[0].column(0).data_type(), &DataType::Utf8);
+        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
+        assert_eq!((scanned.topo.n_nodes(), scanned.topo.n_edges()), (3, 3));
+        let nodes = scan_nodes_batch(p, "from", &no_opts(), &[]).unwrap();
+        assert_eq!(nodes[0].column(0).data_type(), &DataType::Utf8);
         std::fs::remove_file(&path).ok();
     }
 

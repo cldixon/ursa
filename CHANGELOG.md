@@ -16,6 +16,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `edge_ids` and PageRank's last bits changed between runs over the same
   file. Output over a scan now matches `from_arrow` over the same table
   exactly (#148).
+- `scan_edges` and `scan_nodes` over a Parquet file with string ids failed
+  with "Utf8View is not a supported id type". DataFusion reads Parquet
+  strings as `Utf8View`; string ids are now canonicalized to `Utf8` like
+  `LargeUtf8`. CSV and in-memory string ids were not affected.
 
 ### Changed
 
