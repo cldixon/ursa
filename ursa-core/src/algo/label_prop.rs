@@ -42,22 +42,19 @@ pub fn label_propagation(
     let mut touched: Vec<u32> = Vec::new();
 
     // Tally each kept-edge neighbour's label for node `u` in one adjacency.
-    let tally = |adj: &Adjacency,
-                 u: u32,
-                 label: &[u32],
-                 counts: &mut [u32],
-                 touched: &mut Vec<u32>| {
-        for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
-            if mask.is_none_or(|m| m.keep(e)) {
-                let lab = label[v as usize];
-                let c = &mut counts[lab as usize];
-                if *c == 0 {
-                    touched.push(lab);
+    let tally =
+        |adj: &Adjacency, u: u32, label: &[u32], counts: &mut [u32], touched: &mut Vec<u32>| {
+            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                if mask.is_none_or(|m| m.keep(e)) {
+                    let lab = label[v as usize];
+                    let c = &mut counts[lab as usize];
+                    if *c == 0 {
+                        touched.push(lab);
+                    }
+                    *c += 1;
                 }
-                *c += 1;
             }
-        }
-    };
+        };
 
     for _ in 0..max_iter {
         let mut changed = false;
