@@ -5,9 +5,21 @@ name: Audit
 # in deny.toml). Kept in its own workflow — separate from the code gate in ci.yml —
 # so it stays fast and its weekly schedule doesn't drag the whole CI matrix along.
 on:
+  # cargo-deny reads only the manifests, the lockfile, and deny.toml, so other
+  # changes can't change its result. The weekly schedule still runs regardless.
   push:
     branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
   pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
   # Weekly run so a newly-published advisory against an unchanged Cargo.lock is
   # caught between releases, not only when the lockfile next changes. Mondays 07:00
   # UTC (mirrors the release.yml dry-run cadence).
