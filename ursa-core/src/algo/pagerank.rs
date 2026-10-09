@@ -60,10 +60,18 @@ fn l1_delta(a: &[f64], b: &[f64]) -> f64 {
 /// else (the uniform init, the `base + d * contrib` update, the deterministic L1
 /// convergence check, the buffer swap, and the early break) lives here once, so
 /// both kernels iterate through byte-identical float operations.
+///
+/// With `split_by = Some(deg)`, each iteration first computes every node's share
+/// `rank[v] / deg[v]` (0 when `deg[v] == 0`) and hands `contrib` those shares
+/// instead of the ranks. The unweighted kernel would otherwise repeat that same
+/// division once per in-edge, with a second random gather into `deg`; dividing
+/// once per node is the identical operation, so results are bit-for-bit
+/// unchanged.
 fn power_iterate(
     n: usize,
     params: PageRankParams,
     dangling: &[usize],
+    split_by: Option<&[u32]>,
     contrib: impl Fn(usize, &[f64]) -> f64 + Sync,
 ) -> Vec<f64> {
     let nf = n as f64;
@@ -71,6 +79,11 @@ fn power_iterate(
 
     let mut rank = vec![1.0 / nf; n];
     let mut next = vec![0.0f64; n];
+    let mut share = if split_by.is_some() {
+        vec![0.0f64; n]
+    } else {
+        Vec::new()
+    };
 
     for _iter in 0..params.max_iter {
         // Rank stranded on dangling nodes, spread uniformly to everyone. Summed over
@@ -78,8 +91,21 @@ fn power_iterate(
         let dangling_mass: f64 = dangling.iter().map(|&u| rank[u]).sum();
         let base = (1.0 - d) / nf + d * dangling_mass / nf;
 
+        let pulled: &[f64] = match split_by {
+            Some(deg) => {
+                share.par_iter_mut().enumerate().for_each(|(v, slot)| {
+                    *slot = if deg[v] > 0 {
+                        rank[v] / deg[v] as f64
+                    } else {
+                        0.0
+                    };
+                });
+                &share
+            }
+            None => &rank,
+        };
         next.par_iter_mut().enumerate().for_each(|(u, slot)| {
-            *slot = base + d * contrib(u, &rank);
+            *slot = base + d * contrib(u, pulled);
         });
 
         let delta = l1_delta(&next, &rank);
@@ -117,28 +143,23 @@ pub fn pagerank(topo: &Topology, mask: Option<&EdgeMask>, params: PageRankParams
     // scan per iteration.
     let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_deg[u] == 0).collect();
 
-    power_iterate(n, params, &dangling_nodes, |u, rank| {
+    // `share[v]` is `rank[v] / out_deg[v]`, or 0 for a dangling `v` (whose rank is
+    // redistributed through `base` instead). Adding that 0 leaves the non-negative
+    // accumulator bit-identical to skipping the edge.
+    power_iterate(n, params, &dangling_nodes, Some(&out_deg), |u, share| {
         let mut acc = 0.0;
         match mask {
-            // Fast path: unmasked full-graph pull (byte-identical to the original).
+            // Fast path: unmasked full-graph pull.
             None => {
                 for &v in inc.neighbors(u as u32) {
-                    // v is an in-neighbour of u; it contributes rank[v] / outdeg[v].
-                    let od = out_deg[v as usize];
-                    if od > 0 {
-                        acc += rank[v as usize] / od as f64;
-                    }
+                    acc += share[v as usize];
                 }
             }
             // Subgraph pull: skip in-edges whose original row is masked out.
             Some(m) => {
                 for (&v, &e) in inc.neighbors(u as u32).iter().zip(inc.edge_ids(u as u32)) {
-                    if !m.keep(e) {
-                        continue;
-                    }
-                    let od = out_deg[v as usize];
-                    if od > 0 {
-                        acc += rank[v as usize] / od as f64;
+                    if m.keep(e) {
+                        acc += share[v as usize];
                     }
                 }
             }
@@ -189,7 +210,7 @@ pub fn pagerank_weighted(
     // Dangling nodes (zero out-strength), listed once — see the unweighted kernel.
     let dangling_nodes: Vec<usize> = (0..n).filter(|&u| out_str[u] <= 0.0).collect();
 
-    power_iterate(n, params, &dangling_nodes, |u, rank| {
+    power_iterate(n, params, &dangling_nodes, None, |u, rank| {
         let mut acc = 0.0;
         // In-neighbours and their edge rows are aligned element-for-element.
         let nbrs = inc.neighbors(u as u32);
