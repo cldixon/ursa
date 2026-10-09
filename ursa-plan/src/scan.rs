@@ -266,24 +266,24 @@ pub fn scan_edges_batch(
         }
         let out_schema = Arc::new(Schema::new(fields));
 
-        // Consume the scan's batches so each one is released after its cast; a
-        // narrower integer id column is widened per batch, not all at once.
-        let mut out = Vec::with_capacity(batches.len());
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue; // drop empty batches; the non-empty guard above ensures ≥1 remains
-            }
-            let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
-            let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
-            let mut columns = vec![src_c, dst_c];
-            for i in 2..batch.num_columns() {
-                columns.push(batch.column(i).clone());
-            }
-            out.push(
-                RecordBatch::try_new(out_schema.clone(), columns)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-            );
-        }
+        // Canonicalize each batch independently, in parallel (rayon's collect keeps
+        // batch order). Consuming the list releases each batch after its cast, so a
+        // narrower integer or a view-typed string id column is converted batch by
+        // batch rather than all at once.
+        use rayon::prelude::*;
+        let out = batches
+            .into_par_iter()
+            .filter(|batch| batch.num_rows() > 0) // the non-empty guard above ensures ≥1 remains
+            .map(|batch| {
+                let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
+                let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
+                let mut columns = vec![src_c, dst_c];
+                for i in 2..batch.num_columns() {
+                    columns.push(batch.column(i).clone());
+                }
+                RecordBatch::try_new(out_schema.clone(), columns).map_err(arrow_err)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(out)
     })?
 }

@@ -84,11 +84,21 @@ impl EdgeInterner {
                 // loop once the hasher is fast.
                 if s.null_count() == 0 && d.null_count() == 0 {
                     let (sv, dv) = (s.values().as_ref(), d.values().as_ref());
-                    if sv.len() >= PARALLEL_MIN_ROWS
-                        && crate::parallel::current_num_threads() > 1
-                        && !crate::parallel::in_worker()
-                    {
-                        intern_i64_parallel(map, sv, dv, sd, dd)?;
+                    if intern_in_parallel(sv.len()) {
+                        let ids = |is_dst: bool| if is_dst { dv } else { sv };
+                        intern_two_phase(
+                            map,
+                            sv.len(),
+                            sd,
+                            dd,
+                            |map, is_dst, i| match map {
+                                IdMap::Int64 { to_dense, .. } => {
+                                    to_dense.get(&ids(is_dst)[i]).copied()
+                                }
+                                IdMap::Utf8 { .. } => unreachable!("Int64 chunk, Utf8 map"),
+                            },
+                            |map, is_dst, i| map.intern_i64(ids(is_dst)[i]),
+                        )?;
                     } else {
                         for (&s, &d) in sv.iter().zip(dv) {
                             sd.push(map.intern_i64(s)?);
@@ -107,6 +117,22 @@ impl EdgeInterner {
             }
             (IdKind::Utf8, IdMap::Utf8 { .. }) => {
                 let (s, d) = (StrView::new(src), StrView::new(dst));
+                if src.null_count() == 0 && dst.null_count() == 0 && intern_in_parallel(s.len()) {
+                    let ids = |is_dst: bool| if is_dst { &d } else { &s };
+                    return intern_two_phase(
+                        map,
+                        s.len(),
+                        sd,
+                        dd,
+                        |map, is_dst, i| match map {
+                            IdMap::Utf8 { to_dense, .. } => {
+                                to_dense.get(ids(is_dst).value(i)).copied()
+                            }
+                            IdMap::Int64 { .. } => unreachable!("Utf8 chunk, Int64 map"),
+                        },
+                        |map, is_dst, i| map.intern_str(ids(is_dst).value(i)),
+                    );
+                }
                 for i in 0..s.len() {
                     if s.is_null(i) || d.is_null(i) {
                         return Err(IdError::Null);
@@ -152,54 +178,55 @@ const PARALLEL_MIN_ROWS: usize = 1 << 15;
 /// `u32::MAX` (the interner errors first), so it never collides with one.
 const MISS: u32 = u32::MAX;
 
-/// Intern one null-free `Int64` chunk, giving exactly the ids the serial loop
-/// would. Ids already in the map are looked up in parallel against the read-only
-/// map; that lookup is most of the work once a graph's nodes have been seen. One
-/// serial pass then interns the misses in row order (src before dst, row by row,
-/// as the serial loop does). An id already in the map keeps its index whatever
-/// order it is looked up in, and only the serial pass adds ids, so new ids are
-/// numbered in first-seen order.
-fn intern_i64_parallel(
+/// Intern one null-free chunk of `len` rows, giving exactly the ids the serial
+/// loop would. Ids already in the map are looked up in parallel against the
+/// read-only map (`lookup(map, is_dst, row)`); that lookup is most of the work
+/// once a graph's nodes have been seen. One serial pass then interns the misses
+/// (`intern(map, is_dst, row)`) in row order, src before dst, as the serial loop
+/// does. An id already in the map keeps its index whatever order it is looked up
+/// in, and only the serial pass adds ids, so new ids are numbered in first-seen
+/// order.
+fn intern_two_phase(
     map: &mut IdMap,
-    sv: &[i64],
-    dv: &[i64],
+    len: usize,
     sd: &mut Vec<u32>,
     dd: &mut Vec<u32>,
+    lookup: impl Fn(&IdMap, bool, usize) -> Option<u32> + Sync,
+    mut intern: impl FnMut(&mut IdMap, bool, usize) -> Result<u32, IdError>,
 ) -> Result<(), IdError> {
     use crate::parallel::*;
     const CHUNK: usize = 4096;
     let base = sd.len();
-    sd.resize(base + sv.len(), MISS);
-    dd.resize(base + dv.len(), MISS);
+    sd.resize(base + len, MISS);
+    dd.resize(base + len, MISS);
     {
-        let IdMap::Int64 { to_dense, .. } = &*map else {
-            unreachable!("intern_i64_parallel on a Utf8 IdMap")
-        };
-        let lookup = |out: &mut [u32], ids: &[i64]| {
-            for (o, id) in out.iter_mut().zip(ids) {
-                if let Some(&dense) = to_dense.get(id) {
-                    *o = dense;
+        let map = &*map;
+        for (out, is_dst) in [(&mut sd[base..], false), (&mut dd[base..], true)] {
+            out.par_chunks_mut(CHUNK).enumerate().for_each(|(c, out)| {
+                for (k, o) in out.iter_mut().enumerate() {
+                    if let Some(dense) = lookup(map, is_dst, c * CHUNK + k) {
+                        *o = dense;
+                    }
                 }
-            }
-        };
-        sd[base..]
-            .par_chunks_mut(CHUNK)
-            .zip(sv.par_chunks(CHUNK))
-            .for_each(|(out, ids)| lookup(out, ids));
-        dd[base..]
-            .par_chunks_mut(CHUNK)
-            .zip(dv.par_chunks(CHUNK))
-            .for_each(|(out, ids)| lookup(out, ids));
+            });
+        }
     }
-    for (i, (&s, &d)) in sv.iter().zip(dv).enumerate() {
+    for i in 0..len {
         if sd[base + i] == MISS {
-            sd[base + i] = map.intern_i64(s)?;
+            sd[base + i] = intern(map, false, i)?;
         }
         if dd[base + i] == MISS {
-            dd[base + i] = map.intern_i64(d)?;
+            dd[base + i] = intern(map, true, i)?;
         }
     }
     Ok(())
+}
+
+/// Whether a chunk of `len` rows should take [`intern_two_phase`].
+fn intern_in_parallel(len: usize) -> bool {
+    len >= PARALLEL_MIN_ROWS
+        && crate::parallel::current_num_threads() > 1
+        && !crate::parallel::in_worker()
 }
 
 /// Bidirectional map between arbitrary user ids and dense `u32` indices.
@@ -712,6 +739,42 @@ mod tests {
             .step_by(1000)
             .map(|lo| {
                 let len = 1000.min(n - lo);
+                (s_all.slice(lo, len), d_all.slice(lo, len))
+            })
+            .collect();
+        let pairs: Vec<(&dyn Array, &dyn Array)> = small
+            .iter()
+            .map(|(s, d)| (s as &dyn Array, d as &dyn Array))
+            .collect();
+        let (smap, ssd, sdd) = IdMap::from_edge_batches(&pairs).unwrap();
+        assert_eq!((bsd, bdd), (ssd, sdd));
+        assert_eq!(&bmap.user_id_array(), &smap.user_id_array());
+    }
+
+    #[test]
+    fn large_string_chunks_intern_exactly_like_small_ones() {
+        let n = 2 * PARALLEL_MIN_ROWS + 77;
+        let name = |x: u64| format!("did:plc:{x:x}");
+        let src: Vec<String> = (0..n as u64).map(|i| name(i * 7919 % 20_000)).collect();
+        let dst: Vec<String> = (0..n as u64)
+            .map(|i| name(i * 104_729 % 30_011 + 3))
+            .collect();
+        let (s_all, d_all) = (StringArray::from(src), StringArray::from(dst));
+        let big = [
+            (
+                &s_all.slice(0, 50) as &dyn Array,
+                &d_all.slice(0, 50) as &dyn Array,
+            ),
+            (
+                &s_all.slice(50, n - 50) as &dyn Array,
+                &d_all.slice(50, n - 50) as &dyn Array,
+            ),
+        ];
+        let (bmap, bsd, bdd) = IdMap::from_edge_batches(&big).unwrap();
+        let small: Vec<(StringArray, StringArray)> = (0..n)
+            .step_by(999)
+            .map(|lo| {
+                let len = 999.min(n - lo);
                 (s_all.slice(lo, len), d_all.slice(lo, len))
             })
             .collect();
