@@ -172,6 +172,66 @@ fn gather_strings<'a>(
     builder.finish()
 }
 
+/// The distinct integer ids in dense order. Grown as a `Vec` while interning;
+/// [`IntIds::freeze`] then moves it, without a copy, into the `Int64Array` that
+/// is the cached id column, so the ids are not held twice.
+#[derive(Debug, Clone)]
+pub struct IntIds(IntStore);
+
+#[derive(Debug, Clone)]
+enum IntStore {
+    Building(Vec<i64>),
+    Frozen(Int64Array),
+}
+
+impl IntIds {
+    fn new() -> Self {
+        IntIds(IntStore::Building(Vec::new()))
+    }
+
+    #[inline]
+    fn values(&self) -> &[i64] {
+        match &self.0 {
+            IntStore::Building(v) => v,
+            IntStore::Frozen(a) => a.values(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values().len()
+    }
+
+    fn push(&mut self, id: i64) {
+        if let IntStore::Frozen(a) = &self.0 {
+            // Interning after `freeze` (not done by any caller): copy back out.
+            self.0 = IntStore::Building(a.values().to_vec());
+        }
+        let IntStore::Building(v) = &mut self.0 else {
+            unreachable!("thawed above")
+        };
+        v.push(id);
+    }
+
+    /// Move the ids into an `Int64Array` (no copy) and return it.
+    fn freeze(&mut self) -> Int64Array {
+        if let IntStore::Building(v) = &mut self.0 {
+            self.0 = IntStore::Frozen(Int64Array::from(std::mem::take(v)));
+        }
+        match &self.0 {
+            IntStore::Frozen(a) => a.clone(),
+            IntStore::Building(_) => unreachable!("frozen above"),
+        }
+    }
+
+    /// The ids as an `Int64Array`: a cheap clone once frozen, a copy before.
+    fn to_array(&self) -> Int64Array {
+        match &self.0 {
+            IntStore::Frozen(a) => a.clone(),
+            IntStore::Building(v) => Int64Array::from(v.clone()),
+        }
+    }
+}
+
 /// The distinct string ids, stored once.
 ///
 /// The ids live in two Arrow-shaped buffers, the UTF-8 bytes and `i32` offsets,
@@ -382,7 +442,7 @@ fn intern_in_parallel(len: usize) -> bool {
 pub enum IdMap {
     /// Integer user ids (the fast path).
     Int64 {
-        to_user: Vec<i64>,
+        to_user: IntIds,
         to_dense: FxHashMap<i64, u32>,
         id_array: OnceLock<ArrayRef>,
     },
@@ -514,7 +574,7 @@ impl<'a> StrView<'a> {
 impl IdMap {
     fn new_int64() -> Self {
         IdMap::Int64 {
-            to_user: Vec::new(),
+            to_user: IntIds::new(),
             to_dense: FxHashMap::default(),
             id_array: OnceLock::new(),
         }
@@ -535,6 +595,7 @@ impl IdMap {
             map.intern_i64(id)
                 .expect("from_ids is a small-input convenience; node count is within the u32 cap");
         }
+        map.freeze();
         map
     }
 
@@ -616,14 +677,17 @@ impl IdMap {
         }
     }
 
-    /// Settle the map once interning is done: string ids move into their final
-    /// id column (no copy), which is cached as [`Self::user_id_array`].
+    /// Settle the map once interning is done: the ids move into their final id
+    /// column (no copy), which is cached as [`Self::user_id_array`].
     fn freeze(&mut self) {
-        if let IdMap::Utf8 { ids, id_array } = self {
-            let array = ids.freeze();
-            *id_array = OnceLock::new();
-            let _ = id_array.set(Arc::new(array));
-        }
+        let (array, id_array): (ArrayRef, _) = match self {
+            IdMap::Int64 {
+                to_user, id_array, ..
+            } => (Arc::new(to_user.freeze()), id_array),
+            IdMap::Utf8 { ids, id_array } => (Arc::new(ids.freeze()), id_array),
+        };
+        *id_array = OnceLock::new();
+        let _ = id_array.set(array);
     }
 
     /// The Arrow type of the user id column: `Int64` or `Utf8`. Schemas for
@@ -654,7 +718,7 @@ impl IdMap {
     /// [`Self::user_id_array`]).
     fn build_user_id_array(&self) -> ArrayRef {
         match self {
-            IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(to_user.clone())),
+            IdMap::Int64 { to_user, .. } => Arc::new(to_user.to_array()),
             IdMap::Utf8 { ids, .. } => Arc::new(ids.to_array()),
         }
     }
@@ -667,7 +731,7 @@ impl IdMap {
             IdMap::Int64 { to_user, .. } => Arc::new(Int64Array::from(
                 dense
                     .iter()
-                    .map(|&d| to_user[d as usize])
+                    .map(|&d| to_user.values()[d as usize])
                     .collect::<Vec<_>>(),
             )),
             IdMap::Utf8 { ids, .. } => Arc::new(gather_strings(
@@ -925,6 +989,34 @@ mod tests {
         let (smap, ssd, sdd) = IdMap::from_edge_batches(&pairs).unwrap();
         assert_eq!((bsd, bdd), (ssd, sdd));
         assert_eq!(&bmap.user_id_array(), &smap.user_id_array());
+    }
+
+    #[test]
+    fn int_ids_freeze_shares_the_id_column() {
+        let (map, sd, dd) = IdMap::from_edge_arrays(
+            &Int64Array::from(vec![10, 20, 30]),
+            &Int64Array::from(vec![20, 30, 10]),
+        )
+        .unwrap();
+        assert_eq!((sd, dd), (vec![0, 1, 2], vec![1, 2, 0]));
+        // The cached id column is the frozen store itself, not a copy.
+        let IdMap::Int64 { to_user, .. } = &map else {
+            panic!("int map")
+        };
+        let col = map.user_id_array();
+        let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(col.values().as_ptr(), to_user.values().as_ptr());
+        assert_eq!(
+            map.gather_user(&[2, 0])
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap(),
+            &Int64Array::from(vec![30, 10])
+        );
+        // Thawing for a later intern keeps the ids.
+        let mut map = map;
+        assert_eq!(map.intern_i64(40).unwrap(), 3);
+        assert_eq!(map.intern_i64(20).unwrap(), 1);
     }
 
     #[test]
