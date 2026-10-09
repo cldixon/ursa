@@ -542,8 +542,7 @@ def _resolve_node_attr_table(frame: NodeFrame, columns: list[str] | None = None)
 
     inmem = getattr(frame, "_attr_table", None)
     if inmem is not None:
-        # In-memory source is a single RecordBatch; wrap as a one-chunk Table.
-        return pa.Table.from_batches([inmem])
+        return inmem  # already a chunked Table (see _io._node_attr_table)
     scan = getattr(frame, "_scan_spec", None)
     if scan is not None:
         path = scan["path"]
