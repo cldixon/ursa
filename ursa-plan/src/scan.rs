@@ -19,7 +19,9 @@ use arrow::array::RecordBatch;
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::prelude::{CsvReadOptions, DataFrame, ParquetReadOptions, SessionContext};
+use datafusion::prelude::{
+    CsvReadOptions, DataFrame, ParquetReadOptions, SessionConfig, SessionContext,
+};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -165,7 +167,15 @@ async fn open_scan(
     storage_options: &HashMap<String, String>,
     kind: &str,
 ) -> Result<DataFrame> {
-    let ctx = SessionContext::new();
+    // Work stealing lets an idle partition read byte ranges planned for a sibling,
+    // so rows land in a run-dependent partition. Turning it off keeps each
+    // partition on its own contiguous range, which `collect_in_file_order` relies on.
+    let mut config = SessionConfig::new();
+    config
+        .options_mut()
+        .execution
+        .enable_file_stream_work_stealing = false;
+    let ctx = SessionContext::new_with_config(config);
     register_object_store(&ctx, path, storage_options)?;
     Ok(match detect_format(path, kind)? {
         ScanFormat::Parquet => {
@@ -174,6 +184,25 @@ async fn open_scan(
         }
         ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
     })
+}
+
+/// Collect a scan's batches in file row order.
+///
+/// DataFusion reads a large or multi-file source as several parallel partitions,
+/// and `DataFrame::collect` merges them in whichever order they finish. Dense node
+/// ids are assigned in first-seen order, so a run-dependent row order changes
+/// component labels, `edge_ids`, and floating-point summation order (#148).
+/// The partition layout itself is deterministic: files are sorted by path and
+/// split into contiguous byte ranges. With work stealing off (see `open_scan`),
+/// each partition reads only its own range, so concatenating partitions in order
+/// gives the file's own row order on every run, whatever the thread count.
+async fn collect_in_file_order(df: DataFrame) -> Result<Vec<RecordBatch>> {
+    Ok(df
+        .collect_partitioned()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch, plus
@@ -206,7 +235,7 @@ pub fn scan_edges_batch(
         // Keep the scan's batches separate (no `concat_batches` into one contiguous
         // batch) so the transient ingest footprint stays ~1×, not ~2×, at the
         // 500M-edge target; the topology build consumes them as a stream (#60).
-        let batches = df.collect().await?;
+        let batches = collect_in_file_order(df).await?;
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
                 "edge source {path:?} resolved but contained no rows; an empty edge set \
@@ -293,7 +322,7 @@ pub fn scan_nodes_batch(
 
         // Keep the batches separate (no `concat_batches`); the attribute table
         // crosses the FFI as a batch list and is consumed as a stream (#60).
-        let batches = df.collect().await?;
+        let batches = collect_in_file_order(df).await?;
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Err(DataFusionError::Execution(format!(
                 "node source {path:?} resolved but contained no rows (check the path/glob \
@@ -351,6 +380,56 @@ mod tests {
 
     fn no_opts() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Write `n` edges `(i, i + 1)` to a Parquet file with many small row groups, so
+    /// DataFusion splits the scan across several partitions.
+    fn write_multi_row_group_parquet(path: &std::path::Path, n: i64) {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from", DataType::Int64, false),
+            Field::new("to", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..n)),
+                Arc::new(Int64Array::from_iter_values(1..n + 1)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4_096))
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn parquet_scan_preserves_file_row_order() {
+        // #148: a multi-row-group file is read as several parallel partitions. The
+        // scan must return rows in file order on every run, not in partition
+        // completion order, or dense ids (and so kernel output) change per run.
+        let path = std::env::temp_dir().join("ursa_scan_test_row_order.parquet");
+        let n: i64 = 2_000_000; // ~32 MB: above the 10 MB repartition threshold
+        write_multi_row_group_parquet(&path, n);
+        for _ in 0..5 {
+            let batches =
+                scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+            let mut next = 0i64;
+            for b in &batches {
+                let src = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                for v in src.values() {
+                    assert_eq!(*v, next, "scan returned rows out of file order");
+                    next += 1;
+                }
+            }
+            assert_eq!(next, n);
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

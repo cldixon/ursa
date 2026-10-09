@@ -8,6 +8,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `scan_edges` and `scan_nodes` now return rows in file order on every run.
+  A file large enough to be read as several parallel partitions previously
+  came back in a run-dependent order, so dense ids, component labels,
+  `edge_ids` and PageRank's last bits changed between runs over the same
+  file. Output over a scan now matches `from_arrow` over the same table
+  exactly (#148).
+
 ## [0.3.0] — 2026-10-08
 
 ### Added

@@ -8,6 +8,7 @@
 """
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -108,3 +109,37 @@ def test_weighted_pagerank_glob_matches_single_file(tmp_path):
     assert from_single.keys() == from_glob.keys()
     for k in from_single:
         assert abs(from_single[k] - from_glob[k]) < 1e-9
+
+
+# --- #148: a parallel scan returns edges in file order on every run ---------
+def test_scan_edges_is_reproducible_and_matches_from_arrow(tmp_path):
+    # Big enough (~40 MB, no dictionary/compression) that DataFusion splits the
+    # file into several byte-range partitions; a small file is read as one and
+    # can't reorder. Dense ids follow first-seen row order, so any reordering
+    # shows up as different component labels and PageRank summation order.
+    n = 2_500_000
+    i = pa.array(range(n), type=pa.int64())
+    src = pc.bit_wise_and(pc.multiply(i, 7919), 0xFFFFF)
+    dst = pc.bit_wise_and(pc.multiply(i, 104729), 0xFFFFF)
+    path = tmp_path / "edges.parquet"
+    pq.write_table(
+        pa.table({"from": src, "to": dst}),
+        path,
+        row_group_size=50_000,
+        use_dictionary=False,
+        compression="none",
+    )
+
+    def run(edges):
+        return (
+            edges.nodes()
+            .with_columns(pr=ur.pagerank(edges), cc=ur.connected_components(edges))
+            .sort("id")
+            .collect()
+            .to_arrow()
+        )
+
+    baseline = run(ur.from_arrow(pq.read_table(path), src="from", dst="to"))
+    for _ in range(3):
+        scanned = run(ur.scan_edges(str(path), src="from", dst="to"))
+        assert scanned.equals(baseline)  # exact: labels and f64 bits
