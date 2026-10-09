@@ -12,6 +12,7 @@
 use arrow::array::{Array, Float64Array, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 
@@ -44,6 +45,10 @@ fn is_numeric(dt: &DataType) -> bool {
 /// so each is evaluated in turn and its weights appended — the `f64` output aligns
 /// with the CSR's `edge_ids` because that same batch order built the topology.
 ///
+/// The expression is type-coerced and compiled to a physical expression **once**,
+/// then evaluated directly on each batch: no per-batch logical plan, optimizer
+/// pass or async collect, which used to dominate on a scan's many small batches.
+///
 /// Errors if the expression is unsupported, references an unknown column, produces
 /// a non-numeric result, or yields any null or negative weight (weights must be
 /// non-negative — Dijkstra's requirement, and negatives are meaningless for
@@ -54,55 +59,76 @@ pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f
     let expr = parse_ursa_expr(&value)?;
     let df_expr = lower(&expr)?;
 
-    let column = crate::runtime::block_on(async move {
-        let total: usize = edges.iter().map(|b| b.num_rows()).sum();
-        let mut out = Vec::with_capacity(total);
-        let ctx = SessionContext::new();
-        for edge_batch in edges {
-            let df = ctx
-                .read_batch(edge_batch.clone())?
-                .select(vec![df_expr.clone().alias("__ursa_weight")])?;
-            let result = df.collect().await?;
-            // Branch on the *declared* result type, not on cast success: casting a
-            // non-numeric column (e.g. a string weight= ur.col("region")) to Float64
-            // silently yields nulls, which would misreport as "produced a null value".
-            if let Some(first) = result.first() {
-                let dt = first.column(0).data_type();
-                if !is_numeric(dt) {
-                    return Err(DataFusionError::Execution(format!(
-                        "weight expression must be numeric; it produced a column of type {dt:?} \
-                         (a string or other non-numeric column cannot be a weight)"
-                    )));
-                }
-            }
-            for batch in &result {
-                let col = cast(batch.column(0), &DataType::Float64)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                let col = col
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .expect("cast to Float64 yields Float64Array");
-                for i in 0..col.len() {
-                    if col.is_null(i) {
-                        return Err(DataFusionError::Execution(
-                            "weight expression produced a null value; weights must be non-null"
-                                .into(),
-                        ));
-                    }
-                    let w = col.value(i);
-                    if w < 0.0 {
-                        return Err(DataFusionError::Execution(format!(
-                            "weight expression produced a negative value ({w}); weights must be \
-                             non-negative"
-                        )));
-                    }
-                    out.push(w);
-                }
-            }
+    let Some(first) = edges.first() else {
+        return Ok(Vec::new());
+    };
+    let schema = first.schema();
+    let physical = SessionContext::new()
+        .create_physical_expr(df_expr, &DFSchema::try_from(schema.clone())?)?;
+    // Branch on the *declared* result type, not on cast success: casting a
+    // non-numeric column (e.g. a string weight= ur.col("region")) to Float64
+    // silently yields nulls, which would misreport as "produced a null value".
+    let dt = physical.data_type(&schema)?;
+    if !is_numeric(&dt) {
+        return Err(DataFusionError::Execution(format!(
+            "weight expression must be numeric; it produced a column of type {dt:?} \
+             (a string or other non-numeric column cannot be a weight)"
+        )));
+    }
+
+    let total: usize = edges.iter().map(|b| b.num_rows()).sum();
+    let mut out = Vec::with_capacity(total);
+    for batch in edges {
+        let col = physical.evaluate(batch)?.into_array(batch.num_rows())?;
+        let col = cast(&col, &DataType::Float64)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let col = col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("cast to Float64 yields Float64Array");
+        if col.null_count() > 0 {
+            return Err(DataFusionError::Execution(
+                "weight expression produced a null value; weights must be non-null".into(),
+            ));
         }
-        Ok::<Vec<f64>, DataFusionError>(out)
-    })??;
-    Ok(column)
+        let values = col.values();
+        if let Some(&w) = values.iter().find(|&&w| w < 0.0) {
+            return Err(DataFusionError::Execution(format!(
+                "weight expression produced a negative value ({w}); weights must be \
+                 non-negative"
+            )));
+        }
+        out.extend_from_slice(values);
+    }
+    Ok(out)
+}
+
+/// The weights for a weighted operation: `weight_json` evaluated over `edges`, one
+/// per edge row, checked to align with a topology of `n_edges` edges.
+///
+/// `what` names the operation for the missing-edge-table error (e.g. "a weighted
+/// algorithm", "weighted shortest_path"). Every weighted entry point goes through
+/// here, so they report the same errors.
+pub fn edge_weights(
+    edges: Option<&[RecordBatch]>,
+    weight_json: &str,
+    n_edges: usize,
+    what: &str,
+) -> Result<Vec<f64>> {
+    let edges = edges.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{what} needs the edge table, but none was provided"
+        ))
+    })?;
+    let w = evaluate_weight(edges, weight_json)?;
+    if w.len() != n_edges {
+        return Err(DataFusionError::Execution(format!(
+            "weight array length ({}) does not match the edge count ({n_edges}); the edge \
+             table and the graph are misaligned",
+            w.len()
+        )));
+    }
+    Ok(w)
 }
 
 #[cfg(test)]

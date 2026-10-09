@@ -36,7 +36,7 @@ use crate::logical::{Direction, GraphAlgo, LayoutKind};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{path_schema, OutputColumn, OutputDtype};
-use crate::weight::evaluate_weight;
+use crate::weight::edge_weights;
 
 /// One requested output column, deserialized from the Python query IR.
 ///
@@ -515,6 +515,7 @@ pub fn execute_node_query(
     }
     let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
+    let mut weight_cache: HashMap<String, Arc<Vec<f64>>> = HashMap::new();
     for spec in &specs {
         let dtype = parse_output_dtype(spec.dtype.as_deref())?;
         if spec.kind == "neighbors_agg" {
@@ -560,22 +561,24 @@ pub fn execute_node_query(
                             spec.kind
                         )));
                     }
-                    let edges_ref = edges.as_ref().ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "a weighted algorithm needs the edge table, but none was provided"
-                                .into(),
-                        )
-                    })?;
-                    let w = evaluate_weight(edges_ref, &weight_json.to_string())?;
-                    if w.len() != topology.n_edges() {
-                        return Err(DataFusionError::Execution(format!(
-                            "weight array length ({}) does not match the edge count ({}); the edge \
-                             table and the graph are misaligned",
-                            w.len(),
-                            topology.n_edges()
-                        )));
-                    }
-                    Some(Arc::new(w))
+                    // One evaluation per distinct expression: columns weighted by
+                    // the same expression share its `Arc`, which is also what lets
+                    // the kernel memo (keyed on that `Arc`) share their runs.
+                    let key = weight_json.to_string();
+                    let w = match weight_cache.get(&key) {
+                        Some(w) => w.clone(),
+                        None => {
+                            let w = Arc::new(edge_weights(
+                                edges.as_deref(),
+                                &key,
+                                topology.n_edges(),
+                                "a weighted algorithm",
+                            )?);
+                            weight_cache.insert(key, w.clone());
+                            w
+                        }
+                    };
+                    Some(w)
                 }
             };
             let field = spec.field.unwrap_or(0);
@@ -807,28 +810,6 @@ pub fn execute_path_query(
 ) -> Result<Vec<RecordBatch>> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
 
-    // A weight expression (over edge columns) becomes one non-negative f64 per
-    // edge row; Dijkstra gathers it via edge_ids. Omit for unweighted BFS.
-    let weights = match weight {
-        None => None,
-        Some(weight_json) => {
-            let edges_ref = edges.as_ref().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "weighted shortest_path needs the edge table, but none was provided".into(),
-                )
-            })?;
-            let w = evaluate_weight(edges_ref, weight_json)?;
-            if w.len() != topology.n_edges() {
-                return Err(DataFusionError::Execution(format!(
-                    "weight array length ({}) does not match the edge count ({})",
-                    w.len(),
-                    topology.n_edges()
-                )));
-            }
-            Some(Arc::new(w))
-        }
-    };
-
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
     // index. An unknown (or absent) endpoint -> no path (an empty edge frame),
     // short-circuiting the plan.
@@ -846,6 +827,19 @@ pub fn execute_path_query(
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         return Ok(vec![empty]);
+    };
+
+    // A weight expression (over edge columns) becomes one non-negative f64 per
+    // edge row; Dijkstra gathers it via edge_ids. Omit for unweighted BFS.
+    // Evaluated only once both endpoints resolve, as in `shortest_path_nodes`.
+    let weights = match weight {
+        None => None,
+        Some(weight_json) => Some(Arc::new(edge_weights(
+            edges.as_deref(),
+            weight_json,
+            topology.n_edges(),
+            "weighted shortest_path",
+        )?)),
     };
 
     let path_plan = LogicalPlan::Extension(Extension {
@@ -916,19 +910,12 @@ pub fn shortest_path_nodes(
     let path = match weight {
         None => ursa_core::algo::shortest_path(&topology, source, target, direction),
         Some(weight_json) => {
-            let edges_ref = edges.as_ref().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "weighted shortest_path needs the edge table, but none was provided".into(),
-                )
-            })?;
-            let w = evaluate_weight(edges_ref, weight_json)?;
-            if w.len() != topology.n_edges() {
-                return Err(DataFusionError::Execution(format!(
-                    "weight array length ({}) does not match the edge count ({})",
-                    w.len(),
-                    topology.n_edges()
-                )));
-            }
+            let w = edge_weights(
+                edges.as_deref(),
+                weight_json,
+                topology.n_edges(),
+                "weighted shortest_path",
+            )?;
             ursa_core::algo::shortest_path_weighted(&topology, &w, source, target, direction)
         }
     };
