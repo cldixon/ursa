@@ -17,8 +17,6 @@
 //! takes a per-edge weight (gathered via `edge_ids`). `resolution` (γ) scales the
 //! null-model term: larger γ favours smaller communities.
 
-use std::collections::HashMap;
-
 use crate::parallel::*;
 
 use super::rng::{shuffled_order, DEFAULT_SEED};
@@ -101,7 +99,12 @@ fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
     let mut comm: Vec<u32> = (0..n as u32).collect();
     let mut tot: Vec<f64> = graph.k.clone(); // Σ weighted-degree of each community
     let order = shuffled_order(n, seed);
-    let mut weight_to: HashMap<u32, f64> = HashMap::new();
+    // Weight from the current node into each neighbouring community, dense over
+    // community ids (`< n`), plus the communities touched for this node. Summed in
+    // adjacency order, exactly as a map entry would be, and reset after each node.
+    let mut weight_to = vec![0.0f64; n];
+    let mut seen = vec![false; n];
+    let mut touched: Vec<u32> = Vec::new();
 
     loop {
         let mut moved = false;
@@ -110,28 +113,30 @@ fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
             let ku = graph.k[u as usize];
 
             // Weight from u into each neighbouring community.
-            weight_to.clear();
             for &(v, w) in &graph.adj[u as usize] {
-                *weight_to.entry(comm[v as usize]).or_insert(0.0) += w;
+                let c = comm[v as usize];
+                if !std::mem::replace(&mut seen[c as usize], true) {
+                    touched.push(c);
+                }
+                weight_to[c as usize] += w;
             }
 
             // Tentatively remove u from its community.
             tot[ci as usize] -= ku;
 
             // Gain of staying in ci (the baseline every move must strictly beat).
-            let stay = weight_to.get(&ci).copied().unwrap_or(0.0)
-                - resolution * tot[ci as usize] * ku / graph.m2;
-            // Scan neighbour communities in ascending-id order, not `HashMap`
-            // iteration order (which varies per instance/run): with the epsilon,
-            // "tie" is non-transitive, so map order could change the partition on a
-            // same-seed rerun. Sorting makes it order-independent, and requiring a
-            // strict improvement (> best + eps) keeps the smallest id on a tie
-            // (it's seen first) without letting chained near-ties drag the anchor.
-            let mut candidates: Vec<(u32, f64)> = weight_to.iter().map(|(&c, &w)| (c, w)).collect();
-            candidates.sort_unstable_by_key(|&(c, _)| c);
+            let stay = weight_to[ci as usize] - resolution * tot[ci as usize] * ku / graph.m2;
+            // Scan neighbour communities in ascending-id order, never in the order
+            // they were met: with the epsilon, "tie" is non-transitive, so scan
+            // order could change the partition. Ascending order with a strict
+            // improvement (> best + eps) keeps the smallest id on a tie (it's seen
+            // first) without letting chained near-ties drag the anchor.
+            touched.sort_unstable();
             let mut best_c = ci;
             let mut best_gain = stay;
-            for (c, w_in) in candidates {
+            for &c in &touched {
+                let w_in = std::mem::take(&mut weight_to[c as usize]);
+                seen[c as usize] = false;
                 if c == ci {
                     continue;
                 }
@@ -141,6 +146,7 @@ fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
                     best_c = c;
                 }
             }
+            touched.clear();
 
             // Commit (re-insert into the chosen community).
             tot[best_c as usize] += ku;
@@ -257,24 +263,68 @@ impl Graph {
     }
 
     /// Collapse each community into a super-node.
+    ///
+    /// Each community's members are visited in ascending node order, summing edge
+    /// weights into a dense per-community accumulator; its neighbours come out
+    /// sorted by community id. Every float sum therefore runs in a fixed order.
+    /// (The former per-community `HashMap` was randomly seeded per instance, so
+    /// adjacency order, and with it weighted sums, varied from run to run.)
+    /// Communities are independent, so they are built in parallel.
     fn aggregate(&self, comm: &[u32], c: usize) -> Graph {
-        let mut nbr: Vec<HashMap<u32, f64>> = vec![HashMap::new(); c];
-        let mut self_loop = vec![0.0f64; c];
-        for u in 0..self.n() {
-            let cu = comm[u] as usize;
-            self_loop[cu] += self.self_loop[u];
-            for &(v, w) in &self.adj[u] {
-                let cv = comm[v as usize] as usize;
-                if cu == cv {
-                    // Each intra-community edge is seen from both endpoints, so
-                    // halve to land one loop-weight per undirected edge.
-                    self_loop[cu] += w / 2.0;
-                } else {
-                    *nbr[cu].entry(cv as u32).or_insert(0.0) += w;
-                }
-            }
+        let n = self.n();
+        // Members of each community, ascending, via a counting sort on `comm`.
+        let mut start = vec![0usize; c + 1];
+        for &cu in comm {
+            start[cu as usize + 1] += 1;
         }
-        Graph::finalize(maps_to_adj(nbr), self_loop)
+        for i in 0..c {
+            start[i + 1] += start[i];
+        }
+        let mut members = vec![0u32; n];
+        let mut cursor = start[..c].to_vec();
+        for (u, &cu) in comm.iter().enumerate() {
+            members[cursor[cu as usize]] = u as u32;
+            cursor[cu as usize] += 1;
+        }
+
+        let built: Vec<(Vec<(u32, f64)>, f64)> = (0..c)
+            .into_par_iter()
+            .map_init(
+                || (vec![0.0f64; c], vec![false; c], Vec::<u32>::new()),
+                |(acc, seen, touched), cu| {
+                    let mut self_loop = 0.0f64;
+                    for &u in &members[start[cu]..start[cu + 1]] {
+                        self_loop += self.self_loop[u as usize];
+                        for &(v, w) in &self.adj[u as usize] {
+                            let cv = comm[v as usize] as usize;
+                            if cv == cu {
+                                // Each intra-community edge is seen from both
+                                // endpoints, so halve to land one loop-weight per
+                                // undirected edge.
+                                self_loop += w / 2.0;
+                            } else {
+                                if !std::mem::replace(&mut seen[cv], true) {
+                                    touched.push(cv as u32);
+                                }
+                                acc[cv] += w;
+                            }
+                        }
+                    }
+                    touched.sort_unstable();
+                    let adj = touched
+                        .iter()
+                        .map(|&cv| {
+                            seen[cv as usize] = false;
+                            (cv, std::mem::take(&mut acc[cv as usize]))
+                        })
+                        .collect();
+                    touched.clear();
+                    (adj, self_loop)
+                },
+            )
+            .collect();
+        let (adj, self_loop) = built.into_iter().unzip();
+        Graph::finalize(adj, self_loop)
     }
 
     fn finalize(adj: Vec<Vec<(u32, f64)>>, self_loop: Vec<f64>) -> Graph {
@@ -292,21 +342,19 @@ impl Graph {
     }
 }
 
-fn maps_to_adj(maps: Vec<HashMap<u32, f64>>) -> Vec<Vec<(u32, f64)>> {
-    maps.into_iter().map(|m| m.into_iter().collect()).collect()
-}
-
-/// Relabel arbitrary community ids to a contiguous `0..k` by first appearance.
+/// Relabel community ids (each `< comm.len()`) to a contiguous `0..k` by first
+/// appearance.
 fn renumber(comm: &[u32]) -> Vec<u32> {
-    let mut map: HashMap<u32, u32> = HashMap::new();
+    let mut map = vec![u32::MAX; comm.len()];
     let mut next = 0u32;
     comm.iter()
         .map(|&c| {
-            *map.entry(c).or_insert_with(|| {
-                let id = next;
+            let slot = &mut map[c as usize];
+            if *slot == u32::MAX {
+                *slot = next;
                 next += 1;
-                id
-            })
+            }
+            *slot
         })
         .collect()
 }
@@ -338,6 +386,30 @@ mod tests {
             dst.push(b);
         }
         Topology::build(8, src, dst)
+    }
+
+    #[test]
+    fn weighted_runs_are_reproducible_with_inexact_weights() {
+        // Irrational-ish weights make float sums order-sensitive, so this pins the
+        // aggregation order: every run must agree exactly.
+        let n = 600u32;
+        let (mut src, mut dst, mut w) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..6000u32 {
+            let a = (i * 7) % n;
+            let b = (a + 1 + (i * 13) % 40) % n; // local structure -> real communities
+            src.push(a);
+            dst.push(b);
+            w.push(((i % 97) as f64 + 1.0).sqrt() / 3.0);
+        }
+        let t = Topology::build(n as usize, src, dst);
+        let first = louvain_weighted(&t, &w, None, 1.0, Some(5));
+        assert!(
+            first.iter().max().unwrap() > &0,
+            "found more than one community"
+        );
+        for _ in 0..5 {
+            assert_eq!(louvain_weighted(&t, &w, None, 1.0, Some(5)), first);
+        }
     }
 
     #[test]
