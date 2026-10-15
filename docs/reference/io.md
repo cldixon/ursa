@@ -26,6 +26,8 @@ ur.scan_edges(
 
 The format comes from the file extension: `.parquet` or `.csv`. A CSV file must have a header row.
 
+A scanned edge frame has every column of the file, with the file's names, order and types, the same as an `EdgeFrame` built from the file read into memory. `collect()`, `filter`, `sort`, `group_by`, `join` and the sinks see all of them. A graph algorithm reads only the endpoints, plus the columns in a `weight=` expression. A `string_view` column is read as `string`.
+
 An HTTP URL must point at one file and must not carry a query string. A presigned URL does not work over HTTP. Use the `s3://` backend with `storage_options` for signed access.
 
 ### `ur.scan_nodes`

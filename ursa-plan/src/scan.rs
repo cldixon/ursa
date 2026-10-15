@@ -231,8 +231,15 @@ async fn collect_in_file_order(df: DataFrame) -> Result<Vec<RecordBatch>> {
 /// supports. The projection is pushed down, so only the endpoint columns (and any
 /// requested weight columns) are read. The endpoints are canonicalized to a
 /// supported node-id type — `Int64` (the fast path) or `Utf8` strings; `src` and
-/// `dst` must be the same family. Weight columns keep their file types and appear
-/// after `dst`, so a caller can evaluate the weight over the same rows.
+/// `dst` must be the same family — and renamed `src`/`dst`. Weight columns keep
+/// their file names and types and appear after `dst`, so a caller can evaluate the
+/// weight over the same rows.
+///
+/// A weight column that *is* an endpoint (a `weight=` expression over the `src`
+/// or `dst` column, #154) is emitted again under its own name with its file type,
+/// just as an in-memory edge table would carry it. It is not read twice: the
+/// output column shares the scanned array. The one exception is an endpoint
+/// already named `src`/`dst`, whose canonical column carries that name already.
 pub fn scan_edges_batch(
     path: &str,
     src: &str,
@@ -246,7 +253,7 @@ pub fn scan_edges_batch(
         // Project src, dst, then any weight columns not already among them.
         let mut proj: Vec<&str> = vec![src, dst];
         for c in weight_columns {
-            if c != src && c != dst && !proj.contains(&c.as_str()) {
+            if !proj.contains(&c.as_str()) {
                 proj.push(c.as_str());
             }
         }
@@ -263,13 +270,24 @@ pub fn scan_edges_batch(
         // the scan's batches) and every batch is canonicalized to it independently.
         let read_schema = batches[0].schema();
         let id_type = endpoint_id_type(&read_schema, path)?;
-        // src/dst canonicalized; weight columns (positions 2..) passed through.
+        // Output layout: canonical src/dst, then each weight column by its own
+        // name, as an index into the read batch. An endpoint requested as a weight
+        // column (#154) points back at read column 0/1 (uncast).
         let mut fields = vec![
             Field::new("src", id_type.clone(), true),
             Field::new("dst", id_type.clone(), true),
         ];
-        for i in 2..read_schema.fields().len() {
-            fields.push(read_schema.field(i).clone());
+        let mut extra: Vec<usize> = Vec::new();
+        for (i, f) in read_schema.fields().iter().enumerate().skip(2) {
+            fields.push(f.as_ref().clone());
+            extra.push(i);
+        }
+        for (end, idx) in [(src, 0), (dst, 1)] {
+            let wanted = weight_columns.iter().any(|c| c == end);
+            if wanted && !fields.iter().any(|f| f.name() == end) {
+                fields.push(read_schema.field(idx).clone().with_name(end));
+                extra.push(idx);
+            }
         }
         let out_schema = Arc::new(Schema::new(fields));
 
@@ -285,14 +303,121 @@ pub fn scan_edges_batch(
                 let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
                 let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
                 let mut columns = vec![src_c, dst_c];
-                for i in 2..batch.num_columns() {
-                    columns.push(batch.column(i).clone());
-                }
+                columns.extend(extra.iter().map(|&i| batch.column(i).clone()));
                 RecordBatch::try_new(out_schema.clone(), columns).map_err(arrow_err)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(out)
     })?
+}
+
+/// Read an edge file as a table — every column, or the `columns` projection —
+/// for the relational (non-graph) paths: a plain `collect()`, its
+/// `filter`/`sort`/`select`/`group_by`/`join` tail, the sinks, and a subgraph
+/// view's edge mask (#160).
+///
+/// The result is shaped like the same file read into memory and passed to
+/// `EdgeFrame`: columns keep their file names, order and types, so a scanned edge
+/// frame collects exactly what an in-memory one does. The endpoint types are
+/// validated (an integer or string family, the same for both) but not cast,
+/// since an in-memory edge table keeps its endpoint types as well. The one
+/// conversion is `Utf8View` to `Utf8` for every column, as in
+/// [`scan_nodes_batch`]: the table is filtered and sorted with pyarrow compute,
+/// which has few string-view kernels, and an in-memory read of the same file
+/// yields `Utf8`.
+///
+/// `columns` empty reads every column; otherwise only the named columns are read
+/// (projection pushdown), in file order. A name the file lacks is skipped here
+/// and reported by the caller's own column check, so the error matches the
+/// in-memory frame's. The graph-op paths never come here: the index build and
+/// the weighted scan keep their narrow projections ([`scan_edges_topology`],
+/// [`scan_edges_batch`]).
+pub fn scan_edges_table(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    columns: &[String],
+) -> Result<Vec<RecordBatch>> {
+    crate::runtime::block_on(async move {
+        let df = open_scan(path, storage_options, "scan_edges").await?;
+        let schema = df.schema().as_arrow().clone();
+        for end in [src, dst] {
+            if schema.index_of(end).is_err() {
+                return Err(DataFusionError::Execution(format!(
+                    "scan_edges: endpoint column {end:?} not found in edge file {path:?}"
+                )));
+            }
+        }
+        let df = if columns.is_empty() {
+            df
+        } else {
+            let keep: Vec<&str> = schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|n| *n == src || *n == dst || columns.iter().any(|c| c == n))
+                .collect();
+            df.select_columns(&keep)?
+        };
+        let read_schema = df.schema().as_arrow().clone();
+        // Validate the endpoint types exactly as the graph build would.
+        let ends = Schema::new(vec![
+            read_schema.field_with_name(src)?.clone(),
+            read_schema.field_with_name(dst)?.clone(),
+        ]);
+        endpoint_id_type(&ends, path)?;
+
+        let batches = collect_in_file_order(df).await?;
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Err(empty_edge_source(path));
+        }
+        let out_schema = Arc::new(Schema::new(
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| unview_field(f))
+                .collect::<Vec<_>>(),
+        ));
+        cast_batches(&batches, &out_schema)
+    })?
+}
+
+/// `f` with a `Utf8View` type replaced by `Utf8` (see [`scan_nodes_batch`]).
+fn unview_field(f: &Field) -> Field {
+    match f.data_type() {
+        DataType::Utf8View => Field::new(f.name(), DataType::Utf8, f.is_nullable()),
+        _ => f.clone(),
+    }
+}
+
+/// Cast each non-empty batch to `out_schema` column by column, passing through
+/// any column whose type already matches. The cast is per batch (at most
+/// `SCAN_BATCH_ROWS` rows), so the 2 GiB `Utf8` offset limit (#152) bounds a
+/// batch, not the column, and every batch shares the one schema so they stay
+/// concat-compatible on the Python side.
+fn cast_batches(batches: &[RecordBatch], out_schema: &Arc<Schema>) -> Result<Vec<RecordBatch>> {
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let columns = batch
+            .columns()
+            .iter()
+            .zip(out_schema.fields())
+            .map(|(c, f)| {
+                if c.data_type() == f.data_type() {
+                    Ok(c.clone())
+                } else {
+                    cast(c, f.data_type()).map_err(arrow_err)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        out.push(RecordBatch::try_new(out_schema.clone(), columns).map_err(arrow_err)?);
+    }
+    Ok(out)
 }
 
 fn arrow_err(e: arrow::error::ArrowError) -> DataFusionError {
@@ -487,37 +612,15 @@ pub fn scan_nodes_batch(
             .fields()
             .iter()
             .enumerate()
-            .map(|(i, f)| match f.data_type() {
-                _ if i == id_idx => Field::new(f.name(), id_type.clone(), f.is_nullable()),
-                DataType::Utf8View => Field::new(f.name(), DataType::Utf8, f.is_nullable()),
-                _ => f.as_ref().clone(),
+            .map(|(i, f)| {
+                if i == id_idx {
+                    Field::new(f.name(), id_type.clone(), f.is_nullable())
+                } else {
+                    unview_field(f)
+                }
             })
             .collect();
-        let out_schema = Arc::new(Schema::new(fields));
-
-        let mut out = Vec::with_capacity(batches.len());
-        for batch in &batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let columns = batch
-                .columns()
-                .iter()
-                .zip(out_schema.fields())
-                .map(|(c, f)| {
-                    if c.data_type() == f.data_type() {
-                        Ok(c.clone())
-                    } else {
-                        cast(c, f.data_type()).map_err(arrow_err)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            out.push(
-                RecordBatch::try_new(out_schema.clone(), columns)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-            );
-        }
-        Ok(out)
+        cast_batches(&batches, &Arc::new(Schema::new(fields)))
     })?
 }
 
@@ -679,6 +782,15 @@ mod tests {
                 _ => DataType::Utf8,
             };
             assert_eq!(label_type, want_label, "{name}");
+            // The relational table scan (#160) keeps every column under its own
+            // name; views become Utf8 (endpoints too), a dictionary stays one.
+            let table = scan_edges_table(p, "from", "to", &no_opts(), &[]).unwrap();
+            let schema = table[0].schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, ["from", "to", "label"], "{name}");
+            for f in schema.fields() {
+                assert_eq!(f.data_type(), &want_label, "{name} {}", f.name());
+            }
             built.push((
                 scanned.ids.user_id_array(),
                 scanned.topo.out().targets.clone(),
@@ -710,6 +822,131 @@ mod tests {
             }
             assert_eq!(next, n);
         }
+        let batches =
+            scan_edges_table(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+        let mut next = 0i64;
+        for b in &batches {
+            let src = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            for v in src.values() {
+                assert_eq!(*v, next, "table scan returned rows out of file order");
+                next += 1;
+            }
+        }
+        assert_eq!(next, n);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A Parquet edge file with narrow `Int32` endpoints between two attribute
+    /// columns: `w, from, label, to`.
+    fn write_attr_edges_parquet(path: &std::path::Path) {
+        use arrow::array::{Float64Array, Int32Array, StringArray};
+        use datafusion::parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("w", DataType::Float64, false),
+            Field::new("from", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, false),
+            Field::new("to", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![0.5, 1.5, 2.5])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int32Array::from(vec![2, 3, 1])),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn edge_table_scan_keeps_every_column_as_the_file_has_it() {
+        // #160: the relational scan returns the file's columns in file order, with
+        // their own names and types (endpoints validated, not cast), so it matches
+        // the same file read into an in-memory edge table.
+        let path = std::env::temp_dir().join("ursa_scan_test_edge_table.parquet");
+        write_attr_edges_parquet(&path);
+        let p = path.to_str().unwrap();
+        let batches = scan_edges_table(p, "from", "to", &no_opts(), &[]).unwrap();
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["w", "from", "label", "to"]);
+        let types: Vec<&DataType> = schema.fields().iter().map(|f| f.data_type()).collect();
+        assert_eq!(
+            types,
+            [
+                &DataType::Float64,
+                &DataType::Int32,
+                &DataType::Utf8,
+                &DataType::Int32
+            ]
+        );
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+        // A projection reads the named columns plus both endpoints, in file order;
+        // a name the file lacks is left for the caller's column check.
+        let cols = ["label".to_string(), "nope".to_string()];
+        let batches = scan_edges_table(p, "from", "to", &no_opts(), &cols).unwrap();
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["from", "label", "to"]);
+
+        // A missing endpoint names the column; a non-id endpoint is rejected as
+        // the graph build would reject it.
+        let err = scan_edges_table(p, "from", "nope", &no_opts(), &[]).unwrap_err();
+        assert!(err.to_string().contains("\"nope\" not found"), "{err}");
+        let err = scan_edges_table(p, "from", "w", &no_opts(), &[]).unwrap_err();
+        assert!(err.to_string().contains("not a supported id type"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn edge_table_scan_reads_every_csv_column() {
+        let path = std::env::temp_dir().join("ursa_scan_test_edge_table.csv");
+        std::fs::write(&path, "from,to,weight,label\n10,20,0.5,a\n20,30,0.9,b\n").unwrap();
+        let batches =
+            scan_edges_table(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["from", "to", "weight", "label"]);
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn weight_columns_may_name_an_endpoint() {
+        // #154: a weight expression over the src/dst column gets that column by
+        // its own name and file type, after the canonical src/dst pair.
+        let path = std::env::temp_dir().join("ursa_scan_test_weight_endpoint.parquet");
+        write_attr_edges_parquet(&path);
+        let p = path.to_str().unwrap();
+        let cols = ["from".to_string(), "w".to_string()];
+        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &cols).unwrap();
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["src", "dst", "w", "from"]);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(3).data_type(), &DataType::Int32);
+        let from = batches[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(from.values(), &[1, 2, 3]);
+        std::fs::remove_file(&path).ok();
+
+        // An endpoint already named `src` is the canonical column; no duplicate.
+        let path = std::env::temp_dir().join("ursa_scan_test_weight_endpoint.csv");
+        std::fs::write(&path, "src,dst\n1,2\n2,3\n").unwrap();
+        let cols = ["src".to_string()];
+        let batches =
+            scan_edges_batch(path.to_str().unwrap(), "src", "dst", &no_opts(), &cols).unwrap();
+        assert_eq!(batches[0].num_columns(), 2);
         std::fs::remove_file(&path).ok();
     }
 
