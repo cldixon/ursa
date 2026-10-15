@@ -233,7 +233,11 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 "call describe() as the final step of the pipeline."
             )
         index = _require_index(describe_step.args["edges"])
-        batch = _native().graph_describe(index, bool(describe_step.args.get("full", False)))
+        batch = _native().graph_describe(
+            index,
+            bool(describe_step.args.get("full", False)),
+            describe_step.args.get("direction", "out"),
+        )
         return MaterializedFrame(batch)
 
     walk_step = next((s for s in frame._plan if s.op == "random_walk"), None)
@@ -929,15 +933,18 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
             damping=p.get("damping", 0.85),
             max_iter=p.get("max_iter", 30),
             tol=p.get("tol", 1e-6),
+            direction=p.get("direction", "out"),
         )
         _add_weight(column, p)
     elif verb == "degree":
         column["direction"] = p.get("direction", "out")
     elif verb == "closeness":
+        column["direction"] = p.get("direction", "out")
         _add_weight(column, p)
     elif verb == "betweenness":
         column["sample"] = p.get("sample")
         column["seed"] = p.get("seed")
+        column["direction"] = p.get("direction", "out")
         _add_weight(column, p)
     elif verb == "label_propagation":
         column.update(max_iter=p.get("max_iter", 20), seed=p.get("seed"))

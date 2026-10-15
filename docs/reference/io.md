@@ -77,10 +77,12 @@ Each function imports its library only when called. Install the matching [extra]
 ### `ur.from_networkx`
 
 ```py
-ur.from_networkx(graph, *, weight: str = "weight") -> EdgeFrame
+ur.from_networkx(graph, *, weight: str = "weight", symmetrize: bool | None = None) -> EdgeFrame
 ```
 
-One row per edge. If every edge has the `weight` attribute, the frame has a `weight` column. Node ids are the NetworkX node labels. An undirected `Graph` gives each edge once. Node attributes are not included; use `nodes_from_networkx` for them.
+One row per edge. If every edge has the `weight` attribute, the frame has a `weight` column. Node ids are the NetworkX node labels. Node attributes are not included; use `nodes_from_networkx` for them.
+
+An undirected `Graph` or `MultiGraph` gives each edge twice, once in each direction, so the default `direction="out"` of each kernel sees the undirected graph. A self-loop stays one row. For `betweenness` on such a frame, pass `direction="both"`; see [Semantics vs NetworkX](../semantics.md#undirected-graphs). `symmetrize=False` gives each undirected edge once, and `symmetrize=True` adds the reverse of every edge of a `DiGraph`.
 
 ### `ur.nodes_from_networkx`
 

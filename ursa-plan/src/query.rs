@@ -91,12 +91,25 @@ struct ColumnSpec {
 }
 
 impl ColumnSpec {
+    /// The direction of a kernel that takes `'out'` or `'both'` only (`pagerank`,
+    /// `betweenness`). `'in'` is a hard error rather than a silent `'out'`.
+    fn out_or_both(&self) -> Result<Direction> {
+        match parse_direction(self.direction.as_deref().unwrap_or("out"))? {
+            Direction::In => Err(DataFusionError::NotImplemented(format!(
+                "{} does not support direction='in'; use 'out' or 'both'",
+                self.kind
+            ))),
+            d => Ok(d),
+        }
+    }
+
     fn to_algo(&self) -> Result<GraphAlgo> {
         Ok(match self.kind.as_str() {
             "pagerank" => GraphAlgo::PageRank {
                 damping: self.damping.unwrap_or(0.85),
                 max_iter: self.max_iter.unwrap_or(30),
                 tol: self.tol.unwrap_or(1e-6),
+                direction: self.out_or_both()?,
             },
             "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
                 kind: match self.kind.as_str() {
@@ -117,10 +130,13 @@ impl ColumnSpec {
             },
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
-            "closeness" => GraphAlgo::Closeness,
+            "closeness" => GraphAlgo::Closeness {
+                direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
+            },
             "betweenness" => GraphAlgo::Betweenness {
                 sample: self.sample,
                 seed: self.seed,
+                direction: self.out_or_both()?,
             },
             "label_propagation" => GraphAlgo::LabelPropagation {
                 max_iter: self.max_iter.unwrap_or(20),
@@ -165,7 +181,7 @@ fn parse_output_dtype(dtype: Option<&str>) -> Result<OutputDtype> {
     }
 }
 
-fn parse_direction(d: &str) -> Result<Direction> {
+pub(crate) fn parse_direction(d: &str) -> Result<Direction> {
     match d {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
@@ -569,7 +585,7 @@ pub fn execute_node_query(
                     if !matches!(
                         algo,
                         GraphAlgo::PageRank { .. }
-                            | GraphAlgo::Closeness
+                            | GraphAlgo::Closeness { .. }
                             | GraphAlgo::Betweenness { .. }
                             | GraphAlgo::Louvain { .. }
                     ) {

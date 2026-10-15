@@ -15,12 +15,12 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
-    betweenness, betweenness_weighted, closeness, closeness_weighted, clustering_from_triangles,
-    connected_components_strong, connected_components_weak, degree, k_hop, label_propagation,
-    layout_circle, layout_fr, layout_random, louvain, louvain_weighted, neighbor_aggregate,
-    pagerank, pagerank_weighted, per_node_triangles, random_walk, shortest_path,
-    shortest_path_weighted_with_cost, undirected_view, AggKind, LayoutParams, PageRankParams,
-    UndirectedView,
+    betweenness, betweenness_weighted, closeness_directed, closeness_weighted_directed,
+    clustering_from_triangles, connected_components_strong, connected_components_weak, degree,
+    k_hop, label_propagation, layout_circle, layout_fr, layout_random, louvain, louvain_weighted,
+    neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles, random_walk,
+    shortest_path, shortest_path_weighted_with_cost, symmetric_view, symmetric_view_weighted,
+    undirected_view, AggKind, LayoutParams, PageRankParams, UndirectedView,
 };
 use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
@@ -88,7 +88,7 @@ impl OutputColumn {
             OutputColumn::Algo { algo, .. } => match algo {
                 GraphAlgo::PageRank { .. }
                 | GraphAlgo::ClusteringCoefficient
-                | GraphAlgo::Closeness
+                | GraphAlgo::Closeness { .. }
                 | GraphAlgo::Betweenness { .. } => DataType::Float64,
                 // Positions are f32 at the source: the kernel computes in f32 and
                 // there is no wider value to narrow from, so `dtype` has nothing
@@ -138,6 +138,15 @@ struct KernelKey {
     weights: Option<usize>,
 }
 
+/// A direction's stable code inside a [`KernelKey`].
+fn dir_code(d: PlanDirection) -> u64 {
+    match d {
+        PlanDirection::Out => 0,
+        PlanDirection::In => 1,
+        PlanDirection::Both => 2,
+    }
+}
+
 fn kernel_key(algo: &GraphAlgo, weights: Option<&Arc<Vec<f64>>>) -> KernelKey {
     // Each optional parameter contributes a presence flag alongside its value, so
     // `None` can never collide with a `Some` that happens to carry the same bits.
@@ -158,24 +167,31 @@ fn kernel_key(algo: &GraphAlgo, weights: Option<&Arc<Vec<f64>>>) -> KernelKey {
             damping,
             max_iter,
             tol,
-        } => (0, vec![damping.to_bits(), *max_iter as u64, tol.to_bits()]),
-        GraphAlgo::ConnectedComponents { strong } => (1, vec![*strong as u64]),
-        GraphAlgo::Degree { direction } => (
-            2,
-            vec![match direction {
-                PlanDirection::Out => 0,
-                PlanDirection::In => 1,
-                PlanDirection::Both => 2,
-            }],
+            direction,
+        } => (
+            0,
+            vec![
+                damping.to_bits(),
+                *max_iter as u64,
+                tol.to_bits(),
+                dir_code(*direction),
+            ],
         ),
+        GraphAlgo::ConnectedComponents { strong } => (1, vec![*strong as u64]),
+        GraphAlgo::Degree { direction } => (2, vec![dir_code(*direction)]),
         GraphAlgo::TriangleCount => (3, Vec::new()),
         GraphAlgo::ClusteringCoefficient => (4, Vec::new()),
-        GraphAlgo::Betweenness { sample, seed } => {
+        GraphAlgo::Betweenness {
+            sample,
+            seed,
+            direction,
+        } => {
             let mut p = Vec::from(opt_f64(sample));
             p.extend(opt_u64(seed));
+            p.push(dir_code(*direction));
             (5, p)
         }
-        GraphAlgo::Closeness => (6, Vec::new()),
+        GraphAlgo::Closeness { direction } => (6, vec![dir_code(*direction)]),
         GraphAlgo::LabelPropagation { max_iter, seed } => {
             let mut p = vec![*max_iter as u64];
             p.extend(opt_u64(seed));
@@ -246,6 +262,10 @@ struct KernelEval<'a> {
     /// The undirected view and its per-node triangle counts — the intermediate the
     /// triangle-family kernels share. Computed at most once, on first use.
     triangles: Option<(UndirectedView<'a>, Vec<u32>)>,
+    /// The unweighted symmetric (undirected) view the `direction="both"` forms of
+    /// `pagerank` / `betweenness` run over. Built at most once, on first use, and
+    /// shared between them.
+    symmetric: Option<Topology>,
 }
 
 impl<'a> KernelEval<'a> {
@@ -255,7 +275,15 @@ impl<'a> KernelEval<'a> {
             mask,
             memo: HashMap::new(),
             triangles: None,
+            symmetric: None,
         }
+    }
+
+    /// The unweighted symmetric view, built on first use.
+    fn symmetric(&mut self) -> &Topology {
+        let (topo, mask) = (self.topo, self.mask);
+        self.symmetric
+            .get_or_insert_with(|| symmetric_view(topo, mask))
     }
 
     /// The undirected view and per-node triangle counts, computed on first use.
@@ -310,15 +338,24 @@ impl<'a> KernelEval<'a> {
                 damping,
                 max_iter,
                 tol,
+                direction,
             } => {
                 let params = PageRankParams {
                     damping: *damping,
                     max_iter: *max_iter,
                     tol: *tol,
                 };
-                let scores = match weights {
-                    Some(w) => pagerank_weighted(topo, w, mask, params),
-                    None => pagerank(topo, mask, params),
+                // `Both` runs the unchanged directed kernel over the symmetric view
+                // (each undirected edge as two rows): NetworkX's `pagerank` on an
+                // undirected graph. `In` is rejected when the column is built.
+                let scores = match (direction, weights) {
+                    (PlanDirection::Both, Some(w)) => {
+                        let (sym, sw) = symmetric_view_weighted(topo, w, mask);
+                        pagerank_weighted(&sym, &sw, None, params)
+                    }
+                    (PlanDirection::Both, None) => pagerank(self.symmetric(), None, params),
+                    (_, Some(w)) => pagerank_weighted(topo, w, mask, params),
+                    (_, None) => pagerank(topo, mask, params),
                 };
                 vec![Arc::new(Float64Array::from(scores)) as ArrayRef]
             }
@@ -350,17 +387,36 @@ impl<'a> KernelEval<'a> {
                     counts,
                 ))) as ArrayRef]
             }
-            GraphAlgo::Closeness => {
+            GraphAlgo::Closeness { direction } => {
+                let dir: Direction = (*direction).into();
                 let scores = match weights {
-                    Some(w) => closeness_weighted(topo, w, mask),
-                    None => closeness(topo, mask),
+                    Some(w) => closeness_weighted_directed(topo, w, mask, dir),
+                    None => closeness_directed(topo, mask, dir),
                 };
                 vec![Arc::new(Float64Array::from(scores)) as ArrayRef]
             }
-            GraphAlgo::Betweenness { sample, seed } => {
-                let scores = match weights {
-                    Some(w) => betweenness_weighted(topo, w, mask, *sample, *seed),
-                    None => betweenness(topo, mask, *sample, *seed),
+            GraphAlgo::Betweenness {
+                sample,
+                seed,
+                direction,
+            } => {
+                let scores = match (direction, weights) {
+                    // `Both`: Brandes over the symmetric view counts every unordered
+                    // pair twice (once from each end), so halve. NetworkX's
+                    // `betweenness_centrality(U, normalized=False)` on an undirected
+                    // graph applies the same halving.
+                    (PlanDirection::Both, w) => {
+                        let bc = match w {
+                            Some(w) => {
+                                let (sym, sw) = symmetric_view_weighted(topo, w, mask);
+                                betweenness_weighted(&sym, &sw, None, *sample, *seed)
+                            }
+                            None => betweenness(self.symmetric(), None, *sample, *seed),
+                        };
+                        bc.into_iter().map(|x| x * 0.5).collect()
+                    }
+                    (_, Some(w)) => betweenness_weighted(topo, w, mask, *sample, *seed),
+                    (_, None) => betweenness(topo, mask, *sample, *seed),
                 };
                 vec![Arc::new(Float64Array::from(scores)) as ArrayRef]
             }
@@ -623,6 +679,7 @@ mod tests {
                     damping: 0.85,
                     max_iter: 30,
                     tol: 1e-6,
+                    direction: PlanDirection::Out,
                 },
                 weights: None,
                 dtype: OutputDtype::F64,
@@ -647,6 +704,7 @@ mod tests {
                 damping: 0.85,
                 max_iter: 30,
                 tol: 1e-6,
+                direction: PlanDirection::Out,
             },
             weights: None,
             dtype,
@@ -719,6 +777,7 @@ mod tests {
             damping: 0.85,
             max_iter: 30,
             tol: 1e-6,
+            direction: PlanDirection::Out,
         }
     }
 
@@ -774,6 +833,7 @@ mod tests {
                 damping: 0.5, // a different damping is a different computation
                 max_iter: 30,
                 tol: 1e-6,
+                direction: PlanDirection::Out,
             },
             OutputDtype::F64,
         ));

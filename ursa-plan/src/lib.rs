@@ -47,5 +47,5 @@ pub use query::{
 pub use scan::{
     scan_edges_batch, scan_edges_topology, scan_nodes_batch, ScanBuildError, ScannedTopology,
 };
-pub use stats::{avg_path_length, density, describe, diameter};
+pub use stats::{avg_path_length, density, describe, diameter, parse_stat_direction};
 pub use topology::{build_topology, build_topology_batches};
