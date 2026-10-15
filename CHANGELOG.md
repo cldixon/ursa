@@ -51,9 +51,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   file. Output over a scan now matches `from_arrow` over the same table
   exactly (#148).
 - `scan_edges` and `scan_nodes` over a Parquet file with string ids failed
-  with "Utf8View is not a supported id type". DataFusion reads Parquet
-  strings as `Utf8View`; string ids are now canonicalized to `Utf8` like
-  `LargeUtf8`. CSV and in-memory string ids were not affected.
+  with "Utf8View is not a supported id type", even for a plain `string`
+  column, because DataFusion reads Parquet strings as `Utf8View`. Scans now
+  read string columns as the file declares them, and the id map reads
+  `Utf8View` natively (no cast, so the 2 GiB `Utf8` cap is not involved).
+- Every string layout now works as node ids, scanned or in memory: `string`,
+  `large_string`, `string_view` (including tables that came from polars
+  through the Arrow C stream) and dictionary-encoded (categorical) ids, which
+  previously raised `TypeError` or "Dictionary(Int32, Utf8) is not a supported
+  id type".
+- `filter()`/`sort()` on a `scan_nodes` frame with a string attribute column
+  failed with `ArrowNotImplementedError` (no `string_view` kernel); string
+  attributes now arrive as `string`. `neighbors().agg(n_unique=...)` over a
+  dictionary-encoded string attribute is treated as a string, not cast to a
+  number.
 - A kernel that asked for the lazily built transpose or undirected view from
   inside a parallel loop could deadlock, e.g. `neighbors().agg()` or `hop` with
   `direction="in"`/`"both"` on graphs above 65,536 edges.
