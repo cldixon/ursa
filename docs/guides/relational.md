@@ -164,6 +164,31 @@ shape: (3, 3)
 └───────┴────────┴────────┘
 ```
 
+`join` and `group_by` compose in one plan, and the steps run in the order you write them. `join(...).group_by(...)` groups the joined rows. `group_by(...).agg(...).join(...)` joins onto the groups:
+
+```python
+leaders = ur.NodeFrame({"club": ["Mr. Hi", "Officer"], "leader": [0, 33]}, id="club")
+print(
+    ranked.group_by("club")
+    .agg(members=ur.col("id").count(), mean_degree=ur.col("degree").mean())
+    .join(leaders, on="club")
+    .sort("club")
+    .collect()
+)
+```
+
+```text
+shape: (2, 4)
+┌─────────┬─────────┬─────────────┬────────┐
+│ club    ┆ members ┆ mean_degree ┆ leader │
+│ ---     ┆ ---     ┆ ---         ┆ ---    │
+│ string  ┆ int64   ┆ double      ┆ int64  │
+╞═════════╪═════════╪═════════════╪════════╡
+│ Mr. Hi  ┆ 17      ┆ 4.76471     ┆ 0      │
+│ Officer ┆ 17      ┆ 4.41176     ┆ 33     │
+└─────────┴─────────┴─────────────┴────────┘
+```
+
 ## Distinct and sample
 
 `distinct()` removes duplicate rows. `sample(n, seed=)` keeps `n` random rows.

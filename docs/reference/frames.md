@@ -82,7 +82,7 @@ Both frame types have these methods. Each lazy method returns a new frame with o
 | Method | Description |
 |---|---|
 | `.group_by(*keys).agg(*exprs, **named)` | Groups by one or more columns and computes [aggregations](expressions.md#aggregations). The output columns are the keys, then the aggregations. |
-| `.join(other, *, on, how="inner")` | An equi-join with another frame on the shared key column or columns `on`. `how` is `"inner"` or `"left"`. |
+| `.join(other, *, on, how="inner")` | An equi-join with another frame on the shared key column or columns `on`. `how` is `"inner"` or `"left"`. Composes with `group_by().agg()` in either order, which runs as written. |
 
 ### Inspection
 

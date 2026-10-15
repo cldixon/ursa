@@ -4,12 +4,14 @@ A join between two arbitrary frames (distinct from the automatic attribute attac
 that ``edges.nodes().with_columns(...)`` does). v1 supports inner/left joins on a
 shared key; the result keeps the left frame's type. The whole relational tail
 (filter/sort/head/distinct/sample/rename/select) applies after the join. Both
-sides materialize to Arrow and the join runs in DataFusion.
+sides materialize to Arrow and the join runs in DataFusion. A join composes with
+group_by().agg() in either order, as written.
 """
 
 from __future__ import annotations
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 import ursa as ur
@@ -208,11 +210,14 @@ def test_double_join_errors():
         left.join(r1, on="id").join(r2, on="id").collect()
 
 
-def test_join_after_group_by_errors():
+def test_join_after_group_by_on_a_dropped_key_errors():
+    # group_by().agg() replaces the schema with [keys..., outputs...], so joining
+    # the grouped result on the (now gone) id names the missing key and the columns
+    # that are there.
     left = _nodes([0, 1], region=["us", "us"], v=[1, 2])
     right = _nodes([0, 1], b=[3, 4])
-    with pytest.raises(NotImplementedError):
-        (left.group_by("region").agg(total=ur.col("v").sum()).join(right, on="id").collect())
+    with pytest.raises(ur.ColumnNotFoundError, match=r"'id' not in the left frame"):
+        left.group_by("region").agg(total=ur.col("v").sum()).join(right, on="id").collect()
 
 
 def test_join_on_traversal_result_errors():
@@ -220,6 +225,239 @@ def test_join_on_traversal_result_errors():
     attrs = ur.from_arrow(pa.table({"src": [0, 1], "x": [1, 2]}), id="src")
     with pytest.raises(NotImplementedError, match="traversal"):
         ur.hop(edges, 1).from_([0]).join(attrs, on="src").collect()
+
+
+# --- join composed with group_by().agg() -----------------------------------
+# Step order is honored as written: join().group_by() groups the joined rows;
+# group_by().agg().join() joins onto the grouped result. Each test checks the
+# values against a pyarrow join/group_by of the same tables.
+
+
+SALES = pa.table({"id": [0, 1, 2, 3, 4], "v": [10, 20, 30, 40, 50]})
+REGIONS = pa.table({"id": [0, 1, 2, 3], "region": ["us", "us", "eu", "eu"]})  # no id 4
+
+
+def test_join_then_group_by_on_node_frame():
+    out = (
+        ur.from_arrow(SALES, id="id")
+        .join(ur.from_arrow(REGIONS, id="id"), on="id")
+        .group_by("region")
+        .agg(total=ur.col("v").sum(), n=ur.col("v").count())
+        .collect()
+        .to_arrow()
+    )
+    ref = (
+        SALES.join(REGIONS, keys="id", join_type="inner")
+        .group_by("region")
+        .aggregate([("v", "sum"), ("v", "count")])
+    )
+    theirs = {r["region"]: (r["v_sum"], r["v_count"]) for r in ref.to_pylist()}
+    assert theirs == {"us": (30, 2), "eu": (70, 2)}
+    assert {r["region"]: (r["total"], r["n"]) for r in out.to_pylist()} == theirs
+
+
+def test_join_then_group_by_with_filter_and_tail():
+    # A filter (before the group) applies to the joined rows; sort/head/rename
+    # after the group apply to the grouped result. A left join keeps id 4 with a
+    # null region, which groups as its own key.
+    out = (
+        ur.from_arrow(SALES, id="id")
+        .join(ur.from_arrow(REGIONS, id="id"), on="id", how="left")
+        .filter(ur.col("v") > 10)
+        .group_by("region")
+        .agg(total=ur.col("v").sum())
+        .sort("total", descending=True)
+        .head(2)
+        .rename({"total": "revenue"})
+        .collect()
+        .to_arrow()
+    )
+    assert out.column_names == ["region", "revenue"]
+    assert out.to_pylist() == [
+        {"region": "eu", "revenue": 70},
+        {"region": None, "revenue": 50},
+    ]
+
+
+def test_join_then_group_by_on_graph_derived_node_frame():
+    # The notebook case: a graph algorithm, an attribute join, then a per-club rollup.
+    edges = ur.from_arrow(
+        pa.table({"s": [1, 2, 3, 0, 4, 5], "d": [0, 0, 0, 1, 5, 4]}), src="s", dst="d"
+    )
+    attrs = ur.from_arrow(
+        pa.table({"id": [0, 1, 2, 3, 4, 5], "club": ["a", "a", "a", "b", "b", "b"]}), id="id"
+    )
+    out = (
+        edges.nodes()
+        .with_columns(pagerank=ur.pagerank(edges))
+        .join(attrs, on="id")
+        .group_by("club")
+        .agg(pr_sum=ur.col("pagerank").sum(), members=ur.col("id").count())
+        .sort("club")
+        .collect()
+        .to_arrow()
+    )
+    # Reference: the same pagerank collected on its own, joined + grouped in pyarrow.
+    pr = edges.nodes().with_columns(pagerank=ur.pagerank(edges)).collect().to_arrow()
+    ref = (
+        pr.join(attrs.collect().to_arrow(), keys="id")
+        .group_by("club")
+        .aggregate([("pagerank", "sum"), ("id", "count")])
+        .sort_by("club")
+    )
+    assert out.column("club").to_pylist() == ["a", "b"]
+    assert out.column("members").to_pylist() == ref.column("id_count").to_pylist() == [3, 3]
+    assert out.column("pr_sum").to_pylist() == pytest.approx(ref.column("pagerank_sum").to_pylist())
+
+
+def test_group_by_then_join_on_node_frame():
+    # The grouped result (region, total) is the left side; the join adds a
+    # per-region attribute. A sort after the join orders the joined rows.
+    info = ur.from_arrow(pa.table({"region": ["us", "eu"], "manager": ["ann", "bo"]}), id="region")
+    regional = _nodes([0, 1, 2, 3], region=["us", "us", "eu", "eu"], v=[10, 20, 30, 40])
+    out = (
+        regional.group_by("region")
+        .agg(total=ur.col("v").sum())
+        .join(info, on="region")
+        .sort("total")
+        .collect()
+        .to_arrow()
+    )
+    assert out.to_pylist() == [
+        {"region": "us", "total": 30, "manager": "ann"},
+        {"region": "eu", "total": 70, "manager": "bo"},
+    ]
+
+
+def test_group_by_then_join_splits_the_tail_at_the_join():
+    # head/rename written *between* the group and the join shape the grouped side
+    # (the rename even supplies the join key); a sort after the join orders its rows.
+    nodes = ur.from_arrow(
+        pa.table({"id": [0, 1, 2, 3, 4], "g": ["x", "x", "y", "y", "z"], "v": [1, 2, 3, 4, 5]}),
+        id="id",
+    )
+    label = ur.from_arrow(pa.table({"key": ["x", "y", "z"], "name": ["X", "Y", "Z"]}), id="key")
+    out = (
+        nodes.group_by("g")
+        .agg(total=ur.col("v").sum())
+        .sort("total", descending=True)
+        .head(2)  # keeps y (7) and z (5), drops x (3) before the join
+        .rename({"g": "key"})
+        .join(label, on="key")
+        .sort("key")
+        .collect()
+        .to_arrow()
+    )
+    assert out.to_pylist() == [
+        {"key": "y", "total": 7, "name": "Y"},
+        {"key": "z", "total": 5, "name": "Z"},
+    ]
+
+
+def test_group_by_then_join_on_graph_derived_node_frame():
+    edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")
+    nodes = _nodes([0, 1, 2, 3], region=["us", "us", "eu", "eu"])
+    info = ur.from_arrow(pa.table({"region": ["us", "eu"], "hq": ["nyc", "ber"]}), id="region")
+    out = (
+        nodes.with_columns(deg=ur.degree(edges, direction="in"))
+        .group_by("region")
+        .agg(indeg=ur.col("deg").sum())
+        .join(info, on="region")
+        .sort("region")
+        .collect()
+        .to_arrow()
+    )
+    # In-degrees by hand: node0=3, node1=1, node2=0, node3=0.
+    assert out.to_pylist() == [
+        {"region": "eu", "indeg": 0, "hq": "ber"},
+        {"region": "us", "indeg": 4, "hq": "nyc"},
+    ]
+
+
+def test_join_then_group_by_on_edge_frame():
+    edges = ur.from_arrow(
+        pa.table({"s": [0, 0, 1, 2, 2, 2], "d": [1, 2, 2, 0, 1, 3], "w": [1, 2, 3, 4, 5, 6]}),
+        src="s",
+        dst="d",
+    )
+    kinds = pa.table({"s": [0, 1, 2], "kind": ["a", "b", "a"]})
+    out = (
+        edges.join(ur.from_arrow(kinds, id="s"), on="s")
+        .filter(ur.dst() != 3)
+        .group_by("kind")
+        .agg(w=ur.col("w").sum(), n=ur.col("d").count())
+        .sort("kind")
+        .collect()
+        .to_arrow()
+    )
+    ref = (
+        edges.collect()
+        .to_arrow()
+        .join(kinds, keys="s")
+        .filter(pc.field("d") != 3)
+        .group_by("kind")
+        .aggregate([("w", "sum"), ("d", "count")])
+        .sort_by("kind")
+    )
+    assert out.to_pylist() == [
+        {"kind": k, "w": w, "n": n}
+        for k, w, n in zip(
+            ref.column("kind").to_pylist(),
+            ref.column("w_sum").to_pylist(),
+            ref.column("d_count").to_pylist(),
+            strict=True,
+        )
+    ]
+    assert out.to_pylist() == [{"kind": "a", "w": 12, "n": 4}, {"kind": "b", "w": 3, "n": 1}]
+
+
+def test_group_by_then_join_on_edge_frame():
+    # out-degree per source, then a per-source label joined onto the groups.
+    edges = ur.from_arrow(
+        pa.table({"s": [0, 0, 1, 2, 2, 2], "d": [1, 2, 2, 0, 1, 3]}), src="s", dst="d"
+    )
+    names = ur.from_arrow(pa.table({"s": [0, 1, 2], "name": ["n0", "n1", "n2"]}), id="s")
+    out = (
+        edges.group_by("s")
+        .agg(deg=ur.col("d").count())
+        .join(names, on="s")
+        .sort("deg", descending=True)
+        .head(2)
+        .collect()
+        .to_arrow()
+    )
+    assert out.to_pylist() == [
+        {"s": 2, "deg": 3, "name": "n2"},
+        {"s": 0, "deg": 2, "name": "n0"},
+    ]
+
+
+def test_join_then_group_by_still_rejects_a_pre_group_tail():
+    # A sort/head/rename before the group would be silently reordered, so it is
+    # rejected with the same message as the non-join path.
+    left = ur.from_arrow(SALES, id="id")
+    with pytest.raises(NotImplementedError, match=r"head\(\) before group_by"):
+        (
+            left.join(ur.from_arrow(REGIONS, id="id"), on="id")
+            .head(2)
+            .group_by("region")
+            .agg(total=ur.col("v").sum())
+            .collect()
+        )
+
+
+def test_join_with_group_by_on_traversal_result_errors():
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
+    attrs = ur.from_arrow(pa.table({"src": [0, 1], "x": [1, 2]}), id="src")
+    with pytest.raises(NotImplementedError, match="traversal"):
+        (
+            ur.hop(edges, 1)
+            .from_([0])
+            .join(attrs, on="src")
+            .group_by("x")
+            .agg(n=ur.col("src").count())
+            .collect()
+        )
 
 
 # --- #100: a derived (filtered/sampled) edge frame now collects -------------
