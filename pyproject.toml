@@ -11,7 +11,7 @@ name = "ursa-graph"
 # Version is single-sourced from the Cargo workspace (`[workspace.package] version`
 # in the root Cargo.toml, inherited by ursa-py). maturin reads it at build time.
 dynamic = ["version"]
-description = "Polars-shaped dataframes for graph data — a Rust/Arrow/DataFusion graph analytics library."
+description = "Polars-shaped dataframes for graph data (import as `ursa`) — a Rust/Arrow/DataFusion graph analytics library."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }

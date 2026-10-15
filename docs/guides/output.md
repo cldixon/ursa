@@ -1,6 +1,6 @@
 # Get the result out
 
-`collect()` returns a `MaterializedFrame`. It holds an Arrow table. From there the data goes to polars, to pyarrow, to Python values, or to a file. No step copies the data unless it must.
+`collect()` returns a `MaterializedFrame`. It holds an Arrow table. From there the data goes to pyarrow, to Python values, to a file, or (with the optional `polars` extra) to polars. No step copies the data unless it must.
 
 ```python
 import ursa as ur
@@ -51,7 +51,10 @@ Table ['id', 'club', 'degree'] 34
 
 ## To polars
 
-With the `polars` extra installed:
+!!! note "Optional interop: needs the `polars` extra"
+    `polars` is not installed with `ursa-graph`. Install it with `pip install 'ursa-graph[polars]'`; without it, `to_polars()` raises `ModuleNotFoundError`. Every other section on this page works on a bare install.
+
+The handoff is zero-copy, because both sides are Arrow:
 
 ```python
 df = result.to_polars()

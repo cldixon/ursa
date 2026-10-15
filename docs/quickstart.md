@@ -262,7 +262,7 @@ print(type(table).__name__, rows[0])
 Table {'id': 33, 'club': 'Officer', 'degree': 17, 'triangles': 15, 'clustering': 0.11029411764705882}
 ```
 
-With the `polars` extra installed, `result.to_polars()` gives a `polars.DataFrame`.
+To hand the result to polars (an optional extra), see [To polars](guides/output.md#to-polars).
 
 ## 9. Use your own data
 

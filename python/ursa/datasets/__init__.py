@@ -20,7 +20,7 @@ NodeFrame is an *optional* attribute table joined to the graph by id.
 
     import ursa as ur
     edges, nodes = ur.datasets.load_karate(with_nodes=True)
-    ur.pagerank(edges).collect().to_polars()
+    print(ur.pagerank(edges).collect())   # .to_arrow() / .to_dicts() for the data
 """
 
 from __future__ import annotations

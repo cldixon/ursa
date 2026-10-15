@@ -11,7 +11,7 @@ There is no `Graph` object. An edge table *is* the graph. Every operation return
 ## Install
 
 ```bash
-pip install ursa-graph
+pip install ursa-graph     # then: import ursa
 # or
 uv add ursa-graph
 ```
