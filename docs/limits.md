@@ -20,7 +20,6 @@ Ursa is version 0.3. The API is stable in shape, and some combinations of steps 
 | Two `select` steps | One per plan. |
 | `filter` after `group_by().agg()` | Filter before the `group_by`. |
 | `group_by().agg()` with `distinct`, `sample`, or `select` | Not available. `sort`, `head`, and `rename` work on the grouped result. |
-| `join` with `group_by().agg()` | Do them in separate `collect()` calls. |
 | Two `join` steps | One per plan. |
 | A weighted algorithm over a scan with several paths | Pass one path, or read the files into memory first. |
 | A tail (`filter`, `sort`, `head`) after `describe()` | Collect `describe()` on its own. |
