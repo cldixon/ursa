@@ -1610,23 +1610,64 @@ def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, st
     # aliases of one sum — so both paths stay consistent. pyarrow names an
     # aggregate output "{column}_{pcfn}"; each is mapped back to *every* output
     # that requested it.
+    #
+    # pyarrow's hash sum/mean/min/max have no dictionary kernels, so a dictionary-
+    # encoded (categorical) operand is aggregated through a decoded copy under a
+    # private name. Group *keys* stay as-is: hash grouping handles dictionaries and
+    # the key column keeps the user's type in the output.
+    import pyarrow as pa
+
+    operand: dict[str, str] = {}
+    for a in aggs:
+        col = a["column"]
+        if col in operand:
+            continue
+        operand[col] = col
+        if pa.types.is_dictionary(table.schema.field(col).type):
+            tmp = f"__ursa_decoded_{col}"
+            while tmp in table.column_names:
+                tmp += "_"
+            operand[col] = tmp
+            table = table.append_column(tmp, _decode_dictionary(table.column(col)))
     specs = []
     seen_specs: set[tuple[str, str]] = set()
     for a in aggs:
-        spec = (a["column"], _PC_AGG[a["fn"]])
+        spec = (operand[a["column"]], _PC_AGG[a["fn"]])
         if spec not in seen_specs:
             seen_specs.add(spec)
             specs.append(spec)
     grouped = table.combine_chunks().group_by(keys).aggregate(specs)
     cols = {name: grouped.column(name) for name in grouped.column_names}
-    import pyarrow as pa
 
     ordered_names = list(keys)
     ordered_cols = [cols[k] for k in keys]
     for a in aggs:
         ordered_names.append(a["output"])
-        ordered_cols.append(cols[f"{a['column']}_{_PC_AGG[a['fn']]}"])
+        ordered_cols.append(cols[f"{operand[a['column']]}_{_PC_AGG[a['fn']]}"])
     return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
+
+
+def _decode_dictionary(column: Any) -> Any:
+    """A dictionary-encoded (categorical) column decoded to its value type; any
+    other column is returned unchanged."""
+    import pyarrow as pa
+
+    if pa.types.is_dictionary(column.type):
+        return column.cast(column.type.value_type)
+    return column
+
+
+def _sort_pyarrow(table: Any, by: str, descending: bool) -> Any:
+    """Stable-sort ``table`` by column ``by`` (nulls last). pyarrow has no sort
+    kernel for dictionary arrays, so the sort *key* is decoded — ordering by the
+    values (lexicographic for strings), never the dictionary indices — while the
+    output keeps the original (dictionary) column."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    key = pa.table({"key": _decode_dictionary(table.column(by))})
+    order = "descending" if descending else "ascending"
+    return table.take(pc.sort_indices(key, sort_keys=[("key", order)]))  # ty: ignore[unresolved-attribute]
 
 
 def _apply_pyarrow_tail(
@@ -1657,7 +1698,7 @@ def _apply_pyarrow_tail(
         by, descending = sort
         if by not in table.column_names:
             raise ValueError(f"sort references unknown column '{by}'.")
-        table = table.sort_by([(by, "descending" if descending else "ascending")])
+        table = _sort_pyarrow(table, by, descending)
     if limit is not None:
         table = table.slice(0, limit)
     if rename:
