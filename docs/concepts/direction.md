@@ -12,27 +12,41 @@ Operations that walk edges accept `direction`:
 | `"in"` | edges into the node: `dst → src` |
 | `"both"` | edges in either direction |
 
-`degree`, `neighbors`, `hop`, and `shortest_path` accept `direction`.
+`degree`, `neighbors`, `hop`, `shortest_path`, `closeness`, and the statistics (`density`, `avg_path_length`, `diameter`, `describe`) accept all three values. `pagerank` and `betweenness` accept `"out"` and `"both"`.
 
 ```py
 ur.degree(edges, direction="in")
 ur.hop(edges, n=2, direction="both").from_([0])
+ur.pagerank(edges, direction="both")
 ```
+
+For `pagerank`, `betweenness`, and the statistics, `"both"` means the simple undirected graph: one edge for each distinct pair of nodes joined by a row in either direction, with self-loops dropped. That is NetworkX's `G.to_undirected()`.
 
 ## Kernels with a fixed direction
 
-Some algorithms are defined on directed graphs only, and some on undirected graphs only. These take no `direction` parameter.
+Some algorithms are defined on one kind of graph only. These take no `direction` parameter.
 
 | Algorithm | Reads the rows as |
 |---|---|
-| `pagerank`, `betweenness`, `closeness`, `connected_components(mode="strong")` | directed |
+| `connected_components(mode="strong")` | directed |
 | `triangle_count`, `clustering_coefficient`, `connected_components(mode="weak")`, `louvain`, `label_propagation` | undirected |
 
 ## Undirected data
 
-If your data is undirected and each edge appears once, the directed kernels see only one direction. The result is correct for the rows as stored, but it can differ from a published undirected result.
+If your data is undirected and each edge appears once, the default `direction="out"` sees only one direction. The result is correct for the rows as stored, but it can differ from a published undirected result. Pass `direction="both"`:
 
-To get the undirected result from a directed kernel, store each edge in both directions. The example adds the reverse rows with pyarrow:
+```python
+import ursa as ur
+
+edges = ur.datasets.load_karate()
+print(ur.diameter(edges, approximate=False), ur.diameter(edges, approximate=False, direction="both"))
+```
+
+```text
+3 5
+```
+
+You can also store each edge in both directions. Then every kernel's default sees the undirected graph, except `betweenness`, which counts each pair from both ends and so gives twice the undirected value; pass it `direction="both"`. `ur.from_networkx` does this for an undirected `nx.Graph`. The example adds the reverse rows with pyarrow:
 
 ```python
 import pyarrow as pa
@@ -70,6 +84,6 @@ shape: (1, 5)
 
 !!! tip
 
-    For `degree`, `hop`, and `shortest_path`, pass `direction="both"` instead. It gives the undirected result with no change to the data.
+    `ur.describe(edges, direction="both")` gives the undirected figures with no change to the data: 78 edges, density 0.139037, mean degree 4.58824.
 
 See [Semantics vs NetworkX](../semantics.md) for the exact NetworkX call each kernel matches.

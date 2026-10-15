@@ -32,13 +32,16 @@ mod random_walk;
 mod rng;
 pub use rng::sample_indices;
 mod triangle;
+mod undirected;
 
 pub use betweenness::{betweenness, betweenness_weighted};
 pub use bfs::{
     bfs_distances, dijkstra_distances, shortest_path, shortest_path_weighted,
     shortest_path_weighted_with_cost,
 };
-pub use closeness::{closeness, closeness_weighted};
+pub use closeness::{
+    closeness, closeness_directed, closeness_weighted, closeness_weighted_directed,
+};
 pub use clustering::{clustering_coefficient, clustering_from_triangles};
 pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
@@ -50,6 +53,7 @@ pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, Walks};
 pub use triangle::{per_node_triangles, triangle_count, undirected_view, UndirectedView};
+pub use undirected::{symmetric_view, symmetric_view_weighted};
 
 // ---------------------------------------------------------------------------
 // Frontier kernels (BFS / k-hop / unweighted shortest path).

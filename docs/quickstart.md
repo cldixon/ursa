@@ -46,6 +46,10 @@ shape: (78, 2)
 
 ## 2. Compute a metric
 
+!!! warning "Coming from NetworkX with an undirected graph?"
+
+    `direction=` defaults to `"out"`: every row is one directed edge. The karate graph is undirected and stores each edge once, so pass `direction="both"` to get the undirected values NetworkX prints. Read [Semantics vs NetworkX](semantics.md#undirected-graphs) before you compare numbers.
+
 A graph algorithm is a function of the edges. On its own, it is a table of `(id, value)`:
 
 ```python
@@ -67,7 +71,7 @@ shape: (3, 2)
 
 !!! note "Direction"
 
-    Every edge row is directed. The karate graph is undirected, and the dataset stores each edge once. `pagerank` follows the rows as stored, so its result differs from a published undirected PageRank. `degree`, `hop`, and `shortest_path` accept `direction="both"` for the undirected result. See [Direction](concepts/direction.md).
+    Every edge row is directed. The karate graph is undirected, and the dataset stores each edge once. `pagerank` follows the rows as stored, so its result differs from a published undirected PageRank. `ur.pagerank(edges, direction="both")` gives the undirected result. `degree`, `hop`, `shortest_path`, `closeness`, `betweenness`, and the statistics accept `direction="both"` too. See [Direction](concepts/direction.md).
 
 ## 3. Add metrics to your node table
 
@@ -222,6 +226,7 @@ shape: (2, 4)
 ```python
 print(ur.describe(edges).collect())
 print("density:", ur.density(edges))
+print("undirected density:", ur.density(edges, direction="both"))
 ```
 
 ```text
@@ -234,7 +239,10 @@ shape: (1, 5)
 │ 34      ┆ 78      ┆ 0.0695187 ┆ 2.29412    ┆ null         │
 └─────────┴─────────┴───────────┴────────────┴──────────────┘
 density: 0.06951871657754011
+undirected density: 0.13903743315508021
 ```
+
+The default reads the 78 rows as directed edges. `direction="both"` reads them as the undirected graph, as NetworkX does for a `Graph`.
 
 ## 8. Get the result out
 

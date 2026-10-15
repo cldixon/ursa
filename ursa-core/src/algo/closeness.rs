@@ -67,7 +67,19 @@ impl ClosenessWeightedScratch {
 /// unreachable. `O(n · (n + m))` — document the cost; use `sample`-based stats
 /// for very large graphs.
 pub fn closeness(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f64> {
+    closeness_directed(topo, mask, Direction::Out)
+}
+
+/// [`closeness`] with the distance direction as a parameter: `Out` measures
+/// distance *from* the node along out-edges (the default), `In` distance *to* the
+/// node (NetworkX's directed convention), and `Both` the undirected distance —
+/// a BFS that ignores edge direction, which is closeness on the undirected view.
+pub fn closeness_directed(topo: &Topology, mask: Option<&EdgeMask>, dir: Direction) -> Vec<f64> {
     let n = topo.n_nodes();
+    if dir != Direction::Out {
+        // Build the lazily cached transpose here, not inside the parallel loop.
+        topo.incoming();
+    }
     // `map_init` keeps the per-source work-stealing parallelism (each node writes
     // its own output slot, so there is no cross-source ordering to preserve) while
     // building the scratch once per rayon thread and reusing it across that
@@ -76,7 +88,7 @@ pub fn closeness(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f64> {
         .into_par_iter()
         .map_init(
             || ClosenessScratch::new(n),
-            |sc, u| closeness_one(topo, mask, u, sc),
+            |sc, u| closeness_one(topo, mask, dir, u, sc),
         )
         .collect()
 }
@@ -88,6 +100,7 @@ pub fn closeness(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<f64> {
 fn closeness_one(
     topo: &Topology,
     mask: Option<&EdgeMask>,
+    dir: Direction,
     u: u32,
     sc: &mut ClosenessScratch,
 ) -> f64 {
@@ -105,7 +118,7 @@ fn closeness_one(
     while !frontier.is_empty() {
         next.clear();
         for &v in frontier.iter() {
-            topo.for_each_neighbor(v, Direction::Out, mask, |w| {
+            topo.for_each_neighbor(v, dir, mask, |w| {
                 if dist[w as usize] < 0 {
                     dist[w as usize] = level;
                     next.push(w);
@@ -146,6 +159,21 @@ fn closeness_one(
 /// over the reachable nodes at finite positive distance. `weights[e]` is the
 /// weight of edge row `e` (non-negative; `len == n_edges`).
 pub fn closeness_weighted(topo: &Topology, weights: &[f64], mask: Option<&EdgeMask>) -> Vec<f64> {
+    closeness_weighted_directed(topo, weights, mask, Direction::Out)
+}
+
+/// [`closeness_weighted`] with the distance direction as a parameter (see
+/// [`closeness_directed`]). Under `Both`, Dijkstra relaxes every incident edge in
+/// either direction, so where several rows join a pair the cheapest one is used.
+pub fn closeness_weighted_directed(
+    topo: &Topology,
+    weights: &[f64],
+    mask: Option<&EdgeMask>,
+    dir: Direction,
+) -> Vec<f64> {
+    if dir != Direction::Out {
+        topo.incoming();
+    }
     assert_eq!(
         weights.len(),
         topo.n_edges(),
@@ -156,7 +184,7 @@ pub fn closeness_weighted(topo: &Topology, weights: &[f64], mask: Option<&EdgeMa
         .into_par_iter()
         .map_init(
             || ClosenessWeightedScratch::new(n),
-            |sc, u| closeness_weighted_one(topo, weights, mask, u, sc),
+            |sc, u| closeness_weighted_one(topo, weights, mask, dir, u, sc),
         )
         .collect()
 }
@@ -168,6 +196,7 @@ fn closeness_weighted_one(
     topo: &Topology,
     weights: &[f64],
     mask: Option<&EdgeMask>,
+    dir: Direction,
     u: u32,
     sc: &mut ClosenessWeightedScratch,
 ) -> f64 {
@@ -186,7 +215,7 @@ fn closeness_weighted_one(
         }
         settled[v as usize] = true;
         touched.push(v);
-        topo.for_each_weighted_neighbor(v, weights, Direction::Out, mask, |w, wt| {
+        topo.for_each_weighted_neighbor(v, weights, dir, mask, |w, wt| {
             if !settled[w as usize] {
                 let nd = du + wt;
                 if nd < dist[w as usize] {
@@ -256,6 +285,22 @@ mod tests {
         assert!((c[1] - 2.0 / 3.0).abs() < 1e-12, "got {}", c[1]);
         assert!((c[2] - 1.0).abs() < 1e-12, "got {}", c[2]);
         assert_eq!(c[3], 0.0);
+    }
+
+    #[test]
+    fn closeness_by_direction_on_a_line() {
+        // 0->1->2. In: node 2 is reached from {1, 0} at {1, 2}: 2/3. Both: the
+        // undirected path, so node 1 (the middle) is 2/2 = 1 and the ends 2/3.
+        let t = Topology::build(3, vec![0, 1], vec![1, 2]);
+        let c_in = closeness_directed(&t, None, Direction::In);
+        assert_eq!(c_in[0], 0.0);
+        assert!((c_in[2] - 2.0 / 3.0).abs() < 1e-12);
+        let c_both = closeness_directed(&t, None, Direction::Both);
+        assert!((c_both[0] - 2.0 / 3.0).abs() < 1e-12);
+        assert!((c_both[1] - 1.0).abs() < 1e-12);
+        assert!((c_both[2] - 2.0 / 3.0).abs() < 1e-12);
+        let w_both = closeness_weighted_directed(&t, &[1.0, 1.0], None, Direction::Both);
+        assert_eq!(w_both, c_both);
     }
 
     #[test]
