@@ -5,8 +5,10 @@ Run it from the repo root after building the extension (``uv sync`` or
 
     uv run python examples/quickstart.py
 
-Everything is Arrow under the hood, so results flow out to polars/pyarrow
-zero-copy. `polars` is used here only for pretty-printing.
+Everything is Arrow under the hood. It runs on a bare ``pip install ursa-graph``:
+printing a collected result shows a table preview, and ``.to_arrow()`` /
+``.to_dicts()`` hand the data back. (Handing results to polars is an optional
+extra; see https://cldixon.github.io/ursa/guides/output/#to-polars.)
 """
 
 from __future__ import annotations
@@ -27,9 +29,9 @@ def main() -> None:
 
     # -- 1. Standalone node-valued algorithms -------------------------------
     # Each returns an (id, value) frame; .collect() runs it as one DataFusion
-    # plan and .to_polars() hands the Arrow result back zero-copy.
+    # plan and returns the Arrow result, which prints as a table preview.
     print("== standalone algorithms ==")
-    print(ur.pagerank(edges, damping=0.85).collect().to_polars())
+    print(ur.pagerank(edges, damping=0.85).collect())
     print("in-degree:      ", ur.degree(edges, direction="in").collect().to_dicts())
     print("components:     ", ur.connected_components(edges).collect().to_dicts())
     print("triangles:      ", ur.triangle_count(edges).collect().to_dicts())
@@ -56,7 +58,7 @@ def main() -> None:
     )
     print("\n== composed pipeline ==")
     print(top.explain())  # inspect the lazy plan without running it
-    print(top.collect().to_polars())
+    print(top.collect())
 
     # -- 3. Attribute enrichment --------------------------------------------
     # A node attribute table joined with graph metrics; filter on an attribute
@@ -82,23 +84,23 @@ def main() -> None:
         .sort("pr", descending=True)
     )
     print("\n== attribute enrichment + neighbour aggregation ==")
-    print(enriched.collect().to_polars())
+    print(enriched.collect())
 
     # -- 4. Traversal: k-hop reachability -----------------------------------
     # ur.hop returns an EdgeFrame (src = seed, dst = reached). Here: everything
     # reachable within 2 hops from node 0, then compose a relational tail on it.
     print("\n== 2-hop reachability from node 0 ==")
-    reach = ur.hop(edges, n=2).from_([0]).sort("dst").collect().to_polars()
+    reach = ur.hop(edges, n=2).from_([0]).sort("dst").collect()
     print(reach)
 
     # ur.shortest_path returns the path as an EdgeFrame (src, dst, hop-in-order).
     print("\n== shortest path 0 -> 5 ==")
-    print(ur.shortest_path(edges, 0, 5).collect().to_polars())
+    print(ur.shortest_path(edges, 0, 5).collect())
 
     # ur.random_walk returns a (walk_id, step, node) frame — two seeded walks of
     # up to 4 steps from node 0, ready to feed a node2vec-style pipeline.
     print("\n== random walks from node 0 ==")
-    print(ur.random_walk(edges, start=[0], steps=4, walks_per_node=2, seed=7).collect().to_polars())
+    print(ur.random_walk(edges, start=[0], steps=4, walks_per_node=2, seed=7).collect())
 
     # weight= is a per-op expression over edge columns. Weighted PageRank splits a
     # node's rank by edge weight; weighted shortest_path is Dijkstra over the cost.
@@ -108,11 +110,11 @@ def main() -> None:
         dst="d",
     )
     print("\n== weighted pagerank (weight=amount) ==")
-    print(ur.pagerank(weighted_edges, weight=ur.col("amount")).collect().to_polars())
+    print(ur.pagerank(weighted_edges, weight=ur.col("amount")).collect())
 
     # -- 5. Whole-graph summary + path stats --------------------------------
     print("\n== describe ==")
-    print(ur.describe(edges, full=True).collect().to_polars())
+    print(ur.describe(edges, full=True).collect())
     print("density:         ", ur.density(edges))
     print("avg_path_length: ", ur.avg_path_length(edges))
     print("diameter (exact):", ur.diameter(edges, approximate=False))
@@ -151,7 +153,7 @@ def main() -> None:
     #         storage_options={"region": "us-east-1"},
     #     )
     #     nodes = ur.scan_nodes("s3://telco-lake/graph/towers/*.parquet", id="tower_id")
-    #     ur.pagerank(edges).collect().to_polars()   # projection pushed into Parquet
+    #     ur.pagerank(edges).collect()   # projection pushed into Parquet
 
     # -- 7. The expression dialect is Polars-shaped (pure Python) -----------
     predicate = (ur.col("pr") * ur.lit(100) > ur.lit(5)) & (ur.col("indeg") >= ur.lit(2))

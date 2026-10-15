@@ -274,7 +274,16 @@ def _to_arrow_table(data: Any) -> Any:
     Supported: ``pyarrow.Table`` (as-is), ``pyarrow.RecordBatch``, a list of row
     dicts, a dict of equal-length columns, a ``polars.DataFrame``, a
     ``pandas.DataFrame``, or any object exposing the Arrow C-stream capsule.
+
+    ``string_view`` columns (what DataFusion, Athena and polars' Arrow C stream
+    hand back) become plain strings, as a scan reads them: see
+    ``_without_string_views``.
     """
+    return _without_string_views(_as_arrow_table(data))
+
+
+def _as_arrow_table(data: Any) -> Any:
+    """The flavour dispatch behind ``_to_arrow_table``."""
     import sys
 
     import pyarrow as pa
@@ -307,25 +316,68 @@ def _to_arrow_table(data: Any) -> Any:
     )
 
 
+# The most character data an ``Utf8`` (i32-offset) array can address.
+_UTF8_MAX_BYTES = 2**31 - 1
+
+
+def _without_string_views(tbl: Any) -> Any:
+    """``tbl`` with each top-level ``string_view`` column cast to ``string``.
+
+    The Rust side reads string views natively, but the relational tail filters and
+    sorts with pyarrow compute, which has few string-view kernels (no ``take``, no
+    comparisons), so a view column there fails on the first ``filter``/``sort``.
+    Converting once at ingress keeps every frame on the types the whole pipeline
+    supports, and matches what a scan returns. A column whose chunks may hold more
+    than 2 GiB of character data goes to ``large_string`` instead, since a cast to
+    ``string`` past ``Utf8``'s i32 offsets fails (#152). Other columns are shared,
+    not copied."""
+    import pyarrow as pa
+    import pyarrow.types as pat
+
+    for i, field in enumerate(tbl.schema):
+        if not pat.is_string_view(field.type):
+            continue
+        column = tbl.column(i)
+        # ``nbytes`` (views plus data buffers) bounds the character data from above.
+        fits = all(chunk.nbytes <= _UTF8_MAX_BYTES for chunk in column.chunks)
+        target = pa.string() if fits else pa.large_string()
+        tbl = tbl.set_column(i, field.with_type(target), column.cast(target))
+    return tbl
+
+
 def _canonical_id_array(arr: Any) -> Any:
     """Canonicalize a node-id array to a supported id type: any integer type to
     int64 (the fast path), string ids passed through unchanged (covering
     UUID-as-string). Raises ``TypeError`` for anything else — Ursa node ids are
     int64 or string.
 
-    ``Utf8`` and ``LargeUtf8`` are both handled natively by the Rust id map (via
-    its ``StrView``), so neither is cast here. A ``LargeUtf8 -> Utf8`` cast in
-    particular would *panic* rather than error once the string data exceeds the
-    2 GiB that ``Utf8``'s i32 offsets can address — the exact input a large_string
-    column exists to carry — so the cast is removed, not just skipped."""
+    ``Utf8``, ``LargeUtf8`` and ``Utf8View`` (``string_view``, what DataFusion,
+    Athena and Polars hand back for strings) are all handled natively by the Rust
+    id map (via its ``StrView``), so none is cast here. A ``LargeUtf8 -> Utf8``
+    cast in particular would *panic* rather than error once the string data
+    exceeds the 2 GiB that ``Utf8``'s i32 offsets can address — the exact input a
+    large_string column exists to carry — so the cast is removed, not just
+    skipped. A dictionary-encoded column (a categorical) is decoded and then
+    canonicalized by its value type."""
     import pyarrow as pa
     import pyarrow.types as pat
 
-    if pat.is_integer(arr.type):
+    t = arr.type
+    if pat.is_integer(t):
         return arr.cast(pa.int64())
-    if pat.is_string(arr.type) or pat.is_large_string(arr.type):
+    if _is_any_string(t):
         return arr
-    raise TypeError(f"node ids must be an integer or string column; got {arr.type}")
+    if pat.is_dictionary(t) and (pat.is_integer(t.value_type) or _is_any_string(t.value_type)):
+        return _canonical_id_array(arr.dictionary_decode())
+    raise TypeError(f"node ids must be an integer or string column; got {t}")
+
+
+def _is_any_string(t: Any) -> bool:
+    """Whether an Arrow type is one of the string layouts (``string``,
+    ``large_string``, ``string_view``)."""
+    import pyarrow.types as pat
+
+    return pat.is_string(t) or pat.is_large_string(t) or pat.is_string_view(t)
 
 
 def _node_attr_table(tbl: Any, id: str) -> Any:

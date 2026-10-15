@@ -41,8 +41,8 @@ use ursa_core::{EdgeMask, IdMap};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
-    hop_reached_nodes, scan_edges_batch, scan_edges_topology, scan_nodes_batch,
-    shortest_path_nodes, ScanBuildError, ScannedTopology,
+    hop_reached_nodes, parse_stat_direction, scan_edges_batch, scan_edges_topology,
+    scan_nodes_batch, shortest_path_nodes, ScanBuildError, ScannedTopology,
 };
 
 // ---------------------------------------------------------------------------
@@ -500,44 +500,60 @@ fn run_walk_query(
     batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
-/// Whole-graph directed edge density (eager scalar).
+/// Whole-graph edge density (eager scalar). `direction` is out/in/both; `both`
+/// is the undirected density.
 #[pyfunction]
-fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>) -> PyResult<f64> {
+#[pyo3(signature = (index, direction="out"))]
+fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>, direction: &str) -> PyResult<f64> {
+    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
     let topo = index.topo.clone();
-    py.detach(move || density(&topo).map_err(to_pyerr))
+    py.detach(move || density(&topo, dir).map_err(to_pyerr))
 }
 
 /// Average shortest-path length over reachable ordered pairs (eager scalar).
 /// `sample` (a fraction) estimates from a subset of sources; omit for exact.
 #[pyfunction]
-#[pyo3(signature = (index, sample=None))]
+#[pyo3(signature = (index, sample=None, direction="out"))]
 fn graph_avg_path_length(
     py: Python<'_>,
     index: PyRef<'_, GraphIndex>,
     sample: Option<f64>,
+    direction: &str,
 ) -> PyResult<f64> {
+    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
     let topo = index.topo.clone();
-    py.detach(move || avg_path_length(&topo, sample).map_err(to_pyerr))
+    py.detach(move || avg_path_length(&topo, sample, dir).map_err(to_pyerr))
 }
 
 /// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
 /// estimate; pass false for exact.
 #[pyfunction]
+#[pyo3(signature = (index, approximate, direction="out"))]
 fn graph_diameter(
     py: Python<'_>,
     index: PyRef<'_, GraphIndex>,
     approximate: bool,
+    direction: &str,
 ) -> PyResult<i64> {
+    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
     let topo = index.topo.clone();
-    py.detach(move || diameter(&topo, approximate).map_err(to_pyerr))
+    py.detach(move || diameter(&topo, approximate, dir).map_err(to_pyerr))
 }
 
 /// Whole-graph one-row summary (`n_nodes, n_edges, density, avg_degree,
-/// n_components`) as a pyarrow `RecordBatch`. `full` computes `n_components`.
+/// n_components`) as a pyarrow `RecordBatch`. `full` computes `n_components`;
+/// `direction="both"` reports the undirected figures.
 #[pyfunction]
-fn graph_describe(py: Python<'_>, index: PyRef<'_, GraphIndex>, full: bool) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (index, full, direction="out"))]
+fn graph_describe(
+    py: Python<'_>,
+    index: PyRef<'_, GraphIndex>,
+    full: bool,
+    direction: &str,
+) -> PyResult<Py<PyAny>> {
+    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
     let topo = index.topo.clone();
-    let batch = py.detach(move || describe(&topo, full).map_err(to_pyerr))?;
+    let batch = py.detach(move || describe(&topo, full, dir).map_err(to_pyerr))?;
     batch.to_pyarrow(py).map(|obj| obj.unbind())
 }
 

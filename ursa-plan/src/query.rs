@@ -91,12 +91,25 @@ struct ColumnSpec {
 }
 
 impl ColumnSpec {
+    /// The direction of a kernel that takes `'out'` or `'both'` only (`pagerank`,
+    /// `betweenness`). `'in'` is a hard error rather than a silent `'out'`.
+    fn out_or_both(&self) -> Result<Direction> {
+        match parse_direction(self.direction.as_deref().unwrap_or("out"))? {
+            Direction::In => Err(DataFusionError::NotImplemented(format!(
+                "{} does not support direction='in'; use 'out' or 'both'",
+                self.kind
+            ))),
+            d => Ok(d),
+        }
+    }
+
     fn to_algo(&self) -> Result<GraphAlgo> {
         Ok(match self.kind.as_str() {
             "pagerank" => GraphAlgo::PageRank {
                 damping: self.damping.unwrap_or(0.85),
                 max_iter: self.max_iter.unwrap_or(30),
                 tol: self.tol.unwrap_or(1e-6),
+                direction: self.out_or_both()?,
             },
             "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
                 kind: match self.kind.as_str() {
@@ -117,10 +130,13 @@ impl ColumnSpec {
             },
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
-            "closeness" => GraphAlgo::Closeness,
+            "closeness" => GraphAlgo::Closeness {
+                direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
+            },
             "betweenness" => GraphAlgo::Betweenness {
                 sample: self.sample,
                 seed: self.seed,
+                direction: self.out_or_both()?,
             },
             "label_propagation" => GraphAlgo::LabelPropagation {
                 max_iter: self.max_iter.unwrap_or(20),
@@ -165,7 +181,7 @@ fn parse_output_dtype(dtype: Option<&str>) -> Result<OutputDtype> {
     }
 }
 
-fn parse_direction(d: &str) -> Result<Direction> {
+pub(crate) fn parse_direction(d: &str) -> Result<Direction> {
     match d {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
@@ -221,10 +237,15 @@ fn dense_attr_column(
 
     // Branch on the column's declared type, not on cast success: Arrow casts
     // Utf8 -> Float64 by producing nulls for unparseable strings rather than
-    // erroring, which would silently swallow a real string column.
+    // erroring, which would silently swallow a real string column. A dictionary
+    // column (a categorical) is a string column when its values are.
     let attr_dtype = schema.field(attr_idx).data_type();
+    let value_dtype = match attr_dtype {
+        DataType::Dictionary(_, value) => value.as_ref(),
+        other => other,
+    };
     let is_string = matches!(
-        attr_dtype,
+        value_dtype,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     );
     if is_string && !matches!(agg, AggKind::NUnique | AggKind::Count) {
@@ -569,7 +590,7 @@ pub fn execute_node_query(
                     if !matches!(
                         algo,
                         GraphAlgo::PageRank { .. }
-                            | GraphAlgo::Closeness
+                            | GraphAlgo::Closeness { .. }
                             | GraphAlgo::Betweenness { .. }
                             | GraphAlgo::Louvain { .. }
                     ) {
@@ -1291,55 +1312,61 @@ mod tests {
 
     #[test]
     fn neighbor_n_unique_over_a_string_attribute() {
-        use arrow::array::StringArray;
-        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::array::{ArrayRef, DictionaryArray, StringArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 
         // hub: 1->0, 2->0, 3->0. In-neighbours of 0 are 1,2,3 with regions
-        // us/us/eu -> 2 distinct.
+        // us/us/eu -> 2 distinct. The same for every string layout: a dictionary
+        // (categorical) column must count its values, not cast to null floats.
+        let regions = ["x", "us", "us", "eu"];
+        let layouts: [ArrayRef; 3] = [
+            Arc::new(StringArray::from(regions.to_vec())),
+            Arc::new(StringViewArray::from(regions.to_vec())),
+            Arc::new(regions.into_iter().collect::<DictionaryArray<Int32Type>>()),
+        ];
         let src = Int64Array::from(vec![1, 2, 3]);
         let dst = Int64Array::from(vec![0, 0, 0]);
-        let nodes = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("region", DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
-                Arc::new(StringArray::from(vec!["x", "us", "us", "eu"])),
-            ],
-        )
-        .unwrap();
-
-        let (t, ids) = build(&src, &dst);
-        let batch = one(
-            execute_node_query(
-                t,
-                ids,
-                r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
-                &[],
-                Some(("id".into(), false)),
-                None,
-                Some(vec![nodes]),
-                Some("id".into()),
-                None,
-             false, None, vec![], vec![], vec![], None)
-            .unwrap(),
-        );
-
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
+        for region in layouts {
+            let nodes = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("region", region.data_type().clone(), false),
+                ])),
+                vec![Arc::new(Int64Array::from(vec![0, 1, 2, 3])), region],
+            )
             .unwrap();
-        let schema = batch.schema();
-        let idx = schema.index_of("nbr_regions").unwrap();
-        let vals = batch
-            .column(idx)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
-        assert!((vals.value(row0) - 2.0).abs() < 1e-12); // {us, eu}
+
+            let (t, ids) = build(&src, &dst);
+            let batch = one(
+                execute_node_query(
+                    t,
+                    ids,
+                    r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
+                    &[],
+                    Some(("id".into(), false)),
+                    None,
+                    Some(vec![nodes]),
+                    Some("id".into()),
+                    None,
+                 false, None, vec![], vec![], vec![], None)
+                .unwrap(),
+            );
+
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let schema = batch.schema();
+            let idx = schema.index_of("nbr_regions").unwrap();
+            let vals = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let row0 = (0..ids.len()).find(|&i| ids.value(i) == 0).unwrap();
+            assert!((vals.value(row0) - 2.0).abs() < 1e-12); // {us, eu}
+        }
     }
 
     #[test]

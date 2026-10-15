@@ -18,10 +18,10 @@ The number of edges at each node. `direction` is `"out"`, `"in"`, or `"both"`. O
 
 ```py
 ur.pagerank(edges, damping: float = 0.85, max_iter: int = 30, tol: float = 1e-6,
-            weight=None, dtype: str = "f64")
+            weight=None, dtype: str = "f64", direction: str = "out")
 ```
 
-PageRank over the directed rows. The scores sum to 1. A node with no out-edges spreads its score to all nodes. With `weight=`, each out-edge takes a share of the score in proportion to its weight. Output type: `float64`, or `float32` with `dtype="f32"`.
+PageRank over the directed rows. The scores sum to 1. A node with no out-edges spreads its score to all nodes. With `weight=`, each out-edge takes a share of the score in proportion to its weight. `direction="both"` runs on the [undirected view](#the-direction-parameter), which is `nx.pagerank(G.to_undirected())`. `direction="in"` is not supported. Output type: `float64`, or `float32` with `dtype="f32"`.
 
 ### `ur.connected_components`
 
@@ -50,19 +50,19 @@ The local clustering coefficient, on the undirected view. Output type: `float64`
 ### `ur.closeness`
 
 ```py
-ur.closeness(edges, weight=None, dtype: str = "f64")
+ur.closeness(edges, weight=None, dtype: str = "f64", direction: str = "out")
 ```
 
-Closeness centrality, following out-edges. The value is the number of reachable nodes divided by the sum of the distances to them. A node that reaches nothing scores `0.0`. With `weight=`, the distances are weighted path costs.
+Closeness centrality, following out-edges. The value is the number of reachable nodes divided by the sum of the distances to them. A node that reaches nothing scores `0.0`. With `weight=`, the distances are weighted path costs. `direction="in"` measures the distance to the node instead (NetworkX's directed convention), and `direction="both"` ignores direction.
 
 ### `ur.betweenness`
 
 ```py
 ur.betweenness(edges, sample: float | None = None, weight=None, seed: int | None = None,
-               dtype: str = "f64")
+               dtype: str = "f64", direction: str = "out")
 ```
 
-Betweenness centrality (Brandes), directed and not normalized. The exact computation is O(n·m). `sample=` (a fraction in `(0, 1]`) estimates it from a random subset of source nodes, scaled to the full count. `seed` makes the estimate reproducible. With `weight=`, the shortest paths are weighted.
+Betweenness centrality (Brandes), not normalized. The default is directed: each ordered pair counts once. `direction="both"` runs on the [undirected view](#the-direction-parameter) and counts each unordered pair once, which is `nx.betweenness_centrality(G.to_undirected(), normalized=False)`. `direction="in"` is not supported. The exact computation is O(n·m). `sample=` (a fraction in `(0, 1]`) estimates it from a random subset of source nodes, scaled to the full count. `seed` makes the estimate reproducible. With `weight=`, the shortest paths are weighted.
 
 ### `ur.label_propagation`
 
@@ -119,6 +119,12 @@ ur.random_walk(edges, start, steps: int, walks_per_node: int = 1, seed: int | No
 ```
 
 Random walks along out-edges. `start` is a list of ids. The result has the columns `walk_id`, `step`, and `node`, one row per position on each walk. A walk stops early at a node with no out-edges. `seed` makes the walks reproducible.
+
+## The `direction` parameter
+
+`direction` is `"out"` (the default), `"in"`, or `"both"`. `"out"` follows each row from `src` to `dst`, and `"in"` follows it backward.
+
+`"both"` reads the rows as an undirected graph. For `degree`, `neighbors`, `hop`, `shortest_path`, and `closeness`, a walk follows each row in either direction. For `pagerank` and `betweenness`, the kernel runs on the simple undirected view: one edge for each distinct pair of nodes joined by a row in either direction, with self-loops dropped. With `weight=`, such a pair takes the smallest of its rows' weights. Use `"both"` when your data is undirected and stores each edge once. See [Semantics vs NetworkX](../semantics.md#undirected-graphs).
 
 ## The `weight` parameter
 

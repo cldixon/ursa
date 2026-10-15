@@ -8,6 +8,40 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Added
+
+- `direction=` on `density`, `avg_path_length`, `diameter`, `describe`,
+  `pagerank`, `closeness` and `betweenness`. The default stays `"out"`, so
+  existing results are unchanged. `direction="both"` reads the rows as a simple
+  undirected graph: each pair of nodes joined in either direction is one edge,
+  and self-loops are dropped. It matches NetworkX on `G.to_undirected()`: on
+  Zachary's karate club, density 0.139, `avg_path_length` 2.41 and diameter 5,
+  against 0.0695, 1.27 and 3 with the default (#124). `closeness` also takes
+  `"in"`; `pagerank` and `betweenness` reject it. See *Semantics vs NetworkX*.
+- `join()` and `group_by().agg()` now compose in one lazy pipeline, in either
+  order, and run as written: `join(...).group_by(k).agg(...)` groups the joined
+  rows, and `group_by(k).agg(...).join(...)` joins onto the grouped result.
+  Previously this raised `NotImplementedError` and needed two `collect()` steps.
+- `from_networkx(..., symmetrize=)` controls whether reverse rows are written.
+
+### Changed
+
+- **Behaviour change:** `from_networkx` now writes each edge of an undirected
+  `nx.Graph`/`nx.MultiGraph` in both directions (a self-loop stays one row), so
+  the default `direction="out"` gives NetworkX's undirected values for
+  `pagerank`, `closeness`, `density`, `diameter` and the rest. Previously each
+  edge was written once, which silently produced directed results. Pass
+  `symmetrize=False` for the old one-row-per-edge frame. `nx.DiGraph` input is
+  unchanged. On a symmetrized frame `betweenness` counts each unordered pair
+  twice with the default; pass `direction="both"` to match NetworkX (#124).
+- `.to_polars()` no longer appears in first-contact examples (the module and
+  `ursa.datasets` docstrings, the Quickstart, `examples/quickstart.py`), which
+  now print `collect()` or use `.to_arrow()`/`.to_dicts()`, so they run on a
+  bare install. Polars remains an optional extra; its one example lives in the
+  Output guide.
+- The package summary (`pip show ursa-graph`) and the README install line now
+  name the import name, `ursa`.
+
 ### Fixed
 
 - `scan_edges` and `scan_nodes` now return rows in file order on every run.
@@ -17,9 +51,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   file. Output over a scan now matches `from_arrow` over the same table
   exactly (#148).
 - `scan_edges` and `scan_nodes` over a Parquet file with string ids failed
-  with "Utf8View is not a supported id type". DataFusion reads Parquet
-  strings as `Utf8View`; string ids are now canonicalized to `Utf8` like
-  `LargeUtf8`. CSV and in-memory string ids were not affected.
+  with "Utf8View is not a supported id type", even for a plain `string`
+  column, because DataFusion reads Parquet strings as `Utf8View`. Scans now
+  read string columns as the file declares them, and the id map reads
+  `Utf8View` natively (no cast, so the 2 GiB `Utf8` cap is not involved).
+- Every string layout now works as node ids, scanned or in memory: `string`,
+  `large_string`, `string_view` (including tables that came from polars
+  through the Arrow C stream) and dictionary-encoded (categorical) ids, which
+  previously raised `TypeError` or "Dictionary(Int32, Utf8) is not a supported
+  id type".
+- `filter()`/`sort()` on a `scan_nodes` frame with a string attribute column
+  failed with `ArrowNotImplementedError` (no `string_view` kernel); string
+  attributes now arrive as `string`. `neighbors().agg(n_unique=...)` over a
+  dictionary-encoded string attribute is treated as a string, not cast to a
+  number.
 - A kernel that asked for the lazily built transpose or undirected view from
   inside a parallel loop could deadlock, e.g. `neighbors().agg()` or `hop` with
   `direction="in"`/`"both"` on graphs above 65,536 edges.

@@ -15,7 +15,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, StringArray, StringBuilder};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, LargeStringArray, StringArray, StringBuilder, StringViewArray,
+};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 use hashbrown::HashTable;
@@ -515,7 +517,7 @@ enum IdKind {
 fn id_kind(dt: &DataType) -> Result<IdKind, IdError> {
     match dt {
         DataType::Int64 => Ok(IdKind::Int64),
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(IdKind::Utf8),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(IdKind::Utf8),
         other => Err(IdError::Unsupported(format!("{other:?}"))),
     }
 }
@@ -528,26 +530,31 @@ fn as_int64(arr: &dyn Array) -> &Int64Array {
         .expect("id column confirmed Int64")
 }
 
-/// A borrowing view over a `Utf8` or `LargeUtf8` id array, reading either offset
-/// width natively. This replaces a `LargeUtf8 -> Utf8` cast, which (a) **fails**
-/// once the concatenated string data exceeds `i32::MAX` bytes — exactly what
-/// engines emit for large string columns, so a valid big id column would panic
-/// across PyO3 — and (b) copies the whole column before interning even on success.
+/// A borrowing view over a `Utf8`, `LargeUtf8` or `Utf8View` id array, reading
+/// each layout natively. This replaces a cast to `Utf8`, which (a) **fails** once
+/// the concatenated string data exceeds `i32::MAX` bytes — exactly what engines
+/// emit for large string columns, so a valid big id column would panic across
+/// PyO3 — and (b) copies the whole column before interning even on success.
+/// `Utf8View` is what DataFusion, Polars and recent pyarrow produce for strings
+/// (a Parquet scan, `pa.string_view()`), so it is read as-is too.
 enum StrView<'a> {
     Utf8(&'a StringArray),
     Large(&'a LargeStringArray),
+    View(&'a StringViewArray),
 }
 
 impl<'a> StrView<'a> {
-    /// The caller has already confirmed the array is `Utf8`/`LargeUtf8` (`id_kind`).
+    /// The caller has already confirmed the array is a string type (`id_kind`).
     fn new(arr: &'a dyn Array) -> Self {
-        if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+        let any = arr.as_any();
+        if let Some(s) = any.downcast_ref::<StringArray>() {
             StrView::Utf8(s)
+        } else if let Some(s) = any.downcast_ref::<LargeStringArray>() {
+            StrView::Large(s)
         } else {
-            StrView::Large(
-                arr.as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .expect("id kind confirmed Utf8/LargeUtf8"),
+            StrView::View(
+                any.downcast_ref::<StringViewArray>()
+                    .expect("id kind confirmed Utf8/LargeUtf8/Utf8View"),
             )
         }
     }
@@ -555,18 +562,21 @@ impl<'a> StrView<'a> {
         match self {
             StrView::Utf8(a) => a.len(),
             StrView::Large(a) => a.len(),
+            StrView::View(a) => a.len(),
         }
     }
     fn is_null(&self, i: usize) -> bool {
         match self {
             StrView::Utf8(a) => a.is_null(i),
             StrView::Large(a) => a.is_null(i),
+            StrView::View(a) => a.is_null(i),
         }
     }
     fn value(&self, i: usize) -> &str {
         match self {
             StrView::Utf8(a) => a.value(i),
             StrView::Large(a) => a.value(i),
+            StrView::View(a) => a.value(i),
         }
     }
 }
@@ -603,7 +613,7 @@ impl IdMap {
     /// re-expressed in dense `u32` space (`src_dense`, `dst_dense`) ready for
     /// [`Topology::build`]. The id type is taken from the Arrow columns: `Int64`
     /// (and other integer types are not accepted here — callers canonicalize to
-    /// `Int64` first) or `Utf8`/`LargeUtf8`. Errors on a null endpoint, mixed
+    /// `Int64` first) or `Utf8`/`LargeUtf8`/`Utf8View`. Errors on a null endpoint, mixed
     /// src/dst types, or an unsupported id type.
     ///
     /// A thin wrapper over [`Self::from_edge_batches`] for the single-chunk case.
@@ -869,6 +879,63 @@ mod tests {
         assert_eq!((ids.value(0), ids.value(1), ids.value(2)), ("x", "y", "z"));
         let query = LargeStringArray::from(vec![Some("z"), Some("nope")]);
         assert_eq!(map.dense_from_array(&query).unwrap(), vec![Some(2), None]);
+    }
+
+    #[test]
+    fn utf8_view_is_handled_natively_and_round_trips() {
+        // Utf8View (DataFusion's Parquet string type, pyarrow's string_view) is
+        // read in place, like LargeUtf8: no cast, and the same map as Utf8 ids.
+        // Values past 12 bytes live in the data buffers rather than inline.
+        let long = "a-node-id-longer-than-twelve-bytes";
+        let src = StringViewArray::from(vec!["x", long, "y"]);
+        let dst = StringViewArray::from(vec![long, "y", "x"]);
+        let (map, sd, dd) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        let (umap, usd, udd) = IdMap::from_edge_arrays(
+            &StringArray::from(vec!["x", long, "y"]),
+            &StringArray::from(vec![long, "y", "x"]),
+        )
+        .unwrap();
+        assert_eq!(map.user_type(), DataType::Utf8);
+        assert_eq!((&sd, &dd), (&usd, &udd));
+        assert_eq!(&map.user_id_array(), &umap.user_id_array());
+        // A Utf8View lookup array resolves too (seeds, node-attribute join keys).
+        let query = StringViewArray::from(vec![Some(long), None, Some("nope")]);
+        assert_eq!(
+            map.dense_from_array(&query).unwrap(),
+            vec![Some(1), None, None]
+        );
+        // Mixed string layouts across src/dst or chunks are all one id family.
+        let (_, msd, mdd) =
+            IdMap::from_edge_arrays(&src, &StringArray::from(vec![long, "y", "x"])).unwrap();
+        assert_eq!((msd, mdd), (usd, udd));
+        // A null view endpoint is still rejected.
+        let with_null = StringViewArray::from(vec![Some("x"), None, Some("y")]);
+        assert_eq!(
+            IdMap::from_edge_arrays(&with_null, &dst).unwrap_err(),
+            IdError::Null
+        );
+    }
+
+    #[test]
+    fn utf8_view_chunks_intern_in_parallel_like_utf8() {
+        // Above the parallel threshold the view array takes the two-phase path;
+        // it must give the same ids as the Utf8 array of the same values.
+        let n = 2 * PARALLEL_MIN_ROWS + 5;
+        let name = |x: usize| format!("did:plc:{:x}", x * 7919 % 20_000);
+        let src: Vec<String> = (0..n).map(name).collect();
+        let dst: Vec<String> = (0..n).map(|i| name(i + 1)).collect();
+        let utf8 = IdMap::from_edge_arrays(
+            &StringArray::from(src.clone()),
+            &StringArray::from(dst.clone()),
+        )
+        .unwrap();
+        let view = IdMap::from_edge_arrays(
+            &StringViewArray::from_iter_values(&src),
+            &StringViewArray::from_iter_values(&dst),
+        )
+        .unwrap();
+        assert_eq!((&view.1, &view.2), (&utf8.1, &utf8.2));
+        assert_eq!(&view.0.user_id_array(), &utf8.0.user_id_array());
     }
 
     #[test]

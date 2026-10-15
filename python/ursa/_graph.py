@@ -84,6 +84,26 @@ def _graph_expr(verb: str, **params: Any) -> GraphExpr:
     return GraphExpr("graph", {"verb": verb, **params})
 
 
+_DIRECTIONS = ("out", "in", "both")
+
+
+def _check_direction(verb: str, direction: str, allowed: tuple[str, ...] = _DIRECTIONS) -> str:
+    """Validate a ``direction=`` argument eagerly, so a typo fails at the call site
+    rather than at ``collect()``."""
+    if direction not in allowed:
+        hint = ""
+        if direction == "in" and "in" not in allowed:
+            hint = (
+                " ('in' is not supported here; to run it on the reversed graph, "
+                "swap the src/dst roles when you build the frame)"
+            )
+        raise ValueError(
+            f"{verb}(direction={direction!r}) is not supported; "
+            f"use one of {', '.join(repr(d) for d in allowed)}{hint}."
+        )
+    return direction
+
+
 class LayoutExpr(GraphExpr):
     """A layout — the first kernel that yields *two* columns from one run.
 
@@ -271,9 +291,16 @@ def pagerank(
     tol: float = 1e-6,
     weight: Expr | None = None,
     dtype: str = "f64",
+    direction: str = "out",
 ) -> GraphExpr:
     """PageRank (pull-based fixpoint). ``dtype="f32"`` emits the score column as
-    32-bit float (half the size; the fixpoint still iterates in f64)."""
+    32-bit float (half the size; the fixpoint still iterates in f64).
+
+    ``direction="out"`` (default) follows the rows as stored: ``nx.pagerank(G)``
+    on the ``DiGraph``. ``direction="both"`` reads the graph as undirected — one
+    edge per distinct unordered pair, self-loops dropped — which is
+    ``nx.pagerank(G.to_undirected())``. With ``weight=``, a pair joined by several
+    rows takes the smallest weight. ``"in"`` is not supported."""
     return _graph_expr(
         "pagerank",
         edges=edges,
@@ -282,6 +309,7 @@ def pagerank(
         tol=tol,
         weight=weight,
         dtype=dtype,
+        direction=_check_direction("pagerank", direction, ("out", "both")),
     )
 
 
@@ -313,21 +341,50 @@ def betweenness(
     weight: Expr | None = None,
     seed: int | None = None,
     dtype: str = "f64",
+    direction: str = "out",
 ) -> GraphExpr:
-    """Betweenness centrality (Brandes), directed and unnormalized. ``sample=``
+    """Betweenness centrality (Brandes), unnormalized. ``sample=``
     approximates from a ``seed``-shuffled subset of sources (exact is O(nm));
     ``seed`` makes the sampled estimate reproducible. Parallel edges count as
     distinct shortest paths (so a multigraph diverges from a simple-graph
     reference like NetworkX); weighted, only *exactly* float-equal path costs tie.
-    ``dtype="f32"`` emits the centrality column as 32-bit float."""
+    ``dtype="f32"`` emits the centrality column as 32-bit float.
+
+    ``direction="out"`` (default) is directed: each ordered pair counted once,
+    ``nx.betweenness_centrality(G, normalized=False)``. ``direction="both"`` reads
+    the graph as undirected — one edge per distinct unordered pair, self-loops
+    dropped — and counts each unordered pair once:
+    ``nx.betweenness_centrality(G.to_undirected(), normalized=False)``. With
+    ``weight=``, a pair joined by several rows takes the smallest weight. ``"in"``
+    is not supported (over all pairs it equals ``"out"``)."""
     return _graph_expr(
-        "betweenness", edges=edges, sample=sample, weight=weight, seed=seed, dtype=dtype
+        "betweenness",
+        edges=edges,
+        sample=sample,
+        weight=weight,
+        seed=seed,
+        dtype=dtype,
+        direction=_check_direction("betweenness", direction, ("out", "both")),
     )
 
 
-def closeness(edges: EdgeFrame, weight: Expr | None = None, dtype: str = "f64") -> GraphExpr:
-    """Closeness centrality. ``dtype="f32"`` emits the score column as 32-bit float."""
-    return _graph_expr("closeness", edges=edges, weight=weight, dtype=dtype)
+def closeness(
+    edges: EdgeFrame, weight: Expr | None = None, dtype: str = "f64", direction: str = "out"
+) -> GraphExpr:
+    """Closeness centrality, ``reachable / Σ distance``. ``dtype="f32"`` emits the
+    score column as 32-bit float.
+
+    ``direction`` picks which way distance is measured: ``"out"`` (default) from
+    the node along out-edges, ``"in"`` to the node (NetworkX's directed
+    convention), ``"both"`` ignoring direction —
+    ``nx.closeness_centrality(G.to_undirected(), wf_improved=False)``."""
+    return _graph_expr(
+        "closeness",
+        edges=edges,
+        weight=weight,
+        dtype=dtype,
+        direction=_check_direction("closeness", direction),
+    )
 
 
 def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> GraphExpr:

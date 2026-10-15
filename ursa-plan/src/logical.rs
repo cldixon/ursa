@@ -39,6 +39,9 @@ pub enum GraphAlgo {
         damping: f64,
         max_iter: u32,
         tol: f64,
+        /// `Out` (the stored rows) or `Both` (the undirected view). `In` is
+        /// rejected when the column is built.
+        direction: Direction,
     },
     ConnectedComponents {
         // false = weak (undirected union-find); true = strong (Tarjan SCC).
@@ -52,8 +55,15 @@ pub enum GraphAlgo {
     Betweenness {
         sample: Option<f64>,
         seed: Option<u64>,
+        /// `Out` (directed) or `Both` (undirected view, halved). `In` is rejected
+        /// when the column is built.
+        direction: Direction,
     },
-    Closeness,
+    Closeness {
+        /// Which way distance is measured: from the node (`Out`), to it (`In`),
+        /// or ignoring direction (`Both`).
+        direction: Direction,
+    },
     LabelPropagation {
         max_iter: u32,
         seed: Option<u64>,

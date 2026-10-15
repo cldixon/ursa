@@ -35,34 +35,43 @@ def _require(module: str, pip: str | None = None) -> Any:
 
 
 # --- networkx --------------------------------------------------------------
-def from_networkx(graph: Any, *, weight: str = "weight") -> EdgeFrame:
+def from_networkx(
+    graph: Any, *, weight: str = "weight", symmetrize: bool | None = None
+) -> EdgeFrame:
     """Build an EdgeFrame from a ``networkx`` graph.
 
-    Each graph edge becomes one Ursa edge row (``src``/``dst`` from the endpoints).
-    If **every** edge carries the ``weight`` attribute key, a ``weight`` column is
-    added; otherwise the frame is unweighted. Node ids are the networkx node
-    labels (int or string — Ursa supports both).
+    Each directed graph edge becomes one Ursa edge row (``src``/``dst`` from the
+    endpoints). If **every** edge carries the ``weight`` attribute key, a
+    ``weight`` column is added; otherwise the frame is unweighted. Node ids are the
+    networkx node labels (int or string — Ursa supports both).
 
-    An undirected ``networkx.Graph`` yields each edge once; a ``DiGraph`` yields
-    directed rows. Ursa treats directedness as a per-operation parameter, so
-    either is fine — symmetrize beforehand if you want undirected traversals over
-    a ``Graph``. Node **attributes** are not pulled in here; use
-    :func:`nodes_from_networkx` for the attribute table.
+    An Ursa ``EdgeFrame`` is directed, so an **undirected** graph (``nx.Graph`` /
+    ``nx.MultiGraph``) is symmetrized by default: each edge ``{u, v}`` becomes the
+    two rows ``u -> v`` and ``v -> u`` (a self-loop stays one row), so the default
+    ``direction="out"`` of every kernel already sees the undirected graph. Pass
+    ``symmetrize=False`` to get one row per undirected edge instead (then pass
+    ``direction="both"`` to the kernels that take it). ``symmetrize=True`` on a
+    ``DiGraph`` adds the reverse of every edge. Node **attributes** are not pulled
+    in here; use :func:`nodes_from_networkx` for the attribute table.
     """
     import pyarrow as pa
 
     _require("networkx")
+    if symmetrize is None:
+        symmetrize = not graph.is_directed()
     srcs: list[Any] = []
     dsts: list[Any] = []
     weights: list[Any] = []
     all_weighted = True
     for u, v, attrs in graph.edges(data=True):
-        srcs.append(u)
-        dsts.append(v)
-        if weight in attrs:
-            weights.append(attrs[weight])
-        else:
-            all_weighted = False
+        pairs = ((u, v), (v, u)) if symmetrize and u != v else ((u, v),)
+        for a, b in pairs:
+            srcs.append(a)
+            dsts.append(b)
+            if weight in attrs:
+                weights.append(attrs[weight])
+            else:
+                all_weighted = False
     # An empty graph gives empty id lists; pyarrow would infer a *null*-typed
     # column, which the id canonicalizer rejects. Default empty ids to int64 so an
     # empty graph yields an empty (int-id) frame instead of erroring.

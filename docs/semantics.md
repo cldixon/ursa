@@ -6,9 +6,40 @@ The test suite checks every row of the table below against NetworkX on a seeded 
 
 ## Three things to know first
 
-1. **An `EdgeFrame` is directed.** `pagerank`, `betweenness`, and `closeness` follow the rows as stored. `degree`, `hop`, and `shortest_path` follow out-edges unless you pass `direction=`. The undirected kernels (`triangle_count`, `clustering_coefficient`, weak components, `louvain`, `label_propagation`) read the rows as undirected.
+1. **An `EdgeFrame` is directed.** `pagerank`, `betweenness`, `closeness`, `degree`, `hop`, `shortest_path`, and the whole-graph statistics follow out-edges unless you pass `direction=`. The undirected kernels (`triangle_count`, `clustering_coefficient`, weak components, `louvain`, `label_propagation`) read the rows as undirected. If your NetworkX graph is an undirected `nx.Graph`, see [Undirected graphs](#undirected-graphs).
 2. **Parallel edges are rows, and rows are kept.** Ursa does not merge two rows with the same endpoints. A NetworkX `Graph` or `DiGraph` merges them. On a graph with parallel edges, `pagerank` and `betweenness` differ from NetworkX. On a simple graph they match.
 3. **Outputs are deterministic.** Every kernel gives the same result on every run and on every thread count. The random kernels (`random_walk`, sampled `betweenness`, `louvain`, `label_propagation`) are reproducible from `seed=`.
+
+## Undirected graphs
+
+Most NetworkX users arrive with an undirected `nx.Graph`. Stored once per edge, its rows are a directed graph, and the default `direction="out"` results differ from the NetworkX ones: on the karate club, `density` is half the undirected value and `diameter` is 3 instead of 5.
+
+Pass `direction="both"`. It reads the rows as the **simple undirected graph**: one edge for each distinct pair of nodes joined by a row in either direction. A reciprocal pair (`u → v` and `v → u`) and parallel rows are one edge. Self-loops are dropped. This is NetworkX's `U = G.to_undirected()` on a graph without self-loops.
+
+| Ursa | NetworkX |
+|---|---|
+| `ur.degree(edges, direction="both")` | `U.degree()` on a simple graph |
+| `ur.pagerank(edges, direction="both")` | `nx.pagerank(U)` |
+| `ur.betweenness(edges, direction="both")` | `nx.betweenness_centrality(U, normalized=False)` |
+| `ur.closeness(edges, direction="both")` | `nx.closeness_centrality(U, wf_improved=False)` |
+| `ur.density(edges, direction="both")` | `nx.density(U)` |
+| `ur.avg_path_length(edges, direction="both")` | `nx.average_shortest_path_length(U)` on a connected graph |
+| `ur.diameter(edges, approximate=False, direction="both")` | `nx.diameter(U)` on a connected graph |
+| `ur.describe(edges, direction="both")` | `U.number_of_edges()`, `nx.density(U)`, and the mean degree |
+
+On the karate club (`ur.datasets.load_karate()`, 78 rows, each edge once):
+
+| Call | `direction="out"` (default) | `direction="both"` | NetworkX on `U` |
+|---|---|---|---|
+| `density` | 0.0695 | 0.1390 | 0.1390 |
+| `avg_path_length` | 1.2736 | 2.4082 | 2.4082 |
+| `diameter(approximate=False)` | 3 | 5 | 5 |
+
+With `weight=`, a pair joined by several rows takes the smallest of their weights. Two differences from NetworkX remain. NetworkX keeps a self-loop in `U`, and `nx.density` counts it; Ursa drops it. For a reciprocal pair with two different weights, `to_undirected()` keeps one of them, and Ursa keeps the smaller.
+
+`ur.from_networkx` symmetrizes an undirected graph for you: each edge of an `nx.Graph` becomes two rows, so the defaults already give the undirected result. `betweenness` is the exception: on two rows per edge, `direction="out"` counts each pair from both ends, twice the NetworkX value. Pass `direction="both"` to it. `ur.from_networkx(G, symmetrize=False)` keeps one row per edge.
+
+`direction="in"` follows edges backward. `closeness(direction="in")` measures the distance to the node, which is `nx.closeness_centrality(G, wf_improved=False)` on the `DiGraph`. For `density`, `avg_path_length`, `diameter`, and `describe`, `"in"` gives the same value as `"out"`. `pagerank` and `betweenness` reject it.
 
 ## Per-kernel alignment
 
@@ -17,9 +48,10 @@ In the table, `G` is a NetworkX `DiGraph` with the same rows, and `U = nx.Graph(
 | Ursa | NetworkX | Notes |
 |---|---|---|
 | `ur.degree(edges)` | `G.out_degree()` | `direction="in"` is `G.in_degree()`. `direction="both"` is `U.degree()` on a simple graph. |
-| `ur.pagerank(edges, damping=0.85)` | `nx.pagerank(G, alpha=0.85)` | A dangling node spreads its score to all nodes. |
-| `ur.betweenness(edges)` | `nx.betweenness_centrality(G, normalized=False, endpoints=False)` | Each ordered pair is counted once, so there is no final halving. |
+| `ur.pagerank(edges, damping=0.85)` | `nx.pagerank(G, alpha=0.85)` | A dangling node spreads its score to all nodes. `direction="both"` is `nx.pagerank(U)`. |
+| `ur.betweenness(edges)` | `nx.betweenness_centrality(G, normalized=False, endpoints=False)` | Each ordered pair is counted once, so there is no final halving. `direction="both"` is `nx.betweenness_centrality(U, normalized=False)`. |
 | `ur.closeness(edges)` | `nx.closeness_centrality(G.reverse(), wf_improved=False)` | See [Closeness](#closeness). |
+| `ur.density(edges)` | `nx.density(G)` on a simple graph | `direction="both"` is `nx.density(U)`. |
 | `ur.triangle_count(edges)` | `nx.triangles(U)` | |
 | `ur.clustering_coefficient(edges)` | `nx.clustering(U)` | |
 | `ur.connected_components(edges)` | `nx.connected_components(U)` | Weak components. |
@@ -30,13 +62,13 @@ In the table, `G` is a NetworkX `DiGraph` with the same rows, and `U = nx.Graph(
 
 ## Closeness
 
-Ursa measures outgoing distance: from the node, along out-edges. NetworkX measures incoming distance. The equivalent call reverses the graph: `nx.closeness_centrality(G.reverse(), wf_improved=False)`.
+Ursa measures outgoing distance by default: from the node, along out-edges. NetworkX measures incoming distance. The equivalent call reverses the graph: `nx.closeness_centrality(G.reverse(), wf_improved=False)`. `direction="in"` measures incoming distance, matching `nx.closeness_centrality(G, wf_improved=False)`, and `direction="both"` ignores direction, matching `nx.closeness_centrality(U, wf_improved=False)`.
 
 `wf_improved=False` removes the `(n − 1)` scaling that NetworkX applies by default. Ursa's value is `reachable / Σ distance`, the standard form for a disconnected graph. A node that reaches nothing scores `0.0`.
 
 ## Betweenness
 
-Ursa counts each ordered pair `(s, t)` once and does not normalize. Compare with `normalized=False, endpoints=False`. On an undirected baseline, divide the NetworkX value by two, or compare on the `DiGraph`.
+Ursa counts each ordered pair `(s, t)` once and does not normalize. Compare with `normalized=False, endpoints=False`. With `direction="both"`, Ursa reads the undirected view and counts each unordered pair once, which is `nx.betweenness_centrality(U, normalized=False)`.
 
 `sample=` runs Brandes from a random subset of sources and scales the result by `n / k`. The subset is a seeded shuffle, so the estimate is unbiased and reproducible from `seed=`.
 

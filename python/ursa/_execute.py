@@ -233,7 +233,11 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                 "call describe() as the final step of the pipeline."
             )
         index = _require_index(describe_step.args["edges"])
-        batch = _native().graph_describe(index, bool(describe_step.args.get("full", False)))
+        batch = _native().graph_describe(
+            index,
+            bool(describe_step.args.get("full", False)),
+            describe_step.args.get("direction", "out"),
+        )
         return MaterializedFrame(batch)
 
     walk_step = next((s for s in frame._plan if s.op == "random_walk"), None)
@@ -251,6 +255,9 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     saw_group_by = False
     join: tuple[Any, list[str], str] | None = None
+    # group_by().agg() *then* join(): the sort/head/rename written between the two
+    # shape the grouped (left) side; those written after the join apply to its rows.
+    pre_join_tail: tuple[tuple[str, bool] | None, int | None, dict[str, str]] | None = None
     # A `nodes()`-derived NodeFrame inherits the parent edge frame's plan, so its
     # steps before the `nodes` boundary are *edge*-plan steps (source + any subgraph
     # `filter`), not node-result operators. A pre-boundary filter is a subgraph view
@@ -285,6 +292,9 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             if join is not None:
                 raise NotImplementedError("collect() supports a single join() for now.")
             join = _parse_join(step)
+            if saw_group_by:
+                pre_join_tail = (sort, limit, rename)
+                sort, limit, rename = None, None, {}
             continue
         if op == "group_by_agg":
             if group_by is not None:
@@ -343,10 +353,15 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         )
 
     if join is not None:
-        if group_by is not None:
-            raise NotImplementedError(
-                "join() does not compose with group_by().agg() yet; do them in "
-                "separate collect() steps."
+        if pre_join_tail is not None:
+            # group_by().agg() then join(): group exactly as the non-join path does
+            # (with the tail written before the join), then join onto the groups.
+            g_sort, g_limit, g_rename = pre_join_tail
+            grouped = _collect_node_query(
+                frame, graph_exprs, filters, g_sort, g_limit, None, None, g_rename, False, group_by
+            )
+            return _run_join(
+                grouped.to_arrow(), join, [], sort, limit, None, None, rename, False, {}
             )
         # The left table is the raw base (empty tail — the tail applies post-join):
         # a graph-derived NodeFrame runs its algorithms first, a plain one uses its
@@ -373,6 +388,10 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
                     "from_arrow(id=...)) or a with_columns of graph algorithms."
                 )
             left_table = attr
+        if group_by is not None:
+            return _join_then_group(
+                left_table, join, filters, {"id": frame.id_col}, group_by, sort, limit, rename
+            )
         return _run_join(
             left_table,
             join,
@@ -386,6 +405,25 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             {"id": frame.id_col},
         )
 
+    return _collect_node_query(
+        frame, graph_exprs, filters, sort, limit, select, sample, rename, distinct, group_by
+    )
+
+
+def _collect_node_query(
+    frame: NodeFrame,
+    graph_exprs: dict[str, Expr] | None,
+    filters: list[Any],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+    select: list[str] | None,
+    sample: tuple[int, int | None] | None,
+    rename: dict[str, str],
+    distinct: bool,
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None,
+) -> MaterializedFrame:
+    """The non-join NodeFrame collect: a plain attribute table, or the graph
+    algorithms in ``graph_exprs`` (plus any attributes), through the shared tail."""
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
         # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
@@ -584,6 +622,9 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     saw_group_by = False
     join: tuple[Any, list[str], str] | None = None
+    # As in collect_node_frame: the tail written between group_by().agg() and a
+    # later join() shapes the grouped (left) side.
+    pre_join_tail: tuple[tuple[str, bool] | None, int | None, dict[str, str]] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -595,6 +636,9 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             if join is not None:
                 raise NotImplementedError("collect() supports a single join() for now.")
             join = _parse_join(step)
+            if saw_group_by:
+                pre_join_tail = (sort, limit, rename)
+                sort, limit, rename = None, None, {}
         elif op == "group_by_agg":
             if group_by is not None:
                 raise NotImplementedError("collect() supports a single group_by().agg() for now.")
@@ -649,12 +693,19 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 "join() on a traversal result (hop/shortest_path) is not supported yet; "
                 "join is available on plain edge/node frames."
             )
-        if group_by is not None:
-            raise NotImplementedError(
-                "join() does not compose with group_by().agg() yet; do them in "
-                "separate collect() steps."
+        if pre_join_tail is not None:
+            # group_by().agg() then join(): group the edge rows, then join the groups.
+            g_sort, g_limit, g_rename = pre_join_tail
+            grouped = _collect_plain_edges(
+                frame, filters, g_sort, g_limit, None, None, g_rename, False, group_by
+            )
+            return _run_join(
+                grouped.to_arrow(), join, [], sort, limit, None, None, rename, False, {}
             )
         left_table = _edge_source_table(frame)
+        roles = {"src": frame.src_col, "dst": frame.dst_col}
+        if group_by is not None:
+            return _join_then_group(left_table, join, filters, roles, group_by, sort, limit, rename)
         return _run_join(
             left_table,
             join,
@@ -665,7 +716,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             sample,
             rename,
             distinct,
-            {"src": frame.src_col, "dst": frame.dst_col},
+            roles,
         )
 
     if traversal is None:
@@ -882,15 +933,18 @@ def _algo_column(name: str, expr: Expr) -> dict[str, Any]:
             damping=p.get("damping", 0.85),
             max_iter=p.get("max_iter", 30),
             tol=p.get("tol", 1e-6),
+            direction=p.get("direction", "out"),
         )
         _add_weight(column, p)
     elif verb == "degree":
         column["direction"] = p.get("direction", "out")
     elif verb == "closeness":
+        column["direction"] = p.get("direction", "out")
         _add_weight(column, p)
     elif verb == "betweenness":
         column["sample"] = p.get("sample")
         column["seed"] = p.get("seed")
+        column["direction"] = p.get("direction", "out")
         _add_weight(column, p)
     elif verb == "label_propagation":
         column.update(max_iter=p.get("max_iter", 20), seed=p.get("seed"))
@@ -1413,10 +1467,30 @@ def _run_join(
     return _apply_select(MaterializedFrame(batches), select)
 
 
+def _join_then_group(
+    left_table: Any,
+    join: tuple[Any, list[str], str],
+    filters: list[Any],
+    roles: dict[str, str],
+    group_by: tuple[list[str], list[str], list[dict[str, str]]],
+    sort: tuple[str, bool] | None,
+    limit: int | None,
+    rename: dict[str, str],
+) -> MaterializedFrame:
+    """``join()`` then ``group_by().agg()``: run the join (every filter is pre-group,
+    so it applies to the joined rows), then group those rows through the plain
+    pyarrow path with the sort/head/rename tail written after the group."""
+    joined = _run_join(left_table, join, filters, None, None, None, None, {}, False, roles)
+    table = _apply_pyarrow_tail(
+        joined.to_arrow(), [], sort, limit, {}, rename=rename, group_by=group_by
+    )
+    return MaterializedFrame(table)
+
+
 # --- plain-source collection (no algorithm/traversal) ----------------------
 # Materialize a frame's own rows and apply the filter/sort/head tail in pyarrow.
 # Used by read_edges/read_nodes and scan_*/from_* frames collected without a
-# graph op (e.g. scan_edges(...).to_polars()).
+# graph op (e.g. scan_edges(...).collect()).
 # pyarrow.compute kernel names by op (looked up by name so the type checker —
 # which lacks pyarrow.compute stubs — doesn't flag each one).
 _PC_BINARY = {

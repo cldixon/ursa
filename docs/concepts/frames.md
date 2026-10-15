@@ -56,9 +56,9 @@ plan = edges.nodes().with_columns(pr=ur.pagerank(edges)).sort("pr", descending=T
 print(plan.explain())
 ```
 
-`collect()` runs the plan once and returns a `MaterializedFrame`. The result holds an Arrow table. From there, call `to_polars()`, `to_arrow()`, `to_dicts()`, `sink_parquet()`, or `sink_csv()`. See [Get the result out](../guides/output.md).
+`collect()` runs the plan once and returns a `MaterializedFrame`. The result holds an Arrow table. Print it for a table preview, or call `to_arrow()`, `to_dicts()`, `sink_parquet()`, or `sink_csv()`. See [Get the result out](../guides/output.md), which also covers the optional polars handoff.
 
-Shortcuts: `frame.to_polars()`, `frame.to_arrow()`, and `frame.to_dicts()` call `collect()` for you.
+Shortcuts: `frame.to_arrow()` and `frame.to_dicts()` call `collect()` for you.
 
 ## Sources
 

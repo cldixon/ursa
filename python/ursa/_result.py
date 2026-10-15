@@ -69,6 +69,8 @@ class MaterializedFrame:
     def to_polars(self) -> Any:
         """As a ``polars.DataFrame`` (zero-copy via Arrow).
 
+        Needs the optional ``polars`` extra: ``pip install 'ursa-graph[polars]'``.
+        ``to_arrow()``, ``to_dicts()`` and ``print(result)`` work on a bare install.
         ``polars`` is an optional dependency — the error names the extra that
         installs it, since a bare ``ModuleNotFoundError`` here is the first thing
         a new user hits after following any example in the docs (#122).
