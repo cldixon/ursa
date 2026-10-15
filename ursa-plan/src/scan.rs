@@ -145,14 +145,17 @@ fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
 
 /// The canonical Arrow type for a node-id column: any integer type collapses to
 /// `Int64` (the fast path), `Utf8`/`LargeUtf8`/`Utf8View` to `Utf8` (string ids,
-/// covering UUID-as-string). DataFusion reads Parquet strings as `Utf8View` by
-/// default, so that is what a string-id Parquet file arrives as. Any other type
-/// is not a supported node-id type.
+/// covering UUID-as-string). A Parquet file whose Arrow schema says string_view
+/// (as DataFusion writes it) arrives as `Utf8View`. A dictionary
+/// column (a Parquet file written from a pyarrow/pandas categorical keeps that
+/// type in its embedded Arrow schema) canonicalizes by its value type; the cast
+/// decodes it. Any other type is not a supported node-id type.
 fn canonical_id_type(dt: &DataType) -> Result<DataType> {
     use DataType::*;
     match dt {
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ok(Int64),
         Utf8 | LargeUtf8 | Utf8View => Ok(Utf8),
+        Dictionary(_, value) => canonical_id_type(value),
         other => Err(DataFusionError::NotImplemented(format!(
             "node ids must be an integer or string column; {other:?} is not a supported id type"
         ))),
@@ -183,10 +186,14 @@ async fn open_scan(
     // so rows land in a run-dependent partition. Turning it off keeps each
     // partition on its own contiguous range, which `collect_in_file_order` relies on.
     let mut config = SessionConfig::new().with_batch_size(SCAN_BATCH_ROWS);
-    config
-        .options_mut()
-        .execution
-        .enable_file_stream_work_stealing = false;
+    let execution = &mut config.options_mut().execution;
+    execution.enable_file_stream_work_stealing = false;
+    // DataFusion reads every Parquet string column as `Utf8View` by default, which
+    // turns a plain string file into view-typed columns: an extra conversion for
+    // the ids and, for attribute columns, a type pyarrow compute can barely
+    // filter or sort. Read each column as the file declares it instead; a file
+    // that really stores string_view still arrives as `Utf8View`.
+    execution.parquet.schema_force_view_types = false;
     let ctx = SessionContext::new_with_config(config);
     register_object_store(&ctx, path, storage_options)?;
     Ok(match detect_format(path, kind)? {
@@ -467,20 +474,23 @@ pub fn scan_nodes_batch(
             ))
         })?;
 
-        // Canonicalize only the id column (integer -> Int64, string -> Utf8);
-        // attribute columns keep their file types. The out schema is built once and
-        // shared across batches so they stay concat-compatible on the Python side.
+        // Canonicalize the id column (integer -> Int64, string -> Utf8); attribute
+        // columns keep their file types, except that a `Utf8View` column (a file
+        // whose Arrow schema says string_view) becomes `Utf8`: the attribute table
+        // is filtered and sorted with pyarrow compute, which has few string-view
+        // kernels. The cast is per batch (at most `SCAN_BATCH_ROWS` rows), so the
+        // 2 GiB `Utf8` offset limit (#152) bounds a batch, not the column. The out
+        // schema is built once and shared across batches so they stay
+        // concat-compatible on the Python side.
         let id_type = canonical_id_type(read_schema.field(id_idx).data_type())?;
         let fields: Vec<Field> = read_schema
             .fields()
             .iter()
             .enumerate()
-            .map(|(i, f)| {
-                if i == id_idx {
-                    Field::new(f.name(), id_type.clone(), f.is_nullable())
-                } else {
-                    f.as_ref().clone()
-                }
+            .map(|(i, f)| match f.data_type() {
+                _ if i == id_idx => Field::new(f.name(), id_type.clone(), f.is_nullable()),
+                DataType::Utf8View => Field::new(f.name(), DataType::Utf8, f.is_nullable()),
+                _ => f.as_ref().clone(),
             })
             .collect();
         let out_schema = Arc::new(Schema::new(fields));
@@ -490,9 +500,18 @@ pub fn scan_nodes_batch(
             if batch.num_rows() == 0 {
                 continue;
             }
-            let mut columns = batch.columns().to_vec();
-            columns[id_idx] = cast(&columns[id_idx], &id_type)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(out_schema.fields())
+                .map(|(c, f)| {
+                    if c.data_type() == f.data_type() {
+                        Ok(c.clone())
+                    } else {
+                        cast(c, f.data_type()).map_err(arrow_err)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
             out.push(
                 RecordBatch::try_new(out_schema.clone(), columns)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
@@ -579,8 +598,7 @@ mod tests {
 
     #[test]
     fn parquet_string_ids_scan_and_build() {
-        // DataFusion reads Parquet strings as Utf8View; string ids must still be
-        // accepted, canonicalized to Utf8, and build the same graph either way.
+        // Plain Parquet strings scan to Utf8 ids, through every scan entry point.
         use datafusion::parquet::arrow::ArrowWriter;
         let path = std::env::temp_dir().join("ursa_scan_test_string_ids.parquet");
         let schema = Arc::new(Schema::new(vec![
@@ -608,6 +626,67 @@ mod tests {
         let nodes = scan_nodes_batch(p, "from", &no_opts(), &[]).unwrap();
         assert_eq!(nodes[0].column(0).data_type(), &DataType::Utf8);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parquet_view_and_dictionary_string_ids_scan_and_build() {
+        // A file written with Utf8View or dictionary-encoded string columns stores
+        // that type in its embedded Arrow schema (Athena/DataFusion output, pandas
+        // categoricals), and DataFusion reads it back as such. Both must scan to
+        // Utf8 ids and the same graph as a plain Utf8 file.
+        use arrow::array::{ArrayRef, DictionaryArray, StringArray, StringViewArray};
+        use arrow::datatypes::Int32Type;
+        use datafusion::parquet::arrow::ArrowWriter;
+        let src = ["a", "b", "c", "a-node-id-longer-than-twelve-bytes"];
+        let dst = ["b", "c", "a-node-id-longer-than-twelve-bytes", "a"];
+        let make = |layout: &str, v: &[&str]| -> ArrayRef {
+            match layout {
+                "utf8" => Arc::new(StringArray::from(v.to_vec())),
+                "view" => Arc::new(StringViewArray::from(v.to_vec())),
+                _ => Arc::new(v.iter().copied().collect::<DictionaryArray<Int32Type>>()),
+            }
+        };
+        let mut built = Vec::new();
+        for name in ["utf8", "view", "dict"] {
+            let path = std::env::temp_dir().join(format!("ursa_scan_test_ids_{name}.parquet"));
+            let (s, d) = (make(name, &src), make(name, &dst));
+            let attr = make(name, &src);
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("from", s.data_type().clone(), false),
+                Field::new("to", d.data_type().clone(), false),
+                Field::new("label", attr.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![s, d, attr]).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
+            let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            let p = path.to_str().unwrap();
+
+            let label = ["label".to_string()];
+            let batches = scan_edges_batch(p, "from", "to", &no_opts(), &label).unwrap();
+            assert_eq!(batches[0].column(0).data_type(), &DataType::Utf8, "{name}");
+            assert_eq!(batches[0].column(1).data_type(), &DataType::Utf8, "{name}");
+            assert_eq!(batches[0].num_columns(), 3, "{name}");
+            let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
+            let nodes = scan_nodes_batch(p, "from", &no_opts(), &[]).unwrap();
+            assert_eq!(nodes[0].column(0).data_type(), &DataType::Utf8, "{name}");
+            // A string attribute is read as the file declares it, with views
+            // turned into Utf8 for the pyarrow-side relational tail.
+            let label_type = nodes[0].column(2).data_type().clone();
+            let want_label = match name {
+                "dict" => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                _ => DataType::Utf8,
+            };
+            assert_eq!(label_type, want_label, "{name}");
+            built.push((
+                scanned.ids.user_id_array(),
+                scanned.topo.out().targets.clone(),
+            ));
+            std::fs::remove_file(&path).ok();
+        }
+        assert_eq!(built[0], built[1]);
+        assert_eq!(built[0], built[2]);
     }
 
     #[test]
