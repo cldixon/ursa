@@ -1416,7 +1416,7 @@ def _run_join(
 # --- plain-source collection (no algorithm/traversal) ----------------------
 # Materialize a frame's own rows and apply the filter/sort/head tail in pyarrow.
 # Used by read_edges/read_nodes and scan_*/from_* frames collected without a
-# graph op (e.g. scan_edges(...).to_polars()).
+# graph op (e.g. scan_edges(...).collect()).
 # pyarrow.compute kernel names by op (looked up by name so the type checker —
 # which lacks pyarrow.compute stubs — doesn't flag each one).
 _PC_BINARY = {

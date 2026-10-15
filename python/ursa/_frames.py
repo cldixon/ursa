@@ -168,12 +168,20 @@ class _Frame:
         raise NotImplementedError("collect() must be implemented by the frame subclass")
 
     def to_polars(self):  # -> polars.DataFrame
+        """``collect()``, then a ``polars.DataFrame`` (zero-copy via Arrow).
+
+        Needs the optional ``polars`` extra: ``pip install 'ursa-graph[polars]'``.
+        ``to_arrow()`` / ``to_dicts()`` (or just ``print(frame.collect())``) need
+        nothing beyond a bare install.
+        """
         return self.collect().to_polars()
 
     def to_arrow(self):  # -> pyarrow.Table
+        """``collect()``, then a ``pyarrow.Table`` (zero-copy; no extra needed)."""
         return self.collect().to_arrow()
 
     def to_dicts(self) -> list[dict[str, Any]]:
+        """``collect()``, then a list of row dicts (no extra needed)."""
         return self.collect().to_dicts()
 
     def sink_parquet(self, path: str, **opts: Any) -> None:
