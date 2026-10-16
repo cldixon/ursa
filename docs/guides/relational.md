@@ -36,7 +36,7 @@ shape: (4, 4)
 
 ## Sort and head
 
-`sort` takes one column name. `head(n)` keeps the first `n` rows after the sort.
+`sort` takes a column name or a list of names. `head(n)` keeps the first `n` rows after the sort.
 
 ```python
 print(ranked.sort("triangles", descending=True).head(3).collect())
@@ -54,6 +54,28 @@ shape: (3, 4)
 │ 32    ┆ Officer ┆ 12     ┆ 13        │
 └───────┴─────────┴────────┴───────────┘
 ```
+
+With several columns, later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column.
+
+```python
+print(ranked.sort(["club", "degree", "id"], descending=[False, True, False]).head(4).collect())
+```
+
+```text
+shape: (4, 4)
+┌───────┬────────┬────────┬───────────┐
+│ id    ┆ club   ┆ degree ┆ triangles │
+│ ---   ┆ ---    ┆ ---    ┆ ---       │
+│ int64 ┆ string ┆ uint32 ┆ uint32    │
+╞═══════╪════════╪════════╪═══════════╡
+│ 0     ┆ Mr. Hi ┆ 16     ┆ 18        │
+│ 2     ┆ Mr. Hi ┆ 10     ┆ 11        │
+│ 1     ┆ Mr. Hi ┆ 9      ┆ 12        │
+│ 3     ┆ Mr. Hi ┆ 6      ┆ 10        │
+└───────┴────────┴────────┴───────────┘
+```
+
+Rows that tie on every sort column keep their input order on a plain frame. After a graph algorithm, as here, their order is not fixed, so end with a unique column such as `id` when the order matters.
 
 ## Select and rename
 

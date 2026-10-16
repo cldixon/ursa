@@ -246,7 +246,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
 
     graph_exprs: dict[str, Expr] | None = None
     filters: list[Any] = []  # predicate Exprs, serialized at the FFI boundary
-    sort: tuple[str, bool] | None = None
+    sort: list[tuple[str, bool]] | None = None
     limit: int | None = None
     select: list[str] | None = None
     distinct = False
@@ -257,7 +257,7 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
     join: tuple[Any, list[str], str] | None = None
     # group_by().agg() *then* join(): the sort/head/rename written between the two
     # shape the grouped (left) side; those written after the join apply to its rows.
-    pre_join_tail: tuple[tuple[str, bool] | None, int | None, dict[str, str]] | None = None
+    pre_join_tail: tuple[list[tuple[str, bool]] | None, int | None, dict[str, str]] | None = None
     # A `nodes()`-derived NodeFrame inherits the parent edge frame's plan, so its
     # steps before the `nodes` boundary are *edge*-plan steps (source + any subgraph
     # `filter`), not node-result operators. A pre-boundary filter is a subgraph view
@@ -414,7 +414,7 @@ def _collect_node_query(
     frame: NodeFrame,
     graph_exprs: dict[str, Expr] | None,
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     select: list[str] | None,
     sample: tuple[int, int | None] | None,
@@ -444,7 +444,7 @@ def _collect_node_query(
     for p in filters:
         referenced |= _expr_columns(p, {"id": frame.id_col})
     if sort is not None:
-        referenced.add(sort[0])
+        referenced.update(name for name, _ in sort)
     for c in columns:
         if c.get("agg_column") is not None:
             referenced.add(c["agg_column"])
@@ -495,7 +495,7 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
     ``filter``/``sort``/``head``/``distinct`` tail. Its ``(walk_id, step, node)``
     rows are produced by the native walk kernel over the frame's shared index."""
     filters: list[Any] = []
-    sort: tuple[str, bool] | None = None
+    sort: list[tuple[str, bool]] | None = None
     limit: int | None = None
     distinct = False
     select: list[str] | None = None
@@ -613,7 +613,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     ``filter``/``sort``/``head``/``distinct`` tail."""
     traversal = None
     filters: list[Any] = []
-    sort: tuple[str, bool] | None = None
+    sort: list[tuple[str, bool]] | None = None
     limit: int | None = None
     distinct = False
     select: list[str] | None = None
@@ -624,7 +624,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
     join: tuple[Any, list[str], str] | None = None
     # As in collect_node_frame: the tail written between group_by().agg() and a
     # later join() shapes the grouped (left) side.
-    pre_join_tail: tuple[tuple[str, bool] | None, int | None, dict[str, str]] | None = None
+    pre_join_tail: tuple[list[tuple[str, bool]] | None, int | None, dict[str, str]] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -860,7 +860,7 @@ def _run_query(
     edges: EdgeFrame | None,
     columns: list[dict[str, Any]],
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     nodes: Any | None = None,
     nodes_id: str | None = None,
@@ -1252,7 +1252,7 @@ _AGG_FNS = {"mean", "sum", "min", "max", "count", "n_unique"}
 
 
 def _reject_pre_group_tail(
-    sort: tuple[str, bool] | None, limit: int | None, rename: dict[str, str]
+    sort: list[tuple[str, bool]] | None, limit: int | None, rename: dict[str, str]
 ) -> None:
     """The canonical tail applies sort/head/rename *after* the grouping, so a
     sort/head/rename written *before* group_by().agg() would be silently
@@ -1357,14 +1357,34 @@ def _parse_group_agg(step: _PlanStep) -> tuple[list[str], list[str], list[dict[s
     return keys, engine_aggs, plain_aggs
 
 
-def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
+def _parse_sort(args: dict[str, Any]) -> list[tuple[str, bool]]:
+    """Parse a ``sort`` step into ``[(column, descending), ...]`` keys, in order.
+
+    ``by`` is a column name / ``ur.col(name)`` or a list of them; ``descending`` is
+    one bool for every key or a list with one bool per key."""
     by = args["by"]
-    if not isinstance(by, str):
-        raise NotImplementedError(
-            "collect() sort supports a single column name for now "
-            "(e.g. .sort('pagerank', descending=True))."
-        )
-    return (by, bool(args.get("descending", False)))
+    items = list(by) if isinstance(by, (list, tuple)) else [by]
+    if not items:
+        raise ValueError("sort() needs at least one column (got an empty list).")
+    names: list[str] = []
+    for k in items:
+        if isinstance(k, str):
+            names.append(k)
+        elif getattr(k, "kind", None) == "col":
+            names.append(k.payload["name"])
+        else:
+            raise ValueError(f"sort() keys must be column names or ur.col(<name>); got {k!r}.")
+    descending = args.get("descending", False)
+    if isinstance(descending, (list, tuple)):
+        if len(descending) != len(names):
+            raise ValueError(
+                f"sort() got {len(descending)} descending flag(s) for {len(names)} "
+                f"column(s); pass one bool, or one per column."
+            )
+        flags = [bool(d) for d in descending]
+    else:
+        flags = [bool(descending)] * len(names)
+    return list(zip(names, flags, strict=True))
 
 
 # --- join ------------------------------------------------------------------
@@ -1416,7 +1436,7 @@ def _run_join(
     left_table: Any,
     join: tuple[Any, list[str], str],
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     select: list[str] | None,
     sample: tuple[int, int | None] | None,
@@ -1475,7 +1495,7 @@ def _join_then_group(
     filters: list[Any],
     roles: dict[str, str],
     group_by: tuple[list[str], list[str], list[dict[str, str]]],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     rename: dict[str, str],
 ) -> MaterializedFrame:
@@ -1659,23 +1679,30 @@ def _decode_dictionary(column: Any) -> Any:
     return column
 
 
-def _sort_pyarrow(table: Any, by: str, descending: bool) -> Any:
-    """Stable-sort ``table`` by column ``by`` (nulls last). pyarrow has no sort
-    kernel for dictionary arrays, so the sort *key* is decoded — ordering by the
-    values (lexicographic for strings), never the dictionary indices — while the
-    output keeps the original (dictionary) column."""
+def _sort_pyarrow(table: Any, keys: list[tuple[str, bool]]) -> Any:
+    """Stable-sort ``table`` lexicographically by ``keys`` — ``(column,
+    descending)`` pairs, later keys breaking ties in earlier ones — with nulls last
+    for every key. pyarrow has no sort kernel for dictionary arrays, so each sort
+    *key* is decoded — ordering by the values (lexicographic for strings), never
+    the dictionary indices — while the output keeps the original (dictionary)
+    columns."""
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    key = pa.table({"key": _decode_dictionary(table.column(by))})
-    order = "descending" if descending else "ascending"
-    return table.take(pc.sort_indices(key, sort_keys=[("key", order)]))  # ty: ignore[unresolved-attribute]
+    key_table = pa.table(
+        {f"k{i}": _decode_dictionary(table.column(by)) for i, (by, _) in enumerate(keys)}
+    )
+    sort_keys = [
+        (f"k{i}", "descending" if descending else "ascending")
+        for i, (_, descending) in enumerate(keys)
+    ]
+    return table.take(pc.sort_indices(key_table, sort_keys=sort_keys))  # ty: ignore[unresolved-attribute]
 
 
 def _apply_pyarrow_tail(
     table: Any,
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     roles: dict[str, str],
     sample: tuple[int, int | None] | None = None,
@@ -1697,10 +1724,10 @@ def _apply_pyarrow_tail(
     if sample is not None:
         table = _sample_pyarrow(table, sample[0], sample[1])
     if sort is not None:
-        by, descending = sort
-        if by not in table.column_names:
-            raise ValueError(f"sort references unknown column '{by}'.")
-        table = _sort_pyarrow(table, by, descending)
+        for by, _ in sort:
+            if by not in table.column_names:
+                raise ValueError(f"sort references unknown column '{by}'.")
+        table = _sort_pyarrow(table, sort)
     if limit is not None:
         table = table.slice(0, limit)
     if rename:
@@ -1711,7 +1738,7 @@ def _apply_pyarrow_tail(
 def _collect_plain_nodes(
     frame: NodeFrame,
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     select: list[str] | None = None,
     sample: tuple[int, int | None] | None = None,
@@ -1733,7 +1760,7 @@ def _collect_plain_nodes(
         for p in filters:
             referenced |= _expr_columns(p, roles)
         if sort is not None:
-            referenced.add(sort[0])
+            referenced.update(name for name, _ in sort)
         selected_file = set(select) - set(rename.values())
         file_needed = sorted({frame.id_col} | referenced | selected_file)
     attr = _resolve_node_attr_table(frame, file_needed)
@@ -1753,7 +1780,7 @@ def _collect_plain_nodes(
 def _collect_plain_edges(
     frame: EdgeFrame,
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     select: list[str] | None = None,
     sample: tuple[int, int | None] | None = None,
@@ -1775,7 +1802,7 @@ def _collect_plain_edges(
         for p in filters:
             referenced |= _expr_columns(p, roles)
         if sort is not None:
-            referenced.add(sort[0])
+            referenced.update(name for name, _ in sort)
         selected_file = set(select) - set(rename.values())
         file_needed = sorted({frame.src_col, frame.dst_col} | referenced | selected_file)
     table = _edge_source_table(frame, file_needed)

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     # typing.Self is 3.11+; typing_extensions backports it for our 3.10 floor.
     from typing_extensions import Self
 
@@ -117,7 +119,23 @@ class _Frame:
     def rename(self, mapping: dict[str, str]) -> Self:
         return self._extend(_PlanStep("rename", {"mapping": mapping}))
 
-    def sort(self, by: Any, *, descending: bool = False) -> Self:
+    def sort(self, by: Any, *more_by: Any, descending: bool | Sequence[bool] = False) -> Self:
+        """Sort rows by one or more columns, Polars-style.
+
+        ``by`` is a column name (or ``ur.col(name)``) or a list of them; ``more_by``
+        appends further keys (``.sort("a", "b")`` is ``.sort(["a", "b"])``). Rows are
+        ordered lexicographically by the keys in order, so later keys break ties in
+        earlier ones. ``descending`` is a single bool applied to every key, or a list
+        with one bool per key. Nulls sort last for every key, in either direction.
+        A dictionary-encoded (categorical) key orders by its values, not its codes.
+        On a plain frame the sort is stable; after a graph algorithm or traversal,
+        rows that tie on every key come back in an unspecified order (end with a
+        unique key such as ``"id"`` to fix it). An empty key list, a ``descending``
+        list whose length differs from the keys, or an unknown column raises an
+        error at collect time.
+        """
+        if more_by:
+            by = [*(by if isinstance(by, (list, tuple)) else [by]), *more_by]
         return self._extend(_PlanStep("sort", {"by": by, "descending": descending}))
 
     def head(self, n: int = 10) -> Self:
