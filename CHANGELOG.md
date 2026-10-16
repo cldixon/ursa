@@ -10,6 +10,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Added
 
+- `sort()` takes several keys, Polars-style: `sort(["club", "pagerank"],
+  descending=[False, True])` or `sort("a", "b")`. `descending` is one bool for
+  every key or one per key; later keys break ties; nulls sort last for every
+  key; dictionary-encoded keys sort by value. Works on plain, scanned and edge
+  frames, grouped and joined results, graph-derived frames and traversal
+  outputs (#163). On a plain frame the sort is stable; after a graph algorithm
+  or traversal, rows that tie on every key come back in no fixed order, so end
+  with a unique key such as `id`.
+
 - `direction=` on `density`, `avg_path_length`, `diameter`, `describe`,
   `pagerank`, `closeness` and `betweenness`. The default stays `"out"`, so
   existing results are unchanged. `direction="both"` reads the rows as a simple
@@ -24,25 +33,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   Previously this raised `NotImplementedError` and needed two `collect()` steps.
 - `from_networkx(..., symmetrize=)` controls whether reverse rows are written.
 
-### Changed
-
-- **Behaviour change:** `from_networkx` now writes each edge of an undirected
-  `nx.Graph`/`nx.MultiGraph` in both directions (a self-loop stays one row), so
-  the default `direction="out"` gives NetworkX's undirected values for
-  `pagerank`, `closeness`, `density`, `diameter` and the rest. Previously each
-  edge was written once, which silently produced directed results. Pass
-  `symmetrize=False` for the old one-row-per-edge frame. `nx.DiGraph` input is
-  unchanged. On a symmetrized frame `betweenness` counts each unordered pair
-  twice with the default; pass `direction="both"` to match NetworkX (#124).
-- `.to_polars()` no longer appears in first-contact examples (the module and
-  `ursa.datasets` docstrings, the Quickstart, `examples/quickstart.py`), which
-  now print `collect()` or use `.to_arrow()`/`.to_dicts()`, so they run on a
-  bare install. Polars remains an optional extra; its one example lives in the
-  Output guide.
-- The package summary (`pip show ursa-graph`) and the README install line now
-  name the import name, `ursa`.
-
 ### Fixed
+
+- `select("c").distinct()` kept duplicate rows on plain frames, because
+  `distinct` ran over every column before `select` narrowed them (#162).
+  Other orderings that were silently reordered are fixed too: `head` before
+  `sort`/`filter`/`distinct`/`sample`/`join` now takes the first rows as
+  written, a rename that swaps two names no longer mislabels the columns, and
+  two `sort`s on a graph-derived frame no longer drop the first.
+- `rename(...).sort(new_name)` (and `filter`/`select`/`group_by` on the new
+  name) failed with "unknown column", because rename was applied last (#164).
 
 - A plain `collect()` on a `scan_edges` frame returned only the endpoint
   columns, so `filter`/`sort`/`select`/`group_by` on any other edge column
@@ -85,6 +85,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `direction="in"`/`"both"` on graphs above 65,536 edges.
 
 ### Changed
+
+- **Behaviour change:** relational steps (`filter`, `select`, `rename`,
+  `sort`, `head`, `distinct`, `sample`, `group_by().agg()`, `join`) now take
+  effect in the order they are written, as in Polars, on every collect path.
+  Previously each path applied them in a fixed internal order, which gave
+  wrong results for some orderings (see Fixed) and rejected others. Orderings
+  that used to raise now run as written: `sort`/`head`/`rename` before
+  `group_by`, a `filter` after `group_by` (SQL `HAVING`), `select` after
+  `group_by`, chained `rename`s, and `rename` then `join` on the new key. A
+  few pipelines that used to succeed incorrectly now raise: a `filter` on a
+  column's old name after `rename`, a `filter` on a column that an earlier
+  `select` dropped, and a non-filter step on the edges before `nodes()`. The
+  common filter/sort/head/select tail on graph-derived frames still runs in
+  DataFusion.
+
+- **Behaviour change:** `from_networkx` now writes each edge of an undirected
+  `nx.Graph`/`nx.MultiGraph` in both directions (a self-loop stays one row), so
+  the default `direction="out"` gives NetworkX's undirected values for
+  `pagerank`, `closeness`, `density`, `diameter` and the rest. Previously each
+  edge was written once, which silently produced directed results. Pass
+  `symmetrize=False` for the old one-row-per-edge frame. `nx.DiGraph` input is
+  unchanged. On a symmetrized frame `betweenness` counts each unordered pair
+  twice with the default; pass `direction="both"` to match NetworkX (#124).
+- `.to_polars()` no longer appears in first-contact examples (the module and
+  `ursa.datasets` docstrings, the Quickstart, `examples/quickstart.py`), which
+  now print `collect()` or use `.to_arrow()`/`.to_dicts()`, so they run on a
+  bare install. Polars remains an optional extra; its one example lives in the
+  Output guide.
+- The package summary (`pip show ursa-graph`) and the README install line now
+  name the import name, `ursa`.
 
 - Building the graph index over an unweighted `scan_edges` source no longer
   holds the scanned Arrow endpoints for the whole build. Each batch is interned
