@@ -59,6 +59,8 @@ A table of node attributes, with one designated id column.
 
 Both frame types have these methods. Each lazy method returns a new frame with one more step in its plan.
 
+The steps run in the order you write them, as in Polars. Each one sees the rows and column names the steps before it leave, so a step after `rename` uses the new names and a step after `select` sees only the selected columns.
+
 ### Columns
 
 | Method | Description |
