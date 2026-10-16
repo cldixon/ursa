@@ -331,7 +331,7 @@ struct Tail<'a> {
     distinct: bool,
     /// `(n, seed)` for a row sample; `seed = None` uses the default (reproducible).
     sample: Option<(usize, Option<u64>)>,
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     /// `(old, new)` output-column relabels, applied last.
     rename: &'a [(String, String)],
@@ -388,8 +388,21 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
         let batches = df.collect().await?;
         df = ctx.read_batches(sample_rows(batches, n, seed)?)?;
     }
-    if let Some((column, descending)) = tail.sort {
-        df = df.sort(vec![col(&column).sort(!descending, false)])?;
+    if let Some(keys) = tail.sort.filter(|keys| !keys.is_empty()) {
+        // Lexicographic over the keys in order; each key carries its own direction,
+        // and nulls sort last for every key (matching the pyarrow tail).
+        let mut sort_exprs = Vec::with_capacity(keys.len());
+        for (column, descending) in &keys {
+            if !df.schema().fields().iter().any(|f| f.name() == column) {
+                // "column ... not found" classifies as ColumnNotFoundError in ursa-py.
+                let names: Vec<&String> = df.schema().fields().iter().map(|f| f.name()).collect();
+                return Err(DataFusionError::Execution(format!(
+                    "sort references unknown column {column:?} (column not found; available: {names:?})"
+                )));
+            }
+            sort_exprs.push(col(column).sort(!descending, false));
+        }
+        df = df.sort(sort_exprs)?;
     }
     if let Some(n) = tail.limit {
         df = df.limit(0, Some(n))?;
@@ -513,7 +526,7 @@ pub fn execute_node_query(
     ids: Arc<IdMap>,
     columns_json: &str,
     filters: &[String],
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     nodes: Option<Vec<RecordBatch>>,
     nodes_id: Option<String>,
@@ -725,7 +738,7 @@ pub fn execute_join_query(
     on: Vec<String>,
     how: String,
     filters: &[String],
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -793,7 +806,7 @@ pub fn execute_hop_query(
     n: u32,
     direction: &str,
     filters: &[String],
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -840,7 +853,7 @@ pub fn execute_path_query(
     weight: Option<&str>,
     edges: Option<Vec<RecordBatch>>,
     filters: &[String],
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -975,7 +988,7 @@ pub fn execute_walk_query(
     walks_per_node: u32,
     seed: Option<u64>,
     filters: &[String],
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -1131,7 +1144,7 @@ mod tests {
                     "left":{"kind":"col","name":"indeg"},
                     "right":{"kind":"lit","value":0.0}}"#
                     .to_string()],
-                Some(("pr".into(), true)),
+                Some(vec![("pr".into(), true)]),
                 Some(1),
                 None,
                 None,
@@ -1236,7 +1249,7 @@ mod tests {
             ids,
             r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
             &[],
-            Some(("id".into(), false)),
+            Some(vec![("id".into(), false)]),
             None,
             Some(vec![nodes]),
             Some("id".into()),
@@ -1284,7 +1297,7 @@ mod tests {
                 ids,
                 r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#,
                 &[],
-                Some(("id".into(), false)),
+                Some(vec![("id".into(), false)]),
                 None,
                 Some(vec![nodes]),
                 Some("id".into()),
@@ -1343,7 +1356,7 @@ mod tests {
                     ids,
                     r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
                     &[],
-                    Some(("id".into(), false)),
+                    Some(vec![("id".into(), false)]),
                     None,
                     Some(vec![nodes]),
                     Some("id".into()),
@@ -1597,7 +1610,7 @@ mod tests {
                 ids,
                 r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
                 &[],
-                Some(("region".into(), false)),
+                Some(vec![("region".into(), false)]),
                 None,
                 Some(vec![nodes]),
                 Some("id".into()),
@@ -1693,7 +1706,7 @@ mod tests {
             vec!["id".into()],
             "inner".into(),
             &[],
-            Some(("id".into(), false)),
+            Some(vec![("id".into(), false)]),
             None,
             false,
             None,
@@ -1716,6 +1729,48 @@ mod tests {
     }
 
     #[test]
+    fn sort_by_several_keys_with_mixed_directions() {
+        // a ascending, then id descending: a=0 -> ids 3, 1; a=1 -> ids 2, 0.
+        let left = id_attr_batch(vec![0, 1, 2, 3], "a", vec![1, 0, 1, 0]);
+        let right = id_attr_batch(vec![0, 1, 2, 3], "b", vec![0, 0, 0, 0]);
+        let batch = one(execute_join_query(
+            vec![left.clone()],
+            vec![right.clone()],
+            vec!["id".into()],
+            "inner".into(),
+            &[],
+            Some(vec![("a".into(), false), ("id".into(), true)]),
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values().to_vec(), vec![3, 1, 2, 0]);
+
+        let err = execute_join_query(
+            vec![left],
+            vec![right],
+            vec!["id".into()],
+            "inner".into(),
+            &[],
+            Some(vec![("a".into(), false), ("nope".into(), true)]),
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown column \"nope\""), "{err}");
+    }
+
+    #[test]
     fn join_left_keeps_all_left_rows() {
         // left ids 0,1,2; right ids 1,2 -> left join keeps 0 with null b.
         let left = id_attr_batch(vec![0, 1, 2], "a", vec![10, 11, 12]);
@@ -1726,7 +1781,7 @@ mod tests {
             vec!["id".into()],
             "left".into(),
             &[],
-            Some(("id".into(), false)),
+            Some(vec![("id".into(), false)]),
             None,
             false,
             None,
