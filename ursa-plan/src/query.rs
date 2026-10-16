@@ -340,6 +340,12 @@ struct Tail<'a> {
 /// Apply the relational tail to the base frame. Canonical order:
 /// `filters → group_by → distinct → sample → sort → limit → rename`.
 ///
+/// User steps take effect in the order *written* (Polars semantics, #162/#164).
+/// The Python side (`_split_engine_tail` in `_execute.py`) only fills these slots
+/// with the leading steps this fixed order executes exactly as written, and applies
+/// any later step to the collected output itself, so this order never reorders a
+/// user's pipeline.
+///
 /// - `group_by` runs right after `filters` (pre-group WHERE) and replaces the output
 ///   schema, so `sort`/`limit`/`rename` see the grouped columns.
 /// - `sample` runs before `sort`/`limit`, so a following `.sort().head()` re-imposes

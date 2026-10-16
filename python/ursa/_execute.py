@@ -17,6 +17,7 @@ Parquet/CSV file source. Anything outside the wired surface raises a clear error
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ._result import MaterializedFrame
@@ -139,19 +140,16 @@ def _parse_select(columns: Any) -> list[str]:
     return names
 
 
-def _apply_select(mf: MaterializedFrame, select: list[str] | None) -> MaterializedFrame:
-    """Narrow a materialized result to the selected columns (the ``select`` output
+def _select_table(table: Any, select: list[str]) -> Any:
+    """Narrow a pyarrow table to the selected columns (the ``select`` output
     projection). ``select`` never changes rows, only which columns are kept and in
     what order — the Polars-faithful counterpart to additive ``with_columns``."""
-    if select is None:
-        return mf
-    table = mf.to_arrow()
     missing = [c for c in select if c not in table.column_names]
     if missing:
         from . import ColumnNotFoundError
 
         raise ColumnNotFoundError(f"select() references unknown column(s): {missing}")
-    return MaterializedFrame(table.select(select))
+    return table.select(select)
 
 
 def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
@@ -245,19 +243,13 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
         return _collect_random_walk(frame, walk_step)
 
     graph_exprs: dict[str, Expr] | None = None
-    filters: list[Any] = []  # predicate Exprs, serialized at the FFI boundary
-    sort: list[tuple[str, bool]] | None = None
-    limit: int | None = None
-    select: list[str] | None = None
-    distinct = False
-    sample: tuple[int, int | None] | None = None
-    rename: dict[str, str] = {}
-    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
-    saw_group_by = False
+    # The relational steps, in the order written (see `_tail_step`). A join splits
+    # them: the steps written before it shape the left side, those after it apply to
+    # the joined rows.
+    steps: list[_Step] = []
+    pre_join: list[_Step] = []
     join: tuple[Any, list[str], str] | None = None
-    # group_by().agg() *then* join(): the sort/head/rename written between the two
-    # shape the grouped (left) side; those written after the join apply to its rows.
-    pre_join_tail: tuple[list[tuple[str, bool]] | None, int | None, dict[str, str]] | None = None
+    pre_nodes: list[str] = []  # non-filter edge-plan steps before the `nodes` boundary
     # A `nodes()`-derived NodeFrame inherits the parent edge frame's plan, so its
     # steps before the `nodes` boundary are *edge*-plan steps (source + any subgraph
     # `filter`), not node-result operators. A pre-boundary filter is a subgraph view
@@ -288,177 +280,116 @@ def collect_node_frame(frame: NodeFrame) -> MaterializedFrame:
             if op == "nodes":
                 past_nodes_boundary = True
             continue  # source / metadata steps
+        if not past_nodes_boundary and (op in _TAIL_OPS or op == "join"):
+            # An edge-plan step before `nodes()`. A filter is a subgraph view, handled
+            # as the edge mask, not a node-result filter. Any other step reshapes the
+            # edge set the node set derives from; it is not a node-result operator.
+            if op != "filter":
+                pre_nodes.append(op)
+            continue
         if op == "join":
             if join is not None:
                 raise NotImplementedError("collect() supports a single join() for now.")
             join = _parse_join(step)
-            if saw_group_by:
-                pre_join_tail = (sort, limit, rename)
-                sort, limit, rename = None, None, {}
-            continue
-        if op == "group_by_agg":
-            if group_by is not None:
-                raise NotImplementedError("collect() supports a single group_by().agg() for now.")
-            _reject_pre_group_tail(sort, limit, rename)
-            group_by = _parse_group_agg(step)
-            saw_group_by = True
+            pre_join, steps = steps, []
             continue
         if op == "with_columns":
-            # select() defines the output columns; computing more columns after it
-            # is ambiguous (which survive?), so require with_columns before select.
-            if select is not None:
-                raise NotImplementedError(
-                    "with_columns() after select() is not supported; compute columns "
-                    "first, then select() to narrow the output."
-                )
             if graph_exprs is not None:
                 raise NotImplementedError(
                     "collect() supports a single with_columns step in a composed pipeline for now."
                 )
             graph_exprs = step.args["exprs"]
-        elif op == "filter":
-            if not past_nodes_boundary:
-                # An edge-frame subgraph filter (before `nodes()`): handled as the
-                # edge mask, not a node-result filter.
-                continue
-            if saw_group_by:
-                raise NotImplementedError(
-                    "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
-                    "filter before the group_by."
-                )
-            filters.append(step.args["predicate"])
-        elif op == "sort":
-            sort = _parse_sort(step.args)
-        elif op == "head":
-            limit = int(step.args["n"])
-        elif op == "distinct":
-            distinct = True
-        elif op == "sample":
-            sample = (int(step.args["n"]), step.args.get("seed"))
-        elif op == "rename":
-            rename.update(step.args["mapping"])
-        elif op == "select":
-            if select is not None:
-                raise NotImplementedError("collect() supports a single select() step for now.")
-            select = _parse_select(step.args["columns"])
-        else:
+            _check_with_columns_position(steps, join, graph_exprs, frame.id_col)
+            continue
+        if op not in _TAIL_OPS:
             raise NotImplementedError(
                 f"collect() does not yet support the '{op}' step in a composed pipeline."
             )
+        steps.append(_tail_step(step))
 
-    if group_by is not None and (distinct or sample is not None or select is not None):
+    if pre_nodes:
+        # A graph op over that derived edge frame raises the precise guard; otherwise
+        # the node set would silently ignore the step.
+        if graph_exprs:
+            _reject_derived_edge_graph_op(_single_edges(graph_exprs.values()))
         raise NotImplementedError(
-            "group_by().agg() does not compose with distinct/sample/select yet; "
-            "sort/head/rename on the grouped result are supported."
+            f"{'/'.join(f'{op}()' for op in dict.fromkeys(pre_nodes))} on the edges before "
+            "nodes() is not supported yet; collect the edge frame and re-ingest it via "
+            "ur.from_arrow(...) first."
         )
 
     if join is not None:
-        if pre_join_tail is not None:
-            # group_by().agg() then join(): group exactly as the non-join path does
-            # (with the tail written before the join), then join onto the groups.
-            g_sort, g_limit, g_rename = pre_join_tail
-            grouped = _collect_node_query(
-                frame, graph_exprs, filters, g_sort, g_limit, None, None, g_rename, False, group_by
-            )
-            return _run_join(
-                grouped.to_arrow(), join, [], sort, limit, None, None, rename, False, {}
-            )
-        # The left table is the raw base (empty tail — the tail applies post-join):
-        # a graph-derived NodeFrame runs its algorithms first, a plain one uses its
-        # attribute table. ur.id() in a post-join filter resolves to the real id.
-        if graph_exprs:
-            edges = _single_edges(graph_exprs.values())
-            columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
-            nodes = _resolve_node_attr_table(frame, None)
-            nodes_id = frame.id_col if nodes is not None else None
-            weight_cols: set[str] = set()
-            for expr in graph_exprs.values():
-                w = expr.payload.get("weight") if expr.kind == "graph" else None
-                if w is not None:
-                    weight_cols |= _expr_columns(w)
-            edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
-            left_table = _run_query(
-                edges, columns, [], None, None, nodes, nodes_id, edge_attr
-            ).to_arrow()
-        else:
-            attr = _resolve_node_attr_table(frame, None)
-            if attr is None:
-                raise NotImplementedError(
-                    "join() on this NodeFrame needs a source (scan_nodes / "
-                    "from_arrow(id=...)) or a with_columns of graph algorithms."
-                )
-            left_table = attr
-        if group_by is not None:
-            return _join_then_group(
-                left_table, join, filters, {"id": frame.id_col}, group_by, sort, limit, rename
-            )
-        return _run_join(
-            left_table,
-            join,
-            filters,
-            sort,
-            limit,
-            select,
-            sample,
-            rename,
-            distinct,
-            {"id": frame.id_col},
-        )
+        # The left side is this frame with the steps written before the join (a
+        # graph-derived NodeFrame runs its algorithms first, a plain one uses its
+        # attribute table); the steps after the join apply to its rows. ur.id() in a
+        # post-join filter resolves to the real id.
+        left = _collect_node_query(frame, graph_exprs, pre_join)
+        return _run_join(left.to_arrow(), join, steps, {"id": frame.id_col})
+    return _collect_node_query(frame, graph_exprs, steps)
 
-    return _collect_node_query(
-        frame, graph_exprs, filters, sort, limit, select, sample, rename, distinct, group_by
-    )
+
+def _check_with_columns_position(
+    steps: list[_Step],
+    join: Any,
+    graph_exprs: dict[str, Expr],
+    id_col: str,
+) -> None:
+    """``with_columns`` computes the graph columns on the frame's base rows, so a
+    relational step written *before* it would otherwise silently move after it.
+    Only a filter that doesn't read a computed column commutes with it (the computed
+    columns attach by id, so filtering first or last keeps the same rows); anything
+    else is rejected rather than executed in a different order."""
+    if join is not None:
+        raise NotImplementedError(
+            "with_columns() after join() is not supported yet; compute the columns "
+            "first, then join()."
+        )
+    for kind, arg in steps:
+        if kind != "filter":
+            verb = "group_by().agg" if kind == "group_by" else kind
+            raise NotImplementedError(
+                f"with_columns() after {verb}() is not supported; compute columns "
+                f"first, then {verb}()."
+            )
+        clash = _expr_columns(arg, {"id": id_col}) & set(graph_exprs)
+        if clash:
+            raise NotImplementedError(
+                f"filter() before with_columns() references column(s) {sorted(clash)} "
+                "that with_columns() computes; filter after the with_columns()."
+            )
 
 
 def _collect_node_query(
     frame: NodeFrame,
     graph_exprs: dict[str, Expr] | None,
-    filters: list[Any],
-    sort: list[tuple[str, bool]] | None,
-    limit: int | None,
-    select: list[str] | None,
-    sample: tuple[int, int | None] | None,
-    rename: dict[str, str],
-    distinct: bool,
-    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None,
+    steps: list[_Step],
 ) -> MaterializedFrame:
     """The non-join NodeFrame collect: a plain attribute table, or the graph
-    algorithms in ``graph_exprs`` (plus any attributes), through the shared tail."""
+    algorithms in ``graph_exprs`` (plus any attributes), then ``steps`` in order."""
     if not graph_exprs:
         # No graph algorithms: a plain source-backed NodeFrame (scan_nodes /
-        # from_arrow(id=) / read_nodes). Materialize its attribute table + tail.
-        return _collect_plain_nodes(
-            frame, filters, sort, limit, select, sample, rename, distinct, group_by
-        )
+        # from_arrow(id=) / read_nodes). Materialize its attribute table + steps.
+        return _collect_plain_nodes(frame, steps)
 
     edges = _single_edges(graph_exprs.values())
     columns = [_algo_column(name, expr) for name, expr in graph_exprs.items()]
     # Column-need analysis for scan projection pushdown (transparent — never changes
     # the output). The computed columns come from the graph node; the file must
-    # supply the join id, every column a filter/sort/agg reads, and any *file*
-    # column the select keeps. With no select the output is additive (all
-    # attributes), so nothing is droppable and the whole file is read.
-    computed = set(graph_exprs.keys())
-    # Role refs in a filter resolve to the frame's real id column for pushdown.
-    referenced: set[str] = set()
-    for p in filters:
-        referenced |= _expr_columns(p, {"id": frame.id_col})
-    if sort is not None:
-        referenced.update(name for name, _ in sort)
+    # supply the join id, any column a neighbor aggregation reads, and whatever the
+    # steps read before a select/group_by narrows them (see `_projection`). The
+    # engine's sample is content-canonical over every input column, so narrowing
+    # before a sample would change which rows it picks: that reads the whole file.
+    required = {frame.id_col}
     for c in columns:
         if c.get("agg_column") is not None:
-            referenced.add(c["agg_column"])
-    # A rename reads its source (old) columns; keep any that are file columns.
-    referenced |= set(rename)
-    id_name = frame.id_col
-    file_needed: list[str] | None = None
-    if select is not None:
-        # A rename *target* is a new output label, neither a file nor a computed
-        # column, so exclude it from the file projection (else the scan errors on a
-        # column the file doesn't have).
-        selected_file = set(select) - computed - set(rename.values())
-        needed = {id_name} | (referenced - computed) | selected_file
-        file_needed = sorted(needed)
+            required.add(c["agg_column"])
+    file_needed = _projection(
+        steps,
+        required,
+        {"id": frame.id_col},
+        computed=set(graph_exprs),
+        sample_reads_all=True,
+    )
     # If this NodeFrame is a node attribute table, its columns join onto the algo
     # outputs by id (see run_node_query); edges.nodes()-derived frames have none.
     nodes = _resolve_node_attr_table(frame, file_needed)
@@ -473,65 +404,48 @@ def _collect_node_query(
     # the same scan, so _run_query's _require_index reuses it — endpoints and
     # weights share one edge order.
     edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
+    # The engine runs the leading steps its fixed-order tail executes identically
+    # (the common filter/sort/head case entirely); any later step runs in written
+    # order on its output. ur.id() resolves to the result's reserved `id` column.
+    pushed, rest = _split_engine_tail(steps)
     result = _run_query(
         edges,
         columns,
-        filters,
-        sort,
-        limit,
+        pushed.filters,
+        pushed.sort,
+        pushed.limit,
         nodes,
         nodes_id,
         edge_attr,
-        distinct=distinct,
-        sample=sample,
-        rename=rename,
-        group_by=group_by,
+        distinct=pushed.distinct,
+        sample=pushed.sample,
+        rename=pushed.rename,
+        group_by=pushed.group_by,
     )
-    return _apply_select(result, select)
+    return _finish(result, pushed, rest, {"id": "id"})
 
 
 def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame:
-    """Execute a ``random_walk`` node frame plus an optional
-    ``filter``/``sort``/``head``/``distinct`` tail. Its ``(walk_id, step, node)``
-    rows are produced by the native walk kernel over the frame's shared index."""
-    filters: list[Any] = []
-    sort: list[tuple[str, bool]] | None = None
-    limit: int | None = None
-    distinct = False
-    select: list[str] | None = None
-    sample: tuple[int, int | None] | None = None
-    rename: dict[str, str] = {}
-
+    """Execute a ``random_walk`` node frame plus an optional relational tail, in the
+    order written. Its ``(walk_id, step, node)`` rows are produced by the native walk
+    kernel over the frame's shared index."""
+    steps: list[_Step] = []
     _passthrough = {"random_walk", "nodes", "from_arrow", "from_polars", "scan_nodes"}
     for s in frame._plan:
         op = s.op
         if op in _passthrough:
             continue  # the walk step itself / source / metadata
-        elif op == "filter":
-            filters.append(s.args["predicate"])
-        elif op == "sort":
-            sort = _parse_sort(s.args)
-        elif op == "head":
-            limit = int(s.args["n"])
-        elif op == "distinct":
-            distinct = True
-        elif op == "sample":
-            sample = (int(s.args["n"]), s.args.get("seed"))
-        elif op == "rename":
-            rename.update(s.args["mapping"])
-        elif op == "select":
-            if select is not None:
-                raise NotImplementedError("collect() supports a single select() step for now.")
-            select = _parse_select(s.args["columns"])
-        else:
+        if op not in _TAIL_OPS:
             raise NotImplementedError(
                 f"collect() does not yet support the '{op}' step after a random_walk."
             )
+        steps.append(_tail_step(s))
 
     index = _require_index(step.args["edges"])
     starts = _resolve_seeds(step.args["start"])
+    pushed, rest = _split_engine_tail(steps, group_by=False)
     # walk output columns are (walk_id, step, node); no src/dst/id role applies.
-    filter_json = [_filter_json(p, {}) for p in filters]
+    filter_json = [_filter_json(p, {}) for p in pushed.filters]
     batch = _native().run_walk_query(
         index,
         starts,
@@ -539,13 +453,13 @@ def _collect_random_walk(frame: NodeFrame, step: _PlanStep) -> MaterializedFrame
         int(step.args["walks_per_node"]),
         step.args.get("seed"),
         filter_json,
-        sort,
-        limit,
-        distinct,
-        sample,
-        list(rename.items()),
+        pushed.sort,
+        pushed.limit,
+        pushed.distinct,
+        pushed.sample,
+        list(pushed.rename.items()),
     )
-    return _apply_select(MaterializedFrame(batch), select)
+    return _finish(MaterializedFrame(batch), pushed, rest, {})
 
 
 def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
@@ -608,23 +522,14 @@ def _resolve_node_attr_table(frame: NodeFrame, columns: list[str] | None = None)
 
 # --- frame-positioned traversals (ur.hop / ur.shortest_path) ----------------
 def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
-    """Execute a traversal EdgeFrame — ``ur.hop(edges, n).from_(seeds)`` or
-    ``ur.shortest_path(edges, s, t)`` — plus an optional
-    ``filter``/``sort``/``head``/``distinct`` tail."""
+    """Execute a plain EdgeFrame, or a traversal EdgeFrame — ``ur.hop(edges, n)
+    .from_(seeds)`` or ``ur.shortest_path(edges, s, t)`` — plus an optional
+    relational tail, applied in the order written."""
     traversal = None
-    filters: list[Any] = []
-    sort: list[tuple[str, bool]] | None = None
-    limit: int | None = None
-    distinct = False
-    select: list[str] | None = None
-    sample: tuple[int, int | None] | None = None
-    rename: dict[str, str] = {}
-    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
-    saw_group_by = False
+    # As in collect_node_frame: steps in written order, split at a join.
+    steps: list[_Step] = []
+    pre_join: list[_Step] = []
     join: tuple[Any, list[str], str] | None = None
-    # As in collect_node_frame: the tail written between group_by().agg() and a
-    # later join() shapes the grouped (left) side.
-    pre_join_tail: tuple[list[tuple[str, bool]] | None, int | None, dict[str, str]] | None = None
 
     for step in frame._plan:
         op = step.op
@@ -636,15 +541,7 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             if join is not None:
                 raise NotImplementedError("collect() supports a single join() for now.")
             join = _parse_join(step)
-            if saw_group_by:
-                pre_join_tail = (sort, limit, rename)
-                sort, limit, rename = None, None, {}
-        elif op == "group_by_agg":
-            if group_by is not None:
-                raise NotImplementedError("collect() supports a single group_by().agg() for now.")
-            _reject_pre_group_tail(sort, limit, rename)
-            group_by = _parse_group_agg(step)
-            saw_group_by = True
+            pre_join, steps = steps, []
         elif op == "reverse":
             # Metadata on a plain frame (the swapped source rides on the frame).
             # After a traversal its semantics are undesigned -> reject rather than
@@ -655,37 +552,12 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                     "reverse the edges before the traversal."
                 )
             continue
-        elif op == "filter":
-            if saw_group_by:
-                raise NotImplementedError(
-                    "filter() after group_by().agg() (SQL HAVING) is not supported yet; "
-                    "filter before the group_by."
-                )
-            filters.append(step.args["predicate"])
-        elif op == "sort":
-            sort = _parse_sort(step.args)
-        elif op == "head":
-            limit = int(step.args["n"])
-        elif op == "distinct":
-            distinct = True
-        elif op == "sample":
-            sample = (int(step.args["n"]), step.args.get("seed"))
-        elif op == "rename":
-            rename.update(step.args["mapping"])
-        elif op == "select":
-            if select is not None:
-                raise NotImplementedError("collect() supports a single select() step for now.")
-            select = _parse_select(step.args["columns"])
+        elif op in _TAIL_OPS:
+            steps.append(_tail_step(step))
         else:
             raise NotImplementedError(
                 f"collect() does not yet support the '{op}' step on an edge frame."
             )
-
-    if group_by is not None and (distinct or sample is not None or select is not None):
-        raise NotImplementedError(
-            "group_by().agg() does not compose with distinct/sample/select yet; "
-            "sort/head/rename on the grouped result are supported."
-        )
 
     if join is not None:
         if traversal is not None:
@@ -693,43 +565,15 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
                 "join() on a traversal result (hop/shortest_path) is not supported yet; "
                 "join is available on plain edge/node frames."
             )
-        if pre_join_tail is not None:
-            # group_by().agg() then join(): group the edge rows, then join the groups.
-            g_sort, g_limit, g_rename = pre_join_tail
-            grouped = _collect_plain_edges(
-                frame, filters, g_sort, g_limit, None, None, g_rename, False, group_by
-            )
-            return _run_join(
-                grouped.to_arrow(), join, [], sort, limit, None, None, rename, False, {}
-            )
-        left_table = _edge_source_table(frame)
+        # The left side is the edge rows with the steps written before the join.
+        left = _collect_plain_edges(frame, pre_join)
         roles = {"src": frame.src_col, "dst": frame.dst_col}
-        if group_by is not None:
-            return _join_then_group(left_table, join, filters, roles, group_by, sort, limit, rename)
-        return _run_join(
-            left_table,
-            join,
-            filters,
-            sort,
-            limit,
-            select,
-            sample,
-            rename,
-            distinct,
-            roles,
-        )
+        return _run_join(left.to_arrow(), join, steps, roles)
 
     if traversal is None:
         # No traversal: a plain edge frame (scan_edges / from_arrow / read_edges,
-        # or a reversed frame). Materialize its edge rows + tail (distinct included).
-        return _collect_plain_edges(
-            frame, filters, sort, limit, select, sample, rename, distinct, group_by
-        )
-    if group_by is not None:
-        raise NotImplementedError(
-            "group_by().agg() on a traversal result (hop/shortest_path) is not "
-            "supported yet; group_by is available on plain edge/node frames."
-        )
+        # or a reversed frame). Materialize its edge rows + steps.
+        return _collect_plain_edges(frame, steps)
 
     # A traversal *over* a traversal result (hop-of-hop, path-of-hop) has no
     # rebuildable topology source — the inner result's edges are synthetic
@@ -744,9 +588,13 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         )
 
     # A traversal result carries reserved `src`/`dst` columns (+ a path cost for
-    # weighted shortest_path); ur.src()/dst() in a filter resolve to them.
-    filter_json = [_filter_json(p, {"src": "src", "dst": "dst"}) for p in filters]
-    rename_pairs = list(rename.items())
+    # weighted shortest_path); ur.src()/dst() in a filter resolve to them. The engine
+    # runs the leading steps its fixed-order tail executes identically; any later
+    # step (a group_by included) runs in written order on its output.
+    roles = {"src": "src", "dst": "dst"}
+    pushed, rest = _split_engine_tail(steps, group_by=False)
+    filter_json = [_filter_json(p, roles) for p in pushed.filters]
+    rename_pairs = list(pushed.rename.items())
     if traversal.op == "hop":
         index = _require_index(traversal.args["edges"])
         seeds = _resolve_seeds(traversal.args["seeds"])
@@ -756,10 +604,10 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             int(traversal.args["n"]),
             traversal.args["direction"],
             filter_json,
-            sort,
-            limit,
-            distinct,
-            sample,
+            pushed.sort,
+            pushed.limit,
+            pushed.distinct,
+            pushed.sample,
             rename_pairs,
         )
     else:  # shortest_path
@@ -784,13 +632,13 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
             weight_json,
             edge_attr,
             filter_json,
-            sort,
-            limit,
-            distinct,
-            sample,
+            pushed.sort,
+            pushed.limit,
+            pushed.distinct,
+            pushed.sample,
             rename_pairs,
         )
-    return _apply_select(MaterializedFrame(batch), select)
+    return _finish(MaterializedFrame(batch), pushed, rest, roles)
 
 
 # Steps that don't change a NodeFrame's row set, so its id column can be read
@@ -1251,30 +1099,6 @@ def _filter_json(predicate: Any, roles: dict[str, str]) -> str:
 _AGG_FNS = {"mean", "sum", "min", "max", "count", "n_unique"}
 
 
-def _reject_pre_group_tail(
-    sort: list[tuple[str, bool]] | None, limit: int | None, rename: dict[str, str]
-) -> None:
-    """The canonical tail applies sort/head/rename *after* the grouping, so a
-    sort/head/rename written *before* group_by().agg() would be silently
-    reordered (e.g. ``.head(10).group_by(...)`` would truncate groups, not rows).
-    Reject it rather than execute a different query than the one written; these
-    verbs are supported *after* the group."""
-    offenders = [
-        name
-        for name, present in (
-            ("sort", sort is not None),
-            ("head", limit is not None),
-            ("rename", bool(rename)),
-        )
-        if present
-    ]
-    if offenders:
-        raise NotImplementedError(
-            f"{'/'.join(offenders)}() before group_by().agg() is not supported "
-            "(the tail applies them after the group); move them after the group_by."
-        )
-
-
 def _parse_group_keys(keys: Any) -> list[str]:
     """The group key column names. Accepts bare strings or ``ur.col(name)``."""
     out: list[str] = []
@@ -1387,6 +1211,220 @@ def _parse_sort(args: dict[str, Any]) -> list[tuple[str, bool]]:
     return list(zip(names, flags, strict=True))
 
 
+def _sort_columns(sort: list[tuple[str, bool]]) -> set[str]:
+    """Every column a parsed sort reads (all of its keys) — for scan projection
+    pushdown."""
+    return {name for name, _ in sort}
+
+
+# --- the ordered relational tail -------------------------------------------
+# Relational steps take effect in the order they are written, as in Polars (#162,
+# #164): `.select("c").distinct()` dedups the selected column, `.rename({"v":
+# "val"}).sort("val")` sorts by the new name, `.head(3).sort("v")` sorts three rows.
+# A collect parses its plan into an ordered list of `(kind, arg)` steps:
+#   ("filter", Expr)  ("sort", <_parse_sort>)  ("head", n)  ("distinct", None)
+#   ("sample", (n, seed))  ("rename", {old: new})  ("select", [names])
+#   ("group_by", <_parse_group_agg>)
+# A plain frame applies the list in pyarrow, one step at a time. An engine path
+# pushes the longest prefix its fixed-order tail runs identically into DataFusion
+# (`_split_engine_tail`) and applies the rest, in order, to the engine's output.
+_Step = tuple[str, Any]
+
+_TAIL_OPS = frozenset(
+    {"filter", "sort", "head", "distinct", "sample", "rename", "select", "group_by_agg"}
+)
+
+
+def _tail_step(step: _PlanStep) -> _Step:
+    """Parse one relational plan step (an op in ``_TAIL_OPS``) into a tail step."""
+    op, args = step.op, step.args
+    if op == "filter":
+        return ("filter", args["predicate"])
+    if op == "sort":
+        return ("sort", _parse_sort(args))
+    if op == "head":
+        return ("head", int(args["n"]))
+    if op == "distinct":
+        return ("distinct", None)
+    if op == "sample":
+        return ("sample", (int(args["n"]), args.get("seed")))
+    if op == "rename":
+        return ("rename", dict(args["mapping"]))
+    if op == "select":
+        return ("select", _parse_select(args["columns"]))
+    if op == "group_by_agg":
+        return ("group_by", _parse_group_agg(step))
+    raise AssertionError(f"not a relational tail step: {op!r}")
+
+
+@dataclass
+class _EngineTail:
+    """The slots of the engine's fixed-order tail (``ursa_plan::query::apply_tail``),
+    plus the ``select`` applied to its output."""
+
+    filters: list[Any] = field(default_factory=list)
+    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
+    distinct: bool = False
+    sample: tuple[int, int | None] | None = None
+    sort: list[tuple[str, bool]] | None = None
+    limit: int | None = None
+    rename: dict[str, str] = field(default_factory=dict)
+    select: list[str] | None = None
+
+
+# The engine's tail order after its filters, then the select on its output.
+_ENGINE_ORDER = ("group_by", "distinct", "sample", "sort", "head", "rename", "select")
+
+
+def _split_engine_tail(
+    steps: list[_Step], *, group_by: bool = True
+) -> tuple[_EngineTail, list[_Step]]:
+    """Split written-order ``steps`` into the longest prefix the engine's fixed-order
+    tail (``filters → group_by → distinct → sample → sort → limit → rename``, then
+    ``select``) executes exactly as written, and the remaining steps, which the
+    caller applies in order to the engine's output (``_apply_pyarrow_steps``).
+
+    The prefix fills each slot at most once, in engine order. A ``filter`` may still
+    join the filters after a ``sort`` or ``distinct`` (it commutes with both: it keeps
+    the surviving rows' order and doesn't change which rows are distinct), but not
+    after a step that changes the row set or the column names. ``group_by=False``
+    for executors without a group slot. A rename whose targets are also sources (a
+    swap or chain) stays out: the engine relabels pair by pair, Polars all at once."""
+    out = _EngineTail()
+    filled: set[str] = set()
+    pos = 0  # index in _ENGINE_ORDER of the earliest slot still fillable
+    for i, (kind, arg) in enumerate(steps):
+        if kind == "filter":
+            if filled <= {"distinct", "sort"}:
+                out.filters.append(arg)
+                continue
+            return out, list(steps[i:])
+        k = _ENGINE_ORDER.index(kind)
+        if (
+            k < pos
+            or (kind == "group_by" and not group_by)
+            or (kind == "rename" and set(arg) & set(arg.values()))
+        ):
+            return out, list(steps[i:])
+        if kind == "group_by":
+            out.group_by = arg
+        elif kind == "distinct":
+            out.distinct = True
+        elif kind == "sample":
+            out.sample = arg
+        elif kind == "sort":
+            out.sort = arg
+        elif kind == "head":
+            out.limit = arg
+        elif kind == "rename":
+            out.rename = arg
+        else:  # select
+            out.select = arg
+        filled.add(kind)
+        pos = k + 1
+    return out, []
+
+
+def _finish(
+    result: MaterializedFrame,
+    pushed: _EngineTail,
+    rest: list[_Step],
+    roles: dict[str, str],
+) -> MaterializedFrame:
+    """Complete an engine result: the pushed ``select``, then the remaining steps
+    in written order. ``roles`` resolves ur.id()/src()/dst() in a remaining filter."""
+    if pushed.select is None and not rest:
+        return result
+    table = result.to_arrow()
+    if pushed.select is not None:
+        table = _select_table(table, pushed.select)
+    return MaterializedFrame(_apply_pyarrow_steps(table, rest, roles))
+
+
+def _projection(
+    steps: list[_Step],
+    required: set[str],
+    roles: dict[str, str],
+    *,
+    computed: set[str] | frozenset[str] = frozenset(),
+    sample_reads_all: bool = False,
+) -> list[str] | None:
+    """The source columns a scan must read for ``steps`` (scan projection pushdown),
+    or ``None`` to read them all.
+
+    Walks the steps in written order, tracking renames back to source names, up to
+    the first ``select`` or ``group_by`` — the first step that narrows the columns;
+    no later step can read a column it dropped. A ``distinct`` before that reads
+    every column (it dedups whole rows), and so does a ``sample`` when
+    ``sample_reads_all`` (the engine's sample orders by full row content). Without a
+    narrowing step every column reaches the output. ``required`` is always read
+    (the id / endpoints, neighbor-aggregation inputs); ``computed`` columns come
+    from the graph op, not the file."""
+    source: dict[str, str | None] = {}  # current name -> source column (None: none)
+    needed = set(required)
+
+    def src(names: set[str]) -> set[str]:
+        return {s for s in (source.get(n, n) for n in names) if s is not None}
+
+    for kind, arg in steps:
+        if kind == "filter":
+            needed |= src(_expr_columns(arg, roles))
+        elif kind == "sort":
+            needed |= src(_sort_columns(arg))
+        elif kind == "rename":
+            # A rename reads its sources (an unknown one must still error).
+            needed |= src(set(arg))
+            relabelled = {new: source.get(old, old) for old, new in arg.items()}
+            source.update(dict.fromkeys(arg))  # the old names are gone
+            source.update(relabelled)
+        elif kind == "select":
+            needed |= src(set(arg))
+            return sorted(needed - set(computed))
+        elif kind == "group_by":
+            keys, _engine_aggs, aggs = arg
+            needed |= src(set(keys) | {a["column"] for a in aggs})
+            return sorted(needed - set(computed))
+        elif kind == "distinct" or (kind == "sample" and sample_reads_all):
+            return None
+        # head / (position-based) sample read no column
+    return None
+
+
+def _apply_pyarrow_sort(table: Any, sort: list[tuple[str, bool]]) -> Any:
+    for by, _ in sort:
+        if by not in table.column_names:
+            raise ValueError(f"sort references unknown column '{by}'.")
+    return _sort_pyarrow(table, sort)
+
+
+def _apply_pyarrow_steps(table: Any, steps: list[_Step], roles: dict[str, str]) -> Any:
+    """Apply tail ``steps`` to a pyarrow table, each in the order written. ``roles``
+    resolves ur.id()/src()/dst() in a filter to real column names."""
+    for kind, arg in steps:
+        if kind == "filter":
+            _require_predicate(arg)  # same top-of-predicate check as the graph path
+            table = table.filter(_eval_pyarrow(arg, table, roles))
+        elif kind == "group_by":
+            table = _apply_pyarrow_group_by(table, arg[0], arg[2])
+        elif kind == "distinct":
+            # Distinct rows over all columns (group-by with no aggregations); row
+            # order is unspecified for distinct, as on the engine path.
+            table = table.combine_chunks().group_by(table.column_names).aggregate([])
+        elif kind == "sample":
+            table = _sample_pyarrow(table, arg[0], arg[1])
+        elif kind == "sort":
+            table = _apply_pyarrow_sort(table, arg)
+        elif kind == "head":
+            table = table.slice(0, arg)
+        elif kind == "rename":
+            table = _apply_pyarrow_rename(table, arg)
+        elif kind == "select":
+            table = _select_table(table, arg)
+        else:
+            raise AssertionError(f"unknown tail step {kind!r}")
+    return table
+
+
 # --- join ------------------------------------------------------------------
 _JOIN_HOWS = {"inner", "left"}
 
@@ -1435,19 +1473,14 @@ def _parse_join(step: _PlanStep) -> tuple[Any, list[str], str]:
 def _run_join(
     left_table: Any,
     join: tuple[Any, list[str], str],
-    filters: list[Any],
-    sort: list[tuple[str, bool]] | None,
-    limit: int | None,
-    select: list[str] | None,
-    sample: tuple[int, int | None] | None,
-    rename: dict[str, str],
-    distinct: bool,
+    steps: list[_Step],
     roles: dict[str, str],
 ) -> MaterializedFrame:
     """Materialize the right frame, validate keys/collisions, and run the native
-    join + relational tail. The whole tail (filter/sort/head/distinct/sample/
-    rename) applies *after* the join; ``roles`` resolves ur.id()/src()/dst() in a
-    filter to the left frame's real columns."""
+    join, then ``steps`` — the steps written after the join — in order: the engine
+    runs the leading ones its fixed tail executes identically, pyarrow the rest (a
+    group_by included). ``roles`` resolves ur.id()/src()/dst() in a filter to the
+    left frame's real columns."""
     other, on_keys, how = join
     try:
         right_table = other.collect().to_arrow()
@@ -1473,40 +1506,21 @@ def _run_join(
             f"join produces duplicate column name(s) {sorted(collide)}; "
             "rename() one side before joining."
         )
-    filter_json = [_filter_json(p, roles) for p in filters]
+    pushed, rest = _split_engine_tail(steps, group_by=False)
+    filter_json = [_filter_json(p, roles) for p in pushed.filters]
     batches = _native().run_join_query(
         left_table.to_batches(),
         right_table.to_batches(),
         on_keys,
         how,
         filter_json,
-        sort,
-        limit,
-        distinct,
-        sample,
-        list((rename or {}).items()),
+        pushed.sort,
+        pushed.limit,
+        pushed.distinct,
+        pushed.sample,
+        list(pushed.rename.items()),
     )
-    return _apply_select(MaterializedFrame(batches), select)
-
-
-def _join_then_group(
-    left_table: Any,
-    join: tuple[Any, list[str], str],
-    filters: list[Any],
-    roles: dict[str, str],
-    group_by: tuple[list[str], list[str], list[dict[str, str]]],
-    sort: list[tuple[str, bool]] | None,
-    limit: int | None,
-    rename: dict[str, str],
-) -> MaterializedFrame:
-    """``join()`` then ``group_by().agg()``: run the join (every filter is pre-group,
-    so it applies to the joined rows), then group those rows through the plain
-    pyarrow path with the sort/head/rename tail written after the group."""
-    joined = _run_join(left_table, join, filters, None, None, None, None, {}, False, roles)
-    table = _apply_pyarrow_tail(
-        joined.to_arrow(), [], sort, limit, {}, rename=rename, group_by=group_by
-    )
-    return MaterializedFrame(table)
+    return _finish(MaterializedFrame(batches), pushed, rest, roles)
 
 
 # --- plain-source collection (no algorithm/traversal) ----------------------
@@ -1699,71 +1713,12 @@ def _sort_pyarrow(table: Any, keys: list[tuple[str, bool]]) -> Any:
     return table.take(pc.sort_indices(key_table, sort_keys=sort_keys))  # ty: ignore[unresolved-attribute]
 
 
-def _apply_pyarrow_tail(
-    table: Any,
-    filters: list[Any],
-    sort: list[tuple[str, bool]] | None,
-    limit: int | None,
-    roles: dict[str, str],
-    sample: tuple[int, int | None] | None = None,
-    rename: dict[str, str] | None = None,
-    distinct: bool = False,
-    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
-) -> Any:
-    # Same canonical order as the engine tail:
-    # filters → group_by → distinct → sample → sort → limit → rename.
-    for predicate in filters:
-        _require_predicate(predicate)  # same top-of-predicate check as the graph path
-        table = table.filter(_eval_pyarrow(predicate, table, roles))
-    if group_by is not None:
-        table = _apply_pyarrow_group_by(table, group_by[0], group_by[2])
-    if distinct:
-        # Distinct rows over all columns (group-by with no aggregations); row order
-        # is unspecified for distinct, as on the engine path.
-        table = table.combine_chunks().group_by(table.column_names).aggregate([])
-    if sample is not None:
-        table = _sample_pyarrow(table, sample[0], sample[1])
-    if sort is not None:
-        for by, _ in sort:
-            if by not in table.column_names:
-                raise ValueError(f"sort references unknown column '{by}'.")
-        table = _sort_pyarrow(table, sort)
-    if limit is not None:
-        table = table.slice(0, limit)
-    if rename:
-        table = _apply_pyarrow_rename(table, rename)
-    return table
-
-
-def _collect_plain_nodes(
-    frame: NodeFrame,
-    filters: list[Any],
-    sort: list[tuple[str, bool]] | None,
-    limit: int | None,
-    select: list[str] | None = None,
-    sample: tuple[int, int | None] | None = None,
-    rename: dict[str, str] | None = None,
-    distinct: bool = False,
-    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
-) -> MaterializedFrame:
+def _collect_plain_nodes(frame: NodeFrame, steps: list[_Step]) -> MaterializedFrame:
     # On a plain node table, ur.id() resolves to the frame's real id column.
     roles = {"id": frame.id_col}
-    # With no computed columns, the scan need only read the id, whatever the
-    # filter/sort touch, any rename source column, and (if a select narrows the
-    # output) the selected columns. A rename *target* is a new label, not a file
-    # column, so it must not leak into the projection. When group_by is present the
-    # whole file is read (keys + agg columns must be available; select is disallowed).
-    file_needed: list[str] | None = None
-    if select is not None and group_by is None:
-        rename = rename or {}
-        referenced: set[str] = set(rename)
-        for p in filters:
-            referenced |= _expr_columns(p, roles)
-        if sort is not None:
-            referenced.update(name for name, _ in sort)
-        selected_file = set(select) - set(rename.values())
-        file_needed = sorted({frame.id_col} | referenced | selected_file)
-    attr = _resolve_node_attr_table(frame, file_needed)
+    # A scan need only read the id plus what the steps read before a select or
+    # group_by narrows the columns (see `_projection`).
+    attr = _resolve_node_attr_table(frame, _projection(steps, {frame.id_col}, roles))
     if attr is None:
         raise NotImplementedError(
             "collect() on this NodeFrame needs a source (scan_nodes / from_arrow(id=...)) "
@@ -1771,45 +1726,17 @@ def _collect_plain_nodes(
             "materializable node set yet."
         )
     # `attr` is a (chunked) pyarrow.Table.
-    table = _apply_pyarrow_tail(
-        attr, filters, sort, limit, roles, sample, rename, distinct, group_by
-    )
-    return _apply_select(MaterializedFrame(table), select)
+    return MaterializedFrame(_apply_pyarrow_steps(attr, steps, roles))
 
 
-def _collect_plain_edges(
-    frame: EdgeFrame,
-    filters: list[Any],
-    sort: list[tuple[str, bool]] | None,
-    limit: int | None,
-    select: list[str] | None = None,
-    sample: tuple[int, int | None] | None = None,
-    rename: dict[str, str] | None = None,
-    distinct: bool = False,
-    group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None,
-) -> MaterializedFrame:
+def _collect_plain_edges(frame: EdgeFrame, steps: list[_Step]) -> MaterializedFrame:
     # On a plain edge table, ur.src()/dst() resolve to the frame's real endpoint cols.
     roles = {"src": frame.src_col, "dst": frame.dst_col}
-    # As for a node scan: when a select narrows the output, a scan need only read the
-    # endpoints, whatever the filter/sort touch, any rename source column, and the
-    # selected columns (a rename *target* is a new label, not a file column). A
-    # distinct runs over every column before the select, and a group_by needs its
-    # keys and agg columns, so either reads the whole file.
-    file_needed: list[str] | None = None
-    if select is not None and group_by is None and not distinct:
-        rename = rename or {}
-        referenced: set[str] = set(rename)
-        for p in filters:
-            referenced |= _expr_columns(p, roles)
-        if sort is not None:
-            referenced.update(name for name, _ in sort)
-        selected_file = set(select) - set(rename.values())
-        file_needed = sorted({frame.src_col, frame.dst_col} | referenced | selected_file)
-    table = _edge_source_table(frame, file_needed)
-    table = _apply_pyarrow_tail(
-        table, filters, sort, limit, roles, sample, rename, distinct, group_by
-    )
-    return _apply_select(MaterializedFrame(table), select)
+    # As for a node scan: the endpoints plus what the steps read before a select or
+    # group_by narrows the columns.
+    needed = _projection(steps, {frame.src_col, frame.dst_col}, roles)
+    table = _edge_source_table(frame, needed)
+    return MaterializedFrame(_apply_pyarrow_steps(table, steps, roles))
 
 
 def _edge_source_table(frame: EdgeFrame, columns: list[str] | None = None) -> Any:

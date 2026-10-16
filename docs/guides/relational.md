@@ -2,6 +2,8 @@
 
 The row and column methods work on every frame: an edge table, a node table, an algorithm result, or a traversal result. They add steps to the plan and run inside `collect()`.
 
+The steps run in the order you write them, as in Polars. `sort(...).head(3)` keeps the top three rows; `head(3).sort(...)` sorts the first three. A step sees the columns the steps before it leave: after `rename`, later steps use the new names; after `select`, only the selected columns.
+
 ```python
 import ursa as ur
 
@@ -36,7 +38,7 @@ shape: (4, 4)
 
 ## Sort and head
 
-`sort` takes a column name or a list of names. `head(n)` keeps the first `n` rows after the sort.
+`sort` takes a column name or a list of names. `head(n)` keeps the first `n` rows. Written after a `sort`, those are the top rows.
 
 ```python
 print(ranked.sort("triangles", descending=True).head(3).collect())
@@ -98,23 +100,23 @@ shape: (3, 2)
 └───────┴────────┘
 ```
 
-`rename` changes column names. It applies last in a plan, so `filter`, `sort`, and `select` in the same plan use the old names.
+`rename` changes column names. The steps after it use the new names:
 
 ```python
-print(ranked.rename({"id": "member", "degree": "friends"}).head(3).collect())
+print(ranked.rename({"id": "member", "degree": "friends"}).sort("friends", descending=True).head(3).collect())
 ```
 
 ```text
 shape: (3, 4)
-┌────────┬────────┬─────────┬───────────┐
-│ member ┆ club   ┆ friends ┆ triangles │
-│ ---    ┆ ---    ┆ ---     ┆ ---       │
-│ int64  ┆ string ┆ uint32  ┆ uint32    │
-╞════════╪════════╪═════════╪═══════════╡
-│ 0      ┆ Mr. Hi ┆ 16      ┆ 18        │
-│ 1      ┆ Mr. Hi ┆ 9       ┆ 12        │
-│ 2      ┆ Mr. Hi ┆ 10      ┆ 11        │
-└────────┴────────┴─────────┴───────────┘
+┌────────┬─────────┬─────────┬───────────┐
+│ member ┆ club    ┆ friends ┆ triangles │
+│ ---    ┆ ---     ┆ ---     ┆ ---       │
+│ int64  ┆ string  ┆ uint32  ┆ uint32    │
+╞════════╪═════════╪═════════╪═══════════╡
+│ 33     ┆ Officer ┆ 17      ┆ 15        │
+│ 0      ┆ Mr. Hi  ┆ 16      ┆ 18        │
+│ 32     ┆ Officer ┆ 12      ┆ 13        │
+└────────┴─────────┴─────────┴───────────┘
 ```
 
 ## Group by
@@ -186,7 +188,7 @@ shape: (3, 3)
 └───────┴────────┴────────┘
 ```
 
-`join` and `group_by` compose in one plan, and the steps run in the order you write them. `join(...).group_by(...)` groups the joined rows. `group_by(...).agg(...).join(...)` joins onto the groups:
+`join` and `group_by` compose in one plan, in the order you write them. `join(...).group_by(...)` groups the joined rows. `group_by(...).agg(...).join(...)` joins onto the groups. A `filter` after `group_by(...).agg(...)` filters the groups, like SQL `HAVING`:
 
 ```python
 leaders = ur.NodeFrame({"club": ["Mr. Hi", "Officer"], "leader": [0, 33]}, id="club")
@@ -213,31 +215,22 @@ shape: (2, 4)
 
 ## Distinct and sample
 
-`distinct()` removes duplicate rows. `sample(n, seed=)` keeps `n` random rows.
+`distinct()` removes duplicate rows. After a `select`, that is duplicates of the selected columns. `sample(n, seed=)` keeps `n` random rows.
 
 ```python
-print(nodes.select("club").distinct().collect())
+print(nodes.select("club").distinct().sort("club").collect())
 print(nodes.sample(2, seed=3).collect())
 ```
 
 ```text
-shape: (34, 1)
+shape: (2, 1)
 ┌─────────┐
 │ club    │
 │ ---     │
 │ string  │
 ╞═════════╡
 │ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
-│ Mr. Hi  │
 │ Officer │
-│ …       │
 └─────────┘
 shape: (2, 2)
 ┌───────┬─────────┐
