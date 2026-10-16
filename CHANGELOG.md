@@ -44,6 +44,21 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A plain `collect()` on a `scan_edges` frame returned only the endpoint
+  columns, so `filter`/`sort`/`select`/`group_by` on any other edge column
+  failed with "unknown column", and `sink_parquet`/`sink_csv` wrote endpoints
+  only. A scanned edge frame now has every column of the file, in file order
+  and with the file's types, exactly like the same table loaded in memory;
+  a `select()` is pushed down into the scan. Graph ops still read only the
+  columns they need, so index-build memory is unchanged (#160). Scanned
+  endpoints also keep their file type in relational output (an `int32` column
+  stays `int32`) instead of being widened to `int64`.
+- Weight expressions on a `scan_edges` frame can reference the `src`/`dst`
+  columns; previously they failed with "No field named ..." (#154).
+- `sort()` on a dictionary-encoded (categorical) column raised
+  `ArrowNotImplementedError`, and so did `sum`/`mean`/`min`/`max` over one in
+  `group_by().agg()`. Sorting now orders by the values (not the dictionary
+  indices), and the column keeps its dictionary type in the output (#159).
 - `scan_edges` and `scan_nodes` now return rows in file order on every run.
   A file large enough to be read as several parallel partitions previously
   came back in a run-dependent order, so dense ids, component labels,

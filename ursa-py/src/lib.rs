@@ -22,8 +22,9 @@
 //!   (`hop`, `shortest_path` incl. weighted Dijkstra, `random_walk`).
 //! - `graph_density` / `graph_avg_path_length` / `graph_diameter` /
 //!   `graph_describe` — eager whole-graph statistics.
-//! - `scan_edges_arrow` / `scan_nodes_arrow` — read a Parquet/CSV edge or node
-//!   file (local or object storage) through a DataFusion scan.
+//! - `scan_edges_arrow` / `scan_edges_table_arrow` / `scan_nodes_arrow` — read a
+//!   Parquet/CSV edge or node file (local or object storage) through a
+//!   DataFusion scan.
 
 use std::collections::HashMap;
 
@@ -41,8 +42,8 @@ use ursa_core::{EdgeMask, IdMap};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
     execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
-    hop_reached_nodes, parse_stat_direction, scan_edges_batch, scan_edges_topology,
-    scan_nodes_batch, shortest_path_nodes, ScanBuildError, ScannedTopology,
+    hop_reached_nodes, parse_stat_direction, scan_edges_batch, scan_edges_table,
+    scan_edges_topology, scan_nodes_batch, shortest_path_nodes, ScanBuildError, ScannedTopology,
 };
 
 // ---------------------------------------------------------------------------
@@ -558,7 +559,7 @@ fn graph_describe(
 }
 
 /// Read a Parquet/CSV edge file's `src`/`dst` columns (plus any `weight_columns`
-/// needed to evaluate a `weight=` expression) through a DataFusion scan and hand
+/// needed to evaluate a `weight=` expression, by their own names) through a DataFusion scan and hand
 /// them back as a pyarrow `RecordBatch`. `path` may be local or object storage
 /// (`s3://`/`gs://`/`az://`/`file://`); `storage_options` seeds the backend's
 /// credentials/config.
@@ -575,6 +576,28 @@ fn scan_edges_arrow(
     let opts = storage_options.unwrap_or_default();
     let batches =
         py.detach(|| scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr))?;
+    batches.to_pyarrow(py).map(|obj| obj.unbind())
+}
+
+/// Read a Parquet/CSV edge file as a table for the relational paths (a plain
+/// `collect()` and its tail, the sinks, a subgraph view's edge mask): every column
+/// with its file name and type (`Utf8View` read as `Utf8`), endpoints validated but
+/// not cast, so it matches the same file read into an in-memory `EdgeFrame`
+/// (#160). `columns` is a projection pushdown: when non-empty only those columns
+/// (plus `src`/`dst`) are read, in file order; empty reads all of them.
+#[pyfunction]
+#[pyo3(signature = (path, src, dst, storage_options=None, columns=Vec::new()))]
+fn scan_edges_table_arrow(
+    py: Python<'_>,
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: Option<HashMap<String, String>>,
+    columns: Vec<String>,
+) -> PyResult<Py<PyAny>> {
+    let opts = storage_options.unwrap_or_default();
+    let batches =
+        py.detach(|| scan_edges_table(path, src, dst, &opts, &columns).map_err(to_pyerr))?;
     batches.to_pyarrow(py).map(|obj| obj.unbind())
 }
 
@@ -633,6 +656,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;
     m.add_function(wrap_pyfunction!(graph_describe, m)?)?;
     m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_edges_table_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(scan_nodes_arrow, m)?)?;
     Ok(())
 }

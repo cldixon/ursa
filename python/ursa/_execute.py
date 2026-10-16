@@ -1098,13 +1098,15 @@ def _reject_derived_edge_graph_op(edges: Any) -> None:
         )
 
 
-def _drop_null_endpoint_batches(batches: list[Any]) -> list[Any]:
-    """Filter scan batches to rows with a non-null src (column 0) and dst (column 1),
-    emitting a count — the scan half of the ``on_null="drop"`` opt-in. Endpoints are
-    always columns 0/1 whether or not weight columns follow, so this serves the
-    unweighted, weighted, and plain-collect scan paths identically. Filtering here
-    (rather than in a second pass) keeps the topology and any co-scanned weights
-    row-aligned, since they come from the same filtered batches."""
+def _drop_null_endpoint_batches(
+    batches: list[Any], endpoints: tuple[int | str, int | str] = (0, 1)
+) -> list[Any]:
+    """Filter scan batches to rows with a non-null src and dst, emitting a count —
+    the scan half of the ``on_null="drop"`` opt-in. ``endpoints`` locates the two
+    columns: positions 0/1 for the graph-op scans (endpoints first, weight columns
+    after), or the endpoint column names for the full-table scan of the relational
+    paths. Filtering here (rather than in a second pass) keeps the topology and any
+    co-scanned weights row-aligned, since they come from the same filtered batches."""
     import pyarrow.compute as pc
 
     from ._io import _warn_dropped_endpoints
@@ -1113,7 +1115,7 @@ def _drop_null_endpoint_batches(batches: list[Any]) -> list[Any]:
     is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
     out, dropped = [], 0
     for b in batches:
-        mask = and_(is_valid(b.column(0)), is_valid(b.column(1)))
+        mask = and_(is_valid(b.column(endpoints[0])), is_valid(b.column(endpoints[1])))
         kept = b.filter(mask)
         dropped += b.num_rows - kept.num_rows
         out.append(kept)
@@ -1610,23 +1612,64 @@ def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, st
     # aliases of one sum — so both paths stay consistent. pyarrow names an
     # aggregate output "{column}_{pcfn}"; each is mapped back to *every* output
     # that requested it.
+    #
+    # pyarrow's hash sum/mean/min/max have no dictionary kernels, so a dictionary-
+    # encoded (categorical) operand is aggregated through a decoded copy under a
+    # private name. Group *keys* stay as-is: hash grouping handles dictionaries and
+    # the key column keeps the user's type in the output.
+    import pyarrow as pa
+
+    operand: dict[str, str] = {}
+    for a in aggs:
+        col = a["column"]
+        if col in operand:
+            continue
+        operand[col] = col
+        if pa.types.is_dictionary(table.schema.field(col).type):
+            tmp = f"__ursa_decoded_{col}"
+            while tmp in table.column_names:
+                tmp += "_"
+            operand[col] = tmp
+            table = table.append_column(tmp, _decode_dictionary(table.column(col)))
     specs = []
     seen_specs: set[tuple[str, str]] = set()
     for a in aggs:
-        spec = (a["column"], _PC_AGG[a["fn"]])
+        spec = (operand[a["column"]], _PC_AGG[a["fn"]])
         if spec not in seen_specs:
             seen_specs.add(spec)
             specs.append(spec)
     grouped = table.combine_chunks().group_by(keys).aggregate(specs)
     cols = {name: grouped.column(name) for name in grouped.column_names}
-    import pyarrow as pa
 
     ordered_names = list(keys)
     ordered_cols = [cols[k] for k in keys]
     for a in aggs:
         ordered_names.append(a["output"])
-        ordered_cols.append(cols[f"{a['column']}_{_PC_AGG[a['fn']]}"])
+        ordered_cols.append(cols[f"{operand[a['column']]}_{_PC_AGG[a['fn']]}"])
     return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
+
+
+def _decode_dictionary(column: Any) -> Any:
+    """A dictionary-encoded (categorical) column decoded to its value type; any
+    other column is returned unchanged."""
+    import pyarrow as pa
+
+    if pa.types.is_dictionary(column.type):
+        return column.cast(column.type.value_type)
+    return column
+
+
+def _sort_pyarrow(table: Any, by: str, descending: bool) -> Any:
+    """Stable-sort ``table`` by column ``by`` (nulls last). pyarrow has no sort
+    kernel for dictionary arrays, so the sort *key* is decoded — ordering by the
+    values (lexicographic for strings), never the dictionary indices — while the
+    output keeps the original (dictionary) column."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    key = pa.table({"key": _decode_dictionary(table.column(by))})
+    order = "descending" if descending else "ascending"
+    return table.take(pc.sort_indices(key, sort_keys=[("key", order)]))  # ty: ignore[unresolved-attribute]
 
 
 def _apply_pyarrow_tail(
@@ -1657,7 +1700,7 @@ def _apply_pyarrow_tail(
         by, descending = sort
         if by not in table.column_names:
             raise ValueError(f"sort references unknown column '{by}'.")
-        table = table.sort_by([(by, "descending" if descending else "ascending")])
+        table = _sort_pyarrow(table, by, descending)
     if limit is not None:
         table = table.slice(0, limit)
     if rename:
@@ -1720,19 +1763,41 @@ def _collect_plain_edges(
 ) -> MaterializedFrame:
     # On a plain edge table, ur.src()/dst() resolve to the frame's real endpoint cols.
     roles = {"src": frame.src_col, "dst": frame.dst_col}
-    table = _edge_source_table(frame)
+    # As for a node scan: when a select narrows the output, a scan need only read the
+    # endpoints, whatever the filter/sort touch, any rename source column, and the
+    # selected columns (a rename *target* is a new label, not a file column). A
+    # distinct runs over every column before the select, and a group_by needs its
+    # keys and agg columns, so either reads the whole file.
+    file_needed: list[str] | None = None
+    if select is not None and group_by is None and not distinct:
+        rename = rename or {}
+        referenced: set[str] = set(rename)
+        for p in filters:
+            referenced |= _expr_columns(p, roles)
+        if sort is not None:
+            referenced.add(sort[0])
+        selected_file = set(select) - set(rename.values())
+        file_needed = sorted({frame.src_col, frame.dst_col} | referenced | selected_file)
+    table = _edge_source_table(frame, file_needed)
     table = _apply_pyarrow_tail(
         table, filters, sort, limit, roles, sample, rename, distinct, group_by
     )
     return _apply_select(MaterializedFrame(table), select)
 
 
-def _edge_source_table(frame: EdgeFrame) -> Any:
+def _edge_source_table(frame: EdgeFrame, columns: list[str] | None = None) -> Any:
     """The raw edge rows of an edge frame as a pyarrow.Table — the full in-memory
     edge table, or a fresh scan of its ``scan_edges`` source. For a traversal-result
     frame (#116) this resolves to the *parent* edge rows (the CSR the traversal masks;
     its own ``src``/``dst`` are the synthetic reached-pair columns). Raises the precise
-    plan-aware error for a frame with no materializable source."""
+    plan-aware error for a frame with no materializable source.
+
+    A scan reads every column of the file, named, ordered and typed as the same file
+    read into memory and passed to ``EdgeFrame`` (string_view read as string), so a
+    scanned frame collects exactly what an in-memory one does (#160). ``columns`` is
+    a scan projection pushdown: when given, only those columns (plus the endpoints)
+    are read, in file order; ``None`` reads all of them. It is ignored for an
+    in-memory table (already resident)."""
     import pyarrow as pa
 
     frame = _parent_edges(frame)  # traversal -> the parent rows the topology is built from
@@ -1747,12 +1812,12 @@ def _edge_source_table(frame: EdgeFrame) -> Any:
                 "collect() over a scan_edges source supports a single string path "
                 "(glob included) for now, not a list of paths."
             )
-        batches = _native().scan_edges_arrow(
-            path, scan["src"], scan["dst"], _scan_storage_options(scan), []
+        batches = _native().scan_edges_table_arrow(
+            path, scan["src"], scan["dst"], _scan_storage_options(scan), columns or []
         )
         if scan.get("on_null") == "drop":
-            batches = _drop_null_endpoint_batches(batches)
-        return pa.Table.from_batches(batches).rename_columns([scan["src"], scan["dst"]])
+            batches = _drop_null_endpoint_batches(batches, (scan["src"], scan["dst"]))
+        return pa.Table.from_batches(batches)
     # No source: a filtered/derived (or traversal-result) edge frame.
     _require_edges(frame)  # raises the precise, plan-aware message
     raise AssertionError("unreachable")  # _require_edges always raises here
@@ -1767,8 +1832,8 @@ def _edge_mask_for(edges: EdgeFrame | None, index: Any) -> Any | None:
     * ``filter`` (#114): each predicate is evaluated over the *parent* edge rows (the
       same rows, in the same order, the topology was built from — via
       ``_edge_source_table``); repeated ``.filter()`` calls intersect. Endpoint
-      predicates (``ur.src()``/``ur.dst()``) and, for in-memory frames, edge-attribute
-      columns are supported; a scan frame's mask can reference only the endpoints.
+      predicates (``ur.src()``/``ur.dst()``) and edge-attribute columns are supported;
+      a scan reads only the endpoints and the columns the predicates reference.
     * ``hop``/``shortest_path`` (#116): the traversal produces a reached node *set*
       (run over ``index``, the parent CSR); the mask keeps an edge iff **both**
       endpoints are reached — the induced subgraph of the reached region.
@@ -1785,9 +1850,13 @@ def _edge_mask_for(edges: EdgeFrame | None, index: Any) -> Any | None:
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    table = _edge_source_table(edges)  # parent edge rows, topology row order
     parent = _parent_edges(edges)
     roles = {"src": parent.src_col, "dst": parent.dst_col}
+    needed = {parent.src_col, parent.dst_col}
+    for predicate in predicates:
+        needed |= _expr_columns(predicate, roles)
+    # Parent edge rows in topology row order, projected to what the mask reads.
+    table = _edge_source_table(edges, sorted(needed))
     and_ = pc.and_  # ty: ignore[unresolved-attribute]
     mask = None
 

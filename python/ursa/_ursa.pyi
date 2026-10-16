@@ -155,7 +155,7 @@ def graph_diameter(index: GraphIndex, approximate: bool, direction: str = ...) -
 def graph_describe(index: GraphIndex, full: bool, direction: str = ...) -> Any: ...
 
 # Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> a
-# list[pyarrow.RecordBatch] of (src, dst[, weight cols]). storage_options seeds
+# list[pyarrow.RecordBatch] of (src, dst[, weight cols by name]). storage_options seeds
 # the object-store backend.
 def scan_edges_arrow(
     path: str,
@@ -163,6 +163,18 @@ def scan_edges_arrow(
     dst: str,
     storage_options: dict[str, str] | None = ...,
     weight_columns: list[str] = ...,
+) -> Any: ...
+
+# Scan a Parquet/CSV edge file as a table for the relational paths -> a
+# list[pyarrow.RecordBatch] of every column (file names/types, string_view read
+# as string; endpoints validated, not cast). `columns` is a projection pushdown:
+# non-empty reads only those columns plus src/dst, in file order.
+def scan_edges_table_arrow(
+    path: str,
+    src: str,
+    dst: str,
+    storage_options: dict[str, str] | None = ...,
+    columns: list[str] = ...,
 ) -> Any: ...
 
 # Scan a Parquet/CSV node file -> list[pyarrow.RecordBatch] of the attribute
