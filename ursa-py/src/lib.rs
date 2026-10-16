@@ -208,7 +208,7 @@ fn _topology_build_count() -> usize {
 /// `columns_json` is the query's output-column IR (a JSON list of
 /// `{name, kind, ...params}`); each `filters` entry is a serialized predicate-
 /// expression JSON string (lowered through the shared `crate::expr` seam);
-/// `sort` is `(column, descending)`. The GIL is released across build + compute.
+/// `sort` is a list of `(column, descending)` keys (lexicographic, nulls last). The GIL is released across build + compute.
 #[pyfunction]
 #[pyo3(signature = (index, columns_json, filters, sort=None, limit=None, nodes=None, nodes_id=None, edges=None, distinct=false, sample=None, rename=Vec::new(), group_keys=Vec::new(), aggs=Vec::new(), edge_mask=None))]
 #[allow(clippy::too_many_arguments)]
@@ -217,7 +217,7 @@ fn run_node_query(
     index: PyRef<'_, GraphIndex>,
     columns_json: &str,
     filters: Vec<String>,
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     nodes: Option<Bound<'_, PyAny>>,
     nodes_id: Option<String>,
@@ -284,7 +284,7 @@ fn run_join_query(
     on: Vec<String>,
     how: String,
     filters: Vec<String>,
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -319,7 +319,7 @@ fn run_hop_query(
     n: u32,
     direction: &str,
     filters: Vec<String>,
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -365,7 +365,7 @@ fn run_path_query(
     weight: Option<String>,
     edges: Option<Bound<'_, PyAny>>,
     filters: Vec<String>,
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,
@@ -473,7 +473,7 @@ fn run_walk_query(
     walks_per_node: u32,
     seed: Option<u64>,
     filters: Vec<String>,
-    sort: Option<(String, bool)>,
+    sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
     distinct: bool,
     sample: Option<(usize, Option<u64>)>,

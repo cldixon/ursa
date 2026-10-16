@@ -74,7 +74,7 @@ The steps run in the order you write them, as in Polars. Each one sees the rows 
 | Method | Description |
 |---|---|
 | `.filter(predicate)` | Keeps the rows where the [expression](expressions.md) is true. On an `EdgeFrame` before `nodes()`, the filter selects a subgraph. |
-| `.sort(by, *, descending=False)` | Sorts by one column name. |
+| `.sort(by, *more_by, descending=False)` | Sorts by one or more columns. `by` is a column name or a list of names, and `more_by` adds more. Later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column. On a plain frame the sort is stable. After a graph algorithm or a traversal, rows that tie on every column come back in no fixed order, so end with a unique column such as `id` when the order matters. |
 | `.head(n=10)` | Keeps the first `n` rows. `.limit(n)` is the same method. |
 | `.distinct()` | Removes duplicate rows. |
 | `.sample(n, *, seed=None)` | Keeps `n` random rows. `seed` makes the choice reproducible. |

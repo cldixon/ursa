@@ -708,7 +708,7 @@ def _run_query(
     edges: EdgeFrame | None,
     columns: list[dict[str, Any]],
     filters: list[Any],
-    sort: tuple[str, bool] | None,
+    sort: list[tuple[str, bool]] | None,
     limit: int | None,
     nodes: Any | None = None,
     nodes_id: str | None = None,
@@ -1181,24 +1181,40 @@ def _parse_group_agg(step: _PlanStep) -> tuple[list[str], list[str], list[dict[s
     return keys, engine_aggs, plain_aggs
 
 
-def _parse_sort(args: dict[str, Any]) -> tuple[str, bool]:
+def _parse_sort(args: dict[str, Any]) -> list[tuple[str, bool]]:
+    """Parse a ``sort`` step into ``[(column, descending), ...]`` keys, in order.
+
+    ``by`` is a column name / ``ur.col(name)`` or a list of them; ``descending`` is
+    one bool for every key or a list with one bool per key."""
     by = args["by"]
-    if not isinstance(by, str):
-        raise NotImplementedError(
-            "collect() sort supports a single column name for now "
-            "(e.g. .sort('pagerank', descending=True))."
-        )
-    return (by, bool(args.get("descending", False)))
+    items = list(by) if isinstance(by, (list, tuple)) else [by]
+    if not items:
+        raise ValueError("sort() needs at least one column (got an empty list).")
+    names: list[str] = []
+    for k in items:
+        if isinstance(k, str):
+            names.append(k)
+        elif getattr(k, "kind", None) == "col":
+            names.append(k.payload["name"])
+        else:
+            raise ValueError(f"sort() keys must be column names or ur.col(<name>); got {k!r}.")
+    descending = args.get("descending", False)
+    if isinstance(descending, (list, tuple)):
+        if len(descending) != len(names):
+            raise ValueError(
+                f"sort() got {len(descending)} descending flag(s) for {len(names)} "
+                f"column(s); pass one bool, or one per column."
+            )
+        flags = [bool(d) for d in descending]
+    else:
+        flags = [bool(descending)] * len(names)
+    return list(zip(names, flags, strict=True))
 
 
-def _sort_columns(sort: Any) -> set[str]:
-    """The column name(s) a parsed sort reads — for scan projection pushdown. Reads
-    every name in the parsed value, so it holds for any sort-key representation."""
-    if isinstance(sort, str):
-        return {sort}
-    if isinstance(sort, (tuple, list)):
-        return set().union(*(_sort_columns(s) for s in sort))
-    return set()
+def _sort_columns(sort: list[tuple[str, bool]]) -> set[str]:
+    """Every column a parsed sort reads (all of its keys) — for scan projection
+    pushdown."""
+    return {name for name, _ in sort}
 
 
 # --- the ordered relational tail -------------------------------------------
@@ -1250,7 +1266,7 @@ class _EngineTail:
     group_by: tuple[list[str], list[str], list[dict[str, str]]] | None = None
     distinct: bool = False
     sample: tuple[int, int | None] | None = None
-    sort: Any = None
+    sort: list[tuple[str, bool]] | None = None
     limit: int | None = None
     rename: dict[str, str] = field(default_factory=dict)
     select: list[str] | None = None
@@ -1374,11 +1390,11 @@ def _projection(
     return None
 
 
-def _apply_pyarrow_sort(table: Any, sort: Any) -> Any:
-    by, descending = sort
-    if by not in table.column_names:
-        raise ValueError(f"sort references unknown column '{by}'.")
-    return _sort_pyarrow(table, by, descending)
+def _apply_pyarrow_sort(table: Any, sort: list[tuple[str, bool]]) -> Any:
+    for by, _ in sort:
+        if by not in table.column_names:
+            raise ValueError(f"sort references unknown column '{by}'.")
+    return _sort_pyarrow(table, sort)
 
 
 def _apply_pyarrow_steps(table: Any, steps: list[_Step], roles: dict[str, str]) -> Any:
@@ -1677,17 +1693,24 @@ def _decode_dictionary(column: Any) -> Any:
     return column
 
 
-def _sort_pyarrow(table: Any, by: str, descending: bool) -> Any:
-    """Stable-sort ``table`` by column ``by`` (nulls last). pyarrow has no sort
-    kernel for dictionary arrays, so the sort *key* is decoded — ordering by the
-    values (lexicographic for strings), never the dictionary indices — while the
-    output keeps the original (dictionary) column."""
+def _sort_pyarrow(table: Any, keys: list[tuple[str, bool]]) -> Any:
+    """Stable-sort ``table`` lexicographically by ``keys`` — ``(column,
+    descending)`` pairs, later keys breaking ties in earlier ones — with nulls last
+    for every key. pyarrow has no sort kernel for dictionary arrays, so each sort
+    *key* is decoded — ordering by the values (lexicographic for strings), never
+    the dictionary indices — while the output keeps the original (dictionary)
+    columns."""
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    key = pa.table({"key": _decode_dictionary(table.column(by))})
-    order = "descending" if descending else "ascending"
-    return table.take(pc.sort_indices(key, sort_keys=[("key", order)]))  # ty: ignore[unresolved-attribute]
+    key_table = pa.table(
+        {f"k{i}": _decode_dictionary(table.column(by)) for i, (by, _) in enumerate(keys)}
+    )
+    sort_keys = [
+        (f"k{i}", "descending" if descending else "ascending")
+        for i, (_, descending) in enumerate(keys)
+    ]
+    return table.take(pc.sort_indices(key_table, sort_keys=sort_keys))  # ty: ignore[unresolved-attribute]
 
 
 def _collect_plain_nodes(frame: NodeFrame, steps: list[_Step]) -> MaterializedFrame:
