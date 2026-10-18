@@ -8,6 +8,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Unsorted output now has a fixed row order on the engine paths that had none:
+  an attribute frame with graph algorithms (`ur.from_arrow(attrs, id=...)
+  .with_columns(pr=ur.pagerank(edges))`) returns the attribute table's row
+  order, and `join()` returns the left rows in order, each followed by its
+  matches in right-frame order. `group_by().agg()` and `distinct()` return rows
+  in order of first appearance, and `sample()` keeps its picks in input order,
+  on every path including plain frames. `head(n)` takes the first `n` rows of
+  that order. Before, the order changed with the number of CPUs (DataFusion's
+  partition count) on large inputs (#168).
+
 ## [0.4.0] — 2026-10-18
 
 ### Added

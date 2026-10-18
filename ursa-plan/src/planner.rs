@@ -19,7 +19,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::physical::{GraphAlgorithmExec, HopExec, RandomWalkExec, ShortestPathExec};
@@ -101,7 +101,14 @@ impl QueryPlanner for GraphQueryPlanner {
 
 /// A `SessionContext` configured to plan and execute Ursa graph queries.
 pub fn graph_session() -> SessionContext {
+    graph_session_with_config(SessionConfig::new())
+}
+
+/// [`graph_session`] with an explicit `SessionConfig` (tests pin
+/// `target_partitions` with it).
+pub fn graph_session_with_config(config: SessionConfig) -> SessionContext {
     let state = SessionStateBuilder::new()
+        .with_config(config)
         .with_default_features()
         .with_query_planner(Arc::new(GraphQueryPlanner))
         .build();

@@ -29,7 +29,7 @@ use datafusion::common::Column;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::functions_aggregate::expr_fn::min;
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
-use datafusion::prelude::{col, DataFrame, SessionContext};
+use datafusion::prelude::{coalesce, col, lit, DataFrame, SessionContext};
 use serde::Deserialize;
 use ursa_core::algo::AggKind;
 use ursa_core::{EdgeMask, IdMap, Topology};
@@ -340,11 +340,14 @@ struct Tail<'a> {
     /// `(old, new)` output-column relabels, applied last.
     rename: &'a [(String, String)],
     /// The hidden row-ordinal columns the base frame carries (see [`Tiebreak`]),
-    /// most significant first; empty when the query has no sort.
+    /// most significant first. Empty when the output order needs no ordinal: an
+    /// unsorted query over an order-stable leaf.
     tiebreak: Vec<String>,
 }
 
-/// The implicit final sort key that makes an engine `sort` deterministic (#165).
+/// The hidden row ordinal that gives engine output a fixed row order: the
+/// implicit final key of an engine `sort` (#165), and the order of unsorted output
+/// on the paths whose base frame or tail has no order of its own (#168).
 ///
 /// DataFusion's sort is not stable: it sorts each partition with an unstable
 /// kernel and merges the partitions with no input order among equal keys, so rows
@@ -353,11 +356,21 @@ struct Tail<'a> {
 /// machine's cores). A plain frame sorts stably in pyarrow, so ties keep their
 /// input order there. To give the engine the same guarantee, a query with a sort
 /// tags each base row with its position in a hidden `UInt64` ordinal column,
-/// sorts by it as the last, ascending key, and drops it after the sort. Queries without a sort carry no
-/// ordinal. A full sort by one numeric key (the common case, and the tie-heavy
-/// one) sorts `(key, ordinal)` integer pairs itself
-/// ([`sort_by_key_then_ordinal`]); any other sort, and every top-k, hands the
-/// ordinal to DataFusion as a final sort expression.
+/// sorts by it as the last, ascending key, and drops it after the sort. A full
+/// sort by one numeric key (the common case, and the tie-heavy one) sorts
+/// `(key, ordinal)` integer pairs itself ([`sort_by_key_then_ordinal`]); any other
+/// sort, and every top-k, hands the ordinal to DataFusion as a final sort
+/// expression.
+///
+/// Unsorted output has the same problem wherever DataFusion repartitions: a hash
+/// join (the attribute frame's LEFT join onto the algorithm output, and `join`)
+/// and a hash aggregate (`group_by`, `distinct`) emit rows in an order that
+/// depends on the partition count. So the attribute and join paths always number
+/// their base rows, and a graph or traversal leaf does when its tail groups,
+/// dedups or samples. An unsorted query that carries the ordinal ends with an
+/// order by it ([`order_by_ordinals`]), so its rows follow input order, as on the
+/// plain frame. An unsorted leaf query without those steps keeps the leaf's own
+/// deterministic order (one partition, never repartitioned) and pays nothing.
 ///
 /// What "input order" means on each path:
 /// - graph-derived frame (`edges.nodes().with_columns(...)`): the algorithm
@@ -374,8 +387,9 @@ struct Tail<'a> {
 ///
 /// The ordinal survives the tail steps before the sort: `filter` keeps it,
 /// `group_by` and `distinct` carry `min(ordinal)` (so a group or distinct row
-/// takes the position of its first input row), and `sample` keeps each picked
-/// row's ordinal.
+/// takes the position of its first input row, so unsorted groups come out in
+/// first-occurrence order), and `sample` keeps each picked row's ordinal (so an
+/// unsorted sample comes out in input order).
 struct Tiebreak;
 
 impl Tiebreak {
@@ -435,16 +449,17 @@ impl Tiebreak {
     }
 
     /// The base frame of a traversal/graph leaf plan, with an ordinal column when
-    /// `sorted`. Every Ursa leaf emits a single partition in a deterministic order
-    /// (and materializes its whole output before emitting it), so collecting it and
-    /// numbering the rows captures the unsorted output order at no extra memory.
+    /// `numbered` (see [`Tiebreak::leaf_needs`]). Every Ursa leaf emits a single
+    /// partition in a deterministic order (and materializes its whole output before
+    /// emitting it), so collecting it and numbering the rows captures the unsorted
+    /// output order at no extra memory.
     async fn leaf(
         ctx: &SessionContext,
         plan: LogicalPlan,
-        sorted: bool,
+        numbered: bool,
     ) -> Result<(DataFrame, Vec<String>)> {
         let df = ctx.execute_logical_plan(plan).await?;
-        if !sorted {
+        if !numbered {
             return Ok((df, vec![]));
         }
         let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
@@ -456,6 +471,58 @@ impl Tiebreak {
         let df = ctx.read_batches(Self::attach(batches, &name)?)?;
         Ok((df, vec![name]))
     }
+
+    /// Whether a graph/traversal leaf needs the ordinal: under a sort (for ties),
+    /// or when an unsorted tail groups, dedups or samples. A leaf's own output
+    /// order is deterministic, but a hash aggregate repartitions it and the
+    /// engine's sample emits its picks in a content order; the ordinal restores
+    /// input order.
+    fn leaf_needs(
+        sort: &Option<Vec<(String, bool)>>,
+        grouped: bool,
+        distinct: bool,
+        sample: &Option<(usize, Option<u64>)>,
+    ) -> bool {
+        has_sort(sort) || grouped || distinct || sample.is_some()
+    }
+}
+
+/// The `n` of a tail that is only an unsorted `head(n)` (a `rename` aside): its
+/// output is the first `n` base rows in input order, so a base whose every input
+/// row yields at least one output row, in input-row order, can drop the rest of
+/// its input up front (see [`take_prefix`]).
+fn bare_limit(
+    filters: &[String],
+    group_keys: &[String],
+    distinct: bool,
+    sample: &Option<(usize, Option<u64>)>,
+    sort: &Option<Vec<(String, bool)>>,
+    limit: Option<usize>,
+) -> Option<usize> {
+    let bare = filters.is_empty()
+        && group_keys.is_empty()
+        && !distinct
+        && sample.is_none()
+        && !has_sort(sort);
+    limit.filter(|_| bare)
+}
+
+/// The first `n` rows of `batches` (all of them for `None`), zero-copy. Keeps at
+/// least one (possibly empty) batch so the schema survives.
+fn take_prefix(batches: Vec<RecordBatch>, n: Option<usize>) -> Vec<RecordBatch> {
+    let Some(mut left) = n else {
+        return batches;
+    };
+    let mut out = Vec::new();
+    for b in batches {
+        if left == 0 && !out.is_empty() {
+            break;
+        }
+        let take = left.min(b.num_rows());
+        out.push(b.slice(0, take));
+        left -= take;
+    }
+    out
 }
 
 /// Whether a tail sort is present (an empty key list is no sort).
@@ -610,6 +677,10 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
                 }
             }
         }
+    } else if !tail.tiebreak.is_empty() {
+        // Unsorted, but the base or a tail step has no order of its own: the rows
+        // follow input order (#168), and a limit keeps the first `n` of them.
+        df = order_by_ordinals(ctx, df, &tail.tiebreak, tail.limit).await?;
     } else if let Some(n) = tail.limit {
         df = df.limit(0, Some(n))?;
     }
@@ -644,13 +715,175 @@ where
         &'c SessionContext,
     ) -> Pin<Box<dyn Future<Output = Result<(DataFrame, Vec<String>)>> + 'c>>,
 {
+    let ctx = query_session();
     crate::runtime::block_on(async move {
-        let ctx = graph_session();
         let (base, tiebreak) = build(&ctx).await?;
         tail.tiebreak = tiebreak;
         let df = apply_tail(&ctx, base, tail).await?;
         collect_batches(df).await
     })?
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pins the query session's `target_partitions` in unit tests (read on the
+    /// calling thread, before the query moves onto the runtime).
+    static TEST_PARTITIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The session a query runs on: [`graph_session`], whose `target_partitions`
+/// follows the machine's cores.
+fn query_session() -> SessionContext {
+    #[cfg(test)]
+    if let Some(p) = TEST_PARTITIONS.with(|c| c.get()) {
+        return crate::planner::graph_session_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(p),
+        );
+    }
+    graph_session()
+}
+
+/// End an unsorted query whose rows carry the ordinal(s) with an order by them
+/// (ascending, nulls last), then drop them (#168). With a `limit` this is
+/// DataFusion's top-k on the ordinal, which streams and keeps only `n` rows (the
+/// optimizer never moves a limit below a sort, so `head(n)` is the first `n` rows
+/// in input order). Without one, a single ordinal goes through
+/// [`sort_by_ordinal`], which passes input that is already in order through.
+async fn order_by_ordinals(
+    ctx: &SessionContext,
+    df: DataFrame,
+    ords: &[String],
+    limit: Option<usize>,
+) -> Result<DataFrame> {
+    let names: Vec<&str> = ords.iter().map(String::as_str).collect();
+    let by = || -> Vec<_> {
+        ords.iter()
+            .map(|o| col_named(o).sort(true, false))
+            .collect()
+    };
+    if let Some(n) = limit {
+        return df.sort(by())?.limit(0, Some(n))?.drop_columns(&names);
+    }
+    let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+    // Partition by partition, in partition order; only speed depends on this.
+    let batches: Vec<RecordBatch> = df
+        .collect_partitioned()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+    let schema = batches.first().map(|b| b.schema()).unwrap_or(schema);
+    if let [ord] = ords {
+        if let Some(sorted) = sort_by_ordinal(&batches, &schema, ord)? {
+            return ctx.read_batches(sorted);
+        }
+    }
+    let df = if batches.is_empty() {
+        ctx.read_batch(RecordBatch::new_empty(schema))?
+    } else {
+        ctx.read_batches(batches)?
+    };
+    df.sort(by())?.drop_columns(&names)
+}
+
+/// Order collected batches by the single, non-null `UInt64` ordinal column `ord`
+/// and drop it: the unsorted-output counterpart of [`sort_by_key_then_ordinal`],
+/// sharing its already-in-order pass-through ([`emit_in_order`]). The ordinal is
+/// unique per row on every path that carries one (a base row's position, or a
+/// group's first position), so `(ordinal, position)` pairs order the rows.
+/// `None` (nothing done) past `u32::MAX` rows.
+fn sort_by_ordinal(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    ord: &str,
+) -> Result<Option<Vec<RecordBatch>>> {
+    use arrow::array::UInt32Array;
+    use rayon::prelude::*;
+    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+
+    let keep: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| schema.field(i).name() != ord)
+        .collect();
+    let out_schema = Arc::new(schema.project(&keep).map_err(arrow_err)?);
+    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if r > u32::MAX as usize {
+        return Ok(None);
+    }
+    let ord_i = schema.index_of(ord).map_err(arrow_err)?;
+    let mut keys: Vec<(u64, u32)> = Vec::with_capacity(r);
+    let mut pos = 0u32;
+    for b in batches {
+        let ords = b
+            .column(ord_i)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| DataFusionError::Internal("tiebreak column is not u64".into()))?;
+        if ords.null_count() > 0 {
+            return Ok(None);
+        }
+        keys.extend(ords.values().iter().zip(pos..).map(|(&o, p)| (o, p)));
+        pos += b.num_rows() as u32;
+    }
+    // Count the ascending runs: one is input already in order (passed through);
+    // a few long ones (a hash join emits each partition's rows in probe order)
+    // merge in near-linear time with the adaptive merge sort; many short ones
+    // (a shuffled order) sort faster with the unstable pattern-defeating sort.
+    let runs = 1 + keys.windows(2).filter(|w| w[0] > w[1]).count();
+    let indices = if runs == 1 {
+        None
+    } else {
+        if runs <= keys.len() / 1024 {
+            keys.par_sort();
+        } else {
+            keys.par_sort_unstable();
+        }
+        Some(UInt32Array::from_iter_values(keys.iter().map(|&(_, p)| p)))
+    };
+    drop(keys);
+    emit_in_order(batches, out_schema, &keep, indices.as_ref()).map(Some)
+}
+
+/// The `keep` columns of `batches` as one batch, rows gathered by `indices`
+/// (positions across the batches), or in their current order for `None` (no
+/// gather, one concatenation). The result is a single batch: a scan of several
+/// in-memory batches may be split across partitions and come back out of order.
+fn emit_in_order(
+    batches: &[RecordBatch],
+    out_schema: SchemaRef,
+    keep: &[usize],
+    indices: Option<&arrow::array::UInt32Array>,
+) -> Result<Vec<RecordBatch>> {
+    use arrow::compute::{concat, take};
+    use rayon::prelude::*;
+    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+    if batches.iter().all(|b| b.num_rows() == 0) {
+        return Ok(vec![RecordBatch::new_empty(out_schema)]);
+    }
+    let Some(indices) = indices else {
+        let parts: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                RecordBatch::try_new(
+                    out_schema.clone(),
+                    keep.iter().map(|&i| b.column(i).clone()).collect(),
+                )
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(arrow_err)?;
+        let one = arrow::compute::concat_batches(&out_schema, &parts).map_err(arrow_err)?;
+        return Ok(vec![one]);
+    };
+    let cols = keep
+        .par_iter()
+        .map(|&i| {
+            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(i).as_ref()).collect();
+            let c = concat(&parts).map_err(arrow_err)?;
+            take(c.as_ref(), indices, None).map_err(arrow_err)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(vec![
+        RecordBatch::try_new(out_schema, cols).map_err(arrow_err)?
+    ])
 }
 
 /// Whether [`normalized_key`] covers a key of this type.
@@ -721,7 +954,6 @@ fn sort_by_key_then_ordinal(
     ord: &str,
 ) -> Result<Option<Vec<RecordBatch>>> {
     use arrow::array::UInt32Array;
-    use arrow::compute::{concat, take};
     use rayon::prelude::*;
     let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
 
@@ -777,21 +1009,8 @@ fn sort_by_key_then_ordinal(
     }
     if nulls.is_empty() && valid.windows(2).all(|w| w[0] <= w[1]) {
         // Already in order (a traversal sorted by `src`, say): no sort or gather,
-        // just one concatenation. The result must be a single batch: a scan of
-        // several in-memory batches may be split across partitions and come back
-        // out of order.
-        let parts: Vec<RecordBatch> = batches
-            .iter()
-            .map(|b| {
-                RecordBatch::try_new(
-                    out_schema.clone(),
-                    keep.iter().map(|&i| b.column(i).clone()).collect(),
-                )
-            })
-            .collect::<std::result::Result<_, _>>()
-            .map_err(arrow_err)?;
-        let one = arrow::compute::concat_batches(&out_schema, &parts).map_err(arrow_err)?;
-        return Ok(Some(vec![one]));
+        // just one concatenation.
+        return emit_in_order(batches, out_schema, &keep, None).map(Some);
     }
     valid.par_sort_unstable();
     nulls.par_sort_unstable();
@@ -802,17 +1021,7 @@ fn sort_by_key_then_ordinal(
             .chain(nulls.iter().map(|&(_, p)| p)),
     );
     drop((valid, nulls));
-    let cols = keep
-        .iter()
-        .map(|&i| {
-            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(i).as_ref()).collect();
-            let c = concat(&parts).map_err(arrow_err)?;
-            take(c.as_ref(), &indices, None).map_err(arrow_err)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(vec![
-        RecordBatch::try_new(out_schema, cols).map_err(arrow_err)?
-    ]))
+    emit_in_order(batches, out_schema, &keep, Some(&indices)).map(Some)
 }
 
 /// Deterministically sample `n` rows (without replacement) from a collected batch
@@ -1043,7 +1252,10 @@ pub fn execute_node_query(
     let graph_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
     });
-    let sorted = has_sort(&sort);
+    let numbered_leaf = Tiebreak::leaf_needs(&sort, !group_keys.is_empty(), distinct, &sample);
+    // The LEFT join emits exactly one row per table row, so a bare unsorted
+    // `head(n)` needs only the table's first `n` rows.
+    let prefix = bare_limit(filters, &group_keys, distinct, &sample, &sort, limit);
 
     run_query(
         move |ctx| {
@@ -1051,19 +1263,19 @@ pub fn execute_node_query(
                 // Base frame: either the graph output alone, or a node attribute
                 // table with the graph output left-joined onto it by id.
                 Ok(match nodes {
-                    Some(mut batches) => {
+                    Some(batches) => {
+                        let batches = take_prefix(batches, prefix);
                         let graph_df = ctx.execute_logical_plan(graph_plan).await?;
                         let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
-                        // Under a sort, ties keep the attribute table's row order: the
-                        // LEFT join emits each table row once, so number those rows.
-                        let mut tiebreak = vec![];
-                        if sorted {
-                            let schemas: Vec<&Schema> =
-                                batches.iter().map(|b| b.schema_ref().as_ref()).collect();
-                            let name = Tiebreak::fresh_name("", &schemas);
-                            batches = Tiebreak::attach(batches, &name)?;
-                            tiebreak.push(name);
-                        }
+                        // The LEFT join emits each table row once, in an order that
+                        // depends on the partition count; number the table's rows so
+                        // unsorted output, and ties under a sort, follow the table's
+                        // row order.
+                        let schemas: Vec<&Schema> =
+                            batches.iter().map(|b| b.schema_ref().as_ref()).collect();
+                        let name = Tiebreak::fresh_name("", &schemas);
+                        let batches = Tiebreak::attach(batches, &name)?;
+                        let tiebreak = vec![name];
                         let nodes_df = ctx.read_batches(batches)?;
                         // Rename the graph id so the join keys don't collide, then drop it.
                         let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
@@ -1078,7 +1290,7 @@ pub fn execute_node_query(
                             .drop_columns(&["__ursa_gid"])?;
                         (joined, tiebreak)
                     }
-                    None => Tiebreak::leaf(ctx, graph_plan, sorted).await?,
+                    None => Tiebreak::leaf(ctx, graph_plan, numbered_leaf).await?,
                 })
             })
         },
@@ -1146,28 +1358,32 @@ pub fn execute_join_query(
             )));
         }
     };
-    let sorted = has_sort(&sort);
+    let prefix = bare_limit(filters, &[], distinct, &sample, &sort, limit);
     run_query(
         move |ctx| {
             Box::pin(async move {
-                let (mut left, mut right) = (left, right);
-                // Under a sort, ties follow the left row's position, then the right
-                // row's (null, so last, for an unmatched left-join row): the order of
-                // a left-major nested-loop join. A join's output order is otherwise
-                // hash-partition dependent.
-                let mut tiebreak = vec![];
-                if sorted {
-                    let schemas: Vec<&Schema> = left
-                        .iter()
-                        .chain(right.iter())
-                        .map(|b| b.schema_ref().as_ref())
-                        .collect();
-                    let l = Tiebreak::fresh_name("_l", &schemas);
-                    let r = Tiebreak::fresh_name("_r", &schemas);
-                    left = Tiebreak::attach(left, &l)?;
-                    right = Tiebreak::attach(right, &r)?;
-                    tiebreak = vec![l, r];
-                }
+                // A hash join's output order depends on the partition count. Rows
+                // follow the left row's position, then the right row's (null, so
+                // last, for an unmatched left-join row): the order of a left-major
+                // nested-loop join, for unsorted output and for ties under a sort.
+                let schemas: Vec<&Schema> = left
+                    .iter()
+                    .chain(right.iter())
+                    .map(|b| b.schema_ref().as_ref())
+                    .collect();
+                let l = Tiebreak::fresh_name("_l", &schemas);
+                let r = Tiebreak::fresh_name("_r", &schemas);
+                let combined = Tiebreak::fresh_name("", &schemas);
+                // A LEFT join emits at least one row per left row, so a bare
+                // unsorted `head(n)` needs only the first `n` left rows.
+                let left = match join_type {
+                    JoinType::Left => take_prefix(left, prefix),
+                    _ => left,
+                };
+                let left_rows: usize = left.iter().map(|b| b.num_rows()).sum();
+                let right_rows: usize = right.iter().map(|b| b.num_rows()).sum();
+                let left = Tiebreak::attach(left, &l)?;
+                let right = Tiebreak::attach(right, &r)?;
                 let left_df = ctx.read_batches(left)?;
                 let mut right_df = ctx.read_batches(right)?;
                 // Rename each right key to a private sentinel so the join keys don't
@@ -1182,7 +1398,23 @@ pub fn execute_join_query(
                 let joined = left_df
                     .join(right_df, join_type, &left_keys, &right_keys, None)?
                     .drop_columns(&sentinel_refs)?;
-                Ok((joined, tiebreak))
+                // Fold the pair into one ordinal, `l * (R + 1) + coalesce(r, R)`,
+                // which orders exactly like `(l, r nulls last)` and is unique per
+                // joined row: a single ordinal takes the integer fast paths, and a
+                // `distinct` row's `min` is its first row's position. Two columns
+                // remain only when the product could overflow a u64.
+                let span = right_rows as u128 + 1;
+                if (left_rows as u128) * span <= u64::MAX as u128 {
+                    let span = span as u64;
+                    let ord =
+                        col_named(&l) * lit(span) + coalesce(vec![col_named(&r), lit(span - 1)]);
+                    let joined = joined
+                        .with_column(&combined, ord)?
+                        .drop_columns(&[l.as_str(), r.as_str()])?;
+                    Ok((joined, vec![combined]))
+                } else {
+                    Ok((joined, vec![l, r]))
+                }
             })
         },
         Tail {
@@ -1228,9 +1460,9 @@ pub fn execute_hop_query(
         node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
     });
 
-    let sorted = has_sort(&sort);
+    let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
     run_query(
-        move |ctx| Box::pin(Tiebreak::leaf(ctx, hop_plan, sorted)),
+        move |ctx| Box::pin(Tiebreak::leaf(ctx, hop_plan, numbered)),
         Tail {
             filters,
             group_keys: &[],
@@ -1308,9 +1540,9 @@ pub fn execute_path_query(
         )),
     });
 
-    let sorted = has_sort(&sort);
+    let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
     run_query(
-        move |ctx| Box::pin(Tiebreak::leaf(ctx, path_plan, sorted)),
+        move |ctx| Box::pin(Tiebreak::leaf(ctx, path_plan, numbered)),
         Tail {
             filters,
             group_keys: &[],
@@ -1418,9 +1650,9 @@ pub fn execute_walk_query(
         )),
     });
 
-    let sorted = has_sort(&sort);
+    let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
     run_query(
-        move |ctx| Box::pin(Tiebreak::leaf(ctx, walk_plan, sorted)),
+        move |ctx| Box::pin(Tiebreak::leaf(ctx, walk_plan, numbered)),
         Tail {
             filters,
             group_keys: &[],
@@ -2635,5 +2867,194 @@ mod tests {
         assert_eq!(i64s(&batch, "id"), vec![2, 1, 3]);
         assert_eq!(i64s(&batch, "__ursa_ord_l"), vec![9, 8, 7]);
         assert_eq!(batch.num_columns(), 3);
+    }
+
+    /// Run `f` with the query session pinned to `partitions` target partitions.
+    fn on_partitions<T>(partitions: usize, f: impl FnOnce() -> T) -> T {
+        TEST_PARTITIONS.with(|c| c.set(Some(partitions)));
+        let out = f();
+        TEST_PARTITIONS.with(|c| c.set(None));
+        out
+    }
+
+    const PARTITION_COUNTS: [usize; 5] = [1, 2, 4, 8, 16];
+
+    /// An unsorted out-degree node query, with an attribute table or without.
+    fn unsorted_degree_query(
+        t: &Arc<Topology>,
+        ids: &Arc<IdMap>,
+        nodes: Option<Vec<RecordBatch>>,
+        filters: &[String],
+        limit: Option<usize>,
+        distinct: bool,
+        group: Option<(Vec<String>, Vec<String>)>,
+    ) -> RecordBatch {
+        let (group_keys, aggs) = group.unwrap_or_default();
+        let nodes_id = nodes.as_ref().map(|_| "id".to_string());
+        let batch = one(execute_node_query(
+            t.clone(),
+            ids.clone(),
+            r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+            filters,
+            None,
+            limit,
+            nodes,
+            nodes_id,
+            None,
+            distinct,
+            None,
+            vec![],
+            group_keys,
+            aggs,
+            None,
+        )
+        .unwrap());
+        assert_no_hidden(&batch);
+        batch
+    }
+
+    #[test]
+    fn unsorted_attribute_output_follows_table_order() {
+        let n = 30_000;
+        let (t, ids, dense) = tie_graph(n as i64);
+        // Attribute rows in a scrambled order, `c` = row position, in small batches.
+        let order: Vec<i64> = (0..n).map(|i| dense[(i * 4241) % n]).collect();
+        let attrs = id_attr_batch(order.clone(), "c", (0..n as i64).collect());
+        let chunks = || -> Vec<RecordBatch> {
+            (0..n)
+                .step_by(3_000)
+                .map(|s| attrs.slice(s, 3_000.min(n - s)))
+                .collect()
+        };
+        let deg: HashMap<i64, i64> = {
+            let b = unsorted_degree_query(&t, &ids, None, &[], None, false, None);
+            i64s(&b, "id").into_iter().zip(i64s(&b, "deg")).collect()
+        };
+        let deg_one = r#"{"kind":"binary","op":"==","left":{"kind":"col","name":"deg"},"right":{"kind":"lit","value":1}}"#;
+        // Groups (by degree) in order of first appearance, with that first position.
+        let mut first: Vec<(i64, i64)> = vec![];
+        for (c, i) in order.iter().enumerate() {
+            if !first.iter().any(|&(d, _)| d == deg[i]) {
+                first.push((deg[i], c as i64));
+            }
+        }
+        let min_c = r#"{"kind":"alias","name":"m","operand":{"kind":"agg","fn":"min","operand":{"kind":"col","name":"c"}}}"#;
+        for p in PARTITION_COUNTS {
+            on_partitions(p, || {
+                let all = unsorted_degree_query(&t, &ids, Some(chunks()), &[], None, false, None);
+                assert_eq!(i64s(&all, "id"), order, "p={p}");
+                let want_deg: Vec<i64> = order.iter().map(|i| deg[i]).collect();
+                assert_eq!(i64s(&all, "deg"), want_deg, "p={p}");
+                // An unsorted head takes the first rows in table order, within the
+                // first batch, across several, past the end, and none.
+                for k in [100, 7_777, n + 5, 0] {
+                    let head =
+                        unsorted_degree_query(&t, &ids, Some(chunks()), &[], Some(k), false, None);
+                    assert_eq!(i64s(&head, "id"), order[..k.min(n)], "p={p} k={k}");
+                    assert_eq!(i64s(&head, "deg"), want_deg[..k.min(n)], "p={p} k={k}");
+                }
+                // A filter keeps the surviving rows in table order.
+                let f = [deg_one.to_string()];
+                let got = unsorted_degree_query(&t, &ids, Some(chunks()), &f, None, false, None);
+                let want: Vec<i64> = (0..n as i64)
+                    .filter(|&c| deg[&order[c as usize]] == 1)
+                    .collect();
+                assert_eq!(i64s(&got, "c"), want, "p={p}");
+                let got =
+                    unsorted_degree_query(&t, &ids, Some(chunks()), &f, Some(5_000), false, None);
+                assert_eq!(i64s(&got, "c"), want[..5_000], "p={p}");
+                // distinct (every row is unique) keeps every row in place.
+                let got = unsorted_degree_query(&t, &ids, Some(chunks()), &[], None, true, None);
+                assert_eq!(i64s(&got, "id"), order, "p={p}");
+                // group_by: groups in order of their first row, so `min(c)` ascends.
+                let group = Some((vec!["deg".to_string()], vec![min_c.to_string()]));
+                let got = unsorted_degree_query(&t, &ids, Some(chunks()), &[], None, false, group);
+                let got: Vec<(i64, i64)> =
+                    i64s(&got, "deg").into_iter().zip(i64s(&got, "m")).collect();
+                assert_eq!(got, first, "p={p}");
+            });
+        }
+    }
+
+    #[test]
+    fn unsorted_graph_output_groups_follow_node_order() {
+        // No attribute table: the plain output is in dense order and pays nothing,
+        // and a group_by returns its groups in order of first appearance.
+        let (t, ids, dense) = tie_graph(20_000);
+        let count = r#"{"kind":"alias","name":"n","operand":{"kind":"agg","fn":"count","operand":{"kind":"col","name":"id"}}}"#;
+        for p in PARTITION_COUNTS {
+            on_partitions(p, || {
+                let all = unsorted_degree_query(&t, &ids, None, &[], None, false, None);
+                assert_eq!(i64s(&all, "id"), dense, "p={p}");
+                let group = Some((vec!["deg".to_string()], vec![count.to_string()]));
+                let got = unsorted_degree_query(&t, &ids, None, &[], None, false, group);
+                assert_eq!(i64s(&got, "deg"), vec![2, 1], "p={p}");
+                assert_eq!(i64s(&got, "n"), vec![10_000, 10_000], "p={p}");
+            });
+        }
+    }
+
+    #[test]
+    fn unsorted_join_follows_left_then_right_order() {
+        // Left ids repeat (each id twice), right ids 0, 1 or 2 rows per id, both
+        // scrambled; the expected order is a left-major nested-loop join.
+        let n: i64 = 20_000;
+        let lids: Vec<i64> = (0..n).map(|i| (i * 7919) % (n / 2)).collect();
+        let rids: Vec<i64> = (0..n)
+            .map(|i| (i * 104_729) % (n / 2))
+            .filter(|id| id % 5 != 0)
+            .collect();
+        let left = id_attr_batch(lids.clone(), "a", (0..n).collect());
+        let right = id_attr_batch(rids.clone(), "b", (0..rids.len() as i64).collect());
+        let slices = |b: &RecordBatch| -> Vec<RecordBatch> {
+            (0..b.num_rows())
+                .step_by(2_500)
+                .map(|s| b.slice(s, 2_500.min(b.num_rows() - s)))
+                .collect()
+        };
+        let mut by_id: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (pos, id) in rids.iter().enumerate() {
+            by_id.entry(*id).or_default().push(pos as i64);
+        }
+        for how in ["inner", "left"] {
+            let mut want: Vec<(i64, i64, Option<i64>)> = vec![];
+            for (a, id) in lids.iter().enumerate() {
+                match by_id.get(id) {
+                    Some(bs) => want.extend(bs.iter().map(|&b| (*id, a as i64, Some(b)))),
+                    None if how == "left" => want.push((*id, a as i64, None)),
+                    None => {}
+                }
+            }
+            for p in PARTITION_COUNTS {
+                for limit in [None, Some(100), Some(6_000), Some(0)] {
+                    let batch = on_partitions(p, || {
+                        one(execute_join_query(
+                            slices(&left),
+                            slices(&right),
+                            vec!["id".into()],
+                            how.into(),
+                            &[],
+                            None,
+                            limit,
+                            false,
+                            None,
+                            vec![],
+                        )
+                        .unwrap())
+                    });
+                    assert_no_hidden(&batch);
+                    let b = batch.column(batch.schema().index_of("b").unwrap());
+                    let b = b.as_any().downcast_ref::<Int64Array>().unwrap();
+                    let got: Vec<(i64, i64, Option<i64>)> = i64s(&batch, "id")
+                        .into_iter()
+                        .zip(i64s(&batch, "a"))
+                        .zip(b.iter())
+                        .map(|((id, a), b)| (id, a, b))
+                        .collect();
+                    let want = &want[..limit.unwrap_or(want.len()).min(want.len())];
+                    assert_eq!(got, want, "how={how} p={p} limit={limit:?}");
+                }
+            }
+        }
     }
 }
