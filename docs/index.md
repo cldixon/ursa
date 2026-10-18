@@ -111,4 +111,4 @@ Nothing after that line changes.
 - [Guides](guides/index.md): one task per page, with code that runs.
 - [Reference](reference/index.md): every public name.
 
-Ursa is version 0.3 and in active development. The [Limits](limits.md) page lists what does not run yet.
+Ursa is version 0.4 and in active development. The [Limits](limits.md) page lists what does not run yet.

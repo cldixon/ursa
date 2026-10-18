@@ -21,4 +21,4 @@ Every public name in `ursa`, grouped by role. The import convention on every pag
 
 ## Version
 
-The page describes `ursa-graph` 0.3. `ur.__version__` gives the installed version.
+The page describes `ursa-graph` 0.4. `ur.__version__` gives the installed version.
