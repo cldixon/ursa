@@ -160,6 +160,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - An edge mask whose length does not match the graph's edge count is rejected
   instead of silently dropping the edges past its end.
 
+### Security
+
+- Bumped `rustls` (pulled in by the object-store TLS stack used for
+  `s3://`/`gs://`/`az://`/`https://` scans) from 0.23.45 to 0.23.46 for
+  RUSTSEC-2026-0346, -0347, -0348 and -0349.
+
 ## [0.3.0] — 2026-10-08
 
 ### Added
