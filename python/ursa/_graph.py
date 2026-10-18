@@ -20,6 +20,7 @@ them).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from ._expr import Expr
@@ -49,8 +50,8 @@ class GraphExpr(Expr):
     def select(self, *columns: Any) -> NodeFrame:
         return self._frame().select(*columns)
 
-    def sort(self, by: Any, *, descending: bool = False) -> NodeFrame:
-        return self._frame().sort(by, descending=descending)
+    def sort(self, by: Any, *more_by: Any, descending: bool | Sequence[bool] = False) -> NodeFrame:
+        return self._frame().sort(by, *more_by, descending=descending)
 
     def head(self, n: int = 10) -> NodeFrame:
         return self._frame().head(n)

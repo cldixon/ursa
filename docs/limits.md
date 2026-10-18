@@ -16,16 +16,12 @@ Ursa is version 0.3. The API is stable in shape, and some combinations of steps 
 | Combination | Status |
 |---|---|
 | Two `with_columns` steps in one plan | One per plan. Put every column in one call. |
-| `with_columns` after `select` | Compute first, then `select`. |
-| Two `select` steps | One per plan. |
-| `filter` after `group_by().agg()` | Filter before the `group_by`. |
-| `group_by().agg()` with `distinct`, `sample`, or `select` | Not available. `sort`, `head`, and `rename` work on the grouped result. |
+| `with_columns` after another step | Compute first, then the other steps. A `filter` on columns that `with_columns` does not compute may come first. |
+| A step other than `filter` on an `EdgeFrame` before `nodes()` | Collect the edges and build a new frame. |
 | Two `join` steps | One per plan. |
 | A weighted algorithm over a scan with several paths | Pass one path, or read the files into memory first. |
 | A tail (`filter`, `sort`, `head`) after `describe()` | Collect `describe()` on its own. |
 | A graph algorithm over a `distinct`, `sample`, `join`, or `group_by` result | Collect the rows and build a new frame. A `filter` on the edges works directly. See [Reshaped edge sets](guides/subgraphs.md#reshaped-edge-sets). |
-| `group_by().agg()` on a `hop` or `shortest_path` result | Collect the rows and build a new frame. |
-| `filter`, `sort`, or `select` on a renamed column | A rename applies last in a plan. Use the old name in the other steps. |
 | `edges.nodes().collect()` with no columns | Add a column first, for example `with_columns(degree=ur.degree(edges))`. |
 
 ## Scope

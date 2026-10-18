@@ -2,7 +2,7 @@
 tail (issue #159).
 
 pyarrow has no sort kernel for dictionary arrays and no hash sum/mean/min/max
-kernels for them, so the pyarrow tail (`_apply_pyarrow_tail`) decodes the sort
+kernels for them, so the pyarrow tail (`_apply_pyarrow_steps`) decodes the sort
 key / aggregate operand while leaving the user's column type intact in the
 output. Sorting orders by the *values* (lexicographic for strings), never by the
 dictionary indices: the fixtures below put "y" before "x" in the dictionary so an

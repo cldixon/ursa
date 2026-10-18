@@ -1,11 +1,11 @@
 """group_by().agg() + aggregation expressions (issue #19).
 
-A grouped aggregation is a new fixed point in the shared relational tail: it
-runs right after any pre-group filters and *replaces* the schema with
-`[keys..., outputs...]`. Two execution paths must agree on the output — the
-DataFusion engine path (graph/traversal-derived frames route through
-`execute_node_query`'s `group_keys`/`aggs`) and the pyarrow plain path
-(`_apply_pyarrow_group_by` for source-backed frames). Every test here asserts
+A grouped aggregation is a step in the relational tail: like every step it runs
+where it is written, and it *replaces* the schema with `[keys..., outputs...]`.
+Two execution paths must agree on the output — the DataFusion engine path
+(graph/traversal-derived frames route through `execute_node_query`'s
+`group_keys`/`aggs`) and the pyarrow plain path (`_apply_pyarrow_group_by` for
+source-backed frames). Every test here asserts
 the grouped result directly; the cross-path test asserts both paths land on the
 same numbers.
 
@@ -281,26 +281,57 @@ def test_non_aggregation_expr_errors():
         ur.from_arrow(NODES, id="id").group_by("region").agg(ur.col("capacity")).collect()
 
 
-def test_filter_after_group_by_is_rejected():
-    # HAVING is not supported yet — filter after group_by must raise, not silently
-    # apply as a pre-group WHERE.
-    with pytest.raises(NotImplementedError):
-        ur.from_arrow(NODES, id="id").group_by("region").agg(total=ur.col("capacity").sum()).filter(
-            ur.col("total") > 50
-        ).collect()
+def _ring_edges():
+    # A 5-cycle over NODES' ids, so a graph-derived frame keeps every attribute row.
+    return ur.from_arrow(pa.table({"s": [0, 1, 2, 3, 4], "d": [1, 2, 3, 4, 0]}), src="s", dst="d")
 
 
-def test_group_by_does_not_compose_with_distinct():
-    with pytest.raises(NotImplementedError):
-        ur.from_arrow(NODES, id="id").group_by("region").agg(
-            total=ur.col("capacity").sum()
-        ).distinct().collect()
+def test_filter_after_group_by_filters_the_groups():
+    # Steps apply in the order written (#162/#164): a filter after the group_by
+    # filters the grouped rows (SQL HAVING) — us totals 60, eu 90 — on the plain
+    # path and on the engine path (where it runs after the engine's group).
+    plain = ur.from_arrow(NODES, id="id")
+    engine = plain.with_columns(deg=ur.degree(_ring_edges()))
+    for base in (plain, engine):
+        out = (
+            base.group_by("region")
+            .agg(total=ur.col("capacity").sum())
+            .filter(ur.col("total") > 70)
+            .collect()
+            .to_dicts()
+        )
+        assert out == [{"region": "eu", "total": 90}]
 
 
-def test_group_by_on_traversal_result_is_rejected():
+def test_group_by_then_select_and_distinct():
+    # Groups (us,a) (us,b) (eu,c) -> select region -> distinct: eu, us.
+    out = (
+        ur.from_arrow(NODES, id="id")
+        .group_by("region", "tier")
+        .agg(n=ur.col("id").count())
+        .select("region")
+        .distinct()
+        .sort("region")
+        .collect()
+        .to_dicts()
+    )
+    assert out == [{"region": "eu"}, {"region": "us"}]
+
+
+def test_group_by_on_traversal_result():
+    # The engine runs the hop; the group_by runs on its rows. Seed 0 reaches 1, 2
+    # and seed 1 reaches 2, 3 within two hops.
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
-    with pytest.raises(NotImplementedError):
-        ur.hop(edges, 1).from_([0]).group_by("src").agg(n=ur.col("dst").count()).collect()
+    out = (
+        ur.hop(edges, 2)
+        .from_([0, 1])
+        .group_by("src")
+        .agg(n=ur.col("dst").count())
+        .sort("src")
+        .collect()
+        .to_dicts()
+    )
+    assert out == [{"src": 0, "n": 2}, {"src": 1, "n": 2}]
 
 
 def test_unknown_agg_column_errors_on_engine_path():
@@ -316,19 +347,32 @@ def test_unknown_agg_column_errors_on_engine_path():
     assert "missing" in str(exc.value)
 
 
-@pytest.mark.parametrize("verb", ["sort", "head", "rename"])
-def test_pre_group_sort_head_rename_is_rejected(verb):
-    # A sort/head/rename written *before* the group_by would be silently reordered
-    # to after it (the canonical tail order), executing a different query. Reject.
+@pytest.mark.parametrize("engine", [False, True])
+@pytest.mark.parametrize(
+    ("verb", "expected"),
+    [
+        ("sort", {"us": 60, "eu": 90}),
+        # head(2) keeps ids 0 and 1 — both us — so only one group survives.
+        ("head", {"us": 30}),
+        ("rename", {"us": 60, "eu": 90}),
+    ],
+)
+def test_pre_group_sort_head_rename_apply_in_written_order(verb, expected, engine):
+    # A sort/head/rename written *before* the group_by applies to the rows being
+    # grouped, as written — never silently moved after the group.
     base = ur.from_arrow(NODES, id="id")
+    if engine:
+        base = base.with_columns(deg=ur.degree(_ring_edges()))
+    col = "capacity"
     if verb == "sort":
-        pre = base.sort("capacity")
+        pre = base.sort("capacity", descending=True)
     elif verb == "head":
-        pre = base.head(2)
+        pre = base.sort("id").head(2)
     else:
         pre = base.rename({"capacity": "cap"})
-    with pytest.raises(NotImplementedError):
-        pre.group_by("region").agg(total=ur.col("capacity").sum()).collect()
+        col = "cap"
+    out = pre.group_by("region").agg(total=ur.col(col).sum()).collect().to_dicts()
+    assert {r["region"]: r["total"] for r in out} == expected
 
 
 def test_duplicate_column_and_fn_distinct_output_names_agree():

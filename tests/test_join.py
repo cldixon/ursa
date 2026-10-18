@@ -432,18 +432,58 @@ def test_group_by_then_join_on_edge_frame():
     ]
 
 
-def test_join_then_group_by_still_rejects_a_pre_group_tail():
-    # A sort/head/rename before the group would be silently reordered, so it is
-    # rejected with the same message as the non-join path.
+def test_join_then_head_then_group_by_applies_in_written_order():
+    # The sort/head between the join and the group apply to the joined rows before
+    # grouping: the two lowest ids (0, 1) are both us -> one group of 10 + 20.
     left = ur.from_arrow(SALES, id="id")
-    with pytest.raises(NotImplementedError, match=r"head\(\) before group_by"):
-        (
-            left.join(ur.from_arrow(REGIONS, id="id"), on="id")
-            .head(2)
-            .group_by("region")
-            .agg(total=ur.col("v").sum())
-            .collect()
-        )
+    out = (
+        left.join(ur.from_arrow(REGIONS, id="id"), on="id")
+        .sort("id")
+        .head(2)
+        .group_by("region")
+        .agg(total=ur.col("v").sum())
+        .collect()
+        .to_dicts()
+    )
+    assert out == [{"region": "us", "total": 30}]
+
+
+def test_rename_then_join_on_the_new_key():
+    # A rename before the join takes effect before it, so the join can key on the
+    # new name (#164); pyarrow's join of the renamed table is the reference.
+    sales = SALES.rename_columns(["node", "v"])
+    regions = REGIONS.rename_columns(["node", "region"])
+    out = (
+        ur.from_arrow(SALES, id="id")
+        .rename({"id": "node"})
+        .join(ur.from_arrow(regions, id="node"), on="node")
+        .sort("node")
+        .collect()
+        .to_arrow()
+    )
+    ref = sales.join(regions, keys="node", join_type="inner").sort_by("node")
+    assert out.to_pylist() == ref.select(out.column_names).to_pylist()
+    assert out.to_pylist() == [
+        {"node": 0, "v": 10, "region": "us"},
+        {"node": 1, "v": 20, "region": "us"},
+        {"node": 2, "v": 30, "region": "eu"},
+        {"node": 3, "v": 40, "region": "eu"},
+    ]
+
+
+def test_head_before_join_limits_the_left_side():
+    # head(2) before the join keeps the two highest-v rows (ids 4, 3); id 4 has no
+    # region, so the inner join keeps one row. (Previously the head ran after the
+    # join and returned two.)
+    out = (
+        ur.from_arrow(SALES, id="id")
+        .sort("v", descending=True)
+        .head(2)
+        .join(ur.from_arrow(REGIONS, id="id"), on="id")
+        .collect()
+        .to_dicts()
+    )
+    assert out == [{"id": 3, "v": 40, "region": "eu"}]
 
 
 def test_join_with_group_by_on_traversal_result_errors():
