@@ -20,10 +20,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::Column;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::functions_aggregate::expr_fn::min;
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{col, DataFrame, SessionContext};
 use serde::Deserialize;
@@ -335,6 +339,133 @@ struct Tail<'a> {
     limit: Option<usize>,
     /// `(old, new)` output-column relabels, applied last.
     rename: &'a [(String, String)],
+    /// The hidden row-ordinal columns the base frame carries (see [`Tiebreak`]),
+    /// most significant first; empty when the query has no sort.
+    tiebreak: Vec<String>,
+}
+
+/// The implicit final sort key that makes an engine `sort` deterministic (#165).
+///
+/// DataFusion's sort is not stable: it sorts each partition with an unstable
+/// kernel and merges the partitions with no input order among equal keys, so rows
+/// that tie on every user key come back neither in input order nor in an order
+/// that is the same across partition counts (`target_partitions` follows the
+/// machine's cores). A plain frame sorts stably in pyarrow, so ties keep their
+/// input order there. To give the engine the same guarantee, a query with a sort
+/// tags each base row with its position in a hidden `UInt64` ordinal column,
+/// sorts by it as the last, ascending key, and drops it after the sort. Queries without a sort carry no
+/// ordinal. A full sort by one numeric key (the common case, and the tie-heavy
+/// one) sorts `(key, ordinal)` integer pairs itself
+/// ([`sort_by_key_then_ordinal`]); any other sort, and every top-k, hands the
+/// ordinal to DataFusion as a final sort expression.
+///
+/// What "input order" means on each path:
+/// - graph-derived frame (`edges.nodes().with_columns(...)`): the algorithm
+///   output's row order, which is dense node order (first appearance in the
+///   edges), i.e. the order an unsorted collect returns;
+/// - node attribute frame with algorithms: the attribute table's row order (the
+///   algorithm columns are LEFT-joined onto it, one output row per table row), so
+///   ties match the plain frame's stable pyarrow sort;
+/// - `hop` / `shortest_path` / `random_walk`: the traversal's own deterministic
+///   output order (seed order then BFS order; path order; walk then step), i.e.
+///   the order an unsorted collect returns;
+/// - `join`: the left row's position, then the right row's (null, so last, for an
+///   unmatched left-join row), the order of a left-major nested-loop join.
+///
+/// The ordinal survives the tail steps before the sort: `filter` keeps it,
+/// `group_by` and `distinct` carry `min(ordinal)` (so a group or distinct row
+/// takes the position of its first input row), and `sample` keeps each picked
+/// row's ordinal.
+struct Tiebreak;
+
+impl Tiebreak {
+    const BASE: &'static str = "__ursa_ord";
+
+    /// A hidden column name (`__ursa_ord`, with a suffix) that no user column
+    /// already uses.
+    fn fresh_name(suffix: &str, schemas: &[&Schema]) -> String {
+        let mut name = format!("{}{suffix}", Self::BASE);
+        while schemas
+            .iter()
+            .any(|s| s.fields().iter().any(|f| f.name() == &name))
+        {
+            name.push('_');
+        }
+        name
+    }
+
+    /// Rows per batch handed to the sort (DataFusion's default batch size).
+    const CHUNK: usize = 8192;
+
+    /// Append a `UInt64` column `name` numbering the rows `0..` across the batches,
+    /// in order. Batches are also cut into zero-copy slices of at most
+    /// [`Self::CHUNK`] rows: a graph leaf emits its whole output as one batch, and
+    /// smaller batches let DataFusion spread a sort over its partitions.
+    fn attach(batches: Vec<RecordBatch>, name: &str) -> Result<Vec<RecordBatch>> {
+        let mut next = 0u64;
+        batches
+            .into_iter()
+            .flat_map(|b| {
+                let n = b.num_rows();
+                if n <= Self::CHUNK {
+                    vec![b]
+                } else {
+                    (0..n)
+                        .step_by(Self::CHUNK)
+                        .map(|s| b.slice(s, Self::CHUNK.min(n - s)))
+                        .collect()
+                }
+            })
+            .map(|b| {
+                let n = b.num_rows() as u64;
+                let ord: ArrayRef = Arc::new(UInt64Array::from_iter_values(next..next + n));
+                next += n;
+                let schema = b.schema();
+                let mut fields = schema.fields().to_vec();
+                fields.push(Arc::new(Field::new(name, DataType::UInt64, false)));
+                let mut cols = b.columns().to_vec();
+                cols.push(ord);
+                RecordBatch::try_new(
+                    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+                    cols,
+                )
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            })
+            .collect()
+    }
+
+    /// The base frame of a traversal/graph leaf plan, with an ordinal column when
+    /// `sorted`. Every Ursa leaf emits a single partition in a deterministic order
+    /// (and materializes its whole output before emitting it), so collecting it and
+    /// numbering the rows captures the unsorted output order at no extra memory.
+    async fn leaf(
+        ctx: &SessionContext,
+        plan: LogicalPlan,
+        sorted: bool,
+    ) -> Result<(DataFrame, Vec<String>)> {
+        let df = ctx.execute_logical_plan(plan).await?;
+        if !sorted {
+            return Ok((df, vec![]));
+        }
+        let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let name = Self::fresh_name("", &[schema.as_ref()]);
+        let mut batches = df.collect().await?;
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema));
+        }
+        let df = ctx.read_batches(Self::attach(batches, &name)?)?;
+        Ok((df, vec![name]))
+    }
+}
+
+/// Whether a tail sort is present (an empty key list is no sort).
+fn has_sort(sort: &Option<Vec<(String, bool)>>) -> bool {
+    sort.as_ref().is_some_and(|keys| !keys.is_empty())
+}
+
+/// An unqualified column reference that takes the name verbatim (no `a.b` parse).
+fn col_named(name: &str) -> Expr {
+    Expr::Column(Column::from_name(name))
 }
 
 /// Apply the relational tail to the base frame. Canonical order:
@@ -385,10 +516,31 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
             }
             agg_exprs.push(expr);
         }
+        // A group takes the position of its first input row.
+        for o in &tail.tiebreak {
+            agg_exprs.push(min(col_named(o)).alias(o));
+        }
         df = df.aggregate(group_exprs, agg_exprs)?;
     }
     if tail.distinct {
-        df = df.distinct()?;
+        if tail.tiebreak.is_empty() {
+            df = df.distinct()?;
+        } else {
+            // Distinct over the user columns only (the ordinal makes every row
+            // unique); each distinct row takes the position of its first occurrence.
+            let group_exprs: Vec<Expr> = df
+                .schema()
+                .iter()
+                .filter(|(_, f)| !tail.tiebreak.contains(f.name()))
+                .map(|(q, f)| Expr::Column(Column::from((q, f))))
+                .collect();
+            let agg_exprs: Vec<Expr> = tail
+                .tiebreak
+                .iter()
+                .map(|o| min(col_named(o)).alias(o))
+                .collect();
+            df = df.aggregate(group_exprs, agg_exprs)?;
+        }
     }
     if let Some((n, seed)) = tail.sample {
         let batches = df.collect().await?;
@@ -397,20 +549,68 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
     if let Some(keys) = tail.sort.filter(|keys| !keys.is_empty()) {
         // Lexicographic over the keys in order; each key carries its own direction,
         // and nulls sort last for every key (matching the pyarrow tail).
-        let mut sort_exprs = Vec::with_capacity(keys.len());
+        let hidden = |name: &String| tail.tiebreak.contains(name);
+        let mut sort_exprs = Vec::with_capacity(keys.len() + tail.tiebreak.len());
         for (column, descending) in &keys {
-            if !df.schema().fields().iter().any(|f| f.name() == column) {
+            if hidden(column) || !df.schema().fields().iter().any(|f| f.name() == column) {
                 // "column ... not found" classifies as ColumnNotFoundError in ursa-py.
-                let names: Vec<&String> = df.schema().fields().iter().map(|f| f.name()).collect();
+                let names: Vec<&String> = df
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .filter(|n| !hidden(n))
+                    .collect();
                 return Err(DataFusionError::Execution(format!(
                     "sort references unknown column {column:?} (column not found; available: {names:?})"
                 )));
             }
             sort_exprs.push(col(column).sort(!descending, false));
         }
-        df = df.sort(sort_exprs)?;
-    }
-    if let Some(n) = tail.limit {
+        // The implicit final key: rows that tie on every user key keep their input
+        // order (see [`Tiebreak`]), identically for any partition count.
+        let mut sorted = None;
+        if let ([(key, descending)], [ord], None) =
+            (keys.as_slice(), tail.tiebreak.as_slice(), tail.limit)
+        {
+            // A full sort by one key: try the integer-pair fast path.
+            let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+            let field = schema
+                .field_with_name(key)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            if is_fast_key(field.data_type()) {
+                // Partition by partition, in partition order: for a scan of the
+                // ordinal-numbered batches that is input order, so input already in
+                // key order is detected and passed through. (Only speed depends on
+                // this; the ordinal decides the result.)
+                let batches: Vec<RecordBatch> = df
+                    .clone()
+                    .collect_partitioned()
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let schema = batches.first().map(|b| b.schema()).unwrap_or(schema);
+                sorted = sort_by_key_then_ordinal(&batches, &schema, key, *descending, ord)?;
+            }
+        }
+        match sorted {
+            Some(batches) => df = ctx.read_batches(batches)?,
+            None => {
+                for o in &tail.tiebreak {
+                    sort_exprs.push(col_named(o).sort(true, false));
+                }
+                df = df.sort(sort_exprs)?;
+                if !tail.tiebreak.is_empty() {
+                    let names: Vec<&str> = tail.tiebreak.iter().map(String::as_str).collect();
+                    df = df.drop_columns(&names)?;
+                }
+                if let Some(n) = tail.limit {
+                    df = df.limit(0, Some(n))?;
+                }
+            }
+        }
+    } else if let Some(n) = tail.limit {
         df = df.limit(0, Some(n))?;
     }
     for (old, new) in tail.rename {
@@ -435,16 +635,184 @@ async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> 
 /// Each executor thus reduces to *plan/base construction*: the block-on, session
 /// setup, [`apply_tail`], and [`collect_batches`] live here once instead of being
 /// copy-pasted at every call site.
-fn run_query<F>(build: F, tail: Tail<'_>) -> Result<Vec<RecordBatch>>
+///
+/// `build` also returns the hidden ordinal column(s) its base carries (empty
+/// unless the tail sorts; see [`Tiebreak`]).
+fn run_query<F>(build: F, mut tail: Tail<'_>) -> Result<Vec<RecordBatch>>
 where
-    F: for<'c> FnOnce(&'c SessionContext) -> Pin<Box<dyn Future<Output = Result<DataFrame>> + 'c>>,
+    F: for<'c> FnOnce(
+        &'c SessionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(DataFrame, Vec<String>)>> + 'c>>,
 {
     crate::runtime::block_on(async move {
         let ctx = graph_session();
-        let base = build(&ctx).await?;
+        let (base, tiebreak) = build(&ctx).await?;
+        tail.tiebreak = tiebreak;
         let df = apply_tail(&ctx, base, tail).await?;
         collect_batches(df).await
     })?
+}
+
+/// Whether [`normalized_key`] covers a key of this type.
+fn is_fast_key(dt: &DataType) -> bool {
+    dt.is_integer() || dt.is_floating() || *dt == DataType::Boolean
+}
+
+/// An order-preserving `u64` image of a primitive sort key: `a < b` in the sort's
+/// order exactly when `norm(a) < norm(b)`. Integers flip the sign bit, floats map
+/// their bits to IEEE total order (`f64::total_cmp`, which DataFusion's float sort
+/// uses too), and `descending` inverts the image. Nulls are handled by the caller.
+/// `None` for a type this path does not cover.
+fn normalized_key(array: &dyn Array, descending: bool) -> Option<Vec<u64>> {
+    use arrow::array::{BooleanArray, UInt64Array as U64};
+    let dt = array.data_type();
+    let keys: Vec<u64> = if dt.is_signed_integer() {
+        let a = cast(array, &DataType::Int64).ok()?;
+        let a = a.as_any().downcast_ref::<Int64Array>()?;
+        a.values().iter().map(|&v| (v as u64) ^ (1 << 63)).collect()
+    } else if dt.is_unsigned_integer() {
+        let a = cast(array, &DataType::UInt64).ok()?;
+        a.as_any().downcast_ref::<U64>()?.values().to_vec()
+    } else if dt.is_floating() {
+        let a = cast(array, &DataType::Float64).ok()?;
+        let a = a.as_any().downcast_ref::<Float64Array>()?;
+        a.values()
+            .iter()
+            .map(|v| {
+                let b = v.to_bits();
+                if b >> 63 == 1 {
+                    !b
+                } else {
+                    b | (1 << 63)
+                }
+            })
+            .collect()
+    } else if *dt == DataType::Boolean {
+        let a = array.as_any().downcast_ref::<BooleanArray>()?;
+        (0..a.len()).map(|i| a.value(i) as u64).collect()
+    } else {
+        return None;
+    };
+    Some(if descending {
+        keys.into_iter().map(|k| !k).collect()
+    } else {
+        keys
+    })
+}
+
+/// Sort collected batches by one primitive key (nulls last) and then by the
+/// single ordinal column `ord`, and drop `ord`. Returns `None` (nothing done) when
+/// the key's type is not covered by [`normalized_key`].
+///
+/// This is the hot case of the tiebreak (#165): a full sort by one numeric
+/// column, often with heavy ties (a degree, a community label, a traversal's
+/// `src`). DataFusion sorts a single primitive column with a fast specialised
+/// kernel but falls back to a generic lexicographic sort once the ordinal is
+/// added as a second key, several times slower on tie-heavy data. Sorting
+/// `(key, ordinal)` integer pairs in parallel here keeps it close to the
+/// single-key cost. Keys are read batch by batch (each at most
+/// [`Tiebreak::CHUNK`] rows, so each pass stays in cache), and input that is
+/// already in order is passed through without a gather.
+fn sort_by_key_then_ordinal(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    key: &str,
+    descending: bool,
+    ord: &str,
+) -> Result<Option<Vec<RecordBatch>>> {
+    use arrow::array::UInt32Array;
+    use arrow::compute::{concat, take};
+    use rayon::prelude::*;
+    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+
+    let keep: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| schema.field(i).name() != ord)
+        .collect();
+    let out_schema = Arc::new(schema.project(&keep).map_err(arrow_err)?);
+    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if r == 0 {
+        return Ok(Some(vec![RecordBatch::new_empty(out_schema)]));
+    }
+    if r > u32::MAX as usize {
+        return Ok(None); // row positions are u32 here
+    }
+    let key_i = schema.index_of(key).map_err(arrow_err)?;
+    let ord_i = schema.index_of(ord).map_err(arrow_err)?;
+
+    // Valid keys sort by (key, ordinal); the null keys all tie, so they follow in
+    // ordinal order.
+    let mut valid: Vec<(u64, u64, u32)> = Vec::with_capacity(r);
+    let mut nulls: Vec<(u64, u32)> = Vec::new();
+    let mut pos = 0u32;
+    for b in batches {
+        let key_col = b.column(key_i);
+        let Some(norm) = normalized_key(key_col.as_ref(), descending) else {
+            return Ok(None);
+        };
+        let ords = b
+            .column(ord_i)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| DataFusionError::Internal("tiebreak column is not u64".into()))?
+            .values();
+        match key_col.nulls().filter(|n| n.null_count() > 0) {
+            None => valid.extend(
+                norm.iter()
+                    .zip(ords.iter())
+                    .zip(pos..)
+                    .map(|((&k, &o), p)| (k, o, p)),
+            ),
+            Some(mask) => {
+                for (i, (&k, &o)) in norm.iter().zip(ords.iter()).enumerate() {
+                    let p = pos + i as u32;
+                    if mask.is_null(i) {
+                        nulls.push((o, p));
+                    } else {
+                        valid.push((k, o, p));
+                    }
+                }
+            }
+        }
+        pos += b.num_rows() as u32;
+    }
+    if nulls.is_empty() && valid.windows(2).all(|w| w[0] <= w[1]) {
+        // Already in order (a traversal sorted by `src`, say): no sort or gather,
+        // just one concatenation. The result must be a single batch: a scan of
+        // several in-memory batches may be split across partitions and come back
+        // out of order.
+        let parts: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                RecordBatch::try_new(
+                    out_schema.clone(),
+                    keep.iter().map(|&i| b.column(i).clone()).collect(),
+                )
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(arrow_err)?;
+        let one = arrow::compute::concat_batches(&out_schema, &parts).map_err(arrow_err)?;
+        return Ok(Some(vec![one]));
+    }
+    valid.par_sort_unstable();
+    nulls.par_sort_unstable();
+    let indices = UInt32Array::from_iter_values(
+        valid
+            .iter()
+            .map(|&(_, _, p)| p)
+            .chain(nulls.iter().map(|&(_, p)| p)),
+    );
+    drop((valid, nulls));
+    let cols = keep
+        .iter()
+        .map(|&i| {
+            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(i).as_ref()).collect();
+            let c = concat(&parts).map_err(arrow_err)?;
+            take(c.as_ref(), &indices, None).map_err(arrow_err)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(vec![
+        RecordBatch::try_new(out_schema, cols).map_err(arrow_err)?
+    ]))
 }
 
 /// Deterministically sample `n` rows (without replacement) from a collected batch
@@ -675,20 +1043,31 @@ pub fn execute_node_query(
     let graph_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
     });
+    let sorted = has_sort(&sort);
 
     run_query(
         move |ctx| {
             Box::pin(async move {
-                let graph_df = ctx.execute_logical_plan(graph_plan).await?;
                 // Base frame: either the graph output alone, or a node attribute
                 // table with the graph output left-joined onto it by id.
                 Ok(match nodes {
-                    Some(batches) => {
+                    Some(mut batches) => {
+                        let graph_df = ctx.execute_logical_plan(graph_plan).await?;
                         let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
+                        // Under a sort, ties keep the attribute table's row order: the
+                        // LEFT join emits each table row once, so number those rows.
+                        let mut tiebreak = vec![];
+                        if sorted {
+                            let schemas: Vec<&Schema> =
+                                batches.iter().map(|b| b.schema_ref().as_ref()).collect();
+                            let name = Tiebreak::fresh_name("", &schemas);
+                            batches = Tiebreak::attach(batches, &name)?;
+                            tiebreak.push(name);
+                        }
                         let nodes_df = ctx.read_batches(batches)?;
                         // Rename the graph id so the join keys don't collide, then drop it.
                         let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
-                        nodes_df
+                        let joined = nodes_df
                             .join(
                                 graph_df,
                                 JoinType::Left,
@@ -696,9 +1075,10 @@ pub fn execute_node_query(
                                 &["__ursa_gid"],
                                 None,
                             )?
-                            .drop_columns(&["__ursa_gid"])?
+                            .drop_columns(&["__ursa_gid"])?;
+                        (joined, tiebreak)
                     }
-                    None => graph_df,
+                    None => Tiebreak::leaf(ctx, graph_plan, sorted).await?,
                 })
             })
         },
@@ -711,6 +1091,7 @@ pub fn execute_node_query(
             sort,
             limit,
             rename: &rename,
+            tiebreak: vec![],
         },
     )
 }
@@ -765,9 +1146,28 @@ pub fn execute_join_query(
             )));
         }
     };
+    let sorted = has_sort(&sort);
     run_query(
         move |ctx| {
             Box::pin(async move {
+                let (mut left, mut right) = (left, right);
+                // Under a sort, ties follow the left row's position, then the right
+                // row's (null, so last, for an unmatched left-join row): the order of
+                // a left-major nested-loop join. A join's output order is otherwise
+                // hash-partition dependent.
+                let mut tiebreak = vec![];
+                if sorted {
+                    let schemas: Vec<&Schema> = left
+                        .iter()
+                        .chain(right.iter())
+                        .map(|b| b.schema_ref().as_ref())
+                        .collect();
+                    let l = Tiebreak::fresh_name("_l", &schemas);
+                    let r = Tiebreak::fresh_name("_r", &schemas);
+                    left = Tiebreak::attach(left, &l)?;
+                    right = Tiebreak::attach(right, &r)?;
+                    tiebreak = vec![l, r];
+                }
                 let left_df = ctx.read_batches(left)?;
                 let mut right_df = ctx.read_batches(right)?;
                 // Rename each right key to a private sentinel so the join keys don't
@@ -782,7 +1182,7 @@ pub fn execute_join_query(
                 let joined = left_df
                     .join(right_df, join_type, &left_keys, &right_keys, None)?
                     .drop_columns(&sentinel_refs)?;
-                Ok(joined)
+                Ok((joined, tiebreak))
             })
         },
         Tail {
@@ -794,6 +1194,7 @@ pub fn execute_join_query(
             sort,
             limit,
             rename: &rename,
+            tiebreak: vec![],
         },
     )
 }
@@ -827,8 +1228,9 @@ pub fn execute_hop_query(
         node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
     });
 
+    let sorted = has_sort(&sort);
     run_query(
-        move |ctx| Box::pin(async move { ctx.execute_logical_plan(hop_plan).await }),
+        move |ctx| Box::pin(Tiebreak::leaf(ctx, hop_plan, sorted)),
         Tail {
             filters,
             group_keys: &[],
@@ -838,6 +1240,7 @@ pub fn execute_hop_query(
             sort,
             limit,
             rename: &rename,
+            tiebreak: vec![],
         },
     )
 }
@@ -905,8 +1308,9 @@ pub fn execute_path_query(
         )),
     });
 
+    let sorted = has_sort(&sort);
     run_query(
-        move |ctx| Box::pin(async move { ctx.execute_logical_plan(path_plan).await }),
+        move |ctx| Box::pin(Tiebreak::leaf(ctx, path_plan, sorted)),
         Tail {
             filters,
             group_keys: &[],
@@ -916,6 +1320,7 @@ pub fn execute_path_query(
             sort,
             limit,
             rename: &rename,
+            tiebreak: vec![],
         },
     )
 }
@@ -1013,8 +1418,9 @@ pub fn execute_walk_query(
         )),
     });
 
+    let sorted = has_sort(&sort);
     run_query(
-        move |ctx| Box::pin(async move { ctx.execute_logical_plan(walk_plan).await }),
+        move |ctx| Box::pin(Tiebreak::leaf(ctx, walk_plan, sorted)),
         Tail {
             filters,
             group_keys: &[],
@@ -1024,6 +1430,7 @@ pub fn execute_walk_query(
             sort,
             limit,
             rename: &rename,
+            tiebreak: vec![],
         },
     )
 }
@@ -1827,5 +2234,406 @@ mod tests {
             vec![],
         );
         assert!(err.is_err()); // right/outer deferred
+    }
+
+    // --- implicit sort tiebreaker (#165) -----------------------------------------
+
+    fn i64s(batch: &RecordBatch, name: &str) -> Vec<i64> {
+        let c = batch.column(batch.schema().index_of(name).unwrap());
+        let c = cast(c, &DataType::Int64).unwrap();
+        c.as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    fn assert_no_hidden(batch: &RecordBatch) {
+        for f in batch.schema().fields() {
+            assert!(!f.name().starts_with("__ursa"), "leaked {}", f.name());
+        }
+    }
+
+    /// `n` rows `(k = i % 3, v = i, c = 0)` split into small batches, so the sort
+    /// sees many batches and, with several target partitions, a round-robin
+    /// repartition.
+    fn tied_batches(n: i64) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        (0..n)
+            .step_by(256)
+            .map(|start| {
+                let r: Vec<i64> = (start..(start + 256).min(n)).collect();
+                let k: Vec<i64> = r.iter().map(|i| i % 3).collect();
+                let c = vec![0i64; r.len()];
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k)),
+                        Arc::new(Int64Array::from(r)),
+                        Arc::new(Int64Array::from(c)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// Run `batches` through the tail's sort (+ limit) on a session with
+    /// `partitions` target partitions, with or without the ordinal tiebreaker.
+    fn sort_on(
+        batches: Vec<RecordBatch>,
+        partitions: usize,
+        tiebreak: bool,
+        sort: Vec<(String, bool)>,
+        limit: Option<usize>,
+    ) -> RecordBatch {
+        use datafusion::prelude::SessionConfig;
+        let n_cols = batches[0].num_columns();
+        let out = crate::runtime::block_on(async {
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::new()
+                    .with_target_partitions(partitions)
+                    .with_batch_size(512),
+            );
+            let (input, hidden) = if tiebreak {
+                let ord = "__ursa_ord".to_string();
+                (Tiebreak::attach(batches, &ord).unwrap(), vec![ord])
+            } else {
+                (batches, vec![])
+            };
+            let base = ctx.read_batches(input).unwrap();
+            let tail = Tail {
+                filters: &[],
+                group_keys: &[],
+                aggs: &[],
+                distinct: false,
+                sample: None,
+                sort: Some(sort),
+                limit,
+                rename: &[],
+                tiebreak: hidden,
+            };
+            let df = apply_tail(&ctx, base, tail).await.unwrap();
+            collect_batches(df).await.unwrap()
+        })
+        .unwrap();
+        let batch = one(out);
+        assert_no_hidden(&batch);
+        assert_eq!(batch.num_columns(), n_cols);
+        batch
+    }
+
+    fn kv(batch: &RecordBatch) -> Vec<(i64, i64)> {
+        i64s(batch, "k").into_iter().zip(i64s(batch, "v")).collect()
+    }
+
+    #[test]
+    fn sort_ties_keep_input_order_for_any_partition_count() {
+        let n = 20_000;
+        // Stable reference: k descending, ties in input (v) order.
+        let mut expected: Vec<(i64, i64)> = (0..n).map(|i| (i % 3, i)).collect();
+        expected.sort_by_key(|&(k, _)| std::cmp::Reverse(k));
+        let k_desc = || vec![("k".to_string(), true)];
+        // Without the tiebreaker the order of ties is not the input order (and
+        // varies with the partition count).
+        assert_ne!(
+            kv(&sort_on(tied_batches(n), 4, false, k_desc(), None)),
+            expected
+        );
+        // One key, full sort (the integer-pair path); two keys (the DataFusion sort
+        // with the ordinal as its last key); one key with a limit (DataFusion's
+        // top-k, ordinal included).
+        type Case = (Vec<(String, bool)>, Option<usize>);
+        let cases: Vec<Case> = vec![
+            (k_desc(), None),
+            (vec![("k".into(), true), ("c".into(), false)], None),
+            (k_desc(), Some(7_000)),
+            (vec![("k".into(), true), ("c".into(), true)], Some(13_000)),
+        ];
+        for (sort, limit) in cases {
+            let want = &expected[..limit.unwrap_or(expected.len())];
+            for partitions in [1, 2, 3, 4, 8, 16] {
+                for _ in 0..2 {
+                    let got = sort_on(tied_batches(n), partitions, true, sort.clone(), limit);
+                    assert_eq!(kv(&got), want, "{sort:?} limit={limit:?} p={partitions}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn already_sorted_input_comes_back_unchanged() {
+        let n = 5_000;
+        let got = sort_on(tied_batches(n), 4, true, vec![("v".into(), false)], None);
+        assert_eq!(i64s(&got, "v"), (0..n).collect::<Vec<_>>());
+        let got = sort_on(tied_batches(n), 4, true, vec![("c".into(), true)], None);
+        assert_eq!(i64s(&got, "v"), (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn single_key_fast_path_matches_the_datafusion_sort() {
+        // Floats with NaN, -0.0/+0.0, infinities and nulls; ints with negatives;
+        // bools. The integer-pair path (one key) must order exactly like
+        // DataFusion's sort with the ordinal as a final key (forced here by a
+        // second, constant key), in both directions, nulls last.
+        let f = Float64Array::from(vec![
+            Some(1.5),
+            None,
+            Some(f64::NAN),
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::NEG_INFINITY),
+            Some(1.5),
+            Some(-2.0),
+            None,
+            Some(f64::INFINITY),
+            Some(-0.0),
+            Some(-f64::NAN),
+        ]);
+        let n = f.len() as i64;
+        let i = Int64Array::from(vec![3, -1, 3, i64::MIN, 0, 7, -1, i64::MAX, 3, 0, -5, 2]);
+        let u = arrow::array::UInt8Array::from(vec![
+            Some(3),
+            Some(255),
+            None,
+            Some(0),
+            Some(3),
+            Some(1),
+            Some(0),
+            Some(255),
+            Some(3),
+            None,
+            Some(1),
+            Some(0),
+        ]);
+        let b = arrow::array::BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("i", DataType::Int64, false),
+            Field::new("u", DataType::UInt8, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("v", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(f),
+                Arc::new(i),
+                Arc::new(u),
+                Arc::new(b),
+                Arc::new(Int64Array::from_iter_values(0..n)),
+                Arc::new(Int64Array::from(vec![0; n as usize])),
+            ],
+        )
+        .unwrap();
+        let halves = || vec![batch.slice(0, 5), batch.slice(5, n as usize - 5)];
+        for key in ["f", "i", "u", "b"] {
+            for descending in [false, true] {
+                let fast = sort_on(halves(), 4, true, vec![(key.into(), descending)], None);
+                let reference = sort_on(
+                    halves(),
+                    4,
+                    true,
+                    vec![(key.into(), descending), ("c".into(), false)],
+                    None,
+                );
+                assert_eq!(
+                    i64s(&fast, "v"),
+                    i64s(&reference, "v"),
+                    "{key} desc={descending}"
+                );
+                // Nulls last in either direction.
+                let col = fast.column(fast.schema().index_of(key).unwrap());
+                let nulls = col.null_count();
+                assert!((0..col.len()).all(|r| col.is_null(r) == (r >= col.len() - nulls)));
+            }
+        }
+        // Spot-check the float order: -NaN < -inf < -2 < -0 < 0 < 1.5 < inf < NaN,
+        // ties (the two 1.5s, the two -0.0s) and nulls in input order.
+        let fast = sort_on(halves(), 2, true, vec![("f".into(), false)], None);
+        assert_eq!(i64s(&fast, "v"), vec![11, 5, 7, 3, 10, 4, 0, 6, 9, 2, 1, 8]);
+    }
+
+    /// A graph with many out-degree ties: node i -> i + 1 and, for even i, also
+    /// i -> i + 2 (mod n). Ids are scrambled so dense order differs from id order.
+    /// Returns the ids in dense (first-appearance) order.
+    fn tie_graph(n: i64) -> (Arc<Topology>, Arc<IdMap>, Vec<i64>) {
+        let id = |i: i64| (i * 7919) % 100_003;
+        let (mut s, mut d) = (vec![], vec![]);
+        for i in 0..n {
+            s.push(id(i));
+            d.push(id((i + 1) % n));
+            if i % 2 == 0 {
+                s.push(id(i));
+                d.push(id((i + 2) % n));
+            }
+        }
+        let (t, ids) = build(&Int64Array::from(s), &Int64Array::from(d));
+        (t, ids, (0..n).map(id).collect())
+    }
+
+    fn degree_query(
+        t: &Arc<Topology>,
+        ids: &Arc<IdMap>,
+        sort: Vec<(String, bool)>,
+        nodes: Option<Vec<RecordBatch>>,
+        group: Option<(Vec<String>, Vec<String>)>,
+    ) -> RecordBatch {
+        let (group_keys, aggs) = group.unwrap_or_default();
+        let nodes_id = nodes.as_ref().map(|_| "id".to_string());
+        let batch = one(execute_node_query(
+            t.clone(),
+            ids.clone(),
+            r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+            &[],
+            Some(sort),
+            None,
+            nodes,
+            nodes_id,
+            None,
+            false,
+            None,
+            vec![],
+            group_keys,
+            aggs,
+            None,
+        )
+        .unwrap());
+        assert_no_hidden(&batch);
+        batch
+    }
+
+    #[test]
+    fn engine_sort_ties_follow_node_order() {
+        let n = 30_000;
+        let (t, ids, dense) = tie_graph(n as i64);
+        // Graph-derived frame: out-degree 2 (even i) first, then 1 (odd i); ties keep
+        // dense node order.
+        let expected: Vec<i64> = dense
+            .iter()
+            .step_by(2)
+            .chain(dense.iter().skip(1).step_by(2))
+            .copied()
+            .collect();
+        for _ in 0..3 {
+            let batch = degree_query(&t, &ids, vec![("deg".into(), true)], None, None);
+            assert_eq!(i64s(&batch, "id"), expected);
+        }
+        // Attribute frame in reversed node order, two batches, sorted by a constant:
+        // ties keep the table's row order, like the plain frame's stable sort.
+        let rev: Vec<i64> = dense.iter().rev().copied().collect();
+        let attrs = id_attr_batch(rev.clone(), "c", vec![1; n]);
+        let attrs = vec![attrs.slice(0, 10_000), attrs.slice(10_000, n - 10_000)];
+        let batch = degree_query(&t, &ids, vec![("c".into(), false)], Some(attrs), None);
+        assert_eq!(i64s(&batch, "id"), rev);
+        // group_by + sort: groups that tie on the sort key keep the order of their
+        // first input row. Rows: dense[1] (deg 1), dense[0] (deg 2), dense[3] (deg 1).
+        let attrs = id_attr_batch(vec![dense[1], dense[0], dense[3]], "c", vec![5, 5, 5]);
+        let agg = r#"{"kind":"alias","name":"m","operand":{"kind":"agg","fn":"min","operand":{"kind":"col","name":"c"}}}"#;
+        let batch = degree_query(
+            &t,
+            &ids,
+            vec![("m".into(), false)],
+            Some(vec![attrs]),
+            Some((vec!["deg".into()], vec![agg.into()])),
+        );
+        assert_eq!(i64s(&batch, "deg"), vec![1, 2]);
+    }
+
+    #[test]
+    fn engine_sort_ties_follow_traversal_and_join_order() {
+        let (t, ids, dense) = tie_graph(5_000);
+        let seeds = Int64Array::from(dense[..1_000].to_vec());
+        let hop = |sort: Option<Vec<(String, bool)>>| {
+            one(execute_hop_query(
+                t.clone(),
+                ids.clone(),
+                &seeds,
+                2,
+                "out",
+                &[],
+                sort,
+                None,
+                false,
+                None,
+                vec![],
+            )
+            .unwrap())
+        };
+        let pairs = |b: &RecordBatch| -> Vec<(i64, i64)> {
+            i64s(b, "src").into_iter().zip(i64s(b, "dst")).collect()
+        };
+        // Ties on `src` keep the unsorted traversal order (seed order, then BFS).
+        let mut want = pairs(&hop(None));
+        want.sort_by_key(|&(s, _)| std::cmp::Reverse(s)); // stable
+        for _ in 0..3 {
+            let sorted = hop(Some(vec![("src".into(), true)]));
+            assert_no_hidden(&sorted);
+            assert_eq!(pairs(&sorted), want);
+        }
+
+        // Join: ties follow the left row, then the right row.
+        let left = id_attr_batch(vec![3, 1, 2, 1], "a", vec![0, 0, 0, 0]);
+        let right = id_attr_batch(vec![1, 2, 1, 3], "b", vec![7, 8, 9, 10]);
+        for how in ["inner", "left"] {
+            let batch = one(execute_join_query(
+                vec![left.clone()],
+                vec![right.clone()],
+                vec!["id".into()],
+                how.into(),
+                &[],
+                Some(vec![("a".into(), false)]),
+                None,
+                false,
+                None,
+                vec![],
+            )
+            .unwrap());
+            assert_no_hidden(&batch);
+            assert_eq!(i64s(&batch, "id"), vec![3, 1, 1, 2, 1, 1]);
+            assert_eq!(i64s(&batch, "b"), vec![10, 7, 9, 8, 7, 9]);
+        }
+    }
+
+    #[test]
+    fn tiebreak_column_name_avoids_user_columns() {
+        // A user column already named like the ordinal keeps its values and stays in
+        // the output; the ordinal takes a fresh name and is still dropped.
+        let left = id_attr_batch(vec![2, 1, 3], "__ursa_ord_l", vec![9, 8, 7]);
+        let right = id_attr_batch(vec![1, 2, 3], "b", vec![0, 0, 0]);
+        let batch = one(execute_join_query(
+            vec![left],
+            vec![right],
+            vec!["id".into()],
+            "inner".into(),
+            &[],
+            Some(vec![("b".into(), false)]),
+            None,
+            false,
+            None,
+            vec![],
+        )
+        .unwrap());
+        assert_eq!(i64s(&batch, "id"), vec![2, 1, 3]);
+        assert_eq!(i64s(&batch, "__ursa_ord_l"), vec![9, 8, 7]);
+        assert_eq!(batch.num_columns(), 3);
     }
 }

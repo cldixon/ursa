@@ -15,9 +15,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   every key or one per key; later keys break ties; nulls sort last for every
   key; dictionary-encoded keys sort by value. Works on plain, scanned and edge
   frames, grouped and joined results, graph-derived frames and traversal
-  outputs (#163). On a plain frame the sort is stable; after a graph algorithm
-  or traversal, rows that tie on every key come back in no fixed order, so end
-  with a unique key such as `id`.
+  outputs (#163). The sort is stable on every path: rows that tie on every key
+  keep their input order (#165).
 
 - `direction=` on `density`, `avg_path_length`, `diameter`, `describe`,
   `pagerank`, `closeness` and `betweenness`. The default stays `"out"`, so
@@ -35,6 +34,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A `sort()` after a graph algorithm or traversal returned rows that tie on
+  every key in an order that depended on the machine's core count, not in
+  input order. Ties now keep their input order, as on a plain frame: node
+  order (or the attribute table's row order) after a graph algorithm, and the
+  traversal's own output order after `hop`/`shortest_path`/`random_walk`
+  (#165).
 - `select("c").distinct()` kept duplicate rows on plain frames, because
   `distinct` ran over every column before `select` narrowed them (#162).
   Other orderings that were silently reordered are fixed too: `head` before
