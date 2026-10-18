@@ -61,6 +61,8 @@ Both frame types have these methods. Each lazy method returns a new frame with o
 
 The steps run in the order you write them, as in Polars. Each one sees the rows and column names the steps before it leave, so a step after `rename` uses the new names and a step after `select` sees only the selected columns.
 
+Without a `sort`, rows come back in input order, the same on every run and every machine. On a plain frame that is the row order. After a graph algorithm it is the attribute table's row order, or node order for an `edges.nodes()` frame; after a traversal it is the traversal's own output order. A `join` returns the left rows in order, each followed by its matches in the right frame's order. `group_by().agg()` and `distinct()` return each group or distinct row at the position of its first input row, and `sample` keeps the picked rows in input order. `head(n)` keeps the first `n` rows of that order.
+
 ### Columns
 
 | Method | Description |
