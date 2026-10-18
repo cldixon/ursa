@@ -1407,9 +1407,10 @@ def _apply_pyarrow_steps(table: Any, steps: list[_Step], roles: dict[str, str]) 
         elif kind == "group_by":
             table = _apply_pyarrow_group_by(table, arg[0], arg[2])
         elif kind == "distinct":
-            # Distinct rows over all columns (group-by with no aggregations); row
-            # order is unspecified for distinct, as on the engine path.
-            table = table.combine_chunks().group_by(table.column_names).aggregate([])
+            # Distinct rows over all columns (group-by with no aggregations), each
+            # at its first occurrence.
+            names = table.column_names
+            table = _group_in_first_order(table, names, []).select(names)
         elif kind == "sample":
             table = _sample_pyarrow(table, arg[0], arg[1])
         elif kind == "sort":
@@ -1672,7 +1673,7 @@ def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, st
         if spec not in seen_specs:
             seen_specs.add(spec)
             specs.append(spec)
-    grouped = table.combine_chunks().group_by(keys).aggregate(specs)
+    grouped = _group_in_first_order(table, keys, specs)
     cols = {name: grouped.column(name) for name in grouped.column_names}
 
     ordered_names = list(keys)
@@ -1681,6 +1682,27 @@ def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, st
         ordered_names.append(a["output"])
         ordered_cols.append(cols[f"{operand[a['column']]}_{_PC_AGG[a['fn']]}"])
     return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
+
+
+def _group_in_first_order(table: Any, keys: list[str], specs: list[Any]) -> Any:
+    """``table.group_by(keys).aggregate(specs)`` with one row per group in order of
+    the group's first input row, the order the engine path gives (#168).
+
+    pyarrow's hash grouping guarantees no output order (not even single-threaded),
+    so each row is numbered, each group keeps its minimum number, and the groups
+    are put in that order."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    row = "__ursa_row"
+    while row in table.column_names:
+        row += "_"
+    ones = pa.nulls(table.num_rows, pa.int64()).fill_null(1)
+    numbered = table.combine_chunks().append_column(row, pc.cumulative_sum(ones))  # ty: ignore[unresolved-attribute]
+    grouped = numbered.group_by(keys).aggregate([*specs, (row, "min")])
+    first = f"{row}_min"
+    grouped = grouped.take(pc.sort_indices(grouped.column(first)))  # ty: ignore[unresolved-attribute]
+    return grouped.drop_columns([first])
 
 
 def _decode_dictionary(column: Any) -> Any:

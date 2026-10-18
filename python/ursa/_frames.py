@@ -140,19 +140,31 @@ class _Frame:
         return self._extend(_PlanStep("sort", {"by": by, "descending": descending}))
 
     def head(self, n: int = 10) -> Self:
+        """Keep the first ``n`` rows.
+
+        Without a ``sort`` first, those are the first ``n`` in input order, which
+        is fixed on every run and core count: the row order of a plain frame or of
+        a frame's attribute table, node order for ``edges.nodes()``, a traversal's
+        own output order, and for a ``join`` the left rows in order, each followed
+        by its matches in right-frame order.
+        """
         return self._extend(_PlanStep("head", {"n": n}))
 
     limit = head
 
     def sample(self, n: int, *, seed: int | None = None) -> Self:
+        """Keep ``n`` random rows, reproducibly for a ``seed``, in input order."""
         # sample changes the row set, so the cached topology index no longer matches
         # (like distinct) — drop it so a later graph op rebuilds from the sample.
         return self._extend(_PlanStep("sample", {"n": n, "seed": seed}), drops_index=True)
 
     def distinct(self) -> Self:
+        """Remove duplicate rows; each kept row stays at its first occurrence."""
         return self._extend(_PlanStep("distinct", {}), drops_index=True)
 
     def group_by(self, *keys: Any) -> _GroupBy:
+        """Group by ``keys``; ``.agg(...)`` returns one row per group, in order of
+        each group's first input row."""
         return _GroupBy(self, keys)
 
     def join(self, other: _Frame, *, on: Any = None, how: str = "inner") -> Self:
@@ -166,6 +178,10 @@ class _Frame:
         so the cached topology no longer matches (``drops_index=True``); a graph
         algorithm after a join therefore errors clearly rather than using a stale
         topology.
+
+        Rows come back in a fixed order: this frame's rows in order, each followed
+        by its matches in ``other``'s row order (an unmatched ``how="left"`` row
+        once, with nulls). A later ``sort`` breaks ties in that order.
         """
         return self._extend(
             _PlanStep("join", {"other": other, "on": on, "how": how}), drops_index=True

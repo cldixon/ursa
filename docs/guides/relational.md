@@ -79,6 +79,8 @@ shape: (4, 4)
 
 Rows that tie on every sort column keep their input order, on every run. On a plain frame that is the row order. After a graph algorithm, as here, it is the attribute table's row order, or node order for an `edges.nodes()` frame. After a traversal it is the order the traversal returns its rows in.
 
+The same input order is what you get without a `sort`. An unsorted `collect()` of `ranked` returns the attribute table's rows in their order, and `head(n)` keeps the first `n` of them. A `join` returns the left rows in order, each followed by its matches in right-frame order, and `group_by` and `distinct` return their rows in order of first appearance.
+
 ## Select and rename
 
 `select` keeps the named columns, in the given order. Call it after `with_columns`.
