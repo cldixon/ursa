@@ -1,6 +1,6 @@
 # Limits
 
-Ursa is version 0.3. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, `collect()` raises `NotImplementedError` with a message that says what to change. Nothing is dropped silently.
+Ursa is version 0.4. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, `collect()` raises `NotImplementedError` with a message that says what to change. Nothing is dropped silently.
 
 ## Steps that do not run
 
@@ -29,7 +29,7 @@ Ursa is version 0.3. The API is stable in shape, and some combinations of steps 
 - One machine, in memory. The graph index must fit in RAM.
 - Node ids are `int64` or `string`. One frame uses one kind.
 - There is no graph mutation. To change the graph, build a new frame.
-- There is no visualization. Positions and drawing are out of scope for 0.3.
+- There is no visualization. Positions and drawing are out of scope for 0.4.
 
 ## Report a gap
 

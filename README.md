@@ -73,7 +73,7 @@ Nothing after that line changes. See the [quickstart](https://cldixon.github.io/
 - **Your data, where it is.** Parquet and CSV, local or on S3, GCS, and Azure. Polars, pandas, pyarrow, NetworkX, NumPy, and SciPy in memory. Arrow in, Arrow out, with no copies.
 - **Results you can check.** Every kernel is deterministic on any thread count. Each one is [pinned to the NetworkX call it matches](https://cldixon.github.io/ursa/semantics/), and the test suite checks it.
 
-Ursa is version 0.3 and in active development. The [Limits](https://cldixon.github.io/ursa/limits/) page lists what does not run yet.
+Ursa is version 0.4 and in active development. The [Limits](https://cldixon.github.io/ursa/limits/) page lists what does not run yet.
 
 ## How it is built
 

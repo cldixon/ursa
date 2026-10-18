@@ -8,6 +8,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-18
+
 ### Added
 
 - `sort()` takes several keys, Polars-style: `sort(["club", "pagerank"],
@@ -15,9 +17,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   every key or one per key; later keys break ties; nulls sort last for every
   key; dictionary-encoded keys sort by value. Works on plain, scanned and edge
   frames, grouped and joined results, graph-derived frames and traversal
-  outputs (#163). On a plain frame the sort is stable; after a graph algorithm
-  or traversal, rows that tie on every key come back in no fixed order, so end
-  with a unique key such as `id`.
+  outputs (#163). The sort is stable on every path: rows that tie on every key
+  keep their input order (#165).
 
 - `direction=` on `density`, `avg_path_length`, `diameter`, `describe`,
   `pagerank`, `closeness` and `betweenness`. The default stays `"out"`, so
@@ -35,6 +36,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A `sort()` after a graph algorithm or traversal returned rows that tie on
+  every key in an order that depended on the machine's core count, not in
+  input order. Ties now keep their input order, as on a plain frame: node
+  order (or the attribute table's row order) after a graph algorithm, and the
+  traversal's own output order after `hop`/`shortest_path`/`random_walk`
+  (#165).
 - `select("c").distinct()` kept duplicate rows on plain frames, because
   `distinct` ran over every column before `select` narrowed them (#162).
   Other orderings that were silently reordered are fixed too: `head` before
@@ -153,6 +160,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - An edge mask whose length does not match the graph's edge count is rejected
   instead of silently dropping the edges past its end.
 
+### Security
+
+- Bumped `rustls` (pulled in by the object-store TLS stack used for
+  `s3://`/`gs://`/`az://`/`https://` scans) from 0.23.45 to 0.23.46 for
+  RUSTSEC-2026-0346, -0347, -0348 and -0349.
+
 ## [0.3.0] — 2026-10-08
 
 ### Added
@@ -234,7 +247,8 @@ Fixed a missing Arrow dependency.
 
 Initial release.
 
-[Unreleased]: https://github.com/cldixon/ursa/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/cldixon/ursa/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/cldixon/ursa/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cldixon/ursa/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cldixon/ursa/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/cldixon/ursa/compare/v0.1.0...v0.1.1

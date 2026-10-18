@@ -77,7 +77,7 @@ shape: (4, 4)
 └───────┴────────┴────────┴───────────┘
 ```
 
-Rows that tie on every sort column keep their input order on a plain frame. After a graph algorithm, as here, their order is not fixed, so end with a unique column such as `id` when the order matters.
+Rows that tie on every sort column keep their input order, on every run. On a plain frame that is the row order. After a graph algorithm, as here, it is the attribute table's row order, or node order for an `edges.nodes()` frame. After a traversal it is the order the traversal returns its rows in.
 
 ## Select and rename
 
