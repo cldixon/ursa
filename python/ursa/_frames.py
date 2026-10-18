@@ -128,11 +128,12 @@ class _Frame:
         earlier ones. ``descending`` is a single bool applied to every key, or a list
         with one bool per key. Nulls sort last for every key, in either direction.
         A dictionary-encoded (categorical) key orders by its values, not its codes.
-        On a plain frame the sort is stable; after a graph algorithm or traversal,
-        rows that tie on every key come back in an unspecified order (end with a
-        unique key such as ``"id"`` to fix it). An empty key list, a ``descending``
-        list whose length differs from the keys, or an unknown column raises an
-        error at collect time.
+        The sort is stable on every path: rows that tie on every key keep their
+        input order, identically on every run. After a graph algorithm that is
+        node order, or the attribute table's row order when the frame has one;
+        after a traversal it is the traversal's own output order. An empty key
+        list, a ``descending`` list whose length differs from the keys, or an
+        unknown column raises an error at collect time.
         """
         if more_by:
             by = [*(by if isinstance(by, (list, tuple)) else [by]), *more_by]
