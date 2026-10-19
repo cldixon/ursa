@@ -3463,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "hashbrown 0.15.5",
@@ -3475,7 +3475,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-plan"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-py"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "arrow-pyarrow",

@@ -8,6 +8,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-19
+
 ### Fixed
 
 - Unsorted output now has a fixed row order on the engine paths that had none:
@@ -259,7 +261,8 @@ Fixed a missing Arrow dependency.
 
 Initial release.
 
-[Unreleased]: https://github.com/cldixon/ursa/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cldixon/ursa/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/cldixon/ursa/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/cldixon/ursa/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cldixon/ursa/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cldixon/ursa/compare/v0.1.1...v0.2.0
