@@ -10,7 +10,7 @@
 # DataFusion → arrow → object_store → pyo3 chain, whose versions are cross-pinned
 # (the workspace pins `pyo3 = "0.28"`, the newest that arrow-pyarrow 58 builds
 # against; pyo3 0.29 — which patches the two pyo3 advisories below — requires
-# arrow-pyarrow 59, only reachable via DataFusion 55, not yet released), so
+# arrow-pyarrow 59, only reachable via DataFusion 55, released but not yet adopted), so
 # clearing them requires a coordinated DataFusion/arrow/pyo3 upgrade tracked
 # separately, not a change we can make in isolation. `cargo update` confirms no
 # in-semver patched version is reachable. Nothing first-party is waived, and any
@@ -27,6 +27,17 @@ ignore = [
     # and only on the cloud object-store code path); no in-semver fix available.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store (Azure); no compatible fix yet" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store (Azure); no compatible fix yet" },
+    # zstd 0.13.3 / zstd-safe 7.2.4 / zstd-sys 2.0.16 — pinned at `zstd = "^0.13"` by
+    # arrow-ipc/parquet 58 and DataFusion 54; the fixes are in zstd 0.14 / zstd-safe
+    # 8.2 / zstd-sys 2.1.2, reachable only with the DataFusion 55 upgrade. None is
+    # reached here: no dependency calls the stream `with_context` constructors
+    # (parquet and arrow-ipc use `zstd::bulk`; the stream decoders take fresh
+    # contexts), `seekable` and `legacy` are not enabled (zstd builds with no
+    # features), and zstd is not in the wasm32 build of ursa-core.
+    { id = "RUSTSEC-2026-0391", reason = "zstd pinned ^0.13 by arrow/parquet 58; stream with_context constructors not used" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe pinned via zstd ^0.13; `seekable` feature not enabled" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe pinned via zstd ^0.13; `legacy` feature (v0.4-0.7 frames) not enabled" },
+    { id = "RUSTSEC-2026-0410", reason = "zstd-sys pinned via zstd ^0.13; wasm32 allocator shim only, zstd is not in the wasm32 build" },
     # Unmaintained transitive crate with no available replacement version.
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled transitively by pyo3/datafusion, no fork/fix" },
 ]
