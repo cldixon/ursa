@@ -30,85 +30,34 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::functions_aggregate::expr_fn::min;
 use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{coalesce, col, lit, DataFrame, SessionContext};
-use serde::Deserialize;
 use ursa_core::algo::AggKind;
 use ursa_core::{EdgeMask, IdMap, Topology};
 
+use crate::expr::GraphVerb;
 use crate::logical::{Direction, GraphAlgo, LayoutKind};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{path_schema, query_batch, OutputColumn, OutputDtype};
 use crate::weight::{edge_weights, WeightCache};
 
-/// One requested output column, deserialized from the Python query IR.
-///
-/// `deny_unknown_fields` makes an unrecognized JSON key a hard error rather than
-/// a silent drop — so a parameter added on the Python side that isn't wired here
-/// fails loudly instead of being ignored (the review's silent-drop class).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ColumnSpec {
-    name: String,
-    kind: String,
-    #[serde(default)]
-    damping: Option<f64>,
-    #[serde(default)]
-    max_iter: Option<u32>,
-    #[serde(default)]
-    tol: Option<f64>,
-    #[serde(default)]
-    direction: Option<String>,
-    // community / centrality fields
-    #[serde(default)]
-    sample: Option<f64>,
-    #[serde(default)]
-    resolution: Option<f64>,
-    #[serde(default)]
-    seed: Option<u64>,
-    // neighbours().agg(...) fields
-    #[serde(default)]
-    agg_fn: Option<String>,
-    #[serde(default)]
-    agg_column: Option<String>,
-    // weighted-algorithm field: the serialized weight expression (over edge cols).
-    #[serde(default)]
-    weight: Option<serde_json::Value>,
-    // connected_components mode: "weak" (default) or "strong".
-    #[serde(default)]
-    mode: Option<String>,
-    // layout fields.
-    #[serde(default)]
-    iterations: Option<u32>,
-    #[serde(default)]
-    k: Option<f64>,
-    #[serde(default)]
-    gravity: Option<f64>,
-    // Which output of a multi-output kernel this column takes (#115): 0 = x,
-    // 1 = y for layout, and 0 for every single-output kernel. Both spellings of a
-    // layout column carry the same parameters and so share one simulation.
-    #[serde(default)]
-    field: Option<usize>,
-    // output dtype narrowing (#117): "f32" emits a float-valued column as Float32;
-    // None / "f64" keeps the native type. Only valid on float-valued columns.
-    #[serde(default)]
-    dtype: Option<String>,
-}
+/// One output column of a node query: its name and the graph verb computing it.
+pub type NodeColumn = (String, GraphVerb);
 
-impl ColumnSpec {
+impl GraphVerb {
     /// The direction of a kernel that takes `'out'` or `'both'` only (`pagerank`,
     /// `betweenness`). `'in'` is a hard error rather than a silent `'out'`.
     fn out_or_both(&self) -> Result<Direction> {
         match parse_direction(self.direction.as_deref().unwrap_or("out"))? {
             Direction::In => Err(DataFusionError::NotImplemented(format!(
                 "{} does not support direction='in'; use 'out' or 'both'",
-                self.kind
+                self.verb
             ))),
             d => Ok(d),
         }
     }
 
     fn to_algo(&self) -> Result<GraphAlgo> {
-        Ok(match self.kind.as_str() {
+        Ok(match self.verb.as_str() {
             "pagerank" => GraphAlgo::PageRank {
                 damping: self.damping.unwrap_or(0.85),
                 max_iter: self.max_iter.unwrap_or(30),
@@ -116,7 +65,7 @@ impl ColumnSpec {
                 direction: self.out_or_both()?,
             },
             "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
-                kind: match self.kind.as_str() {
+                kind: match self.verb.as_str() {
                     "layout_fr" => LayoutKind::Fr,
                     "layout_random" => LayoutKind::Random,
                     _ => LayoutKind::Circle,
@@ -130,7 +79,7 @@ impl ColumnSpec {
                 direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
             },
             "connected_components" => GraphAlgo::ConnectedComponents {
-                strong: parse_cc_strong(self.mode.as_deref())?,
+                strong: parse_cc_strong(self.mode.as_ref().map(|m| m.as_str().unwrap_or("")))?,
             },
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
@@ -1109,7 +1058,7 @@ fn sample_rows(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Result
 pub fn execute_node_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
-    columns_json: &str,
+    columns: &[NodeColumn],
     filters: &[String],
     sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
@@ -1124,22 +1073,8 @@ pub fn execute_node_query(
     mask: Option<Arc<EdgeMask>>,
 ) -> Result<Vec<RecordBatch>> {
     execute_node_query_cached(
-        topology,
-        ids,
-        columns_json,
-        filters,
-        sort,
-        limit,
-        nodes,
-        nodes_id,
-        edges,
-        distinct,
-        sample,
-        rename,
-        group_keys,
-        aggs,
-        mask,
-        None,
+        topology, ids, columns, filters, sort, limit, nodes, nodes_id, edges, distinct, sample,
+        rename, group_keys, aggs, mask, None,
     )
 }
 
@@ -1150,7 +1085,7 @@ pub fn execute_node_query(
 pub fn execute_node_query_cached(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
-    columns_json: &str,
+    columns: &[NodeColumn],
     filters: &[String],
     sort: Option<Vec<(String, bool)>>,
     limit: Option<usize>,
@@ -1165,9 +1100,7 @@ pub fn execute_node_query_cached(
     mask: Option<Arc<EdgeMask>>,
     shared_weights: Option<&WeightCache>,
 ) -> Result<Vec<RecordBatch>> {
-    let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
-        .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
-    if specs.is_empty() {
+    if columns.is_empty() {
         return Err(DataFusionError::Execution(
             "graph query has no output columns".into(),
         ));
@@ -1176,27 +1109,27 @@ pub fn execute_node_query_cached(
     // column and DataFusion rejects duplicate unqualified fields, so a collision
     // would otherwise panic inside the node constructor's DFSchema conversion.
     let mut seen = std::collections::HashSet::new();
-    for spec in &specs {
-        if spec.name == "id" {
+    for (name, _) in columns {
+        if name == "id" {
             return Err(DataFusionError::Execution(
                 "output column name 'id' is reserved (it is the node id column); \
                  give the with_columns output a different name"
                     .into(),
             ));
         }
-        if !seen.insert(spec.name.as_str()) {
+        if !seen.insert(name.as_str()) {
             return Err(DataFusionError::Execution(format!(
-                "duplicate output column name {:?}; each with_columns output needs a unique name",
-                spec.name
+                "duplicate output column name {name:?}; each with_columns output needs a unique name"
             )));
         }
     }
     let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
+    let specs = columns;
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
     let mut weight_cache: HashMap<String, Arc<Vec<f64>>> = HashMap::new();
-    for spec in &specs {
-        let dtype = parse_output_dtype(spec.dtype.as_deref())?;
-        if spec.kind == "neighbors_agg" {
+    for (name, spec) in specs {
+        let dtype = parse_output_dtype(spec.dtype.as_ref().map(|d| d.as_str().unwrap_or("")))?;
+        if spec.verb == "neighbors_agg" {
             let nodes_ref = nodes.as_ref().ok_or_else(|| {
                 DataFusionError::NotImplemented(
                     "neighbors().agg() needs a node attribute table \
@@ -1204,14 +1137,14 @@ pub fn execute_node_query_cached(
                         .into(),
                 )
             })?;
-            let attr_col = spec.agg_column.as_deref().ok_or_else(|| {
+            let attr_col = spec.agg_column().ok_or_else(|| {
                 DataFusionError::Execution("neighbors().agg() is missing its column".into())
             })?;
             let direction = parse_direction(spec.direction.as_deref().unwrap_or("out"))?;
-            let agg = parse_agg(spec.agg_fn.as_deref().unwrap_or("mean"))?;
+            let agg = parse_agg(spec.agg_fn().unwrap_or("mean"))?;
             let attr = dense_attr_column(nodes_ref, &nodes_id_name, attr_col, &ids, agg)?;
             columns.push(OutputColumn::NeighborAgg {
-                name: spec.name.clone(),
+                name: name.clone(),
                 attr: Arc::new(attr),
                 direction: direction.into(),
                 agg,
@@ -1236,7 +1169,7 @@ pub fn execute_node_query_cached(
                     ) {
                         return Err(DataFusionError::NotImplemented(format!(
                             "weight= is not supported for {:?}",
-                            spec.kind
+                            spec.verb
                         )));
                     }
                     // One evaluation per distinct expression: columns weighted by
@@ -1267,7 +1200,7 @@ pub fn execute_node_query_cached(
             if field > 0 && !matches!(algo, GraphAlgo::Layout { .. }) {
                 return Err(DataFusionError::NotImplemented(format!(
                     "{:?} emits a single column; field={field} has nothing to select",
-                    spec.kind
+                    spec.verb
                 )));
             }
             if field > 1 {
@@ -1276,7 +1209,7 @@ pub fn execute_node_query_cached(
                 )));
             }
             let column = OutputColumn::Algo {
-                name: spec.name.clone(),
+                name: name.clone(),
                 algo,
                 weights,
                 dtype,
@@ -1288,7 +1221,7 @@ pub fn execute_node_query_cached(
             if dtype == OutputDtype::F32 && !column.is_float_valued() {
                 return Err(DataFusionError::NotImplemented(format!(
                     "dtype='f32' is only supported for float-valued kernels; {:?} emits integers",
-                    spec.kind
+                    spec.verb
                 )));
             }
             columns.push(column);
@@ -1889,6 +1822,29 @@ async fn collect_batches(df: DataFrame) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
+/// Test helper: node columns from the compact JSON the unit tests write, a list of
+/// `{"name": ..., "kind": <verb>, ...params}`.
+#[cfg(test)]
+pub(crate) fn cols(json: &str) -> Vec<NodeColumn> {
+    let specs: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+    specs
+        .into_iter()
+        .map(|mut spec| {
+            let obj = spec.as_object_mut().unwrap();
+            let name = obj.remove("name").unwrap().as_str().unwrap().to_string();
+            let verb = obj.remove("kind").unwrap();
+            if let (Some(f), Some(c)) = (obj.remove("agg_fn"), obj.remove("agg_column")) {
+                obj.insert(
+                    "agg".into(),
+                    serde_json::json!({"kind": "agg", "fn": f, "operand": {"kind": "col", "name": c}}),
+                );
+            }
+            obj.insert("verb".into(), verb);
+            (name, GraphVerb::from_value(&spec).unwrap())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,7 +1913,7 @@ mod tests {
         let batch = one(execute_node_query(
             t,
             ids,
-            r#"[{"name":"pagerank","kind":"pagerank"}]"#,
+            &cols(r#"[{"name":"pagerank","kind":"pagerank"}]"#),
             &[],
             None,
             None,
@@ -1984,7 +1940,7 @@ mod tests {
             execute_node_query(
                 t,
                 ids,
-                r#"[{"name":"pr","kind":"pagerank"},{"name":"indeg","kind":"degree","direction":"in"}]"#,
+                &cols(r#"[{"name":"pr","kind":"pagerank"},{"name":"indeg","kind":"degree","direction":"in"}]"#),
                 &[r#"{"kind":"binary","op":">",
                     "left":{"kind":"col","name":"indeg"},
                     "right":{"kind":"lit","value":0.0}}"#
@@ -2014,7 +1970,7 @@ mod tests {
         let err = execute_node_query(
             t,
             ids,
-            r#"[{"name":"x","kind":"no_such_algorithm"}]"#,
+            &cols(r#"[{"name":"x","kind":"no_such_algorithm"}]"#),
             &[],
             None,
             None,
@@ -2048,7 +2004,7 @@ mod tests {
             let batch = one(execute_node_query(
                 t,
                 ids,
-                &spec,
+                &cols(&spec),
                 &[],
                 None,
                 None,
@@ -2092,7 +2048,7 @@ mod tests {
         let batch = one(execute_node_query(
             t,
             ids,
-            r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
+            &cols(r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#),
             &[],
             Some(vec![("id".into(), false)]),
             None,
@@ -2140,7 +2096,7 @@ mod tests {
             execute_node_query(
                 t,
                 ids,
-                r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#,
+                &cols(r#"[{"name":"nbr_cap","kind":"neighbors_agg","agg_fn":"mean","agg_column":"capacity","direction":"in"}]"#),
                 &[],
                 Some(vec![("id".into(), false)]),
                 None,
@@ -2199,7 +2155,7 @@ mod tests {
                 execute_node_query(
                     t,
                     ids,
-                    r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#,
+                    &cols(r#"[{"name":"nbr_regions","kind":"neighbors_agg","agg_fn":"n_unique","agg_column":"region","direction":"in"}]"#),
                     &[],
                     Some(vec![("id".into(), false)]),
                     None,
@@ -2409,7 +2365,9 @@ mod tests {
         let err = execute_node_query(
             t,
             ids,
-            r#"[{"name":"m","kind":"neighbors_agg","agg_fn":"mean","agg_column":"region","direction":"in"}]"#,
+            &cols(
+                r#"[{"name":"m","kind":"neighbors_agg","agg_fn":"mean","agg_column":"region","direction":"in"}]"#,
+            ),
             &[],
             None,
             None,
@@ -2453,7 +2411,7 @@ mod tests {
             execute_node_query(
                 t,
                 ids,
-                r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#,
+                &cols(r#"[{"name":"indeg","kind":"degree","direction":"in"}]"#),
                 &[],
                 Some(vec![("region".into(), false)]),
                 None,
@@ -2507,7 +2465,7 @@ mod tests {
         let err = execute_node_query(
             t,
             ids,
-            r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+            &cols(r#"[{"name":"deg","kind":"degree","direction":"out"}]"#),
             &[],
             None,
             None,
@@ -2934,7 +2892,7 @@ mod tests {
         let batch = one(execute_node_query(
             t.clone(),
             ids.clone(),
-            r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+            &cols(r#"[{"name":"deg","kind":"degree","direction":"out"}]"#),
             &[],
             Some(sort),
             None,
@@ -3094,7 +3052,7 @@ mod tests {
         let batch = one(execute_node_query(
             t.clone(),
             ids.clone(),
-            r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+            &cols(r#"[{"name":"deg","kind":"degree","direction":"out"}]"#),
             filters,
             None,
             limit,
@@ -3428,7 +3386,7 @@ mod tests {
                 one(execute_node_query(
                     t.clone(),
                     ids.clone(),
-                    r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+                    &cols(r#"[{"name":"deg","kind":"degree","direction":"out"}]"#),
                     &[],
                     None,
                     Some(20_000),

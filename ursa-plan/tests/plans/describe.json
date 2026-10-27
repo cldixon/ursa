@@ -1,0 +1,43 @@
+{
+ "description": "The undirected whole-graph summary.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "describe",
+  "edges": {
+   "plan": {
+    "op": "from_arrow",
+    "frame": 1,
+    "src": "src",
+    "dst": "dst"
+   },
+   "frame": 1
+  },
+  "full": true,
+  "direction": "both"
+ },
+ "expect": {
+  "columns": [
+   "n_nodes",
+   "n_edges",
+   "density",
+   "avg_degree",
+   "n_components"
+  ],
+  "rows": [
+   [
+    34,
+    78,
+    0.13903743315508021,
+    4.588235294117647,
+    1
+   ]
+  ]
+ }
+}

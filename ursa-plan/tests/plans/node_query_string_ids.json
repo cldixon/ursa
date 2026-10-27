@@ -1,0 +1,81 @@
+{
+ "description": "Degree over the Florentine families (string ids), ties in node order.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "florentine"
+  }
+ ],
+ "plan": {
+  "op": "head",
+  "input": {
+   "op": "sort",
+   "input": {
+    "op": "with_columns",
+    "input": {
+     "op": "nodes",
+     "input": {
+      "op": "from_arrow",
+      "frame": 0,
+      "src": "src",
+      "dst": "dst"
+     }
+    },
+    "columns": [
+     {
+      "name": "degree",
+      "expr": {
+       "kind": "graph",
+       "verb": "degree",
+       "edges": {
+        "plan": {
+         "op": "from_arrow",
+         "frame": 1,
+         "src": "src",
+         "dst": "dst"
+        },
+        "frame": 1
+       },
+       "direction": "both"
+      }
+     }
+    ]
+   },
+   "step": 0,
+   "by": [
+    {
+     "column": "degree",
+     "descending": true
+    }
+   ]
+  },
+  "step": 1,
+  "n": 4
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "degree"
+  ],
+  "rows": [
+   [
+    "Medici",
+    6
+   ],
+   [
+    "Strozzi",
+    4
+   ],
+   [
+    "Guadagni",
+    4
+   ],
+   [
+    "Ridolfi",
+    3
+   ]
+  ]
+ }
+}

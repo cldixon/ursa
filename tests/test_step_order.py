@@ -17,7 +17,6 @@ import pyarrow.parquet as pq
 import pytest
 
 import ursa as ur
-from ursa._execute import _projection, _split_engine_tail, _tail_step
 
 pytestmark = pytest.mark.skipif(
     not ur._NATIVE_AVAILABLE, reason="native extension not built (run `maturin develop`)"
@@ -290,36 +289,9 @@ def test_rename_then_join_on_edges(edges):
 
 
 # --- engine path: the common tail stays fully pushed down --------------------
-
-
-def _steps(*kinds):
-    return [(k, a) for k, a in kinds]
-
-
-def test_engine_split_pushes_the_common_tail():
-    sort = [("v", True)]
-    pushed, rest = _split_engine_tail(
-        _steps(("filter", "f1"), ("sort", sort), ("filter", "f2"), ("head", 5))
-    )
-    assert rest == []
-    assert pushed.filters == ["f1", "f2"] and pushed.sort == sort and pushed.limit == 5
-
-
-@pytest.mark.parametrize(
-    ("steps", "n_pushed"),
-    [
-        ([("head", 3), ("sort", [("v", False)])], 1),
-        ([("head", 3), ("filter", "f")], 1),
-        ([("rename", {"v": "w"}), ("sort", [("w", False)])], 1),
-        ([("select", ["c"]), ("distinct", None)], 1),
-        ([("sort", [("v", False)]), ("sort", [("c", False)])], 1),
-        ([("rename", {"a": "b", "b": "a"})], 0),
-        ([("group_by", ([], [], [])), ("filter", "f")], 1),
-    ],
-)
-def test_engine_split_leaves_out_of_order_steps_to_the_remainder(steps, n_pushed):
-    _pushed, rest = _split_engine_tail(steps)
-    assert rest == steps[n_pushed:]
+# How written-order steps split between the engine's fixed-order tail and the
+# host is a unit concern of the plan executor; see the `split_engine_tail` and
+# `projection` tests in `ursa-plan/src/plan.rs`.
 
 
 # --- clear errors where an ordering is not supported -------------------------
@@ -371,5 +343,3 @@ def test_scan_pushdown_reads_every_sort_key_through_a_rename(tmp_path):
     pipeline = frame.rename({"c": "k"}).sort(["k", "v"], descending=[True, False]).head(3)
     out = pipeline.select("id", "k").collect().to_dicts()
     assert out == [{"id": 6, "k": "z"}, {"id": 2, "k": "y"}, {"id": 4, "k": "y"}]
-    steps = [_tail_step(s) for s in pipeline.select("id")._plan if s.op != "scan_nodes"]
-    assert _projection(steps, {"id"}, {"id": "id"}) == ["c", "id", "v"]

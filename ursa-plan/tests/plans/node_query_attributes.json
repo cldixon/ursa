@@ -1,0 +1,102 @@
+{
+ "description": "A graph column attached to a node attribute table, filtered on an attribute.",
+ "inputs": [
+  {
+   "nodes": "karate"
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "head",
+  "input": {
+   "op": "sort",
+   "input": {
+    "op": "filter",
+    "input": {
+     "op": "with_columns",
+     "input": {
+      "op": "from_arrow",
+      "frame": 0,
+      "id": "id"
+     },
+     "columns": [
+      {
+       "name": "deg",
+       "expr": {
+        "kind": "graph",
+        "verb": "degree",
+        "edges": {
+         "plan": {
+          "op": "from_arrow",
+          "frame": 1,
+          "src": "src",
+          "dst": "dst"
+         },
+         "frame": 1
+        },
+        "direction": "out"
+       }
+      }
+     ]
+    },
+    "step": 0,
+    "predicate": {
+     "kind": "binary",
+     "op": "==",
+     "left": {
+      "kind": "col",
+      "name": "club"
+     },
+     "right": {
+      "kind": "lit",
+      "value": "Officer"
+     }
+    }
+   },
+   "step": 1,
+   "by": [
+    {
+     "column": "deg",
+     "descending": true
+    },
+    {
+     "column": "id",
+     "descending": false
+    }
+   ]
+  },
+  "step": 2,
+  "n": 4
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "club",
+   "deg"
+  ],
+  "rows": [
+   [
+    23,
+    "Officer",
+    5
+   ],
+   [
+    24,
+    "Officer",
+    3
+   ],
+   [
+    14,
+    "Officer",
+    2
+   ],
+   [
+    15,
+    "Officer",
+    2
+   ]
+  ]
+ }
+}

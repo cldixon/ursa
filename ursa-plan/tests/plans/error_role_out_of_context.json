@@ -1,0 +1,51 @@
+{
+ "description": "ur.src() in a filter over walk rows.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "ids": [
+    0
+   ]
+  }
+ ],
+ "plan": {
+  "op": "filter",
+  "input": {
+   "op": "random_walk",
+   "edges": {
+    "plan": {
+     "op": "from_arrow",
+     "frame": 1,
+     "src": "src",
+     "dst": "dst"
+    },
+    "frame": 1
+   },
+   "start": 2,
+   "steps": 2,
+   "walks_per_node": 1,
+   "seed": 1
+  },
+  "step": 0,
+  "predicate": {
+   "kind": "binary",
+   "op": ">",
+   "left": {
+    "kind": "src"
+   },
+   "right": {
+    "kind": "lit",
+    "value": 0
+   }
+  }
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "ur.src() is not available in this context (resolvable roles here: [])."
+ }
+}

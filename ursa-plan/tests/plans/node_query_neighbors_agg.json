@@ -1,0 +1,92 @@
+{
+ "description": "A neighbour aggregation of a string attribute.",
+ "inputs": [
+  {
+   "nodes": "karate"
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "head",
+  "input": {
+   "op": "with_columns",
+   "input": {
+    "op": "from_arrow",
+    "frame": 0,
+    "id": "id"
+   },
+   "columns": [
+    {
+     "name": "clubs",
+     "expr": {
+      "kind": "graph",
+      "verb": "neighbors_agg",
+      "edges": {
+       "plan": {
+        "op": "from_arrow",
+        "frame": 1,
+        "src": "src",
+        "dst": "dst"
+       },
+       "frame": 1
+      },
+      "direction": "both",
+      "from_": false,
+      "agg": {
+       "kind": "agg",
+       "fn": "n_unique",
+       "operand": {
+        "kind": "col",
+        "name": "club"
+       }
+      },
+      "dtype": "f64"
+     }
+    }
+   ]
+  },
+  "step": 0,
+  "n": 6
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "club",
+   "clubs"
+  ],
+  "rows": [
+   [
+    0,
+    "Mr. Hi",
+    2.0
+   ],
+   [
+    1,
+    "Mr. Hi",
+    2.0
+   ],
+   [
+    2,
+    "Mr. Hi",
+    2.0
+   ],
+   [
+    3,
+    "Mr. Hi",
+    1.0
+   ],
+   [
+    4,
+    "Mr. Hi",
+    1.0
+   ],
+   [
+    5,
+    "Mr. Hi",
+    1.0
+   ]
+  ]
+ }
+}

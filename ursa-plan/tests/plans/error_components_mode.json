@@ -1,0 +1,46 @@
+{
+ "description": "An unknown connected_components mode.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "with_columns",
+  "input": {
+   "op": "nodes",
+   "input": {
+    "op": "from_arrow",
+    "frame": 0,
+    "src": "src",
+    "dst": "dst"
+   }
+  },
+  "columns": [
+   {
+    "name": "connected_components",
+    "expr": {
+     "kind": "graph",
+     "verb": "connected_components",
+     "edges": {
+      "plan": {
+       "op": "from_arrow",
+       "frame": 1,
+       "src": "src",
+       "dst": "dst"
+      },
+      "frame": 1
+     },
+     "mode": "bogus"
+    }
+   }
+  ]
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "connected_components(mode='bogus') is not supported; use mode='weak' or mode='strong'."
+ }
+}

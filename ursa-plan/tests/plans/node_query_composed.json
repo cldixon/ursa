@@ -1,0 +1,129 @@
+{
+ "description": "Two graph columns over edges.nodes(), then a filter/sort/head tail.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "head",
+  "input": {
+   "op": "sort",
+   "input": {
+    "op": "filter",
+    "input": {
+     "op": "with_columns",
+     "input": {
+      "op": "nodes",
+      "input": {
+       "op": "from_arrow",
+       "frame": 0,
+       "src": "src",
+       "dst": "dst"
+      }
+     },
+     "columns": [
+      {
+       "name": "pr",
+       "expr": {
+        "kind": "graph",
+        "verb": "pagerank",
+        "edges": {
+         "plan": {
+          "op": "from_arrow",
+          "frame": 1,
+          "src": "src",
+          "dst": "dst"
+         },
+         "frame": 1
+        },
+        "damping": 0.85,
+        "max_iter": 30,
+        "tol": 1e-06,
+        "weight": null,
+        "dtype": "f64",
+        "direction": "out"
+       }
+      },
+      {
+       "name": "deg",
+       "expr": {
+        "kind": "graph",
+        "verb": "degree",
+        "edges": {
+         "plan": {
+          "op": "from_arrow",
+          "frame": 1,
+          "src": "src",
+          "dst": "dst"
+         },
+         "frame": 1
+        },
+        "direction": "both"
+       }
+      }
+     ]
+    },
+    "step": 0,
+    "predicate": {
+     "kind": "binary",
+     "op": ">",
+     "left": {
+      "kind": "col",
+      "name": "deg"
+     },
+     "right": {
+      "kind": "lit",
+      "value": 5
+     }
+    }
+   },
+   "step": 1,
+   "by": [
+    {
+     "column": "pr",
+     "descending": true
+    }
+   ]
+  },
+  "step": 2,
+  "n": 5
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "pr",
+   "deg"
+  ],
+  "rows": [
+   [
+    33,
+    0.25904714771295256,
+    17
+   ],
+   [
+    32,
+    0.09548932925521017,
+    12
+   ],
+   [
+    31,
+    0.04592546892062465,
+    6
+   ],
+   [
+    3,
+    0.019410006359109923,
+    6
+   ],
+   [
+    2,
+    0.0175457686816172,
+    10
+   ]
+  ]
+ }
+}

@@ -1,0 +1,112 @@
+{
+ "description": "A node query joined to the attribute table, with a tail after the join.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "nodes": "karate"
+  }
+ ],
+ "plan": {
+  "op": "sort",
+  "input": {
+   "op": "filter",
+   "input": {
+    "op": "join",
+    "input": {
+     "op": "with_columns",
+     "input": {
+      "op": "nodes",
+      "input": {
+       "op": "from_arrow",
+       "frame": 0,
+       "src": "src",
+       "dst": "dst"
+      }
+     },
+     "columns": [
+      {
+       "name": "deg",
+       "expr": {
+        "kind": "graph",
+        "verb": "degree",
+        "edges": {
+         "plan": {
+          "op": "from_arrow",
+          "frame": 1,
+          "src": "src",
+          "dst": "dst"
+         },
+         "frame": 1
+        },
+        "direction": "out"
+       }
+      }
+     ]
+    },
+    "right": {
+     "op": "from_arrow",
+     "frame": 2,
+     "id": "id"
+    },
+    "on": [
+     "id"
+    ],
+    "how": "inner"
+   },
+   "step": 0,
+   "predicate": {
+    "kind": "binary",
+    "op": ">",
+    "left": {
+     "kind": "col",
+     "name": "deg"
+    },
+    "right": {
+     "kind": "lit",
+     "value": 3
+    }
+   }
+  },
+  "step": 1,
+  "by": [
+   {
+    "column": "deg",
+    "descending": true
+   }
+  ]
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "deg",
+   "club"
+  ],
+  "rows": [
+   [
+    0,
+    16,
+    "Mr. Hi"
+   ],
+   [
+    1,
+    8,
+    "Mr. Hi"
+   ],
+   [
+    2,
+    8,
+    "Mr. Hi"
+   ],
+   [
+    23,
+    5,
+    "Officer"
+   ]
+  ]
+ }
+}

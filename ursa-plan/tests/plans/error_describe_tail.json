@@ -1,0 +1,34 @@
+{
+ "description": "describe() takes no tail yet.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "head",
+  "input": {
+   "op": "describe",
+   "edges": {
+    "plan": {
+     "op": "from_arrow",
+     "frame": 1,
+     "src": "src",
+     "dst": "dst"
+    },
+    "frame": 1
+   },
+   "full": false,
+   "direction": "out"
+  },
+  "step": 0,
+  "n": 1
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "describe() output does not support a filter/sort/head tail yet; call describe() as the final step of the pipeline."
+ }
+}
