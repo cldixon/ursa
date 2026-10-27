@@ -7,3 +7,4 @@ data/
 results/*.parquet
 
 __pycache__/
+plan_matrix/results.tsv
