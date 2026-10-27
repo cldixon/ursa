@@ -37,7 +37,7 @@ use ursa_core::{EdgeMask, IdMap, Topology};
 use crate::logical::{Direction, GraphAlgo, LayoutKind};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
-use crate::result::{path_schema, OutputColumn, OutputDtype};
+use crate::result::{path_schema, query_batch, OutputColumn, OutputDtype};
 use crate::weight::{edge_weights, WeightCache};
 
 /// One requested output column, deserialized from the Python query IR.
@@ -363,11 +363,12 @@ struct Tail<'a> {
 /// expression.
 ///
 /// Unsorted output has the same problem wherever DataFusion repartitions: a hash
-/// join (the attribute frame's LEFT join onto the algorithm output, and `join`)
-/// and a hash aggregate (`group_by`, `distinct`) emit rows in an order that
-/// depends on the partition count. So the attribute and join paths always number
-/// their base rows, and a graph or traversal leaf does when its tail groups,
-/// dedups or samples. An unsorted query that carries the ordinal ends with an
+/// join (`join`) and a hash aggregate (`group_by`, `distinct`) emit rows in an
+/// order that depends on the partition count, and so does a filter over several
+/// batches. So the join path always numbers its base rows, a graph or traversal
+/// leaf does when its tail groups, dedups or samples, and the attribute path
+/// (whose rows are gathered in table order, batch by batch) does when its tail
+/// also filters. An unsorted query that carries the ordinal ends with an
 /// order by it ([`order_by_ordinals`]), so its rows follow input order, as on the
 /// plain frame. An unsorted leaf query without those steps keeps the leaf's own
 /// deterministic order (one partition, never repartitioned) and pays nothing.
@@ -377,7 +378,7 @@ struct Tail<'a> {
 ///   output's row order, which is dense node order (first appearance in the
 ///   edges), i.e. the order an unsorted collect returns;
 /// - node attribute frame with algorithms: the attribute table's row order (the
-///   algorithm columns are LEFT-joined onto it, one output row per table row), so
+///   algorithm columns are attached to it by id, one output row per table row), so
 ///   ties match the plain frame's stable pyarrow sort;
 /// - `hop` / `shortest_path` / `random_walk`: the traversal's own deterministic
 ///   output order (seed order then BFS order; path order; walk then step), i.e.
@@ -1100,9 +1101,10 @@ fn sample_rows(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Result
 ///
 /// The base is a [`GraphAlgorithmNode`] emitting `(id, values...)`. When `nodes`
 /// is supplied (a node **attribute** table with id column `nodes_id`), the
-/// algorithm outputs are LEFT-joined onto it by id — so the result carries the
-/// attribute columns plus the computed columns, and `filter`/`sort` can reference
-/// either. Filters/sort/limit are stock DataFusion `DataFrame` operations.
+/// algorithm outputs are attached to it by id ([`attach_by_gather`]: a LEFT join
+/// that keeps table order) — so the result carries the attribute columns plus the
+/// computed columns, and `filter`/`sort` can reference either. Filters/sort/limit
+/// are stock DataFusion `DataFrame` operations.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_node_query(
     topology: Arc<Topology>,
@@ -1293,49 +1295,54 @@ pub fn execute_node_query_cached(
         }
     }
 
-    let graph_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
-    });
     let numbered_leaf = Tiebreak::leaf_needs(&sort, !group_keys.is_empty(), distinct, &sample);
-    // The LEFT join emits exactly one row per table row, so a bare unsorted
-    // `head(n)` needs only the table's first `n` rows.
+    let filtered = !filters.is_empty();
+    // One output row per table row, in table order, so a bare unsorted `head(n)`
+    // needs only the table's first `n` rows.
     let prefix = bare_limit(filters, &group_keys, distinct, &sample, &sort, limit);
 
     run_query(
         move |ctx| {
             Box::pin(async move {
                 // Base frame: either the graph output alone, or a node attribute
-                // table with the graph output left-joined onto it by id.
-                Ok(match nodes {
-                    Some(batches) => {
-                        let batches = take_prefix(batches, prefix);
-                        let graph_df = ctx.execute_logical_plan(graph_plan).await?;
-                        let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
-                        // The LEFT join emits each table row once, in an order that
-                        // depends on the partition count; number the table's rows so
-                        // unsorted output, and ties under a sort, follow the table's
-                        // row order.
-                        let schemas: Vec<&Schema> =
-                            batches.iter().map(|b| b.schema_ref().as_ref()).collect();
-                        let name = Tiebreak::fresh_name("", &schemas);
-                        let batches = Tiebreak::attach(batches, &name)?;
-                        let tiebreak = vec![name];
-                        let nodes_df = ctx.read_batches(batches)?;
-                        // Rename the graph id so the join keys don't collide, then drop it.
-                        let graph_df = graph_df.with_column_renamed("id", "__ursa_gid")?;
-                        let joined = nodes_df
-                            .join(
-                                graph_df,
-                                JoinType::Left,
-                                &[id_col.as_str()],
-                                &["__ursa_gid"],
-                                None,
-                            )?
-                            .drop_columns(&["__ursa_gid"])?;
-                        (joined, tiebreak)
-                    }
-                    None => Tiebreak::leaf(ctx, graph_plan, numbered_leaf).await?,
+                // table with the graph output attached to it by id.
+                let Some(batches) = nodes else {
+                    let graph_plan = LogicalPlan::Extension(Extension {
+                        node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
+                    });
+                    return Tiebreak::leaf(ctx, graph_plan, numbered_leaf).await;
+                };
+                let batches = take_prefix(batches, prefix);
+                let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
+                // CPU-bound (Rayon-parallel inside), as in `GraphAlgorithmExec`.
+                let (graph, ids) = tokio::task::spawn_blocking(move || {
+                    query_batch(&topology, &ids, &columns, mask.as_deref()).map(|b| (b, ids))
                 })
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))??;
+                // One output row per table row, in table order: unsorted output and
+                // ties under a sort follow the table's row order. The gathered rows
+                // are already in that order, but a tail step that repartitions
+                // (filter, group_by, distinct, sample, sort) does not keep it, so
+                // those number the table's rows.
+                let numbered = numbered_leaf || filtered;
+                let schemas: Vec<&Schema> =
+                    batches.iter().map(|b| b.schema_ref().as_ref()).collect();
+                let name = Tiebreak::fresh_name("", &schemas);
+                let (base, tiebreak) = match attach_by_gather(&batches, &id_col, &graph, &ids)? {
+                    Some(gathered) if !numbered => (read_ordered(ctx, gathered)?, vec![]),
+                    Some(gathered) => (
+                        ctx.read_batches(Tiebreak::attach(gathered, &name)?)?,
+                        vec![name],
+                    ),
+                    // An id column the gather does not read: the hash LEFT join,
+                    // which coerces the key types, numbered for its order.
+                    None => (
+                        attach_by_join(ctx, batches, &id_col, graph, &name)?,
+                        vec![name],
+                    ),
+                };
+                Ok((base, tiebreak))
             })
         },
         Tail {
@@ -1356,16 +1363,15 @@ pub fn execute_node_query_cached(
 /// the standard relational tail to the joined frame.
 ///
 /// This is the user-facing `frame.join(other, on=, how=)` — a join between two
-/// arbitrary frames, distinct from the internal LEFT join that attaches node
-/// attributes to algorithm outputs (in [`execute_node_query`]). It is
-/// topology-independent: both operands are just Arrow tables, so no `GraphIndex`
-/// is involved.
+/// arbitrary frames, distinct from the internal attach of algorithm outputs to
+/// node attributes (in [`execute_node_query`]). It is topology-independent: both
+/// operands are just Arrow tables, so no `GraphIndex` is involved.
 ///
 /// `on` names key columns present in **both** frames (a same-name equi-join). The
 /// right side's key columns are renamed to private sentinels for the join and then
 /// dropped, so each key appears once (the left copy) in the output — mirroring the
-/// attribute-attach join. Non-key column-name collisions are rejected by the caller
-/// before we get here. `how` is `inner` or `left`; the whole tail
+/// attribute-attach join ([`attach_by_join`]). Non-key column-name collisions are
+/// rejected by the caller before we get here. `how` is `inner` or `left`; the whole tail
 /// (`filters → group_by → distinct → sample → sort → limit → rename`) then runs on
 /// the joined frame.
 ///
@@ -1717,6 +1723,156 @@ pub fn execute_walk_query(
 fn resolve_dense(ids: &IdMap, arr: &dyn Array) -> Result<Vec<Option<u32>>, DataFusionError> {
     ids.dense_from_array(arr)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// `batches` (at least one) as a single partition the engine cannot split, so a
+/// tail that does not repartition (none, `head`, `rename`) keeps their row order.
+/// A `read_batches` scan of several batches may be split across partitions, and
+/// its rows then come back out of order.
+fn read_ordered(ctx: &SessionContext, batches: Vec<RecordBatch>) -> Result<DataFrame> {
+    use datafusion::catalog::streaming::StreamingTable;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::streaming::PartitionStream;
+    use datafusion::physical_plan::SendableRecordBatchStream;
+
+    #[derive(Debug)]
+    struct Ordered {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    }
+    impl PartitionStream for Ordered {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batches = self.batches.clone().into_iter().map(Ok);
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                futures::stream::iter(batches),
+            ))
+        }
+    }
+    let schema = batches[0].schema();
+    let part = Arc::new(Ordered {
+        schema: schema.clone(),
+        batches,
+    });
+    ctx.read_table(Arc::new(StreamingTable::try_new(schema, vec![part])?))
+}
+
+/// The LEFT join of the node attribute table `batches` onto `graph` by id, with
+/// the table's rows numbered by the ordinal `ord` (its output order depends on the
+/// partition count). The fallback of [`attach_by_gather`].
+fn attach_by_join(
+    ctx: &SessionContext,
+    batches: Vec<RecordBatch>,
+    id_col: &str,
+    graph: RecordBatch,
+    ord: &str,
+) -> Result<DataFrame> {
+    let nodes_df = ctx.read_batches(Tiebreak::attach(batches, ord)?)?;
+    // Rename the graph id so the join keys don't collide, then drop it.
+    let graph_df = ctx
+        .read_batch(graph)?
+        .with_column_renamed("id", "__ursa_gid")?;
+    nodes_df
+        .join(graph_df, JoinType::Left, &[id_col], &["__ursa_gid"], None)?
+        .drop_columns(&["__ursa_gid"])
+}
+
+/// Attach the computed columns of `graph` (the `(id, values...)` batch, in dense
+/// order) to the node attribute table `batches` by id: each table row takes the
+/// values of its id's node, or nulls for an id that is null or not in the graph.
+/// This is the LEFT join of the table onto `graph`, with the same output schema,
+/// but each batch keeps its rows in table order and its attribute columns as they
+/// are: the ids resolve to dense indices once, and each computed column is a
+/// `take` by them.
+///
+/// `None` when the table's id column is not one the gather reads (an `int64` id
+/// for an `int64` graph; a string or string-dictionary id for a string graph) or
+/// a table column shares a computed column's name; the caller joins instead.
+fn attach_by_gather(
+    batches: &[RecordBatch],
+    id_col: &str,
+    graph: &RecordBatch,
+    ids: &IdMap,
+) -> Result<Option<Vec<RecordBatch>>> {
+    use arrow::array::{AsArray, UInt32Array};
+    use arrow::compute::take;
+    use rayon::prelude::*;
+    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+
+    let Some(first) = batches.first() else {
+        return Ok(None);
+    };
+    let schema = first.schema();
+    let Ok(id_idx) = schema.index_of(id_col) else {
+        return Ok(None);
+    };
+    let strings = |dt: &DataType| {
+        matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    let readable = match (ids, schema.field(id_idx).data_type()) {
+        (IdMap::Int64 { .. }, DataType::Int64) => true,
+        (IdMap::Utf8 { .. }, DataType::Dictionary(_, value)) => strings(value),
+        (IdMap::Utf8 { .. }, dt) => strings(dt),
+        _ => false,
+    };
+    let graph_schema = graph.schema();
+    let computed = &graph_schema.fields()[1..];
+    let clash = computed
+        .iter()
+        .any(|f| schema.fields().iter().any(|t| t.name() == f.name()));
+    if !readable || clash || batches.iter().any(|b| b.schema() != schema) {
+        return Ok(None);
+    }
+
+    let mut fields = schema.fields().to_vec();
+    fields.extend(
+        computed
+            .iter()
+            .map(|f| Arc::new(f.as_ref().clone().with_nullable(true))),
+    );
+    let out_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+
+    // Resolve the ids in parallel slices; a dictionary resolves its values once
+    // and gathers them by its keys.
+    const SLICE: usize = 1 << 16;
+    let resolve = |arr: &dyn Array| -> Result<UInt32Array> {
+        let dense: Vec<Vec<Option<u32>>> = (0..arr.len())
+            .step_by(SLICE)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|s| resolve_dense(ids, arr.slice(s, SLICE.min(arr.len() - s)).as_ref()))
+            .collect::<Result<_>>()?;
+        Ok(dense.into_iter().flatten().collect())
+    };
+    batches
+        .iter()
+        .map(|b| {
+            let id = b.column(id_idx);
+            let rows = match id.as_any_dictionary_opt() {
+                Some(dict) => {
+                    let values = resolve(dict.values().as_ref())?;
+                    take(&values, dict.keys(), None).map_err(arrow_err)?
+                }
+                None => Arc::new(resolve(id.as_ref())?) as ArrayRef,
+            };
+            let mut cols = b.columns().to_vec();
+            cols.extend(
+                graph.columns()[1..]
+                    .par_iter()
+                    .map(|c| take(c.as_ref(), rows.as_ref(), None).map_err(arrow_err))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            RecordBatch::try_new(out_schema.clone(), cols).map_err(arrow_err)
+        })
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 /// Collect a `DataFrame` to a **batch list** that always carries the schema (an
@@ -3099,6 +3255,201 @@ mod tests {
                     assert_eq!(got, want, "how={how} p={p} limit={limit:?}");
                 }
             }
+        }
+    }
+
+    /// The attribute table `ids` (one column per id type), in batches of `chunk`
+    /// rows, with a row-position column `c`, field and schema metadata, and a
+    /// non-null field: everything the join's output schema carries.
+    fn attr_batches(ids: ArrayRef, chunk: usize) -> Vec<RecordBatch> {
+        use arrow::datatypes::{Field, Schema};
+        let n = ids.len();
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("c", DataType::Int64, false)
+                    .with_metadata([("k".to_string(), "v".to_string())].into()),
+                Field::new("id", ids.data_type().clone(), true),
+            ],
+            [("top".to_string(), "x".to_string())].into(),
+        ));
+        let c: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
+        let b = RecordBatch::try_new(schema, vec![c, ids]).unwrap();
+        (0..n.max(1))
+            .step_by(chunk)
+            .map(|s| b.slice(s, chunk.min(n - s)))
+            .collect()
+    }
+
+    #[test]
+    fn attribute_gather_matches_the_join() {
+        use arrow::array::{DictionaryArray, LargeStringArray, StringViewArray};
+        use arrow::datatypes::Int32Type;
+
+        // Ids repeat, include values absent from the graph and nulls, and come in
+        // several batches; the graph has both id types.
+        let n = 5_000usize;
+        let raw: Vec<Option<i64>> = (0..n)
+            .map(|i| (i % 13 != 0).then_some(((i * 7919) % 1_200) as i64))
+            .collect();
+        let src = Int64Array::from_iter_values((0..1_000).map(|i| (i * 31) % 1_000));
+        let dst = Int64Array::from_iter_values((0..1_000).map(|i| (i * 17 + 3) % 1_000));
+        let strs =
+            |a: &Int64Array| StringArray::from_iter(a.iter().map(|v| v.map(|v| v.to_string())));
+        let raw_str: Vec<Option<String>> = raw.iter().map(|v| v.map(|v| v.to_string())).collect();
+        let int_graph = crate::topology::build_topology(&src, &dst).unwrap();
+        let str_graph = crate::topology::build_topology(&strs(&src), &strs(&dst)).unwrap();
+        type Graph = (Arc<Topology>, Arc<IdMap>);
+        let cases: Vec<(&str, &Graph, ArrayRef)> = vec![
+            ("int64", &int_graph, Arc::new(Int64Array::from(raw.clone()))),
+            (
+                "utf8",
+                &str_graph,
+                Arc::new(StringArray::from(raw_str.clone())),
+            ),
+            (
+                "large_utf8",
+                &str_graph,
+                Arc::new(LargeStringArray::from(raw_str.clone())),
+            ),
+            (
+                "utf8_view",
+                &str_graph,
+                Arc::new(StringViewArray::from(raw_str.clone())),
+            ),
+            (
+                "dictionary",
+                &str_graph,
+                Arc::new(
+                    raw_str
+                        .iter()
+                        .map(|v| v.as_deref())
+                        .collect::<DictionaryArray<Int32Type>>(),
+                ),
+            ),
+        ];
+        let columns = vec![
+            OutputColumn::Algo {
+                name: "deg".into(),
+                algo: GraphAlgo::Degree {
+                    direction: Direction::In,
+                },
+                weights: None,
+                dtype: OutputDtype::F64,
+                field: 0,
+            },
+            OutputColumn::Algo {
+                name: "pr".into(),
+                algo: GraphAlgo::PageRank {
+                    damping: 0.85,
+                    max_iter: 30,
+                    tol: 1e-6,
+                    direction: Direction::Out,
+                },
+                weights: None,
+                dtype: OutputDtype::F32,
+                field: 0,
+            },
+        ];
+        for (label, (t, ids), id_arr) in cases {
+            let graph = query_batch(t, ids, &columns, None).unwrap();
+            for chunk in [700, n] {
+                let batches = attr_batches(id_arr.clone(), chunk);
+                let gathered = attach_by_gather(&batches, "id", &graph, ids)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{label}: gather declined"));
+                assert_eq!(gathered.len(), batches.len(), "{label}");
+                let gathered = one(gathered);
+                for p in [1, 4] {
+                    let joined = on_partitions(p, || {
+                        let ctx = query_session();
+                        crate::runtime::block_on(async {
+                            let ord = Tiebreak::fresh_name("", &[]);
+                            let df =
+                                attach_by_join(&ctx, batches.clone(), "id", graph.clone(), &ord)?;
+                            let df = order_by_ordinals(&ctx, df, &[ord], None).await?;
+                            collect_batches(df).await
+                        })
+                        .unwrap()
+                        .unwrap()
+                    });
+                    let joined = one(joined);
+                    assert_eq!(gathered.schema(), joined.schema(), "{label} p={p}");
+                    assert_eq!(gathered, joined, "{label} chunk={chunk} p={p}");
+                }
+            }
+        }
+        // An id column the gather does not read declines, and the caller joins.
+        let (t, ids) = &int_graph;
+        let graph = query_batch(t, ids, &columns, None).unwrap();
+        let i32_ids: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2]));
+        let batches = attr_batches(i32_ids, 2);
+        assert!(attach_by_gather(&batches, "id", &graph, ids)
+            .unwrap()
+            .is_none());
+        let str_ids: ArrayRef = Arc::new(StringArray::from(vec!["1"]));
+        let batches = attr_batches(str_ids, 2);
+        assert!(attach_by_gather(&batches, "id", &graph, ids)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn attribute_output_on_an_empty_table_keeps_its_schema() {
+        // #153: a 0-row table (one empty batch) gives an empty frame with the
+        // table's columns plus the computed ones.
+        let (src, dst) = diamond();
+        let (t, ids) = build(&src, &dst);
+        let empty = attr_batches(Arc::new(Int64Array::from(Vec::<i64>::new())), 1);
+        assert_eq!(empty.len(), 1);
+        for filters in [vec![], vec![r#"{"kind":"binary","op":">","left":{"kind":"col","name":"deg"},"right":{"kind":"lit","value":0}}"#.to_string()]] {
+            let batch =
+                unsorted_degree_query(&t, &ids, Some(empty.clone()), &filters, None, false, None);
+            assert_eq!(batch.num_rows(), 0);
+            let schema = batch.schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, ["c", "id", "deg"]);
+        }
+    }
+
+    #[test]
+    fn unsorted_attribute_rename_follows_table_order() {
+        // The gathered rows reach a bare tail as one ordered partition: a rename
+        // keeps the table's row order across batches and partition counts.
+        let n = 30_000;
+        let (t, ids, dense) = tie_graph(n as i64);
+        let order: Vec<i64> = (0..n).map(|i| dense[(i * 4241) % n]).collect();
+        let attrs = id_attr_batch(order.clone(), "c", (0..n as i64).collect());
+        for p in PARTITION_COUNTS {
+            let chunks: Vec<RecordBatch> = (0..n)
+                .step_by(3_000)
+                .map(|s| attrs.slice(s, 3_000.min(n - s)))
+                .collect();
+            let batch = on_partitions(p, || {
+                one(execute_node_query(
+                    t.clone(),
+                    ids.clone(),
+                    r#"[{"name":"deg","kind":"degree","direction":"out"}]"#,
+                    &[],
+                    None,
+                    Some(20_000),
+                    Some(chunks),
+                    Some("id".into()),
+                    None,
+                    false,
+                    None,
+                    vec![("c".into(), "pos".into())],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap())
+            });
+            assert_eq!(i64s(&batch, "id"), order[..20_000], "p={p}");
+            assert_eq!(
+                i64s(&batch, "pos"),
+                (0..20_000).collect::<Vec<_>>(),
+                "p={p}"
+            );
         }
     }
 }

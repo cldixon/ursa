@@ -6,7 +6,7 @@
 //! between sources, so the per-source distance buffer (and the Dijkstra heap /
 //! settled flags) is allocated once per split instead of once per source. Results
 //! are byte-identical: the unweighted fold is an exact `i64` sum (order does not
-//! matter), and the weighted fold keeps the original `0..n` node-order summation
+//! matter), and the weighted fold keeps the original ascending node-order summation
 //! so its `f64` total is bit-for-bit unchanged.
 
 use std::cmp::Reverse;
@@ -190,8 +190,10 @@ pub fn closeness_weighted_directed(
 }
 
 /// One weighted closeness value, over reusable scratch. The `f64` distance sum
-/// keeps the original `0..n` node-order scan so the total is bit-for-bit identical
-/// to the allocate-per-source version (float addition is not associative).
+/// adds the reached nodes in ascending node order — the order of the original
+/// `0..n` scan, whose unreached (infinite) entries were skipped — so the total is
+/// bit-for-bit identical (float addition is not associative) at `O(reached)` rather
+/// than `O(n)` per source.
 fn closeness_weighted_one(
     topo: &Topology,
     weights: &[f64],
@@ -228,8 +230,11 @@ fn closeness_weighted_one(
 
     let mut sum = 0.0f64;
     let mut reachable = 0i64;
-    // Node-order (0..n) scan — the exact summation order of the original, so the
-    // f64 total is bit-for-bit unchanged.
+    // Ascending node order — the exact summation order of the original `0..n` scan,
+    // so the f64 total is bit-for-bit unchanged. `touched` is exactly the finite-
+    // distance set (every node given a finite distance is pushed, so eventually
+    // settled), so sorting it visits the same nodes in the same order. When most
+    // nodes were reached, the plain scan is cheaper than the sort.
     //
     // Count every reachable non-source node — the same rule the unweighted kernel
     // applies (`d >= 1` there excludes only the source). A node reachable at total
@@ -239,10 +244,20 @@ fn closeness_weighted_one(
     // it in the path total and guards `totsp > 0` for the divide — as the `sum > 0.0`
     // check below does. (Previously an extra `d > 0.0` here dropped such nodes from
     // the count, diverging from the unweighted kernel on zero-weight graphs.)
-    for (v, &d) in dist.iter().enumerate() {
-        if v != u as usize && d.is_finite() {
-            sum += d;
-            reachable += 1;
+    if touched.len() < dist.len() / 32 {
+        touched.sort_unstable();
+        for &v in touched.iter() {
+            if v != u {
+                sum += dist[v as usize];
+                reachable += 1;
+            }
+        }
+    } else {
+        for (v, &d) in dist.iter().enumerate() {
+            if v != u as usize && d.is_finite() {
+                sum += d;
+                reachable += 1;
+            }
         }
     }
     let result = if sum > 0.0 {
@@ -349,6 +364,71 @@ mod tests {
         assert!((c[0] - 2.0).abs() < 1e-12, "got {}", c[0]);
         // From node 1: only node 2 reachable at cost 1 -> 1/1 = 1.
         assert!((c[1] - 1.0).abs() < 1e-12, "got {}", c[1]);
+    }
+
+    #[test]
+    fn weighted_sum_matches_the_node_order_scan_bit_for_bit() {
+        // The reached-set sum must equal the original full `0..n` scan exactly, on
+        // a sparse graph (small reaches: the sorted reached-set path) and a dense
+        // one (large reaches: the scan path), in every direction.
+        for (n, m) in [(2000u32, 1500usize), (200, 2000)] {
+            let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let (mut src, mut dst, mut wt) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..m {
+                src.push(next() % n);
+                dst.push(next() % n);
+                wt.push(0.1 + (next() % 1000) as f64 / 3.0);
+            }
+            let t = Topology::build(n as usize, src, dst);
+            for dir in [Direction::Out, Direction::In, Direction::Both] {
+                let got = closeness_weighted_directed(&t, &wt, None, dir);
+                let mut sc = ClosenessWeightedScratch::new(n as usize);
+                for u in 0..n {
+                    // Run the kernel's Dijkstra, then fold the full dist array in
+                    // node order as the original did.
+                    closeness_weighted_one(&t, &wt, None, dir, u, &mut sc);
+                    let mut dist = vec![f64::INFINITY; n as usize];
+                    let mut heap = BinaryHeap::new();
+                    let mut settled = vec![false; n as usize];
+                    dist[u as usize] = 0.0;
+                    heap.push(Reverse((TotalF64(0.0), u)));
+                    while let Some(Reverse((TotalF64(du), v))) = heap.pop() {
+                        if std::mem::replace(&mut settled[v as usize], true) {
+                            continue;
+                        }
+                        t.for_each_weighted_neighbor(v, &wt, dir, None, |w, c| {
+                            if !settled[w as usize] && du + c < dist[w as usize] {
+                                dist[w as usize] = du + c;
+                                heap.push(Reverse((TotalF64(du + c), w)));
+                            }
+                        });
+                    }
+                    let (mut sum, mut reachable) = (0.0f64, 0i64);
+                    for (v, &d) in dist.iter().enumerate() {
+                        if v != u as usize && d.is_finite() {
+                            sum += d;
+                            reachable += 1;
+                        }
+                    }
+                    let want = if sum > 0.0 {
+                        reachable as f64 / sum
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        got[u as usize].to_bits(),
+                        want.to_bits(),
+                        "n={n} {dir:?} u={u}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

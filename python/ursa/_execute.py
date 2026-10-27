@@ -739,8 +739,13 @@ def _run_query(
     # parent CSR restricted by a per-edge-row boolean mask — a predicate over the parent
     # rows and/or the induced subgraph of a traversal's reached nodes — with no rebuild.
     edge_mask = _edge_mask_for(edges, index)
-    # The node attribute table crosses the FFI as a batch list (not one batch).
-    nodes_batches = nodes.to_batches() if nodes is not None else None
+    # The node attribute table crosses the FFI as a batch list (not one batch); a
+    # 0-row table sends one empty batch, so its schema crosses too (#153).
+    nodes_batches = None
+    if nodes is not None:
+        import pyarrow as pa
+
+        nodes_batches = nodes.to_batches() or [pa.RecordBatch.from_pylist([], schema=nodes.schema)]
     # A node-query result carries the reserved `id` column plus the computed/joined
     # columns; `ur.id()` in a filter resolves to it. (src/dst have no role here.)
     filter_json = [_filter_json(p, {"id": "id"}) for p in filters]
@@ -1831,6 +1836,12 @@ def _edge_mask_for(edges: EdgeFrame | None, index: Any) -> Any | None:
       endpoints are reached — the induced subgraph of the reached region.
 
     Returns ``None`` when the frame carries neither (the full graph).
+
+    Frames are immutable, so the mask is memoized on the frame's own
+    ``_mask_build_cell`` (#175) and later collects skip the source re-read and
+    predicate / traversal evaluation. It is stored alongside the ``index`` it was
+    computed against and only served for that same index object, so a rebuilt parent
+    CSR (e.g. a weighted scan re-scans and replaces it) recomputes the mask.
     """
     if edges is None:
         return None
@@ -1838,7 +1849,23 @@ def _edge_mask_for(edges: EdgeFrame | None, index: Any) -> Any | None:
     predicates = [s.args["predicate"] for s in getattr(edges, "_plan", ()) if s.op == "filter"]
     if traversal is None and not predicates:
         return None
+    cell = edges._mask_build_cell
+    cached = cell.value
+    if cached is not None and cached[0] is index:
+        return cached[1]
+    with cell.lock:
+        cached = cell.value
+        if cached is not None and cached[0] is index:
+            return cached[1]
+        mask = _compute_edge_mask(edges, index, traversal, predicates)
+        cell.value = (index, mask)
+    return mask
 
+
+def _compute_edge_mask(
+    edges: EdgeFrame, index: Any, traversal: Any | None, predicates: list[Any]
+) -> Any:
+    """Evaluate the edge mask described in ``_edge_mask_for`` (uncached)."""
     import pyarrow as pa
     import pyarrow.compute as pc
 
