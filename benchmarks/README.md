@@ -163,6 +163,33 @@ leads triangle_count and louvain, rustworkx leads pagerank:
 | louvain | **15.8ms** | 28.5ms | 243ms | n/a |
 | connected_components | 1.8ms | **0.1ms** | 0.5ms | 0.3ms |
 
+## Kernel micro-benchmarks (criterion)
+
+This harness measures Ursa through Python and DataFusion. To time the Rust
+kernels on their own, use the criterion benches in `ursa-core/benches/kernels.rs`.
+They cover the CSR build, transpose and undirected views, `i64` id interning,
+and every kernel family on seeded Erdős–Rényi and R-MAT graphs of 10k to 1M edges.
+A full run takes about four minutes:
+
+```bash
+cargo bench -p ursa-core                      # everything
+cargo bench -p ursa-core -- pagerank          # filter by name (regex)
+```
+
+To compare two commits, save a baseline on one and measure the other against it:
+
+```bash
+git checkout main
+cargo bench -p ursa-core -- --save-baseline main
+git checkout my-branch
+cargo bench -p ursa-core -- --baseline main   # prints the change per bench
+```
+
+Baselines live under `target/criterion/`. The `Bench` workflow
+(`.github/workflows/bench.yml`) runs the suite weekly and on demand and uploads
+that directory as an artifact, saved as the `ci` baseline. Shared runners are
+noisy, so treat a small delta there as a hint and confirm it locally.
+
 ## Datasets
 
 Two kinds, both needed:
