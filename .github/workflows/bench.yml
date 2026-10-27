@@ -1,0 +1,50 @@
+name: Bench
+
+# Criterion micro-benchmarks for the ursa-core kernels (ursa-core/benches/, #178).
+# Not a PR gate: shared runners are too noisy to fail a build on a timing delta,
+# and a full run takes minutes. It runs weekly and on demand so there is always a
+# recent baseline on a known runner type; download the `criterion` artifact to
+# compare against a local run (see benchmarks/README.md).
+on:
+  workflow_dispatch:
+  # Mondays 08:00 UTC, an hour after the audit.yml run.
+  schedule:
+    - cron: "0 8 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  criterion:
+    name: cargo bench (ursa-core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml (single source of truth for the version).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Saved as the `ci` baseline, so the uploaded target/criterion tree can be
+      # dropped into a local checkout and compared with `-- --baseline ci`.
+      - name: cargo bench
+        run: cargo bench -p ursa-core --locked -- --save-baseline ci
+
+      - name: Upload criterion results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.sha }}
+          path: target/criterion
+          retention-days: 90

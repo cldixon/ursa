@@ -9,6 +9,9 @@
 //! aligns with the CSR's `edge_ids` permutation so a weighted kernel gathers
 //! `weights[edge_ids[k]]` per adjacency slot.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
 use arrow::array::{Array, Float64Array, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -131,6 +134,74 @@ pub fn edge_weights(
     Ok(w)
 }
 
+/// How many evaluated weight vectors a [`WeightCache`] keeps. Each entry is one
+/// `f64` per edge (80 MB at 10M edges), so the bound is deliberately small: enough
+/// for a couple of weight expressions alternating over one graph, oldest evicted.
+const WEIGHT_CACHE_CAPACITY: usize = 2;
+
+/// Evaluated edge weights memoized across queries, keyed by the weight expression's
+/// canonical JSON (`serde_json::Value::to_string`). Held on the graph index, so it
+/// lives exactly as long as the edge rows the weights were evaluated over: a frame
+/// that changes its edge rows gets a fresh index and with it a fresh cache.
+///
+/// Repeated weighted collects then evaluate once, and hand the kernels the *same*
+/// `Arc`, which keeps the result memo (keyed on the weights pointer) stable.
+#[derive(Default)]
+pub struct WeightCache {
+    entries: Mutex<Vec<(String, Arc<Vec<f64>>)>>,
+    evaluations: AtomicUsize,
+}
+
+impl WeightCache {
+    /// The cached weights for a canonical weight-expression key, if present.
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<f64>>> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, w)| w.clone())
+    }
+
+    /// The weights for `key`, evaluated via [`edge_weights`] on a miss. Evaluation
+    /// runs outside the lock; if a concurrent query cached the same key first, its
+    /// `Arc` wins so every caller shares one vector.
+    pub fn get_or_eval(
+        &self,
+        key: &str,
+        edges: Option<&[RecordBatch]>,
+        n_edges: usize,
+        what: &str,
+    ) -> Result<Arc<Vec<f64>>> {
+        if let Some(w) = self.get(key) {
+            return Ok(w);
+        }
+        let w = Arc::new(edge_weights(edges, key, n_edges, what)?);
+        self.evaluations.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, existing)) = entries.iter().find(|(k, _)| k == key) {
+            return Ok(existing.clone());
+        }
+        if entries.len() >= WEIGHT_CACHE_CAPACITY {
+            entries.remove(0);
+        }
+        entries.push((key.to_string(), w.clone()));
+        Ok(w)
+    }
+
+    /// Weight evaluations this cache has run (test/observability hook).
+    pub fn evaluations(&self) -> usize {
+        self.evaluations.load(Ordering::Relaxed)
+    }
+}
+
+/// The canonical cache key for a serialized weight expression: the same
+/// `serde_json::Value::to_string` form a node query's column spec yields.
+pub fn weight_cache_key(weight_json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(weight_json)
+        .map_err(|e| DataFusionError::Execution(format!("invalid weight expression JSON: {e}")))?;
+    Ok(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +318,29 @@ mod tests {
             "right":{"kind":"lit","value":2}}"#;
         let err = evaluate_weight(&[edge_batch()], json).unwrap_err();
         assert!(err.to_string().contains("must be numeric"), "got: {err}");
+    }
+
+    #[test]
+    fn weight_cache_evaluates_once_and_stays_bounded() {
+        let cache = WeightCache::default();
+        let edges = [edge_batch()];
+        let amount = weight_cache_key(r#"{"kind": "col", "name": "amount"}"#).unwrap();
+        let a = cache.get_or_eval(&amount, Some(&edges), 3, "t").unwrap();
+        // A hit needs no edge table and returns the same Arc (a stable memo key).
+        let b = cache.get_or_eval(&amount, None, 3, "t").unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(cache.evaluations(), 1);
+        // Past capacity the oldest entry is evicted and a re-request re-evaluates.
+        assert_eq!(WEIGHT_CACHE_CAPACITY, 2);
+        for json in [
+            r#"{"kind":"col","name":"fx"}"#,
+            r#"{"kind":"binary","op":"+","left":{"kind":"col","name":"fx"},"right":{"kind":"lit","value":1}}"#,
+        ] {
+            let key = weight_cache_key(json).unwrap();
+            cache.get_or_eval(&key, Some(&edges), 3, "t").unwrap();
+        }
+        assert_eq!(cache.evaluations(), 3);
+        assert!(cache.get(&amount).is_none());
+        assert!(cache.get_or_eval(&amount, None, 3, "t").is_err());
     }
 }

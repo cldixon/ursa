@@ -41,8 +41,8 @@ pub use node::GraphAlgorithmNode;
 pub use physical::GraphAlgorithmExec;
 pub use planner::graph_session;
 pub use query::{
-    execute_hop_query, execute_join_query, execute_node_query, execute_path_query,
-    execute_walk_query, hop_reached_nodes, shortest_path_nodes,
+    execute_hop_query, execute_join_query, execute_node_query, execute_node_query_cached,
+    execute_path_query, execute_walk_query, hop_reached_nodes, shortest_path_nodes,
 };
 pub use scan::{
     scan_edges_batch, scan_edges_table, scan_edges_topology, scan_nodes_batch, ScanBuildError,
@@ -50,3 +50,4 @@ pub use scan::{
 };
 pub use stats::{avg_path_length, density, describe, diameter, parse_stat_direction};
 pub use topology::{build_topology, build_topology_batches};
+pub use weight::{weight_cache_key, WeightCache};

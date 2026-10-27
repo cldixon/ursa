@@ -262,10 +262,14 @@ struct KernelEval<'a> {
     /// The undirected view and its per-node triangle counts — the intermediate the
     /// triangle-family kernels share. Computed at most once, on first use.
     triangles: Option<(UndirectedView<'a>, Vec<u32>)>,
-    /// The unweighted symmetric (undirected) view the `direction="both"` forms of
-    /// `pagerank` / `betweenness` run over. Built at most once, on first use, and
-    /// shared between them.
+    /// The masked unweighted symmetric (undirected) view the `direction="both"`
+    /// forms of `pagerank` / `betweenness` run over. Built at most once, on first
+    /// use, and shared between them; unmasked, the topology caches it instead.
     symmetric: Option<Topology>,
+    /// The weighted symmetric views and their per-row weights, keyed by the
+    /// address of the weight column (fixed for the query, as in [`KernelKey`]), so
+    /// a weighted `pagerank` and `betweenness` over one column share the build.
+    symmetric_weighted: HashMap<usize, (Topology, Vec<f64>)>,
 }
 
 impl<'a> KernelEval<'a> {
@@ -276,14 +280,30 @@ impl<'a> KernelEval<'a> {
             memo: HashMap::new(),
             triangles: None,
             symmetric: None,
+            symmetric_weighted: HashMap::new(),
         }
     }
 
-    /// The unweighted symmetric view, built on first use.
+    /// The unweighted symmetric view: the topology's cached one when unmasked,
+    /// otherwise built on first use.
     fn symmetric(&mut self) -> &Topology {
         let (topo, mask) = (self.topo, self.mask);
-        self.symmetric
-            .get_or_insert_with(|| symmetric_view(topo, mask))
+        match mask {
+            None => topo.symmetric(),
+            Some(m) => self
+                .symmetric
+                .get_or_insert_with(|| symmetric_view(topo, Some(m))),
+        }
+    }
+
+    /// The weighted symmetric view over `weights`, built on first use.
+    fn symmetric_weighted(&mut self, weights: &[f64]) -> (&Topology, &[f64]) {
+        let (topo, mask) = (self.topo, self.mask);
+        let (sym, sw) = self
+            .symmetric_weighted
+            .entry(weights.as_ptr() as usize)
+            .or_insert_with(|| symmetric_view_weighted(topo, weights, mask));
+        (sym, sw)
     }
 
     /// The undirected view and per-node triangle counts, computed on first use.
@@ -350,8 +370,8 @@ impl<'a> KernelEval<'a> {
                 // undirected graph. `In` is rejected when the column is built.
                 let scores = match (direction, weights) {
                     (PlanDirection::Both, Some(w)) => {
-                        let (sym, sw) = symmetric_view_weighted(topo, w, mask);
-                        pagerank_weighted(&sym, &sw, None, params)
+                        let (sym, sw) = self.symmetric_weighted(w);
+                        pagerank_weighted(sym, sw, None, params)
                     }
                     (PlanDirection::Both, None) => pagerank(self.symmetric(), None, params),
                     (_, Some(w)) => pagerank_weighted(topo, w, mask, params),
@@ -408,8 +428,8 @@ impl<'a> KernelEval<'a> {
                     (PlanDirection::Both, w) => {
                         let bc = match w {
                             Some(w) => {
-                                let (sym, sw) = symmetric_view_weighted(topo, w, mask);
-                                betweenness_weighted(&sym, &sw, None, *sample, *seed)
+                                let (sym, sw) = self.symmetric_weighted(w);
+                                betweenness_weighted(sym, sw, None, *sample, *seed)
                             }
                             None => betweenness(self.symmetric(), None, *sample, *seed),
                         };

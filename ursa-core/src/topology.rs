@@ -501,6 +501,12 @@ pub struct Topology {
     inc: OnceLock<Adjacency>,
     /// Undirected sorted adjacency, built on first demand (triangle/clustering).
     undirected: OnceLock<UndirectedCsr>,
+    /// The unmasked symmetric view (see [`Topology::symmetric`]), built on first
+    /// demand from `undirected`.
+    symmetric: OnceLock<Box<Topology>>,
+    /// Set on a symmetric view: its transpose is its own out-CSR, so `incoming`
+    /// returns `out` rather than building a copy.
+    self_transpose: bool,
 }
 
 impl Topology {
@@ -537,6 +543,46 @@ impl Topology {
             out,
             inc: OnceLock::new(),
             undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: false,
+        }
+    }
+
+    /// A symmetric topology taken directly from an undirected CSR: node `u`'s
+    /// out-segment is its sorted, deduplicated neighbour list, and slot `k` is row
+    /// `k` (`edge_ids` is the identity). That is exactly what [`Topology::build`]
+    /// produces from the rows `u -> v` in (source, target) order, without the
+    /// counting sort.
+    ///
+    /// Each segment is ascending and every pair appears once in each direction, so
+    /// the transpose has the same offsets and targets as `out`; `incoming` returns
+    /// `out` itself. The one difference from a built transpose is that an in-slot's
+    /// `edge_ids` entry names the mirror row (`u -> v` instead of `v -> u`). The two
+    /// rows of a pair are interchangeable — same endpoints, and the same weight in
+    /// the weighted view — and a view is never masked, so no kernel can tell.
+    pub(crate) fn from_undirected(
+        n_nodes: usize,
+        offsets: Vec<u64>,
+        targets: Vec<u32>,
+    ) -> Topology {
+        debug_assert_eq!(offsets.len(), n_nodes + 1);
+        let n_edges = targets.len();
+        assert!(
+            n_edges <= u32::MAX as usize,
+            "more than u32::MAX (~4.29B) edges is beyond the v0.1 edge-id cap"
+        );
+        Topology {
+            n_nodes,
+            n_edges,
+            out: Adjacency {
+                offsets,
+                targets,
+                edge_ids: (0..n_edges as u32).collect(),
+            },
+            inc: OnceLock::new(),
+            undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: true,
         }
     }
 
@@ -561,6 +607,9 @@ impl Topology {
     /// retained-endpoint build produced, without the permanent dense-endpoint
     /// storage.
     pub fn incoming(&self) -> &Adjacency {
+        if self.self_transpose {
+            return &self.out;
+        }
         self.inc
             .get_or_init(|| Adjacency::transpose(&self.out, self.n_nodes))
     }
@@ -570,6 +619,22 @@ impl Topology {
     /// `clustering_coefficient` so a pipeline computing both pays the build once.
     pub fn undirected(&self) -> &UndirectedCsr {
         self.undirected.get_or_init(|| self.build_undirected(None))
+    }
+
+    /// The unmasked symmetric view — one `u -> v` and one `v -> u` row per
+    /// distinct unordered pair, self-loops dropped — that the `direction="both"`
+    /// forms of the directed kernels run over. Built on first call from the cached
+    /// [`Topology::undirected`] CSR with no re-sort (see
+    /// [`Topology::from_undirected`]) and cached, so repeated queries share it.
+    pub fn symmetric(&self) -> &Topology {
+        self.symmetric.get_or_init(|| {
+            let u = self.undirected();
+            Box::new(Topology::from_undirected(
+                self.n_nodes,
+                u.offsets.clone(),
+                u.targets.clone(),
+            ))
+        })
     }
 
     /// Build the flat undirected CSR: per-node sorted/deduped `out ∪ in` neighbour
@@ -864,6 +929,19 @@ mod tests {
         let mut rows: Vec<u32> = t.out().edge_ids(0).to_vec();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn symmetric_view_is_cached_and_its_own_transpose() {
+        let t = diamond();
+        let s = t.symmetric();
+        assert!(std::ptr::eq(s, t.symmetric()));
+        // Pairs {0,1}, {0,2}, {1,2}; the reciprocal 0->2 / 2->0 collapses.
+        assert_eq!(s.out().offsets, vec![0, 2, 4, 6]);
+        assert_eq!(s.out().targets, vec![1, 2, 0, 2, 0, 1]);
+        assert_eq!(s.out().edge_ids, vec![0, 1, 2, 3, 4, 5]);
+        assert!(std::ptr::eq(s.incoming(), s.out()));
+        assert!(!std::ptr::eq(t.incoming(), t.out()));
     }
 
     #[test]

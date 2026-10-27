@@ -11,26 +11,29 @@
 //! unchanged directed kernels can run over it. Dense node ids are preserved: node
 //! `i` of the view is node `i` of the source topology, including isolated nodes.
 //!
-//! The view is built per call and not cached: it is `2·m_undirected` rows, the
-//! same order of memory as the undirected CSR it is built from.
+//! The unmasked unweighted view is cached on the topology
+//! ([`Topology::symmetric`]); a masked or weighted view is built per call. Either
+//! way it is taken straight from the sorted undirected CSR, with no counting sort,
+//! and is its own transpose (see [`Topology::from_undirected`]).
 
 use crate::parallel::*;
 
-use super::triangle::undirected_view;
+use super::triangle::{undirected_view, UndirectedView};
 use crate::topology::{EdgeMask, Topology};
 
 /// The unweighted symmetric view of `topo` (honoring `mask`): one `u -> v` and one
 /// `v -> u` row per distinct unordered pair, self-loops dropped. Row order is by
 /// source then target, so the result is deterministic.
+///
+/// Unmasked, prefer the cached [`Topology::symmetric`]; this copies it.
 pub fn symmetric_view(topo: &Topology, mask: Option<&EdgeMask>) -> Topology {
-    let view = undirected_view(topo, mask);
-    let adj = view.get();
     let n = topo.n_nodes();
-    let mut src = Vec::with_capacity(adj.targets.len());
-    for u in 0..n as u32 {
-        src.extend(std::iter::repeat_n(u, adj.degree(u)));
+    match undirected_view(topo, mask) {
+        UndirectedView::Cached(adj) => {
+            Topology::from_undirected(n, adj.offsets.clone(), adj.targets.clone())
+        }
+        UndirectedView::Masked(adj) => Topology::from_undirected(n, adj.offsets, adj.targets),
     }
-    Topology::build(n, src, adj.targets.clone())
 }
 
 /// The weighted symmetric view: as [`symmetric_view`], plus the per-row weight of
@@ -39,6 +42,11 @@ pub fn symmetric_view(topo: &Topology, mask: Option<&EdgeMask>) -> Topology {
 /// `v -> u`), the undirected edge takes the **minimum** of their weights — the
 /// cheapest way across, which is what a shortest-path kernel would pick anyway.
 /// Both directed rows of a pair carry that same weight.
+///
+/// Built flat, as [`Topology::undirected`] is: each node gets an upper-bound
+/// segment of `out_deg + in_deg` slots, sorts and deduplicates its neighbours into
+/// it (parallel, disjoint segments), and one serial pass slides the kept prefixes
+/// left.
 pub fn symmetric_view_weighted(
     topo: &Topology,
     weights: &[f64],
@@ -53,10 +61,20 @@ pub fn symmetric_view_weighted(
     let out = topo.out();
     // Build the transpose before the parallel loop rather than lazily inside it.
     let inc = topo.incoming();
-    let lists: Vec<Vec<(u32, f64)>> = (0..n as u32)
+
+    let mut bound = vec![0u64; n + 1];
+    for u in 0..n {
+        let d = out.degree(u as u32) as u64 + inc.degree(u as u32) as u64;
+        bound[u + 1] = bound[u] + d;
+    }
+    let cap = bound[n] as usize;
+    let mut targets = vec![0u32; cap];
+    let mut wts = vec![0f64; cap];
+    let (t_addr, w_addr) = (targets.as_mut_ptr() as usize, wts.as_mut_ptr() as usize);
+    let lens: Vec<u32> = (0..n as u32)
         .into_par_iter()
-        .map(|u| {
-            let mut nb: Vec<(u32, f64)> = Vec::new();
+        .map_init(Vec::new, |nb: &mut Vec<(u32, f64)>, u| {
+            nb.clear();
             for adj in [out, inc] {
                 for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
                     if w != u && mask.is_none_or(|m| m.keep(e)) {
@@ -68,21 +86,37 @@ pub fn symmetric_view_weighted(
             // pair's minimum weight; keep only that one.
             nb.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
             nb.dedup_by_key(|p| p.0);
-            nb
+            let start = bound[u as usize] as usize;
+            // SAFETY: segments `bound[u]..bound[u + 1]` are disjoint across nodes,
+            // `nb` holds at most `out_deg + in_deg` entries so it fits in its
+            // segment, and both buffers outlive the loop.
+            unsafe {
+                let t = (t_addr as *mut u32).add(start);
+                let w = (w_addr as *mut f64).add(start);
+                for (i, &(v, x)) in nb.iter().enumerate() {
+                    *t.add(i) = v;
+                    *w.add(i) = x;
+                }
+            }
+            nb.len() as u32
         })
         .collect();
-    let m: usize = lists.iter().map(Vec::len).sum();
-    let mut src = Vec::with_capacity(m);
-    let mut dst = Vec::with_capacity(m);
-    let mut wts = Vec::with_capacity(m);
-    for (u, nb) in lists.into_iter().enumerate() {
-        for (v, w) in nb {
-            src.push(u as u32);
-            dst.push(v);
-            wts.push(w);
-        }
+
+    // Compact: each segment's kept prefix moves left (never right), in order.
+    let mut offsets = vec![0u64; n + 1];
+    let mut write = 0usize;
+    for u in 0..n {
+        let (start, len) = (bound[u] as usize, lens[u] as usize);
+        targets.copy_within(start..start + len, write);
+        wts.copy_within(start..start + len, write);
+        write += len;
+        offsets[u + 1] = write as u64;
     }
-    (Topology::build(n, src, dst), wts)
+    targets.truncate(write);
+    targets.shrink_to_fit();
+    wts.truncate(write);
+    wts.shrink_to_fit();
+    (Topology::from_undirected(n, offsets, targets), wts)
 }
 
 #[cfg(test)]
@@ -98,6 +132,110 @@ mod tests {
         }
         r.sort_unstable();
         r
+    }
+
+    /// Today's reference: the rows `u -> v` of the undirected CSR, re-sorted by a
+    /// full `Topology::build`, and the weighted per-node `Vec` build.
+    fn reference(t: &Topology, mask: Option<&EdgeMask>) -> Topology {
+        let view = undirected_view(t, mask);
+        let adj = view.get();
+        let mut src = Vec::new();
+        for u in 0..t.n_nodes() as u32 {
+            src.extend(std::iter::repeat_n(u, adj.degree(u)));
+        }
+        Topology::build(t.n_nodes(), src, adj.targets.clone())
+    }
+
+    fn reference_weighted(
+        t: &Topology,
+        weights: &[f64],
+        mask: Option<&EdgeMask>,
+    ) -> (Topology, Vec<f64>) {
+        let (mut src, mut dst, mut wts) = (Vec::new(), Vec::new(), Vec::new());
+        for u in 0..t.n_nodes() as u32 {
+            let mut nb: Vec<(u32, f64)> = Vec::new();
+            for adj in [t.out(), t.incoming()] {
+                for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                    if w != u && mask.is_none_or(|m| m.keep(e)) {
+                        nb.push((w, weights[e as usize]));
+                    }
+                }
+            }
+            nb.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            nb.dedup_by_key(|p| p.0);
+            for (v, w) in nb {
+                src.push(u);
+                dst.push(v);
+                wts.push(w);
+            }
+        }
+        (Topology::build(t.n_nodes(), src, dst), wts)
+    }
+
+    /// A random multigraph with self-loops, parallel and reciprocal rows, and
+    /// isolated nodes; big enough for the parallel CSR builds.
+    fn random_graph(n: u32, m: u32) -> (Topology, Vec<f64>, EdgeMask) {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut src = Vec::new();
+        let mut dst = Vec::new();
+        for _ in 0..m {
+            src.push((next() % n as u64) as u32);
+            dst.push((next() % n as u64) as u32);
+        }
+        let weights: Vec<f64> = (0..m).map(|_| (next() % 7) as f64 * 0.5).collect();
+        let keep: Vec<bool> = (0..m).map(|_| next() % 3 != 0).collect();
+        // Leave the top ids out so some nodes are isolated.
+        (
+            Topology::build(n as usize + 5, src, dst),
+            weights,
+            EdgeMask::from_bools(&keep),
+        )
+    }
+
+    fn assert_same_csr(a: &crate::topology::Adjacency, b: &crate::topology::Adjacency) {
+        assert_eq!(a.offsets, b.offsets);
+        assert_eq!(a.targets, b.targets);
+        assert_eq!(a.edge_ids, b.edge_ids);
+    }
+
+    #[test]
+    fn direct_views_match_the_rebuilt_reference() {
+        for (n, m) in [(1u32, 3u32), (40, 300), (3_000, 200_000)] {
+            let (t, w, mask) = random_graph(n, m);
+            for mask in [None, Some(&mask)] {
+                let want = reference(&t, mask);
+                let got = symmetric_view(&t, mask);
+                assert_eq!(got.n_edges(), want.n_edges());
+                assert_same_csr(got.out(), want.out());
+                // The view is its own transpose: same offsets and targets as the
+                // built one; each in-slot names the mirror row of a pair.
+                let (gi, wi) = (got.incoming(), want.incoming());
+                assert_eq!(gi.offsets, wi.offsets);
+                assert_eq!(gi.targets, wi.targets);
+
+                let (want, want_w) = reference_weighted(&t, &w, mask);
+                let (got, got_w) = symmetric_view_weighted(&t, &w, mask);
+                assert_same_csr(got.out(), want.out());
+                assert_eq!(got_w, want_w);
+                // Weights gathered through the transpose are the same either way.
+                let (gi, wi) = (got.incoming(), want.incoming());
+                assert_eq!(gi.targets, wi.targets);
+                let gather = |ids: &[u32], ws: &[f64]| -> Vec<u64> {
+                    ids.iter().map(|&e| ws[e as usize].to_bits()).collect()
+                };
+                assert_eq!(gather(&gi.edge_ids, &got_w), gather(&wi.edge_ids, &want_w));
+            }
+            // The cached view equals the per-call one.
+            let cached = t.symmetric();
+            assert!(std::ptr::eq(cached, t.symmetric()));
+            assert_same_csr(cached.out(), reference(&t, None).out());
+        }
     }
 
     #[test]

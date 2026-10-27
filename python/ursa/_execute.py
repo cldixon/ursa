@@ -152,22 +152,28 @@ def _select_table(table: Any, select: list[str]) -> Any:
     return table.select(select)
 
 
-def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
+def _prepare_weighted(
+    edges: EdgeFrame, weight_columns: set[str], weight_jsons: list[str] | None = None
+) -> Any | None:
     """The edge attribute table (a **list** of pyarrow RecordBatches) for evaluating
     a weight expression, aligned to the graph's edge-row order.
 
     The edge table crosses the FFI as a batch list (never concatenated into one
     contiguous batch, #60); ``evaluate_weight`` streams the batches in order, and
-    that order matches the topology's ``edge_ids`` because the *same* batch order
+    that order matches the topology's ``edge_ids`` because the *same* row order
     built the index.
 
-    For a ``scan_edges`` frame this does **one** scan projecting ``src``, ``dst``
-    and the weight columns together, and builds (memoizes) the frame's topology
-    index from those same batches' endpoints. Reading endpoints and weights in the
-    same scan is what makes ``weights[edge_ids[k]]`` correct: a second, independent
-    scan could order partitions differently (globs/multi-partition listing order is
-    not a DataFusion contract), silently misaligning every weighted result (#37).
-    In-memory frames already share one retained table, so they just subset it."""
+    ``weight_jsons`` (the serialized expressions, for a node query) lets this
+    return ``None`` when the frame's built index already caches every one of those
+    weight vectors (#175): the engine reuses them without reading the edge table.
+
+    For a ``scan_edges`` frame this scans ``src``, ``dst`` and the weight columns
+    together, dropping null-endpoint rows under ``on_null="drop"`` exactly as the
+    index build does. Scans are file-ordered and deterministic (#148), so these rows
+    align with an index already built from an earlier scan, which is reused rather
+    than rebuilt (its cached views and weights survive); with no index yet, it is
+    built from these same batches, saving a second scan. In-memory frames already
+    share one retained table, so they just subset it."""
     if not weight_columns:
         return None
     # A weighted algorithm on a derived edge frame must be rejected here too: this
@@ -178,6 +184,9 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
     # and the topology index both live on the parent, so resolve to it (the parent cell
     # is the one `_require_index` reads, keeping weights and edge_ids self-consistent).
     edges = _parent_edges(edges)
+    index = edges._index_build_cell.value
+    if weight_jsons and index is not None and all(index.has_weights(j) for j in weight_jsons):
+        return None
     cols = sorted(weight_columns)
     table = getattr(edges, "_edge_attr_table", None)
     if table is not None:
@@ -198,17 +207,19 @@ def _prepare_weighted(edges: EdgeFrame, weight_columns: set[str]) -> Any | None:
             raise NotImplementedError(
                 "weighted algorithms over a multi-path scan_edges source are not supported yet."
             )
-        # One scan → a batch list of [src, dst, *cols]. Build the index from THESE
-        # batches' endpoints so weights and edge_ids share a single, self-consistent
-        # edge order, overwriting any index memoized from an earlier scan.
+        # One scan → a batch list of [src, dst, *cols], filtered like the index
+        # build so its rows match the index's edge rows one for one. A built index
+        # is kept; otherwise these batches' endpoints build it.
         combined = _native().scan_edges_arrow(
             path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
         )
         if scan.get("on_null") == "drop":
             combined = _drop_null_endpoint_batches(combined)
         cell = edges._index_build_cell
-        with cell.lock:
-            cell.value = _native().build_index(combined)
+        if cell.value is None:
+            with cell.lock:
+                if cell.value is None:
+                    cell.value = _native().build_index(combined)
         return combined
     raise NotImplementedError(
         "a weighted algorithm needs an in-memory or scan_edges source so the weight "
@@ -400,10 +411,15 @@ def _collect_node_query(
         w = expr.payload.get("weight") if expr.kind == "graph" else None
         if w is not None:
             weight_cols |= _expr_columns(w)
-    # _prepare_weighted (for a scan source) also (re)builds the frame's index from
-    # the same scan, so _run_query's _require_index reuses it — endpoints and
-    # weights share one edge order.
-    edge_attr = _prepare_weighted(edges, weight_cols) if weight_cols else None
+    # _prepare_weighted (for a scan source) also builds the frame's index from the
+    # same scan if none exists yet, so _run_query's _require_index reuses it; it
+    # skips the edge read entirely when the index already caches these weights.
+    weight_jsons = [
+        json.dumps(_expr_to_json(e.payload["weight"]))
+        for e in graph_exprs.values()
+        if e.kind == "graph" and e.payload.get("weight") is not None
+    ]
+    edge_attr = _prepare_weighted(edges, weight_cols, weight_jsons) if weight_cols else None
     # The engine runs the leading steps its fixed-order tail executes identically
     # (the common filter/sort/head case entirely); any later step runs in written
     # order on its output. ur.id() resolves to the result's reserved `id` column.
@@ -618,8 +634,8 @@ def collect_edge_frame(frame: EdgeFrame) -> MaterializedFrame:
         edge_attr = None
         if weight is not None:
             weight_json = json.dumps(_expr_to_json(weight))
-            # Prepare weights first: for a scan source this rebuilds the index from
-            # the same scan, so _require_index (below) reuses the aligned index.
+            # Prepare weights first: for a scan source with no index yet this builds
+            # it from the same scan, so _require_index (below) reuses it.
             edge_attr = _prepare_weighted(traversal.args["edges"], _expr_columns(weight))
         index = _require_index(traversal.args["edges"])
         # source/target cross as 1-element user-id arrays (int64 or string),
