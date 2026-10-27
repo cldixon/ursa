@@ -38,7 +38,7 @@ use crate::logical::{Direction, GraphAlgo, LayoutKind};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::planner::graph_session;
 use crate::result::{path_schema, query_batch, OutputColumn, OutputDtype};
-use crate::weight::edge_weights;
+use crate::weight::{edge_weights, WeightCache};
 
 /// One requested output column, deserialized from the Python query IR.
 ///
@@ -1123,6 +1123,48 @@ pub fn execute_node_query(
     aggs: Vec<String>,
     mask: Option<Arc<EdgeMask>>,
 ) -> Result<Vec<RecordBatch>> {
+    execute_node_query_cached(
+        topology,
+        ids,
+        columns_json,
+        filters,
+        sort,
+        limit,
+        nodes,
+        nodes_id,
+        edges,
+        distinct,
+        sample,
+        rename,
+        group_keys,
+        aggs,
+        mask,
+        None,
+    )
+}
+
+/// [`execute_node_query`] with a [`WeightCache`] that outlives the query (the one
+/// held on the graph index): a weight expression already in it is not re-evaluated,
+/// and `edges` may then be omitted.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_node_query_cached(
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    columns_json: &str,
+    filters: &[String],
+    sort: Option<Vec<(String, bool)>>,
+    limit: Option<usize>,
+    nodes: Option<Vec<RecordBatch>>,
+    nodes_id: Option<String>,
+    edges: Option<Vec<RecordBatch>>,
+    distinct: bool,
+    sample: Option<(usize, Option<u64>)>,
+    rename: Vec<(String, String)>,
+    group_keys: Vec<String>,
+    aggs: Vec<String>,
+    mask: Option<Arc<EdgeMask>>,
+    shared_weights: Option<&WeightCache>,
+) -> Result<Vec<RecordBatch>> {
     let specs: Vec<ColumnSpec> = serde_json::from_str(columns_json)
         .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}")))?;
     if specs.is_empty() {
@@ -1204,12 +1246,14 @@ pub fn execute_node_query(
                     let w = match weight_cache.get(&key) {
                         Some(w) => w.clone(),
                         None => {
-                            let w = Arc::new(edge_weights(
-                                edges.as_deref(),
-                                &key,
-                                topology.n_edges(),
-                                "a weighted algorithm",
-                            )?);
+                            let n_edges = topology.n_edges();
+                            let what = "a weighted algorithm";
+                            let w = match shared_weights {
+                                Some(c) => c.get_or_eval(&key, edges.as_deref(), n_edges, what)?,
+                                None => {
+                                    Arc::new(edge_weights(edges.as_deref(), &key, n_edges, what)?)
+                                }
+                            };
                             weight_cache.insert(key, w.clone());
                             w
                         }

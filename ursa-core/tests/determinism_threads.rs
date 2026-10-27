@@ -19,7 +19,8 @@
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
-    betweenness, label_propagation, layout_fr, louvain, pagerank, LayoutParams, PageRankParams,
+    betweenness, label_propagation, layout_fr, louvain, pagerank, pagerank_weighted,
+    symmetric_view_weighted, LayoutParams, PageRankParams,
 };
 use ursa_core::Topology;
 
@@ -70,6 +71,38 @@ fn pagerank_is_thread_count_independent() {
             on_pool(threads, || pagerank(&t, None, params)),
             reference,
             "pagerank diverged at {threads} threads"
+        );
+    }
+}
+
+#[test]
+fn symmetric_views_are_thread_count_independent() {
+    // The `direction="both"` views, each built on the pool under test (a fresh
+    // topology per pool, so the lazy undirected CSR is built there too), and
+    // PageRank over them.
+    let params = PageRankParams {
+        damping: 0.85,
+        max_iter: 100,
+        tol: 1e-12,
+    };
+    let run = || {
+        let t = seeded_graph(2000, 100_000);
+        let w: Vec<f64> = (0..t.n_edges()).map(|e| (e % 7) as f64 + 0.5).collect();
+        let sym = t.symmetric();
+        let (wsym, sw) = symmetric_view_weighted(&t, &w, None);
+        (
+            sym.out().targets.clone(),
+            wsym.out().targets.clone(),
+            sw.clone(),
+            pagerank(sym, None, params),
+            pagerank_weighted(&wsym, &sw, None, params),
+        )
+    };
+    let reference = on_pool(1, run);
+    for &threads in &THREADS {
+        assert!(
+            on_pool(threads, run) == reference,
+            "symmetric views diverged at {threads} threads"
         );
     }
 }
