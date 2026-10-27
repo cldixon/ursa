@@ -41,9 +41,10 @@ use ursa_core::topology::Topology;
 use ursa_core::{EdgeMask, IdMap};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, describe, diameter, execute_hop_query,
-    execute_join_query, execute_node_query, execute_path_query, execute_walk_query,
+    execute_join_query, execute_node_query_cached, execute_path_query, execute_walk_query,
     hop_reached_nodes, parse_stat_direction, scan_edges_batch, scan_edges_table,
-    scan_edges_topology, scan_nodes_batch, shortest_path_nodes, ScanBuildError, ScannedTopology,
+    scan_edges_topology, scan_nodes_batch, shortest_path_nodes, weight_cache_key, ScanBuildError,
+    ScannedTopology, WeightCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,10 +139,36 @@ static TOPOLOGY_BUILDS: AtomicUsize = AtomicUsize::new(0);
 /// Python `EdgeFrame` and passed to every graph op over that frame, so the
 /// topology is built once instead of on every `collect()` (spec §index-
 /// preservation contract). Opaque to Python; produced only by [`build_index`].
+///
+/// It also carries the weight vectors evaluated over the frame's edge rows, so a
+/// repeated weighted query evaluates its `weight=` expression once (#175).
 #[pyclass]
 struct GraphIndex {
     topo: Arc<Topology>,
     ids: Arc<IdMap>,
+    weights: Arc<WeightCache>,
+}
+
+impl GraphIndex {
+    fn new(topo: Arc<Topology>, ids: Arc<IdMap>) -> Self {
+        let weights = Arc::default();
+        GraphIndex { topo, ids, weights }
+    }
+}
+
+#[pymethods]
+impl GraphIndex {
+    /// Whether the weights for this serialized weight expression are already
+    /// cached, so a weighted query need not read the edge weight columns again.
+    fn has_weights(&self, weight_json: &str) -> PyResult<bool> {
+        let key = weight_cache_key(weight_json).map_err(to_pyerr)?;
+        Ok(self.weights.get(&key).is_some())
+    }
+
+    /// Weight evaluations run against this index (test/observability hook).
+    fn _weight_eval_count(&self) -> usize {
+        self.weights.evaluations()
+    }
 }
 
 /// Build the graph index from an **edge batch list** — a pyarrow list of
@@ -163,7 +190,7 @@ fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex>
         build_topology_batches(&pairs).map_err(|e| PyValueError::new_err(e.to_string()))
     })?;
     TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
-    Ok(GraphIndex { topo, ids })
+    Ok(GraphIndex::new(topo, ids))
 }
 
 /// Scan an edge file and build its graph index in one native call, returning the
@@ -194,7 +221,7 @@ fn scan_build_index(
     })?;
     TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
     let ScannedTopology { topo, ids, dropped } = scanned;
-    Ok((GraphIndex { topo, ids }, dropped))
+    Ok((GraphIndex::new(topo, ids), dropped))
 }
 
 /// Total topology builds so far (test/observability hook for the index contract).
@@ -230,6 +257,7 @@ fn run_node_query(
     edge_mask: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let (topo, ids) = (index.topo.clone(), index.ids.clone());
+    let weights = index.weights.clone();
     let columns_json = columns_json.to_string();
     // A subgraph view (#114): a per-edge-row boolean mask over the shared parent CSR.
     let mask = match edge_mask {
@@ -248,7 +276,7 @@ fn run_node_query(
         None => None,
     };
     let batches = py.detach(move || {
-        execute_node_query(
+        execute_node_query_cached(
             topo,
             ids,
             &columns_json,
@@ -264,6 +292,7 @@ fn run_node_query(
             group_keys,
             aggs,
             mask,
+            Some(&weights),
         )
         .map_err(to_pyerr)
     })?;
