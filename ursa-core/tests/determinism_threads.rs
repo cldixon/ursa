@@ -19,7 +19,8 @@
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
-    betweenness, label_propagation, layout_fr, louvain, pagerank, LayoutParams, PageRankParams,
+    betweenness, label_propagation, layout_fr, louvain, louvain_weighted, pagerank, LayoutParams,
+    PageRankParams,
 };
 use ursa_core::Topology;
 
@@ -111,6 +112,24 @@ fn louvain_is_thread_count_independent() {
             on_pool(threads, || louvain(&t, None, 1.0, Some(7))),
             reference,
             "louvain diverged at {threads} threads"
+        );
+    }
+}
+
+#[test]
+fn louvain_weighted_large_is_thread_count_independent() {
+    // Large enough (> 2^16 edges) for the working graph to be built in parallel
+    // chunks, with inexact weights so any change in summation order would show.
+    let t = seeded_graph(20_000, 100_000);
+    let w: Vec<f64> = (0..t.n_edges())
+        .map(|i| ((i % 89) as f64 + 1.0).sqrt() / 7.0)
+        .collect();
+    let reference = on_pool(1, || louvain_weighted(&t, &w, None, 1.0, Some(7)));
+    for &threads in &THREADS {
+        assert_eq!(
+            on_pool(threads, || louvain_weighted(&t, &w, None, 1.0, Some(7))),
+            reference,
+            "weighted louvain diverged at {threads} threads"
         );
     }
 }
