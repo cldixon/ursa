@@ -4,13 +4,13 @@
 //! [`GraphExtensionPlanner`] maps [`crate::node::GraphAlgorithmNode`] to
 //! [`crate::physical::GraphAlgorithmExec`] during physical planning;
 //! `GraphQueryPlanner` installs it into DataFusion's `DefaultPhysicalPlanner`;
-//! [`graph_session`] builds a `SessionContext` with that planner registered. The
+//! [`graph_session`] hands out a `SessionContext` with that planner registered. The
 //! result: `ctx.execute_logical_plan(plan)` optimizes and executes a plan whose
 //! graph nodes are ours, with everything else handled by stock DataFusion. This
 //! is where future optimizer rules (push filters before traversal, fuse
 //! `neighbors().agg`, share topology builds) will register.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use datafusion::error::Result;
@@ -99,18 +99,32 @@ impl QueryPlanner for GraphQueryPlanner {
     }
 }
 
+/// The default query session state, built once: registering DataFusion's
+/// built-in functions, file formats and optimizer rules costs more than many
+/// small queries themselves, and none of it varies between queries.
+static GRAPH_STATE: OnceLock<SessionState> = OnceLock::new();
+
 /// A `SessionContext` configured to plan and execute Ursa graph queries.
+///
+/// Each call clones the shared template state, so a query gets its own context
+/// (queries never register tables, but a clone keeps them independent anyway)
+/// with exactly the config a fresh build would have: `target_partitions` follows
+/// the machine's cores.
 pub fn graph_session() -> SessionContext {
-    graph_session_with_config(SessionConfig::new())
+    let state = GRAPH_STATE.get_or_init(|| build_graph_state(SessionConfig::new()));
+    SessionContext::new_with_state(state.clone())
 }
 
 /// [`graph_session`] with an explicit `SessionConfig` (tests pin
-/// `target_partitions` with it).
+/// `target_partitions` with it). Builds a fresh state rather than the template.
 pub fn graph_session_with_config(config: SessionConfig) -> SessionContext {
-    let state = SessionStateBuilder::new()
+    SessionContext::new_with_state(build_graph_state(config))
+}
+
+fn build_graph_state(config: SessionConfig) -> SessionState {
+    SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
         .with_query_planner(Arc::new(GraphQueryPlanner))
-        .build();
-    SessionContext::new_with_state(state)
+        .build()
 }

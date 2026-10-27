@@ -290,3 +290,88 @@ def test_from_networkx_symmetrizes_an_undirected_graph():
     # A DiGraph keeps its rows as given; a self-loop is never doubled.
     assert ur.from_networkx(nx.DiGraph([(0, 1), (1, 2)])).collect().to_arrow().num_rows == 2
     assert ur.from_networkx(nx.Graph([(0, 0), (0, 1)])).collect().to_arrow().num_rows == 3
+
+
+def _symmetric_rows(edges, weights):
+    """The simple undirected view as directed rows `u -> v` and `v -> u`, sorted by
+    (source, target), each pair at the minimum weight of the rows joining it."""
+    best = {}
+    for (u, v), w in zip(edges, weights, strict=True):
+        if u != v:
+            key = (min(u, v), max(u, v))
+            best[key] = min(best.get(key, w), w)
+    rows = sorted(
+        [(u, v, w) for (u, v), w in best.items()] + [(v, u, w) for (u, v), w in best.items()]
+    )
+    return rows
+
+
+def test_both_is_bit_identical_to_the_out_kernels_over_the_symmetric_rows():
+    # direction="both" runs the directed kernels over the symmetric view. The oracle
+    # builds that view by hand as an edge list and runs direction="out" on it. A
+    # leading self-loop per node pins the dense ids to 0..n in both frames; the view
+    # drops self-loops, and the oracle masks them out with a filter.
+    import random
+
+    rng = random.Random(7)
+    n = 60
+    pairs = [(rng.randrange(n), rng.randrange(n)) for _ in range(400)]
+    pairs += [(v, u) for u, v in pairs[:50]] + pairs[50:80]  # reciprocal + parallel
+    weights = [float(rng.randrange(1, 6)) for _ in pairs]
+    loops = list(range(n))
+    graph = ur.from_arrow(
+        pa.table(
+            {
+                "src": loops + [u for u, _ in pairs],
+                "dst": loops + [v for _, v in pairs],
+                "w": [1.0] * n + weights,
+            }
+        ),
+        src="src",
+        dst="dst",
+    )
+    sym = _symmetric_rows(pairs, weights)
+    oracle = ur.from_arrow(
+        pa.table(
+            {
+                "src": loops + [u for u, _, _ in sym],
+                "dst": loops + [v for _, v, _ in sym],
+                "w": [1.0] * n + [w for _, _, w in sym],
+            }
+        ),
+        src="src",
+        dst="dst",
+    ).filter(ur.col("src") != ur.col("dst"))
+    w = ur.col("w")
+
+    def both(e):
+        return (
+            e.nodes()
+            .with_columns(
+                pr=ur.pagerank(e, direction="both"),
+                prw=ur.pagerank(e, weight=w, direction="both"),
+                bc=ur.betweenness(e, direction="both"),
+                bcw=ur.betweenness(e, weight=w, direction="both"),
+            )
+            .collect()
+            .to_dicts()
+        )
+
+    first = both(graph)
+    assert both(graph) == first  # the second query reuses the cached view
+    assert both(graph.filter(ur.col("w") > 0.0)) == first  # the per-query masked build
+    want = (
+        oracle.nodes()
+        .with_columns(
+            pr=ur.pagerank(oracle),
+            prw=ur.pagerank(oracle, weight=w),
+            bc=ur.betweenness(oracle),
+            bcw=ur.betweenness(oracle, weight=w),
+        )
+        .collect()
+        .to_dicts()
+    )
+    for row in want:
+        row["bc"] *= 0.5
+        row["bcw"] *= 0.5
+    assert first == want

@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+# The library has no `#[bench]`s; without this, `cargo bench -p ursa-core -- <criterion
+# flags>` also runs the lib's libtest harness, which rejects flags like
+# `--save-baseline`.
+bench = false
+
 [dependencies]
 arrow = { workspace = true }
 rayon = { workspace = true, optional = true }
@@ -34,4 +40,12 @@ rayon = ["dep:rayon"]
 # the rayon pool size per run; rayon is a normal dep but integration-test crates
 # only see dev-deps, so it is declared here too.
 rayon = { workspace = true }
-# criterion micro-benches land here (see benches/ in the v0.1 checklist).
+# Micro-benchmarks (benches/kernels.rs, #178). Default features off: no plotters
+# (no chart rendering) and no rayon inside criterion's own analysis, so the bench
+# harness never competes with the kernels' pool. Dev-only, so it never reaches the
+# `--no-default-features` / wasm32 checks.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "kernels"
+harness = false

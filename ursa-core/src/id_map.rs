@@ -36,6 +36,8 @@ use std::hash::BuildHasher;
 #[derive(Debug)]
 pub struct EdgeInterner {
     map: Option<IdMap>,
+    /// The `with_capacity` edge count.
+    rows_hint: usize,
     src_dense: Vec<u32>,
     dst_dense: Vec<u32>,
 }
@@ -43,10 +45,12 @@ pub struct EdgeInterner {
 impl EdgeInterner {
     /// An empty interner whose dense endpoint vectors are sized for `n_edges`. The
     /// count is only a hint: more edges grow the vectors, fewer leave the tail
-    /// unused.
+    /// unused. It also sizes how wide a range of integer ids may stay in a direct
+    /// table (see [`IntIndex`]).
     pub fn with_capacity(n_edges: usize) -> Self {
         EdgeInterner {
             map: None,
+            rows_hint: n_edges,
             src_dense: Vec::with_capacity(n_edges),
             dst_dense: Vec::with_capacity(n_edges),
         }
@@ -79,6 +83,9 @@ impl EdgeInterner {
             IdKind::Utf8 => IdMap::new_utf8(),
         });
         let (sd, dd) = (&mut self.src_dense, &mut self.dst_dense);
+        if let IdMap::Int64 { to_dense, .. } = map {
+            to_dense.budget_rows(self.rows_hint.max(sd.len() + src.len()));
+        }
         match (kind, &*map) {
             (IdKind::Int64, IdMap::Int64 { .. }) => {
                 let (s, d) = (as_int64(src), as_int64(dst));
@@ -97,9 +104,7 @@ impl EdgeInterner {
                             sd,
                             dd,
                             |map, is_dst, i| match map {
-                                IdMap::Int64 { to_dense, .. } => {
-                                    to_dense.get(&ids(is_dst)[i]).copied()
-                                }
+                                IdMap::Int64 { to_dense, .. } => to_dense.get(ids(is_dst)[i]),
                                 IdMap::Utf8 { .. } => unreachable!("Int64 chunk, Utf8 map"),
                             },
                             |map, is_dst, i| map.intern_i64(ids(is_dst)[i]),
@@ -372,12 +377,216 @@ impl StrIds {
     }
 }
 
+/// The integer id index stays a direct table while the range of ids seen fits
+/// in this many slots per distinct id, or one slot per edge row, plus
+/// [`DIRECT_MIN_SLOTS`]; past that it moves to a hash map (see [`IntIndex`]).
+const DIRECT_SLOTS_PER_ID: u64 = 4;
+
+/// The fixed allowance of the direct table: any id range up to this many slots
+/// (4 MiB) stays direct whatever its density.
+const DIRECT_MIN_SLOTS: u64 = 1 << 20;
+
+/// Integer user id -> dense index.
+///
+/// Most integer ids are compact (`0..n`, or an offset range, as anonymised
+/// exports and `from_numpy` inputs are), so the index starts as a direct table:
+/// `slot[user - base]` holds the dense index, or `MISS` for an id not seen. A
+/// lookup is one array read, against a hash probe that is a cache miss into a
+/// table several times larger. The table grows geometrically, in either
+/// direction, as ids outside it appear. Once the range of ids seen gets sparse,
+/// it moves to a hash map for good: when it would need more than
+/// `DIRECT_SLOTS_PER_ID` slots per distinct id and more than one per edge row
+/// (plus `DIRECT_MIN_SLOTS`), or more than `u32::MAX` slots. The per-row
+/// allowance keeps compact ids direct when they arrive in random order, when
+/// few distinct ids are seen yet but each spans the whole range; at 4 bytes per
+/// row the table stays below the dense endpoints the interner holds anyway.
+/// Neither form decides the dense numbering, which is first-seen order either
+/// way, so the output is identical.
+#[derive(Debug, Clone)]
+pub struct IntIndex {
+    table: IntTable,
+    /// Edge rows the table may also budget a slot each for (see `make_room`).
+    rows: u64,
+}
+
+#[derive(Debug, Clone)]
+enum IntTable {
+    /// Ids `base..base + slot.len()`, of which `lo..=hi` have been seen (the
+    /// rest is growth headroom). The table never reaches past `i64::MAX`.
+    Direct {
+        base: i64,
+        slot: Vec<u32>,
+        lo: i64,
+        hi: i64,
+    },
+    Hash(FxHashMap<i64, u32>),
+}
+
+impl IntIndex {
+    fn new() -> Self {
+        IntIndex {
+            table: IntTable::Direct {
+                base: 0,
+                slot: Vec::new(),
+                lo: 0,
+                hi: 0,
+            },
+            rows: 0,
+        }
+    }
+
+    /// Allow the direct table one slot per row for `rows` edge rows.
+    fn budget_rows(&mut self, rows: usize) {
+        self.rows = self.rows.max(rows as u64);
+    }
+
+    /// The dense index of `user`, if interned.
+    #[inline]
+    fn get(&self, user: i64) -> Option<u32> {
+        match &self.table {
+            IntTable::Direct { base, slot, .. } => {
+                // `user - base` wraps to a value of at least `slot.len()` for an
+                // id below `base`, since the table ends at or before `i64::MAX`,
+                // so one comparison covers both ends.
+                let off = user.wrapping_sub(*base) as u64;
+                match off < slot.len() as u64 {
+                    true => Some(slot[off as usize]).filter(|&d| d != MISS),
+                    false => None,
+                }
+            }
+            IntTable::Hash(map) => map.get(&user).copied(),
+        }
+    }
+
+    /// The dense index of `user`, interning it as `to_user`'s next id if new.
+    #[inline]
+    fn intern(&mut self, user: i64, to_user: &mut IntIds) -> Result<u32, IdError> {
+        use std::collections::hash_map::Entry;
+        let next = to_user.len();
+        if let IntTable::Direct { base, slot, .. } = &self.table {
+            if user.wrapping_sub(*base) as u64 >= slot.len() as u64 {
+                self.make_room(user, next as u64 + 1, to_user);
+            }
+        }
+        match &mut self.table {
+            IntTable::Direct { base, slot, lo, hi } => {
+                let s = &mut slot[user.wrapping_sub(*base) as u64 as usize];
+                if *s != MISS {
+                    return Ok(*s);
+                }
+                if next >= u32::MAX as usize {
+                    return Err(IdError::TooManyNodes);
+                }
+                *s = next as u32;
+                (*lo, *hi) = ((*lo).min(user), (*hi).max(user));
+                to_user.push(user);
+                Ok(next as u32)
+            }
+            IntTable::Hash(to_dense) => {
+                // One hash probe via `entry` (vs a `get` miss followed by an
+                // `insert` re-hash): every new node is a miss.
+                match to_dense.entry(user) {
+                    Entry::Occupied(e) => Ok(*e.get()),
+                    Entry::Vacant(e) => {
+                        if next >= u32::MAX as usize {
+                            return Err(IdError::TooManyNodes);
+                        }
+                        e.insert(next as u32);
+                        to_user.push(user);
+                        Ok(next as u32)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Make the direct table cover `user`, which lies outside it, once `ids`
+    /// distinct ids are interned: grow it, or move to a hash map if the range
+    /// would get too sparse. Afterwards `intern` finds `user` in range or hashes.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self, user: i64, ids: u64, to_user: &IntIds) {
+        let rows = self.rows;
+        let IntTable::Direct { base, slot, lo, hi } = &mut self.table else {
+            return;
+        };
+        // The range of ids seen, with `user`. Headroom is free to drop, so it
+        // does not count against the budget.
+        let (new_lo, new_hi) = if slot.is_empty() {
+            (user, user)
+        } else {
+            ((*lo).min(user), (*hi).max(user))
+        };
+        let need = (new_hi as i128 - new_lo as i128 + 1) as u128;
+        let budget = (DIRECT_SLOTS_PER_ID * ids).max(rows) + DIRECT_MIN_SLOTS;
+        let limit = budget.min(u32::MAX as u64) as u128;
+        if need > limit {
+            let mut map = FxHashMap::default();
+            map.reserve(to_user.len());
+            for (i, &id) in to_user.values().iter().enumerate() {
+                map.insert(id, i as u32);
+            }
+            self.table = IntTable::Hash(map);
+            return;
+        }
+        // Grow past `user` by the table's current length, so each growth at
+        // least doubles it and the copies stay linear in total; keep the
+        // headroom on the other side. Past the limit, drop headroom first. The
+        // ends of the `i64` range cap it too; `i128` keeps it clear of overflow.
+        let (old_lo, old_hi) = (*base as i128, *base as i128 + slot.len() as i128 - 1);
+        let pad = slot.len() as i128;
+        let up = slot.is_empty() || user as i128 > old_hi;
+        let (mut ext_lo, mut ext_hi) = match (slot.is_empty(), up) {
+            (true, _) => (user as i128, user as i128),
+            (false, true) => (old_lo, user as i128 + pad),
+            (false, false) => (user as i128 - pad, old_hi),
+        };
+        if (ext_hi - ext_lo + 1) as u128 > limit {
+            (ext_lo, ext_hi) = if up {
+                (new_lo as i128, new_lo as i128 + limit as i128 - 1)
+            } else {
+                (new_hi as i128 + 1 - limit as i128, new_hi as i128)
+            };
+        }
+        let ext_lo = ext_lo.max(i64::MIN as i128);
+        let ext_hi = ext_hi.min(i64::MAX as i128);
+        let new_len = (ext_hi - ext_lo + 1) as usize;
+        if slot.is_empty() || ext_lo == old_lo {
+            slot.resize(new_len, MISS);
+        } else {
+            // Move the ids seen; the old headroom is all `MISS`.
+            let from = (*lo as i128 - old_lo) as usize;
+            let to = (*lo as i128 - ext_lo) as usize;
+            let used = (*hi as i128 - *lo as i128 + 1) as usize;
+            let mut grown = vec![MISS; new_len];
+            grown[to..to + used].copy_from_slice(&slot[from..from + used]);
+            *slot = grown;
+        }
+        (*base, *lo, *hi) = (ext_lo as i64, new_lo, new_hi);
+    }
+
+    /// Trim the direct table to the ids seen, once interning is done.
+    fn shrink(&mut self) {
+        if let IntTable::Direct { base, slot, lo, hi } = &mut self.table {
+            if !slot.is_empty() {
+                let from = (*lo as i128 - *base as i128) as usize;
+                let used = (*hi as i128 - *lo as i128 + 1) as usize;
+                slot.copy_within(from..from + used, 0);
+                slot.truncate(used);
+                *base = *lo;
+            }
+            slot.shrink_to_fit();
+        }
+    }
+}
+
 /// Chunks at least this long intern their known ids in parallel (see
 /// [`intern_two_phase`]); shorter ones are not worth the fork.
 const PARALLEL_MIN_ROWS: usize = 1 << 15;
 
-/// Marks an endpoint the parallel lookup did not find. Dense ids stay below
-/// `u32::MAX` (the interner errors first), so it never collides with one.
+/// Marks an endpoint the parallel lookup did not find, and an unseen id's slot
+/// in the direct table ([`IntIndex`]). Dense ids stay below `u32::MAX` (the
+/// interner errors first), so it never collides with one.
 const MISS: u32 = u32::MAX;
 
 /// Intern one null-free chunk of `len` rows, giving exactly the ids the serial
@@ -445,7 +654,7 @@ pub enum IdMap {
     /// Integer user ids (the fast path).
     Int64 {
         to_user: IntIds,
-        to_dense: FxHashMap<i64, u32>,
+        to_dense: IntIndex,
         id_array: OnceLock<ArrayRef>,
     },
     /// String user ids (also covers UUID-as-string).
@@ -585,7 +794,7 @@ impl IdMap {
     fn new_int64() -> Self {
         IdMap::Int64 {
             to_user: IntIds::new(),
-            to_dense: FxHashMap::default(),
+            to_dense: IntIndex::new(),
             id_array: OnceLock::new(),
         }
     }
@@ -653,29 +862,12 @@ impl IdMap {
         Ok(interner.finish())
     }
 
+    #[inline]
     fn intern_i64(&mut self, user: i64) -> Result<u32, IdError> {
-        use std::collections::hash_map::Entry;
         match self {
             IdMap::Int64 {
                 to_user, to_dense, ..
-            } => {
-                // One hash probe via `entry` (vs a `get` miss followed by an
-                // `insert` re-hash): interning is a hot inner loop, and every new
-                // node is a miss, so halving the miss-path hashing matters.
-                let next = to_user.len();
-                match to_dense.entry(user) {
-                    Entry::Occupied(e) => Ok(*e.get()),
-                    Entry::Vacant(e) => {
-                        if next >= u32::MAX as usize {
-                            return Err(IdError::TooManyNodes);
-                        }
-                        let idx = next as u32;
-                        e.insert(idx);
-                        to_user.push(user);
-                        Ok(idx)
-                    }
-                }
-            }
+            } => to_dense.intern(user, to_user),
             IdMap::Utf8 { .. } => unreachable!("intern_i64 on a Utf8 IdMap"),
         }
     }
@@ -692,8 +884,13 @@ impl IdMap {
     fn freeze(&mut self) {
         let (array, id_array): (ArrayRef, _) = match self {
             IdMap::Int64 {
-                to_user, id_array, ..
-            } => (Arc::new(to_user.freeze()), id_array),
+                to_user,
+                to_dense,
+                id_array,
+            } => {
+                to_dense.shrink();
+                (Arc::new(to_user.freeze()), id_array)
+            }
             IdMap::Utf8 { ids, id_array } => (Arc::new(ids.freeze()), id_array),
         };
         *id_array = OnceLock::new();
@@ -767,12 +964,15 @@ impl IdMap {
                     return Err(IdError::MixedTypes);
                 }
                 let a = as_int64(arr);
+                if a.null_count() == 0 {
+                    return Ok(a.values().iter().map(|&u| to_dense.get(u)).collect());
+                }
                 Ok((0..a.len())
                     .map(|i| {
                         if a.is_null(i) {
                             None
                         } else {
-                            to_dense.get(&a.value(i)).copied()
+                            to_dense.get(a.value(i))
                         }
                     })
                     .collect())
@@ -782,6 +982,9 @@ impl IdMap {
                     return Err(IdError::MixedTypes);
                 }
                 let a = StrView::new(arr);
+                if arr.null_count() == 0 {
+                    return Ok((0..a.len()).map(|i| ids.get(a.value(i))).collect());
+                }
                 Ok((0..a.len())
                     .map(|i| {
                         if a.is_null(i) {
@@ -1177,6 +1380,217 @@ mod tests {
             IdMap::from_edge_arrays(&s, &d),
             Err(IdError::Unsupported(_))
         ));
+    }
+
+    /// Intern `chunks` of `(src, dst)` ids, through the direct table (as built
+    /// normally) or forced onto the hash map from the start.
+    fn intern_chunks(chunks: &[(Vec<i64>, Vec<i64>)], hashed: bool) -> (IdMap, Vec<u32>, Vec<u32>) {
+        let rows = chunks.iter().map(|(s, _)| s.len()).sum();
+        let mut interner = EdgeInterner::with_capacity(rows);
+        if hashed {
+            let mut map = IdMap::new_int64();
+            let IdMap::Int64 { to_dense, .. } = &mut map else {
+                unreachable!()
+            };
+            to_dense.table = IntTable::Hash(FxHashMap::default());
+            interner.map = Some(map);
+        }
+        for (s, d) in chunks {
+            interner
+                .push(&Int64Array::from(s.clone()), &Int64Array::from(d.clone()))
+                .unwrap();
+        }
+        interner.finish()
+    }
+
+    fn is_direct(map: &IdMap) -> bool {
+        matches!(
+            map,
+            IdMap::Int64 {
+                to_dense: IntIndex {
+                    table: IntTable::Direct { .. },
+                    ..
+                },
+                ..
+            }
+        )
+    }
+
+    /// Intern `chunks` both ways and require identical output: dense endpoints,
+    /// the id column, gathers, and lookups of seen, unseen and null ids. Returns
+    /// whether the default build ended on the direct table.
+    fn assert_same_as_hash(chunks: &[(Vec<i64>, Vec<i64>)]) -> bool {
+        let (dmap, dsd, ddd) = intern_chunks(chunks, false);
+        let (hmap, hsd, hdd) = intern_chunks(chunks, true);
+        assert!(!is_direct(&hmap));
+        assert_eq!((&dsd, &ddd), (&hsd, &hdd));
+        assert_eq!(&dmap.user_id_array(), &hmap.user_id_array());
+        assert_eq!(&dmap.gather_user(&dsd), &hmap.gather_user(&hsd));
+        let mut probe: Vec<i64> = chunks
+            .iter()
+            .flat_map(|(s, d)| s.iter().chain(d))
+            .flat_map(|&u| [u, u.wrapping_add(1), u.wrapping_sub(1)])
+            .collect();
+        probe.extend([i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX]);
+        let probe = Int64Array::from(probe);
+        assert_eq!(
+            dmap.dense_from_array(&probe).unwrap(),
+            hmap.dense_from_array(&probe).unwrap()
+        );
+        let nullable: Int64Array = probe
+            .iter()
+            .enumerate()
+            .map(|(i, u)| u.filter(|_| i % 3 != 0))
+            .collect();
+        assert_eq!(
+            dmap.dense_from_array(&nullable).unwrap(),
+            hmap.dense_from_array(&nullable).unwrap()
+        );
+        is_direct(&dmap)
+    }
+
+    /// One chunk of `ids` read as consecutive `(src, dst)` pairs.
+    fn pairs(ids: &[i64]) -> (Vec<i64>, Vec<i64>) {
+        ids.chunks_exact(2).map(|p| (p[0], p[1])).unzip()
+    }
+
+    #[test]
+    fn compact_ids_stay_direct_and_match_the_hash_map() {
+        // A shuffled compact range, above the parallel threshold, in two chunks.
+        let n = 3 * PARALLEL_MIN_ROWS as i64;
+        let src: Vec<i64> = (0..n).map(|i| (i * 7919) % n).collect();
+        let dst: Vec<i64> = (0..n).map(|i| (i * 104_729 + 3) % n).collect();
+        let (s0, s1) = src.split_at(100);
+        let (d0, d1) = dst.split_at(100);
+        let chunks = [(s0.to_vec(), d0.to_vec()), (s1.to_vec(), d1.to_vec())];
+        assert!(assert_same_as_hash(&chunks));
+        // An offset range, first seen from the top down, grows the table downwards.
+        let ids: Vec<i64> = (0..10_000).rev().map(|i| 5_000_000_000 + i).collect();
+        assert!(assert_same_as_hash(&[pairs(&ids)]));
+    }
+
+    #[test]
+    fn compact_ids_in_random_order_stay_direct() {
+        // Two random ids from `0..1.5M` already span most of the range: the
+        // per-row allowance, from the known row count, keeps the table direct.
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+        let ids: Vec<i64> = (0..1_200_000)
+            .map(|_| rng.gen_range(0..1_500_000))
+            .collect();
+        let (src, dst) = pairs(&ids);
+        let chunks: Vec<(Vec<i64>, Vec<i64>)> = src
+            .chunks(8192)
+            .zip(dst.chunks(8192))
+            .map(|(s, d)| (s.to_vec(), d.to_vec()))
+            .collect();
+        assert!(assert_same_as_hash(&chunks));
+        // With no row count up front the budget only grows with the rows pushed,
+        // so the same input falls back early, with the same output.
+        let mut interner = EdgeInterner::with_capacity(0);
+        for (s, d) in &chunks {
+            interner
+                .push(&Int64Array::from(s.clone()), &Int64Array::from(d.clone()))
+                .unwrap();
+        }
+        let (map, sd, dd) = interner.finish();
+        assert!(!is_direct(&map));
+        let (dmap, dsd, ddd) = intern_chunks(&chunks, false);
+        assert_eq!((sd, dd), (dsd, ddd));
+        assert_eq!(&map.user_id_array(), &dmap.user_id_array());
+    }
+
+    #[test]
+    fn gappy_ids_match_the_hash_map() {
+        // Every third id: gaps never become nodes.
+        let ids: Vec<i64> = (0..60_000).map(|i| (i * 7919 % 60_000) * 3 + 1).collect();
+        assert!(assert_same_as_hash(&[pairs(&ids)]));
+        let (map, _, _) = intern_chunks(&[pairs(&ids)], false);
+        assert_eq!(map.len(), 60_000);
+    }
+
+    #[test]
+    fn sparse_ids_fall_back_to_the_hash_map() {
+        // Sparse from the start.
+        let ids: Vec<i64> = (0..1000).map(|i| i * 1_000_003_000).collect();
+        assert!(!assert_same_as_hash(&[pairs(&ids)]));
+        // Compact, then one far id mid-chunk, then compact ids again: the
+        // migration keeps every index already handed out.
+        let mut ids: Vec<i64> = (0..5000).collect();
+        ids.insert(3001, 1 << 40);
+        ids.extend(0..6000);
+        assert!(!assert_same_as_hash(&[pairs(&ids)]));
+        // The same across chunks, with the far id in a parallel-sized chunk.
+        let n = 2 * PARALLEL_MIN_ROWS as i64;
+        let first = pairs(&(0..n).collect::<Vec<_>>());
+        let mut second: Vec<i64> = (0..n).rev().collect();
+        second[n as usize / 2 + 1] = -(1 << 50);
+        assert!(!assert_same_as_hash(&[first, pairs(&second)]));
+    }
+
+    #[test]
+    fn negative_and_extreme_ids_match_the_hash_map() {
+        let neg: Vec<i64> = (-5000..5000).rev().collect();
+        assert!(assert_same_as_hash(&[pairs(&neg)]));
+        // Compact ranges at either end of `i64`: the table stops at the edge.
+        let top: Vec<i64> = (0..2000).map(|i| i64::MAX - i).collect();
+        assert!(assert_same_as_hash(&[pairs(&top)]));
+        let top_up: Vec<i64> = (0..2000).rev().map(|i| i64::MAX - i).collect();
+        assert!(assert_same_as_hash(&[pairs(&top_up)]));
+        let bottom: Vec<i64> = (0..2000).map(|i| i64::MIN + i).collect();
+        assert!(assert_same_as_hash(&[pairs(&bottom)]));
+        let bottom_down: Vec<i64> = (0..2000).rev().map(|i| i64::MIN + i).collect();
+        assert!(assert_same_as_hash(&[pairs(&bottom_down)]));
+        // Both ends at once is the widest range there is.
+        assert!(!assert_same_as_hash(&[pairs(&[
+            i64::MAX,
+            i64::MIN,
+            0,
+            i64::MAX
+        ])]));
+        assert!(!assert_same_as_hash(&[pairs(&[i64::MIN, i64::MAX])]));
+    }
+
+    #[test]
+    fn random_ids_match_the_hash_map() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(171);
+        for case in 0..60 {
+            // Ranges from dense to sparse, offsets anywhere in `i64`, chunk sizes
+            // on both sides of the parallel threshold.
+            let span: i64 = [10, 1000, 100_000, 3_000_000, 1 << 40, i64::MAX][case % 6];
+            let offset: i64 = match case % 4 {
+                0 => 0,
+                1 => -span / 2,
+                2 => rng.gen(),
+                _ => i64::MAX - span,
+            };
+            let rows = [7, 5000, PARALLEL_MIN_ROWS + 9][case % 3];
+            let chunks: Vec<(Vec<i64>, Vec<i64>)> = (0..1 + case % 3)
+                .map(|_| {
+                    let mut id = || offset.wrapping_add(rng.gen_range(0..span));
+                    (0..rows).map(|_| (id(), id())).unzip()
+                })
+                .collect();
+            assert_same_as_hash(&chunks);
+        }
+    }
+
+    #[test]
+    fn freeze_trims_the_direct_table() {
+        let (map, _, _) = intern_chunks(&[pairs(&(0..3000).collect::<Vec<_>>())], false);
+        let IdMap::Int64 {
+            to_dense:
+                IntIndex {
+                    table: IntTable::Direct { base, slot, .. },
+                    ..
+                },
+            ..
+        } = &map
+        else {
+            panic!("compact ids stay direct")
+        };
+        assert_eq!((*base, slot.len()), (0, 3000));
     }
 
     #[test]
