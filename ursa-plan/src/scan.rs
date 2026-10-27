@@ -11,15 +11,24 @@
 //! credential chain (`from_env`). Projection pushdown still applies over the
 //! network — only the selected columns' byte ranges are fetched via ranged GETs
 //! (for an HTTP store, when the server honors range requests).
+//!
+//! The session a scan runs on is built once per object-store identity and cloned
+//! per scan (see [`scan_state`]), so repeated scans reuse the client (its
+//! connection pool and credentials) and, for local files, DataFusion's Parquet
+//! footer and statistics caches.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::kernels::boolean::{and, is_not_null};
 use arrow::compute::{cast, filter};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::execute_stream_partitioned;
 use datafusion::prelude::{
     CsvReadOptions, DataFrame, ParquetReadOptions, SessionConfig, SessionContext,
@@ -34,19 +43,19 @@ use object_store::ObjectStore;
 use url::{Position, Url};
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
-/// Register the object store for a scan `path` on `ctx`, keyed by the URL's
-/// `scheme://authority`. A schemeless (bare local) path parses as an error and is
-/// a no-op — the local filesystem needs no registration. Remote backends are
-/// seeded from `opts` layered over their default credential chain (`from_env`), so
-/// an empty `opts` still works with env/instance-profile credentials.
-fn register_object_store(
-    ctx: &SessionContext,
+/// The object store for a scan `path`, with the `scheme://authority` base it is
+/// registered under. A schemeless (bare local) path parses as an error and needs
+/// no store — the default registry already serves the local filesystem. Remote
+/// backends are seeded from `opts` layered over their default credential chain
+/// (`from_env`), so an empty `opts` still works with env/instance-profile
+/// credentials.
+fn object_store_for(
     path: &str,
     opts: &HashMap<String, String>,
-) -> Result<()> {
+) -> Result<Option<(Url, Arc<dyn ObjectStore>)>> {
     let url = match Url::parse(path) {
         Ok(u) => u,
-        Err(_) => return Ok(()), // bare local path (e.g. "/tmp/x.csv" or "edges.csv")
+        Err(_) => return Ok(None), // bare local path (e.g. "/tmp/x.csv" or "edges.csv")
     };
     let scheme = url.scheme();
     let opt_err = |e: object_store::Error| DataFusionError::Execution(e.to_string());
@@ -101,8 +110,149 @@ fn register_object_store(
     // have no port, so this is identical to the old `scheme://host` for them.
     let base = Url::parse(&url[..Position::BeforePath])
         .map_err(|e| DataFusionError::Execution(format!("scan: bad object-store url: {e}")))?;
-    ctx.register_object_store(&base, store);
-    Ok(())
+    Ok(Some((base, store)))
+}
+
+/// Environment variables the cloud builders' `from_env` (and their credential
+/// providers) read. They are part of a client's identity: a cached client is
+/// reused only while rebuilding it would read the same environment.
+fn credential_env() -> Vec<(String, String)> {
+    const PREFIXES: [&str; 4] = ["AWS_", "GOOGLE_", "AZURE_", "GCE_"];
+    const NAMES: [&str; 2] = ["SERVICE_ACCOUNT", "IDENTITY_ENDPOINT"];
+    let mut env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| PREFIXES.iter().any(|p| k.starts_with(p)) || NAMES.contains(&k.as_str()))
+        .collect();
+    env.sort();
+    env
+}
+
+/// What a scan's session depends on: the store's `scheme://authority`, and for a
+/// cloud store the `storage_options` and credential environment it is built
+/// from. Two scans with equal keys would build identical clients, so they share
+/// one. Every local path (bare or `file://`) shares the `None` base.
+#[derive(PartialEq, Eq, Hash)]
+struct StoreKey {
+    base: Option<String>,
+    options: Vec<(String, String)>,
+    env: Vec<(String, String)>,
+}
+
+impl StoreKey {
+    fn new(path: &str, opts: &HashMap<String, String>) -> Self {
+        let Ok(url) = Url::parse(path) else {
+            return Self::local();
+        };
+        match url.scheme() {
+            "file" => Self::local(),
+            // The HTTP store takes no options or credentials.
+            "http" | "https" => Self {
+                base: Some(url[..Position::BeforePath].to_string()),
+                options: Vec::new(),
+                env: Vec::new(),
+            },
+            _ => {
+                let mut options: Vec<_> =
+                    opts.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                options.sort();
+                Self {
+                    base: Some(url[..Position::BeforePath].to_string()),
+                    options,
+                    env: credential_env(),
+                }
+            }
+        }
+    }
+
+    fn local() -> Self {
+        Self {
+            base: None,
+            options: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        self.base.is_none()
+    }
+}
+
+/// Scan session templates by store identity. Bounded so a caller rotating
+/// short-lived credentials through `storage_options` cannot grow it without
+/// limit: past the cap it starts over (each entry is one client plus its caches).
+static SCAN_STATES: OnceLock<Mutex<HashMap<StoreKey, SessionState>>> = OnceLock::new();
+const MAX_SCAN_STATES: usize = 64;
+
+/// The session state a scan of `path` runs on: a clone of the template for the
+/// path's [`StoreKey`], built on first use by [`build_scan_state`].
+///
+/// Building a session registers every DataFusion built-in and, for a cloud
+/// store, a fresh client from the environment; a clone shares all of that,
+/// including the store's connection pool and the runtime's file caches.
+fn scan_state(path: &str, opts: &HashMap<String, String>) -> Result<SessionState> {
+    let key = StoreKey::new(path, opts);
+    let states = SCAN_STATES.get_or_init(Default::default);
+    if let Some(state) = states
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(state.clone());
+    }
+    // Built outside the lock: a cloud builder may read a credentials file.
+    let state = build_scan_state(path, opts, key.is_local())?;
+    let mut states = states.lock().unwrap_or_else(PoisonError::into_inner);
+    if states.len() >= MAX_SCAN_STATES {
+        states.clear();
+    }
+    Ok(states.entry(key).or_insert(state).clone())
+}
+
+/// A scan session for `path`'s object store.
+///
+/// The runtime keeps DataFusion's Parquet metadata (footer) and file statistics
+/// caches for local files only. Both validate an entry against the file's size
+/// and modification time, which a scan re-reads from the filesystem every time,
+/// so a file rewritten in place is read afresh. Remote stores keep them off: an
+/// S3 or HTTP modification time has one-second resolution, too coarse to tell a
+/// same-size rewrite apart. The file-listing cache is off everywhere, since it
+/// never revalidates: a glob would miss files added after its first scan, and a
+/// stale listing would hand the other caches stale sizes and times to check.
+fn build_scan_state(
+    path: &str,
+    opts: &HashMap<String, String>,
+    local: bool,
+) -> Result<SessionState> {
+    // Work stealing lets an idle partition read byte ranges planned for a sibling,
+    // so rows land in a run-dependent partition. Turning it off keeps each
+    // partition on its own contiguous range, which `collect_in_file_order` relies on.
+    let mut config = SessionConfig::new().with_batch_size(SCAN_BATCH_ROWS);
+    let execution = &mut config.options_mut().execution;
+    execution.enable_file_stream_work_stealing = false;
+    // DataFusion reads every Parquet string column as `Utf8View` by default, which
+    // turns a plain string file into view-typed columns: an extra conversion for
+    // the ids and, for attribute columns, a type pyarrow compute can barely
+    // filter or sort. Read each column as the file declares it instead; a file
+    // that really stores string_view still arrives as `Utf8View`.
+    execution.parquet.schema_force_view_types = false;
+
+    let mut caches = CacheManagerConfig::default().with_list_files_cache_limit(0);
+    if !local {
+        caches = caches
+            .with_file_statistics_cache_limit(0)
+            .with_metadata_cache_limit(0);
+    }
+    let runtime = RuntimeEnvBuilder::new()
+        .with_cache_manager(caches)
+        .build_arc()?;
+    if let Some((base, store)) = object_store_for(path, opts)? {
+        runtime.register_object_store(&base, store);
+    }
+    Ok(SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .build())
 }
 
 /// The Parquet/CSV file format of a scan target, from its extension. Matches on
@@ -168,9 +318,9 @@ fn canonical_id_type(dt: &DataType) -> Result<DataType> {
 /// the graph itself (2 MiB of `Int64` endpoints).
 const SCAN_BATCH_ROWS: usize = 1 << 17;
 
-/// Open a scan source into an unprojected `DataFrame`: create a fresh session,
-/// register the matching object store for the path's scheme, and read the file in
-/// the format its extension names. The shared prologue of `scan_edges_batch` and
+/// Open a scan source into an unprojected `DataFrame`: take the session for the
+/// path's object store (see [`scan_state`]) and read the file in the format its
+/// extension names. The shared prologue of `scan_edges_batch` and
 /// `scan_nodes_batch` — each then applies its own projection and id canonicalization.
 ///
 /// `kind` (`"scan_edges"`/`"scan_nodes"`) only tunes the error message from
@@ -182,20 +332,7 @@ async fn open_scan(
     storage_options: &HashMap<String, String>,
     kind: &str,
 ) -> Result<DataFrame> {
-    // Work stealing lets an idle partition read byte ranges planned for a sibling,
-    // so rows land in a run-dependent partition. Turning it off keeps each
-    // partition on its own contiguous range, which `collect_in_file_order` relies on.
-    let mut config = SessionConfig::new().with_batch_size(SCAN_BATCH_ROWS);
-    let execution = &mut config.options_mut().execution;
-    execution.enable_file_stream_work_stealing = false;
-    // DataFusion reads every Parquet string column as `Utf8View` by default, which
-    // turns a plain string file into view-typed columns: an extra conversion for
-    // the ids and, for attribute columns, a type pyarrow compute can barely
-    // filter or sort. Read each column as the file declares it instead; a file
-    // that really stores string_view still arrives as `Utf8View`.
-    execution.parquet.schema_force_view_types = false;
-    let ctx = SessionContext::new_with_config(config);
-    register_object_store(&ctx, path, storage_options)?;
+    let ctx = SessionContext::new_with_state(scan_state(path, storage_options)?);
     Ok(match detect_format(path, kind)? {
         ScanFormat::Parquet => {
             ctx.read_parquet(path, ParquetReadOptions::default())
@@ -1048,25 +1185,151 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Write the edges `(from[i], to[i])` to a one-row-group Parquet file.
+    fn write_edges_parquet(path: &std::path::Path, from: &[i64], to: &[i64]) {
+        use datafusion::parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from", DataType::Int64, false),
+            Field::new("to", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(from.to_vec())),
+                Arc::new(Int64Array::from(to.to_vec())),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn scanned_sources(path: &str) -> Vec<i64> {
+        scan_edges_batch(path, "from", "to", &no_opts(), &[])
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                let c = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                c.values().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_file_rewritten_in_place_is_read_afresh() {
+        // The shared scan session caches Parquet footers and statistics; a rewrite
+        // between two scans must still be seen, whether it changes the file's size
+        // or only its contents and modification time.
+        let dir = std::env::temp_dir().join("ursa_scan_test_rewrite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edges.parquet");
+        let p = path.to_str().unwrap();
+        write_edges_parquet(&path, &[1, 2], &[2, 3]);
+        assert_eq!(scanned_sources(p), vec![1, 2]);
+        // The footer is cached, so the rewrites below test its validation.
+        let state = scan_state(p, &no_opts()).unwrap();
+        let footers = state.runtime_env().cache_manager.get_file_metadata_cache();
+        assert!(footers
+            .list_entries()
+            .keys()
+            .any(|k| k.as_ref().ends_with("ursa_scan_test_rewrite/edges.parquet")));
+
+        // A different size.
+        write_edges_parquet(&path, &[7, 8, 9], &[8, 9, 7]);
+        assert_eq!(scanned_sources(p), vec![7, 8, 9]);
+
+        // The same size: only the modification time tells the files apart. Set it
+        // explicitly so a coarse filesystem clock cannot hide the rewrite.
+        let size = std::fs::metadata(&path).unwrap().len();
+        write_edges_parquet(&path, &[4, 5, 6], &[5, 6, 4]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(scanned_sources(&format!("file://{p}")), vec![4, 5, 6]);
+        assert_eq!(scanned_sources(p), vec![4, 5, 6]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_glob_sees_files_added_between_scans() {
+        // The file-listing cache stays off: a glob is listed on every scan.
+        let dir = std::env::temp_dir().join("ursa_scan_test_glob_grows");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let glob = format!("{}/*.parquet", dir.to_str().unwrap());
+        write_edges_parquet(&dir.join("part-0.parquet"), &[1], &[2]);
+        assert_eq!(scanned_sources(&glob), vec![1]);
+        write_edges_parquet(&dir.join("part-1.parquet"), &[3], &[4]);
+        assert_eq!(scanned_sources(&glob), vec![1, 3]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_sessions_are_shared_by_store_identity() {
+        let runtime = |path: &str, opts: &HashMap<String, String>| {
+            scan_state(path, opts).unwrap().runtime_env().clone()
+        };
+        // Every local path shares one runtime (and so one set of file caches).
+        let local = runtime("/tmp/a.parquet", &no_opts());
+        assert!(Arc::ptr_eq(
+            &local,
+            &runtime("file:///tmp/b.csv", &no_opts())
+        ));
+
+        // A cloud client is reused only for the same bucket and the same options.
+        let east: HashMap<String, String> = [("region".to_string(), "us-east-1".to_string())]
+            .into_iter()
+            .collect();
+        let west: HashMap<String, String> = [("region".to_string(), "us-west-2".to_string())]
+            .into_iter()
+            .collect();
+        let a = runtime("s3://ursa-test-bucket/a.parquet", &east);
+        assert!(Arc::ptr_eq(
+            &a,
+            &runtime("s3://ursa-test-bucket/b/*.parquet", &east)
+        ));
+        assert!(!Arc::ptr_eq(
+            &a,
+            &runtime("s3://ursa-test-bucket/a.parquet", &west)
+        ));
+        assert!(!Arc::ptr_eq(
+            &a,
+            &runtime("s3://ursa-other-bucket/a.parquet", &east)
+        ));
+        assert!(!Arc::ptr_eq(&a, &local));
+
+        // The scan config survives the clone.
+        let state = scan_state("/tmp/a.parquet", &no_opts()).unwrap();
+        let options = state.config().options();
+        assert_eq!(options.execution.batch_size, SCAN_BATCH_ROWS);
+        assert!(!options.execution.enable_file_stream_work_stealing);
+        assert!(!options.execution.parquet.schema_force_view_types);
+    }
+
     #[test]
     fn builds_s3_store_from_storage_options() {
         // The aws cloud feature is enabled and the storage_options -> config-key
         // mapping resolves: an S3 store builds from a region option, lazily and
         // credential-free (auth is deferred to request time). The GCS/Azure
-        // builders are referenced in `register_object_store`, so the gcp/azure
+        // builders are referenced in `object_store_for`, so the gcp/azure
         // features are proven enabled at *compile* time; their `.build()` requires
         // real credentials, so they're not exercised in this credential-free test.
-        let ctx = SessionContext::new();
         let opts: HashMap<String, String> = [("region".to_string(), "us-east-1".to_string())]
             .into_iter()
             .collect();
-        register_object_store(&ctx, "s3://my-bucket/graph/*.parquet", &opts).unwrap();
+        object_store_for("s3://my-bucket/graph/*.parquet", &opts).unwrap();
     }
 
     #[test]
     fn unknown_scheme_is_rejected() {
-        let ctx = SessionContext::new();
-        let err = register_object_store(&ctx, "ftp://host/graph.parquet", &no_opts());
+        let err = object_store_for("ftp://host/graph.parquet", &no_opts());
         assert!(err.is_err());
     }
 
@@ -1075,9 +1338,8 @@ mod tests {
         // The `http` feature is enabled: an http(s) URL registers a store, keyed by
         // the full authority including the port (so localhost:PORT reads route
         // correctly). Credential-free and lazy — no request is made here.
-        let ctx = SessionContext::new();
-        register_object_store(&ctx, "http://127.0.0.1:8080/graph/edges.csv", &no_opts()).unwrap();
-        register_object_store(&ctx, "https://example.com/edges.parquet", &no_opts()).unwrap();
+        object_store_for("http://127.0.0.1:8080/graph/edges.csv", &no_opts()).unwrap();
+        object_store_for("https://example.com/edges.parquet", &no_opts()).unwrap();
     }
 
     #[test]
@@ -1114,10 +1376,9 @@ mod tests {
 
     #[test]
     fn unknown_storage_option_errors() {
-        let ctx = SessionContext::new();
         let bad: HashMap<String, String> = [("not_a_real_option".to_string(), "x".to_string())]
             .into_iter()
             .collect();
-        assert!(register_object_store(&ctx, "s3://my-bucket/f.parquet", &bad).is_err());
+        assert!(object_store_for("s3://my-bucket/f.parquet", &bad).is_err());
     }
 }

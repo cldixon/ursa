@@ -203,3 +203,104 @@ def test_concurrent_collects_on_a_view_compute_the_mask_once(monkeypatch):
         t.join()
     assert len(calls) == 1
     assert all(r.equals(results[0]) for r in results)
+
+
+# --- weighted queries reuse the index and the evaluated weights (#175) -------
+def _weighted_table():
+    return pa.table(
+        {
+            "s": [0, 0, 1, 2, 3, 3, 4],
+            "d": [1, 2, 0, 0, 4, 0, 1],
+            "w": [1.0, 9.0, 1.0, 2.0, 0.5, 3.0, 7.0],
+            "fx": [2.0, 1.0, 1.0, 0.5, 4.0, 1.0, 1.0],
+        }
+    )
+
+
+def _weighted_pr(edges, weight):
+    return (
+        edges.nodes()
+        .with_columns(pr=ur.pagerank(edges, weight=weight), deg=ur.degree(edges))
+        .collect()
+        .to_arrow()
+    )
+
+
+@pytest.fixture(params=["memory", "scan"])
+def weighted_source(request, tmp_path):
+    """A factory for fresh frames over the same weighted edges, in memory or scanned."""
+    if request.param == "memory":
+        return lambda: ur.from_arrow(_weighted_table(), src="s", dst="d")
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "w.parquet"
+    pq.write_table(_weighted_table(), path)
+    return lambda: ur.scan_edges(str(path), src="s", dst="d")
+
+
+def test_weighted_collects_build_the_index_once_and_evaluate_weights_once(weighted_source):
+    edges = weighted_source()
+    before = _native()._topology_build_count()
+    first = _weighted_pr(edges, ur.col("w"))
+    index = edges._index_build_cell.value
+    assert index._weight_eval_count() == 1
+    for _ in range(3):
+        assert _weighted_pr(edges, ur.col("w")).equals(first)
+    # One CSR build, kept across collects (not rebuilt by each weighted scan), and
+    # one weight evaluation served from the index's cache thereafter.
+    assert _native()._topology_build_count() - before == 1
+    assert edges._index_build_cell.value is index
+    assert index._weight_eval_count() == 1
+    # A different expression is evaluated (once) on top of the first.
+    _weighted_pr(edges, ur.col("w") * ur.col("fx"))
+    _weighted_pr(edges, ur.col("w") * ur.col("fx"))
+    assert index._weight_eval_count() == 2
+    assert _native()._topology_build_count() - before == 1
+
+
+def test_weighted_results_match_a_fresh_frame(weighted_source):
+    # Cached weights (and an index built by an earlier unweighted collect, natively
+    # for a scan) give results identical to a fresh frame's first weighted collect.
+    edges = weighted_source()
+    ur.degree(edges).collect()  # index built before any weights are read
+    for weight in (ur.col("w"), ur.col("w") * ur.col("fx"), ur.col("w")):
+        got = _weighted_pr(edges, weight)
+        assert got.equals(_weighted_pr(weighted_source(), weight))
+
+
+def test_weighted_scan_reuses_index_after_on_null_drop(tmp_path):
+    # Under on_null="drop" the weight rows must stay aligned with the index's kept
+    # rows when the index came from an earlier (native, unweighted) build.
+    import pyarrow.parquet as pq
+
+    t = pa.table(
+        {"s": [0, None, 1, 2, 3], "d": [1, 2, 0, None, 0], "w": [1.0, 50.0, 4.0, 60.0, 2.0]}
+    )
+    path = tmp_path / "w.parquet"
+    pq.write_table(t, path)
+    clean = ur.from_arrow(t.take([0, 2, 4]), src="s", dst="d")  # the non-null rows
+    expected = _weighted_pr(clean, ur.col("w"))
+    edges = ur.scan_edges(str(path), src="s", dst="d", on_null="drop")
+    with pytest.warns(UserWarning, match="dropped 2 edge row"):
+        ur.degree(edges).collect()
+    before = _native()._topology_build_count()
+    with pytest.warns(UserWarning, match="dropped 2 edge row"):
+        assert _weighted_pr(edges, ur.col("w")).equals(expected)
+    assert _weighted_pr(edges, ur.col("w")).equals(expected)  # cached: no rescan
+    assert _native()._topology_build_count() == before
+
+
+def test_weighted_shortest_path_over_a_scan_keeps_the_index(tmp_path):
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "w.parquet"
+    pq.write_table(_weighted_table(), path)
+    edges = ur.scan_edges(str(path), src="s", dst="d")
+    ur.degree(edges).collect()
+    index = edges._index_build_cell.value
+    out = ur.shortest_path(edges, 3, 2, weight=ur.col("w")).collect().to_arrow()
+    assert edges._index_build_cell.value is index
+    fresh = ur.shortest_path(
+        ur.scan_edges(str(path), src="s", dst="d"), 3, 2, weight=ur.col("w")
+    ).collect()
+    assert out.equals(fresh.to_arrow())
