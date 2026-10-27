@@ -72,7 +72,13 @@ pub type Slot = usize;
 ///
 /// Relational nodes carry `step`, the host's handle for the frame step they came
 /// from, so the host can run that step itself when the engine's fixed-order tail
-/// can't (see [`Inputs::apply_steps`]).
+/// can't (see [`Inputs::apply_steps`]). A step whose arguments the host could not
+/// parse is sent with `invalid` set and its arguments left out: the executor
+/// raises the host's error ([`Inputs::step_error`]) where it would have read the
+/// step, so a guard that fires earlier still wins.
+///
+/// Integer arguments are [`IntArg`]s, typed only where the engine reads them: the
+/// host's own evaluator takes the original step and whatever it accepts.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Plan {
@@ -106,15 +112,21 @@ pub enum Plan {
     },
     Filter {
         input: Box<Plan>,
+        #[serde(default)]
         predicate: Expr,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     Select {
         input: Box<Plan>,
+        #[serde(default)]
         columns: Vec<String>,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     WithColumns {
         input: Box<Plan>,
@@ -123,47 +135,70 @@ pub enum Plan {
     Rename {
         input: Box<Plan>,
         /// `(old, new)` pairs, in the order given.
+        #[serde(default)]
         mapping: Vec<(String, String)>,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     Sort {
         input: Box<Plan>,
+        #[serde(default)]
         by: Vec<SortKey>,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     Head {
         input: Box<Plan>,
-        n: usize,
+        #[serde(default)]
+        n: IntArg,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     Sample {
         input: Box<Plan>,
-        n: usize,
         #[serde(default)]
-        seed: Option<u64>,
+        n: IntArg,
+        #[serde(default)]
+        seed: Option<IntArg>,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     Distinct {
         input: Box<Plan>,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     Join {
         input: Box<Plan>,
         right: Box<Plan>,
+        #[serde(default)]
         on: Vec<String>,
         how: String,
+        #[serde(default)]
+        step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     GroupByAgg {
         input: Box<Plan>,
+        #[serde(default)]
         keys: Vec<String>,
+        #[serde(default)]
         aggs: Vec<AggSpec>,
         #[serde(default)]
         step: Option<Slot>,
+        #[serde(default)]
+        invalid: bool,
     },
     /// `edges.nodes()`: the node set of an edge plan.
     Nodes { input: Box<Plan> },
@@ -172,7 +207,7 @@ pub enum Plan {
     /// `ur.hop(edges, n, direction).from_(seeds)`.
     Hop {
         edges: EdgeInput,
-        n: u32,
+        n: IntArg,
         direction: String,
         seeds: Slot,
     },
@@ -190,10 +225,10 @@ pub enum Plan {
     RandomWalk {
         edges: EdgeInput,
         start: Slot,
-        steps: u32,
-        walks_per_node: u32,
+        steps: IntArg,
+        walks_per_node: IntArg,
         #[serde(default)]
-        seed: Option<u64>,
+        seed: Option<IntArg>,
     },
     /// `ur.describe(edges, full, direction)`.
     Describe {
@@ -201,6 +236,9 @@ pub enum Plan {
         full: bool,
         direction: String,
     },
+    /// A frame the host could not serialize (a join's right side). Executing it
+    /// raises the host's error for `step`, at the point the frame would have run.
+    Invalid { step: Slot },
 }
 
 /// A scan path: one path (a glob included) or a list of them.
@@ -209,6 +247,76 @@ pub enum Plan {
 pub enum ScanPath {
     One(String),
     Many(Vec<String>),
+}
+
+/// An integer argument, as given. The engine converts it where it reads it, with
+/// the errors a Python integer conversion gives (`OverflowError`, `TypeError`).
+/// A host value with no JSON form is sent as `{"type": <type name>}`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct IntArg(pub Value);
+
+impl IntArg {
+    /// The value as an integer, or the `TypeError` for a non-integer.
+    fn int(&self, name: &str) -> PlanResult<Option<i128>> {
+        let ty = match &self.0 {
+            Value::Bool(b) => return Ok(Some(*b as i128)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    return Ok(Some(i as i128));
+                }
+                if let Some(u) = n.as_u64() {
+                    return Ok(Some(u as i128));
+                }
+                // An integer past 64 bits arrives as an integral float.
+                let f = n.as_f64().unwrap_or(0.0);
+                if f.fract() == 0.0 && f.abs() >= 9.2e18 {
+                    return Ok(None);
+                }
+                "float"
+            }
+            Value::String(_) => "str",
+            Value::Null => "NoneType",
+            Value::Array(_) => "list",
+            Value::Object(o) => o.get("type").and_then(Value::as_str).unwrap_or("object"),
+        };
+        Err(PlanError::Type(format!(
+            "argument '{name}': '{ty}' object cannot be interpreted as an integer"
+        )))
+    }
+
+    /// As a `u64`/`usize` argument.
+    pub fn u64(&self, name: &str) -> PlanResult<u64> {
+        match self.int(name)? {
+            Some(i) if i < 0 => Err(PlanError::Overflow(
+                "can't convert negative int to unsigned".into(),
+            )),
+            Some(i) if i <= u64::MAX as i128 => Ok(i as u64),
+            _ => Err(PlanError::Overflow("int too big to convert".into())),
+        }
+    }
+
+    pub fn usize(&self, name: &str) -> PlanResult<usize> {
+        self.u64(name).map(|v| v as usize)
+    }
+
+    /// As a `u32` argument.
+    pub fn u32(&self, name: &str) -> PlanResult<u32> {
+        match self.int(name)? {
+            Some(i) if (0..=u32::MAX as i128).contains(&i) => Ok(i as u32),
+            _ => Err(PlanError::Overflow(
+                "out of range integral type conversion attempted".into(),
+            )),
+        }
+    }
+}
+
+/// An optional seed argument.
+fn seed_arg(seed: &Option<IntArg>, name: &str) -> PlanResult<Option<u64>> {
+    match seed {
+        Some(IntArg(Value::Null)) | None => Ok(None),
+        Some(s) => s.u64(name).map(Some),
+    }
 }
 
 /// One `with_columns` output.
@@ -241,22 +349,33 @@ pub struct AggSpec {
 /// An expression in the grammar of [`crate::expr`]: a graph verb, typed, or any
 /// other node, kept as its JSON and parsed where it is used (a filter predicate
 /// after its role references resolve, a weight by the weight evaluator).
+///
+/// A graph node with no `verb` (the stub a graph verb serializes to where it
+/// isn't a column, e.g. used as a filter predicate) stays a scalar, so the
+/// context it is used in rejects it with its own error.
 #[derive(Debug, Clone)]
 pub enum Expr {
     Graph(Box<GraphVerb>),
     Scalar(Value),
 }
 
+impl Default for Expr {
+    fn default() -> Self {
+        Expr::Scalar(Value::Null)
+    }
+}
+
 impl<'de> Deserialize<'de> for Expr {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = Value::deserialize(d)?;
-        if kind(&v) == "graph" {
-            GraphVerb::from_value(&v)
+        // Only the verb-less stub stays scalar: a malformed graph verb (an
+        // unknown parameter, say) is still a hard error.
+        if kind(&v) == "graph" && v.get("verb").is_some() {
+            return GraphVerb::from_value(&v)
                 .map(|g| Expr::Graph(Box::new(g)))
-                .map_err(serde::de::Error::custom)
-        } else {
-            Ok(Expr::Scalar(v))
+                .map_err(serde::de::Error::custom);
         }
+        Ok(Expr::Scalar(v))
     }
 }
 
@@ -289,6 +408,13 @@ impl EdgeInput {
 
 /// An [`EdgeInput`] split into the topology it runs over and the mask that
 /// restricts it. See the module docs.
+///
+/// Two simplifications hold only while the topology is a source (#191 lifts
+/// that): `topology` is a bare [`Plan`], and [`EdgeInput::view`] collects the
+/// `filter`s of the whole chain. Once the topology can be any subplan
+/// (`filter(a).distinct().filter(b)`), `a` belongs to the topology's own rows and
+/// must not be applied again by the mask. So #192 needs `topology` as an
+/// [`EdgeInput`] with a recursive view, taking only the filters above it.
 #[derive(Debug)]
 pub struct EdgeView<'a> {
     /// The plan whose rows define the CSR.
@@ -417,6 +543,7 @@ impl Plan {
             Plan::ShortestPath { .. } => "shortest_path",
             Plan::RandomWalk { .. } => "random_walk",
             Plan::Describe { .. } => "describe",
+            Plan::Invalid { .. } => "invalid",
         }
     }
 
@@ -461,8 +588,27 @@ impl Plan {
             | Plan::Head { step, .. }
             | Plan::Sample { step, .. }
             | Plan::Distinct { step, .. }
+            | Plan::Join { step, .. }
             | Plan::GroupByAgg { step, .. } => *step,
+            Plan::Invalid { step } => Some(*step),
             _ => None,
+        }
+    }
+
+    /// Whether the host could not parse this step's arguments.
+    pub fn invalid(&self) -> bool {
+        match self {
+            Plan::Filter { invalid, .. }
+            | Plan::Select { invalid, .. }
+            | Plan::Rename { invalid, .. }
+            | Plan::Sort { invalid, .. }
+            | Plan::Head { invalid, .. }
+            | Plan::Sample { invalid, .. }
+            | Plan::Distinct { invalid, .. }
+            | Plan::Join { invalid, .. }
+            | Plan::GroupByAgg { invalid, .. } => *invalid,
+            Plan::Invalid { .. } => true,
+            _ => false,
         }
     }
 
@@ -539,6 +685,9 @@ pub trait Inputs {
 
     /// Host rows as batches.
     fn batches(&self, rows: HostRows) -> PlanResult<Vec<RecordBatch>>;
+
+    /// The error the host met parsing the step behind `step` (see [`Plan`]).
+    fn step_error(&self, step: Slot) -> PlanError;
 }
 
 /// Rows held by the host, opaque to the executor.
@@ -569,6 +718,15 @@ pub enum PlanError {
     ColumnNotFound(String),
     /// An invalid argument (Python's `ValueError`).
     Value(String),
+    /// An argument of the wrong type (Python's `TypeError`).
+    Type(String),
+    /// An integer argument out of range (Python's `OverflowError`).
+    Overflow(String),
+    /// A [`PlanError::NotImplemented`] raised because of `cause`.
+    Wrapped {
+        message: String,
+        cause: Box<PlanError>,
+    },
     /// A malformed plan.
     Invalid(String),
     /// An engine error from an executor.
@@ -598,9 +756,12 @@ impl fmt::Debug for HostError {
 impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlanError::NotImplemented(m) | PlanError::ColumnNotFound(m) | PlanError::Value(m) => {
-                f.write_str(m)
-            }
+            PlanError::NotImplemented(m)
+            | PlanError::ColumnNotFound(m)
+            | PlanError::Value(m)
+            | PlanError::Type(m)
+            | PlanError::Overflow(m)
+            | PlanError::Wrapped { message: m, .. } => f.write_str(m),
             PlanError::Invalid(m) => write!(f, "invalid plan: {m}"),
             PlanError::Engine(e) => write!(f, "{e}"),
             PlanError::Host(e) => f.write_str(&e.message),
@@ -625,6 +786,9 @@ pub fn execute_plan(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Vec<RecordBa
 
 /// [`execute_plan`], leaving a result the host produced with the host.
 pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
+    if let Plan::Invalid { step } = plan {
+        return Err(inputs.step_error(*step));
+    }
     let chain = plan.chain();
     if is_node_frame(&chain) {
         collect_node_frame(&chain, inputs)
@@ -635,23 +799,13 @@ pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
 
 /// The graph index an edge input runs over, after the checks a graph op over it
 /// needs. For a traversal result that is its input's index (the traversal only
-/// masks it), so its input is checked too unless the host builds that from a
-/// single-path scan.
+/// masks it), so its input is checked too.
 pub fn require_index(edges: &EdgeInput, inputs: &dyn Inputs) -> PlanResult<GraphIndex> {
     edges.view()?;
     if let Some(Plan::Hop { edges: parent, .. } | Plan::ShortestPath { edges: parent, .. }) =
         edges.traversal()
     {
-        let single_path_scan = matches!(
-            parent.plan.chain()[0],
-            Plan::ScanEdges {
-                path: Some(ScanPath::One(_)),
-                ..
-            }
-        );
-        if !single_path_scan {
-            parent.view()?;
-        }
+        parent.view()?;
     }
     inputs.index(edges.frame)
 }
@@ -788,6 +942,7 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
                 return not_implemented("collect() supports a single join() for now.");
             }
             check_join_how(how)?;
+            check_step(step, inputs)?;
             join = Some(step);
             pre_join = std::mem::take(&mut steps);
             continue;
@@ -807,6 +962,7 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
                 "collect() does not yet support the '{op}' step in a composed pipeline."
             ));
         }
+        check_step(step, inputs)?;
         steps.push(step);
     }
 
@@ -964,6 +1120,7 @@ fn collect_node_query(
     let mut weight_keys: Vec<String> = vec![];
     for (_, verb) in &columns {
         if let Some(w) = &verb.weight {
+            check_literals(w, "weight")?;
             weight_cols.extend(value_columns(w, &[]));
             weight_keys.push(w.to_string());
         }
@@ -976,7 +1133,7 @@ fn collect_node_query(
     // The engine runs the leading steps its fixed-order tail executes identically;
     // any later step runs in written order on its output. ur.id() resolves to the
     // result's reserved `id` column.
-    let (pushed, rest) = split_engine_tail(steps, true);
+    let (pushed, rest) = split_engine_tail(steps, true)?;
     let index = require_index(edges, inputs)?;
     let mask = edge_mask(edges, &index, inputs)?;
     let roles = [("id", "id".to_string())];
@@ -1186,20 +1343,21 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
                 "collect() does not yet support the '{op}' step after a random_walk."
             ));
         }
+        check_step(s, inputs)?;
         steps.push(s);
     }
     let index = require_index(edges, inputs)?;
     let starts = inputs.seeds(*start)?;
-    let (pushed, rest) = split_engine_tail(&steps, false);
+    let (pushed, rest) = split_engine_tail(&steps, false)?;
     // Walk output columns are (walk_id, step, node); no role applies.
     let filters = filter_jsons(&pushed.filters, &[])?;
     let result = execute_walk_query(
         index.topo,
         index.ids,
         starts.as_ref(),
-        *n_steps,
-        *walks_per_node,
-        *seed,
+        n_steps.u32("steps")?,
+        walks_per_node.u32("walks_per_node")?,
+        seed_arg(seed, "seed")?,
         &filters,
         pushed.sort.clone(),
         pushed.limit,
@@ -1231,6 +1389,7 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
                     return not_implemented("collect() supports a single join() for now.");
                 }
                 check_join_how(how)?;
+                check_step(step, inputs)?;
                 join = Some(step);
                 pre_join = std::mem::take(&mut steps);
             }
@@ -1243,7 +1402,10 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
                     );
                 }
             }
-            _ if is_tail(step) => steps.push(step),
+            _ if is_tail(step) => {
+                check_step(step, inputs)?;
+                steps.push(step);
+            }
             _ => {
                 return not_implemented(format!(
                     "collect() does not yet support the '{op}' step on an edge frame."
@@ -1284,7 +1446,7 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
 
     // A traversal result carries reserved `src`/`dst` columns.
     let roles = [("src", "src".to_string()), ("dst", "dst".to_string())];
-    let (pushed, rest) = split_engine_tail(&steps, false);
+    let (pushed, rest) = split_engine_tail(&steps, false)?;
     let filters = filter_jsons(&pushed.filters, &roles)?;
     let result = match traversal {
         Plan::Hop {
@@ -1299,7 +1461,7 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
                 index.topo,
                 index.ids,
                 seeds.as_ref(),
-                *n,
+                n.u32("n")?,
                 direction,
                 &filters,
                 pushed.sort.clone(),
@@ -1320,6 +1482,9 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             // Its columns are read first: for a scan with no index yet, that read
             // builds the index too.
             let mut edge_attr = None;
+            if let Some(w) = weight {
+                check_literals(w, "weight")?;
+            }
             let weight_json = weight.as_ref().map(Value::to_string);
             if let Some(w) = weight {
                 let cols: BTreeSet<String> = value_columns(w, &[]);
@@ -1399,14 +1564,15 @@ fn run_join(
     };
     let left = left.into_batches(inputs)?;
     let right = execute_plan(right, inputs).map_err(|e| match e {
-        PlanError::NotImplemented(msg)
+        PlanError::NotImplemented(_)
+        | PlanError::Wrapped { .. }
         | PlanError::Host(HostError {
-            message: msg,
             not_implemented: true,
             ..
-        }) => PlanError::NotImplemented(format!(
-            "join(other): could not materialize the right-hand frame ({msg})."
-        )),
+        }) => PlanError::Wrapped {
+            message: format!("join(other): could not materialize the right-hand frame ({e})."),
+            cause: Box::new(e),
+        },
         e => e,
     })?;
     let names = |b: &[RecordBatch]| -> Vec<String> {
@@ -1445,7 +1611,7 @@ fn run_join(
             py_list(collide.into_iter())
         )));
     }
-    let (pushed, rest) = split_engine_tail(steps, false);
+    let (pushed, rest) = split_engine_tail(steps, false)?;
     let filters = filter_jsons(&pushed.filters, roles)?;
     let result = execute_join_query(
         left,
@@ -1499,7 +1665,10 @@ const ENGINE_ORDER: [&str; 7] = [
 /// step that changes the rows or the column names. `group_by = false` for the
 /// executors without a group slot. A rename whose targets are also sources (a swap
 /// or chain) stays out: the engine relabels pair by pair, the host all at once.
-fn split_engine_tail<'a>(steps: &[&'a Plan], group_by: bool) -> (EngineTail<'a>, Vec<&'a Plan>) {
+fn split_engine_tail<'a>(
+    steps: &[&'a Plan],
+    group_by: bool,
+) -> PlanResult<(EngineTail<'a>, Vec<&'a Plan>)> {
     let mut out = EngineTail::default();
     let mut filled: HashSet<&str> = HashSet::new();
     let mut pos = 0; // the earliest ENGINE_ORDER slot still fillable
@@ -1507,12 +1676,12 @@ fn split_engine_tail<'a>(steps: &[&'a Plan], group_by: bool) -> (EngineTail<'a>,
         if let Plan::Filter { predicate, .. } = step {
             if filled.iter().all(|k| matches!(*k, "distinct" | "sort")) {
                 let Expr::Scalar(v) = predicate else {
-                    return (out, steps[i..].to_vec());
+                    return Ok((out, steps[i..].to_vec()));
                 };
                 out.filters.push(v);
                 continue;
             }
-            return (out, steps[i..].to_vec());
+            return Ok((out, steps[i..].to_vec()));
         }
         let op = step.op();
         let k = ENGINE_ORDER.iter().position(|o| *o == op).unwrap_or(0);
@@ -1524,14 +1693,16 @@ fn split_engine_tail<'a>(steps: &[&'a Plan], group_by: bool) -> (EngineTail<'a>,
             _ => false,
         };
         if k < pos || (op == "group_by_agg" && !group_by) || swap {
-            return (out, steps[i..].to_vec());
+            return Ok((out, steps[i..].to_vec()));
         }
         match step {
             Plan::GroupByAgg { keys, aggs, .. } => {
                 out.group_by = Some((keys.clone(), aggs.iter().map(agg_json).collect()))
             }
             Plan::Distinct { .. } => out.distinct = true,
-            Plan::Sample { n, seed, .. } => out.sample = Some((*n, *seed)),
+            Plan::Sample { n, seed, .. } => {
+                out.sample = Some((n.usize("sample")?, seed_arg(seed, "sample")?))
+            }
             Plan::Sort { by, .. } => {
                 out.sort = Some(
                     by.iter()
@@ -1539,14 +1710,14 @@ fn split_engine_tail<'a>(steps: &[&'a Plan], group_by: bool) -> (EngineTail<'a>,
                         .collect(),
                 )
             }
-            Plan::Head { n, .. } => out.limit = Some(*n),
+            Plan::Head { n, .. } => out.limit = Some(n.usize("limit")?),
             Plan::Rename { mapping, .. } => out.rename = mapping.clone(),
             _ => out.select = Some(step), // select
         }
         filled.insert(op);
         pos = k + 1;
     }
-    (out, vec![])
+    Ok((out, vec![]))
 }
 
 /// The engine's JSON for one aggregation: `alias(agg(col))`.
@@ -1576,7 +1747,7 @@ fn finish(
         .into_iter()
         .chain(rest.iter().copied())
         .collect();
-    inputs.apply_steps(Rows::Batches(result), &steps, roles)
+    apply_steps(Rows::Batches(result), &steps, roles, inputs)
 }
 
 fn apply_steps(
@@ -1686,9 +1857,44 @@ fn filter_jsons(predicates: &[&Value], roles: &Roles) -> PlanResult<Vec<String>>
         .iter()
         .map(|p| {
             require_predicate(p)?;
+            check_literals(p, "filter")?;
             Ok(resolve_roles(p, roles)?.to_string())
         })
         .collect()
+}
+
+/// A step the host could not parse raises the host's error where the step is
+/// read, as it did when the host parsed each step on reaching it.
+fn check_step(step: &Plan, inputs: &dyn Inputs) -> PlanResult<()> {
+    match step.step() {
+        Some(handle) if step.invalid() => Err(inputs.step_error(handle)),
+        _ => Ok(()),
+    }
+}
+
+/// Reject a literal the host could not put in JSON (`{"kind": "lit",
+/// "unrepresentable": <type>}`), with the error serializing it used to raise:
+/// a `TypeError` for a value of another type, an engine JSON error for a
+/// non-finite float. The host's own evaluator still reads the original value.
+fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
+    if kind(v) == "lit" {
+        if let Some(ty) = v.get("unrepresentable").and_then(Value::as_str) {
+            if ty == "float" {
+                return Err(PlanError::Engine(DataFusionError::Execution(format!(
+                    "invalid {what} expression JSON: NaN and infinity have no JSON form"
+                ))));
+            }
+            return Err(PlanError::Type(format!(
+                "Object of type {ty} is not JSON serializable"
+            )));
+        }
+    }
+    for key in ["left", "right", "operand"] {
+        if let Some(e) = v.get(key) {
+            check_literals(e, what)?;
+        }
+    }
+    Ok(())
 }
 
 fn require_predicate(p: &Value) -> PlanResult<()> {
@@ -1876,7 +2082,7 @@ mod tests {
             {"op": "sort", "by": [{"column": "v", "descending": true}], "input":
             {"op": "filter", "predicate": col_pred("a"), "input": src()}}}}));
         let steps = steps_of(&p);
-        let (pushed, rest) = split_engine_tail(&steps, true);
+        let (pushed, rest) = split_engine_tail(&steps, true).unwrap();
         assert!(rest.is_empty());
         assert_eq!(pushed.filters.len(), 2);
         assert_eq!(pushed.sort, Some(vec![("v".to_string(), true)]));
@@ -1909,7 +2115,7 @@ mod tests {
         for (json, n_pushed) in cases {
             let p = plan(json);
             let steps = steps_of(&p);
-            let (_, rest) = split_engine_tail(&steps, true);
+            let (_, rest) = split_engine_tail(&steps, true).unwrap();
             assert_eq!(rest.len(), steps.len() - n_pushed, "{p:?}");
         }
     }
@@ -1932,6 +2138,52 @@ mod tests {
             false,
         );
         assert_eq!(got, Some(vec!["c".into(), "id".into(), "v".into()]));
+    }
+
+    #[test]
+    fn int_args_convert_like_python_integers() {
+        let arg = |v: serde_json::Value| IntArg(v);
+        assert_eq!(arg(serde_json::json!(5)).u64("n").unwrap(), 5);
+        assert_eq!(arg(serde_json::json!(true)).u32("n").unwrap(), 1);
+        let msg = |e: PlanError| e.to_string();
+        assert_eq!(
+            msg(arg(serde_json::json!(-1)).u64("n").unwrap_err()),
+            "can't convert negative int to unsigned"
+        );
+        assert_eq!(
+            msg(arg(serde_json::json!(1e21)).u64("n").unwrap_err()),
+            "int too big to convert"
+        );
+        assert_eq!(
+            msg(arg(serde_json::json!(-1)).u32("n").unwrap_err()),
+            "out of range integral type conversion attempted"
+        );
+        assert!(matches!(
+            arg(serde_json::json!("x")).u64("seed"),
+            Err(PlanError::Type(m)) if m == "argument 'seed': 'str' object cannot be interpreted as an integer"
+        ));
+        assert!(matches!(
+            arg(serde_json::json!({"type": "Decimal"})).u64("seed"),
+            Err(PlanError::Type(m)) if m.contains("'Decimal' object")
+        ));
+    }
+
+    #[test]
+    fn unparsed_graph_nodes_stay_scalar() {
+        // The stub a graph verb serializes to as a predicate is not a GraphVerb;
+        // it parses, so the filter can reject it with its own error.
+        let p = plan(
+            serde_json::json!({"op": "filter", "predicate": {"kind": "graph"},
+            "input": src()}),
+        );
+        let Plan::Filter { predicate, .. } = &p else {
+            unreachable!()
+        };
+        assert!(matches!(predicate, Expr::Scalar(_)));
+        assert!(matches!(
+            require_predicate(&serde_json::json!({"kind": "graph"})),
+            Err(PlanError::NotImplemented(_))
+        ));
     }
 
     #[test]

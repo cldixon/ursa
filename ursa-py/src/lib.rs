@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use arrow::array::{make_array, Array, ArrayData, ArrayRef, BooleanArray, RecordBatch};
 use arrow_pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{
+    PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -240,6 +242,13 @@ fn plan_err(e: PlanError) -> PyErr {
         PlanError::NotImplemented(m) => PyNotImplementedError::new_err(m),
         PlanError::ColumnNotFound(m) => ColumnNotFoundError::new_err(m),
         PlanError::Value(m) => PyValueError::new_err(m),
+        PlanError::Type(m) => PyTypeError::new_err(m),
+        PlanError::Overflow(m) => PyOverflowError::new_err(m),
+        PlanError::Wrapped { message, cause } => Python::attach(|py| {
+            let err = PyNotImplementedError::new_err(message);
+            err.set_cause(py, Some(plan_err(*cause)));
+            err
+        }),
         e @ PlanError::Invalid(_) => PyValueError::new_err(e.to_string()),
         PlanError::Engine(e) => to_pyerr(e),
         PlanError::Host(e) => match e.payload.downcast::<PyErr>() {
@@ -362,6 +371,14 @@ impl Inputs for PyInputs {
     fn batches(&self, rows: HostRows) -> PlanResult<Vec<RecordBatch>> {
         let table = py_rows(rows);
         self.call("batches", (table,), batch_list)
+    }
+
+    fn step_error(&self, step: Slot) -> PlanError {
+        // The host raises the error it stored for the step.
+        match self.call("step_error", (step,), |_| Ok(())) {
+            Err(e) => e,
+            Ok(()) => PlanError::Invalid(format!("step {step} has no stored error")),
+        }
     }
 }
 

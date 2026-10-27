@@ -47,7 +47,7 @@ impl GraphVerb {
     /// The direction of a kernel that takes `'out'` or `'both'` only (`pagerank`,
     /// `betweenness`). `'in'` is a hard error rather than a silent `'out'`.
     fn out_or_both(&self) -> Result<Direction> {
-        match parse_direction(self.direction.as_deref().unwrap_or("out"))? {
+        match parse_direction(&self.direction()?)? {
             Direction::In => Err(DataFusionError::NotImplemented(format!(
                 "{} does not support direction='in'; use 'out' or 'both'",
                 self.verb
@@ -57,11 +57,14 @@ impl GraphVerb {
     }
 
     fn to_algo(&self) -> Result<GraphAlgo> {
+        let p = Self::param::<f64>;
+        let n = Self::param::<u32>;
+        let seed = Self::param::<u64>(&self.seed)?;
         Ok(match self.verb.as_str() {
             "pagerank" => GraphAlgo::PageRank {
-                damping: self.damping.unwrap_or(0.85),
-                max_iter: self.max_iter.unwrap_or(30),
-                tol: self.tol.unwrap_or(1e-6),
+                damping: p(&self.damping)?.unwrap_or(0.85),
+                max_iter: n(&self.max_iter)?.unwrap_or(30),
+                tol: p(&self.tol)?.unwrap_or(1e-6),
                 direction: self.out_or_both()?,
             },
             "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
@@ -70,13 +73,13 @@ impl GraphVerb {
                     "layout_random" => LayoutKind::Random,
                     _ => LayoutKind::Circle,
                 },
-                iterations: self.iterations.unwrap_or(300),
-                k: self.k.unwrap_or(1.0),
-                gravity: self.gravity.unwrap_or(0.02),
-                seed: self.seed,
+                iterations: n(&self.iterations)?.unwrap_or(300),
+                k: p(&self.k)?.unwrap_or(1.0),
+                gravity: p(&self.gravity)?.unwrap_or(0.02),
+                seed,
             },
             "degree" => GraphAlgo::Degree {
-                direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
+                direction: parse_direction(&self.direction()?)?,
             },
             "connected_components" => GraphAlgo::ConnectedComponents {
                 strong: parse_cc_strong(self.mode.as_ref().map(|m| m.as_str().unwrap_or("")))?,
@@ -84,20 +87,20 @@ impl GraphVerb {
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
             "closeness" => GraphAlgo::Closeness {
-                direction: parse_direction(self.direction.as_deref().unwrap_or("out"))?,
+                direction: parse_direction(&self.direction()?)?,
             },
             "betweenness" => GraphAlgo::Betweenness {
-                sample: self.sample,
-                seed: self.seed,
+                sample: p(&self.sample)?,
+                seed,
                 direction: self.out_or_both()?,
             },
             "label_propagation" => GraphAlgo::LabelPropagation {
-                max_iter: self.max_iter.unwrap_or(20),
-                seed: self.seed,
+                max_iter: n(&self.max_iter)?.unwrap_or(20),
+                seed,
             },
             "louvain" => GraphAlgo::Louvain {
-                resolution: self.resolution.unwrap_or(1.0),
-                seed: self.seed,
+                resolution: p(&self.resolution)?.unwrap_or(1.0),
+                seed,
             },
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
@@ -1140,7 +1143,7 @@ pub fn execute_node_query_cached(
             let attr_col = spec.agg_column().ok_or_else(|| {
                 DataFusionError::Execution("neighbors().agg() is missing its column".into())
             })?;
-            let direction = parse_direction(spec.direction.as_deref().unwrap_or("out"))?;
+            let direction = parse_direction(&spec.direction()?)?;
             let agg = parse_agg(spec.agg_fn().unwrap_or("mean"))?;
             let attr = dense_attr_column(nodes_ref, &nodes_id_name, attr_col, &ids, agg)?;
             columns.push(OutputColumn::NeighborAgg {
@@ -1194,7 +1197,7 @@ pub fn execute_node_query_cached(
                     Some(w)
                 }
             };
-            let field = spec.field.unwrap_or(0);
+            let field = GraphVerb::param::<usize>(&spec.field)?.unwrap_or(0);
             // Only layout produces a second output; a field selector on anything
             // else is a caller mistake worth naming rather than silently ignoring.
             if field > 0 && !matches!(algo, GraphAlgo::Layout { .. }) {

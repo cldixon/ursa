@@ -77,6 +77,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A graph op over a traversal of a reshaped scan
+  (`ur.pagerank(ur.hop(ur.scan_edges(p).sample(100), 1).from_([1]))`) ran over
+  the whole file's index; it now raises the same `NotImplementedError` as the
+  in-memory equivalent (#190).
 - Graph columns on a 0-row in-memory node frame return an empty frame with the
   table's columns plus the computed ones, instead of raising "No field named
   __ursa_gid" (#153, #182).

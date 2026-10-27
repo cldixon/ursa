@@ -120,6 +120,12 @@ impl Inputs for MemoryInputs {
     fn batches(&self, _rows: HostRows) -> Result<Vec<RecordBatch>> {
         unsupported("host rows")
     }
+
+    fn step_error(&self, step: Slot) -> PlanError {
+        PlanError::Invalid(format!(
+            "the conformance host stores no error for step {step}"
+        ))
+    }
 }
 
 fn data_dir() -> PathBuf {
@@ -245,6 +251,9 @@ fn run_case(path: &Path) {
             PlanError::NotImplemented(_) => "not_implemented",
             PlanError::ColumnNotFound(_) => "column_not_found",
             PlanError::Value(_) => "value",
+            PlanError::Type(_) => "type",
+            PlanError::Overflow(_) => "overflow",
+            PlanError::Wrapped { .. } => "not_implemented",
             PlanError::Engine(_) => "engine",
             PlanError::Invalid(_) => "invalid",
             PlanError::Host(_) => "host",
@@ -291,6 +300,29 @@ fn plan_fixtures_conform() {
     assert!(cases.len() >= 10, "expected the plan fixtures in {dir:?}");
     for case in &cases {
         run_case(case);
+    }
+}
+
+/// A step the engine's tail can't run goes to the host by its handle; a plan with
+/// no handle there (built in Rust, not by a host) is an error, never a silently
+/// dropped step.
+#[test]
+fn host_steps_without_a_handle_are_an_error() {
+    let inputs = MemoryInputs(vec![Input::Unused, input(&json!({"edges": "karate"}))]);
+    let edges = json!({"plan": {"op": "from_arrow", "frame": 1, "src": "src", "dst": "dst"},
+                       "frame": 1});
+    let degree = json!({"op": "with_columns",
+        "input": {"op": "nodes", "input": {"op": "from_arrow", "frame": 0, "src": "src", "dst": "dst"}},
+        "columns": [{"name": "deg", "expr": {"kind": "graph", "verb": "degree", "edges": edges}}]});
+    // A pushed select, and a head after a sort-less rename-chain remainder.
+    for tail in [
+        json!({"op": "select", "columns": ["id"], "input": degree}),
+        json!({"op": "head", "n": 1, "input": {"op": "rename", "mapping": [["id", "deg"], ["deg", "id"]], "input": degree}}),
+    ] {
+        let plan = Plan::from_json(&tail.to_string()).unwrap();
+        let err = execute_plan(&plan, &inputs).unwrap_err();
+        assert!(matches!(err, PlanError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("no host handle"), "{err}");
     }
 }
 

@@ -20,10 +20,11 @@
    "frame": 1,
    "id": "id"
   },
+  "how": "outer",
   "on": [
    "id"
   ],
-  "how": "outer"
+  "step": 0
  },
  "expect": {
   "error": "not_implemented",

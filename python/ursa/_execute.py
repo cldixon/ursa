@@ -75,12 +75,16 @@ class _Host:
     ``_PlanStep`` it came from, so the steps the engine can't run are applied
     here from the original step, with no round trip through JSON."""
 
-    __slots__ = ("_frame_slots", "_slots", "_steps")
+    __slots__ = ("_errors", "_frame_slots", "_slots", "_steps")
 
     def __init__(self) -> None:
         self._slots: list[Any] = []
         self._frame_slots: dict[int, int] = {}
         self._steps: list[_PlanStep] = []
+        # step handle -> the error parsing that step's arguments raised. It is
+        # raised when the executor reaches the step (`step_error`), so a shape
+        # guard that fires first still wins, as when steps were parsed lazily.
+        self._errors: dict[int, BaseException] = {}
 
     # -- serialization ---------------------------------------------------------
     def frame(self, frame: _Frame) -> dict[str, Any]:
@@ -112,6 +116,11 @@ class _Host:
         self._steps.append(step)
         return len(self._steps) - 1
 
+    def _defer(self, step: _PlanStep, error: BaseException) -> int:
+        handle = self._handle(step)
+        self._errors[handle] = error
+        return handle
+
     def _step(self, step: _PlanStep, input: Any, slot: int) -> dict[str, Any]:
         op, a = step.op, step.args
         if op == "scan_edges":
@@ -134,7 +143,7 @@ class _Host:
             return {
                 "op": op,
                 "edges": self.edges(a["edges"]),
-                "n": int(a["n"]),
+                "n": _int_json(a["n"]),
                 "direction": a["direction"],
                 "seeds": self._slot(a["seeds"]),
             }
@@ -154,9 +163,9 @@ class _Host:
                 "op": op,
                 "edges": self.edges(a["edges"]),
                 "start": self._slot(a["start"]),
-                "steps": int(a["steps"]),
-                "walks_per_node": int(a["walks_per_node"]),
-                "seed": a.get("seed"),
+                "steps": _int_json(a["steps"]),
+                "walks_per_node": _int_json(a["walks_per_node"]),
+                "seed": _int_json(a.get("seed")),
             }
         if op == "describe":
             return {
@@ -179,30 +188,40 @@ class _Host:
                 )
             try:
                 right = self.frame(other)
-            except NotImplementedError as exc:
-                raise NotImplementedError(
-                    f"join(other): could not materialize the right-hand frame ({exc})."
-                ) from exc
-            on = _parse_join_keys(a["on"])
-            return {"op": op, "input": input, "right": right, "on": on, "how": a["how"]}
-        node: dict[str, Any] = {"op": op, "input": input, "step": self._handle(step)}
+            except Exception as exc:  # raised where the right side runs
+                right = {"op": "invalid", "step": self._defer(step, exc)}
+            node = {"op": op, "input": input, "right": right, "how": a["how"]}
+            try:
+                node.update(on=_parse_join_keys(a["on"]), step=self._handle(step))
+            except Exception as exc:
+                node.update(invalid=True, step=self._defer(step, exc))
+            return node
+        try:
+            args = self._tail_args(op, step)
+        except Exception as exc:
+            return {"op": op, "input": input, "step": self._defer(step, exc), "invalid": True}
+        return {"op": op, "input": input, "step": self._handle(step), **args}
+
+    def _tail_args(self, op: str, step: _PlanStep) -> dict[str, Any]:
+        """A relational step's arguments, parsed. An unknown op fails the plan's
+        parse."""
+        a = step.args
         if op == "filter":
-            node["predicate"] = _expr_to_json(a["predicate"])
-        elif op == "select":
-            node["columns"] = _parse_select(a["columns"])
-        elif op == "rename":
-            node["mapping"] = [[old, new] for old, new in dict(a["mapping"]).items()]
-        elif op == "sort":
-            node["by"] = [{"column": c, "descending": d} for c, d in _parse_sort(a)]
-        elif op == "head":
-            node["n"] = int(a["n"])
-        elif op == "sample":
-            node.update(n=int(a["n"]), seed=a.get("seed"))
-        elif op == "group_by_agg":
+            return {"predicate": _expr_to_json(a["predicate"])}
+        if op == "select":
+            return {"columns": _parse_select(a["columns"])}
+        if op == "rename":
+            return {"mapping": [[old, new] for old, new in dict(a["mapping"]).items()]}
+        if op == "sort":
+            return {"by": [{"column": c, "descending": d} for c, d in _parse_sort(a)]}
+        if op == "head":
+            return {"n": int(a["n"])}
+        if op == "sample":
+            return {"n": int(a["n"]), "seed": _int_json(a.get("seed"))}
+        if op == "group_by_agg":
             keys, aggs = _parse_group_agg(step)
-            node.update(keys=keys, aggs=aggs)
-        # distinct: no arguments. An unknown op fails the plan's parse.
-        return node
+            return {"keys": keys, "aggs": aggs}
+        return {}  # distinct
 
     def _expr(self, expr: Any) -> dict[str, Any]:
         """A with_columns expression: a graph verb with its edge input, or any
@@ -253,6 +272,9 @@ class _Host:
     def batches(self, table: Any) -> list[Any]:
         return _batches(table)
 
+    def step_error(self, handle: int) -> None:
+        raise self._errors[handle]
+
 
 def _batches(table: Any) -> list[Any]:
     """A table as a batch list that keeps its schema when empty (#153)."""
@@ -280,7 +302,7 @@ def _expr_to_json(expr: Any) -> dict[str, Any]:
     if kind == "col":
         return {"kind": "col", "name": p["name"]}
     if kind == "lit":
-        return {"kind": "lit", "value": _lit_json(p["value"])}
+        return _lit_json(p["value"])
     if kind == "binary":
         return {
             "kind": "binary",
@@ -297,18 +319,34 @@ def _expr_to_json(expr: Any) -> dict[str, Any]:
     return {"kind": kind}
 
 
-def _lit_json(value: Any) -> Any:
-    """A literal as JSON. A value JSON can't hold (NaN, a datetime, ...) becomes
-    null: the engine rejects it with a clear error, while the host's evaluator
-    reads the original from the step."""
+def _lit_json(value: Any) -> dict[str, Any]:
+    """A literal node. A plain or numpy bool, int, float or string is its JSON
+    value. Anything else (a datetime, a timedelta, NaN) has no JSON form here and
+    is marked ``unrepresentable``: the engine rejects it with the error its
+    serialization raised before (``TypeError``), while the host's evaluator reads
+    the original value from the step."""
+    dtype = getattr(value, "dtype", None)
+    if type(value).__module__ == "numpy" and getattr(dtype, "kind", "") in "biuf":
+        value = value.item()  # a numpy bool/int/float scalar -> its Python value
     if value is None or isinstance(value, (bool, str, int)):
+        return {"kind": "lit", "value": value}
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return {"kind": "lit", "value": value}
+        return {"kind": "lit", "value": None, "unrepresentable": "float"}
+    return {"kind": "lit", "value": None, "unrepresentable": type(value).__name__}
+
+
+def _int_json(value: Any) -> Any:
+    """An integer argument as given, for ``IntArg``: the engine converts it where
+    it reads it, so the host's evaluator keeps accepting what it accepted."""
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else {"type": "float"}
     if hasattr(value, "__index__"):
         return value.__index__()
-    if isinstance(value, float) or hasattr(value, "__float__"):
-        f = float(value)
-        return f if math.isfinite(f) else None
-    return None
+    return {"type": type(value).__name__}
 
 
 def _expr_columns(expr: Any, roles: dict[str, str] | None = None) -> set[str]:
