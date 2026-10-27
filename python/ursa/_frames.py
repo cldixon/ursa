@@ -36,7 +36,8 @@ _ENGINE_TODO = (
 
 class _BuildCell:
     """A shared, mutable holder for a lazily-built, memoized artifact — an
-    EdgeFrame's topology index, or a NodeFrame's scanned attribute batch.
+    EdgeFrame's topology index or subgraph-view edge mask, or a NodeFrame's
+    scanned attribute batch.
 
     Two problems it solves (both from the perf review):
 
@@ -269,7 +270,16 @@ class EdgeFrame(_Frame):
     # `_edge_table` retains the full in-memory edge table (all columns) for a
     # `from_arrow`/`from_polars` frame, so a `weight=` expression over edge columns
     # can be evaluated. It rides the same preserve/drop rail; scan frames have None.
-    __slots__ = ("_dst_col", "_edge_table", "_index_cell", "_scan", "_source", "_src_col")
+    # `_mask_cell` memoizes the subgraph-view edge mask (#175) of *this* frame.
+    __slots__ = (
+        "_dst_col",
+        "_edge_table",
+        "_index_cell",
+        "_mask_cell",
+        "_scan",
+        "_source",
+        "_src_col",
+    )
 
     def __init__(self, data: Any, *, src: str, dst: str, on_null: str = "error") -> None:
         """Build an EdgeFrame from in-memory data, inferring the Arrow schema.
@@ -339,6 +349,10 @@ class EdgeFrame(_Frame):
         # structural ones pass None so a fresh cell is created here.
         self._index_cell = index_cell if index_cell is not None else _BuildCell()
         self._edge_table = edge_table
+        # The subgraph-view edge mask is a function of this frame's own plan (its
+        # filter chain / traversal) over the parent rows, so it is never shared: every
+        # frame — each derivation included — gets a fresh cell (see `_edge_mask_for`).
+        self._mask_cell = _BuildCell()
 
     @classmethod
     def _construct(
@@ -364,6 +378,11 @@ class EdgeFrame(_Frame):
     def _index_build_cell(self) -> _BuildCell:
         """The shared cell holding this frame's built topology index."""
         return self._index_cell
+
+    @property
+    def _mask_build_cell(self) -> _BuildCell:
+        """This frame's own cell holding its memoized ``(index, edge mask)`` pair."""
+        return self._mask_cell
 
     @property
     def _edge_arrays(self) -> tuple[Any, Any] | None:

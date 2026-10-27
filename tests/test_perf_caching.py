@@ -95,6 +95,116 @@ def test_concurrent_first_collects_build_once_and_agree():
     assert all(r == results[0] for r in results[1:])
 
 
+# --- subgraph-view edge mask memo (#175) -------------------------------------
+def _count_mask_builds(monkeypatch):
+    """Wrap the uncached mask evaluation so each (re)computation is counted."""
+    import ursa._execute as ex
+
+    calls = []
+    real = ex._compute_edge_mask
+
+    def counting(*args, **kwargs):
+        calls.append(args[0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ex, "_compute_edge_mask", counting)
+    return calls
+
+
+def _weighted():
+    return pa.table(
+        {"s": [0, 0, 1, 2, 3, 3], "d": [1, 2, 0, 0, 1, 2], "w": [0.1, 0.9, 0.6, 0.2, 0.7, 0.8]}
+    )
+
+
+def test_filtered_view_computes_its_mask_once_across_collects(monkeypatch):
+    calls = _count_mask_builds(monkeypatch)
+    edges = ur.from_arrow(_weighted(), src="s", dst="d")
+    view = edges.filter(ur.col("w") > 0.5)
+    first = ur.degree(view).collect().to_arrow()
+    assert ur.degree(view).collect().to_arrow().equals(first)
+    assert ur.pagerank(view).collect().to_arrow().num_rows == first.num_rows
+    assert len(calls) == 1
+    # Byte-identical to a fresh frame with no memo.
+    fresh = ur.degree(ur.from_arrow(_weighted(), src="s", dst="d").filter(ur.col("w") > 0.5))
+    assert fresh.collect().to_arrow().equals(first)
+
+
+def test_scanned_view_computes_its_mask_once_across_collects(monkeypatch, tmp_path):
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "edges.parquet"
+    pq.write_table(_weighted(), path)
+    calls = _count_mask_builds(monkeypatch)
+    view = ur.scan_edges(str(path), src="s", dst="d").filter(ur.col("w") > 0.5)
+    first = ur.degree(view).collect().to_arrow()
+    assert ur.degree(view).collect().to_arrow().equals(first)
+    assert len(calls) == 1
+    in_memory = ur.from_arrow(_weighted(), src="s", dst="d").filter(ur.col("w") > 0.5)
+    assert ur.degree(in_memory).collect().to_arrow().equals(first)
+
+
+def test_chained_filter_gets_its_own_mask_and_intersects(monkeypatch):
+    calls = _count_mask_builds(monkeypatch)
+    edges = ur.from_arrow(_weighted(), src="s", dst="d")
+    view = edges.filter(ur.col("w") > 0.5)
+    ur.degree(view).collect()
+    narrower = view.filter(ur.src() != 3)
+    assert narrower._mask_build_cell is not view._mask_build_cell
+    got = ur.degree(narrower).collect().to_arrow()
+    ur.degree(narrower).collect()
+    assert len(calls) == 2  # one per frame, none on repeats
+    both = edges.filter((ur.col("w") > 0.5) & (ur.src() != 3))
+    assert ur.degree(both).collect().to_arrow().equals(got)
+    # The parent's memo was not clobbered by the narrower view.
+    assert (
+        ur.degree(view)
+        .collect()
+        .to_arrow()
+        .equals(ur.degree(edges.filter(ur.col("w") > 0.5)).collect().to_arrow())
+    )
+
+
+def test_traversal_view_computes_its_mask_once_across_collects(monkeypatch):
+    calls = _count_mask_builds(monkeypatch)
+    edges = ur.from_arrow(_weighted(), src="s", dst="d")
+    for view in (ur.hop(edges, n=1).from_([3]), ur.shortest_path(edges, 3, 0)):
+        calls.clear()
+        first = ur.degree(view).collect().to_arrow()
+        assert ur.degree(view).collect().to_arrow().equals(first)
+        assert len(calls) == 1
+
+
+def test_cached_mask_is_not_served_for_a_different_index(monkeypatch):
+    # The memo is keyed on the parent index object: if the parent CSR is rebuilt
+    # (a weighted scan replaces it), the mask is recomputed against the new one.
+    calls = _count_mask_builds(monkeypatch)
+    edges = ur.from_arrow(_weighted(), src="s", dst="d")
+    view = edges.filter(ur.col("w") > 0.5)
+    first = ur.degree(view).collect().to_arrow()
+    cell = edges._index_build_cell
+    with cell.lock:
+        cell.value = _native().build_index(_weighted().select(["s", "d"]).to_batches())
+    assert ur.degree(view).collect().to_arrow().equals(first)
+    assert len(calls) == 2
+
+
+def test_concurrent_collects_on_a_view_compute_the_mask_once(monkeypatch):
+    calls = _count_mask_builds(monkeypatch)
+    view = ur.from_arrow(_weighted(), src="s", dst="d").filter(ur.col("w") > 0.5)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(ur.degree(view).collect().to_arrow()))
+        for _ in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(calls) == 1
+    assert all(r.equals(results[0]) for r in results)
+
+
 # --- weighted queries reuse the index and the evaluated weights (#175) -------
 def _weighted_table():
     return pa.table(
