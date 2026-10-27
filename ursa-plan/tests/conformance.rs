@@ -33,7 +33,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use serde_json::{json, Value};
 use ursa_core::EdgeMask;
-use ursa_plan::plan::{Roles, Slot};
+use ursa_plan::plan::{HostRows, Roles, Rows, Slot};
 use ursa_plan::{build_topology_batches, execute_plan, GraphIndex, Inputs, Plan, PlanError};
 
 type Result<T> = ursa_plan::PlanResult<T>;
@@ -91,16 +91,16 @@ impl Inputs for MemoryInputs {
         }
     }
 
-    fn node_table(&self, frame: Slot, _columns: Option<&[String]>) -> Result<Vec<RecordBatch>> {
+    fn node_table(&self, frame: Slot, _columns: Option<&[String]>) -> Result<Rows> {
         match &self.0[frame] {
-            Input::Nodes(batches) => Ok(batches.clone()),
+            Input::Nodes(batches) => Ok(Rows::Batches(batches.clone())),
             _ => unsupported("node table for a non-node slot"),
         }
     }
 
-    fn edge_table(&self, frame: Slot, _columns: Option<&[String]>) -> Result<Vec<RecordBatch>> {
+    fn edge_table(&self, frame: Slot, _columns: Option<&[String]>) -> Result<Rows> {
         match &self.0[frame] {
-            Input::Edges(batches, _) => Ok(batches.clone()),
+            Input::Edges(batches, _) => Ok(Rows::Batches(batches.clone())),
             _ => unsupported("edge table for a non-edge slot"),
         }
     }
@@ -112,14 +112,13 @@ impl Inputs for MemoryInputs {
         }
     }
 
-    fn apply_steps(
-        &self,
-        _rows: Vec<RecordBatch>,
-        steps: &[&Plan],
-        _roles: &Roles,
-    ) -> Result<Vec<RecordBatch>> {
+    fn apply_steps(&self, _rows: Rows, steps: &[&Plan], _roles: &Roles) -> Result<Rows> {
         let ops: Vec<&str> = steps.iter().map(|s| s.op()).collect();
         unsupported(&format!("relational evaluator (asked to run {ops:?})"))
+    }
+
+    fn batches(&self, _rows: HostRows) -> Result<Vec<RecordBatch>> {
+        unsupported("host rows")
     }
 }
 

@@ -41,9 +41,9 @@ use std::sync::Arc;
 use ursa_core::topology::Topology;
 use ursa_core::{EdgeMask, IdMap};
 
-use ursa_plan::plan::{EdgeInput, HostError, Roles, Slot};
+use ursa_plan::plan::{execute, EdgeInput, HostError, HostRows, Roles, Rows, Slot};
 use ursa_plan::{
-    avg_path_length, build_topology_batches, density, diameter, execute_plan, hop_reached_nodes,
+    avg_path_length, build_topology_batches, density, diameter, hop_reached_nodes,
     parse_stat_direction, require_index, scan_edges_batch, scan_edges_table, scan_edges_topology,
     scan_nodes_batch, shortest_path_nodes, weight_cache_key, Inputs, Plan, PlanError, PlanResult,
     ScanBuildError, ScannedTopology,
@@ -320,19 +320,19 @@ impl Inputs for PyInputs {
         })
     }
 
-    fn node_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Vec<RecordBatch>> {
+    fn node_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows> {
         self.call(
             "node_table",
             (frame, columns.map(<[String]>::to_vec)),
-            batch_list,
+            host_rows,
         )
     }
 
-    fn edge_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Vec<RecordBatch>> {
+    fn edge_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows> {
         self.call(
             "edge_table",
             (frame, columns.map(<[String]>::to_vec)),
-            batch_list,
+            host_rows,
         )
     }
 
@@ -340,43 +340,61 @@ impl Inputs for PyInputs {
         self.call("seeds", (slot,), array_from_pyarrow)
     }
 
-    fn apply_steps(
-        &self,
-        rows: Vec<RecordBatch>,
-        steps: &[&Plan],
-        roles: &Roles,
-    ) -> PlanResult<Vec<RecordBatch>> {
+    fn apply_steps(&self, rows: Rows, steps: &[&Plan], roles: &Roles) -> PlanResult<Rows> {
         let handles: Vec<Slot> = steps.iter().filter_map(|s| s.step()).collect();
         Python::attach(|py| {
-            let call = || -> PyResult<Vec<RecordBatch>> {
+            let call = || -> PyResult<Rows> {
                 let roles_dict = PyDict::new(py);
                 for (role, column) in roles {
                     roles_dict.set_item(*role, column)?;
                 }
-                let rows = rows.to_pyarrow(py)?;
+                let rows = rows_to_python(py, rows)?;
                 let out = self
                     .host
                     .bind(py)
                     .call_method1("apply_steps", (rows, handles, roles_dict))?;
-                batch_list(&out)
+                host_rows(&out)
             };
             call().map_err(|e| host_err(py, e))
         })
     }
+
+    fn batches(&self, rows: HostRows) -> PlanResult<Vec<RecordBatch>> {
+        let table = py_rows(rows);
+        self.call("batches", (table,), batch_list)
+    }
+}
+
+/// A host table (a `pyarrow.Table`) the executor holds without converting it.
+fn host_rows(obj: &Bound<'_, PyAny>) -> PyResult<Rows> {
+    Ok(Rows::Host(Box::new(obj.clone().unbind())))
+}
+
+fn py_rows(rows: HostRows) -> Py<PyAny> {
+    *rows
+        .downcast::<Py<PyAny>>()
+        .expect("host rows come from this host")
+}
+
+/// Rows as the Python host takes them: its own table, or a batch list.
+fn rows_to_python(py: Python<'_>, rows: Rows) -> PyResult<Py<PyAny>> {
+    match rows {
+        Rows::Host(h) => Ok(py_rows(h)),
+        Rows::Batches(b) => b.to_pyarrow(py).map(Bound::unbind),
+    }
 }
 
 /// Execute a serialized plan (`ursa_plan::plan::Plan` as JSON) and return its
-/// result as a list of pyarrow `RecordBatch`es. `host` resolves the plan's slots
+/// result: a list of pyarrow `RecordBatch`es from the engine, or the
+/// `pyarrow.Table` the host finished it with. `host` resolves the plan's slots
 /// (see [`PyInputs`]). The GIL is released for the whole execution and taken
 /// back only for the host's callbacks.
 #[pyfunction]
 fn run_plan(py: Python<'_>, plan: &str, host: Py<PyAny>) -> PyResult<Py<PyAny>> {
     let plan = Plan::from_json(plan).map_err(plan_err)?;
     let inputs = PyInputs { host };
-    let batches = py
-        .detach(|| execute_plan(&plan, &inputs))
-        .map_err(plan_err)?;
-    batches.to_pyarrow(py).map(|obj| obj.unbind())
+    let rows = py.detach(|| execute(&plan, &inputs)).map_err(plan_err)?;
+    rows_to_python(py, rows)
 }
 
 /// The graph index of a serialized edge input (`ursa_plan::plan::EdgeInput`),

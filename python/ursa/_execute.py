@@ -232,20 +232,26 @@ class _Host:
     def edge_weights(self, slot: int, columns: list[str], keys: list[str]) -> Any | None:
         return _prepare_weighted(self._slots[slot], columns, keys)
 
-    def node_table(self, slot: int, columns: list[str] | None) -> list[Any]:
-        return _batches(_resolve_node_attr_table(self._slots[slot], columns))
+    def node_table(self, slot: int, columns: list[str] | None) -> Any:
+        return _resolve_node_attr_table(self._slots[slot], columns)
 
-    def edge_table(self, slot: int, columns: list[str] | None) -> list[Any]:
-        return _batches(_edge_source_table(self._slots[slot], columns))
+    def edge_table(self, slot: int, columns: list[str] | None) -> Any:
+        return _edge_source_table(self._slots[slot], columns)
 
     def seeds(self, slot: int) -> Any:
         return _resolve_seeds(self._slots[slot])
 
-    def apply_steps(self, batches: list[Any], handles: list[int], roles: dict[str, str]) -> Any:
+    def apply_steps(self, rows: Any, handles: list[int], roles: dict[str, str]) -> Any:
+        """Run the steps behind ``handles`` in pyarrow, on a table this host
+        produced or on the engine's batch list."""
         import pyarrow as pa
 
+        table = pa.Table.from_batches(rows) if isinstance(rows, list) else rows
         steps = [_tail_step(self._steps[h]) for h in handles]
-        return _batches(_apply_pyarrow_steps(pa.Table.from_batches(batches), steps, roles))
+        return _apply_pyarrow_steps(table, steps, roles)
+
+    def batches(self, table: Any) -> list[Any]:
+        return _batches(table)
 
 
 def _batches(table: Any) -> list[Any]:

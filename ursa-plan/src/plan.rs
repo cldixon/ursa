@@ -499,8 +499,10 @@ pub type Roles = [(&'static str, String)];
 /// What [`execute_plan`] reads from its host, by slot. Every method is called at
 /// most when the executor needs the value, in the order the executor needs it.
 ///
-/// Row-valued results are batch lists of at least one batch, so an empty result
-/// still carries its schema.
+/// Batch lists are at least one batch long, so an empty result still carries its
+/// schema. Rows the host produces may stay host-side ([`Rows::Host`]) until the
+/// engine needs them as batches ([`Inputs::batches`]), so a result the host
+/// finishes never crosses into Rust and back.
 pub trait Inputs {
     /// The cached graph index of the edge frame `frame` (built on first use).
     fn index(&self, frame: Slot) -> PlanResult<GraphIndex>;
@@ -521,11 +523,11 @@ pub trait Inputs {
 
     /// The rows of the node source `frame`, reading at least `columns` (`None`:
     /// every column).
-    fn node_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Vec<RecordBatch>>;
+    fn node_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows>;
 
     /// The rows of the edge source `frame`, reading at least `columns` (`None`:
     /// every column).
-    fn edge_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Vec<RecordBatch>>;
+    fn edge_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows>;
 
     /// A seed set: user ids (int64 or string).
     fn seeds(&self, slot: Slot) -> PlanResult<ArrayRef>;
@@ -533,12 +535,29 @@ pub trait Inputs {
     /// Run relational steps on `rows`, in order, with `roles` resolving role
     /// references. These are the steps the engine's tail can't run as written
     /// (and every step on a plain source), each identified by its `step` handle.
-    fn apply_steps(
-        &self,
-        rows: Vec<RecordBatch>,
-        steps: &[&Plan],
-        roles: &Roles,
-    ) -> PlanResult<Vec<RecordBatch>>;
+    fn apply_steps(&self, rows: Rows, steps: &[&Plan], roles: &Roles) -> PlanResult<Rows>;
+
+    /// Host rows as batches.
+    fn batches(&self, rows: HostRows) -> PlanResult<Vec<RecordBatch>>;
+}
+
+/// Rows held by the host, opaque to the executor.
+pub type HostRows = Box<dyn Any + Send + Sync>;
+
+/// A row set: engine batches, or rows the host holds (see [`Inputs`]).
+pub enum Rows {
+    Batches(Vec<RecordBatch>),
+    Host(HostRows),
+}
+
+impl Rows {
+    /// The rows as batches, converting host rows through `inputs`.
+    pub fn into_batches(self, inputs: &dyn Inputs) -> PlanResult<Vec<RecordBatch>> {
+        match self {
+            Rows::Batches(b) => Ok(b),
+            Rows::Host(h) => inputs.batches(h),
+        }
+    }
 }
 
 /// An error from planning or execution.
@@ -601,6 +620,11 @@ pub type PlanResult<T> = std::result::Result<T, PlanError>;
 
 /// Execute a plan, reading its inputs from `inputs`. Returns at least one batch.
 pub fn execute_plan(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Vec<RecordBatch>> {
+    execute(plan, inputs)?.into_batches(inputs)
+}
+
+/// [`execute_plan`], leaving a result the host produced with the host.
+pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
     let chain = plan.chain();
     if is_node_frame(&chain) {
         collect_node_frame(&chain, inputs)
@@ -699,7 +723,7 @@ fn is_tail(p: &Plan) -> bool {
 /// A node frame's collect (`collect_node_frame`): `describe`, a random walk, or
 /// a node query (graph columns over the node set or an attribute table, an
 /// optional join, then the relational steps in the order written).
-fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Vec<RecordBatch>> {
+fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> {
     let id_col = node_id_col(chain);
     // describe() is a whole-graph summary, computed eagerly off the topology and
     // wrapped as a one-row frame (not a per-node algorithm).
@@ -717,7 +741,7 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Vec<Re
         }
         let index = require_index(edges, inputs)?;
         let dir = parse_stat_direction(direction)?;
-        return Ok(vec![describe(&index.topo, *full, dir)?]);
+        return Ok(Rows::Batches(vec![describe(&index.topo, *full, dir)?]));
     }
 
     if let Some(walk) = chain.iter().find(|p| matches!(p, Plan::RandomWalk { .. })) {
@@ -891,7 +915,7 @@ fn collect_node_query(
     graph_exprs: Option<&[NamedExpr]>,
     steps: &[&Plan],
     inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+) -> PlanResult<Rows> {
     let Some(graph_exprs) = graph_exprs.filter(|g| !g.is_empty()) else {
         return collect_plain_nodes(chain, id_col, steps, inputs);
     };
@@ -925,7 +949,11 @@ fn collect_node_query(
     // An attribute table's columns join onto the algorithm outputs by id;
     // `edges.nodes()`-derived frames have none.
     let nodes = match node_source_slot(chain) {
-        Some(slot) => Some(inputs.node_table(slot, file_needed.as_deref())?),
+        Some(slot) => Some(
+            inputs
+                .node_table(slot, file_needed.as_deref())?
+                .into_batches(inputs)?,
+        ),
         None => None,
     };
     let nodes_id = nodes.as_ref().map(|_| id_col.to_string());
@@ -1113,7 +1141,7 @@ fn collect_plain_nodes(
     id_col: &str,
     steps: &[&Plan],
     inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+) -> PlanResult<Rows> {
     let roles = [("id", id_col.to_string())];
     // A scan reads the id plus what the steps read before a select or group_by
     // narrows the columns.
@@ -1136,11 +1164,7 @@ fn collect_plain_nodes(
 }
 
 /// A random walk and its relational steps (`_collect_random_walk`).
-fn collect_random_walk(
-    chain: &[&Plan],
-    walk: &Plan,
-    inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
     let Plan::RandomWalk {
         edges,
         start,
@@ -1190,7 +1214,7 @@ fn collect_random_walk(
 
 /// An edge frame's collect (`collect_edge_frame`): a plain edge frame, or a
 /// `hop` / `shortest_path` result, plus its relational steps in the order written.
-fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Vec<RecordBatch>> {
+fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> {
     let (src_col, dst_col) = edge_roles(chain);
     let mut traversal: Option<&Plan> = None;
     let mut steps: Vec<&Plan> = vec![];
@@ -1333,7 +1357,7 @@ fn collect_plain_edges(
     steps: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+) -> PlanResult<Rows> {
     // The endpoints plus what the steps read before a select or group_by narrows
     // the columns.
     let required: BTreeSet<String> = roles.iter().map(|(_, c)| c.clone()).collect();
@@ -1364,15 +1388,16 @@ fn check_join_how(how: &str) -> PlanResult<()> {
 /// Materialize the right side, check the keys and column collisions, and run the
 /// join, then `steps` (written after it) in order (`_run_join`).
 fn run_join(
-    left: Vec<RecordBatch>,
+    left: Rows,
     join: &Plan,
     steps: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+) -> PlanResult<Rows> {
     let Plan::Join { right, on, how, .. } = join else {
         unreachable!("run_join takes a join step")
     };
+    let left = left.into_batches(inputs)?;
     let right = execute_plan(right, inputs).map_err(|e| match e {
         PlanError::NotImplemented(msg)
         | PlanError::Host(HostError {
@@ -1542,24 +1567,24 @@ fn finish(
     rest: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+) -> PlanResult<Rows> {
     if pushed.select.is_none() && rest.is_empty() {
-        return Ok(result);
+        return Ok(Rows::Batches(result));
     }
     let steps: Vec<&Plan> = pushed
         .select
         .into_iter()
         .chain(rest.iter().copied())
         .collect();
-    inputs.apply_steps(result, &steps, roles)
+    inputs.apply_steps(Rows::Batches(result), &steps, roles)
 }
 
 fn apply_steps(
-    rows: Vec<RecordBatch>,
+    rows: Rows,
     steps: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
-) -> PlanResult<Vec<RecordBatch>> {
+) -> PlanResult<Rows> {
     if steps.is_empty() {
         return Ok(rows);
     }
