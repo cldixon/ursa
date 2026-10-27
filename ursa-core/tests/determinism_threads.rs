@@ -19,7 +19,8 @@
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
-    betweenness, label_propagation, layout_fr, louvain, pagerank, LayoutParams, PageRankParams,
+    betweenness, betweenness_weighted, closeness_weighted, label_propagation, layout_fr, louvain,
+    pagerank, LayoutParams, PageRankParams,
 };
 use ursa_core::Topology;
 
@@ -99,6 +100,57 @@ fn betweenness_sampled_is_thread_count_independent() {
             reference,
             "sampled betweenness diverged at {threads} threads"
         );
+    }
+}
+
+#[test]
+fn betweenness_small_samples_are_thread_count_independent() {
+    // Few sources: fewer 64-source chunks than threads, so the multi-threaded runs
+    // take the per-source schedule (sources of one chunk in parallel, folded in
+    // source order) while the single-threaded reference takes the per-chunk one —
+    // they must still agree exactly. 0.1 is one chunk, 0.4 is three; the dense
+    // graph exercises the parallel block fold, the sparse one the reached-set fold.
+    for (n, m) in [(400, 4000), (2000, 1500)] {
+        let t = seeded_graph(n, m);
+        let w: Vec<f64> = (0..m).map(|e| 1.0 + (e % 7) as f64 * 0.5).collect();
+        for frac in [0.1, 0.4] {
+            let reference = on_pool(1, || betweenness(&t, None, Some(frac), Some(42)));
+            let reference_w = on_pool(1, || {
+                betweenness_weighted(&t, &w, None, Some(frac), Some(42))
+            });
+            for &threads in &THREADS {
+                assert_eq!(
+                    on_pool(threads, || betweenness(&t, None, Some(frac), Some(42))),
+                    reference,
+                    "sampled betweenness (n={n}, {frac}) diverged at {threads} threads"
+                );
+                assert_eq!(
+                    on_pool(threads, || {
+                        betweenness_weighted(&t, &w, None, Some(frac), Some(42))
+                    }),
+                    reference_w,
+                    "weighted betweenness (n={n}, {frac}) diverged at {threads} threads"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn closeness_weighted_is_thread_count_independent() {
+    // Weighted closeness sums f64 distances; the reached-set fold must give the
+    // same bytes however sources are spread over workers.
+    for (n, m) in [(400, 4000), (3000, 2500)] {
+        let t = seeded_graph(n, m);
+        let w: Vec<f64> = (0..m).map(|e| 0.25 + (e % 11) as f64 * 0.75).collect();
+        let reference = on_pool(1, || closeness_weighted(&t, &w, None));
+        for &threads in &THREADS {
+            assert_eq!(
+                on_pool(threads, || closeness_weighted(&t, &w, None)),
+                reference,
+                "weighted closeness (n={n}) diverged at {threads} threads"
+            );
+        }
     }
 }
 
