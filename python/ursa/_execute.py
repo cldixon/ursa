@@ -723,8 +723,13 @@ def _run_query(
     # parent CSR restricted by a per-edge-row boolean mask — a predicate over the parent
     # rows and/or the induced subgraph of a traversal's reached nodes — with no rebuild.
     edge_mask = _edge_mask_for(edges, index)
-    # The node attribute table crosses the FFI as a batch list (not one batch).
-    nodes_batches = nodes.to_batches() if nodes is not None else None
+    # The node attribute table crosses the FFI as a batch list (not one batch); a
+    # 0-row table sends one empty batch, so its schema crosses too (#153).
+    nodes_batches = None
+    if nodes is not None:
+        import pyarrow as pa
+
+        nodes_batches = nodes.to_batches() or [pa.RecordBatch.from_pylist([], schema=nodes.schema)]
     # A node-query result carries the reserved `id` column plus the computed/joined
     # columns; `ur.id()` in a filter resolves to it. (src/dst have no role here.)
     filter_json = [_filter_json(p, {"id": "id"}) for p in filters]

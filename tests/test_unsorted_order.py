@@ -206,6 +206,53 @@ def test_join_follows_left_then_right_order(edges, attrs, how):
     assert _rows(out, ["id", "k", "v", "w"]) == want
 
 
+@pytest.mark.parametrize("kind", ["int64", "string", "large_string", "string_view", "dictionary"])
+def test_attribute_frame_with_repeated_absent_and_null_ids(edges, kind):
+    # Every table row gets its id's values, in table order: a repeated id gets
+    # them on each row, and a null id or one not in the graph gets nulls.
+    deg = _deg(edges)
+    graph_ids = list(deg)
+    ids = [graph_ids[(i * 37) % 500] if i % 7 else None for i in range(4000)]
+    ids[::11] = [-5] * len(ids[::11])
+    if kind == "int64":
+        graph, col = edges, pa.array(ids, pa.int64())
+    else:
+        e = _edges_table()
+        graph = ur.from_arrow(
+            pa.table({"s": e["s"].cast(pa.string()), "d": e["d"].cast(pa.string())}),
+            src="s",
+            dst="d",
+        )
+        deg = {str(k): v for k, v in deg.items()}
+        ids = [None if i is None else str(i) for i in ids]
+        col = pa.array(ids, pa.string())
+        col = col.dictionary_encode() if kind == "dictionary" else col.cast(getattr(pa, kind)())
+    t = pa.table({"id": col, "v": list(range(len(ids)))})
+    t = pa.Table.from_batches(t.to_batches(max_chunksize=900))
+    frame = ur.from_arrow(t, id="id").with_columns(deg=ur.degree(graph, direction="out"))
+    out = frame.collect().to_arrow()
+    assert out.column("v").to_pylist() == list(range(len(ids)))
+    assert out.column("deg").to_pylist() == [deg.get(i) for i in ids]
+    head = frame.filter(ur.col("deg") >= 0).head(50).collect().to_arrow()
+    assert head.column("v").to_pylist() == [v for v, i in enumerate(ids) if i in deg][:50]
+
+
+def test_empty_attribute_frame_keeps_its_columns(edges):
+    # #153: a 0-row node table with graph columns is an empty frame, not an error.
+    nodes = ur.from_arrow(
+        pa.table({"id": pa.array([], pa.int64()), "w": pa.array([], pa.float64())}), id="id"
+    )
+    for build in [
+        lambda f: f,
+        lambda f: f.filter(ur.col("pr") > 0),
+        lambda f: f.sort("pr").head(3),
+    ]:
+        out = build(nodes.with_columns(pr=ur.pagerank(edges))).collect().to_arrow()
+        assert out.num_rows == 0
+        assert out.schema.names == ["id", "w", "pr"]
+        assert out.schema.field("pr").type == pa.float64()
+
+
 def test_chunked_scan_attribute_frame_with_filter(edges, attrs, tmp_path):
     import pyarrow.parquet as pq
 
