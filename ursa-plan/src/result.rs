@@ -762,7 +762,7 @@ mod tests {
         let err = crate::query::execute_node_query(
             topo,
             ids,
-            json,
+            &crate::query::cols(json),
             &[],        // filters
             None,       // sort
             None,       // limit

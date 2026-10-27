@@ -1,0 +1,33 @@
+{
+ "description": "An unsupported join kind.",
+ "inputs": [
+  {
+   "nodes": "karate"
+  },
+  {
+   "nodes": "karate"
+  }
+ ],
+ "plan": {
+  "op": "join",
+  "input": {
+   "op": "from_arrow",
+   "frame": 0,
+   "id": "id"
+  },
+  "right": {
+   "op": "from_arrow",
+   "frame": 1,
+   "id": "id"
+  },
+  "how": "outer",
+  "on": [
+   "id"
+  ],
+  "step": 0
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "join how='outer' is not supported yet (use ['inner', 'left']); 'right'/'outer' are a follow-up."
+ }
+}

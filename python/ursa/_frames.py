@@ -458,14 +458,12 @@ class EdgeFrame(_Frame):
             edge_table=self._edge_table,
         )
 
-    # A frame-positioned traversal (ur.hop) executes here, returning the reached
-    # edges as a materialized frame. A plain edge frame with no traversal step is
-    # not collectable on its own (call an algorithm on it) — collect_edge_frame
-    # raises a clear error in that case.
+    # Plain edge frames and traversal results (ur.hop / ur.shortest_path) execute
+    # here, through the plan executor (see `_execute.collect`).
     def collect(self) -> MaterializedFrame:
-        from ._execute import collect_edge_frame
+        from ._execute import collect
 
-        return collect_edge_frame(self)
+        return collect(self)
 
     # to_polars / to_arrow / to_dicts / sink_* are inherited from _Frame (they
     # route through collect()).
@@ -579,9 +577,9 @@ class NodeFrame(_Frame):
     # execute here, returning the materialized result. to_polars / to_arrow /
     # to_dicts / sink_* are inherited from _Frame (they route through collect()).
     def collect(self) -> MaterializedFrame:
-        from ._execute import collect_node_frame
+        from ._execute import collect
 
-        return collect_node_frame(self)
+        return collect(self)
 
     def __repr__(self) -> str:
         return f"<NodeFrame id={self._id_col!r} lazy; {len(self._plan)} step(s)>"

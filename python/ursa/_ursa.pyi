@@ -17,7 +17,9 @@ def __core_version() -> str: ...
 
 # The CSR topology + IdMap, built once and cached on the EdgeFrame. Opaque handle;
 # built by build_index and passed to every graph op over the frame.
-class GraphIndex: ...
+class GraphIndex:
+    def has_weights(self, weight_json: str) -> bool: ...
+    def _weight_eval_count(self) -> int: ...
 
 # Build the graph index from an edge batch list — a list of pyarrow RecordBatches
 # whose first two columns are the (canonicalized) src/dst id columns (int64 or
@@ -28,74 +30,23 @@ def build_index(edges: Any) -> GraphIndex: ...
 # Total topology builds so far (test/observability hook for the index contract).
 def _topology_build_count() -> int: ...
 
-# The one execution entry point: a built index + a JSON column IR +
-# filter/sort/limit -> list[pyarrow.RecordBatch] (a chunked result).
-def run_node_query(
-    index: GraphIndex,
-    columns_json: str,
-    filters: list[str],
-    sort: list[tuple[str, bool]] | None = ...,
-    limit: int | None = ...,
-    nodes: Any | None = ...,
-    nodes_id: str | None = ...,
-    edges: Any | None = ...,
-    distinct: bool = ...,
-    sample: tuple[int, int | None] | None = ...,
-    rename: list[tuple[str, str]] = ...,
-    group_keys: list[str] = ...,
-    aggs: list[str] = ...,
-    edge_mask: Any | None = ...,
-) -> Any: ...
+# Scan an edge file and build its index in one call -> (index, rows dropped).
+def scan_build_index(
+    path: str,
+    src: str,
+    dst: str,
+    storage_options: dict[str, str] | None = ...,
+    drop_nulls: bool = ...,
+) -> tuple[GraphIndex, int]: ...
 
-# Equi-join two materialized frames (pyarrow batch lists) on the `on` key columns,
-# apply the relational tail, and return the joined list[pyarrow.RecordBatch].
-# `how` is "inner" or "left". User-facing frame.join(other, ...).
-def run_join_query(
-    left: Any,
-    right: Any,
-    on: list[str],
-    how: str,
-    filters: list[str] = ...,
-    sort: list[tuple[str, bool]] | None = ...,
-    limit: int | None = ...,
-    distinct: bool = ...,
-    sample: tuple[int, int | None] | None = ...,
-    rename: list[tuple[str, str]] = ...,
-) -> Any: ...
+# The one execution entry point: a serialized plan (ursa_plan::plan::Plan as JSON)
+# and the host that resolves its slots (ursa._execute._Host) ->
+# list[pyarrow.RecordBatch] (a chunked result).
+def run_plan(plan: str, host: Any) -> Any: ...
 
-# A hop traversal: a built index + user-id seed array (int64 or string) +
-# n/direction + relational
-# tail -> list[pyarrow.RecordBatch] of reached (src, dst) pairs.
-def run_hop_query(
-    index: GraphIndex,
-    seeds: Any,
-    n: int,
-    direction: str,
-    filters: list[str],
-    sort: list[tuple[str, bool]] | None = ...,
-    limit: int | None = ...,
-    distinct: bool = ...,
-    sample: tuple[int, int | None] | None = ...,
-    rename: list[tuple[str, str]] = ...,
-) -> Any: ...
-
-# A shortest_path traversal: a built index + 1-element source/target user-id
-# arrays (int64 or string) + direction + relational tail -> (src, dst, hop, cost)
-# list[pyarrow.RecordBatch] of the path edges.
-def run_path_query(
-    index: GraphIndex,
-    source: Any,
-    target: Any,
-    direction: str,
-    weight: str | None = ...,
-    edges: Any | None = ...,
-    filters: list[str] = ...,
-    sort: list[tuple[str, bool]] | None = ...,
-    limit: int | None = ...,
-    distinct: bool = ...,
-    sample: tuple[int, int | None] | None = ...,
-    rename: list[tuple[str, str]] = ...,
-) -> Any: ...
+# The checked graph index of a serialized edge input (ursa_plan::plan::EdgeInput),
+# for the eager whole-graph stats.
+def resolve_index(edges: str, host: Any) -> GraphIndex: ...
 
 # The node set reached within `n` hops of `seeds` (seeds included) as a pyarrow
 # array of user ids — the reached region behind a graph op over a hop result (#116).
@@ -118,23 +69,6 @@ def shortest_path_nodes_query(
     edges: Any | None = ...,
 ) -> Any: ...
 
-# A random_walk: a built index + user-id start ids (int64 or string) + walk params
-# + relational tail
-# -> list[pyarrow.RecordBatch] of the (walk_id, step, node) walk rows.
-def run_walk_query(
-    index: GraphIndex,
-    starts: Any,
-    steps: int,
-    walks_per_node: int,
-    seed: int | None = ...,
-    filters: list[str] = ...,
-    sort: list[tuple[str, bool]] | None = ...,
-    limit: int | None = ...,
-    distinct: bool = ...,
-    sample: tuple[int, int | None] | None = ...,
-    rename: list[tuple[str, str]] = ...,
-) -> Any: ...
-
 # The whole-graph stats take direction "out" (default), "in" or "both". "both"
 # reads the graph as undirected: one edge per distinct unordered pair, self-loops
 # dropped (NetworkX's G.to_undirected()). "in" equals "out" over the whole graph.
@@ -149,10 +83,6 @@ def graph_avg_path_length(
 
 # Graph diameter (eager scalar); approximate is a lower-bound estimate.
 def graph_diameter(index: GraphIndex, approximate: bool, direction: str = ...) -> int: ...
-
-# Whole-graph one-row summary -> pyarrow.RecordBatch; "both" reports the
-# undirected n_edges / density / avg_degree.
-def graph_describe(index: GraphIndex, full: bool, direction: str = ...) -> Any: ...
 
 # Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> a
 # list[pyarrow.RecordBatch] of (src, dst[, weight cols by name]). storage_options seeds

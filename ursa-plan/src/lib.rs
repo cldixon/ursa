@@ -27,6 +27,7 @@ pub mod expr;
 pub mod logical;
 pub mod node;
 pub mod physical;
+pub mod plan;
 pub mod planner;
 pub mod query;
 pub mod result;
@@ -39,10 +40,11 @@ pub mod weight;
 pub use logical::{Direction, GraphAlgo};
 pub use node::GraphAlgorithmNode;
 pub use physical::GraphAlgorithmExec;
+pub use plan::{execute_plan, require_index, GraphIndex, Inputs, Plan, PlanError, PlanResult};
 pub use planner::graph_session;
 pub use query::{
     execute_hop_query, execute_join_query, execute_node_query, execute_node_query_cached,
-    execute_path_query, execute_walk_query, hop_reached_nodes, shortest_path_nodes,
+    execute_path_query, execute_walk_query, hop_reached_nodes, shortest_path_nodes, NodeColumn,
 };
 pub use scan::{
     scan_edges_batch, scan_edges_table, scan_edges_topology, scan_nodes_batch, ScanBuildError,

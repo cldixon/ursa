@@ -1,0 +1,77 @@
+{
+ "description": "An unweighted shortest path, ignoring direction.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "ids": [
+    16
+   ]
+  },
+  {
+   "ids": [
+    26
+   ]
+  }
+ ],
+ "plan": {
+  "op": "shortest_path",
+  "edges": {
+   "plan": {
+    "op": "from_arrow",
+    "frame": 1,
+    "src": "src",
+    "dst": "dst"
+   },
+   "frame": 1
+  },
+  "source": 2,
+  "target": 3,
+  "weight": null,
+  "direction": "both"
+ },
+ "expect": {
+  "columns": [
+   "src",
+   "dst",
+   "hop",
+   "cost"
+  ],
+  "rows": [
+   [
+    16,
+    5,
+    0,
+    1.0
+   ],
+   [
+    5,
+    0,
+    1,
+    2.0
+   ],
+   [
+    0,
+    8,
+    2,
+    3.0
+   ],
+   [
+    8,
+    33,
+    3,
+    4.0
+   ],
+   [
+    33,
+    26,
+    4,
+    5.0
+   ]
+  ]
+ }
+}

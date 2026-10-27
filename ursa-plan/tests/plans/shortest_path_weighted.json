@@ -1,0 +1,86 @@
+{
+ "description": "A weighted (Dijkstra) shortest path over string ids.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "lesmis"
+  },
+  {
+   "ids": [
+    "Napoleon"
+   ]
+  },
+  {
+   "ids": [
+    "Javert"
+   ]
+  }
+ ],
+ "plan": {
+  "op": "shortest_path",
+  "edges": {
+   "plan": {
+    "op": "from_arrow",
+    "frame": 1,
+    "src": "src",
+    "dst": "dst"
+   },
+   "frame": 1
+  },
+  "source": 2,
+  "target": 3,
+  "weight": {
+   "kind": "col",
+   "name": "weight"
+  },
+  "direction": "out"
+ },
+ "expect": {
+  "columns": [
+   "src",
+   "dst",
+   "hop",
+   "cost"
+  ],
+  "rows": [
+   [
+    "Napoleon",
+    "Myriel",
+    0,
+    1.0
+   ],
+   [
+    "Myriel",
+    "Valjean",
+    1,
+    6.0
+   ],
+   [
+    "Valjean",
+    "Marguerite",
+    2,
+    7.0
+   ],
+   [
+    "Marguerite",
+    "Fantine",
+    3,
+    9.0
+   ],
+   [
+    "Fantine",
+    "MmeThenardier",
+    4,
+    11.0
+   ],
+   [
+    "MmeThenardier",
+    "Javert",
+    5,
+    12.0
+   ]
+  ]
+ }
+}

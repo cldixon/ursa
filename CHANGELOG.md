@@ -18,6 +18,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- `collect()` now hands the whole query to Rust as one plan. The frame is
+  serialized to a plan IR in `ursa-plan` (`ursa_plan::plan::Plan`), and a single
+  entry point, `execute_plan` (`ursa._ursa.run_plan` in Python), picks which
+  executor runs it and rejects unsupported shapes, with the same error messages
+  as before. The Python layer no longer decides which of the engine's seven entry
+  points to call. Results are unchanged. Caches, subgraph masks, plain-source
+  reads and the steps the engine's tail can't run in written order still run in
+  Python, called back from the executor as it needs them. `run_node_query`,
+  `run_join_query`, `run_hop_query`, `run_path_query`, `run_walk_query` and
+  `graph_describe` are gone from `ursa._ursa`. `ursa-plan` gains plan
+  conformance tests: JSON plans over karate and other small graphs, with
+  expected output recorded from the Python package (#190, part of #189).
 - **Behaviour change:** `louvain` partitions differ from 0.4.1 for the same
   seed. Local moving now revisits only the neighbours of nodes that moved, and a
   level stops when a sweep's worth of work gains less than 1e-7 modularity (with
@@ -65,6 +77,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A graph op over a traversal of a reshaped scan
+  (`ur.pagerank(ur.hop(ur.scan_edges(p).sample(100), 1).from_([1]))`) ran over
+  the whole file's index; it now raises the same `NotImplementedError` as the
+  in-memory equivalent (#190).
 - Graph columns on a 0-row in-memory node frame return an empty frame with the
   table's columns plus the computed ones, instead of raising "No field named
   __ursa_gid" (#153, #182).

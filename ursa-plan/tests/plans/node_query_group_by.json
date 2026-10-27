@@ -1,0 +1,102 @@
+{
+ "description": "group_by().agg() over a graph column, then a sort.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "sort",
+  "input": {
+   "op": "group_by_agg",
+   "input": {
+    "op": "with_columns",
+    "input": {
+     "op": "nodes",
+     "input": {
+      "op": "from_arrow",
+      "frame": 0,
+      "src": "src",
+      "dst": "dst"
+     }
+    },
+    "columns": [
+     {
+      "name": "deg",
+      "expr": {
+       "kind": "graph",
+       "verb": "degree",
+       "edges": {
+        "plan": {
+         "op": "from_arrow",
+         "frame": 1,
+         "src": "src",
+         "dst": "dst"
+        },
+        "frame": 1
+       },
+       "direction": "out"
+      }
+     }
+    ]
+   },
+   "step": 0,
+   "keys": [
+    "deg"
+   ],
+   "aggs": [
+    {
+     "output": "n",
+     "fn": "count",
+     "column": "id"
+    }
+   ]
+  },
+  "step": 1,
+  "by": [
+   {
+    "column": "deg",
+    "descending": false
+   }
+  ]
+ },
+ "expect": {
+  "columns": [
+   "deg",
+   "n"
+  ],
+  "rows": [
+   [
+    0,
+    8
+   ],
+   [
+    1,
+    7
+   ],
+   [
+    2,
+    11
+   ],
+   [
+    3,
+    4
+   ],
+   [
+    5,
+    1
+   ],
+   [
+    8,
+    2
+   ],
+   [
+    16,
+    1
+   ]
+  ]
+ }
+}

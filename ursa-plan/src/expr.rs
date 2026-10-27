@@ -16,11 +16,19 @@
 //! The Python layer builds an [`UrsaExpr`] tree (mirrored across the FFI from
 //! `ursa-py`); [`lower`] walks it to a `datafusion::logical_expr::Expr`, emitting
 //! the graph verbs as the custom logical nodes in [`crate::logical`] instead.
+//!
+//! Graph verbs share the grammar: a `{"kind": "graph", "verb": ...}` node is a
+//! [`GraphVerb`], carrying its parameters and the edge input it runs over (see
+//! [`crate::plan::EdgeInput`]). They never lower to a DataFusion expression; the
+//! plan executor turns them into graph output columns.
 
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr as DfExpr;
 use datafusion::logical_expr::{binary_expr, Operator};
+use serde::Deserialize;
 use serde_json::Value;
+
+use crate::plan::EdgeInput;
 
 /// A node in Ursa's expression dialect. This is the stable, engine-independent
 /// representation the Python bindings construct; `ursa-plan` owns its translation.
@@ -64,8 +72,115 @@ pub enum UrsaExpr {
         operand: Box<UrsaExpr>,
     },
     // Graph verbs (`ur.degree`, `ur.pagerank`, `ur.neighbors(..).agg(..)`, ...) are
-    // not part of this expression enum; they lower to the custom logical nodes in
-    // `crate::logical`/`crate::node` at plan-build time.
+    // [`GraphVerb`] nodes of the same grammar. They have no scalar lowering: the
+    // plan executor turns them into the output columns of a graph node.
+}
+
+/// A graph verb in the expression grammar: `{"kind": "graph", "verb": <name>,
+/// "edges": <edge input>, ...params}`.
+///
+/// `deny_unknown_fields` makes a parameter the Python layer sends but this side
+/// doesn't know a hard error rather than a silent drop. Parameter values are kept
+/// as given and typed where the verb is lowered ([`GraphVerb::param`]), so a
+/// malformed value is reported as an engine error at that point, as it was before
+/// the plan IR. Which parameters a verb accepts is checked by the plan executor.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphVerb {
+    /// The verb's name: `pagerank`, `degree`, `neighbors_agg`, `layout_fr`, ...
+    pub verb: String,
+    /// The edges the verb runs over. `None` only for a malformed expression.
+    #[serde(default)]
+    pub edges: Option<EdgeInput>,
+    #[serde(default)]
+    pub damping: Option<Value>,
+    #[serde(default)]
+    pub max_iter: Option<Value>,
+    #[serde(default)]
+    pub tol: Option<Value>,
+    #[serde(default)]
+    pub direction: Option<Value>,
+    /// `betweenness`: the fraction of sources to sample.
+    #[serde(default)]
+    pub sample: Option<Value>,
+    #[serde(default)]
+    pub resolution: Option<Value>,
+    #[serde(default)]
+    pub seed: Option<Value>,
+    /// A weight expression over edge columns (this grammar, unparsed).
+    #[serde(default)]
+    pub weight: Option<Value>,
+    /// `connected_components`: `"weak"` or `"strong"`, as given. An explicit
+    /// null is kept (`Some(Null)`): it is an invalid mode, not the default.
+    #[serde(default, deserialize_with = "present")]
+    pub mode: Option<Value>,
+    #[serde(default)]
+    pub iterations: Option<Value>,
+    #[serde(default)]
+    pub k: Option<Value>,
+    #[serde(default)]
+    pub gravity: Option<Value>,
+    /// Which output of a multi-output kernel this column takes (#115): 0 = x,
+    /// 1 = y for a layout.
+    #[serde(default)]
+    pub field: Option<Value>,
+    /// Output dtype narrowing (#117): `"f32"` or `"f64"`, as given.
+    #[serde(default)]
+    pub dtype: Option<Value>,
+    /// `neighbors_agg`: the aggregation, `ur.col(<name>).<fn>()`.
+    #[serde(default)]
+    pub agg: Option<Value>,
+    /// `neighbors_agg`: whether `from_=` was given (not supported yet).
+    #[serde(default, rename = "from_")]
+    pub from: Option<bool>,
+}
+
+/// A field that is present (`null` included) deserializes to `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+impl GraphVerb {
+    /// A parameter typed as `T` (`None` when absent or null). A value of the wrong
+    /// type is an engine error, as for any malformed column spec.
+    pub fn param<T: serde::de::DeserializeOwned>(value: &Option<Value>) -> Result<Option<T>> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}"))),
+        }
+    }
+
+    /// The `direction` parameter (`"out"` when absent).
+    pub fn direction(&self) -> Result<String> {
+        Ok(Self::param::<String>(&self.direction)?.unwrap_or_else(|| "out".into()))
+    }
+
+    /// Parse a `{"kind": "graph", ...}` node.
+    pub fn from_value(v: &Value) -> Result<GraphVerb> {
+        let mut v = v.clone();
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("kind");
+        }
+        serde_json::from_value(v)
+            .map_err(|e| DataFusionError::Execution(format!("invalid graph expression: {e}")))
+    }
+
+    /// The aggregation function of a `neighbors_agg` (`mean`, `sum`, ...).
+    pub fn agg_fn(&self) -> Option<&str> {
+        self.agg.as_ref()?.get("fn")?.as_str()
+    }
+
+    /// The attribute column a `neighbors_agg` aggregates, when its operand is a
+    /// plain `ur.col(<name>)`.
+    pub fn agg_column(&self) -> Option<&str> {
+        let operand = self.agg.as_ref()?.get("operand")?;
+        if operand.get("kind")?.as_str()? != "col" {
+            return None;
+        }
+        operand.get("name")?.as_str()
+    }
 }
 
 /// Lower an [`UrsaExpr`] to a DataFusion expression. Covers columns, literals

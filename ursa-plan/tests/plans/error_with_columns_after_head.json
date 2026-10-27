@@ -1,0 +1,47 @@
+{
+ "description": "A relational step before with_columns.",
+ "inputs": [
+  {
+   "nodes": "karate"
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "with_columns",
+  "input": {
+   "op": "head",
+   "input": {
+    "op": "from_arrow",
+    "frame": 0,
+    "id": "id"
+   },
+   "step": 0,
+   "n": 2
+  },
+  "columns": [
+   {
+    "name": "deg",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "from_arrow",
+       "frame": 1,
+       "src": "src",
+       "dst": "dst"
+      },
+      "frame": 1
+     },
+     "direction": "out"
+    }
+   }
+  ]
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "with_columns() after head() is not supported; compute columns first, then head()."
+ }
+}

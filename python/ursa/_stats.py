@@ -63,10 +63,10 @@ def density(edges: EdgeFrame, direction: str = "out") -> float:
     direction (reciprocal and parallel rows collapse, self-loops are dropped):
     ``nx.density(G.to_undirected())`` for a graph without self-loops.
     """
-    from ._execute import _native, _require_index
+    from ._execute import _graph_index, _native
 
     _check_direction("density", direction)
-    return float(_native().graph_density(_require_index(edges), direction))
+    return float(_native().graph_density(_graph_index(edges), direction))
 
 
 def avg_path_length(edges: EdgeFrame, sample: float | None = None, direction: str = "out") -> float:
@@ -75,10 +75,10 @@ def avg_path_length(edges: EdgeFrame, sample: float | None = None, direction: st
     giving ``nx.average_shortest_path_length(G.to_undirected())`` on a connected
     graph. ``sample`` (a fraction in (0, 1]) estimates from a subset of sources;
     omit for the exact mean."""
-    from ._execute import _native, _require_index
+    from ._execute import _graph_index, _native
 
     _check_direction("avg_path_length", direction)
-    return float(_native().graph_avg_path_length(_require_index(edges), sample, direction))
+    return float(_native().graph_avg_path_length(_graph_index(edges), sample, direction))
 
 
 def diameter(edges: EdgeFrame, approximate: bool = True, direction: str = "out") -> int:
@@ -87,7 +87,7 @@ def diameter(edges: EdgeFrame, approximate: bool = True, direction: str = "out")
     ignores direction, giving ``nx.diameter(G.to_undirected())`` on a connected
     graph. ``approximate`` (default) is a lower-bound estimate; pass
     ``approximate=False`` for the exact value."""
-    from ._execute import _native, _require_index
+    from ._execute import _graph_index, _native
 
     _check_direction("diameter", direction)
-    return int(_native().graph_diameter(_require_index(edges), approximate, direction))
+    return int(_native().graph_diameter(_graph_index(edges), approximate, direction))

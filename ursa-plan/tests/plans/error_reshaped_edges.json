@@ -1,0 +1,54 @@
+{
+ "description": "A graph op over a distinct edge frame.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "with_columns",
+  "input": {
+   "op": "nodes",
+   "input": {
+    "op": "distinct",
+    "input": {
+     "op": "from_arrow",
+     "frame": 0,
+     "src": "src",
+     "dst": "dst"
+    },
+    "step": 0
+   }
+  },
+  "columns": [
+   {
+    "name": "degree",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "distinct",
+       "input": {
+        "op": "from_arrow",
+        "frame": 1,
+        "src": "src",
+        "dst": "dst"
+       },
+       "step": 1
+      },
+      "frame": 1
+     },
+     "direction": "out"
+    }
+   }
+  ]
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "graph ops on a distinct/sample/join/group_by-derived edge frame aren't wired yet \u2014 unlike filter (a subgraph view over the parent topology), these reshape the edge set in a way an edge mask can't express. Run the op on the source frame, or collect and re-ingest the derived edges."
+ }
+}

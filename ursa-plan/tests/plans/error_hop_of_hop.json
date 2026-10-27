@@ -1,0 +1,52 @@
+{
+ "description": "A traversal over a traversal result.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "ids": [
+    0
+   ]
+  },
+  {
+   "ids": [
+    1
+   ]
+  }
+ ],
+ "plan": {
+  "op": "hop",
+  "edges": {
+   "plan": {
+    "op": "hop",
+    "edges": {
+     "plan": {
+      "op": "from_arrow",
+      "frame": 2,
+      "src": "src",
+      "dst": "dst"
+     },
+     "frame": 2
+    },
+    "n": 1,
+    "direction": "out",
+    "seeds": 3
+   },
+   "frame": 1
+  },
+  "n": 1,
+  "direction": "out",
+  "seeds": 4
+ },
+ "expect": {
+  "error": "not_implemented",
+  "message": "chaining a traversal (hop/shortest_path) off a traversal result isn't supported \u2014 the inner result's edges are synthetic reached-pairs, not the parent graph. Collect it and re-ingest via ur.from_arrow(...) to traverse further."
+ }
+}

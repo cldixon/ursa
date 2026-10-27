@@ -1,0 +1,93 @@
+{
+ "description": "Weighted PageRank over Les Mis\u00e9rables, top five.",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "lesmis"
+  }
+ ],
+ "plan": {
+  "op": "head",
+  "input": {
+   "op": "sort",
+   "input": {
+    "op": "with_columns",
+    "input": {
+     "op": "nodes",
+     "input": {
+      "op": "from_arrow",
+      "frame": 0,
+      "src": "src",
+      "dst": "dst"
+     }
+    },
+    "columns": [
+     {
+      "name": "pagerank",
+      "expr": {
+       "kind": "graph",
+       "verb": "pagerank",
+       "edges": {
+        "plan": {
+         "op": "from_arrow",
+         "frame": 1,
+         "src": "src",
+         "dst": "dst"
+        },
+        "frame": 1
+       },
+       "damping": 0.85,
+       "max_iter": 30,
+       "tol": 1e-06,
+       "weight": {
+        "kind": "col",
+        "name": "weight"
+       },
+       "dtype": "f64",
+       "direction": "out"
+      }
+     }
+    ]
+   },
+   "step": 0,
+   "by": [
+    {
+     "column": "pagerank",
+     "descending": true
+    }
+   ]
+  },
+  "step": 1,
+  "n": 5
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "pagerank"
+  ],
+  "rows": [
+   [
+    "MmeHucheloup",
+    0.06377292130845318
+   ],
+   [
+    "Joly",
+    0.0468511421824276
+   ],
+   [
+    "Grantaire",
+    0.04630426455175217
+   ],
+   [
+    "Fantine",
+    0.038203994853884704
+   ],
+   [
+    "Bossuet",
+    0.03779035250100435
+   ]
+  ]
+ }
+}
