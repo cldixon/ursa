@@ -227,4 +227,4 @@ if __name__ == "__main__":
     name = sys.argv[2]
     dt = SCENARIOS[name]()
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    print(f"{name}\t{dt:.4f}\t{peak:.0f}", flush=True)
+    print(f"{name}\t{dt:.6g}\t{peak:.0f}", flush=True)
