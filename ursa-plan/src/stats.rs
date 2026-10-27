@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
-use ursa_core::algo::{bfs_distances, connected_components_weak};
+use ursa_core::algo::connected_components_weak;
 use ursa_core::{Direction, Topology};
 
 /// Parse a stat's `direction` argument (`"out"`, `"in"` or `"both"`).
@@ -143,36 +143,89 @@ fn sample_sources(n: usize, frac: Option<f64>) -> Vec<u32> {
     }
 }
 
+/// Reusable per-source BFS scratch for [`bfs_source_scan`]. `touched` lists the
+/// nodes reached from the current source, so the fold and the reset cost
+/// `O(reached)` rather than allocating and scanning a fresh `n`-length distance
+/// array per source.
+struct ScanScratch {
+    dist: Vec<i32>,
+    frontier: Vec<u32>,
+    next: Vec<u32>,
+    touched: Vec<u32>,
+}
+
+/// One source's `(sum, count, max)` over the finite distances `>= 1`, on reusable
+/// scratch (clean on entry, reset to clean on exit). The distances are integers,
+/// so the `f64` sum is exact and summing the reached set in discovery order
+/// matches the original `0..n` scan.
+fn bfs_fold_one(topo: &Topology, s: u32, dir: Direction, sc: &mut ScanScratch) -> (f64, u64, i32) {
+    let ScanScratch {
+        dist,
+        frontier,
+        next,
+        touched,
+    } = sc;
+    dist[s as usize] = 0;
+    frontier.push(s);
+    let mut level = 1i32;
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    let mut max = 0i32;
+    while !frontier.is_empty() {
+        next.clear();
+        for &u in frontier.iter() {
+            topo.for_each_neighbor(u, dir, None, |v| {
+                if dist[v as usize] < 0 {
+                    dist[v as usize] = level;
+                    next.push(v);
+                }
+            });
+        }
+        if !next.is_empty() {
+            sum += level as f64 * next.len() as f64;
+            count += next.len() as u64;
+            max = level;
+        }
+        touched.extend_from_slice(next);
+        level += 1;
+        std::mem::swap(frontier, next);
+    }
+    dist[s as usize] = -1;
+    for &v in touched.iter() {
+        dist[v as usize] = -1;
+    }
+    touched.clear();
+    frontier.clear();
+    next.clear();
+    (sum, count, max)
+}
+
 /// Run BFS from each source and fold the finite distances (`>= 1`, i.e. reachable
 /// and not the source itself). Returns `(sum, count, max)` over all reachable
 /// ordered pairs from the sampled sources — the shared core of both path stats.
 ///
 /// Each source's BFS is independent (O(n·m) overall), so they run in parallel
-/// (rayon). Per-source partials are collected in source order and then folded
-/// sequentially, so the `sum` is reduced in a fixed order — the total is
-/// deterministic run to run regardless of thread scheduling.
+/// (rayon), each rayon worker reusing one [`ScanScratch`]. Per-source partials are
+/// collected in source order and then folded sequentially, so the `sum` is reduced
+/// in a fixed order — the total is deterministic run to run regardless of thread
+/// scheduling.
 fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u64, i32) {
     if dir != Direction::Out {
         // Build the cached transpose once, before the parallel scan requests it.
         topo.incoming();
     }
+    let n = topo.n_nodes();
     let partials: Vec<(f64, u64, i32)> = sources
         .par_iter()
-        .map(|&s| {
-            let mut sum = 0.0f64;
-            let mut count = 0u64;
-            let mut max = 0i32;
-            for d in bfs_distances(topo, s, dir) {
-                if d >= 1 {
-                    sum += d as f64;
-                    count += 1;
-                    if d > max {
-                        max = d;
-                    }
-                }
-            }
-            (sum, count, max)
-        })
+        .map_init(
+            || ScanScratch {
+                dist: vec![-1i32; n],
+                frontier: Vec::new(),
+                next: Vec::new(),
+                touched: Vec::new(),
+            },
+            |sc, &s| bfs_fold_one(topo, s, dir, sc),
+        )
         .collect();
 
     let mut sum = 0.0f64;
@@ -369,6 +422,46 @@ mod tests {
             .abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn path_scan_matches_a_full_distance_fold() {
+        // The scratch-reusing scan must fold to exactly what a fresh `bfs_distances`
+        // per source, scanned over all `n`, gives — sparse and dense, every direction.
+        use ursa_core::algo::bfs_distances;
+        for (n, m) in [(3000i64, 2500usize), (300, 3000)] {
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as i64
+            };
+            let (mut src, mut dst) = (Vec::new(), Vec::new());
+            for _ in 0..m {
+                src.push(next() % n);
+                dst.push(next() % n);
+            }
+            let t = topo(&src, &dst);
+            let sources: Vec<u32> = (0..t.n_nodes() as u32).collect();
+            for dir in [Direction::Out, Direction::In, Direction::Both] {
+                let (mut sum, mut count, mut max) = (0.0f64, 0u64, 0i32);
+                for &s in &sources {
+                    let mut ps = 0.0f64;
+                    for d in bfs_distances(&t, s, dir) {
+                        if d >= 1 {
+                            ps += d as f64;
+                            count += 1;
+                            max = max.max(d);
+                        }
+                    }
+                    sum += ps;
+                }
+                let got = bfs_source_scan(&t, &sources, dir);
+                assert_eq!(got.0.to_bits(), sum.to_bits(), "{dir:?}");
+                assert_eq!((got.1, got.2), (count, max), "{dir:?}");
+            }
+        }
     }
 
     #[test]
