@@ -246,3 +246,34 @@ machine-specific; commit curated Markdown leaderboards, not per-box Parquet).
 - **Convergence tolerance.** Timing uses a realistic fixed iteration budget for
   PageRank, so three implementations converge to *slightly* different points; the
   correctness tolerance accommodates that drift while still catching real bugs.
+
+## Plan-layer matrix (`plan_matrix/`)
+
+The harness above races Ursa against other libraries, one kernel at a time. The
+plan matrix instead compares **two builds of Ursa** on the paths between the
+kernels: index builds, cached weights, masks and symmetric views, attribute
+attach, relational tails, per-collect overhead, and one pipeline that exercises
+all of them. It is the before/after gate for changes to `ursa-plan`,
+`ursa-py` and `python/ursa` (#189). There are 21 scenarios, each in its own
+process, recording time and peak RSS.
+
+```bash
+cd benchmarks/plan_matrix
+python gen.py data                              # ~470 MB of seeded Parquet, once
+
+# Install each build into its own environment, e.g. from a wheel:
+#   maturin build --release -o wheels/<label>  (in a checkout of that commit)
+#   uv venv .venv-<label> && uv pip install -p .venv-<label> pyarrow numpy wheels/<label>/*.whl
+python run.py --label main    --python .venv-main/bin/python
+python run.py --label branch  --python .venv-branch/bin/python
+python run.py --label main.r2 --python .venv-main/bin/python    # the noise floor
+
+python report.py results.tsv --base main --base main.r2 --vs branch
+```
+
+The report gives each scenario's speedup against the faster baseline run, and
+the spread between the two baseline runs. On a shared 4-core VM a single
+scenario can swing 20–25% between identical runs, so treat a difference smaller
+than that scenario's noise as unconfirmed. A full pass takes about 6 minutes on
+`main` (Louvain at 500k edges dominates before #185, about 2 minutes) and
+about 3 minutes after.
