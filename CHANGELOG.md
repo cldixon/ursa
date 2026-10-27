@@ -8,6 +8,75 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Added
+
+- Criterion micro-benchmarks for the `ursa-core` kernels (`cargo bench -p
+  ursa-core`, `ursa-core/benches/kernels.rs`): topology build and views, id
+  interning, and every kernel family on seeded Erdős–Rényi and R-MAT graphs up
+  to 1M edges. A `Bench` workflow runs them weekly and on demand;
+  `benchmarks/README.md` describes comparing two commits (#187).
+
+### Changed
+
+- **Behaviour change:** `louvain` partitions differ from 0.4.1 for the same
+  seed. Local moving now revisits only the neighbours of nodes that moved, and a
+  level stops when a sweep's worth of work gains less than 1e-7 modularity (with
+  a hard cap of 64 sweeps' worth), instead of sweeping until no node moves.
+  Modularity is equal or higher on most graphs; results stay deterministic for a
+  given seed and identical on any thread count. Louvain is now near-linear in
+  graph size: 1M edges takes 2.2s, down from about 6 minutes (#125, #185).
+- Faster and leaner; outputs are byte-identical unless noted. Timings on a
+  4-core machine:
+  - Repeated weighted collects over a `scan_edges` frame no longer rescan the
+    file and rebuild the index. The evaluated `weight=` vector is cached on the
+    index (up to two expressions), so a repeat skips the read entirely: weighted
+    PageRank over a 10M-edge scan, 2.2s to 1.4s, and peak memory 1.0 to 0.68 GB
+    (#179).
+  - `direction="both"` builds its symmetric graph once per index, straight from
+    the cached undirected adjacency, and it is its own transpose; the weighted
+    view is built flat and shared within a query. PageRank with
+    `direction="both"` on 10M edges: 0.91s to 0.34s; weighted, 4.3s to 1.4s and
+    1.9 to 1.2 GB peak (#180).
+  - A filtered or traversal-result edge frame computes its edge mask once and
+    reuses it on later collects: a repeated masked `degree` over a 10M-edge scan,
+    0.19s to 0.03s (#181).
+  - Graph columns on a node attribute frame are attached by a dense-id gather
+    instead of a hash join and a re-sort into table order: degree onto a
+    1M-node table, 0.10s to 0.02s (#182). A float `group_by().agg(mean)` over
+    such a frame now sums in table order; it previously followed the join's
+    emit order, which varied in the last bits between runs.
+  - Queries and scans reuse their DataFusion session, and scans of one object
+    store with the same `storage_options` reuse one client and its connection
+    pool. Local Parquet footers and statistics are cached across collects and
+    revalidated by size and modification time, so a file rewritten in place is
+    read afresh (#183).
+  - Weighted closeness sums only the nodes each source reaches, so sparse
+    graphs no longer pay O(n²): 80k nodes, 1.27s to 0.23s. `avg_path_length`
+    and `diameter` reuse per-thread BFS scratch: about 12× faster on sparse
+    graphs. Betweenness reduces its partial sums in bounded windows, so exact
+    runs no longer hold O(sources/64 × n) memory; small samples run their
+    sources in parallel, and unweighted Brandes reads predecessors from the
+    in-adjacency (#184).
+  - Building the index over compact integer ids (`0..n`, or any dense range, in
+    any order) interns through a direct table instead of a hash map: about 1.4×
+    faster in memory and up to 1.7× from a Parquet scan, with a smaller id map.
+    Sparse ids switch to the hash map automatically. Id lookups over columns with
+    no nulls skip per-row null checks (#186).
+
+### Fixed
+
+- Graph columns on a 0-row in-memory node frame return an empty frame with the
+  table's columns plus the computed ones, instead of raising "No field named
+  __ursa_gid" (#153, #182).
+
+### Security
+
+- Bumped `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382) and `tokio`
+  1.53.1 → 1.54.1 (RUSTSEC-2026-0386). RUSTSEC-2026-0391/0398/0403/0410 in
+  `zstd` 0.13 are waived in `deny.toml`: the fixes need zstd 0.14, which arrow,
+  parquet and DataFusion 54 do not accept yet, and none of the affected code is
+  reached (#188).
+
 ## [0.4.1] — 2026-10-19
 
 ### Fixed
