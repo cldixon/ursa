@@ -1473,11 +1473,8 @@ fn scalar_expr(frame: &Frame, v: &Value, roles: &Roles, what: &str) -> PlanResul
         .into_iter()
         .filter(|c| !frame.has_column(c))
         .collect();
-    if !missing.is_empty() {
-        return Err(PlanError::ColumnNotFound(format!(
-            "{what} references unknown column(s): {}",
-            py_list(missing.iter())
-        )));
+    if let Some(c) = missing.first() {
+        return Err(unknown_column(what, c, &frame.names()));
     }
     let e = crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?;
     Ok(crate::compare::resolve_comparisons(e, frame.df_schema())?)
@@ -2407,16 +2404,8 @@ fn lower_steps(
             }
             Plan::Select { columns, .. } => select(frame, columns, roles)?,
             Plan::Rename { mapping, .. } => {
-                let missing: Vec<&String> = mapping
-                    .iter()
-                    .map(|(old, _)| old)
-                    .filter(|old| !frame.has_column(old))
-                    .collect();
-                if !missing.is_empty() {
-                    return Err(PlanError::ColumnNotFound(format!(
-                        "rename() references unknown column(s): {}",
-                        py_list(missing.into_iter())
-                    )));
+                if let Some((old, _)) = mapping.iter().find(|(old, _)| !frame.has_column(old)) {
+                    return Err(unknown_column("rename()", old, &frame.names()));
                 }
                 if !mapping.is_empty() {
                     frame.rename(mapping)?;
@@ -2494,11 +2483,8 @@ fn select(frame: &mut Frame, items: &[SelectItem], roles: &Roles) -> PlanResult<
             _ => None,
         })
         .collect();
-    if !missing.is_empty() {
-        return Err(PlanError::ColumnNotFound(format!(
-            "select() references unknown column(s): {}",
-            py_list(missing.into_iter())
-        )));
+    if let Some(c) = missing.first() {
+        return Err(unknown_column("select()", c, &frame.names()));
     }
     let mut exprs = Vec::with_capacity(items.len());
     for item in items {
@@ -2551,10 +2537,7 @@ fn sort_keys(frame: &Frame, by: &[SortKey], roles: &Roles) -> PlanResult<Vec<(Df
     for k in by {
         if let Some(c) = &k.column {
             if !frame.has_column(c) {
-                return Err(PlanError::Value(format!(
-                    "sort references unknown column {}.",
-                    py_str(c)
-                )));
+                return Err(unknown_column("sort()", c, &frame.names()));
             }
         }
     }
@@ -2579,18 +2562,12 @@ fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<
     use datafusion::functions_aggregate::expr_fn::{avg, count, count_distinct, max, min, sum};
     for k in keys {
         if !frame.has_column(k) {
-            return Err(PlanError::Value(format!(
-                "group_by() references unknown column {}.",
-                py_str(k)
-            )));
+            return Err(unknown_column("group_by()", k, &frame.names()));
         }
     }
     for a in aggs {
         if !frame.has_column(&a.column) {
-            return Err(PlanError::Value(format!(
-                "agg() references unknown column {}.",
-                py_str(&a.column)
-            )));
+            return Err(unknown_column("agg()", &a.column, &frame.names()));
         }
     }
     use crate::agg::{float_agg, has_nulls, FloatAgg};
@@ -2677,9 +2654,10 @@ fn host_check(
 ) -> PlanResult<()> {
     let has = |name: &str| schema.is_none_or(|s| s.index_of(name).is_ok());
     let unknown = |name: &str| {
-        Err(PlanError::Value(format!(
-            "filter references unknown column '{name}'."
-        )))
+        let names: Vec<String> = schema
+            .map(|s| s.fields().iter().map(|f| f.name().clone()).collect())
+            .unwrap_or_default();
+        Err(unknown_column("filter()", name, &names))
     };
     let k = kind(v);
     match k {
@@ -2945,6 +2923,16 @@ fn value_columns(v: &Value, roles: &Roles) -> BTreeSet<String> {
         _ => {}
     }
     out
+}
+
+/// The error for a step that names a column the frame doesn't have (Python's
+/// `ColumnNotFoundError`, which is also a `ValueError`), with the columns it has.
+fn unknown_column(step: &str, name: &str, available: &[String]) -> PlanError {
+    PlanError::ColumnNotFound(format!(
+        "{step} references unknown column {}; the frame has {}.",
+        py_str(name),
+        py_list(available.iter())
+    ))
 }
 
 // --- Python-compatible message formatting --------------------------------------

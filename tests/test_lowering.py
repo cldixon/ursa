@@ -254,3 +254,29 @@ def test_stacked_distincts_and_groups_on_an_engine_frame():
     assert frame.distinct().select("c").distinct().collect().to_dicts() == [{"c": "x"}, {"c": "y"}]
     grouped = frame.group_by("c").agg(n=col("id").count()).distinct().distinct()
     assert grouped.collect().to_dicts() == [{"c": "x", "n": 4}, {"c": "y", "n": 4}]
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_unknown_columns_raise_column_not_found_on_every_step(engine):
+    # One class and one message shape on every frame; ColumnNotFoundError is also
+    # a ValueError, as the plain frame's errors were.
+    assert issubclass(ur.ColumnNotFoundError, ValueError)
+    assert issubclass(ur.ColumnNotFoundError, ur.UrsaError)
+    frame = ur.from_arrow(NODES, id="id")
+    if engine:
+        frame = frame.with_columns(deg=ur.degree(_graph()))
+    steps = {
+        "filter()": lambda f: f.filter(col("nope") > 1),
+        "select()": lambda f: f.select("id", "nope"),
+        "rename()": lambda f: f.rename({"nope": "x"}),
+        "sort()": lambda f: f.sort(["v", "nope"]),
+        "group_by()": lambda f: f.group_by("nope").agg(n=col("v").count()),
+        "agg()": lambda f: f.group_by("c").agg(n=col("nope").count()),
+        "with_columns()": lambda f: f.with_columns(w=col("nope") + 1),
+    }
+    for step, build in steps.items():
+        with pytest.raises(ur.ColumnNotFoundError) as exc:
+            build(frame).collect()
+        message = str(exc.value)
+        assert message.startswith(f"{step} references unknown column 'nope'; the frame has ")
+        assert "'id'" in message

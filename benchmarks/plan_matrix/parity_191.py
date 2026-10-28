@@ -293,7 +293,16 @@ def load(path: str) -> dict:
 PLAIN_FRAMES = ("plain", "scan", "edges_plain", "edges_scan")
 
 
+def unknown_column(y: dict) -> bool:
+    """The branch raised the one unknown-column error."""
+    return y.get("error") == "ColumnNotFoundError" and "references unknown column" in y.get(
+        "message", ""
+    )
+
+
 def category(x: dict, y: dict, frame: str, steps: list[str]) -> str:
+    if "error" in x and unknown_column(y):
+        return "unknown column: ColumnNotFoundError, one message"
     if "error" in x and "error" in y:
         return "error class/text (engine frame: now the plain frame's)"
     if "error" in x:
@@ -345,6 +354,8 @@ def compare(main_path: str, branch_path: str) -> None:
             ref["identical"] += 1
         elif norm(x) == norm(y):
             ref["identical but the id/src/dst nullability (from_arrow relaxes it)"] += 1
+        elif "error" in x and unknown_column(y):
+            ref["unknown column: ColumnNotFoundError, one message"] += 1
         elif any(s in ("sort_f", "sort_f_d") for s in steps):
             ref["#201 float sort"] += 1
         elif k.startswith("scan_graph|e_"):

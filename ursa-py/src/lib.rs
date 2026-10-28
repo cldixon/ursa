@@ -63,12 +63,45 @@ create_exception!(
     PyException,
     "Base class for every error Ursa raises from native execution."
 );
-create_exception!(
-    _ursa,
-    ColumnNotFoundError,
-    UrsaError,
-    "A query referenced a column that does not exist in the frame."
-);
+/// `ColumnNotFoundError`: a query referenced a column that does not exist in
+/// the frame. It subclasses both `UrsaError` and `ValueError` (so `except
+/// ValueError` written for the errors plain frames raised keeps working), which
+/// `create_exception!` can't express: the class is built once, with `type()`.
+static COLUMN_NOT_FOUND: pyo3::sync::PyOnceLock<Py<pyo3::types::PyType>> =
+    pyo3::sync::PyOnceLock::new();
+
+fn column_not_found_type(py: Python<'_>) -> PyResult<&Bound<'_, pyo3::types::PyType>> {
+    let ty = COLUMN_NOT_FOUND.get_or_try_init(py, || -> PyResult<_> {
+        let bases = (
+            py.get_type::<UrsaError>(),
+            py.get_type::<pyo3::exceptions::PyValueError>(),
+        );
+        let ns = pyo3::types::PyDict::new(py);
+        ns.set_item("__module__", "ursa._ursa")?;
+        ns.set_item(
+            "__doc__",
+            "A query referenced a column that does not exist in the frame.",
+        )?;
+        let ty = py
+            .get_type::<pyo3::types::PyType>()
+            .call1(("ColumnNotFoundError", bases, ns))?;
+        Ok(ty.cast_into::<pyo3::types::PyType>()?.unbind())
+    })?;
+    Ok(ty.bind(py))
+}
+
+/// A `ColumnNotFoundError` carrying `msg`.
+struct ColumnNotFoundError;
+
+impl ColumnNotFoundError {
+    fn new_err(msg: impl Into<String>) -> PyErr {
+        let msg = msg.into();
+        Python::attach(|py| match column_not_found_type(py) {
+            Ok(ty) => PyErr::from_type(ty.clone(), msg),
+            Err(e) => e,
+        })
+    }
+}
 create_exception!(
     _ursa,
     ComputeError,
@@ -483,10 +516,7 @@ fn __core_version() -> &'static str {
 fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the exception hierarchy (see the `create_exception!` block above)
     m.add("UrsaError", m.py().get_type::<UrsaError>())?;
-    m.add(
-        "ColumnNotFoundError",
-        m.py().get_type::<ColumnNotFoundError>(),
-    )?;
+    m.add("ColumnNotFoundError", column_not_found_type(m.py())?)?;
     m.add("ComputeError", m.py().get_type::<ComputeError>())?;
     m.add_function(wrap_pyfunction!(__core_version, m)?)?;
     // the cached graph index (built once per frame)

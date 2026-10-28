@@ -7,7 +7,7 @@ The engine raises one of three exception types. They are ordinary exceptions, so
 | Type | Raised when |
 |---|---|
 | `ur.UrsaError` | The base class. Catch it to catch every engine error. |
-| `ur.ColumnNotFoundError` | A query names a column that the frame does not have. A subclass of `UrsaError`. |
+| `ur.ColumnNotFoundError` | A step names a column that the frame does not have: a `filter`, `select`, `with_columns`, `rename`, `sort`, `group_by` or `agg`. The message has one shape, `sort() references unknown column 'x'; the frame has [...]`. A subclass of both `UrsaError` and `ValueError`. |
 | `ur.ComputeError` | A computation fails: an invalid parameter, an unsupported operation, or a kernel error. A subclass of `UrsaError`. |
 
 ```py
@@ -24,7 +24,7 @@ The message names the column or the parameter, and says what is valid.
 | Type | Raised when |
 |---|---|
 | `NotImplementedError` | The plan has a step, or a combination of steps, that does not run yet. See [Limits](../limits.md). |
-| `ValueError` | An argument is invalid before the plan runs: an unknown `on_null` value, an edge tuple of the wrong length, a filter on a column the frame does not have, or two aggregations with one name. |
+| `ValueError` | An argument is invalid before the plan runs: an unknown `on_null` value, an edge tuple of the wrong length, or two aggregations with one name. A `ColumnNotFoundError` is a `ValueError` too. |
 | `ModuleNotFoundError` | `to_polars()` is called without `polars` installed. The message names the `ursa-graph[polars]` extra. |
 | `RuntimeError` | A dataset download fails. See [Datasets](datasets.md#the-download-cache). |
 

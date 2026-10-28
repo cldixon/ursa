@@ -178,7 +178,9 @@ def test_a_kernel_type_mismatch_is_a_compute_error():
         match=r"Function 'equal' has no kernel matching input types \(int64, string\)",
     ):
         nodes.filter(ur.col("i") == "x").collect()
-    with pytest.raises(ValueError, match="filter references unknown column 'nope'"):
+    with pytest.raises(
+        ur.ColumnNotFoundError, match=r"filter\(\) references unknown column 'nope'"
+    ):
         nodes.filter(ur.col("nope") > 1).collect()
 
 

@@ -164,12 +164,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   graph algorithm, a traversal or a join) than on a plain frame, depending on
   where it fell in the fixed-order tail. Every step now has the plain frame's
   semantics:
-  - `sample(n, seed=)` picks rows with the stdlib's seeded generator over the
-    row positions, as a plain frame always did, so the same rows and seed give
-    the same picks on every frame. An engine frame used a content-ordered
-    generator of its own, so its picks for a given seed change. Any seed Python's
-    `random` accepts now works there too (it raised for a negative, string or
-    very large seed).
+  - `sample(seed=)` after a graph algorithm, join or group_by now picks the
+    same rows as on a plain frame; picks for a given seed differ from 0.4.x.
+    Rows are drawn with the stdlib's seeded generator over the row positions,
+    so any seed Python's `random` accepts works there too (a negative, string
+    or very large seed used to raise).
   - `group_by().agg()` float `sum`, `mean`, `min` and `max` follow pyarrow's
     rules on every frame: values are added in input order, `min`/`max` skip NaN
     unless every value is NaN, and ties keep the first value. On an engine
@@ -178,10 +177,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - Every `group_by().agg()` output column is nullable, as on a plain frame (an
     engine frame marked `count`, `n_unique` and keys that held no null as
     non-nullable).
-  - An unknown column in `sort`, `rename`, `group_by` or `agg` raises the plain
-    frame's error on every frame: `ValueError` (`sort references unknown column
-    'x'.`), or `ColumnNotFoundError` for `rename` and `select`. An engine frame
-    raised `ColumnNotFoundError` or `ComputeError` with DataFusion's message.
+  - An unknown column raises `ColumnNotFoundError` on every frame and every
+    step (`filter`, `select`, `with_columns`, `rename`, `sort`, `group_by`,
+    `agg`), with one message shape: `sort() references unknown column 'x'; the
+    frame has ['a', 'b'].` Before, the class depended on the step and the frame:
+    `ValueError`, `ColumnNotFoundError` or `ComputeError`, with differing
+    messages. `ColumnNotFoundError` now subclasses `ValueError` as well as
+    `UrsaError`, so `except ValueError` still catches it.
   - `head(n)` with a negative `n` keeps no rows on every frame; an engine frame
     raised `OverflowError`.
 
@@ -192,7 +194,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   keep input order. A NaN with the sign bit set, the usual result of `0/0`,
   used to sort before every number after a graph algorithm or a join. A
   descending sort now puts NaN first on every frame; a plain frame used to put
-  it last in either direction. Nulls still come last.
+  it last in either direction. Nulls still come last. For `r = [1.0, NaN, None,
+  2.0]`, `sort("r", descending=True)` was `2.0, 1.0, NaN, None` on a plain frame
+  and is now `NaN, 2.0, 1.0, None`.
 - On a frame the engine ran (after a graph algorithm or a join), a second
   `distinct()` over a dictionary-encoded (categorical) column could return
   duplicate rows (`f.distinct().select("c").distinct()`), and a `distinct()`
