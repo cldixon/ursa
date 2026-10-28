@@ -67,8 +67,8 @@ Without a `sort`, rows come back in input order, the same on every run and every
 
 | Method | Description |
 |---|---|
-| `.with_columns(**exprs)` | Adds one column per keyword. Each value is an [expression](expressions.md) or an algorithm. Existing columns stay. |
-| `.select(*columns)` | Keeps only the named columns, in the given order. Each item is a name or `ur.col(name)`. Call it after `with_columns`. |
+| `.with_columns(**exprs)` | Adds one column per keyword. Each value is an [expression](expressions.md) or an algorithm, computed over the rows the steps before it leave. A keyword that names an existing column replaces it in place; other columns stay. An algorithm's column attaches to the rows by the node id column. |
+| `.select(*columns)` | Keeps only the given columns, in the given order. Each item is a name, `ur.col(name)`, or an [expression](expressions.md), named by its `.alias()` or else by its first column. |
 | `.rename({old: new, ...})` | Renames columns. |
 
 ### Rows
@@ -76,7 +76,7 @@ Without a `sort`, rows come back in input order, the same on every run and every
 | Method | Description |
 |---|---|
 | `.filter(predicate)` | Keeps the rows where the [expression](expressions.md) is true. On an `EdgeFrame` before `nodes()`, the filter selects a subgraph. |
-| `.sort(by, *more_by, descending=False)` | Sorts by one or more columns. `by` is a column name or a list of names, and `more_by` adds more. Later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column. The sort is stable: rows that tie on every column keep their input order, on every run. After a graph algorithm that is node order, or the attribute table's row order when the frame has one; after a traversal it is the traversal's own output order. |
+| `.sort(by, *more_by, descending=False)` | Sorts by one or more columns or [expressions](expressions.md). `by` is a column name, an expression, or a list of them, and `more_by` adds more. Later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column. A float column sorts NaN above every number, whatever its sign bit, and `-0.0` equal to `0.0` (see [NaN in comparisons](../semantics.md#nan-in-comparisons-and-sorts)). The sort is stable: rows that tie on every column keep their input order, on every run. After a graph algorithm that is node order, or the attribute table's row order when the frame has one; after a traversal it is the traversal's own output order. |
 | `.head(n=10)` | Keeps the first `n` rows. `.limit(n)` is the same method. |
 | `.distinct()` | Removes duplicate rows. |
 | `.sample(n, *, seed=None)` | Keeps `n` random rows. `seed` makes the choice reproducible. |

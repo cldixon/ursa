@@ -23,10 +23,12 @@
 //! `OptimizerRule`s (filter-before-traversal, segmented-reduction fusion) are the
 //! remaining planned work; execution is correct without them.
 
+pub mod agg;
 pub mod compare;
 pub mod eval;
 pub mod expr;
 pub mod logical;
+pub mod lower;
 pub mod node;
 pub mod physical;
 pub mod plan;
@@ -44,10 +46,7 @@ pub use node::GraphAlgorithmNode;
 pub use physical::GraphAlgorithmExec;
 pub use plan::{execute_plan, require_index, GraphIndex, Inputs, Plan, PlanError, PlanResult};
 pub use planner::graph_session;
-pub use query::{
-    execute_hop_query, execute_join_query, execute_node_query, execute_node_query_cached,
-    execute_path_query, execute_walk_query, NodeColumn,
-};
+pub use query::NodeColumn;
 pub use scan::{
     scan_edges_batch, scan_edges_table, scan_edges_topology, scan_nodes_batch, ScanBuildError,
     ScannedTopology,

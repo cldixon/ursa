@@ -25,10 +25,10 @@ use crate::expr::{lower, parse_ursa_expr};
 pub type Compiled = Arc<dyn PhysicalExpr>;
 
 /// The session predicates are planned on: type coercion and constant folding,
-/// with no state of its own, so one is shared.
+/// with no state of its own, so one is shared (the query session's).
 fn session() -> &'static SessionContext {
     static CTX: OnceLock<SessionContext> = OnceLock::new();
-    CTX.get_or_init(SessionContext::new)
+    CTX.get_or_init(crate::planner::graph_session)
 }
 
 /// Compile a predicate (its JSON, role references already resolved) against
@@ -41,6 +41,11 @@ pub fn compile(predicate: &Value, schema: &SchemaRef) -> Result<Compiled> {
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
     let expr = logical(predicate, &df_schema)?;
     session().create_physical_expr(expr, &df_schema)
+}
+
+/// A lowered expression compiled against `schema` (type coercion included).
+pub fn physical(expr: Expr, schema: &DFSchema) -> Result<Compiled> {
+    session().create_physical_expr(expr, schema)
 }
 
 /// The predicate as a logical expression over `schema` (for a scan to push down).
@@ -83,22 +88,25 @@ pub fn filter_batches(
     batches: Vec<RecordBatch>,
     predicates: &[Compiled],
 ) -> Result<Vec<RecordBatch>> {
+    use rayon::prelude::*;
     let Some(schema) = batches.first().map(|b| b.schema()) else {
         return Ok(batches);
     };
-    let mut out = Vec::with_capacity(batches.len());
-    for mut batch in batches {
-        for p in predicates {
-            if batch.num_rows() == 0 {
-                break;
+    // Batch by batch, in parallel; the batches keep their order.
+    let filtered: Vec<RecordBatch> = batches
+        .into_par_iter()
+        .map(|mut batch| {
+            for p in predicates {
+                if batch.num_rows() == 0 {
+                    break;
+                }
+                let keep = evaluate(p, &batch)?;
+                batch = filter_record_batch(&batch, &keep)?;
             }
-            let keep = evaluate(p, &batch)?;
-            batch = filter_record_batch(&batch, &keep)?;
-        }
-        if batch.num_rows() > 0 {
-            out.push(batch);
-        }
-    }
+            Ok(batch)
+        })
+        .collect::<Result<_>>()?;
+    let mut out: Vec<RecordBatch> = filtered.into_iter().filter(|b| b.num_rows() > 0).collect();
     if out.is_empty() {
         out.push(RecordBatch::new_empty(schema));
     }

@@ -32,7 +32,6 @@ use pyo3::exceptions::{
     PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 use std::sync::Arc;
 
@@ -40,8 +39,7 @@ use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 
 use ursa_plan::plan::{
-    count_topology_build, execute, topology_builds, EdgeInput, HostError, HostRows, Roles, Rows,
-    Slot,
+    count_topology_build, execute, topology_builds, EdgeInput, HostError, HostRows, Rows, Slot,
 };
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, diameter, parse_stat_direction,
@@ -65,12 +63,45 @@ create_exception!(
     PyException,
     "Base class for every error Ursa raises from native execution."
 );
-create_exception!(
-    _ursa,
-    ColumnNotFoundError,
-    UrsaError,
-    "A query referenced a column that does not exist in the frame."
-);
+/// `ColumnNotFoundError`: a query referenced a column that does not exist in
+/// the frame. It subclasses both `UrsaError` and `ValueError` (so `except
+/// ValueError` written for the errors plain frames raised keeps working), which
+/// `create_exception!` can't express: the class is built once, with `type()`.
+static COLUMN_NOT_FOUND: pyo3::sync::PyOnceLock<Py<pyo3::types::PyType>> =
+    pyo3::sync::PyOnceLock::new();
+
+fn column_not_found_type(py: Python<'_>) -> PyResult<&Bound<'_, pyo3::types::PyType>> {
+    let ty = COLUMN_NOT_FOUND.get_or_try_init(py, || -> PyResult<_> {
+        let bases = (
+            py.get_type::<UrsaError>(),
+            py.get_type::<pyo3::exceptions::PyValueError>(),
+        );
+        let ns = pyo3::types::PyDict::new(py);
+        ns.set_item("__module__", "ursa._ursa")?;
+        ns.set_item(
+            "__doc__",
+            "A query referenced a column that does not exist in the frame.",
+        )?;
+        let ty = py
+            .get_type::<pyo3::types::PyType>()
+            .call1(("ColumnNotFoundError", bases, ns))?;
+        Ok(ty.cast_into::<pyo3::types::PyType>()?.unbind())
+    })?;
+    Ok(ty.bind(py))
+}
+
+/// A `ColumnNotFoundError` carrying `msg`.
+struct ColumnNotFoundError;
+
+impl ColumnNotFoundError {
+    fn new_err(msg: impl Into<String>) -> PyErr {
+        let msg = msg.into();
+        Python::attach(|py| match column_not_found_type(py) {
+            Ok(ty) => PyErr::from_type(ty.clone(), msg),
+            Err(e) => e,
+        })
+    }
+}
 create_exception!(
     _ursa,
     ComputeError,
@@ -365,22 +396,9 @@ impl Inputs for PyInputs {
         self.call("seeds", (slot,), array_from_pyarrow)
     }
 
-    fn apply_steps(&self, rows: Rows, steps: &[&Plan], roles: &Roles) -> PlanResult<Rows> {
-        let handles: Vec<Slot> = steps.iter().filter_map(|s| s.step()).collect();
-        Python::attach(|py| {
-            let call = || -> PyResult<Rows> {
-                let roles_dict = PyDict::new(py);
-                for (role, column) in roles {
-                    roles_dict.set_item(*role, column)?;
-                }
-                let rows = rows_to_python(py, rows)?;
-                let out = self
-                    .host
-                    .bind(py)
-                    .call_method1("apply_steps", (rows, handles, roles_dict))?;
-                host_rows(&out)
-            };
-            call().map_err(|e| host_err(py, e))
+    fn sample(&self, step: Slot, rows: usize) -> PlanResult<Option<Vec<usize>>> {
+        self.call("sample", (step, rows), |obj| {
+            obj.extract::<Option<Vec<usize>>>()
         })
     }
 
@@ -498,10 +516,7 @@ fn __core_version() -> &'static str {
 fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the exception hierarchy (see the `create_exception!` block above)
     m.add("UrsaError", m.py().get_type::<UrsaError>())?;
-    m.add(
-        "ColumnNotFoundError",
-        m.py().get_type::<ColumnNotFoundError>(),
-    )?;
+    m.add("ColumnNotFoundError", column_not_found_type(m.py())?)?;
     m.add("ComputeError", m.py().get_type::<ComputeError>())?;
     m.add_function(wrap_pyfunction!(__core_version, m)?)?;
     // the cached graph index (built once per frame)

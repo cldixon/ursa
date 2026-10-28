@@ -109,11 +109,13 @@ def test_select_column_order_is_respected(tmp_path):
     assert df.columns == ["indeg", "id"]
 
 
-def test_with_columns_after_select_is_rejected(tmp_path):
+def test_with_columns_after_select(tmp_path):
+    # with_columns after another step computes over the rows and columns it left
+    # (#191): here the selected id column, with the graph column appended.
     nodes = ur.scan_nodes(_nodes_file(tmp_path), id="id")
     pipeline = nodes.select("id").with_columns(indeg=ur.degree(EDGES, direction="in"))
-    with pytest.raises(NotImplementedError, match=r"with_columns.*after select"):
-        pipeline.collect()
+    want = nodes.with_columns(indeg=ur.degree(EDGES, direction="in")).select("id", "indeg")
+    assert pipeline.collect().to_arrow().equals(want.collect().to_arrow())
 
 
 def test_select_unknown_column_errors(tmp_path):

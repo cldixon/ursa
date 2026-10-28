@@ -103,10 +103,14 @@ def test_sink_csv_rejects_dropped_opts():
 
 
 @native
-def test_describe_tail_raises():
+def test_describe_takes_a_tail():
+    # describe() is a one-row frame; steps written after it run on that row (#191).
     edges = _edges()
-    with pytest.raises(NotImplementedError, match="describe"):
-        ur.describe(edges).head(3).collect()
+    summary = ur.describe(edges).collect().to_arrow()
+    assert ur.describe(edges).head(3).collect().to_arrow().equals(summary)
+    narrowed = ur.describe(edges).select("n_nodes", "n_edges").collect().to_arrow()
+    assert narrowed.equals(summary.select(["n_nodes", "n_edges"]))
+    assert ur.describe(edges).filter(ur.col("n_nodes") > 10**9).collect().to_arrow().num_rows == 0
 
 
 # --- #35: reverse() carries the source -------------------------------------

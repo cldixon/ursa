@@ -118,7 +118,8 @@ static GRAPH_STATE: OnceLock<SessionState> = OnceLock::new();
 /// Each call clones the shared template state, so a query gets its own context
 /// (queries never register tables, but a clone keeps them independent anyway)
 /// with exactly the config a fresh build would have: `target_partitions` follows
-/// the machine's cores.
+/// the machine's cores, and round-robin repartitioning is off, so a frame read as
+/// one partition keeps its row order through order-keeping operators.
 pub fn graph_session() -> SessionContext {
     let state = GRAPH_STATE.get_or_init(|| build_graph_state(SessionConfig::new()));
     SessionContext::new_with_state(state.clone())
@@ -130,7 +131,13 @@ pub fn graph_session_with_config(config: SessionConfig) -> SessionContext {
     SessionContext::new_with_state(build_graph_state(config))
 }
 
-fn build_graph_state(config: SessionConfig) -> SessionState {
+fn build_graph_state(mut config: SessionConfig) -> SessionState {
+    // A single-partition frame keeps its row order through filters and
+    // projections (see `crate::lower`).
+    config
+        .options_mut()
+        .optimizer
+        .enable_round_robin_repartition = false;
     SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()

@@ -1,42 +1,26 @@
-//! The unified graph-query entry point: one description in, one DataFusion
-//! `LogicalPlan` executed, one Arrow batch out.
+//! The leaves of a query: the graph and traversal extension nodes, the attach of
+//! graph columns to a frame's rows by id, and the user-facing join.
 //!
-//! This is the seam between Ursa's Python dialect and the engine. The Python
-//! layer emits a small JSON IR for the output columns (each a named node-valued
-//! algorithm) plus the relational tail (`filter` / `sort` / `limit`);
-//! [`execute_node_query`] builds the topology once, assembles a single plan —
-//! `Limit → Sort → Filter → Extension(GraphAlgorithmNode)` — and runs it on the
-//! graph-aware session. Filters/sort/limit are stock DataFusion logical nodes, so
-//! DataFusion optimizes and executes them; the graph node is ours.
-//!
-//! Each `filter` crosses as a serialized predicate-expression JSON string and is
-//! lowered through [`crate::expr`] — the same seam a `weight=` expression uses — so
-//! the full predicate algebra (comparisons, boolean combinators, arithmetic, `col
-//! <op> col`, string/bool equality) is available. Multiple `.filter()` calls arrive
-//! as separate strings and are conjoined by DataFusion's per-filter application.
+//! Each builds the DataFusion plan (or the rows) a [`crate::lower::Frame`] starts
+//! from; the relational steps written after it are lowered on top of it by
+//! [`crate::plan`], in written order (#191).
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::Column;
+use arrow::datatypes::{DataType, Schema};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::functions_aggregate::expr_fn::min;
-use datafusion::logical_expr::{Expr, Extension, JoinType, LogicalPlan};
-use datafusion::prelude::{coalesce, col, lit, DataFrame, SessionContext};
+use datafusion::logical_expr::{Extension, JoinType, LogicalPlan};
+use datafusion::prelude::{coalesce, lit, DataFrame, SessionContext};
 use ursa_core::algo::AggKind;
 use ursa_core::{EdgeMask, IdMap, Topology};
 
 use crate::expr::GraphVerb;
 use crate::logical::{Direction, GraphAlgo, LayoutKind};
+use crate::lower::col_named;
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
-use crate::planner::graph_session;
 use crate::result::{path_schema, query_batch, OutputColumn, OutputDtype};
 use crate::weight::{edge_weights, WeightCache};
 
@@ -264,846 +248,21 @@ fn dense_attr_column(
     Ok(out)
 }
 
-/// Lower one serialized predicate-expression JSON string to a DataFusion filter
-/// expression via the shared `crate::expr` seam.
-fn filter_expr(json: &str) -> Result<Expr> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| DataFusionError::Execution(format!("invalid filter expression JSON: {e}")))?;
-    crate::expr::lower(&crate::expr::parse_ursa_expr(&value)?)
-}
-
-/// The relational tail shared by all four graph executors — the stock DataFusion
-/// operations that run on top of the graph/traversal output. Applied in a fixed
-/// canonical order (see [`apply_tail`]); extensible — a future `group_by`/`join`
-/// adds a field here instead of touching the four call sites.
-struct Tail<'a> {
-    filters: &'a [String],
-    /// `(group_keys, aggs)`: group by the key columns and aggregate. Each `agg` is a
-    /// serialized `alias(agg(col))` JSON. Applied right after `filters` (so `filter`
-    /// is a pre-group WHERE), and it *replaces* the schema with `[keys..., aggs...]`
-    /// — the later `sort`/`limit`/`rename` then reference the grouped columns.
-    group_keys: &'a [String],
-    aggs: &'a [String],
-    distinct: bool,
-    /// `(n, seed)` for a row sample; `seed = None` uses the default (reproducible).
-    sample: Option<(usize, Option<u64>)>,
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    /// `(old, new)` output-column relabels, applied last.
-    rename: &'a [(String, String)],
-    /// The hidden row-ordinal columns the base frame carries (see [`Tiebreak`]),
-    /// most significant first. Empty when the output order needs no ordinal: an
-    /// unsorted query over an order-stable leaf.
-    tiebreak: Vec<String>,
-}
-
-/// The hidden row ordinal that gives engine output a fixed row order: the
-/// implicit final key of an engine `sort` (#165), and the order of unsorted output
-/// on the paths whose base frame or tail has no order of its own (#168).
-///
-/// DataFusion's sort is not stable: it sorts each partition with an unstable
-/// kernel and merges the partitions with no input order among equal keys, so rows
-/// that tie on every user key come back neither in input order nor in an order
-/// that is the same across partition counts (`target_partitions` follows the
-/// machine's cores). A plain frame sorts stably in pyarrow, so ties keep their
-/// input order there. To give the engine the same guarantee, a query with a sort
-/// tags each base row with its position in a hidden `UInt64` ordinal column,
-/// sorts by it as the last, ascending key, and drops it after the sort. A full
-/// sort by one numeric key (the common case, and the tie-heavy one) sorts
-/// `(key, ordinal)` integer pairs itself ([`sort_by_key_then_ordinal`]); any other
-/// sort, and every top-k, hands the ordinal to DataFusion as a final sort
-/// expression.
-///
-/// Unsorted output has the same problem wherever DataFusion repartitions: a hash
-/// join (`join`) and a hash aggregate (`group_by`, `distinct`) emit rows in an
-/// order that depends on the partition count, and so does a filter over several
-/// batches. So the join path always numbers its base rows, a graph or traversal
-/// leaf does when its tail groups, dedups or samples, and the attribute path
-/// (whose rows are gathered in table order, batch by batch) does when its tail
-/// also filters. An unsorted query that carries the ordinal ends with an
-/// order by it ([`order_by_ordinals`]), so its rows follow input order, as on the
-/// plain frame. An unsorted leaf query without those steps keeps the leaf's own
-/// deterministic order (one partition, never repartitioned) and pays nothing.
-///
-/// What "input order" means on each path:
-/// - graph-derived frame (`edges.nodes().with_columns(...)`): the algorithm
-///   output's row order, which is dense node order (first appearance in the
-///   edges), i.e. the order an unsorted collect returns;
-/// - node attribute frame with algorithms: the attribute table's row order (the
-///   algorithm columns are attached to it by id, one output row per table row), so
-///   ties match the plain frame's stable pyarrow sort;
-/// - `hop` / `shortest_path` / `random_walk`: the traversal's own deterministic
-///   output order (seed order then BFS order; path order; walk then step), i.e.
-///   the order an unsorted collect returns;
-/// - `join`: the left row's position, then the right row's (null, so last, for an
-///   unmatched left-join row), the order of a left-major nested-loop join.
-///
-/// The ordinal survives the tail steps before the sort: `filter` keeps it,
-/// `group_by` and `distinct` carry `min(ordinal)` (so a group or distinct row
-/// takes the position of its first input row, so unsorted groups come out in
-/// first-occurrence order), and `sample` keeps each picked row's ordinal (so an
-/// unsorted sample comes out in input order).
-struct Tiebreak;
-
-impl Tiebreak {
-    const BASE: &'static str = "__ursa_ord";
-
-    /// A hidden column name (`__ursa_ord`, with a suffix) that no user column
-    /// already uses.
-    fn fresh_name(suffix: &str, schemas: &[&Schema]) -> String {
-        let mut name = format!("{}{suffix}", Self::BASE);
-        while schemas
-            .iter()
-            .any(|s| s.fields().iter().any(|f| f.name() == &name))
-        {
-            name.push('_');
-        }
-        name
-    }
-
-    /// Rows per batch handed to the sort (DataFusion's default batch size).
-    const CHUNK: usize = 8192;
-
-    /// Append a `UInt64` column `name` numbering the rows `0..` across the batches,
-    /// in order. Batches are also cut into zero-copy slices of at most
-    /// [`Self::CHUNK`] rows: a graph leaf emits its whole output as one batch, and
-    /// smaller batches let DataFusion spread a sort over its partitions.
-    fn attach(batches: Vec<RecordBatch>, name: &str) -> Result<Vec<RecordBatch>> {
-        let mut next = 0u64;
-        batches
-            .into_iter()
-            .flat_map(|b| {
-                let n = b.num_rows();
-                if n <= Self::CHUNK {
-                    vec![b]
-                } else {
-                    (0..n)
-                        .step_by(Self::CHUNK)
-                        .map(|s| b.slice(s, Self::CHUNK.min(n - s)))
-                        .collect()
-                }
-            })
-            .map(|b| {
-                let n = b.num_rows() as u64;
-                let ord: ArrayRef = Arc::new(UInt64Array::from_iter_values(next..next + n));
-                next += n;
-                let schema = b.schema();
-                let mut fields = schema.fields().to_vec();
-                fields.push(Arc::new(Field::new(name, DataType::UInt64, false)));
-                let mut cols = b.columns().to_vec();
-                cols.push(ord);
-                RecordBatch::try_new(
-                    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
-                    cols,
-                )
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-            })
-            .collect()
-    }
-
-    /// The base frame of a traversal/graph leaf plan, with an ordinal column when
-    /// `numbered` (see [`Tiebreak::leaf_needs`]). Every Ursa leaf emits a single
-    /// partition in a deterministic order (and materializes its whole output before
-    /// emitting it), so collecting it and numbering the rows captures the unsorted
-    /// output order at no extra memory.
-    async fn leaf(
-        ctx: &SessionContext,
-        plan: LogicalPlan,
-        numbered: bool,
-    ) -> Result<(DataFrame, Vec<String>)> {
-        let df = ctx.execute_logical_plan(plan).await?;
-        if !numbered {
-            return Ok((df, vec![]));
-        }
-        let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let name = Self::fresh_name("", &[schema.as_ref()]);
-        let mut batches = df.collect().await?;
-        if batches.is_empty() {
-            batches.push(RecordBatch::new_empty(schema));
-        }
-        let df = ctx.read_batches(Self::attach(batches, &name)?)?;
-        Ok((df, vec![name]))
-    }
-
-    /// Whether a graph/traversal leaf needs the ordinal: under a sort (for ties),
-    /// or when an unsorted tail groups, dedups or samples. A leaf's own output
-    /// order is deterministic, but a hash aggregate repartitions it and the
-    /// engine's sample emits its picks in a content order; the ordinal restores
-    /// input order.
-    fn leaf_needs(
-        sort: &Option<Vec<(String, bool)>>,
-        grouped: bool,
-        distinct: bool,
-        sample: &Option<(usize, Option<u64>)>,
-    ) -> bool {
-        has_sort(sort) || grouped || distinct || sample.is_some()
-    }
-}
-
-/// The `n` of a tail that is only an unsorted `head(n)` (a `rename` aside): its
-/// output is the first `n` base rows in input order, so a base whose every input
-/// row yields at least one output row, in input-row order, can drop the rest of
-/// its input up front (see [`take_prefix`]).
-fn bare_limit(
-    filters: &[String],
-    group_keys: &[String],
-    distinct: bool,
-    sample: &Option<(usize, Option<u64>)>,
-    sort: &Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-) -> Option<usize> {
-    let bare = filters.is_empty()
-        && group_keys.is_empty()
-        && !distinct
-        && sample.is_none()
-        && !has_sort(sort);
-    limit.filter(|_| bare)
-}
-
-/// The first `n` rows of `batches` (all of them for `None`), zero-copy. Keeps at
-/// least one (possibly empty) batch so the schema survives.
-fn take_prefix(batches: Vec<RecordBatch>, n: Option<usize>) -> Vec<RecordBatch> {
-    let Some(mut left) = n else {
-        return batches;
-    };
-    let mut out = Vec::new();
-    for b in batches {
-        if left == 0 && !out.is_empty() {
-            break;
-        }
-        let take = left.min(b.num_rows());
-        out.push(b.slice(0, take));
-        left -= take;
-    }
-    out
-}
-
-/// Whether a tail sort is present (an empty key list is no sort).
-fn has_sort(sort: &Option<Vec<(String, bool)>>) -> bool {
-    sort.as_ref().is_some_and(|keys| !keys.is_empty())
-}
-
-/// An unqualified column reference that takes the name verbatim (no `a.b` parse).
-fn col_named(name: &str) -> Expr {
-    Expr::Column(Column::from_name(name))
-}
-
-/// Apply the relational tail to the base frame. Canonical order:
-/// `filters → group_by → distinct → sample → sort → limit → rename`.
-///
-/// User steps take effect in the order *written* (Polars semantics, #162/#164).
-/// The Python side (`_split_engine_tail` in `_execute.py`) only fills these slots
-/// with the leading steps this fixed order executes exactly as written, and applies
-/// any later step to the collected output itself, so this order never reorders a
-/// user's pipeline.
-///
-/// - `group_by` runs right after `filters` (pre-group WHERE) and replaces the output
-///   schema, so `sort`/`limit`/`rename` see the grouped columns.
-/// - `sample` runs before `sort`/`limit`, so a following `.sort().head()` re-imposes
-///   a deterministic order and `head` is honored on the sampled rows.
-/// - `rename` runs last and only relabels output columns.
-async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> Result<DataFrame> {
-    for f in tail.filters {
-        let expr = crate::compare::resolve_comparisons(filter_expr(f)?, df.schema())?;
-        df = df.filter(expr)?;
-    }
-    if !tail.group_keys.is_empty() {
-        // Clear error for an unknown group key (df.aggregate would otherwise fail
-        // with an opaque schema error).
-        for k in tail.group_keys {
-            if !df.schema().fields().iter().any(|f| f.name() == k) {
-                return Err(DataFusionError::Execution(format!(
-                    "group_by() references unknown column {k:?}"
-                )));
-            }
-        }
-        let group_exprs: Vec<Expr> = tail.group_keys.iter().map(col).collect();
-        let mut agg_exprs = Vec::with_capacity(tail.aggs.len());
-        for a in tail.aggs {
-            let v: serde_json::Value = serde_json::from_str(a).map_err(|e| {
-                DataFusionError::Execution(format!("invalid agg expression JSON: {e}"))
-            })?;
-            let expr = crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?;
-            // Clear error for an aggregation over an unknown column (df.aggregate
-            // would otherwise fail with an opaque schema error) — mirrors the
-            // group-key check above and the pyarrow plain path's guard.
-            for c in expr.column_refs() {
-                if !df.schema().fields().iter().any(|f| f.name() == &c.name) {
-                    return Err(DataFusionError::Execution(format!(
-                        "agg() references unknown column {:?}",
-                        c.name
-                    )));
-                }
-            }
-            agg_exprs.push(expr);
-        }
-        // A group takes the position of its first input row.
-        for o in &tail.tiebreak {
-            agg_exprs.push(min(col_named(o)).alias(o));
-        }
-        df = df.aggregate(group_exprs, agg_exprs)?;
-    }
-    if tail.distinct {
-        if tail.tiebreak.is_empty() {
-            df = df.distinct()?;
-        } else {
-            // Distinct over the user columns only (the ordinal makes every row
-            // unique); each distinct row takes the position of its first occurrence.
-            let group_exprs: Vec<Expr> = df
-                .schema()
-                .iter()
-                .filter(|(_, f)| !tail.tiebreak.contains(f.name()))
-                .map(|(q, f)| Expr::Column(Column::from((q, f))))
-                .collect();
-            let agg_exprs: Vec<Expr> = tail
-                .tiebreak
-                .iter()
-                .map(|o| min(col_named(o)).alias(o))
-                .collect();
-            df = df.aggregate(group_exprs, agg_exprs)?;
-        }
-    }
-    if let Some((n, seed)) = tail.sample {
-        let batches = df.collect().await?;
-        df = ctx.read_batches(sample_rows(batches, n, seed)?)?;
-    }
-    if let Some(keys) = tail.sort.filter(|keys| !keys.is_empty()) {
-        // Lexicographic over the keys in order; each key carries its own direction,
-        // and nulls sort last for every key (matching the pyarrow tail).
-        let hidden = |name: &String| tail.tiebreak.contains(name);
-        let mut sort_exprs = Vec::with_capacity(keys.len() + tail.tiebreak.len());
-        for (column, descending) in &keys {
-            if hidden(column) || !df.schema().fields().iter().any(|f| f.name() == column) {
-                // "column ... not found" classifies as ColumnNotFoundError in ursa-py.
-                let names: Vec<&String> = df
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name())
-                    .filter(|n| !hidden(n))
-                    .collect();
-                return Err(DataFusionError::Execution(format!(
-                    "sort references unknown column {column:?} (column not found; available: {names:?})"
-                )));
-            }
-            sort_exprs.push(col(column).sort(!descending, false));
-        }
-        // The implicit final key: rows that tie on every user key keep their input
-        // order (see [`Tiebreak`]), identically for any partition count.
-        let mut sorted = None;
-        if let ([(key, descending)], [ord], None) =
-            (keys.as_slice(), tail.tiebreak.as_slice(), tail.limit)
-        {
-            // A full sort by one key: try the integer-pair fast path.
-            let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-            let field = schema
-                .field_with_name(key)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            if is_fast_key(field.data_type()) {
-                // Partition by partition, in partition order: for a scan of the
-                // ordinal-numbered batches that is input order, so input already in
-                // key order is detected and passed through. (Only speed depends on
-                // this; the ordinal decides the result.)
-                let batches: Vec<RecordBatch> = df
-                    .clone()
-                    .collect_partitioned()
-                    .await?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                let schema = batches.first().map(|b| b.schema()).unwrap_or(schema);
-                sorted = sort_by_key_then_ordinal(&batches, &schema, key, *descending, ord)?;
-            }
-        }
-        match sorted {
-            Some(batches) => df = ctx.read_batches(batches)?,
-            None => {
-                for o in &tail.tiebreak {
-                    sort_exprs.push(col_named(o).sort(true, false));
-                }
-                df = df.sort(sort_exprs)?;
-                if !tail.tiebreak.is_empty() {
-                    let names: Vec<&str> = tail.tiebreak.iter().map(String::as_str).collect();
-                    df = df.drop_columns(&names)?;
-                }
-                if let Some(n) = tail.limit {
-                    df = df.limit(0, Some(n))?;
-                }
-            }
-        }
-    } else if !tail.tiebreak.is_empty() {
-        // Unsorted, but the base or a tail step has no order of its own: the rows
-        // follow input order (#168), and a limit keeps the first `n` of them.
-        df = order_by_ordinals(ctx, df, &tail.tiebreak, tail.limit).await?;
-    } else if let Some(n) = tail.limit {
-        df = df.limit(0, Some(n))?;
-    }
-    for (old, new) in tail.rename {
-        // with_column_renamed silently no-ops on an absent column; check first so a
-        // rename of a column that doesn't exist is a clear error, not a silent drop.
-        if !df.schema().fields().iter().any(|f| f.name() == old) {
-            return Err(DataFusionError::Execution(format!(
-                "rename() references unknown column {old:?}"
-            )));
-        }
-        df = df.with_column_renamed(old, new)?;
-    }
-    Ok(df)
-}
-
-/// The shared execution spine of every query executor. Build the graph session,
-/// let `build` produce the base `DataFrame` — the one part that differs per
-/// executor (a traversal/graph `Extension` plan, the node-attribute join, or a
-/// join of two materialized frames) — then apply the relational tail in canonical
-/// order and collect. Runs on the shared runtime; the caller has released the GIL.
-///
-/// Each executor thus reduces to *plan/base construction*: the block-on, session
-/// setup, [`apply_tail`], and [`collect_batches`] live here once instead of being
-/// copy-pasted at every call site.
-///
-/// `build` also returns the hidden ordinal column(s) its base carries (empty
-/// unless the tail sorts; see [`Tiebreak`]).
-fn run_query<F>(build: F, mut tail: Tail<'_>) -> Result<Vec<RecordBatch>>
-where
-    F: for<'c> FnOnce(
-        &'c SessionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(DataFrame, Vec<String>)>> + 'c>>,
-{
-    let ctx = query_session();
-    crate::runtime::block_on(async move {
-        let (base, tiebreak) = build(&ctx).await?;
-        tail.tiebreak = tiebreak;
-        let df = apply_tail(&ctx, base, tail).await?;
-        collect_batches(df).await
-    })?
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Pins the query session's `target_partitions` in unit tests (read on the
-    /// calling thread, before the query moves onto the runtime).
-    static TEST_PARTITIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// The session a query runs on: [`graph_session`], whose `target_partitions`
-/// follows the machine's cores.
-fn query_session() -> SessionContext {
-    #[cfg(test)]
-    if let Some(p) = TEST_PARTITIONS.with(|c| c.get()) {
-        return crate::planner::graph_session_with_config(
-            datafusion::prelude::SessionConfig::new().with_target_partitions(p),
-        );
-    }
-    graph_session()
-}
-
-/// End an unsorted query whose rows carry the ordinal(s) with an order by them
-/// (ascending, nulls last), then drop them (#168). With a `limit` this is
-/// DataFusion's top-k on the ordinal, which streams and keeps only `n` rows (the
-/// optimizer never moves a limit below a sort, so `head(n)` is the first `n` rows
-/// in input order). Without one, a single ordinal goes through
-/// [`sort_by_ordinal`], which passes input that is already in order through.
-async fn order_by_ordinals(
-    ctx: &SessionContext,
-    df: DataFrame,
-    ords: &[String],
-    limit: Option<usize>,
-) -> Result<DataFrame> {
-    let names: Vec<&str> = ords.iter().map(String::as_str).collect();
-    let by = || -> Vec<_> {
-        ords.iter()
-            .map(|o| col_named(o).sort(true, false))
-            .collect()
-    };
-    if let Some(n) = limit {
-        return df.sort(by())?.limit(0, Some(n))?.drop_columns(&names);
-    }
-    let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-    // Partition by partition, in partition order; only speed depends on this.
-    let batches: Vec<RecordBatch> = df
-        .collect_partitioned()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
-    let schema = batches.first().map(|b| b.schema()).unwrap_or(schema);
-    if let [ord] = ords {
-        if let Some(sorted) = sort_by_ordinal(&batches, &schema, ord)? {
-            return ctx.read_batches(sorted);
-        }
-    }
-    let df = if batches.is_empty() {
-        ctx.read_batch(RecordBatch::new_empty(schema))?
-    } else {
-        ctx.read_batches(batches)?
-    };
-    df.sort(by())?.drop_columns(&names)
-}
-
-/// Order collected batches by the single, non-null `UInt64` ordinal column `ord`
-/// and drop it: the unsorted-output counterpart of [`sort_by_key_then_ordinal`],
-/// sharing its already-in-order pass-through ([`emit_in_order`]). The ordinal is
-/// unique per row on every path that carries one (a base row's position, or a
-/// group's first position), so `(ordinal, position)` pairs order the rows.
-/// `None` (nothing done) past `u32::MAX` rows.
-fn sort_by_ordinal(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-    ord: &str,
-) -> Result<Option<Vec<RecordBatch>>> {
-    use arrow::array::UInt32Array;
-    use rayon::prelude::*;
-    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
-
-    let keep: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| schema.field(i).name() != ord)
-        .collect();
-    let out_schema = Arc::new(schema.project(&keep).map_err(arrow_err)?);
-    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if r > u32::MAX as usize {
-        return Ok(None);
-    }
-    let ord_i = schema.index_of(ord).map_err(arrow_err)?;
-    let mut keys: Vec<(u64, u32)> = Vec::with_capacity(r);
-    let mut pos = 0u32;
-    for b in batches {
-        let ords = b
-            .column(ord_i)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| DataFusionError::Internal("tiebreak column is not u64".into()))?;
-        if ords.null_count() > 0 {
-            return Ok(None);
-        }
-        keys.extend(ords.values().iter().zip(pos..).map(|(&o, p)| (o, p)));
-        pos += b.num_rows() as u32;
-    }
-    // Count the ascending runs: one is input already in order (passed through);
-    // a few long ones (a hash join emits each partition's rows in probe order)
-    // merge in near-linear time with the adaptive merge sort; many short ones
-    // (a shuffled order) sort faster with the unstable pattern-defeating sort.
-    let runs = 1 + keys.windows(2).filter(|w| w[0] > w[1]).count();
-    let indices = if runs == 1 {
-        None
-    } else {
-        if runs <= keys.len() / 1024 {
-            keys.par_sort();
-        } else {
-            keys.par_sort_unstable();
-        }
-        Some(UInt32Array::from_iter_values(keys.iter().map(|&(_, p)| p)))
-    };
-    drop(keys);
-    emit_in_order(batches, out_schema, &keep, indices.as_ref()).map(Some)
-}
-
-/// The `keep` columns of `batches` as one batch, rows gathered by `indices`
-/// (positions across the batches), or in their current order for `None` (no
-/// gather, one concatenation). The result is a single batch: a scan of several
-/// in-memory batches may be split across partitions and come back out of order.
-fn emit_in_order(
-    batches: &[RecordBatch],
-    out_schema: SchemaRef,
-    keep: &[usize],
-    indices: Option<&arrow::array::UInt32Array>,
-) -> Result<Vec<RecordBatch>> {
-    use arrow::compute::{concat, take};
-    use rayon::prelude::*;
-    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
-    if batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok(vec![RecordBatch::new_empty(out_schema)]);
-    }
-    let Some(indices) = indices else {
-        let parts: Vec<RecordBatch> = batches
-            .iter()
-            .map(|b| {
-                RecordBatch::try_new(
-                    out_schema.clone(),
-                    keep.iter().map(|&i| b.column(i).clone()).collect(),
-                )
-            })
-            .collect::<std::result::Result<_, _>>()
-            .map_err(arrow_err)?;
-        let one = arrow::compute::concat_batches(&out_schema, &parts).map_err(arrow_err)?;
-        return Ok(vec![one]);
-    };
-    let cols = keep
-        .par_iter()
-        .map(|&i| {
-            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(i).as_ref()).collect();
-            let c = concat(&parts).map_err(arrow_err)?;
-            take(c.as_ref(), indices, None).map_err(arrow_err)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(vec![
-        RecordBatch::try_new(out_schema, cols).map_err(arrow_err)?
-    ])
-}
-
-/// Whether [`normalized_key`] covers a key of this type.
-fn is_fast_key(dt: &DataType) -> bool {
-    dt.is_integer() || dt.is_floating() || *dt == DataType::Boolean
-}
-
-/// An order-preserving `u64` image of a primitive sort key: `a < b` in the sort's
-/// order exactly when `norm(a) < norm(b)`. Integers flip the sign bit, floats map
-/// their bits to IEEE total order (`f64::total_cmp`, which DataFusion's float sort
-/// uses too), and `descending` inverts the image. Nulls are handled by the caller.
-/// `None` for a type this path does not cover.
-fn normalized_key(array: &dyn Array, descending: bool) -> Option<Vec<u64>> {
-    use arrow::array::{BooleanArray, UInt64Array as U64};
-    let dt = array.data_type();
-    let keys: Vec<u64> = if dt.is_signed_integer() {
-        let a = cast(array, &DataType::Int64).ok()?;
-        let a = a.as_any().downcast_ref::<Int64Array>()?;
-        a.values().iter().map(|&v| (v as u64) ^ (1 << 63)).collect()
-    } else if dt.is_unsigned_integer() {
-        let a = cast(array, &DataType::UInt64).ok()?;
-        a.as_any().downcast_ref::<U64>()?.values().to_vec()
-    } else if dt.is_floating() {
-        let a = cast(array, &DataType::Float64).ok()?;
-        let a = a.as_any().downcast_ref::<Float64Array>()?;
-        a.values()
-            .iter()
-            .map(|v| {
-                let b = v.to_bits();
-                if b >> 63 == 1 {
-                    !b
-                } else {
-                    b | (1 << 63)
-                }
-            })
-            .collect()
-    } else if *dt == DataType::Boolean {
-        let a = array.as_any().downcast_ref::<BooleanArray>()?;
-        (0..a.len()).map(|i| a.value(i) as u64).collect()
-    } else {
-        return None;
-    };
-    Some(if descending {
-        keys.into_iter().map(|k| !k).collect()
-    } else {
-        keys
-    })
-}
-
-/// Sort collected batches by one primitive key (nulls last) and then by the
-/// single ordinal column `ord`, and drop `ord`. Returns `None` (nothing done) when
-/// the key's type is not covered by [`normalized_key`].
-///
-/// This is the hot case of the tiebreak (#165): a full sort by one numeric
-/// column, often with heavy ties (a degree, a community label, a traversal's
-/// `src`). DataFusion sorts a single primitive column with a fast specialised
-/// kernel but falls back to a generic lexicographic sort once the ordinal is
-/// added as a second key, several times slower on tie-heavy data. Sorting
-/// `(key, ordinal)` integer pairs in parallel here keeps it close to the
-/// single-key cost. Keys are read batch by batch (each at most
-/// [`Tiebreak::CHUNK`] rows, so each pass stays in cache), and input that is
-/// already in order is passed through without a gather.
-fn sort_by_key_then_ordinal(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-    key: &str,
-    descending: bool,
-    ord: &str,
-) -> Result<Option<Vec<RecordBatch>>> {
-    use arrow::array::UInt32Array;
-    use rayon::prelude::*;
-    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
-
-    let keep: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| schema.field(i).name() != ord)
-        .collect();
-    let out_schema = Arc::new(schema.project(&keep).map_err(arrow_err)?);
-    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if r == 0 {
-        return Ok(Some(vec![RecordBatch::new_empty(out_schema)]));
-    }
-    if r > u32::MAX as usize {
-        return Ok(None); // row positions are u32 here
-    }
-    let key_i = schema.index_of(key).map_err(arrow_err)?;
-    let ord_i = schema.index_of(ord).map_err(arrow_err)?;
-
-    // Valid keys sort by (key, ordinal); the null keys all tie, so they follow in
-    // ordinal order.
-    let mut valid: Vec<(u64, u64, u32)> = Vec::with_capacity(r);
-    let mut nulls: Vec<(u64, u32)> = Vec::new();
-    let mut pos = 0u32;
-    for b in batches {
-        let key_col = b.column(key_i);
-        let Some(norm) = normalized_key(key_col.as_ref(), descending) else {
-            return Ok(None);
-        };
-        let ords = b
-            .column(ord_i)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| DataFusionError::Internal("tiebreak column is not u64".into()))?
-            .values();
-        match key_col.nulls().filter(|n| n.null_count() > 0) {
-            None => valid.extend(
-                norm.iter()
-                    .zip(ords.iter())
-                    .zip(pos..)
-                    .map(|((&k, &o), p)| (k, o, p)),
-            ),
-            Some(mask) => {
-                for (i, (&k, &o)) in norm.iter().zip(ords.iter()).enumerate() {
-                    let p = pos + i as u32;
-                    if mask.is_null(i) {
-                        nulls.push((o, p));
-                    } else {
-                        valid.push((k, o, p));
-                    }
-                }
-            }
-        }
-        pos += b.num_rows() as u32;
-    }
-    if nulls.is_empty() && valid.windows(2).all(|w| w[0] <= w[1]) {
-        // Already in order (a traversal sorted by `src`, say): no sort or gather,
-        // just one concatenation.
-        return emit_in_order(batches, out_schema, &keep, None).map(Some);
-    }
-    valid.par_sort_unstable();
-    nulls.par_sort_unstable();
-    let indices = UInt32Array::from_iter_values(
-        valid
-            .iter()
-            .map(|&(_, _, p)| p)
-            .chain(nulls.iter().map(|&(_, p)| p)),
-    );
-    drop((valid, nulls));
-    emit_in_order(batches, out_schema, &keep, Some(&indices)).map(Some)
-}
-
-/// Deterministically sample `n` rows (without replacement) from a collected batch
-/// list, returned as a single batch in a stable order.
-///
-/// The engine may split the input across partitions/threads, and cross-partition
-/// row order is not a DataFusion contract — so a position-based sample would vary
-/// by thread count. To be partition-independent, rows are put in a **content-
-/// canonical** order (arrow's `RowConverter` encodes each full row tuple to
-/// comparable bytes) before a seeded PRNG ([`ursa_core::algo::sample_indices`])
-/// selects positions. The selected set is thus a pure function of
-/// `(row contents, n, seed)` — identical across thread counts and repeated runs,
-/// mirroring the `random_walk` determinism guarantee. `seed = None` uses the
-/// default seed; `n >= row_count` returns all rows.
-fn sample_rows(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Result<Vec<RecordBatch>> {
-    use arrow::row::{RowConverter, SortField};
-    use rayon::prelude::*;
-    let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
-
-    let Some(first) = batches.first() else {
-        return Ok(batches);
-    };
-    let schema = first.schema();
-    let r: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if n >= r {
-        return Ok(batches);
-    }
-    // Canonical, partition-independent order: sort row indices by the full-tuple
-    // byte encoding. Depends only on values, so it is identical regardless of how
-    // the rows were partitioned. Duplicate rows encode equal (interchangeable).
-    // Rows are encoded batch by batch (no concatenated copy of the input) and
-    // sorted in parallel; the sort is stable, like the serial one it replaces.
-    let fields: Vec<SortField> = schema
-        .fields()
-        .iter()
-        .map(|f| SortField::new(f.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields).map_err(arrow_err)?;
-    let mut rows = converter.empty_rows(r, 0);
-    for batch in &batches {
-        converter
-            .append(&mut rows, batch.columns())
-            .map_err(arrow_err)?;
-    }
-    let mut canonical: Vec<usize> = (0..r).collect();
-    canonical.par_sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
-    drop(rows);
-    // Seed-deterministic selection over canonical positions (already sorted
-    // ascending), mapped back to (batch, row); emitted in canonical order.
-    let mut starts = Vec::with_capacity(batches.len());
-    let mut acc = 0usize;
-    for b in &batches {
-        starts.push(acc);
-        acc += b.num_rows();
-    }
-    let picks: Vec<(usize, usize)> = ursa_core::algo::sample_indices(r, n, seed)
-        .into_iter()
-        .map(|p| {
-            let g = canonical[p];
-            let b = starts.partition_point(|&s| s <= g) - 1;
-            (b, g - starts[b])
-        })
-        .collect();
-    let cols = (0..schema.fields().len())
-        .map(|c| {
-            let sources: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
-            arrow::compute::interleave(&sources, &picks)
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(arrow_err)?;
-    let sampled = RecordBatch::try_new(schema, cols).map_err(arrow_err)?;
-    Ok(vec![sampled])
-}
-
-/// Build and execute one graph query as a single DataFusion plan.
-///
-/// The base is a [`GraphAlgorithmNode`] emitting `(id, values...)`. When `nodes`
-/// is supplied (a node **attribute** table with id column `nodes_id`), the
-/// algorithm outputs are attached to it by id ([`attach_by_gather`]: a LEFT join
-/// that keeps table order) — so the result carries the attribute columns plus the
-/// computed columns, and `filter`/`sort` can reference either. Filters/sort/limit
-/// are stock DataFusion `DataFrame` operations.
+/// Validate and build the output columns of a `with_columns` of graph verbs:
+/// one [`OutputColumn`] per `(name, verb)`. `nodes` is the attribute table a
+/// neighbour aggregation reads (with its id column `nodes_id`); `edges` holds the
+/// edge columns a weight reads, unless `shared_weights` (the cache on the graph
+/// index) already has every weight.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_node_query(
-    topology: Arc<Topology>,
-    ids: Arc<IdMap>,
+pub fn node_columns(
+    topology: &Topology,
+    ids: &IdMap,
     columns: &[NodeColumn],
-    filters: &[String],
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    nodes: Option<Vec<RecordBatch>>,
-    nodes_id: Option<String>,
-    edges: Option<Vec<RecordBatch>>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    rename: Vec<(String, String)>,
-    group_keys: Vec<String>,
-    aggs: Vec<String>,
-    mask: Option<Arc<EdgeMask>>,
-) -> Result<Vec<RecordBatch>> {
-    execute_node_query_cached(
-        topology, ids, columns, filters, sort, limit, nodes, nodes_id, edges, distinct, sample,
-        rename, group_keys, aggs, mask, None,
-    )
-}
-
-/// [`execute_node_query`] with a [`WeightCache`] that outlives the query (the one
-/// held on the graph index): a weight expression already in it is not re-evaluated,
-/// and `edges` may then be omitted.
-#[allow(clippy::too_many_arguments)]
-pub fn execute_node_query_cached(
-    topology: Arc<Topology>,
-    ids: Arc<IdMap>,
-    columns: &[NodeColumn],
-    filters: &[String],
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    nodes: Option<Vec<RecordBatch>>,
-    nodes_id: Option<String>,
-    edges: Option<Vec<RecordBatch>>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    rename: Vec<(String, String)>,
-    group_keys: Vec<String>,
-    aggs: Vec<String>,
-    mask: Option<Arc<EdgeMask>>,
+    nodes: Option<&[RecordBatch]>,
+    nodes_id: Option<&str>,
+    edges: Option<&[RecordBatch]>,
     shared_weights: Option<&WeightCache>,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<Vec<OutputColumn>> {
     if columns.is_empty() {
         return Err(DataFusionError::Execution(
             "graph query has no output columns".into(),
@@ -1127,14 +286,14 @@ pub fn execute_node_query_cached(
             )));
         }
     }
-    let nodes_id_name = nodes_id.clone().unwrap_or_else(|| "id".to_string());
+    let nodes_id_name = nodes_id.unwrap_or("id");
     let specs = columns;
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
     let mut weight_cache: HashMap<String, Arc<Vec<f64>>> = HashMap::new();
     for (name, spec) in specs {
         let dtype = parse_output_dtype(spec.dtype.as_ref().map(|d| d.as_str().unwrap_or("")))?;
         if spec.verb == "neighbors_agg" {
-            let nodes_ref = nodes.as_ref().ok_or_else(|| {
+            let nodes_ref = nodes.ok_or_else(|| {
                 DataFusionError::NotImplemented(
                     "neighbors().agg() needs a node attribute table \
                      (ur.from_arrow(nodes, id=...))"
@@ -1146,7 +305,7 @@ pub fn execute_node_query_cached(
             })?;
             let direction = parse_direction(&spec.direction()?)?;
             let agg = parse_agg(spec.agg_fn().unwrap_or("mean"))?;
-            let attr = dense_attr_column(nodes_ref, &nodes_id_name, attr_col, &ids, agg)?;
+            let attr = dense_attr_column(nodes_ref, nodes_id_name, attr_col, ids, agg)?;
             columns.push(OutputColumn::NeighborAgg {
                 name: name.clone(),
                 attr: Arc::new(attr),
@@ -1186,10 +345,8 @@ pub fn execute_node_query_cached(
                             let n_edges = topology.n_edges();
                             let what = "a weighted algorithm";
                             let w = match shared_weights {
-                                Some(c) => c.get_or_eval(&key, edges.as_deref(), n_edges, what)?,
-                                None => {
-                                    Arc::new(edge_weights(edges.as_deref(), &key, n_edges, what)?)
-                                }
+                                Some(c) => c.get_or_eval(&key, edges, n_edges, what)?,
+                                None => Arc::new(edge_weights(edges, &key, n_edges, what)?),
                             };
                             weight_cache.insert(key, w.clone());
                             w
@@ -1231,111 +388,103 @@ pub fn execute_node_query_cached(
             columns.push(column);
         }
     }
+    Ok(columns)
+}
 
-    let numbered_leaf = Tiebreak::leaf_needs(&sort, !group_keys.is_empty(), distinct, &sample);
-    let filtered = !filters.is_empty();
-    // One output row per table row, in table order, so a bare unsorted `head(n)`
-    // needs only the table's first `n` rows.
-    let prefix = bare_limit(filters, &group_keys, distinct, &sample, &sort, limit);
-
-    run_query(
-        move |ctx| {
-            Box::pin(async move {
-                // Base frame: either the graph output alone, or a node attribute
-                // table with the graph output attached to it by id.
-                let Some(batches) = nodes else {
-                    let graph_plan = LogicalPlan::Extension(Extension {
-                        node: Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
-                    });
-                    return Tiebreak::leaf(ctx, graph_plan, numbered_leaf).await;
-                };
-                let batches = take_prefix(batches, prefix);
-                let id_col = nodes_id.unwrap_or_else(|| "id".to_string());
-                // CPU-bound (Rayon-parallel inside), as in `GraphAlgorithmExec`.
-                let (graph, ids) = tokio::task::spawn_blocking(move || {
-                    query_batch(&topology, &ids, &columns, mask.as_deref()).map(|b| (b, ids))
-                })
-                .await
-                .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))??;
-                // One output row per table row, in table order: unsorted output and
-                // ties under a sort follow the table's row order. The gathered rows
-                // are already in that order, but a tail step that repartitions
-                // (filter, group_by, distinct, sample, sort) does not keep it, so
-                // those number the table's rows.
-                let numbered = numbered_leaf || filtered;
-                let schemas: Vec<&Schema> =
-                    batches.iter().map(|b| b.schema_ref().as_ref()).collect();
-                let name = Tiebreak::fresh_name("", &schemas);
-                let (base, tiebreak) = match attach_by_gather(&batches, &id_col, &graph, &ids)? {
-                    Some(gathered) if !numbered => (read_ordered(ctx, gathered)?, vec![]),
-                    Some(gathered) => (
-                        ctx.read_batches(Tiebreak::attach(gathered, &name)?)?,
-                        vec![name],
-                    ),
-                    // An id column the gather does not read: the hash LEFT join,
-                    // which coerces the key types, numbered for its order.
-                    None => (
-                        attach_by_join(ctx, batches, &id_col, graph, &name)?,
-                        vec![name],
-                    ),
-                };
-                Ok((base, tiebreak))
-            })
-        },
-        Tail {
-            filters,
-            group_keys: &group_keys,
-            aggs: &aggs,
-            distinct,
-            sample,
-            sort,
-            limit,
-            rename: &rename,
-            tiebreak: vec![],
-        },
+/// The graph leaf of a node query: a [`GraphAlgorithmNode`] emitting
+/// `(id, values...)` for every node, in dense node order, as one partition.
+pub fn graph_leaf(
+    ctx: &SessionContext,
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    columns: Vec<OutputColumn>,
+    mask: Option<Arc<EdgeMask>>,
+) -> DataFrame {
+    extension(
+        ctx,
+        Arc::new(GraphAlgorithmNode::new(topology, ids, columns, mask)),
     )
 }
 
-/// Equi-join two already-materialized frames on shared key column(s), then apply
-/// the standard relational tail to the joined frame.
-///
-/// This is the user-facing `frame.join(other, on=, how=)` — a join between two
-/// arbitrary frames, distinct from the internal attach of algorithm outputs to
-/// node attributes (in [`execute_node_query`]). It is topology-independent: both
-/// operands are just Arrow tables, so no `GraphIndex` is involved.
+/// A plan of one of Ursa's extension nodes.
+fn extension(
+    ctx: &SessionContext,
+    node: Arc<dyn datafusion::logical_expr::UserDefinedLogicalNode>,
+) -> DataFrame {
+    DataFrame::new(ctx.state(), LogicalPlan::Extension(Extension { node }))
+}
+
+/// Attach the graph columns `columns` to `batches` (rows with the id column
+/// `id_col`, at least one batch) by id: each row takes its id's values, or nulls
+/// for an id that is null or not in the graph. The rows keep their order and
+/// columns; the computed columns are appended.
+pub fn attach_columns(
+    ctx: &SessionContext,
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    columns: Vec<OutputColumn>,
+    mask: Option<Arc<EdgeMask>>,
+    batches: Vec<RecordBatch>,
+    id_col: &str,
+) -> Result<Vec<RecordBatch>> {
+    let graph = graph_batch(topology, ids.clone(), columns, mask)?;
+    if let Some(gathered) = attach_by_gather(&batches, id_col, &graph, &ids)? {
+        return Ok(gathered);
+    }
+    // An id column the gather does not read: the hash LEFT join, which coerces
+    // the key types, numbered for its order.
+    let ord = crate::lower::fresh_name(&batches[0].schema());
+    let joined = attach_by_join(ctx, batches, id_col, graph, &ord)?;
+    crate::lower::Frame::from_numbered(ctx.clone(), joined, ord).collect()
+}
+
+/// The graph columns as one `(id, values...)` batch in dense order, computed on
+/// the runtime's blocking pool, as the graph node's operator does: kernels that
+/// allocate per call run measurably faster off the calling (Python) thread.
+fn graph_batch(
+    topology: Arc<Topology>,
+    ids: Arc<IdMap>,
+    columns: Vec<OutputColumn>,
+    mask: Option<Arc<EdgeMask>>,
+) -> Result<RecordBatch> {
+    crate::runtime::block_on(async move {
+        tokio::task::spawn_blocking(move || query_batch(&topology, &ids, &columns, mask.as_deref()))
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("graph kernel panicked: {e}")))?
+    })?
+}
+
+/// Equi-join two materialized frames on shared key column(s): the user-facing
+/// `frame.join(other, on=, how=)`, distinct from the attach of algorithm outputs
+/// to node attributes ([`attach_columns`]). Both operands are just Arrow tables,
+/// so no graph index is involved.
 ///
 /// `on` names key columns present in **both** frames (a same-name equi-join). The
 /// right side's key columns are renamed to private sentinels for the join and then
-/// dropped, so each key appears once (the left copy) in the output — mirroring the
-/// attribute-attach join ([`attach_by_join`]). Non-key column-name collisions are
-/// rejected by the caller before we get here. `how` is `inner` or `left`; the whole tail
-/// (`filters → group_by → distinct → sample → sort → limit → rename`) then runs on
-/// the joined frame.
+/// dropped, so each key appears once (the left copy) in the output. Non-key
+/// column-name collisions are rejected by the caller. `how` is `inner` or `left`.
 ///
-/// v1 supports `inner`/`left` only. `right`/`outer` are deferred deliberately: for
-/// a right-only or unmatched row the left key is null, so simply dropping the
-/// right key (as we do for `inner`/`left`, where the left key always survives)
-/// would lose the key value — a correct `right`/`outer` needs `coalesce(left_key,
-/// right_key)`, a follow-up.
-#[allow(clippy::too_many_arguments)]
-pub fn execute_join_query(
+/// A hash join's output order depends on the partition count, so the rows are
+/// numbered: the left row's position, then the right row's (null, so last, for
+/// an unmatched left-join row), the order of a left-major nested-loop join.
+///
+/// `right`/`outer` are deferred deliberately: for a right-only or unmatched row
+/// the left key is null, so dropping the right key (as for `inner`/`left`, where
+/// the left key always survives) would lose the key value — a correct
+/// `right`/`outer` needs `coalesce(left_key, right_key)`, a follow-up.
+pub fn join_frame(
+    ctx: &SessionContext,
     left: Vec<RecordBatch>,
     right: Vec<RecordBatch>,
-    on: Vec<String>,
-    how: String,
-    filters: &[String],
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    rename: Vec<(String, String)>,
-) -> Result<Vec<RecordBatch>> {
+    on: &[String],
+    how: &str,
+) -> Result<crate::lower::Frame> {
     if on.is_empty() {
         return Err(DataFusionError::Execution(
             "join() needs at least one key column (on=)".into(),
         ));
     }
-    let join_type = match how.as_str() {
+    let join_type = match how {
         "inner" => JoinType::Inner,
         "left" => JoinType::Left,
         other => {
@@ -1345,135 +494,87 @@ pub fn execute_join_query(
             )));
         }
     };
-    let prefix = bare_limit(filters, &[], distinct, &sample, &sort, limit);
-    run_query(
-        move |ctx| {
-            Box::pin(async move {
-                // A hash join's output order depends on the partition count. Rows
-                // follow the left row's position, then the right row's (null, so
-                // last, for an unmatched left-join row): the order of a left-major
-                // nested-loop join, for unsorted output and for ties under a sort.
-                let schemas: Vec<&Schema> = left
-                    .iter()
-                    .chain(right.iter())
-                    .map(|b| b.schema_ref().as_ref())
-                    .collect();
-                let l = Tiebreak::fresh_name("_l", &schemas);
-                let r = Tiebreak::fresh_name("_r", &schemas);
-                let combined = Tiebreak::fresh_name("", &schemas);
-                // A LEFT join emits at least one row per left row, so a bare
-                // unsorted `head(n)` needs only the first `n` left rows.
-                let left = match join_type {
-                    JoinType::Left => take_prefix(left, prefix),
-                    _ => left,
-                };
-                let left_rows: usize = left.iter().map(|b| b.num_rows()).sum();
-                let right_rows: usize = right.iter().map(|b| b.num_rows()).sum();
-                let left = Tiebreak::attach(left, &l)?;
-                let right = Tiebreak::attach(right, &r)?;
-                let left_df = ctx.read_batches(left)?;
-                let mut right_df = ctx.read_batches(right)?;
-                // Rename each right key to a private sentinel so the join keys don't
-                // collide, then drop the sentinels after the join — the left key survives.
-                let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
-                for (k, s) in on.iter().zip(sentinels.iter()) {
-                    right_df = right_df.with_column_renamed(k, s)?;
-                }
-                let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
-                let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-                let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-                let joined = left_df
-                    .join(right_df, join_type, &left_keys, &right_keys, None)?
-                    .drop_columns(&sentinel_refs)?;
-                // Fold the pair into one ordinal, `l * (R + 1) + coalesce(r, R)`,
-                // which orders exactly like `(l, r nulls last)` and is unique per
-                // joined row: a single ordinal takes the integer fast paths, and a
-                // `distinct` row's `min` is its first row's position. Two columns
-                // remain only when the product could overflow a u64.
-                let span = right_rows as u128 + 1;
-                if (left_rows as u128) * span <= u64::MAX as u128 {
-                    let span = span as u64;
-                    let ord =
-                        col_named(&l) * lit(span) + coalesce(vec![col_named(&r), lit(span - 1)]);
-                    let joined = joined
-                        .with_column(&combined, ord)?
-                        .drop_columns(&[l.as_str(), r.as_str()])?;
-                    Ok((joined, vec![combined]))
-                } else {
-                    Ok((joined, vec![l, r]))
-                }
-            })
-        },
-        Tail {
-            filters,
-            group_keys: &[],
-            aggs: &[],
-            distinct,
-            sample,
-            sort,
-            limit,
-            rename: &rename,
-            tiebreak: vec![],
-        },
-    )
+    let schemas = Schema::try_merge([
+        left[0].schema().as_ref().clone(),
+        Schema::new(
+            right[0]
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| left[0].schema().index_of(f.name()).is_err())
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+    ])
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let l = crate::lower::fresh_name_with(&schemas, "_l");
+    let r = crate::lower::fresh_name_with(&schemas, "_r");
+    let combined = crate::lower::fresh_name(&schemas);
+    let left_rows: usize = left.iter().map(|b| b.num_rows()).sum();
+    let right_rows: usize = right.iter().map(|b| b.num_rows()).sum();
+    let left_df = ctx.read_batches(crate::lower::attach_ordinal(left, &l)?)?;
+    let mut right_df = ctx.read_batches(crate::lower::attach_ordinal(right, &r)?)?;
+    // Rename each right key to a private sentinel so the join keys don't collide,
+    // then drop the sentinels after the join — the left key survives.
+    let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
+    for (k, s) in on.iter().zip(sentinels.iter()) {
+        right_df = right_df.with_column_renamed(k, s)?;
+    }
+    let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
+    let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+    let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+    let joined = left_df
+        .join(right_df, join_type, &left_keys, &right_keys, None)?
+        .drop_columns(&sentinel_refs)?;
+    // Fold the pair into one ordinal, `l * (R + 1) + coalesce(r, R)`, which orders
+    // exactly like `(l, r nulls last)` and is unique per joined row.
+    let span = right_rows as u128 + 1;
+    if (left_rows as u128) * span > u64::MAX as u128 {
+        return Err(DataFusionError::NotImplemented(
+            "a join whose row positions overflow 64 bits".into(),
+        ));
+    }
+    let span = span as u64;
+    let ord = col_named(&l) * lit(span) + coalesce(vec![col_named(&r), lit(span - 1)]);
+    let joined = joined
+        .with_column(&combined, ord)?
+        .drop_columns(&[l.as_str(), r.as_str()])?;
+    Ok(crate::lower::Frame::from_numbered(
+        ctx.clone(),
+        joined,
+        combined,
+    ))
 }
 
-/// Build and execute one `hop` traversal as a single DataFusion plan.
-///
-/// A [`HopNode`] emits the reached `(src, dst)` edge frame; the optional
-/// relational tail (`filter` / `sort` / `limit` / `distinct`) runs as stock
-/// DataFusion operations on top, so a hop composes exactly like a node query.
+/// The leaf of a `hop` traversal: a [`HopNode`] emitting the reached `(src, dst)`
+/// edge frame in its own order (seed order, then BFS order), as one partition.
 /// `seeds` are user ids; unknown seeds contribute nothing (matching the kernel).
-#[allow(clippy::too_many_arguments)]
-pub fn execute_hop_query(
+pub fn hop_leaf(
+    ctx: &SessionContext,
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
     mask: Option<Arc<EdgeMask>>,
     seeds: &dyn Array,
     n: u32,
     direction: &str,
-    filters: &[String],
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    rename: Vec<(String, String)>,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<DataFrame> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
-
     // Resolve user-id seeds to dense indices; drop unknowns/nulls (kernel-consistent).
     let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
-
-    let hop_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction).with_mask(mask)),
-    });
-
-    let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
-    run_query(
-        move |ctx| Box::pin(Tiebreak::leaf(ctx, hop_plan, numbered)),
-        Tail {
-            filters,
-            group_keys: &[],
-            aggs: &[],
-            distinct,
-            sample,
-            sort,
-            limit,
-            rename: &rename,
-            tiebreak: vec![],
-        },
-    )
+    Ok(extension(
+        ctx,
+        Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction).with_mask(mask)),
+    ))
 }
 
-/// Build and execute one `shortest_path` traversal as a single DataFusion plan.
-///
-/// A [`ShortestPathNode`] emits the path's `(src, dst, hop, cost)` edge frame; the same
-/// optional relational tail as [`execute_hop_query`] runs on top. `source`/`target`
-/// are user ids; if either is unknown the result is an empty path. Pass `weight`
-/// (a serialized edge-weight expression) with the edge table for a minimum-cost
+/// The leaf of a `shortest_path`: a [`ShortestPathNode`] emitting the path's
+/// `(src, dst, hop, cost)` edge frame in path order. `source`/`target` are user
+/// ids; if either is unknown the result is an empty path. Pass `weight` (a
+/// serialized edge-weight expression) with the edge table for a minimum-cost
 /// Dijkstra path; omit both for unweighted BFS.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_path_query(
+pub fn path_leaf(
+    ctx: &SessionContext,
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
     mask: Option<Arc<EdgeMask>>,
@@ -1482,18 +583,10 @@ pub fn execute_path_query(
     direction: &str,
     weight: Option<&str>,
     edges: Option<Vec<RecordBatch>>,
-    filters: &[String],
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    rename: Vec<(String, String)>,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<crate::lower::Frame> {
     let direction: ursa_core::Direction = parse_direction(direction)?.into();
-
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
-    // index. An unknown (or absent) endpoint -> no path (an empty edge frame),
-    // short-circuiting the plan.
+    // index. An unknown (or absent) endpoint -> no path (an empty edge frame).
     let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
     let target = resolve_dense(&ids, target)?.into_iter().next().flatten();
     let (Some(source), Some(target)) = (source, target) else {
@@ -1507,12 +600,11 @@ pub fn execute_path_query(
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        return Ok(vec![empty]);
+        return crate::lower::Frame::from_batches(ctx.clone(), vec![empty]);
     };
-
     // A weight expression (over edge columns) becomes one non-negative f64 per
-    // edge row; Dijkstra gathers it via edge_ids. Omit for unweighted BFS.
-    // Evaluated only once both endpoints resolve, as in `shortest_path_nodes`.
+    // edge row; Dijkstra gathers it via edge_ids. Evaluated only once both
+    // endpoints resolve.
     let weights = match weight {
         None => None,
         Some(weight_json) => Some(Arc::new(edge_weights(
@@ -1522,39 +614,21 @@ pub fn execute_path_query(
             "weighted shortest_path",
         )?)),
     };
-
-    let path_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(
-            ShortestPathNode::new(topology, ids, source, target, direction, weights)
-                .with_mask(mask),
-        ),
-    });
-
-    let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
-    run_query(
-        move |ctx| Box::pin(Tiebreak::leaf(ctx, path_plan, numbered)),
-        Tail {
-            filters,
-            group_keys: &[],
-            aggs: &[],
-            distinct,
-            sample,
-            sort,
-            limit,
-            rename: &rename,
-            tiebreak: vec![],
-        },
-    )
+    let node =
+        ShortestPathNode::new(topology, ids, source, target, direction, weights).with_mask(mask);
+    Ok(crate::lower::Frame::from_ordered(
+        ctx.clone(),
+        extension(ctx, Arc::new(node)),
+    ))
 }
 
-/// Build and execute one `random_walk` as a single DataFusion plan.
-///
-/// A [`RandomWalkNode`] emits the `(walk_id, step, node)` node frame; the same
-/// optional relational tail as [`execute_hop_query`] runs on top. `starts` are
-/// user ids (unknown ids are dropped, kernel-consistent). `seed` makes the walk
+/// The leaf of a `random_walk`: a [`RandomWalkNode`] emitting the
+/// `(walk_id, step, node)` frame in walk-then-step order. `starts` are user ids
+/// (unknown ids are dropped, kernel-consistent); `seed` makes the walk
 /// reproducible.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_walk_query(
+pub fn walk_leaf(
+    ctx: &SessionContext,
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
     mask: Option<Arc<EdgeMask>>,
@@ -1562,37 +636,15 @@ pub fn execute_walk_query(
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
-    filters: &[String],
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    rename: Vec<(String, String)>,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<DataFrame> {
     let starts_dense: Vec<u32> = resolve_dense(&ids, starts)?.into_iter().flatten().collect();
-
-    let walk_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(
+    Ok(extension(
+        ctx,
+        Arc::new(
             RandomWalkNode::new(topology, ids, starts_dense, steps, walks_per_node, seed)
                 .with_mask(mask),
         ),
-    });
-
-    let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
-    run_query(
-        move |ctx| Box::pin(Tiebreak::leaf(ctx, walk_plan, numbered)),
-        Tail {
-            filters,
-            group_keys: &[],
-            aggs: &[],
-            distinct,
-            sample,
-            sort,
-            limit,
-            rename: &rename,
-            tiebreak: vec![],
-        },
-    )
+    ))
 }
 
 /// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping
@@ -1606,42 +658,6 @@ pub(crate) fn resolve_dense(
         .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
-/// `batches` (at least one) as a single partition the engine cannot split, so a
-/// tail that does not repartition (none, `head`, `rename`) keeps their row order.
-/// A `read_batches` scan of several batches may be split across partitions, and
-/// its rows then come back out of order.
-fn read_ordered(ctx: &SessionContext, batches: Vec<RecordBatch>) -> Result<DataFrame> {
-    use datafusion::catalog::streaming::StreamingTable;
-    use datafusion::execution::TaskContext;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::streaming::PartitionStream;
-    use datafusion::physical_plan::SendableRecordBatchStream;
-
-    #[derive(Debug)]
-    struct Ordered {
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    }
-    impl PartitionStream for Ordered {
-        fn schema(&self) -> &SchemaRef {
-            &self.schema
-        }
-        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-            let batches = self.batches.clone().into_iter().map(Ok);
-            Box::pin(RecordBatchStreamAdapter::new(
-                self.schema.clone(),
-                futures::stream::iter(batches),
-            ))
-        }
-    }
-    let schema = batches[0].schema();
-    let part = Arc::new(Ordered {
-        schema: schema.clone(),
-        batches,
-    });
-    ctx.read_table(Arc::new(StreamingTable::try_new(schema, vec![part])?))
-}
-
 /// The LEFT join of the node attribute table `batches` onto `graph` by id, with
 /// the table's rows numbered by the ordinal `ord` (its output order depends on the
 /// partition count). The fallback of [`attach_by_gather`].
@@ -1652,7 +668,7 @@ fn attach_by_join(
     graph: RecordBatch,
     ord: &str,
 ) -> Result<DataFrame> {
-    let nodes_df = ctx.read_batches(Tiebreak::attach(batches, ord)?)?;
+    let nodes_df = ctx.read_batches(crate::lower::attach_ordinal(batches, ord)?)?;
     // Rename the graph id so the join keys don't collide, then drop it.
     let graph_df = ctx
         .read_batch(graph)?
@@ -1756,20 +772,6 @@ fn attach_by_gather(
         .map(Some)
 }
 
-/// Collect a `DataFrame` to a **batch list** that always carries the schema (an
-/// empty result becomes a single zero-row batch), so a query's columns transport
-/// across the FFI even when no rows match. Returning the list — rather than
-/// `concat_batches`-ing it into one contiguous batch — is what keeps peak result
-/// memory flat for a large hop/walk/collect output (#60).
-async fn collect_batches(df: DataFrame) -> Result<Vec<RecordBatch>> {
-    let out_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-    let mut batches = df.collect().await?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(out_schema));
-    }
-    Ok(batches)
-}
-
 /// Test helper: node columns from the compact JSON the unit tests write, a list of
 /// `{"name": ..., "kind": <verb>, ...params}`.
 #[cfg(test)]
@@ -1796,7 +798,225 @@ pub(crate) fn cols(json: &str) -> Vec<NodeColumn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lower::{Frame, TEST_PARTITIONS};
     use arrow::compute::concat_batches;
+    use arrow::datatypes::Field;
+    use datafusion::prelude::col;
+
+    // The query entry points these tests were written against took their
+    // relational steps in fixed slots. They are adapters here, over the leaves
+    // above and `lower::Frame`, applying the slots in the order they had.
+
+    fn query_session() -> SessionContext {
+        crate::lower::session()
+    }
+
+    fn tail(
+        frame: &mut Frame,
+        filters: &[String],
+        group: (Vec<String>, Vec<String>),
+        distinct: bool,
+        sort: Option<Vec<(String, bool)>>,
+        limit: Option<usize>,
+        rename: Vec<(String, String)>,
+    ) -> Result<()> {
+        for f in filters {
+            let v: serde_json::Value = serde_json::from_str(f).unwrap();
+            let e = crate::eval::logical(&v, frame.df_schema())?;
+            frame.filter(e)?;
+        }
+        let (keys, aggs) = group;
+        if !keys.is_empty() {
+            for k in &keys {
+                if !frame.has_column(k) {
+                    return Err(DataFusionError::Execution(format!(
+                        "group_by() references unknown column {k:?}"
+                    )));
+                }
+            }
+            let aggs = aggs
+                .iter()
+                .map(|a| {
+                    let v: serde_json::Value = serde_json::from_str(a).unwrap();
+                    crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            frame.group_by(keys.iter().map(col).collect(), aggs, true)?;
+        }
+        if distinct {
+            frame.distinct()?;
+        }
+        match sort.filter(|k| !k.is_empty()) {
+            Some(keys) => {
+                for (c, _) in &keys {
+                    if !frame.has_column(c) {
+                        return Err(DataFusionError::Execution(format!(
+                            "sort references unknown column {c:?} (column not found)"
+                        )));
+                    }
+                }
+                let keys = keys.into_iter().map(|(c, d)| (col_named(&c), d)).collect();
+                frame.sort(keys, limit)?;
+            }
+            None => {
+                if let Some(n) = limit {
+                    frame.head(n)?;
+                }
+            }
+        }
+        if !rename.is_empty() {
+            for (old, _) in &rename {
+                if !frame.has_column(old) {
+                    return Err(DataFusionError::Execution(format!(
+                        "rename() references unknown column {old:?}"
+                    )));
+                }
+            }
+            frame.rename(&rename)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_node_query(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        columns: &[NodeColumn],
+        filters: &[String],
+        sort: Option<Vec<(String, bool)>>,
+        limit: Option<usize>,
+        nodes: Option<Vec<RecordBatch>>,
+        nodes_id: Option<String>,
+        edges: Option<Vec<RecordBatch>>,
+        distinct: bool,
+        sample: Option<(usize, Option<u64>)>,
+        rename: Vec<(String, String)>,
+        group_keys: Vec<String>,
+        aggs: Vec<String>,
+        mask: Option<Arc<EdgeMask>>,
+    ) -> Result<Vec<RecordBatch>> {
+        assert!(sample.is_none(), "sample is drawn by the plan's host");
+        let built = node_columns(
+            &topology,
+            &ids,
+            columns,
+            nodes.as_deref(),
+            nodes_id.as_deref(),
+            edges.as_deref(),
+            None,
+        )?;
+        let ctx = query_session();
+        let mut frame = match nodes {
+            None => Frame::from_ordered(ctx.clone(), graph_leaf(&ctx, topology, ids, built, mask)),
+            Some(batches) => {
+                let id = nodes_id.as_deref().unwrap_or("id");
+                let rows = attach_columns(&ctx, topology, ids, built, mask, batches, id)?;
+                Frame::from_batches(ctx, rows)?
+            }
+        };
+        tail(
+            &mut frame,
+            filters,
+            (group_keys, aggs),
+            distinct,
+            sort,
+            limit,
+            rename,
+        )?;
+        frame.collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_join_query(
+        left: Vec<RecordBatch>,
+        right: Vec<RecordBatch>,
+        on: Vec<String>,
+        how: String,
+        filters: &[String],
+        sort: Option<Vec<(String, bool)>>,
+        limit: Option<usize>,
+        distinct: bool,
+        sample: Option<(usize, Option<u64>)>,
+        rename: Vec<(String, String)>,
+    ) -> Result<Vec<RecordBatch>> {
+        assert!(sample.is_none(), "sample is drawn by the plan's host");
+        let mut frame = join_frame(&query_session(), left, right, &on, &how)?;
+        tail(
+            &mut frame,
+            filters,
+            Default::default(),
+            distinct,
+            sort,
+            limit,
+            rename,
+        )?;
+        frame.collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_hop_query(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        mask: Option<Arc<EdgeMask>>,
+        seeds: &dyn Array,
+        n: u32,
+        direction: &str,
+        filters: &[String],
+        sort: Option<Vec<(String, bool)>>,
+        limit: Option<usize>,
+        distinct: bool,
+        sample: Option<(usize, Option<u64>)>,
+        rename: Vec<(String, String)>,
+    ) -> Result<Vec<RecordBatch>> {
+        assert!(sample.is_none(), "sample is drawn by the plan's host");
+        let ctx = query_session();
+        let leaf = hop_leaf(&ctx, topology, ids, mask, seeds, n, direction)?;
+        let mut frame = Frame::from_ordered(ctx, leaf);
+        tail(
+            &mut frame,
+            filters,
+            Default::default(),
+            distinct,
+            sort,
+            limit,
+            rename,
+        )?;
+        frame.collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_path_query(
+        topology: Arc<Topology>,
+        ids: Arc<IdMap>,
+        mask: Option<Arc<EdgeMask>>,
+        source: &dyn Array,
+        target: &dyn Array,
+        direction: &str,
+        weight: Option<&str>,
+        edges: Option<Vec<RecordBatch>>,
+        filters: &[String],
+        sort: Option<Vec<(String, bool)>>,
+        limit: Option<usize>,
+        distinct: bool,
+        sample: Option<(usize, Option<u64>)>,
+        rename: Vec<(String, String)>,
+    ) -> Result<Vec<RecordBatch>> {
+        assert!(sample.is_none(), "sample is drawn by the plan's host");
+        let ctx = query_session();
+        let mut frame = path_leaf(
+            &ctx, topology, ids, mask, source, target, direction, weight, edges,
+        )?;
+        tail(
+            &mut frame,
+            filters,
+            Default::default(),
+            distinct,
+            sort,
+            limit,
+            rename,
+        )?;
+        frame.collect()
+    }
 
     /// Concatenate a query's batch-list result into one batch for assertions (the
     /// FFI now returns the list; tests still check a single materialized batch).
@@ -1816,42 +1036,6 @@ mod tests {
     /// Build the cached (topology, ids) pair the query fns now take.
     fn build(src: &Int64Array, dst: &Int64Array) -> (Arc<Topology>, Arc<IdMap>) {
         crate::topology::build_topology(src, dst).unwrap()
-    }
-
-    fn ints(vals: &[i64]) -> RecordBatch {
-        use arrow::datatypes::{Field, Schema};
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
-    }
-
-    fn sampled_vals(batches: Vec<RecordBatch>, n: usize, seed: Option<u64>) -> Vec<i64> {
-        let out = sample_rows(batches, n, seed).unwrap();
-        let b = &out[0];
-        b.column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec()
-    }
-
-    #[test]
-    fn sample_rows_is_partition_independent_and_seeded() {
-        // The same 6 rows arriving in different batch splits (as different partition
-        // layouts would produce) must yield the identical sample for a given seed —
-        // the content-canonical order removes all dependence on arrival order.
-        let split_a = vec![ints(&[5, 1, 4, 2, 6, 3])]; // one batch
-        let split_b = vec![ints(&[3, 6, 2]), ints(&[4, 1, 5])]; // two batches, reordered
-        let a = sampled_vals(split_a, 3, Some(9));
-        let b = sampled_vals(split_b, 3, Some(9));
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 3);
-        // n >= row count returns all rows.
-        assert_eq!(sampled_vals(vec![ints(&[7, 8])], 5, Some(1)).len(), 2);
-        // a different seed can pick a different subset.
-        let s9 = sampled_vals(vec![ints(&[1, 2, 3, 4, 5, 6, 7, 8])], 3, Some(9));
-        let s10 = sampled_vals(vec![ints(&[1, 2, 3, 4, 5, 6, 7, 8])], 3, Some(10));
-        assert_ne!(s9, s10);
     }
 
     #[test]
@@ -2636,34 +1820,29 @@ mod tests {
     ) -> RecordBatch {
         use datafusion::prelude::SessionConfig;
         let n_cols = batches[0].num_columns();
-        let out = crate::runtime::block_on(async {
-            let ctx = SessionContext::new_with_config(
-                SessionConfig::new()
-                    .with_target_partitions(partitions)
-                    .with_batch_size(512),
-            );
-            let (input, hidden) = if tiebreak {
-                let ord = "__ursa_ord".to_string();
-                (Tiebreak::attach(batches, &ord).unwrap(), vec![ord])
-            } else {
-                (batches, vec![])
-            };
-            let base = ctx.read_batches(input).unwrap();
-            let tail = Tail {
-                filters: &[],
-                group_keys: &[],
-                aggs: &[],
-                distinct: false,
-                sample: None,
-                sort: Some(sort),
-                limit,
-                rename: &[],
-                tiebreak: hidden,
-            };
-            let df = apply_tail(&ctx, base, tail).await.unwrap();
-            collect_batches(df).await.unwrap()
-        })
-        .unwrap();
+        let out = if tiebreak {
+            on_partitions(partitions, || {
+                let mut frame = Frame::from_batches(query_session(), batches).unwrap();
+                let keys = sort.iter().map(|(c, d)| (col_named(c), *d)).collect();
+                frame.sort(keys, limit).unwrap();
+                frame.collect().unwrap()
+            })
+        } else {
+            crate::runtime::block_on(async {
+                let ctx = SessionContext::new_with_config(
+                    SessionConfig::new()
+                        .with_target_partitions(partitions)
+                        .with_batch_size(512),
+                );
+                let keys = sort.iter().map(|(c, d)| col(c).sort(!d, false)).collect();
+                let mut df = ctx.read_batches(batches).unwrap().sort(keys).unwrap();
+                if let Some(n) = limit {
+                    df = df.limit(0, Some(n)).unwrap();
+                }
+                df.collect().await.unwrap()
+            })
+            .unwrap()
+        };
         let batch = one(out);
         assert_no_hidden(&batch);
         assert_eq!(batch.num_columns(), n_cols);
@@ -2809,10 +1988,11 @@ mod tests {
                 assert!((0..col.len()).all(|r| col.is_null(r) == (r >= col.len() - nulls)));
             }
         }
-        // Spot-check the float order: -NaN < -inf < -2 < -0 < 0 < 1.5 < inf < NaN,
-        // ties (the two 1.5s, the two -0.0s) and nulls in input order.
+        // Spot-check the float order (#201): -inf < -2 < -0 = 0 < 1.5 < inf < NaN,
+        // every NaN equal whatever its sign; ties (the zeros, the two 1.5s, the two
+        // NaNs) and nulls in input order.
         let fast = sort_on(halves(), 2, true, vec![("f".into(), false)], None);
-        assert_eq!(i64s(&fast, "v"), vec![11, 5, 7, 3, 10, 4, 0, 6, 9, 2, 1, 8]);
+        assert_eq!(i64s(&fast, "v"), vec![5, 7, 3, 4, 10, 0, 6, 9, 2, 11, 1, 8]);
     }
 
     /// A graph with many out-degree ties: node i -> i + 1 and, for even i, also
@@ -3274,15 +2454,10 @@ mod tests {
                 for p in [1, 4] {
                     let joined = on_partitions(p, || {
                         let ctx = query_session();
-                        crate::runtime::block_on(async {
-                            let ord = Tiebreak::fresh_name("", &[]);
-                            let df =
-                                attach_by_join(&ctx, batches.clone(), "id", graph.clone(), &ord)?;
-                            let df = order_by_ordinals(&ctx, df, &[ord], None).await?;
-                            collect_batches(df).await
-                        })
-                        .unwrap()
-                        .unwrap()
+                        let ord = crate::lower::fresh_name(&batches[0].schema());
+                        let df = attach_by_join(&ctx, batches.clone(), "id", graph.clone(), &ord)
+                            .unwrap();
+                        Frame::from_numbered(ctx, df, ord).collect().unwrap()
                     });
                     let joined = one(joined);
                     assert_eq!(gathered.schema(), joined.schema(), "{label} p={p}");

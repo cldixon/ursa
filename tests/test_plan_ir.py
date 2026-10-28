@@ -92,9 +92,15 @@ def test_plain_sample_takes_any_seed_the_host_accepts(seed):
         (2**70, OverflowError, "int too big to convert"),
     ],
 )
-def test_engine_sample_seed_errors_are_unchanged(seed, error, match):
-    with pytest.raises(error, match=match):
-        ur.degree(_edges())._frame().sample(2, seed=seed).collect()
+def test_engine_sample_takes_any_seed_like_a_plain_frame(seed, error, match):
+    # A sample draws its rows with the stdlib generator wherever it runs (#191),
+    # so an engine frame takes every seed a plain frame does, and picks the same
+    # rows from the same input.
+    del error, match
+    engine = ur.degree(_edges())._frame()
+    plain = ur.from_arrow(engine.collect().to_arrow(), id="id")
+    got = engine.sample(2, seed=seed).collect().to_dicts()
+    assert got == plain.sample(2, seed=seed).collect().to_dicts()
 
 
 def test_integer_argument_errors_are_unchanged():
@@ -103,8 +109,8 @@ def test_integer_argument_errors_are_unchanged():
         ur.hop(e, -1).from_([0]).collect()
     with pytest.raises(OverflowError, match="can't convert negative int to unsigned"):
         ur.random_walk(e, start=[0], steps=2, seed=-1).collect()
-    with pytest.raises(OverflowError, match="can't convert negative int to unsigned"):
-        ur.degree(e).head(-1).collect()
+    # A negative head keeps no rows, on every path (#191).
+    assert ur.degree(e).head(-1).collect().to_arrow().num_rows == 0
     assert ur.from_arrow(NODES, id="id").head(-1).collect().to_arrow().num_rows == 0
 
 
@@ -123,8 +129,8 @@ def test_connected_components_mode_none_is_rejected():
 
 def test_shape_guards_win_over_argument_errors():
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    with pytest.raises(NotImplementedError, match=r"describe\(\) output does not support"):
-        ur.describe(e).sort([]).collect()
+    with pytest.raises(NotImplementedError, match=r"'join' step after describe\(\)"):
+        ur.describe(e).join(n, on="id").sort([]).collect()
     with pytest.raises(NotImplementedError, match="join how='outer' is not supported"):
         n.join(n, how="outer").collect()
 
@@ -140,9 +146,11 @@ def test_a_graph_verb_as_a_predicate_is_not_a_boolean_predicate(frame):
 @pytest.mark.parametrize("bad", ["serialize", "execute"])
 def test_join_right_side_errors_keep_their_cause(bad):
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    # A select of an expression fails parsing the right frame; a describe tail
-    # fails its shape guard. Either way the right side's own error is the cause.
-    right = n.select(ur.col("v") * 2) if bad == "serialize" else ur.describe(e).head(1)
+    # A select of a non-expression fails parsing the right frame; a step on the
+    # edges before nodes() fails its shape guard. Either way the right side's own
+    # error is the cause.
+    shape_guard = e.head(2).nodes().with_columns(d=ur.degree(e))
+    right = n.select(3) if bad == "serialize" else shape_guard
     with pytest.raises(NotImplementedError, match="could not materialize the right-hand") as exc:
         n.join(right, on="id").collect()
     assert isinstance(exc.value.__cause__, NotImplementedError)

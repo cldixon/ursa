@@ -765,28 +765,23 @@ mod tests {
 
     #[test]
     fn f32_on_an_integer_column_is_rejected_at_query_build() {
-        // The JSON path (execute_node_query) is where the float-only rule is enforced;
+        // The JSON path (node_columns) is where the float-only rule is enforced;
         // a degree column asking for f32 must error, not silently emit a lossy float.
         let (topo, ids) = diamond();
         let json = r#"[{"name":"deg","kind":"degree","direction":"out","dtype":"f32"}]"#;
-        let err = crate::query::execute_node_query(
-            topo,
-            ids,
+        let err = crate::query::node_columns(
+            &topo,
+            &ids,
             &crate::query::cols(json),
-            &[],        // filters
-            None,       // sort
-            None,       // limit
-            None,       // nodes
-            None,       // nodes_id
-            None,       // edges
-            false,      // distinct
-            None,       // sample
-            Vec::new(), // rename
-            Vec::new(), // group_keys
-            Vec::new(), // aggs
-            None,       // mask
+            None,
+            None,
+            None,
+            None,
         );
-        let msg = format!("{}", err.unwrap_err());
+        let Err(err) = err else {
+            panic!("f32 on an integer column was accepted")
+        };
+        let msg = format!("{err}");
         assert!(msg.contains("f32"), "unexpected error: {msg}");
     }
 

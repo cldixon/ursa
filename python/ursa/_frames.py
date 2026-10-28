@@ -123,12 +123,14 @@ class _Frame:
     def sort(self, by: Any, *more_by: Any, descending: bool | Sequence[bool] = False) -> Self:
         """Sort rows by one or more columns, Polars-style.
 
-        ``by`` is a column name (or ``ur.col(name)``) or a list of them; ``more_by``
-        appends further keys (``.sort("a", "b")`` is ``.sort(["a", "b"])``). Rows are
-        ordered lexicographically by the keys in order, so later keys break ties in
-        earlier ones. ``descending`` is a single bool applied to every key, or a list
-        with one bool per key. Nulls sort last for every key, in either direction.
-        A dictionary-encoded (categorical) key orders by its values, not its codes.
+        ``by`` is a column name, ``ur.col(name)`` or another expression, or a list of
+        them; ``more_by`` appends further keys (``.sort("a", "b")`` is
+        ``.sort(["a", "b"])``). Rows are ordered lexicographically by the keys in
+        order, so later keys break ties in earlier ones. ``descending`` is a single
+        bool applied to every key, or a list with one bool per key. Nulls sort last
+        for every key, in either direction. A float key sorts every NaN above every
+        number and ``-0.0`` equal to ``0.0``. A dictionary-encoded (categorical) key
+        orders by its values, not its codes.
         The sort is stable on every path: rows that tie on every key keep their
         input order, identically on every run. After a graph algorithm that is
         node order, or the attribute table's row order when the frame has one;

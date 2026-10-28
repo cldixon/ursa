@@ -98,6 +98,8 @@ Ursa's Louvain reaches a modularity within a small margin of the NetworkX value.
 
 Ursa keeps self-loops and parallel edges as rows. If your NetworkX baseline used a `Graph` or `DiGraph`, it merged the parallel edges. To compare, remove the duplicates from the rows before you build the frame. See [Reshaped edge sets](guides/subgraphs.md#reshaped-edge-sets).
 
-## NaN in comparisons
+## NaN in comparisons and sorts
 
 A filter compares NaN in total order, the order `sort()` uses: NaN equals NaN and is greater than every number. That holds for every NaN, whatever its sign bit (`0/0` gives a negative one on most machines), and `-0.0` equals `0.0`. So `ur.col("x") > 1` keeps a NaN row, `ur.col("x") == float("nan")` keeps exactly the NaN rows, and `ur.col("x") != ur.col("x")` keeps none. A comparison with null is null, and `filter` drops that row. NumPy and pyarrow compare the IEEE way instead, where every comparison with NaN is false. To drop NaN rows, filter on a range, for example `ur.col("x") <= float("inf")`.
+
+`sort()` orders floats the same way. Ascending, every NaN comes after every number; descending, before. Nulls come last in either direction. Rows that tie, such as two NaNs of different sign or `-0.0` and `0.0`, keep their input order.

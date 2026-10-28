@@ -193,6 +193,34 @@ def pipeline_scan():
     return best(q)
 
 
+def algo_filter():
+    """A plain filter after a graph algorithm (1M nodes)."""
+    e = warm(mem("e10m"))
+    frame = e.nodes().with_columns(dg=ur.degree(e))
+    return best(lambda: frame.filter(ur.col("dg") > 12).collect())
+
+
+def algo_head():
+    """A plain head after a graph algorithm (1M nodes)."""
+    e = warm(mem("e10m"))
+    frame = e.nodes().with_columns(dg=ur.degree(e))
+    return best(lambda: frame.head(1000).collect())
+
+
+def post_algo_tail():
+    """A post-algorithm tail in the engine: filter + group_by + sort over a 1M-row
+    graph result (degree attached to a 1M-row attribute table), with a float sum."""
+    e, nodes = warm(mem("e10m")), nodes_1m()
+    frame = nodes.with_columns(dg=ur.degree(e))
+
+    def q():
+        frame.filter(ur.col("x") > 0.1).group_by("dg").agg(
+            n=ur.col("id").count(), s=ur.col("x").sum(), m=ur.col("x").max()
+        ).sort("n", descending=True).collect()
+
+    return best(q)
+
+
 SCENARIOS: dict[str, Callable[[], float]] = {
     f.__name__: f
     for f in (
@@ -217,6 +245,9 @@ SCENARIOS: dict[str, Callable[[], float]] = {
         louvain_500k,
         small_collects,
         pipeline_scan,
+        algo_filter,
+        algo_head,
+        post_algo_tail,
     )
 }
 

@@ -1,12 +1,11 @@
-"""Dictionary-encoded (categorical) columns through the plain-frame relational
-tail (issue #159).
+"""Dictionary-encoded (categorical) columns through the relational steps
+(issue #159).
 
-pyarrow has no sort kernel for dictionary arrays and no hash sum/mean/min/max
-kernels for them, so the pyarrow tail (`_apply_pyarrow_steps`) decodes the sort
-key / aggregate operand while leaving the user's column type intact in the
-output. Sorting orders by the *values* (lexicographic for strings), never by the
-dictionary indices: the fixtures below put "y" before "x" in the dictionary so an
-index-order sort would come out wrong.
+A sort key or an aggregate operand that is dictionary-encoded is read by its
+values, while the user's column type stays intact in the output. Sorting orders
+by the *values* (lexicographic for strings), never by the dictionary indices: the
+fixtures below put "y" before "x" in the dictionary so an index-order sort would
+come out wrong.
 """
 
 from __future__ import annotations

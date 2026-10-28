@@ -116,7 +116,7 @@ except ImportError:  # pragma: no cover - native module not yet built
     class UrsaError(Exception):
         """Base class for every error Ursa raises from native execution."""
 
-    class ColumnNotFoundError(UrsaError):
+    class ColumnNotFoundError(UrsaError, ValueError):
         """A query referenced a column that does not exist in the frame."""
 
     class ComputeError(UrsaError):

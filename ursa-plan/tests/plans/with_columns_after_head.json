@@ -1,5 +1,5 @@
 {
- "description": "A relational step before with_columns.",
+ "description": "with_columns after a relational step computes over the rows it keeps.",
  "inputs": [
   {
    "nodes": "karate"
@@ -41,7 +41,22 @@
   ]
  },
  "expect": {
-  "error": "not_implemented",
-  "message": "with_columns() after head() is not supported; compute columns first, then head()."
+  "columns": [
+   "id",
+   "club",
+   "deg"
+  ],
+  "rows": [
+   [
+    0,
+    "Mr. Hi",
+    16
+   ],
+   [
+    1,
+    "Mr. Hi",
+    8
+   ]
+  ]
  }
 }

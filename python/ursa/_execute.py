@@ -5,16 +5,16 @@
 ``ursa._ursa.run_plan``. Rust decides how the plan runs: it walks the tree, rejects
 the shapes that aren't supported, and maps the rest onto its executors.
 
-Scans, subgraph masks, weights and every ``filter`` run in Rust (#192). What stays
-here is what belongs to the Python frames. ``run_plan`` reads it back through
-``_Host``, by slot, as it needs it:
+Scans, subgraph masks, weights and every relational step run in Rust (#191,
+#192). What stays here is what belongs to the Python frames. ``run_plan`` reads it
+back through ``_Host``, by slot, as it needs it:
 
 - each frame's source: its in-memory table, or its scan's storage options;
 - the per-frame cells (``_frames._BuildCell``): the topology index (which carries
   the weight and mask caches), and a scanned node table's native cache;
 - seed id sets;
-- the pyarrow tail: the relational steps other than ``filter`` that the engine's
-  fixed-order tail can't run as written (#191 retires it).
+- the rows a ``sample`` keeps, drawn with the stdlib's seeded generator, so any
+  seed Python's ``random`` accepts keeps working.
 """
 
 from __future__ import annotations
@@ -68,8 +68,9 @@ class _Host:
 
     A slot is a frame (whose source, caches and masks live on the Python object)
     or a seed set. A relational node of the plan also carries the handle of the
-    ``_PlanStep`` it came from, so the steps the engine can't run are applied
-    here from the original step, with no round trip through JSON."""
+    ``_PlanStep`` it came from: a ``sample`` draws its rows here from the original
+    step's arguments, and a step whose arguments failed to parse raises that
+    error where the executor reaches it."""
 
     __slots__ = ("_errors", "_frame_slots", "_slots", "_steps")
 
@@ -205,11 +206,11 @@ class _Host:
         if op == "filter":
             return {"predicate": _expr_to_json(a["predicate"])}
         if op == "select":
-            return {"columns": _parse_select(a["columns"])}
+            return {"columns": [_select_item(c) for c in a["columns"]]}
         if op == "rename":
             return {"mapping": [[old, new] for old, new in dict(a["mapping"]).items()]}
         if op == "sort":
-            return {"by": [{"column": c, "descending": d} for c, d in _parse_sort(a)]}
+            return {"by": [_sort_key(k, d) for k, d in _parse_sort(a)]}
         if op == "head":
             return {"n": int(a["n"])}
         if op == "sample":
@@ -282,14 +283,17 @@ class _Host:
     def seeds(self, slot: int) -> Any:
         return _resolve_seeds(self._slots[slot])
 
-    def apply_steps(self, rows: Any, handles: list[int], roles: dict[str, str]) -> Any:
-        """Run the steps behind ``handles`` (never a ``filter``: those run in Rust)
-        in pyarrow, on a table this host produced or on the engine's batch list."""
-        import pyarrow as pa
+    def sample(self, handle: int, rows: int) -> list[int] | None:
+        """The positions (ascending) a ``sample`` step keeps out of ``rows`` rows,
+        or None for all of them: a seeded stdlib draw over the row positions."""
+        import random
 
-        table = pa.Table.from_batches(rows) if isinstance(rows, list) else rows
-        steps = [_tail_step(self._steps[h]) for h in handles]
-        return _apply_pyarrow_steps(table, steps, roles)
+        args = self._steps[handle].args
+        n, seed = int(args["n"]), args.get("seed")
+        if n >= rows:
+            return None
+        rng = random.Random(seed if seed is not None else _DEFAULT_SAMPLE_SEED)
+        return sorted(rng.sample(range(rows), n))
 
     def batches(self, table: Any) -> list[Any]:
         return _batches(table)
@@ -458,33 +462,20 @@ def _int_json(value: Any) -> Any:
 
 
 # --- select (column projection) --------------------------------------------
-def _parse_select(columns: Any) -> list[str]:
-    """The output column names for a ``select(...)`` step. Accepts bare names or
-    ``ur.col(name)`` (Polars-shaped); richer select expressions are future work."""
-    names: list[str] = []
-    for c in columns:
-        if isinstance(c, str):
-            names.append(c)
-        elif getattr(c, "kind", None) == "col":
-            names.append(c.payload["name"])
-        else:
-            raise NotImplementedError(
-                "select() supports column names or ur.col(<name>) for now "
-                "(e.g. .select('id', ur.col('pagerank')))."
-            )
-    return names
-
-
-def _select_table(table: Any, select: list[str]) -> Any:
-    """Narrow a pyarrow table to the selected columns (the ``select`` output
-    projection). ``select`` never changes rows, only which columns are kept and in
-    what order — the Polars-faithful counterpart to additive ``with_columns``."""
-    missing = [c for c in select if c not in table.column_names]
-    if missing:
-        from . import ColumnNotFoundError
-
-        raise ColumnNotFoundError(f"select() references unknown column(s): {missing}")
-    return table.select(select)
+def _select_item(column: Any) -> Any:
+    """One ``select(...)`` item: a column name (a bare name or ``ur.col(name)``),
+    or any other expression, serialized (``ursa_plan::plan::SelectItem``)."""
+    if isinstance(column, str):
+        return column
+    kind = getattr(column, "kind", None)
+    if kind == "col":
+        return column.payload["name"]
+    if kind is not None and kind != "graph":
+        return _expr_to_json(column)
+    raise NotImplementedError(
+        "select() takes column names, ur.col(<name>) or expressions over columns "
+        "(e.g. .select('id', (ur.col('w') * 2).alias('w2')))."
+    )
 
 
 def _scan_storage_options(scan: dict[str, Any]) -> dict[str, Any] | None:
@@ -724,23 +715,28 @@ def _parse_group_agg(step: _PlanStep) -> tuple[list[str], list[dict[str, str]]]:
     return keys, [{"output": output, "fn": fn, "column": col} for (output, fn, col) in resolved]
 
 
-def _parse_sort(args: dict[str, Any]) -> list[tuple[str, bool]]:
-    """Parse a ``sort`` step into ``[(column, descending), ...]`` keys, in order.
+def _parse_sort(args: dict[str, Any]) -> list[tuple[Any, bool]]:
+    """Parse a ``sort`` step into ``[(key, descending), ...]``, in order: each key a
+    column name, or an expression.
 
-    ``by`` is a column name / ``ur.col(name)`` or a list of them; ``descending`` is
-    one bool for every key or a list with one bool per key."""
+    ``by`` is a column name / ``ur.col(name)`` / expression or a list of them;
+    ``descending`` is one bool for every key or a list with one bool per key."""
     by = args["by"]
     items = list(by) if isinstance(by, (list, tuple)) else [by]
     if not items:
         raise ValueError("sort() needs at least one column (got an empty list).")
-    names: list[str] = []
+    names: list[Any] = []
     for k in items:
         if isinstance(k, str):
             names.append(k)
         elif getattr(k, "kind", None) == "col":
             names.append(k.payload["name"])
+        elif getattr(k, "kind", None) not in (None, "graph"):
+            names.append(k)  # an expression key
         else:
-            raise ValueError(f"sort() keys must be column names or ur.col(<name>); got {k!r}.")
+            raise ValueError(
+                f"sort() keys must be column names, ur.col(<name>) or expressions; got {k!r}."
+            )
     descending = args.get("descending", False)
     if isinstance(descending, (list, tuple)):
         if len(descending) != len(names):
@@ -754,72 +750,11 @@ def _parse_sort(args: dict[str, Any]) -> list[tuple[str, bool]]:
     return list(zip(names, flags, strict=True))
 
 
-# --- the pyarrow tail -------------------------------------------------------
-# Relational steps take effect in the order they are written, as in Polars (#162,
-# #164): `.select("c").distinct()` dedups the selected column, `.rename({"v":
-# "val"}).sort("val")` sorts by the new name, `.head(3).sort("v")` sorts three rows.
-# The executor runs the leading steps its engine tail runs identically and hands
-# the rest here (`_Host.apply_steps`), as it does the steps on a plain source,
-# except `filter`, which the executor evaluates itself. Each is parsed into a
-# `(kind, arg)` step and applied in pyarrow, in order:
-#   ("sort", <_parse_sort>)  ("head", n)  ("distinct", None)
-#   ("sample", (n, seed))  ("rename", {old: new})  ("select", [names])
-#   ("group_by", <_parse_group_agg>)
-_Step = tuple[str, Any]
-
-
-def _tail_step(step: _PlanStep) -> _Step:
-    """Parse one relational plan step into a tail step."""
-    op, args = step.op, step.args
-    if op == "sort":
-        return ("sort", _parse_sort(args))
-    if op == "head":
-        return ("head", int(args["n"]))
-    if op == "distinct":
-        return ("distinct", None)
-    if op == "sample":
-        return ("sample", (int(args["n"]), args.get("seed")))
-    if op == "rename":
-        return ("rename", dict(args["mapping"]))
-    if op == "select":
-        return ("select", _parse_select(args["columns"]))
-    if op == "group_by_agg":
-        return ("group_by", _parse_group_agg(step))
-    raise AssertionError(f"not a relational tail step: {op!r}")
-
-
-def _apply_pyarrow_sort(table: Any, sort: list[tuple[str, bool]]) -> Any:
-    for by, _ in sort:
-        if by not in table.column_names:
-            raise ValueError(f"sort references unknown column '{by}'.")
-    return _sort_pyarrow(table, sort)
-
-
-def _apply_pyarrow_steps(table: Any, steps: list[_Step], roles: dict[str, str]) -> Any:
-    """Apply tail ``steps`` to a pyarrow table, each in the order written. ``roles``
-    would resolve role references; no step here takes one (filters run in Rust)."""
-    del roles
-    for kind, arg in steps:
-        if kind == "group_by":
-            table = _apply_pyarrow_group_by(table, arg[0], arg[1])
-        elif kind == "distinct":
-            # Distinct rows over all columns (group-by with no aggregations), each
-            # at its first occurrence.
-            names = table.column_names
-            table = _group_in_first_order(table, names, []).select(names)
-        elif kind == "sample":
-            table = _sample_pyarrow(table, arg[0], arg[1])
-        elif kind == "sort":
-            table = _apply_pyarrow_sort(table, arg)
-        elif kind == "head":
-            table = table.slice(0, arg)
-        elif kind == "rename":
-            table = _apply_pyarrow_rename(table, arg)
-        elif kind == "select":
-            table = _select_table(table, arg)
-        else:
-            raise AssertionError(f"unknown tail step {kind!r}")
-    return table
+def _sort_key(key: Any, descending: bool) -> dict[str, Any]:
+    """A sort key for the plan: a column, or an expression."""
+    if isinstance(key, str):
+        return {"column": key, "descending": descending}
+    return {"expr": _expr_to_json(key), "descending": descending}
 
 
 # --- join ------------------------------------------------------------------
@@ -844,152 +779,8 @@ def _parse_join_keys(on: Any) -> list[str]:
     return keys
 
 
-# --- the rest of the pyarrow tail (#191) ---------------------------------------
-# A plain frame takes exactly one deterministic sampling policy, distinct from the
-# engine's (both reproducible, not byte-identical to each other): a stable stdlib
-# PRNG over the single in-memory table's row order (which, unlike the engine, is
-# unpartitioned, so no content-canonical ordering is needed for thread-invariance).
+# A sample with no seed draws with this one, so it is reproducible too.
 _DEFAULT_SAMPLE_SEED = 0x5EED5EED
-
-
-def _sample_pyarrow(table: Any, n: int, seed: int | None) -> Any:
-    """Deterministically take ``n`` rows (without replacement) from a pyarrow table.
-    ``n >= row_count`` returns all rows; ``seed=None`` uses the default seed."""
-    import random
-
-    r = table.num_rows
-    if n >= r:
-        return table
-    idx = random.Random(seed if seed is not None else _DEFAULT_SAMPLE_SEED).sample(range(r), n)
-    return table.take(sorted(idx))
-
-
-def _apply_pyarrow_rename(table: Any, rename: dict[str, str]) -> Any:
-    """Relabel output columns of a pyarrow table. An unknown source column is an
-    error (no silent no-op), matching the engine path's ``rename`` check."""
-    if not rename:
-        return table
-    missing = [old for old in rename if old not in table.column_names]
-    if missing:
-        from . import ColumnNotFoundError
-
-        raise ColumnNotFoundError(f"rename() references unknown column(s): {missing}")
-    return table.rename_columns([rename.get(c, c) for c in table.column_names])
-
-
-# pyarrow.compute aggregate function names by our fn name.
-_PC_AGG = {
-    "mean": "mean",
-    "sum": "sum",
-    "min": "min",
-    "max": "max",
-    "count": "count",
-    "n_unique": "count_distinct",
-}
-
-
-def _apply_pyarrow_group_by(table: Any, keys: list[str], aggs: list[dict[str, str]]) -> Any:
-    """Group ``table`` by ``keys`` and aggregate, producing `[keys..., outputs...]`
-    with the same output column names as the engine path. Mirrors the engine's
-    unknown-key error."""
-    for k in keys:
-        if k not in table.column_names:
-            raise ValueError(f"group_by() references unknown column '{k}'.")
-    for a in aggs:
-        if a["column"] not in table.column_names:
-            raise ValueError(f"agg() references unknown column '{a['column']}'.")
-    # Deduplicate the (column, pcfn) computations: two aggregations with distinct
-    # output names but the same column+fn (e.g. .agg(a=col('x').sum(), b=col('x')
-    # .sum())) share one pyarrow aggregate, and the engine path likewise emits two
-    # aliases of one sum — so both paths stay consistent. pyarrow names an
-    # aggregate output "{column}_{pcfn}"; each is mapped back to *every* output
-    # that requested it.
-    #
-    # pyarrow's hash sum/mean/min/max have no dictionary kernels, so a dictionary-
-    # encoded (categorical) operand is aggregated through a decoded copy under a
-    # private name. Group *keys* stay as-is: hash grouping handles dictionaries and
-    # the key column keeps the user's type in the output.
-    import pyarrow as pa
-
-    operand: dict[str, str] = {}
-    for a in aggs:
-        col = a["column"]
-        if col in operand:
-            continue
-        operand[col] = col
-        if pa.types.is_dictionary(table.schema.field(col).type):
-            tmp = f"__ursa_decoded_{col}"
-            while tmp in table.column_names:
-                tmp += "_"
-            operand[col] = tmp
-            table = table.append_column(tmp, _decode_dictionary(table.column(col)))
-    specs = []
-    seen_specs: set[tuple[str, str]] = set()
-    for a in aggs:
-        spec = (operand[a["column"]], _PC_AGG[a["fn"]])
-        if spec not in seen_specs:
-            seen_specs.add(spec)
-            specs.append(spec)
-    grouped = _group_in_first_order(table, keys, specs)
-    cols = {name: grouped.column(name) for name in grouped.column_names}
-
-    ordered_names = list(keys)
-    ordered_cols = [cols[k] for k in keys]
-    for a in aggs:
-        ordered_names.append(a["output"])
-        ordered_cols.append(cols[f"{operand[a['column']]}_{_PC_AGG[a['fn']]}"])
-    return pa.table(dict(zip(ordered_names, ordered_cols, strict=True)))
-
-
-def _group_in_first_order(table: Any, keys: list[str], specs: list[Any]) -> Any:
-    """``table.group_by(keys).aggregate(specs)`` with one row per group in order of
-    the group's first input row, the order the engine path gives (#168).
-
-    pyarrow's hash grouping guarantees no output order (not even single-threaded),
-    so each row is numbered, each group keeps its minimum number, and the groups
-    are put in that order."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    row = "__ursa_row"
-    while row in table.column_names:
-        row += "_"
-    ones = pa.nulls(table.num_rows, pa.int64()).fill_null(1)
-    numbered = table.combine_chunks().append_column(row, pc.cumulative_sum(ones))  # ty: ignore[unresolved-attribute]
-    grouped = numbered.group_by(keys).aggregate([*specs, (row, "min")])
-    first = f"{row}_min"
-    grouped = grouped.take(pc.sort_indices(grouped.column(first)))  # ty: ignore[unresolved-attribute]
-    return grouped.drop_columns([first])
-
-
-def _decode_dictionary(column: Any) -> Any:
-    """A dictionary-encoded (categorical) column decoded to its value type; any
-    other column is returned unchanged."""
-    import pyarrow as pa
-
-    if pa.types.is_dictionary(column.type):
-        return column.cast(column.type.value_type)
-    return column
-
-
-def _sort_pyarrow(table: Any, keys: list[tuple[str, bool]]) -> Any:
-    """Stable-sort ``table`` lexicographically by ``keys`` — ``(column,
-    descending)`` pairs, later keys breaking ties in earlier ones — with nulls last
-    for every key. pyarrow has no sort kernel for dictionary arrays, so each sort
-    *key* is decoded — ordering by the values (lexicographic for strings), never
-    the dictionary indices — while the output keeps the original (dictionary)
-    columns."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    key_table = pa.table(
-        {f"k{i}": _decode_dictionary(table.column(by)) for i, (by, _) in enumerate(keys)}
-    )
-    sort_keys = [
-        (f"k{i}", "descending" if descending else "ascending")
-        for i, (_, descending) in enumerate(keys)
-    ]
-    return table.take(pc.sort_indices(key_table, sort_keys=sort_keys))  # ty: ignore[unresolved-attribute]
 
 
 def _native() -> Any:
