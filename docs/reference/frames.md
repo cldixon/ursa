@@ -93,7 +93,7 @@ Without a `sort`, rows come back in input order, the same on every run and every
 | Method | Description |
 |---|---|
 | `.explain(physical=False)` | The plan as text: the steps, the schema, and the DataFusion plans a collect runs. Runs nothing. See [below](#explain). |
-| `.schema()` | The schema `collect()` returns, as a `pyarrow.Schema`: column names, types and nullability. Runs nothing; a frame over a scan reads the file's schema. |
+| `.schema()` | The schema `collect()` returns, as a `pyarrow.Schema`: column names, types and nullability. Runs nothing; a frame over a scan reads the file's schema (see below). |
 
 ### Execution
 
@@ -112,11 +112,13 @@ Some combinations of steps do not run yet. See [Limits](../limits.md).
 
 `explain()` returns text in three parts:
 
-1. **The plan:** the frame's steps as a tree, last step first, each written as its method call. A graph column, traversal or `describe` lists the edge frame it runs over under it (`edges:`), and a `join` its right side (`right:`).
+1. **The plan:** the frame's steps, last step first, one per line, each written as its method call. A graph column, traversal or `describe` lists the edge frame it runs over indented under it (`edges:`), and a `join` its right side (`right:`).
 2. **Schema:** the columns `collect()` returns, with their Arrow types, marked `not null` where they hold no nulls by construction.
 3. **DataFusion plans:** the DataFusion logical plans a collect executes, in order, each optimized. A collect runs one plan for each stretch of steps between the points where it materializes rows (a graph algorithm, a sort, a join input), so a plan can have several; steps that run directly on materialized rows (a `filter`, a `head`) show no plan of their own. `explain(physical=True)` adds each one's physical plan.
 
 `explain()` reads no rows and builds no graph index; a scan reads its file's schema. On a frame that does not collect as it is, such as `edges.nodes()` with no columns yet, the DataFusion part says why. The text is for reading: its format is not a stable API and may change between versions. Use `schema()` for the columns programmatically.
+
+`schema()` and `explain()` cache nothing they read from a scan: each call lists the scan's files and reads their schema (a Parquet file's footer) again, so the result follows the files as they are now. For an `s3://`, `gs://`, `az://` or `http(s)://` path that is a network round trip per call.
 
 ## `ur.MaterializedFrame`
 

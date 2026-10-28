@@ -243,7 +243,9 @@ impl IndexCell {
 
     /// Replace the value (the host setting it).
     pub fn set_value(&self, value: Option<CellValue>) {
-        *self.lock() = value;
+        // The old value (and the host's handle on it) is dropped after the lock.
+        let old = std::mem::replace(&mut *self.lock(), value);
+        drop(old);
     }
 
     /// Keep `index` unless one is already built; the cell's index either way.
@@ -290,6 +292,97 @@ impl IndexCell {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<CellValue>> {
         self.value.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A node that stands in for a child a dropped node no longer holds.
+fn placeholder() -> Arc<Node> {
+    static LEAF: OnceLock<Arc<Node>> = OnceLock::new();
+    LEAF.get_or_init(|| {
+        Arc::new(Node {
+            op: Op::FromArrow {
+                table: Arc::new(()),
+                schema: Arc::new(arrow::datatypes::Schema::empty()),
+                endpoints: None,
+            },
+            kind: Kind::Nodes { id: String::new() },
+            state: Arc::default(),
+            seeds: OnceLock::new(),
+            seeds_host: OnceLock::new(),
+            info: OnceLock::new(),
+        })
+    })
+    .clone()
+}
+
+/// Move a node's children (the frames its step reads, and those its validation
+/// keeps) into `out`, leaving placeholders.
+fn take_children(node: &mut Node, out: &mut Vec<Arc<Node>>) {
+    let mut take = |child: &mut Arc<Node>| out.push(std::mem::replace(child, placeholder()));
+    let seeds = |s: &mut Seeds, take: &mut dyn FnMut(&mut Arc<Node>)| {
+        if let Seeds::Frame(n) = s {
+            take(n);
+        }
+    };
+    match &mut node.op {
+        Op::FromArrow { .. } | Op::ScanEdges { .. } | Op::ScanNodes { .. } => {}
+        Op::Step { input, step, .. } => {
+            take(input);
+            match step {
+                Step::Join { right, .. } => take(right),
+                Step::WithColumns(columns) => {
+                    for c in columns {
+                        if let ColumnExpr::Graph {
+                            edges: Some(edges), ..
+                        } = &mut c.expr
+                        {
+                            take(edges);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Op::Nodes { input } | Op::Reverse { input } => take(input),
+        Op::Hop {
+            edges, seeds: s, ..
+        } => {
+            take(edges);
+            seeds(s, &mut take);
+        }
+        Op::ShortestPath {
+            edges,
+            source,
+            target,
+            ..
+        } => {
+            take(edges);
+            seeds(source, &mut take);
+            seeds(target, &mut take);
+        }
+        Op::RandomWalk { edges, start, .. } => {
+            take(edges);
+            seeds(start, &mut take);
+        }
+        Op::Describe { edges, .. } => take(edges),
+    }
+    if let Some(info) = node.info.take() {
+        out.extend(info.pending.into_iter().flatten());
+        out.extend(info.chain.anchor);
+    }
+}
+
+impl Drop for Node {
+    /// Drop a chain one node at a time: a frame of many steps would otherwise
+    /// drop them recursively, a stack frame per step.
+    fn drop(&mut self) {
+        let mut stack = vec![];
+        take_children(self, &mut stack);
+        while let Some(child) = stack.pop() {
+            if let Ok(mut node) = Arc::try_unwrap(child) {
+                take_children(&mut node, &mut stack);
+            }
+        }
     }
 }
 
@@ -599,6 +692,10 @@ pub struct Lowering {
     slots: Vec<SlotRef>,
     frames: HashMap<*const Node, Slot>,
     steps: Vec<Arc<Node>>,
+    /// Lowered for a shape check ([`check_shape`]): a node frame's steps whose
+    /// check is their own are left out (see `infer::elides`), and a join's right
+    /// side, which a shape check never reads, is a stub.
+    shape: bool,
 }
 
 impl Lowering {
@@ -607,6 +704,7 @@ impl Lowering {
             slots: vec![],
             frames: HashMap::new(),
             steps: vec![],
+            shape: false,
         }
     }
 
@@ -655,7 +753,11 @@ impl Lowering {
         let slot = self.frame_slot(top);
         let mut chain: Vec<Arc<Node>> = vec![top.clone()];
         while let Some(input) = chain.last().and_then(|n| n.input()).cloned() {
-            chain.push(input);
+            chain.push(if self.shape {
+                crate::infer::shape_input(&input)
+            } else {
+                input
+            });
         }
         chain.reverse();
         let mut step_slot = slot;
@@ -728,7 +830,13 @@ impl Lowering {
                 }
                 if let Step::Join { right, on, how } = step {
                     let input = input();
-                    let right = Box::new(self.frame(right));
+                    let right = Box::new(if self.shape {
+                        Plan::Invalid {
+                            step: self.handle(right),
+                        }
+                    } else {
+                        self.frame(right)
+                    });
                     let handle = self.handle(node);
                     return Plan::Join {
                         input,
@@ -1087,6 +1195,8 @@ impl Inputs for TreeInputs<'_> {
     fn step_error(&self, step: Slot) -> PlanError {
         match self.step_node(step).map(|n| &n.op) {
             Ok(Op::Step { error: Some(e), .. }) => self.host.error(e),
+            // A join's right side in a shape check (never read there).
+            _ if self.mode == Mode::Shape => pending(),
             _ => PlanError::Invalid(format!("step {step} has no stored error")),
         }
     }
@@ -1398,7 +1508,9 @@ pub fn lowered_json(node: &Arc<Node>, mut each: impl FnMut(SlotSource<'_>)) -> S
 
 /// Check a lowered tree's shape without its inputs ([`crate::plan::check_shape`]).
 pub(crate) fn check_shape(node: &Arc<Node>, host: &dyn Host) -> PlanResult<()> {
-    let (plan, lowering) = Lowering::of(node);
+    let mut lowering = Lowering::new();
+    lowering.shape = true;
+    let plan = lowering.frame(node);
     crate::plan::check_shape(&plan, &lowering.inputs(host, Mode::Shape))
 }
 

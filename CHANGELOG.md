@@ -92,7 +92,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   argument is NaN, which has no JSON form` (it quoted a JSON parser offset).
   The guard on steps on a traversal's edges before `nodes()` is raised by the
   first `with_columns` after `nodes()`, which raises the graph op's own guard
-  instead when its edges are those, as `collect()` did.
+  instead when its edges are those, as `collect()` did. Two other errors read differently. A role column that is not a string
+  (`scan_edges(path, src=1, dst="d")`) raises `TypeError: argument 'src': 'int'
+  object is not an instance of 'str'` where the frame is made (`collect()`
+  raised `ValueError: invalid plan: invalid type: integer \`1\`, expected a
+  string`). An argument the plan could not read keeps that message but no longer
+  ends with the JSON parser's `at line 1 column N`.
 - `collect()` now hands the whole query to Rust as one plan. The frame is
   serialized to a plan IR in `ursa-plan` (`ursa_plan::plan::Plan`), and a single
   entry point, `execute_plan` (`ursa._ursa.run_plan` in Python), picks which

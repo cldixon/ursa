@@ -278,7 +278,7 @@ shape: (2, 2)
 
 ## Explain
 
-`explain()` prints the plan and runs nothing: the steps as a tree, last step first, the schema the frame collects to, and the DataFusion plans a collect runs. `schema()` returns that schema as a `pyarrow.Schema`.
+`explain()` prints the plan and runs nothing: the steps, last step first, with the frames a step reads (a graph column's edges, a join's right side) indented under it, the schema the frame collects to, and the DataFusion plans a collect runs. `schema()` returns that schema as a `pyarrow.Schema`.
 
 ```python
 print(ranked.filter(ur.col("degree") > 5).sort("degree", descending=True).head(3).explain())
@@ -287,14 +287,14 @@ print(ranked.filter(ur.col("degree") > 5).sort("degree", descending=True).head(3
 ```text
 NodeFrame plan:
   head(3)
-    sort("degree" desc)
-      filter((col("degree") > lit(5)))
-        with_columns(degree=degree(direction="both"), triangles=triangle_count())
-          degree edges:
-            from_arrow(src="src", dst="dst")
-          triangles edges:
-            from_arrow(src="src", dst="dst")
-          from_arrow(id="id")
+  sort("degree" desc)
+  filter((col("degree") > lit(5)))
+  with_columns(degree=degree(direction="both"), triangles=triangle_count())
+    degree edges:
+      from_arrow(src="src", dst="dst")
+    triangles edges:
+      from_arrow(src="src", dst="dst")
+  from_arrow(id="id")
 
 Schema:
   id: Int64

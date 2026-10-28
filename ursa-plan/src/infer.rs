@@ -7,7 +7,10 @@
 //!    ([`crate::plan::check_shape`]), with a host that has no inputs: every
 //!    guard on the shape of the plan and every step's arguments are checked up
 //!    to the first input the executor would read. The errors are the collect's
-//!    own. One is not raised here: `edges.nodes()` with no columns does not
+//!    own. The walk reads what a step's guards read and no more: the steps a
+//!    node frame's executor checks one by one are left out below the new step
+//!    (see `elides`), and a join's right side, which the walk never reaches, is
+//!    a stub, so a step's check does not grow with the chain before it. One is not raised here: `edges.nodes()` with no columns does not
 //!    collect, but a later `with_columns` makes it collect.
 //! 2. **The columns.** Each step is checked against the columns the frame has
 //!    when the step runs, with the checks the executor's lowering makes
@@ -21,7 +24,7 @@
 //! which a collect reads then (the file may also change between the two). So is
 //! anything downstream of a step whose output is not known exactly here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -49,27 +52,109 @@ pub struct Info {
     /// The frame does not collect as it is, for a reason left to `collect()`
     /// (the error's message; see `at_collect`).
     pub terminal: Option<String>,
+    /// What validation knows of the frame's chain, kept step by step.
+    pub chain: ChainInfo,
 }
 
+/// What a frame's chain holds, kept step by step so a step reads it in O(1).
+#[derive(Default, Clone)]
+pub struct ChainInfo {
+    /// The chain's first step.
+    pub root: Root,
+    /// The chain crosses `nodes()`.
+    pub nodes: bool,
+    /// A `with_columns` comes after `nodes()` (or, on a frame with no
+    /// `nodes()`, anywhere): the node frame's first one is in the chain.
+    pub columns: bool,
+    /// For a step whose shape check is its own (see `elides`): the nearest step
+    /// below it that is not, which a shape check reads in its place.
+    pub anchor: Option<Arc<Node>>,
+}
+
+/// A chain's first step, as the executor tells chains apart.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum Root {
+    #[default]
+    Source,
+    Traversal,
+    Walk,
+    Describe,
+}
+
+/// A column's shared name and type (when known).
+type Field_ = (Arc<str>, Option<DataType>);
+
 /// A frame's columns: names in order, and each type where it is known.
+///
+/// A step that appends columns (`with_columns`) shares its input's: its columns
+/// are a level over them, so a step on a wide frame costs what it adds, not the
+/// frame's width. Every `MAX_DEPTH` levels they are copied into one.
 pub struct Cols {
-    fields: Vec<(String, Option<DataType>)>,
-    arrow: SchemaRef,
+    /// The columns before this level's, if any.
+    below: Option<Arc<Cols>>,
+    /// This level's columns, in order.
+    own: Vec<Field_>,
+    /// `own` by name, for a wide level.
+    index: Option<HashMap<Arc<str>, usize>>,
+    depth: usize,
+    /// Every column's type is known.
+    all_typed: bool,
+    /// All the columns in order, for a frame of more than one level.
+    flat: OnceLock<Vec<Field_>>,
+    /// The columns as an Arrow schema, built when first needed.
+    arrow: OnceLock<SchemaRef>,
     /// The schema expressions are typed against, built when first needed.
     df: OnceLock<Option<DFSchema>>,
 }
 
+/// How many levels of appended columns a frame's columns keep before they are
+/// copied into one.
+const MAX_DEPTH: usize = 64;
+
+/// How wide a level is before it is looked up by name through an index.
+const INDEXED: usize = 16;
+
 impl Cols {
     fn new(fields: Vec<(String, Option<DataType>)>) -> Arc<Cols> {
-        let arrow = Arc::new(Schema::new(
-            fields
-                .iter()
-                .map(|(n, t)| Field::new(n, t.clone().unwrap_or(DataType::Null), true))
-                .collect::<Vec<_>>(),
-        ));
+        Cols::shared(fields.into_iter().map(|(n, t)| (n.into(), t)).collect())
+    }
+
+    fn shared(own: Vec<Field_>) -> Arc<Cols> {
         Arc::new(Cols {
-            fields,
-            arrow,
+            below: None,
+            index: (own.len() > INDEXED).then(|| {
+                own.iter()
+                    .enumerate()
+                    .map(|(i, (n, _))| (n.clone(), i))
+                    .collect()
+            }),
+            all_typed: own.iter().all(|(_, t)| t.is_some()),
+            own,
+            depth: 0,
+            flat: OnceLock::new(),
+            arrow: OnceLock::new(),
+            df: OnceLock::new(),
+        })
+    }
+
+    /// `base`'s columns, then `extra` (whose names `base` does not have).
+    fn append(base: &Arc<Cols>, extra: Vec<Field_>) -> Arc<Cols> {
+        if extra.is_empty() {
+            return base.clone();
+        }
+        if base.depth + 1 >= MAX_DEPTH {
+            let mut all = base.fields().to_vec();
+            all.extend(extra);
+            return Cols::shared(all);
+        }
+        Arc::new(Cols {
+            all_typed: base.all_typed && extra.iter().all(|(_, t)| t.is_some()),
+            below: Some(base.clone()),
+            own: extra,
+            index: None,
+            depth: base.depth + 1,
+            flat: OnceLock::new(),
+            arrow: OnceLock::new(),
             df: OnceLock::new(),
         })
     }
@@ -84,38 +169,140 @@ impl Cols {
         )
     }
 
+    /// The columns, in order.
+    fn fields(&self) -> &[Field_] {
+        let Some(below) = &self.below else {
+            return &self.own;
+        };
+        self.flat.get_or_init(|| {
+            // The levels from the first, then each one's columns in order (no
+            // level below caches its own copy).
+            let mut levels = vec![self];
+            let mut next = below.as_ref();
+            loop {
+                levels.push(next);
+                match &next.below {
+                    Some(b) => next = b,
+                    None => break,
+                }
+            }
+            levels
+                .iter()
+                .rev()
+                .flat_map(|l| l.own.iter().cloned())
+                .collect()
+        })
+    }
+
+    /// A column's type (`Some(None)` for a column of unknown type).
+    fn find(&self, name: &str) -> Option<&Option<DataType>> {
+        let mut level = Some(self);
+        while let Some(cols) = level {
+            let at = match &cols.index {
+                Some(index) => index.get(name).copied(),
+                None => cols.own.iter().position(|(n, _)| &**n == name),
+            };
+            if let Some(i) = at {
+                return Some(&cols.own[i].1);
+            }
+            level = cols.below.as_deref();
+        }
+        None
+    }
+
     fn type_of(&self, name: &str) -> Option<DataType> {
-        self.fields
-            .iter()
-            .find(|(n, _)| n == name)
-            .and_then(|(_, t)| t.clone())
+        self.find(name).cloned().flatten()
     }
 
     /// The type of an expression lowered against these columns.
     fn type_of_expr(&self, e: &Option<datafusion::logical_expr::Expr>) -> Option<DataType> {
-        let (Some(e), Some(df)) = (e, self.typed()) else {
-            return None;
-        };
-        e.get_type(df).ok()
+        type_in(e, self)
+    }
+}
+
+/// The type of an expression lowered against `view`.
+fn type_in(e: &Option<datafusion::logical_expr::Expr>, view: &dyn View) -> Option<DataType> {
+    let (Some(e), Some(df)) = (e, view.typed()) else {
+        return None;
+    };
+    e.get_type(df).ok()
+}
+
+/// A frame's columns as one expression reads them: its own columns are typed
+/// alone, so checking an expression over a wide frame costs what it reads, not
+/// the frame's width. Names and errors are the whole frame's.
+struct Narrow<'a> {
+    cols: &'a Cols,
+    /// The columns the expression reads that the frame has.
+    read: Arc<Cols>,
+    /// The frame has every column the expression reads.
+    complete: bool,
+}
+
+impl<'a> Narrow<'a> {
+    fn new(cols: &'a Cols, v: &serde_json::Value, roles: &[(&'static str, String)]) -> Narrow<'a> {
+        let names = crate::plan::value_columns(v, roles);
+        let read: Vec<Field_> = names
+            .iter()
+            .filter_map(|n| cols.find(n).map(|t| (n.as_str().into(), t.clone())))
+            .collect();
+        Narrow {
+            complete: read.len() == names.len(),
+            read: Cols::shared(read),
+            cols,
+        }
+    }
+}
+
+impl View for Narrow<'_> {
+    fn names(&self) -> Vec<String> {
+        self.cols.names()
+    }
+    fn has_column(&self, name: &str) -> bool {
+        self.cols.has_column(name)
+    }
+    fn arrow(&self) -> SchemaRef {
+        if self.complete {
+            self.read.arrow()
+        } else {
+            self.cols.arrow()
+        }
+    }
+    fn typed(&self) -> Option<&DFSchema> {
+        if self.cols.all_typed {
+            self.read.typed()
+        } else {
+            None
+        }
     }
 }
 
 impl View for Cols {
     fn names(&self) -> Vec<String> {
-        self.fields.iter().map(|(n, _)| n.clone()).collect()
+        self.fields().iter().map(|(n, _)| n.to_string()).collect()
     }
     fn has_column(&self, name: &str) -> bool {
-        self.fields.iter().any(|(n, _)| n == name)
+        self.find(name).is_some()
     }
     fn arrow(&self) -> SchemaRef {
-        self.arrow.clone()
+        self.arrow
+            .get_or_init(|| {
+                Arc::new(Schema::new(
+                    self.fields()
+                        .iter()
+                        .map(|(n, t)| {
+                            Field::new(n.as_ref(), t.clone().unwrap_or(DataType::Null), true)
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .clone()
     }
     fn typed(&self) -> Option<&DFSchema> {
         self.df
             .get_or_init(|| {
-                let typed = self.fields.iter().all(|(_, t)| t.is_some());
-                typed
-                    .then(|| DFSchema::try_from(self.arrow.as_ref().clone()).ok())
+                self.all_typed
+                    .then(|| DFSchema::try_from(self.arrow().as_ref().clone()).ok())
                     .flatten()
             })
             .as_ref()
@@ -149,10 +336,7 @@ pub(crate) fn validate(node: &Arc<Node>, host: &dyn Host) -> PlanResult<Info> {
                     .iter()
                     .all(|c| matches!(c.expr, ColumnExpr::Scalar(_)))
                     && input.info().pending.is_none()
-                    && !matches!(
-                        node.chain()[0].op(),
-                        Op::Describe { .. } | Op::RandomWalk { .. }
-                    )
+                    && !matches!(input.info().chain.root, Root::Describe | Root::Walk)
             }
             _ => true,
         };
@@ -162,6 +346,7 @@ pub(crate) fn validate(node: &Arc<Node>, host: &dyn Host) -> PlanResult<Info> {
             }
             let mut info = infer(node, host)?;
             info.terminal = input.info().terminal.clone();
+            info.chain = chain_info(node);
             return Ok(info);
         }
     }
@@ -174,7 +359,70 @@ pub(crate) fn validate(node: &Arc<Node>, host: &dyn Host) -> PlanResult<Info> {
     }
     let mut info = infer(node, host)?;
     info.terminal = terminal;
+    info.chain = chain_info(node);
     Ok(info)
+}
+
+/// The [`ChainInfo`] of a node, from its input's.
+fn chain_info(node: &Arc<Node>) -> ChainInfo {
+    let root = |op: &Op| match op {
+        Op::Hop { .. } | Op::ShortestPath { .. } => Root::Traversal,
+        Op::RandomWalk { .. } => Root::Walk,
+        Op::Describe { .. } => Root::Describe,
+        _ => Root::Source,
+    };
+    let Some(input) = node.input() else {
+        return ChainInfo {
+            root: root(node.op()),
+            ..ChainInfo::default()
+        };
+    };
+    let parent = &input.info().chain;
+    let mut info = ChainInfo {
+        anchor: None,
+        ..parent.clone()
+    };
+    match node.op() {
+        Op::Nodes { .. } => {
+            info.nodes = true;
+            info.columns = false;
+        }
+        Op::Step {
+            step: Step::WithColumns(_),
+            ..
+        } if parent.nodes || !matches!(node.kind(), Kind::Edges { .. }) => info.columns = true,
+        _ => {}
+    }
+    if elides(node, parent) {
+        info.anchor = Some(shape_input(input));
+    }
+    info
+}
+
+/// Whether a step's shape check is its own: whatever is appended to it walks
+/// the same guards without it. So it is for a node frame's steps after its
+/// first `with_columns` (all but that one, over a source with no `nodes()`):
+/// the executor checks each of those steps alone, before it reads the frame's
+/// rows, where a shape check ends. The steps of an edge frame are read by the
+/// graph ops and `nodes()` over it, and those after `describe()` or a walk by
+/// their own guards, so they are not elided.
+fn elides(node: &Node, parent: &ChainInfo) -> bool {
+    let Op::Step { step, .. } = node.op() else {
+        return false;
+    };
+    matches!(node.kind(), Kind::Nodes { .. })
+        && parent.root != Root::Describe
+        && parent.root != Root::Walk
+        && (parent.columns || (!parent.nodes && !matches!(step, Step::WithColumns(_))))
+}
+
+/// The step a shape check reads in place of `node` below a new step.
+pub(crate) fn shape_input(node: &Arc<Node>) -> Arc<Node> {
+    node.info()
+        .chain
+        .anchor
+        .clone()
+        .unwrap_or_else(|| node.clone())
 }
 
 /// Whether a shape error is left to `collect()`: one a later step can replace
@@ -189,22 +437,18 @@ fn at_collect(node: &Node, message: &str) -> bool {
     if !message.ends_with(crate::plan::STEPS_BEFORE_NODES) {
         return false;
     }
-    let chain = node.chain();
-    let Some(at) = chain
-        .iter()
-        .position(|n| matches!(n.op(), Op::Nodes { .. }))
-    else {
-        return false;
-    };
-    !chain[at..].iter().any(|n| {
-        matches!(
-            n.op(),
-            Op::Step {
-                step: Step::WithColumns(_),
-                ..
-            }
-        )
-    })
+    // The chain crosses `nodes()` and no `with_columns` follows it: this node's
+    // own step is not yet in its input's chain info.
+    let parent = node.input().map(|i| i.info().chain.clone());
+    let nodes = matches!(node.op(), Op::Nodes { .. }) || parent.as_ref().is_some_and(|c| c.nodes);
+    let columns = matches!(
+        node.op(),
+        Op::Step {
+            step: Step::WithColumns(_),
+            ..
+        }
+    ) || parent.is_some_and(|c| c.nodes && c.columns);
+    nodes && !columns
 }
 
 fn known(cols: Vec<(String, Option<DataType>)>) -> PlanResult<Info> {
@@ -217,12 +461,21 @@ fn known(cols: Vec<(String, Option<DataType>)>) -> PlanResult<Info> {
 /// The roles a frame's expressions resolve (`ur.src()`, `ur.dst()`, `ur.id()`),
 /// as the executor resolves them for it.
 fn roles_of(node: &Node) -> Vec<(&'static str, String)> {
-    match &node.chain()[0].op {
-        Op::RandomWalk { .. } | Op::Describe { .. } => vec![],
-        Op::Hop { .. } | Op::ShortestPath { .. } => {
+    let root = match node.input() {
+        Some(input) => input.info().chain.root,
+        None => match node.op() {
+            Op::RandomWalk { .. } => Root::Walk,
+            Op::Describe { .. } => Root::Describe,
+            Op::Hop { .. } | Op::ShortestPath { .. } => Root::Traversal,
+            _ => Root::Source,
+        },
+    };
+    match root {
+        Root::Walk | Root::Describe => vec![],
+        Root::Traversal => {
             vec![("src", "src".to_string()), ("dst", "dst".to_string())]
         }
-        _ => match node.kind() {
+        Root::Source => match node.kind() {
             Kind::Edges { src, dst } => vec![("src", src.clone()), ("dst", dst.clone())],
             Kind::Nodes { id } => vec![("id", id.clone())],
         },
@@ -321,7 +574,14 @@ fn relational(
     let roles = roles_of(node);
     Ok(Some(match step {
         Step::Filter(p) => {
-            filter_check(p, &roles, cols.as_ref())?;
+            match p {
+                crate::plan::Expr::Scalar(v) => {
+                    filter_check(p, &roles, &Narrow::new(cols, v, &roles))?;
+                }
+                _ => {
+                    filter_check(p, &roles, cols.as_ref())?;
+                }
+            }
             cols.clone()
         }
         Step::Select(items) => {
@@ -350,15 +610,16 @@ fn relational(
                     py_str(&id_col)
                 )));
             }
-            let mut attached = cols.fields.clone();
+            let mut graph_fields: Vec<Field_> = vec![];
             for (name, t) in graph.iter().flat_map(|g| g.iter()) {
                 if cols.has_column(name) {
                     // The attach joins instead, and its result is not modelled.
                     return Ok(None);
                 }
-                attached.push((name.clone(), t.clone()));
+                graph_fields.push((name.as_str().into(), t.clone()));
             }
-            match scalar_columns(columns, &cols.names(), Cols::new(attached), &roles)? {
+            let attached = Cols::append(cols, graph_fields);
+            match scalar_columns(columns, cols, &attached, &roles)? {
                 Some(c) => c,
                 None => return Ok(None),
             }
@@ -368,7 +629,7 @@ fn relational(
             Cols::new(
                 renamed
                     .into_iter()
-                    .zip(cols.fields.iter())
+                    .zip(cols.fields().iter())
                     .map(|(n, (_, t))| (n, t.clone()))
                     .collect(),
             )
@@ -434,17 +695,17 @@ fn relational(
                     py_list(collide.into_iter())
                 )));
             }
-            let mut out = cols.fields.clone();
+            let mut out = cols.fields().to_vec();
             if how.keeps_right() {
                 out.extend(
                     rcols
-                        .fields
+                        .fields()
                         .iter()
-                        .filter(|(n, _)| !on.contains(n))
+                        .filter(|(n, _)| !on.iter().any(|o| o.as_str() == &**n))
                         .cloned(),
                 );
             }
-            Cols::new(out)
+            Cols::shared(out)
         }
     }))
 }
@@ -508,10 +769,7 @@ fn check_weight_columns<'a>(
     edges: &Node,
     weights: impl Iterator<Item = &'a serde_json::Value>,
 ) -> PlanResult<()> {
-    if matches!(
-        edges.chain()[0].op(),
-        Op::Hop { .. } | Op::ShortestPath { .. }
-    ) {
+    if edges.info().chain.root == Root::Traversal {
         return Ok(());
     }
     let Some(cols) = edges.info().cols.clone() else {
@@ -537,32 +795,42 @@ fn check_weight_columns<'a>(
 /// written.
 fn scalar_columns(
     columns: &[Column],
-    before: &[String],
-    attached: Arc<Cols>,
+    before: &Arc<Cols>,
+    attached: &Arc<Cols>,
     roles: &[(&'static str, String)],
 ) -> PlanResult<Option<Arc<Cols>>> {
-    let mut types: Vec<(String, Option<DataType>)> = vec![];
+    let mut types: Vec<Field_> = vec![];
     for c in columns {
         let t = match &c.expr {
             ColumnExpr::Scalar(v) => {
-                let e = crate::plan::scalar_check(attached.as_ref(), v, roles, "with_columns()")?;
-                attached.type_of_expr(&e)
+                let read = Narrow::new(attached, v, roles);
+                let e = crate::plan::scalar_check(&read, v, roles, "with_columns()")?;
+                type_in(&e, &read)
             }
             ColumnExpr::Graph { .. } => attached.type_of(&c.name),
         };
-        types.push((c.name.clone(), t));
+        types.push((c.name.as_str().into(), t));
     }
-    let lookup = |n: &str| types.iter().find(|(c, _)| c == n).map(|(_, t)| t.clone());
-    let mut out: Vec<(String, Option<DataType>)> = before
+    if !types.iter().any(|(n, _)| before.has_column(n)) {
+        return Ok(Some(Cols::append(before, types)));
+    }
+    let lookup = |n: &str| {
+        types
+            .iter()
+            .find(|(c, _)| &**c == n)
+            .map(|(_, t)| t.clone())
+    };
+    let mut out: Vec<Field_> = before
+        .fields()
         .iter()
-        .map(|c| (c.clone(), lookup(c).unwrap_or_else(|| attached.type_of(c))))
+        .map(|(c, t)| (c.clone(), lookup(c).unwrap_or_else(|| t.clone())))
         .collect();
-    for (name, t) in &types {
-        if !before.contains(name) {
-            out.push((name.clone(), t.clone()));
+    for (name, t) in types {
+        if !before.has_column(&name) {
+            out.push((name, t));
         }
     }
-    Ok(Some(Cols::new(out)))
+    Ok(Some(Cols::shared(out)))
 }
 
 /// The first `with_columns` of an `edges.nodes()` frame: the node set and its
@@ -600,13 +868,15 @@ fn node_set(
         )
     });
     let id = if shaped { None } else { id_type(first) };
-    let mut attached: Vec<(String, Option<DataType>)> = vec![("id".into(), id)];
-    for g in &groups {
-        attached.extend(g.iter().cloned());
-    }
+    let before = Cols::new(vec![("id".into(), id)]);
+    let graph: Vec<Field_> = groups
+        .iter()
+        .flatten()
+        .map(|(n, t)| (n.as_str().into(), t.clone()))
+        .collect();
+    let attached = Cols::append(&before, graph);
     let roles = roles_of(node);
-    let Some(cols) = scalar_columns(columns, &["id".to_string()], Cols::new(attached), &roles)?
-    else {
+    let Some(cols) = scalar_columns(columns, &before, &attached, &roles)? else {
         return Ok(Info::default());
     };
     for step in pending {

@@ -7,7 +7,12 @@ from __future__ import annotations
 import ast
 import copy
 import pickle
+import struct
+import subprocess
+import sys
+import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pyarrow as pa
@@ -115,6 +120,31 @@ def test_schema_runs_nothing(tmp_path):
     assert _native()._scan_log(False) == []
     assert _native()._topology_build_count() == before
     assert e._index_build_cell.value is None
+
+
+def _corrupt_pages(path: Path) -> None:
+    """Overwrite a Parquet file's data pages, keeping its footer readable."""
+    raw = bytearray(path.read_bytes())
+    footer = struct.unpack("<I", raw[-8:-4])[0]
+    end = len(raw) - 8 - footer
+    raw[4:end] = b"\xff" * (end - 4)
+    path.write_bytes(bytes(raw))
+
+
+def test_schema_reads_no_rows_of_a_scan(tmp_path):
+    e, n = _scans(tmp_path)
+    _corrupt_pages(tmp_path / "e.parquet")
+    _corrupt_pages(tmp_path / "n.parquet")
+    frames = [
+        e.filter(col("w") > 1).select("s", "d", "w"),
+        e.nodes().with_columns(pr=ur.pagerank(e, weight=col("w"))),
+        n.join(e.nodes().with_columns(deg=ur.degree(e)), on="id"),
+    ]
+    for frame in frames:
+        frame.schema()
+        frame.explain()
+        with pytest.raises(Exception):  # noqa: B017 - whatever the reader raises
+            frame.collect()
 
 
 def _parity_modules():
@@ -314,6 +344,85 @@ def test_a_long_pipeline_validates_each_step():
     assert f.collect().to_arrow().num_rows == 4
     with pytest.raises(ur.ColumnNotFoundError):
         f.filter(col("nope") > 0)
+
+
+def _per_step(build, steps: int) -> float:
+    best = float("inf")
+    for _ in range(3):
+        t = time.perf_counter()
+        build(steps)
+        best = min(best, time.perf_counter() - t)
+    return best
+
+
+def _filters(n: int) -> None:
+    f = _edges()
+    for i in range(n):
+        f = f.filter(col("s") > i - n)
+
+
+def _graph_columns(n: int) -> None:
+    e = _edges()
+    f = e.nodes()
+    for i in range(n):
+        f = f.with_columns(**{f"d{i}": ur.degree(e)})
+
+
+def _scalar_columns(n: int) -> None:
+    f = _nodes()
+    for i in range(n):
+        f = f.with_columns(**{f"c{i}": col("v") + i})
+
+
+@pytest.mark.parametrize("build", [_filters, _graph_columns, _scalar_columns])
+def test_a_step_validates_in_time_independent_of_the_chain_before_it(build):
+    # 4x the steps in well under 4x^2 the time: a step's validation reads its
+    # input's, not the whole chain (or every column) again.
+    small, large = _per_step(build, 200), _per_step(build, 800)
+    assert large < 6 * small, (small, large)
+
+
+def test_a_frame_joined_with_itself_validates_in_linear_time():
+    # A self-join's validation reads its input's once (a collect still runs
+    # each side, as it always has: 2**24 joins here).
+    f = _nodes()
+    t = time.perf_counter()
+    for i in range(24):
+        f = f.join(f, on="id", how="semi")
+        if i == 5:
+            assert f.schema().names == ["id", "label", "v"]
+            assert f.collect().to_arrow().num_rows == 4
+    assert time.perf_counter() - t < 1.0
+
+
+def test_a_long_chain_drops_on_a_small_stack():
+    # Dropping a chain unlinks it a node at a time, not a stack frame per step.
+    code = textwrap.dedent(
+        """
+        import threading, pyarrow as pa, ursa as ur
+        def run():
+            f = ur.from_arrow(pa.table({"s": [1], "d": [2]}), src="s", dst="d")
+            for _ in range(20_000):
+                f = f.filter(ur.col("s") > 0)
+            del f
+            print("ok")
+        threading.stack_size(256 * 1024)
+        t = threading.Thread(target=run)
+        t.start()
+        t.join()
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0 and out.stdout.strip() == "ok", out
+
+
+def test_a_long_chain_explains_a_line_per_step():
+    f = _edges()
+    for _ in range(2000):
+        f = f.filter(col("s") > 0)
+    text = f.explain()
+    plan = text.split("\n\n")[0].splitlines()
+    assert len(plan) == 2002 and all(line.startswith("  ") and line[2] != " " for line in plan[1:])
 
 
 # --- caches on the Rust state -----------------------------------------------------

@@ -9,36 +9,40 @@ use serde_json::Value;
 
 use crate::plan::{EdgeInput, Expr, Plan, SelectItem};
 
-/// Append `plan` as an indented tree, its last step first.
+/// Append `plan`'s steps, its last step first, one per line at `depth`; the
+/// frames a step reads besides its input (a join's right side, a graph op's
+/// edges) are indented under it. A chain is walked in a loop, so a frame of
+/// many steps costs a line each.
 pub fn tree(plan: &Plan, depth: usize, out: &mut String) {
     let pad = "  ".repeat(depth);
-    let _ = writeln!(out, "{pad}{}", line(plan));
-    match plan {
-        Plan::Join { right, .. } => {
-            let _ = writeln!(out, "{pad}  right:");
-            tree(right, depth + 2, out);
-        }
-        Plan::WithColumns { columns, .. } => {
-            for c in columns {
-                if let Expr::Graph(verb) = &c.expr {
-                    if let Some(edges) = &verb.edges {
-                        let _ = writeln!(out, "{pad}  {} edges:", c.name);
-                        edge_tree(edges, depth + 2, out);
+    let mut next = Some(plan);
+    while let Some(plan) = next {
+        let _ = writeln!(out, "{pad}{}", line(plan));
+        match plan {
+            Plan::Join { right, .. } => {
+                let _ = writeln!(out, "{pad}  right:");
+                tree(right, depth + 2, out);
+            }
+            Plan::WithColumns { columns, .. } => {
+                for c in columns {
+                    if let Expr::Graph(verb) = &c.expr {
+                        if let Some(edges) = &verb.edges {
+                            let _ = writeln!(out, "{pad}  {} edges:", c.name);
+                            edge_tree(edges, depth + 2, out);
+                        }
                     }
                 }
             }
+            Plan::Hop { edges, .. }
+            | Plan::ShortestPath { edges, .. }
+            | Plan::RandomWalk { edges, .. }
+            | Plan::Describe { edges, .. } => {
+                let _ = writeln!(out, "{pad}  edges:");
+                edge_tree(edges, depth + 2, out);
+            }
+            _ => {}
         }
-        Plan::Hop { edges, .. }
-        | Plan::ShortestPath { edges, .. }
-        | Plan::RandomWalk { edges, .. }
-        | Plan::Describe { edges, .. } => {
-            let _ = writeln!(out, "{pad}  edges:");
-            edge_tree(edges, depth + 2, out);
-        }
-        _ => {}
-    }
-    if let Some(input) = plan.input() {
-        tree(input, depth + 1, out);
+        next = plan.input();
     }
 }
 

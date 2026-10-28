@@ -670,24 +670,45 @@ impl PlanNode {
     /// (one object per cell).
     #[getter]
     fn index_cell(&self, py: Python<'_>) -> PyResult<Py<IndexCell>> {
+        // The handle is read and set under the state's lock, and Python runs
+        // only outside it (a weakref call or an allocation can run the garbage
+        // collector, which can release the GIL to another thread).
         let state = self.0.state();
-        let mut slot = state
-            .host_cell
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(weak) = slot.as_ref().and_then(|h| h.downcast_ref::<Py<PyAny>>()) {
-            let live = weak.bind(py).call0()?;
-            if !live.is_none() {
-                return Ok(live.cast_into::<IndexCell>()?.unbind());
+        let slot = || {
+            state
+                .host_cell
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        loop {
+            let seen = slot().clone();
+            if let Some(weak) = seen.as_ref().and_then(|h| h.downcast_ref::<Py<PyAny>>()) {
+                let live = weak.bind(py).call0()?;
+                if !live.is_none() {
+                    return Ok(live.cast_into::<IndexCell>()?.unbind());
+                }
             }
+            let cell = Py::new(py, IndexCell(state.clone()))?;
+            let weakref: HostHandle = Arc::new(
+                py.import("weakref")?
+                    .getattr("ref")?
+                    .call1((cell.clone_ref(py),))?
+                    .unbind(),
+            );
+            let mut current = slot();
+            let unchanged = match (current.as_ref(), seen.as_ref()) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged {
+                let old = current.replace(weakref);
+                drop(current);
+                drop(old);
+                return Ok(cell);
+            }
+            // Another thread set one meanwhile: use that one.
         }
-        let cell = Py::new(py, IndexCell(state.clone()))?;
-        let weakref = py
-            .import("weakref")?
-            .getattr("ref")?
-            .call1((cell.clone_ref(py),))?;
-        *slot = Some(Arc::new(weakref.unbind()));
-        Ok(cell)
     }
 
     /// A `scan_nodes` frame's scanned-table cache, shared with its derivations
@@ -774,15 +795,16 @@ impl IndexCell {
     /// A lock for code that sets `value` (one per cell).
     #[getter]
     fn lock(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let lock = self.0.host_lock.get_or_init(|| {
-            let l = py
-                .import("threading")
-                .and_then(|t| t.getattr("Lock"))
-                .and_then(|l| l.call0())
-                .map(Bound::unbind)
-                .expect("threading.Lock() is available");
-            Arc::new(l) as HostHandle
-        });
+        // Made outside the cell's initializer, which holds a lock Python must not
+        // run under; a lock made by a thread that loses the race is dropped.
+        let lock = match self.0.host_lock.get() {
+            Some(l) => l,
+            None => {
+                let l: HostHandle =
+                    Arc::new(py.import("threading")?.getattr("Lock")?.call0()?.unbind());
+                self.0.host_lock.get_or_init(|| l)
+            }
+        };
         Ok(lock
             .downcast_ref::<Py<PyAny>>()
             .expect("a Python lock")
