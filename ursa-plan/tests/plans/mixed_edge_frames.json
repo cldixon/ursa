@@ -1,0 +1,348 @@
+{
+ "description": "Graph columns over three edge frames in one with_columns, attached by id.",
+ "inputs": [
+  {
+   "nodes": "karate"
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "with_columns",
+  "input": {
+   "op": "from_arrow",
+   "frame": 0,
+   "id": "id"
+  },
+  "columns": [
+   {
+    "name": "d",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "from_arrow",
+       "frame": 1,
+       "src": "src",
+       "dst": "dst"
+      },
+      "frame": 1
+     },
+     "direction": "out"
+    }
+   },
+   {
+    "name": "d_view",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "filter",
+       "input": {
+        "op": "from_arrow",
+        "frame": 2,
+        "src": "src",
+        "dst": "dst"
+       },
+       "step": 0,
+       "predicate": {
+        "kind": "binary",
+        "op": "<",
+        "left": {
+         "kind": "col",
+         "name": "src"
+        },
+        "right": {
+         "kind": "lit",
+         "value": 10
+        }
+       }
+      },
+      "frame": 2
+     },
+     "direction": "out"
+    }
+   },
+   {
+    "name": "d_head",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "head",
+       "input": {
+        "op": "from_arrow",
+        "frame": 3,
+        "src": "src",
+        "dst": "dst"
+       },
+       "step": 1,
+       "n": 20
+      },
+      "frame": 3
+     },
+     "direction": "out"
+    }
+   }
+  ]
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "club",
+   "d",
+   "d_view",
+   "d_head"
+  ],
+  "rows": [
+   [
+    0,
+    "Mr. Hi",
+    16,
+    16,
+    16
+   ],
+   [
+    1,
+    "Mr. Hi",
+    8,
+    8,
+    4
+   ],
+   [
+    2,
+    "Mr. Hi",
+    8,
+    8,
+    0
+   ],
+   [
+    3,
+    "Mr. Hi",
+    3,
+    3,
+    0
+   ],
+   [
+    4,
+    "Mr. Hi",
+    2,
+    2,
+    0
+   ],
+   [
+    5,
+    "Mr. Hi",
+    3,
+    3,
+    0
+   ],
+   [
+    6,
+    "Mr. Hi",
+    1,
+    1,
+    0
+   ],
+   [
+    7,
+    "Mr. Hi",
+    0,
+    0,
+    0
+   ],
+   [
+    8,
+    "Mr. Hi",
+    3,
+    3,
+    0
+   ],
+   [
+    9,
+    "Officer",
+    1,
+    1,
+    null
+   ],
+   [
+    10,
+    "Mr. Hi",
+    0,
+    0,
+    0
+   ],
+   [
+    11,
+    "Mr. Hi",
+    0,
+    0,
+    0
+   ],
+   [
+    12,
+    "Mr. Hi",
+    0,
+    0,
+    0
+   ],
+   [
+    13,
+    "Mr. Hi",
+    1,
+    0,
+    0
+   ],
+   [
+    14,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    15,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    16,
+    "Mr. Hi",
+    0,
+    0,
+    null
+   ],
+   [
+    17,
+    "Mr. Hi",
+    0,
+    0,
+    0
+   ],
+   [
+    18,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    19,
+    "Mr. Hi",
+    1,
+    0,
+    0
+   ],
+   [
+    20,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    21,
+    "Mr. Hi",
+    0,
+    0,
+    0
+   ],
+   [
+    22,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    23,
+    "Officer",
+    5,
+    0,
+    null
+   ],
+   [
+    24,
+    "Officer",
+    3,
+    0,
+    null
+   ],
+   [
+    25,
+    "Officer",
+    1,
+    0,
+    null
+   ],
+   [
+    26,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    27,
+    "Officer",
+    1,
+    0,
+    null
+   ],
+   [
+    28,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    29,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    30,
+    "Officer",
+    2,
+    0,
+    null
+   ],
+   [
+    31,
+    "Officer",
+    2,
+    0,
+    0
+   ],
+   [
+    32,
+    "Officer",
+    1,
+    0,
+    null
+   ],
+   [
+    33,
+    "Officer",
+    0,
+    0,
+    null
+   ]
+  ]
+ }
+}

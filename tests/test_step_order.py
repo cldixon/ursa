@@ -317,10 +317,14 @@ def test_with_columns_after_a_relational_step(nodes):
     ]
 
 
-def test_relational_step_on_edges_before_nodes_is_rejected():
+def test_relational_step_on_edges_before_nodes_shapes_the_node_set():
+    # #191: the reshaped edges' rows give the node set; the degree over the whole
+    # graph attaches to it by id.
     g = ur.from_arrow(EDGES, src="s", dst="d")
-    with pytest.raises(NotImplementedError, match=r"head\(\) on the edges before nodes\(\)"):
-        g.head(2).nodes().with_columns(deg=ur.degree(g)).collect()
+    got = g.head(2).nodes().with_columns(deg=ur.degree(g)).collect().to_dicts()
+    full = {r["id"]: r["degree"] for r in ur.degree(g).collect().to_dicts()}
+    ids = ur.degree(g.head(2)).collect().to_arrow().column("id").to_pylist()
+    assert got == [{"id": i, "deg": full[i]} for i in ids]
 
 
 # --- multi-key sort composes with written order (#163) ----------------------

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -107,8 +107,9 @@ class _Frame:
         # topology is unchanged — the dropped rows are expressed as an edge mask at
         # execution time — so the cached index is *preserved* (drops_index=False,
         # the default). A graph op on a filtered edge frame runs the parent CSR with
-        # that mask instead of rebuilding. (distinct/sample/join/group_by still drop
-        # the index; they are not mask-expressible in v1.)
+        # that mask instead of rebuilding. (distinct/sample/join/group_by drop the
+        # index: a graph op over them builds one from their rows, cached by the
+        # engine under a fingerprint of the edge plan, #191.)
         return self._extend(_PlanStep("filter", {"predicate": predicate}))
 
     def select(self, *columns: Any) -> Self:
@@ -165,7 +166,7 @@ class _Frame:
         """Remove duplicate rows; each kept row stays at its first occurrence."""
         return self._extend(_PlanStep("distinct", {}), drops_index=True)
 
-    def group_by(self, *keys: Any) -> _GroupBy:
+    def group_by(self, *keys: Any) -> _GroupBy[Self]:
         """Group by ``keys``; ``.agg(...)`` returns one row per group, in order of
         each group's first input row."""
         return _GroupBy(self, keys)
@@ -184,8 +185,7 @@ class _Frame:
         distinct from the automatic attribute attach that
         ``edges.nodes().with_columns(...)`` does. A join changes the row/column set,
         so the cached topology no longer matches (``drops_index=True``); a graph
-        algorithm after a join therefore errors clearly rather than using a stale
-        topology.
+        algorithm over joined edges runs over the topology of the joined rows.
 
         Rows come back in a fixed order. For ``inner``, ``left``, ``semi`` and
         ``anti``: this frame's rows in order, each followed by its matches in
@@ -243,18 +243,21 @@ class _Frame:
         return f"<{self.__class__.__name__} lazy; {len(self._plan)} step(s)>"
 
 
-class _GroupBy:
-    """Intermediate returned by ``group_by``; ``.agg(...)`` closes it into a frame."""
+_F = TypeVar("_F", bound=_Frame)
 
-    def __init__(self, frame: _Frame, keys: tuple[Any, ...]) -> None:
+
+class _GroupBy(Generic[_F]):
+    """Intermediate returned by ``group_by``; ``.agg(...)`` closes it into a frame
+    of the grouped frame's type (grouped edges are still edges)."""
+
+    def __init__(self, frame: _F, keys: tuple[Any, ...]) -> None:
         self._frame = frame
         self._keys = keys
 
-    def agg(self, *exprs: Any, **named: Any) -> _Frame:
-        # A grouped result replaces the schema, so (like filter/sample/distinct/join)
-        # it drops the topology index — forcing a fresh cell so a graph op on the
-        # grouped frame re-runs the derived-frame guard instead of reusing a parent's
-        # already-built index.
+    def agg(self, *exprs: Any, **named: Any) -> _F:
+        # A grouped result replaces the schema, so (like sample/distinct/join) it
+        # drops the topology index — a fresh cell, so a graph op on the grouped
+        # frame runs over the grouped rows' topology, never a parent's index.
         return self._frame._extend(
             _PlanStep("group_by_agg", {"keys": self._keys, "exprs": exprs, "named": named}),
             drops_index=True,
@@ -415,8 +418,8 @@ class EdgeFrame(_Frame):
         # A row-changing op (filter/sample/distinct/join) invalidates the cached
         # *topology index* — the CSR no longer matches the frame — so `drops_index`
         # forces a fresh index cell (`has_index=False`, `index_cell=None`). A graph
-        # op on such a frame then rebuilds, and `_require_edges` rejects it via its
-        # plan check (a graph op on a derived edge frame isn't wired). The in-memory
+        # op on such a frame runs over the topology of its rows, which the engine
+        # builds and caches by a fingerprint of the edge plan (#191). The in-memory
         # source / scan spec / edge table are **kept** regardless, so the plain
         # (non-graph) collect path can still materialize the derived edge rows —
         # e.g. `edges.filter(...).collect()` and `edges.join(...).collect()` work
@@ -438,6 +441,7 @@ class EdgeFrame(_Frame):
         return NodeFrame._construct(
             id_col="id",
             plan=(*self._plan, _PlanStep("nodes", {"from": (self._src_col, self._dst_col)})),
+            edges=self,
         )
 
     def reverse(self) -> EdgeFrame:
@@ -489,7 +493,7 @@ class NodeFrame(_Frame):
     table by id. NodeFrames derived from ``edges.nodes()`` carry neither.
     """
 
-    __slots__ = ("_attr_cell", "_id_col", "_scan", "_seeds_cell", "_source")
+    __slots__ = ("_attr_cell", "_edges", "_id_col", "_scan", "_seeds_cell", "_source")
 
     def __init__(self, data: Any, *, id: str) -> None:
         """Build a NodeFrame (attribute table) from in-memory data.
@@ -517,6 +521,7 @@ class NodeFrame(_Frame):
         source: Any | None,
         scan: dict[str, Any] | None,
         attr_cell: _BuildCell | None,
+        edges: EdgeFrame | None = None,
     ) -> None:
         """Assign every slot; shared by ``__init__`` and ``_construct`` so the
         layout can never drift (see ``EdgeFrame._fill``)."""
@@ -531,6 +536,9 @@ class NodeFrame(_Frame):
         # This frame's ids as a seed set, once a derived frame had to run to get
         # them (frames are immutable, so they don't change).
         self._seeds_cell = _BuildCell()
+        # The edge frame `edges.nodes()` was called on: the steps before `nodes`
+        # are its steps, and read its source.
+        self._edges = edges
 
     @classmethod
     def _construct(
@@ -540,11 +548,12 @@ class NodeFrame(_Frame):
         source: Any | None = None,
         scan: dict[str, Any] | None = None,
         attr_cell: _BuildCell | None = None,
+        edges: EdgeFrame | None = None,
     ) -> NodeFrame:
         """Internal factory building a frame from plumbing without the public
         data-normalizing ``__init__`` (see ``EdgeFrame._construct``)."""
         obj = cls.__new__(cls)
-        obj._fill(id_col, plan, source, scan, attr_cell)
+        obj._fill(id_col, plan, source, scan, attr_cell, edges)
         return obj
 
     @property
@@ -576,6 +585,7 @@ class NodeFrame(_Frame):
             source=self._source,
             scan=self._scan,
             attr_cell=self._attr_cell,
+            edges=self._edges,
         )
 
     # Composed pipelines (with_columns of graph algorithms + filter/sort/head)

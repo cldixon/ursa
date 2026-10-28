@@ -245,8 +245,8 @@ Frames are immutable; transformations return new frames. This makes the topology
 |---|---|
 | `with_columns(...)` on property columns | **preserved** (shared via cheap reference) |
 | `filter(...)` on an EdgeFrame | **preserved** as a *subgraph view* — the dropped rows ride along as an edge mask over the parent CSR, so a graph op runs restricted with **no rebuild** |
-| `distinct()`, `sample()`, `join()`, `group_by().agg()` on an EdgeFrame | **dropped** (these reshape the edge set in a way a mask can't express; rebuilt lazily on next graph op) |
-| `select(...)` that drops `src` or `dst` | frame **demotes** to a plain tabular frame |
+| `distinct()`, `sample()`, `join()`, `group_by().agg()`, `sort()`, `head()` on an EdgeFrame | **dropped** (these reshape the edge set in a way a mask can't express). The next graph op builds the topology of the reshaped rows, exactly as a fresh frame over them would, and caches it for the session under a fingerprint of the edge plan and its inputs (an in-memory table's identity, a local file's size and mtime), so repeated collects reuse it (#191) |
+| `select(...)`, `rename(...)` on an EdgeFrame | **preserved** while `src` and `dst` remain; one that drops either makes a graph op over the frame raise (a rename does not move a role) |
 | any operation on a NodeFrame | no effect (NodeFrames carry no index) |
 
 The index is built lazily on the first operation that needs it, cached, and shared by every subsequent graph operation over that frame — including concurrent ones.

@@ -271,6 +271,87 @@ def join_two_reingest():
     return best(q)
 
 
+def grouped(e: ur.EdgeFrame) -> ur.EdgeFrame:
+    """The edges aggregated per (s, d): a reshaped edge set (#191)."""
+    return e.group_by("s", "d").agg(w=W.sum())
+
+
+def reshaped_pagerank_first():
+    """Weighted pagerank over a group_by-aggregated 10M-edge frame, first collect:
+    the subplan runs and the topology of its rows is built."""
+    g = grouped(mem("e10m"))
+    return once(lambda: ur.pagerank(g, weight=W).collect())
+
+
+def reshaped_pagerank_repeat():
+    """The same, repeated over the same edge table (the plan written afresh each
+    time): the topology and weights come from the subplan cache."""
+    e = mem("e10m")
+    ur.pagerank(grouped(e), weight=W).collect()
+    return best(lambda: ur.pagerank(grouped(e), weight=W).collect())
+
+
+def reshaped_pagerank_reingest():
+    """The same work as main had to write it: collect the aggregate, re-ingest it,
+    run pagerank (one pass, nothing cached)."""
+    g = grouped(mem("e10m"))
+
+    def q():
+        fresh = ur.from_arrow(g.collect().to_arrow(), src="s", dst="d")
+        ur.pagerank(fresh, weight=W).collect()
+
+    return once(q)
+
+
+def allowed_500k() -> ur.NodeFrame:
+    return nodes_1m().filter(ur.col("x") < 0.5).select("id").rename({"id": "s"})
+
+
+def semi_degree():
+    """Degree over the 10M edges semi-joined to a 500k-row set of allowed sources
+    (first collect)."""
+    e, allowed = mem("e10m"), allowed_500k()
+    return once(lambda: ur.degree(e.join(allowed, on="s", how="semi")).collect())
+
+
+def semi_degree_reingest():
+    """`semi_degree` as main had to write it: collect the join, re-ingest it."""
+    e, allowed = mem("e10m"), allowed_500k()
+
+    def q():
+        rows = e.join(allowed, on="s", how="semi").collect().to_arrow()
+        ur.degree(ur.from_arrow(rows, src="s", dst="d")).collect()
+
+    return once(q)
+
+
+def mixed_with_columns():
+    """Two edge frames in one with_columns over a 1M-row attribute frame: pagerank
+    over the 10M edges and degree over a filtered view of them (warm)."""
+    e, nodes = warm(mem("e10m")), nodes_1m()
+    view = e.filter(W > 0.5)
+
+    def q():
+        nodes.with_columns(pr=ur.pagerank(e), d=ur.degree(view)).collect()
+
+    q()
+    return best(q)
+
+
+def mixed_separate():
+    """`mixed_with_columns` as main had to write it: one collect per edge frame,
+    the first result re-ingested (warm)."""
+    e, nodes = warm(mem("e10m")), nodes_1m()
+    view = e.filter(W > 0.5)
+
+    def q():
+        first = nodes.with_columns(pr=ur.pagerank(e)).collect().to_arrow()
+        ur.from_arrow(first, id="id").with_columns(d=ur.degree(view)).collect()
+
+    q()
+    return best(q)
+
+
 SCENARIOS: dict[str, Callable[[], float]] = {
     f.__name__: f
     for f in (
@@ -302,6 +383,13 @@ SCENARIOS: dict[str, Callable[[], float]] = {
         join_degree,
         join_two,
         join_two_reingest,
+        reshaped_pagerank_first,
+        reshaped_pagerank_repeat,
+        reshaped_pagerank_reingest,
+        semi_degree,
+        semi_degree_reingest,
+        mixed_with_columns,
+        mixed_separate,
     )
 }
 

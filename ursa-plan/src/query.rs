@@ -260,7 +260,7 @@ pub fn node_columns(
     nodes: Option<&[RecordBatch]>,
     nodes_id: Option<&str>,
     edges: Option<&[RecordBatch]>,
-    shared_weights: Option<&WeightCache>,
+    shared_weights: Option<(&WeightCache, &str)>,
 ) -> Result<Vec<OutputColumn>> {
     if columns.is_empty() {
         return Err(DataFusionError::Execution(
@@ -344,7 +344,13 @@ pub fn node_columns(
                             let n_edges = topology.n_edges();
                             let what = "a weighted algorithm";
                             let w = match shared_weights {
-                                Some(c) => c.get_or_eval(&key, edges, n_edges, what)?,
+                                Some((c, scope)) => c.get_or_eval(
+                                    &format!("{scope}{key}"),
+                                    &key,
+                                    edges,
+                                    n_edges,
+                                    what,
+                                )?,
                                 None => Arc::new(edge_weights(edges, &key, n_edges, what)?),
                             };
                             weight_cache.insert(key, w.clone());
