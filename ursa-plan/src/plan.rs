@@ -1762,7 +1762,9 @@ fn predicate_mask(
     inputs: &dyn Inputs,
 ) -> PlanResult<EdgeMask> {
     let roles = view_roles(view);
-    let mut needed: BTreeSet<String> = BTreeSet::from([view.roles.0.clone(), view.roles.1.clone()]);
+    // Only what the predicates read: the index build already checked the
+    // endpoints, and a scan reads them anyway to drop null-endpoint rows.
+    let mut needed: BTreeSet<String> = BTreeSet::new();
     for p in &view.predicates {
         needed.extend(expr_columns(p, &roles));
     }

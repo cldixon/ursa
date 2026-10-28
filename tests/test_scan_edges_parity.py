@@ -269,8 +269,9 @@ def test_graph_ops_keep_their_narrow_scans(tmp_path, scan_calls):
     ur.pagerank(edges, weight=ur.col("w")).collect()
     assert scan_calls == [("edges", ["w"])]
     scan_calls.clear()
-    # A subgraph view's mask reads the endpoints and the predicate's columns only.
+    # A subgraph view's mask reads the predicate's columns only (#192: the index
+    # build already checked the endpoints).
     sub = edges.filter(ur.col("label") == "a")
     ur.degree(sub).collect()
-    assert ("table", ["d", "label", "s"]) in scan_calls
+    assert ("table", ["label"]) in scan_calls
     assert all(kind != "table" or cols for kind, cols in scan_calls)

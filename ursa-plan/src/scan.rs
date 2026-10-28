@@ -493,10 +493,9 @@ pub fn scan_edges_batch(
     })?
 }
 
-/// Read an edge file as a table — every column, or the `columns` projection —
-/// for the relational (non-graph) paths: a plain `collect()` and its steps, the
-/// sinks, and a subgraph view's edge mask (#160). See [`scan_edges_rows`], which
-/// also takes predicates to push into the scan.
+/// Read an edge file as a table — every column, or the `columns` projection plus
+/// both endpoints — as a scanned edge frame collects it (#160). See
+/// [`scan_edges_rows`], which also takes predicates to push into the scan.
 pub fn scan_edges_table(
     path: &str,
     src: &str,
@@ -504,7 +503,12 @@ pub fn scan_edges_table(
     storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
-    Ok(scan_edges_rows(path, src, dst, storage_options, columns, &[], false)?.batches)
+    // A projection here always carries both endpoints.
+    let mut columns = columns.to_vec();
+    if !columns.is_empty() {
+        columns.extend([src.to_string(), dst.to_string()]);
+    }
+    Ok(scan_edges_rows(path, src, dst, storage_options, &columns, &[], false)?.batches)
 }
 
 /// An edge file's rows, read by [`scan_edges_rows`].
@@ -527,7 +531,8 @@ pub struct EdgeRows {
 /// [`scan_nodes_batch`], so a scan and an in-memory read of the same file agree.
 ///
 /// `columns` empty reads every column; otherwise only the named columns are read
-/// (projection pushdown), in file order. A name the file lacks is skipped here
+/// (projection pushdown), in file order, with the endpoints only when named (or
+/// to drop null-endpoint rows). A name the file lacks is skipped here
 /// and reported by the caller's own column check, so the error matches the
 /// in-memory frame's. `filters` (predicate JSON, roles resolved, every column
 /// read) are pushed into the scan: a Parquet file skips the row groups whose
@@ -609,6 +614,13 @@ fn scan_edges_rows_plan(
                 )));
             }
         }
+        // Validate the endpoint types exactly as the graph build would.
+        let ends = Schema::new(vec![
+            schema.field_with_name(src)?.clone(),
+            schema.field_with_name(dst)?.clone(),
+        ]);
+        endpoint_id_type(&ends, path)?;
+        // The endpoints are read when asked for, or to drop null-endpoint rows.
         let df = if columns.is_empty() {
             df
         } else {
@@ -616,17 +628,19 @@ fn scan_edges_rows_plan(
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
-                .filter(|n| *n == src || *n == dst || columns.iter().any(|c| c == n))
+                .filter(|n| {
+                    (drop_nulls && (*n == src || *n == dst)) || columns.iter().any(|c| c == n)
+                })
                 .collect();
+            // Some column is read, so the rows are counted.
+            let keep = if keep.is_empty() {
+                vec![src, dst]
+            } else {
+                keep
+            };
             df.select_columns(&keep)?
         };
         let read_schema = df.schema().as_arrow().clone();
-        // Validate the endpoint types exactly as the graph build would.
-        let ends = Schema::new(vec![
-            read_schema.field_with_name(src)?.clone(),
-            read_schema.field_with_name(dst)?.clone(),
-        ]);
-        endpoint_id_type(&ends, path)?;
 
         let mut filtered = df.clone();
         let mut pushed = 0;
