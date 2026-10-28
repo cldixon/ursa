@@ -192,6 +192,46 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   joined to a degree result, 74 ms to 73 ms. A two-join pipeline over them
   runs as one plan in 98 ms, against 115 ms as two collects with the first
   result re-ingested, the only way to write it before.
+- Graph ops run over reshaped edge sets (#191, part 3 of 3, part of #189). A
+  graph algorithm, traversal, `random_walk` or `describe` over an edge frame
+  after `distinct`, `sample`, `join`, `group_by().agg()`, `sort` or `head` runs
+  over the graph of that frame's rows: exactly what collecting the rows and
+  building a new frame with `ur.from_arrow(...)` gives, node order and row
+  order included. For example `ur.pagerank(e.group_by("s", "d").agg(w=ur.col("w").sum()),
+  weight=ur.col("w"))`, `ur.degree(e.join(allowed, on="s", how="semi"))` or
+  `ur.hop(e.distinct(), 2).from_([0])`. A `filter` written after the reshaping
+  step is a subgraph view of the reshaped graph, as on any edge frame;
+  `select`, `rename` and `with_columns` keep the rows, so a weight or filter
+  after them reads the columns they leave. The edges must keep their `src` and
+  `dst` columns; a step that drops one raises `ColumnNotFoundError` naming the
+  step (a `rename` does not move a role).
+
+  The topology of a reshaped edge set is cached for the session under a
+  fingerprint of its edge plan: the plan as written, an in-memory table's
+  identity, and a local file's size and modification time (a rewritten file is
+  read again). Repeated collects reuse it, with its weight, mask and
+  symmetric-view caches, as a source frame's index is reused (#179). The cache
+  holds four topologies, least recently used evicted; a plan over a remote file
+  builds its topology on every collect. This lifts these limits:
+  - a graph algorithm over a `distinct`, `sample`, `join` or `group_by` result;
+  - a step other than `filter` on an `EdgeFrame` before `nodes()`:
+    `e.head(100).nodes()` has the node set of those rows;
+  - graph columns over different edge frames in one `with_columns`
+    (`nodes.with_columns(pr=ur.pagerank(e), d=ur.degree(e.filter(...)))`). Each
+    edge frame's columns attach to the frame's rows by node id, as an attribute
+    frame's always have; a node another graph lacks gets null there. On
+    `edges.nodes()` the first graph column's edges give the node set (or the
+    reshaped edges `nodes()` was called on);
+  - `with_columns` of scalar expressions on an `EdgeFrame`.
+
+  On a 4-core machine: weighted pagerank over a 10M-edge frame aggregated by
+  `group_by("s", "d")`, BENCH_FIRST first and BENCH_REPEAT repeated, against
+  BENCH_REINGEST collecting and re-ingesting the aggregate.
+- **Behaviour change:** a graph op over an edge frame whose `select`, `rename`
+  or `group_by` dropped its `src` or `dst` column raises `ColumnNotFoundError`:
+  `a graph op needs the edge frame's src column 's', but rename() renamed it to
+  'a'; a rename does not move the src role, ...`. A traversal, `random_walk` or
+  `describe` over such a frame used to ignore the step (#191).
 - **Behaviour change:** a step behaves the same wherever it runs. Before, the
   same step could give different results on a frame the engine ran (after a
   graph algorithm, a traversal or a join) than on a plain frame, depending on
@@ -247,8 +287,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   stays inside the filtered subgraph (#192).
 - A graph op over a traversal of a reshaped scan
   (`ur.pagerank(ur.hop(ur.scan_edges(p).sample(100), 1).from_([1]))`) ran over
-  the whole file's index; it now raises the same `NotImplementedError` as the
-  in-memory equivalent (#190).
+  the whole file's index; it now runs over the sampled rows' graph, as the
+  in-memory equivalent does (#190, #191).
+- `hop`, `shortest_path`, `random_walk`, `describe` and a graph column on an
+  attribute frame ignored a `sort` or `head` on their edges, and ran over the
+  whole graph: `ur.random_walk(e.head(3), ...)` walked edges `head` dropped.
+  They now run over the graph of the kept rows (#191).
+- A weight, or a filter on the edges, read the source's column where a
+  `with_columns` on the edges had replaced it, or a column `select` had
+  dropped: `ur.shortest_path(e.with_columns(w=ur.col("w") * 2), a, b,
+  weight=ur.col("w"))` used the original `w` (#191).
 - Graph columns on a 0-row in-memory node frame return an empty frame with the
   table's columns plus the computed ones, instead of raising "No field named
   __ursa_gid" (#153, #182).

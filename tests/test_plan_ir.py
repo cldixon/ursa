@@ -146,10 +146,11 @@ def test_a_graph_verb_as_a_predicate_is_not_a_boolean_predicate(frame):
 @pytest.mark.parametrize("bad", ["serialize", "execute"])
 def test_join_right_side_errors_keep_their_cause(bad):
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    # A select of a non-expression fails parsing the right frame; a step on the
-    # edges before nodes() fails its shape guard. Either way the right side's own
-    # error is the cause.
-    shape_guard = e.head(2).nodes().with_columns(d=ur.degree(e))
+    # A select of a non-expression fails parsing the right frame; a step on a
+    # traversal result's edges before nodes() fails its shape guard. Either way the
+    # right side's own error is the cause.
+    hop = ur.hop(e, 1).from_([0])
+    shape_guard = hop.head(2).nodes().with_columns(d=ur.degree(e))
     right = n.select(3) if bad == "serialize" else shape_guard
     with pytest.raises(NotImplementedError, match="could not materialize the right-hand") as exc:
         n.join(right, on="id").collect()
@@ -157,15 +158,16 @@ def test_join_right_side_errors_keep_their_cause(bad):
 
 
 @pytest.mark.parametrize("source", ["memory", "scan"])
-def test_graph_op_over_a_traversal_of_a_reshaped_frame_is_rejected(source, tmp_path):
-    # The traversal runs over its input's index, so a reshaped input (here a
-    # sample) has none to run over. A scan used to slip through and run over the
-    # whole file's index.
+def test_graph_op_over_a_traversal_of_a_reshaped_frame(source, tmp_path):
+    # The traversal runs over its input's index: for a reshaped input (here a
+    # sample) the index of the sampled rows, as a fresh frame over them builds
+    # it (#191). A scan once slipped through and ran over the whole file's index.
     if source == "memory":
         e = _edges()
     else:
         path = tmp_path / "e.parquet"
         pq.write_table(EDGES.select(["s", "d"]), path)
         e = ur.scan_edges(str(path), src="s", dst="d")
-    with pytest.raises(NotImplementedError, match="distinct/sample/join/group_by-derived"):
-        ur.degree(ur.hop(e.sample(2), 1).from_([0])).collect()
+    sampled = ur.from_arrow(e.sample(2).collect().to_arrow(), src="s", dst="d")
+    want = ur.degree(ur.hop(sampled, 1).from_([0])).collect().to_arrow()
+    assert ur.degree(ur.hop(e.sample(2), 1).from_([0])).collect().to_arrow().equals(want)

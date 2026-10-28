@@ -156,14 +156,16 @@ def test_edge_frame_join_enriches_edges():
     assert {"s", "d", "kind"} <= set(out.column_names)
 
 
-def test_graph_op_after_edge_join_errors():
-    edges = ur.from_arrow(pa.table({"s": [0, 1], "d": [1, 2]}), src="s", dst="d")
+def test_graph_op_after_edge_join_runs_over_the_joined_rows():
+    edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
     other = ur.from_arrow(pa.table({"s": [0, 1], "x": [1, 2]}), id="s")
     joined = edges.join(other, on="s")
-    # A graph algorithm on a joined (derived) edge frame must error clearly, not
-    # build a wrong topology.
-    with pytest.raises(Exception):  # noqa: B017
-        ur.pagerank(joined).collect()
+    # A graph algorithm on a joined (derived) edge frame runs over the joined rows'
+    # topology (#191), never the parent's.
+    fresh = ur.from_arrow(joined.collect().to_arrow(), src="s", dst="d")
+    got = ur.pagerank(joined).collect().to_arrow()
+    assert got.equals(ur.pagerank(fresh).collect().to_arrow())
+    assert got.column("id").to_pylist() == [0, 1, 2]
 
 
 # --- error surface ---------------------------------------------------------
@@ -528,10 +530,11 @@ def test_sampled_edge_frame_collects():
 #     cell was pre-populated by another path) ---------------------------------
 
 
-def test_weighted_algo_on_derived_scan_frame_still_guards(tmp_path):
+def test_weighted_algo_on_derived_scan_frame_uses_the_derived_topology(tmp_path):
     # A weighted algorithm builds the index directly from the scan; on a *derived*
-    # frame that must still raise the guard, not silently use the pre-derivation
-    # topology (regression: the source-retention change made this path reachable).
+    # frame it must run over the derived rows' topology (#191), never the
+    # pre-derivation one (regression: the source-retention change once made that
+    # reachable).
     import pyarrow.parquet as pq
 
     path = tmp_path / "e.parquet"
@@ -539,18 +542,25 @@ def test_weighted_algo_on_derived_scan_frame_still_guards(tmp_path):
         pa.table({"s": [0, 1, 2, 0], "d": [1, 2, 0, 1], "w": [1.0, 1.0, 1.0, 2.0]}), path
     )
     derived = ur.scan_edges(str(path), src="s", dst="d").distinct()
-    with pytest.raises(NotImplementedError, match="distinct/sample/join/group_by"):
-        derived.nodes().with_columns(pr=ur.pagerank(derived, weight=ur.col("w"))).collect()
+    got = derived.nodes().with_columns(pr=ur.pagerank(derived, weight=ur.col("w"))).collect()
+    fresh = ur.from_arrow(derived.collect().to_arrow(), src="s", dst="d")
+    want = fresh.nodes().with_columns(pr=ur.pagerank(fresh, weight=ur.col("w"))).collect()
+    assert got.to_arrow().equals(want.to_arrow())
 
 
-def test_graph_op_on_grouped_edge_frame_guards():
-    # A grouped edge frame drops the index (fresh cell), so a graph op on it hits
-    # the guard even after the parent frame's index was already built.
+def test_graph_op_on_grouped_edge_frame_runs_over_the_groups():
+    # A grouped edge frame drops the index (fresh cell): a graph op on it runs over
+    # the grouped rows' topology, never the parent's already-built index (#191).
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 0]}), src="s", dst="d")
     edges.nodes().with_columns(deg=ur.degree(edges)).collect()  # build parent index
-    grouped = edges.group_by("s").agg(c=ur.col("d").count())
-    with pytest.raises(NotImplementedError, match="distinct/sample/join/group_by"):
-        ur.pagerank(grouped).collect()  # ty: ignore[invalid-argument-type]
+    grouped = edges.group_by("s", "d").agg(c=ur.col("d").count())
+    fresh = ur.from_arrow(grouped.collect().to_arrow(), src="s", dst="d")
+    want = ur.pagerank(fresh).collect().to_arrow()
+    assert ur.pagerank(grouped).collect().to_arrow().equals(want)
+    # Grouped by the source alone, the edges have no dst column left.
+    by_src = edges.group_by("s").agg(c=ur.col("d").count())
+    with pytest.raises(ur.ColumnNotFoundError, match="no dst column"):
+        ur.pagerank(by_src).collect()
 
 
 # --- oracle ----------------------------------------------------------------

@@ -297,3 +297,50 @@ def test_weighted_shortest_path_over_a_scan_keeps_the_index(tmp_path):
         ur.scan_edges(str(path), src="s", dst="d"), 3, 2, weight=ur.col("w")
     ).collect()
     assert out.equals(fresh.to_arrow())
+
+
+# --- reshaped edge sets: the subplan-fingerprint topology cache (#191) ---------
+# A reshaped edge frame has no index cell of its own; its index is built from its
+# rows and cached in the engine under a fingerprint of the edge plan, so a repeat
+# does not rebuild it, while a different plan or a changed file never shares it.
+def test_a_reshaped_frame_builds_its_index_once_across_collects():
+    edges = ur.from_arrow(_weighted(), src="s", dst="d")
+    grouped = edges.group_by("s", "d").agg(w=ur.col("w").sum())
+    first = ur.pagerank(grouped, weight=ur.col("w")).collect().to_arrow()
+    before = _native()._topology_build_count()
+    # The same plan written again (new frame objects) hits the cache too.
+    again = edges.group_by("s", "d").agg(w=ur.col("w").sum())
+    assert ur.pagerank(again, weight=ur.col("w")).collect().to_arrow().equals(first)
+    ur.degree(grouped).collect()
+    assert _native()._topology_build_count() == before
+    # A different subplan is a different topology.
+    ur.degree(edges.group_by("s", "d").agg(w=ur.col("w").max())).collect()
+    ur.degree(edges.distinct()).collect()
+    assert _native()._topology_build_count() == before + 2
+    # So is the same plan over another table with the same rows.
+    other = ur.from_arrow(_weighted(), src="s", dst="d")
+    ur.degree(other.group_by("s", "d").agg(w=ur.col("w").sum())).collect()
+    assert _native()._topology_build_count() == before + 3
+
+
+def test_a_reshaped_scan_rebuilds_when_its_file_changes(tmp_path):
+    import os
+
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "edges.parquet"
+    pq.write_table(_weighted(), path)
+    edges = ur.scan_edges(str(path), src="s", dst="d")
+    first = ur.degree(edges.distinct()).collect().to_arrow()
+    before = _native()._topology_build_count()
+    assert ur.degree(edges.distinct()).collect().to_arrow().equals(first)
+    assert _native()._topology_build_count() == before
+    # Rewritten in place (same size, a later time): read and built afresh.
+    changed = _weighted().set_column(1, "d", pa.array([2, 1, 0, 0, 1, 2]))
+    pq.write_table(changed, path)
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    got = ur.degree(edges.distinct()).collect().to_arrow()
+    assert _native()._topology_build_count() == before + 1
+    fresh = ur.degree(ur.from_arrow(changed, src="s", dst="d").distinct()).collect().to_arrow()
+    assert got.equals(fresh)

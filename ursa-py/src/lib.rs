@@ -418,6 +418,10 @@ impl Inputs for PyInputs {
     fn warn_dropped(&self, n: usize) -> PlanResult<()> {
         self.call("warn_dropped", (n,), |_| Ok(()))
     }
+
+    fn identity(&self, frame: Slot) -> PlanResult<Option<String>> {
+        self.call("identity", (frame,), |obj| obj.extract::<Option<String>>())
+    }
 }
 
 /// A host table (a `pyarrow.Table`) the executor holds without converting it.

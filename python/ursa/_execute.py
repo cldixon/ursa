@@ -19,8 +19,11 @@ back through ``_Host``, by slot, as it needs it:
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
+import threading
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from ._result import MaterializedFrame
@@ -87,9 +90,15 @@ class _Host:
     def frame(self, frame: _Frame) -> dict[str, Any]:
         """The plan tree of ``frame``: each step wraps the one before it."""
         slot = self._frame_slot(frame)
+        # The steps of `edges.nodes()` up to `nodes` are the edge frame's own, and
+        # read its source (a reshaped one's rows give the node set, #191).
+        edges = getattr(frame, "_edges", None)
+        step_slot = slot if edges is None else self._frame_slot(edges)
         node: dict[str, Any] | None = None
         for step in frame._plan:
-            node = self._step(step, node, slot)
+            node = self._step(step, node, step_slot)
+            if step.op == "nodes":
+                step_slot = slot
         assert node is not None, "a frame's plan starts with its source"
         return node
 
@@ -275,6 +284,12 @@ class _Host:
                     cell.value = _native().NodeTableCache()
         return cell.value
 
+    def identity(self, slot: int) -> str | None:
+        """A token for a frame's in-memory table (``None`` without one), for the
+        key of the reshaped-topology cache (#191)."""
+        table = self.table(slot)
+        return None if table is None else _table_token(table)
+
     def warn_dropped(self, n: int) -> None:
         from ._io import _warn_dropped_endpoints
 
@@ -300,6 +315,24 @@ class _Host:
 
     def step_error(self, handle: int) -> None:
         raise self._errors[handle]
+
+
+# One token per in-memory table object while it lives: the identity of a
+# reshaped edge set's input in the native topology cache's key (#191). A token is
+# never reused, so a new table can't be mistaken for one that was freed.
+_TABLE_TOKENS: dict[int, str] = {}
+_TOKEN_LOCK = threading.Lock()
+_next_token = itertools.count(1).__next__
+
+
+def _table_token(table: Any) -> str:
+    key = id(table)
+    with _TOKEN_LOCK:
+        token = _TABLE_TOKENS.get(key)
+        if token is None:
+            token = _TABLE_TOKENS[key] = str(_next_token())
+            weakref.finalize(table, _TABLE_TOKENS.pop, key, None)
+    return token
 
 
 def _batches(table: Any) -> list[Any]:

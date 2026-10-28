@@ -229,6 +229,8 @@ def category(x: dict) -> str:
         return "lifted: join on a traversal result (main raised)"
     if "'join' step after" in m:
         return "lifted: join after describe() / random_walk (main raised)"
+    if "'with_columns' step on an edge frame" in m:
+        return "lifted: with_columns on an edge frame (#191 part 3; main raised)"
     return "UNEXPLAINED"
 
 

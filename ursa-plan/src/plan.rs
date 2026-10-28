@@ -444,9 +444,9 @@ impl EdgeInput {
 /// `ur.hop(e.filter(a), 2)` follows only the edges `a` keeps, and a graph op over
 /// that result keeps them too (#192). Each view takes only the filters written
 /// above its topology; the filters of a traversal's input belong to that input's
-/// view and are applied once, through it. When #191 lets the topology be any
-/// subplan (`filter(a).distinct().filter(b)`), `a` stays with the topology's own
-/// rows and the mask takes `b` alone.
+/// view and are applied once, through it. When the topology is a reshaped subplan
+/// (`filter(a).distinct().filter(b)`), `a` stays with the topology's own rows and
+/// the mask takes `b` alone.
 #[derive(Debug)]
 pub struct EdgeView<'a> {
     /// The host slot of the frame whose rows and index the view masks: the frame
@@ -455,10 +455,19 @@ pub struct EdgeView<'a> {
     /// Whether that frame has rows of its own (a source under property-only
     /// steps), not a traversal result's synthetic pairs.
     pub sourced: bool,
-    /// The plan whose rows define the CSR: a source, under any `reverse`.
+    /// The plan whose rows define the CSR: a source, under any `reverse`, or the
+    /// topmost step that reshapes the edge rows ([`RESHAPING_OPS`]).
     pub topology: &'a Plan,
+    /// Whether `topology` is a reshaped subplan: its index is built from its rows
+    /// and cached by a fingerprint of it ([`crate::reshape`]), not the frame's.
+    pub reshaped: bool,
     /// The `src` / `dst` columns of the topology's rows, as the frame names them.
     pub roles: (String, String),
+    /// The steps written above the topology that keep its rows: `filter` (the
+    /// mask) and the column steps `select`, `rename` and `with_columns`, in order.
+    /// Each filter reads the columns as the column steps before it leave them;
+    /// a weight reads them as all of them leave them.
+    pub steps: Vec<&'a Plan>,
     /// `filter` predicates over the topology's edge rows, ANDed (#114).
     pub predicates: Vec<&'a Expr>,
     /// A `hop` / `shortest_path` whose reached node set induces the subgraph
@@ -482,12 +491,29 @@ impl EdgeView<'_> {
     pub fn has_mask(&self) -> bool {
         !self.predicates.is_empty() || self.induced_by.is_some()
     }
+
+    /// Whether a column step (`select`, `rename`, `with_columns`) is written
+    /// above the topology, so its rows' columns differ from the topology's.
+    fn has_column_steps(&self) -> bool {
+        self.steps.iter().any(|s| !matches!(s, Plan::Filter { .. }))
+    }
 }
+
+/// The steps that reshape an edge plan's rows: a graph op over one runs over the
+/// topology of its output rows (#191).
+const RESHAPING_OPS: [&str; 6] = ["distinct", "sample", "join", "group_by_agg", "sort", "head"];
+
+/// The steps that keep an edge plan's rows but change its columns.
+const COLUMN_OPS: [&str; 3] = ["select", "rename", "with_columns"];
+
+/// The message for a `with_columns` of a graph verb on an edge frame.
+const EDGE_WITH_COLUMNS: &str = "collect() does not yet support the 'with_columns' step on an \
+     edge frame.";
 
 impl EdgeInput {
     /// Split the edge plan into its [`EdgeView`], rejecting the edge plans a graph
-    /// op can't run over yet: a step that reshapes the edge set (`distinct`,
-    /// `sample`, `join`, `group_by`), or a relational step after a traversal.
+    /// op can't run over: a relational step after a traversal, a `with_columns`
+    /// of a graph verb, or a step that leaves no `src` / `dst` column.
     pub fn view(&self) -> PlanResult<EdgeView<'_>> {
         let chain = self.plan.chain();
         let ops: BTreeSet<&str> = chain.iter().map(|p| p.op()).collect();
@@ -510,17 +536,6 @@ impl EdgeInput {
                     tail.join(", ")
                 )));
             }
-        } else if ops
-            .iter()
-            .any(|op| ["distinct", "sample", "join", "group_by_agg"].contains(op))
-        {
-            return Err(PlanError::NotImplemented(
-                "graph ops on a distinct/sample/join/group_by-derived edge frame aren't \
-                 wired yet — unlike filter (a subgraph view over the parent topology), \
-                 these reshape the edge set in a way an edge mask can't express. Run the op \
-                 on the source frame, or collect and re-ingest the derived edges."
-                    .into(),
-            ));
         }
         if let Some(t @ (Plan::Hop { edges, .. } | Plan::ShortestPath { edges, .. })) = traversal {
             // The traversal's input is a view of its own (filters included).
@@ -529,7 +544,9 @@ impl EdgeInput {
                 frame: edges.frame,
                 sourced: edges.traversal().is_none(),
                 topology: input.topology,
+                reshaped: input.reshaped,
                 roles: input.roles.clone(),
+                steps: vec![],
                 predicates: vec![],
                 induced_by: Some(Induced {
                     traversal: t,
@@ -538,16 +555,40 @@ impl EdgeInput {
                 }),
             });
         }
-        // The topology: the nearest `reverse` or source below the property-only
-        // steps. A `reverse` keeps the rows (and their order), so a filter written
-        // below it still filters the same rows.
-        let topology = chain
+        let edge_graph_columns = chain.iter().any(|p| match p {
+            Plan::WithColumns { columns, .. } => {
+                columns.iter().any(|c| matches!(c.expr, Expr::Graph(_)))
+            }
+            _ => false,
+        });
+        if edge_graph_columns {
+            return not_implemented(EDGE_WITH_COLUMNS);
+        }
+        let roles = edge_roles(&chain);
+        check_roles(&chain, &roles)?;
+        // The topology: the topmost reshaping step, whose output rows a graph op
+        // runs over; else the nearest `reverse` or source below the steps that
+        // keep the rows. A `reverse` keeps the rows (and their order), so a filter
+        // written below it still filters the same rows.
+        let (topology, reshaped, above) =
+            match chain.iter().rposition(|p| RESHAPING_OPS.contains(&p.op())) {
+                Some(i) => (chain[i], true, &chain[i + 1..]),
+                None => {
+                    let topology = chain
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|p| p.input().is_none() || matches!(p, Plan::Reverse { .. }))
+                        .unwrap_or(self.plan.as_ref());
+                    (topology, false, &chain[..])
+                }
+            };
+        let steps: Vec<&Plan> = above
             .iter()
-            .rev()
             .copied()
-            .find(|p| p.input().is_none() || matches!(p, Plan::Reverse { .. }))
-            .unwrap_or(self.plan.as_ref());
-        let predicates = chain
+            .filter(|p| p.op() == "filter" || COLUMN_OPS.contains(&p.op()))
+            .collect();
+        let predicates = steps
             .iter()
             .filter_map(|p| match p {
                 Plan::Filter { predicate, .. } => Some(predicate),
@@ -558,7 +599,9 @@ impl EdgeInput {
             frame: self.frame,
             sourced: true,
             topology,
-            roles: edge_roles(&chain),
+            reshaped,
+            roles,
+            steps,
             predicates,
             induced_by: None,
         })
@@ -571,6 +614,69 @@ impl EdgeInput {
             .into_iter()
             .find(|p| matches!(p, Plan::Hop { .. } | Plan::ShortestPath { .. }))
     }
+}
+
+/// Check that an edge plan's steps leave both endpoint columns, by name: a graph
+/// op over it reads them. A `rename` does not move a role (an edge frame keeps
+/// its `src_col` / `dst_col`), so renaming an endpoint column away removes it.
+fn check_roles(chain: &[&Plan], roles: &(String, String)) -> PlanResult<()> {
+    for (role, name) in [("src", &roles.0), ("dst", &roles.1)] {
+        let mut removed_by: Option<&Plan> = None;
+        for step in chain {
+            let present = match step {
+                Plan::Select { columns, .. } => Some(columns.iter().any(|c| match c {
+                    SelectItem::Name(n) => n == name,
+                    SelectItem::Expr(v) => &expr_name(v) == name,
+                })),
+                Plan::Rename { mapping, .. } => {
+                    if mapping.iter().any(|(_, new)| new == name) {
+                        Some(true)
+                    } else if mapping.iter().any(|(old, _)| old == name) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                Plan::GroupByAgg { keys, aggs, .. } => {
+                    Some(keys.contains(name) || aggs.iter().any(|a| &a.output == name))
+                }
+                Plan::WithColumns { columns, .. } if columns.iter().any(|c| &c.name == name) => {
+                    Some(true)
+                }
+                _ => None,
+            };
+            match present {
+                Some(false) => removed_by = Some(step),
+                Some(true) => removed_by = None,
+                None => {}
+            }
+        }
+        let Some(step) = removed_by else { continue };
+        let verb = match step.op() {
+            "group_by_agg" => "group_by().agg",
+            op => op,
+        };
+        let how = if let Plan::Rename { mapping, .. } = step {
+            let new = mapping
+                .iter()
+                .find(|(old, _)| old == name)
+                .map(|(_, new)| new.as_str())
+                .unwrap_or_default();
+            format!(
+                "renamed it to {}; a rename does not move the {role} role, so",
+                py_str(new)
+            )
+        } else {
+            "removed it, so".to_string()
+        };
+        return Err(PlanError::ColumnNotFound(format!(
+            "a graph op needs the edge frame's {role} column {}, but {verb}() {how} \
+             the edges have no {role} column. Keep the src and dst columns, or collect \
+             the edges and build a new frame with ur.from_arrow(..., src=, dst=).",
+            py_str(name)
+        )));
+    }
+    Ok(())
 }
 
 const TRAVERSAL_OPS: [&str; 2] = ["hop", "shortest_path"];
@@ -835,6 +941,13 @@ pub trait Inputs {
 
     /// Tell the user `on_null="drop"` removed `n` edge rows (`n > 0`).
     fn warn_dropped(&self, n: usize) -> PlanResult<()>;
+
+    /// A token naming the in-memory table of `frame` for a cache key: equal for
+    /// the same table, never reused for another. `None` (the default) keeps a
+    /// subplan over the table out of the reshaped-topology cache.
+    fn identity(&self, _frame: Slot) -> PlanResult<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Rows held by the host, opaque to the executor.
@@ -997,7 +1110,132 @@ pub fn require_index(edges: &EdgeInput, inputs: &dyn Inputs) -> PlanResult<Graph
     // The view checks a traversal's input too (it is a view of its own), and
     // names the frame whose index a traversal result runs over: its input's.
     let view = edges.view()?;
-    inputs.index(view.frame)
+    view_index(&view, inputs, &mut Scratch::default())
+}
+
+/// Per-query state shared while an edge input is resolved (its index, weights
+/// and mask): the seed sets read so far, and each reshaped topology's
+/// fingerprint and rows, so a subplan runs at most once per query.
+#[derive(Default)]
+pub struct Scratch {
+    seeds: HashMap<Slot, ArrayRef>,
+    /// By the topology plan's address.
+    keys: HashMap<usize, Option<String>>,
+    rows: HashMap<usize, Vec<RecordBatch>>,
+}
+
+impl Scratch {
+    /// A seed set, read from the host on first use.
+    pub fn seed_set(&mut self, slot: Slot, inputs: &dyn Inputs) -> PlanResult<ArrayRef> {
+        if let Some(a) = self.seeds.get(&slot) {
+            return Ok(a.clone());
+        }
+        let a = inputs.seeds(slot)?;
+        self.seeds.insert(slot, a.clone());
+        Ok(a)
+    }
+}
+
+/// The index a view runs over: its frame's (built on first use), or for a
+/// reshaped topology the cached index of its subplan, built from the subplan's
+/// rows on a miss.
+fn view_index(
+    view: &EdgeView<'_>,
+    inputs: &dyn Inputs,
+    scratch: &mut Scratch,
+) -> PlanResult<GraphIndex> {
+    if !view.reshaped {
+        return inputs.index(view.frame);
+    }
+    let key = topology_key(view, inputs, scratch)?;
+    crate::reshape::cached_index(key.as_deref(), || {
+        let rows = topology_rows(view, None, inputs, scratch)?;
+        crate::reshape::build_index(&rows, &view.roles)
+    })
+}
+
+/// The index a view runs over if it is already built (never builds one).
+fn built_view_index(
+    view: &EdgeView<'_>,
+    inputs: &dyn Inputs,
+    scratch: &mut Scratch,
+) -> PlanResult<Option<GraphIndex>> {
+    if !view.reshaped {
+        return inputs.built_index(view.frame);
+    }
+    Ok(topology_key(view, inputs, scratch)?.and_then(|k| crate::reshape::lookup(&k)))
+}
+
+/// The fingerprint of a reshaped view's topology (computed once per query).
+fn topology_key(
+    view: &EdgeView<'_>,
+    inputs: &dyn Inputs,
+    scratch: &mut Scratch,
+) -> PlanResult<Option<String>> {
+    let at = view.topology as *const Plan as usize;
+    if let Some(k) = scratch.keys.get(&at) {
+        return Ok(k.clone());
+    }
+    let key = crate::reshape::fingerprint(view.topology, &view.roles, inputs, scratch)?;
+    scratch.keys.insert(at, key.clone());
+    Ok(key)
+}
+
+/// The rows of a view's topology, in index order: a reshaped subplan's output
+/// (run once per query), or the source's rows reading at least `columns`
+/// (`None`: all).
+fn topology_rows(
+    view: &EdgeView<'_>,
+    columns: Option<&[String]>,
+    inputs: &dyn Inputs,
+    scratch: &mut Scratch,
+) -> PlanResult<Vec<RecordBatch>> {
+    if !view.reshaped {
+        return edge_rows(view.topology.chain()[0], view.frame, columns, inputs);
+    }
+    let at = view.topology as *const Plan as usize;
+    if let Some(rows) = scratch.rows.get(&at) {
+        return Ok(rows.clone());
+    }
+    let rows = frame_of(view.topology, inputs)?.collect()?;
+    scratch.rows.insert(at, rows.clone());
+    Ok(rows)
+}
+
+/// `rows` after one column step (`select`, `rename`, `with_columns`).
+fn column_step(
+    rows: Vec<RecordBatch>,
+    step: &Plan,
+    roles: &Roles,
+    inputs: &dyn Inputs,
+) -> PlanResult<Vec<RecordBatch>> {
+    check_step(step, inputs)?;
+    let frame = Frame::from_batches(crate::lower::session(), rows)?;
+    Ok(lower_node_steps(frame, &[step], roles, None, inputs)?.collect()?)
+}
+
+/// The weight-cache scope of a view: the column steps its weights read through
+/// (empty without any, so a source's weights keep their plain keys).
+fn weight_scope(view: &EdgeView<'_>) -> String {
+    if !view.has_column_steps() {
+        return String::new();
+    }
+    let mut scope = String::from("columns [");
+    for s in view.steps.iter().filter(|s| s.op() != "filter") {
+        scope.push_str(&column_step_key(s));
+    }
+    scope.push_str("] ");
+    scope
+}
+
+/// A column step's arguments, for a cache key.
+fn column_step_key(step: &Plan) -> String {
+    match step {
+        Plan::Select { columns, .. } => format!("select {columns:?};"),
+        Plan::Rename { mapping, .. } => format!("rename {mapping:?};"),
+        Plan::WithColumns { columns, .. } => format!("with_columns {columns:?};"),
+        other => format!("{};", other.op()),
+    }
 }
 
 // --- frame shape -------------------------------------------------------------
@@ -1102,7 +1340,8 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     // The steps after the `nodes()` boundary, in the order written. A
     // `nodes()`-derived frame inherits the edge plan: its steps before the
     // boundary are edge-plan steps (a `filter` there is a subgraph view, read as
-    // the edge mask), not node-result operators.
+    // the edge mask; a reshaping step makes the node set its rows' nodes), not
+    // node-result operators.
     let mut steps: Vec<&Plan> = vec![];
     let mut pre_nodes: Vec<&str> = vec![]; // non-filter edge-plan steps before `nodes`
     let mut past_nodes_boundary = !chain.iter().any(|p| matches!(p, Plan::Nodes { .. }));
@@ -1123,7 +1362,7 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
             }
             continue; // source / metadata steps
         }
-        if !past_nodes_boundary && (is_tail(step) || op == "join") {
+        if !past_nodes_boundary && (is_tail(step) || op == "join" || op == "with_columns") {
             if op != "filter" {
                 pre_nodes.push(op);
             }
@@ -1153,11 +1392,33 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
         _ => None,
     });
 
-    if !pre_nodes.is_empty() {
+    // The edge frame `nodes()` was called on, when steps other than `filter`
+    // shape it: its view is checked, and a reshaped one's rows give the node set.
+    let nodes_input = chain.iter().find_map(|p| match p {
+        Plan::Nodes { input } => Some(input.as_ref()),
+        _ => None,
+    });
+    let after_traversal = nodes_input.is_some_and(|p| {
+        p.chain()
+            .iter()
+            .any(|s| matches!(s, Plan::Hop { .. } | Plan::ShortestPath { .. }))
+    });
+    // Its slot is not in the plan: only a reshaped topology, which needs none,
+    // is resolved through it.
+    let shaped_edges = nodes_input
+        .filter(|_| !pre_nodes.is_empty() && !after_traversal)
+        .map(|p| EdgeInput {
+            plan: Box::new(p.clone()),
+            frame: Slot::MAX,
+        });
+    let shaped = shaped_edges.as_ref().map(EdgeInput::view).transpose()?;
+    if !pre_nodes.is_empty() && after_traversal {
         // A graph op over that derived edge frame raises the precise guard;
         // otherwise the node set would silently ignore the step.
         if let Some(exprs) = first_columns.filter(|g| !g.is_empty()) {
-            single_edges(graph_columns(exprs))?.view()?;
+            if let Some((edges, _)) = edge_groups(graph_columns(exprs))?.first() {
+                edges.view()?;
+            }
         }
         let mut seen = HashSet::new();
         let ops: Vec<String> = pre_nodes
@@ -1190,7 +1451,8 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
         let Plan::WithColumns { columns, .. } = steps[first] else {
             unreachable!("found above")
         };
-        let frame = node_set_frame(columns, inputs)?;
+        let node_set = shaped.as_ref().filter(|v| v.reshaped);
+        let frame = node_set_frame(columns, node_set, inputs)?;
         let frame = lower_node_steps(frame, &steps[..first], &roles, None, inputs)?;
         let frame = lower_node_steps(frame, &steps[first + 1..], &roles, None, inputs)?;
         return Ok(Built::frame(frame));
@@ -1293,56 +1555,75 @@ fn graph_columns(exprs: &[NamedExpr]) -> Vec<(&str, &GraphVerb)> {
         .collect()
 }
 
-/// The one edge input every graph verb of a `with_columns` shares.
-fn single_edges<'a>(verbs: Vec<(&str, &'a GraphVerb)>) -> PlanResult<&'a EdgeInput> {
-    let mut edges: Option<&EdgeInput> = None;
-    for (_, verb) in verbs {
-        let Some(this) = &verb.edges else {
+/// A graph column of a `with_columns`: its name and verb.
+type GraphColumn<'a> = (&'a str, &'a GraphVerb);
+
+/// The graph columns that run over one edge input.
+type EdgeGroup<'a> = (&'a EdgeInput, Vec<GraphColumn<'a>>);
+
+/// The graph verbs of a `with_columns`, grouped by the edge frame they run
+/// over, in the order each frame first appears. A verb with no edges is an error.
+fn edge_groups<'a>(verbs: Vec<GraphColumn<'a>>) -> PlanResult<Vec<EdgeGroup<'a>>> {
+    let mut groups: Vec<EdgeGroup<'a>> = vec![];
+    for (name, verb) in verbs {
+        let Some(edges) = &verb.edges else {
             return not_implemented(NON_GRAPH_COLUMN);
         };
-        match edges {
-            None => edges = Some(this),
-            Some(first) if first.frame != this.frame => {
-                return not_implemented(
-                    "collect() requires every algorithm in with_columns to run over the \
-                     same edges frame for now.",
-                )
-            }
-            Some(_) => {}
+        match groups.iter_mut().find(|(e, _)| e.frame == edges.frame) {
+            Some((_, g)) => g.push((name, verb)),
+            None => groups.push((edges, vec![(name, verb)])),
         }
     }
-    edges.ok_or_else(|| PlanError::NotImplemented(NON_GRAPH_COLUMN.into()))
+    Ok(groups)
 }
 
 const NON_GRAPH_COLUMN: &str = "with_columns() takes ursa expressions: ur.col(...), \
      ur.lit(...), arithmetic and comparisons over them, or graph verbs; got a value of \
      another kind.";
 
-/// The graph columns of a `with_columns`, computed: the index and mask their
-/// edges run over, and the columns, built. `nodes` is the frame's attribute
-/// table (what a neighbour aggregation reads), if it has one.
+/// The graph columns of one edge frame in a `with_columns`, computed: the index
+/// and mask their edges run over, and the columns, built.
 struct GraphColumns {
     index: GraphIndex,
     mask: Option<Arc<EdgeMask>>,
     columns: Vec<crate::result::OutputColumn>,
 }
 
+/// The graph columns of a `with_columns`, one [`GraphColumns`] per edge frame
+/// the verbs run over, in the order written (#191: each verb has its own edge
+/// input). `nodes` is the frame's attribute table (what a neighbour aggregation
+/// reads), if it has one.
 fn graph_columns_for(
     exprs: &[NamedExpr],
     nodes: Option<(&[RecordBatch], &str)>,
     inputs: &dyn Inputs,
-) -> PlanResult<Option<GraphColumns>> {
+) -> PlanResult<Vec<GraphColumns>> {
     let verbs = graph_columns(exprs);
     if verbs.is_empty() {
-        return Ok(None);
+        return Ok(vec![]);
     }
-    let edges = single_edges(verbs.clone())?;
+    let mut out = vec![];
+    for (edges, verbs) in edge_groups(verbs)? {
+        out.push(edge_group_columns(edges, &verbs, nodes, inputs)?);
+    }
+    Ok(out)
+}
+
+/// The columns of the verbs that run over one edge input.
+fn edge_group_columns(
+    edges: &EdgeInput,
+    verbs: &[(&str, &GraphVerb)],
+    nodes: Option<(&[RecordBatch], &str)>,
+    inputs: &dyn Inputs,
+) -> PlanResult<GraphColumns> {
+    let view = edges.view()?;
+    let mut scratch = Scratch::default();
     // A weighted algorithm needs the edge columns its weight expression reads.
     // The read is skipped when the index already caches every one of these
     // weights (and, for a scan, builds the index too).
     let mut weight_cols: BTreeSet<String> = BTreeSet::new();
     let mut weight_keys: Vec<String> = vec![];
-    for (_, verb) in &verbs {
+    for (_, verb) in verbs {
         if let Some(w) = &verb.weight {
             check_literals(w, "weight")?;
             weight_cols.extend(value_columns(w, &[]));
@@ -1352,14 +1633,15 @@ fn graph_columns_for(
     let edge_attr = if weight_cols.is_empty() {
         None
     } else {
-        prepare_weighted(edges, &weight_cols, &weight_keys, inputs)?
+        prepare_weighted(&view, &weight_cols, &weight_keys, inputs, &mut scratch)?
     };
-    let index = require_index(edges, inputs)?;
-    let mask = edge_mask(edges, &index, inputs)?;
+    let index = view_index(&view, inputs, &mut scratch)?;
+    let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
     let specs: Vec<NodeColumn> = verbs
         .iter()
         .map(|(name, verb)| (name.to_string(), (*verb).clone()))
         .collect();
+    let scope = weight_scope(&view);
     let columns = node_columns(
         &index.topo,
         &index.ids,
@@ -1367,27 +1649,78 @@ fn graph_columns_for(
         nodes.map(|(b, _)| b),
         nodes.map(|(_, id)| id),
         edge_attr.as_deref(),
-        Some(&index.weights),
+        Some((index.weights.as_ref(), scope.as_str())),
     )?;
-    Ok(Some(GraphColumns {
+    Ok(GraphColumns {
         index,
         mask,
         columns,
-    }))
+    })
 }
 
-/// The frame of `edges.nodes().with_columns(...)`: the graph's node set, in node
-/// order, with the graph columns, then the `with_columns`' other expressions.
-fn node_set_frame(exprs: &[NamedExpr], inputs: &dyn Inputs) -> PlanResult<Frame> {
-    let Some(g) = graph_columns_for(exprs, None, inputs)? else {
+/// The frame of `edges.nodes().with_columns(...)`: the node set, in node order,
+/// with the graph columns, then the `with_columns`' other expressions.
+///
+/// The node set is `node_set`'s (the view of a reshaped edge frame `nodes()` was
+/// called on) or else the first graph column's edge frame's, as it always was.
+/// The columns of every other edge frame attach to those nodes by id, as a later
+/// `with_columns` would attach them: a node that frame's graph lacks gets null.
+fn node_set_frame(
+    exprs: &[NamedExpr],
+    node_set: Option<&EdgeView<'_>>,
+    inputs: &dyn Inputs,
+) -> PlanResult<Frame> {
+    let mut groups = graph_columns_for(exprs, None, inputs)?.into_iter();
+    let Some(first) = groups.next() else {
         return not_implemented(NON_GRAPH_COLUMN);
     };
+    // Resolved after the columns, so a topology they share is built once.
+    let node_set = node_set
+        .map(|v| view_index(v, inputs, &mut Scratch::default()))
+        .transpose()?;
     let ctx = crate::lower::session();
-    let leaf = graph_leaf(&ctx, g.index.topo, g.index.ids, g.columns, g.mask);
-    let mut frame = Frame::from_ordered(ctx, leaf);
+    let mut frame = match node_set {
+        Some(set) if !Arc::ptr_eq(&set.topo, &first.index.topo) => {
+            let leaf = graph_leaf(&ctx, set.topo, set.ids, vec![], None);
+            let mut frame = Frame::from_ordered(ctx.clone(), leaf);
+            attach_group(&mut frame, first, "id")?;
+            frame
+        }
+        _ => {
+            let leaf = graph_leaf(
+                &ctx,
+                first.index.topo,
+                first.index.ids,
+                first.columns,
+                first.mask,
+            );
+            Frame::from_ordered(ctx, leaf)
+        }
+    };
+    for g in groups {
+        attach_group(&mut frame, g, "id")?;
+    }
     let before: Vec<String> = vec!["id".to_string()];
     scalar_columns(&mut frame, exprs, &before, &[("id", "id".to_string())])?;
     Ok(frame)
+}
+
+/// Attach one edge frame's graph columns to `frame`'s rows by the id column
+/// `id_col`.
+fn attach_group(frame: &mut Frame, g: GraphColumns, id_col: &str) -> PlanResult<()> {
+    let ctx = frame.ctx().clone();
+    let rows = frame.ordered_batches()?;
+    let attached = attach_columns(
+        &ctx,
+        g.index.topo,
+        g.index.ids,
+        g.columns,
+        g.mask,
+        rows,
+        id_col,
+    )?;
+    frame.set_batches(attached)?;
+    Ok(())
 }
 
 /// Lower the steps of a frame, in order: relational steps, `with_columns` (graph
@@ -1434,26 +1767,17 @@ fn with_columns(
 ) -> PlanResult<()> {
     let before = frame.names();
     let nodes = table.map(|t| (t, id_col));
-    if let Some(g) = graph_columns_for(exprs, nodes, inputs)? {
-        if !frame.has_column(id_col) {
-            return Err(PlanError::ColumnNotFound(format!(
-                "with_columns() attaches graph columns by the node id column {}, which an \
-                 earlier step removed or renamed.",
-                py_str(id_col)
-            )));
-        }
-        let ctx = frame.ctx().clone();
-        let rows = frame.ordered_batches()?;
-        let attached = attach_columns(
-            &ctx,
-            g.index.topo,
-            g.index.ids,
-            g.columns,
-            g.mask,
-            rows,
-            id_col,
-        )?;
-        frame.set_batches(attached)?;
+    let groups = graph_columns_for(exprs, nodes, inputs)?;
+    if !groups.is_empty() && !frame.has_column(id_col) {
+        return Err(PlanError::ColumnNotFound(format!(
+            "with_columns() attaches graph columns by the node id column {}, which an \
+             earlier step removed or renamed.",
+            py_str(id_col)
+        )));
+    }
+    // Each edge frame's columns attach by id; the attribute frame's rows decide.
+    for g in groups {
+        attach_group(frame, g, id_col)?;
     }
     scalar_columns(frame, exprs, &before, roles)
 }
@@ -1626,22 +1950,24 @@ const FLOAT_VALUED_VERBS: [&str; 5] = [
     "pagerank",
 ];
 
-/// The edge rows a weight reads: `columns` of the edges' rows, aligned with their
+/// The edge rows a weight reads: `columns` of the view's rows, aligned with its
 /// index's edge rows, or `None` when the index already caches every weight in
 /// `keys` (#179). For a scan with no index yet the same read builds the index.
 fn prepare_weighted(
-    edges: &EdgeInput,
+    view: &EdgeView<'_>,
     columns: &BTreeSet<String>,
     keys: &[String],
     inputs: &dyn Inputs,
+    scratch: &mut Scratch,
 ) -> PlanResult<Option<Vec<RecordBatch>>> {
-    // Checked before anything is read: for a scan the read also builds the index,
-    // which must never happen for an edge plan a graph op can't run over.
-    let view = edges.view()?;
     let frame = view.frame;
     if !keys.is_empty() {
-        if let Some(index) = inputs.built_index(frame)? {
-            if keys.iter().all(|k| index.weights.get(k).is_some()) {
+        if let Some(index) = built_view_index(view, inputs, scratch)? {
+            let scope = weight_scope(view);
+            if keys
+                .iter()
+                .all(|k| index.weights.get(&format!("{scope}{k}")).is_some())
+            {
                 return Ok(None);
             }
         }
@@ -1649,6 +1975,15 @@ fn prepare_weighted(
     const NO_SOURCE: &str = "a weighted algorithm needs an in-memory or scan_edges source so \
          the weight columns can be read.";
     let columns: Vec<String> = columns.iter().cloned().collect();
+    if view.sourced && (view.reshaped || view.has_column_steps()) {
+        // The rows as the steps above the topology leave their columns.
+        let roles = view_roles(view);
+        let mut rows = topology_rows(view, None, inputs, scratch)?;
+        for step in view.steps.iter().filter(|s| s.op() != "filter") {
+            rows = column_step(rows, step, &roles, inputs)?;
+        }
+        return weight_columns(&rows, &columns).map(Some);
+    }
     let chain = view.topology.chain();
     match chain[0] {
         _ if !view.sourced => not_implemented(NO_SOURCE),
@@ -1657,27 +1992,7 @@ fn prepare_weighted(
                 return not_implemented(NO_SOURCE);
             };
             let table = table.into_batches(inputs)?;
-            let schema = table[0].schema();
-            let missing: Vec<&String> = columns
-                .iter()
-                .filter(|c| schema.index_of(c).is_err())
-                .collect();
-            if !missing.is_empty() {
-                return Err(PlanError::ColumnNotFound(format!(
-                    "weight expression references unknown edge column(s): {}",
-                    py_list(missing.into_iter())
-                )));
-            }
-            let indices: Vec<usize> = columns
-                .iter()
-                .map(|c| schema.index_of(c).expect("checked above"))
-                .collect();
-            let batches = table
-                .iter()
-                .map(|b| b.project(&indices))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None)))?;
-            Ok(Some(batches))
+            weight_columns(&table, &columns).map(Some)
         }
         Plan::ScanEdges { path, on_null, .. } => {
             let path = single_path(
@@ -1713,6 +2028,30 @@ fn prepare_weighted(
     }
 }
 
+/// `columns` of edge rows, for a weight; an unknown one is an error.
+fn weight_columns(table: &[RecordBatch], columns: &[String]) -> PlanResult<Vec<RecordBatch>> {
+    let schema = table[0].schema();
+    let missing: Vec<&String> = columns
+        .iter()
+        .filter(|c| schema.index_of(c).is_err())
+        .collect();
+    if !missing.is_empty() {
+        return Err(PlanError::ColumnNotFound(format!(
+            "weight expression references unknown edge column(s): {}",
+            py_list(missing.into_iter())
+        )));
+    }
+    let indices: Vec<usize> = columns
+        .iter()
+        .map(|c| schema.index_of(c).expect("checked above"))
+        .collect();
+    table
+        .iter()
+        .map(|b| b.project(&indices))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None)))
+}
+
 /// Remove the rows of `batches` (src/dst first) with a null endpoint; the number
 /// removed.
 fn drop_null_endpoints(batches: &mut [RecordBatch]) -> PlanResult<usize> {
@@ -1746,28 +2085,17 @@ const MULTI_PATH_EDGES: &str = "collect() over a scan_edges source supports a si
 const MULTI_PATH_NODES: &str = "collect() over a scan_nodes source supports a single string \
      path (glob included) for now, not a list of paths.";
 
-/// The subgraph-view mask of `edges` over `index`, or `None` for the whole graph.
+/// The subgraph-view mask of a view over `index`, or `None` for the whole graph.
 fn edge_mask(
-    edges: &EdgeInput,
+    view: &EdgeView<'_>,
     index: &GraphIndex,
     inputs: &dyn Inputs,
+    scratch: &mut Scratch,
 ) -> PlanResult<Option<Arc<EdgeMask>>> {
-    view_mask(&edges.view()?, index, inputs, &mut HashMap::new())
+    view_mask(view, index, inputs, scratch)
 }
 
 // --- subgraph-view masks (#114, #116, #192) -----------------------------------
-
-/// Seed sets already read for a view, by slot (a fingerprint reads them first).
-type SeedSets = HashMap<Slot, ArrayRef>;
-
-fn seed_set(slot: Slot, seeds: &mut SeedSets, inputs: &dyn Inputs) -> PlanResult<ArrayRef> {
-    if let Some(a) = seeds.get(&slot) {
-        return Ok(a.clone());
-    }
-    let a = inputs.seeds(slot)?;
-    seeds.insert(slot, a.clone());
-    Ok(a)
-}
 
 /// A view's mask over `index`: one bit per edge row, served from the index's
 /// [`MaskCache`] under the view's fingerprint, computed on a miss.
@@ -1775,24 +2103,28 @@ fn view_mask(
     view: &EdgeView<'_>,
     index: &GraphIndex,
     inputs: &dyn Inputs,
-    seeds: &mut SeedSets,
+    scratch: &mut Scratch,
 ) -> PlanResult<Option<Arc<EdgeMask>>> {
     if !view.has_mask() {
         return Ok(None);
     }
-    let key = view_key(view, inputs, seeds)?;
+    let key = view_key(view, inputs, scratch)?;
     index
         .masks
-        .get_or_build(&key, || build_mask(view, index, inputs, seeds))
+        .get_or_build(&key, || build_mask(view, index, inputs, scratch))
         .map(Some)
 }
 
 /// The fingerprint of a view's mask: what it is a function of, given the rows of
 /// its index.
-fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, seeds: &mut SeedSets) -> PlanResult<String> {
+fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, scratch: &mut Scratch) -> PlanResult<String> {
     let roles = view_roles(view);
     let mut key = String::new();
-    for p in &view.predicates {
+    for step in &view.steps {
+        let Plan::Filter { predicate: p, .. } = step else {
+            key.push_str(&column_step_key(step));
+            continue;
+        };
         let resolved = match p {
             Expr::Scalar(v) => resolve_roles(v, &roles).unwrap_or_else(|_| v.clone()),
             Expr::Graph(_) => Value::from("graph"),
@@ -1803,7 +2135,7 @@ fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, seeds: &mut SeedSets) -> P
         traversal, input, ..
     }) = &view.induced_by
     {
-        let inner = view_key(input, inputs, seeds)?;
+        let inner = view_key(input, inputs, scratch)?;
         match traversal {
             Plan::Hop {
                 n,
@@ -1811,7 +2143,7 @@ fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, seeds: &mut SeedSets) -> P
                 seeds: slot,
                 ..
             } => {
-                let set = seed_set(*slot, seeds, inputs)?;
+                let set = scratch.seed_set(*slot, inputs)?;
                 key.push_str(&format!(
                     "hop n={} direction={direction} seeds={} over [{inner}];",
                     n.0,
@@ -1826,8 +2158,8 @@ fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, seeds: &mut SeedSets) -> P
                 ..
             } => {
                 let (s, t) = (
-                    seed_set(*source, seeds, inputs)?,
-                    seed_set(*target, seeds, inputs)?,
+                    scratch.seed_set(*source, inputs)?,
+                    scratch.seed_set(*target, inputs)?,
                 );
                 key.push_str(&format!(
                     "shortest_path direction={direction} source={} target={} weight={} over [{inner}];",
@@ -1843,7 +2175,7 @@ fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, seeds: &mut SeedSets) -> P
 }
 
 /// A content digest of an id array (int64 or string), for a fingerprint.
-fn array_digest(a: &dyn Array) -> String {
+pub(crate) fn array_digest(a: &dyn Array) -> String {
     use std::hash::{Hash, Hasher};
     let strings = arrow::compute::cast(a, &arrow::datatypes::DataType::Utf8).ok();
     let mut parts = [
@@ -1875,23 +2207,21 @@ fn build_mask(
     view: &EdgeView<'_>,
     index: &GraphIndex,
     inputs: &dyn Inputs,
-    seeds: &mut SeedSets,
+    scratch: &mut Scratch,
 ) -> PlanResult<EdgeMask> {
     let mut mask: Option<EdgeMask> = None;
     if let Some(Induced {
-        traversal,
-        edges,
-        input,
+        traversal, input, ..
     }) = &view.induced_by
     {
         // The reached node set, found over the input's own view, induces the
         // subgraph: an edge is kept iff both its endpoints are reached (#116).
-        let within = view_mask(input, index, inputs, seeds)?;
-        let reached = reached_nodes(traversal, edges, index, within.as_deref(), inputs, seeds)?;
+        let within = view_mask(input, index, inputs, scratch)?;
+        let reached = reached_nodes(traversal, input, index, within.as_deref(), inputs, scratch)?;
         mask = Some(EdgeMask::induced(&index.topo, &reached, within.as_deref()));
     }
     if !view.predicates.is_empty() {
-        let m = predicate_mask(view, index.topo.n_edges(), inputs)?;
+        let m = predicate_mask(view, index.topo.n_edges(), inputs, scratch)?;
         mask = Some(match mask {
             Some(t) => t.intersect(&m),
             None => m,
@@ -1904,11 +2234,11 @@ fn build_mask(
 /// region, seeds included, or the nodes on a shortest path.
 fn reached_nodes(
     traversal: &Plan,
-    edges: &EdgeInput,
+    edges: &EdgeView<'_>,
     index: &GraphIndex,
     within: Option<&EdgeMask>,
     inputs: &dyn Inputs,
-    seeds: &mut SeedSets,
+    scratch: &mut Scratch,
 ) -> PlanResult<Vec<bool>> {
     let (topo, ids) = (&index.topo, &index.ids);
     let mut reached = vec![false; topo.n_nodes()];
@@ -1919,7 +2249,7 @@ fn reached_nodes(
             seeds: slot,
             ..
         } => {
-            let set = seed_set(*slot, seeds, inputs)?;
+            let set = scratch.seed_set(*slot, inputs)?;
             let dense: Vec<u32> = resolve_dense(ids, set.as_ref())?
                 .into_iter()
                 .flatten()
@@ -1935,8 +2265,8 @@ fn reached_nodes(
             direction,
             ..
         } => {
-            let s = seed_set(*source, seeds, inputs)?;
-            let t = seed_set(*target, seeds, inputs)?;
+            let s = scratch.seed_set(*source, inputs)?;
+            let t = scratch.seed_set(*target, inputs)?;
             let weights = match weight {
                 None => None,
                 Some(w) => {
@@ -1945,7 +2275,7 @@ fn reached_nodes(
                     let attr = if cols.is_empty() {
                         None
                     } else {
-                        prepare_weighted(edges, &cols, &[], inputs)?
+                        prepare_weighted(edges, &cols, &[], inputs, scratch)?
                     };
                     Some(
                         attr.map(|a| (w.to_string(), a))
@@ -1985,29 +2315,48 @@ fn reached_nodes(
 }
 
 /// The mask of a view's filters over its topology's edge rows (#114): each
-/// predicate evaluated over those rows, in index order, ANDed.
+/// predicate evaluated over those rows, in index order, ANDed. A filter written
+/// after a column step reads the columns that step leaves.
 fn predicate_mask(
     view: &EdgeView<'_>,
     n_edges: usize,
     inputs: &dyn Inputs,
+    scratch: &mut Scratch,
 ) -> PlanResult<EdgeMask> {
     let roles = view_roles(view);
-    // Only what the predicates read: the index build already checked the
-    // endpoints, and a scan reads them anyway to drop null-endpoint rows.
-    let mut needed: BTreeSet<String> = BTreeSet::new();
-    for p in &view.predicates {
-        needed.extend(expr_columns(p, &roles));
-    }
-    let needed: Vec<String> = needed.into_iter().collect();
-    let chain = view.topology.chain();
-    let rows = edge_rows(chain[0], view.frame, Some(&needed), inputs)?;
     debug_assert!(view.sourced, "a filter view is over a source's rows");
-    let schema = rows[0].schema();
-    let mut compiled = Vec::with_capacity(view.predicates.len());
-    for p in &view.predicates {
-        compiled.push(host_predicate(p, &roles, &schema)?);
-    }
-    let flags = crate::eval::keep_flags(&rows, &compiled)?;
+    let flags = if view.has_column_steps() {
+        let mut rows = topology_rows(view, None, inputs, scratch)?;
+        let mut flags: Option<arrow::array::BooleanArray> = None;
+        for step in &view.steps {
+            let Plan::Filter { predicate, .. } = step else {
+                rows = column_step(rows, step, &roles, inputs)?;
+                continue;
+            };
+            let compiled = host_predicate(predicate, &roles, &rows[0].schema())?;
+            let keep = crate::eval::keep_flags(&rows, &[compiled])?;
+            flags = Some(match flags {
+                Some(f) => arrow::compute::and(&f, &keep)?,
+                None => keep,
+            });
+        }
+        flags.expect("a view with a predicate has a filter step")
+    } else {
+        // Only what the predicates read: the index build already checked the
+        // endpoints, and a scan reads them anyway to drop null-endpoint rows.
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        for p in &view.predicates {
+            needed.extend(expr_columns(p, &roles));
+        }
+        let needed: Vec<String> = needed.into_iter().collect();
+        let rows = topology_rows(view, Some(&needed), inputs, scratch)?;
+        let schema = rows[0].schema();
+        let mut compiled = Vec::with_capacity(view.predicates.len());
+        for p in &view.predicates {
+            compiled.push(host_predicate(p, &roles, &schema)?);
+        }
+        crate::eval::keep_flags(&rows, &compiled)?
+    };
     if flags.len() != n_edges {
         return Err(PlanError::Value(format!(
             "edge_mask length ({}) does not match the edge count ({n_edges})",
@@ -2111,10 +2460,12 @@ fn random_walk_frame(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanR
         check_step(s, inputs)?;
         steps.push(s);
     }
-    let index = require_index(edges, inputs)?;
+    let view = edges.view()?;
+    let mut scratch = Scratch::default();
+    let index = view_index(&view, inputs, &mut scratch)?;
     let starts = inputs.seeds(*start)?;
     // A walk over a subgraph view follows only its edges (#192).
-    let mask = edge_mask(edges, &index, inputs)?;
+    let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
     let ctx = crate::lower::session();
     let leaf = walk_leaf(
         &ctx,
@@ -2169,6 +2520,12 @@ fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
                 check_step(step, inputs)?;
                 steps.push(step);
             }
+            // Scalar columns (#191); graph columns belong on `edges.nodes()`.
+            Plan::WithColumns { columns, .. }
+                if columns.iter().all(|c| matches!(c.expr, Expr::Scalar(_))) =>
+            {
+                steps.push(step);
+            }
             _ => {
                 return not_implemented(format!(
                     "collect() does not yet support the '{op}' step on an edge frame."
@@ -2206,10 +2563,12 @@ fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
             direction,
             seeds,
         } => {
-            let index = require_index(edges, inputs)?;
+            let view = edges.view()?;
+            let mut scratch = Scratch::default();
+            let index = view_index(&view, inputs, &mut scratch)?;
             let seeds = inputs.seeds(*seeds)?;
             // A traversal over a subgraph view follows only its edges (#192).
-            let mask = edge_mask(edges, &index, inputs)?;
+            let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
             let leaf = hop_leaf(
                 &ctx,
                 index.topo,
@@ -2236,16 +2595,18 @@ fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
                 check_literals(w, "weight")?;
             }
             let weight_json = weight.as_ref().map(Value::to_string);
+            let view = edges.view()?;
+            let mut scratch = Scratch::default();
             if let Some(w) = weight {
                 let cols: BTreeSet<String> = value_columns(w, &[]);
                 if !cols.is_empty() {
-                    edge_attr = prepare_weighted(edges, &cols, &[], inputs)?;
+                    edge_attr = prepare_weighted(&view, &cols, &[], inputs, &mut scratch)?;
                 }
             }
-            let index = require_index(edges, inputs)?;
+            let index = view_index(&view, inputs, &mut scratch)?;
             let source = inputs.seeds(*source)?;
             let target = inputs.seeds(*target)?;
-            let mask = edge_mask(edges, &index, inputs)?;
+            let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
             path_leaf(
                 &ctx,
                 index.topo,
@@ -3279,9 +3640,26 @@ mod tests {
         assert_eq!(view.topology.op(), "from_arrow");
         assert_eq!(view.induced_by.map(|i| i.traversal.op()), Some("hop"));
 
+        // A reshaping step is the topology; the filter and column steps above it
+        // keep its rows, and the filter is the mask (#191).
         let reshaped: EdgeInput = serde_json::from_value(serde_json::json!({"frame": 3, "plan":
-            {"op": "distinct", "input": edges}}))
+            {"op": "rename", "mapping": [["w", "x"]], "input": {"op": "filter",
+             "predicate": col_pred("w"), "input": {"op": "distinct",
+             "input": {"op": "filter", "predicate": col_pred("w"), "input": edges}}}}}))
         .unwrap();
-        assert!(matches!(reshaped.view(), Err(PlanError::NotImplemented(_))));
+        let view = reshaped.view().unwrap();
+        assert!(view.reshaped);
+        assert_eq!(view.topology.op(), "distinct");
+        let ops: Vec<&str> = view.steps.iter().map(|s| s.op()).collect();
+        assert_eq!(ops, ["filter", "rename"]);
+        assert_eq!(view.predicates.len(), 1);
+
+        // A step that leaves no endpoint column is an error naming it.
+        let dropped: EdgeInput = serde_json::from_value(serde_json::json!({"frame": 4, "plan":
+            {"op": "select", "columns": ["s", "w"], "input": edges}}))
+        .unwrap();
+        let err = dropped.view().unwrap_err();
+        assert!(matches!(err, PlanError::ColumnNotFound(_)), "{err}");
+        assert!(err.to_string().contains("dst column 'd', but select() removed it"));
     }
 }

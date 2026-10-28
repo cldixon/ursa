@@ -263,6 +263,49 @@ fn build_scan_state(
         .build())
 }
 
+/// The identity of a local scan's input, for a cache key: each file it reads
+/// (a glob expanded as the scan expands it), with its size and modification
+/// time in nanoseconds, in path order. `None` for a remote path, whose
+/// modification time is too coarse to tell a same-size rewrite apart (see
+/// [`build_scan_state`]), or a path the scan can't list (it raises its own
+/// error when it runs).
+pub fn scan_identity(path: &str, opts: &HashMap<String, String>) -> Option<String> {
+    use datafusion::datasource::listing::ListingTableUrl;
+    use futures::TryStreamExt;
+    if Url::parse(path).is_ok_and(|u| u.scheme() != "file") {
+        return None;
+    }
+    let ext = match detect_format(path, "scan").ok()? {
+        ScanFormat::Parquet => ".parquet",
+        ScanFormat::Csv => ".csv",
+    };
+    let state = scan_state(path, opts).ok()?;
+    let url = ListingTableUrl::parse(path).ok()?;
+    let store = state.runtime_env().object_store(url.object_store()).ok()?;
+    let mut files = crate::runtime::block_on(async {
+        url.list_all_files(&state, store.as_ref(), ext)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .ok()?
+    .ok()?;
+    if files.is_empty() {
+        return None;
+    }
+    files.sort_by(|a, b| a.location.cmp(&b.location));
+    Some(
+        files
+            .iter()
+            .map(|f| {
+                let t = f.last_modified.timestamp_nanos_opt().unwrap_or_default();
+                format!("{}:{}:{t}", f.location, f.size)
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 /// What each scan read, while recording is on (test/observability hook): the
 /// scan's kind (`index`, `edges`, `table`, `nodes`), the columns it was asked
 /// for, and how many filters it pushed into the read.

@@ -162,12 +162,15 @@ impl WeightCache {
             .map(|(_, w)| w.clone())
     }
 
-    /// The weights for `key`, evaluated via [`edge_weights`] on a miss. Evaluation
-    /// runs outside the lock; if a concurrent query cached the same key first, its
+    /// The weights for `key`, evaluated from `weight_json` via [`edge_weights`] on
+    /// a miss. The key is the expression's canonical JSON, prefixed with the
+    /// column steps its edge rows went through, if any (#191). Evaluation runs
+    /// outside the lock; if a concurrent query cached the same key first, its
     /// `Arc` wins so every caller shares one vector.
     pub fn get_or_eval(
         &self,
         key: &str,
+        weight_json: &str,
         edges: Option<&[RecordBatch]>,
         n_edges: usize,
         what: &str,
@@ -175,7 +178,7 @@ impl WeightCache {
         if let Some(w) = self.get(key) {
             return Ok(w);
         }
-        let w = Arc::new(edge_weights(edges, key, n_edges, what)?);
+        let w = Arc::new(edge_weights(edges, weight_json, n_edges, what)?);
         self.evaluations.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, existing)) = entries.iter().find(|(k, _)| k == key) {
@@ -325,9 +328,11 @@ mod tests {
         let cache = WeightCache::default();
         let edges = [edge_batch()];
         let amount = weight_cache_key(r#"{"kind": "col", "name": "amount"}"#).unwrap();
-        let a = cache.get_or_eval(&amount, Some(&edges), 3, "t").unwrap();
+        let a = cache
+            .get_or_eval(&amount, &amount, Some(&edges), 3, "t")
+            .unwrap();
         // A hit needs no edge table and returns the same Arc (a stable memo key).
-        let b = cache.get_or_eval(&amount, None, 3, "t").unwrap();
+        let b = cache.get_or_eval(&amount, &amount, None, 3, "t").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(cache.evaluations(), 1);
         // Past capacity the oldest entry is evicted and a re-request re-evaluates.
@@ -337,10 +342,10 @@ mod tests {
             r#"{"kind":"binary","op":"+","left":{"kind":"col","name":"fx"},"right":{"kind":"lit","value":1}}"#,
         ] {
             let key = weight_cache_key(json).unwrap();
-            cache.get_or_eval(&key, Some(&edges), 3, "t").unwrap();
+            cache.get_or_eval(&key, &key, Some(&edges), 3, "t").unwrap();
         }
         assert_eq!(cache.evaluations(), 3);
         assert!(cache.get(&amount).is_none());
-        assert!(cache.get_or_eval(&amount, None, 3, "t").is_err());
+        assert!(cache.get_or_eval(&amount, &amount, None, 3, "t").is_err());
     }
 }

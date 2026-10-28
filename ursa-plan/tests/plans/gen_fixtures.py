@@ -6,7 +6,7 @@ would send it to ``run_plan``, and the fixture inputs its slots bind;
 raises). ``expect`` uses only the public API, so it can run against any build,
 e.g. the release the fixtures should pin::
 
-    python ursa-plan/tests/plans/gen_fixtures.py serialize
+    python ursa-plan/tests/plans/gen_fixtures.py serialize [case ...]
     python ursa-plan/tests/plans/gen_fixtures.py expect [case ...]
 """
 
@@ -184,9 +184,17 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
             "Two with_columns steps: the second attaches by id.",
             lambda: k.nodes().with_columns(a=ur.degree(k)).with_columns(b=ur.pagerank(k)),
         ),
-        "error_reshaped_edges": (
-            "A graph op over a distinct edge frame.",
+        "reshaped_edges": (
+            "A graph op over a distinct edge frame runs over its rows' topology.",
             lambda: ur.degree(k.distinct())._frame(),
+        ),
+        "mixed_edge_frames": (
+            "Graph columns over three edge frames in one with_columns, attached by id.",
+            lambda: kn.with_columns(
+                d=ur.degree(k),
+                d_view=ur.degree(k.filter(ur.col("src") < 10)),
+                d_head=ur.degree(k.head(20)),
+            ),
         ),
         "error_hop_of_hop": (
             "A traversal over a traversal result.",
@@ -225,10 +233,12 @@ def _path(name: str) -> Path:
     return HERE / f"{name}.json"
 
 
-def serialize() -> None:
+def serialize(only: list[str] | None = None) -> None:
     from ursa._execute import _Host
 
     for name, (description, build) in _cases().items():
+        if only and name not in only:
+            continue
         host = _Host()
         plan = host.frame(build())
         inputs = [_input(obj) for obj in host._slots]
@@ -262,6 +272,6 @@ def expect(only: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     if sys.argv[1] == "serialize":
-        serialize()
+        serialize(sys.argv[2:] or None)
     else:
         expect(sys.argv[2:] or None)
