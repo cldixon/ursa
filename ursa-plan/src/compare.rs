@@ -67,7 +67,11 @@ pub fn compares_floats(expr: &Expr, schema: &DFSchema) -> bool {
     let mut floats = false;
     let _ = expr.apply(|e| {
         if let Expr::BinaryExpr(BinaryExpr { left, op, .. }) = e {
-            if is_comparison(op) && left.get_type(schema).is_ok_and(|t| is_float(&t)) {
+            if is_comparison(op)
+                && left
+                    .get_type(schema)
+                    .is_ok_and(|t| is_float(value_type(&t)))
+            {
                 floats = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -326,7 +330,15 @@ pub fn pa_name(dt: &DataType) -> String {
 /// Bring one side to its common type; a float side becomes canonical.
 fn coerce(e: Expr, dt: &DataType, how: To) -> Result<Expr> {
     let (e, target) = match how {
-        To::Same => (e, value_type(dt).clone()),
+        // A float dictionary is canonicalized over its values: `isnan` takes no
+        // dictionary.
+        To::Same => match dt {
+            DataType::Dictionary(_, v) if is_float(v) => (
+                Expr::Cast(Cast::new(Box::new(e), v.as_ref().clone())),
+                v.as_ref().clone(),
+            ),
+            _ => (e, value_type(dt).clone()),
+        },
         To::Cast(t) => (Expr::Cast(Cast::new(Box::new(e), t.clone())), t),
         To::Checked(t) => (checked_cast(e, t.clone()), t),
     };

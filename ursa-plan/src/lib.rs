@@ -34,6 +34,7 @@ pub mod lazy;
 pub mod logical;
 pub mod lower;
 pub mod node;
+mod parquet_stats;
 pub mod physical;
 pub mod plan;
 pub mod planner;
@@ -56,6 +57,8 @@ pub use scan::{
     scan_edges_batch, scan_edges_table, scan_edges_topology, scan_nodes_batch, ScanBuildError,
     ScannedTopology,
 };
-pub use stats::{avg_path_length, density, describe, diameter, parse_stat_direction};
+pub use stats::{
+    avg_path_length, density, describe, describe_masked, diameter, parse_stat_direction,
+};
 pub use topology::{build_topology, build_topology_batches};
 pub use weight::{weight_cache_key, WeightCache};

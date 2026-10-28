@@ -19,7 +19,7 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::connected_components_weak;
-use ursa_core::{Direction, Topology};
+use ursa_core::{Direction, EdgeMask, Topology};
 
 /// Parse a stat's `direction` argument (`"out"`, `"in"` or `"both"`).
 pub fn parse_stat_direction(d: &str) -> Result<Direction> {
@@ -36,15 +36,29 @@ fn edge_count(topo: &Topology, dir: Direction) -> u64 {
     }
 }
 
+/// [`edge_count`] over the subgraph view `mask` keeps (#207): the kept rows for
+/// `Out`/`In`, or the distinct unordered pairs among them for `Both`.
+fn masked_edge_count(topo: &Topology, mask: &EdgeMask, dir: Direction) -> u64 {
+    match dir {
+        Direction::Both => topo.undirected_masked(mask).targets.len() as u64 / 2,
+        _ => mask.n_kept() as u64,
+    }
+}
+
 /// Edge density off an already-built topology. Directed (`Out`/`In`):
 /// `m / (n * (n - 1))`. Undirected (`Both`): `m_u / (n * (n - 1) / 2)`. Returns
 /// `0.0` for fewer than two nodes.
 fn density_of(topo: &Topology, dir: Direction) -> f64 {
-    let n = topo.n_nodes() as f64;
+    density_from(topo.n_nodes(), edge_count(topo, dir), dir)
+}
+
+/// Density from a node and an edge count (as [`density_of`] reads them).
+fn density_from(n_nodes: usize, n_edges: u64, dir: Direction) -> f64 {
+    let n = n_nodes as f64;
     if n < 2.0 {
         return 0.0;
     }
-    let m = edge_count(topo, dir) as f64;
+    let m = n_edges as f64;
     match dir {
         Direction::Both => 2.0 * m / (n * (n - 1.0)),
         _ => m / (n * (n - 1.0)),
@@ -77,9 +91,26 @@ pub fn density(topology: &Topology, dir: Direction) -> Result<f64> {
 /// density and `avg_degree` the mean undirected degree (`2 * m_u / n`).
 /// `n_components` is always the weak (undirected) count.
 pub fn describe(topology: &Topology, full: bool, dir: Direction) -> Result<RecordBatch> {
+    describe_masked(topology, None, full, dir)
+}
+
+/// [`describe`] over a subgraph view (#207): the parent's node set, and only the
+/// edge rows `mask` keeps for `n_edges`, `density`, `avg_degree` and
+/// `n_components` — what `degree` and the other graph ops read over the same
+/// view. `None` is the whole graph.
+pub fn describe_masked(
+    topology: &Topology,
+    mask: Option<&EdgeMask>,
+    full: bool,
+    dir: Direction,
+) -> Result<RecordBatch> {
     let n_nodes = topology.n_nodes() as i64;
-    let n_edges = edge_count(topology, dir) as i64;
-    let density = density_of(topology, dir);
+    let edges = match mask {
+        Some(m) => masked_edge_count(topology, m, dir),
+        None => edge_count(topology, dir),
+    };
+    let n_edges = edges as i64;
+    let density = density_from(topology.n_nodes(), edges, dir);
     let endpoints_per_edge = if dir == Direction::Both { 2.0 } else { 1.0 };
     let avg_degree = if n_nodes == 0 {
         0.0
@@ -88,7 +119,7 @@ pub fn describe(topology: &Topology, full: bool, dir: Direction) -> Result<Recor
     };
     let n_components: Option<i64> = if full {
         // Labels are dense node ids, so a seen-bitmap counts them without hashing.
-        let labels = connected_components_weak(topology, None);
+        let labels = connected_components_weak(topology, mask);
         let mut seen = vec![false; labels.len()];
         let mut distinct = 0i64;
         for &l in &labels {
@@ -336,6 +367,47 @@ mod tests {
         let i = batch.schema().index_of("n_components").unwrap();
         // null unless full=true
         assert!(batch.column(i).is_null(0));
+    }
+
+    #[test]
+    fn describe_masked_reads_only_the_kept_edges() {
+        use arrow::array::Float64Array;
+        // #207: 0->1, 0->2, 1->2, 2->3 with 0->2 and 1->2 kept. The view keeps
+        // all 4 nodes (3 isolated) and 2 edges.
+        let t = topo(&[0, 0, 1, 2], &[1, 2, 2, 3]);
+        let mask = EdgeMask::from_bools(&[false, true, true, false]);
+        let row = |dir| {
+            let b = describe_masked(&t, Some(&mask), true, dir).unwrap();
+            let col = |name: &str| b.column(b.schema().index_of(name).unwrap()).clone();
+            let i = |name: &str| {
+                col(name)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            };
+            let f = |name: &str| {
+                col(name)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(0)
+            };
+            (
+                i("n_nodes"),
+                i("n_edges"),
+                f("density"),
+                f("avg_degree"),
+                i("n_components"),
+            )
+        };
+        assert_eq!(row(Direction::Out), (4, 2, 2.0 / 12.0, 0.5, 2));
+        assert_eq!(row(Direction::Both), (4, 2, 2.0 / 6.0, 1.0, 2));
+        // No mask is the whole graph, as `describe` reports it.
+        assert_eq!(
+            describe_masked(&t, None, true, Direction::Out).unwrap(),
+            describe(&t, true, Direction::Out).unwrap()
+        );
     }
 
     #[test]
