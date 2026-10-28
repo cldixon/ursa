@@ -1,0 +1,71 @@
+{
+ "description": "A hop over a filtered edge frame follows only the kept edges (#192).",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "ids": [
+    0,
+    3
+   ]
+  }
+ ],
+ "plan": {
+  "op": "hop",
+  "edges": {
+   "plan": {
+    "op": "filter",
+    "input": {
+     "op": "from_arrow",
+     "frame": 1,
+     "src": "src",
+     "dst": "dst"
+    },
+    "step": 0,
+    "predicate": {
+     "kind": "binary",
+     "op": ">",
+     "left": {
+      "kind": "src"
+     },
+     "right": {
+      "kind": "lit",
+      "value": 2
+     }
+    }
+   },
+   "frame": 1
+  },
+  "n": 2,
+  "direction": "out",
+  "seeds": 2
+ },
+ "expect": {
+  "columns": [
+   "src",
+   "dst"
+  ],
+  "rows": [
+   [
+    3,
+    7
+   ],
+   [
+    3,
+    12
+   ],
+   [
+    3,
+    13
+   ],
+   [
+    3,
+    33
+   ]
+  ]
+ }
+}

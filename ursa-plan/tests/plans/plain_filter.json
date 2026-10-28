@@ -1,0 +1,374 @@
+{
+ "description": "A plain edge frame's filter, evaluated by the plan (#192).",
+ "inputs": [
+  {
+   "edges": "lesmis"
+  }
+ ],
+ "plan": {
+  "op": "filter",
+  "input": {
+   "op": "from_arrow",
+   "frame": 0,
+   "src": "src",
+   "dst": "dst"
+  },
+  "step": 0,
+  "predicate": {
+   "kind": "binary",
+   "op": "&",
+   "left": {
+    "kind": "binary",
+    "op": ">=",
+    "left": {
+     "kind": "col",
+     "name": "weight"
+    },
+    "right": {
+     "kind": "lit",
+     "value": 4
+    }
+   },
+   "right": {
+    "kind": "binary",
+    "op": "!=",
+    "left": {
+     "kind": "src"
+    },
+    "right": {
+     "kind": "lit",
+     "value": "Valjean"
+    }
+   }
+  }
+ },
+ "expect": {
+  "columns": [
+   "src",
+   "dst",
+   "weight"
+  ],
+  "rows": [
+   [
+    "Myriel",
+    "MlleBaptistine",
+    8.0
+   ],
+   [
+    "Myriel",
+    "MmeMagloire",
+    10.0
+   ],
+   [
+    "Myriel",
+    "Valjean",
+    5.0
+   ],
+   [
+    "MlleBaptistine",
+    "MmeMagloire",
+    6.0
+   ],
+   [
+    "Listolier",
+    "Tholomyes",
+    4.0
+   ],
+   [
+    "Listolier",
+    "Fameuil",
+    4.0
+   ],
+   [
+    "Listolier",
+    "Blacheville",
+    4.0
+   ],
+   [
+    "Tholomyes",
+    "Fameuil",
+    4.0
+   ],
+   [
+    "Tholomyes",
+    "Blacheville",
+    4.0
+   ],
+   [
+    "Fameuil",
+    "Blacheville",
+    4.0
+   ],
+   [
+    "Blacheville",
+    "Favourite",
+    4.0
+   ],
+   [
+    "Favourite",
+    "Dahlia",
+    5.0
+   ],
+   [
+    "Favourite",
+    "Zephine",
+    4.0
+   ],
+   [
+    "Favourite",
+    "Fantine",
+    4.0
+   ],
+   [
+    "Dahlia",
+    "Zephine",
+    4.0
+   ],
+   [
+    "Dahlia",
+    "Fantine",
+    4.0
+   ],
+   [
+    "Zephine",
+    "Fantine",
+    4.0
+   ],
+   [
+    "Fantine",
+    "Javert",
+    5.0
+   ],
+   [
+    "MmeThenardier",
+    "Thenardier",
+    13.0
+   ],
+   [
+    "MmeThenardier",
+    "Cosette",
+    4.0
+   ],
+   [
+    "Thenardier",
+    "Javert",
+    5.0
+   ],
+   [
+    "Thenardier",
+    "Gueulemer",
+    5.0
+   ],
+   [
+    "Thenardier",
+    "Babet",
+    6.0
+   ],
+   [
+    "Thenardier",
+    "Claquesous",
+    4.0
+   ],
+   [
+    "Cosette",
+    "Marius",
+    21.0
+   ],
+   [
+    "Javert",
+    "Enjolras",
+    6.0
+   ],
+   [
+    "Eponine",
+    "Marius",
+    5.0
+   ],
+   [
+    "Gavroche",
+    "Marius",
+    4.0
+   ],
+   [
+    "Gavroche",
+    "Enjolras",
+    7.0
+   ],
+   [
+    "Gavroche",
+    "Combeferre",
+    6.0
+   ],
+   [
+    "Gavroche",
+    "Courfeyrac",
+    7.0
+   ],
+   [
+    "Gavroche",
+    "Bahorel",
+    5.0
+   ],
+   [
+    "Gavroche",
+    "Bossuet",
+    5.0
+   ],
+   [
+    "Gillenormand",
+    "MlleGillenormand",
+    9.0
+   ],
+   [
+    "Gillenormand",
+    "Marius",
+    12.0
+   ],
+   [
+    "MlleGillenormand",
+    "Marius",
+    6.0
+   ],
+   [
+    "Marius",
+    "Enjolras",
+    7.0
+   ],
+   [
+    "Marius",
+    "Combeferre",
+    5.0
+   ],
+   [
+    "Marius",
+    "Courfeyrac",
+    9.0
+   ],
+   [
+    "Marius",
+    "Bossuet",
+    5.0
+   ],
+   [
+    "Enjolras",
+    "Combeferre",
+    15.0
+   ],
+   [
+    "Enjolras",
+    "Prouvaire",
+    4.0
+   ],
+   [
+    "Enjolras",
+    "Feuilly",
+    6.0
+   ],
+   [
+    "Enjolras",
+    "Courfeyrac",
+    17.0
+   ],
+   [
+    "Enjolras",
+    "Bahorel",
+    4.0
+   ],
+   [
+    "Enjolras",
+    "Bossuet",
+    10.0
+   ],
+   [
+    "Enjolras",
+    "Joly",
+    5.0
+   ],
+   [
+    "Combeferre",
+    "Feuilly",
+    5.0
+   ],
+   [
+    "Combeferre",
+    "Courfeyrac",
+    13.0
+   ],
+   [
+    "Combeferre",
+    "Bahorel",
+    5.0
+   ],
+   [
+    "Combeferre",
+    "Bossuet",
+    9.0
+   ],
+   [
+    "Combeferre",
+    "Joly",
+    5.0
+   ],
+   [
+    "Feuilly",
+    "Courfeyrac",
+    6.0
+   ],
+   [
+    "Feuilly",
+    "Bossuet",
+    6.0
+   ],
+   [
+    "Feuilly",
+    "Joly",
+    5.0
+   ],
+   [
+    "Courfeyrac",
+    "Bahorel",
+    6.0
+   ],
+   [
+    "Courfeyrac",
+    "Bossuet",
+    12.0
+   ],
+   [
+    "Courfeyrac",
+    "Joly",
+    5.0
+   ],
+   [
+    "Bahorel",
+    "Bossuet",
+    4.0
+   ],
+   [
+    "Bahorel",
+    "Joly",
+    5.0
+   ],
+   [
+    "Bossuet",
+    "Joly",
+    7.0
+   ],
+   [
+    "Gueulemer",
+    "Babet",
+    6.0
+   ],
+   [
+    "Gueulemer",
+    "Claquesous",
+    4.0
+   ],
+   [
+    "Babet",
+    "Claquesous",
+    4.0
+   ]
+  ]
+ }
+}

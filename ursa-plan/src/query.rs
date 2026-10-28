@@ -504,7 +504,9 @@ fn col_named(name: &str) -> Expr {
 /// - `rename` runs last and only relabels output columns.
 async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> Result<DataFrame> {
     for f in tail.filters {
-        df = df.filter(filter_expr(f)?)?;
+        let expr = filter_expr(f)?;
+        crate::eval::check_timezones(&expr, df.schema())?;
+        df = df.filter(expr)?;
     }
     if !tail.group_keys.is_empty() {
         // Clear error for an unknown group key (df.aggregate would otherwise fail
@@ -1427,6 +1429,7 @@ pub fn execute_join_query(
 pub fn execute_hop_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
+    mask: Option<Arc<EdgeMask>>,
     seeds: &dyn Array,
     n: u32,
     direction: &str,
@@ -1443,7 +1446,7 @@ pub fn execute_hop_query(
     let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
 
     let hop_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction)),
+        node: Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction).with_mask(mask)),
     });
 
     let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
@@ -1474,6 +1477,7 @@ pub fn execute_hop_query(
 pub fn execute_path_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
+    mask: Option<Arc<EdgeMask>>,
     source: &dyn Array,
     target: &dyn Array,
     direction: &str,
@@ -1521,9 +1525,10 @@ pub fn execute_path_query(
     };
 
     let path_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(ShortestPathNode::new(
-            topology, ids, source, target, direction, weights,
-        )),
+        node: Arc::new(
+            ShortestPathNode::new(topology, ids, source, target, direction, weights)
+                .with_mask(mask),
+        ),
     });
 
     let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
@@ -1543,65 +1548,6 @@ pub fn execute_path_query(
     )
 }
 
-/// The node set reached within `n` hops of `seeds` (seeds included), as a user-id
-/// array — the reached region behind "graph op over a hop result" (#116).
-///
-/// Backs the subgraph mask that a node-valued kernel runs over: the reached nodes
-/// induce a subgraph of the parent CSR. Runs the same multi-source BFS as `ur.hop`
-/// but returns the reached node *set* instead of `(seed, reached)` pairs. Unknown
-/// seeds are dropped (kernel-consistent).
-pub fn hop_reached_nodes(
-    topology: Arc<Topology>,
-    ids: Arc<IdMap>,
-    seeds: &dyn Array,
-    n: u32,
-    direction: &str,
-) -> Result<ArrayRef> {
-    let direction: ursa_core::Direction = parse_direction(direction)?.into();
-    let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
-    let reached = ursa_core::algo::k_hop_reached_set(&topology, &seeds_dense, n, direction);
-    Ok(ids.gather_user(&reached))
-}
-
-/// The nodes on the shortest path from `source` to `target` (inclusive), as a
-/// user-id array — the reached region behind "graph op over a shortest_path result"
-/// (#116). An unknown/unreachable endpoint yields an empty array (no path).
-///
-/// Mirrors [`execute_path_query`]'s weighting: pass `weight` (a serialized edge
-/// expression) with the edge table for minimum-cost Dijkstra; omit both for
-/// unweighted BFS.
-#[allow(clippy::too_many_arguments)]
-pub fn shortest_path_nodes(
-    topology: Arc<Topology>,
-    ids: Arc<IdMap>,
-    source: &dyn Array,
-    target: &dyn Array,
-    direction: &str,
-    weight: Option<&str>,
-    edges: Option<Vec<RecordBatch>>,
-) -> Result<ArrayRef> {
-    let direction: ursa_core::Direction = parse_direction(direction)?.into();
-    let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
-    let target = resolve_dense(&ids, target)?.into_iter().next().flatten();
-    let (Some(source), Some(target)) = (source, target) else {
-        return Ok(ids.gather_user(&[]));
-    };
-
-    let path = match weight {
-        None => ursa_core::algo::shortest_path(&topology, source, target, direction),
-        Some(weight_json) => {
-            let w = edge_weights(
-                edges.as_deref(),
-                weight_json,
-                topology.n_edges(),
-                "weighted shortest_path",
-            )?;
-            ursa_core::algo::shortest_path_weighted(&topology, &w, source, target, direction)
-        }
-    };
-    Ok(ids.gather_user(&path.unwrap_or_default()))
-}
-
 /// Build and execute one `random_walk` as a single DataFusion plan.
 ///
 /// A [`RandomWalkNode`] emits the `(walk_id, step, node)` node frame; the same
@@ -1612,6 +1558,7 @@ pub fn shortest_path_nodes(
 pub fn execute_walk_query(
     topology: Arc<Topology>,
     ids: Arc<IdMap>,
+    mask: Option<Arc<EdgeMask>>,
     starts: &dyn Array,
     steps: u32,
     walks_per_node: u32,
@@ -1626,14 +1573,10 @@ pub fn execute_walk_query(
     let starts_dense: Vec<u32> = resolve_dense(&ids, starts)?.into_iter().flatten().collect();
 
     let walk_plan = LogicalPlan::Extension(Extension {
-        node: Arc::new(RandomWalkNode::new(
-            topology,
-            ids,
-            starts_dense,
-            steps,
-            walks_per_node,
-            seed,
-        )),
+        node: Arc::new(
+            RandomWalkNode::new(topology, ids, starts_dense, steps, walks_per_node, seed)
+                .with_mask(mask),
+        ),
     });
 
     let numbered = Tiebreak::leaf_needs(&sort, false, distinct, &sample);
@@ -1656,7 +1599,10 @@ pub fn execute_walk_query(
 /// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping
 /// an id-type mismatch to a clear execution error. The shared seam for every
 /// traversal's seed/source/target/start resolution.
-fn resolve_dense(ids: &IdMap, arr: &dyn Array) -> Result<Vec<Option<u32>>, DataFusionError> {
+pub(crate) fn resolve_dense(
+    ids: &IdMap,
+    arr: &dyn Array,
+) -> Result<Vec<Option<u32>>, DataFusionError> {
     ids.dense_from_array(arr)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
@@ -2196,6 +2142,7 @@ mod tests {
         let batch = one(execute_hop_query(
             t,
             ids,
+            None,
             &seeds,
             2,
             "out",
@@ -2232,6 +2179,7 @@ mod tests {
         let batch = one(execute_path_query(
             t,
             ids,
+            None,
             &s,
             &tg,
             "out",
@@ -2275,6 +2223,7 @@ mod tests {
         let batch = one(execute_path_query(
             t,
             ids,
+            None,
             &s,
             &tg,
             "out",
@@ -2302,6 +2251,7 @@ mod tests {
         let err = execute_path_query(
             t,
             ids,
+            None,
             &s,
             &tg,
             "out",
@@ -2328,6 +2278,7 @@ mod tests {
         let batch = one(execute_hop_query(
             t,
             ids,
+            None,
             &seeds,
             1,
             "out",
@@ -2959,6 +2910,7 @@ mod tests {
             one(execute_hop_query(
                 t.clone(),
                 ids.clone(),
+                None,
                 &seeds,
                 2,
                 "out",

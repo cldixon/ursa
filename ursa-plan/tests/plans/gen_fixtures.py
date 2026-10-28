@@ -7,7 +7,7 @@ raises). ``expect`` uses only the public API, so it can run against any build,
 e.g. the release the fixtures should pin::
 
     python ursa-plan/tests/plans/gen_fixtures.py serialize
-    python ursa-plan/tests/plans/gen_fixtures.py expect
+    python ursa-plan/tests/plans/gen_fixtures.py expect [case ...]
 """
 
 from __future__ import annotations
@@ -130,6 +130,23 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
                 .sort(["walk_id", "step"])
             ),
         ),
+        "plain_filter": (
+            "A plain edge frame's filter, evaluated by the plan (#192).",
+            lambda: lm.filter((ur.col("weight") >= 4) & (ur.src() != "Valjean")),
+        ),
+        "subgraph_degree": (
+            "Degree over a subgraph view: the filter is the edge mask (#114, #192).",
+            lambda: ur.degree(lm.filter(ur.col("weight") > 2), direction="both")._frame(),
+        ),
+        "hop_over_view": (
+            "A hop over a filtered edge frame follows only the kept edges (#192).",
+            lambda: ur.hop(k.filter(ur.src() > 2), n=2).from_([0, 3]),
+        ),
+        "degree_over_hop_of_view": (
+            "A graph op over a traversal of a filtered frame: the reached region of the "
+            "view, within the view (#116, #192).",
+            lambda: ur.degree(ur.hop(k.filter(ur.dst() != 2), n=1).from_([0]))._frame(),
+        ),
         "describe": (
             "The undirected whole-graph summary.",
             lambda: ur.describe(k, full=True, direction="both"),
@@ -196,13 +213,15 @@ def serialize() -> None:
         path.write_text(json.dumps(case, indent=1) + "\n")
 
 
-def expect() -> None:
+def expect(only: list[str] | None = None) -> None:
     errors = {
         NotImplementedError: "not_implemented",
         ur.ColumnNotFoundError: "column_not_found",
         ValueError: "value",
     }
     for name, (_description, build) in _cases().items():
+        if only and name not in only:
+            continue
         path = _path(name)
         case = json.loads(path.read_text())
         try:
@@ -217,4 +236,7 @@ def expect() -> None:
 
 
 if __name__ == "__main__":
-    {"serialize": serialize, "expect": expect}[sys.argv[1]]()
+    if sys.argv[1] == "serialize":
+        serialize()
+    else:
+        expect(sys.argv[2:] or None)

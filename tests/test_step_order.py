@@ -334,27 +334,19 @@ def test_rename_then_multi_key_sort_sees_every_new_name(nodes):
     assert out == ref == [{"id": i} for i in [5, 1, 3, 4, 2, 6]]
 
 
-def test_scan_pushdown_reads_every_sort_key_through_a_rename(tmp_path, monkeypatch):
+def test_scan_pushdown_reads_every_sort_key_through_a_rename(tmp_path):
     # A select narrows the output; the scan must still read both sort keys (one
-    # renamed), and not the unused column.
+    # renamed), and not the unused column. (The scan runs in Rust: its log
+    # records what each read projected.)
     from ursa import _execute
 
     native = _execute._native()
-    reads = []
-
-    class Recorder:
-        def __getattr__(self, name):
-            return getattr(native, name)
-
-        def scan_nodes_arrow(self, path, id, opts, columns):
-            reads.append(list(columns))
-            return native.scan_nodes_arrow(path, id, opts, columns)
-
-    monkeypatch.setattr(_execute, "_native", Recorder)
+    native._scan_log(True)
     path = tmp_path / "wide.parquet"
     pq.write_table(NODES.append_column("unused", pa.array([0] * 6)), path)
     frame = ur.scan_nodes(str(path), id="id")
     pipeline = frame.rename({"c": "k"}).sort(["k", "v"], descending=[True, False]).head(3)
     out = pipeline.select("id", "k").collect().to_dicts()
     assert out == [{"id": 6, "k": "z"}, {"id": 2, "k": "y"}, {"id": 4, "k": "y"}]
+    reads = [columns for kind, columns, _ in native._scan_log(False) if kind == "nodes"]
     assert reads == [["c", "id", "v"]]

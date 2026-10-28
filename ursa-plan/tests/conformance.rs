@@ -22,6 +22,7 @@
 //! produce the same rows.
 
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,8 +33,8 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use serde_json::{json, Value};
-use ursa_core::EdgeMask;
 use ursa_plan::plan::{HostRows, Roles, Rows, Slot};
+use ursa_plan::scan::NodeTableCache;
 use ursa_plan::{build_topology_batches, execute_plan, GraphIndex, Inputs, Plan, PlanError};
 
 type Result<T> = ursa_plan::PlanResult<T>;
@@ -48,8 +49,8 @@ enum Input {
 }
 
 /// An in-memory host: tables read from `tests/data/`, indexes built on first use.
-/// It has no relational evaluator and no mask evaluator, so a fixture runs only
-/// steps the engine runs itself.
+/// It has no relational evaluator of its own (the pyarrow tail), so a fixture runs
+/// only steps the engine runs itself, filters and subgraph masks included.
 struct MemoryInputs(Vec<Input>);
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -75,34 +76,35 @@ impl Inputs for MemoryInputs {
         Ok(index.get_or_init(|| GraphIndex::new(topo, ids)).clone())
     }
 
-    fn edge_mask(&self, _frame: Slot, _n_edges: usize) -> Result<Option<Arc<EdgeMask>>> {
-        unsupported("edge mask evaluator")
-    }
-
-    fn edge_weights(
-        &self,
-        frame: Slot,
-        _columns: &[String],
-        _keys: &[String],
-    ) -> Result<Option<Vec<RecordBatch>>> {
+    fn built_index(&self, frame: Slot) -> Result<Option<GraphIndex>> {
         match &self.0[frame] {
-            Input::Edges(batches, _) => Ok(Some(batches.clone())),
-            _ => unsupported("edge table for a non-edge slot"),
+            Input::Edges(_, index) => Ok(index.get().cloned()),
+            _ => unsupported("index for a non-edge slot"),
         }
     }
 
-    fn node_table(&self, frame: Slot, _columns: Option<&[String]>) -> Result<Rows> {
+    fn put_index(&self, frame: Slot, index: GraphIndex) -> Result<GraphIndex> {
         match &self.0[frame] {
-            Input::Nodes(batches) => Ok(Rows::Batches(batches.clone())),
-            _ => unsupported("node table for a non-node slot"),
+            Input::Edges(_, cell) => Ok(cell.get_or_init(|| index).clone()),
+            _ => unsupported("index for a non-edge slot"),
         }
     }
 
-    fn edge_table(&self, frame: Slot, _columns: Option<&[String]>) -> Result<Rows> {
+    fn table(&self, frame: Slot) -> Result<Option<Rows>> {
         match &self.0[frame] {
-            Input::Edges(batches, _) => Ok(Rows::Batches(batches.clone())),
-            _ => unsupported("edge table for a non-edge slot"),
+            Input::Edges(batches, _) | Input::Nodes(batches) => {
+                Ok(Some(Rows::Batches(batches.clone())))
+            }
+            _ => Ok(None),
         }
+    }
+
+    fn storage_options(&self, _frame: Slot) -> Result<HashMap<String, String>> {
+        unsupported("scans")
+    }
+
+    fn node_cache(&self, _frame: Slot) -> Result<Arc<NodeTableCache>> {
+        unsupported("scans")
     }
 
     fn seeds(&self, slot: Slot) -> Result<ArrayRef> {
@@ -125,6 +127,10 @@ impl Inputs for MemoryInputs {
         PlanError::Invalid(format!(
             "the conformance host stores no error for step {step}"
         ))
+    }
+
+    fn warn_dropped(&self, _n: usize) -> Result<()> {
+        Ok(())
     }
 }
 

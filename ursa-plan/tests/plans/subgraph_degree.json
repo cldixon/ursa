@@ -1,0 +1,390 @@
+{
+ "description": "Degree over a subgraph view: the filter is the edge mask (#114, #192).",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "lesmis"
+  }
+ ],
+ "plan": {
+  "op": "with_columns",
+  "input": {
+   "op": "nodes",
+   "input": {
+    "op": "filter",
+    "input": {
+     "op": "from_arrow",
+     "frame": 0,
+     "src": "src",
+     "dst": "dst"
+    },
+    "step": 0,
+    "predicate": {
+     "kind": "binary",
+     "op": ">",
+     "left": {
+      "kind": "col",
+      "name": "weight"
+     },
+     "right": {
+      "kind": "lit",
+      "value": 2
+     }
+    }
+   }
+  },
+  "columns": [
+   {
+    "name": "degree",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "filter",
+       "input": {
+        "op": "from_arrow",
+        "frame": 1,
+        "src": "src",
+        "dst": "dst"
+       },
+       "step": 1,
+       "predicate": {
+        "kind": "binary",
+        "op": ">",
+        "left": {
+         "kind": "col",
+         "name": "weight"
+        },
+        "right": {
+         "kind": "lit",
+         "value": 2
+        }
+       }
+      },
+      "frame": 1
+     },
+     "direction": "both"
+    }
+   }
+  ]
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "degree"
+  ],
+  "rows": [
+   [
+    "Napoleon",
+    0
+   ],
+   [
+    "Myriel",
+    3
+   ],
+   [
+    "MlleBaptistine",
+    3
+   ],
+   [
+    "MmeMagloire",
+    3
+   ],
+   [
+    "CountessDeLo",
+    0
+   ],
+   [
+    "Geborand",
+    0
+   ],
+   [
+    "Champtercier",
+    0
+   ],
+   [
+    "Cravatte",
+    0
+   ],
+   [
+    "Count",
+    0
+   ],
+   [
+    "OldMan",
+    0
+   ],
+   [
+    "Valjean",
+    15
+   ],
+   [
+    "Labarre",
+    0
+   ],
+   [
+    "Marguerite",
+    0
+   ],
+   [
+    "MmeDeR",
+    0
+   ],
+   [
+    "Isabeau",
+    0
+   ],
+   [
+    "Gervais",
+    0
+   ],
+   [
+    "Fantine",
+    9
+   ],
+   [
+    "MmeThenardier",
+    3
+   ],
+   [
+    "Thenardier",
+    8
+   ],
+   [
+    "Cosette",
+    4
+   ],
+   [
+    "Javert",
+    4
+   ],
+   [
+    "Fauchelevent",
+    2
+   ],
+   [
+    "Bamatabois",
+    0
+   ],
+   [
+    "Simplice",
+    1
+   ],
+   [
+    "Scaufflaire",
+    0
+   ],
+   [
+    "Woman1",
+    0
+   ],
+   [
+    "Judge",
+    2
+   ],
+   [
+    "Champmathieu",
+    2
+   ],
+   [
+    "Brevet",
+    0
+   ],
+   [
+    "Chenildieu",
+    0
+   ],
+   [
+    "Cochepaille",
+    0
+   ],
+   [
+    "Woman2",
+    1
+   ],
+   [
+    "MotherInnocent",
+    1
+   ],
+   [
+    "Gavroche",
+    7
+   ],
+   [
+    "Gillenormand",
+    3
+   ],
+   [
+    "MlleGillenormand",
+    2
+   ],
+   [
+    "Marius",
+    10
+   ],
+   [
+    "Enjolras",
+    12
+   ],
+   [
+    "Bossuet",
+    9
+   ],
+   [
+    "Gueulemer",
+    4
+   ],
+   [
+    "Babet",
+    4
+   ],
+   [
+    "Claquesous",
+    3
+   ],
+   [
+    "Montparnasse",
+    0
+   ],
+   [
+    "Toussaint",
+    0
+   ],
+   [
+    "Listolier",
+    7
+   ],
+   [
+    "Tholomyes",
+    7
+   ],
+   [
+    "Fameuil",
+    7
+   ],
+   [
+    "Blacheville",
+    7
+   ],
+   [
+    "Favourite",
+    7
+   ],
+   [
+    "Dahlia",
+    7
+   ],
+   [
+    "Zephine",
+    7
+   ],
+   [
+    "Perpetue",
+    0
+   ],
+   [
+    "Eponine",
+    2
+   ],
+   [
+    "Anzelma",
+    0
+   ],
+   [
+    "Magnon",
+    0
+   ],
+   [
+    "Pontmercy",
+    0
+   ],
+   [
+    "Boulatruelle",
+    0
+   ],
+   [
+    "Brujon",
+    3
+   ],
+   [
+    "LtGillenormand",
+    0
+   ],
+   [
+    "Gribier",
+    0
+   ],
+   [
+    "MmePontmercy",
+    0
+   ],
+   [
+    "Mabeuf",
+    1
+   ],
+   [
+    "Courfeyrac",
+    9
+   ],
+   [
+    "MmeBurgon",
+    0
+   ],
+   [
+    "Jondrette",
+    0
+   ],
+   [
+    "Combeferre",
+    8
+   ],
+   [
+    "Prouvaire",
+    2
+   ],
+   [
+    "Feuilly",
+    6
+   ],
+   [
+    "Bahorel",
+    7
+   ],
+   [
+    "Joly",
+    7
+   ],
+   [
+    "Grantaire",
+    2
+   ],
+   [
+    "Child1",
+    1
+   ],
+   [
+    "Child2",
+    1
+   ],
+   [
+    "MmeHucheloup",
+    0
+   ],
+   [
+    "BaronessT",
+    0
+   ],
+   [
+    "MlleVaubois",
+    0
+   ],
+   [
+    "MotherPlutarch",
+    1
+   ]
+  ]
+ }
+}

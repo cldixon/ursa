@@ -128,6 +128,43 @@ impl EdgeMask {
             n_kept,
         }
     }
+
+    /// The subgraph of `topo` induced by a node set: an edge row is kept iff both
+    /// of its endpoints are in `nodes` (`nodes[v]`, one flag per dense node).
+    /// Built in dense space off the CSR, one pass over the reached nodes' out-slots
+    /// (#116). Further restricted by `within` when given (a traversal over a view).
+    pub fn induced(topo: &Topology, nodes: &[bool], within: Option<&EdgeMask>) -> EdgeMask {
+        use crate::parallel::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let n_edges = topo.n_edges();
+        let words: Vec<AtomicU64> = (0..n_edges.div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        let out = topo.out();
+        (0..topo.n_nodes() as u32)
+            .into_par_iter()
+            .filter(|&u| nodes[u as usize])
+            .for_each(|u| {
+                for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                    if nodes[v as usize] && within.is_none_or(|m| m.keep(e)) {
+                        words[(e >> 6) as usize].fetch_or(1u64 << (e & 63), Ordering::Relaxed);
+                    }
+                }
+            });
+        let words: Vec<u64> = words.into_iter().map(AtomicU64::into_inner).collect();
+        let n_kept = words.iter().map(|w| w.count_ones() as usize).sum();
+        EdgeMask {
+            words,
+            n_edges,
+            n_kept,
+        }
+    }
+
+    /// The kept rows' bits, 64 rows per word (row `e` at bit `e % 64` of word
+    /// `e / 64`), for hashing or comparing masks.
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
 }
 
 /// One direction's adjacency in CSR form.
@@ -920,6 +957,19 @@ mod tests {
         assert_eq!(inc, vec![0, 1]);
         // node 0's only in-neighbour is 2
         assert_eq!(t.incoming().neighbors(0), &[2]);
+    }
+
+    #[test]
+    fn induced_mask_keeps_edges_between_kept_nodes() {
+        // rows: 0:0->1, 1:1->2, 2:2->0, 3:0->2
+        let t = Topology::build(3, vec![0, 1, 2, 0], vec![1, 2, 0, 2]);
+        let m = EdgeMask::induced(&t, &[true, false, true], None);
+        let kept: Vec<bool> = (0..4).map(|e| m.keep(e)).collect();
+        assert_eq!(kept, vec![false, false, true, true]);
+        assert_eq!(m.n_kept(), 2);
+        let within = EdgeMask::from_bools(&[true, true, false, true]);
+        let m = EdgeMask::induced(&t, &[true, false, true], Some(&within));
+        assert_eq!((0..4).filter(|&e| m.keep(e)).collect::<Vec<_>>(), vec![3]);
     }
 
     #[test]

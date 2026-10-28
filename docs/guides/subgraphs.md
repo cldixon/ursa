@@ -52,6 +52,8 @@ The filtered frame builds its own index on first use. The original frame keeps i
 
 `hop` and `shortest_path` return an `EdgeFrame`. A kernel over it runs on the nodes the traversal reached, with the edges among them.
 
+A traversal over a filtered frame, such as `ur.hop(strong, n=2)`, follows only the edges the filter keeps. A kernel over its result stays inside the filtered graph too. `random_walk` over a filtered frame also takes only the kept edges.
+
 ```python
 around_valjean = ur.hop(edges, n=1, direction="both").from_(["Valjean"])
 

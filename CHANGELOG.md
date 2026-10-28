@@ -30,6 +30,35 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `graph_describe` are gone from `ursa._ursa`. `ursa-plan` gains plan
   conformance tests: JSON plans over karate and other small graphs, with
   expected output recorded from the Python package (#190, part of #189).
+- One expression evaluator: every `filter` now runs in Rust through the same
+  DataFusion lowering, wherever it sits. Before, `pyarrow.compute` evaluated
+  filters on plain frames, subgraph-view masks and steps after the engine's
+  tail. Subgraph masks are built in Rust, in dense id space; a traversal
+  result's mask comes straight from the reached node set. Plain sources are
+  DataFusion scans: `scan_edges(...).filter(...)` pushes its leading filters
+  into the read, so Parquet skips row groups whose statistics rule them out.
+  Masks are cached on the graph index, keyed by the view, so two frames with
+  the same filter share one. A `scan_nodes` frame keeps one table, the union
+  of the columns read so far, instead of one table per projection (#178).
+  Results are unchanged; NaN still compares as it did on each path: IEEE on
+  plain frames, masks and steps after the engine's tail, and the engine's
+  order (NaN above every value, equal to itself) inside an engine query (#192,
+  part of #189). PERF_PLACEHOLDER
+- Filters inside an engine query (after graph columns, a join or a traversal)
+  accept every literal a plain-frame filter does: datetimes, dates, times,
+  timedeltas, `numpy.datetime64`/`timedelta64`, `Decimal`, NaN, infinity and
+  `None`. They used to raise `TypeError: Object of type ... is not JSON
+  serializable` (or `ComputeError` for NaN and infinity, "unsupported literal
+  type" for `None`) (#192).
+- A filter whose operand types don't match (for example `ur.col("n") == "x"`
+  on an integer column, or a string `+`) raises `ursa.ComputeError` on every
+  path. Plain frames and subgraph masks used to raise pyarrow's
+  `ArrowNotImplementedError` (a `NotImplementedError` subclass) or
+  `ArrowInvalid` (a `ValueError` subclass); the engine already raised
+  `ComputeError` (#192).
+- `ursa._ursa` no longer has `hop_reached_nodes_query`,
+  `shortest_path_nodes_query`, `scan_edges_arrow`, `scan_edges_table_arrow` or
+  `scan_nodes_arrow`; the plan reads and masks itself (#192).
 - **Behaviour change:** `louvain` partitions differ from 0.4.1 for the same
   seed. Local moving now revisits only the neighbours of nodes that moved, and a
   level stops when a sweep's worth of work gains less than 1e-7 modularity (with
@@ -77,6 +106,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- `hop`, `shortest_path` and `random_walk` over a filtered edge frame ignored the
+  filter: `ur.hop(e.filter(ur.col("w") > 5), 2)` reached nodes through edges
+  the filter removed. They now follow only the kept edges, and a graph op over
+  such a traversal result (`ur.degree(ur.hop(e.filter(...), 1).from_(s))`)
+  stays inside the filtered subgraph (#192).
 - A graph op over a traversal of a reshaped scan
   (`ur.pagerank(ur.hop(ur.scan_edges(p).sample(100), 1).from_([1]))`) ran over
   the whole file's index; it now raises the same `NotImplementedError` as the

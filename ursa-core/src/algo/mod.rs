@@ -36,8 +36,8 @@ mod undirected;
 
 pub use betweenness::{betweenness, betweenness_weighted};
 pub use bfs::{
-    bfs_distances, dijkstra_distances, shortest_path, shortest_path_weighted,
-    shortest_path_weighted_with_cost,
+    bfs_distances, dijkstra_distances, shortest_path, shortest_path_masked, shortest_path_weighted,
+    shortest_path_weighted_with_cost, shortest_path_weighted_with_cost_masked,
 };
 pub use closeness::{
     closeness, closeness_directed, closeness_weighted, closeness_weighted_directed,
@@ -45,13 +45,13 @@ pub use closeness::{
 pub use clustering::{clustering_coefficient, clustering_from_triangles};
 pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
-pub use hop::{k_hop, k_hop_reached_set};
+pub use hop::{k_hop, k_hop_masked, k_hop_reached_masked, k_hop_reached_set};
 pub use label_prop::label_propagation;
 pub use layout::{layout_circle, layout_fr, layout_random, LayoutParams, Positions};
 pub use louvain::{louvain, louvain_weighted};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
-pub use random_walk::{random_walk, Walks};
+pub use random_walk::{random_walk, random_walk_masked, Walks};
 pub use triangle::{per_node_triangles, triangle_count, undirected_view, UndirectedView};
 pub use undirected::{symmetric_view, symmetric_view_weighted};
 

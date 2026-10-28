@@ -18,17 +18,14 @@
 //! - `build_index` / `scan_build_index` — build (and cache on the Python frame) the
 //!   CSR topology; every graph op over the frame reuses it.
 //! - `resolve_index` — the checked index of an edge plan, for the eager stats.
-//! - `hop_reached_nodes_query` / `shortest_path_nodes_query` — the reached node
-//!   set behind a graph op over a traversal result (the host's edge mask, #116).
+//! - `NodeTableCache` — the scanned table of a `scan_nodes` frame, kept on the
+//!   frame and read through by the plan.
 //! - `graph_density` / `graph_avg_path_length` / `graph_diameter` — eager
 //!   whole-graph statistics.
-//! - `scan_edges_arrow` / `scan_edges_table_arrow` / `scan_nodes_arrow` — read a
-//!   Parquet/CSV edge or node file (local or object storage) through a
-//!   DataFusion scan.
 
 use std::collections::HashMap;
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef, BooleanArray, RecordBatch};
+use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch};
 use arrow_pyarrow::{FromPyArrow, ToPyArrow};
 use pyo3::create_exception;
 use pyo3::exceptions::{
@@ -37,17 +34,18 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ursa_core::topology::Topology;
-use ursa_core::{EdgeMask, IdMap};
+use ursa_core::IdMap;
 
-use ursa_plan::plan::{execute, EdgeInput, HostError, HostRows, Roles, Rows, Slot};
+use ursa_plan::plan::{
+    count_topology_build, execute, topology_builds, EdgeInput, HostError, HostRows, Roles, Rows,
+    Slot,
+};
 use ursa_plan::{
-    avg_path_length, build_topology_batches, density, diameter, hop_reached_nodes,
-    parse_stat_direction, require_index, scan_edges_batch, scan_edges_table, scan_edges_topology,
-    scan_nodes_batch, shortest_path_nodes, weight_cache_key, Inputs, Plan, PlanError, PlanResult,
+    avg_path_length, build_topology_batches, density, diameter, parse_stat_direction,
+    require_index, scan_edges_topology, weight_cache_key, Inputs, Plan, PlanError, PlanResult,
     ScanBuildError, ScannedTopology,
 };
 
@@ -113,32 +111,6 @@ fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
     Ok(make_array(ArrayData::from_pyarrow_bound(obj)?))
 }
 
-/// Build a subgraph [`EdgeMask`] from a pyarrow **boolean** array whose element `e`
-/// says whether original edge row `e` is in the subgraph (#114). The array is in
-/// original edge-row order — the order the topology was built from — so `mask.keep`
-/// aligns with the CSR's `edge_ids`. A null is treated as *not kept*.
-///
-/// The mask must cover exactly the graph's `n_edges` rows: a shorter one would
-/// silently drop every edge past its end (`keep` is false out of range).
-fn edge_mask_from_pyarrow(obj: &Bound<'_, PyAny>, n_edges: usize) -> PyResult<Arc<EdgeMask>> {
-    let arr = array_from_pyarrow(obj)?;
-    let b = arr
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| PyValueError::new_err("edge_mask must be a pyarrow boolean array"))?;
-    if b.len() != n_edges {
-        return Err(PyValueError::new_err(format!(
-            "edge_mask length ({}) does not match the edge count ({n_edges})",
-            b.len()
-        )));
-    }
-    Ok(Arc::new(EdgeMask::from_boolean_array(b)))
-}
-
-/// Counts topology builds, so tests can prove the index-preservation contract
-/// (a multi-algorithm pipeline over one frame builds the CSR exactly once).
-static TOPOLOGY_BUILDS: AtomicUsize = AtomicUsize::new(0);
-
 /// A built graph index — the CSR `Topology` plus the `IdMap` — cached on the
 /// Python `EdgeFrame` and passed to every graph op over that frame, so the
 /// topology is built once instead of on every `collect()` (spec §index-
@@ -168,6 +140,37 @@ impl GraphIndex {
     fn _weight_eval_count(&self) -> usize {
         self.0.weights.evaluations()
     }
+
+    /// Subgraph-view masks computed over this index (test/observability hook).
+    fn _mask_build_count(&self) -> usize {
+        self.0.masks.builds()
+    }
+}
+
+/// The scanned table of one `scan_nodes` frame (`ursa_plan::scan::NodeTableCache`):
+/// one superset of the columns read so far, kept on the frame and shared by its
+/// derivations, so repeated collects read the file once. Opaque to Python.
+#[pyclass]
+#[derive(Default)]
+struct NodeTableCache(Arc<ursa_plan::scan::NodeTableCache>);
+
+#[pymethods]
+impl NodeTableCache {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scans this cache has run (test/observability hook).
+    fn _scan_count(&self) -> usize {
+        self.0.scans()
+    }
+
+    /// The columns it holds: `None` before the first read, `[]` for every column
+    /// (test/observability hook).
+    fn _held(&self) -> Option<Vec<String>> {
+        self.0.held().map(Option::unwrap_or_default)
+    }
 }
 
 /// Build the graph index from an **edge batch list** — a pyarrow list of
@@ -188,7 +191,7 @@ fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex>
             .collect();
         build_topology_batches(&pairs).map_err(|e| PyValueError::new_err(e.to_string()))
     })?;
-    TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    count_topology_build();
     Ok(GraphIndex::new(topo, ids))
 }
 
@@ -218,7 +221,7 @@ fn scan_build_index(
             ScanBuildError::Build(e) => PyValueError::new_err(e.to_string()),
         })
     })?;
-    TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    count_topology_build();
     let ScannedTopology { topo, ids, dropped } = scanned;
     Ok((GraphIndex::new(topo, ids), dropped))
 }
@@ -226,7 +229,14 @@ fn scan_build_index(
 /// Total topology builds so far (test/observability hook for the index contract).
 #[pyfunction]
 fn _topology_build_count() -> usize {
-    TOPOLOGY_BUILDS.load(Ordering::Relaxed)
+    topology_builds()
+}
+
+/// Turn the native scan log on (clearing it) or off, returning what was recorded:
+/// `(kind, columns, filters pushed)` per scan (test/observability hook).
+#[pyfunction]
+fn _scan_log(record: bool) -> Vec<(String, Vec<String>, usize)> {
+    ursa_plan::scan::scan_log(record)
 }
 
 // ---------------------------------------------------------------------------
@@ -305,44 +315,50 @@ impl Inputs for PyInputs {
         })
     }
 
-    fn edge_mask(&self, frame: Slot, n_edges: usize) -> PlanResult<Option<Arc<EdgeMask>>> {
-        self.call("edge_mask", (frame,), |obj| {
+    fn built_index(&self, frame: Slot) -> PlanResult<Option<ursa_plan::GraphIndex>> {
+        self.call("built_index", (frame,), |obj| {
             if obj.is_none() {
                 return Ok(None);
             }
-            edge_mask_from_pyarrow(obj, n_edges).map(Some)
+            Ok(Some(obj.extract::<PyRef<'_, GraphIndex>>()?.0.clone()))
         })
     }
 
-    fn edge_weights(
+    fn put_index(
         &self,
         frame: Slot,
-        columns: &[String],
-        keys: &[String],
-    ) -> PlanResult<Option<Vec<RecordBatch>>> {
-        let args = (frame, columns.to_vec(), keys.to_vec());
-        self.call("edge_weights", args, |obj| {
-            if obj.is_none() {
-                return Ok(None);
-            }
-            batch_list(obj).map(Some)
+        index: ursa_plan::GraphIndex,
+    ) -> PlanResult<ursa_plan::GraphIndex> {
+        self.call("put_index", (frame, GraphIndex(index)), |obj| {
+            Ok(obj.extract::<PyRef<'_, GraphIndex>>()?.0.clone())
         })
     }
 
-    fn node_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows> {
-        self.call(
-            "node_table",
-            (frame, columns.map(<[String]>::to_vec)),
-            host_rows,
-        )
+    fn table(&self, frame: Slot) -> PlanResult<Option<Rows>> {
+        self.call("table", (frame,), |obj| {
+            if obj.is_none() {
+                return Ok(None);
+            }
+            host_rows(obj).map(Some)
+        })
     }
 
-    fn edge_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows> {
-        self.call(
-            "edge_table",
-            (frame, columns.map(<[String]>::to_vec)),
-            host_rows,
-        )
+    fn storage_options(&self, frame: Slot) -> PlanResult<HashMap<String, String>> {
+        self.call("storage_options", (frame,), |obj| {
+            // With the message a native scan's own argument conversion gave.
+            obj.extract::<Option<HashMap<String, String>>>()
+                .map(Option::unwrap_or_default)
+                .map_err(|e| {
+                    let value = e.value(obj.py()).to_string();
+                    PyTypeError::new_err(format!("argument 'storage_options': {value}"))
+                })
+        })
+    }
+
+    fn node_cache(&self, frame: Slot) -> PlanResult<Arc<ursa_plan::scan::NodeTableCache>> {
+        self.call("node_cache", (frame,), |obj| {
+            Ok(obj.extract::<PyRef<'_, NodeTableCache>>()?.0.clone())
+        })
     }
 
     fn seeds(&self, slot: Slot) -> PlanResult<ArrayRef> {
@@ -379,6 +395,10 @@ impl Inputs for PyInputs {
             Err(e) => e,
             Ok(()) => PlanError::Invalid(format!("step {step} has no stored error")),
         }
+    }
+
+    fn warn_dropped(&self, n: usize) -> PlanResult<()> {
+        self.call("warn_dropped", (n,), |_| Ok(()))
     }
 }
 
@@ -427,63 +447,6 @@ fn resolve_index(py: Python<'_>, edges: &str, host: Py<PyAny>) -> PyResult<Graph
     Ok(GraphIndex(index))
 }
 
-/// The set of nodes reached within `n` hops of `seeds` (seeds included), as a
-/// pyarrow array of user ids. Backs graph ops over a `hop` result (#116): the
-/// reached region induces the subgraph mask a node-valued kernel runs over.
-#[pyfunction]
-fn hop_reached_nodes_query(
-    py: Python<'_>,
-    index: PyRef<'_, GraphIndex>,
-    seeds: &Bound<'_, PyAny>,
-    n: u32,
-    direction: &str,
-) -> PyResult<Py<PyAny>> {
-    let (topo, ids) = (index.0.topo.clone(), index.0.ids.clone());
-    let seeds = array_from_pyarrow(seeds)?;
-    let direction = direction.to_string();
-    let arr = py.detach(move || {
-        hop_reached_nodes(topo, ids, seeds.as_ref(), n, &direction).map_err(to_pyerr)
-    })?;
-    arr.into_data().to_pyarrow(py).map(|obj| obj.unbind())
-}
-
-/// The nodes on the shortest path from `source` to `target` (inclusive), as a
-/// pyarrow array of user ids (empty when there is no path). Backs graph ops over a
-/// `shortest_path` result (#116). `weight` + `edges` select weighted Dijkstra.
-#[pyfunction]
-#[pyo3(signature = (index, source, target, direction, weight=None, edges=None))]
-fn shortest_path_nodes_query(
-    py: Python<'_>,
-    index: PyRef<'_, GraphIndex>,
-    source: &Bound<'_, PyAny>,
-    target: &Bound<'_, PyAny>,
-    direction: &str,
-    weight: Option<String>,
-    edges: Option<Bound<'_, PyAny>>,
-) -> PyResult<Py<PyAny>> {
-    let (topo, ids) = (index.0.topo.clone(), index.0.ids.clone());
-    let source = array_from_pyarrow(source)?;
-    let target = array_from_pyarrow(target)?;
-    let direction = direction.to_string();
-    let edges = match edges {
-        Some(obj) => Some(Vec::<RecordBatch>::from_pyarrow_bound(&obj)?),
-        None => None,
-    };
-    let arr = py.detach(move || {
-        shortest_path_nodes(
-            topo,
-            ids,
-            source.as_ref(),
-            target.as_ref(),
-            &direction,
-            weight.as_deref(),
-            edges,
-        )
-        .map_err(to_pyerr)
-    })?;
-    arr.into_data().to_pyarrow(py).map(|obj| obj.unbind())
-}
-
 /// Whole-graph edge density (eager scalar). `direction` is out/in/both; `both`
 /// is the undirected density.
 #[pyfunction]
@@ -524,69 +487,6 @@ fn graph_diameter(
     py.detach(move || diameter(&topo, approximate, dir).map_err(to_pyerr))
 }
 
-/// Read a Parquet/CSV edge file's `src`/`dst` columns (plus any `weight_columns`
-/// needed to evaluate a `weight=` expression, by their own names) through a DataFusion scan and hand
-/// them back as a pyarrow `RecordBatch`. `path` may be local or object storage
-/// (`s3://`/`gs://`/`az://`/`file://`); `storage_options` seeds the backend's
-/// credentials/config.
-#[pyfunction]
-#[pyo3(signature = (path, src, dst, storage_options=None, weight_columns=Vec::new()))]
-fn scan_edges_arrow(
-    py: Python<'_>,
-    path: &str,
-    src: &str,
-    dst: &str,
-    storage_options: Option<HashMap<String, String>>,
-    weight_columns: Vec<String>,
-) -> PyResult<Py<PyAny>> {
-    let opts = storage_options.unwrap_or_default();
-    let batches =
-        py.detach(|| scan_edges_batch(path, src, dst, &opts, &weight_columns).map_err(to_pyerr))?;
-    batches.to_pyarrow(py).map(|obj| obj.unbind())
-}
-
-/// Read a Parquet/CSV edge file as a table for the relational paths (a plain
-/// `collect()` and its tail, the sinks, a subgraph view's edge mask): every column
-/// with its file name and type (`Utf8View` read as `Utf8`), endpoints validated but
-/// not cast, so it matches the same file read into an in-memory `EdgeFrame`
-/// (#160). `columns` is a projection pushdown: when non-empty only those columns
-/// (plus `src`/`dst`) are read, in file order; empty reads all of them.
-#[pyfunction]
-#[pyo3(signature = (path, src, dst, storage_options=None, columns=Vec::new()))]
-fn scan_edges_table_arrow(
-    py: Python<'_>,
-    path: &str,
-    src: &str,
-    dst: &str,
-    storage_options: Option<HashMap<String, String>>,
-    columns: Vec<String>,
-) -> PyResult<Py<PyAny>> {
-    let opts = storage_options.unwrap_or_default();
-    let batches =
-        py.detach(|| scan_edges_table(path, src, dst, &opts, &columns).map_err(to_pyerr))?;
-    batches.to_pyarrow(py).map(|obj| obj.unbind())
-}
-
-/// Read a Parquet/CSV node/attribute file through a DataFusion scan and hand it
-/// back as a batch list (`id` cast to int64). It feeds the `nodes` attribute slot
-/// of `run_node_query`, exactly like an in-memory table. `columns` is a projection
-/// pushdown: when non-empty only those columns are read from the file (it must
-/// include the `id` column); empty reads all columns. `path`/`storage_options`
-/// support object storage like `scan_edges_arrow`.
-#[pyfunction]
-#[pyo3(signature = (path, id, storage_options=None, columns=Vec::new()))]
-fn scan_nodes_arrow(
-    py: Python<'_>,
-    path: &str,
-    id: &str,
-    storage_options: Option<HashMap<String, String>>,
-    columns: Vec<String>,
-) -> PyResult<Py<PyAny>> {
-    let opts = storage_options.unwrap_or_default();
-    let batches = py.detach(|| scan_nodes_batch(path, id, &opts, &columns).map_err(to_pyerr))?;
-    batches.to_pyarrow(py).map(|obj| obj.unbind())
-}
-
 /// The `ursa-core` version — the simplest possible proof the native module loaded.
 #[pyfunction]
 fn __core_version() -> &'static str {
@@ -609,16 +509,13 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
     m.add_function(wrap_pyfunction!(scan_build_index, m)?)?;
     m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
+    m.add_function(wrap_pyfunction!(_scan_log, m)?)?;
+    m.add_class::<NodeTableCache>()?;
     // the one execution entry point
     m.add_function(wrap_pyfunction!(run_plan, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_index, m)?)?;
-    m.add_function(wrap_pyfunction!(hop_reached_nodes_query, m)?)?;
-    m.add_function(wrap_pyfunction!(shortest_path_nodes_query, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
     m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;
     m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;
-    m.add_function(wrap_pyfunction!(scan_edges_arrow, m)?)?;
-    m.add_function(wrap_pyfunction!(scan_edges_table_arrow, m)?)?;
-    m.add_function(wrap_pyfunction!(scan_nodes_arrow, m)?)?;
     Ok(())
 }

@@ -5,15 +5,16 @@
 ``ursa._ursa.run_plan``. Rust decides how the plan runs: it walks the tree, rejects
 the shapes that aren't supported, and maps the rest onto its executors.
 
-What stays here is leaf work that has not moved to Rust yet. ``run_plan`` reads it
-back through ``_Host``, by slot, as it needs it:
+Scans, subgraph masks, weights and every ``filter`` run in Rust (#192). What stays
+here is what belongs to the Python frames. ``run_plan`` reads it back through
+``_Host``, by slot, as it needs it:
 
-- the per-frame caches: the topology index, subgraph-view edge masks, scanned node
-  attribute tables (all memoized on ``_frames._BuildCell``);
-- in-memory tables, plain-source scans, and the edge columns a weight reads;
+- each frame's source: its in-memory table, or its scan's storage options;
+- the per-frame cells (``_frames._BuildCell``): the topology index (which carries
+  the weight and mask caches), and a scanned node table's native cache;
 - seed id sets;
-- the pyarrow evaluator for the relational steps the engine's fixed-order tail
-  can't run as written, and for every step on a plain source (#191 retires it).
+- the pyarrow tail: the relational steps other than ``filter`` that the engine's
+  fixed-order tail can't run as written (#191 retires it).
 """
 
 from __future__ import annotations
@@ -25,18 +26,13 @@ from typing import TYPE_CHECKING, Any
 from ._result import MaterializedFrame
 
 if TYPE_CHECKING:
-    from ._frames import EdgeFrame, NodeFrame, _Frame, _PlanStep
+    from ._frames import EdgeFrame, _Frame, _PlanStep
 
 # The lazy index build is guarded per-frame by the lock on each frame's shared
 # `_BuildCell` (see `_frames._BuildCell`), so first-collects of *unrelated* frames
 # from different threads build concurrently instead of serializing on one global
 # lock. collect() runs GIL-free, so the memo assignment itself still needs the
 # cell's lock.
-
-# Operators valid at the *top* of a filter predicate — comparisons and boolean
-# combinators. (Arithmetic ops may appear deeper, e.g. `(a + b) > 3`, but a bare
-# arithmetic or column expression is not itself a boolean predicate.)
-_PREDICATE_OPS = {">", "<", ">=", "<=", "==", "!=", "&", "|"}
 
 
 # --- collect ---------------------------------------------------------------
@@ -244,25 +240,51 @@ class _Host:
     def index(self, slot: int) -> Any:
         return _require_index(self._slots[slot])
 
-    def edge_mask(self, slot: int) -> Any | None:
+    def built_index(self, slot: int) -> Any | None:
+        return self._slots[slot]._index_build_cell.value
+
+    def put_index(self, slot: int, index: Any) -> Any:
+        """Keep an index built from a weighted scan's rows, unless another collect
+        built one meanwhile; the frame's index either way."""
+        cell = self._slots[slot]._index_build_cell
+        with cell.lock:
+            if cell.value is None:
+                cell.value = index
+            return cell.value
+
+    def table(self, slot: int) -> Any | None:
+        """An in-memory frame's table: a node frame's attribute table, or an edge
+        frame's whole edge table (``None`` without one)."""
+        from ._frames import NodeFrame
+
         frame = self._slots[slot]
-        return _edge_mask_for(frame, _require_index(frame))
+        if isinstance(frame, NodeFrame):
+            return frame._attr_table
+        return frame._edge_attr_table
 
-    def edge_weights(self, slot: int, columns: list[str], keys: list[str]) -> Any | None:
-        return _prepare_weighted(self._slots[slot], columns, keys)
+    def storage_options(self, slot: int) -> dict[str, Any] | None:
+        return _scan_storage_options(self._slots[slot]._scan_spec)
 
-    def node_table(self, slot: int, columns: list[str] | None) -> Any:
-        return _resolve_node_attr_table(self._slots[slot], columns)
+    def node_cache(self, slot: int) -> Any:
+        """A ``scan_nodes`` frame's native table cache, kept in its shared cell."""
+        cell = self._slots[slot]._attr_build_cell
+        if cell.value is None:
+            with cell.lock:
+                if cell.value is None:
+                    cell.value = _native().NodeTableCache()
+        return cell.value
 
-    def edge_table(self, slot: int, columns: list[str] | None) -> Any:
-        return _edge_source_table(self._slots[slot], columns)
+    def warn_dropped(self, n: int) -> None:
+        from ._io import _warn_dropped_endpoints
+
+        _warn_dropped_endpoints(n)
 
     def seeds(self, slot: int) -> Any:
         return _resolve_seeds(self._slots[slot])
 
     def apply_steps(self, rows: Any, handles: list[int], roles: dict[str, str]) -> Any:
-        """Run the steps behind ``handles`` in pyarrow, on a table this host
-        produced or on the engine's batch list."""
+        """Run the steps behind ``handles`` (never a ``filter``: those run in Rust)
+        in pyarrow, on a table this host produced or on the engine's batch list."""
         import pyarrow as pa
 
         table = pa.Table.from_batches(rows) if isinstance(rows, list) else rows
@@ -320,11 +342,18 @@ def _expr_to_json(expr: Any) -> dict[str, Any]:
 
 
 def _lit_json(value: Any) -> dict[str, Any]:
-    """A literal node. A plain or numpy bool, int, float or string is its JSON
-    value. Anything else (a datetime, a timedelta, NaN) has no JSON form here and
-    is marked ``unrepresentable``: the engine rejects it with the error its
-    serialization raised before (``TypeError``), while the host's evaluator reads
-    the original value from the step."""
+    """A literal node. A plain or numpy bool, int, float or string, or None, is its
+    JSON value. A value JSON can't hold takes the type ``pyarrow.scalar`` gives it,
+    so it compares as it always did (``ursa_plan::expr::parse_typed_literal``):
+
+    - NaN and infinity: ``{"type": "float64", "value": "nan" | "inf" | "-inf"}``;
+    - a datetime / ``np.datetime64``: ``timestamp`` (``unit``, ``tz``, an integer);
+    - a date: ``date32`` (days); a time: ``time`` (``unit``, an integer);
+    - a timedelta / ``np.timedelta64``: ``duration`` (``unit``, an integer);
+    - a ``Decimal``: ``decimal`` (``precision``, ``scale``, the unscaled digits).
+
+    Anything else is marked ``unrepresentable`` and rejected with the
+    ``TypeError`` JSON encoding raised for it."""
     dtype = getattr(value, "dtype", None)
     if type(value).__module__ == "numpy" and getattr(dtype, "kind", "") in "biuf":
         value = value.item()  # a numpy bool/int/float scalar -> its Python value
@@ -333,8 +362,48 @@ def _lit_json(value: Any) -> dict[str, Any]:
     if isinstance(value, float):
         if math.isfinite(value):
             return {"kind": "lit", "value": value}
-        return {"kind": "lit", "value": None, "unrepresentable": "float"}
+        text = "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf")
+        return {"kind": "lit", "type": "float64", "value": text}
+    typed = _typed_lit_json(value)
+    if typed is not None:
+        return typed
     return {"kind": "lit", "value": None, "unrepresentable": type(value).__name__}
+
+
+def _typed_lit_json(value: Any) -> dict[str, Any] | None:
+    """The typed literal for ``value`` (see ``_lit_json``), or None."""
+    import pyarrow as pa
+    import pyarrow.types as pat
+
+    try:
+        scalar = pa.scalar(value)
+    except Exception:  # a value pyarrow has no scalar for
+        return None
+    t = scalar.type
+    if pat.is_timestamp(t):
+        return {
+            "kind": "lit",
+            "type": "timestamp",
+            "unit": t.unit,
+            "tz": t.tz,
+            "value": scalar.value,
+        }
+    if pat.is_date32(t):
+        return {"kind": "lit", "type": "date32", "value": scalar.value}
+    if pat.is_time(t):
+        return {"kind": "lit", "type": "time", "unit": t.unit, "value": scalar.value}
+    if pat.is_duration(t):
+        return {"kind": "lit", "type": "duration", "unit": t.unit, "value": scalar.value}
+    if pat.is_decimal128(t):
+        digits = int(scalar.as_py().scaleb(t.scale))
+        return {
+            "kind": "lit",
+            "type": "decimal",
+            "precision": t.precision,
+            "scale": t.scale,
+            "value": str(digits),
+        }
+    return None
 
 
 def _int_json(value: Any) -> Any:
@@ -347,23 +416,6 @@ def _int_json(value: Any) -> Any:
     if hasattr(value, "__index__"):
         return value.__index__()
     return {"type": type(value).__name__}
-
-
-def _expr_columns(expr: Any, roles: dict[str, str] | None = None) -> set[str]:
-    """The (original) column names an expression references — for scan projection
-    pushdown. Role refs resolve through ``roles`` to the frame's real columns."""
-    kind, p = expr.kind, expr.payload
-    if kind == "col":
-        return {p["name"]}
-    if kind == "binary":
-        return _expr_columns(p["left"], roles) | _expr_columns(p["right"], roles)
-    if kind == "unary":
-        return _expr_columns(p["operand"], roles)
-    if kind in ("src", "dst", "id") and roles is not None and kind in roles:
-        return {roles[kind]}
-    if kind in ("agg", "alias") and "operand" in p:
-        return _expr_columns(p["operand"], roles)
-    return set()
 
 
 # --- select (column projection) --------------------------------------------
@@ -396,80 +448,7 @@ def _select_table(table: Any, select: list[str]) -> Any:
     return table.select(select)
 
 
-def _prepare_weighted(
-    edges: EdgeFrame, weight_columns: list[str] | set[str], weight_jsons: list[str] | None = None
-) -> Any | None:
-    """The edge attribute table (a **list** of pyarrow RecordBatches) for evaluating
-    a weight expression, aligned to the graph's edge-row order.
-
-    The edge table crosses the FFI as a batch list (never concatenated into one
-    contiguous batch, #60); ``evaluate_weight`` streams the batches in order, and
-    that order matches the topology's ``edge_ids`` because the *same* row order
-    built the index.
-
-    ``weight_jsons`` (the serialized expressions, for a node query) lets this
-    return ``None`` when the frame's built index already caches every one of those
-    weight vectors (#175): the engine reuses them without reading the edge table.
-
-    For a ``scan_edges`` frame this scans ``src``, ``dst`` and the weight columns
-    together, dropping null-endpoint rows under ``on_null="drop"`` exactly as the
-    index build does. Scans are file-ordered and deterministic (#148), so these rows
-    align with an index already built from an earlier scan, which is reused rather
-    than rebuilt (its cached views and weights survive); with no index yet, it is
-    built from these same batches, saving a second scan. In-memory frames already
-    share one retained table, so they just subset it."""
-    if not weight_columns:
-        return None
-    # (The executor has already rejected an edge plan a graph op can't run over, so
-    # the scan branch never builds the index of a reshaped frame.)
-    # A traversal-result frame (#116) carries no source of its own — the weight columns
-    # and the topology index both live on the parent, so resolve to it (the parent cell
-    # is the one `_require_index` reads, keeping weights and edge_ids self-consistent).
-    edges = _parent_edges(edges)
-    index = edges._index_build_cell.value
-    if weight_jsons and index is not None and all(index.has_weights(j) for j in weight_jsons):
-        return None
-    cols = sorted(weight_columns)
-    table = getattr(edges, "_edge_attr_table", None)
-    if table is not None:
-        missing = [c for c in cols if c not in table.column_names]
-        if missing:
-            from . import ColumnNotFoundError
-
-            raise ColumnNotFoundError(
-                f"weight expression references unknown edge column(s): {missing}"
-            )
-        # The full in-memory edge table shares its row order with the endpoints the
-        # index was built from, so its chunks (in order) align with edge_ids.
-        return table.select(cols).to_batches()
-    scan = getattr(edges, "_scan_spec", None)
-    if scan is not None:
-        path = scan["path"]
-        if not isinstance(path, str):
-            raise NotImplementedError(
-                "weighted algorithms over a multi-path scan_edges source are not supported yet."
-            )
-        # One scan → a batch list of [src, dst, *cols], filtered like the index
-        # build so its rows match the index's edge rows one for one. A built index
-        # is kept; otherwise these batches' endpoints build it.
-        combined = _native().scan_edges_arrow(
-            path, scan["src"], scan["dst"], _scan_storage_options(scan), cols
-        )
-        if scan.get("on_null") == "drop":
-            combined = _drop_null_endpoint_batches(combined)
-        cell = edges._index_build_cell
-        if cell.value is None:
-            with cell.lock:
-                if cell.value is None:
-                    cell.value = _native().build_index(combined)
-        return combined
-    raise NotImplementedError(
-        "a weighted algorithm needs an in-memory or scan_edges source so the weight "
-        "columns can be read."
-    )
-
-
-def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
+def _scan_storage_options(scan: dict[str, Any]) -> dict[str, Any] | None:
     """The storage_options for a scan spec, after rejecting the unsupported
     ``store=`` (obstore) parameter. ``s3://``/``gs://``/``az://`` credentials and
     config flow through storage_options; obstore interop is future work."""
@@ -479,52 +458,6 @@ def _scan_storage_options(scan: dict[str, Any]) -> dict[str, str] | None:
             "storage_options={...} instead."
         )
     return scan.get("storage_options")
-
-
-def _resolve_node_attr_table(frame: NodeFrame, columns: list[str] | None = None) -> Any | None:
-    """The node attribute table as a chunked ``pyarrow.Table``: an in-memory
-    ``from_arrow`` table if present, else a ``scan_nodes`` file source materialized
-    through a DataFusion scan. ``edges.nodes()``-derived frames have neither and
-    return ``None``.
-
-    ``columns`` is a scan **projection pushdown**: when given, only those columns
-    are read from the node file (the join id plus whatever the plan proves it
-    needs); ``None`` reads all columns. It is ignored for an in-memory source
-    (already resident) — a later ``select`` narrows the output there.
-
-    The scan returns a **list** of RecordBatches (never concatenated, #60); this
-    assembles them into one chunked Table. Scan results are memoized on the frame's
-    shared attribute cell **keyed by the projected column set**, so repeated
-    collects reuse a prior read while a different projection (e.g. a seeds-only
-    ``[id]`` read) gets its own cache slot rather than a wrong subset."""
-    import pyarrow as pa
-
-    inmem = getattr(frame, "_attr_table", None)
-    if inmem is not None:
-        return inmem  # already a chunked Table (see _io._node_attr_table)
-    scan = getattr(frame, "_scan_spec", None)
-    if scan is not None:
-        path = scan["path"]
-        if not isinstance(path, str):
-            raise NotImplementedError(
-                "collect() over a scan_nodes source supports a single string path "
-                "(glob included) for now, not a list of paths."
-            )
-        key = tuple(columns) if columns is not None else None
-        cell = frame._attr_build_cell
-        cache = cell.value
-        if cache is not None and key in cache:
-            return cache[key]
-        with cell.lock:
-            cache = cell.value if cell.value is not None else {}
-            if key not in cache:
-                batches = _native().scan_nodes_arrow(
-                    path, scan["id"], _scan_storage_options(scan), columns or []
-                )
-                cache[key] = pa.Table.from_batches(batches)
-                cell.value = cache
-            return cache[key]
-    return None
 
 
 # Steps that don't change a NodeFrame's row set, so its id column can be read
@@ -549,14 +482,14 @@ def _resolve_seeds(seeds: Any) -> Any:
 
     if isinstance(seeds, NodeFrame):
         plain = all(step.op in _SEED_PASSTHROUGH for step in seeds._plan)
-        # As seeds, only the id column is needed — project the scan to just [id]
-        # (a real, non-lossy projection-pushdown win; a 50-column node file used
-        # only for seeds reads one column).
-        attr = _resolve_node_attr_table(seeds, [seeds.id_col]) if plain else None
-        # A plain attribute table yields its ids directly; a derived frame
-        # (filtered / computed) must be executed to get them.
-        if attr is not None:
-            tbl = attr  # a (chunked) pyarrow.Table
+        # A plain attribute table yields its ids directly. A plain scan reads just
+        # the id column (through the frame's node cache: a 50-column node file
+        # used only for seeds reads one column); a derived frame (filtered /
+        # computed) must be executed to get them.
+        if plain and seeds._attr_table is not None:
+            tbl = seeds._attr_table  # a (chunked) pyarrow.Table
+        elif plain and seeds._scan_spec is not None:
+            tbl = seeds.select(seeds.id_col).collect().to_arrow()
         else:
             try:
                 tbl = seeds.collect().to_arrow()
@@ -589,53 +522,6 @@ def _resolve_seeds(seeds: Any) -> Any:
         raise NotImplementedError("seed ids must be all integers or all strings.") from exc
 
 
-_TRAVERSAL_OPS = ("hop", "shortest_path")
-
-
-def _traversal_step(frame: Any) -> Any | None:
-    """The ``hop``/``shortest_path`` step in a traversal EdgeFrame's plan, or ``None``.
-    A traversal frame carries exactly one such step (see ``_graph._Hop`` /
-    ``_graph.shortest_path``); the parent edges ride in ``step.args['edges']``."""
-    for step in getattr(frame, "_plan", ()):
-        if step.op in _TRAVERSAL_OPS:
-            return step
-    return None
-
-
-def _parent_edges(frame: Any) -> Any:
-    """The parent edge frame a graph op actually runs over. For a traversal-result
-    frame (#116) that is the frame the traversal was built from (carried in the
-    step) — its CSR is the topology, and the traversal only *masks* it. For any
-    other frame it is the frame itself."""
-    step = _traversal_step(frame)
-    return step.args["edges"] if step is not None else frame
-
-
-def _drop_null_endpoint_batches(
-    batches: list[Any], endpoints: tuple[int | str, int | str] = (0, 1)
-) -> list[Any]:
-    """Filter scan batches to rows with a non-null src and dst, emitting a count —
-    the scan half of the ``on_null="drop"`` opt-in. ``endpoints`` locates the two
-    columns: positions 0/1 for the graph-op scans (endpoints first, weight columns
-    after), or the endpoint column names for the full-table scan of the relational
-    paths. Filtering here (rather than in a second pass) keeps the topology and any
-    co-scanned weights row-aligned, since they come from the same filtered batches."""
-    import pyarrow.compute as pc
-
-    from ._io import _warn_dropped_endpoints
-
-    # pyarrow.compute members are looked up by name (the type checker lacks its stubs).
-    is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
-    out, dropped = [], 0
-    for b in batches:
-        mask = and_(is_valid(b.column(endpoints[0])), is_valid(b.column(endpoints[1])))
-        kept = b.filter(mask)
-        dropped += b.num_rows - kept.num_rows
-        out.append(kept)
-    _warn_dropped_endpoints(dropped)
-    return out
-
-
 def _require_edges(edges: EdgeFrame | None) -> list[Any]:
     """Resolve an EdgeFrame to a **batch list** of ``[src, dst]`` RecordBatches
     (endpoints canonicalized to int64 or string) ready for ``build_index``, or raise
@@ -659,21 +545,12 @@ def _require_edges(edges: EdgeFrame | None) -> list[Any]:
 
     scan = getattr(edges, "_scan_spec", None)
     if scan is not None:
-        path = scan["path"]
-        if not isinstance(path, str):
-            raise NotImplementedError(
-                "collect() over a scan_edges source supports a single string path "
-                "(glob included) for now, not a list of paths."
-            )
-        # The scan returns a list of [src, dst] batches; build_index reads columns
-        # 0/1 of each, so it is passed straight through (minus null-endpoint rows
-        # when on_null="drop").
-        batches = _native().scan_edges_arrow(
-            path, scan["src"], scan["dst"], _scan_storage_options(scan)
+        # A single-path scan builds natively (`_scan_build_index`); a list of
+        # paths is not supported yet.
+        raise NotImplementedError(
+            "collect() over a scan_edges source supports a single string path "
+            "(glob included) for now, not a list of paths."
         )
-        if scan.get("on_null") == "drop":
-            batches = _drop_null_endpoint_batches(batches)
-        return batches
 
     raise NotImplementedError(
         "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or "
@@ -689,22 +566,18 @@ def _require_index(edges: EdgeFrame | None) -> Any:
     (see ``EdgeFrame._extend``). Concurrency-safe via a module lock."""
     if edges is None:
         raise NotImplementedError("this expression is not associated with an edge frame.")
-    # (The executor checks the edge plan before it asks for the index: see
-    # ursa_plan::plan::require_index.)
-    # A traversal-result frame (#116) has no source of its own — its CSR is the
-    # parent's, and the traversal only masks it. Resolve to the parent so the parent
-    # CSR is built once and shared with direct ops on that frame (index-preservation).
-    parent = _parent_edges(edges)
-    cell = parent._index_build_cell
+    # (The executor checks the edge plan before it asks for the index, and asks a
+    # traversal result's input frame for it: see ursa_plan::plan::require_index.)
+    cell = edges._index_build_cell
     idx = cell.value
     if idx is not None:
         return idx
     with cell.lock:
         idx = cell.value
         if idx is None:
-            idx = _scan_build_index(parent)
+            idx = _scan_build_index(edges)
             if idx is None:
-                idx = _native().build_index(_require_edges(parent))
+                idx = _native().build_index(_require_edges(edges))
             cell.value = idx
     return idx
 
@@ -729,22 +602,6 @@ def _scan_build_index(edges: EdgeFrame) -> Any:
     )
     _warn_dropped_endpoints(dropped)
     return idx
-
-
-def _require_predicate(predicate: Any) -> None:
-    """Reject a ``filter()`` argument that isn't a boolean predicate at its top node
-    — a bare ``col`` or an arithmetic expression is not a filter. Enforced
-    identically on both the graph-op (Rust) and plain-frame (pyarrow) paths, so the
-    same input is accepted or rejected the same way regardless of the source."""
-    kind = predicate.kind
-    top_binary_ok = kind == "binary" and predicate.payload["op"] in _PREDICATE_OPS
-    top_unary_ok = kind == "unary" and predicate.payload["op"] == "~"
-    if not (top_binary_ok or top_unary_ok):
-        raise NotImplementedError(
-            "filter() expects a boolean predicate — a comparison (>, >=, <, <=, ==, !=) "
-            "or a boolean combination (&, |, ~), e.g. .filter(ur.col('deg') > 2) or "
-            ".filter((ur.col('a') > 1) & (ur.col('b') == 'x'))."
-        )
 
 
 # --- group_by().agg() ------------------------------------------------------
@@ -856,9 +713,10 @@ def _parse_sort(args: dict[str, Any]) -> list[tuple[str, bool]]:
 # #164): `.select("c").distinct()` dedups the selected column, `.rename({"v":
 # "val"}).sort("val")` sorts by the new name, `.head(3).sort("v")` sorts three rows.
 # The executor runs the leading steps its engine tail runs identically and hands
-# the rest here (`_Host.apply_steps`), as does every step on a plain source. Each
-# is parsed into a `(kind, arg)` step and applied in pyarrow, in order:
-#   ("filter", Expr)  ("sort", <_parse_sort>)  ("head", n)  ("distinct", None)
+# the rest here (`_Host.apply_steps`), as it does the steps on a plain source,
+# except `filter`, which the executor evaluates itself. Each is parsed into a
+# `(kind, arg)` step and applied in pyarrow, in order:
+#   ("sort", <_parse_sort>)  ("head", n)  ("distinct", None)
 #   ("sample", (n, seed))  ("rename", {old: new})  ("select", [names])
 #   ("group_by", <_parse_group_agg>)
 _Step = tuple[str, Any]
@@ -867,8 +725,6 @@ _Step = tuple[str, Any]
 def _tail_step(step: _PlanStep) -> _Step:
     """Parse one relational plan step into a tail step."""
     op, args = step.op, step.args
-    if op == "filter":
-        return ("filter", args["predicate"])
     if op == "sort":
         return ("sort", _parse_sort(args))
     if op == "head":
@@ -895,12 +751,10 @@ def _apply_pyarrow_sort(table: Any, sort: list[tuple[str, bool]]) -> Any:
 
 def _apply_pyarrow_steps(table: Any, steps: list[_Step], roles: dict[str, str]) -> Any:
     """Apply tail ``steps`` to a pyarrow table, each in the order written. ``roles``
-    resolves ur.id()/src()/dst() in a filter to real column names."""
+    would resolve role references; no step here takes one (filters run in Rust)."""
+    del roles
     for kind, arg in steps:
-        if kind == "filter":
-            _require_predicate(arg)  # same top-of-predicate check as the graph path
-            table = table.filter(_eval_pyarrow(arg, table, roles))
-        elif kind == "group_by":
+        if kind == "group_by":
             table = _apply_pyarrow_group_by(table, arg[0], arg[1])
         elif kind == "distinct":
             # Distinct rows over all columns (group-by with no aggregations), each
@@ -944,70 +798,7 @@ def _parse_join_keys(on: Any) -> list[str]:
     return keys
 
 
-# --- plain-source collection (no algorithm/traversal) ----------------------
-# Materialize a frame's own rows and apply the filter/sort/head tail in pyarrow.
-# Used by read_edges/read_nodes and scan_*/from_* frames collected without a
-# graph op (e.g. scan_edges(...).collect()).
-# pyarrow.compute kernel names by op (looked up by name so the type checker —
-# which lacks pyarrow.compute stubs — doesn't flag each one).
-_PC_BINARY = {
-    "+": "add",
-    "-": "subtract",
-    "*": "multiply",
-    "/": "divide",
-    ">": "greater",
-    ">=": "greater_equal",
-    "<": "less",
-    "<=": "less_equal",
-    "==": "equal",
-    "!=": "not_equal",
-    "&": "and_kleene",
-    "|": "or_kleene",
-}
-_PC_UNARY = {"~": "invert"}
-
-
-def _eval_pyarrow(expr: Any, table: Any, roles: dict[str, str]) -> Any:
-    """Evaluate an ``Expr`` predicate tree over a pyarrow ``table``, mirroring the
-    Rust ``expr::lower`` semantics for the plain-frame path (which never touches the
-    engine). Returns a pyarrow Array/scalar; the top-level result is a boolean mask."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    kind, p = expr.kind, expr.payload
-    if kind == "col":
-        name = p["name"]
-        if name not in table.column_names:
-            raise ValueError(f"filter references unknown column '{name}'.")
-        return table.column(name)
-    if kind == "lit":
-        return pa.scalar(p["value"])
-    if kind in ("src", "dst", "id"):
-        if kind not in roles:
-            raise NotImplementedError(
-                f"ur.{kind}() is not available in this context "
-                f"(resolvable roles here: {sorted(roles)})."
-            )
-        name = roles[kind]
-        if name not in table.column_names:
-            raise ValueError(f"filter references unknown column '{name}'.")
-        return table.column(name)
-    if kind == "binary":
-        op = p["op"]
-        if op not in _PC_BINARY:
-            raise NotImplementedError(f"filter operator {op!r} is not supported.")
-        left = _eval_pyarrow(p["left"], table, roles)
-        right = _eval_pyarrow(p["right"], table, roles)
-        return getattr(pc, _PC_BINARY[op])(left, right)
-    if kind == "unary":
-        if p["op"] not in _PC_UNARY:
-            raise NotImplementedError(f"unary filter operator {p['op']!r} is not supported.")
-        return getattr(pc, _PC_UNARY[p["op"]])(_eval_pyarrow(p["operand"], table, roles))
-    raise NotImplementedError(
-        f"filter expression node {kind!r} is not supported (aggregations belong in group_by)."
-    )
-
-
+# --- the rest of the pyarrow tail (#191) ---------------------------------------
 # A plain frame takes exactly one deterministic sampling policy, distinct from the
 # engine's (both reproducible, not byte-identical to each other): a stable stdlib
 # PRNG over the single in-memory table's row order (which, unlike the engine, is
@@ -1153,149 +944,6 @@ def _sort_pyarrow(table: Any, keys: list[tuple[str, bool]]) -> Any:
         for i, (_, descending) in enumerate(keys)
     ]
     return table.take(pc.sort_indices(key_table, sort_keys=sort_keys))  # ty: ignore[unresolved-attribute]
-
-
-def _edge_source_table(frame: EdgeFrame, columns: list[str] | None = None) -> Any:
-    """The raw edge rows of an edge frame as a pyarrow.Table — the full in-memory
-    edge table, or a fresh scan of its ``scan_edges`` source. For a traversal-result
-    frame (#116) this resolves to the *parent* edge rows (the CSR the traversal masks;
-    its own ``src``/``dst`` are the synthetic reached-pair columns). Raises the precise
-    plan-aware error for a frame with no materializable source.
-
-    A scan reads every column of the file, named, ordered and typed as the same file
-    read into memory and passed to ``EdgeFrame`` (string_view read as string), so a
-    scanned frame collects exactly what an in-memory one does (#160). ``columns`` is
-    a scan projection pushdown: when given, only those columns (plus the endpoints)
-    are read, in file order; ``None`` reads all of them. It is ignored for an
-    in-memory table (already resident)."""
-    import pyarrow as pa
-
-    frame = _parent_edges(frame)  # traversal -> the parent rows the topology is built from
-    table = getattr(frame, "_edge_attr_table", None)  # full in-memory edge table
-    if table is not None:
-        return table
-    scan = getattr(frame, "_scan_spec", None)
-    if scan is not None:
-        path = scan["path"]
-        if not isinstance(path, str):
-            raise NotImplementedError(
-                "collect() over a scan_edges source supports a single string path "
-                "(glob included) for now, not a list of paths."
-            )
-        batches = _native().scan_edges_table_arrow(
-            path, scan["src"], scan["dst"], _scan_storage_options(scan), columns or []
-        )
-        if scan.get("on_null") == "drop":
-            batches = _drop_null_endpoint_batches(batches, (scan["src"], scan["dst"]))
-        return pa.Table.from_batches(batches)
-    # No source: a filtered/derived (or traversal-result) edge frame.
-    _require_edges(frame)  # raises the precise, plan-aware message
-    raise AssertionError("unreachable")  # _require_edges always raises here
-
-
-def _edge_mask_for(edges: EdgeFrame | None, index: Any) -> Any | None:
-    """The subgraph-view edge mask for a derived edge frame, or ``None`` (full graph).
-
-    The parent topology is kept; the surviving rows are expressed as a boolean pyarrow
-    array aligned with the CSR's ``edge_ids``. Two sources of mask, combined by AND:
-
-    * ``filter`` (#114): each predicate is evaluated over the *parent* edge rows (the
-      same rows, in the same order, the topology was built from — via
-      ``_edge_source_table``); repeated ``.filter()`` calls intersect. Endpoint
-      predicates (``ur.src()``/``ur.dst()``) and edge-attribute columns are supported;
-      a scan reads only the endpoints and the columns the predicates reference.
-    * ``hop``/``shortest_path`` (#116): the traversal produces a reached node *set*
-      (run over ``index``, the parent CSR); the mask keeps an edge iff **both**
-      endpoints are reached — the induced subgraph of the reached region.
-
-    Returns ``None`` when the frame carries neither (the full graph).
-
-    Frames are immutable, so the mask is memoized on the frame's own
-    ``_mask_build_cell`` (#175) and later collects skip the source re-read and
-    predicate / traversal evaluation. It is stored alongside the ``index`` it was
-    computed against and only served for that same index object, so a rebuilt parent
-    CSR (e.g. a weighted scan re-scans and replaces it) recomputes the mask.
-    """
-    if edges is None:
-        return None
-    traversal = _traversal_step(edges)
-    predicates = [s.args["predicate"] for s in getattr(edges, "_plan", ()) if s.op == "filter"]
-    if traversal is None and not predicates:
-        return None
-    cell = edges._mask_build_cell
-    cached = cell.value
-    if cached is not None and cached[0] is index:
-        return cached[1]
-    with cell.lock:
-        cached = cell.value
-        if cached is not None and cached[0] is index:
-            return cached[1]
-        mask = _compute_edge_mask(edges, index, traversal, predicates)
-        cell.value = (index, mask)
-    return mask
-
-
-def _compute_edge_mask(
-    edges: EdgeFrame, index: Any, traversal: Any | None, predicates: list[Any]
-) -> Any:
-    """Evaluate the edge mask described in ``_edge_mask_for`` (uncached)."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    parent = _parent_edges(edges)
-    roles = {"src": parent.src_col, "dst": parent.dst_col}
-    needed = {parent.src_col, parent.dst_col}
-    for predicate in predicates:
-        needed |= _expr_columns(predicate, roles)
-    # Parent edge rows in topology row order, projected to what the mask reads.
-    table = _edge_source_table(edges, sorted(needed))
-    and_ = pc.and_  # ty: ignore[unresolved-attribute]
-    mask = None
-
-    if traversal is not None:
-        # The reached node set induces the subgraph: keep e iff both endpoints reached.
-        reached = _traversal_reached_nodes(edges, traversal, index)
-        is_in = pc.is_in  # ty: ignore[unresolved-attribute]
-        src_in = is_in(table.column(parent.src_col), value_set=reached)
-        dst_in = is_in(table.column(parent.dst_col), value_set=reached)
-        mask = and_(src_in, dst_in)
-
-    for predicate in predicates:
-        _require_predicate(predicate)  # same top-of-predicate check as every path
-        m = _eval_pyarrow(predicate, table, roles)
-        mask = m if mask is None else and_(mask, m)
-    # The FFI takes a single contiguous boolean Array (not a ChunkedArray).
-    if isinstance(mask, pa.ChunkedArray):
-        mask = mask.combine_chunks()
-    return mask
-
-
-def _traversal_reached_nodes(edges: EdgeFrame, traversal: Any, index: Any) -> Any:
-    """The reached node set (as a pyarrow array of user ids) behind a graph op over a
-    traversal result (#116) — the seeds' k-hop region, or the shortest path's nodes,
-    computed over ``index`` (the parent CSR). Mirrors the executor's
-    traversal execution so the mask agrees with what the traversal itself would emit."""
-    if traversal.op == "hop":
-        seeds = _resolve_seeds(traversal.args["seeds"])
-        return _native().hop_reached_nodes_query(
-            index, seeds, int(traversal.args["n"]), traversal.args["direction"]
-        )
-    # shortest_path: a weight= expression (over parent edge columns) selects weighted
-    # Dijkstra, serialized and evaluated in Rust against the parent edge attribute batch.
-    weight = traversal.args.get("weight")
-    weight_json = None
-    edge_attr = None
-    if weight is not None:
-        weight_json = json.dumps(_expr_to_json(weight))
-        edge_attr = _prepare_weighted(_parent_edges(edges), _expr_columns(weight))
-    return _native().shortest_path_nodes_query(
-        index,
-        _resolve_seeds([traversal.args["source"]]),
-        _resolve_seeds([traversal.args["target"]]),
-        traversal.args["direction"],
-        weight_json,
-        edge_attr,
-    )
 
 
 def _native() -> Any:

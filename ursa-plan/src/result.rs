@@ -17,10 +17,11 @@ use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
     betweenness, betweenness_weighted, closeness_directed, closeness_weighted_directed,
     clustering_from_triangles, connected_components_strong, connected_components_weak, degree,
-    k_hop, label_propagation, layout_circle, layout_fr, layout_random, louvain, louvain_weighted,
-    neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles, random_walk,
-    shortest_path, shortest_path_weighted_with_cost, symmetric_view, symmetric_view_weighted,
-    undirected_view, AggKind, LayoutParams, PageRankParams, UndirectedView,
+    k_hop_masked, label_propagation, layout_circle, layout_fr, layout_random, louvain,
+    louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles,
+    random_walk_masked, shortest_path_masked, shortest_path_weighted_with_cost_masked,
+    symmetric_view, symmetric_view_weighted, undirected_view, AggKind, LayoutParams,
+    PageRankParams, UndirectedView,
 };
 use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
@@ -553,11 +554,12 @@ pub fn hop_schema(id_type: DataType) -> SchemaRef {
 pub fn hop_batch(
     topo: &Topology,
     ids: &IdMap,
+    mask: Option<&EdgeMask>,
     seeds: &[u32],
     n: u32,
     direction: Direction,
 ) -> Result<RecordBatch> {
-    let (seed_dense, reached_dense) = k_hop(topo, seeds, n, direction);
+    let (seed_dense, reached_dense) = k_hop_masked(topo, mask, seeds, n, direction);
     RecordBatch::try_new(
         hop_schema(ids.user_type()),
         vec![
@@ -589,6 +591,7 @@ pub fn path_schema(id_type: DataType) -> SchemaRef {
 pub fn path_batch(
     topo: &Topology,
     ids: &IdMap,
+    mask: Option<&EdgeMask>,
     source: u32,
     target: u32,
     direction: Direction,
@@ -602,11 +605,17 @@ pub fn path_batch(
     // unweighted paths derive the cost as the hop count (`hop + 1`) for schema
     // uniformity, so `cost` is always present and downstream never special-cases it.
     let (route, node_costs) = match weights {
-        Some(w) => match shortest_path_weighted_with_cost(topo, w, source, target, direction) {
-            Some((path, costs)) => (Some(path), Some(costs)),
-            None => (None, None),
-        },
-        None => (shortest_path(topo, source, target, direction), None),
+        Some(w) => {
+            match shortest_path_weighted_with_cost_masked(topo, mask, w, source, target, direction)
+            {
+                Some((path, costs)) => (Some(path), Some(costs)),
+                None => (None, None),
+            }
+        }
+        None => (
+            shortest_path_masked(topo, mask, source, target, direction),
+            None,
+        ),
     };
     if let Some(nodes) = route {
         for (i, window) in nodes.windows(2).enumerate() {
@@ -650,12 +659,13 @@ pub fn walk_schema(id_type: DataType) -> SchemaRef {
 pub fn walk_batch(
     topo: &Topology,
     ids: &IdMap,
+    mask: Option<&EdgeMask>,
     starts: &[u32],
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
 ) -> Result<RecordBatch> {
-    let walks = random_walk(topo, starts, steps, walks_per_node, seed);
+    let walks = random_walk_masked(topo, mask, starts, steps, walks_per_node, seed);
     let node = ids.gather_user(&walks.node);
     RecordBatch::try_new(
         walk_schema(ids.user_type()),

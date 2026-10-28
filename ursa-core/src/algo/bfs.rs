@@ -10,7 +10,7 @@
 //! out- and in-neighbours, via the shared [`Topology::for_each_neighbor`] /
 //! [`Topology::for_each_weighted_neighbor`] helpers.
 
-use crate::topology::{Direction, Topology};
+use crate::topology::{Direction, EdgeMask, Topology};
 
 /// Hop distance from `source` to every node: `dist[v]` is the number of edges on
 /// a shortest `source → v` path, or `-1` if `v` is unreachable. `dist[source]` is
@@ -51,6 +51,17 @@ pub fn shortest_path(
     target: u32,
     dir: Direction,
 ) -> Option<Vec<u32>> {
+    shortest_path_masked(topo, None, source, target, dir)
+}
+
+/// [`shortest_path`] over the subgraph view `mask` (`None`: the whole graph).
+pub fn shortest_path_masked(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    source: u32,
+    target: u32,
+    dir: Direction,
+) -> Option<Vec<u32>> {
     let n = topo.n_nodes();
     if (source as usize) >= n || (target as usize) >= n {
         return None;
@@ -70,7 +81,7 @@ pub fn shortest_path(
         next.clear();
         for &u in &frontier {
             let mut hit = false;
-            topo.for_each_neighbor(u, dir, None, |v| {
+            topo.for_each_neighbor(u, dir, mask, |v| {
                 if parent[v as usize] < 0 {
                     parent[v as usize] = u as i64;
                     if v == target {
@@ -196,6 +207,19 @@ pub fn shortest_path_weighted_with_cost(
     target: u32,
     dir: Direction,
 ) -> Option<(Vec<u32>, Vec<f64>)> {
+    shortest_path_weighted_with_cost_masked(topo, None, weights, source, target, dir)
+}
+
+/// [`shortest_path_weighted_with_cost`] over the subgraph view `mask` (`None`:
+/// the whole graph).
+pub fn shortest_path_weighted_with_cost_masked(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    weights: &[f64],
+    source: u32,
+    target: u32,
+    dir: Direction,
+) -> Option<(Vec<u32>, Vec<f64>)> {
     assert_eq!(
         weights.len(),
         topo.n_edges(),
@@ -230,7 +254,7 @@ pub fn shortest_path_weighted_with_cost(
         if u == target {
             break; // settled the target — its distance is final
         }
-        topo.for_each_weighted_neighbor(u, weights, dir, None, |v, w| {
+        topo.for_each_weighted_neighbor(u, weights, dir, mask, |v, w| {
             if !settled[v as usize] {
                 let nd = du + w;
                 if nd < dist[v as usize] {

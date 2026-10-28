@@ -15,7 +15,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use super::rng::DEFAULT_SEED;
-use crate::topology::Topology;
+use crate::topology::{EdgeMask, Topology};
 
 /// A flat column-oriented walk table; the three vectors are row-aligned. `node`
 /// holds dense `u32` indices — translation to user ids happens at the Arrow
@@ -36,6 +36,20 @@ pub fn random_walk(
     walks_per_node: u32,
     seed: Option<u64>,
 ) -> Walks {
+    random_walk_masked(topo, None, starts, steps, walks_per_node, seed)
+}
+
+/// [`random_walk`] over the subgraph view `mask` (`None`: the whole graph): each
+/// step picks uniformly among the kept out-edges, and a node with none is a dead
+/// end.
+pub fn random_walk_masked(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    starts: &[u32],
+    steps: u32,
+    walks_per_node: u32,
+    seed: Option<u64>,
+) -> Walks {
     let n = topo.n_nodes();
     let out = topo.out();
     let mut rng = ChaCha8Rng::seed_from_u64(seed.unwrap_or(DEFAULT_SEED));
@@ -44,6 +58,7 @@ pub fn random_walk(
     let mut step_col = Vec::new();
     let mut node_col = Vec::new();
     let mut next_id = 0i64;
+    let mut kept: Vec<u32> = Vec::new();
 
     for &start in starts {
         if (start as usize) >= n {
@@ -55,7 +70,15 @@ pub fn random_walk(
             step_col.push(0);
             node_col.push(cur);
             for s in 1..=steps {
-                let nbrs = out.neighbors(cur);
+                let nbrs = match mask {
+                    None => out.neighbors(cur),
+                    Some(m) => {
+                        kept.clear();
+                        let slots = out.neighbors(cur).iter().zip(out.edge_ids(cur));
+                        kept.extend(slots.filter(|(_, &e)| m.keep(e)).map(|(&v, _)| v));
+                        &kept
+                    }
+                };
                 if nbrs.is_empty() {
                     break; // dead end — the walk stops here
                 }
@@ -122,5 +145,24 @@ mod tests {
     fn out_of_range_start_is_skipped() {
         let w = random_walk(&line(), &[99], 3, 1, None);
         assert!(w.node.is_empty());
+    }
+
+    #[test]
+    fn masked_walks_skip_dropped_edges() {
+        // 0 -> {1, 2, 3}; keep only 0->3, so every first step lands on 3.
+        let t = Topology::build(4, vec![0, 0, 0], vec![1, 2, 3]);
+        let m = EdgeMask::from_bools(&[false, false, true]);
+        let w = random_walk_masked(&t, Some(&m), &[0], 2, 5, Some(3));
+        assert!(w
+            .node
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| w.step[i] != 1 || v == 3));
+        // With no kept out-edge the start is a dead end.
+        let none = EdgeMask::from_bools(&[false, false, false]);
+        assert_eq!(
+            random_walk_masked(&t, Some(&none), &[0], 2, 1, None).node,
+            vec![0]
+        );
     }
 }
