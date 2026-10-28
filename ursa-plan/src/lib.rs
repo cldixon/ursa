@@ -30,6 +30,7 @@ pub mod expr;
 pub mod logical;
 pub mod lower;
 pub mod node;
+mod parquet_stats;
 pub mod physical;
 pub mod plan;
 pub mod planner;
