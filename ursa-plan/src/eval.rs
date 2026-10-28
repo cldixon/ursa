@@ -12,11 +12,10 @@ use std::sync::{Arc, OnceLock};
 use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, SchemaRef};
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DFSchema, ScalarValue};
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::functions::math::expr_fn::isnan;
-use datafusion::logical_expr::{lit, when, BinaryExpr, Expr, ExprSchemable, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
@@ -33,81 +32,22 @@ fn session() -> &'static SessionContext {
     CTX.get_or_init(SessionContext::new)
 }
 
-/// How a float comparison treats NaN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NanOrder {
-    /// The engine's order (DataFusion, Polars): NaN is greater than every other
-    /// value and equal to itself.
-    Total,
-    /// IEEE 754: any comparison with NaN is false (`!=` is true), as pyarrow
-    /// compares.
-    Ieee,
-}
-
 /// Compile a predicate (its JSON, role references already resolved) against
 /// `schema`.
-pub fn compile(predicate: &Value, schema: &SchemaRef, nan: NanOrder) -> Result<Compiled> {
+///
+/// Float comparisons use the engine's total order everywhere (#199): NaN equals
+/// NaN and is greater than every number, as in `sort()`.
+pub fn compile(predicate: &Value, schema: &SchemaRef) -> Result<Compiled> {
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
-    let expr = logical(predicate, &df_schema, nan)?;
+    let expr = logical(predicate, &df_schema)?;
     session().create_physical_expr(expr, &df_schema)
 }
 
 /// The predicate as a logical expression over `schema` (for a scan to push down).
-pub fn logical(predicate: &Value, schema: &DFSchema, nan: NanOrder) -> Result<Expr> {
+pub fn logical(predicate: &Value, schema: &DFSchema) -> Result<Expr> {
     let expr = lower(&parse_ursa_expr(predicate)?)?;
     check_timezones(&expr, schema)?;
-    match nan {
-        NanOrder::Total => Ok(expr),
-        NanOrder::Ieee => ieee_comparisons(expr, schema),
-    }
-}
-
-fn is_float(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Float16 | DataType::Float32 | DataType::Float64
-    )
-}
-
-/// Rewrite each comparison with a float operand to compare NaN the IEEE way:
-/// null if either side is null, else the NaN answer if either side is NaN, else
-/// the comparison itself.
-fn ieee_comparisons(expr: Expr, schema: &DFSchema) -> Result<Expr> {
-    expr.transform_up(|e| {
-        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = &e else {
-            return Ok(Transformed::no(e));
-        };
-        let nan_answer = match op {
-            Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => false,
-            Operator::NotEq => true,
-            _ => return Ok(Transformed::no(e)),
-        };
-        let floats: Vec<&Expr> = [left.as_ref(), right.as_ref()]
-            .into_iter()
-            .filter(|side| side.get_type(schema).is_ok_and(|t| is_float(&t)))
-            .collect();
-        let Some(nan) = floats
-            .into_iter()
-            .map(|side| isnan(side.clone()))
-            .reduce(Expr::or)
-        else {
-            return Ok(Transformed::no(e));
-        };
-        let null = left
-            .as_ref()
-            .clone()
-            .is_null()
-            .or(right.as_ref().clone().is_null());
-        let ieee = when(null, lit(ScalarValue::Boolean(None)))
-            .when(nan, lit(nan_answer))
-            .otherwise(e.clone())?;
-        // Where the IEEE answer is true the engine's is too (all but `!=`), so the
-        // plain comparison can lead as a conjunct: the same value, and a form a
-        // scan's statistics pruning understands.
-        let rewritten = if nan_answer { ieee } else { e.and(ieee) };
-        Ok(Transformed::yes(rewritten))
-    })
-    .map(|t| t.data)
+    Ok(expr)
 }
 
 /// A comparison of a timezone-aware timestamp with a naive one: an error, as it
@@ -277,9 +217,9 @@ mod tests {
         .unwrap()
     }
 
-    fn kept(pred: Value, nan: NanOrder) -> Vec<usize> {
+    fn kept(pred: Value) -> Vec<usize> {
         let b = batch();
-        let p = compile(&pred, &b.schema(), nan).unwrap();
+        let p = compile(&pred, &b.schema()).unwrap();
         let flags = keep_flags(&[b], &[p]).unwrap();
         (0..flags.len()).filter(|&i| flags.value(i)).collect()
     }
@@ -290,22 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn nan_compares_by_the_chosen_order() {
+    fn nan_compares_in_total_order() {
+        // f = [0.5, NaN, null, 2.0]: NaN is above every number and equals itself.
         let gt = cmp(">", "f", serde_json::json!({"kind": "lit", "value": 1.0}));
-        assert_eq!(kept(gt.clone(), NanOrder::Total), vec![1, 3]);
-        assert_eq!(kept(gt.clone(), NanOrder::Ieee), vec![3]);
-        // ~(f > 1): IEEE keeps the NaN row (false negated), and the null stays null.
+        assert_eq!(kept(gt.clone()), vec![1, 3]);
         let not = serde_json::json!({"kind": "unary", "op": "~", "operand": gt});
-        assert_eq!(kept(not, NanOrder::Ieee), vec![0, 1]);
+        assert_eq!(kept(not), vec![0]);
         let nan = serde_json::json!({"kind": "lit", "type": "float64", "value": "nan"});
-        assert_eq!(
-            kept(cmp("!=", "f", nan.clone()), NanOrder::Ieee),
-            vec![0, 1, 3]
-        );
-        assert_eq!(
-            kept(cmp("==", "f", nan), NanOrder::Ieee),
-            Vec::<usize>::new()
-        );
+        assert_eq!(kept(cmp("!=", "f", nan.clone())), vec![0, 3]);
+        assert_eq!(kept(cmp("==", "f", nan)), vec![1]);
     }
 
     #[test]
@@ -314,7 +247,6 @@ mod tests {
         let p = compile(
             &cmp(">", "i", serde_json::json!({"kind": "lit", "value": 2})),
             &b.schema(),
-            NanOrder::Ieee,
         )
         .unwrap();
         let out = filter_batches(vec![b.clone(), b.clone()], std::slice::from_ref(&p)).unwrap();
@@ -331,7 +263,6 @@ mod tests {
         let none = compile(
             &cmp(">", "i", serde_json::json!({"kind": "lit", "value": 9})),
             &b.schema(),
-            NanOrder::Ieee,
         )
         .unwrap();
         let out = filter_batches(vec![b], &[none]).unwrap();
@@ -342,6 +273,6 @@ mod tests {
     #[test]
     fn a_null_literal_keeps_nothing() {
         let eq_null = cmp("==", "i", serde_json::json!({"kind": "lit", "value": null}));
-        assert_eq!(kept(eq_null, NanOrder::Ieee), Vec::<usize>::new());
+        assert_eq!(kept(eq_null), Vec::<usize>::new());
     }
 }

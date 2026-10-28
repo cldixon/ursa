@@ -40,10 +40,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   Masks are cached on the graph index, keyed by the view, so two frames with
   the same filter share one. A `scan_nodes` frame keeps one table, the union
   of the columns read so far, instead of one table per projection (#178).
-  Results are unchanged; NaN still compares as it did on each path: IEEE on
-  plain frames, masks and steps after the engine's tail, and the engine's
-  order (NaN above every value, equal to itself) inside an engine query (#192,
-  part of #189). PERF_PLACEHOLDER
+  Results are unchanged, except for NaN (next entry) (#192, part of #189). PERF_PLACEHOLDER
+- **Behaviour change:** NaN compares in total order in every filter: NaN equals
+  NaN and is greater than every number, as in `sort()`. Filters inside an
+  engine query already did; filters on plain frames, subgraph masks and steps
+  after the engine's tail compared IEEE-style (any comparison with NaN false,
+  `!=` true). With `f = [0.5, NaN, null, 2.0, -1.0]`, a plain frame keeps:
+
+  | filter | before | after |
+  |---|---|---|
+  | `f > 1` | `2.0` | `NaN, 2.0` |
+  | `~(f > 1)` | `0.5, NaN, -1.0` | `0.5, -1.0` |
+  | `f == nan` | none | `NaN` |
+  | `f != nan` | `0.5, NaN, 2.0, -1.0` | `0.5, 2.0, -1.0` |
+  | `f != f` | `NaN` | none |
+  | `f / 0 > 1` | `0.5, 2.0` | `0.5, NaN, 2.0` |
+
+  Nulls are unchanged: a comparison with null is null, and the row is dropped
+  (#199).
 - Filters inside an engine query (after graph columns, a join or a traversal)
   accept every literal a plain-frame filter does: datetimes, dates, times,
   timedeltas, `numpy.datetime64`/`timedelta64`, `Decimal`, NaN, infinity and

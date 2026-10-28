@@ -64,7 +64,6 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use ursa_core::{EdgeMask, IdMap, Topology};
 
-use crate::eval::NanOrder;
 use crate::expr::GraphVerb;
 use crate::query::{
     execute_hop_query, execute_join_query, execute_node_query_cached, execute_path_query,
@@ -1815,7 +1814,6 @@ fn edge_rows(
                 &opts,
                 columns.unwrap_or(&[]),
                 &[],
-                HOST_NAN,
                 on_null == "drop",
             )?;
             if rows.dropped > 0 {
@@ -2133,7 +2131,6 @@ fn collect_plain_edges(
         &opts,
         needed.as_deref().unwrap_or(&[]),
         &pushed,
-        HOST_NAN,
         drop_nulls,
     )?;
     if rows.dropped > 0 {
@@ -2417,13 +2414,6 @@ fn apply_steps(
     Ok(rows)
 }
 
-/// How a filter the host's pyarrow evaluator used to run compares NaN: the IEEE
-/// way, as pyarrow does, so plain frames, subgraph masks and the steps after the
-/// engine's tail keep their results (#192). Filters inside an engine query keep
-/// the engine's total order ([`NanOrder::Total`]). One switch, to flip when the
-/// two are unified.
-pub const HOST_NAN: NanOrder = NanOrder::Ieee;
-
 /// Compile a filter predicate that runs outside an engine query against `schema`,
 /// with the checks and errors the host's evaluator had (`_eval_pyarrow`).
 fn host_predicate(
@@ -2439,7 +2429,6 @@ fn host_predicate(
     Ok(crate::eval::compile(
         &resolve_roles(v, roles)?,
         schema,
-        HOST_NAN,
     )?)
 }
 

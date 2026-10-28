@@ -44,7 +44,6 @@ use serde_json::Value;
 use url::{Position, Url};
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
-use crate::eval::NanOrder;
 
 /// The object store for a scan `path`, with the `scheme://authority` base it is
 /// registered under. A schemeless (bare local) path parses as an error and needs
@@ -513,7 +512,6 @@ pub fn scan_edges_table(
         storage_options,
         columns,
         &[],
-        NanOrder::Ieee,
         false,
     )?
     .batches)
@@ -556,7 +554,6 @@ pub fn scan_edges_rows(
     storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
-    nan: NanOrder,
     drop_nulls: bool,
 ) -> Result<EdgeRows> {
     let (rows, pushed, _) = scan_edges_rows_plan(
@@ -566,7 +563,6 @@ pub fn scan_edges_rows(
         storage_options,
         columns,
         filters,
-        nan,
         drop_nulls,
     )?;
     if pushed < filters.len() {
@@ -588,7 +584,6 @@ pub fn scan_edges_rows_pushing(
     storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
-    nan: NanOrder,
     drop_nulls: bool,
 ) -> Result<(EdgeRows, usize)> {
     let (rows, pushed, _) = scan_edges_rows_plan(
@@ -598,7 +593,6 @@ pub fn scan_edges_rows_pushing(
         storage_options,
         columns,
         filters,
-        nan,
         drop_nulls,
     )?;
     Ok((rows, pushed))
@@ -613,7 +607,6 @@ fn scan_edges_rows_plan(
     storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
-    nan: NanOrder,
     drop_nulls: bool,
 ) -> Result<(EdgeRows, usize, Arc<dyn ExecutionPlan>)> {
     crate::runtime::block_on(async move {
@@ -648,7 +641,7 @@ fn scan_edges_rows_plan(
         let mut filtered = df.clone();
         let mut pushed = 0;
         for f in filters {
-            let Ok(expr) = crate::eval::logical(f, filtered.schema(), nan) else {
+            let Ok(expr) = crate::eval::logical(f, filtered.schema()) else {
                 break;
             };
             let readable = expr
@@ -1146,7 +1139,6 @@ mod tests {
             &no_opts(),
             &[],
             &[pred],
-            NanOrder::Ieee,
             false,
         )
         .unwrap();
@@ -1177,7 +1169,6 @@ mod tests {
             &no_opts(),
             &[],
             &[none],
-            NanOrder::Ieee,
             false,
         )
         .unwrap();

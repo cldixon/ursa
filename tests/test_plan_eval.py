@@ -92,7 +92,7 @@ def test_equal_views_share_one_mask():
     assert edges._index_build_cell.value._mask_build_count() == 1
 
 
-# --- NaN: each path keeps the comparison it had on main ---------------------------
+# --- NaN: total order on every path (#199, a behaviour change) --------------------
 NAN_TABLE = pa.table(
     {"id": [0, 1, 2, 3, 4], "f": pa.array([0.5, math.nan, None, 2.0, -1.0], pa.float64())}
 )
@@ -107,23 +107,32 @@ def _engine(pred):
     return _rows(ur.from_arrow(NAN_TABLE, id="id").join(keys, on="id").filter(pred).select("id"))
 
 
+def _mask(pred):
+    edges = ur.from_arrow(NAN_TABLE.append_column("d", pa.array([1, 2, 3, 4, 0])), src="id", dst="d")
+    out = _rows(ur.degree(edges.filter(pred))._frame())
+    return [{"id": r["id"]} for r in out if r["degree"]]
+
+
+# Rows kept, ids into f = [0.5, NaN, null, 2.0, -1.0]. The comment is what main
+# kept on plain frames and masks, which compared IEEE-style (the engine already
+# used total order).
 @pytest.mark.parametrize(
-    ("pred", "plain", "engine"),
+    ("pred", "kept"),
     [
-        (ur.col("f") > 1.0, [3], [1, 3]),
-        (~(ur.col("f") > 1.0), [0, 1, 4], [0, 4]),
-        (ur.col("f") != ur.col("f"), [1], []),
-        ((ur.col("f") / 0) > 1, [0, 3], [0, 1, 3]),
-        (ur.col("f") == math.nan, [], [1]),
-        (ur.col("f") < math.inf, [0, 3, 4], [0, 3, 4]),
+        (ur.col("f") > 1.0, [1, 3]),  # main: [3]
+        (~(ur.col("f") > 1.0), [0, 4]),  # main: [0, 1, 4]
+        (ur.col("f") != ur.col("f"), []),  # main: [1]
+        ((ur.col("f") / 0) > 1, [0, 1, 3]),  # main: [0, 3]
+        (ur.col("f") == math.nan, [1]),  # main: []
+        (ur.col("f") != math.nan, [0, 3, 4]),  # main: [0, 1, 3, 4]
+        (ur.col("f") < math.inf, [0, 3, 4]),  # unchanged
     ],
 )
-def test_nan_compares_ieee_on_plain_paths_and_in_total_order_in_the_engine(pred, plain, engine):
-    # A filter main ran in pyarrow (plain frames, subgraph masks, steps after the
-    # engine's tail) keeps IEEE NaN; a filter inside an engine query keeps the
-    # engine's total order (NaN above everything, equal to itself).
-    assert [r["id"] for r in _plain(pred)] == plain
-    assert [r["id"] for r in _engine(pred)] == engine
+def test_nan_now_compares_in_total_order_on_plain_and_mask_paths(pred, kept):
+    # NaN equals NaN and is above every number, as in sort() and inside the engine.
+    assert [r["id"] for r in _plain(pred)] == kept
+    assert [r["id"] for r in _engine(pred)] == kept
+    assert [r["id"] for r in _mask(pred)] == kept
 
 
 # --- typed literals ---------------------------------------------------------------
