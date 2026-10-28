@@ -177,7 +177,7 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
         ),
         "error_join_how": (
             "An unsupported join kind.",
-            lambda: kn.join(kn, on="id", how="outer"),
+            lambda: kn.join(kn, on="id", how="cross"),
         ),
         "error_role_out_of_context": (
             "ur.src() in a filter over walk rows.",

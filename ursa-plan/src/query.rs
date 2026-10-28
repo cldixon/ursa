@@ -1,5 +1,5 @@
-//! The leaves of a query: the graph and traversal extension nodes, the attach of
-//! graph columns to a frame's rows by id, and the user-facing join.
+//! The leaves of a query: the graph and traversal extension nodes, and the attach
+//! of graph columns to a frame's rows by id.
 //!
 //! Each builds the DataFusion plan (or the rows) a [`crate::lower::Frame`] starts
 //! from; the relational steps written after it are lowered on top of it by
@@ -13,13 +13,12 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Extension, JoinType, LogicalPlan};
-use datafusion::prelude::{coalesce, lit, DataFrame, SessionContext};
+use datafusion::prelude::{DataFrame, SessionContext};
 use ursa_core::algo::AggKind;
 use ursa_core::{EdgeMask, IdMap, Topology};
 
 use crate::expr::GraphVerb;
 use crate::logical::{Direction, GraphAlgo, LayoutKind};
-use crate::lower::col_named;
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::result::{path_schema, query_batch, OutputColumn, OutputDtype};
 use crate::weight::{edge_weights, WeightCache};
@@ -454,98 +453,6 @@ fn graph_batch(
     })?
 }
 
-/// Equi-join two materialized frames on shared key column(s): the user-facing
-/// `frame.join(other, on=, how=)`, distinct from the attach of algorithm outputs
-/// to node attributes ([`attach_columns`]). Both operands are just Arrow tables,
-/// so no graph index is involved.
-///
-/// `on` names key columns present in **both** frames (a same-name equi-join). The
-/// right side's key columns are renamed to private sentinels for the join and then
-/// dropped, so each key appears once (the left copy) in the output. Non-key
-/// column-name collisions are rejected by the caller. `how` is `inner` or `left`.
-///
-/// A hash join's output order depends on the partition count, so the rows are
-/// numbered: the left row's position, then the right row's (null, so last, for
-/// an unmatched left-join row), the order of a left-major nested-loop join.
-///
-/// `right`/`outer` are deferred deliberately: for a right-only or unmatched row
-/// the left key is null, so dropping the right key (as for `inner`/`left`, where
-/// the left key always survives) would lose the key value — a correct
-/// `right`/`outer` needs `coalesce(left_key, right_key)`, a follow-up.
-pub fn join_frame(
-    ctx: &SessionContext,
-    left: Vec<RecordBatch>,
-    right: Vec<RecordBatch>,
-    on: &[String],
-    how: &str,
-) -> Result<crate::lower::Frame> {
-    if on.is_empty() {
-        return Err(DataFusionError::Execution(
-            "join() needs at least one key column (on=)".into(),
-        ));
-    }
-    let join_type = match how {
-        "inner" => JoinType::Inner,
-        "left" => JoinType::Left,
-        other => {
-            return Err(DataFusionError::NotImplemented(format!(
-                "join how={other:?} is not supported yet (use 'inner' or 'left'; \
-                 'right'/'outer' are a follow-up)"
-            )));
-        }
-    };
-    let schemas = Schema::try_merge([
-        left[0].schema().as_ref().clone(),
-        Schema::new(
-            right[0]
-                .schema()
-                .fields()
-                .iter()
-                .filter(|f| left[0].schema().index_of(f.name()).is_err())
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
-    ])
-    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    let l = crate::lower::fresh_name_with(&schemas, "_l");
-    let r = crate::lower::fresh_name_with(&schemas, "_r");
-    let combined = crate::lower::fresh_name(&schemas);
-    let left_rows: usize = left.iter().map(|b| b.num_rows()).sum();
-    let right_rows: usize = right.iter().map(|b| b.num_rows()).sum();
-    let left_df = ctx.read_batches(crate::lower::attach_ordinal(left, &l)?)?;
-    let mut right_df = ctx.read_batches(crate::lower::attach_ordinal(right, &r)?)?;
-    // Rename each right key to a private sentinel so the join keys don't collide,
-    // then drop the sentinels after the join — the left key survives.
-    let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
-    for (k, s) in on.iter().zip(sentinels.iter()) {
-        right_df = right_df.with_column_renamed(k, s)?;
-    }
-    let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
-    let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-    let sentinel_refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
-    let joined = left_df
-        .join(right_df, join_type, &left_keys, &right_keys, None)?
-        .drop_columns(&sentinel_refs)?;
-    // Fold the pair into one ordinal, `l * (R + 1) + coalesce(r, R)`, which orders
-    // exactly like `(l, r nulls last)` and is unique per joined row.
-    let span = right_rows as u128 + 1;
-    if (left_rows as u128) * span > u64::MAX as u128 {
-        return Err(DataFusionError::NotImplemented(
-            "a join whose row positions overflow 64 bits".into(),
-        ));
-    }
-    let span = span as u64;
-    let ord = col_named(&l) * lit(span) + coalesce(vec![col_named(&r), lit(span - 1)]);
-    let joined = joined
-        .with_column(&combined, ord)?
-        .drop_columns(&[l.as_str(), r.as_str()])?;
-    Ok(crate::lower::Frame::from_numbered(
-        ctx.clone(),
-        joined,
-        combined,
-    ))
-}
-
 /// The leaf of a `hop` traversal: a [`HopNode`] emitting the reached `(src, dst)`
 /// edge frame in its own order (seed order, then BFS order), as one partition.
 /// `seeds` are user ids; unknown seeds contribute nothing (matching the kernel).
@@ -798,7 +705,7 @@ pub(crate) fn cols(json: &str) -> Vec<NodeColumn> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::{Frame, TEST_PARTITIONS};
+    use crate::lower::{col_named, Frame, TEST_PARTITIONS};
     use arrow::compute::concat_batches;
     use arrow::datatypes::Field;
     use datafusion::prelude::col;
@@ -940,7 +847,11 @@ mod tests {
         rename: Vec<(String, String)>,
     ) -> Result<Vec<RecordBatch>> {
         assert!(sample.is_none(), "sample is drawn by the plan's host");
-        let mut frame = join_frame(&query_session(), left, right, &on, &how)?;
+        let how = crate::lower::How::parse(&how)
+            .ok_or_else(|| DataFusionError::NotImplemented(format!("join how={how:?}")))?;
+        let ctx = query_session();
+        let left = Frame::from_batches(ctx.clone(), left)?;
+        let mut frame = crate::lower::join(left, Frame::from_batches(ctx, right)?, &on, how)?;
         tail(
             &mut frame,
             filters,
@@ -1752,7 +1663,7 @@ mod tests {
             vec![left],
             vec![right],
             vec!["id".into()],
-            "outer".into(),
+            "cross".into(),
             &[],
             None,
             None,
@@ -1760,7 +1671,7 @@ mod tests {
             None,
             vec![],
         );
-        assert!(err.is_err()); // right/outer deferred
+        assert!(err.is_err());
     }
 
     // --- implicit sort tiebreaker (#165) -----------------------------------------

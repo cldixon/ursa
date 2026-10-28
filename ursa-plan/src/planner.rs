@@ -2,7 +2,8 @@
 //! `SessionContext` that knows how to do so.
 //!
 //! [`GraphExtensionPlanner`] maps [`crate::node::GraphAlgorithmNode`] to
-//! [`crate::physical::GraphAlgorithmExec`] during physical planning;
+//! [`crate::physical::GraphAlgorithmExec`] (and each of Ursa's other extension
+//! nodes to its operator) during physical planning;
 //! `GraphQueryPlanner` installs it into DataFusion's `DefaultPhysicalPlanner`;
 //! [`graph_session`] hands out a `SessionContext` with that planner registered. The
 //! result: `ctx.execute_logical_plan(plan)` optimizes and executes a plan whose
@@ -22,6 +23,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
+use crate::ordinal::EnumerateNode;
 use crate::physical::{GraphAlgorithmExec, HopExec, RandomWalkExec, ShortestPathExec};
 
 /// Maps each Ursa graph logical node to its `ExecutionPlan`.
@@ -35,10 +37,13 @@ impl ExtensionPlanner for GraphExtensionPlanner {
         _planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
-        _physical_inputs: &[Arc<dyn ExecutionPlan>],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let any = node.as_any();
+        if let (Some(n), [input]) = (any.downcast_ref::<EnumerateNode>(), physical_inputs) {
+            return Ok(Some(n.plan(input.clone())));
+        }
         if let Some(n) = any.downcast_ref::<GraphAlgorithmNode>() {
             return Ok(Some(Arc::new(GraphAlgorithmExec::new(
                 n.topology.clone(),

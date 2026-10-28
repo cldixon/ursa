@@ -14,7 +14,6 @@ Ursa is version 0.4. The API is stable in shape, and some combinations of steps 
 | Combination | Status |
 |---|---|
 | A step other than `filter` on an `EdgeFrame` before `nodes()` | Collect the edges and build a new frame. |
-| Two `join` steps | One per plan. |
 | A weighted algorithm over a scan with several paths | Pass one path, or read the files into memory first. |
 | A graph algorithm over a `distinct`, `sample`, `join`, or `group_by` result | Collect the rows and build a new frame. A `filter` on the edges works directly. See [Reshaped edge sets](guides/subgraphs.md#reshaped-edge-sets). |
 | `edges.nodes().collect()` with no columns | Add a column first, for example `with_columns(degree=ur.degree(edges))`. |

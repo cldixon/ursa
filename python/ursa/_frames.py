@@ -174,17 +174,26 @@ class _Frame:
         """Equi-join this frame with ``other`` on the shared key column(s) ``on``.
 
         ``on`` is a column name (or ``ur.col(name)``), or a list of them, present in
-        both frames; ``how`` is ``"inner"`` or ``"left"``. The result keeps this
-        frame's type (a NodeFrame stays a NodeFrame). This is a join between two
-        arbitrary frames — distinct from the automatic attribute attach that
+        both frames; ``how`` is ``"inner"``, ``"left"``, ``"right"``, ``"outer"``
+        (also spelled ``"full"``), ``"semi"`` or ``"anti"``. ``other`` is any frame:
+        a source, a graph column, a traversal, another join. The result keeps this
+        frame's type (a NodeFrame stays a NodeFrame) and has this frame's columns,
+        then ``other``'s non-key columns (none for ``semi``/``anti``); each key
+        appears once, holding ``other``'s key on a row with no match in this frame.
+        A null key matches nothing. This is a join between two arbitrary frames —
+        distinct from the automatic attribute attach that
         ``edges.nodes().with_columns(...)`` does. A join changes the row/column set,
         so the cached topology no longer matches (``drops_index=True``); a graph
         algorithm after a join therefore errors clearly rather than using a stale
         topology.
 
-        Rows come back in a fixed order: this frame's rows in order, each followed
-        by its matches in ``other``'s row order (an unmatched ``how="left"`` row
-        once, with nulls). A later ``sort`` breaks ties in that order.
+        Rows come back in a fixed order. For ``inner``, ``left``, ``semi`` and
+        ``anti``: this frame's rows in order, each followed by its matches in
+        ``other``'s row order (an unmatched ``how="left"`` row once, with nulls).
+        ``right`` is the mirror image: ``other``'s rows in order, each followed by
+        its matches in this frame's order. ``outer`` is ``left``'s order, then
+        ``other``'s unmatched rows in its order. A later ``sort`` breaks ties in
+        that order.
         """
         return self._extend(
             _PlanStep("join", {"other": other, "on": on, "how": how}), drops_index=True
