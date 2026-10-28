@@ -10,12 +10,19 @@
 //!
 //! [`execute_plan`] owns the *dispatch* (#190): it walks the tree, rejects the
 //! shapes that aren't supported (the [`PlanError::NotImplemented`] guards, with
-//! the messages the Python layer used to raise), and maps each supported shape
-//! onto the executors in [`crate::query`].
+//! the messages the Python layer used to raise), and builds each frame's leaf
+//! from [`crate::query`]: a source's rows, a graph or traversal node, a join.
+//!
+//! Every relational step is then lowered onto that leaf, in the order written,
+//! as stock DataFusion operators ([`crate::lower`], #191): `filter`, `select`,
+//! `with_columns`, `rename`, `sort`, `head`, `distinct`, `sample` and
+//! `group_by().agg()`, with the order guarantees implemented once there. A step
+//! means the same wherever it runs; its semantics and errors are the ones the
+//! plain frame always had.
 //!
 //! Since #192 it also owns the leaf work around them, with one expression
-//! evaluator ([`crate::expr`] lowered to DataFusion, [`crate::eval`] outside an
-//! engine query):
+//! evaluator ([`crate::expr`] lowered to DataFusion, [`crate::eval`] outside a
+//! plan):
 //!
 //! - plain sources: a scan reads the columns the steps need and takes its
 //!   leading filters into the read (Parquet row-group pruning); every `filter`
@@ -27,9 +34,8 @@
 //!
 //! The host (the Python layer) keeps what belongs to its frames, reached through
 //! [`Inputs`] by slot: each frame's source (its in-memory table, or a scan's
-//! storage options), its cached index and node-table cache, seed id sets, and
-//! the relational steps other than `filter` that the engine's fixed-order tail
-//! can't run in written order (the pyarrow tail, retired by #191).
+//! storage options), its cached index and node-table cache, seed id sets, and the
+//! rows a `sample` keeps (drawn with the host's seeded generator).
 //!
 //! Inputs are resolved lazily, in the order the executor needs them, so a plan
 //! that fails validation never builds an index or reads a file.
@@ -64,10 +70,14 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use ursa_core::{EdgeMask, IdMap, Topology};
 
+use arrow::datatypes::DataType;
+use datafusion::logical_expr::Expr as DfExpr;
+
 use crate::expr::GraphVerb;
+use crate::lower::{col_named, Frame};
 use crate::query::{
-    execute_hop_query, execute_join_query, execute_node_query_cached, execute_path_query,
-    execute_walk_query, parse_direction, resolve_dense, NodeColumn,
+    attach_columns, graph_leaf, hop_leaf, join_frame, node_columns, parse_direction, path_leaf,
+    resolve_dense, walk_leaf, NodeColumn,
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, NodeTableCache};
 use crate::stats::{describe, parse_stat_direction};
@@ -80,14 +90,13 @@ pub type Slot = usize;
 /// A query plan: one node per frame step, each holding its input.
 ///
 /// Relational nodes carry `step`, the host's handle for the frame step they came
-/// from, so the host can run that step itself when the engine's fixed-order tail
-/// can't (see [`Inputs::apply_steps`]). A step whose arguments the host could not
-/// parse is sent with `invalid` set and its arguments left out: the executor
-/// raises the host's error ([`Inputs::step_error`]) where it would have read the
-/// step, so a guard that fires earlier still wins.
+/// from: a `sample` draws its rows through it ([`Inputs::sample`]). A step whose
+/// arguments the host could not parse is sent with `invalid` set and its
+/// arguments left out: the executor raises the host's error
+/// ([`Inputs::step_error`]) where it would have read the step, so a guard that
+/// fires earlier still wins.
 ///
-/// Integer arguments are [`IntArg`]s, typed only where the engine reads them: the
-/// host's own evaluator takes the original step and whatever it accepts.
+/// Integer arguments are [`IntArg`]s, typed only where the engine reads them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Plan {
@@ -131,7 +140,7 @@ pub enum Plan {
     Select {
         input: Box<Plan>,
         #[serde(default)]
-        columns: Vec<String>,
+        columns: Vec<SelectItem>,
         #[serde(default)]
         step: Option<Slot>,
         #[serde(default)]
@@ -336,11 +345,22 @@ pub struct NamedExpr {
     pub expr: Expr,
 }
 
-/// One sort key.
+/// One `select` item: a column name, or an expression (its JSON).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SelectItem {
+    Name(String),
+    Expr(Value),
+}
+
+/// One sort key: a column, or an expression (its JSON).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SortKey {
-    pub column: String,
+    #[serde(default)]
+    pub column: Option<String>,
+    #[serde(default)]
+    pub expr: Option<Value>,
     #[serde(default)]
     pub descending: bool,
 }
@@ -554,7 +574,7 @@ impl EdgeInput {
 
 const TRAVERSAL_OPS: [&str; 2] = ["hop", "shortest_path"];
 
-/// The relational steps the engine's tail and the host both run (`_TAIL_OPS`).
+/// The relational steps [`lower_steps`] lowers.
 const TAIL_OPS: [&str; 8] = [
     "filter",
     "sort",
@@ -769,9 +789,8 @@ pub type Roles = [(&'static str, String)];
 ///
 /// The host keeps what belongs to its frames: their sources, their built
 /// [`GraphIndex`] (and with it the weight and mask caches), a node scan's
-/// [`NodeTableCache`], seeds, and the relational steps the engine's tail can't
-/// run in written order (the pyarrow tail, retired by #191). Everything else
-/// (scans, masks, weights, filters) runs here.
+/// [`NodeTableCache`], seeds, and the draw of a `sample`. Everything else
+/// (scans, masks, weights, every relational step) runs here.
 ///
 /// Batch lists are at least one batch long, so an empty result still carries its
 /// schema. Rows the host produces may stay host-side ([`Rows::Host`]) until the
@@ -802,11 +821,10 @@ pub trait Inputs {
     /// A seed set: user ids (int64 or string).
     fn seeds(&self, slot: Slot) -> PlanResult<ArrayRef>;
 
-    /// Run relational steps on `rows`, in order, with `roles` resolving role
-    /// references. These are the non-`filter` steps the engine's tail can't run as
-    /// written (and those on a plain source), each identified by its `step`
-    /// handle.
-    fn apply_steps(&self, rows: Rows, steps: &[&Plan], roles: &Roles) -> PlanResult<Rows>;
+    /// The rows a `sample` step keeps out of `rows` rows: their positions,
+    /// ascending, or `None` for all of them. The host draws them with its own
+    /// seeded generator from the step's `n` and `seed` (behind its `step` handle).
+    fn sample(&self, step: Slot, rows: usize) -> PlanResult<Option<Vec<usize>>>;
 
     /// Host rows as batches.
     fn batches(&self, rows: HostRows) -> PlanResult<Vec<RecordBatch>>;
@@ -911,6 +929,12 @@ impl From<DataFusionError> for PlanError {
     }
 }
 
+impl From<arrow::error::ArrowError> for PlanError {
+    fn from(e: arrow::error::ArrowError) -> Self {
+        PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
 pub type PlanResult<T> = std::result::Result<T, PlanError>;
 
 /// Execute a plan, reading its inputs from `inputs`. Returns at least one batch.
@@ -1005,46 +1029,44 @@ fn is_tail(p: &Plan) -> bool {
 
 // --- node frames ---------------------------------------------------------------
 
-/// A node frame's collect (`collect_node_frame`): `describe`, a random walk, or
-/// a node query (graph columns over the node set or an attribute table, an
-/// optional join, then the relational steps in the order written).
+/// A node frame's collect: `describe` or a random walk with the steps written
+/// after it, or a node source (an attribute table, or `edges.nodes()`) and its
+/// steps in the order written: graph columns (`with_columns`), a join, and the
+/// relational steps, lowered onto one frame.
 fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> {
     let id_col = node_id_col(chain);
     // describe() is a whole-graph summary, computed eagerly off the topology and
-    // wrapped as a one-row frame (not a per-node algorithm).
+    // wrapped as a one-row frame; steps written after it run on that row.
     if let Some(Plan::Describe {
         edges,
         full,
         direction,
-    }) = chain.iter().find(|p| matches!(p, Plan::Describe { .. }))
+    }) = chain.first()
     {
-        if chain.iter().any(|p| !matches!(p, Plan::Describe { .. })) {
-            return not_implemented(
-                "describe() output does not support a filter/sort/head tail yet; \
-                 call describe() as the final step of the pipeline.",
-            );
-        }
+        let steps = leaf_steps(chain, "describe()", inputs)?;
         let index = require_index(edges, inputs)?;
         let dir = parse_stat_direction(direction)?;
-        return Ok(Rows::Batches(vec![describe(&index.topo, *full, dir)?]));
+        let summary = describe(&index.topo, *full, dir)?;
+        if steps.is_empty() {
+            return Ok(Rows::Batches(vec![summary]));
+        }
+        let mut frame = Frame::from_batches(crate::lower::session(), vec![summary])?;
+        lower_steps(&mut frame, &steps, &[], inputs)?;
+        return Ok(Rows::Batches(frame.collect()?));
     }
 
     if let Some(walk) = chain.iter().find(|p| matches!(p, Plan::RandomWalk { .. })) {
         return collect_random_walk(chain, walk, inputs);
     }
 
-    let mut graph_exprs: Option<&[NamedExpr]> = None;
-    // The relational steps, in the order written. A join splits them: the steps
-    // written before it shape the left side, those after it apply to the joined rows.
+    // The steps after the `nodes()` boundary, in the order written. A
+    // `nodes()`-derived frame inherits the edge plan: its steps before the
+    // boundary are edge-plan steps (a `filter` there is a subgraph view, read as
+    // the edge mask), not node-result operators.
     let mut steps: Vec<&Plan> = vec![];
-    let mut pre_join: Vec<&Plan> = vec![];
-    let mut join: Option<&Plan> = None;
     let mut pre_nodes: Vec<&str> = vec![]; // non-filter edge-plan steps before `nodes`
-                                           // A `nodes()`-derived frame inherits the edge plan: its steps before the `nodes`
-                                           // boundary are edge-plan steps (a `filter` there is a subgraph view, read as the
-                                           // edge mask), not node-result operators.
+    let mut joined = false;
     let mut past_nodes_boundary = !chain.iter().any(|p| matches!(p, Plan::Nodes { .. }));
-
     for &step in chain {
         let op = step.op();
         if matches!(
@@ -1068,40 +1090,41 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             }
             continue;
         }
-        if let Plan::Join { how, .. } = step {
-            if join.is_some() {
-                return not_implemented("collect() supports a single join() for now.");
+        match step {
+            Plan::Join { how, .. } => {
+                if joined {
+                    return not_implemented("collect() supports a single join() for now.");
+                }
+                check_join_how(how)?;
+                joined = true;
             }
-            check_join_how(how)?;
-            check_step(step, inputs)?;
-            join = Some(step);
-            pre_join = std::mem::take(&mut steps);
-            continue;
-        }
-        if let Plan::WithColumns { columns, .. } = step {
-            if graph_exprs.is_some() {
-                return not_implemented(
-                    "collect() supports a single with_columns step in a composed pipeline for now.",
-                );
+            Plan::WithColumns { columns, .. } => {
+                for e in columns {
+                    if let Expr::Graph(verb) = &e.expr {
+                        check_verb(verb)?;
+                    }
+                }
             }
-            graph_exprs = Some(columns);
-            check_with_columns_position(&steps, join.is_some(), columns, &id_col)?;
-            continue;
-        }
-        if !is_tail(step) {
-            return not_implemented(format!(
-                "collect() does not yet support the '{op}' step in a composed pipeline."
-            ));
+            _ if !is_tail(step) => {
+                return not_implemented(format!(
+                    "collect() does not yet support the '{op}' step in a composed pipeline."
+                ));
+            }
+            _ => {}
         }
         check_step(step, inputs)?;
         steps.push(step);
     }
+    let first_columns = steps.iter().find_map(|s| match s {
+        Plan::WithColumns { columns, .. } => Some(columns.as_slice()),
+        _ => None,
+    });
 
     if !pre_nodes.is_empty() {
         // A graph op over that derived edge frame raises the precise guard;
         // otherwise the node set would silently ignore the step.
-        if let Some(exprs) = graph_exprs.filter(|g| !g.is_empty()) {
-            single_edges(exprs)?.view()?;
+        if let Some(exprs) = first_columns.filter(|g| !g.is_empty()) {
+            single_edges(graph_columns(exprs))?.view()?;
         }
         let mut seen = HashSet::new();
         let ops: Vec<String> = pre_nodes
@@ -1116,32 +1139,86 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
         ));
     }
 
-    if let Some(join) = join {
-        // The left side is this frame with the steps written before the join; the
-        // steps after it apply to its rows. ur.id() after the join is the real id.
-        let left = collect_node_query(chain, &id_col, graph_exprs, &pre_join, inputs)?;
-        return run_join(left, join, &steps, &[("id", id_col)], inputs);
+    let roles = [("id", id_col.clone())];
+    let Some(slot) = node_source_slot(chain) else {
+        // `edges.nodes()`: no rows until the first with_columns computes them.
+        if first_columns.is_none() {
+            return not_implemented(
+                "collect() on this NodeFrame needs a source (scan_nodes / from_arrow(id=...)) \
+                 or a with_columns of graph algorithms; a bare edges.nodes() has no \
+                 materializable node set yet.",
+            );
+        }
+        let first = steps
+            .iter()
+            .position(|s| matches!(s, Plan::WithColumns { .. }))
+            .expect("a with_columns step");
+        check_before_node_set(&steps[..first], steps[first])?;
+        let Plan::WithColumns { columns, .. } = steps[first] else {
+            unreachable!("found above")
+        };
+        let frame = node_set_frame(columns, inputs)?;
+        let frame = lower_node_steps(frame, &steps[..first], &roles, None, inputs)?;
+        let frame = lower_node_steps(frame, &steps[first + 1..], &roles, None, inputs)?;
+        return Ok(Rows::Batches(frame.collect()?));
+    };
+    // A scan reads the id, what a neighbour aggregation reads, and whatever the
+    // steps read before a select or group_by narrows the columns.
+    let mut required: BTreeSet<String> = BTreeSet::from([id_col.clone()]);
+    for s in &steps {
+        if let Plan::WithColumns { columns, .. } = s {
+            for e in columns {
+                if let Expr::Graph(verb) = &e.expr {
+                    if let Some(c) = verb.agg_column() {
+                        required.insert(c.to_string());
+                    }
+                }
+            }
+        }
     }
-    collect_node_query(chain, &id_col, graph_exprs, &steps, inputs)
+    let needed = projection(&steps, required, &roles);
+    let table = node_rows(chain, slot, needed.as_deref(), inputs)?;
+    if steps.is_empty() {
+        return Ok(table);
+    }
+    let table = table.into_batches(inputs)?;
+    let frame = Frame::from_batches(crate::lower::session(), table.clone())?;
+    let frame = lower_node_steps(frame, &steps, &roles, Some(&table), inputs)?;
+    Ok(Rows::Batches(frame.collect()?))
 }
 
-/// `with_columns` computes the graph columns on the frame's base rows, so a
-/// relational step written before it would otherwise silently move after it. Only
-/// a filter that doesn't read a computed column commutes with it.
-fn check_with_columns_position(
-    steps: &[&Plan],
-    joined: bool,
-    graph_exprs: &[NamedExpr],
-    id_col: &str,
-) -> PlanResult<()> {
-    if joined {
-        return not_implemented(
-            "with_columns() after join() is not supported yet; compute the columns \
-             first, then join().",
-        );
+/// The steps written after a leaf (`describe`, a random walk), each relational.
+fn leaf_steps<'a>(
+    chain: &[&'a Plan],
+    leaf: &str,
+    inputs: &dyn Inputs,
+) -> PlanResult<Vec<&'a Plan>> {
+    let mut steps = vec![];
+    for &s in &chain[1..] {
+        if matches!(s, Plan::Nodes { .. }) {
+            continue;
+        }
+        if !is_tail(s) {
+            return not_implemented(format!(
+                "collect() does not yet support the '{}' step after {leaf}.",
+                s.op()
+            ));
+        }
+        check_step(s, inputs)?;
+        steps.push(s);
     }
-    let computed: HashSet<&str> = graph_exprs.iter().map(|e| e.name.as_str()).collect();
-    for step in steps {
+    Ok(steps)
+}
+
+/// `edges.nodes()` has no rows before its first `with_columns` computes them, so
+/// only a filter that commutes with it may be written first: one that reads no
+/// column it computes.
+fn check_before_node_set(before: &[&Plan], with_columns: &Plan) -> PlanResult<()> {
+    let Plan::WithColumns { columns, .. } = with_columns else {
+        unreachable!("a with_columns step")
+    };
+    let computed: HashSet<&str> = columns.iter().map(|e| e.name.as_str()).collect();
+    for step in before {
         let Plan::Filter { predicate, .. } = step else {
             let verb = match step.op() {
                 "group_by_agg" => "group_by().agg",
@@ -1152,7 +1229,7 @@ fn check_with_columns_position(
                  then {verb}()."
             ));
         };
-        let clash: BTreeSet<String> = expr_columns(predicate, &[("id", id_col.to_string())])
+        let clash: BTreeSet<String> = expr_columns(predicate, &[("id", "id".to_string())])
             .into_iter()
             .filter(|c| computed.contains(c.as_str()))
             .collect();
@@ -1167,13 +1244,21 @@ fn check_with_columns_position(
     Ok(())
 }
 
-/// The one edge input every graph expression of a `with_columns` shares.
-fn single_edges(exprs: &[NamedExpr]) -> PlanResult<&EdgeInput> {
+/// The graph verbs of a `with_columns`.
+fn graph_columns(exprs: &[NamedExpr]) -> Vec<(&str, &GraphVerb)> {
+    exprs
+        .iter()
+        .filter_map(|e| match &e.expr {
+            Expr::Graph(v) => Some((e.name.as_str(), v.as_ref())),
+            Expr::Scalar(_) => None,
+        })
+        .collect()
+}
+
+/// The one edge input every graph verb of a `with_columns` shares.
+fn single_edges<'a>(verbs: Vec<(&str, &'a GraphVerb)>) -> PlanResult<&'a EdgeInput> {
     let mut edges: Option<&EdgeInput> = None;
-    for e in exprs {
-        let Expr::Graph(verb) = &e.expr else {
-            return not_implemented(NON_GRAPH_COLUMN);
-        };
+    for (_, verb) in verbs {
         let Some(this) = &verb.edges else {
             return not_implemented(NON_GRAPH_COLUMN);
         };
@@ -1191,63 +1276,35 @@ fn single_edges(exprs: &[NamedExpr]) -> PlanResult<&EdgeInput> {
     edges.ok_or_else(|| PlanError::NotImplemented(NON_GRAPH_COLUMN.into()))
 }
 
-const NON_GRAPH_COLUMN: &str = "collect() supports with_columns of graph algorithms only; \
-     non-graph expressions are not executable yet.";
+const NON_GRAPH_COLUMN: &str = "with_columns() takes ursa expressions: ur.col(...), \
+     ur.lit(...), arithmetic and comparisons over them, or graph verbs; got a value of \
+     another kind.";
 
-/// The node query (`_collect_node_query`): a plain attribute table, or the graph
-/// columns (attached to the attribute table, if any), then `steps` in order.
-fn collect_node_query(
-    chain: &[&Plan],
-    id_col: &str,
-    graph_exprs: Option<&[NamedExpr]>,
-    steps: &[&Plan],
+/// The graph columns of a `with_columns`, computed: the index and mask their
+/// edges run over, and the columns, built. `nodes` is the frame's attribute
+/// table (what a neighbour aggregation reads), if it has one.
+struct GraphColumns {
+    index: GraphIndex,
+    mask: Option<Arc<EdgeMask>>,
+    columns: Vec<crate::result::OutputColumn>,
+}
+
+fn graph_columns_for(
+    exprs: &[NamedExpr],
+    nodes: Option<(&[RecordBatch], &str)>,
     inputs: &dyn Inputs,
-) -> PlanResult<Rows> {
-    let Some(graph_exprs) = graph_exprs.filter(|g| !g.is_empty()) else {
-        return collect_plain_nodes(chain, id_col, steps, inputs);
-    };
-    let edges = single_edges(graph_exprs)?;
-    let mut columns: Vec<NodeColumn> = Vec::with_capacity(graph_exprs.len());
-    for e in graph_exprs {
-        let Expr::Graph(verb) = &e.expr else {
-            unreachable!("single_edges admits graph expressions only")
-        };
-        check_verb(verb)?;
-        columns.push((e.name.clone(), verb.as_ref().clone()));
+) -> PlanResult<Option<GraphColumns>> {
+    let verbs = graph_columns(exprs);
+    if verbs.is_empty() {
+        return Ok(None);
     }
-    // Scan projection pushdown: the file must supply the join id, any column a
-    // neighbour aggregation reads, and whatever the steps read before a select or
-    // group_by narrows them. The engine's sample orders by every input column, so
-    // narrowing before a sample would change its picks: that reads the whole file.
-    let mut required: BTreeSet<String> = BTreeSet::from([id_col.to_string()]);
-    for (_, verb) in &columns {
-        if let Some(c) = verb.agg_column() {
-            required.insert(c.to_string());
-        }
-    }
-    let computed: HashSet<&str> = graph_exprs.iter().map(|e| e.name.as_str()).collect();
-    let file_needed = projection(
-        steps,
-        required,
-        &[("id", id_col.to_string())],
-        &computed,
-        true,
-    );
-    // An attribute table's columns join onto the algorithm outputs by id;
-    // `edges.nodes()`-derived frames have none.
-    let nodes = match node_source_slot(chain) {
-        Some(slot) => {
-            Some(node_rows(chain, slot, file_needed.as_deref(), inputs)?.into_batches(inputs)?)
-        }
-        None => None,
-    };
-    let nodes_id = nodes.as_ref().map(|_| id_col.to_string());
-    // A weighted algorithm needs the edge columns its weight expression reads. The
-    // host skips the read when the index already caches every one of these weights
-    // (and, for a scan, builds the index from the same read).
+    let edges = single_edges(verbs.clone())?;
+    // A weighted algorithm needs the edge columns its weight expression reads.
+    // The read is skipped when the index already caches every one of these
+    // weights (and, for a scan, builds the index too).
     let mut weight_cols: BTreeSet<String> = BTreeSet::new();
     let mut weight_keys: Vec<String> = vec![];
-    for (_, verb) in &columns {
+    for (_, verb) in &verbs {
         if let Some(w) = &verb.weight {
             check_literals(w, "weight")?;
             weight_cols.extend(value_columns(w, &[]));
@@ -1259,34 +1316,171 @@ fn collect_node_query(
     } else {
         prepare_weighted(edges, &weight_cols, &weight_keys, inputs)?
     };
-    // The engine runs the leading steps its fixed-order tail executes identically;
-    // any later step runs in written order on its output. ur.id() resolves to the
-    // result's reserved `id` column.
-    let (pushed, rest) = split_engine_tail(steps, true)?;
     let index = require_index(edges, inputs)?;
     let mask = edge_mask(edges, &index, inputs)?;
-    let roles = [("id", "id".to_string())];
-    let filters = filter_jsons(&pushed.filters, &roles)?;
-    let (group_keys, aggs) = pushed.group_by.clone().unwrap_or_default();
-    let result = execute_node_query_cached(
-        index.topo,
-        index.ids,
-        &columns,
-        &filters,
-        pushed.sort.clone(),
-        pushed.limit,
-        nodes,
-        nodes_id,
-        edge_attr,
-        pushed.distinct,
-        pushed.sample,
-        pushed.rename.clone(),
-        group_keys,
-        aggs,
-        mask,
+    let specs: Vec<NodeColumn> = verbs
+        .iter()
+        .map(|(name, verb)| (name.to_string(), (*verb).clone()))
+        .collect();
+    let columns = node_columns(
+        &index.topo,
+        &index.ids,
+        &specs,
+        nodes.map(|(b, _)| b),
+        nodes.map(|(_, id)| id),
+        edge_attr.as_deref(),
         Some(&index.weights),
     )?;
-    finish(result, &pushed, &rest, &roles, inputs)
+    Ok(Some(GraphColumns {
+        index,
+        mask,
+        columns,
+    }))
+}
+
+/// The frame of `edges.nodes().with_columns(...)`: the graph's node set, in node
+/// order, with the graph columns, then the `with_columns`' other expressions.
+fn node_set_frame(exprs: &[NamedExpr], inputs: &dyn Inputs) -> PlanResult<Frame> {
+    let Some(g) = graph_columns_for(exprs, None, inputs)? else {
+        return not_implemented(NON_GRAPH_COLUMN);
+    };
+    let ctx = crate::lower::session();
+    let leaf = graph_leaf(&ctx, g.index.topo, g.index.ids, g.columns, g.mask);
+    let mut frame = Frame::from_ordered(ctx, leaf);
+    let before: Vec<String> = vec!["id".to_string()];
+    scalar_columns(&mut frame, exprs, &before, &[("id", "id".to_string())])?;
+    Ok(frame)
+}
+
+/// Lower the steps of a node frame, in order: relational steps, `with_columns`
+/// (graph columns attached to the rows by id) and a join. `table` is the frame's
+/// attribute table, which a neighbour aggregation reads.
+fn lower_node_steps(
+    mut frame: Frame,
+    steps: &[&Plan],
+    roles: &Roles,
+    table: Option<&[RecordBatch]>,
+    inputs: &dyn Inputs,
+) -> PlanResult<Frame> {
+    let id_col = roles[0].1.clone();
+    let mut rest = steps;
+    while let Some(i) = rest
+        .iter()
+        .position(|s| matches!(s, Plan::WithColumns { .. } | Plan::Join { .. }))
+    {
+        lower_steps(&mut frame, &rest[..i], roles, inputs)?;
+        match rest[i] {
+            Plan::WithColumns { columns, .. } => {
+                with_columns(&mut frame, columns, &id_col, table, roles, inputs)?
+            }
+            join => frame = run_join(frame, join, inputs)?,
+        }
+        rest = &rest[i + 1..];
+    }
+    lower_steps(&mut frame, rest, roles, inputs)?;
+    Ok(frame)
+}
+
+/// `with_columns` on a frame with rows: the graph columns attached by the id
+/// column `id_col`, then the other expressions, evaluated over the frame's
+/// columns. A column that already exists is replaced in place; new columns are
+/// appended in the order written.
+fn with_columns(
+    frame: &mut Frame,
+    exprs: &[NamedExpr],
+    id_col: &str,
+    table: Option<&[RecordBatch]>,
+    roles: &Roles,
+    inputs: &dyn Inputs,
+) -> PlanResult<()> {
+    let before = frame.names();
+    let nodes = table.map(|t| (t, id_col));
+    if let Some(g) = graph_columns_for(exprs, nodes, inputs)? {
+        if !frame.has_column(id_col) {
+            return Err(PlanError::ColumnNotFound(format!(
+                "with_columns() attaches graph columns by the node id column {}, which an \
+                 earlier step removed or renamed.",
+                py_str(id_col)
+            )));
+        }
+        let ctx = frame.ctx().clone();
+        let rows = frame.ordered_batches()?;
+        let attached = attach_columns(
+            &ctx,
+            g.index.topo,
+            g.index.ids,
+            g.columns,
+            g.mask,
+            rows,
+            id_col,
+        )?;
+        frame.set_batches(attached)?;
+    }
+    scalar_columns(frame, exprs, &before, roles)
+}
+
+/// The non-graph expressions of a `with_columns`, evaluated over the frame (its
+/// columns `before` the graph columns were attached), and the column order:
+/// `before`, with replaced columns in place, then each new column as written.
+fn scalar_columns(
+    frame: &mut Frame,
+    exprs: &[NamedExpr],
+    before: &[String],
+    roles: &Roles,
+) -> PlanResult<()> {
+    if exprs.iter().all(|e| matches!(e.expr, Expr::Graph(_))) {
+        return Ok(());
+    }
+    let mut lowered: HashMap<&str, DfExpr> = HashMap::new();
+    for e in exprs {
+        if let Expr::Scalar(v) = &e.expr {
+            lowered.insert(&e.name, scalar_expr(frame, v, roles, "with_columns()")?);
+        }
+    }
+    let mut out: Vec<DfExpr> = before
+        .iter()
+        .map(|c| match lowered.remove(c.as_str()) {
+            Some(e) => e.alias(c),
+            None => col_named(c),
+        })
+        .collect();
+    for e in exprs {
+        if before.contains(&e.name) {
+            continue;
+        }
+        out.push(match lowered.remove(e.name.as_str()) {
+            Some(x) => x.alias(&e.name),
+            None => col_named(&e.name),
+        });
+    }
+    frame.project(out)?;
+    Ok(())
+}
+
+/// A scalar expression over the frame's columns (`what` names the step, for its
+/// errors): its role references resolved, its columns checked, lowered with
+/// comparisons resolved as a filter's are.
+fn scalar_expr(frame: &Frame, v: &Value, roles: &Roles, what: &str) -> PlanResult<DfExpr> {
+    if !matches!(
+        kind(v),
+        "col" | "lit" | "binary" | "unary" | "src" | "dst" | "id" | "alias"
+    ) {
+        return not_implemented(NON_GRAPH_COLUMN);
+    }
+    check_literals(v, what)?;
+    let v = resolve_roles(v, roles)?;
+    let missing: Vec<String> = value_columns(&v, &[])
+        .into_iter()
+        .filter(|c| !frame.has_column(c))
+        .collect();
+    if !missing.is_empty() {
+        return Err(PlanError::ColumnNotFound(format!(
+            "{what} references unknown column(s): {}",
+            py_list(missing.iter())
+        )));
+    }
+    let e = crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?;
+    Ok(crate::compare::resolve_comparisons(e, frame.df_schema())?)
 }
 
 /// The host slot of a node source (`None` for a `nodes()`-derived frame).
@@ -1851,35 +2045,7 @@ fn node_rows(
     }
 }
 
-/// A plain node source and its steps, all run by the host (`_collect_plain_nodes`).
-fn collect_plain_nodes(
-    chain: &[&Plan],
-    id_col: &str,
-    steps: &[&Plan],
-    inputs: &dyn Inputs,
-) -> PlanResult<Rows> {
-    let roles = [("id", id_col.to_string())];
-    // A scan reads the id plus what the steps read before a select or group_by
-    // narrows the columns.
-    let needed = projection(
-        steps,
-        BTreeSet::from([id_col.to_string()]),
-        &roles,
-        &HashSet::new(),
-        false,
-    );
-    let Some(slot) = node_source_slot(chain) else {
-        return not_implemented(
-            "collect() on this NodeFrame needs a source (scan_nodes / from_arrow(id=...)) \
-             or a with_columns of graph algorithms; a bare edges.nodes() has no \
-             materializable node set yet.",
-        );
-    };
-    let table = node_rows(chain, slot, needed.as_deref(), inputs)?;
-    apply_steps(table, steps, &roles, inputs)
-}
-
-/// A random walk and its relational steps (`_collect_random_walk`).
+/// A random walk and the steps written after it.
 fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
     let Plan::RandomWalk {
         edges,
@@ -1909,10 +2075,9 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
     let starts = inputs.seeds(*start)?;
     // A walk over a subgraph view follows only its edges (#192).
     let mask = edge_mask(edges, &index, inputs)?;
-    let (pushed, rest) = split_engine_tail(&steps, false)?;
-    // Walk output columns are (walk_id, step, node); no role applies.
-    let filters = filter_jsons(&pushed.filters, &[])?;
-    let result = execute_walk_query(
+    let ctx = crate::lower::session();
+    let leaf = walk_leaf(
+        &ctx,
         index.topo,
         index.ids,
         mask,
@@ -1920,26 +2085,22 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
         n_steps.u32("steps")?,
         walks_per_node.u32("walks_per_node")?,
         seed_arg(seed, "seed")?,
-        &filters,
-        pushed.sort.clone(),
-        pushed.limit,
-        pushed.distinct,
-        pushed.sample,
-        pushed.rename.clone(),
     )?;
-    finish(result, &pushed, &rest, &[], inputs)
+    let mut frame = Frame::from_ordered(ctx, leaf);
+    // Walk output columns are (walk_id, step, node); no role applies.
+    lower_steps(&mut frame, &steps, &[], inputs)?;
+    Ok(Rows::Batches(frame.collect()?))
 }
 
 // --- edge frames ---------------------------------------------------------------
 
-/// An edge frame's collect (`collect_edge_frame`): a plain edge frame, or a
-/// `hop` / `shortest_path` result, plus its relational steps in the order written.
+/// An edge frame's collect: a plain edge frame, or a `hop` / `shortest_path`
+/// result, then its steps in the order written (one join among them).
 fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> {
     let (src_col, dst_col) = edge_roles(chain);
     let mut traversal: Option<&Plan> = None;
     let mut steps: Vec<&Plan> = vec![];
-    let mut pre_join: Vec<&Plan> = vec![];
-    let mut join: Option<&Plan> = None;
+    let mut joined = false;
 
     for &step in chain {
         let op = step.op();
@@ -1947,13 +2108,13 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             Plan::Hop { .. } | Plan::ShortestPath { .. } => traversal = Some(step),
             Plan::ScanEdges { .. } | Plan::FromArrow { .. } | Plan::Nodes { .. } => {}
             Plan::Join { how, .. } => {
-                if join.is_some() {
+                if joined {
                     return not_implemented("collect() supports a single join() for now.");
                 }
                 check_join_how(how)?;
                 check_step(step, inputs)?;
-                join = Some(step);
-                pre_join = std::mem::take(&mut steps);
+                joined = true;
+                steps.push(step);
             }
             Plan::Reverse { .. } => {
                 // After a traversal its semantics are undesigned.
@@ -1976,21 +2137,16 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
         }
     }
 
-    let roles = [("src", src_col), ("dst", dst_col)];
-    if let Some(join) = join {
-        if traversal.is_some() {
-            return not_implemented(
-                "join() on a traversal result (hop/shortest_path) is not supported yet; \
-                 join is available on plain edge/node frames.",
-            );
-        }
-        let left = collect_plain_edges(chain, &pre_join, &roles, inputs)?;
-        return run_join(left, join, &steps, &roles, inputs);
-    }
-
     let Some(traversal) = traversal else {
+        let roles = [("src", src_col), ("dst", dst_col)];
         return collect_plain_edges(chain, &steps, &roles, inputs);
     };
+    if joined {
+        return not_implemented(
+            "join() on a traversal result (hop/shortest_path) is not supported yet; \
+             join is available on plain edge/node frames.",
+        );
+    }
 
     let (Plan::Hop { edges, .. } | Plan::ShortestPath { edges, .. }) = traversal else {
         unreachable!("a traversal is a hop or a shortest_path")
@@ -2008,9 +2164,8 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
 
     // A traversal result carries reserved `src`/`dst` columns.
     let roles = [("src", "src".to_string()), ("dst", "dst".to_string())];
-    let (pushed, rest) = split_engine_tail(&steps, false)?;
-    let filters = filter_jsons(&pushed.filters, &roles)?;
-    let result = match traversal {
+    let ctx = crate::lower::session();
+    let mut frame = match traversal {
         Plan::Hop {
             edges,
             n,
@@ -2021,20 +2176,16 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             let seeds = inputs.seeds(*seeds)?;
             // A traversal over a subgraph view follows only its edges (#192).
             let mask = edge_mask(edges, &index, inputs)?;
-            execute_hop_query(
+            let leaf = hop_leaf(
+                &ctx,
                 index.topo,
                 index.ids,
                 mask,
                 seeds.as_ref(),
                 n.u32("n")?,
                 direction,
-                &filters,
-                pushed.sort.clone(),
-                pushed.limit,
-                pushed.distinct,
-                pushed.sample,
-                pushed.rename.clone(),
-            )?
+            )?;
+            Frame::from_ordered(ctx, leaf)
         }
         Plan::ShortestPath {
             edges,
@@ -2061,7 +2212,8 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             let source = inputs.seeds(*source)?;
             let target = inputs.seeds(*target)?;
             let mask = edge_mask(edges, &index, inputs)?;
-            execute_path_query(
+            path_leaf(
+                &ctx,
                 index.topo,
                 index.ids,
                 mask,
@@ -2070,22 +2222,17 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
                 direction,
                 weight_json.as_deref(),
                 edge_attr,
-                &filters,
-                pushed.sort.clone(),
-                pushed.limit,
-                pushed.distinct,
-                pushed.sample,
-                pushed.rename.clone(),
             )?
         }
         _ => unreachable!("a traversal is a hop or a shortest_path"),
     };
-    finish(result, &pushed, &rest, &roles, inputs)
+    lower_steps(&mut frame, &steps, &roles, inputs)?;
+    Ok(Rows::Batches(frame.collect()?))
 }
 
 /// A plain edge source and its steps. A scan reads the columns the steps need and
-/// takes its leading filters with it (#192); the other steps run in order on its
-/// rows.
+/// takes its leading filters with it (#192); the other steps are lowered on its
+/// rows, in order.
 fn collect_plain_edges(
     chain: &[&Plan],
     steps: &[&Plan],
@@ -2095,55 +2242,57 @@ fn collect_plain_edges(
     // The endpoints plus what the steps read before a select or group_by narrows
     // the columns.
     let required: BTreeSet<String> = roles.iter().map(|(_, c)| c.clone()).collect();
-    let needed = projection(steps, required, roles, &HashSet::new(), false);
+    let needed = projection(steps, required, roles);
     let Some(slot) = source_slot(chain) else {
         return not_implemented(NO_EDGE_SOURCE);
     };
-    let Plan::ScanEdges {
-        path,
-        src,
-        dst,
-        on_null,
-        ..
-    } = chain[0]
-    else {
-        let Some(table) = inputs.table(slot)? else {
-            return not_implemented(NO_EDGE_SOURCE);
-        };
-        return apply_steps(table, steps, roles, inputs);
-    };
-    let path = single_path(path, MULTI_PATH_EDGES)?;
-    let opts = inputs.storage_options(slot)?;
-    let drop_nulls = on_null == "drop";
-    // The leading filters go into the scan, unless `on_null="drop"` must count
-    // the null rows of the whole file first.
-    let mut pushed: Vec<Value> = vec![];
-    if !drop_nulls {
-        for step in steps {
-            match pushable(step, roles) {
-                Some(v) => pushed.push(v),
-                None => break,
+    let (rows, steps) = match chain[0] {
+        Plan::ScanEdges {
+            path,
+            src,
+            dst,
+            on_null,
+            ..
+        } => {
+            let path = single_path(path, MULTI_PATH_EDGES)?;
+            let opts = inputs.storage_options(slot)?;
+            let drop_nulls = on_null == "drop";
+            // The leading filters go into the scan, unless `on_null="drop"` must
+            // count the null rows of the whole file first.
+            let mut pushed: Vec<Value> = vec![];
+            if !drop_nulls {
+                for step in steps {
+                    match pushable(step, roles) {
+                        Some(v) => pushed.push(v),
+                        None => break,
+                    }
+                }
             }
+            let (rows, n_pushed) = crate::scan::scan_edges_rows_pushing(
+                path,
+                src,
+                dst,
+                &opts,
+                needed.as_deref().unwrap_or(&[]),
+                &pushed,
+                drop_nulls,
+            )?;
+            if rows.dropped > 0 {
+                inputs.warn_dropped(rows.dropped)?;
+            }
+            (Rows::Batches(rows.batches), &steps[n_pushed..])
         }
+        _ => match inputs.table(slot)? {
+            Some(table) => (table, steps),
+            None => return not_implemented(NO_EDGE_SOURCE),
+        },
+    };
+    if steps.is_empty() {
+        return Ok(rows);
     }
-    let (rows, n_pushed) = crate::scan::scan_edges_rows_pushing(
-        path,
-        src,
-        dst,
-        &opts,
-        needed.as_deref().unwrap_or(&[]),
-        &pushed,
-        drop_nulls,
-    )?;
-    if rows.dropped > 0 {
-        inputs.warn_dropped(rows.dropped)?;
-    }
-    apply_steps(
-        Rows::Batches(rows.batches),
-        &steps[n_pushed..],
-        roles,
-        inputs,
-    )
+    let frame = Frame::from_batches(crate::lower::session(), rows.into_batches(inputs)?)?;
+    let frame = lower_node_steps(frame, steps, roles, None, inputs)?;
+    Ok(Rows::Batches(frame.collect()?))
 }
 
 /// A step a scan can take into its read: a well-formed `filter`, roles resolved.
@@ -2175,19 +2324,15 @@ fn check_join_how(how: &str) -> PlanResult<()> {
     ))
 }
 
-/// Materialize the right side, check the keys and column collisions, and run the
-/// join, then `steps` (written after it) in order (`_run_join`).
-fn run_join(
-    left: Rows,
-    join: &Plan,
-    steps: &[&Plan],
-    roles: &Roles,
-    inputs: &dyn Inputs,
-) -> PlanResult<Rows> {
+/// Join `left` with the join step's right side: materialize the right side, check
+/// the keys and column collisions, and join; the result's rows carry their
+/// left-major order as an ordinal.
+fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> {
     let Plan::Join { right, on, how, .. } = join else {
         unreachable!("run_join takes a join step")
     };
-    let left = left.into_batches(inputs)?;
+    let ctx = left.ctx().clone();
+    let left = left.collect()?;
     let right = execute_plan(right, inputs).map_err(|e| match e {
         PlanError::NotImplemented(_)
         | PlanError::Wrapped { .. }
@@ -2236,184 +2381,270 @@ fn run_join(
             py_list(collide.into_iter())
         )));
     }
-    let (pushed, rest) = split_engine_tail(steps, false)?;
-    let filters = filter_jsons(&pushed.filters, roles)?;
-    let result = execute_join_query(
-        left,
-        right,
-        on.clone(),
-        how.clone(),
-        &filters,
-        pushed.sort.clone(),
-        pushed.limit,
-        pushed.distinct,
-        pushed.sample,
-        pushed.rename.clone(),
-    )?;
-    finish(result, &pushed, &rest, roles, inputs)
+    Ok(join_frame(&ctx, left, right, on, how)?)
 }
 
-// --- the engine tail and the host's steps ------------------------------------
+// --- relational steps --------------------------------------------------------
 
-/// The slots of the engine's fixed-order tail (`apply_tail` in [`crate::query`]),
-/// plus the `select` applied to its output.
-#[derive(Default)]
-struct EngineTail<'a> {
-    filters: Vec<&'a Value>,
-    group_by: Option<(Vec<String>, Vec<String>)>,
-    distinct: bool,
-    sample: Option<(usize, Option<u64>)>,
-    sort: Option<Vec<(String, bool)>>,
-    limit: Option<usize>,
-    rename: Vec<(String, String)>,
-    select: Option<&'a Plan>,
-}
-
-/// The engine's tail order after its filters, then the select on its output.
-const ENGINE_ORDER: [&str; 7] = [
-    "group_by_agg",
-    "distinct",
-    "sample",
-    "sort",
-    "head",
-    "rename",
-    "select",
-];
-
-/// Split written-order `steps` into the longest prefix the engine's fixed-order
-/// tail (`filters → group_by → distinct → sample → sort → limit → rename`, then
-/// `select`) runs exactly as written, and the rest, which the host runs in order
-/// on the engine's output.
-///
-/// Each slot fills at most once, in engine order. A `filter` may still join the
-/// filters after a `sort` or `distinct` (it commutes with both) but not after a
-/// step that changes the rows or the column names. `group_by = false` for the
-/// executors without a group slot. A rename whose targets are also sources (a swap
-/// or chain) stays out: the engine relabels pair by pair, the host all at once.
-fn split_engine_tail<'a>(
-    steps: &[&'a Plan],
-    group_by: bool,
-) -> PlanResult<(EngineTail<'a>, Vec<&'a Plan>)> {
-    let mut out = EngineTail::default();
-    let mut filled: HashSet<&str> = HashSet::new();
-    let mut pos = 0; // the earliest ENGINE_ORDER slot still fillable
-    for (i, &step) in steps.iter().enumerate() {
-        if let Plan::Filter { predicate, .. } = step {
-            if filled.iter().all(|k| matches!(*k, "distinct" | "sort")) {
-                let Expr::Scalar(v) = predicate else {
-                    return Ok((out, steps[i..].to_vec()));
-                };
-                out.filters.push(v);
-                continue;
-            }
-            return Ok((out, steps[i..].to_vec()));
-        }
-        let op = step.op();
-        let k = ENGINE_ORDER.iter().position(|o| *o == op).unwrap_or(0);
-        let swap = match step {
-            Plan::Rename { mapping, .. } => {
-                let targets: HashSet<&String> = mapping.iter().map(|(_, new)| new).collect();
-                mapping.iter().any(|(old, _)| targets.contains(old))
-            }
-            _ => false,
-        };
-        if k < pos || (op == "group_by_agg" && !group_by) || swap {
-            return Ok((out, steps[i..].to_vec()));
-        }
-        match step {
-            Plan::GroupByAgg { keys, aggs, .. } => {
-                out.group_by = Some((keys.clone(), aggs.iter().map(agg_json).collect()))
-            }
-            Plan::Distinct { .. } => out.distinct = true,
-            Plan::Sample { n, seed, .. } => {
-                out.sample = Some((n.usize("sample")?, seed_arg(seed, "sample")?))
-            }
-            Plan::Sort { by, .. } => {
-                out.sort = Some(
-                    by.iter()
-                        .map(|k| (k.column.clone(), k.descending))
-                        .collect(),
-                )
-            }
-            Plan::Head { n, .. } => out.limit = Some(n.usize("limit")?),
-            Plan::Rename { mapping, .. } => out.rename = mapping.clone(),
-            _ => out.select = Some(step), // select
-        }
-        filled.insert(op);
-        pos = k + 1;
-    }
-    Ok((out, vec![]))
-}
-
-/// The engine's JSON for one aggregation: `alias(agg(col))`.
-fn agg_json(a: &AggSpec) -> String {
-    serde_json::json!({
-        "kind": "alias",
-        "name": a.output,
-        "operand": {"kind": "agg", "fn": a.func, "operand": {"kind": "col", "name": a.column}},
-    })
-    .to_string()
-}
-
-/// Complete an engine result: the pushed `select`, then the remaining steps, in
-/// order, on the host (`_finish`).
-fn finish(
-    result: Vec<RecordBatch>,
-    pushed: &EngineTail<'_>,
-    rest: &[&Plan],
-    roles: &Roles,
-    inputs: &dyn Inputs,
-) -> PlanResult<Rows> {
-    if pushed.select.is_none() && rest.is_empty() {
-        return Ok(Rows::Batches(result));
-    }
-    let steps: Vec<&Plan> = pushed
-        .select
-        .into_iter()
-        .chain(rest.iter().copied())
-        .collect();
-    apply_steps(Rows::Batches(result), &steps, roles, inputs)
-}
-
-/// Run `steps` on `rows` in order: each run of `filter`s here, every other step on
-/// the host (its pyarrow tail, until #191).
-fn apply_steps(
-    rows: Rows,
+/// Lower relational `steps` onto `frame`, in the order written (#191). `roles`
+/// resolves `ur.src()` / `ur.dst()` / `ur.id()` in their expressions.
+fn lower_steps(
+    frame: &mut Frame,
     steps: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
-) -> PlanResult<Rows> {
-    let mut rows = rows;
-    let mut rest = steps;
-    while let Some(first) = rest.first() {
-        let is_filter = matches!(first, Plan::Filter { .. });
-        let n = rest
-            .iter()
-            .take_while(|s| matches!(s, Plan::Filter { .. }) == is_filter)
-            .count();
-        let (run, tail) = rest.split_at(n);
-        rows = if is_filter {
-            let mut batches = rows.into_batches(inputs)?;
-            for step in run {
-                let Plan::Filter { predicate, .. } = step else {
-                    unreachable!("a run of filters")
-                };
-                let compiled = host_predicate(predicate, roles, &batches[0].schema())?;
-                batches = crate::eval::filter_batches(batches, &[compiled])?;
+) -> PlanResult<()> {
+    let mut i = 0;
+    while i < steps.len() {
+        let step = steps[i];
+        if step.step().is_some() && step.invalid() {
+            return Err(inputs.step_error(step.step().expect("checked")));
+        }
+        match step {
+            Plan::Filter { predicate, .. } => {
+                let compiled = filter_expr(predicate, roles, frame)?;
+                frame.filter(compiled)?;
             }
-            Rows::Batches(batches)
-        } else {
-            if let Some(step) = run.iter().find(|s| s.step().is_none()) {
+            Plan::Select { columns, .. } => select(frame, columns, roles)?,
+            Plan::Rename { mapping, .. } => {
+                let missing: Vec<&String> = mapping
+                    .iter()
+                    .map(|(old, _)| old)
+                    .filter(|old| !frame.has_column(old))
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(PlanError::ColumnNotFound(format!(
+                        "rename() references unknown column(s): {}",
+                        py_list(missing.into_iter())
+                    )));
+                }
+                if !mapping.is_empty() {
+                    frame.rename(mapping)?;
+                }
+            }
+            Plan::Sort { by, .. } => {
+                let keys = sort_keys(frame, by, roles)?;
+                // A head written right after the sort is its top-k.
+                let limit = match steps.get(i + 1) {
+                    Some(Plan::Head {
+                        n, invalid: false, ..
+                    }) => {
+                        i += 1;
+                        Some(head_n(n)?)
+                    }
+                    _ => None,
+                };
+                if !keys.is_empty() {
+                    frame.sort(keys, limit)?;
+                } else if let Some(n) = limit {
+                    frame.head(n)?;
+                }
+            }
+            Plan::Head { n, .. } => frame.head(head_n(n)?)?,
+            Plan::Distinct { .. } => frame.distinct()?,
+            Plan::Sample { .. } => {
+                let handle = step
+                    .step()
+                    .ok_or_else(|| PlanError::Invalid("a sample step has no host handle".into()))?;
+                frame.sample(|rows| inputs.sample(handle, rows))?;
+            }
+            Plan::GroupByAgg { keys, aggs, .. } => group_by(frame, keys, aggs)?,
+            other => {
                 return Err(PlanError::Invalid(format!(
-                    "the '{}' step has no host handle, so its host can't run it",
-                    step.op()
+                    "the '{}' step is not a relational step",
+                    other.op()
+                )))
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// A `head` count: a negative one keeps no rows, as a slice of that length did.
+fn head_n(n: &IntArg) -> PlanResult<usize> {
+    Ok(match n.int("n")? {
+        Some(i) if i < 0 => 0,
+        Some(i) => usize::try_from(i).unwrap_or(usize::MAX),
+        None => usize::MAX,
+    })
+}
+
+/// A `filter` predicate over the frame: the checks and errors filters have
+/// always had ([`host_check`]), then lowered with comparisons resolved.
+fn filter_expr(predicate: &Expr, roles: &Roles, frame: &Frame) -> PlanResult<DfExpr> {
+    let Expr::Scalar(v) = predicate else {
+        return require_predicate(&Value::Null).map(|_| unreachable!());
+    };
+    require_predicate(v)?;
+    host_check(v, roles, Some(&frame.schema()))?;
+    Ok(crate::eval::logical(
+        &resolve_roles(v, roles)?,
+        frame.df_schema(),
+    )?)
+}
+
+/// `select`: column names and expressions, in order. An expression's column is
+/// named by its alias, or else by its first column (as in Polars).
+fn select(frame: &mut Frame, items: &[SelectItem], roles: &Roles) -> PlanResult<()> {
+    let missing: Vec<&String> = items
+        .iter()
+        .filter_map(|c| match c {
+            SelectItem::Name(n) if !frame.has_column(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(PlanError::ColumnNotFound(format!(
+            "select() references unknown column(s): {}",
+            py_list(missing.into_iter())
+        )));
+    }
+    let mut exprs = Vec::with_capacity(items.len());
+    for item in items {
+        exprs.push(match item {
+            SelectItem::Name(n) => col_named(n),
+            SelectItem::Expr(v) => {
+                let e = scalar_expr(frame, v, roles, "select()")?;
+                let name = expr_name(&resolve_roles(v, roles)?);
+                match e {
+                    DfExpr::Alias(_) => e,
+                    e => e.alias(name),
+                }
+            }
+        });
+    }
+    frame.project(exprs)?;
+    Ok(())
+}
+
+/// The output name of an unaliased expression: its first column's, else
+/// `literal`.
+fn expr_name(v: &Value) -> String {
+    match kind(v) {
+        "col" => v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "alias" => v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "binary" => {
+            let l = v.get("left").unwrap_or(&Value::Null);
+            if value_columns(l, &[]).is_empty() {
+                expr_name(v.get("right").unwrap_or(&Value::Null))
+            } else {
+                expr_name(l)
+            }
+        }
+        "unary" | "agg" => expr_name(v.get("operand").unwrap_or(&Value::Null)),
+        _ => "literal".to_string(),
+    }
+}
+
+/// The keys of a `sort`, checked against the frame: a column (which must exist)
+/// or an expression.
+fn sort_keys(frame: &Frame, by: &[SortKey], roles: &Roles) -> PlanResult<Vec<(DfExpr, bool)>> {
+    for k in by {
+        if let Some(c) = &k.column {
+            if !frame.has_column(c) {
+                return Err(PlanError::Value(format!(
+                    "sort references unknown column {}.",
+                    py_str(c)
                 )));
             }
-            inputs.apply_steps(rows, run, roles)?
-        };
-        rest = tail;
+        }
     }
-    Ok(rows)
+    by.iter()
+        .map(|k| {
+            let e = match (&k.column, &k.expr) {
+                (Some(c), _) => col_named(c),
+                (None, Some(v)) => scalar_expr(frame, v, roles, "sort()")?,
+                (None, None) => {
+                    return Err(PlanError::Invalid(
+                        "a sort key needs a column or an expr".into(),
+                    ))
+                }
+            };
+            Ok((e, k.descending))
+        })
+        .collect()
+}
+
+/// `group_by(keys).agg(aggs)`, its columns checked as they always were.
+fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<()> {
+    use datafusion::functions_aggregate::expr_fn::{avg, count, count_distinct, max, min, sum};
+    for k in keys {
+        if !frame.has_column(k) {
+            return Err(PlanError::Value(format!(
+                "group_by() references unknown column {}.",
+                py_str(k)
+            )));
+        }
+    }
+    for a in aggs {
+        if !frame.has_column(&a.column) {
+            return Err(PlanError::Value(format!(
+                "agg() references unknown column {}.",
+                py_str(&a.column)
+            )));
+        }
+    }
+    use crate::agg::{float_agg, has_nulls, FloatAgg};
+    // The rows, in order: a float sum's NaN rule depends on whether its column
+    // holds a null.
+    let rows = frame.ordered_batches()?;
+    let row_schema = rows[0].schema();
+    let schema = frame.schema();
+    let mut exprs = Vec::with_capacity(aggs.len());
+    let mut ordered = false;
+    for a in aggs {
+        // A dictionary (categorical) operand aggregates its values.
+        let mut operand = col_named(&a.column);
+        let mut dt = schema.field_with_name(&a.column)?.data_type().clone();
+        if let DataType::Dictionary(_, value) = dt {
+            dt = value.as_ref().clone();
+            operand = DfExpr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(operand),
+                dt.clone(),
+            ));
+        }
+        if dt.is_floating() {
+            let kind = match a.func.as_str() {
+                "sum" => Some(FloatAgg::Sum),
+                "mean" => Some(FloatAgg::Mean),
+                "min" => Some(FloatAgg::Min),
+                "max" => Some(FloatAgg::Max),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let nulls = has_nulls(&rows, row_schema.index_of(&a.column)?);
+                exprs.push(float_agg(kind, &dt, nulls, operand).alias(&a.output));
+                ordered = true;
+                continue;
+            }
+        }
+        let e = match a.func.as_str() {
+            "mean" => avg(operand),
+            "sum" => sum(operand),
+            "min" => min(operand),
+            "max" => max(operand),
+            "count" => count(operand),
+            "n_unique" => count_distinct(operand),
+            other => {
+                return not_implemented(format!(
+                    "aggregation {} is not supported (use count, max, mean, min, n_unique, sum).",
+                    py_str(other)
+                ))
+            }
+        };
+        exprs.push(e.alias(&a.output));
+    }
+    frame.group_by(keys.iter().map(|k| col_named(k)).collect(), exprs, ordered)?;
+    Ok(())
 }
 
 /// Compile a filter predicate that runs outside an engine query against `schema`,
@@ -2501,21 +2732,14 @@ fn host_check(
 }
 
 /// The columns a scan must read for `steps` (projection pushdown), or `None` to
-/// read them all (`_projection`).
+/// read them all.
 ///
-/// Walks the steps in written order, tracking renames back to source names, up to
-/// the first `select` or `group_by`, the first step that narrows the columns. A
-/// `distinct` before that reads every column, and so does a `sample` when
-/// `sample_reads_all` (the engine's sample orders by full row content). Without a
-/// narrowing step every column reaches the output. `required` is always read;
-/// `computed` columns come from the graph op, not the file.
-fn projection(
-    steps: &[&Plan],
-    required: BTreeSet<String>,
-    roles: &Roles,
-    computed: &HashSet<&str>,
-    sample_reads_all: bool,
-) -> Option<Vec<String>> {
+/// Walks the steps in written order, tracking renames back to source names and
+/// the columns `with_columns` computes (which no file holds), up to the first
+/// `select` or `group_by`, the first step that narrows the columns. A `distinct`
+/// before that reads every column. Without a narrowing step every column reaches
+/// the output. `required` is always read.
+fn projection(steps: &[&Plan], required: BTreeSet<String>, roles: &Roles) -> Option<Vec<String>> {
     // current name -> source column (None: no source column)
     let mut source: HashMap<String, Option<String>> = HashMap::new();
     let mut needed = required;
@@ -2525,14 +2749,7 @@ fn projection(
             .filter_map(|n| source.get(&n).cloned().unwrap_or(Some(n)))
             .collect()
     };
-    let done = |needed: BTreeSet<String>| -> Option<Vec<String>> {
-        Some(
-            needed
-                .into_iter()
-                .filter(|c| !computed.contains(c.as_str()))
-                .collect(),
-        )
-    };
+    let scalar = |v: &Value| -> Vec<String> { value_columns(v, roles).into_iter().collect() };
     for step in steps {
         match step {
             Plan::Filter { predicate, .. } => {
@@ -2540,8 +2757,24 @@ fn projection(
                 needed.extend(src(&source, cols));
             }
             Plan::Sort { by, .. } => {
-                let cols = by.iter().map(|k| k.column.clone()).collect();
-                needed.extend(src(&source, cols));
+                for k in by {
+                    let cols = match (&k.column, &k.expr) {
+                        (Some(c), _) => vec![c.clone()],
+                        (None, Some(v)) => scalar(v),
+                        (None, None) => vec![],
+                    };
+                    needed.extend(src(&source, cols));
+                }
+            }
+            Plan::WithColumns { columns, .. } => {
+                for e in columns {
+                    if let Expr::Scalar(v) = &e.expr {
+                        needed.extend(src(&source, scalar(v)));
+                    }
+                }
+                for e in columns {
+                    source.insert(e.name.clone(), None); // computed, not read
+                }
             }
             Plan::Rename { mapping, .. } => {
                 // A rename reads its sources (an unknown one must still error).
@@ -2560,17 +2793,22 @@ fn projection(
                 source.extend(relabelled);
             }
             Plan::Select { columns, .. } => {
-                needed.extend(src(&source, columns.clone()));
-                return done(needed);
+                for c in columns {
+                    let cols = match c {
+                        SelectItem::Name(n) => vec![n.clone()],
+                        SelectItem::Expr(v) => scalar(v),
+                    };
+                    needed.extend(src(&source, cols));
+                }
+                return Some(needed.into_iter().collect());
             }
             Plan::GroupByAgg { keys, aggs, .. } => {
                 let mut cols: BTreeSet<String> = keys.iter().cloned().collect();
                 cols.extend(aggs.iter().map(|a| a.column.clone()));
                 needed.extend(src(&source, cols.into_iter().collect()));
-                return done(needed);
+                return Some(needed.into_iter().collect());
             }
-            Plan::Distinct { .. } => return None,
-            Plan::Sample { .. } if sample_reads_all => return None,
+            Plan::Distinct { .. } | Plan::Join { .. } => return None,
             _ => {} // head / (position-based) sample read no column
         }
     }
@@ -2581,19 +2819,6 @@ fn projection(
 
 /// The operators valid at the top of a filter predicate.
 const PREDICATE_OPS: [&str; 8] = [">", "<", ">=", "<=", "==", "!=", "&", "|"];
-
-/// Serialize the engine filters: each must be a boolean predicate at its top
-/// node, with its role references resolved to `roles` (`_filter_json`).
-fn filter_jsons(predicates: &[&Value], roles: &Roles) -> PlanResult<Vec<String>> {
-    predicates
-        .iter()
-        .map(|p| {
-            require_predicate(p)?;
-            check_literals(p, "filter")?;
-            Ok(resolve_roles(p, roles)?.to_string())
-        })
-        .collect()
-}
 
 /// A step the host could not parse raises the host's error where the step is
 /// read, as it did when the host parsed each step on reaching it.
@@ -2811,51 +3036,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_split_pushes_the_common_tail() {
-        let p = plan(serde_json::json!({"op": "head", "n": 5, "input":
-            {"op": "filter", "predicate": col_pred("b"), "input":
-            {"op": "sort", "by": [{"column": "v", "descending": true}], "input":
-            {"op": "filter", "predicate": col_pred("a"), "input": src()}}}}));
-        let steps = steps_of(&p);
-        let (pushed, rest) = split_engine_tail(&steps, true).unwrap();
-        assert!(rest.is_empty());
-        assert_eq!(pushed.filters.len(), 2);
-        assert_eq!(pushed.sort, Some(vec![("v".to_string(), true)]));
-        assert_eq!(pushed.limit, Some(5));
-    }
-
-    #[test]
-    fn engine_split_leaves_out_of_order_steps_to_the_remainder() {
-        let head = |input| serde_json::json!({"op": "head", "n": 3, "input": input});
-        let sort = |c: &str, input| serde_json::json!({"op": "sort", "by": [{"column": c}], "input": input});
-        let filter =
-            |input| serde_json::json!({"op": "filter", "predicate": col_pred("v"), "input": input});
-        let rename = |pairs: serde_json::Value, input| serde_json::json!({"op": "rename", "mapping": pairs, "input": input});
-        let select = |input| serde_json::json!({"op": "select", "columns": ["c"], "input": input});
-        let distinct = |input| serde_json::json!({"op": "distinct", "input": input});
-        let group = |input| serde_json::json!({"op": "group_by_agg", "keys": ["c"], "aggs": [], "input": input});
-        // (plan, steps pushed)
-        let cases = [
-            (sort("v", head(src())), 1),
-            (filter(head(src())), 1),
-            (sort("w", rename(serde_json::json!([["v", "w"]]), src())), 1),
-            (distinct(select(src())), 1),
-            (sort("c", sort("v", src())), 1),
-            (
-                rename(serde_json::json!([["a", "b"], ["b", "a"]]), src()),
-                0,
-            ),
-            (filter(group(src())), 1),
-        ];
-        for (json, n_pushed) in cases {
-            let p = plan(json);
-            let steps = steps_of(&p);
-            let (_, rest) = split_engine_tail(&steps, true).unwrap();
-            assert_eq!(rest.len(), steps.len() - n_pushed, "{p:?}");
-        }
-    }
-
-    #[test]
     fn projection_reads_every_sort_key_through_a_rename() {
         // rename(c -> k).sort([k, v]).head(3).select(id): the scan reads c, id, v.
         let p = plan(
@@ -2869,8 +3049,6 @@ mod tests {
             &steps,
             BTreeSet::from(["id".to_string()]),
             &[("id", "id".to_string())],
-            &HashSet::new(),
-            false,
         );
         assert_eq!(got, Some(vec!["c".into(), "id".into(), "v".into()]));
     }

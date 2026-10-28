@@ -33,7 +33,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use serde_json::{json, Value};
-use ursa_plan::plan::{HostRows, Roles, Rows, Slot};
+use ursa_plan::plan::{HostRows, Rows, Slot};
 use ursa_plan::scan::NodeTableCache;
 use ursa_plan::{build_topology_batches, execute_plan, GraphIndex, Inputs, Plan, PlanError};
 
@@ -49,8 +49,8 @@ enum Input {
 }
 
 /// An in-memory host: tables read from `tests/data/`, indexes built on first use.
-/// It has no relational evaluator of its own (the pyarrow tail), so a fixture runs
-/// only steps the engine runs itself, filters and subgraph masks included.
+/// It has no sampler (the host draws a `sample`'s rows), so a fixture has no
+/// `sample` step; every other step runs in the engine.
 struct MemoryInputs(Vec<Input>);
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -114,9 +114,8 @@ impl Inputs for MemoryInputs {
         }
     }
 
-    fn apply_steps(&self, _rows: Rows, steps: &[&Plan], _roles: &Roles) -> Result<Rows> {
-        let ops: Vec<&str> = steps.iter().map(|s| s.op()).collect();
-        unsupported(&format!("relational evaluator (asked to run {ops:?})"))
+    fn sample(&self, _step: Slot, _rows: usize) -> Result<Option<Vec<usize>>> {
+        unsupported("sampler")
     }
 
     fn batches(&self, _rows: HostRows) -> Result<Vec<RecordBatch>> {
@@ -309,26 +308,26 @@ fn plan_fixtures_conform() {
     }
 }
 
-/// A step the engine's tail can't run goes to the host by its handle; a plan with
-/// no handle there (built in Rust, not by a host) is an error, never a silently
-/// dropped step.
+/// Relational steps run in the engine, in the order written, whatever their
+/// order: a plan built in Rust carries no host handles, and needs none.
 #[test]
-fn host_steps_without_a_handle_are_an_error() {
+fn relational_steps_need_no_host() {
     let inputs = MemoryInputs(vec![Input::Unused, input(&json!({"edges": "karate"}))]);
     let edges = json!({"plan": {"op": "from_arrow", "frame": 1, "src": "src", "dst": "dst"},
                        "frame": 1});
     let degree = json!({"op": "with_columns",
         "input": {"op": "nodes", "input": {"op": "from_arrow", "frame": 0, "src": "src", "dst": "dst"}},
         "columns": [{"name": "deg", "expr": {"kind": "graph", "verb": "degree", "edges": edges}}]});
-    // A pushed select, and a head after a sort-less rename-chain remainder.
-    for tail in [
-        json!({"op": "select", "columns": ["id"], "input": degree}),
-        json!({"op": "head", "n": 1, "input": {"op": "rename", "mapping": [["id", "deg"], ["deg", "id"]], "input": degree}}),
-    ] {
+    // A select, and a head after a rename that swaps two names.
+    let select = json!({"op": "select", "columns": ["id"], "input": degree});
+    let swap = json!({"op": "head", "n": 1, "input":
+        {"op": "rename", "mapping": [["id", "deg"], ["deg", "id"]], "input": degree}});
+    for (tail, columns) in [(select, vec!["id"]), (swap, vec!["deg", "id"])] {
         let plan = Plan::from_json(&tail.to_string()).unwrap();
-        let err = execute_plan(&plan, &inputs).unwrap_err();
-        assert!(matches!(err, PlanError::Invalid(_)), "{err}");
-        assert!(err.to_string().contains("no host handle"), "{err}");
+        let out = execute_plan(&plan, &inputs).unwrap();
+        let schema = out[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, columns);
     }
 }
 

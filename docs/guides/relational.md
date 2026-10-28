@@ -38,7 +38,7 @@ shape: (4, 4)
 
 ## Sort and head
 
-`sort` takes a column name or a list of names. `head(n)` keeps the first `n` rows. Written after a `sort`, those are the top rows.
+`sort` takes a column name, an expression, or a list of them. `head(n)` keeps the first `n` rows. Written after a `sort`, those are the top rows.
 
 ```python
 print(ranked.sort("triangles", descending=True).head(3).collect())
@@ -83,7 +83,7 @@ The same input order is what you get without a `sort`. An unsorted `collect()` o
 
 ## Select and rename
 
-`select` keeps the named columns, in the given order. Call it after `with_columns`.
+`select` keeps the named columns, in the given order. An item can also be an expression, such as `(ur.col("degree") * 2).alias("double")`.
 
 ```python
 print(ranked.select("id", "degree").sort("degree", descending=True).head(3).collect())

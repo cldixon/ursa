@@ -133,8 +133,71 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     Sparse ids switch to the hash map automatically. Id lookups over columns with
     no nulls skip per-row null checks (#186).
 
+- Every relational step now runs in the engine, lowered to one DataFusion plan
+  in the order written: `filter`, `select`, `with_columns`, `rename`, `sort`,
+  `head`, `distinct`, `sample` and `group_by().agg()`, on any frame. Before,
+  the engine ran a fixed-order tail of them (`filter → group_by → distinct →
+  sample → sort → head → rename`) and pyarrow ran whatever didn't fit, after the
+  engine returned. The order guarantees (unsorted output in input order, stable
+  sorts, `distinct` and `group_by` at first occurrence, `sample` in input order)
+  are implemented once, and cost an ordinal only above an operator that
+  reorders rows (#191, part of #189). This lifts these limits:
+  - two `with_columns` steps in one plan, and `with_columns` after any other
+    step: it computes over the rows and columns the steps before it leave, and
+    an algorithm's column attaches to them by the node id column;
+  - `with_columns` of expressions other than graph verbs, such as
+    `with_columns(v2=ur.col("v") * 2)`; a keyword naming an existing column
+    replaces it in place;
+  - a tail (`filter`, `sort`, `head`, ...) after `describe()`;
+  - `sort` by an expression, such as `sort(ur.col("v") * -1)`;
+  - `select` of an expression, named by its `.alias()` or else its first
+    column.
+
+  On a 1M-node graph (4 cores, medians of 6 interleaved runs): a `filter` after
+  an algorithm, 6.8 ms to 5.7 ms; a `head`, 2.3 ms to 2.5 ms (within noise); a
+  `filter` + `group_by` (a count, a float sum and a float max) + `sort` tail over
+  a 1M-row attribute frame, 26 ms to 39 ms. The float aggregations now fold each
+  group's values in input order, as a plain frame always has, which keeps every
+  bit of a sum reproducible but runs them less in parallel.
+- **Behaviour change:** a step behaves the same wherever it runs. Before, the
+  same step could give different results on a frame the engine ran (after a
+  graph algorithm, a traversal or a join) than on a plain frame, depending on
+  where it fell in the fixed-order tail. Every step now has the plain frame's
+  semantics:
+  - `sample(n, seed=)` picks rows with the stdlib's seeded generator over the
+    row positions, as a plain frame always did, so the same rows and seed give
+    the same picks on every frame. An engine frame used a content-ordered
+    generator of its own, so its picks for a given seed change. Any seed Python's
+    `random` accepts now works there too (it raised for a negative, string or
+    very large seed).
+  - `group_by().agg()` float `sum`, `mean`, `min` and `max` follow pyarrow's
+    rules on every frame: values are added in input order, `min`/`max` skip NaN
+    unless every value is NaN, and ties keep the first value. On an engine
+    frame `max` could return NaN, or a value that was not the maximum, when the
+    group had NaNs.
+  - Every `group_by().agg()` output column is nullable, as on a plain frame (an
+    engine frame marked `count`, `n_unique` and keys that held no null as
+    non-nullable).
+  - An unknown column in `sort`, `rename`, `group_by` or `agg` raises the plain
+    frame's error on every frame: `ValueError` (`sort references unknown column
+    'x'.`), or `ColumnNotFoundError` for `rename` and `select`. An engine frame
+    raised `ColumnNotFoundError` or `ComputeError` with DataFusion's message.
+  - `head(n)` with a negative `n` keeps no rows on every frame; an engine frame
+    raised `OverflowError`.
+
 ### Fixed
 
+- `sort()` orders floats as filters compare them (#201): every NaN is above
+  every number whatever its sign bit, and `-0.0` equals `0.0`, so they tie and
+  keep input order. A NaN with the sign bit set, the usual result of `0/0`,
+  used to sort before every number after a graph algorithm or a join. A
+  descending sort now puts NaN first on every frame; a plain frame used to put
+  it last in either direction. Nulls still come last.
+- On a frame the engine ran (after a graph algorithm or a join), a second
+  `distinct()` over a dictionary-encoded (categorical) column could return
+  duplicate rows (`f.distinct().select("c").distinct()`), and a `distinct()`
+  after `group_by().agg()` raised "Schema contains duplicate unqualified field
+  name" (#191).
 - `hop`, `shortest_path` and `random_walk` over a filtered edge frame ignored the
   filter: `ur.hop(e.filter(ur.col("w") > 5), 2)` reached nodes through edges
   the filter removed. They now follow only the kept edges, and a graph op over

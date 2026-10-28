@@ -335,7 +335,7 @@ fn coerce(e: Expr, dt: &DataType, how: To) -> Result<Expr> {
 
 /// A float made canonical for comparison: every NaN the positive NaN, `-0.0`
 /// as `0.0`, so total order reads "NaN equals NaN, above every number".
-fn canonical(e: Expr) -> Expr {
+pub fn canonical(e: Expr) -> Expr {
     if let Expr::Literal(v, _) = &e {
         if let Some(c) = canonical_scalar(v) {
             return lit(c);

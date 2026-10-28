@@ -32,7 +32,6 @@ use pyo3::exceptions::{
     PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 use std::sync::Arc;
 
@@ -40,8 +39,7 @@ use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 
 use ursa_plan::plan::{
-    count_topology_build, execute, topology_builds, EdgeInput, HostError, HostRows, Roles, Rows,
-    Slot,
+    count_topology_build, execute, topology_builds, EdgeInput, HostError, HostRows, Rows, Slot,
 };
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, diameter, parse_stat_direction,
@@ -365,22 +363,9 @@ impl Inputs for PyInputs {
         self.call("seeds", (slot,), array_from_pyarrow)
     }
 
-    fn apply_steps(&self, rows: Rows, steps: &[&Plan], roles: &Roles) -> PlanResult<Rows> {
-        let handles: Vec<Slot> = steps.iter().filter_map(|s| s.step()).collect();
-        Python::attach(|py| {
-            let call = || -> PyResult<Rows> {
-                let roles_dict = PyDict::new(py);
-                for (role, column) in roles {
-                    roles_dict.set_item(*role, column)?;
-                }
-                let rows = rows_to_python(py, rows)?;
-                let out = self
-                    .host
-                    .bind(py)
-                    .call_method1("apply_steps", (rows, handles, roles_dict))?;
-                host_rows(&out)
-            };
-            call().map_err(|e| host_err(py, e))
+    fn sample(&self, step: Slot, rows: usize) -> PlanResult<Option<Vec<usize>>> {
+        self.call("sample", (step, rows), |obj| {
+            obj.extract::<Option<Vec<usize>>>()
         })
     }
 

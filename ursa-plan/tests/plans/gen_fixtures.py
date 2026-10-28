@@ -151,12 +151,12 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
             "The undirected whole-graph summary.",
             lambda: ur.describe(k, full=True, direction="both"),
         ),
-        "error_describe_tail": (
-            "describe() takes no tail yet.",
+        "describe_tail": (
+            "A step after describe() runs on its summary row.",
             lambda: ur.describe(k).head(1),
         ),
-        "error_two_with_columns": (
-            "One with_columns per pipeline.",
+        "two_with_columns": (
+            "Two with_columns steps: the second attaches by id.",
             lambda: k.nodes().with_columns(a=ur.degree(k)).with_columns(b=ur.pagerank(k)),
         ),
         "error_reshaped_edges": (
@@ -167,8 +167,8 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
             "A traversal over a traversal result.",
             lambda: ur.hop(ur.hop(k, n=1).from_([0]), n=1).from_([1]),
         ),
-        "error_with_columns_after_head": (
-            "A relational step before with_columns.",
+        "with_columns_after_head": (
+            "with_columns after a relational step computes over the rows it keeps.",
             lambda: kn.head(2).with_columns(deg=ur.degree(k)),
         ),
         "error_components_mode": (

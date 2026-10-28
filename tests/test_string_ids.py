@@ -385,8 +385,8 @@ def test_string_view_parquet_written_by_an_engine_scans(tmp_path):
 
 def test_scan_nodes_string_attributes_filter_and_sort(tmp_path):
     # DataFusion read every Parquet string as string_view, so a plain string
-    # attribute column of a scanned node file could not be filtered or sorted by
-    # the pyarrow tail ("no kernel matching input types (string_view, ...)").
+    # attribute column of a scanned node file could not be filtered or sorted
+    # ("no kernel matching input types (string_view, ...)").
     import pyarrow.parquet as pq
 
     path = tmp_path / "nodes.parquet"

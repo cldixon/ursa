@@ -1,11 +1,9 @@
 """group_by().agg() + aggregation expressions (issue #19).
 
-A grouped aggregation is a step in the relational tail: like every step it runs
-where it is written, and it *replaces* the schema with `[keys..., outputs...]`.
-Two execution paths must agree on the output — the DataFusion engine path
-(graph/traversal-derived frames route through `execute_node_query`'s
-`group_keys`/`aggs`) and the pyarrow plain path (`_apply_pyarrow_group_by` for
-source-backed frames). Every test here asserts
+A grouped aggregation is a relational step: like every step it runs where it is
+written, and it *replaces* the schema with `[keys..., outputs...]`. A frame after
+a graph algorithm or a traversal and a plain source-backed frame must agree on
+the output (#191 lowers both the same way). Every test here asserts
 the grouped result directly; the cross-path test asserts both paths land on the
 same numbers.
 
@@ -195,7 +193,7 @@ def test_group_by_on_a_plain_edge_frame():
 
 def test_engine_and_plain_paths_agree(tmp_path):
     # Engine path: the grouping runs over a graph-derived NodeFrame (in-degree +
-    # the joined region attribute), through execute_node_query's group_keys/aggs.
+    # the joined region attribute).
     # Every node here appears in the graph, so degree is defined (never NULL) — a
     # clean cross-path comparison.
     edges = ur.from_arrow(pa.table({"s": [1, 2, 3, 0], "d": [0, 0, 0, 1]}), src="s", dst="d")

@@ -4,10 +4,9 @@
 in order (later keys break ties in earlier ones). ``descending`` is one bool for
 every key or a list with one bool per key. Nulls sort last for every key in either
 direction, the sort is stable, and dictionary-encoded keys order by value. Every
-path is covered: the pyarrow tail (in-memory and scanned node/edge frames, grouped
-and join+group results) and the native engine tail (graph-derived frames and
-traversal outputs). Expected values are hard-coded and cross-checked against
-pyarrow's own multi-key ``sort_by``.
+kind of frame is covered: in-memory and scanned node/edge frames, grouped and
+join+group results, graph-derived frames and traversal outputs. Expected values
+are hard-coded and cross-checked against pyarrow's own multi-key ``sort_by``.
 """
 
 from __future__ import annotations
@@ -169,7 +168,7 @@ def test_join_then_group_by_multi_key_sort():
     assert out.column("total").to_pylist() == [110, 70, 30]
 
 
-# --- the native engine tail -------------------------------------------------
+# --- graph-derived frames and traversals -------------------------------------
 
 # 1->2, 1->3, 2->3, 3->1, 4->1, 4->2: out-degree 1:2, 2:1, 3:1, 4:2.
 EDGES = pa.table({"src": [1, 1, 2, 3, 4, 4], "dst": [2, 3, 3, 1, 1, 2]})
@@ -223,7 +222,7 @@ def test_graph_derived_frame_with_attributes_mixed_directions():
 
 def test_graph_derived_frame_nulls_last_in_both_keys():
     # Node 5 has no club and node 6 has no tier; nulls go last for every key and
-    # either direction, matching the pyarrow tail.
+    # either direction, as on a plain frame.
     edges = ur.from_arrow(
         pa.table({"src": [1, 2, 3, 4, 5, 6], "dst": [2, 3, 4, 5, 6, 1]}), src="src", dst="dst"
     )
@@ -292,8 +291,8 @@ def test_errors_plain_frame():
         nf.sort(["c", "v"], descending=[True]).collect()
     with pytest.raises(ValueError, match="unknown column 'nope'"):
         nf.sort(["c", "nope"]).collect()
-    with pytest.raises(ValueError, match=r"column names or ur\.col"):
-        nf.sort([ur.col("v") + 1]).collect()
+    with pytest.raises(ValueError, match=r"column names, ur\.col"):
+        nf.sort([3]).collect()
 
 
 def test_errors_native_engine():
@@ -303,5 +302,5 @@ def test_errors_native_engine():
         frame.sort(["deg", "id"], descending=[True]).collect()
     with pytest.raises(ValueError, match="at least one column"):
         frame.sort([]).collect()
-    with pytest.raises(ur.ColumnNotFoundError, match="nope"):
+    with pytest.raises(ValueError, match="unknown column 'nope'"):
         frame.sort(["deg", "nope"]).collect()

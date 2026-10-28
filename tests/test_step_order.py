@@ -3,8 +3,7 @@
 Polars — whose surface ursa follows — applies `select`/`distinct`/`rename`/
 `sort`/`head`/`filter`/`sample`/`group_by` in the order they are written. These
 tests pin that on every collect path: plain in-memory and scanned node/edge
-frames (the pyarrow tail, with scan projection pushdown), graph-derived node
-frames (the DataFusion engine tail plus the out-of-order remainder), traversal
+frames (with scan projection pushdown), graph-derived node frames, traversal
 results, and joins. Expected values are exact and cross-checked against pyarrow
 computing the same steps in the same order.
 """
@@ -288,20 +287,27 @@ def test_rename_then_join_on_edges(edges):
     assert out.collect().to_dicts() == [{"src": 1, "name": "a"}, {"src": 2, "name": "b"}]
 
 
-# --- engine path: the common tail stays fully pushed down --------------------
-# How written-order steps split between the engine's fixed-order tail and the
-# host is a unit concern of the plan executor; see the `split_engine_tail` and
-# `projection` tests in `ursa-plan/src/plan.rs`.
+# --- scan projection ----------------------------------------------------------
+# Which columns a scan reads for written-order steps is a unit concern of the
+# plan executor; see the `projection` tests in `ursa-plan/src/plan.rs`.
 
 
-# --- clear errors where an ordering is not supported -------------------------
+# --- with_columns after other steps ------------------------------------------
 
 
-def test_with_columns_after_a_relational_step_is_rejected(nodes):
+def test_with_columns_after_a_relational_step(nodes):
+    # with_columns computes over the rows the steps before it kept (#191).
     g = ur.from_arrow(EDGES, src="s", dst="d")
-    with pytest.raises(NotImplementedError, match=r"with_columns\(\) after head\(\)"):
-        nodes.head(2).with_columns(deg=ur.degree(g)).collect()
-    with pytest.raises(NotImplementedError, match=r"computes"):
+    head_first = nodes.head(2).with_columns(deg=ur.degree(g)).collect().to_arrow()
+    assert head_first.equals(nodes.with_columns(deg=ur.degree(g)).head(2).collect().to_arrow())
+    sorted_first = nodes.sort("v").head(3).with_columns(deg=ur.degree(g, direction="in"))
+    assert sorted_first.collect().to_dicts() == [
+        {"id": 2, "c": "y", "v": 1, "deg": 2},
+        {"id": 3, "c": "x", "v": 2, "deg": 1},
+        {"id": 1, "c": "x", "v": 3, "deg": 3},
+    ]
+    # A filter written before the column exists can't see it.
+    with pytest.raises(ValueError, match="unknown column 'deg'"):
         nodes.filter(ur.col("deg") > 0).with_columns(deg=ur.degree(g)).collect()
     # A filter on an attribute commutes with the computed columns.
     out = nodes.filter(ur.col("v") > 4).with_columns(deg=ur.degree(g, direction="in"))

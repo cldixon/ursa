@@ -1,7 +1,7 @@
 """rename / sample / distinct — the shared relational tail (issues #18, #67).
 
-These verbs run on top of any graph/traversal/plain output via the one shared
-tail (`apply_tail` in Rust; `_apply_pyarrow_steps` for plain frames). rename
+These verbs run on top of any graph/traversal/plain output, lowered the same way
+on every frame (#191). rename
 relabels output columns; sample takes a deterministic seeded subset; distinct
 (newly available on node queries) collapses duplicate rows.
 """

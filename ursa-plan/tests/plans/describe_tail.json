@@ -1,5 +1,5 @@
 {
- "description": "describe() takes no tail yet.",
+ "description": "A step after describe() runs on its summary row.",
  "inputs": [
   {
    "unused": true
@@ -28,7 +28,21 @@
   "n": 1
  },
  "expect": {
-  "error": "not_implemented",
-  "message": "describe() output does not support a filter/sort/head tail yet; call describe() as the final step of the pipeline."
+  "columns": [
+   "n_nodes",
+   "n_edges",
+   "density",
+   "avg_degree",
+   "n_components"
+  ],
+  "rows": [
+   [
+    34,
+    78,
+    0.06951871657754011,
+    2.2941176470588234,
+    null
+   ]
+  ]
  }
 }
