@@ -39,6 +39,13 @@ def describe(edges: EdgeFrame, full: bool = False, direction: str = "out") -> No
     undirected density and ``avg_degree`` the mean undirected degree
     (``2 * n_edges / n_nodes``). ``n_components`` is always the weak count.
 
+    Over a filtered edge frame, or a ``hop`` / ``shortest_path`` result, this
+    is the subgraph view ``degree`` reads: the parent graph's nodes, and only
+    the kept edges. ``n_nodes`` stays the parent's count, a node left without
+    an edge is its own component, and ``density`` divides by the parent's
+    ``n``, so a small neighbourhood of a large graph has a density near 0.
+    Rebuild a frame from the collected rows for figures over their nodes only.
+
     This is a whole-graph summary, not a node-keyed frame: it has no ``id`` column,
     so the carried ``id_col`` is an unused placeholder (you collect the summary
     rather than derive node-keyed frames from it).

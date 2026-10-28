@@ -14,6 +14,8 @@ A lazy one-row summary with the columns `n_nodes`, `n_edges`, `density`, and `av
 
 By default, `n_edges` is the number of rows and `avg_degree` is the mean out-degree. With `direction="both"`, `n_edges` is the number of undirected edges, `density` is the undirected density, and `avg_degree` is the mean undirected degree, `2 · n_edges / n_nodes`.
 
+Over a filtered edge frame, `describe` reads the same subgraph view as `degree` and the other graph ops: the parent graph's nodes, and only the rows the filter keeps. The same holds for a `hop` or `shortest_path` result, whose edges are the subgraph its reached nodes induce. `n_nodes` is still the parent graph's node count. Every node the filter or traversal leaves without an edge counts as its own component, and `density` divides by the parent's `n`, so a small neighbourhood of a large graph has a density near 0. For figures over only the kept rows' nodes, rebuild a frame from the collected rows. After a reshaping step (`distinct`, `head`, a join, ...) `describe` reads the graph of the reshaped rows, as a new frame over them would.
+
 The result is not keyed by node. Call `collect()` on it directly; the shared row methods do not apply.
 
 ## `ur.density`

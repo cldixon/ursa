@@ -281,7 +281,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   rows' graph. For `s = [0, 0, 1, 2]`, `d = [1, 2, 2, 3]`,
   `w = [0.1, 0.9, 0.9, 0.1]`, `ur.describe(e.filter(ur.col("w") > 0.5))` was
   `n_nodes=4, n_edges=4, density=0.333, avg_degree=1.0` and is now
-  `n_nodes=4, n_edges=2, density=0.167, avg_degree=0.5` (#207).
+  `n_nodes=4, n_edges=2, density=0.167, avg_degree=0.5` (#207). As with
+  `degree`, the node set stays the parent graph's. So over a traversal result
+  `n_nodes` is the whole graph's, every unreached node is its own component,
+  and `density` divides by the parent's node count. A 10-node neighbourhood of
+  a large graph has a density near 0.
 - `sort()` orders floats as filters compare them (#201): every NaN is above
   every number whatever its sign bit, and `-0.0` equals `0.0`, so they tie and
   keep input order, dictionary-encoded float columns included. A NaN with the
