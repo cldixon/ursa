@@ -201,7 +201,7 @@ shape: (3, 3)
 | `"semi"` | The left rows that have a match, once each, with the left columns only. | Left-frame order. |
 | `"anti"` | The left rows that have no match, with the left columns only. | Left-frame order. |
 
-The output has the left frame's columns, then the right frame's other columns. Each key column appears once. It holds the left key, or the right key on a row that only the right frame has. A null key never matches. A non-key column on both sides is an error; `rename()` one side first.
+The output has the left frame's columns, then the right frame's other columns. Each key column appears once, with the left frame's type. It holds the left key, or the right key on a row that only the right frame has. A null key never matches. A non-key column on both sides is an error; `rename()` one side first.
 
 ```python
 members = ur.NodeFrame({"id": [0, 1, 34], "since": [1970, 1971, 1975]}, id="id")

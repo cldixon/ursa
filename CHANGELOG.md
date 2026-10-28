@@ -175,7 +175,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `"semi"` and `"anti"` as well as `"inner"` and `"left"`. The output is the
   left frame's columns, then the right frame's non-key columns (none for
   `semi`/`anti`); each key appears once, holding the right key on a row only the
-  right frame has. Null keys never match. The row order is fixed:
+  right frame has, with the left key's type for every `how` (a `right` or
+  `outer` join whose right key holds a value that type can't raises a
+  `ValueError`). Null keys never match. The row order is fixed:
   - `inner`, `left`, `semi`, `anti`: the left rows in order, each followed by
     its matches in right-frame order (as before for `inner` and `left`);
   - `right`: the mirror image, the right rows in order, each followed by its

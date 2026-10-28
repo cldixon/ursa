@@ -722,8 +722,16 @@ pub fn unfit_right_key(
     let (ls, rs) = (left.schema(), right.schema());
     let batches = right.run()?;
     for k in on {
-        let lt = ls.field_with_name(k).map_err(arrow_err)?.data_type().clone();
-        let rt = rs.field_with_name(k).map_err(arrow_err)?.data_type().clone();
+        let lt = ls
+            .field_with_name(k)
+            .map_err(arrow_err)?
+            .data_type()
+            .clone();
+        let rt = rs
+            .field_with_name(k)
+            .map_err(arrow_err)?
+            .data_type()
+            .clone();
         if lt == rt {
             continue;
         }
