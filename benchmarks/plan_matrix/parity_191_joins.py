@@ -33,9 +33,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parity_191 import EDGES, NEG_NAN, OTHER, TMP, G, T, encode, load  # noqa: E402
+from parity_191 import EDGES, NEG_NAN, OTHER, TMP, G, T, encode, load
 
-import ursa as ur  # noqa: E402
+import ursa as ur
 
 warnings.simplefilter("ignore")
 col = ur.col
@@ -55,9 +55,7 @@ R_ID = pa.Table.from_batches(
     ).to_batches(max_chunksize=4)
 )
 pq.write_table(R_ID, TMP / "rid.parquet", row_group_size=4)
-R_F = pa.table(
-    {"f": [nan, NEG_NAN, -0.0, 0.0, 1.5, None, float("inf"), 1.5], "fw": list(range(8))}
-)
+R_F = pa.table({"f": [nan, NEG_NAN, -0.0, 0.0, 1.5, None, float("inf"), 1.5], "fw": list(range(8))})
 R_S = pa.table({"s": ["a", "b", None, "é", "zz", "a"], "sw": list(range(6))})
 R_C = pa.table(
     {"c": pa.array(["x", "z", None, "x", "y"]).dictionary_encode(), "cw": list(range(5))}
@@ -100,7 +98,10 @@ def left_frames() -> dict:
     return {
         "plain": (ur.from_arrow(T, id="id"), "id"),
         "scan": (ur.scan_nodes(str(TMP / "nodes.parquet"), id="id"), "id"),
-        "attr_graph": (ur.from_arrow(T, id="id").with_columns(dg=ur.degree(G, direction="in")), "id"),
+        "attr_graph": (
+            ur.from_arrow(T, id="id").with_columns(dg=ur.degree(G, direction="in")),
+            "id",
+        ),
         "nodes": (G.nodes().with_columns(dg=ur.degree(G)), "id"),
         "join": (ur.from_arrow(T, id="id").join(ur.from_arrow(OTHER, id="id"), on="id"), "id"),
         "group": (ur.from_arrow(T, id="id").group_by("id").agg(n=col("k").count()), "id"),
@@ -166,18 +167,16 @@ def cases() -> dict:
             # A stepped right side.
             for pname, pre in pre_steps(key).items():
                 out[f"{lname}|mem<{pname}|{how}"] = (
-                    lambda left=left, how=how, key=key, pre=pre, r=rights["mem"]: (
-                        left.join(pre(r), on=key, how=how)
+                    lambda left=left, how=how, key=key, pre=pre, r=rights["mem"]: left.join(
+                        pre(r), on=key, how=how
                     )
                 )
         # Two and three joins.
         for h1 in ["inner", "left", "right", "outer"]:
             for h2 in ["inner", "left", "right", "outer", "semi", "anti"]:
-                out[f"{lname}|two|{h1}+{h2}"] = lambda left=left, key=key, h1=h1, h2=h2: (
-                    left.join(ur.from_arrow(rkey(R_ID, key), id=key), on=key, how=h1).join(
-                        ur.from_arrow(rkey(R_3, key), id=key), on=key, how=h2
-                    )
-                )
+                out[f"{lname}|two|{h1}+{h2}"] = lambda left=left, key=key, h1=h1, h2=h2: left.join(
+                    ur.from_arrow(rkey(R_ID, key), id=key), on=key, how=h1
+                ).join(ur.from_arrow(rkey(R_3, key), id=key), on=key, how=h2)
             out[f"{lname}|three|{h1}"] = lambda left=left, key=key, h1=h1: (
                 left.join(ur.from_arrow(rkey(R_ID, key), id=key), on=key, how="left")
                 .join(ur.from_arrow(rkey(R_3, key), id=key), on=key, how=h1)

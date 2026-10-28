@@ -1,0 +1,129 @@
+{
+ "description": "An outer join: left order, then the unmatched right rows (#191).",
+ "inputs": [
+  {
+   "nodes": "karate"
+  },
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  }
+ ],
+ "plan": {
+  "op": "join",
+  "input": {
+   "op": "filter",
+   "input": {
+    "op": "from_arrow",
+    "frame": 0,
+    "id": "id"
+   },
+   "step": 0,
+   "predicate": {
+    "kind": "binary",
+    "op": "<",
+    "left": {
+     "kind": "col",
+     "name": "id"
+    },
+    "right": {
+     "kind": "lit",
+     "value": 4
+    }
+   }
+  },
+  "right": {
+   "op": "filter",
+   "input": {
+    "op": "with_columns",
+    "input": {
+     "op": "nodes",
+     "input": {
+      "op": "from_arrow",
+      "frame": 1,
+      "src": "src",
+      "dst": "dst"
+     }
+    },
+    "columns": [
+     {
+      "name": "deg",
+      "expr": {
+       "kind": "graph",
+       "verb": "degree",
+       "edges": {
+        "plan": {
+         "op": "from_arrow",
+         "frame": 2,
+         "src": "src",
+         "dst": "dst"
+        },
+        "frame": 2
+       },
+       "direction": "both"
+      }
+     }
+    ]
+   },
+   "step": 1,
+   "predicate": {
+    "kind": "binary",
+    "op": ">",
+    "left": {
+     "kind": "col",
+     "name": "deg"
+    },
+    "right": {
+     "kind": "lit",
+     "value": 9
+    }
+   }
+  },
+  "how": "outer",
+  "on": [
+   "id"
+  ],
+  "step": 2
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "club",
+   "deg"
+  ],
+  "rows": [
+   [
+    0,
+    "Mr. Hi",
+    16
+   ],
+   [
+    1,
+    "Mr. Hi",
+    null
+   ],
+   [
+    2,
+    "Mr. Hi",
+    10
+   ],
+   [
+    3,
+    "Mr. Hi",
+    null
+   ],
+   [
+    32,
+    null,
+    12
+   ],
+   [
+    33,
+    null,
+    17
+   ]
+  ]
+ }
+}

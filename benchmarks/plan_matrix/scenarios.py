@@ -249,9 +249,9 @@ def join_two():
     degree = e.nodes().with_columns(dg=ur.degree(e))
 
     def q():
-        nodes.join(degree, on="id").filter(ur.col("dg") > 8).join(
-            other, on="id", how="left"
-        ).sort("dg", descending=True).collect()
+        nodes.join(degree, on="id").filter(ur.col("dg") > 8).join(other, on="id", how="left").sort(
+            "dg", descending=True
+        ).collect()
 
     return best(q)
 

@@ -600,28 +600,36 @@ impl Frame {
         self.reorder()?;
         self.drop_ordinal()?;
         let batches = self.run()?;
-        if self.nullable.is_empty() {
-            return Ok(batches);
-        }
-        let schema = batches[0].schema();
-        let fields: Vec<Field> = schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let f = f.as_ref().clone();
-                if self.nullable.contains(f.name()) {
-                    f.with_nullable(true)
-                } else {
-                    f
-                }
-            })
-            .collect();
-        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-        batches
-            .into_iter()
-            .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).map_err(arrow_err))
-            .collect()
+        relax_nullability(batches, &self.nullable)
     }
+}
+
+/// `batches` with the columns named in `nullable` marked nullable.
+fn relax_nullability(
+    batches: Vec<RecordBatch>,
+    nullable: &BTreeSet<String>,
+) -> Result<Vec<RecordBatch>> {
+    if nullable.is_empty() {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let f = f.as_ref().clone();
+            if nullable.contains(f.name()) {
+                f.with_nullable(true)
+            } else {
+                f
+            }
+        })
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    batches
+        .into_iter()
+        .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).map_err(arrow_err))
+        .collect()
 }
 
 /// A join's `how`.
@@ -673,10 +681,16 @@ const ABSENT: u64 = SPAN - 1;
 impl Frame {
     /// This frame as a join input: its plan, with the ordinal `ord` numbering the
     /// rows `0..` in logical order (an ordinal the frame carries is dropped: it
-    /// need not be dense), and the columns it reports nullable.
-    fn join_input(mut self, ord: &str) -> Result<(DataFrame, BTreeSet<String>)> {
+    /// need not be dense). Columns the frame reports nullable are nullable in the
+    /// plan, as in its collected rows, so what the join (and any expression over
+    /// its output) infers matches.
+    fn join_input(mut self, ord: &str) -> Result<DataFrame> {
         self.reorder()?;
         self.drop_ordinal()?;
+        if !self.nullable.is_empty() {
+            let batches = self.run()?;
+            self.set(relax_nullability(batches, &self.nullable)?)?;
+        }
         let df = match self.batches.take() {
             Some(batches) => {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -687,7 +701,7 @@ impl Frame {
             }
             None => crate::ordinal::enumerate(self.plan()?, ord, ABSENT - 1)?,
         };
-        Ok((df, self.nullable))
+        Ok(df)
     }
 }
 
@@ -724,9 +738,9 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
     let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
     let sentinel = |c: &str| on.iter().position(|k| k == c).map(|i| &sentinels[i]);
 
-    let (left_df, left_nullable) = left.join_input(&l)?;
-    let (right_df, right_nullable) = if how.keeps_right() {
-        let (df, nullable) = right.join_input(&r)?;
+    let left_df = left.join_input(&l)?;
+    let right_df = if how.keeps_right() {
+        let df = right.join_input(&r)?;
         let mut cols: Vec<Expr> = right_names
             .iter()
             .map(|c| match sentinel(c) {
@@ -735,7 +749,7 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
             })
             .collect();
         cols.push(col_named(&r));
-        (df.select(cols)?, nullable)
+        df.select(cols)?
     } else {
         // Only whether a row has a match is read: the keys, in any order.
         let mut right = right;
@@ -744,7 +758,7 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
             .zip(&sentinels)
             .map(|(k, s)| col_named(k).alias(s))
             .collect();
-        (right.plan()?.select(keys)?, BTreeSet::new())
+        right.plan()?.select(keys)?
     };
     let join_type = match how {
         How::Inner => JoinType::Inner,
@@ -787,25 +801,7 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
     };
     out.push(ord.alias(&combined));
     let df = joined.select(out)?;
-
-    // What the result reports nullable: the left frame's columns, the right
-    // frame's other columns, and a key the right side may fill as the right key.
-    let mut nullable = left_nullable;
-    if how.right_rows() {
-        // The key reads the right key where the left one is missing (always,
-        // for a right-only row): it is nullable as the right key is.
-        for k in on {
-            if right_nullable.contains(k) {
-                nullable.insert(k.clone());
-            } else {
-                nullable.remove(k);
-            }
-        }
-    }
-    nullable.extend(right_nullable.into_iter().filter(|c| sentinel(c).is_none()));
-    let mut frame = Frame::from_numbered(ctx, df, combined);
-    frame.nullable = nullable;
-    Ok(frame)
+    Ok(Frame::from_numbered(ctx, df, combined))
 }
 
 /// The first `n` rows of `batches` (zero-copy), keeping at least one batch so the

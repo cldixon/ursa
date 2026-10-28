@@ -12,8 +12,6 @@ rows, which pins the row order each ``how`` guarantees:
 
 from __future__ import annotations
 
-import math
-
 import pyarrow as pa
 import pytest
 
@@ -31,19 +29,24 @@ def _rows(t: pa.Table) -> list[tuple]:
     return list(zip(*cols, strict=True))
 
 
-def _eq(a, b) -> bool:
-    return a is not None and b is not None and a == b
-
-
 def nested_loop(left: pa.Table, right: pa.Table, on: list[str], how: str) -> list[tuple]:
-    """The join of two collected tables, in the order the join guarantees."""
+    """The join of two collected tables, in the order the join guarantees (a
+    nested loop, indexed by key)."""
     lk = [left.column_names.index(k) for k in on]
     rk = [right.column_names.index(k) for k in on]
     rv = [i for i, c in enumerate(right.column_names) if c not in on]
     lrows, rrows = _rows(left), _rows(right)
 
-    def match(lr, rr):
-        return all(_eq(lr[a], rr[b]) for a, b in zip(lk, rk, strict=True))
+    def index(rows, cols):
+        by_key: dict = {}
+        for r in rows:
+            key = tuple(r[c] for c in cols)
+            if None not in key:  # a null key matches nothing
+                by_key.setdefault(key, []).append(r)
+        return by_key
+
+    def key(row, cols):
+        return tuple(row[c] for c in cols)
 
     def joined(lr, rr):
         if lr is None:  # a right-only row: the keys take the right key
@@ -54,12 +57,14 @@ def nested_loop(left: pa.Table, right: pa.Table, on: list[str], how: str) -> lis
 
     out = []
     if how == "right":
+        by_left = index(lrows, lk)
         for rr in rrows:
-            ms = [lr for lr in lrows if match(lr, rr)]
+            ms = by_left.get(key(rr, rk), [])
             out.extend(joined(lr, rr) for lr in ms) if ms else out.append(joined(None, rr))
         return out
+    by_right = index(rrows, rk)
     for lr in lrows:
-        ms = [rr for rr in rrows if match(lr, rr)]
+        ms = by_right.get(key(lr, lk), [])
         if how == "semi":
             out.extend([tuple(lr)] if ms else [])
         elif how == "anti":
@@ -69,16 +74,16 @@ def nested_loop(left: pa.Table, right: pa.Table, on: list[str], how: str) -> lis
         elif how in ("left", "outer"):
             out.append(joined(lr, None))
     if how == "outer":
-        out.extend(joined(None, rr) for rr in rrows if not any(match(lr, rr) for lr in lrows))
+        left_keys = index(lrows, lk)
+        out.extend(joined(None, rr) for rr in rrows if key(rr, rk) not in left_keys)
     return out
 
 
-def check(left, right, on, how, *, ref_left=None, ref_right=None):
+def check(left, right, on, how):
     """Join `left` and `right` in the engine and compare with the nested loop
-    over their collected rows (or `ref_left` / `ref_right`, when given)."""
+    over their collected rows."""
     on = [on] if isinstance(on, str) else on
-    lt = (ref_left if ref_left is not None else left).collect().to_arrow()
-    rt = (ref_right if ref_right is not None else right).collect().to_arrow()
+    lt, rt = left.collect().to_arrow(), right.collect().to_arrow()
     out = left.join(right, on=on, how=how).collect().to_arrow()
     want_cols = lt.column_names + (
         [] if how in ("semi", "anti") else [c for c in rt.column_names if c not in on]
@@ -207,18 +212,21 @@ def test_null_keys_never_match():
     ]
 
 
-def test_float_keys_with_nan_and_signed_zero():
-    nan = float("nan")
-    left = ur.from_arrow(pa.table({"f": [0.0, -0.0, nan, 1.5, None], "a": [1, 2, 3, 4, 5]}), id="f")
-    right = ur.from_arrow(pa.table({"f": [nan, 0.0, 1.5, -0.0], "b": [6, 7, 8, 9]}), id="f")
-    for how in HOWS:
-        out = left.join(right, on="f", how=how).collect().to_arrow()
-        # The order holds; which float keys match is the hash join's equality.
-        assert out.num_rows == len(_rows(out))
-    inner = left.join(right, on="f").collect().to_dicts()
-    assert [r["a"] for r in inner] == sorted(r["a"] for r in inner)
-    assert {(r["a"], r["b"]) for r in inner} >= {(4, 8)}
-    assert not any(math.isnan(r["f"]) and r["a"] == 5 for r in inner)
+def test_float_keys_match_by_their_bits():
+    # The hash join's equality, as for inner/left joins before: a float key
+    # matches the same bits, so 0.0 and -0.0 differ and a NaN matches a NaN of
+    # the same sign.
+    nan, neg_nan = float("nan"), -float("nan")
+    left = ur.from_arrow(
+        pa.table({"f": [0.0, -0.0, nan, 1.5, None, neg_nan], "a": [1, 2, 3, 4, 5, 6]}), id="a"
+    )
+    right = ur.from_arrow(
+        pa.table({"f": [nan, 0.0, 1.5, -0.0, neg_nan], "b": [6, 7, 8, 9, 10]}), id="b"
+    )
+    pairs = [(r["a"], r["b"]) for r in left.join(right, on="f").collect().to_dicts()]
+    assert pairs == [(1, 7), (2, 9), (3, 6), (4, 8), (6, 10)]
+    outer = [(r["a"], r["b"]) for r in left.join(right, on="f", how="outer").collect().to_dicts()]
+    assert outer == [(1, 7), (2, 9), (3, 6), (4, 8), (5, None), (6, 10)]
 
 
 @pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
@@ -354,7 +362,9 @@ def test_engine_frame_on_the_left(name, how):
 def test_join_on_a_traversal_result(how):
     e = edges()
     hop = ur.hop(e, 1).from_([0, 2])
-    sources = ur.from_arrow(pa.table({"src": [2, 0, 7, 2], "label": ["a", "b", "c", "d"]}), id="src")
+    sources = ur.from_arrow(
+        pa.table({"src": [2, 0, 7, 2], "label": ["a", "b", "c", "d"]}), id="src"
+    )
     check(hop, sources, "src", how)
     # A traversal on the right, and traversals on both sides.
     check(sources, hop, "src", how)
@@ -384,3 +394,13 @@ def test_join_after_describe():
     info = ur.from_arrow(pa.table({"n_nodes": [6, 7], "label": ["six", "seven"]}), id="n_nodes")
     out = ur.describe(e).join(info, on="n_nodes").collect().to_dicts()
     assert [r["label"] for r in out] == ["six"]
+
+
+def test_a_joined_group_by_side_keeps_its_nullable_columns():
+    # group_by().agg() reports its columns nullable; a join input carries that
+    # into the plan, so an expression over the joined key is nullable too, as
+    # when the join collected its inputs.
+    e = edges()
+    grouped = e.nodes().with_columns(dg=ur.degree(e)).group_by("id").agg(n=ur.col("dg").count())
+    out = grouped.join(other(), on="id").with_columns(k=ur.col("id") + 1).collect().to_arrow()
+    assert out.schema.field("id").nullable and out.schema.field("k").nullable

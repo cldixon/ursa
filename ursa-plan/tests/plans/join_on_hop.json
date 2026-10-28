@@ -1,0 +1,147 @@
+{
+ "description": "A join on a traversal result, an attribute table on the right (#191).",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "ids": [
+    0,
+    33
+   ]
+  },
+  {
+   "nodes": "karate"
+  }
+ ],
+ "plan": {
+  "op": "join",
+  "input": {
+   "op": "hop",
+   "edges": {
+    "plan": {
+     "op": "from_arrow",
+     "frame": 1,
+     "src": "src",
+     "dst": "dst"
+    },
+    "frame": 1
+   },
+   "n": 1,
+   "direction": "out",
+   "seeds": 2
+  },
+  "right": {
+   "op": "rename",
+   "input": {
+    "op": "from_arrow",
+    "frame": 3,
+    "id": "id"
+   },
+   "step": 0,
+   "mapping": [
+    [
+     "id",
+     "dst"
+    ]
+   ]
+  },
+  "how": "inner",
+  "on": [
+   "dst"
+  ],
+  "step": 1
+ },
+ "expect": {
+  "columns": [
+   "src",
+   "dst",
+   "club"
+  ],
+  "rows": [
+   [
+    0,
+    1,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    2,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    3,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    4,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    5,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    6,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    7,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    8,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    10,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    11,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    12,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    13,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    17,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    19,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    21,
+    "Mr. Hi"
+   ],
+   [
+    0,
+    31,
+    "Officer"
+   ]
+  ]
+ }
+}
