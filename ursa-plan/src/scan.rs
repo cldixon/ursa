@@ -24,9 +24,11 @@ use arrow::array::{Array, RecordBatch};
 use arrow::compute::kernels::boolean::{and, is_not_null};
 use arrow::compute::{cast, filter};
 use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::context::SessionState;
+use datafusion::execution::options::ReadOptions;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{execute_stream_partitioned, ExecutionPlan};
@@ -43,6 +45,8 @@ use object_store::ObjectStore;
 use serde_json::Value;
 use url::{Position, Url};
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
+
+use crate::parquet_stats::InexactFloatBounds;
 
 /// The object store for a scan `path`, with the `scheme://authority` base it is
 /// registered under. A schemeless (bare local) path parses as an error and needs
@@ -411,12 +415,35 @@ async fn open_scan(
 ) -> Result<DataFrame> {
     let ctx = SessionContext::new_with_state(scan_state(path, storage_options)?);
     Ok(match detect_format(path, kind)? {
-        ScanFormat::Parquet => {
-            ctx.read_parquet(path, ParquetReadOptions::default())
-                .await?
-        }
+        ScanFormat::Parquet => read_parquet(&ctx, path).await?,
         ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
     })
+}
+
+/// `ctx.read_parquet(path, ParquetReadOptions::default())`, with the file
+/// statistics' float bounds marked inexact ([`InexactFloatBounds`], #202):
+/// DataFusion 54 would otherwise read a float column whose non-NaN values are
+/// all equal as that constant, NaN rows included. The table is built as
+/// `read_parquet` builds it, sharing the runtime's file statistics cache.
+async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
+    let table_path = ListingTableUrl::parse(path)?;
+    let mut options = ParquetReadOptions::default()
+        .to_listing_options(&ctx.copied_config(), ctx.copied_table_options());
+    if !path.ends_with(options.file_extension.as_str()) && !table_path.is_collection() {
+        return Err(DataFusionError::Execution(format!(
+            "File path '{}' does not match the expected extension '{}'",
+            table_path.as_str(),
+            options.file_extension
+        )));
+    }
+    options.format = Arc::new(InexactFloatBounds::new(options.format));
+    let config = ListingTableConfig::new(table_path)
+        .with_listing_options(options)
+        .infer_schema(&ctx.state())
+        .await?;
+    let provider = ListingTable::try_new(config)?
+        .with_cache(ctx.runtime_env().cache_manager.get_file_statistic_cache());
+    ctx.read_table(Arc::new(provider))
 }
 
 /// Collect a scan's batches in file row order.
@@ -1818,5 +1845,98 @@ mod tests {
             .into_iter()
             .collect();
         assert!(object_store_for("s3://my-bucket/f.parquet", &bad).is_err());
+    }
+
+    /// An edge file `s, d, r` with `r` written as `values` (`None`: null), in
+    /// row groups of `group` rows.
+    fn write_float_parquet<T>(path: &std::path::Path, values: Vec<Option<T::Native>>, group: usize)
+    where
+        T: arrow::datatypes::ArrowPrimitiveType,
+    {
+        use arrow::array::PrimitiveArray;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        let n = values.len() as i64;
+        let r: PrimitiveArray<T> = values.into_iter().collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Int64, false),
+            Field::new("d", DataType::Int64, false),
+            Field::new("r", r.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..n).map(|i| (i + 1) % n).collect::<Vec<_>>(),
+                )),
+                Arc::new(r),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(group))
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// Column `r` of `batches`, as `f64` bit patterns (`None`: null), so NaN
+    /// compares equal to itself.
+    fn float_bits(batches: &[RecordBatch]) -> Vec<Option<u64>> {
+        use arrow::array::Float64Array;
+        let mut out = vec![];
+        for b in batches {
+            let r = cast(b.column_by_name("r").unwrap(), &DataType::Float64).unwrap();
+            let r = r.as_any().downcast_ref::<Float64Array>().unwrap();
+            out.extend(r.iter().map(|v| v.map(f64::to_bits)));
+        }
+        out
+    }
+
+    #[test]
+    fn nan_rows_read_back_as_nan_beside_a_constant_float_row_group() {
+        // #202: a float column whose non-NaN values are all equal was read as that
+        // constant, NaN rows included, through every scan path.
+        use arrow::datatypes::{Float32Type, Float64Type};
+        let nan = f64::NAN;
+        let cases: Vec<(Vec<Option<f64>>, usize)> = vec![
+            (vec![Some(nan), Some(nan), Some(1.0)], 2), // all-NaN group, constant group
+            (vec![Some(nan), Some(1.0), Some(1.0)], 3), // one group, NaN beside a constant
+            (vec![Some(nan), Some(nan), Some(nan)], 2), // all NaN
+            (vec![None, None, Some(1.0)], 2),           // all-null group
+            (vec![Some(nan), None, Some(1.0), Some(1.0)], 2), // mixed
+            (vec![Some(nan), Some(2.0), Some(1.0)], 2), // the issue's control
+        ];
+        for (i, (values, group)) in cases.into_iter().enumerate() {
+            let want: Vec<Option<u64>> = values.iter().map(|v| v.map(f64::to_bits)).collect();
+            for f32_col in [false, true] {
+                let path =
+                    std::env::temp_dir().join(format!("ursa_scan_test_nan_{i}_{f32_col}.parquet"));
+                if f32_col {
+                    let v = values.iter().map(|v| v.map(|x| x as f32)).collect();
+                    write_float_parquet::<Float32Type>(&path, v, group);
+                } else {
+                    write_float_parquet::<Float64Type>(&path, values.clone(), group);
+                }
+                let p = path.to_str().unwrap();
+                let rows = scan_edges_rows(p, "s", "d", &no_opts(), &[], &[], false).unwrap();
+                assert_eq!(
+                    float_bits(&rows.batches),
+                    want,
+                    "rows: case {i}, f32 {f32_col}"
+                );
+                let weighted =
+                    scan_edges_batch(p, "s", "d", &no_opts(), &["r".to_string()]).unwrap();
+                assert_eq!(
+                    float_bits(&weighted),
+                    want,
+                    "weights: case {i}, f32 {f32_col}"
+                );
+                std::fs::remove_file(&path).ok();
+            }
+        }
     }
 }

@@ -272,6 +272,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A Parquet scan read NaN in a float column as another number when the
+  column's other values were all equal: with row groups `[NaN, NaN]` and
+  `[1.0]`, or one row group `[NaN, 1.0, 1.0]`, `ur.scan_edges(p, ...)` read
+  `r` as `[1.0, 1.0, 1.0]`, and a weight or filter over `r` saw the same
+  values. `pq.read_table` and an in-memory frame read `[NaN, NaN, 1.0]`, as the
+  scan now does. Parquet min/max statistics leave NaN out, and DataFusion 54
+  marked the file's float bounds exact, then read a column whose exact bounds
+  were equal as that constant. Scans now treat a float column's file-level
+  min/max as inexact: they still prune, but no longer stand in for the values
+  (#202).
 - `sort()` orders floats as filters compare them (#201): every NaN is above
   every number whatever its sign bit, and `-0.0` equals `0.0`, so they tie and
   keep input order, dictionary-encoded float columns included. A NaN with the
