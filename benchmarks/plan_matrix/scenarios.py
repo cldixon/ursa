@@ -271,29 +271,30 @@ def join_two_reingest():
     return best(q)
 
 
-def grouped_10m() -> ur.EdgeFrame:
-    """The 10M-edge frame aggregated per (s, d): a reshaped edge set (#191)."""
-    return mem("e10m").group_by("s", "d").agg(w=W.sum())
+def grouped(e: ur.EdgeFrame) -> ur.EdgeFrame:
+    """The edges aggregated per (s, d): a reshaped edge set (#191)."""
+    return e.group_by("s", "d").agg(w=W.sum())
 
 
 def reshaped_pagerank_first():
     """Weighted pagerank over a group_by-aggregated 10M-edge frame, first collect:
     the subplan runs and the topology of its rows is built."""
-    g = grouped_10m()
+    g = grouped(mem("e10m"))
     return once(lambda: ur.pagerank(g, weight=W).collect())
 
 
 def reshaped_pagerank_repeat():
-    """The same, repeated: the topology and weights come from the subplan cache."""
-    g = grouped_10m()
-    ur.pagerank(g, weight=W).collect()
-    return best(lambda: ur.pagerank(grouped_10m(), weight=W).collect())
+    """The same, repeated over the same edge table (the plan written afresh each
+    time): the topology and weights come from the subplan cache."""
+    e = mem("e10m")
+    ur.pagerank(grouped(e), weight=W).collect()
+    return best(lambda: ur.pagerank(grouped(e), weight=W).collect())
 
 
 def reshaped_pagerank_reingest():
     """The same work as main had to write it: collect the aggregate, re-ingest it,
     run pagerank (one pass, nothing cached)."""
-    g = grouped_10m()
+    g = grouped(mem("e10m"))
 
     def q():
         fresh = ur.from_arrow(g.collect().to_arrow(), src="s", dst="d")

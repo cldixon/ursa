@@ -1,6 +1,6 @@
 # Work on a subgraph
 
-An `EdgeFrame` with fewer rows is a smaller graph. Any algorithm over it sees only those rows. You get a smaller graph in three ways: a filter on the edges, a traversal, or `distinct`.
+An `EdgeFrame` with fewer rows is a smaller graph. Any algorithm over it sees only those rows. You get a smaller graph in three ways: a filter on the edges, a traversal, or a step that reshapes the edge rows, such as `distinct`.
 
 ```python
 import ursa as ur

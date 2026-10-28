@@ -48,10 +48,16 @@
 //! subplan plus the host frame it came from. [`EdgeInput::view`] splits it into
 //! the interface #191 and #192 build on, an [`EdgeView`]:
 //!
-//! - `topology`: the subplan whose rows define the CSR. Today that is a source
-//!   (under any `reverse`). #191 widens it to any subplan (a `distinct`, `join`,
-//!   `group_by`, ...), rebuilt from that subplan's output and cached by a
-//!   fingerprint of it.
+//! - `topology`: the subplan whose rows define the CSR: a source (under any
+//!   `reverse`), whose index the host frame keeps, or the topmost step that
+//!   reshapes the edge rows (`distinct`, `sample`, `join`, `group_by().agg()`,
+//!   `sort`, `head`; #191), whose index is built from that subplan's output, as
+//!   a fresh frame over those rows would build it, and cached by a fingerprint
+//!   of the subplan ([`crate::reshape`]).
+//! - the steps above the topology that keep its rows: `filter`, and the column
+//!   steps `select`, `rename` and `with_columns`, which a weight or a later
+//!   filter reads through. A step that leaves no `src` / `dst` column is an
+//!   error naming it.
 //! - a mask, derived in dense id space over the topology's edge rows: the
 //!   `filter` predicates written above the topology (a subgraph view, #114),
 //!   ANDed, and for a traversal result the subgraph its reached node set induces
@@ -1616,8 +1622,6 @@ fn edge_group_columns(
     nodes: Option<(&[RecordBatch], &str)>,
     inputs: &dyn Inputs,
 ) -> PlanResult<GraphColumns> {
-    let view = edges.view()?;
-    let mut scratch = Scratch::default();
     // A weighted algorithm needs the edge columns its weight expression reads.
     // The read is skipped when the index already caches every one of these
     // weights (and, for a scan, builds the index too).
@@ -1630,6 +1634,8 @@ fn edge_group_columns(
             weight_keys.push(w.to_string());
         }
     }
+    let view = edges.view()?;
+    let mut scratch = Scratch::default();
     let edge_attr = if weight_cols.is_empty() {
         None
     } else {
