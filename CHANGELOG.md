@@ -269,6 +269,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     `ValueError` before the plan runs: `select() would produce duplicate column
     'f'.` A plain frame returned both columns (`select("f", "f")`, or
     `rename({"f": "g"})` when `g` exists).
+- `group_by().agg()` with a float `sum`, `mean`, `min` or `max` (or an integer
+  or boolean `mean`) no longer reads its rows through one serial hash
+  repartition (#204). The rows are cut into fixed-size chunks, each chunk is
+  hash-partitioned by the group key in parallel, and every partition reads its
+  chunks' rows back in chunk order. Each group still folds its values in input
+  order, so results are unchanged, bit for bit, on any number of cores. On 10M
+  rows (4 cores, medians of 5 interleaved runs), before → after (the release
+  before #191 part 1 in brackets):
+
+  | `agg` | ~1k groups | ~1M groups | one group holds half the rows |
+  |---|---|---|---|
+  | float `sum` | 0.083s → 0.067s (0.100s) | 0.69s → 0.21s (0.46s) | 0.57s → 0.28s (0.43s) |
+  | `count` + `sum` + `max` | 0.106s → 0.072s (0.108s) | 0.95s → 0.28s (0.64s) | 0.81s → 0.36s (0.61s) |
+  | `count` alone | unchanged, 0.027s | unchanged, 0.19s | unchanged, 0.20s |
+
+  PageRank over edges grouped by `(s, d)` with a float sum (10M edges), 3.96s
+  to 2.08s, with peak memory 2.29 GB to 1.71 GB. The `filter` + `group_by` +
+  `sort` tail over a 1M-row attribute frame, 23 ms to 22 ms (17 ms before #191
+  part 1): its ~50 groups spread over 4 partitions only as evenly as they hash.
 
 ### Fixed
 
