@@ -271,7 +271,9 @@ def test_a_traversal_or_describe_no_longer_ignores_head_or_sort():
     e = _edges()
     small = e.head(3)
     walk = ur.random_walk(small, start=[0, 1, 3], steps=6, seed=4).collect().to_arrow()
-    kept = {(s, d) for s, d in zip(EDGES["s"][:3].to_pylist(), EDGES["d"][:3].to_pylist())}
+    kept = {
+        (s, d) for s, d in zip(EDGES["s"][:3].to_pylist(), EDGES["d"][:3].to_pylist(), strict=True)
+    }
     nodes = walk.column("node").to_pylist()
     walks = walk.column("walk_id").to_pylist()
     for i in range(1, len(nodes)):

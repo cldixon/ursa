@@ -3666,6 +3666,8 @@ mod tests {
         .unwrap();
         let err = dropped.view().unwrap_err();
         assert!(matches!(err, PlanError::ColumnNotFound(_)), "{err}");
-        assert!(err.to_string().contains("dst column 'd', but select() removed it"));
+        assert!(err
+            .to_string()
+            .contains("dst column 'd', but select() removed it"));
     }
 }

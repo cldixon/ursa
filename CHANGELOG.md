@@ -224,9 +224,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     reshaped edges `nodes()` was called on);
   - `with_columns` of scalar expressions on an `EdgeFrame`.
 
-  On a 4-core machine: weighted pagerank over a 10M-edge frame aggregated by
-  `group_by("s", "d")`, BENCH_FIRST first and BENCH_REPEAT repeated, against
-  BENCH_REINGEST collecting and re-ingesting the aggregate.
+  On a 4-core machine (medians of 5 interleaved runs): weighted pagerank over a
+  10M-edge frame aggregated by `group_by("s", "d")` takes 6.0s on its first
+  collect and 1.7s repeated, against 6.2s for collecting the aggregate and
+  re-ingesting it every time. A `with_columns` of pagerank over 10M edges and
+  degree over a filtered view of them, on a 1M-row attribute frame, takes 0.25s
+  in one collect against 0.27s as two.
 - **Behaviour change:** a graph op over an edge frame whose `select`, `rename`
   or `group_by` dropped its `src` or `dst` column raises `ColumnNotFoundError`:
   `a graph op needs the edge frame's src column 's', but rename() renamed it to

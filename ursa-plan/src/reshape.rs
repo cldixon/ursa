@@ -473,9 +473,7 @@ mod tests {
             (2, Some("t2".to_string())),
             (3, None),
         ]));
-        let head = |frame, n, step| {
-            serde_json::json!({"op": "head", "input": source(frame), "n": n, "step": step})
-        };
+        let head = |frame, n, step| serde_json::json!({"op": "head", "input": source(frame), "n": n, "step": step});
         // The step handle and the slot don't matter; the table and the args do.
         assert_eq!(key(head(0, 5, 0), &host), key(head(1, 5, 9), &host));
         assert_ne!(key(head(0, 5, 0), &host), key(head(0, 6, 0), &host));
