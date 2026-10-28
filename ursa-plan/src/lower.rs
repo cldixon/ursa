@@ -401,10 +401,16 @@ impl Frame {
                     fast = Some((c.name.clone(), *descending));
                 }
             }
-            let e = if dt.is_floating() {
-                crate::compare::canonical(e.clone())
-            } else {
-                e.clone()
+            let e = match &dt {
+                dt if dt.is_floating() => crate::compare::canonical(e.clone()),
+                // A dictionary of floats sorts by its values: canonical too.
+                DataType::Dictionary(_, value) if value.is_floating() => {
+                    crate::compare::canonical(Expr::Cast(datafusion::logical_expr::Cast::new(
+                        Box::new(e.clone()),
+                        value.as_ref().clone(),
+                    )))
+                }
+                _ => e.clone(),
             };
             sort_exprs.push(e.sort(!descending, false));
         }
@@ -430,8 +436,10 @@ impl Frame {
 
     /// `head(n)`: the first `n` rows.
     pub fn head(&mut self, n: usize) -> Result<()> {
-        if let (Some(batches), true) = (self.batches.take(), self.in_order) {
-            return self.set(take_prefix(batches, n));
+        if self.in_order {
+            if let Some(batches) = self.batches.take() {
+                return self.set(take_prefix(batches, n));
+            }
         }
         let df = if self.in_order {
             self.plan()?.limit(0, Some(n))?

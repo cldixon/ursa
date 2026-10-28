@@ -24,7 +24,7 @@ The message names the column or the parameter, and says what is valid.
 | Type | Raised when |
 |---|---|
 | `NotImplementedError` | The plan has a step, or a combination of steps, that does not run yet. See [Limits](../limits.md). |
-| `ValueError` | An argument is invalid before the plan runs: an unknown `on_null` value, an edge tuple of the wrong length, or two aggregations with one name. A `ColumnNotFoundError` is a `ValueError` too. |
+| `ValueError` | An argument is invalid before the plan runs: an unknown `on_null` value, an edge tuple of the wrong length, two aggregations with one name, or a `select` or `rename` that would give two columns one name. A `ColumnNotFoundError` is a `ValueError` too. |
 | `ModuleNotFoundError` | `to_polars()` is called without `polars` installed. The message names the `ursa-graph[polars]` extra. |
 | `RuntimeError` | A dataset download fails. See [Datasets](datasets.md#the-download-cache). |
 

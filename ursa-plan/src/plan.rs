@@ -2407,6 +2407,17 @@ fn lower_steps(
                 if let Some((old, _)) = mapping.iter().find(|(old, _)| !frame.has_column(old)) {
                     return Err(unknown_column("rename()", old, &frame.names()));
                 }
+                let renamed: Vec<String> = frame
+                    .names()
+                    .into_iter()
+                    .map(|n| {
+                        mapping
+                            .iter()
+                            .find(|(old, _)| *old == n)
+                            .map_or(n, |(_, new)| new.clone())
+                    })
+                    .collect();
+                check_unique("rename()", renamed.iter())?;
                 if !mapping.is_empty() {
                     frame.rename(mapping)?;
                 }
@@ -2500,7 +2511,29 @@ fn select(frame: &mut Frame, items: &[SelectItem], roles: &Roles) -> PlanResult<
             }
         });
     }
+    check_unique(
+        "select()",
+        exprs.iter().map(|e| match e {
+            DfExpr::Alias(a) => &a.name,
+            DfExpr::Column(c) => &c.name,
+            _ => unreachable!("select items are columns or aliases"),
+        }),
+    )?;
     frame.project(exprs)?;
+    Ok(())
+}
+
+/// A step's output keeps one column per name.
+fn check_unique<'a>(step: &str, names: impl Iterator<Item = &'a String>) -> PlanResult<()> {
+    let mut seen = BTreeSet::new();
+    for n in names {
+        if !seen.insert(n) {
+            return Err(PlanError::Value(format!(
+                "{step} would produce duplicate column {}.",
+                py_str(n)
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2584,10 +2617,16 @@ fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<
         let mut dt = schema.field_with_name(&a.column)?.data_type().clone();
         if let DataType::Dictionary(_, value) = dt {
             dt = value.as_ref().clone();
-            operand = DfExpr::Cast(datafusion::logical_expr::Cast::new(
-                Box::new(operand),
-                dt.clone(),
-            ));
+            operand = cast_to(operand, dt.clone());
+        }
+        // Booleans and integers average in f64, folded in input order like
+        // pyarrow's; a boolean sum counts the trues.
+        let numeric = dt.is_integer() || dt == DataType::Boolean;
+        if numeric && a.func == "mean" {
+            operand = cast_to(operand, DataType::Float64);
+            dt = DataType::Float64;
+        } else if dt == DataType::Boolean && a.func == "sum" {
+            operand = cast_to(operand, DataType::UInt64);
         }
         if dt.is_floating() {
             let kind = match a.func.as_str() {
@@ -2622,6 +2661,10 @@ fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<
     }
     frame.group_by(keys.iter().map(|k| col_named(k)).collect(), exprs, ordered)?;
     Ok(())
+}
+
+fn cast_to(e: DfExpr, dt: DataType) -> DfExpr {
+    DfExpr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), dt))
 }
 
 /// Compile a filter predicate that runs outside an engine query against `schema`,
@@ -2994,6 +3037,67 @@ fn py_value(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_means_fold_in_order_for_any_partition_count() {
+        use crate::lower::{session, Frame, TEST_PARTITIONS};
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{Field, Schema};
+        // Large values: their f64 sum depends on the order they are added in.
+        let n = 50_000usize;
+        let k: Vec<i64> = (0..n).map(|i| (i * 7 % 3) as i64).collect();
+        let v: Vec<i64> = (0..n)
+            .map(|i| (1i64 << 58) + (i as i64).wrapping_mul(0x9E37_79B9_7F4A) % (3i64 << 58))
+            .collect();
+        let mut sums = [0.0f64; 3];
+        let mut counts = [0usize; 3];
+        for (g, x) in k.iter().zip(&v) {
+            sums[*g as usize] += *x as f64;
+            counts[*g as usize] += 1;
+        }
+        let want: Vec<u64> = (0..3)
+            .map(|g| (sums[g] / counts[g] as f64).to_bits())
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batches: Vec<RecordBatch> = (0..n)
+            .step_by(4096)
+            .map(|s| {
+                let e = (s + 4096).min(n);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k[s..e].to_vec())),
+                        Arc::new(Int64Array::from(v[s..e].to_vec())),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let mean = AggSpec {
+            output: "m".into(),
+            func: "mean".into(),
+            column: "v".into(),
+        };
+        for p in [1, 3, 8] {
+            TEST_PARTITIONS.with(|c| c.set(Some(p)));
+            let mut f = Frame::from_batches(session(), batches.clone()).unwrap();
+            group_by(&mut f, &["k".to_string()], std::slice::from_ref(&mean)).unwrap();
+            let out = f.collect().unwrap();
+            TEST_PARTITIONS.with(|c| c.set(None));
+            let mut got = vec![0u64; 3];
+            for b in &out {
+                let ks = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let ms = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                for r in 0..b.num_rows() {
+                    got[ks.value(r) as usize] = ms.value(r).to_bits();
+                }
+            }
+            assert_eq!(got, want, "p={p}");
+        }
+    }
 
     #[test]
     fn python_reprs() {

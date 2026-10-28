@@ -52,6 +52,9 @@ FLOATS = pa.table(
 )
 
 
+DICT_FLOATS = FLOATS.set_column(1, "r", FLOATS.column("r").dictionary_encode())
+
+
 def _float_frames(tmp_path) -> dict:
     path = tmp_path / "floats.parquet"
     pq.write_table(FLOATS, path, row_group_size=3)
@@ -64,6 +67,9 @@ def _float_frames(tmp_path) -> dict:
         "scan": ur.scan_nodes(str(path), id="id"),
         "join": ur.from_arrow(FLOATS, id="id").join(keys, on="id"),
         "graph": ur.from_arrow(FLOATS, id="id").with_columns(dg=ur.degree(e)),
+        # A dictionary of floats sorts by its values, canonical too.
+        "dict": ur.from_arrow(DICT_FLOATS, id="id"),
+        "dict_graph": ur.from_arrow(DICT_FLOATS, id="id").with_columns(dg=ur.degree(e)),
     }
 
 
@@ -229,6 +235,67 @@ def test_engine_aggregates_match_the_plain_frame_bit_for_bit():
         assert _bits(out.column("gs").to_pylist()) == _bits(want)
         assert out.schema.field("n").nullable
         assert out.schema.field("gmax").type == pa.float32()
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_integer_means_fold_in_order(engine):
+    # An integer mean adds its values as f64 in input order, as pyarrow does, so
+    # large values give the same bits on any core count.
+    rng = np.random.default_rng(1)
+    n = 50_000
+    t = pa.table(
+        {
+            "id": np.arange(n),
+            "k": rng.integers(0, 2, n),
+            "v": rng.integers(2**58, 2**60, n),
+            "b": rng.integers(0, 2, n).astype(bool),
+        }
+    )
+    frame = ur.from_arrow(t, id="id")
+    if engine:
+        ring = pa.table({"s": np.arange(n), "d": (np.arange(n) + 1) % n})
+        frame = frame.with_columns(dg=ur.degree(ur.from_arrow(ring, src="s", dst="d")))
+    out = frame.group_by("k").agg(m=col("v").mean(), bm=col("b").mean()).collect().to_arrow()
+    ks = t.column("k").to_numpy()
+    for k, m, bm in zip(*(out.column(c).to_pylist() for c in ("k", "m", "bm")), strict=True):
+        total = 0.0
+        for x in t.column("v").to_numpy()[ks == k].tolist():
+            total += float(x)
+        assert _bits([m]) == _bits([total / int((ks == k).sum())])
+        assert bm == float(t.column("b").to_numpy()[ks == k].mean())
+    reference = t.group_by("k", use_threads=False).aggregate([("v", "mean")])
+    want = dict(zip(*(reference.column(c).to_pylist() for c in ("k", "v_mean")), strict=True))
+    assert _bits(out.column("m").to_pylist()) == _bits(
+        [want[k] for k in out.column("k").to_pylist()]
+    )
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_boolean_sums_and_means(engine):
+    t = pa.table({"id": [1, 2, 3], "k": [1, 1, 2], "b": [True, False, True]})
+    frame = ur.from_arrow(t, id="id")
+    if engine:
+        frame = frame.with_columns(deg=ur.degree(_graph()))
+    out = frame.group_by("k").agg(s=col("b").sum(), m=col("b").mean()).collect().to_arrow()
+    assert out.column("s").to_pylist() == [1, 1]
+    assert out.column("s").type == pa.uint64()
+    assert out.column("m").to_pylist() == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_duplicate_output_columns_raise(engine):
+    frame = ur.from_arrow(NODES, id="id")
+    if engine:
+        frame = frame.with_columns(deg=ur.degree(_graph()))
+    with pytest.raises(ValueError, match=r"^select\(\) would produce duplicate column 'v'\.$"):
+        frame.select("id", "v", "v").collect()
+    with pytest.raises(ValueError, match=r"^select\(\) would produce duplicate column 'v'\.$"):
+        frame.select("id", "v", (col("c")).alias("v")).collect()
+    with pytest.raises(ValueError, match=r"^rename\(\) would produce duplicate column 'c'\.$"):
+        frame.rename({"v": "c"}).collect()
+    # Swapping two names is fine.
+    swapped = frame.rename({"v": "c", "c": "v"}).collect().to_arrow()
+    assert swapped.column("c").to_pylist() == NODES.column("v").to_pylist()
 
 
 def test_engine_sample_draws_like_a_plain_frame():

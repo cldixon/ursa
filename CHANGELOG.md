@@ -173,7 +173,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     rules on every frame: values are added in input order, `min`/`max` skip NaN
     unless every value is NaN, and ties keep the first value. On an engine
     frame `max` could return NaN, or a value that was not the maximum, when the
-    group had NaNs.
+    group had NaNs. An integer or boolean `mean` adds its values as floats in
+    input order too, so it gives the same bits on any number of cores.
   - Every `group_by().agg()` output column is nullable, as on a plain frame (an
     engine frame marked `count`, `n_unique` and keys that held no null as
     non-nullable).
@@ -186,15 +187,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     `UrsaError`, so `except ValueError` still catches it.
   - `head(n)` with a negative `n` keeps no rows on every frame; an engine frame
     raised `OverflowError`.
+  - A `select` or `rename` that would give two columns one name raises
+    `ValueError` before the plan runs: `select() would produce duplicate column
+    'f'.` A plain frame returned both columns (`select("f", "f")`, or
+    `rename({"f": "g"})` when `g` exists).
 
 ### Fixed
 
 - `sort()` orders floats as filters compare them (#201): every NaN is above
   every number whatever its sign bit, and `-0.0` equals `0.0`, so they tie and
-  keep input order. A NaN with the sign bit set, the usual result of `0/0`,
-  used to sort before every number after a graph algorithm or a join. A
-  descending sort now puts NaN first on every frame; a plain frame used to put
-  it last in either direction. Nulls still come last. For `r = [1.0, NaN, None,
+  keep input order, dictionary-encoded float columns included. A NaN with the
+  sign bit set, the usual result of `0/0`, used to sort before every number
+  after a graph algorithm or a join. A descending sort now puts NaN first on
+  every frame; a plain frame used to put it last in either direction. Nulls still come last. For `r = [1.0, NaN, None,
   2.0]`, `sort("r", descending=True)` was `2.0, 1.0, NaN, None` on a plain frame
   and is now `NaN, 2.0, 1.0, None`.
 - On a frame the engine ran (after a graph algorithm or a join), a second
