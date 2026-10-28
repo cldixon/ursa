@@ -363,12 +363,20 @@ ursa/
 ├── ursa-core/    # Topology struct + algorithm kernels. Pure Rust.
 │                 # Depends on arrow + rayon. NO DataFusion dependency.
 │                 # Independently unit-testable and benchmarkable (criterion).
-├── ursa-plan/    # DataFusion extensions: custom logical nodes (Hop, NeighborAgg,
-│                 # GraphAlgorithm, ...), optimizer rules, ExecutionPlan impls
-│                 # that call into ursa-core. Scan/session plumbing, object_store.
-└── ursa-py/      # PyO3 bindings. Thin: expression/plan builders, collect()
-                  # orchestration, Arrow FFI to/from Python (pycapsule interface).
+├── ursa-plan/    # The plan: the frame tree a frame holds (lazy), the plan IR,
+│                 # validation as each step is built, schema() and explain(), and
+│                 # all execution: lowering to one DataFusion plan with Ursa's
+│                 # custom nodes (Hop, GraphAlgorithm, ...), ExecutionPlan impls
+│                 # that call into ursa-core, scans and object_store, and the
+│                 # caches (topology index, weights, masks, scanned tables).
+├── ursa-py/      # PyO3 bindings. Thin: one method per frame step, Arrow FFI
+│                 # to/from Python (pycapsule interface), the Python host.
+└── python/ursa/  # The API surface: signatures, docstrings, type stubs, input
+                  # conversion (pandas/polars/numpy/lists to Arrow, Python
+                  # values to the plan IR), interop egress, datasets.
 ```
+
+**Decided (#189):** `ursa-plan` owns the plan IR, its validation and its execution; `ursa-py` and the Python package own ergonomics only. A Python frame holds a Rust plan object, as a Polars `LazyFrame` does: each method converts its arguments and calls into Rust, which builds the next step, validates it (an unknown column, a type mismatch, an unsupported shape raises on the line that adds the step) and returns the new plan. No Python module decides which steps, verbs, aggregations or joins exist. What Python keeps is what only Python can do: converting its own objects, a seed iterable, the stdlib's seeded draw for `sample`, warnings.
 
 ### The topology index
 
@@ -382,7 +390,7 @@ The index is a CSR (compressed sparse row) adjacency structure with three load-b
 
 Construction is a parallel counting sort over the `src`/`dst` Arrow columns (two passes). For triangle counting / intersection kernels, sort each adjacency list at build time (or on first intersection use).
 
-**Lifecycle.** The index lives on the EdgeFrame as `Arc<Topology>` with `OnceLock`-style lazy slots per direction. Immutable once built. Property-only transformations clone the `Arc` (the preservation contract in §Core concepts); structural transformations drop it; concurrent queries over one frame share one build.
+**Lifecycle.** The index lives on the EdgeFrame's Rust plan state (`ursa_plan::lazy::State`): a cell holding a `GraphIndex` (`Arc<Topology>` with `OnceLock`-style lazy slots per direction, plus the weight and mask caches). Immutable once built. Property-only transformations share the state (the preservation contract in §Core concepts), so a derivation made before the build sees it; structural transformations start a fresh one; concurrent queries over one frame share one build.
 
 ### Graph operators in the DataFusion plan
 

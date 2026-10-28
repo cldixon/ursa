@@ -280,13 +280,15 @@ def test_an_aware_naive_timestamp_comparison_is_a_value_error(pred, message, pat
     # would read the naive side as UTC.
     nodes = ur.from_arrow(TZ, id="id")
     edges = ur.from_arrow(TZ, src="id", dst="d")
-    frame = {
+    build = {
         "plain": lambda: nodes.filter(pred),
         "mask": lambda: ur.degree(edges.filter(pred))._frame(),
         "engine": lambda: nodes.with_columns(dg=ur.degree(edges)).filter(pred),
-    }[path]()
+    }[path]
+    # The types are known from the in-memory tables, so the filter is rejected
+    # where it is added (#193).
     with pytest.raises(ValueError, match=message):
-        frame.collect()
+        build()
     # The same instant on both sides compares.
     same = ur.col("utc") > AWARE
     assert [r["id"] for r in _rows(nodes.filter(same).select("id"))] == [2]

@@ -539,11 +539,11 @@ def test_non_predicate_filter_argument_is_honest():
     # must reject it with a clear error rather than silently coercing — identically
     # on the graph-op path and the plain-frame (pyarrow) path.
     edges = ur.from_arrow(pa.table({"s": SRC, "d": DST}), src="s", dst="d")
-    graph = edges.nodes().with_columns(pr=ur.pagerank(edges)).filter(ur.col("pr"))
+    graph = edges.nodes().with_columns(pr=ur.pagerank(edges))
     with pytest.raises(NotImplementedError):
-        graph.collect()
+        graph.filter(ur.col("pr"))  # rejected where the filter is added (#193)
     # plain-frame path: a bare boolean column must be rejected here too, not silently
     # accepted (the graph and plain paths share the same predicate-shape check).
     plain = ur.from_arrow(pa.table({"id": [0, 1, 2], "flag": [True, False, True]}), id="id")
     with pytest.raises(NotImplementedError):
-        plain.filter(ur.col("flag")).collect()
+        plain.filter(ur.col("flag"))

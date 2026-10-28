@@ -1,12 +1,11 @@
 # Limits
 
-Ursa is version 0.4. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, `collect()` raises `NotImplementedError` with a message that says what to change. Nothing is dropped silently.
+Ursa is version 0.4. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, the step that adds it raises `NotImplementedError` with a message that says what to change (a few, such as a scan of several files, raise when `collect()` reads them). Nothing is dropped silently.
 
 ## Steps that do not run
 
 | Step | Status |
 |---|---|
-| `frame.schema()` | Not available. Use `collect().columns` or `explain()`. |
 | CSV options on a scan, such as a delimiter | Not available. The file must be comma-separated with a header. |
 
 ## Combinations that do not run

@@ -13,9 +13,9 @@ Topology is always threaded explicitly as the ``edges`` argument — there is no
 ambient graph. Direction is a per-op parameter; weight is any expression over
 edge columns.
 
-These build ``Expr("graph", ...)`` / frame plan nodes; ``collect()`` executes
-them through the ``ursa-plan`` physical operators (``ursa-core`` kernels behind
-them).
+These build ``Expr("graph", ...)`` nodes and the frames' Rust plan objects;
+``collect()`` executes them through the ``ursa-plan`` physical operators
+(``ursa-core`` kernels behind them).
 """
 
 from __future__ import annotations
@@ -23,8 +23,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from . import _ir
 from ._expr import Expr
-from ._frames import EdgeFrame, NodeFrame, _PlanStep
+from ._frames import EdgeFrame, NodeFrame, _native
 
 
 class GraphExpr(Expr):
@@ -77,32 +78,27 @@ class GraphExpr(Expr):
     def sink_csv(self, path: str) -> None:
         self._frame().sink_csv(path)
 
-    def explain(self) -> str:
-        return self._frame().explain()
+    def explain(self, physical: bool = False) -> str:
+        return self._frame().explain(physical)
+
+    def schema(self) -> Any:
+        return self._frame().schema()
 
 
 def _graph_expr(verb: str, **params: Any) -> GraphExpr:
     return GraphExpr("graph", {"verb": verb, **params})
 
 
-_DIRECTIONS = ("out", "in", "both")
-
-
-def _check_direction(verb: str, direction: str, allowed: tuple[str, ...] = _DIRECTIONS) -> str:
+def _check_direction(verb: str, direction: str) -> str:
     """Validate a ``direction=`` argument eagerly, so a typo fails at the call site
-    rather than at ``collect()``."""
-    if direction not in allowed:
-        hint = ""
-        if direction == "in" and "in" not in allowed:
-            hint = (
-                " ('in' is not supported here; to run it on the reversed graph, "
-                "swap the src/dst roles when you build the frame)"
-            )
-        raise ValueError(
-            f"{verb}(direction={direction!r}) is not supported; "
-            f"use one of {', '.join(repr(d) for d in allowed)}{hint}."
-        )
+    rather than at ``collect()`` (the engine knows which directions a verb takes)."""
+    _native().check_direction(verb, direction)
     return direction
+
+
+def _seeds(seeds: Any) -> Any:
+    """A seed set for the plan: a NodeFrame's plan, or the value as given."""
+    return seeds._node if isinstance(seeds, NodeFrame) else seeds
 
 
 class LayoutExpr(GraphExpr):
@@ -198,23 +194,14 @@ class _Hop:
         return self._materialize().distinct()
 
     def _materialize(self) -> EdgeFrame:
-        # Carry the parent edges into the step so collect() can resolve (src, dst);
-        # the produced EdgeFrame's own source/scan are empty (its rows are the
-        # hop's reached edges, not the parent graph's).
-        step = _PlanStep(
-            "hop",
-            {
-                "n": self._n,
-                "direction": self._direction,
-                "seeds": self._seeds,
-                "edges": self._edges,
-            },
+        # The frame's rows are the hop's reached edges, not the parent graph's: its
+        # columns are literal ``src``/``dst`` (seed -> reached), so a tail filter
+        # references ``src``/``dst``. (The parent's role names aren't carried
+        # through a traversal.)
+        node = _native().PlanNode.hop(
+            self._edges._node, _ir.int_arg(self._n), self._direction, _seeds(self._seeds)
         )
-        # The collected batch has literal ``src``/``dst`` columns (seed -> reached),
-        # so the frame advertises those names — a tail filter references ``src``/
-        # ``dst``, matching what it actually gets. (The parent's role names aren't
-        # carried through a traversal.)
-        return EdgeFrame._construct(src_col="src", dst_col="dst", plan=(step,))
+        return EdgeFrame._wrap(node)
 
     def collect(self):
         return self._materialize().collect()
@@ -242,19 +229,12 @@ def shortest_path(
     unweighted BFS. For a weighted path ``cost`` is the summed edge weight (so the
     final row's ``cost`` is the total path cost); for an unweighted path it is the
     hop count (``hop + 1``), kept for schema uniformity."""
-    step = _PlanStep(
-        "shortest_path",
-        {
-            "source": source,
-            "target": target,
-            "weight": weight,
-            "direction": direction,
-            "edges": edges,
-        },
-    )
     # Result columns are literal ``src``/``dst`` (one row per edge on the path);
-    # advertise those names so a tail filter matches (see _Hop._materialize).
-    return EdgeFrame._construct(src_col="src", dst_col="dst", plan=(step,))
+    # source/target resolve like hop seeds, as 1-element id sets.
+    node = _native().PlanNode.shortest_path(
+        edges._node, [source], [target], _ir.optional_expr(weight), direction
+    )
+    return EdgeFrame._wrap(node)
 
 
 def random_walk(
@@ -266,17 +246,14 @@ def random_walk(
 ) -> NodeFrame:
     """Random walks; a frame of ``(walk_id, step, node)`` — feeds node2vec-style
     embedding pipelines directly."""
-    step = _PlanStep(
-        "random_walk",
-        {
-            "start": start,
-            "steps": steps,
-            "walks_per_node": walks_per_node,
-            "seed": seed,
-            "edges": edges,
-        },
+    node = _native().PlanNode.random_walk(
+        edges._node,
+        _seeds(start),
+        _ir.int_arg(steps),
+        _ir.int_arg(walks_per_node),
+        _ir.int_arg(seed),
     )
-    return NodeFrame._construct(id_col="node", plan=(step,))
+    return NodeFrame._wrap(node)
 
 
 # --- node-valued algorithms (dual-positioned) ------------------------------
@@ -310,7 +287,7 @@ def pagerank(
         tol=tol,
         weight=weight,
         dtype=dtype,
-        direction=_check_direction("pagerank", direction, ("out", "both")),
+        direction=_check_direction("pagerank", direction),
     )
 
 
@@ -365,7 +342,7 @@ def betweenness(
         weight=weight,
         seed=seed,
         dtype=dtype,
-        direction=_check_direction("betweenness", direction, ("out", "both")),
+        direction=_check_direction("betweenness", direction),
     )
 
 

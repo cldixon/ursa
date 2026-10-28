@@ -25,8 +25,12 @@
 
 pub mod agg;
 pub mod compare;
+pub mod dry;
 pub mod eval;
+pub mod explain;
 pub mod expr;
+pub mod infer;
+pub mod lazy;
 pub mod logical;
 pub mod lower;
 pub mod node;

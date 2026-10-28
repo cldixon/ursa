@@ -247,6 +247,49 @@ fn dense_attr_column(
     Ok(out)
 }
 
+/// Validate the output names of a `with_columns` of graph verbs up front: the
+/// result schema prepends the reserved `id` column and DataFusion rejects
+/// duplicate unqualified fields, so a collision would otherwise panic inside the
+/// node constructor's DFSchema conversion.
+pub fn check_output_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name == "id" {
+            return Err(DataFusionError::Execution(
+                "output column name 'id' is reserved (it is the node id column); \
+                 give the with_columns output a different name"
+                    .into(),
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(DataFusionError::Execution(format!(
+                "duplicate output column name {name:?}; each with_columns output needs a unique name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The type of a graph verb's column, as [`node_columns`] builds it (`None`
+/// when its parameters don't parse; the collect reports them).
+pub fn verb_value_type(spec: &GraphVerb) -> Option<DataType> {
+    let dtype = parse_output_dtype(spec.dtype.as_ref().map(|d| d.as_str().unwrap_or(""))).ok()?;
+    if spec.verb == "neighbors_agg" {
+        return Some(match dtype {
+            OutputDtype::F32 => DataType::Float32,
+            OutputDtype::F64 => DataType::Float64,
+        });
+    }
+    let column = OutputColumn::Algo {
+        name: String::new(),
+        algo: spec.to_algo().ok()?,
+        weights: None,
+        dtype,
+        field: 0,
+    };
+    Some(column.value_type())
+}
+
 /// Validate and build the output columns of a `with_columns` of graph verbs:
 /// one [`OutputColumn`] per `(name, verb)`. `nodes` is the attribute table a
 /// neighbour aggregation reads (with its id column `nodes_id`); `edges` holds the
@@ -267,24 +310,7 @@ pub fn node_columns(
             "graph query has no output columns".into(),
         ));
     }
-    // Validate output names up front: the result schema prepends the reserved `id`
-    // column and DataFusion rejects duplicate unqualified fields, so a collision
-    // would otherwise panic inside the node constructor's DFSchema conversion.
-    let mut seen = std::collections::HashSet::new();
-    for (name, _) in columns {
-        if name == "id" {
-            return Err(DataFusionError::Execution(
-                "output column name 'id' is reserved (it is the node id column); \
-                 give the with_columns output a different name"
-                    .into(),
-            ));
-        }
-        if !seen.insert(name.as_str()) {
-            return Err(DataFusionError::Execution(format!(
-                "duplicate output column name {name:?}; each with_columns output needs a unique name"
-            )));
-        }
-    }
+    check_output_names(columns.iter().map(|(name, _)| name.as_str()))?;
     let nodes_id_name = nodes_id.unwrap_or("id");
     let specs = columns;
     let mut columns: Vec<OutputColumn> = Vec::with_capacity(specs.len());
@@ -452,6 +478,12 @@ fn graph_batch(
     columns: Vec<OutputColumn>,
     mask: Option<Arc<EdgeMask>>,
 ) -> Result<RecordBatch> {
+    if crate::dry::active() {
+        return Ok(RecordBatch::new_empty(crate::result::query_schema(
+            &columns,
+            ids.user_type(),
+        )));
+    }
     crate::runtime::block_on(async move {
         tokio::task::spawn_blocking(move || query_batch(&topology, &ids, &columns, mask.as_deref()))
             .await

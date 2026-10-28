@@ -33,6 +33,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import parity_193
 from parity_191 import EDGES, NEG_NAN, OTHER, TMP, G, T, encode, load
 
 import ursa as ur
@@ -211,10 +212,7 @@ def cases() -> dict:
 def run_all(path: str) -> None:
     with open(path, "w") as out:
         for name, build in cases().items():
-            try:
-                rec = {"case": name, **encode(build().collect().to_arrow())}
-            except Exception as exc:
-                rec = {"case": name, "error": type(exc).__name__, "message": str(exc)}
+            rec = {"case": name, **parity_193.run_case(build, encode)}
             out.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
@@ -260,5 +258,7 @@ def compare(main_path: str, branch_path: str) -> None:
 if __name__ == "__main__":
     if sys.argv[1] == "run":
         run_all(sys.argv[2])
+    elif sys.argv[1] == "compare193":
+        sys.exit(1 if parity_193.compare(sys.argv[2], sys.argv[3]) else 0)
     else:
         compare(sys.argv[2], sys.argv[3])

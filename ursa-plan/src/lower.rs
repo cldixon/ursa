@@ -241,6 +241,14 @@ impl Frame {
         }
         let df = self.plan()?;
         let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        if crate::dry::active() {
+            // A dry run records the plan instead of running it (an empty result
+            // takes the plan's schema here too).
+            crate::dry::record(df.logical_plan());
+            let batches = vec![RecordBatch::new_empty(schema)];
+            self.set(batches.clone())?;
+            return Ok(batches);
+        }
         let mut batches = crate::runtime::block_on(df.collect())??;
         batches.retain(|b| b.num_rows() > 0);
         if batches.is_empty() {

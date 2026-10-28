@@ -2,9 +2,11 @@
 //!
 //! A [`Plan`] is a whole query as a tree: one variant per frame step, each holding
 //! its input as a child plan, so a `join` has two children and a graph verb holds
-//! the edge plan it runs over. The Python layer serializes a frame to this tree
-//! (JSON, `deny_unknown_fields` on every variant) and calls [`execute_plan`];
-//! nothing else in the engine is reached from Python for a `collect()`.
+//! the edge plan it runs over. A frame's tree of [`crate::lazy`] nodes is lowered
+//! to this IR for each run (it also parses from JSON, `deny_unknown_fields` on
+//! every variant, which the conformance fixtures use) and handed to
+//! [`execute_plan`]. The same walk checks a frame's shape as it is built
+//! ([`check_shape`]) and computes its schema over empty inputs ([`dry_run`]).
 //!
 //! ## What runs where (#189)
 //!
@@ -33,10 +35,11 @@
 //! - the edge columns a weight reads, and the index a weighted scan builds;
 //! - a scanned node table, through the frame's [`NodeTableCache`].
 //!
-//! The host (the Python layer) keeps what belongs to its frames, reached through
-//! [`Inputs`] by slot: each frame's source (its in-memory table, or a scan's
-//! storage options), its cached index and node-table cache, seed id sets, and the
-//! rows a `sample` keeps (drawn with the host's seeded generator).
+//! What belongs to the frames is reached through [`Inputs`] by slot
+//! ([`crate::lazy::TreeInputs`] reads it off the frame tree): each frame's
+//! source (its in-memory table, or a scan's storage options), its cached index
+//! and node-table cache, seed id sets, and the rows a `sample` keeps (drawn with
+//! the host's seeded generator).
 //!
 //! Inputs are resolved lazily, in the order the executor needs them, so a plan
 //! that fails validation never builds an index or reads a file.
@@ -104,7 +107,7 @@ pub type Slot = usize;
 /// fires earlier still wins.
 ///
 /// Integer arguments are [`IntArg`]s, typed only where the engine reads them.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Plan {
     /// `ur.scan_edges(path, src=, dst=)`.
@@ -267,7 +270,7 @@ pub enum Plan {
 }
 
 /// A scan path: one path (a glob included) or a list of them.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum ScanPath {
     One(String),
@@ -277,7 +280,7 @@ pub enum ScanPath {
 /// An integer argument, as given. The engine converts it where it reads it, with
 /// the errors a Python integer conversion gives (`OverflowError`, `TypeError`).
 /// A host value with no JSON form is sent as `{"type": <type name>}`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(transparent)]
 pub struct IntArg(pub Value);
 
@@ -345,7 +348,7 @@ fn seed_arg(seed: &Option<IntArg>, name: &str) -> PlanResult<Option<u64>> {
 }
 
 /// One `with_columns` output.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamedExpr {
     pub name: String,
@@ -353,7 +356,7 @@ pub struct NamedExpr {
 }
 
 /// One `select` item: a column name, or an expression (its JSON).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum SelectItem {
     Name(String),
@@ -361,7 +364,7 @@ pub enum SelectItem {
 }
 
 /// One sort key: a column, or an expression (its JSON).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SortKey {
     #[serde(default)]
@@ -373,7 +376,7 @@ pub struct SortKey {
 }
 
 /// One `group_by().agg()` aggregation: `fn` over `column`, named `output`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggSpec {
     pub output: String,
@@ -404,26 +407,52 @@ impl Default for Expr {
 impl<'de> Deserialize<'de> for Expr {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = Value::deserialize(d)?;
-        // Only the verb-less stub stays scalar: a malformed graph verb (an
-        // unknown parameter, say) is still a hard error.
+        Expr::from_value(v).map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for Expr {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Expr::Scalar(v) => v.serialize(s),
+            Expr::Graph(verb) => {
+                let mut v = serde_json::to_value(verb).map_err(serde::ser::Error::custom)?;
+                if let Value::Object(m) = &mut v {
+                    m.insert("kind".into(), Value::from("graph"));
+                }
+                v.serialize(s)
+            }
+        }
+    }
+}
+
+impl Plan {
+    /// The plan as JSON (what [`Plan::from_json`] parses).
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("a plan serializes")
+    }
+}
+
+impl Expr {
+    /// An expression from its JSON. Only the verb-less graph stub stays scalar:
+    /// a malformed graph verb (an unknown parameter, say) is an error.
+    pub fn from_value(v: Value) -> datafusion::error::Result<Expr> {
         if kind(&v) == "graph" && v.get("verb").is_some() {
-            return GraphVerb::from_value(&v)
-                .map(|g| Expr::Graph(Box::new(g)))
-                .map_err(serde::de::Error::custom);
+            return GraphVerb::from_value(&v).map(|g| Expr::Graph(Box::new(g)));
         }
         Ok(Expr::Scalar(v))
     }
 }
 
 /// The `kind` tag of a JSON expression node (`""` when absent).
-fn kind(v: &Value) -> &str {
+pub(crate) fn kind(v: &Value) -> &str {
     v.get("kind").and_then(Value::as_str).unwrap_or("")
 }
 
 /// The edges a graph node runs over: the edge plan as written, and the host frame
 /// it came from (whose cached index and mask the host holds). See the module docs
 /// and [`EdgeInput::view`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeInput {
     pub plan: Box<Plan>,
@@ -507,13 +536,15 @@ impl EdgeView<'_> {
 
 /// The steps that reshape an edge plan's rows: a graph op over one runs over the
 /// topology of its output rows (#191).
-const RESHAPING_OPS: [&str; 6] = ["distinct", "sample", "join", "group_by_agg", "sort", "head"];
+pub(crate) const RESHAPING_OPS: [&str; 6] =
+    ["distinct", "sample", "join", "group_by_agg", "sort", "head"];
 
 /// The steps that keep an edge plan's rows but change its columns.
-const COLUMN_OPS: [&str; 3] = ["select", "rename", "with_columns"];
+pub(crate) const COLUMN_OPS: [&str; 3] = ["select", "rename", "with_columns"];
 
 /// The message for a `with_columns` of a graph verb on an edge frame.
-const EDGE_WITH_COLUMNS: &str = "collect() does not yet support the 'with_columns' step on an \
+pub(crate) const EDGE_WITH_COLUMNS: &str =
+    "collect() does not yet support the 'with_columns' step on an \
      edge frame.";
 
 impl EdgeInput {
@@ -636,7 +667,7 @@ fn select_name(v: &Value, roles: &Roles) -> String {
 /// expression computing it. Its rows then hold another graph than the source's,
 /// so the step is the topology, as a reshaping step is (a fresh frame over its
 /// rows reads the endpoints by name).
-fn writes_role(step: &Plan, roles: &(String, String)) -> bool {
+pub(crate) fn writes_role(step: &Plan, roles: &(String, String)) -> bool {
     let role_refs = [("src", roles.0.clone()), ("dst", roles.1.clone())];
     let is_role = |n: &str| n == roles.0 || n == roles.1;
     // An expression that is the column `name` itself, by name or by role.
@@ -724,7 +755,7 @@ fn check_roles(chain: &[&Plan], roles: &(String, String)) -> PlanResult<()> {
     Ok(())
 }
 
-const TRAVERSAL_OPS: [&str; 2] = ["hop", "shortest_path"];
+pub(crate) const TRAVERSAL_OPS: [&str; 2] = ["hop", "shortest_path"];
 
 /// The relational steps [`lower_steps`] lowers.
 const TAIL_OPS: [&str; 8] = [
@@ -925,6 +956,10 @@ static TOPOLOGY_BUILDS: AtomicUsize = AtomicUsize::new(0);
 
 /// Count one topology build.
 pub fn count_topology_build() {
+    // A dry run's empty indexes are not builds (see `crate::dry`).
+    if crate::dry::active() {
+        return;
+    }
     TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1109,6 +1144,95 @@ pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
     }
 }
 
+/// The aggregations `group_by().agg()` and `neighbors().agg()` compute, sorted.
+pub const AGG_FNS: [&str; 6] = ["count", "max", "mean", "min", "n_unique", "sum"];
+
+/// The error for an aggregation that is not one of [`AGG_FNS`].
+pub fn check_agg_fn(func: &str) -> PlanResult<()> {
+    if AGG_FNS.contains(&func) {
+        return Ok(());
+    }
+    not_implemented(format!(
+        "aggregation {} is not supported (use {}).",
+        py_str(func),
+        AGG_FNS.join(", ")
+    ))
+}
+
+/// The `direction=` values a verb or whole-graph stat takes, and whether its
+/// error is a stat's (`None` for a verb that checks its direction in the
+/// engine).
+pub fn verb_directions(verb: &str) -> Option<(&'static [&'static str], bool)> {
+    const ALL: &[&str] = &["out", "in", "both"];
+    match verb {
+        "pagerank" | "betweenness" => Some((&["out", "both"], false)),
+        "closeness" => Some((ALL, false)),
+        "describe" | "density" | "avg_path_length" | "diameter" => Some((ALL, true)),
+        _ => None,
+    }
+}
+
+/// What an edge source does with a row whose endpoint is null.
+pub const ON_NULL_MODES: [&str; 2] = ["error", "drop"];
+
+/// The error collecting `edges.nodes()` with no columns raises: the one shape
+/// error a later step can fix (a `with_columns`), so it is never raised before
+/// a collect.
+pub(crate) const BARE_NODES: &str = "collect() on this NodeFrame needs a source (scan_nodes / \
+     from_arrow(id=...)) or a with_columns of graph algorithms; a bare edges.nodes() has no \
+     materializable node set yet.";
+
+/// The end of the error for relational steps on a traversal result's edges
+/// before `nodes()`. A later `with_columns` over those edges raises the graph
+/// op's own guard first, so it is not raised before a collect either.
+pub(crate) const STEPS_BEFORE_NODES: &str = " on the edges before nodes() is not supported yet; \
+     collect the edge frame and re-ingest it via ur.from_arrow(...) first.";
+
+/// What a host returns where a plan's shape is checked without its inputs
+/// ([`check_shape`]): the walk stops at the first input it needs.
+#[derive(Debug)]
+pub struct Pending;
+
+/// The error an [`Inputs`] returns for an input it does not provide while a
+/// plan's shape is checked.
+pub fn pending() -> PlanError {
+    PlanError::Host(HostError {
+        message: "an input is needed".into(),
+        not_implemented: false,
+        payload: Box::new(Pending),
+    })
+}
+
+fn is_pending(e: &PlanError) -> bool {
+    matches!(e, PlanError::Host(h) if h.payload.is::<Pending>())
+}
+
+/// Check a plan's shape the way [`execute_plan`] does before it reads anything:
+/// its guards and its steps' arguments, in the order a collect checks them,
+/// up to the first input it needs (`inputs` returns [`pending`] for every input
+/// but [`Inputs::step_error`]). The first error is returned.
+pub fn check_shape(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<()> {
+    match build(plan, inputs) {
+        Err(e) if !is_pending(&e) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// A plan run over empty inputs ([`crate::dry`]): the schema a collect returns,
+/// and the DataFusion plans it would execute, in order. `inputs` serves empty
+/// tables and indexes.
+pub fn dry_run(
+    plan: &Plan,
+    inputs: &dyn Inputs,
+) -> PlanResult<(
+    arrow::datatypes::SchemaRef,
+    Vec<datafusion::logical_expr::LogicalPlan>,
+)> {
+    let run = crate::dry::DryRun::enter();
+    let rows = execute(plan, inputs)?.into_batches(inputs)?;
+    Ok((rows[0].schema(), run.plans()))
+}
+
 /// A plan, built: a source's rows as they are (no step to run), or a frame to
 /// lower further steps onto and collect.
 enum Built {
@@ -1196,7 +1320,7 @@ fn view_index(
         return inputs.index(view.frame);
     }
     let key = topology_key(view, inputs, scratch)?;
-    if key.cacheable {
+    if key.cacheable && !crate::dry::active() {
         return crate::reshape::cached_index(&key.key, || {
             let rows = topology_rows(view, None, inputs, scratch)?;
             crate::reshape::build_index(&rows, &view.roles)
@@ -1221,7 +1345,8 @@ fn built_view_index(
         return inputs.built_index(view.frame);
     }
     let key = topology_key(view, inputs, scratch)?;
-    Ok(if key.cacheable {
+    // A dry run never reads the cache: its topologies are empty, kept per query.
+    Ok(if key.cacheable && !crate::dry::active() {
         crate::reshape::lookup(&key.key)
     } else {
         scratch.local.get(&key.key).cloned()
@@ -1302,7 +1427,7 @@ fn column_step_key(step: &Plan) -> String {
 
 // --- frame shape -------------------------------------------------------------
 
-fn is_node_frame(chain: &[&Plan]) -> bool {
+pub(crate) fn is_node_frame(chain: &[&Plan]) -> bool {
     chain.iter().any(|p| matches!(p, Plan::Nodes { .. }))
         || matches!(
             chain[0],
@@ -1314,7 +1439,7 @@ fn is_node_frame(chain: &[&Plan]) -> bool {
 }
 
 /// A node frame's id column.
-fn node_id_col(chain: &[&Plan]) -> String {
+pub(crate) fn node_id_col(chain: &[&Plan]) -> String {
     if chain.iter().any(|p| matches!(p, Plan::Nodes { .. })) {
         return "id".into();
     }
@@ -1326,7 +1451,7 @@ fn node_id_col(chain: &[&Plan]) -> String {
 }
 
 /// An edge frame's `(src, dst)` columns.
-fn edge_roles(chain: &[&Plan]) -> (String, String) {
+pub(crate) fn edge_roles(chain: &[&Plan]) -> (String, String) {
     let (mut src, mut dst) = match chain[0] {
         Plan::ScanEdges { src, dst, .. }
         | Plan::FromArrow {
@@ -1345,7 +1470,7 @@ fn edge_roles(chain: &[&Plan]) -> (String, String) {
 }
 
 /// The host slot of a frame's source.
-fn source_slot(chain: &[&Plan]) -> Option<Slot> {
+pub(crate) fn source_slot(chain: &[&Plan]) -> Option<Slot> {
     match chain[0] {
         Plan::ScanEdges { frame, .. }
         | Plan::ScanNodes { frame, .. }
@@ -1354,7 +1479,7 @@ fn source_slot(chain: &[&Plan]) -> Option<Slot> {
     }
 }
 
-fn not_implemented<T>(msg: impl Into<String>) -> PlanResult<T> {
+pub(crate) fn not_implemented<T>(msg: impl Into<String>) -> PlanResult<T> {
     Err(PlanError::NotImplemented(msg.into()))
 }
 
@@ -1488,22 +1613,14 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
             .filter(|op| seen.insert(*op))
             .map(|op| format!("{op}()"))
             .collect();
-        return not_implemented(format!(
-            "{} on the edges before nodes() is not supported yet; collect the edge frame \
-             and re-ingest it via ur.from_arrow(...) first.",
-            ops.join("/")
-        ));
+        return not_implemented(format!("{}{STEPS_BEFORE_NODES}", ops.join("/")));
     }
 
     let roles = [("id", id_col.clone())];
     let Some(slot) = node_source_slot(chain) else {
         // `edges.nodes()`: no rows until the first with_columns computes them.
         if first_columns.is_none() {
-            return not_implemented(
-                "collect() on this NodeFrame needs a source (scan_nodes / from_arrow(id=...)) \
-                 or a with_columns of graph algorithms; a bare edges.nodes() has no \
-                 materializable node set yet.",
-            );
+            return not_implemented(BARE_NODES);
         }
         let first = steps
             .iter()
@@ -1607,7 +1724,7 @@ fn check_before_node_set(before: &[&Plan], with_columns: &Plan) -> PlanResult<()
 }
 
 /// The graph verbs of a `with_columns`.
-fn graph_columns(exprs: &[NamedExpr]) -> Vec<(&str, &GraphVerb)> {
+pub(crate) fn graph_columns(exprs: &[NamedExpr]) -> Vec<(&str, &GraphVerb)> {
     exprs
         .iter()
         .filter_map(|e| match &e.expr {
@@ -1618,14 +1735,14 @@ fn graph_columns(exprs: &[NamedExpr]) -> Vec<(&str, &GraphVerb)> {
 }
 
 /// A graph column of a `with_columns`: its name and verb.
-type GraphColumn<'a> = (&'a str, &'a GraphVerb);
+pub(crate) type GraphColumn<'a> = (&'a str, &'a GraphVerb);
 
 /// The graph columns that run over one edge input.
-type EdgeGroup<'a> = (&'a EdgeInput, Vec<GraphColumn<'a>>);
+pub(crate) type EdgeGroup<'a> = (&'a EdgeInput, Vec<GraphColumn<'a>>);
 
 /// The graph verbs of a `with_columns`, grouped by the edge frame they run
 /// over, in the order each frame first appears. A verb with no edges is an error.
-fn edge_groups<'a>(verbs: Vec<GraphColumn<'a>>) -> PlanResult<Vec<EdgeGroup<'a>>> {
+pub(crate) fn edge_groups<'a>(verbs: Vec<GraphColumn<'a>>) -> PlanResult<Vec<EdgeGroup<'a>>> {
     let mut groups: Vec<EdgeGroup<'a>> = vec![];
     for (name, verb) in verbs {
         let Some(edges) = &verb.edges else {
@@ -1639,7 +1756,7 @@ fn edge_groups<'a>(verbs: Vec<GraphColumn<'a>>) -> PlanResult<Vec<EdgeGroup<'a>>
     Ok(groups)
 }
 
-const NON_GRAPH_COLUMN: &str = "with_columns() takes ursa expressions: ur.col(...), \
+pub(crate) const NON_GRAPH_COLUMN: &str = "with_columns() takes ursa expressions: ur.col(...), \
      ur.lit(...), arithmetic and comparisons over them, or graph verbs; got a value of \
      another kind.";
 
@@ -1896,6 +2013,17 @@ fn scalar_columns(
 /// errors): its role references resolved, its columns checked, lowered with
 /// comparisons resolved as a filter's are.
 fn scalar_expr(frame: &Frame, v: &Value, roles: &Roles, what: &str) -> PlanResult<DfExpr> {
+    Ok(scalar_check(frame, v, roles, what)?.expect("a frame knows its types"))
+}
+
+/// [`scalar_expr`] over any [`View`]: its checks, in order, and the lowered
+/// expression when the view knows its column types.
+pub(crate) fn scalar_check(
+    view: &dyn View,
+    v: &Value,
+    roles: &Roles,
+    what: &str,
+) -> PlanResult<Option<DfExpr>> {
     if !matches!(
         kind(v),
         "col" | "lit" | "binary" | "unary" | "src" | "dst" | "id" | "alias"
@@ -1906,17 +2034,48 @@ fn scalar_expr(frame: &Frame, v: &Value, roles: &Roles, what: &str) -> PlanResul
     let v = resolve_roles(v, roles)?;
     let missing: Vec<String> = value_columns(&v, &[])
         .into_iter()
-        .filter(|c| !frame.has_column(c))
+        .filter(|c| !view.has_column(c))
         .collect();
     if let Some(c) = missing.first() {
-        return Err(unknown_column(what, c, &frame.names()));
+        return Err(unknown_column(what, c, &view.names()));
     }
     let e = crate::expr::lower(&crate::expr::parse_ursa_expr(&v)?)?;
-    Ok(crate::compare::resolve_comparisons(e, frame.df_schema())?)
+    match view.typed() {
+        Some(schema) => Ok(Some(crate::compare::resolve_comparisons(e, schema)?)),
+        None => Ok(None),
+    }
+}
+
+/// The columns a step's checks read: a frame being lowered, or the columns a
+/// frame is known to have before it runs (`crate::infer`).
+pub(crate) trait View {
+    /// The column names, in order.
+    fn names(&self) -> Vec<String>;
+    fn has_column(&self, name: &str) -> bool;
+    /// The columns as an Arrow schema (only the names are read where the view
+    /// does not know its types).
+    fn arrow(&self) -> arrow::datatypes::SchemaRef;
+    /// The schema to type expressions against, when the types are known.
+    fn typed(&self) -> Option<&datafusion::common::DFSchema>;
+}
+
+impl View for Frame {
+    fn names(&self) -> Vec<String> {
+        Frame::names(self)
+    }
+    fn has_column(&self, name: &str) -> bool {
+        Frame::has_column(self, name)
+    }
+    fn arrow(&self) -> arrow::datatypes::SchemaRef {
+        self.schema()
+    }
+    fn typed(&self) -> Option<&datafusion::common::DFSchema> {
+        Some(self.df_schema())
+    }
 }
 
 /// The host slot of a node source (`None` for a `nodes()`-derived frame).
-fn node_source_slot(chain: &[&Plan]) -> Option<Slot> {
+pub(crate) fn node_source_slot(chain: &[&Plan]) -> Option<Slot> {
     match chain[0] {
         Plan::ScanNodes { frame, .. }
         | Plan::FromArrow {
@@ -1927,7 +2086,7 @@ fn node_source_slot(chain: &[&Plan]) -> Option<Slot> {
 }
 
 /// The checks `_algo_column` ran on each graph column before it reached the engine.
-fn check_verb(verb: &GraphVerb) -> PlanResult<()> {
+pub(crate) fn check_verb(verb: &GraphVerb) -> PlanResult<()> {
     let name = verb.verb.as_str();
     if !EXECUTABLE.contains(&name) {
         return not_implemented(format!(
@@ -2144,17 +2303,19 @@ fn drop_null_endpoints(batches: &mut [RecordBatch]) -> PlanResult<usize> {
 }
 
 /// A scan's one path, or the error for a list of them (`msg`).
-fn single_path<'a>(path: &'a Option<ScanPath>, msg: &str) -> PlanResult<&'a str> {
+pub(crate) fn single_path<'a>(path: &'a Option<ScanPath>, msg: &str) -> PlanResult<&'a str> {
     match path {
         Some(ScanPath::One(p)) => Ok(p),
         _ => not_implemented(msg),
     }
 }
 
-const MULTI_PATH_EDGES: &str = "collect() over a scan_edges source supports a single string \
+pub(crate) const MULTI_PATH_EDGES: &str =
+    "collect() over a scan_edges source supports a single string \
      path (glob included) for now, not a list of paths.";
 
-const MULTI_PATH_NODES: &str = "collect() over a scan_nodes source supports a single string \
+pub(crate) const MULTI_PATH_NODES: &str =
+    "collect() over a scan_nodes source supports a single string \
      path (glob included) for now, not a list of paths.";
 
 /// The subgraph-view mask of a view over `index`, or `None` for the whole graph.
@@ -2478,7 +2639,8 @@ fn edge_rows(
     }
 }
 
-const NO_EDGE_SOURCE: &str = "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), \
+pub(crate) const NO_EDGE_SOURCE: &str =
+    "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), \
      or ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source.";
 
 /// The rows of a node source frame: its in-memory table, or its scan (through the
@@ -2781,7 +2943,7 @@ fn pushable(step: &Plan, roles: &Roles) -> Option<Value> {
 
 // --- join --------------------------------------------------------------------
 
-fn check_join_how(how: &str) -> PlanResult<()> {
+pub(crate) fn check_join_how(how: &str) -> PlanResult<()> {
     if How::parse(how).is_some() {
         return Ok(());
     }
@@ -2884,20 +3046,7 @@ fn lower_steps(
             }
             Plan::Select { columns, .. } => select(frame, columns, roles)?,
             Plan::Rename { mapping, .. } => {
-                if let Some((old, _)) = mapping.iter().find(|(old, _)| !frame.has_column(old)) {
-                    return Err(unknown_column("rename()", old, &frame.names()));
-                }
-                let renamed: Vec<String> = frame
-                    .names()
-                    .into_iter()
-                    .map(|n| {
-                        mapping
-                            .iter()
-                            .find(|(old, _)| *old == n)
-                            .map_or(n, |(_, new)| new.clone())
-                    })
-                    .collect();
-                check_unique("rename()", renamed.iter())?;
+                rename_check(frame, mapping)?;
                 if !mapping.is_empty() {
                     frame.rename(mapping)?;
                 }
@@ -2941,6 +3090,43 @@ fn lower_steps(
     Ok(())
 }
 
+/// A `rename`'s mapping checked against `view`: the renamed column names.
+pub(crate) fn rename_check(
+    view: &dyn View,
+    mapping: &[(String, String)],
+) -> PlanResult<Vec<String>> {
+    if let Some((old, _)) = mapping.iter().find(|(old, _)| !view.has_column(old)) {
+        return Err(unknown_column("rename()", old, &view.names()));
+    }
+    let renamed: Vec<String> = view
+        .names()
+        .into_iter()
+        .map(|n| {
+            mapping
+                .iter()
+                .find(|(old, _)| *old == n)
+                .map_or(n, |(_, new)| new.clone())
+        })
+        .collect();
+    check_unique("rename()", renamed.iter())?;
+    Ok(renamed)
+}
+
+/// A `group_by().agg()`'s columns checked against `view`.
+pub(crate) fn group_by_check(view: &dyn View, keys: &[String], aggs: &[AggSpec]) -> PlanResult<()> {
+    for k in keys {
+        if !view.has_column(k) {
+            return Err(unknown_column("group_by()", k, &view.names()));
+        }
+    }
+    for a in aggs {
+        if !view.has_column(&a.column) {
+            return Err(unknown_column("agg()", &a.column, &view.names()));
+        }
+    }
+    Ok(())
+}
+
 /// A `head` count: a negative one keeps no rows, as a slice of that length did.
 fn head_n(n: &IntArg) -> PlanResult<usize> {
     Ok(match n.int("n")? {
@@ -2953,58 +3139,88 @@ fn head_n(n: &IntArg) -> PlanResult<usize> {
 /// A `filter` predicate over the frame: the checks and errors filters have
 /// always had ([`host_check`]), then lowered with comparisons resolved.
 fn filter_expr(predicate: &Expr, roles: &Roles, frame: &Frame) -> PlanResult<DfExpr> {
+    Ok(filter_check(predicate, roles, frame)?.expect("a frame knows its types"))
+}
+
+/// [`filter_expr`] over any [`View`]: its checks, in order, and the lowered
+/// predicate when the view knows its column types.
+pub(crate) fn filter_check(
+    predicate: &Expr,
+    roles: &Roles,
+    view: &dyn View,
+) -> PlanResult<Option<DfExpr>> {
     let Expr::Scalar(v) = predicate else {
         return require_predicate(&Value::Null).map(|_| unreachable!());
     };
     require_predicate(v)?;
-    host_check(v, roles, Some(&frame.schema()))?;
-    Ok(crate::eval::logical(
-        &resolve_roles(v, roles)?,
-        frame.df_schema(),
-    )?)
+    host_check(v, roles, Some(&view.arrow()))?;
+    let resolved = resolve_roles(v, roles)?;
+    match view.typed() {
+        Some(schema) => Ok(Some(crate::eval::logical(&resolved, schema)?)),
+        None => {
+            crate::expr::lower(&crate::expr::parse_ursa_expr(&resolved)?)?;
+            Ok(None)
+        }
+    }
 }
 
 /// `select`: column names and expressions, in order. An expression's column is
 /// named by its alias, or else by its first column (as in Polars).
 fn select(frame: &mut Frame, items: &[SelectItem], roles: &Roles) -> PlanResult<()> {
-    let missing: Vec<&String> = items
-        .iter()
-        .filter_map(|c| match c {
-            SelectItem::Name(n) if !frame.has_column(n) => Some(n),
-            _ => None,
-        })
+    let exprs = select_check(frame, items, roles)?
+        .into_iter()
+        .map(|(_, e)| e.expect("a frame knows its types"))
         .collect();
-    if let Some(c) = missing.first() {
-        return Err(unknown_column("select()", c, &frame.names()));
-    }
-    let mut exprs = Vec::with_capacity(items.len());
-    for item in items {
-        exprs.push(match item {
-            SelectItem::Name(n) => col_named(n),
-            SelectItem::Expr(v) => {
-                let e = scalar_expr(frame, v, roles, "select()")?;
-                let name = expr_name(&resolve_roles(v, roles)?);
-                match e {
-                    DfExpr::Alias(_) => e,
-                    e => e.alias(name),
-                }
-            }
-        });
-    }
-    check_unique(
-        "select()",
-        exprs.iter().map(|e| match e {
-            DfExpr::Alias(a) => &a.name,
-            DfExpr::Column(c) => &c.name,
-            _ => unreachable!("select items are columns or aliases"),
-        }),
-    )?;
     frame.project(exprs)?;
     Ok(())
 }
 
+/// A `select`'s items checked against `view`, in order: each output's name, and
+/// its expression when the view knows its column types.
+pub(crate) fn select_check(
+    view: &dyn View,
+    items: &[SelectItem],
+    roles: &Roles,
+) -> PlanResult<Vec<(String, Option<DfExpr>)>> {
+    let missing: Vec<&String> = items
+        .iter()
+        .filter_map(|c| match c {
+            SelectItem::Name(n) if !view.has_column(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    if let Some(c) = missing.first() {
+        return Err(unknown_column("select()", c, &view.names()));
+    }
+    let typed = view.typed().is_some();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(match item {
+            SelectItem::Name(n) => (n.clone(), typed.then(|| col_named(n))),
+            SelectItem::Expr(v) => {
+                let e = scalar_check(view, v, roles, "select()")?;
+                let name = expr_name(&resolve_roles(v, roles)?);
+                let e = e.map(|e| match e {
+                    DfExpr::Alias(_) => e,
+                    e => e.alias(name.clone()),
+                });
+                let name = match &e {
+                    Some(DfExpr::Alias(a)) => a.name.clone(),
+                    _ => name,
+                };
+                (name, e)
+            }
+        });
+    }
+    check_unique("select()", out.iter().map(|(n, _)| n))?;
+    Ok(out)
+}
+
 /// A step's output keeps one column per name.
-fn check_unique<'a>(step: &str, names: impl Iterator<Item = &'a String>) -> PlanResult<()> {
+pub(crate) fn check_unique<'a>(
+    step: &str,
+    names: impl Iterator<Item = &'a String>,
+) -> PlanResult<()> {
     let mut seen = BTreeSet::new();
     for n in names {
         if !seen.insert(n) {
@@ -3019,7 +3235,7 @@ fn check_unique<'a>(step: &str, names: impl Iterator<Item = &'a String>) -> Plan
 
 /// The output name of an unaliased expression: its first column's, else
 /// `literal`.
-fn expr_name(v: &Value) -> String {
+pub(crate) fn expr_name(v: &Value) -> String {
     match kind(v) {
         "col" => v
             .get("name")
@@ -3047,18 +3263,31 @@ fn expr_name(v: &Value) -> String {
 /// The keys of a `sort`, checked against the frame: a column (which must exist)
 /// or an expression.
 fn sort_keys(frame: &Frame, by: &[SortKey], roles: &Roles) -> PlanResult<Vec<(DfExpr, bool)>> {
+    Ok(sort_check(frame, by, roles)?
+        .into_iter()
+        .map(|(e, d)| (e.expect("a frame knows its types"), d))
+        .collect())
+}
+
+/// [`sort_keys`] over any [`View`].
+pub(crate) fn sort_check(
+    view: &dyn View,
+    by: &[SortKey],
+    roles: &Roles,
+) -> PlanResult<Vec<(Option<DfExpr>, bool)>> {
     for k in by {
         if let Some(c) = &k.column {
-            if !frame.has_column(c) {
-                return Err(unknown_column("sort()", c, &frame.names()));
+            if !view.has_column(c) {
+                return Err(unknown_column("sort()", c, &view.names()));
             }
         }
     }
+    let typed = view.typed().is_some();
     by.iter()
         .map(|k| {
             let e = match (&k.column, &k.expr) {
-                (Some(c), _) => col_named(c),
-                (None, Some(v)) => scalar_expr(frame, v, roles, "sort()")?,
+                (Some(c), _) => typed.then(|| col_named(c)),
+                (None, Some(v)) => scalar_check(view, v, roles, "sort()")?,
                 (None, None) => {
                     return Err(PlanError::Invalid(
                         "a sort key needs a column or an expr".into(),
@@ -3073,16 +3302,7 @@ fn sort_keys(frame: &Frame, by: &[SortKey], roles: &Roles) -> PlanResult<Vec<(Df
 /// `group_by(keys).agg(aggs)`, its columns checked as they always were.
 fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<()> {
     use datafusion::functions_aggregate::expr_fn::{avg, count, count_distinct, max, min, sum};
-    for k in keys {
-        if !frame.has_column(k) {
-            return Err(unknown_column("group_by()", k, &frame.names()));
-        }
-    }
-    for a in aggs {
-        if !frame.has_column(&a.column) {
-            return Err(unknown_column("agg()", &a.column, &frame.names()));
-        }
-    }
+    group_by_check(frame, keys, aggs)?;
     use crate::agg::{float_agg, has_nulls, FloatAgg};
     // The rows, in order: a float sum's NaN rule depends on whether its column
     // holds a null.
@@ -3130,12 +3350,7 @@ fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<
             "max" => max(operand),
             "count" => count(operand),
             "n_unique" => count_distinct(operand),
-            other => {
-                return not_implemented(format!(
-                    "aggregation {} is not supported (use count, max, mean, min, n_unique, sum).",
-                    py_str(other)
-                ))
-            }
+            other => return check_agg_fn(other),
         };
         exprs.push(e.alias(&a.output));
     }
@@ -3170,7 +3385,7 @@ const HOST_BINARY_OPS: [&str; 12] = [
 /// Walk a predicate the way the host's evaluator did, raising its errors in its
 /// order: an unknown column (checked against `schema`, when given), a role not
 /// available here, an operator or node it doesn't evaluate.
-fn host_check(
+pub(crate) fn host_check(
     v: &Value,
     roles: &Roles,
     schema: Option<&arrow::datatypes::SchemaRef>,
@@ -3334,7 +3549,7 @@ fn check_step(step: &Plan, inputs: &dyn Inputs) -> PlanResult<()> {
 /// "unrepresentable": <type>}`), with the error serializing it used to raise:
 /// a `TypeError` for a value of another type, an engine JSON error for a
 /// non-finite float. The host's own evaluator still reads the original value.
-fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
+pub(crate) fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
     if kind(v) == "lit" {
         if let Some(ty) = v.get("unrepresentable").and_then(Value::as_str) {
             if ty == "float" {
@@ -3358,7 +3573,7 @@ fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
     Ok(())
 }
 
-fn require_predicate(p: &Value) -> PlanResult<()> {
+pub(crate) fn require_predicate(p: &Value) -> PlanResult<()> {
     let op = p.get("op").and_then(Value::as_str).unwrap_or("");
     let ok = match kind(p) {
         "binary" => PREDICATE_OPS.contains(&op),
@@ -3377,7 +3592,7 @@ fn require_predicate(p: &Value) -> PlanResult<()> {
 
 /// An expression with `ur.src()` / `ur.dst()` / `ur.id()` resolved to the columns
 /// `roles` names; a role not in `roles` is an error.
-fn resolve_roles(v: &Value, roles: &Roles) -> PlanResult<Value> {
+pub(crate) fn resolve_roles(v: &Value, roles: &Roles) -> PlanResult<Value> {
     let k = kind(v);
     let mut out = v.clone();
     match k {
@@ -3410,14 +3625,14 @@ fn resolve_roles(v: &Value, roles: &Roles) -> PlanResult<Value> {
 }
 
 /// The columns an expression reads, role references resolved through `roles`.
-fn expr_columns(e: &Expr, roles: &Roles) -> BTreeSet<String> {
+pub(crate) fn expr_columns(e: &Expr, roles: &Roles) -> BTreeSet<String> {
     match e {
         Expr::Scalar(v) => value_columns(v, roles),
         Expr::Graph(_) => BTreeSet::new(),
     }
 }
 
-fn value_columns(v: &Value, roles: &Roles) -> BTreeSet<String> {
+pub(crate) fn value_columns(v: &Value, roles: &Roles) -> BTreeSet<String> {
     let k = kind(v);
     let mut out = BTreeSet::new();
     match k {
@@ -3450,7 +3665,7 @@ fn value_columns(v: &Value, roles: &Roles) -> BTreeSet<String> {
 
 /// The error for a step that names a column the frame doesn't have (Python's
 /// `ColumnNotFoundError`, which is also a `ValueError`), with the columns it has.
-fn unknown_column(step: &str, name: &str, available: &[String]) -> PlanError {
+pub(crate) fn unknown_column(step: &str, name: &str, available: &[String]) -> PlanError {
     PlanError::ColumnNotFound(format!(
         "{step} references unknown column {}; the frame has {}.",
         py_str(name),
@@ -3464,7 +3679,7 @@ fn unknown_column(step: &str, name: &str, available: &[String]) -> PlanError {
 // Python's `repr`.
 
 /// `repr(s)` for a Python `str`.
-fn py_str(s: &str) -> String {
+pub(crate) fn py_str(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
         '"'
     } else {
@@ -3493,13 +3708,13 @@ fn py_str(s: &str) -> String {
 }
 
 /// `repr(list_of_str)`.
-fn py_list<S: AsRef<str>>(items: impl Iterator<Item = S>) -> String {
+pub(crate) fn py_list<S: AsRef<str>>(items: impl Iterator<Item = S>) -> String {
     let parts: Vec<String> = items.map(|s| py_str(s.as_ref())).collect();
     format!("[{}]", parts.join(", "))
 }
 
 /// `repr(value)` for a JSON-representable Python value.
-fn py_value(v: &Value) -> String {
+pub(crate) fn py_value(v: &Value) -> String {
     match v {
         Value::Null => "None".into(),
         Value::Bool(true) => "True".into(),

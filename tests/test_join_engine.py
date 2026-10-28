@@ -410,18 +410,21 @@ def test_a_joined_group_by_side_keeps_its_nullable_columns():
 
 
 def test_a_left_side_error_comes_before_the_right_sides():
-    # The left side runs first, then the right, then the keys are checked.
+    # The left side runs first, then the right. A left side's run-time error
+    # (a divide by zero) is raised by collect().
     left = ur.from_arrow(pa.table({"id": [0, 1], "a": [1, 2], "z": [0, 0]}), id="id")
     left = left.with_columns(q=ur.col("a") / ur.col("z"))
+    right = ur.from_arrow(pa.table({"id": [0], "b": [1]}), id="id")
+    with pytest.raises(ur.ComputeError, match="Divide by zero"):
+        left.join(right, on="id").collect()
+    # What the plan alone shows is raised where the join is added (#193): a key
+    # missing from the right side, even before the left side's run-time error.
     no_key = ur.from_arrow(pa.table({"k": [0], "b": [1]}), id="k")
-    with pytest.raises(ur.ComputeError, match="Divide by zero"):
-        left.join(no_key, on="id").collect()
-    # A right side whose own step fails to parse (a deferred host error).
-    bad = ur.from_arrow(pa.table({"id": [0], "b": [1]}), id="id").sort([])
-    with pytest.raises(ur.ComputeError, match="Divide by zero"):
-        left.join(bad, on="id").collect()
+    with pytest.raises(ur.ColumnNotFoundError, match="not in the right frame"):
+        left.join(no_key, on="id")
+    # And a right side whose own step fails to parse raises where that step is.
     with pytest.raises(ValueError, match="sort"):
-        attrs().join(bad, on="id").collect()
+        ur.from_arrow(pa.table({"id": [0], "b": [1]}), id="id").sort([])
 
 
 @pytest.mark.parametrize("how", HOWS)

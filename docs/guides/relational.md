@@ -278,19 +278,36 @@ shape: (2, 2)
 
 ## Explain
 
-`explain()` prints the plan and runs nothing.
+`explain()` prints the plan and runs nothing: the steps as a tree, last step first, the schema the frame collects to, and the DataFusion plans a collect runs. `schema()` returns that schema as a `pyarrow.Schema`.
 
 ```python
 print(ranked.filter(ur.col("degree") > 5).sort("degree", descending=True).head(3).explain())
 ```
 
 ```text
-NodeFrame plan [index: dropped (rebuild lazily)]
-  0: from_arrow(id='id')
-  1: with_columns(exprs={'degree': degree(...), 'triangles': triangle_count(...)})
-  2: filter(predicate=(col('degree') > lit(5)))
-  3: sort(by='degree', descending=True)
-  4: head(n=3)
+NodeFrame plan:
+  head(3)
+    sort("degree" desc)
+      filter((col("degree") > lit(5)))
+        with_columns(degree=degree(direction="both"), triangles=triangle_count())
+          degree edges:
+            from_arrow(src="src", dst="dst")
+          triangles edges:
+            from_arrow(src="src", dst="dst")
+          from_arrow(id="id")
+
+Schema:
+  id: Int64
+  club: Utf8
+  degree: UInt32
+  triangles: UInt32
+
+DataFusion logical plan 1 of 1 (optimized):
+  Projection: ?table?.id, ?table?.club, ?table?.degree, ?table?.triangles
+    Sort: ?table?.degree DESC NULLS LAST, ?table?.__ursa_ord ASC NULLS LAST, fetch=3
+      TableScan: ?table? projection=[id, club, degree, triangles, __ursa_ord]
 ```
 
-Some combinations of steps do not run yet. `collect()` raises `NotImplementedError` with the fix. See [Limits](../limits.md).
+The text is for reading; its format is not a stable API. [Frames](../reference/frames.md#explain) describes its parts.
+
+Some combinations of steps do not run yet. The step that adds one raises `NotImplementedError` with the fix. See [Limits](../limits.md).

@@ -39,9 +39,9 @@ def test_rename_relabels_output_column():
 @native
 def test_rename_unknown_column_raises():
     edges = _edges()
-    frame = edges.nodes().with_columns(pr=ur.pagerank(edges)).rename({"nope": "x"})
+    frame = edges.nodes().with_columns(pr=ur.pagerank(edges))
     with pytest.raises(Exception, match="rename"):
-        frame.collect()
+        frame.rename({"nope": "x"})  # raised where the step is added (#193)
 
 
 @native

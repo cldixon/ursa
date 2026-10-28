@@ -10,6 +10,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Added
 
+- `frame.schema()` returns the schema `collect()` returns, as a
+  `pyarrow.Schema` (names, types, nullability and metadata), on every frame:
+  sources and scans, graph columns, joins, `group_by`, traversals, walks and
+  `describe`. It runs nothing: the plan is built over empty inputs, so a scan
+  reads its file's schema and no rows, and no graph index is built.
+  `frame.explain()` now shows the plan as a tree, that schema, and the DataFusion
+  logical plans a collect runs, optimized; `explain(physical=True)` adds their
+  physical plans. Both are generated in Rust. The text is for reading, not a
+  stable format (#193).
 - Criterion micro-benchmarks for the `ursa-core` kernels (`cargo bench -p
   ursa-core`, `ursa-core/benches/kernels.rs`): topology build and views, id
   interning, and every kernel family on seeded Erdős–Rényi and R-MAT graphs up
@@ -18,6 +27,72 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- Frames hold Rust plan objects (#193, the last item of #189). An `EdgeFrame`
+  or `NodeFrame` holds one `ursa._ursa.PlanNode`, as a Polars `LazyFrame` holds
+  its plan: each method converts its arguments, calls into Rust, which builds
+  and validates the next step (`ursa_plan::lazy`, `ursa_plan::infer`), and wraps
+  the new node in a frame of the same type. `collect()`, `schema()` and
+  `explain()` run there, and so do the caches: a frame's topology index (with
+  its weights, masks and symmetric views) and a scanned node table live on the
+  Rust state a frame shares with the derivations that keep its rows, so a
+  derivation made before a build still sees it. Python keeps the API surface,
+  input conversion (pandas/polars/numpy/lists to Arrow, expressions and
+  arguments to the plan IR), interop egress and the datasets, plus four small
+  callbacks (`ursa._execute`): a seed iterable's conversion, the stdlib's
+  seeded draw for `sample`, the `on_null="drop"` warning and an in-memory
+  table's identity token. Nothing in Python lists the engine's steps, verbs,
+  aggregations, joins, directions or modes any more; a test fails if a module
+  does. `ursa._ursa.run_plan`, `resolve_index` and `scan_build_index` are gone.
+  Results are byte-identical: three parity harnesses (10,928 plans) give the
+  same schema, values (floats by their bits), row order and errors as before,
+  on one core and on four. Building a step, its validation included, takes
+  about 9.5 µs (2.3 µs before, when nothing was checked); a 20-step pipeline on
+  karate builds and collects in 6.7 ms, as before, and a small collect is 0.26
+  ms against 0.28 ms (4 cores, medians of 6 interleaved runs).
+- **Behaviour change:** a step that cannot run raises on the line that adds it,
+  not at `collect()`. The exception class and message are the ones `collect()`
+  raised. What moved:
+  - an unknown column in `filter`, `select`, `with_columns`, `rename`, `sort`,
+    `group_by` or `agg` (`ColumnNotFoundError: sort() references unknown column
+    'x'; the frame has [...]`), a `join` key missing from either side, the node
+    id column a graph column attaches by, a weight's edge column, and an edge
+    frame whose steps dropped `src` or `dst` under a graph op;
+  - two output columns with one name (`select`, `rename`, a join's non-key
+    columns), and a graph column named `id`;
+  - a filter that is not a boolean predicate, an operator or expression node a
+    filter does not take, a role (`ur.src()`, `ur.dst()`, `ur.id()`) the frame
+    does not have, and a comparison between types that do not compare
+    (`ComputeError: ... has no kernel matching input types (string, int64)`, or
+    the `ValueError` for an aware against a naive timestamp);
+  - every unsupported shape (`NotImplementedError`): a step after `describe()`
+    or a `random_walk` other than a relational step or a join, a graph verb in
+    an edge frame's `with_columns`, `reverse()` after a traversal, a traversal of
+    a traversal result, a step between a traversal and a graph op over it, a
+    `with_columns` after another step on `edges.nodes()`, an unknown `how`, a
+    graph verb's unsupported `mode=`, `dtype=`, `weight=` or `neighbors()` form,
+    and a `join` whose right side does not collect;
+  - an argument the step could not take: `sort([])`, a `descending` list of the
+    wrong length, a `select` item that is not an expression, `group_by` keys or
+    aggregations of the wrong form, `join(on=None)`, a non-integer `head(n)` or
+    `sample(n)`, a non-frame `join(other)`, and a literal with no JSON form.
+
+  These stay at `collect()`, since only the rows (or the files) tell: a null
+  endpoint, an integer divide by zero, a value out of range, a right or outer
+  join key the left type cannot hold, a missing or empty file, a scan's columns
+  (the file is read then, and may change in between), `store=`, a scan of
+  several files, an invalid graph verb parameter value, and `edges.nodes()`
+  collected with no columns (a later `with_columns` makes it collect). When a
+  plan has a step the plan alone shows is wrong and also an error only the rows
+  show earlier in it, the step's error is now the one raised. A step on an edge
+  frame is checked even where a later use reads only the frame's topology:
+  `ur.degree(e.select("s", "d", "nope"))` and
+  `e.filter(ur.col("nope") > 1).nodes()` used to run, skipping the step, and
+  now raise where the step is added. One message reads differently: a NaN or
+  infinite graph-verb parameter raises `ValueError: invalid plan: a plan
+  argument is NaN, which has no JSON form` (it quoted a JSON parser offset).
+  The guard on steps on a traversal's edges before `nodes()` is raised by the
+  first `with_columns` after `nodes()`, which raises the graph op's own guard
+  instead when its edges are those, as `collect()` did.
 - `collect()` now hands the whole query to Rust as one plan. The frame is
   serialized to a plan IR in `ursa-plan` (`ursa_plan::plan::Plan`), and a single
   entry point, `execute_plan` (`ursa._ursa.run_plan` in Python), picks which

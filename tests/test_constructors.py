@@ -74,6 +74,7 @@ def test_pandas_dataframe_input_drops_index():
     assert isinstance(edges, ur.EdgeFrame)
     assert edges._edge_table is not None
     assert edges._edge_table.schema.names == ["s", "d"]
+    assert edges.schema().names == ["s", "d"]
 
 
 def test_slot_identity_matches_from_arrow():
@@ -81,32 +82,23 @@ def test_slot_identity_matches_from_arrow():
     # from_arrow frame have the same plan and the same canonical source shape.
     a = ur.EdgeFrame(_ROWS, src="s", dst="d")
     b = ur.from_arrow(_pa_table(), src="s", dst="d")
-    assert a._plan == b._plan
-    assert a._plan[0].op == "from_arrow"
+    assert a._node.ops() == b._node.ops() == ["from_arrow"]
     assert a._edge_table is not None and b._edge_table is not None
     assert a._edge_table.schema == b._edge_table.schema
-    assert a._source is not None and b._source is not None
-    assert a._source[0].equals(b._source[0])
-    assert a._source[1].equals(b._source[1])
-    # __new__-built frames must have every slot set (fresh, independent cells).
+    assert a._edge_arrays is not None and b._edge_arrays is not None
+    assert a._edge_arrays[0].equals(b._edge_arrays[0])
+    assert a._edge_arrays[1].equals(b._edge_arrays[1])
+    # Each source frame has its own, independent index cell.
     assert a._index_cell is not None
     assert a._index_cell is not b._index_cell
 
 
 def test_all_slots_set_after_construct():
     # Guards the __new__ + __slots__ gotcha: an unset slot raises AttributeError.
+    # A frame's one slot is its plan object; everything else reads through it.
     edges = ur.EdgeFrame(_ROWS, src="s", dst="d")
-    for slot in (
-        "_plan",
-        "_has_index",
-        "_src_col",
-        "_dst_col",
-        "_source",
-        "_scan",
-        "_index_cell",
-        "_edge_table",
-    ):
-        getattr(edges, slot)  # would raise AttributeError if any were unset
+    for attr in ("_node", "src_col", "dst_col", "_index_cell", "_edge_table", "_edge_arrays"):
+        getattr(edges, attr)  # would raise AttributeError if the slot were unset
 
 
 def test_nodeframe_constructor_flavours():

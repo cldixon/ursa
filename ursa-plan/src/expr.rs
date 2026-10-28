@@ -88,54 +88,58 @@ pub enum UrsaExpr {
 /// as given and typed where the verb is lowered ([`GraphVerb::param`]), so a
 /// malformed value is reported as an engine error at that point, as it was before
 /// the plan IR. Which parameters a verb accepts is checked by the plan executor.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphVerb {
     /// The verb's name: `pagerank`, `degree`, `neighbors_agg`, `layout_fr`, ...
     pub verb: String,
     /// The edges the verb runs over. `None` only for a malformed expression.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edges: Option<EdgeInput>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damping: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iter: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tol: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<Value>,
     /// `betweenness`: the fraction of sources to sample.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<Value>,
     /// A weight expression over edge columns (this grammar, unparsed).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<Value>,
     /// `connected_components`: `"weak"` or `"strong"`, as given. An explicit
     /// null is kept (`Some(Null)`): it is an invalid mode, not the default.
-    #[serde(default, deserialize_with = "present")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mode: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iterations: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gravity: Option<Value>,
     /// Which output of a multi-output kernel this column takes (#115): 0 = x,
     /// 1 = y for a layout.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<Value>,
     /// Output dtype narrowing (#117): `"f32"` or `"f64"`, as given.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtype: Option<Value>,
     /// `neighbors_agg`: the aggregation, `ur.col(<name>).<fn>()`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agg: Option<Value>,
     /// `neighbors_agg`: whether `from_=` was given (not supported yet).
-    #[serde(default, rename = "from_")]
+    #[serde(default, rename = "from_", skip_serializing_if = "Option::is_none")]
     pub from: Option<bool>,
 }
 

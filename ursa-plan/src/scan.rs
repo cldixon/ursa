@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::kernels::boolean::{and, is_not_null};
 use arrow::compute::{cast, filter};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::context::SessionState;
@@ -315,6 +315,10 @@ static SCAN_LOG: Mutex<Option<Vec<ScanRecord>>> = Mutex::new(None);
 pub type ScanRecord = (String, Vec<String>, usize);
 
 fn log_scan(kind: &str, columns: &[String], pushed: usize) {
+    // A dry run reads a file's schema, not its rows (see `crate::dry`).
+    if crate::dry::active() {
+        return;
+    }
     let mut log = SCAN_LOG.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(log) = log.as_mut() {
         log.push((kind.to_string(), columns.to_vec(), pushed));
@@ -430,6 +434,10 @@ async fn open_scan(
 /// each partition reads only its own range, so concatenating partitions in order
 /// gives the file's own row order on every run, whatever the thread count.
 async fn collect_in_file_order(df: DataFrame) -> Result<Vec<RecordBatch>> {
+    if crate::dry::active() {
+        crate::dry::record(df.logical_plan());
+        return Ok(vec![]);
+    }
     Ok(df
         .collect_partitioned()
         .await?
@@ -442,6 +450,13 @@ async fn collect_in_file_order(df: DataFrame) -> Result<Vec<RecordBatch>> {
 async fn collect_in_file_order_with_plan(
     df: DataFrame,
 ) -> Result<(Vec<RecordBatch>, Arc<dyn ExecutionPlan>)> {
+    if crate::dry::active() {
+        crate::dry::record(df.logical_plan());
+        let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let empty: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema));
+        return Ok((vec![], empty));
+    }
     let task_ctx = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
     let parts = datafusion::physical_plan::collect_partitioned(plan.clone(), task_ctx).await?;
@@ -483,17 +498,19 @@ pub fn scan_edges_batch(
             }
         }
         let df = df.select_columns(&proj)?;
+        let dry = crate::dry::active();
+        let dry_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         // Keep the scan's batches separate (no `concat_batches` into one contiguous
         // batch) so the transient ingest footprint stays ~1×, not ~2×, at the
         // 500M-edge target; the topology build consumes them as a stream (#60).
         let batches = collect_in_file_order(df).await?;
-        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        if !dry && (batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0)) {
             return Err(empty_edge_source(path));
         }
 
         // The canonical id type is taken once from the read schema (identical across
         // the scan's batches) and every batch is canonicalized to it independently.
-        let read_schema = batches[0].schema();
+        let read_schema = if dry { dry_schema } else { batches[0].schema() };
         let id_type = endpoint_id_type(&read_schema, path)?;
         // Output layout: canonical src/dst, then each weight column by its own
         // name, as an index into the read batch. An endpoint requested as a weight
@@ -515,6 +532,9 @@ pub fn scan_edges_batch(
             }
         }
         let out_schema = Arc::new(Schema::new(fields));
+        if dry {
+            return Ok(vec![RecordBatch::new_empty(out_schema)]);
+        }
 
         // Canonicalize each batch independently, in parallel (rayon's collect keeps
         // batch order). Consuming the list releases each batch after its cast, so a
@@ -707,7 +727,7 @@ fn scan_edges_rows_plan(
         let filters = &filters[..pushed];
         let (mut batches, plan) = collect_in_file_order_with_plan(filtered).await?;
         let empty = |b: &[RecordBatch]| b.iter().all(|b| b.num_rows() == 0);
-        if empty(&batches) {
+        if empty(&batches) && !crate::dry::active() {
             // An empty file is an error; an empty filter result is not.
             let any = if filters.is_empty() {
                 false
@@ -865,10 +885,13 @@ pub fn scan_edges_topology(
     drop_nulls: bool,
 ) -> std::result::Result<ScannedTopology, ScanBuildError> {
     log_scan("index", &[], 0);
-    let (interner, dropped) = crate::runtime::block_on(async move {
+    let (interner, id_type, dropped) = crate::runtime::block_on(async move {
         let df = open_scan(path, storage_options, "scan_edges").await?;
         let df = df.select_columns(&[src, dst])?;
         let id_type = endpoint_id_type(df.schema().as_arrow(), path)?;
+        if crate::dry::active() {
+            return Ok::<_, ScanBuildError>((None, Some(id_type), 0));
+        }
         let task_ctx = df.task_ctx();
         let plan = df.create_physical_plan().await?;
         // Parquet metadata gives the row count up front, so the dense endpoint
@@ -903,8 +926,16 @@ pub fn scan_edges_topology(
                 }
             }
         }
-        Ok::<_, ScanBuildError>((interner, dropped))
+        Ok::<_, ScanBuildError>((Some(interner), None, dropped))
     })??;
+    let interner = match interner {
+        Some(interner) => interner,
+        None => {
+            // A dry run: an empty index of the file's id type.
+            let (topo, ids) = crate::topology::empty_topology(&id_type.expect("set when dry"));
+            return Ok(ScannedTopology { topo, ids, dropped });
+        }
+    };
     if interner.is_empty() && dropped == 0 {
         return Err(empty_edge_source(path).into());
     }
@@ -953,15 +984,17 @@ pub fn scan_nodes_batch(
 
         // Keep the batches separate (no `concat_batches`); the attribute table
         // crosses the FFI as a batch list and is consumed as a stream (#60).
+        let dry = crate::dry::active();
+        let dry_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = collect_in_file_order(df).await?;
-        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        if !dry && (batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0)) {
             return Err(DataFusionError::Execution(format!(
                 "node source {path:?} resolved but contained no rows (check the path/glob \
                  points at data with the given id column)"
             )));
         }
 
-        let read_schema = batches[0].schema();
+        let read_schema = if dry { dry_schema } else { batches[0].schema() };
         let id_idx = read_schema.index_of(id).map_err(|_| {
             DataFusionError::Execution(format!(
                 "scan_nodes: id column {id:?} not found in node file {path:?}"
@@ -989,7 +1022,11 @@ pub fn scan_nodes_batch(
                 }
             })
             .collect();
-        cast_batches(&batches, &Arc::new(Schema::new(fields)))
+        let out_schema = Arc::new(Schema::new(fields));
+        if dry {
+            return Ok(vec![RecordBatch::new_empty(out_schema)]);
+        }
+        cast_batches(&batches, &out_schema)
     })?
 }
 
