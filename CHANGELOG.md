@@ -185,7 +185,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
   An unknown `how` now says which are supported: `join how='cross' is not
   supported (use ['anti', 'full', 'inner', 'left', 'outer', 'right', 'semi']).`
-  BENCH_PLACEHOLDER
+  On a 4-core machine (medians of 6 interleaved runs): a plain join of two
+  1M-row tables, 71 ms to 68 ms (within noise); a 1M-row attribute frame
+  joined to a degree result, 74 ms to 73 ms. A two-join pipeline over them
+  runs as one plan in 98 ms, against 115 ms as two collects with the first
+  result re-ingested, the only way to write it before.
 - **Behaviour change:** a step behaves the same wherever it runs. Before, the
   same step could give different results on a frame the engine ran (after a
   graph algorithm, a traversal or a join) than on a plain frame, depending on
