@@ -14,7 +14,7 @@
 
 use crate::parallel::*;
 
-use crate::topology::{Direction, Topology};
+use crate::topology::{Direction, EdgeMask, Topology};
 
 /// Per-worker reusable BFS scratch, so a parallel seed sweep allocates the
 /// `n`-sized `visited` bitmap once per thread instead of once per seed.
@@ -50,6 +50,18 @@ impl Scratch {
 /// with a per-worker reusable `Scratch`. Per-seed outputs are concatenated in
 /// seed order, so the result is byte-for-byte identical to a serial sweep.
 pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32>, Vec<u32>) {
+    k_hop_masked(topo, None, seeds, k, dir)
+}
+
+/// [`k_hop`] over the subgraph view `mask` (`None`: the whole graph): only kept
+/// edges are followed.
+pub fn k_hop_masked(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    seeds: &[u32],
+    k: u32,
+    dir: Direction,
+) -> (Vec<u32>, Vec<u32>) {
     let n = topo.n_nodes();
     if k == 0 || n == 0 {
         return (Vec::new(), Vec::new());
@@ -64,7 +76,7 @@ pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32
         .par_iter()
         .map_init(
             || Scratch::new(n),
-            |scratch, &seed| bfs_seed(topo, seed, k, dir, scratch),
+            |scratch, &seed| bfs_seed(topo, mask, seed, k, dir, scratch),
         )
         .collect();
 
@@ -83,6 +95,7 @@ pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32
 /// across seeds handled by the same worker.
 fn bfs_seed(
     topo: &Topology,
+    mask: Option<&EdgeMask>,
     seed: u32,
     k: u32,
     dir: Direction,
@@ -110,7 +123,7 @@ fn bfs_seed(
     for _level in 0..k {
         next.clear();
         for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, None, |v| {
+            topo.for_each_neighbor(u, dir, mask, |v| {
                 if !visited[v as usize] {
                     visited[v as usize] = true;
                     touched.push(v);
@@ -144,10 +157,24 @@ fn bfs_seed(
 /// origin. `k == 0` yields exactly the (known) seeds; unknown/out-of-range seeds
 /// contribute nothing. `Both` walks out- and in-neighbours together.
 pub fn k_hop_reached_set(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> Vec<u32> {
+    let visited = k_hop_reached_masked(topo, None, seeds, k, dir);
+    // Ascending dense order — a deterministic set independent of BFS visit order.
+    (0..visited.len() as u32)
+        .filter(|&v| visited[v as usize])
+        .collect()
+}
+
+/// The reached region of [`k_hop_reached_set`] over the subgraph view `mask`, as a
+/// per-node flag (`reached[v]`), the form an induced edge mask is built from
+/// ([`EdgeMask::induced`]).
+pub fn k_hop_reached_masked(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    seeds: &[u32],
+    k: u32,
+    dir: Direction,
+) -> Vec<bool> {
     let n = topo.n_nodes();
-    if n == 0 {
-        return Vec::new();
-    }
     let mut visited = vec![false; n];
     let mut frontier: Vec<u32> = Vec::new();
     for &s in seeds {
@@ -161,7 +188,7 @@ pub fn k_hop_reached_set(topo: &Topology, seeds: &[u32], k: u32, dir: Direction)
     for _level in 0..k {
         next.clear();
         for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, None, |v| {
+            topo.for_each_neighbor(u, dir, mask, |v| {
                 if !visited[v as usize] {
                     visited[v as usize] = true;
                     next.push(v);
@@ -173,9 +200,7 @@ pub fn k_hop_reached_set(topo: &Topology, seeds: &[u32], k: u32, dir: Direction)
         }
         std::mem::swap(&mut frontier, &mut next);
     }
-
-    // Ascending dense order — a deterministic set independent of BFS visit order.
-    (0..n as u32).filter(|&v| visited[v as usize]).collect()
+    visited
 }
 
 #[cfg(test)]
@@ -281,5 +306,16 @@ mod tests {
             k_hop_reached_set(&t, &[3, 99], 1, Direction::In),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn masked_hops_follow_only_kept_edges() {
+        // path(): rows 0:0->1, 1:1->2, 2:2->3, 3:1->4. Dropping row 1 cuts 1->2.
+        let t = path();
+        let m = EdgeMask::from_bools(&[true, false, true, true]);
+        let (s, d) = k_hop_masked(&t, Some(&m), &[0], 3, Direction::Out);
+        assert_eq!(pairs(&s, &d), vec![(0, 1), (0, 4)]);
+        let reached = k_hop_reached_masked(&t, Some(&m), &[0], 3, Direction::Out);
+        assert_eq!(reached, vec![true, true, false, false, true]);
     }
 }

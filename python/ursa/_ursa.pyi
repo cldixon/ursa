@@ -20,6 +20,14 @@ def __core_version() -> str: ...
 class GraphIndex:
     def has_weights(self, weight_json: str) -> bool: ...
     def _weight_eval_count(self) -> int: ...
+    def _mask_build_count(self) -> int: ...
+
+# A scan_nodes frame's scanned table, kept in the frame's cell: one superset of
+# the columns read so far. Opaque handle; the plan reads through it.
+class NodeTableCache:
+    def __init__(self) -> None: ...
+    def _scan_count(self) -> int: ...
+    def _held(self) -> list[str] | None: ...
 
 # Build the graph index from an edge batch list — a list of pyarrow RecordBatches
 # whose first two columns are the (canonicalized) src/dst id columns (int64 or
@@ -29,6 +37,10 @@ def build_index(edges: Any) -> GraphIndex: ...
 
 # Total topology builds so far (test/observability hook for the index contract).
 def _topology_build_count() -> int: ...
+
+# Turn the scan log on (clearing it) or off; returns (kind, columns, filters
+# pushed) per native scan since it was last turned on (test/observability hook).
+def _scan_log(record: bool) -> list[tuple[str, list[str], int]]: ...
 
 # Scan an edge file and build its index in one call -> (index, rows dropped).
 def scan_build_index(
@@ -48,27 +60,6 @@ def run_plan(plan: str, host: Any) -> Any: ...
 # for the eager whole-graph stats.
 def resolve_index(edges: str, host: Any) -> GraphIndex: ...
 
-# The node set reached within `n` hops of `seeds` (seeds included) as a pyarrow
-# array of user ids — the reached region behind a graph op over a hop result (#116).
-def hop_reached_nodes_query(
-    index: GraphIndex,
-    seeds: Any,
-    n: int,
-    direction: str,
-) -> Any: ...
-
-# The nodes on the shortest path from source to target (inclusive) as a pyarrow
-# array of user ids (empty when there is no path) — the region behind a graph op
-# over a shortest_path result (#116). weight + edges select weighted Dijkstra.
-def shortest_path_nodes_query(
-    index: GraphIndex,
-    source: Any,
-    target: Any,
-    direction: str,
-    weight: str | None = ...,
-    edges: Any | None = ...,
-) -> Any: ...
-
 # The whole-graph stats take direction "out" (default), "in" or "both". "both"
 # reads the graph as undirected: one edge per distinct unordered pair, self-loops
 # dropped (NetworkX's G.to_undirected()). "in" equals "out" over the whole graph.
@@ -83,39 +74,6 @@ def graph_avg_path_length(
 
 # Graph diameter (eager scalar); approximate is a lower-bound estimate.
 def graph_diameter(index: GraphIndex, approximate: bool, direction: str = ...) -> int: ...
-
-# Scan a Parquet/CSV edge file (local or s3://gs://az://file://) -> a
-# list[pyarrow.RecordBatch] of (src, dst[, weight cols by name]). storage_options seeds
-# the object-store backend.
-def scan_edges_arrow(
-    path: str,
-    src: str,
-    dst: str,
-    storage_options: dict[str, str] | None = ...,
-    weight_columns: list[str] = ...,
-) -> Any: ...
-
-# Scan a Parquet/CSV edge file as a table for the relational paths -> a
-# list[pyarrow.RecordBatch] of every column (file names/types, string_view read
-# as string; endpoints validated, not cast). `columns` is a projection pushdown:
-# non-empty reads only those columns plus src/dst, in file order.
-def scan_edges_table_arrow(
-    path: str,
-    src: str,
-    dst: str,
-    storage_options: dict[str, str] | None = ...,
-    columns: list[str] = ...,
-) -> Any: ...
-
-# Scan a Parquet/CSV node file -> list[pyarrow.RecordBatch] of the attribute
-# table (id cast int64). `columns` is a projection pushdown: non-empty reads only
-# those columns (must include id); empty reads all.
-def scan_nodes_arrow(
-    path: str,
-    id: str,
-    storage_options: dict[str, str] | None = ...,
-    columns: list[str] = ...,
-) -> Any: ...
 
 # Demo path: plain lists in and out (pure Python->Rust smoke tests).
 def _demo_pagerank(

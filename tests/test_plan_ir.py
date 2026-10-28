@@ -1,9 +1,10 @@
 """The plan IR (#190) keeps what collect() accepted and raised before it.
 
 `collect()` serializes every step up front, so these pin the cases where that
-could have changed behaviour: literals with no JSON form, integer arguments the
-host's evaluator accepts but the engine doesn't, explicit nulls, which error wins
-when a pipeline has two, and that a wrapped join error keeps its cause.
+could have changed behaviour: literals with no JSON form (typed literals of the
+plan since #192), integer arguments the host's evaluator accepts but the engine
+doesn't, explicit nulls, which error wins when a pipeline has two, and that a
+wrapped join error keeps its cause.
 """
 
 import datetime
@@ -60,19 +61,15 @@ def test_literals_with_no_json_form_still_build_subgraph_masks(name):
     assert degree.column("degree").to_pylist() == [1 if s in kept else 0 for s in range(4)]
 
 
-@pytest.mark.parametrize(
-    ("name", "error", "match"),
-    [
-        ("nan", ur.ComputeError, "invalid filter expression JSON"),
-        ("datetime", TypeError, "Object of type datetime is not JSON serializable"),
-        ("np_datetime64", TypeError, "Object of type datetime64 is not JSON serializable"),
-        ("np_timedelta64", TypeError, "Object of type timedelta64 is not JSON serializable"),
-    ],
-)
-def test_literals_with_no_json_form_are_rejected_by_engine_filters(name, error, match):
-    value, _column, _kept = LITERALS[name]
-    with pytest.raises(error, match=match):
-        ur.degree(_edges()).filter(ur.col("degree") > value).collect()
+@pytest.mark.parametrize("name", list(LITERALS))
+def test_literals_with_no_json_form_filter_in_the_engine_too(name):
+    # #192: they are typed literals of the plan, so a filter the engine runs (here
+    # after graph columns on an attribute frame) keeps the plain path's rows.
+    # (`main` raised TypeError / ComputeError "invalid filter expression JSON".)
+    value, column, kept = LITERALS[name]
+    attrs = ur.from_arrow(EDGES, id="s").with_columns(dg=ur.degree(_edges()))
+    out = attrs.filter(ur.col(column) > value).collect().to_arrow()
+    assert out.column("s").to_pylist() == kept
 
 
 def test_numpy_numbers_are_engine_literals():

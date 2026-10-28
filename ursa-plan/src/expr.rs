@@ -22,6 +22,7 @@
 //! [`crate::plan::EdgeInput`]). They never lower to a DataFusion expression; the
 //! plan executor turns them into graph output columns.
 
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr as DfExpr;
 use datafusion::logical_expr::{binary_expr, Operator};
@@ -41,6 +42,9 @@ pub enum UrsaExpr {
     LitF64(f64),
     LitStr(String),
     LitBool(bool),
+    /// A typed literal the JSON scalars can't carry: null, NaN/infinity, a
+    /// timestamp, date, time, duration or decimal (see [`parse_typed_literal`]).
+    Lit(ScalarValue),
     /// role references: `ur.src()`, `ur.dst()`, `ur.id()`. These are only reachable
     /// in a *weight* expression, where they are unsupported; predicate contexts
     /// resolve them to concrete columns in the Python layer before serializing, so
@@ -197,6 +201,7 @@ pub fn lower(expr: &UrsaExpr) -> Result<DfExpr> {
         UrsaExpr::LitF64(v) => lit(*v),
         UrsaExpr::LitStr(v) => lit(v.clone()),
         UrsaExpr::LitBool(v) => lit(*v),
+        UrsaExpr::Lit(v) => lit(v.clone()),
         UrsaExpr::Binary { op, left, right } => {
             let (l, r) = (lower(left)?, lower(right)?);
             match op.as_str() {
@@ -279,15 +284,24 @@ pub fn parse_ursa_expr(v: &Value) -> Result<UrsaExpr> {
             Ok(UrsaExpr::Column(name.to_string()))
         }
         "lit" => {
+            if v.get("type").is_some() {
+                return parse_typed_literal(v).map(UrsaExpr::Lit);
+            }
             let value = v
                 .get("value")
                 .ok_or_else(|| err("lit node missing 'value'"))?;
+            if value.is_null() {
+                return Ok(UrsaExpr::Lit(ScalarValue::Null));
+            }
             // Check bool before the numeric ladder: serde reports a JSON bool only
             // via `as_bool`, so ordering is for clarity, not correctness.
             if let Some(b) = value.as_bool() {
                 Ok(UrsaExpr::LitBool(b))
             } else if let Some(i) = value.as_i64() {
                 Ok(UrsaExpr::LitI64(i))
+            } else if let Some(u) = value.as_u64() {
+                // Past i64::MAX: pyarrow reads such an integer as uint64.
+                Ok(UrsaExpr::Lit(ScalarValue::UInt64(Some(u))))
             } else if let Some(f) = value.as_f64() {
                 Ok(UrsaExpr::LitF64(f))
             } else if let Some(s) = value.as_str() {
@@ -362,6 +376,122 @@ pub fn parse_ursa_expr(v: &Value) -> Result<UrsaExpr> {
              (use ur.col, literals, arithmetic/comparison/boolean ops, ~, and aggregations)"
         ))),
     }
+}
+
+/// A typed literal: `{"kind": "lit", "type": <type>, "value": ...}`, the form a
+/// literal with no JSON scalar takes (the Python layer derives it from
+/// `pyarrow.scalar(value)`, so the type is the one pyarrow infers):
+///
+/// - `float64`: `"nan"`, `"inf"` or `"-inf"`;
+/// - `timestamp`: an integer count of `unit` (`s`/`ms`/`us`/`ns`) since the
+///   epoch, with an optional `tz`;
+/// - `date32`: days since the epoch;
+/// - `time`: an integer count of `unit` since midnight;
+/// - `duration`: an integer count of `unit`;
+/// - `decimal`: the unscaled value as a string, with `precision` and `scale`
+///   (`decimal256` past 38 digits);
+/// - `binary`: the bytes, hex-encoded;
+/// - `arrow`: any other scalar, as a one-row Arrow IPC stream, hex-encoded.
+pub fn parse_typed_literal(v: &Value) -> Result<ScalarValue> {
+    let err = |m: String| DataFusionError::Execution(format!("invalid literal: {m}"));
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let value = v.get("value").unwrap_or(&Value::Null);
+    let int = || {
+        value
+            .as_i64()
+            .ok_or_else(|| err(format!("{ty} literal needs an integer value")))
+    };
+    let unit = || v.get("unit").and_then(Value::as_str).unwrap_or("");
+    let bad_unit = || err(format!("unknown {ty} unit {:?}", unit()));
+    Ok(match ty {
+        "float64" => ScalarValue::Float64(Some(match value.as_str() {
+            Some("nan") => f64::NAN,
+            Some("inf") => f64::INFINITY,
+            Some("-inf") => f64::NEG_INFINITY,
+            _ => return Err(err(format!("float64 literal {value}"))),
+        })),
+        "timestamp" => {
+            let tz: Option<std::sync::Arc<str>> =
+                v.get("tz").and_then(Value::as_str).map(Into::into);
+            let i = Some(int()?);
+            match unit() {
+                "s" => ScalarValue::TimestampSecond(i, tz),
+                "ms" => ScalarValue::TimestampMillisecond(i, tz),
+                "us" => ScalarValue::TimestampMicrosecond(i, tz),
+                "ns" => ScalarValue::TimestampNanosecond(i, tz),
+                _ => return Err(bad_unit()),
+            }
+        }
+        "date32" => {
+            ScalarValue::Date32(Some(i32::try_from(int()?).map_err(|e| err(e.to_string()))?))
+        }
+        "time" => {
+            let i = int()?;
+            let i32_of = |i: i64| i32::try_from(i).map_err(|e| err(e.to_string()));
+            match unit() {
+                "s" => ScalarValue::Time32Second(Some(i32_of(i)?)),
+                "ms" => ScalarValue::Time32Millisecond(Some(i32_of(i)?)),
+                "us" => ScalarValue::Time64Microsecond(Some(i)),
+                "ns" => ScalarValue::Time64Nanosecond(Some(i)),
+                _ => return Err(bad_unit()),
+            }
+        }
+        "duration" => {
+            let i = Some(int()?);
+            match unit() {
+                "s" => ScalarValue::DurationSecond(i),
+                "ms" => ScalarValue::DurationMillisecond(i),
+                "us" => ScalarValue::DurationMicrosecond(i),
+                "ns" => ScalarValue::DurationNanosecond(i),
+                _ => return Err(bad_unit()),
+            }
+        }
+        "decimal" => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| err(format!("decimal literal {value}")))?;
+            let field = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(-1);
+            let (precision, scale) = (field("precision"), field("scale"));
+            if !(1..=76).contains(&precision) || !(-128..=127).contains(&scale) {
+                return Err(err(format!("decimal({precision}, {scale})")));
+            }
+            if precision <= 38 {
+                let digits = text
+                    .parse::<i128>()
+                    .map_err(|_| err(format!("decimal literal {value}")))?;
+                ScalarValue::Decimal128(Some(digits), precision as u8, scale as i8)
+            } else {
+                let digits = arrow::datatypes::i256::from_string(text)
+                    .ok_or_else(|| err(format!("decimal literal {value}")))?;
+                ScalarValue::Decimal256(Some(digits), precision as u8, scale as i8)
+            }
+        }
+        "binary" => ScalarValue::Binary(Some(
+            hex(value.as_str().unwrap_or("")).map_err(|_| err("binary literal".into()))?,
+        )),
+        // Any other scalar pyarrow makes: a one-row Arrow IPC stream, hex-encoded.
+        "arrow" => {
+            let bytes =
+                hex(value.as_str().unwrap_or("")).map_err(|_| err("arrow literal".into()))?;
+            let mut reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                    .map_err(|e| err(e.to_string()))?;
+            let batch = reader
+                .next()
+                .ok_or_else(|| err("empty arrow literal".into()))?
+                .map_err(|e| err(e.to_string()))?;
+            ScalarValue::try_from_array(batch.column(0), 0)?
+        }
+        other => return Err(err(format!("unknown literal type {other:?}"))),
+    })
+}
+
+/// Bytes from their hex digits.
+fn hex(s: &str) -> std::result::Result<Vec<u8>, std::num::ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("x"), 16))
+        .collect()
 }
 
 #[cfg(test)]

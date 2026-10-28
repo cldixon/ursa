@@ -132,6 +132,7 @@ pub struct HopExec {
     seeds: Arc<Vec<u32>>,
     n: u32,
     direction: Direction,
+    mask: Option<Arc<EdgeMask>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -157,9 +158,16 @@ impl HopExec {
             seeds,
             n,
             direction,
+            mask: None,
             schema,
             properties,
         }
+    }
+
+    /// This traversal over the subgraph view `mask`.
+    pub fn with_mask(mut self, mask: Option<Arc<EdgeMask>>) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -204,13 +212,16 @@ impl ExecutionPlan for HopExec {
         let topo = self.topology.clone();
         let ids = self.ids.clone();
         let seeds = self.seeds.clone();
+        let mask = self.mask.clone();
         let (n, direction) = (self.n, self.direction);
 
         // CPU-bound frontier walk — keep it off the tokio worker.
         let fut = async move {
-            tokio::task::spawn_blocking(move || hop_batch(&topo, &ids, &seeds, n, direction))
-                .await
-                .map_err(|e| DataFusionError::Execution(format!("hop kernel panicked: {e}")))?
+            tokio::task::spawn_blocking(move || {
+                hop_batch(&topo, &ids, mask.as_deref(), &seeds, n, direction)
+            })
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("hop kernel panicked: {e}")))?
         };
 
         let stream = RecordBatchStreamAdapter::new(schema, futures::stream::once(fut));
@@ -229,6 +240,7 @@ pub struct ShortestPathExec {
     target: u32,
     direction: Direction,
     weights: Option<Arc<Vec<f64>>>,
+    mask: Option<Arc<EdgeMask>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -256,9 +268,16 @@ impl ShortestPathExec {
             target,
             direction,
             weights,
+            mask: None,
             schema,
             properties,
         }
+    }
+
+    /// This traversal over the subgraph view `mask`.
+    pub fn with_mask(mut self, mask: Option<Arc<EdgeMask>>) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -301,6 +320,7 @@ impl ExecutionPlan for ShortestPathExec {
         let topo = self.topology.clone();
         let ids = self.ids.clone();
         let weights = self.weights.clone();
+        let mask = self.mask.clone();
         let (source, target, direction) = (self.source, self.target, self.direction);
 
         // CPU-bound frontier walk — keep it off the tokio worker.
@@ -309,6 +329,7 @@ impl ExecutionPlan for ShortestPathExec {
                 path_batch(
                     &topo,
                     &ids,
+                    mask.as_deref(),
                     source,
                     target,
                     direction,
@@ -337,6 +358,7 @@ pub struct RandomWalkExec {
     steps: u32,
     walks_per_node: u32,
     seed: Option<u64>,
+    mask: Option<Arc<EdgeMask>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -364,9 +386,16 @@ impl RandomWalkExec {
             steps,
             walks_per_node,
             seed,
+            mask: None,
             schema,
             properties,
         }
+    }
+
+    /// This traversal over the subgraph view `mask`.
+    pub fn with_mask(mut self, mask: Option<Arc<EdgeMask>>) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -412,12 +441,21 @@ impl ExecutionPlan for RandomWalkExec {
         let topo = self.topology.clone();
         let ids = self.ids.clone();
         let starts = self.starts.clone();
+        let mask = self.mask.clone();
         let (steps, walks_per_node, seed) = (self.steps, self.walks_per_node, self.seed);
 
         // CPU-bound stochastic walk — keep it off the tokio worker.
         let fut = async move {
             tokio::task::spawn_blocking(move || {
-                walk_batch(&topo, &ids, &starts, steps, walks_per_node, seed)
+                walk_batch(
+                    &topo,
+                    &ids,
+                    mask.as_deref(),
+                    &starts,
+                    steps,
+                    walks_per_node,
+                    seed,
+                )
             })
             .await
             .map_err(|e| DataFusionError::Execution(format!("random_walk kernel panicked: {e}")))?

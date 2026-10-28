@@ -205,30 +205,42 @@ def test_missing_endpoint_column_is_a_column_error(tmp_path):
         ur.scan_edges(str(path), src="s", dst="nope").collect()
 
 
+class _ScanCalls:
+    """The native scans since the last ``clear()``, as ``(kind, projected columns)``
+    pairs, read from the native scan log (the scans run in Rust since #192)."""
+
+    def __init__(self) -> None:
+        self._calls: list[tuple[str, list[str]]] = []
+        self.pushed: list[int] = []
+        _execute._native()._scan_log(True)
+
+    def _pull(self) -> list[tuple[str, list[str]]]:
+        for kind, columns, pushed in _execute._native()._scan_log(True):
+            self._calls.append((kind, columns))
+            self.pushed.append(pushed)
+        return self._calls
+
+    def clear(self) -> None:
+        self._pull()
+        self._calls.clear()
+        self.pushed.clear()
+
+    def __eq__(self, other: object) -> bool:
+        return self._pull() == other
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._pull()
+
+    def __iter__(self):
+        return iter(list(self._pull()))
+
+
 @pytest.fixture
-def scan_calls(monkeypatch):
-    """Record every native edge scan: (function, projected columns)."""
-    native = _execute._native()
-    calls = []
-
-    class Recorder:
-        def __getattr__(self, name):
-            return getattr(native, name)
-
-        def scan_edges_table_arrow(self, path, src, dst, opts, columns):
-            calls.append(("table", list(columns)))
-            return native.scan_edges_table_arrow(path, src, dst, opts, columns)
-
-        def scan_edges_arrow(self, path, src, dst, opts=None, weight_columns=()):
-            calls.append(("edges", list(weight_columns)))
-            return native.scan_edges_arrow(path, src, dst, opts, list(weight_columns))
-
-        def scan_build_index(self, *args):
-            calls.append(("index", []))
-            return native.scan_build_index(*args)
-
-    monkeypatch.setattr(_execute, "_native", Recorder)
-    return calls
+def scan_calls():
+    """Record every native edge scan: (kind, projected columns)."""
+    calls = _ScanCalls()
+    yield calls
+    _execute._native()._scan_log(False)
 
 
 def _wide(tmp_path):
@@ -257,8 +269,9 @@ def test_graph_ops_keep_their_narrow_scans(tmp_path, scan_calls):
     ur.pagerank(edges, weight=ur.col("w")).collect()
     assert scan_calls == [("edges", ["w"])]
     scan_calls.clear()
-    # A subgraph view's mask reads the endpoints and the predicate's columns only.
+    # A subgraph view's mask reads the predicate's columns only (#192: the index
+    # build already checked the endpoints).
     sub = edges.filter(ur.col("label") == "a")
     ur.degree(sub).collect()
-    assert ("table", ["d", "label", "s"]) in scan_calls
+    assert ("table", ["label"]) in scan_calls
     assert all(kind != "table" or cols for kind, cols in scan_calls)

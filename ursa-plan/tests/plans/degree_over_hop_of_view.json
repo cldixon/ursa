@@ -1,0 +1,247 @@
+{
+ "description": "A graph op over a traversal of a filtered frame: the reached region of the view, within the view (#116, #192).",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "ids": [
+    0
+   ]
+  },
+  {
+   "unused": true
+  },
+  {
+   "ids": [
+    0
+   ]
+  }
+ ],
+ "plan": {
+  "op": "with_columns",
+  "input": {
+   "op": "nodes",
+   "input": {
+    "op": "hop",
+    "edges": {
+     "plan": {
+      "op": "filter",
+      "input": {
+       "op": "from_arrow",
+       "frame": 1,
+       "src": "src",
+       "dst": "dst"
+      },
+      "step": 0,
+      "predicate": {
+       "kind": "binary",
+       "op": "!=",
+       "left": {
+        "kind": "dst"
+       },
+       "right": {
+        "kind": "lit",
+        "value": 2
+       }
+      }
+     },
+     "frame": 1
+    },
+    "n": 1,
+    "direction": "out",
+    "seeds": 2
+   }
+  },
+  "columns": [
+   {
+    "name": "degree",
+    "expr": {
+     "kind": "graph",
+     "verb": "degree",
+     "edges": {
+      "plan": {
+       "op": "hop",
+       "edges": {
+        "plan": {
+         "op": "filter",
+         "input": {
+          "op": "from_arrow",
+          "frame": 1,
+          "src": "src",
+          "dst": "dst"
+         },
+         "step": 1,
+         "predicate": {
+          "kind": "binary",
+          "op": "!=",
+          "left": {
+           "kind": "dst"
+          },
+          "right": {
+           "kind": "lit",
+           "value": 2
+          }
+         }
+        },
+        "frame": 1
+       },
+       "n": 1,
+       "direction": "out",
+       "seeds": 4
+      },
+      "frame": 3
+     },
+     "direction": "out"
+    }
+   }
+  ]
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "degree"
+  ],
+  "rows": [
+   [
+    0,
+    15
+   ],
+   [
+    1,
+    6
+   ],
+   [
+    2,
+    0
+   ],
+   [
+    3,
+    3
+   ],
+   [
+    4,
+    2
+   ],
+   [
+    5,
+    2
+   ],
+   [
+    6,
+    0
+   ],
+   [
+    7,
+    0
+   ],
+   [
+    8,
+    0
+   ],
+   [
+    10,
+    0
+   ],
+   [
+    11,
+    0
+   ],
+   [
+    12,
+    0
+   ],
+   [
+    13,
+    0
+   ],
+   [
+    17,
+    0
+   ],
+   [
+    19,
+    0
+   ],
+   [
+    21,
+    0
+   ],
+   [
+    31,
+    0
+   ],
+   [
+    30,
+    0
+   ],
+   [
+    9,
+    0
+   ],
+   [
+    27,
+    0
+   ],
+   [
+    28,
+    0
+   ],
+   [
+    32,
+    0
+   ],
+   [
+    16,
+    0
+   ],
+   [
+    33,
+    0
+   ],
+   [
+    14,
+    0
+   ],
+   [
+    15,
+    0
+   ],
+   [
+    18,
+    0
+   ],
+   [
+    20,
+    0
+   ],
+   [
+    22,
+    0
+   ],
+   [
+    23,
+    0
+   ],
+   [
+    25,
+    0
+   ],
+   [
+    29,
+    0
+   ],
+   [
+    24,
+    0
+   ],
+   [
+    26,
+    0
+   ]
+  ]
+ }
+}

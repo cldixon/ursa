@@ -30,6 +30,64 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `graph_describe` are gone from `ursa._ursa`. `ursa-plan` gains plan
   conformance tests: JSON plans over karate and other small graphs, with
   expected output recorded from the Python package (#190, part of #189).
+- One expression evaluator: every `filter` now runs in Rust through the same
+  DataFusion lowering, wherever it sits. Before, `pyarrow.compute` evaluated
+  filters on plain frames, subgraph-view masks and steps after the engine's
+  tail. Subgraph masks are built in Rust, in dense id space; a traversal
+  result's mask comes straight from the reached node set. Plain sources are
+  DataFusion scans: `scan_edges(...).filter(...)` pushes its leading filters
+  into the read, so Parquet skips row groups whose statistics rule them out.
+  Masks are cached on the graph index, keyed by the view, so two frames with
+  the same filter share one. A `scan_nodes` frame keeps one table, the union
+  of the columns read so far, instead of one table per projection (#178).
+  Results are unchanged, except for NaN (next entry) (#192, part of #189). On 10M
+  edges (4 cores): the first masked `degree` over a scan, 0.24s to 0.11s; the
+  mask of a 2-hop traversal result from 2,000 seeds, 0.92s to 0.24s; a
+  1%-selective filter on a 10M-row Parquet file sorted by the filtered column,
+  0.12s to 0.010s.
+- **Behaviour change:** NaN compares in total order in every filter: NaN equals
+  NaN and is greater than every number, as in `sort()`. Filters inside an
+  engine query already did; filters on plain frames, subgraph masks and steps
+  after the engine's tail compared IEEE-style (any comparison with NaN false,
+  `!=` true). With `f = [0.5, NaN, null, 2.0, -1.0]`, a plain frame keeps:
+
+  | filter | before | after |
+  |---|---|---|
+  | `f > 1` | `2.0` | `NaN, 2.0` |
+  | `~(f > 1)` | `0.5, NaN, -1.0` | `0.5, -1.0` |
+  | `f == nan` | none | `NaN` |
+  | `f != nan` | `0.5, NaN, 2.0, -1.0` | `0.5, 2.0, -1.0` |
+  | `f != f` | `NaN` | none |
+  | `f / 0 > 1` | `0.5, 2.0` | `0.5, NaN, 2.0` |
+
+  Nulls are unchanged: a comparison with null is null, and the row is dropped
+  (#199).
+- Filters inside an engine query (after graph columns, a join or a traversal)
+  accept every literal a plain-frame filter does: datetimes, dates, times,
+  timedeltas, `numpy.datetime64`/`timedelta64` (a unit of a day or finer),
+  `Decimal` (up to 76 digits), `bytes`, NaN, infinity and `None`. They used to
+  raise `TypeError: Object of type ... is not JSON serializable` (or
+  `ComputeError` for NaN and infinity, "unsupported literal type" for `None`).
+  A day-unit `numpy.datetime64` now works on plain frames too (it raised a
+  `TypeError`); a month or year unit raises a `TypeError` that says so (#192).
+- Every filter compares the way plain frames did: operand types pyarrow had no
+  comparison kernel for stay errors, timestamps, durations and times compare
+  at the finer unit, an integer past 2**53 against a float and a `uint64` past
+  2**63 against a signed integer stay "not in range" errors. Engine filters
+  used DataFusion's coercion, which parsed `ur.col("n") == "1"` as a number and
+  compared timestamps at the coarser unit (#192).
+- Such errors are `ursa.ComputeError` on every path. Plain frames and subgraph
+  masks used to raise pyarrow's exceptions: `ArrowNotImplementedError` (a
+  `NotImplementedError` subclass) for a type mismatch such as
+  `ur.col("n") == "x"`, and `ArrowInvalid` (a `ValueError` subclass) for an
+  integer divide by zero or a value "not in range". The engine already raised
+  `ComputeError`. A timezone-aware against a naive timestamp of the same unit
+  stays a `ValueError` (#192).
+- A `string_view` column compares with a string literal; pyarrow had no kernel
+  for it (#192).
+- `ursa._ursa` no longer has `hop_reached_nodes_query`,
+  `shortest_path_nodes_query`, `scan_edges_arrow`, `scan_edges_table_arrow` or
+  `scan_nodes_arrow`; the plan reads and masks itself (#192).
 - **Behaviour change:** `louvain` partitions differ from 0.4.1 for the same
   seed. Local moving now revisits only the neighbours of nodes that moved, and a
   level stops when a sweep's worth of work gains less than 1e-7 modularity (with
@@ -77,6 +135,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- `hop`, `shortest_path` and `random_walk` over a filtered edge frame ignored the
+  filter: `ur.hop(e.filter(ur.col("w") > 5), 2)` reached nodes through edges
+  the filter removed. They now follow only the kept edges, and a graph op over
+  such a traversal result (`ur.degree(ur.hop(e.filter(...), 1).from_(s))`)
+  stays inside the filtered subgraph (#192).
 - A graph op over a traversal of a reshaped scan
   (`ur.pagerank(ur.hop(ur.scan_edges(p).sample(100), 1).from_([1]))`) ran over
   the whole file's index; it now raises the same `NotImplementedError` as the

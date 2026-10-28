@@ -29,7 +29,7 @@ use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::execute_stream_partitioned;
+use datafusion::physical_plan::{execute_stream_partitioned, ExecutionPlan};
 use datafusion::prelude::{
     CsvReadOptions, DataFrame, ParquetReadOptions, SessionConfig, SessionContext,
 };
@@ -40,6 +40,7 @@ use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::http::HttpBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
+use serde_json::Value;
 use url::{Position, Url};
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
@@ -235,6 +236,13 @@ fn build_scan_state(
     // filter or sort. Read each column as the file declares it instead; a file
     // that really stores string_view still arrives as `Utf8View`.
     execution.parquet.schema_force_view_types = false;
+    // A filter pushed into a scan (#192) runs on each file partition in place: a
+    // round-robin repartition in front of it would interleave the partitions'
+    // rows and lose file order.
+    config
+        .options_mut()
+        .optimizer
+        .enable_round_robin_repartition = false;
 
     let mut caches = CacheManagerConfig::default().with_list_files_cache_limit(0);
     if !local {
@@ -253,6 +261,32 @@ fn build_scan_state(
         .with_runtime_env(runtime)
         .with_default_features()
         .build())
+}
+
+/// What each scan read, while recording is on (test/observability hook): the
+/// scan's kind (`index`, `edges`, `table`, `nodes`), the columns it was asked
+/// for, and how many filters it pushed into the read.
+static SCAN_LOG: Mutex<Option<Vec<ScanRecord>>> = Mutex::new(None);
+
+/// One logged scan: `(kind, columns, filters pushed)`.
+pub type ScanRecord = (String, Vec<String>, usize);
+
+fn log_scan(kind: &str, columns: &[String], pushed: usize) {
+    let mut log = SCAN_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(log) = log.as_mut() {
+        log.push((kind.to_string(), columns.to_vec(), pushed));
+    }
+}
+
+/// Turn scan recording on (`true`, clearing the log) or off, returning what was
+/// recorded since it was last turned on or read.
+pub fn scan_log(record: bool) -> Vec<ScanRecord> {
+    let mut log = SCAN_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+    let out = log.take().unwrap_or_default();
+    if record {
+        *log = Some(Vec::new());
+    }
+    out
 }
 
 /// The Parquet/CSV file format of a scan target, from its extension. Matches on
@@ -361,6 +395,16 @@ async fn collect_in_file_order(df: DataFrame) -> Result<Vec<RecordBatch>> {
         .collect())
 }
 
+/// [`collect_in_file_order`], also returning the executed plan (for its metrics).
+async fn collect_in_file_order_with_plan(
+    df: DataFrame,
+) -> Result<(Vec<RecordBatch>, Arc<dyn ExecutionPlan>)> {
+    let task_ctx = Arc::new(df.task_ctx());
+    let plan = df.create_physical_plan().await?;
+    let parts = datafusion::physical_plan::collect_partitioned(plan.clone(), task_ctx).await?;
+    Ok((parts.into_iter().flatten().collect(), plan))
+}
+
 /// Read the `src`/`dst` columns of an edge file into one `(src, dst)` batch, plus
 /// any `weight_columns` needed to evaluate a `weight=` expression.
 ///
@@ -384,6 +428,7 @@ pub fn scan_edges_batch(
     storage_options: &HashMap<String, String>,
     weight_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    log_scan("edges", weight_columns, 0);
     crate::runtime::block_on(async move {
         let df = open_scan(path, storage_options, "scan_edges").await?;
 
@@ -448,27 +493,9 @@ pub fn scan_edges_batch(
     })?
 }
 
-/// Read an edge file as a table — every column, or the `columns` projection —
-/// for the relational (non-graph) paths: a plain `collect()`, its
-/// `filter`/`sort`/`select`/`group_by`/`join` tail, the sinks, and a subgraph
-/// view's edge mask (#160).
-///
-/// The result is shaped like the same file read into memory and passed to
-/// `EdgeFrame`: columns keep their file names, order and types, so a scanned edge
-/// frame collects exactly what an in-memory one does. The endpoint types are
-/// validated (an integer or string family, the same for both) but not cast,
-/// since an in-memory edge table keeps its endpoint types as well. The one
-/// conversion is `Utf8View` to `Utf8` for every column, as in
-/// [`scan_nodes_batch`]: the table is filtered and sorted with pyarrow compute,
-/// which has few string-view kernels, and an in-memory read of the same file
-/// yields `Utf8`.
-///
-/// `columns` empty reads every column; otherwise only the named columns are read
-/// (projection pushdown), in file order. A name the file lacks is skipped here
-/// and reported by the caller's own column check, so the error matches the
-/// in-memory frame's. The graph-op paths never come here: the index build and
-/// the weighted scan keep their narrow projections ([`scan_edges_topology`],
-/// [`scan_edges_batch`]).
+/// Read an edge file as a table — every column, or the `columns` projection plus
+/// both endpoints — as a scanned edge frame collects it (#160). See
+/// [`scan_edges_rows`], which also takes predicates to push into the scan.
 pub fn scan_edges_table(
     path: &str,
     src: &str,
@@ -476,6 +503,107 @@ pub fn scan_edges_table(
     storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    // A projection here always carries both endpoints.
+    let mut columns = columns.to_vec();
+    if !columns.is_empty() {
+        columns.extend([src.to_string(), dst.to_string()]);
+    }
+    Ok(scan_edges_rows(path, src, dst, storage_options, &columns, &[], false)?.batches)
+}
+
+/// An edge file's rows, read by [`scan_edges_rows`].
+pub struct EdgeRows {
+    /// At least one batch, carrying the schema.
+    pub batches: Vec<RecordBatch>,
+    /// Rows dropped for a null endpoint (always 0 unless `drop_nulls`).
+    pub dropped: usize,
+}
+
+/// Read an edge file as a table, keeping the rows every predicate in `filters`
+/// holds for.
+///
+/// The result is shaped like the same file read into memory and passed to
+/// `EdgeFrame`: columns keep their file names, order and types, so a scanned edge
+/// frame collects exactly what an in-memory one does. The endpoint types are
+/// validated (an integer or string family, the same for both) but not cast,
+/// since an in-memory edge table keeps its endpoint types as well. The one
+/// conversion is `Utf8View` to `Utf8` for every column, as in
+/// [`scan_nodes_batch`], so a scan and an in-memory read of the same file agree.
+///
+/// `columns` empty reads every column; otherwise only the named columns are read
+/// (projection pushdown), in file order, with the endpoints only when named (or
+/// to drop null-endpoint rows). A name the file lacks is skipped here
+/// and reported by the caller's own column check, so the error matches the
+/// in-memory frame's. `filters` (predicate JSON, roles resolved, every column
+/// read) are pushed into the scan: a Parquet file skips the row groups whose
+/// statistics rule them out (#192). With `drop_nulls` (`on_null="drop"`) rows
+/// with a null endpoint are removed and counted in [`EdgeRows::dropped`]; pass no
+/// `filters` then, so the count covers the whole file. The graph-op paths never
+/// come here: the index build and the weighted scan keep their narrow
+/// projections ([`scan_edges_topology`], [`scan_edges_batch`]).
+#[allow(clippy::too_many_arguments)]
+pub fn scan_edges_rows(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    columns: &[String],
+    filters: &[Value],
+    drop_nulls: bool,
+) -> Result<EdgeRows> {
+    let (rows, pushed, _) = scan_edges_rows_plan(
+        path,
+        src,
+        dst,
+        storage_options,
+        columns,
+        filters,
+        drop_nulls,
+    )?;
+    if pushed < filters.len() {
+        return Err(DataFusionError::Execution(format!(
+            "scan_edges: filter {pushed} reads a column the scan does not read"
+        )));
+    }
+    Ok(rows)
+}
+
+/// [`scan_edges_rows`], pushing the longest prefix of `filters` whose columns
+/// the read has, and returning how many it pushed. The caller runs the rest, so
+/// a filter over a column the file lacks raises the caller's own error.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_edges_rows_pushing(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    columns: &[String],
+    filters: &[Value],
+    drop_nulls: bool,
+) -> Result<(EdgeRows, usize)> {
+    let (rows, pushed, _) = scan_edges_rows_plan(
+        path,
+        src,
+        dst,
+        storage_options,
+        columns,
+        filters,
+        drop_nulls,
+    )?;
+    Ok((rows, pushed))
+}
+
+/// [`scan_edges_rows`], also returning the executed scan plan (for its metrics).
+#[allow(clippy::too_many_arguments)]
+fn scan_edges_rows_plan(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    columns: &[String],
+    filters: &[Value],
+    drop_nulls: bool,
+) -> Result<(EdgeRows, usize, Arc<dyn ExecutionPlan>)> {
     crate::runtime::block_on(async move {
         let df = open_scan(path, storage_options, "scan_edges").await?;
         let schema = df.schema().as_arrow().clone();
@@ -486,6 +614,13 @@ pub fn scan_edges_table(
                 )));
             }
         }
+        // Validate the endpoint types exactly as the graph build would.
+        let ends = Schema::new(vec![
+            schema.field_with_name(src)?.clone(),
+            schema.field_with_name(dst)?.clone(),
+        ]);
+        endpoint_id_type(&ends, path)?;
+        // The endpoints are read when asked for, or to drop null-endpoint rows.
         let df = if columns.is_empty() {
             df
         } else {
@@ -493,31 +628,83 @@ pub fn scan_edges_table(
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
-                .filter(|n| *n == src || *n == dst || columns.iter().any(|c| c == n))
+                .filter(|n| {
+                    (drop_nulls && (*n == src || *n == dst)) || columns.iter().any(|c| c == n)
+                })
                 .collect();
+            // Some column is read, so the rows are counted.
+            let keep = if keep.is_empty() {
+                vec![src, dst]
+            } else {
+                keep
+            };
             df.select_columns(&keep)?
         };
         let read_schema = df.schema().as_arrow().clone();
-        // Validate the endpoint types exactly as the graph build would.
-        let ends = Schema::new(vec![
-            read_schema.field_with_name(src)?.clone(),
-            read_schema.field_with_name(dst)?.clone(),
-        ]);
-        endpoint_id_type(&ends, path)?;
 
-        let batches = collect_in_file_order(df).await?;
-        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-            return Err(empty_edge_source(path));
+        let mut filtered = df.clone();
+        let mut pushed = 0;
+        for f in filters {
+            let Ok(expr) = crate::eval::logical(f, filtered.schema()) else {
+                break;
+            };
+            let readable = expr
+                .column_refs()
+                .iter()
+                .all(|c| read_schema.index_of(&c.name).is_ok());
+            // Parquet min/max statistics leave NaN out, so a float comparison
+            // would prune row groups whose NaN rows match: evaluate it after
+            // the read instead.
+            if !readable || crate::compare::compares_floats(&expr, filtered.schema()) {
+                break;
+            }
+            filtered = filtered.filter(expr)?;
+            pushed += 1;
         }
+        let filters = &filters[..pushed];
+        let (mut batches, plan) = collect_in_file_order_with_plan(filtered).await?;
+        let empty = |b: &[RecordBatch]| b.iter().all(|b| b.num_rows() == 0);
+        if empty(&batches) {
+            // An empty file is an error; an empty filter result is not.
+            let any = if filters.is_empty() {
+                false
+            } else {
+                !empty(&df.limit(0, Some(1))?.collect().await?)
+            };
+            if !any {
+                return Err(empty_edge_source(path));
+            }
+        }
+        let mut dropped = 0;
+        if drop_nulls {
+            let (s, d) = (read_schema.index_of(src)?, read_schema.index_of(dst)?);
+            for b in &mut batches {
+                let keep = and(
+                    &is_not_null(b.column(s)).map_err(arrow_err)?,
+                    &is_not_null(b.column(d)).map_err(arrow_err)?,
+                )
+                .map_err(arrow_err)?;
+                let kept = arrow::compute::filter_record_batch(b, &keep).map_err(arrow_err)?;
+                dropped += b.num_rows() - kept.num_rows();
+                *b = kept;
+            }
+        }
+        let base = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(read_schema.clone()));
         let out_schema = Arc::new(Schema::new(
-            batches[0]
-                .schema()
-                .fields()
+            base.fields()
                 .iter()
                 .map(|f| unview_field(f))
                 .collect::<Vec<_>>(),
         ));
-        cast_batches(&batches, &out_schema)
+        let mut batches = cast_batches(&batches, &out_schema)?;
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(out_schema));
+        }
+        log_scan("table", columns, pushed);
+        Ok((EdgeRows { batches, dropped }, pushed, plan))
     })?
 }
 
@@ -634,6 +821,7 @@ pub fn scan_edges_topology(
     storage_options: &HashMap<String, String>,
     drop_nulls: bool,
 ) -> std::result::Result<ScannedTopology, ScanBuildError> {
+    log_scan("index", &[], 0);
     let (interner, dropped) = crate::runtime::block_on(async move {
         let df = open_scan(path, storage_options, "scan_edges").await?;
         let df = df.select_columns(&[src, dst])?;
@@ -707,6 +895,7 @@ pub fn scan_nodes_batch(
     storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    log_scan("nodes", columns, 0);
     crate::runtime::block_on(async move {
         let df = open_scan(path, storage_options, "scan_nodes").await?;
 
@@ -759,6 +948,104 @@ pub fn scan_nodes_batch(
             .collect();
         cast_batches(&batches, &Arc::new(Schema::new(fields)))
     })?
+}
+
+/// A cached node table: the columns it was read with (`None`: every column), and
+/// its batches.
+type HeldTable = (Option<Vec<String>>, Vec<RecordBatch>);
+
+/// The scanned attribute table of one `scan_nodes` frame, kept across collects
+/// (#178, #192).
+///
+/// It holds one table: the superset of the columns read so far (or every column).
+/// A read of columns it holds is a projection of it; any other read scans the
+/// union and replaces it. So the cache never holds more than one copy of a
+/// column, however many projections a frame's plans ask for.
+#[derive(Default)]
+pub struct NodeTableCache {
+    /// `(columns read, None for all; the table)`.
+    table: Mutex<Option<HeldTable>>,
+    scans: std::sync::atomic::AtomicUsize,
+}
+
+impl NodeTableCache {
+    /// The node file's table with `columns` (in that order; `None`: every column,
+    /// in file order), read through the cache. Concurrent callers wait for one
+    /// scan.
+    pub fn read(
+        &self,
+        path: &str,
+        id: &str,
+        storage_options: &HashMap<String, String>,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((held, batches)) = table.as_ref() {
+            if let Some(out) = project(held.as_deref(), batches, columns)? {
+                return Ok(out);
+            }
+        }
+        // Read the union of what is held and what is asked for.
+        let read: Option<Vec<String>> = match (table.as_ref(), columns) {
+            (_, None) | (Some((None, _)), _) => None,
+            (Some((Some(held), _)), Some(want)) => {
+                let mut all = held.clone();
+                all.extend(want.iter().filter(|c| !held.contains(c)).cloned());
+                Some(all)
+            }
+            (None, Some(want)) => Some(want.to_vec()),
+        };
+        let batches = scan_nodes_batch(path, id, storage_options, read.as_deref().unwrap_or(&[]))?;
+        self.scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(out) = project(read.as_deref(), &batches, columns)? else {
+            // A column the file lacks: the narrow read raises the scan's error.
+            return scan_nodes_batch(path, id, storage_options, columns.unwrap_or(&[]));
+        };
+        *table = Some((read, batches));
+        Ok(out)
+    }
+
+    /// Scans this cache has run (test/observability hook).
+    pub fn scans(&self) -> usize {
+        self.scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The columns the cached table holds (`Some(None)`: every column).
+    pub fn held(&self) -> Option<Option<Vec<String>>> {
+        let table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+        table.as_ref().map(|(held, _)| held.clone())
+    }
+}
+
+/// `batches` (a table read with `held` columns, `None` for all) narrowed to
+/// `want`, or `None` when it lacks one of them.
+fn project(
+    held: Option<&[String]>,
+    batches: &[RecordBatch],
+    want: Option<&[String]>,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(want) = want else {
+        return Ok(held.is_none().then(|| batches.to_vec()));
+    };
+    let schema = batches[0].schema();
+    let mut indices = Vec::with_capacity(want.len());
+    for c in want {
+        match schema.index_of(c) {
+            Ok(i) => indices.push(i),
+            Err(_) => return Ok(None),
+        }
+    }
+    if held.is_some_and(|h| {
+        indices.len() == h.len() && indices.iter().enumerate().all(|(i, &j)| i == j)
+    }) {
+        return Ok(Some(batches.to_vec()));
+    }
+    batches
+        .iter()
+        .map(|b| b.project(&indices).map_err(arrow_err))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -816,6 +1103,114 @@ mod tests {
         assert_eq!(scanned.topo.out().offsets, topo.out().offsets);
         assert_eq!(scanned.topo.out().targets, topo.out().targets);
         assert_eq!(scanned.topo.out().edge_ids, topo.out().edge_ids);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The units a pruning metric pruned, summed over every node of a plan.
+    fn metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+        use datafusion::physical_plan::metrics::MetricValue;
+        let own: usize = plan
+            .metrics()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|x| match x.value() {
+                        MetricValue::PruningMetrics {
+                            name: n,
+                            pruning_metrics,
+                        } if n.as_ref() == name => Some(pruning_metrics.pruned()),
+                        _ => None,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        own + plan
+            .children()
+            .iter()
+            .map(|c| metric(c, name))
+            .sum::<usize>()
+    }
+
+    #[test]
+    fn a_pushed_filter_skips_row_groups_and_keeps_file_order() {
+        // 2M rows in 4,096-row groups, `from` ascending: `from >= 1_990_000` can
+        // only hold in the last few groups, so the rest are pruned by statistics.
+        let path = std::env::temp_dir().join("ursa_scan_test_pushdown.parquet");
+        write_multi_row_group_parquet(&path, 2_000_000);
+        let p = path.to_str().unwrap();
+        let pred = serde_json::json!({"kind": "binary", "op": ">=",
+            "left": {"kind": "col", "name": "from"}, "right": {"kind": "lit", "value": 1_990_000}});
+        let (rows, pushed, plan) =
+            scan_edges_rows_plan(p, "from", "to", &no_opts(), &[], &[pred], false).unwrap();
+        assert_eq!(pushed, 1);
+        let got: Vec<i64> = rows
+            .batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(got, (1_990_000..2_000_000).collect::<Vec<_>>());
+        let pruned = metric(&plan, "row_groups_pruned_statistics");
+        assert!(pruned >= 480, "pruned {pruned} of 489 row groups");
+
+        // A filter that keeps nothing is an empty result, not an empty source.
+        let none = serde_json::json!({"kind": "binary", "op": "<",
+            "left": {"kind": "col", "name": "from"}, "right": {"kind": "lit", "value": 0}});
+        let rows = scan_edges_rows(p, "from", "to", &no_opts(), &[], &[none], false).unwrap();
+        assert_eq!(rows.batches.len(), 1);
+        assert_eq!(rows.batches[0].num_rows(), 0);
+        assert_eq!(rows.batches[0].num_columns(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_node_cache_keeps_one_superset_table() {
+        let path = std::env::temp_dir().join("ursa_scan_test_node_cache.csv");
+        std::fs::write(&path, "id,a,b,c\n1,x,10,0.5\n2,y,20,1.5\n").unwrap();
+        let p = path.to_str().unwrap();
+        let cache = NodeTableCache::default();
+        let cols = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = |b: &[RecordBatch]| -> Vec<String> {
+            b[0].schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+        let ab = cache
+            .read(p, "id", &no_opts(), Some(&cols(&["id", "a", "b"])))
+            .unwrap();
+        assert_eq!(names(&ab), ["id", "a", "b"]);
+        // A subset, in another order, is served from the held table.
+        let ba = cache
+            .read(p, "id", &no_opts(), Some(&cols(&["b", "id"])))
+            .unwrap();
+        assert_eq!(names(&ba), ["b", "id"]);
+        assert_eq!(cache.scans(), 1);
+        // A new column widens the held table to the union.
+        let c = cache
+            .read(p, "id", &no_opts(), Some(&cols(&["id", "c"])))
+            .unwrap();
+        assert_eq!(names(&c), ["id", "c"]);
+        assert_eq!(cache.held(), Some(Some(cols(&["id", "a", "b", "c"]))));
+        assert_eq!(cache.scans(), 2);
+        // Every column, then any projection, read it once more at most.
+        let all = cache.read(p, "id", &no_opts(), None).unwrap();
+        assert_eq!(names(&all), ["id", "a", "b", "c"]);
+        cache
+            .read(p, "id", &no_opts(), Some(&cols(&["a", "id"])))
+            .unwrap();
+        assert_eq!(cache.scans(), 3);
+        // A column the file lacks is the scan's own error.
+        let err = cache
+            .read(p, "id", &no_opts(), Some(&cols(&["id", "nope"])))
+            .unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
         std::fs::remove_file(&path).ok();
     }
 

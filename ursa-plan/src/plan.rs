@@ -8,22 +8,28 @@
 //!
 //! ## What runs where (#189)
 //!
-//! This is the first step of moving planning into Rust (#190). [`execute_plan`]
-//! owns the *dispatch*: it walks the tree, rejects the shapes that aren't
-//! supported (the [`PlanError::NotImplemented`] guards, with the messages the
-//! Python layer used to raise), and maps each supported shape onto the existing
-//! executors in [`crate::query`]. What those executors do is unchanged.
+//! [`execute_plan`] owns the *dispatch* (#190): it walks the tree, rejects the
+//! shapes that aren't supported (the [`PlanError::NotImplemented`] guards, with
+//! the messages the Python layer used to raise), and maps each supported shape
+//! onto the executors in [`crate::query`].
 //!
-//! Some leaf work still belongs to the host (the Python layer) and is reached
-//! through [`Inputs`], by slot:
+//! Since #192 it also owns the leaf work around them, with one expression
+//! evaluator ([`crate::expr`] lowered to DataFusion, [`crate::eval`] outside an
+//! engine query):
 //!
-//! - in-memory Arrow tables and scans of plain sources, and the cached
-//!   [`GraphIndex`] of each edge frame;
-//! - subgraph-view edge masks and the edge columns a weight reads (both cached on
-//!   the host's frames);
-//! - seed id sets;
-//! - the relational steps the engine's fixed-order tail can't run in the order
-//!   written (the pyarrow tail, retired by #191).
+//! - plain sources: a scan reads the columns the steps need and takes its
+//!   leading filters into the read (Parquet row-group pruning); every `filter`
+//!   step runs here, wherever it sits;
+//! - subgraph-view masks, built in dense id space and cached on the
+//!   [`GraphIndex`] ([`MaskCache`]);
+//! - the edge columns a weight reads, and the index a weighted scan builds;
+//! - a scanned node table, through the frame's [`NodeTableCache`].
+//!
+//! The host (the Python layer) keeps what belongs to its frames, reached through
+//! [`Inputs`] by slot: each frame's source (its in-memory table, or a scan's
+//! storage options), its cached index and node-table cache, seed id sets, and
+//! the relational steps other than `filter` that the engine's fixed-order tail
+//! can't run in written order (the pyarrow tail, retired by #191).
 //!
 //! Inputs are resolved lazily, in the order the executor needs them, so a plan
 //! that fails validation never builds an index or reads a file.
@@ -36,21 +42,23 @@
 //! the interface #191 and #192 build on, an [`EdgeView`]:
 //!
 //! - `topology`: the subplan whose rows define the CSR. Today that is a source
-//!   (under any `reverse`), or a traversal's own input. #191 widens it to any
-//!   subplan (a `distinct`, `join`, `group_by`, ...), rebuilt from that subplan's
-//!   output and cached by a fingerprint of it.
+//!   (under any `reverse`). #191 widens it to any subplan (a `distinct`, `join`,
+//!   `group_by`, ...), rebuilt from that subplan's output and cached by a
+//!   fingerprint of it.
 //! - a mask, derived in dense id space over the topology's edge rows: the
-//!   `filter` predicates over those rows (a subgraph view, #114), ANDed, and the
-//!   subgraph induced by a traversal's reached node set (#116). Today the host
-//!   evaluates it ([`Inputs::edge_mask`]); #192 evaluates it here, as a bitset
-//!   over CSR edge ids, with no round trip through user ids.
+//!   `filter` predicates written above the topology (a subgraph view, #114),
+//!   ANDed, and for a traversal result the subgraph its reached node set induces
+//!   (#116). The view is recursive: a traversal's input is a view of its own, so
+//!   the traversal follows only that view's edges and the induced subgraph stays
+//!   within it, and each filter is applied exactly once.
 
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use datafusion::error::DataFusionError;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -59,10 +67,11 @@ use ursa_core::{EdgeMask, IdMap, Topology};
 use crate::expr::GraphVerb;
 use crate::query::{
     execute_hop_query, execute_join_query, execute_node_query_cached, execute_path_query,
-    execute_walk_query, NodeColumn,
+    execute_walk_query, parse_direction, resolve_dense, NodeColumn,
 };
+use crate::scan::{scan_edges_batch, scan_edges_rows, NodeTableCache};
 use crate::stats::{describe, parse_stat_direction};
-use crate::weight::WeightCache;
+use crate::weight::{edge_weights, WeightCache};
 
 /// A numbered input the host resolves: a frame (its table, scan, index, mask) or
 /// a seed set.
@@ -85,8 +94,8 @@ pub enum Plan {
     /// `ur.scan_edges(path, src=, dst=)`.
     ScanEdges {
         frame: Slot,
-        /// The path(s), when representable; the host holds the full scan spec
-        /// (including storage options) until scans move here (#192).
+        /// The path(s), when representable (anything else is not a single path).
+        /// Storage options stay with the host ([`Inputs::storage_options`]).
         #[serde(default)]
         path: Option<ScanPath>,
         src: String,
@@ -409,20 +418,42 @@ impl EdgeInput {
 /// An [`EdgeInput`] split into the topology it runs over and the mask that
 /// restricts it. See the module docs.
 ///
-/// Two simplifications hold only while the topology is a source (#191 lifts
-/// that): `topology` is a bare [`Plan`], and [`EdgeInput::view`] collects the
-/// `filter`s of the whole chain. Once the topology can be any subplan
-/// (`filter(a).distinct().filter(b)`), `a` belongs to the topology's own rows and
-/// must not be applied again by the mask. So #192 needs `topology` as an
-/// [`EdgeInput`] with a recursive view, taking only the filters above it.
+/// The view is recursive: a traversal result's mask is the subgraph its reached
+/// node set induces *within the view the traversal ran over*, so
+/// `ur.hop(e.filter(a), 2)` follows only the edges `a` keeps, and a graph op over
+/// that result keeps them too (#192). Each view takes only the filters written
+/// above its topology; the filters of a traversal's input belong to that input's
+/// view and are applied once, through it. When #191 lets the topology be any
+/// subplan (`filter(a).distinct().filter(b)`), `a` stays with the topology's own
+/// rows and the mask takes `b` alone.
 #[derive(Debug)]
 pub struct EdgeView<'a> {
-    /// The plan whose rows define the CSR.
+    /// The host slot of the frame whose rows and index the view masks: the frame
+    /// itself, or a traversal result's input frame.
+    pub frame: Slot,
+    /// Whether that frame has rows of its own (a source under property-only
+    /// steps), not a traversal result's synthetic pairs.
+    pub sourced: bool,
+    /// The plan whose rows define the CSR: a source, under any `reverse`.
     pub topology: &'a Plan,
+    /// The `src` / `dst` columns of the topology's rows, as the frame names them.
+    pub roles: (String, String),
     /// `filter` predicates over the topology's edge rows, ANDed (#114).
     pub predicates: Vec<&'a Expr>,
-    /// A `hop` / `shortest_path` whose reached node set induces the subgraph (#116).
-    pub induced_by: Option<&'a Plan>,
+    /// A `hop` / `shortest_path` whose reached node set induces the subgraph
+    /// (#116), and the view it ran over.
+    pub induced_by: Option<Induced<'a>>,
+}
+
+/// The traversal behind a traversal-result view.
+#[derive(Debug)]
+pub struct Induced<'a> {
+    /// The `hop` / `shortest_path` node.
+    pub traversal: &'a Plan,
+    /// The edges it ran over.
+    pub edges: &'a EdgeInput,
+    /// Their view: its mask restricts the traversal and the induced subgraph.
+    pub input: Box<EdgeView<'a>>,
 }
 
 impl EdgeView<'_> {
@@ -470,6 +501,31 @@ impl EdgeInput {
                     .into(),
             ));
         }
+        if let Some(t @ (Plan::Hop { edges, .. } | Plan::ShortestPath { edges, .. })) = traversal {
+            // The traversal's input is a view of its own (filters included).
+            let input = edges.view()?;
+            return Ok(EdgeView {
+                frame: edges.frame,
+                sourced: edges.traversal().is_none(),
+                topology: input.topology,
+                roles: input.roles.clone(),
+                predicates: vec![],
+                induced_by: Some(Induced {
+                    traversal: t,
+                    edges,
+                    input: Box::new(input),
+                }),
+            });
+        }
+        // The topology: the nearest `reverse` or source below the property-only
+        // steps. A `reverse` keeps the rows (and their order), so a filter written
+        // below it still filters the same rows.
+        let topology = chain
+            .iter()
+            .rev()
+            .copied()
+            .find(|p| p.input().is_none() || matches!(p, Plan::Reverse { .. }))
+            .unwrap_or(self.plan.as_ref());
         let predicates = chain
             .iter()
             .filter_map(|p| match p {
@@ -477,23 +533,13 @@ impl EdgeInput {
                 _ => None,
             })
             .collect();
-        // The topology: the traversal's own input, else the nearest `reverse` or
-        // source below the property-only steps.
-        let topology = match traversal {
-            Some(Plan::Hop { edges, .. }) | Some(Plan::ShortestPath { edges, .. }) => {
-                edges.plan.as_ref()
-            }
-            _ => chain
-                .iter()
-                .rev()
-                .copied()
-                .find(|p| p.input().is_none() || matches!(p, Plan::Reverse { .. }))
-                .unwrap_or(self.plan.as_ref()),
-        };
         Ok(EdgeView {
+            frame: self.frame,
+            sourced: true,
             topology,
+            roles: edge_roles(&chain),
             predicates,
-            induced_by: traversal,
+            induced_by: None,
         })
     }
 
@@ -623,20 +669,96 @@ impl Plan {
     }
 }
 
-/// A built graph index: the CSR topology, the id map, and the weight vectors
-/// evaluated over its edge rows. The host caches one per edge frame.
+/// A built graph index: the CSR topology, the id map, and what is derived from
+/// its edge rows and cached with it: the weight vectors evaluated over them, and
+/// the subgraph-view masks over them. The host keeps one per edge frame, so both
+/// caches live exactly as long as the rows they were computed from.
 #[derive(Clone)]
 pub struct GraphIndex {
     pub topo: Arc<Topology>,
     pub ids: Arc<IdMap>,
     pub weights: Arc<WeightCache>,
+    pub masks: Arc<MaskCache>,
 }
 
 impl GraphIndex {
     pub fn new(topo: Arc<Topology>, ids: Arc<IdMap>) -> Self {
-        let weights = Arc::default();
-        GraphIndex { topo, ids, weights }
+        GraphIndex {
+            topo,
+            ids,
+            weights: Arc::default(),
+            masks: Arc::default(),
+        }
     }
+}
+
+/// How many subgraph-view masks a [`MaskCache`] keeps (1 bit per edge each:
+/// 1.25 MB at 10M edges), least recently used evicted.
+const MASK_CACHE_CAPACITY: usize = 16;
+
+/// One cached mask, filled once by whoever computes it first.
+type MaskSlot = Arc<Mutex<Option<Arc<EdgeMask>>>>;
+
+/// Subgraph-view masks memoized across queries (#181, moved here by #192), keyed
+/// by a fingerprint of the view: its filters with roles resolved, and for a
+/// traversal result the traversal, its resolved seeds, and the view it ran over.
+/// Held on a [`GraphIndex`], so a mask is only ever served for the index it was
+/// computed over.
+#[derive(Default)]
+pub struct MaskCache {
+    /// Most recently used last. Each slot is locked while its mask is computed,
+    /// so concurrent queries over one view compute it once.
+    slots: Mutex<Vec<(String, MaskSlot)>>,
+    builds: AtomicUsize,
+}
+
+impl MaskCache {
+    /// The mask for `key`, computed by `build` on a miss.
+    pub fn get_or_build(
+        &self,
+        key: &str,
+        build: impl FnOnce() -> PlanResult<EdgeMask>,
+    ) -> PlanResult<Arc<EdgeMask>> {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            let slot = match slots.iter().position(|(k, _)| k == key) {
+                Some(i) => slots.remove(i).1,
+                None => Arc::default(),
+            };
+            if slots.len() >= MASK_CACHE_CAPACITY {
+                slots.remove(0);
+            }
+            slots.push((key.to_string(), slot.clone()));
+            slot
+        };
+        let mut mask = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(m) = mask.as_ref() {
+            return Ok(m.clone());
+        }
+        let m = Arc::new(build()?);
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        *mask = Some(m.clone());
+        Ok(m)
+    }
+
+    /// Masks this cache has computed (test/observability hook).
+    pub fn builds(&self) -> usize {
+        self.builds.load(Ordering::Relaxed)
+    }
+}
+
+/// Topology builds so far, wherever they happen (test/observability hook for the
+/// index-preservation contract).
+static TOPOLOGY_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Count one topology build.
+pub fn count_topology_build() {
+    TOPOLOGY_BUILDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Topology builds so far.
+pub fn topology_builds() -> usize {
+    TOPOLOGY_BUILDS.load(Ordering::Relaxed)
 }
 
 /// Role name → column name: what `ur.src()` / `ur.dst()` / `ur.id()` resolve to.
@@ -644,6 +766,12 @@ pub type Roles = [(&'static str, String)];
 
 /// What [`execute_plan`] reads from its host, by slot. Every method is called at
 /// most when the executor needs the value, in the order the executor needs it.
+///
+/// The host keeps what belongs to its frames: their sources, their built
+/// [`GraphIndex`] (and with it the weight and mask caches), a node scan's
+/// [`NodeTableCache`], seeds, and the relational steps the engine's tail can't
+/// run in written order (the pyarrow tail, retired by #191). Everything else
+/// (scans, masks, weights, filters) runs here.
 ///
 /// Batch lists are at least one batch long, so an empty result still carries its
 /// schema. Rows the host produces may stay host-side ([`Rows::Host`]) until the
@@ -653,34 +781,31 @@ pub trait Inputs {
     /// The cached graph index of the edge frame `frame` (built on first use).
     fn index(&self, frame: Slot) -> PlanResult<GraphIndex>;
 
-    /// The subgraph-view mask of `frame`, one entry per edge row of its index
-    /// (`n_edges`), or `None` for the full graph.
-    fn edge_mask(&self, frame: Slot, n_edges: usize) -> PlanResult<Option<Arc<EdgeMask>>>;
+    /// The index of `frame` if it is already built (never builds one).
+    fn built_index(&self, frame: Slot) -> PlanResult<Option<GraphIndex>>;
 
-    /// The edge rows holding `columns`, aligned with the index's edge rows, for
-    /// evaluating weights; `None` when every weight in `keys` (serialized weight
-    /// expressions) is already cached on the frame's index.
-    fn edge_weights(
-        &self,
-        frame: Slot,
-        columns: &[String],
-        keys: &[String],
-    ) -> PlanResult<Option<Vec<RecordBatch>>>;
+    /// Keep `index` as the index of `frame` unless one was built meanwhile, and
+    /// return the frame's index.
+    fn put_index(&self, frame: Slot, index: GraphIndex) -> PlanResult<GraphIndex>;
 
-    /// The rows of the node source `frame`, reading at least `columns` (`None`:
-    /// every column).
-    fn node_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows>;
+    /// The in-memory table of a frame: an edge frame's whole edge table, or a node
+    /// frame's attribute table; `None` for a frame with none.
+    fn table(&self, frame: Slot) -> PlanResult<Option<Rows>>;
 
-    /// The rows of the edge source `frame`, reading at least `columns` (`None`:
-    /// every column).
-    fn edge_table(&self, frame: Slot, columns: Option<&[String]>) -> PlanResult<Rows>;
+    /// The storage options of a scan source (the host raises the error for
+    /// options it can't pass, such as `store=`).
+    fn storage_options(&self, frame: Slot) -> PlanResult<HashMap<String, String>>;
+
+    /// The scanned-table cache of a `scan_nodes` frame.
+    fn node_cache(&self, frame: Slot) -> PlanResult<Arc<NodeTableCache>>;
 
     /// A seed set: user ids (int64 or string).
     fn seeds(&self, slot: Slot) -> PlanResult<ArrayRef>;
 
     /// Run relational steps on `rows`, in order, with `roles` resolving role
-    /// references. These are the steps the engine's tail can't run as written
-    /// (and every step on a plain source), each identified by its `step` handle.
+    /// references. These are the non-`filter` steps the engine's tail can't run as
+    /// written (and those on a plain source), each identified by its `step`
+    /// handle.
     fn apply_steps(&self, rows: Rows, steps: &[&Plan], roles: &Roles) -> PlanResult<Rows>;
 
     /// Host rows as batches.
@@ -688,6 +813,9 @@ pub trait Inputs {
 
     /// The error the host met parsing the step behind `step` (see [`Plan`]).
     fn step_error(&self, step: Slot) -> PlanError;
+
+    /// Tell the user `on_null="drop"` removed `n` edge rows (`n > 0`).
+    fn warn_dropped(&self, n: usize) -> PlanResult<()>;
 }
 
 /// Rows held by the host, opaque to the executor.
@@ -773,6 +901,12 @@ impl std::error::Error for PlanError {}
 
 impl From<DataFusionError> for PlanError {
     fn from(e: DataFusionError) -> Self {
+        // A timezone-aware/naive comparison keeps the `ValueError` pyarrow raised.
+        if let DataFusionError::External(inner) = e.find_root() {
+            if let Some(m) = inner.downcast_ref::<crate::eval::TimezoneMismatch>() {
+                return PlanError::Value(m.0.clone());
+            }
+        }
         PlanError::Engine(e)
     }
 }
@@ -801,13 +935,10 @@ pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
 /// needs. For a traversal result that is its input's index (the traversal only
 /// masks it), so its input is checked too.
 pub fn require_index(edges: &EdgeInput, inputs: &dyn Inputs) -> PlanResult<GraphIndex> {
-    edges.view()?;
-    if let Some(Plan::Hop { edges: parent, .. } | Plan::ShortestPath { edges: parent, .. }) =
-        edges.traversal()
-    {
-        parent.view()?;
-    }
-    inputs.index(edges.frame)
+    // The view checks a traversal's input too (it is a view of its own), and
+    // names the frame whose index a traversal result runs over: its input's.
+    let view = edges.view()?;
+    inputs.index(view.frame)
 }
 
 // --- frame shape -------------------------------------------------------------
@@ -1105,11 +1236,9 @@ fn collect_node_query(
     // An attribute table's columns join onto the algorithm outputs by id;
     // `edges.nodes()`-derived frames have none.
     let nodes = match node_source_slot(chain) {
-        Some(slot) => Some(
-            inputs
-                .node_table(slot, file_needed.as_deref())?
-                .into_batches(inputs)?,
-        ),
+        Some(slot) => {
+            Some(node_rows(chain, slot, file_needed.as_deref(), inputs)?.into_batches(inputs)?)
+        }
         None => None,
     };
     let nodes_id = nodes.as_ref().map(|_| id_col.to_string());
@@ -1267,28 +1396,458 @@ const FLOAT_VALUED_VERBS: [&str; 5] = [
     "pagerank",
 ];
 
+/// The edge rows a weight reads: `columns` of the edges' rows, aligned with their
+/// index's edge rows, or `None` when the index already caches every weight in
+/// `keys` (#179). For a scan with no index yet the same read builds the index.
 fn prepare_weighted(
     edges: &EdgeInput,
     columns: &BTreeSet<String>,
     keys: &[String],
     inputs: &dyn Inputs,
 ) -> PlanResult<Option<Vec<RecordBatch>>> {
-    // Checked before the host reads anything: for a scan the read also builds the
-    // index, which must never happen for an edge plan a graph op can't run over.
-    edges.view()?;
+    // Checked before anything is read: for a scan the read also builds the index,
+    // which must never happen for an edge plan a graph op can't run over.
+    let view = edges.view()?;
+    let frame = view.frame;
+    if !keys.is_empty() {
+        if let Some(index) = inputs.built_index(frame)? {
+            if keys.iter().all(|k| index.weights.get(k).is_some()) {
+                return Ok(None);
+            }
+        }
+    }
+    const NO_SOURCE: &str = "a weighted algorithm needs an in-memory or scan_edges source so \
+         the weight columns can be read.";
     let columns: Vec<String> = columns.iter().cloned().collect();
-    inputs.edge_weights(edges.frame, &columns, keys)
+    let chain = view.topology.chain();
+    match chain[0] {
+        _ if !view.sourced => not_implemented(NO_SOURCE),
+        Plan::FromArrow { .. } => {
+            let Some(table) = inputs.table(frame)? else {
+                return not_implemented(NO_SOURCE);
+            };
+            let table = table.into_batches(inputs)?;
+            let schema = table[0].schema();
+            let missing: Vec<&String> = columns
+                .iter()
+                .filter(|c| schema.index_of(c).is_err())
+                .collect();
+            if !missing.is_empty() {
+                return Err(PlanError::ColumnNotFound(format!(
+                    "weight expression references unknown edge column(s): {}",
+                    py_list(missing.into_iter())
+                )));
+            }
+            let indices: Vec<usize> = columns
+                .iter()
+                .map(|c| schema.index_of(c).expect("checked above"))
+                .collect();
+            let batches = table
+                .iter()
+                .map(|b| b.project(&indices))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None)))?;
+            Ok(Some(batches))
+        }
+        Plan::ScanEdges { path, on_null, .. } => {
+            let path = single_path(
+                path,
+                "weighted algorithms over a multi-path scan_edges source are not supported yet.",
+            )?;
+            let opts = inputs.storage_options(frame)?;
+            // The frame's own roles: a reversed scan reads its endpoints swapped,
+            // as its index was built.
+            let (src, dst) = &view.roles;
+            let mut batches = scan_edges_batch(path, src, dst, &opts, &columns)?;
+            if on_null == "drop" {
+                let dropped = drop_null_endpoints(&mut batches)?;
+                if dropped > 0 {
+                    inputs.warn_dropped(dropped)?;
+                }
+            }
+            // One scan, src/dst first: with no index yet, these rows build it, so
+            // the weights line up with its edge rows by construction.
+            if inputs.built_index(frame)?.is_none() {
+                let pairs: Vec<(&dyn Array, &dyn Array)> = batches
+                    .iter()
+                    .map(|b| (b.column(0).as_ref(), b.column(1).as_ref()))
+                    .collect();
+                let (topo, ids) = crate::topology::build_topology_batches(&pairs)
+                    .map_err(|e| PlanError::Value(e.to_string()))?;
+                count_topology_build();
+                inputs.put_index(frame, GraphIndex::new(topo, ids))?;
+            }
+            Ok(Some(batches))
+        }
+        _ => not_implemented(NO_SOURCE),
+    }
 }
 
+/// Remove the rows of `batches` (src/dst first) with a null endpoint; the number
+/// removed.
+fn drop_null_endpoints(batches: &mut [RecordBatch]) -> PlanResult<usize> {
+    use arrow::compute::kernels::boolean::{and, is_not_null};
+    let arrow = |e| PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None));
+    let mut dropped = 0;
+    for b in batches.iter_mut() {
+        let keep = and(
+            &is_not_null(b.column(0)).map_err(arrow)?,
+            &is_not_null(b.column(1)).map_err(arrow)?,
+        )
+        .map_err(arrow)?;
+        let kept = arrow::compute::filter_record_batch(b, &keep).map_err(arrow)?;
+        dropped += b.num_rows() - kept.num_rows();
+        *b = kept;
+    }
+    Ok(dropped)
+}
+
+/// A scan's one path, or the error for a list of them (`msg`).
+fn single_path<'a>(path: &'a Option<ScanPath>, msg: &str) -> PlanResult<&'a str> {
+    match path {
+        Some(ScanPath::One(p)) => Ok(p),
+        _ => not_implemented(msg),
+    }
+}
+
+const MULTI_PATH_EDGES: &str = "collect() over a scan_edges source supports a single string \
+     path (glob included) for now, not a list of paths.";
+
+const MULTI_PATH_NODES: &str = "collect() over a scan_nodes source supports a single string \
+     path (glob included) for now, not a list of paths.";
+
+/// The subgraph-view mask of `edges` over `index`, or `None` for the whole graph.
 fn edge_mask(
     edges: &EdgeInput,
     index: &GraphIndex,
     inputs: &dyn Inputs,
 ) -> PlanResult<Option<Arc<EdgeMask>>> {
-    if edges.view()?.has_mask() {
-        inputs.edge_mask(edges.frame, index.topo.n_edges())
-    } else {
-        Ok(None)
+    view_mask(&edges.view()?, index, inputs, &mut HashMap::new())
+}
+
+// --- subgraph-view masks (#114, #116, #192) -----------------------------------
+
+/// Seed sets already read for a view, by slot (a fingerprint reads them first).
+type SeedSets = HashMap<Slot, ArrayRef>;
+
+fn seed_set(slot: Slot, seeds: &mut SeedSets, inputs: &dyn Inputs) -> PlanResult<ArrayRef> {
+    if let Some(a) = seeds.get(&slot) {
+        return Ok(a.clone());
+    }
+    let a = inputs.seeds(slot)?;
+    seeds.insert(slot, a.clone());
+    Ok(a)
+}
+
+/// A view's mask over `index`: one bit per edge row, served from the index's
+/// [`MaskCache`] under the view's fingerprint, computed on a miss.
+fn view_mask(
+    view: &EdgeView<'_>,
+    index: &GraphIndex,
+    inputs: &dyn Inputs,
+    seeds: &mut SeedSets,
+) -> PlanResult<Option<Arc<EdgeMask>>> {
+    if !view.has_mask() {
+        return Ok(None);
+    }
+    let key = view_key(view, inputs, seeds)?;
+    index
+        .masks
+        .get_or_build(&key, || build_mask(view, index, inputs, seeds))
+        .map(Some)
+}
+
+/// The fingerprint of a view's mask: what it is a function of, given the rows of
+/// its index.
+fn view_key(view: &EdgeView<'_>, inputs: &dyn Inputs, seeds: &mut SeedSets) -> PlanResult<String> {
+    let roles = view_roles(view);
+    let mut key = String::new();
+    for p in &view.predicates {
+        let resolved = match p {
+            Expr::Scalar(v) => resolve_roles(v, &roles).unwrap_or_else(|_| v.clone()),
+            Expr::Graph(_) => Value::from("graph"),
+        };
+        key.push_str(&format!("filter {resolved};"));
+    }
+    if let Some(Induced {
+        traversal, input, ..
+    }) = &view.induced_by
+    {
+        let inner = view_key(input, inputs, seeds)?;
+        match traversal {
+            Plan::Hop {
+                n,
+                direction,
+                seeds: slot,
+                ..
+            } => {
+                let set = seed_set(*slot, seeds, inputs)?;
+                key.push_str(&format!(
+                    "hop n={} direction={direction} seeds={} over [{inner}];",
+                    n.0,
+                    array_digest(set.as_ref())
+                ));
+            }
+            Plan::ShortestPath {
+                source,
+                target,
+                weight,
+                direction,
+                ..
+            } => {
+                let (s, t) = (
+                    seed_set(*source, seeds, inputs)?,
+                    seed_set(*target, seeds, inputs)?,
+                );
+                key.push_str(&format!(
+                    "shortest_path direction={direction} source={} target={} weight={} over [{inner}];",
+                    array_digest(s.as_ref()),
+                    array_digest(t.as_ref()),
+                    weight.as_ref().map(Value::to_string).unwrap_or_default()
+                ));
+            }
+            _ => unreachable!("a traversal is a hop or a shortest_path"),
+        }
+    }
+    Ok(key)
+}
+
+/// A content digest of an id array (int64 or string), for a fingerprint.
+fn array_digest(a: &dyn Array) -> String {
+    use std::hash::{Hash, Hasher};
+    let strings = arrow::compute::cast(a, &arrow::datatypes::DataType::Utf8).ok();
+    let mut parts = [
+        std::collections::hash_map::DefaultHasher::new(),
+        std::collections::hash_map::DefaultHasher::new(),
+    ];
+    for (salt, h) in parts.iter_mut().enumerate() {
+        salt.hash(h);
+        a.data_type().to_string().hash(h);
+        a.len().hash(h);
+        match strings
+            .as_ref()
+            .map(|s| s.as_any().downcast_ref::<arrow::array::StringArray>())
+        {
+            Some(Some(s)) => s.iter().for_each(|v| v.hash(h)),
+            _ => format!("{a:?}").hash(h),
+        }
+    }
+    format!("{:016x}{:016x}", parts[0].finish(), parts[1].finish())
+}
+
+/// The role map of a view's rows.
+fn view_roles(view: &EdgeView<'_>) -> [(&'static str, String); 2] {
+    [("src", view.roles.0.clone()), ("dst", view.roles.1.clone())]
+}
+
+/// Compute a view's mask (uncached).
+fn build_mask(
+    view: &EdgeView<'_>,
+    index: &GraphIndex,
+    inputs: &dyn Inputs,
+    seeds: &mut SeedSets,
+) -> PlanResult<EdgeMask> {
+    let mut mask: Option<EdgeMask> = None;
+    if let Some(Induced {
+        traversal,
+        edges,
+        input,
+    }) = &view.induced_by
+    {
+        // The reached node set, found over the input's own view, induces the
+        // subgraph: an edge is kept iff both its endpoints are reached (#116).
+        let within = view_mask(input, index, inputs, seeds)?;
+        let reached = reached_nodes(traversal, edges, index, within.as_deref(), inputs, seeds)?;
+        mask = Some(EdgeMask::induced(&index.topo, &reached, within.as_deref()));
+    }
+    if !view.predicates.is_empty() {
+        let m = predicate_mask(view, index.topo.n_edges(), inputs)?;
+        mask = Some(match mask {
+            Some(t) => t.intersect(&m),
+            None => m,
+        });
+    }
+    Ok(mask.expect("a view with a mask has a traversal or a filter"))
+}
+
+/// The nodes a traversal reaches over `within` (one flag per dense node): a hop's
+/// region, seeds included, or the nodes on a shortest path.
+fn reached_nodes(
+    traversal: &Plan,
+    edges: &EdgeInput,
+    index: &GraphIndex,
+    within: Option<&EdgeMask>,
+    inputs: &dyn Inputs,
+    seeds: &mut SeedSets,
+) -> PlanResult<Vec<bool>> {
+    let (topo, ids) = (&index.topo, &index.ids);
+    let mut reached = vec![false; topo.n_nodes()];
+    match traversal {
+        Plan::Hop {
+            n,
+            direction,
+            seeds: slot,
+            ..
+        } => {
+            let set = seed_set(*slot, seeds, inputs)?;
+            let dense: Vec<u32> = resolve_dense(ids, set.as_ref())?
+                .into_iter()
+                .flatten()
+                .collect();
+            let n = n.u32("n")?;
+            let dir: ursa_core::Direction = parse_direction(direction)?.into();
+            reached = ursa_core::algo::k_hop_reached_masked(topo, within, &dense, n, dir);
+        }
+        Plan::ShortestPath {
+            source,
+            target,
+            weight,
+            direction,
+            ..
+        } => {
+            let s = seed_set(*source, seeds, inputs)?;
+            let t = seed_set(*target, seeds, inputs)?;
+            let weights = match weight {
+                None => None,
+                Some(w) => {
+                    check_literals(w, "weight")?;
+                    let cols = value_columns(w, &[]);
+                    let attr = if cols.is_empty() {
+                        None
+                    } else {
+                        prepare_weighted(edges, &cols, &[], inputs)?
+                    };
+                    Some(
+                        attr.map(|a| (w.to_string(), a))
+                            .unwrap_or((w.to_string(), vec![])),
+                    )
+                }
+            };
+            let dir: ursa_core::Direction = parse_direction(direction)?.into();
+            let s = resolve_dense(ids, s.as_ref())?.into_iter().next().flatten();
+            let t = resolve_dense(ids, t.as_ref())?.into_iter().next().flatten();
+            let path = match (s, t) {
+                (Some(s), Some(t)) => match weights {
+                    None => ursa_core::algo::shortest_path_masked(topo, within, s, t, dir),
+                    Some((json, attr)) => {
+                        let attr = (!attr.is_empty()).then_some(attr);
+                        let w = edge_weights(
+                            attr.as_deref(),
+                            &json,
+                            topo.n_edges(),
+                            "weighted shortest_path",
+                        )?;
+                        ursa_core::algo::shortest_path_weighted_with_cost_masked(
+                            topo, within, &w, s, t, dir,
+                        )
+                        .map(|(p, _)| p)
+                    }
+                },
+                _ => None,
+            };
+            for v in path.unwrap_or_default() {
+                reached[v as usize] = true;
+            }
+        }
+        _ => unreachable!("a traversal is a hop or a shortest_path"),
+    }
+    Ok(reached)
+}
+
+/// The mask of a view's filters over its topology's edge rows (#114): each
+/// predicate evaluated over those rows, in index order, ANDed.
+fn predicate_mask(
+    view: &EdgeView<'_>,
+    n_edges: usize,
+    inputs: &dyn Inputs,
+) -> PlanResult<EdgeMask> {
+    let roles = view_roles(view);
+    // Only what the predicates read: the index build already checked the
+    // endpoints, and a scan reads them anyway to drop null-endpoint rows.
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    for p in &view.predicates {
+        needed.extend(expr_columns(p, &roles));
+    }
+    let needed: Vec<String> = needed.into_iter().collect();
+    let chain = view.topology.chain();
+    let rows = edge_rows(chain[0], view.frame, Some(&needed), inputs)?;
+    debug_assert!(view.sourced, "a filter view is over a source's rows");
+    let schema = rows[0].schema();
+    let mut compiled = Vec::with_capacity(view.predicates.len());
+    for p in &view.predicates {
+        compiled.push(host_predicate(p, &roles, &schema)?);
+    }
+    let flags = crate::eval::keep_flags(&rows, &compiled)?;
+    if flags.len() != n_edges {
+        return Err(PlanError::Value(format!(
+            "edge_mask length ({}) does not match the edge count ({n_edges})",
+            flags.len()
+        )));
+    }
+    Ok(EdgeMask::from_boolean_array(&flags))
+}
+
+/// The rows of an edge source (`base`, a frame's first step) in index order:
+/// the in-memory table, or a scan reading at least `columns` (`None`: all).
+fn edge_rows(
+    base: &Plan,
+    frame: Slot,
+    columns: Option<&[String]>,
+    inputs: &dyn Inputs,
+) -> PlanResult<Vec<RecordBatch>> {
+    match base {
+        Plan::FromArrow { .. } => match inputs.table(frame)? {
+            Some(rows) => rows.into_batches(inputs),
+            None => not_implemented(NO_EDGE_SOURCE),
+        },
+        Plan::ScanEdges {
+            path,
+            src,
+            dst,
+            on_null,
+            ..
+        } => {
+            let path = single_path(path, MULTI_PATH_EDGES)?;
+            let opts = inputs.storage_options(frame)?;
+            let rows = scan_edges_rows(
+                path,
+                src,
+                dst,
+                &opts,
+                columns.unwrap_or(&[]),
+                &[],
+                on_null == "drop",
+            )?;
+            if rows.dropped > 0 {
+                inputs.warn_dropped(rows.dropped)?;
+            }
+            Ok(rows.batches)
+        }
+        _ => not_implemented(NO_EDGE_SOURCE),
+    }
+}
+
+const NO_EDGE_SOURCE: &str = "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), \
+     or ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source.";
+
+/// The rows of a node source frame: its in-memory table, or its scan (through the
+/// frame's [`NodeTableCache`]) reading at least `columns` (`None`: all).
+fn node_rows(
+    chain: &[&Plan],
+    frame: Slot,
+    columns: Option<&[String]>,
+    inputs: &dyn Inputs,
+) -> PlanResult<Rows> {
+    match chain[0] {
+        Plan::ScanNodes { path, id, .. } => {
+            let path = single_path(path, MULTI_PATH_NODES)?;
+            let opts = inputs.storage_options(frame)?;
+            let cache = inputs.node_cache(frame)?;
+            Ok(Rows::Batches(cache.read(path, id, &opts, columns)?))
+        }
+        _ => inputs
+            .table(frame)?
+            .ok_or_else(|| PlanError::NotImplemented(NO_EDGE_SOURCE.into())),
     }
 }
 
@@ -1316,7 +1875,7 @@ fn collect_plain_nodes(
              materializable node set yet.",
         );
     };
-    let table = inputs.node_table(slot, needed.as_deref())?;
+    let table = node_rows(chain, slot, needed.as_deref(), inputs)?;
     apply_steps(table, steps, &roles, inputs)
 }
 
@@ -1348,12 +1907,15 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
     }
     let index = require_index(edges, inputs)?;
     let starts = inputs.seeds(*start)?;
+    // A walk over a subgraph view follows only its edges (#192).
+    let mask = edge_mask(edges, &index, inputs)?;
     let (pushed, rest) = split_engine_tail(&steps, false)?;
     // Walk output columns are (walk_id, step, node); no role applies.
     let filters = filter_jsons(&pushed.filters, &[])?;
     let result = execute_walk_query(
         index.topo,
         index.ids,
+        mask,
         starts.as_ref(),
         n_steps.u32("steps")?,
         walks_per_node.u32("walks_per_node")?,
@@ -1457,9 +2019,12 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
         } => {
             let index = require_index(edges, inputs)?;
             let seeds = inputs.seeds(*seeds)?;
+            // A traversal over a subgraph view follows only its edges (#192).
+            let mask = edge_mask(edges, &index, inputs)?;
             execute_hop_query(
                 index.topo,
                 index.ids,
+                mask,
                 seeds.as_ref(),
                 n.u32("n")?,
                 direction,
@@ -1495,9 +2060,11 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             let index = require_index(edges, inputs)?;
             let source = inputs.seeds(*source)?;
             let target = inputs.seeds(*target)?;
+            let mask = edge_mask(edges, &index, inputs)?;
             execute_path_query(
                 index.topo,
                 index.ids,
+                mask,
                 source.as_ref(),
                 target.as_ref(),
                 direction,
@@ -1516,7 +2083,9 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
     finish(result, &pushed, &rest, &roles, inputs)
 }
 
-/// A plain edge source and its steps, all run by the host (`_collect_plain_edges`).
+/// A plain edge source and its steps. A scan reads the columns the steps need and
+/// takes its leading filters with it (#192); the other steps run in order on its
+/// rows.
 fn collect_plain_edges(
     chain: &[&Plan],
     steps: &[&Plan],
@@ -1528,13 +2097,69 @@ fn collect_plain_edges(
     let required: BTreeSet<String> = roles.iter().map(|(_, c)| c.clone()).collect();
     let needed = projection(steps, required, roles, &HashSet::new(), false);
     let Some(slot) = source_slot(chain) else {
-        return not_implemented(
-            "collect() needs edges from ur.from_arrow(...), ur.from_polars(...), or \
-             ur.scan_edges(<.parquet|.csv>); this frame has no resolvable source.",
-        );
+        return not_implemented(NO_EDGE_SOURCE);
     };
-    let table = inputs.edge_table(slot, needed.as_deref())?;
-    apply_steps(table, steps, roles, inputs)
+    let Plan::ScanEdges {
+        path,
+        src,
+        dst,
+        on_null,
+        ..
+    } = chain[0]
+    else {
+        let Some(table) = inputs.table(slot)? else {
+            return not_implemented(NO_EDGE_SOURCE);
+        };
+        return apply_steps(table, steps, roles, inputs);
+    };
+    let path = single_path(path, MULTI_PATH_EDGES)?;
+    let opts = inputs.storage_options(slot)?;
+    let drop_nulls = on_null == "drop";
+    // The leading filters go into the scan, unless `on_null="drop"` must count
+    // the null rows of the whole file first.
+    let mut pushed: Vec<Value> = vec![];
+    if !drop_nulls {
+        for step in steps {
+            match pushable(step, roles) {
+                Some(v) => pushed.push(v),
+                None => break,
+            }
+        }
+    }
+    let (rows, n_pushed) = crate::scan::scan_edges_rows_pushing(
+        path,
+        src,
+        dst,
+        &opts,
+        needed.as_deref().unwrap_or(&[]),
+        &pushed,
+        drop_nulls,
+    )?;
+    if rows.dropped > 0 {
+        inputs.warn_dropped(rows.dropped)?;
+    }
+    apply_steps(
+        Rows::Batches(rows.batches),
+        &steps[n_pushed..],
+        roles,
+        inputs,
+    )
+}
+
+/// A step a scan can take into its read: a well-formed `filter`, roles resolved.
+/// The scan pushes it only if it reads columns the scan reads.
+fn pushable(step: &Plan, roles: &Roles) -> Option<Value> {
+    let Plan::Filter {
+        predicate: Expr::Scalar(v),
+        invalid: false,
+        ..
+    } = step
+    else {
+        return None;
+    };
+    require_predicate(v).ok()?;
+    host_check(v, roles, None).ok()?;
+    resolve_roles(v, roles).ok()
 }
 
 // --- join --------------------------------------------------------------------
@@ -1750,22 +2375,129 @@ fn finish(
     apply_steps(Rows::Batches(result), &steps, roles, inputs)
 }
 
+/// Run `steps` on `rows` in order: each run of `filter`s here, every other step on
+/// the host (its pyarrow tail, until #191).
 fn apply_steps(
     rows: Rows,
     steps: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
 ) -> PlanResult<Rows> {
-    if steps.is_empty() {
-        return Ok(rows);
+    let mut rows = rows;
+    let mut rest = steps;
+    while let Some(first) = rest.first() {
+        let is_filter = matches!(first, Plan::Filter { .. });
+        let n = rest
+            .iter()
+            .take_while(|s| matches!(s, Plan::Filter { .. }) == is_filter)
+            .count();
+        let (run, tail) = rest.split_at(n);
+        rows = if is_filter {
+            let mut batches = rows.into_batches(inputs)?;
+            for step in run {
+                let Plan::Filter { predicate, .. } = step else {
+                    unreachable!("a run of filters")
+                };
+                let compiled = host_predicate(predicate, roles, &batches[0].schema())?;
+                batches = crate::eval::filter_batches(batches, &[compiled])?;
+            }
+            Rows::Batches(batches)
+        } else {
+            if let Some(step) = run.iter().find(|s| s.step().is_none()) {
+                return Err(PlanError::Invalid(format!(
+                    "the '{}' step has no host handle, so its host can't run it",
+                    step.op()
+                )));
+            }
+            inputs.apply_steps(rows, run, roles)?
+        };
+        rest = tail;
     }
-    if let Some(step) = steps.iter().find(|s| s.step().is_none()) {
-        return Err(PlanError::Invalid(format!(
-            "the '{}' step has no host handle, so its host can't run it",
-            step.op()
-        )));
+    Ok(rows)
+}
+
+/// Compile a filter predicate that runs outside an engine query against `schema`,
+/// with the checks and errors the host's evaluator had (`_eval_pyarrow`).
+fn host_predicate(
+    predicate: &Expr,
+    roles: &Roles,
+    schema: &arrow::datatypes::SchemaRef,
+) -> PlanResult<crate::eval::Compiled> {
+    let Expr::Scalar(v) = predicate else {
+        return require_predicate(&Value::Null).map(|_| unreachable!());
+    };
+    require_predicate(v)?;
+    host_check(v, roles, Some(schema))?;
+    Ok(crate::eval::compile(&resolve_roles(v, roles)?, schema)?)
+}
+
+/// The binary operators the host's evaluator supported.
+const HOST_BINARY_OPS: [&str; 12] = [
+    "+", "-", "*", "/", ">", ">=", "<", "<=", "==", "!=", "&", "|",
+];
+
+/// Walk a predicate the way the host's evaluator did, raising its errors in its
+/// order: an unknown column (checked against `schema`, when given), a role not
+/// available here, an operator or node it doesn't evaluate.
+fn host_check(
+    v: &Value,
+    roles: &Roles,
+    schema: Option<&arrow::datatypes::SchemaRef>,
+) -> PlanResult<()> {
+    let has = |name: &str| schema.is_none_or(|s| s.index_of(name).is_ok());
+    let unknown = |name: &str| {
+        Err(PlanError::Value(format!(
+            "filter references unknown column '{name}'."
+        )))
+    };
+    let k = kind(v);
+    match k {
+        "col" => {
+            let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+            if !has(name) {
+                return unknown(name);
+            }
+            Ok(())
+        }
+        "lit" => check_literals(v, "filter"),
+        "src" | "dst" | "id" => {
+            let Some((_, column)) = roles.iter().find(|(r, _)| *r == k) else {
+                // The same message as an engine filter's.
+                return resolve_roles(v, roles).map(|_| ());
+            };
+            if !has(column) {
+                return unknown(column);
+            }
+            Ok(())
+        }
+        "binary" => {
+            let op = v.get("op").and_then(Value::as_str).unwrap_or("");
+            if !HOST_BINARY_OPS.contains(&op) {
+                return not_implemented(format!(
+                    "filter operator {} is not supported.",
+                    py_str(op)
+                ));
+            }
+            for side in ["left", "right"] {
+                host_check(v.get(side).unwrap_or(&Value::Null), roles, schema)?;
+            }
+            Ok(())
+        }
+        "unary" => {
+            let op = v.get("op").and_then(Value::as_str).unwrap_or("");
+            if op != "~" {
+                return not_implemented(format!(
+                    "unary filter operator {} is not supported.",
+                    py_str(op)
+                ));
+            }
+            host_check(v.get("operand").unwrap_or(&Value::Null), roles, schema)
+        }
+        other => not_implemented(format!(
+            "filter expression node {} is not supported (aggregations belong in group_by).",
+            py_str(other)
+        )),
     }
-    inputs.apply_steps(rows, steps, roles)
 }
 
 /// The columns a scan must read for `steps` (projection pushdown), or `None` to
@@ -1883,6 +2615,9 @@ fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
                 return Err(PlanError::Engine(DataFusionError::Execution(format!(
                     "invalid {what} expression JSON: NaN and infinity have no JSON form"
                 ))));
+            }
+            if let Some(reason) = v.get("reason").and_then(Value::as_str) {
+                return Err(PlanError::Type(reason.to_string()));
             }
             return Err(PlanError::Type(format!(
                 "Object of type {ty} is not JSON serializable"
@@ -2225,7 +2960,7 @@ mod tests {
         .unwrap();
         let view = hop.view().unwrap();
         assert_eq!(view.topology.op(), "from_arrow");
-        assert_eq!(view.induced_by.map(Plan::op), Some("hop"));
+        assert_eq!(view.induced_by.map(|i| i.traversal.op()), Some("hop"));
 
         let reshaped: EdgeInput = serde_json::from_value(serde_json::json!({"frame": 3, "plan":
             {"op": "distinct", "input": edges}}))

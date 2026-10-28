@@ -151,6 +151,9 @@ pub struct HopNode {
     pub seeds: Arc<Vec<u32>>,
     pub n: u32,
     pub direction: Direction,
+    /// The subgraph view the traversal runs over (#192): masked-out edges are
+    /// not followed.
+    pub mask: Option<Arc<EdgeMask>>,
     schema: DFSchemaRef,
 }
 
@@ -172,8 +175,15 @@ impl HopNode {
             seeds: Arc::new(seeds),
             n,
             direction,
+            mask: None,
             schema,
         }
+    }
+
+    /// This node over the subgraph view `mask`.
+    pub fn with_mask(mut self, mask: Option<Arc<EdgeMask>>) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -183,6 +193,7 @@ impl PartialEq for HopNode {
             && self.seeds == other.seeds
             && self.n == other.n
             && self.direction == other.direction
+            && mask_ptr(&self.mask) == mask_ptr(&other.mask)
     }
 }
 
@@ -197,18 +208,21 @@ impl PartialOrd for HopNode {
             self.direction,
             &*self.seeds,
             Arc::as_ptr(&self.topology) as usize,
+            mask_ptr(&self.mask),
         )
             .partial_cmp(&(
                 other.n,
                 other.direction,
                 &*other.seeds,
                 Arc::as_ptr(&other.topology) as usize,
+                mask_ptr(&other.mask),
             ))
     }
 }
 
 impl Hash for HopNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        mask_ptr(&self.mask).hash(state);
         (Arc::as_ptr(&self.topology) as usize).hash(state);
         self.n.hash(state);
         self.direction.hash(state);
@@ -270,6 +284,9 @@ pub struct ShortestPathNode {
     pub direction: Direction,
     /// Per-edge-row weights for a weighted (Dijkstra) path; `None` is unweighted BFS.
     pub weights: Option<Arc<Vec<f64>>>,
+    /// The subgraph view the traversal runs over (#192): masked-out edges are
+    /// not followed.
+    pub mask: Option<Arc<EdgeMask>>,
     schema: DFSchemaRef,
 }
 
@@ -293,8 +310,15 @@ impl ShortestPathNode {
             target,
             direction,
             weights,
+            mask: None,
             schema,
         }
+    }
+
+    /// This node over the subgraph view `mask`.
+    pub fn with_mask(mut self, mask: Option<Arc<EdgeMask>>) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -312,6 +336,7 @@ impl PartialEq for ShortestPathNode {
             && self.target == other.target
             && self.direction == other.direction
             && weights_key(&self.weights) == weights_key(&other.weights)
+            && mask_ptr(&self.mask) == mask_ptr(&other.mask)
     }
 }
 
@@ -326,6 +351,7 @@ impl PartialOrd for ShortestPathNode {
             self.direction,
             weights_key(&self.weights),
             Arc::as_ptr(&self.topology) as usize,
+            mask_ptr(&self.mask),
         )
             .partial_cmp(&(
                 other.source,
@@ -333,12 +359,14 @@ impl PartialOrd for ShortestPathNode {
                 other.direction,
                 weights_key(&other.weights),
                 Arc::as_ptr(&other.topology) as usize,
+                mask_ptr(&other.mask),
             ))
     }
 }
 
 impl Hash for ShortestPathNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        mask_ptr(&self.mask).hash(state);
         (Arc::as_ptr(&self.topology) as usize).hash(state);
         self.source.hash(state);
         self.target.hash(state);
@@ -398,6 +426,9 @@ pub struct RandomWalkNode {
     pub steps: u32,
     pub walks_per_node: u32,
     pub seed: Option<u64>,
+    /// The subgraph view the traversal runs over (#192): masked-out edges are
+    /// not followed.
+    pub mask: Option<Arc<EdgeMask>>,
     schema: DFSchemaRef,
 }
 
@@ -421,8 +452,15 @@ impl RandomWalkNode {
             steps,
             walks_per_node,
             seed,
+            mask: None,
             schema,
         }
+    }
+
+    /// This node over the subgraph view `mask`.
+    pub fn with_mask(mut self, mask: Option<Arc<EdgeMask>>) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -433,6 +471,7 @@ impl PartialEq for RandomWalkNode {
             && self.steps == other.steps
             && self.walks_per_node == other.walks_per_node
             && self.seed == other.seed
+            && mask_ptr(&self.mask) == mask_ptr(&other.mask)
     }
 }
 
@@ -447,6 +486,7 @@ impl PartialOrd for RandomWalkNode {
             self.seed,
             &*self.starts,
             Arc::as_ptr(&self.topology) as usize,
+            mask_ptr(&self.mask),
         )
             .partial_cmp(&(
                 other.steps,
@@ -454,12 +494,14 @@ impl PartialOrd for RandomWalkNode {
                 other.seed,
                 &*other.starts,
                 Arc::as_ptr(&other.topology) as usize,
+                mask_ptr(&other.mask),
             ))
     }
 }
 
 impl Hash for RandomWalkNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        mask_ptr(&self.mask).hash(state);
         (Arc::as_ptr(&self.topology) as usize).hash(state);
         self.steps.hash(state);
         self.walks_per_node.hash(state);
