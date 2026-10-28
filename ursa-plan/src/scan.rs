@@ -46,7 +46,7 @@ use serde_json::Value;
 use url::{Position, Url};
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
-use crate::parquet_stats::InexactFloatBounds;
+use crate::parquet_stats::CheckedBounds;
 
 /// The object store for a scan `path`, with the `scheme://authority` base it is
 /// registered under. A schemeless (bare local) path parses as an error and needs
@@ -420,10 +420,11 @@ async fn open_scan(
     })
 }
 
-/// `ctx.read_parquet(path, ParquetReadOptions::default())`, with the file
-/// statistics' float bounds marked inexact ([`InexactFloatBounds`], #202):
-/// DataFusion 54 would otherwise read a float column whose non-NaN values are
-/// all equal as that constant, NaN rows included. The table is built as
+/// `ctx.read_parquet(path, ParquetReadOptions::default())`, with a column's
+/// file-level min/max exact only where every row group backs them
+/// ([`CheckedBounds`], #202): DataFusion 54 would otherwise read a column whose
+/// known values are all equal as that constant, the rows of a row group without
+/// bounds (all NaN, a long string) included. The table is built as
 /// `read_parquet` builds it, sharing the runtime's file statistics cache.
 async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
     let table_path = ListingTableUrl::parse(path)?;
@@ -436,7 +437,7 @@ async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
             options.file_extension
         )));
     }
-    options.format = Arc::new(InexactFloatBounds::new(options.format));
+    options.format = Arc::new(CheckedBounds::new(options.format));
     let config = ListingTableConfig::new(table_path)
         .with_listing_options(options)
         .infer_schema(&ctx.state())

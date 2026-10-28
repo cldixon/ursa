@@ -272,16 +272,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
-- A Parquet scan read NaN in a float column as another number when the
-  column's other values were all equal: with row groups `[NaN, NaN]` and
-  `[1.0]`, or one row group `[NaN, 1.0, 1.0]`, `ur.scan_edges(p, ...)` read
-  `r` as `[1.0, 1.0, 1.0]`, and a weight or filter over `r` saw the same
-  values. `pq.read_table` and an in-memory frame read `[NaN, NaN, 1.0]`, as the
-  scan now does. Parquet min/max statistics leave NaN out, and DataFusion 54
-  marked the file's float bounds exact, then read a column whose exact bounds
-  were equal as that constant. Scans now treat a float column's file-level
-  min/max as inexact: they still prune, but no longer stand in for the values
-  (#202).
+- A Parquet scan could read a column as a single repeated value. With row
+  groups `[NaN, NaN]` and `[1.0]`, or one row group `[NaN, 1.0, 1.0]`,
+  `ur.scan_edges(p, ...)` read float column `r` as `[1.0, 1.0, 1.0]`; with
+  string row groups `["a", "a"]` and two strings over 4 KiB, it read all four
+  rows as `"a"`. A weight, filter or graph op over the column saw the same
+  wrong values; `pq.read_table` and an in-memory frame read what was written,
+  as the scan now does. Parquet statistics carry no min/max for an all-NaN
+  float row group or a string past pyarrow's 4 KiB limit, and leave NaN out of
+  float bounds. DataFusion 54 still marked the file's bounds exact, and read a
+  column whose exact min equalled its exact max as that constant. Scans now
+  keep a column's file-level min/max exact only when every row group backs
+  them, and never for a float column: the bounds still prune, but no longer
+  stand in for the values (#202).
+- A comparison on a dictionary-encoded float column (`ur.col("w") > 1` on a
+  categorical of floats, in memory or from Parquet) raised "Unsupported data
+  type Dictionary(Int32, Float64) for function isnan". It now compares by
+  value under the same total order as a plain float column (#199): NaN is
+  above every number (#202).
 - `sort()` orders floats as filters compare them (#201): every NaN is above
   every number whatever its sign bit, and `-0.0` equals `0.0`, so they tie and
   keep input order, dictionary-encoded float columns included. A NaN with the
