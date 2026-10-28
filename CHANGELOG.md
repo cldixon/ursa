@@ -160,9 +160,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   group's values in input order, as a plain frame always has, which keeps every
   bit of a sum reproducible but runs them less in parallel.
 - Joins run in the engine, anywhere in a plan (#191, part 2 of 3, part of
-  #189). Both sides of a `join` lower into one DataFusion plan: the right side
-  is no longer collected first, and a graph or traversal leaf on either side
-  runs inside the join's plan. This lifts these limits:
+  #189). The right side of a `join` is built like any frame, with its steps
+  lowered, instead of being executed as a separate plan; both sides are put in
+  order, numbered and joined in one DataFusion plan, and the steps after the
+  join lower onto it. This lifts these limits:
   - any number of `join` steps in one plan (`a.join(b).join(c)`), before or
     after any other step, `with_columns` included;
   - `join` on a traversal result (`hop`, `shortest_path`), after a

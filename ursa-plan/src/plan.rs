@@ -19,7 +19,7 @@
 //! `group_by().agg()`, with the order guarantees implemented once there. A step
 //! means the same wherever it runs; its semantics and errors are the ones the
 //! plain frame always had. A `join` builds its right side the same way, as a
-//! frame of its own, and both sides lower into one plan ([`crate::lower::join`]).
+//! frame of its own, and joins the two in one plan ([`crate::lower::join`]).
 //!
 //! Since #192 it also owns the leaf work around them, with one expression
 //! evaluator ([`crate::expr`] lowered to DataFusion, [`crate::eval`] outside a
@@ -947,7 +947,7 @@ pub fn execute_plan(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Vec<RecordBa
 pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
     match build(plan, inputs)? {
         Built::Rows(rows) => Ok(rows),
-        Built::Frame(frame) => Ok(Rows::Batches(frame.collect()?)),
+        Built::Frame(frame) => Ok(Rows::Batches((*frame).collect()?)),
     }
 }
 
@@ -955,7 +955,13 @@ pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
 /// lower further steps onto and collect.
 enum Built {
     Rows(Rows),
-    Frame(Frame),
+    Frame(Box<Frame>),
+}
+
+impl Built {
+    fn frame(frame: Frame) -> Built {
+        Built::Frame(Box::new(frame))
+    }
 }
 
 /// Build a plan's frame: run its guards, build its leaf, and lower its steps,
@@ -973,10 +979,10 @@ fn build(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Built> {
 }
 
 /// A plan as a [`Frame`], for a step that takes a whole frame (a join's right
-/// side): it lowers into the plan of the step that uses it.
+/// side): built like any frame, its steps lowered, and not collected.
 fn frame_of(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> {
     match build(plan, inputs)? {
-        Built::Frame(frame) => Ok(frame),
+        Built::Frame(frame) => Ok(*frame),
         Built::Rows(rows) => Ok(Frame::from_batches(
             crate::lower::session(),
             rows.into_batches(inputs)?,
@@ -1080,7 +1086,7 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
             return Ok(Built::Rows(Rows::Batches(vec![summary])));
         }
         let frame = Frame::from_batches(crate::lower::session(), vec![summary])?;
-        return Ok(Built::Frame(lower_node_steps(
+        return Ok(Built::frame(lower_node_steps(
             frame,
             &steps,
             &[],
@@ -1187,7 +1193,7 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
         let frame = node_set_frame(columns, inputs)?;
         let frame = lower_node_steps(frame, &steps[..first], &roles, None, inputs)?;
         let frame = lower_node_steps(frame, &steps[first + 1..], &roles, None, inputs)?;
-        return Ok(Built::Frame(frame));
+        return Ok(Built::frame(frame));
     };
     // A scan reads the id, what a neighbour aggregation reads, and whatever the
     // steps read before a select or group_by narrows the columns.
@@ -1211,7 +1217,7 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     let table = table.into_batches(inputs)?;
     let frame = Frame::from_batches(crate::lower::session(), table.clone())?;
     let frame = lower_node_steps(frame, &steps, &roles, Some(&table), inputs)?;
-    Ok(Built::Frame(frame))
+    Ok(Built::frame(frame))
 }
 
 /// The steps written after a leaf (`describe`, a random walk): relational steps
@@ -2122,7 +2128,7 @@ fn random_walk_frame(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanR
     )?;
     let frame = Frame::from_ordered(ctx, leaf);
     // Walk output columns are (walk_id, step, node); no role applies.
-    Ok(Built::Frame(lower_node_steps(
+    Ok(Built::frame(lower_node_steps(
         frame,
         &steps,
         &[],
@@ -2254,7 +2260,7 @@ fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
         }
         _ => unreachable!("a traversal is a hop or a shortest_path"),
     };
-    Ok(Built::Frame(lower_node_steps(
+    Ok(Built::frame(lower_node_steps(
         frame, &steps, &roles, None, inputs,
     )?))
 }
@@ -2321,7 +2327,7 @@ fn plain_edges_frame(
     }
     let frame = Frame::from_batches(crate::lower::session(), rows.into_batches(inputs)?)?;
     let frame = lower_node_steps(frame, steps, roles, None, inputs)?;
-    Ok(Built::Frame(frame))
+    Ok(Built::frame(frame))
 }
 
 /// A step a scan can take into its read: a well-formed `filter`, roles resolved.

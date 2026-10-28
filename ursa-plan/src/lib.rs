@@ -30,7 +30,6 @@ pub mod expr;
 pub mod logical;
 pub mod lower;
 pub mod node;
-pub mod ordinal;
 pub mod physical;
 pub mod plan;
 pub mod planner;

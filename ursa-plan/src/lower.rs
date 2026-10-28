@@ -38,13 +38,10 @@
 //!
 //! ## Joins
 //!
-//! A join ([`join`]) runs both sides in the one plan. Its hash join emits rows in
-//! build/probe order, so each side is numbered densely first: a side that is
-//! still an ordered plan by an [`crate::ordinal::EnumerateNode`] inside the
-//! plan, materialized rows directly, and a side out of order (after a
-//! `group_by`, a `distinct` or another join) is put back in order and then
-//! numbered. The joined rows carry one ordinal folded from the two positions,
-//! which orders them as the join guarantees:
+//! A join ([`join`]) runs both sides as frames of the one plan. Its hash join
+//! emits rows in build/probe order, so each side's rows are put in logical order
+//! and numbered densely first, and the joined rows carry one ordinal folded from
+//! the two positions, which orders them as the join guarantees:
 //!
 //! - `inner`, `left`, `semi`, `anti`: left rows in order, each followed by its
 //!   matches in right-frame order (an unmatched `left` row once, with nulls);
@@ -679,29 +676,25 @@ const SPAN: u64 = 1 << 32;
 const ABSENT: u64 = SPAN - 1;
 
 impl Frame {
-    /// This frame as a join input: its plan, with the ordinal `ord` numbering the
-    /// rows `0..` in logical order (an ordinal the frame carries is dropped: it
-    /// need not be dense). Columns the frame reports nullable are nullable in the
-    /// plan, as in its collected rows, so what the join (and any expression over
-    /// its output) infers matches.
+    /// This frame as a join input: its rows in logical order, numbered `0..` by
+    /// the ordinal `ord` (an ordinal the frame carries is dropped: it need not
+    /// be dense), read as a plan the join spreads over the partitions. Columns
+    /// the frame reports nullable are nullable in the rows, so what the join (and
+    /// any expression over its output) infers matches.
+    ///
+    /// The rows are run first: numbering a side inside the join's plan (an
+    /// operator appending positions to one ordered partition) measured slower
+    /// than numbering its collected rows, which DataFusion then reads as several
+    /// partitions.
     fn join_input(mut self, ord: &str) -> Result<DataFrame> {
         self.reorder()?;
         self.drop_ordinal()?;
-        if !self.nullable.is_empty() {
-            let batches = self.run()?;
-            self.set(relax_nullability(batches, &self.nullable)?)?;
+        let batches = relax_nullability(self.run()?, &self.nullable)?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if rows as u64 >= ABSENT {
+            return Err(too_many_rows());
         }
-        let df = match self.batches.take() {
-            Some(batches) => {
-                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                if rows as u64 >= ABSENT {
-                    return Err(too_many_rows());
-                }
-                self.ctx.read_batches(attach_ordinal(batches, ord)?)?
-            }
-            None => crate::ordinal::enumerate(self.plan()?, ord, ABSENT - 1)?,
-        };
-        Ok(df)
+        self.ctx.read_batches(attach_ordinal(batches, ord)?)
     }
 }
 
@@ -1254,7 +1247,7 @@ mod tests {
             TEST_PARTITIONS.with(|c| c.set(Some(p)));
             for how in hows {
                 let want = nested_loop(&left, &right, how);
-                // Each side materialized, or still a plan (numbered in it).
+                // Each side materialized, or still a plan (run when joined).
                 for lazy in [false, true] {
                     let ctx = session();
                     let side = |rows: &[(Option<i64>, i64)], v: &str| {
