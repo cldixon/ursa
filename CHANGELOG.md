@@ -272,6 +272,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- `describe()` over a filtered edge frame reported the unfiltered graph: every
+  edge was counted, while `degree()` over the same frame read the filter as a
+  subgraph view. It now reads the same view: the parent's node set, and only
+  the kept edges for `n_edges`, `density`, `avg_degree` and `n_components`. A
+  traversal result is described as the subgraph its reached nodes induce, and a
+  filter above a reshaping step (`e.distinct().filter(p)`) masks the reshaped
+  rows' graph. For `s = [0, 0, 1, 2]`, `d = [1, 2, 2, 3]`,
+  `w = [0.1, 0.9, 0.9, 0.1]`, `ur.describe(e.filter(ur.col("w") > 0.5))` was
+  `n_nodes=4, n_edges=4, density=0.333, avg_degree=1.0` and is now
+  `n_nodes=4, n_edges=2, density=0.167, avg_degree=0.5` (#207). As with
+  `degree`, the node set stays the parent graph's. So over a traversal result
+  `n_nodes` is the whole graph's, every unreached node is its own component,
+  and `density` divides by the parent's node count. A 10-node neighbourhood of
+  a large graph has a density near 0.
 - A Parquet scan could read a column as a single repeated value. With row
   groups `[NaN, NaN]` and `[1.0]`, or one row group `[NaN, 1.0, 1.0]`,
   `ur.scan_edges(p, ...)` read float column `r` as `[1.0, 1.0, 1.0]`; with
