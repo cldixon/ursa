@@ -404,3 +404,58 @@ def test_a_joined_group_by_side_keeps_its_nullable_columns():
     grouped = e.nodes().with_columns(dg=ur.degree(e)).group_by("id").agg(n=ur.col("dg").count())
     out = grouped.join(other(), on="id").with_columns(k=ur.col("id") + 1).collect().to_arrow()
     assert out.schema.field("id").nullable and out.schema.field("k").nullable
+
+
+# --- errors in the order main raised them; key types --------------------------
+
+
+def test_a_left_side_error_comes_before_the_right_sides():
+    # The left side runs first, then the right, then the keys are checked.
+    left = ur.from_arrow(pa.table({"id": [0, 1], "a": [1, 2], "z": [0, 0]}), id="id")
+    left = left.with_columns(q=ur.col("a") / ur.col("z"))
+    no_key = ur.from_arrow(pa.table({"k": [0], "b": [1]}), id="k")
+    with pytest.raises(ur.ComputeError, match="Divide by zero"):
+        left.join(no_key, on="id").collect()
+    # A right side whose own step fails to parse (a deferred host error).
+    bad = ur.from_arrow(pa.table({"id": [0], "b": [1]}), id="id").sort([])
+    with pytest.raises(ur.ComputeError, match="Divide by zero"):
+        left.join(bad, on="id").collect()
+    with pytest.raises(ValueError, match="sort"):
+        attrs().join(bad, on="id").collect()
+
+
+@pytest.mark.parametrize("how", HOWS)
+@pytest.mark.parametrize(
+    "left_type, right_type",
+    [
+        (pa.uint64(), pa.int64()),
+        (pa.int32(), pa.int64()),
+        (pa.dictionary(pa.int32(), pa.string()), pa.string()),
+        (pa.string(), pa.dictionary(pa.int32(), pa.string())),
+    ],
+)
+def test_the_key_keeps_the_left_type(how, left_type, right_type):
+    def frame(ids, t, col):
+        keys = pa.array(ids) if pa.types.is_integer(t) else pa.array([str(i) for i in ids])
+        return ur.from_arrow(pa.table({"key": keys.cast(t), col: list(range(len(ids)))}), id=col)
+
+    left, right = frame([3, 1, 2], left_type, "a"), frame([2, 5, 3, 7], right_type, "b")
+    out = check(left, right, "key", how)
+    assert out.schema.field("key").type == left_type
+
+
+@pytest.mark.parametrize("how", ["right", "outer"])
+def test_a_right_key_the_left_type_cannot_hold_errors(how):
+    left = ur.from_arrow(pa.table({"key": pa.array([1, 2], pa.uint64()), "a": [0, 1]}), id="a")
+    right = ur.from_arrow(pa.table({"key": pa.array([2, -1], pa.int64()), "b": [0, 1]}), id="b")
+    with pytest.raises(ValueError, match=r"key 'key' keeps the left frame's type \(UInt64\)"):
+        left.join(right, on="key", how=how).collect()
+    # inner and left never emit a right-only key.
+    assert left.join(right, on="key").collect().to_dicts() == [{"key": 2, "a": 1, "b": 0}]
+
+
+def test_a_column_named_like_a_private_key_name():
+    left = ur.from_arrow(pa.table({"id": [1, 2], "__ursa_rk_id": [5, 6]}), id="id")
+    right = ur.from_arrow(pa.table({"id": [2, 1], "b": [7, 8]}), id="id")
+    out = left.join(right, on="id", how="outer").collect().to_dicts()
+    assert out == [{"id": 1, "__ursa_rk_id": 5, "b": 8}, {"id": 2, "__ursa_rk_id": 6, "b": 7}]

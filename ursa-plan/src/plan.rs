@@ -2367,7 +2367,8 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
         unreachable!("run_join takes a join step")
     };
     let how = How::parse(how).expect("checked by check_join_how");
-    let right = frame_of(right, inputs).map_err(|e| match e {
+    // The right side's errors name it, building it or running it.
+    let wrap = |e: PlanError| match e {
         PlanError::NotImplemented(_)
         | PlanError::Wrapped { .. }
         | PlanError::Host(HostError {
@@ -2378,7 +2379,13 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
             cause: Box::new(e),
         },
         e => e,
-    })?;
+    };
+    // In the order each always ran: the left rows, then the right side, then
+    // the keys.
+    let mut left = left;
+    left.materialize()?;
+    let mut right = frame_of(right, inputs).map_err(wrap)?;
+    right.materialize().map_err(|e| wrap(e.into()))?;
     let (left_cols, right_cols) = (left.names(), right.names());
     for k in on {
         if !left_cols.contains(k) {
@@ -2408,6 +2415,15 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
             "join produces duplicate column name(s) {}; rename() one side before joining.",
             py_list(collide.into_iter())
         )));
+    }
+    if how == How::Right || how == How::Outer {
+        if let Some((k, lt, rt)) = crate::lower::unfit_right_key(&left, &mut right, on)? {
+            return Err(PlanError::Value(format!(
+                "join(on=): key {} keeps the left frame's type ({lt}), which can't hold \
+                 every value of the right frame's key ({rt}); cast one side first.",
+                py_str(&k)
+            )));
+        }
     }
     Ok(crate::lower::join(left, right, on, how)?)
 }

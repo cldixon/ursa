@@ -687,15 +687,64 @@ impl Frame {
     /// than numbering its collected rows, which DataFusion then reads as several
     /// partitions.
     fn join_input(mut self, ord: &str) -> Result<DataFrame> {
-        self.reorder()?;
-        self.drop_ordinal()?;
-        let batches = relax_nullability(self.run()?, &self.nullable)?;
+        self.materialize()?;
+        let batches = self.batches.take().expect("materialized");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if rows as u64 >= ABSENT {
             return Err(too_many_rows());
         }
         self.ctx.read_batches(attach_ordinal(batches, ord)?)
     }
+}
+
+impl Frame {
+    /// Run the frame to its rows, in logical order, its ordinal dropped and the
+    /// columns it reports nullable marked so (what `collect` returns, kept as
+    /// the frame's rows).
+    pub fn materialize(&mut self) -> Result<()> {
+        self.reorder()?;
+        self.drop_ordinal()?;
+        let batches = relax_nullability(self.run()?, &self.nullable)?;
+        self.set(batches)
+    }
+}
+
+/// For a join whose keys can take the right key's value (`right`, `outer`): the
+/// first key whose values in `right` the left key's type cannot hold, with the
+/// two types. Each key keeps the left key's type in the output.
+pub fn unfit_right_key(
+    left: &Frame,
+    right: &mut Frame,
+    on: &[String],
+) -> Result<Option<(String, DataType, DataType)>> {
+    use arrow::compute::kernels::cmp::distinct;
+    use arrow::compute::{cast_with_options, CastOptions};
+    let (ls, rs) = (left.schema(), right.schema());
+    let batches = right.run()?;
+    for k in on {
+        let lt = ls.field_with_name(k).map_err(arrow_err)?.data_type().clone();
+        let rt = rs.field_with_name(k).map_err(arrow_err)?.data_type().clone();
+        if lt == rt {
+            continue;
+        }
+        // A value fits if it survives the cast to the left type and back.
+        let safe = CastOptions {
+            safe: true,
+            ..Default::default()
+        };
+        for b in &batches {
+            let values = b.column(b.schema().index_of(k).map_err(arrow_err)?);
+            let fits = cast_with_options(values, &lt, &safe)
+                .and_then(|as_left| cast_with_options(&as_left, &rt, &safe))
+                .and_then(|back| distinct(&back, values))
+                .map(|d| d.true_count() == 0)
+                .unwrap_or(false);
+            if !fits {
+                return Ok(Some((k.clone(), lt, rt)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn too_many_rows() -> DataFusionError {
@@ -728,7 +777,14 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
     let combined = fresh_name(&taken);
     // Each right key under a private name, so the join keys don't collide; it is
     // dropped after the join (or read where a row has no left key).
-    let sentinels: Vec<String> = on.iter().map(|k| format!("__ursa_rk_{k}")).collect();
+    let sentinels: Vec<String> = (0..on.len())
+        .map(|i| fresh_name_with(&taken, &format!("_rk{i}")))
+        .collect();
+    let left_types: Vec<DataType> = on
+        .iter()
+        .map(|k| Ok(left.schema().field_with_name(k)?.data_type().clone()))
+        .collect::<std::result::Result<_, arrow::error::ArrowError>>()
+        .map_err(arrow_err)?;
     let sentinel = |c: &str| on.iter().position(|k| k == c).map(|i| &sentinels[i]);
 
     let left_df = left.join_input(&l)?;
@@ -768,8 +824,15 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
     let mut out: Vec<Expr> = left_names
         .iter()
         .map(|c| match sentinel(c) {
+            // The left key's value, or the right key's, as the left key's type
+            // (the caller checked that the right key's values fit it).
             Some(s) if how.right_rows() => {
-                coalesce(vec![col_named(c), col_named(s)]).alias(c.as_str())
+                let i = on.iter().position(|k| k == c).expect("a key");
+                let right_key = Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(col_named(s)),
+                    left_types[i].clone(),
+                ));
+                coalesce(vec![col_named(c), right_key]).alias(c.as_str())
             }
             _ => col_named(c),
         })
