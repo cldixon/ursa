@@ -15,7 +15,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   sources and scans, graph columns, joins, `group_by`, traversals, walks and
   `describe`. It runs nothing: the plan is built over empty inputs, so a scan
   reads its file's schema and no rows, and no graph index is built.
-  `frame.explain()` now shows the plan as a tree, that schema, and the DataFusion
+  `frame.explain()` now shows the plan's steps (one line each, with the frames
+  a step reads indented under it), that schema, and the DataFusion
   logical plans a collect runs, optimized; `explain(physical=True)` adds their
   physical plans. Both are generated in Rust. The text is for reading, not a
   stable format (#193).
@@ -46,9 +47,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   Results are byte-identical: three parity harnesses (10,928 plans) give the
   same schema, values (floats by their bits), row order and errors as before,
   on one core and on four. Building a step, its validation included, takes
-  about 9.5 µs (2.3 µs before, when nothing was checked); a 20-step pipeline on
-  karate builds and collects in 6.7 ms, as before, and a small collect is 0.26
-  ms against 0.28 ms (4 cores, medians of 6 interleaved runs).
+  about 8 µs (2.3 µs before, when nothing was checked), however long the chain
+  before it and however wide the frame: a check reads its input's results, and
+  a frame joined with itself is checked once per side, not once per path. A
+  20-step pipeline on karate builds and collects in 5.8 ms, as before, and a
+  small collect is 0.18 ms against 0.21 ms (4 cores, medians of 5 interleaved
+  runs). A frame drops its chain a step at a time, so a long one drops on a
+  small thread stack.
 - **Behaviour change:** a step that cannot run raises on the line that adds it,
   not at `collect()`. The exception class and message are the ones `collect()`
   raised. What moved:
