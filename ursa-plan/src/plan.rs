@@ -87,7 +87,7 @@ use crate::query::{
     walk_leaf, NodeColumn,
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, NodeTableCache};
-use crate::stats::{describe, parse_stat_direction};
+use crate::stats::{describe_masked, parse_stat_direction};
 use crate::weight::{edge_weights, WeightCache};
 
 /// A numbered input the host resolves: a frame (its table, scan, index, mask) or
@@ -1379,9 +1379,14 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     }) = chain.first()
     {
         let steps = leaf_steps(chain, "describe()", inputs)?;
-        let index = require_index(edges, inputs)?;
+        // The edges' subgraph view, as every graph op reads it (#207): the
+        // topology's node set, and only the edge rows its mask keeps.
+        let view = edges.view()?;
+        let mut scratch = Scratch::default();
+        let index = view_index(&view, inputs, &mut scratch)?;
+        let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
         let dir = parse_stat_direction(direction)?;
-        let summary = describe(&index.topo, *full, dir)?;
+        let summary = describe_masked(&index.topo, mask.as_deref(), *full, dir)?;
         if steps.is_empty() {
             return Ok(Built::Rows(Rows::Batches(vec![summary])));
         }
