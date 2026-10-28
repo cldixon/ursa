@@ -26,9 +26,11 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 
 use crate::expr::GraphVerb;
+use serde_json::Value;
+
 use crate::plan::{
-    array_digest, count_topology_build, EdgeInput, Expr, GraphIndex, Inputs, Plan, PlanError,
-    PlanResult, ScanPath, Scratch,
+    array_digest, count_topology_build, EdgeInput, Expr, GraphIndex, Inputs, IntArg, Plan,
+    PlanError, PlanResult, ScanPath, Scratch,
 };
 
 /// How many reshaped-topology indexes the cache keeps, least recently used
@@ -50,16 +52,12 @@ pub fn lookup(key: &str) -> Option<GraphIndex> {
     index.clone()
 }
 
-/// The index for `key`, built by `build` on a miss (`None`: an uncacheable
-/// subplan, built every time). Concurrent queries over one subplan build it
-/// once: each entry is locked while its index is built.
+/// The index for `key`, built by `build` on a miss. Concurrent queries over
+/// one subplan build it once: each entry is locked while its index is built.
 pub fn cached_index(
-    key: Option<&str>,
+    key: &str,
     build: impl FnOnce() -> PlanResult<GraphIndex>,
 ) -> PlanResult<GraphIndex> {
-    let Some(key) = key else {
-        return build();
-    };
     let slot = {
         let mut slots = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = match slots.iter().position(|(k, _)| k == key) {
@@ -76,9 +74,18 @@ pub fn cached_index(
     if let Some(i) = index.as_ref() {
         return Ok(i.clone());
     }
-    let built = build()?;
-    *index = Some(built.clone());
-    Ok(built)
+    match build() {
+        Ok(built) => {
+            *index = Some(built.clone());
+            Ok(built)
+        }
+        Err(e) => {
+            // A failed build leaves no empty entry to evict a live one.
+            let mut slots = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            slots.retain(|(_, s)| !Arc::ptr_eq(s, &slot));
+            Err(e)
+        }
+    }
 }
 
 /// How many indexes the cache holds (test/observability hook).
@@ -132,15 +139,26 @@ fn canonical_ids(a: &ArrayRef) -> PlanResult<ArrayRef> {
     }
 }
 
+/// The key of a reshaped topology ([`fingerprint`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyKey {
+    /// The subplan with its inputs' identities, and the columns that play `src`
+    /// / `dst`. An input with no identity is named by its slot instead, which
+    /// tells subplans apart within one query only.
+    pub key: String,
+    /// Whether every input has an identity, so the key holds across queries and
+    /// the index may be cached.
+    pub cacheable: bool,
+}
+
 /// The fingerprint of a reshaped topology: the subplan `plan` with its inputs'
-/// identities, and the columns that play `src` / `dst`. `None` when an input
-/// has no identity (the index is then not cached). See the module docs.
+/// identities, and the columns that play `src` / `dst`. See the module docs.
 pub fn fingerprint(
     plan: &Plan,
     roles: &(String, String),
     inputs: &dyn Inputs,
     scratch: &mut Scratch,
-) -> PlanResult<Option<String>> {
+) -> PlanResult<TopologyKey> {
     let mut fp = Fingerprint {
         out: format!("roles {:?} {:?};", roles.0, roles.1),
         ok: true,
@@ -148,7 +166,27 @@ pub fn fingerprint(
         scratch,
     };
     fp.plan(plan)?;
-    Ok(fp.ok.then_some(fp.out))
+    Ok(TopologyKey {
+        key: fp.out,
+        cacheable: fp.ok,
+    })
+}
+
+/// Whether an integer argument's JSON is the value the host holds, exactly: a
+/// sample's seed is drawn by the host from its own value, and a seed with no
+/// exact JSON form (bytes, an int past 64 bits, a non-finite float) arrives as
+/// a type marker or a rounded float that two seeds could share.
+fn exact(v: &Value) -> bool {
+    match v {
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+        Value::Number(n) => {
+            n.is_i64()
+                || n.is_u64()
+                || n.as_f64()
+                    .is_some_and(|f| f.fract() != 0.0 || f.abs() < 9.007_199_254_740_992e15)
+        }
+        _ => false,
+    }
 }
 
 struct Fingerprint<'a> {
@@ -163,6 +201,22 @@ impl Fingerprint<'_> {
     fn push(&mut self, s: impl AsRef<str>) {
         self.out.push_str(s.as_ref());
         self.out.push(';');
+    }
+
+    /// An input with no identity: named by `what` for this query only.
+    fn local(&mut self, what: String) {
+        self.ok = false;
+        self.push(what);
+    }
+
+    /// An integer argument, or its slot-free local stand-in when its JSON is
+    /// not exact.
+    fn int(&mut self, name: &str, arg: Option<&IntArg>) {
+        match arg {
+            Some(a) if !exact(&a.0) => self.local(format!("{name} inexact {}", a.0)),
+            Some(a) => self.push(format!("{name}={}", a.0)),
+            None => self.push(format!("{name}=None")),
+        }
     }
 
     /// The content of a seed set.
@@ -183,7 +237,7 @@ impl Fingerprint<'_> {
         };
         match identity {
             Some(id) => self.push(format!("files {id}")),
-            None => self.ok = false,
+            None => self.local(format!("scan @{frame}")),
         }
         Ok(())
     }
@@ -208,7 +262,7 @@ impl Fingerprint<'_> {
     fn plan(&mut self, plan: &Plan) -> PlanResult<()> {
         if plan.invalid() {
             // A step the host could not serialize: the plan raises its error.
-            self.ok = false;
+            self.local(format!("invalid @{:?}", plan.step()));
             return Ok(());
         }
         if let Some(input) = plan.input() {
@@ -239,12 +293,15 @@ impl Fingerprint<'_> {
                 self.push(format!("{op} src={src:?} dst={dst:?} id={id:?}"));
                 match self.inputs.identity(*frame)? {
                     Some(token) => self.push(format!("table {token}")),
-                    None => self.ok = false,
+                    None => self.local(format!("table @{frame}")),
                 }
             }
             Plan::Filter { predicate, .. } => match predicate {
                 Expr::Scalar(v) => self.push(format!("{op} {v}")),
-                Expr::Graph(_) => self.ok = false,
+                Expr::Graph(verb) => {
+                    self.local("graph predicate".into());
+                    self.verb(verb)?;
+                }
             },
             Plan::Select { columns, .. } => self.push(format!("{op} {columns:?}")),
             Plan::WithColumns { columns, .. } => {
@@ -259,10 +316,14 @@ impl Fingerprint<'_> {
             }
             Plan::Rename { mapping, .. } => self.push(format!("{op} {mapping:?}")),
             Plan::Sort { by, .. } => self.push(format!("{op} {by:?}")),
-            Plan::Head { n, .. } => self.push(format!("{op} {}", n.0)),
+            Plan::Head { n, .. } => {
+                self.push(op);
+                self.int("n", Some(n));
+            }
             Plan::Sample { n, seed, .. } => {
-                let seed = seed.as_ref().map(|s| s.0.to_string());
-                self.push(format!("{op} n={} seed={seed:?}", n.0));
+                self.push(op);
+                self.int("n", Some(n));
+                self.int("seed", seed.as_ref());
             }
             Plan::Distinct { .. } | Plan::Nodes { .. } | Plan::Reverse { .. } => self.push(op),
             Plan::Join { right, on, how, .. } => {
@@ -279,7 +340,8 @@ impl Fingerprint<'_> {
                 direction,
                 seeds,
             } => {
-                self.push(format!("{op} n={} direction={direction:?}", n.0));
+                self.push(format!("{op} direction={direction:?}"));
+                self.int("n", Some(n));
                 self.seeds(*seeds)?;
                 self.edges(edges)?;
             }
@@ -303,11 +365,10 @@ impl Fingerprint<'_> {
                 walks_per_node,
                 seed,
             } => {
-                let seed = seed.as_ref().map(|s| s.0.to_string());
-                self.push(format!(
-                    "{op} steps={} walks_per_node={} seed={seed:?}",
-                    steps.0, walks_per_node.0
-                ));
+                self.push(op);
+                self.int("steps", Some(steps));
+                self.int("walks_per_node", Some(walks_per_node));
+                self.int("seed", seed.as_ref());
                 self.seeds(*start)?;
                 self.edges(edges)?;
             }
@@ -319,7 +380,7 @@ impl Fingerprint<'_> {
                 self.push(format!("{op} full={full} direction={direction:?}"));
                 self.edges(edges)?;
             }
-            Plan::Invalid { .. } => self.ok = false,
+            Plan::Invalid { step } => self.local(format!("invalid @{step}")),
         }
         Ok(())
     }
@@ -397,17 +458,21 @@ mod tests {
 
     #[test]
     fn caches_by_key_least_recently_used_evicted() {
-        let first = cached_index(Some("test lru 0"), || Ok(index_of(1))).unwrap();
-        let again = cached_index(Some("test lru 0"), || panic!("rebuilt")).unwrap();
+        let first = cached_index("test lru 0", || Ok(index_of(1))).unwrap();
+        let again = cached_index("test lru 0", || panic!("rebuilt")).unwrap();
         assert!(Arc::ptr_eq(&first.topo, &again.topo));
-        // No key: never cached.
-        let a = cached_index(None, || Ok(index_of(2))).unwrap();
-        let b = cached_index(None, || Ok(index_of(2))).unwrap();
-        assert!(!Arc::ptr_eq(&a.topo, &b.topo));
+        // A failed build leaves no entry behind.
+        assert!(cached_index("test lru failed", || Err(PlanError::Value("x".into()))).is_err());
+        assert!(lookup("test lru failed").is_none());
+        assert!(CACHE
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(k, _)| k != "test lru failed"));
         // Past capacity the oldest goes; other tests share the cache, so only
         // this test's keys are checked.
         for i in 1..=TOPOLOGY_CACHE_CAPACITY {
-            cached_index(Some(&format!("test lru {i}")), || Ok(index_of(3))).unwrap();
+            cached_index(&format!("test lru {i}"), || Ok(index_of(3))).unwrap();
         }
         assert!(lookup("test lru 0").is_none());
         assert!(cached_count() <= TOPOLOGY_CACHE_CAPACITY);
@@ -456,9 +521,15 @@ mod tests {
         }
     }
 
-    fn key(plan: serde_json::Value, host: &Host) -> Option<String> {
+    fn fp(plan: serde_json::Value, host: &Host) -> TopologyKey {
         let plan = Plan::from_json(&plan.to_string()).unwrap();
         fingerprint(&plan, &roles(), host, &mut Scratch::default()).unwrap()
+    }
+
+    /// The cache key, `None` when the subplan can't be cached.
+    fn key(plan: serde_json::Value, host: &Host) -> Option<String> {
+        let k = fp(plan, host);
+        k.cacheable.then_some(k.key)
     }
 
     fn source(frame: usize) -> serde_json::Value {
@@ -498,6 +569,35 @@ mod tests {
         let plan = Plan::from_json(&head(0, 5, 0).to_string()).unwrap();
         let swapped = ("b".to_string(), "a".to_string());
         let k = fingerprint(&plan, &swapped, &host, &mut Scratch::default()).unwrap();
-        assert_ne!(k, key(head(0, 5, 0), &host));
+        assert_ne!(Some(k.key), key(head(0, 5, 0), &host));
+        // An input with no identity still has a key for its query, by slot.
+        assert_ne!(fp(head(3, 5, 0), &host), fp(head(4, 5, 0), &host));
+    }
+
+    #[test]
+    fn a_seed_without_an_exact_json_form_is_not_cached() {
+        let host = Host(HashMap::from([(0, Some("t".to_string()))]));
+        let sample = |seed: serde_json::Value| serde_json::json!({"op": "sample", "input": source(0), "n": 3, "seed": seed});
+        for seed in [
+            serde_json::json!(5),
+            serde_json::json!(-5),
+            serde_json::json!(u64::MAX),
+            serde_json::json!("abc"),
+            serde_json::json!(0.25),
+            serde_json::Value::Null,
+        ] {
+            assert!(key(sample(seed.clone()), &host).is_some(), "{seed}");
+        }
+        // Bytes and a non-finite float arrive as type markers, an int past 64
+        // bits as a rounded float: two seeds could share each.
+        let big: serde_json::Value = serde_json::from_str("18446744073709551617").unwrap();
+        for seed in [
+            serde_json::json!({"type": "bytes"}),
+            serde_json::json!({"type": "float"}),
+            big,
+            serde_json::json!(1e20),
+        ] {
+            assert_eq!(key(sample(seed.clone()), &host), None, "{seed}");
+        }
     }
 }

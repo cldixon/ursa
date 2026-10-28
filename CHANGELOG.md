@@ -211,8 +211,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   identity, and a local file's size and modification time (a rewritten file is
   read again). Repeated collects reuse it, with its weight, mask and
   symmetric-view caches, as a source frame's index is reused (#179). The cache
-  holds four topologies, least recently used evicted; a plan over a remote file
-  builds its topology on every collect. This lifts these limits:
+  holds four topologies, least recently used evicted, each a whole graph index
+  with its weights and masks, for the life of the process; a plan over a
+  remote file, or a `sample` whose seed has no exact JSON form (bytes, an int
+  past 64 bits, a non-finite float), builds its topology on every collect. This lifts these limits:
   - a graph algorithm over a `distinct`, `sample`, `join` or `group_by` result;
   - a step other than `filter` on an `EdgeFrame` before `nodes()`:
     `e.head(100).nodes()` has the node set of those rows;
@@ -295,7 +297,14 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - `hop`, `shortest_path`, `random_walk`, `describe` and a graph column on an
   attribute frame ignored a `sort` or `head` on their edges, and ran over the
   whole graph: `ur.random_walk(e.head(3), ...)` walked edges `head` dropped.
-  They now run over the graph of the kept rows (#191).
+  They now run over the graph of the kept rows (#191). A `sort` also changes
+  the order rows come back in: `ur.hop(e.sort("w"), 2)` and
+  `ur.shortest_path(e.sort("w"), ...)` follow the sorted rows' node and edge
+  order (as a frame built from those rows does), not the unsorted frame's.
+- The same graph ops ran over the original endpoints after a step that wrote
+  new values into the `src` or `dst` column: `e.rename({"s": "d", "d": "s"})`
+  or `e.with_columns(s=ur.col("s") + 10)`. They now read the endpoints from
+  the rows the step leaves, as a frame built from those rows does (#191).
 - A weight, or a filter on the edges, read the source's column where a
   `with_columns` on the edges had replaced it, or a column `select` had
   dropped: `ur.shortest_path(e.with_columns(w=ur.col("w") * 2), a, b,

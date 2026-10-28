@@ -572,23 +572,26 @@ impl EdgeInput {
         }
         let roles = edge_roles(&chain);
         check_roles(&chain, &roles)?;
-        // The topology: the topmost reshaping step, whose output rows a graph op
-        // runs over; else the nearest `reverse` or source below the steps that
-        // keep the rows. A `reverse` keeps the rows (and their order), so a filter
-        // written below it still filters the same rows.
-        let (topology, reshaped, above) =
-            match chain.iter().rposition(|p| RESHAPING_OPS.contains(&p.op())) {
-                Some(i) => (chain[i], true, &chain[i + 1..]),
-                None => {
-                    let topology = chain
-                        .iter()
-                        .rev()
-                        .copied()
-                        .find(|p| p.input().is_none() || matches!(p, Plan::Reverse { .. }))
-                        .unwrap_or(self.plan.as_ref());
-                    (topology, false, &chain[..])
-                }
-            };
+        // The topology: the topmost reshaping step (or step that writes an
+        // endpoint column), whose output rows a graph op runs over; else the
+        // nearest `reverse` or source below the steps that keep the rows. A
+        // `reverse` keeps the rows (and their order), so a filter written below
+        // it still filters the same rows.
+        let (topology, reshaped, above) = match chain
+            .iter()
+            .rposition(|p| RESHAPING_OPS.contains(&p.op()) || writes_role(p, &roles))
+        {
+            Some(i) => (chain[i], true, &chain[i + 1..]),
+            None => {
+                let topology = chain
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|p| p.input().is_none() || matches!(p, Plan::Reverse { .. }))
+                    .unwrap_or(self.plan.as_ref());
+                (topology, false, &chain[..])
+            }
+        };
         let steps: Vec<&Plan> = above
             .iter()
             .copied()
@@ -622,17 +625,53 @@ impl EdgeInput {
     }
 }
 
+/// The output name of a `select` expression, its role references resolved (as
+/// `select` names it).
+fn select_name(v: &Value, roles: &Roles) -> String {
+    expr_name(&resolve_roles(v, roles).unwrap_or_else(|_| v.clone()))
+}
+
+/// Whether a column step writes a column named as an endpoint (`src` / `dst`)
+/// with other values: a rename onto it, or a `select` / `with_columns`
+/// expression computing it. Its rows then hold another graph than the source's,
+/// so the step is the topology, as a reshaping step is (a fresh frame over its
+/// rows reads the endpoints by name).
+fn writes_role(step: &Plan, roles: &(String, String)) -> bool {
+    let role_refs = [("src", roles.0.clone()), ("dst", roles.1.clone())];
+    let is_role = |n: &str| n == roles.0 || n == roles.1;
+    // An expression that is the column `name` itself, by name or by role.
+    let itself = |v: &Value, name: &str| {
+        resolve_roles(v, &role_refs)
+            .is_ok_and(|r| kind(&r) == "col" && r.get("name").and_then(Value::as_str) == Some(name))
+    };
+    match step {
+        Plan::Rename { mapping, .. } => mapping.iter().any(|(old, new)| old != new && is_role(new)),
+        Plan::Select { columns, .. } => columns.iter().any(|c| match c {
+            SelectItem::Name(_) => false,
+            SelectItem::Expr(v) => {
+                let name = select_name(v, &role_refs);
+                is_role(&name) && !itself(v, &name)
+            }
+        }),
+        Plan::WithColumns { columns, .. } => columns
+            .iter()
+            .any(|c| is_role(&c.name) && !matches!(&c.expr, Expr::Scalar(v) if itself(v, &c.name))),
+        _ => false,
+    }
+}
+
 /// Check that an edge plan's steps leave both endpoint columns, by name: a graph
 /// op over it reads them. A `rename` does not move a role (an edge frame keeps
 /// its `src_col` / `dst_col`), so renaming an endpoint column away removes it.
 fn check_roles(chain: &[&Plan], roles: &(String, String)) -> PlanResult<()> {
+    let role_refs = [("src", roles.0.clone()), ("dst", roles.1.clone())];
     for (role, name) in [("src", &roles.0), ("dst", &roles.1)] {
         let mut removed_by: Option<&Plan> = None;
         for step in chain {
             let present = match step {
                 Plan::Select { columns, .. } => Some(columns.iter().any(|c| match c {
                     SelectItem::Name(n) => n == name,
-                    SelectItem::Expr(v) => &expr_name(v) == name,
+                    SelectItem::Expr(v) => &select_name(v, &role_refs) == name,
                 })),
                 Plan::Rename { mapping, .. } => {
                     if mapping.iter().any(|(_, new)| new == name) {
@@ -1126,8 +1165,11 @@ pub fn require_index(edges: &EdgeInput, inputs: &dyn Inputs) -> PlanResult<Graph
 pub struct Scratch {
     seeds: HashMap<Slot, ArrayRef>,
     /// By the topology plan's address.
-    keys: HashMap<usize, Option<String>>,
+    keys: HashMap<usize, crate::reshape::TopologyKey>,
     rows: HashMap<usize, Vec<RecordBatch>>,
+    /// The indexes of topologies that can't be cached across queries, by their
+    /// key: built once per query.
+    local: HashMap<String, GraphIndex>,
 }
 
 impl Scratch {
@@ -1154,10 +1196,19 @@ fn view_index(
         return inputs.index(view.frame);
     }
     let key = topology_key(view, inputs, scratch)?;
-    crate::reshape::cached_index(key.as_deref(), || {
-        let rows = topology_rows(view, None, inputs, scratch)?;
-        crate::reshape::build_index(&rows, &view.roles)
-    })
+    if key.cacheable {
+        return crate::reshape::cached_index(&key.key, || {
+            let rows = topology_rows(view, None, inputs, scratch)?;
+            crate::reshape::build_index(&rows, &view.roles)
+        });
+    }
+    if let Some(index) = scratch.local.get(&key.key) {
+        return Ok(index.clone());
+    }
+    let rows = topology_rows(view, None, inputs, scratch)?;
+    let index = crate::reshape::build_index(&rows, &view.roles)?;
+    scratch.local.insert(key.key, index.clone());
+    Ok(index)
 }
 
 /// The index a view runs over if it is already built (never builds one).
@@ -1169,7 +1220,12 @@ fn built_view_index(
     if !view.reshaped {
         return inputs.built_index(view.frame);
     }
-    Ok(topology_key(view, inputs, scratch)?.and_then(|k| crate::reshape::lookup(&k)))
+    let key = topology_key(view, inputs, scratch)?;
+    Ok(if key.cacheable {
+        crate::reshape::lookup(&key.key)
+    } else {
+        scratch.local.get(&key.key).cloned()
+    })
 }
 
 /// The fingerprint of a reshaped view's topology (computed once per query).
@@ -1177,7 +1233,7 @@ fn topology_key(
     view: &EdgeView<'_>,
     inputs: &dyn Inputs,
     scratch: &mut Scratch,
-) -> PlanResult<Option<String>> {
+) -> PlanResult<crate::reshape::TopologyKey> {
     let at = view.topology as *const Plan as usize;
     if let Some(k) = scratch.keys.get(&at) {
         return Ok(k.clone());
@@ -1603,6 +1659,7 @@ fn graph_columns_for(
     exprs: &[NamedExpr],
     nodes: Option<(&[RecordBatch], &str)>,
     inputs: &dyn Inputs,
+    scratch: &mut Scratch,
 ) -> PlanResult<Vec<GraphColumns>> {
     let verbs = graph_columns(exprs);
     if verbs.is_empty() {
@@ -1610,7 +1667,7 @@ fn graph_columns_for(
     }
     let mut out = vec![];
     for (edges, verbs) in edge_groups(verbs)? {
-        out.push(edge_group_columns(edges, &verbs, nodes, inputs)?);
+        out.push(edge_group_columns(edges, &verbs, nodes, inputs, scratch)?);
     }
     Ok(out)
 }
@@ -1621,6 +1678,7 @@ fn edge_group_columns(
     verbs: &[(&str, &GraphVerb)],
     nodes: Option<(&[RecordBatch], &str)>,
     inputs: &dyn Inputs,
+    scratch: &mut Scratch,
 ) -> PlanResult<GraphColumns> {
     // A weighted algorithm needs the edge columns its weight expression reads.
     // The read is skipped when the index already caches every one of these
@@ -1635,14 +1693,13 @@ fn edge_group_columns(
         }
     }
     let view = edges.view()?;
-    let mut scratch = Scratch::default();
     let edge_attr = if weight_cols.is_empty() {
         None
     } else {
-        prepare_weighted(&view, &weight_cols, &weight_keys, inputs, &mut scratch)?
+        prepare_weighted(&view, &weight_cols, &weight_keys, inputs, scratch)?
     };
-    let index = view_index(&view, inputs, &mut scratch)?;
-    let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
+    let index = view_index(&view, inputs, scratch)?;
+    let mask = edge_mask(&view, &index, inputs, scratch)?;
     let specs: Vec<NodeColumn> = verbs
         .iter()
         .map(|(name, verb)| (name.to_string(), (*verb).clone()))
@@ -1676,13 +1733,16 @@ fn node_set_frame(
     node_set: Option<&EdgeView<'_>>,
     inputs: &dyn Inputs,
 ) -> PlanResult<Frame> {
-    let mut groups = graph_columns_for(exprs, None, inputs)?.into_iter();
+    // One scratch for the columns and the node set: a topology they share is
+    // built once, even one that can't be cached across queries.
+    let mut scratch = Scratch::default();
+    let mut groups = graph_columns_for(exprs, None, inputs, &mut scratch)?.into_iter();
     let Some(first) = groups.next() else {
         return not_implemented(NON_GRAPH_COLUMN);
     };
     // Resolved after the columns, so a topology they share is built once.
     let node_set = node_set
-        .map(|v| view_index(v, inputs, &mut Scratch::default()))
+        .map(|v| view_index(v, inputs, &mut scratch))
         .transpose()?;
     let ctx = crate::lower::session();
     let mut frame = match node_set {
@@ -1773,7 +1833,7 @@ fn with_columns(
 ) -> PlanResult<()> {
     let before = frame.names();
     let nodes = table.map(|t| (t, id_col));
-    let groups = graph_columns_for(exprs, nodes, inputs)?;
+    let groups = graph_columns_for(exprs, nodes, inputs, &mut Scratch::default())?;
     if !groups.is_empty() && !frame.has_column(id_col) {
         return Err(PlanError::ColumnNotFound(format!(
             "with_columns() attaches graph columns by the node id column {}, which an \
@@ -1798,7 +1858,13 @@ fn scalar_columns(
     roles: &Roles,
 ) -> PlanResult<()> {
     if exprs.iter().all(|e| matches!(e.expr, Expr::Graph(_))) {
-        return Ok(());
+        // The graph columns were attached one edge frame at a time, after the
+        // `before` columns: in written order unless the edge frames interleave.
+        let names = frame.names();
+        let attached = names.get(before.len()..).unwrap_or_default();
+        if attached.iter().eq(exprs.iter().map(|e| &e.name)) {
+            return Ok(());
+        }
     }
     let mut lowered: HashMap<&str, DfExpr> = HashMap::new();
     for e in exprs {

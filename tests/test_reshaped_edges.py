@@ -300,3 +300,92 @@ def test_a_traversal_weight_reads_the_column_with_columns_replaced():
     # from the source).
     with pytest.raises(ur.ColumnNotFoundError, match="unknown edge column"):
         ur.shortest_path(e.select("s", "d"), 3, 2, weight=ur.col("w")).collect()
+
+
+# --- review fixes --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "seeds",
+    [(b"a", b"b"), (2**64 + 1, 2**64 + 2), (float("inf"), float("-inf")), (1, 2)],
+    ids=["bytes", "past_64_bits", "non_finite", "ints"],
+)
+def test_samples_with_distinct_seeds_never_share_a_topology(seeds):
+    # A seed with no exact JSON form is drawn by the host from its own value; the
+    # cache must not let two such seeds share one topology.
+    big = ur.from_arrow(pa.table({"s": list(range(50)), "d": list(range(1, 51))}), src="s", dst="d")
+    for seed in seeds:
+        sampled = big.sample(10, seed=seed)
+        _same(
+            ur.degree(sampled).collect().to_arrow(),
+            ur.degree(_reingest(sampled)).collect().to_arrow(),
+        )
+
+
+SMALL = pa.table({"s": [0, 0, 1, 3], "d": [1, 2, 2, 0], "w": [1.0, 2.0, 3.0, 4.0]})
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda e: e.rename({"s": "d", "d": "s"}),
+        lambda e: e.rename({"d": "x"}).rename({"s": "d", "x": "s"}),
+        lambda e: e.with_columns(s=ur.col("s") + 10),
+        lambda e: e.with_columns(s=ur.col("s") + 10).head(3),
+        lambda e: e.select((ur.col("d") * 1).alias("s"), ur.col("s").alias("d"), "w"),
+    ],
+    ids=["swap", "swap_in_two", "with_columns", "with_columns_head", "select_expr"],
+)
+def test_a_step_that_rewrites_an_endpoint_column_builds_its_rows_graph(make):
+    # The contract is the re-ingest: the endpoints are read by name from the rows
+    # the steps leave, whether or not a reshaping step follows.
+    e = ur.from_arrow(SMALL, src="s", dst="d")
+    shaped = make(e)
+    fresh = _reingest(shaped)
+    for run in (
+        lambda f: ur.degree(f),
+        lambda f: ur.pagerank(f, weight=ur.col("w")),
+        lambda f: ur.hop(f, 1).from_([0, 1]),
+        lambda f: ur.degree(f.filter(ur.col("w") > 1.5)),
+    ):
+        _same(run(shaped).collect().to_arrow(), run(fresh).collect().to_arrow())
+
+
+def test_selecting_the_endpoints_by_role_keeps_the_graph():
+    e = ur.from_arrow(SMALL, src="s", dst="d")
+    got = ur.hop(e.select(ur.src(), ur.dst()), 1).from_([0]).collect().to_dicts()
+    assert got == [{"src": 0, "dst": 1}, {"src": 0, "dst": 2}]
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize("host", ["attr", "nodes"])
+def test_interleaved_edge_frames_keep_the_written_column_order(scalar, host):
+    e = _edges()
+    e2 = e.filter(ur.col("w") > 0.5)
+    base = ur.from_arrow(NODES, id="id") if host == "attr" else e.nodes()
+    cols = {"a": ur.degree(e), "b": ur.degree(e2), "c": ur.pagerank(e)}
+    if scalar:
+        cols["k"] = ur.col("id") + 1
+    got = base.with_columns(**cols).collect().to_arrow()
+    first = NODES.column_names if host == "attr" else ["id"]
+    assert got.column_names == [*first, *cols]
+    want = base
+    for name, expr in cols.items():
+        want = want.with_columns(**{name: expr})
+    want = want.collect().to_arrow()
+    for name in cols:
+        assert got.column(name).to_pylist() == want.column(name).to_pylist()
+
+
+def test_a_topology_that_cannot_be_cached_is_built_once_per_query(monkeypatch):
+    # With no table identity (as for a remote scan) nothing is cached; the node
+    # set and the column of `ur.degree(e.distinct())` still share one build.
+    from ursa._execute import _Host, _native
+
+    monkeypatch.setattr(_Host, "identity", lambda self, slot: None)
+    e = _edges()
+    for _ in range(2):
+        before = _native()._topology_build_count()
+        got = ur.degree(e.distinct()).collect().to_arrow()
+        assert _native()._topology_build_count() - before == 1
+    _same(got, ur.degree(_reingest(e.distinct())).collect().to_arrow())

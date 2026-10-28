@@ -103,11 +103,16 @@ print(ur.pagerank(grouped, weight=ur.col("w")).collect().to_dicts())
 [{'id': 0, 'pagerank': 0.18441687554671388}, {'id': 1, 'pagerank': 0.34117100648207455}, {'id': 2, 'pagerank': 0.47441211797121174}]
 ```
 
-The edges must keep their `src` and `dst` columns. A `select` or `group_by` that drops one raises `ColumnNotFoundError`, naming the step. A `rename` does not move a role: the frame's `src` and `dst` columns keep their names, so renaming one away raises the same error.
+The edges must keep their `src` and `dst` columns. A `select` or `group_by` that drops one raises `ColumnNotFoundError`, naming the step. A `rename` does not move a role: the frame's `src` and `dst` columns keep their names, so renaming one away raises the same error. The endpoints are read by name, so a step that writes new values into a `src` or `dst` column (a `rename` onto it, or a `with_columns` or `select` expression named like it) makes a new graph from those values, as a reshaping step does.
 
-A `filter` written after the reshaping step is a subgraph of the reshaped graph, as a filter on any edge frame is. `select`, `rename` and `with_columns` keep the rows, so they keep the graph; a filter or a weight after them reads the columns they leave.
+Where a `filter` sits decides which nodes stay:
 
-The graph of a reshaped frame is built on first use and cached for the session under a fingerprint of the edge plan and its inputs: the in-memory table, or a local file's size and modification time. Collecting the same reshaped frame again reuses it. A frame over a remote file (`s3://`, `https://`, ...) builds it on every collect.
+- A `filter` written after the reshaping step is a subgraph view of the reshaped graph, as a filter on any edge frame is. Every node of the reshaped graph stays, isolated ones included.
+- A `filter` written before it is part of the reshaped edge set. In `e.filter(p).sort("w")`, the graph is built from the rows the filter keeps, so a node whose every edge was filtered out is not in it.
+
+`select`, `rename` and `with_columns` that leave the endpoints alone keep the rows, so they keep the graph; a filter or a weight after them reads the columns they leave.
+
+The graph of a reshaped frame is built on first use and cached for the session under a fingerprint of the edge plan and its inputs: the in-memory table, or a local file's size and modification time. Collecting the same reshaped frame again reuses it. A frame over a remote file (`s3://`, `https://`, ...) builds it on every collect. The cache holds the four most recently used reshaped graphs, each a whole graph index with the weights and filter masks computed over it, so it can hold as much memory as four indexes of the frame's size. It is freed when the process exits; there is no call to clear it.
 
 ## Several edge frames in one query
 

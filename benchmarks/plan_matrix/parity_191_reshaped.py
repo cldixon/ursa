@@ -109,6 +109,10 @@ RESHAPES: dict = {
     "rename_other": (lambda e: e, lambda e: e.rename({"w": "w0"}).rename({"w0": "w"})),
     "select": (lambda e: e, lambda e: e.select("s", "d", "w")),
     "select_filter": (lambda e: e, lambda e: e.select("d", "s", "w").filter(col("w") < 2.0)),
+    # A step that writes new values into an endpoint column.
+    "swap": (lambda e: e.rename({"s": "d", "d": "s"}), lambda e: e),
+    "rewrite_src": (lambda e: e.with_columns(s=(col("s") * 7) % 50), lambda e: e),
+    "select_roles": (lambda e: e.select(ur.src(), ur.dst(), "w", "k"), lambda e: e),
     # Errors: a step that leaves no src / dst column.
     "drop_dst": (lambda e: e, lambda e: e.select("s", "w")),
     "rename_src": (lambda e: e, lambda e: e.rename({"s": "a"})),
@@ -238,6 +242,8 @@ def category(name: str, a: dict, b: dict) -> str:
         return "fixed: sort/head on the edges was ignored by a graph op (main)"
     if rname in ("head_filter", "reverse_after", "with_columns_head"):
         return "fixed: sort/head on the edges was ignored by a graph op (main)"
+    if rname in ("swap", "rewrite_src"):
+        return "fixed: new values written into src/dst were ignored by a graph op (main)"
     if rname in ("select", "select_filter", "group_select") and "unknown edge column" in b.get(
         "message", ""
     ):
