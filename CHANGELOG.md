@@ -64,16 +64,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   (#199).
 - Filters inside an engine query (after graph columns, a join or a traversal)
   accept every literal a plain-frame filter does: datetimes, dates, times,
-  timedeltas, `numpy.datetime64`/`timedelta64`, `Decimal`, NaN, infinity and
-  `None`. They used to raise `TypeError: Object of type ... is not JSON
-  serializable` (or `ComputeError` for NaN and infinity, "unsupported literal
-  type" for `None`) (#192).
-- A filter whose operand types don't match (for example `ur.col("n") == "x"`
-  on an integer column, or a string `+`) raises `ursa.ComputeError` on every
-  path. Plain frames and subgraph masks used to raise pyarrow's
-  `ArrowNotImplementedError` (a `NotImplementedError` subclass) or
-  `ArrowInvalid` (a `ValueError` subclass); the engine already raised
-  `ComputeError` (#192).
+  timedeltas, `numpy.datetime64`/`timedelta64` (a unit of a day or finer),
+  `Decimal` (up to 76 digits), `bytes`, NaN, infinity and `None`. They used to
+  raise `TypeError: Object of type ... is not JSON serializable` (or
+  `ComputeError` for NaN and infinity, "unsupported literal type" for `None`).
+  A day-unit `numpy.datetime64` now works on plain frames too (it raised a
+  `TypeError`); a month or year unit raises a `TypeError` that says so (#192).
+- Every filter compares the way plain frames did: operand types pyarrow had no
+  comparison kernel for stay errors, timestamps, durations and times compare
+  at the finer unit, an integer past 2**53 against a float and a `uint64` past
+  2**63 against a signed integer stay "not in range" errors. Engine filters
+  used DataFusion's coercion, which parsed `ur.col("n") == "1"` as a number and
+  compared timestamps at the coarser unit (#192).
+- Such errors are `ursa.ComputeError` on every path. Plain frames and subgraph
+  masks used to raise pyarrow's exceptions: `ArrowNotImplementedError` (a
+  `NotImplementedError` subclass) for a type mismatch such as
+  `ur.col("n") == "x"`, and `ArrowInvalid` (a `ValueError` subclass) for an
+  integer divide by zero or a value "not in range". The engine already raised
+  `ComputeError`. A timezone-aware against a naive timestamp of the same unit
+  stays a `ValueError` (#192).
+- A `string_view` column compares with a string literal; pyarrow had no kernel
+  for it (#192).
 - `ursa._ursa` no longer has `hop_reached_nodes_query`,
   `shortest_path_nodes_query`, `scan_edges_arrow`, `scan_edges_table_arrow` or
   `scan_nodes_arrow`; the plan reads and masks itself (#192).

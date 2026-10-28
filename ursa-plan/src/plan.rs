@@ -2616,6 +2616,9 @@ fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
                     "invalid {what} expression JSON: NaN and infinity have no JSON form"
                 ))));
             }
+            if let Some(reason) = v.get("reason").and_then(Value::as_str) {
+                return Err(PlanError::Type(reason.to_string()));
+            }
             return Err(PlanError::Type(format!(
                 "Object of type {ty} is not JSON serializable"
             )));

@@ -12,10 +12,9 @@ use std::sync::{Arc, OnceLock};
 use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, SchemaRef};
-use datafusion::common::tree_node::TreeNode;
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
@@ -35,8 +34,9 @@ fn session() -> &'static SessionContext {
 /// Compile a predicate (its JSON, role references already resolved) against
 /// `schema`.
 ///
-/// Float comparisons use the engine's total order everywhere (#199): NaN equals
-/// NaN and is greater than every number, as in `sort()`.
+/// Comparisons resolve as [`crate::compare`] describes: pyarrow's operand
+/// rules, and floats in total order with NaN canonical (#199): NaN equals NaN
+/// and is greater than every number, as in `sort()`.
 pub fn compile(predicate: &Value, schema: &SchemaRef) -> Result<Compiled> {
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
     let expr = logical(predicate, &df_schema)?;
@@ -46,13 +46,13 @@ pub fn compile(predicate: &Value, schema: &SchemaRef) -> Result<Compiled> {
 /// The predicate as a logical expression over `schema` (for a scan to push down).
 pub fn logical(predicate: &Value, schema: &DFSchema) -> Result<Expr> {
     let expr = lower(&parse_ursa_expr(predicate)?)?;
-    check_timezones(&expr, schema)?;
-    Ok(expr)
+    crate::compare::resolve_comparisons(expr, schema)
 }
 
-/// A comparison of a timezone-aware timestamp with a naive one: an error, as it
-/// was when pyarrow evaluated filters (DataFusion would read the naive side as
-/// UTC, which is wrong whenever it meant local time). Raised as `ValueError`.
+/// A comparison of a timezone-aware timestamp with a naive one of the same unit:
+/// an error, as it was when pyarrow evaluated filters (DataFusion would read the
+/// naive side as UTC, which is wrong whenever it meant local time). Raised as
+/// `ValueError` ([`crate::compare`]).
 #[derive(Debug)]
 pub struct TimezoneMismatch(pub String);
 
@@ -63,66 +63,6 @@ impl std::fmt::Display for TimezoneMismatch {
 }
 
 impl std::error::Error for TimezoneMismatch {}
-
-/// pyarrow's spelling of a timestamp type, as its error messages print it.
-fn arrow_timestamp_name(dt: &DataType) -> String {
-    use arrow::datatypes::TimeUnit;
-    let DataType::Timestamp(unit, tz) = dt else {
-        return dt.to_string();
-    };
-    let unit = match unit {
-        TimeUnit::Second => "s",
-        TimeUnit::Millisecond => "ms",
-        TimeUnit::Microsecond => "us",
-        TimeUnit::Nanosecond => "ns",
-    };
-    match tz {
-        Some(tz) => format!("timestamp[{unit}, tz={tz}]"),
-        None => format!("timestamp[{unit}]"),
-    }
-}
-
-/// Reject a comparison between a timezone-aware and a naive timestamp in `expr`
-/// ([`TimezoneMismatch`]).
-pub fn check_timezones(expr: &Expr, schema: &DFSchema) -> Result<()> {
-    use datafusion::common::tree_node::TreeNodeRecursion;
-    let mut err = None;
-    expr.apply(|e| {
-        if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e {
-            let comparison = matches!(
-                op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            );
-            if comparison {
-                if let (Ok(l @ DataType::Timestamp(..)), Ok(r @ DataType::Timestamp(..))) =
-                    (left.get_type(schema), right.get_type(schema))
-                {
-                    let aware = |t: &DataType| matches!(t, DataType::Timestamp(_, Some(_)));
-                    if aware(&l) != aware(&r) {
-                        // pyarrow's wording, in either order.
-                        err = Some(TimezoneMismatch(format!(
-                            "Cannot compare timestamp with timezone to timestamp without \
-                             timezone, got: {} and {}",
-                            arrow_timestamp_name(&l),
-                            arrow_timestamp_name(&r)
-                        )));
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
-                }
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    match err {
-        Some(e) => Err(DataFusionError::External(Box::new(e))),
-        None => Ok(()),
-    }
-}
 
 /// The predicate's value on `batch`, as a boolean array.
 fn evaluate(predicate: &Compiled, batch: &RecordBatch) -> Result<BooleanArray> {

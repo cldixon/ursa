@@ -504,8 +504,7 @@ fn col_named(name: &str) -> Expr {
 /// - `rename` runs last and only relabels output columns.
 async fn apply_tail(ctx: &SessionContext, mut df: DataFrame, tail: Tail<'_>) -> Result<DataFrame> {
     for f in tail.filters {
-        let expr = filter_expr(f)?;
-        crate::eval::check_timezones(&expr, df.schema())?;
+        let expr = crate::compare::resolve_comparisons(filter_expr(f)?, df.schema())?;
         df = df.filter(expr)?;
     }
     if !tail.group_keys.is_empty() {

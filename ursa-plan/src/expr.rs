@@ -299,6 +299,9 @@ pub fn parse_ursa_expr(v: &Value) -> Result<UrsaExpr> {
                 Ok(UrsaExpr::LitBool(b))
             } else if let Some(i) = value.as_i64() {
                 Ok(UrsaExpr::LitI64(i))
+            } else if let Some(u) = value.as_u64() {
+                // Past i64::MAX: pyarrow reads such an integer as uint64.
+                Ok(UrsaExpr::Lit(ScalarValue::UInt64(Some(u))))
             } else if let Some(f) = value.as_f64() {
                 Ok(UrsaExpr::LitF64(f))
             } else if let Some(s) = value.as_str() {
@@ -385,7 +388,10 @@ pub fn parse_ursa_expr(v: &Value) -> Result<UrsaExpr> {
 /// - `date32`: days since the epoch;
 /// - `time`: an integer count of `unit` since midnight;
 /// - `duration`: an integer count of `unit`;
-/// - `decimal`: the unscaled value as a string, with `precision` and `scale`.
+/// - `decimal`: the unscaled value as a string, with `precision` and `scale`
+///   (`decimal256` past 38 digits);
+/// - `binary`: the bytes, hex-encoded;
+/// - `arrow`: any other scalar, as a one-row Arrow IPC stream, hex-encoded.
 pub fn parse_typed_literal(v: &Value) -> Result<ScalarValue> {
     let err = |m: String| DataFusionError::Execution(format!("invalid literal: {m}"));
     let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
@@ -441,19 +447,51 @@ pub fn parse_typed_literal(v: &Value) -> Result<ScalarValue> {
             }
         }
         "decimal" => {
-            let digits = value
+            let text = value
                 .as_str()
-                .and_then(|s| s.parse::<i128>().ok())
                 .ok_or_else(|| err(format!("decimal literal {value}")))?;
             let field = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(-1);
             let (precision, scale) = (field("precision"), field("scale"));
-            if !(1..=38).contains(&precision) || !(-128..=127).contains(&scale) {
+            if !(1..=76).contains(&precision) || !(-128..=127).contains(&scale) {
                 return Err(err(format!("decimal({precision}, {scale})")));
             }
-            ScalarValue::Decimal128(Some(digits), precision as u8, scale as i8)
+            if precision <= 38 {
+                let digits = text
+                    .parse::<i128>()
+                    .map_err(|_| err(format!("decimal literal {value}")))?;
+                ScalarValue::Decimal128(Some(digits), precision as u8, scale as i8)
+            } else {
+                let digits = arrow::datatypes::i256::from_string(text)
+                    .ok_or_else(|| err(format!("decimal literal {value}")))?;
+                ScalarValue::Decimal256(Some(digits), precision as u8, scale as i8)
+            }
+        }
+        "binary" => ScalarValue::Binary(Some(
+            hex(value.as_str().unwrap_or("")).map_err(|_| err("binary literal".into()))?,
+        )),
+        // Any other scalar pyarrow makes: a one-row Arrow IPC stream, hex-encoded.
+        "arrow" => {
+            let bytes =
+                hex(value.as_str().unwrap_or("")).map_err(|_| err("arrow literal".into()))?;
+            let mut reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                    .map_err(|e| err(e.to_string()))?;
+            let batch = reader
+                .next()
+                .ok_or_else(|| err("empty arrow literal".into()))?
+                .map_err(|e| err(e.to_string()))?;
+            ScalarValue::try_from_array(batch.column(0), 0)?
         }
         other => return Err(err(format!("unknown literal type {other:?}"))),
     })
+}
+
+/// Bytes from their hex digits.
+fn hex(s: &str) -> std::result::Result<Vec<u8>, std::num::ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("x"), 16))
+        .collect()
 }
 
 #[cfg(test)]

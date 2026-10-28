@@ -652,7 +652,10 @@ fn scan_edges_rows_plan(
                 .column_refs()
                 .iter()
                 .all(|c| read_schema.index_of(&c.name).is_ok());
-            if !readable {
+            // Parquet min/max statistics leave NaN out, so a float comparison
+            // would prune row groups whose NaN rows match: evaluate it after
+            // the read instead.
+            if !readable || crate::compare::compares_floats(&expr, filtered.schema()) {
                 break;
             }
             filtered = filtered.filter(expr)?;

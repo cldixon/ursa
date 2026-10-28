@@ -10,6 +10,7 @@ import datetime
 import decimal
 import math
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -172,7 +173,10 @@ def test_a_kernel_type_mismatch_is_a_compute_error():
     # main raised pyarrow.ArrowNotImplementedError on plain frames; the engine path
     # raised ComputeError for the same predicate, which is now what both raise.
     nodes = ur.from_arrow(TYPED, id="id")
-    with pytest.raises(ur.ComputeError, match="Cannot cast string 'x'"):
+    with pytest.raises(
+        ur.ComputeError,
+        match=r"Function 'equal' has no kernel matching input types \(int64, string\)",
+    ):
         nodes.filter(ur.col("i") == "x").collect()
     with pytest.raises(ValueError, match="filter references unknown column 'nope'"):
         nodes.filter(ur.col("nope") > 1).collect()
@@ -284,3 +288,218 @@ def test_an_aware_naive_timestamp_comparison_is_a_value_error(pred, message, pat
     # The same instant on both sides compares.
     same = ur.col("utc") > AWARE
     assert [r["id"] for r in _rows(nodes.filter(same).select("id"))] == [2]
+
+
+# --- comparisons resolve as pyarrow's kernels did, on every path (#192 review) ---
+NEG_NAN = float((np.array([0.0]) / np.array([0.0]))[0])  # 0/0: the sign bit is set on x86
+
+
+def _table(**cols):
+    n = len(next(iter(cols.values())))
+    return pa.table({"id": list(range(n)), "d": [(i + 1) % n for i in range(n)], **cols})
+
+
+def _every_path(table, pred, tmp_path):
+    """The ids `pred` keeps (or the error it raises) on the plain, scan (pushdown),
+    mask, mask-over-scan and engine paths, which must all agree."""
+    path = tmp_path / "t.parquet"
+    pq.write_table(table, path, row_group_size=2)
+    nodes = ur.from_arrow(table, id="id")
+    edges = ur.from_arrow(table, src="id", dst="d")
+    scan = ur.scan_edges(str(path), src="id", dst="d")
+    keys = ur.from_arrow(pa.table({"id": table.column("id")}), id="id")
+
+    def masked(e):
+        out = _rows(ur.degree(e.filter(pred))._frame())
+        return sorted(r["id"] for r in out if r["degree"])
+
+    paths = {
+        "plain": lambda: sorted(r["id"] for r in _rows(nodes.filter(pred))),
+        "scan": lambda: sorted(r["id"] for r in _rows(scan.filter(pred))),
+        "mask": lambda: masked(edges),
+        "scan_mask": lambda: masked(scan),
+        "engine": lambda: sorted(r["id"] for r in _rows(nodes.join(keys, on="id").filter(pred))),
+    }
+    out = {}
+    for name, run in paths.items():
+        try:
+            out[name] = run()
+        except Exception as e:  # the error class and message are compared too
+            out[name] = (type(e).__name__, str(e))
+    assert len({repr(v) for v in out.values()}) == 1, out
+    return out["plain"]
+
+
+TS_NS = pa.array([1500], pa.timestamp("ns"))  # 1.5 us after the epoch
+ONE_US = datetime.datetime(1970, 1, 1, 0, 0, 0, 1)
+
+
+@pytest.mark.parametrize(
+    ("table", "pred", "kept"),
+    [
+        # timestamps compare at the finer unit (main: pyarrow)
+        (_table(ts=TS_NS), ur.col("ts") == ONE_US, []),
+        (_table(ts=TS_NS), ur.col("ts") > ONE_US, [0]),
+        (
+            _table(ts=pa.array([1, 2], pa.timestamp("s"))),
+            ur.col("ts") > np.datetime64(1500000, "us"),
+            [1],
+        ),
+        (
+            _table(ts=pa.array([1, 2], pa.timestamp("ms"))),
+            ur.col("ts") >= np.datetime64(2, "ms"),
+            [1],
+        ),
+        (
+            _table(du=pa.array([1, 2], pa.duration("s"))),
+            ur.col("du") > np.timedelta64(1500, "ms"),
+            [1],
+        ),
+        # NaN canonical in total order: above every number, equal to itself,
+        # whatever its sign bit; NaN rows survive Parquet statistics.
+        (_table(f=[0.5, math.nan, 3.0, math.nan]), ur.col("f") > 1, [1, 2, 3]),
+        (_table(r=[NEG_NAN, 2.0, 1.0]), ur.col("r") < 0, []),
+        (_table(r=[NEG_NAN, 2.0, 1.0]), ur.col("r") > 1.5, [0, 1]),
+        (_table(r=[NEG_NAN, 1.0, math.nan, 2.0]), ur.col("r") == math.nan, [0, 2]),
+        # -0.0 == 0.0
+        (_table(x=[-0.0, 1.0]), ur.col("x") == 0, [0]),
+        (_table(x=[-0.0, 1.0]), ur.col("x") == -0.0, [0]),
+        (_table(x=[0.0, 1.0]), ur.col("x") < 0, []),
+        # uint64 past 2^63, exact
+        (
+            _table(u=pa.array([2**63 + 1, 2**63 + 2], pa.uint64())),
+            ur.col("u") == np.uint64(2**63 + 1),
+            [0],
+        ),
+        (_table(u=pa.array([2**63 + 1, 2**63 + 2], pa.uint64())), ur.col("u") > 2**63 + 1, [1]),
+        # literals pyarrow builds: bytes, wide decimals, a day-unit datetime64
+        (_table(b=pa.array([b"a", b"b"])), ur.col("b") == b"a", [0]),
+        (_table(s=["a", "b"]), ur.col("s") == b"a", [0]),
+        (
+            _table(
+                x=pa.array(
+                    [decimal.Decimal("1" * 39 + ".5"), decimal.Decimal(1)], pa.decimal256(42, 1)
+                )
+            ),
+            ur.col("x") > decimal.Decimal("1" * 39),
+            [0],
+        ),
+        (
+            _table(
+                x=pa.array(
+                    [decimal.Decimal("12345678901234567890123456789.5"), decimal.Decimal(1)],
+                    pa.decimal128(31, 1),
+                )
+            ),
+            ur.col("x") >= decimal.Decimal("12345678901234567890123456789.5"),
+            [0],
+        ),
+        (
+            _table(
+                ts=pa.array(
+                    [datetime.datetime(2020, 1, 2), datetime.datetime(2020, 1, 4)],
+                    pa.timestamp("us"),
+                )
+            ),
+            ur.col("ts") > np.datetime64("2020-01-03"),
+            [1],
+        ),
+        (
+            _table(du=pa.array([3600, 2 * 86400], pa.duration("s"))),
+            ur.col("du") > np.timedelta64(1, "D"),
+            [1],
+        ),
+    ],
+)
+def test_comparisons_keep_the_same_rows_on_every_path(table, pred, kept, tmp_path):
+    assert _every_path(table, pred, tmp_path) == kept
+
+
+@pytest.mark.parametrize(
+    ("table", "pred", "message"),
+    [
+        (
+            _table(i=[1, 2]),
+            ur.col("i") == "1",
+            r"'equal' has no kernel matching input types \(int64, string\)",
+        ),
+        (_table(f=[1.0, 2.0]), ur.col("f") > "1", r"'greater' has no kernel .* \(double, string\)"),
+        (
+            _table(ts=pa.array([1, 2], pa.timestamp("us"))),
+            ur.col("ts") > "2024-01-01",
+            r"'greater' has no kernel .* \(timestamp\[us\], string\)",
+        ),
+        (
+            _table(dt=pa.array([datetime.date(2020, 1, 1)])),
+            ur.col("dt") < "2020-01-02",
+            r"'less' has no kernel .* \(date32\[day\], string\)",
+        ),
+        (_table(i=[1, 2]), ur.col("i") == True, r"no kernel .* \(int64, bool\)"),  # noqa: E712
+        (_table(i=[1, 2]), ur.col("i") == [1, 2], r"no kernel .* \(int64, list<item: int64>\)"),
+        (
+            _table(du=pa.array([1], pa.duration("s"))),
+            ur.col("du") > 1,
+            r"no kernel .* \(duration\[s\], int64\)",
+        ),
+        # lossy comparisons main refused: an int past 2^53 against a float, a
+        # uint64 past 2^63 against a signed int
+        (
+            _table(i=[2**53 + 1, 2**53]),
+            ur.col("i") == float(2**53),
+            r"Integer value 9007199254740993 not in range: -9007199254740992 to 9007199254740992",
+        ),
+        (
+            _table(u=pa.array([2**63 + 1, 5], pa.uint64())),
+            ur.col("u") == 5,
+            r"Integer value 9223372036854775809 not in range: 0 to 9223372036854775807",
+        ),
+        # aware vs naive at different units: no kernel (the same unit is a ValueError)
+        (
+            _table(ts=pa.array([1, 2], pa.timestamp("ns", "Europe/Paris"))),
+            ur.col("ts") > datetime.datetime(2020, 1, 1),
+            r"no kernel .* \(timestamp\[ns, tz=Europe/Paris\], timestamp\[us\]\)",
+        ),
+        (_table(i=[1, 2]), (ur.col("i") / 0) > 1, r"Divide by zero"),
+    ],
+)
+def test_comparisons_main_rejected_are_compute_errors_on_every_path(table, pred, message, tmp_path):
+    with pytest.raises(ur.ComputeError, match=message):
+        _every_path(table, pred, tmp_path)
+        _rows(ur.from_arrow(table, id="id").filter(pred))
+
+
+def test_month_and_year_datetime64_are_rejected_clearly():
+    nodes = ur.from_arrow(_table(ts=pa.array([1, 2], pa.timestamp("us"))), id="id")
+    for unit in ("M", "Y"):
+        with pytest.raises(TypeError, match=f"unit '{unit}' has no fixed length"):
+            nodes.filter(ur.col("ts") > np.datetime64("2020", unit)).collect()
+
+
+def test_string_view_compares_with_string():
+    # Accepted (pyarrow had no kernel for it; the engine compares the values).
+    t = pa.table({"id": [0, 1], "s": pa.array(["a", "b"], pa.string_view())})
+    nodes = ur.from_arrow(t, id="id")
+    assert [r["id"] for r in _rows(nodes.filter(ur.col("s") == "b"))] == [1]
+
+
+def test_float_filters_stay_out_of_parquet_pruning(tmp_path, scan_log):
+    # min/max statistics leave NaN out, so a float comparison runs after the read.
+    path = tmp_path / "f.parquet"
+    pq.write_table(_table(f=[0.5, math.nan, 3.0, math.nan]), path, row_group_size=2)
+    scan = ur.scan_edges(str(path), src="id", dst="d")
+    assert [r["id"] for r in _rows(scan.filter(ur.col("f") > 1))] == [1, 2, 3]
+    assert [pushed for _, _, pushed in scan_log()] == [0]
+    scan.filter(ur.col("id") > 1).collect()  # an integer comparison is pushed
+    assert [pushed for _, _, pushed in scan_log()] == [1]
+
+
+def test_a_traversal_view_does_not_rerun_a_derived_seed_frame():
+    edges = _edges()
+    seeds = ur.from_arrow(pa.table({"id": [0, 1, 2]}), id="id").filter(ur.col("id") < 2)
+    view = ur.hop(edges, n=1).from_(seeds)
+    first = ur.degree(view).collect().to_arrow()
+    cached = seeds._seeds_cell.value
+    assert cached is not None
+    assert ur.degree(view).collect().to_arrow().equals(first)
+    assert seeds._seeds_cell.value is cached
+    assert edges._index_build_cell.value._mask_build_count() == 1

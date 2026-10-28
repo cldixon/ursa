@@ -372,9 +372,15 @@ def _lit_json(value: Any) -> dict[str, Any]:
 
 def _typed_lit_json(value: Any) -> dict[str, Any] | None:
     """The typed literal for ``value`` (see ``_lit_json``), or None."""
+    import decimal
+
     import pyarrow as pa
     import pyarrow.types as pat
 
+    if type(value).__module__ == "numpy" and getattr(value.dtype, "kind", "") in "mM":
+        value = _numpy_temporal(value)
+        if isinstance(value, dict):
+            return value  # a unit no Arrow type holds: rejected
     try:
         scalar = pa.scalar(value)
     except Exception:  # a value pyarrow has no scalar for
@@ -394,8 +400,10 @@ def _typed_lit_json(value: Any) -> dict[str, Any] | None:
         return {"kind": "lit", "type": "time", "unit": t.unit, "value": scalar.value}
     if pat.is_duration(t):
         return {"kind": "lit", "type": "duration", "unit": t.unit, "value": scalar.value}
-    if pat.is_decimal128(t):
-        digits = int(scalar.as_py().scaleb(t.scale))
+    if pat.is_decimal(t):
+        # The unscaled digits, exactly: the default context keeps only 28.
+        with decimal.localcontext(decimal.Context(prec=t.precision + 2)):
+            digits = int(scalar.as_py().scaleb(t.scale))
         return {
             "kind": "lit",
             "type": "decimal",
@@ -403,7 +411,38 @@ def _typed_lit_json(value: Any) -> dict[str, Any] | None:
             "scale": t.scale,
             "value": str(digits),
         }
-    return None
+    if pat.is_binary(t):
+        return {"kind": "lit", "type": "binary", "value": scalar.as_py().hex()}
+    # Anything else pyarrow makes (a list, a struct, ...) travels as Arrow IPC.
+    sink = pa.BufferOutputStream()
+    batch = pa.record_batch([pa.array([scalar.as_py()], t)], names=["v"])
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return {"kind": "lit", "type": "arrow", "value": sink.getvalue().to_pybytes().hex()}
+
+
+def _numpy_temporal(value: Any) -> Any:
+    """A numpy datetime64/timedelta64 in a unit pyarrow takes: a day-based
+    datetime64 as a date, a week/day/hour/minute timedelta64 in seconds. A
+    month or year unit has no Arrow type: the unrepresentable marker for it."""
+    import numpy as np
+
+    unit = np.datetime_data(value.dtype)[0]
+    if value.dtype.kind == "M":
+        if unit in ("D", "W"):
+            return value.astype("datetime64[D]").item()
+    elif unit in ("W", "D", "h", "m"):
+        return value.astype("timedelta64[s]")
+    if unit in ("M", "Y"):
+        name = type(value).__name__
+        return {
+            "kind": "lit",
+            "value": None,
+            "unrepresentable": name,
+            "reason": f"a numpy {name} with unit '{unit}' has no fixed length; "
+            "use a unit of a day or finer in a filter",
+        }
+    return value
 
 
 def _int_json(value: Any) -> Any:
@@ -490,6 +529,10 @@ def _resolve_seeds(seeds: Any) -> Any:
             tbl = seeds._attr_table  # a (chunked) pyarrow.Table
         elif plain and seeds._scan_spec is not None:
             tbl = seeds.select(seeds.id_col).collect().to_arrow()
+        elif seeds._seeds_cell.value is not None:
+            # A derived frame already ran for its ids (a traversal view's mask
+            # key reads them on every collect).
+            return seeds._seeds_cell.value
         else:
             try:
                 tbl = seeds.collect().to_arrow()
@@ -504,7 +547,10 @@ def _resolve_seeds(seeds: Any) -> Any:
         name = seeds.id_col if seeds.id_col in tbl.column_names else "id"
         column = tbl.column(name)
         chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-        return _canonical_id_array(pa.concat_arrays(chunks))
+        ids = _canonical_id_array(pa.concat_arrays(chunks))
+        if not plain:
+            seeds._seeds_cell.value = ids
+        return ids
 
     try:
         vals = list(seeds)

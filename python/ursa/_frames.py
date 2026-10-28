@@ -478,7 +478,7 @@ class NodeFrame(_Frame):
     table by id. NodeFrames derived from ``edges.nodes()`` carry neither.
     """
 
-    __slots__ = ("_attr_cell", "_id_col", "_scan", "_source")
+    __slots__ = ("_attr_cell", "_id_col", "_scan", "_seeds_cell", "_source")
 
     def __init__(self, data: Any, *, id: str) -> None:
         """Build a NodeFrame (attribute table) from in-memory data.
@@ -517,6 +517,9 @@ class NodeFrame(_Frame):
         # Holds a scan_nodes frame's native table cache (see _BuildCell); carried
         # across derivations so a scan-backed node file is read from disk once.
         self._attr_cell = attr_cell if attr_cell is not None else _BuildCell()
+        # This frame's ids as a seed set, once a derived frame had to run to get
+        # them (frames are immutable, so they don't change).
+        self._seeds_cell = _BuildCell()
 
     @classmethod
     def _construct(

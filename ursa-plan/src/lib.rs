@@ -23,6 +23,7 @@
 //! `OptimizerRule`s (filter-before-traversal, segmented-reduction fusion) are the
 //! remaining planned work; execution is correct without them.
 
+pub mod compare;
 pub mod eval;
 pub mod expr;
 pub mod logical;
