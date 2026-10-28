@@ -79,7 +79,7 @@ shape: (4, 4)
 
 Rows that tie on every sort column keep their input order, on every run. On a plain frame that is the row order. After a graph algorithm, as here, it is the attribute table's row order, or node order for an `edges.nodes()` frame. After a traversal it is the order the traversal returns its rows in.
 
-The same input order is what you get without a `sort`. An unsorted `collect()` of `ranked` returns the attribute table's rows in their order, and `head(n)` keeps the first `n` of them. A `join` returns the left rows in order, each followed by its matches in right-frame order, and `group_by` and `distinct` return their rows in order of first appearance.
+The same input order is what you get without a `sort`. An unsorted `collect()` of `ranked` returns the attribute table's rows in their order, and `head(n)` keeps the first `n` of them. A `join` returns the left rows in order, each followed by its matches in right-frame order (see [Join](#join) for `right` and `outer`), and `group_by` and `distinct` return their rows in order of first appearance.
 
 ## Select and rename
 
@@ -170,7 +170,7 @@ shape: (3, 2)
 
 ## Join
 
-`join(other, on=, how=)` is an equi-join on shared key columns. `how` is `"inner"` or `"left"`. It joins two tables you built; the automatic join of an algorithm result onto a `NodeFrame` does not need it.
+`join(other, on=, how=)` is an equi-join on shared key columns. It joins two frames you built; the automatic join of an algorithm result onto a `NodeFrame` does not need it. `other` can be any frame: a table, a frame with graph columns, a traversal, or another join. A plan can join as many times as you like, before or after any other step.
 
 ```python
 extra = ur.NodeFrame({"id": [0, 1, 2], "joined": [1970, 1971, 1972]}, id="id")
@@ -188,6 +188,37 @@ shape: (3, 3)
 │ 1     ┆ Mr. Hi ┆ 1971   │
 │ 2     ┆ Mr. Hi ┆ 1972   │
 └───────┴────────┴────────┘
+```
+
+`how` picks which rows come back, and in what order:
+
+| `how` | Rows | Order |
+|---|---|---|
+| `"inner"` | Each pair of matching rows. | The left rows in order, each followed by its matches in right-frame order. |
+| `"left"` | `"inner"`, plus each unmatched left row once, with nulls. | As `"inner"`, an unmatched left row in its place. |
+| `"right"` | `"inner"`, plus each unmatched right row once, with nulls. | The mirror image: the right rows in order, each followed by its matches in left-frame order. |
+| `"outer"` (or `"full"`) | `"inner"`, plus every unmatched row from either side. | As `"left"`, then the unmatched right rows in right-frame order. |
+| `"semi"` | The left rows that have a match, once each, with the left columns only. | Left-frame order. |
+| `"anti"` | The left rows that have no match, with the left columns only. | Left-frame order. |
+
+The output has the left frame's columns, then the right frame's other columns. Each key column appears once, with the left frame's type. It holds the left key, or the right key on a row that only the right frame has. A null key never matches. A non-key column on both sides is an error; `rename()` one side first.
+
+```python
+members = ur.NodeFrame({"id": [0, 1, 34], "since": [1970, 1971, 1975]}, id="id")
+print(nodes.join(members, on="id", how="outer").sort("id", descending=True).head(3).collect())
+```
+
+```text
+shape: (3, 3)
+┌───────┬─────────┬───────┐
+│ id    ┆ club    ┆ since │
+│ ---   ┆ ---     ┆ ---   │
+│ int64 ┆ string  ┆ int64 │
+╞═══════╪═════════╪═══════╡
+│ 34    ┆ null    ┆ 1975  │
+│ 33    ┆ Officer ┆ null  │
+│ 32    ┆ Officer ┆ null  │
+└───────┴─────────┴───────┘
 ```
 
 `join` and `group_by` compose in one plan, in the order you write them. `join(...).group_by(...)` groups the joined rows. `group_by(...).agg(...).join(...)` joins onto the groups. A `filter` after `group_by(...).agg(...)` filters the groups, like SQL `HAVING`:

@@ -36,8 +36,18 @@
 //!   ordinal), and before a step that reads positions (`sample`) or sums floats
 //!   (`group_by`, so a sum adds in input order, as pyarrow's did).
 //!
-//! A join numbers its rows too (its hash join repartitions); that stays with the
-//! join until #191's part 2.
+//! ## Joins
+//!
+//! A join ([`join`]) runs both sides as frames of the one plan. Its hash join
+//! emits rows in build/probe order, so each side's rows are put in logical order
+//! and numbered densely first, and the joined rows carry one ordinal folded from
+//! the two positions, which orders them as the join guarantees:
+//!
+//! - `inner`, `left`, `semi`, `anti`: left rows in order, each followed by its
+//!   matches in right-frame order (an unmatched `left` row once, with nulls);
+//! - `right`: the mirror image, right rows in order, each followed by its
+//!   matches in left-frame order;
+//! - `outer`: `left`'s order, then the unmatched right rows in right-frame order.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -48,8 +58,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{Column, DFSchema, DFSchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::functions_aggregate::expr_fn::min;
+use datafusion::logical_expr::{lit, JoinType};
 use datafusion::logical_expr::{Expr, ExprSchemable};
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::prelude::{coalesce, DataFrame, SessionContext};
 
 /// The session relational steps run on: the graph session, which plans Ursa's
 /// extension nodes and never round-robin repartitions, so a single-partition
@@ -586,28 +597,275 @@ impl Frame {
         self.reorder()?;
         self.drop_ordinal()?;
         let batches = self.run()?;
-        if self.nullable.is_empty() {
-            return Ok(batches);
+        relax_nullability(batches, &self.nullable)
+    }
+}
+
+/// `batches` with the columns named in `nullable` marked nullable.
+fn relax_nullability(
+    batches: Vec<RecordBatch>,
+    nullable: &BTreeSet<String>,
+) -> Result<Vec<RecordBatch>> {
+    if nullable.is_empty() {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let f = f.as_ref().clone();
+            if nullable.contains(f.name()) {
+                f.with_nullable(true)
+            } else {
+                f
+            }
+        })
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    batches
+        .into_iter()
+        .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).map_err(arrow_err))
+        .collect()
+}
+
+/// A join's `how`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    Inner,
+    Left,
+    Right,
+    /// `outer` (`full`, Polars' name for it).
+    Outer,
+    /// The left rows that have a match, once each, with the left columns only.
+    Semi,
+    /// The left rows that have no match, with the left columns only.
+    Anti,
+}
+
+impl How {
+    /// The `how` a join step names, if it is one.
+    pub fn parse(how: &str) -> Option<How> {
+        Some(match how {
+            "inner" => How::Inner,
+            "left" => How::Left,
+            "right" => How::Right,
+            "outer" | "full" => How::Outer,
+            "semi" => How::Semi,
+            "anti" => How::Anti,
+            _ => return None,
+        })
+    }
+
+    /// Whether the output has the right frame's columns.
+    pub fn keeps_right(self) -> bool {
+        !matches!(self, How::Semi | How::Anti)
+    }
+
+    /// Whether a row can come from the right frame alone, so a key takes the
+    /// right key's value where there is no left one.
+    fn right_rows(self) -> bool {
+        matches!(self, How::Right | How::Outer)
+    }
+}
+
+/// Each side's position takes 32 bits of a joined row's ordinal.
+const SPAN: u64 = 1 << 32;
+
+/// The position of a side a joined row lacks: after every row's.
+const ABSENT: u64 = SPAN - 1;
+
+impl Frame {
+    /// This frame as a join input: its rows in logical order, numbered `0..` by
+    /// the ordinal `ord` (an ordinal the frame carries is dropped: it need not
+    /// be dense), read as a plan the join spreads over the partitions. Columns
+    /// the frame reports nullable are nullable in the rows, so what the join (and
+    /// any expression over its output) infers matches.
+    ///
+    /// The rows are run first: numbering a side inside the join's plan (an
+    /// operator appending positions to one ordered partition) measured slower
+    /// than numbering its collected rows, which DataFusion then reads as several
+    /// partitions.
+    fn join_input(mut self, ord: &str) -> Result<DataFrame> {
+        self.materialize()?;
+        let batches = self.batches.take().expect("materialized");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if rows as u64 >= ABSENT {
+            return Err(too_many_rows());
         }
-        let schema = batches[0].schema();
-        let fields: Vec<Field> = schema
-            .fields()
+        self.ctx.read_batches(attach_ordinal(batches, ord)?)
+    }
+}
+
+impl Frame {
+    /// Run the frame to its rows, in logical order, its ordinal dropped and the
+    /// columns it reports nullable marked so (what `collect` returns, kept as
+    /// the frame's rows).
+    pub fn materialize(&mut self) -> Result<()> {
+        self.reorder()?;
+        self.drop_ordinal()?;
+        let batches = relax_nullability(self.run()?, &self.nullable)?;
+        self.set(batches)
+    }
+}
+
+/// For a join whose keys can take the right key's value (`right`, `outer`): the
+/// first key whose values in `right` the left key's type cannot hold, with the
+/// two types. Each key keeps the left key's type in the output.
+pub fn unfit_right_key(
+    left: &Frame,
+    right: &mut Frame,
+    on: &[String],
+) -> Result<Option<(String, DataType, DataType)>> {
+    use arrow::compute::kernels::cmp::distinct;
+    use arrow::compute::{cast_with_options, CastOptions};
+    let (ls, rs) = (left.schema(), right.schema());
+    let batches = right.run()?;
+    for k in on {
+        let lt = ls
+            .field_with_name(k)
+            .map_err(arrow_err)?
+            .data_type()
+            .clone();
+        let rt = rs
+            .field_with_name(k)
+            .map_err(arrow_err)?
+            .data_type()
+            .clone();
+        if lt == rt {
+            continue;
+        }
+        // A value fits if it survives the cast to the left type and back.
+        let safe = CastOptions {
+            safe: true,
+            ..Default::default()
+        };
+        for b in &batches {
+            let values = b.column(b.schema().index_of(k).map_err(arrow_err)?);
+            let fits = cast_with_options(values, &lt, &safe)
+                .and_then(|as_left| cast_with_options(&as_left, &rt, &safe))
+                .and_then(|back| distinct(&back, values))
+                .map(|d| d.true_count() == 0)
+                .unwrap_or(false);
+            if !fits {
+                return Ok(Some((k.clone(), lt, rt)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn too_many_rows() -> DataFusionError {
+    DataFusionError::NotImplemented(format!("a join input of more than {} rows", ABSENT - 1))
+}
+
+/// `left.join(right, on=, how=)`: an equi-join on the key columns `on`, which
+/// both frames have (checked by the caller, with the column collisions). The
+/// output has the left frame's columns, then the right frame's other columns
+/// (none for `semi` and `anti`); each key appears once, holding the left key, or
+/// the right key on a row with no left match. A null key matches nothing. The
+/// rows come out in the order the module docs give.
+pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame> {
+    if on.is_empty() {
+        return Err(DataFusionError::Execution(
+            "join() needs at least one key column (on=)".into(),
+        ));
+    }
+    let ctx = left.ctx.clone();
+    let (left_names, right_names) = (left.names(), right.names());
+    let taken = Schema::new(
+        left_names
             .iter()
-            .map(|f| {
-                let f = f.as_ref().clone();
-                if self.nullable.contains(f.name()) {
-                    f.with_nullable(true)
-                } else {
-                    f
-                }
+            .chain(right_names.iter())
+            .map(|n| Field::new(n, DataType::Null, true))
+            .collect::<Vec<_>>(),
+    );
+    let l = fresh_name_with(&taken, "_l");
+    let r = fresh_name_with(&taken, "_r");
+    let combined = fresh_name(&taken);
+    // Each right key under a private name, so the join keys don't collide; it is
+    // dropped after the join (or read where a row has no left key).
+    let sentinels: Vec<String> = (0..on.len())
+        .map(|i| fresh_name_with(&taken, &format!("_rk{i}")))
+        .collect();
+    let left_types: Vec<DataType> = on
+        .iter()
+        .map(|k| Ok(left.schema().field_with_name(k)?.data_type().clone()))
+        .collect::<std::result::Result<_, arrow::error::ArrowError>>()
+        .map_err(arrow_err)?;
+    let sentinel = |c: &str| on.iter().position(|k| k == c).map(|i| &sentinels[i]);
+
+    let left_df = left.join_input(&l)?;
+    let right_df = if how.keeps_right() {
+        let df = right.join_input(&r)?;
+        let mut cols: Vec<Expr> = right_names
+            .iter()
+            .map(|c| match sentinel(c) {
+                Some(s) => col_named(c).alias(s),
+                None => col_named(c),
             })
             .collect();
-        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-        batches
-            .into_iter()
-            .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).map_err(arrow_err))
-            .collect()
+        cols.push(col_named(&r));
+        df.select(cols)?
+    } else {
+        // Only whether a row has a match is read: the keys, in any order.
+        let mut right = right;
+        let keys: Vec<Expr> = on
+            .iter()
+            .zip(&sentinels)
+            .map(|(k, s)| col_named(k).alias(s))
+            .collect();
+        right.plan()?.select(keys)?
+    };
+    let join_type = match how {
+        How::Inner => JoinType::Inner,
+        How::Left => JoinType::Left,
+        How::Right => JoinType::Right,
+        How::Outer => JoinType::Full,
+        How::Semi => JoinType::LeftSemi,
+        How::Anti => JoinType::LeftAnti,
+    };
+    let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
+    let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+    let joined = left_df.join(right_df, join_type, &left_keys, &right_keys, None)?;
+
+    let mut out: Vec<Expr> = left_names
+        .iter()
+        .map(|c| match sentinel(c) {
+            // The left key's value, or the right key's, as the left key's type
+            // (the caller checked that the right key's values fit it).
+            Some(s) if how.right_rows() => {
+                let i = on.iter().position(|k| k == c).expect("a key");
+                let right_key = Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(col_named(s)),
+                    left_types[i].clone(),
+                ));
+                coalesce(vec![col_named(c), right_key]).alias(c.as_str())
+            }
+            _ => col_named(c),
+        })
+        .collect();
+    if how.keeps_right() {
+        out.extend(
+            right_names
+                .iter()
+                .filter(|c| sentinel(c).is_none())
+                .map(|c| col_named(c)),
+        );
     }
+    // One ordinal per joined row, the two positions folded into 64 bits so it
+    // orders like the pair (an absent side last).
+    let pos = |c: &str| col_named(c);
+    let or_absent = |c: &str| coalesce(vec![col_named(c), lit(ABSENT)]);
+    let ord = match how {
+        How::Inner | How::Left => pos(&l) * lit(SPAN) + or_absent(&r),
+        How::Right => pos(&r) * lit(SPAN) + or_absent(&l),
+        How::Outer => or_absent(&l) * lit(SPAN) + or_absent(&r),
+        How::Semi | How::Anti => pos(&l),
+    };
+    out.push(ord.alias(&combined));
+    let df = joined.select(out)?;
+    Ok(Frame::from_numbered(ctx, df, combined))
 }
 
 /// The first `n` rows of `batches` (zero-copy), keeping at least one batch so the
@@ -963,6 +1221,122 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, vec![3, 1, 2]);
+    }
+
+    type Row = (Option<i64>, Option<i64>, Option<i64>);
+
+    /// A nested-loop join of `(key, value)` rows, in the order the join
+    /// guarantees: `(key, left value, right value)` per output row.
+    fn nested_loop(
+        left: &[(Option<i64>, i64)],
+        right: &[(Option<i64>, i64)],
+        how: How,
+    ) -> Vec<Row> {
+        let eq = |a: Option<i64>, b: Option<i64>| a.is_some() && a == b;
+        let mut out = vec![];
+        if how == How::Right {
+            for &(k, rv) in right {
+                let m: Vec<_> = left.iter().filter(|(lk, _)| eq(*lk, k)).collect();
+                if m.is_empty() {
+                    out.push((k, None, Some(rv)));
+                }
+                out.extend(m.iter().map(|&&(_, lv)| (k, Some(lv), Some(rv))));
+            }
+            return out;
+        }
+        for &(k, lv) in left {
+            let m: Vec<_> = right.iter().filter(|(rk, _)| eq(*rk, k)).collect();
+            match how {
+                How::Semi if !m.is_empty() => out.push((k, Some(lv), None)),
+                How::Anti if m.is_empty() => out.push((k, Some(lv), None)),
+                How::Semi | How::Anti => {}
+                _ => {
+                    if m.is_empty() && how != How::Inner {
+                        out.push((k, Some(lv), None));
+                    }
+                    out.extend(m.iter().map(|&&(_, rv)| (k, Some(lv), Some(rv))));
+                }
+            }
+        }
+        if how == How::Outer {
+            for &(k, rv) in right {
+                if !left.iter().any(|(lk, _)| eq(*lk, k)) {
+                    out.push((k, None, Some(rv)));
+                }
+            }
+        }
+        out
+    }
+
+    /// `(key, value)` rows as batches of `name_k`, `name_v`, 97 rows each.
+    fn keyed(rows: &[(Option<i64>, i64)], value: &str) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new(value, DataType::Int64, false),
+        ]));
+        rows.chunks(97)
+            .map(|c| {
+                let k = Int64Array::from(c.iter().map(|r| r.0).collect::<Vec<_>>());
+                let v = Int64Array::from(c.iter().map(|r| r.1).collect::<Vec<_>>());
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(k), Arc::new(v)]).unwrap()
+            })
+            .collect()
+    }
+
+    fn joined_rows(batches: &[RecordBatch], how: How) -> Vec<Row> {
+        let mut out = vec![];
+        for b in batches {
+            let i64s = |name: &str| -> Option<Int64Array> {
+                let i = b.schema().index_of(name).ok()?;
+                Some(b.column(i).as_any().downcast_ref::<Int64Array>()?.clone())
+            };
+            let (k, l, r) = (i64s("k").unwrap(), i64s("a").unwrap(), i64s("b"));
+            assert_eq!(r.is_some(), how.keeps_right(), "{:?}", b.schema());
+            for i in 0..b.num_rows() {
+                let get = |a: &Int64Array| a.is_valid(i).then(|| a.value(i));
+                out.push((get(&k), get(&l), r.as_ref().and_then(get)));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn joins_follow_their_order_for_any_partition_count() {
+        // Keys with duplicates on both sides, nulls, and keys on one side only.
+        let key = |i: i64, m: i64| (i % 11 != 0).then_some((i * 7) % m);
+        let left: Vec<_> = (0..1500).map(|i| (key(i, 400), i)).collect();
+        let right: Vec<_> = (0..1200).map(|i| (key(i + 3, 523), 10_000 + i)).collect();
+        let hows = [
+            How::Inner,
+            How::Left,
+            How::Right,
+            How::Outer,
+            How::Semi,
+            How::Anti,
+        ];
+        for p in [1, 3, 8] {
+            TEST_PARTITIONS.with(|c| c.set(Some(p)));
+            for how in hows {
+                let want = nested_loop(&left, &right, how);
+                // Each side materialized, or still a plan (run when joined).
+                for lazy in [false, true] {
+                    let ctx = session();
+                    let side = |rows: &[(Option<i64>, i64)], v: &str| {
+                        let b = keyed(rows, v);
+                        if lazy {
+                            Frame::from_ordered(ctx.clone(), read_ordered(&ctx, b).unwrap())
+                        } else {
+                            Frame::from_batches(ctx.clone(), b).unwrap()
+                        }
+                    };
+                    let (l, r) = (side(&left, "a"), side(&right, "b"));
+                    let j = join(l, r, &["k".to_string()], how).unwrap();
+                    let got = joined_rows(&j.collect().unwrap(), how);
+                    assert_eq!(got, want, "p={p} how={how:?} lazy={lazy}");
+                }
+            }
+            TEST_PARTITIONS.with(|c| c.set(None));
+        }
     }
 
     #[test]

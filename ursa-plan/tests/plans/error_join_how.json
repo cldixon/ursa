@@ -20,7 +20,7 @@
    "frame": 1,
    "id": "id"
   },
-  "how": "outer",
+  "how": "cross",
   "on": [
    "id"
   ],
@@ -28,6 +28,6 @@
  },
  "expect": {
   "error": "not_implemented",
-  "message": "join how='outer' is not supported yet (use ['inner', 'left']); 'right'/'outer' are a follow-up."
+  "message": "join how='cross' is not supported (use ['anti', 'full', 'inner', 'left', 'outer', 'right', 'semi'])."
  }
 }

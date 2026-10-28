@@ -11,14 +11,15 @@
 //! [`execute_plan`] owns the *dispatch* (#190): it walks the tree, rejects the
 //! shapes that aren't supported (the [`PlanError::NotImplemented`] guards, with
 //! the messages the Python layer used to raise), and builds each frame's leaf
-//! from [`crate::query`]: a source's rows, a graph or traversal node, a join.
+//! from [`crate::query`]: a source's rows, a graph or traversal node.
 //!
 //! Every relational step is then lowered onto that leaf, in the order written,
 //! as stock DataFusion operators ([`crate::lower`], #191): `filter`, `select`,
 //! `with_columns`, `rename`, `sort`, `head`, `distinct`, `sample` and
 //! `group_by().agg()`, with the order guarantees implemented once there. A step
 //! means the same wherever it runs; its semantics and errors are the ones the
-//! plain frame always had.
+//! plain frame always had. A `join` builds its right side the same way, as a
+//! frame of its own, and joins the two in one plan ([`crate::lower::join`]).
 //!
 //! Since #192 it also owns the leaf work around them, with one expression
 //! evaluator ([`crate::expr`] lowered to DataFusion, [`crate::eval`] outside a
@@ -74,10 +75,10 @@ use arrow::datatypes::DataType;
 use datafusion::logical_expr::Expr as DfExpr;
 
 use crate::expr::GraphVerb;
-use crate::lower::{col_named, Frame};
+use crate::lower::{col_named, Frame, How};
 use crate::query::{
-    attach_columns, graph_leaf, hop_leaf, join_frame, node_columns, parse_direction, path_leaf,
-    resolve_dense, walk_leaf, NodeColumn,
+    attach_columns, graph_leaf, hop_leaf, node_columns, parse_direction, path_leaf, resolve_dense,
+    walk_leaf, NodeColumn,
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, NodeTableCache};
 use crate::stats::{describe, parse_stat_direction};
@@ -944,14 +945,48 @@ pub fn execute_plan(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Vec<RecordBa
 
 /// [`execute_plan`], leaving a result the host produced with the host.
 pub fn execute(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
+    match build(plan, inputs)? {
+        Built::Rows(rows) => Ok(rows),
+        Built::Frame(frame) => Ok(Rows::Batches((*frame).collect()?)),
+    }
+}
+
+/// A plan, built: a source's rows as they are (no step to run), or a frame to
+/// lower further steps onto and collect.
+enum Built {
+    Rows(Rows),
+    Frame(Box<Frame>),
+}
+
+impl Built {
+    fn frame(frame: Frame) -> Built {
+        Built::Frame(Box::new(frame))
+    }
+}
+
+/// Build a plan's frame: run its guards, build its leaf, and lower its steps,
+/// without collecting it.
+fn build(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Built> {
     if let Plan::Invalid { step } = plan {
         return Err(inputs.step_error(*step));
     }
     let chain = plan.chain();
     if is_node_frame(&chain) {
-        collect_node_frame(&chain, inputs)
+        node_frame(&chain, inputs)
     } else {
-        collect_edge_frame(&chain, inputs)
+        edge_frame(&chain, inputs)
+    }
+}
+
+/// A plan as a [`Frame`], for a step that takes a whole frame (a join's right
+/// side): built like any frame, its steps lowered, and not collected.
+fn frame_of(plan: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> {
+    match build(plan, inputs)? {
+        Built::Frame(frame) => Ok(*frame),
+        Built::Rows(rows) => Ok(Frame::from_batches(
+            crate::lower::session(),
+            rows.into_batches(inputs)?,
+        )?),
     }
 }
 
@@ -1029,11 +1064,11 @@ fn is_tail(p: &Plan) -> bool {
 
 // --- node frames ---------------------------------------------------------------
 
-/// A node frame's collect: `describe` or a random walk with the steps written
-/// after it, or a node source (an attribute table, or `edges.nodes()`) and its
-/// steps in the order written: graph columns (`with_columns`), a join, and the
-/// relational steps, lowered onto one frame.
-fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> {
+/// A node frame: `describe` or a random walk with the steps written after it, or
+/// a node source (an attribute table, or `edges.nodes()`) and its steps in the
+/// order written: graph columns (`with_columns`), joins, and the relational
+/// steps, lowered onto one frame.
+fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     let id_col = node_id_col(chain);
     // describe() is a whole-graph summary, computed eagerly off the topology and
     // wrapped as a one-row frame; steps written after it run on that row.
@@ -1048,15 +1083,20 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
         let dir = parse_stat_direction(direction)?;
         let summary = describe(&index.topo, *full, dir)?;
         if steps.is_empty() {
-            return Ok(Rows::Batches(vec![summary]));
+            return Ok(Built::Rows(Rows::Batches(vec![summary])));
         }
-        let mut frame = Frame::from_batches(crate::lower::session(), vec![summary])?;
-        lower_steps(&mut frame, &steps, &[], inputs)?;
-        return Ok(Rows::Batches(frame.collect()?));
+        let frame = Frame::from_batches(crate::lower::session(), vec![summary])?;
+        return Ok(Built::frame(lower_node_steps(
+            frame,
+            &steps,
+            &[],
+            None,
+            inputs,
+        )?));
     }
 
     if let Some(walk) = chain.iter().find(|p| matches!(p, Plan::RandomWalk { .. })) {
-        return collect_random_walk(chain, walk, inputs);
+        return random_walk_frame(chain, walk, inputs);
     }
 
     // The steps after the `nodes()` boundary, in the order written. A
@@ -1065,7 +1105,6 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
     // the edge mask), not node-result operators.
     let mut steps: Vec<&Plan> = vec![];
     let mut pre_nodes: Vec<&str> = vec![]; // non-filter edge-plan steps before `nodes`
-    let mut joined = false;
     let mut past_nodes_boundary = !chain.iter().any(|p| matches!(p, Plan::Nodes { .. }));
     for &step in chain {
         let op = step.op();
@@ -1091,13 +1130,7 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             continue;
         }
         match step {
-            Plan::Join { how, .. } => {
-                if joined {
-                    return not_implemented("collect() supports a single join() for now.");
-                }
-                check_join_how(how)?;
-                joined = true;
-            }
+            Plan::Join { how, .. } => check_join_how(how)?,
             Plan::WithColumns { columns, .. } => {
                 for e in columns {
                     if let Expr::Graph(verb) = &e.expr {
@@ -1160,7 +1193,7 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
         let frame = node_set_frame(columns, inputs)?;
         let frame = lower_node_steps(frame, &steps[..first], &roles, None, inputs)?;
         let frame = lower_node_steps(frame, &steps[first + 1..], &roles, None, inputs)?;
-        return Ok(Rows::Batches(frame.collect()?));
+        return Ok(Built::frame(frame));
     };
     // A scan reads the id, what a neighbour aggregation reads, and whatever the
     // steps read before a select or group_by narrows the columns.
@@ -1179,15 +1212,16 @@ fn collect_node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
     let needed = projection(&steps, required, &roles);
     let table = node_rows(chain, slot, needed.as_deref(), inputs)?;
     if steps.is_empty() {
-        return Ok(table);
+        return Ok(Built::Rows(table));
     }
     let table = table.into_batches(inputs)?;
     let frame = Frame::from_batches(crate::lower::session(), table.clone())?;
     let frame = lower_node_steps(frame, &steps, &roles, Some(&table), inputs)?;
-    Ok(Rows::Batches(frame.collect()?))
+    Ok(Built::frame(frame))
 }
 
-/// The steps written after a leaf (`describe`, a random walk), each relational.
+/// The steps written after a leaf (`describe`, a random walk): relational steps
+/// and joins.
 fn leaf_steps<'a>(
     chain: &[&'a Plan],
     leaf: &str,
@@ -1198,11 +1232,15 @@ fn leaf_steps<'a>(
         if matches!(s, Plan::Nodes { .. }) {
             continue;
         }
-        if !is_tail(s) {
-            return not_implemented(format!(
-                "collect() does not yet support the '{}' step after {leaf}.",
-                s.op()
-            ));
+        match s {
+            Plan::Join { how, .. } => check_join_how(how)?,
+            _ if is_tail(s) => {}
+            _ => {
+                return not_implemented(format!(
+                    "collect() does not yet support the '{}' step after {leaf}.",
+                    s.op()
+                ))
+            }
         }
         check_step(s, inputs)?;
         steps.push(s);
@@ -1352,8 +1390,8 @@ fn node_set_frame(exprs: &[NamedExpr], inputs: &dyn Inputs) -> PlanResult<Frame>
     Ok(frame)
 }
 
-/// Lower the steps of a node frame, in order: relational steps, `with_columns`
-/// (graph columns attached to the rows by id) and a join. `table` is the frame's
+/// Lower the steps of a frame, in order: relational steps, `with_columns` (graph
+/// columns attached to the rows by id) and joins. `table` is the frame's
 /// attribute table, which a neighbour aggregation reads.
 fn lower_node_steps(
     mut frame: Frame,
@@ -1362,7 +1400,8 @@ fn lower_node_steps(
     table: Option<&[RecordBatch]>,
     inputs: &dyn Inputs,
 ) -> PlanResult<Frame> {
-    let id_col = roles[0].1.clone();
+    // The id column graph columns attach by (a node frame's `id` role).
+    let id_col = roles.first().map_or("id", |(_, c)| c.as_str());
     let mut rest = steps;
     while let Some(i) = rest
         .iter()
@@ -1371,7 +1410,7 @@ fn lower_node_steps(
         lower_steps(&mut frame, &rest[..i], roles, inputs)?;
         match rest[i] {
             Plan::WithColumns { columns, .. } => {
-                with_columns(&mut frame, columns, &id_col, table, roles, inputs)?
+                with_columns(&mut frame, columns, id_col, table, roles, inputs)?
             }
             join => frame = run_join(frame, join, inputs)?,
         }
@@ -2043,7 +2082,7 @@ fn node_rows(
 }
 
 /// A random walk and the steps written after it.
-fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanResult<Rows> {
+fn random_walk_frame(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanResult<Built> {
     let Plan::RandomWalk {
         edges,
         start,
@@ -2052,7 +2091,7 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
         seed,
     } = walk
     else {
-        unreachable!("collect_random_walk takes a random_walk step")
+        unreachable!("random_walk_frame takes a random_walk step")
     };
     let mut steps: Vec<&Plan> = vec![];
     for &s in chain {
@@ -2060,10 +2099,14 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
         if matches!(op, "random_walk" | "nodes" | "from_arrow" | "scan_nodes") {
             continue;
         }
-        if !is_tail(s) {
-            return not_implemented(format!(
-                "collect() does not yet support the '{op}' step after a random_walk."
-            ));
+        match s {
+            Plan::Join { how, .. } => check_join_how(how)?,
+            _ if is_tail(s) => {}
+            _ => {
+                return not_implemented(format!(
+                    "collect() does not yet support the '{op}' step after a random_walk."
+                ))
+            }
         }
         check_step(s, inputs)?;
         steps.push(s);
@@ -2083,21 +2126,25 @@ fn collect_random_walk(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> Pla
         walks_per_node.u32("walks_per_node")?,
         seed_arg(seed, "seed")?,
     )?;
-    let mut frame = Frame::from_ordered(ctx, leaf);
+    let frame = Frame::from_ordered(ctx, leaf);
     // Walk output columns are (walk_id, step, node); no role applies.
-    lower_steps(&mut frame, &steps, &[], inputs)?;
-    Ok(Rows::Batches(frame.collect()?))
+    Ok(Built::frame(lower_node_steps(
+        frame,
+        &steps,
+        &[],
+        None,
+        inputs,
+    )?))
 }
 
 // --- edge frames ---------------------------------------------------------------
 
-/// An edge frame's collect: a plain edge frame, or a `hop` / `shortest_path`
-/// result, then its steps in the order written (one join among them).
-fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> {
+/// An edge frame: a plain edge frame, or a `hop` / `shortest_path` result, then
+/// its steps in the order written (joins among them).
+fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     let (src_col, dst_col) = edge_roles(chain);
     let mut traversal: Option<&Plan> = None;
     let mut steps: Vec<&Plan> = vec![];
-    let mut joined = false;
 
     for &step in chain {
         let op = step.op();
@@ -2105,12 +2152,8 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
             Plan::Hop { .. } | Plan::ShortestPath { .. } => traversal = Some(step),
             Plan::ScanEdges { .. } | Plan::FromArrow { .. } | Plan::Nodes { .. } => {}
             Plan::Join { how, .. } => {
-                if joined {
-                    return not_implemented("collect() supports a single join() for now.");
-                }
                 check_join_how(how)?;
                 check_step(step, inputs)?;
-                joined = true;
                 steps.push(step);
             }
             Plan::Reverse { .. } => {
@@ -2136,14 +2179,8 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
 
     let Some(traversal) = traversal else {
         let roles = [("src", src_col), ("dst", dst_col)];
-        return collect_plain_edges(chain, &steps, &roles, inputs);
+        return plain_edges_frame(chain, &steps, &roles, inputs);
     };
-    if joined {
-        return not_implemented(
-            "join() on a traversal result (hop/shortest_path) is not supported yet; \
-             join is available on plain edge/node frames.",
-        );
-    }
 
     let (Plan::Hop { edges, .. } | Plan::ShortestPath { edges, .. }) = traversal else {
         unreachable!("a traversal is a hop or a shortest_path")
@@ -2162,7 +2199,7 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
     // A traversal result carries reserved `src`/`dst` columns.
     let roles = [("src", "src".to_string()), ("dst", "dst".to_string())];
     let ctx = crate::lower::session();
-    let mut frame = match traversal {
+    let frame = match traversal {
         Plan::Hop {
             edges,
             n,
@@ -2223,19 +2260,20 @@ fn collect_edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Rows> 
         }
         _ => unreachable!("a traversal is a hop or a shortest_path"),
     };
-    lower_steps(&mut frame, &steps, &roles, inputs)?;
-    Ok(Rows::Batches(frame.collect()?))
+    Ok(Built::frame(lower_node_steps(
+        frame, &steps, &roles, None, inputs,
+    )?))
 }
 
 /// A plain edge source and its steps. A scan reads the columns the steps need and
 /// takes its leading filters with it (#192); the other steps are lowered on its
 /// rows, in order.
-fn collect_plain_edges(
+fn plain_edges_frame(
     chain: &[&Plan],
     steps: &[&Plan],
     roles: &Roles,
     inputs: &dyn Inputs,
-) -> PlanResult<Rows> {
+) -> PlanResult<Built> {
     // The endpoints plus what the steps read before a select or group_by narrows
     // the columns.
     let required: BTreeSet<String> = roles.iter().map(|(_, c)| c.clone()).collect();
@@ -2285,11 +2323,11 @@ fn collect_plain_edges(
         },
     };
     if steps.is_empty() {
-        return Ok(rows);
+        return Ok(Built::Rows(rows));
     }
     let frame = Frame::from_batches(crate::lower::session(), rows.into_batches(inputs)?)?;
     let frame = lower_node_steps(frame, steps, roles, None, inputs)?;
-    Ok(Rows::Batches(frame.collect()?))
+    Ok(Built::frame(frame))
 }
 
 /// A step a scan can take into its read: a well-formed `filter`, roles resolved.
@@ -2311,26 +2349,26 @@ fn pushable(step: &Plan, roles: &Roles) -> Option<Value> {
 // --- join --------------------------------------------------------------------
 
 fn check_join_how(how: &str) -> PlanResult<()> {
-    if matches!(how, "inner" | "left") {
+    if How::parse(how).is_some() {
         return Ok(());
     }
     not_implemented(format!(
-        "join how={} is not supported yet (use ['inner', 'left']); 'right'/'outer' are \
-         a follow-up.",
+        "join how={} is not supported (use ['anti', 'full', 'inner', 'left', 'outer', \
+         'right', 'semi']).",
         py_str(how)
     ))
 }
 
-/// Join `left` with the join step's right side: materialize the right side, check
-/// the keys and column collisions, and join; the result's rows carry their
-/// left-major order as an ordinal.
+/// Join `left` with the join step's right side: build the right side as a frame
+/// of its own, check the keys and column collisions, and join the two in one
+/// plan ([`crate::lower::join`]).
 fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> {
     let Plan::Join { right, on, how, .. } = join else {
         unreachable!("run_join takes a join step")
     };
-    let ctx = left.ctx().clone();
-    let left = left.collect()?;
-    let right = execute_plan(right, inputs).map_err(|e| match e {
+    let how = How::parse(how).expect("checked by check_join_how");
+    // The right side's errors name it, building it or running it.
+    let wrap = |e: PlanError| match e {
         PlanError::NotImplemented(_)
         | PlanError::Wrapped { .. }
         | PlanError::Host(HostError {
@@ -2341,15 +2379,14 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
             cause: Box::new(e),
         },
         e => e,
-    })?;
-    let names = |b: &[RecordBatch]| -> Vec<String> {
-        b[0].schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect()
     };
-    let (left_cols, right_cols) = (names(&left), names(&right));
+    // In the order each always ran: the left rows, then the right side, then
+    // the keys.
+    let mut left = left;
+    left.materialize()?;
+    let mut right = frame_of(right, inputs).map_err(wrap)?;
+    right.materialize().map_err(|e| wrap(e.into()))?;
+    let (left_cols, right_cols) = (left.names(), right.names());
     for k in on {
         if !left_cols.contains(k) {
             return Err(PlanError::ColumnNotFound(format!(
@@ -2366,11 +2403,12 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
             )));
         }
     }
-    // A same-named non-key column on both sides would collide in the output.
+    // A same-named non-key column on both sides would collide in the output
+    // (`semi` and `anti` keep the left columns only).
     let right_set: HashSet<&String> = right_cols.iter().filter(|c| !on.contains(c)).collect();
     let collide: BTreeSet<&String> = left_cols
         .iter()
-        .filter(|c| !on.contains(c) && right_set.contains(c))
+        .filter(|c| how.keeps_right() && !on.contains(c) && right_set.contains(c))
         .collect();
     if !collide.is_empty() {
         return Err(PlanError::Value(format!(
@@ -2378,7 +2416,16 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
             py_list(collide.into_iter())
         )));
     }
-    Ok(join_frame(&ctx, left, right, on, how)?)
+    if how == How::Right || how == How::Outer {
+        if let Some((k, lt, rt)) = crate::lower::unfit_right_key(&left, &mut right, on)? {
+            return Err(PlanError::Value(format!(
+                "join(on=): key {} keeps the left frame's type ({lt}), which can't hold \
+                 every value of the right frame's key ({rt}); cast one side first.",
+                py_str(&k)
+            )));
+        }
+    }
+    Ok(crate::lower::join(left, right, on, how)?)
 }
 
 // --- relational steps --------------------------------------------------------

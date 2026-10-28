@@ -100,6 +100,31 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
             "Degree over the Florentine families (string ids), ties in node order.",
             lambda: ur.degree(fl, direction="both").sort("degree", descending=True).head(4),
         ),
+        "two_joins": (
+            "Two joins in one plan, a filter between them (#191).",
+            lambda: (
+                k.nodes()
+                .with_columns(deg=ur.degree(k, direction="both"))
+                .join(kn, on="id")
+                .filter(ur.col("deg") > 9)
+                .join(k.nodes().with_columns(indeg=ur.degree(k, direction="in")), on="id")
+                .sort("id")
+            ),
+        ),
+        "join_on_hop": (
+            "A join on a traversal result, an attribute table on the right (#191).",
+            lambda: ur.hop(k, 1).from_([0, 33]).join(kn.rename({"id": "dst"}), on="dst"),
+        ),
+        "join_outer": (
+            "An outer join: left order, then the unmatched right rows (#191).",
+            lambda: kn.filter(ur.col("id") < 4).join(
+                k.nodes()
+                .with_columns(deg=ur.degree(k, direction="both"))
+                .filter(ur.col("deg") > 9),
+                on="id",
+                how="outer",
+            ),
+        ),
         "join_node_query": (
             "A node query joined to the attribute table, with a tail after the join.",
             lambda: (
@@ -177,7 +202,7 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
         ),
         "error_join_how": (
             "An unsupported join kind.",
-            lambda: kn.join(kn, on="id", how="outer"),
+            lambda: kn.join(kn, on="id", how="cross"),
         ),
         "error_role_out_of_context": (
             "ur.src() in a filter over walk rows.",

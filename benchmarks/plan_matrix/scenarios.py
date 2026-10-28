@@ -221,6 +221,56 @@ def post_algo_tail():
     return best(q)
 
 
+def other_1m() -> ur.NodeFrame:
+    """A second 1M-row table keyed by the same ids, in another order."""
+    t = pq.read_table(path("nodes1m"))
+    t = t.take(list(range(t.num_rows - 1, -1, -1))).rename_columns(["id", "y"])
+    return ur.from_arrow(t, id="id")
+
+
+def join_plain():
+    """A plain single join: two 1M-row in-memory tables on their id."""
+    left, right = nodes_1m(), other_1m()
+    return best(lambda: left.join(right, on="id").collect())
+
+
+def join_degree():
+    """A 1M-row attribute frame joined to a degree result (an engine frame on the
+    right: 1M nodes over 10M edges)."""
+    e, nodes = warm(mem("e10m")), nodes_1m()
+    degree = e.nodes().with_columns(dg=ur.degree(e))
+    return best(lambda: nodes.join(degree, on="id").collect())
+
+
+def join_two():
+    """A two-join pipeline: the attribute frame joined to a degree result, then to
+    a second table, with a filter between them and a sort at the end."""
+    e, nodes, other = warm(mem("e10m")), nodes_1m(), other_1m()
+    degree = e.nodes().with_columns(dg=ur.degree(e))
+
+    def q():
+        nodes.join(degree, on="id").filter(ur.col("dg") > 8).join(other, on="id", how="left").sort(
+            "dg", descending=True
+        ).collect()
+
+    return best(q)
+
+
+def join_two_reingest():
+    """`join_two` written as two collects, the first result re-ingested: how the
+    pipeline ran before a plan could hold two joins."""
+    e, nodes, other = warm(mem("e10m")), nodes_1m(), other_1m()
+    degree = e.nodes().with_columns(dg=ur.degree(e))
+
+    def q():
+        first = nodes.join(degree, on="id").filter(ur.col("dg") > 8).collect().to_arrow()
+        ur.from_arrow(first, id="id").join(other, on="id", how="left").sort(
+            "dg", descending=True
+        ).collect()
+
+    return best(q)
+
+
 SCENARIOS: dict[str, Callable[[], float]] = {
     f.__name__: f
     for f in (
@@ -248,6 +298,10 @@ SCENARIOS: dict[str, Callable[[], float]] = {
         algo_filter,
         algo_head,
         post_algo_tail,
+        join_plain,
+        join_degree,
+        join_two,
+        join_two_reingest,
     )
 }
 

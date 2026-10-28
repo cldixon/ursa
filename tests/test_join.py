@@ -1,11 +1,12 @@
 """frame.join(other, on=, how=) — the relational join verb (issue #18).
 
 A join between two arbitrary frames (distinct from the automatic attribute attach
-that ``edges.nodes().with_columns(...)`` does). v1 supports inner/left joins on a
-shared key; the result keeps the left frame's type. The whole relational tail
-(filter/sort/head/distinct/sample/rename/select) applies after the join. Both
-sides materialize to Arrow and the join runs in DataFusion. A join composes with
-group_by().agg() in either order, as written.
+that ``edges.nodes().with_columns(...)`` does) on a shared key; the result keeps the
+left frame's type. The whole relational tail (filter/sort/head/distinct/sample/
+rename/select) applies after the join. Both sides lower into one DataFusion plan.
+A join composes with group_by().agg() in either order, as written. Every ``how``,
+several joins in one plan and joins on traversal results are in
+``test_join_engine.py``.
 """
 
 from __future__ import annotations
@@ -179,7 +180,7 @@ def test_join_unsupported_how_errors():
     left = _nodes([0, 1], a=[1, 2])
     right = _nodes([0, 1], b=[3, 4])
     with pytest.raises(NotImplementedError, match="not supported"):
-        left.join(right, on="id", how="outer").collect()
+        left.join(right, on="id", how="cross").collect()
 
 
 def test_join_missing_key_errors():
@@ -202,12 +203,14 @@ def test_other_not_a_frame_errors():
         left.join(pa.table({"id": [0, 1], "b": [3, 4]}), on="id").collect()
 
 
-def test_double_join_errors():
-    left = _nodes([0, 1], a=[1, 2])
-    r1 = _nodes([0, 1], b=[3, 4])
-    r2 = _nodes([0, 1], c=[5, 6])
-    with pytest.raises(NotImplementedError, match="single join"):
-        left.join(r1, on="id").join(r2, on="id").collect()
+def test_double_join():
+    # Two joins in one plan (#191): each joins onto the rows the steps before it
+    # leave.
+    left = _nodes([0, 1, 2], a=[1, 2, 3])
+    r1 = _nodes([2, 0, 1], b=[3, 4, 5])
+    r2 = _nodes([1, 2], c=[5, 6])
+    out = left.join(r1, on="id").join(r2, on="id").collect().to_dicts()
+    assert out == [{"id": 1, "a": 2, "b": 5, "c": 5}, {"id": 2, "a": 3, "b": 3, "c": 6}]
 
 
 def test_join_after_group_by_on_a_dropped_key_errors():
@@ -220,11 +223,12 @@ def test_join_after_group_by_on_a_dropped_key_errors():
         left.group_by("region").agg(total=ur.col("v").sum()).join(right, on="id").collect()
 
 
-def test_join_on_traversal_result_errors():
+def test_join_on_traversal_result():
+    # A hop result joins like any other frame (#191).
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
     attrs = ur.from_arrow(pa.table({"src": [0, 1], "x": [1, 2]}), id="src")
-    with pytest.raises(NotImplementedError, match="traversal"):
-        ur.hop(edges, 1).from_([0]).join(attrs, on="src").collect()
+    out = ur.hop(edges, 2).from_([0]).join(attrs, on="src").collect().to_dicts()
+    assert out == [{"src": 0, "dst": 1, "x": 1}, {"src": 0, "dst": 2, "x": 1}]
 
 
 # --- join composed with group_by().agg() -----------------------------------
@@ -486,18 +490,19 @@ def test_head_before_join_limits_the_left_side():
     assert out == [{"id": 3, "v": 40, "region": "eu"}]
 
 
-def test_join_with_group_by_on_traversal_result_errors():
+def test_join_with_group_by_on_traversal_result():
     edges = ur.from_arrow(pa.table({"s": [0, 1, 2], "d": [1, 2, 3]}), src="s", dst="d")
     attrs = ur.from_arrow(pa.table({"src": [0, 1], "x": [1, 2]}), id="src")
-    with pytest.raises(NotImplementedError, match="traversal"):
-        (
-            ur.hop(edges, 1)
-            .from_([0])
-            .join(attrs, on="src")
-            .group_by("x")
-            .agg(n=ur.col("src").count())
-            .collect()
-        )
+    out = (
+        ur.hop(edges, 2)
+        .from_([0, 1])
+        .join(attrs, on="src")
+        .group_by("x")
+        .agg(n=ur.col("src").count())
+        .collect()
+        .to_dicts()
+    )
+    assert out == [{"x": 1, "n": 2}, {"x": 2, "n": 2}]
 
 
 # --- #100: a derived (filtered/sampled) edge frame now collects -------------

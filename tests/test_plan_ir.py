@@ -129,10 +129,10 @@ def test_connected_components_mode_none_is_rejected():
 
 def test_shape_guards_win_over_argument_errors():
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    with pytest.raises(NotImplementedError, match=r"'join' step after describe\(\)"):
-        ur.describe(e).join(n, on="id").sort([]).collect()
-    with pytest.raises(NotImplementedError, match="join how='outer' is not supported"):
-        n.join(n, how="outer").collect()
+    with pytest.raises(NotImplementedError, match=r"'with_columns' step after describe\(\)"):
+        ur.describe(e).with_columns(d=ur.degree(e)).sort([]).collect()
+    with pytest.raises(NotImplementedError, match="join how='cross' is not supported"):
+        n.join(n, how="cross").collect()
 
 
 @pytest.mark.parametrize("frame", ["engine", "plain"])

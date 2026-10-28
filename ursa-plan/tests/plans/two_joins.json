@@ -1,0 +1,160 @@
+{
+ "description": "Two joins in one plan, a filter between them (#191).",
+ "inputs": [
+  {
+   "unused": true
+  },
+  {
+   "edges": "karate"
+  },
+  {
+   "nodes": "karate"
+  },
+  {
+   "unused": true
+  }
+ ],
+ "plan": {
+  "op": "sort",
+  "input": {
+   "op": "join",
+   "input": {
+    "op": "filter",
+    "input": {
+     "op": "join",
+     "input": {
+      "op": "with_columns",
+      "input": {
+       "op": "nodes",
+       "input": {
+        "op": "from_arrow",
+        "frame": 0,
+        "src": "src",
+        "dst": "dst"
+       }
+      },
+      "columns": [
+       {
+        "name": "deg",
+        "expr": {
+         "kind": "graph",
+         "verb": "degree",
+         "edges": {
+          "plan": {
+           "op": "from_arrow",
+           "frame": 1,
+           "src": "src",
+           "dst": "dst"
+          },
+          "frame": 1
+         },
+         "direction": "both"
+        }
+       }
+      ]
+     },
+     "right": {
+      "op": "from_arrow",
+      "frame": 2,
+      "id": "id"
+     },
+     "how": "inner",
+     "on": [
+      "id"
+     ],
+     "step": 0
+    },
+    "step": 1,
+    "predicate": {
+     "kind": "binary",
+     "op": ">",
+     "left": {
+      "kind": "col",
+      "name": "deg"
+     },
+     "right": {
+      "kind": "lit",
+      "value": 9
+     }
+    }
+   },
+   "right": {
+    "op": "with_columns",
+    "input": {
+     "op": "nodes",
+     "input": {
+      "op": "from_arrow",
+      "frame": 3,
+      "src": "src",
+      "dst": "dst"
+     }
+    },
+    "columns": [
+     {
+      "name": "indeg",
+      "expr": {
+       "kind": "graph",
+       "verb": "degree",
+       "edges": {
+        "plan": {
+         "op": "from_arrow",
+         "frame": 1,
+         "src": "src",
+         "dst": "dst"
+        },
+        "frame": 1
+       },
+       "direction": "in"
+      }
+     }
+    ]
+   },
+   "how": "inner",
+   "on": [
+    "id"
+   ],
+   "step": 2
+  },
+  "step": 3,
+  "by": [
+   {
+    "column": "id",
+    "descending": false
+   }
+  ]
+ },
+ "expect": {
+  "columns": [
+   "id",
+   "deg",
+   "club",
+   "indeg"
+  ],
+  "rows": [
+   [
+    0,
+    16,
+    "Mr. Hi",
+    0
+   ],
+   [
+    2,
+    10,
+    "Mr. Hi",
+    2
+   ],
+   [
+    32,
+    12,
+    "Officer",
+    11
+   ],
+   [
+    33,
+    17,
+    "Officer",
+    17
+   ]
+  ]
+ }
+}

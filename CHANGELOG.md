@@ -159,6 +159,39 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   a 1M-row attribute frame, 26 ms to 39 ms. The float aggregations now fold each
   group's values in input order, as a plain frame always has, which keeps every
   bit of a sum reproducible but runs them less in parallel.
+- Joins run in the engine, anywhere in a plan (#191, part 2 of 3, part of
+  #189). The right side of a `join` is built like any frame, with its steps
+  lowered, instead of being executed as a separate plan; both sides are put in
+  order, numbered and joined in one DataFusion plan, and the steps after the
+  join lower onto it. This lifts these limits:
+  - any number of `join` steps in one plan (`a.join(b).join(c)`), before or
+    after any other step, `with_columns` included;
+  - `join` on a traversal result (`hop`, `shortest_path`), after a
+    `random_walk`, and after `describe()`, on either side of the join;
+  - a right side that is any frame: a graph column, an algorithm result, a
+    traversal or another join.
+
+  `how` takes `"right"`, `"outer"` (also spelled `"full"`, Polars' name),
+  `"semi"` and `"anti"` as well as `"inner"` and `"left"`. The output is the
+  left frame's columns, then the right frame's non-key columns (none for
+  `semi`/`anti`); each key appears once, holding the right key on a row only the
+  right frame has, with the left key's type for every `how` (a `right` or
+  `outer` join whose right key holds a value that type can't raises a
+  `ValueError`). Null keys never match. The row order is fixed:
+  - `inner`, `left`, `semi`, `anti`: the left rows in order, each followed by
+    its matches in right-frame order (as before for `inner` and `left`);
+  - `right`: the mirror image, the right rows in order, each followed by its
+    matches in left-frame order;
+  - `outer`: `left`'s order, then the unmatched right rows in right-frame
+    order.
+
+  An unknown `how` now says which are supported: `join how='cross' is not
+  supported (use ['anti', 'full', 'inner', 'left', 'outer', 'right', 'semi']).`
+  On a 4-core machine (medians of 6 interleaved runs): a plain join of two
+  1M-row tables, 71 ms to 68 ms (within noise); a 1M-row attribute frame
+  joined to a degree result, 74 ms to 73 ms. A two-join pipeline over them
+  runs as one plan in 98 ms, against 115 ms as two collects with the first
+  result re-ingested, the only way to write it before.
 - **Behaviour change:** a step behaves the same wherever it runs. Before, the
   same step could give different results on a frame the engine ran (after a
   graph algorithm, a traversal or a join) than on a plain frame, depending on
