@@ -108,7 +108,9 @@ def _engine(pred):
 
 
 def _mask(pred):
-    edges = ur.from_arrow(NAN_TABLE.append_column("d", pa.array([1, 2, 3, 4, 0])), src="id", dst="d")
+    edges = ur.from_arrow(
+        NAN_TABLE.append_column("d", pa.array([1, 2, 3, 4, 0])), src="id", dst="d"
+    )
     out = _rows(ur.degree(edges.filter(pred))._frame())
     return [{"id": r["id"]} for r in out if r["degree"]]
 

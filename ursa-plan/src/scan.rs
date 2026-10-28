@@ -44,7 +44,6 @@ use serde_json::Value;
 use url::{Position, Url};
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
-
 /// The object store for a scan `path`, with the `scheme://authority` base it is
 /// registered under. A schemeless (bare local) path parses as an error and needs
 /// no store — the default registry already serves the local filesystem. Remote
@@ -505,16 +504,7 @@ pub fn scan_edges_table(
     storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
-    Ok(scan_edges_rows(
-        path,
-        src,
-        dst,
-        storage_options,
-        columns,
-        &[],
-        false,
-    )?
-    .batches)
+    Ok(scan_edges_rows(path, src, dst, storage_options, columns, &[], false)?.batches)
 }
 
 /// An edge file's rows, read by [`scan_edges_rows`].
@@ -1132,16 +1122,8 @@ mod tests {
         let p = path.to_str().unwrap();
         let pred = serde_json::json!({"kind": "binary", "op": ">=",
             "left": {"kind": "col", "name": "from"}, "right": {"kind": "lit", "value": 1_990_000}});
-        let (rows, pushed, plan) = scan_edges_rows_plan(
-            p,
-            "from",
-            "to",
-            &no_opts(),
-            &[],
-            &[pred],
-            false,
-        )
-        .unwrap();
+        let (rows, pushed, plan) =
+            scan_edges_rows_plan(p, "from", "to", &no_opts(), &[], &[pred], false).unwrap();
         assert_eq!(pushed, 1);
         let got: Vec<i64> = rows
             .batches
@@ -1162,16 +1144,7 @@ mod tests {
         // A filter that keeps nothing is an empty result, not an empty source.
         let none = serde_json::json!({"kind": "binary", "op": "<",
             "left": {"kind": "col", "name": "from"}, "right": {"kind": "lit", "value": 0}});
-        let rows = scan_edges_rows(
-            p,
-            "from",
-            "to",
-            &no_opts(),
-            &[],
-            &[none],
-            false,
-        )
-        .unwrap();
+        let rows = scan_edges_rows(p, "from", "to", &no_opts(), &[], &[none], false).unwrap();
         assert_eq!(rows.batches.len(), 1);
         assert_eq!(rows.batches[0].num_rows(), 0);
         assert_eq!(rows.batches[0].num_columns(), 2);

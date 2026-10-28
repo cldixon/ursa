@@ -2426,10 +2426,7 @@ fn host_predicate(
     };
     require_predicate(v)?;
     host_check(v, roles, Some(schema))?;
-    Ok(crate::eval::compile(
-        &resolve_roles(v, roles)?,
-        schema,
-    )?)
+    Ok(crate::eval::compile(&resolve_roles(v, roles)?, schema)?)
 }
 
 /// The binary operators the host's evaluator supported.
