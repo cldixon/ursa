@@ -29,6 +29,9 @@ use datafusion::physical_plan::{
 use datafusion::prelude::DataFrame;
 use futures::StreamExt;
 
+/// Rows per output batch (DataFusion's batch size).
+const CHUNK: usize = 8192;
+
 /// Append the ordinal column `name` to `df`, numbering its rows in the order the
 /// plan emits them. `limit` caps the row count (an error past it).
 pub fn enumerate(df: DataFrame, name: &str, limit: u64) -> Result<DataFrame> {
@@ -194,19 +197,34 @@ impl ExecutionPlan for EnumerateExec {
         let schema = self.schema.clone();
         let limit = self.limit;
         let mut next = 0u64;
-        let stream = self.input.execute(0, context)?.map(move |batch| {
-            let batch = batch?;
-            let n = batch.num_rows() as u64;
-            if next + n > limit {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "a join input of more than {limit} rows"
-                )));
-            }
-            let mut cols = batch.columns().to_vec();
-            cols.push(Arc::new(UInt64Array::from_iter_values(next..next + n)));
-            next += n;
-            RecordBatch::try_new(schema.clone(), cols)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        // Each batch is cut into zero-copy slices of DataFusion's batch size, as
+        // numbered materialized rows are, so the join's repartition and probe
+        // spread over them (a graph leaf emits its rows as one batch).
+        let stream = self.input.execute(0, context)?.flat_map(move |batch| {
+            let numbered = batch.and_then(|batch| {
+                let n = batch.num_rows();
+                if next + n as u64 > limit {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "a join input of more than {limit} rows"
+                    )));
+                }
+                (0..n.max(1))
+                    .step_by(CHUNK)
+                    .map(|s| {
+                        let part = batch.slice(s.min(n), CHUNK.min(n - s.min(n)));
+                        let len = part.num_rows() as u64;
+                        let mut cols = part.columns().to_vec();
+                        cols.push(Arc::new(UInt64Array::from_iter_values(next..next + len)));
+                        next += len;
+                        RecordBatch::try_new(schema.clone(), cols)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            });
+            futures::stream::iter(match numbered {
+                Ok(parts) => parts.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(e)],
+            })
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
