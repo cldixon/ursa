@@ -40,7 +40,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   Masks are cached on the graph index, keyed by the view, so two frames with
   the same filter share one. A `scan_nodes` frame keeps one table, the union
   of the columns read so far, instead of one table per projection (#178).
-  Results are unchanged, except for NaN (next entry) (#192, part of #189). PERF_PLACEHOLDER
+  Results are unchanged, except for NaN (next entry) (#192, part of #189). On 10M
+  edges (4 cores): the first masked `degree` over a scan, 0.24s to 0.11s; the
+  mask of a 2-hop traversal result from 2,000 seeds, 0.92s to 0.24s; a
+  1%-selective filter on a 10M-row Parquet file sorted by the filtered column,
+  0.12s to 0.010s.
 - **Behaviour change:** NaN compares in total order in every filter: NaN equals
   NaN and is greater than every number, as in `sort()`. Filters inside an
   engine query already did; filters on plain frames, subgraph masks and steps
