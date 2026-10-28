@@ -4,7 +4,8 @@
 //! DataFusion's own float `sum` / `mean` / `min` / `max` differ in their
 //! treatment of NaN, so these run as user-defined aggregates inside the stock
 //! aggregate node. Each folds a group's values in input order (the lowering
-//! hands the aggregate its rows in order, as one partition):
+//! hands the aggregate each group's rows in order, in one partition, see
+//! [`crate::partition`]):
 //!
 //! - `sum` starts at `0.0` and adds each value (so `-0.0` alone sums to `0.0`).
 //!   When the sum is already NaN and the value is NaN too, the result keeps the
@@ -150,7 +151,7 @@ impl Fold {
 }
 
 /// Fold `v` into a group's running value (`None` before its first value).
-fn step(agg: FloatAgg, nulls: bool, acc: Option<f64>, v: f64) -> f64 {
+pub(crate) fn step(agg: FloatAgg, nulls: bool, acc: Option<f64>, v: f64) -> f64 {
     let Some(acc) = acc else {
         return match agg {
             FloatAgg::Sum | FloatAgg::Mean => 0.0 + v,
@@ -198,8 +199,8 @@ impl Accumulator for Fold {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        // The aggregate's input is one ordered partition, so a group has one
-        // partial state; another one continues the fold where it stopped.
+        // A group's rows are in one partition, in order, so its partial states
+        // arrive in order; each one continues the fold where the last stopped.
         let accs = states[0].as_primitive::<Float64Type>();
         let ns = states[1].as_primitive::<UInt64Type>();
         for i in 0..accs.len() {
@@ -309,8 +310,8 @@ impl GroupsAccumulator for Folds {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        // The aggregate's input is one ordered partition, so a group has one
-        // partial state; another one continues the fold where it stopped.
+        // A group's rows are in one partition, in order, so its partial states
+        // arrive in order; each one continues the fold where the last stopped.
         self.grow(total_num_groups);
         let accs = values[0].as_primitive::<Float64Type>();
         let ns = values[1].as_primitive::<UInt64Type>();

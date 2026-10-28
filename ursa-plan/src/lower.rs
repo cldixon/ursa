@@ -85,9 +85,9 @@ thread_local! {
 /// The base name of the hidden ordinal column.
 const ORD: &str = "__ursa_ord";
 
-/// Rows per batch a numbered frame is cut into (DataFusion's batch size), so a
-/// sort over it can spread across partitions.
-const CHUNK: usize = 8192;
+// Rows per batch a numbered frame is cut into (DataFusion's batch size), so a
+// sort over it can spread across partitions.
+use crate::partition::CHUNK;
 
 fn arrow_err(e: arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
@@ -470,21 +470,30 @@ impl Frame {
 
     /// The plan an aggregate reads: the numbered rows, spread over the session's
     /// partitions when the aggregate doesn't depend on their order (the ordinal
-    /// restores it), else as one ordered partition.
+    /// restores it), else hash-partitioned by the keys with each partition's rows
+    /// in input order.
     fn aggregate_input(&mut self, ordered: bool, keys: &[Expr]) -> Result<DataFrame> {
         let n = self.ctx.state().config().target_partitions().max(1);
         if ordered {
-            // Hash-partitioned by the keys from one ordered partition: each
-            // group's rows land in one partition, still in input order, so the
-            // groups fold in parallel and each fold sees its values in order.
-            let df = self.plan()?;
             if n == 1 || keys.is_empty() {
-                return Ok(df);
+                return self.plan();
             }
-            return df.repartition(datafusion::logical_expr::Partitioning::Hash(
-                keys.to_vec(),
-                n,
-            ));
+            // Hash-partitioned by the keys, chunks routed in parallel and read
+            // back in chunk order: each group's rows land in one partition, still
+            // in input order, so the groups fold in parallel and each fold sees
+            // its values in order.
+            let batches = self.run()?;
+            let schema = batches[0].schema();
+            let keys = keys
+                .iter()
+                .map(|k| match k {
+                    Expr::Column(c) => schema.index_of(&c.name).map_err(arrow_err),
+                    other => Err(DataFusionError::Internal(format!(
+                        "an ordered group key is a column, not {other}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return crate::partition::read_partitioned(&self.ctx, batches, &keys, n);
         }
         let Some(batches) = &self.batches else {
             return self.plan();
@@ -515,8 +524,8 @@ impl Frame {
 
     /// `group_by(keys).agg(aggs)`: one row per group, at its first input row.
     /// When an aggregate depends on the order of its values (`ordered`: a float
-    /// fold), the rows reach the aggregate in input order, as one partition, so a
-    /// sum adds them in that order.
+    /// fold), each group's rows reach the aggregate in input order, in one
+    /// partition, so a sum adds them in that order.
     pub fn group_by(&mut self, keys: Vec<Expr>, aggs: Vec<Expr>, ordered: bool) -> Result<()> {
         let ord = self.number()?;
         if ordered {
@@ -589,6 +598,18 @@ impl Frame {
         self.set(batches)?;
         self.in_order = true;
         Ok(())
+    }
+
+    /// The physical plan the frame would run, as indented text.
+    #[cfg(test)]
+    pub(crate) fn physical_plan_text(&mut self) -> Result<String> {
+        let df = self.plan()?;
+        let plan = crate::runtime::block_on(df.clone().create_physical_plan())??;
+        self.replace(df);
+        let text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        Ok(text)
     }
 
     /// Execute: the rows in logical order, ordinal dropped, as a batch list that

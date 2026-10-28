@@ -3584,6 +3584,234 @@ mod tests {
         }
     }
 
+    /// The rows of a grouped result as text, floats by their bits.
+    fn grouped_rows(batches: &[RecordBatch]) -> Vec<String> {
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        let mut rows = vec![];
+        for b in batches {
+            for r in 0..b.num_rows() {
+                let cells: Vec<String> = b
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        if c.is_null(r) {
+                            return "null".to_string();
+                        }
+                        let any = c.as_any();
+                        if let Some(a) = any.downcast_ref::<Float64Array>() {
+                            format!("{:#x}", a.value(r).to_bits())
+                        } else if let Some(a) = any.downcast_ref::<Int64Array>() {
+                            a.value(r).to_string()
+                        } else if let Some(a) = any.downcast_ref::<StringArray>() {
+                            a.value(r).to_string()
+                        } else {
+                            arrow::util::display::array_value_to_string(c, r).unwrap()
+                        }
+                    })
+                    .collect();
+                rows.push(cells.join(","));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn float_folds_through_the_parallel_partition_match_a_sequential_fold() {
+        use crate::agg::{step, FloatAgg};
+        use crate::lower::{session, Frame, TEST_PARTITIONS};
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        use std::collections::HashMap;
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        let specials = [
+            f64::NAN,
+            neg_nan,
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e16,
+            -1e16,
+            1.0,
+        ];
+        let n = 120_000usize;
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // Keys: half the rows in one group, the rest over 7000 groups and a
+        // null key; a second, string key splits some of them.
+        let mut k1 = Vec::with_capacity(n);
+        let mut k2 = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(n);
+        let mut w = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = rand();
+            k1.push(match r % 100 {
+                0..=49 => Some(0i64),
+                50 => None,
+                _ => Some((r >> 8) as i64 % 7000),
+            });
+            k2.push(match (r >> 20) % 3 {
+                0 => None,
+                1 => Some("a"),
+                _ => Some("é"),
+            });
+            let s = rand();
+            let val = if s % 3 == 0 {
+                specials[(s >> 8) as usize % specials.len()]
+            } else {
+                0.1 * i as f64 * if s % 2 == 0 { 1.0 } else { -1e3 }
+            };
+            v.push((s % 17 != 0).then_some(val));
+            w.push(val);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int64, true),
+            Field::new("k2", DataType::Utf8, true),
+            Field::new("v", DataType::Float64, true),
+            Field::new("w", DataType::Float64, false),
+        ]));
+        // Batches of uneven sizes, one over two chunks, splitting groups.
+        let mut batches = vec![];
+        let mut s = 0;
+        for size in [1usize, 7, 4096, 20_000, 333, 8192, 8193].iter().cycle() {
+            if s >= n {
+                break;
+            }
+            let e = (s + size).min(n);
+            batches.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k1[s..e].to_vec())),
+                        Arc::new(StringArray::from(k2[s..e].to_vec())),
+                        Arc::new(Float64Array::from(v[s..e].to_vec())),
+                        Arc::new(Float64Array::from(w[s..e].to_vec())),
+                    ],
+                )
+                .unwrap(),
+            );
+            s = e;
+        }
+        let aggs: Vec<AggSpec> = [
+            ("vs", "sum", "v"),
+            ("vm", "mean", "v"),
+            ("vmin", "min", "v"),
+            ("vmax", "max", "v"),
+            ("ws", "sum", "w"),
+            ("wmax", "max", "w"),
+            ("n", "count", "v"),
+        ]
+        .iter()
+        .map(|(o, f, c)| AggSpec {
+            output: o.to_string(),
+            func: f.to_string(),
+            column: c.to_string(),
+        })
+        .collect();
+        // The reference: each group folded sequentially, in first-appearance order.
+        type Key = (Option<i64>, Option<&'static str>);
+        let folds = [
+            (FloatAgg::Sum, true),
+            (FloatAgg::Mean, true),
+            (FloatAgg::Min, true),
+            (FloatAgg::Max, true),
+            (FloatAgg::Sum, false),
+            (FloatAgg::Max, false),
+        ];
+        let mut order: Vec<Key> = vec![];
+        let mut state: HashMap<Key, (Vec<Option<f64>>, u64, u64)> = HashMap::new();
+        for i in 0..n {
+            let key = (k1[i], k2[i]);
+            let e = state.entry(key).or_insert_with(|| {
+                order.push(key);
+                (vec![None; folds.len()], 0, 0)
+            });
+            for (j, &(agg, nulls)) in folds.iter().enumerate() {
+                let val = if nulls { v[i] } else { Some(w[i]) };
+                if let Some(val) = val {
+                    e.0[j] = Some(step(agg, nulls, e.0[j], val));
+                }
+            }
+            if v[i].is_some() {
+                e.1 += 1;
+            }
+            e.2 += 1;
+        }
+        let cell = |x: Option<f64>| x.map_or("null".to_string(), |f| format!("{:#x}", f.to_bits()));
+        let want: Vec<String> = order
+            .iter()
+            .map(|key| {
+                let (accs, nv, _) = &state[key];
+                let mut cells = vec![
+                    key.0.map_or("null".into(), |k| k.to_string()),
+                    key.1.map_or("null".into(), |k| k.to_string()),
+                ];
+                for (j, &(agg, _)) in folds.iter().enumerate() {
+                    let a = accs[j];
+                    cells.push(cell(match agg {
+                        FloatAgg::Mean => a.map(|s| s / *nv as f64),
+                        _ => a,
+                    }));
+                }
+                cells.push(nv.to_string());
+                cells.join(",")
+            })
+            .collect();
+        assert!(order.len() > 10_000, "{}", order.len());
+        let cores = std::thread::available_parallelism().map_or(4, |c| c.get());
+        for p in [1, 3, 8, cores] {
+            TEST_PARTITIONS.with(|c| c.set(Some(p)));
+            let mut f = Frame::from_batches(session(), batches.clone()).unwrap();
+            group_by(&mut f, &["k1".to_string(), "k2".to_string()], &aggs).unwrap();
+            let out = f.collect().unwrap();
+            TEST_PARTITIONS.with(|c| c.set(None));
+            let got = grouped_rows(&out);
+            assert_eq!(got.len(), want.len(), "p={p}");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g, w, "p={p}, group {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ordered_aggregate_reads_the_parallel_partition_without_a_repartition() {
+        use crate::lower::{session, Frame, TEST_PARTITIONS};
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values((0..20_000).map(|i| i % 97))),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..20_000).map(|i| i as f64),
+                )),
+            ],
+        )
+        .unwrap();
+        let sum = AggSpec {
+            output: "s".into(),
+            func: "sum".into(),
+            column: "v".into(),
+        };
+        TEST_PARTITIONS.with(|c| c.set(Some(4)));
+        let mut f = Frame::from_batches(session(), vec![batch]).unwrap();
+        group_by(&mut f, &["k".to_string()], std::slice::from_ref(&sum)).unwrap();
+        let plan = f.physical_plan_text().unwrap();
+        TEST_PARTITIONS.with(|c| c.set(None));
+        assert!(plan.contains("OrderedHashPartitionExec"), "{plan}");
+        assert!(plan.contains("SinglePartitioned"), "{plan}");
+        assert!(!plan.contains("RepartitionExec"), "{plan}");
+    }
+
     #[test]
     fn python_reprs() {
         assert_eq!(py_str("a"), "'a'");
