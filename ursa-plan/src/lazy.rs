@@ -1657,7 +1657,10 @@ mod tests {
         assert_eq!(ids[0].schema().fields().len(), 1);
         assert_eq!(schema(&nodes, &TestHost).unwrap(), ids[0].schema());
         let pending = filter(&nodes, gt("id", 0)).unwrap();
-        assert_eq!(rows(&pending).iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(
+            rows(&pending).iter().map(|b| b.num_rows()).sum::<usize>(),
+            2
+        );
         let g = pending
             .step(Step::WithColumns(vec![degree(&e)]), None, &TestHost)
             .unwrap();
