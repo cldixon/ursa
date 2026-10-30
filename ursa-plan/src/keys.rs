@@ -37,20 +37,31 @@ pub fn is_float_key(dt: &DataType) -> bool {
     }
 }
 
-/// A float's bits, with what makes one canonical.
+/// A float's bits, with what makes one canonical. Both checks are branch-free
+/// so a pass over a column vectorizes.
 trait FloatBits: Copy + PartialEq + arrow::datatypes::ArrowNativeType {
+    /// Whether the bits are not canonical: a `-0.0`, or a NaN other than the
+    /// positive quiet one.
+    fn odd(self) -> bool;
     /// The canonical bits: every NaN the positive quiet NaN, `-0.0` as `0.0`.
     fn canon(self) -> Self;
 }
 
 macro_rules! float_bits {
-    ($u:ty, $exp:expr, $mant:expr, $nan:expr, $neg_zero:expr) => {
+    ($u:ty, $abs:expr, $inf:expr, $nan:expr, $neg_zero:expr) => {
         impl FloatBits for $u {
             #[inline(always)]
+            fn odd(self) -> bool {
+                (self == $neg_zero) | ((self & $abs > $inf) & (self != $nan))
+            }
+
+            #[inline(always)]
             fn canon(self) -> $u {
-                if self & $exp == $exp && self & $mant != 0 {
+                let nan = self & $abs > $inf;
+                let zero = self == $neg_zero;
+                if nan {
                     $nan
-                } else if self == $neg_zero {
+                } else if zero {
                     0
                 } else {
                     self
@@ -59,12 +70,12 @@ macro_rules! float_bits {
         }
     };
 }
-float_bits!(u16, 0x7c00, 0x03ff, 0x7e00, 0x8000);
-float_bits!(u32, 0x7f80_0000, 0x007f_ffff, 0x7fc0_0000, 1 << 31);
+float_bits!(u16, 0x7fff, 0x7c00, 0x7e00, 0x8000);
+float_bits!(u32, 0x7fff_ffff, 0x7f80_0000, 0x7fc0_0000, 1 << 31);
 float_bits!(
     u64,
+    0x7fff_ffff_ffff_ffff,
     0x7ff0_0000_0000_0000,
-    0x000f_ffff_ffff_ffff,
     0x7ff8_0000_0000_0000,
     1 << 63
 );
@@ -77,13 +88,17 @@ fn bits<F: ArrowPrimitiveType, U: FloatBits>(a: &dyn Array) -> &[U] {
 /// The valid positions of float array `a` whose value is not canonical.
 fn changed<F: ArrowPrimitiveType, U: FloatBits>(a: &dyn Array) -> Vec<usize> {
     let b = bits::<F, U>(a);
-    // A read-only pass first: most columns hold nothing to change.
-    if !b.iter().any(|&x| x.canon() != x) {
+    // A read-only pass first, in chunks the compiler vectorizes: most columns
+    // hold nothing to change.
+    if !b
+        .chunks(512)
+        .any(|c| c.iter().fold(false, |acc, &x| acc | x.odd()))
+    {
         return vec![];
     }
     b.iter()
         .enumerate()
-        .filter(|&(i, &x)| x.canon() != x && a.is_valid(i))
+        .filter(|&(i, &x)| x.odd() && a.is_valid(i))
         .map(|(i, _)| i)
         .collect()
 }
@@ -334,6 +349,41 @@ mod tests {
         assert_eq!(FloatBits::canon(0x7c00u16), 0x7c00); // +inf
         assert_eq!(FloatBits::canon(0xfc00u16), 0xfc00); // -inf
         assert_eq!((f32::NAN as f64).to_bits(), f64::NAN.to_bits());
+    }
+
+    #[test]
+    fn odd_is_exactly_what_canon_changes() {
+        for x in 0..=u16::MAX {
+            assert_eq!(x.odd(), x.canon() != x, "{x:#x}");
+        }
+        let specials64 = [
+            0u64,
+            1 << 63,
+            0x7ff0 << 48,
+            0xfff0 << 48,
+            0x7ff8 << 48,
+            0xfff8 << 48,
+        ]
+        .into_iter()
+        .chain([
+            0x7ff0_0000_0000_0001,
+            0xfff0_0000_0000_0001,
+            1.5f64.to_bits(),
+        ]);
+        for x in specials64 {
+            assert_eq!(x.odd(), x.canon() != x, "{x:#x}");
+        }
+        for x in [
+            0u32,
+            1 << 31,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0xffc0_0000,
+            0x7f80_0001,
+        ] {
+            assert_eq!(x.odd(), x.canon() != x, "{x:#x}");
+        }
     }
 
     #[test]
