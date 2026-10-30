@@ -22,7 +22,7 @@ An `EdgeFrame` can carry more columns. A weight, a timestamp, or a type column a
 
 The first graph operation on an `EdgeFrame` builds a topology index (a CSR structure) and caches it on the frame. Later operations on the same frame reuse it. The index is built once per frame, not once per algorithm.
 
-A `filter` on the edges makes a subgraph with its own index. See [Work on a subgraph](../guides/subgraphs.md).
+A `filter` on the edges is a subgraph view. It uses the parent's index with a mask of the kept edges. A step that reshapes the rows (`distinct`, `head`, a join, ...) gets an index of its own. See [Work on a subgraph](../guides/subgraphs.md).
 
 ### Rows are kept
 
@@ -49,7 +49,7 @@ When you call `nodes.with_columns(pagerank=ur.pagerank(edges))`, Ursa joins the 
 
 ## Lazy plans and `collect()`
 
-A frame method returns a new frame with one more step in its plan. The plan is a value. You can hold it, extend it, or print it with `explain()`.
+A frame method returns a new frame with one more step in its plan. The step is checked when you add it: a step that cannot run raises on that line. The plan is a value. You can hold it, extend it, print it with `explain()`, or get its result schema with `schema()`. Neither call runs the plan.
 
 ```py
 plan = edges.nodes().with_columns(pr=ur.pagerank(edges)).sort("pr", descending=True)

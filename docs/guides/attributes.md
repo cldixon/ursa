@@ -95,12 +95,12 @@ shape: (13, 3)
 │ 1     ┆ Mr. Hi  ┆ 2            │
 │ 2     ┆ Mr. Hi  ┆ 2            │
 │ 8     ┆ Mr. Hi  ┆ 2            │
+│ 9     ┆ Officer ┆ 2            │
 │ 13    ┆ Mr. Hi  ┆ 2            │
 │ 19    ┆ Mr. Hi  ┆ 2            │
-│ 31    ┆ Officer ┆ 2            │
-│ 30    ┆ Officer ┆ 2            │
-│ 9     ┆ Officer ┆ 2            │
 │ 27    ┆ Officer ┆ 2            │
+│ 28    ┆ Officer ┆ 2            │
+│ 30    ┆ Officer ┆ 2            │
 │ …     ┆ …       ┆ …            │
 └───────┴─────────┴──────────────┘
 ```

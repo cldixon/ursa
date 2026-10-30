@@ -25,13 +25,13 @@ print(core.sort("degree", descending=True).head(5).collect())
 
 ```text
 shape: (1, 5)
-┌─────────┬─────────┬──────────┬────────────┬──────────────┐
-│ n_nodes ┆ n_edges ┆ density  ┆ avg_degree ┆ n_components │
-│ ---     ┆ ---     ┆ ---      ┆ ---        ┆ ---          │
-│ int64   ┆ int64   ┆ double   ┆ double     ┆ int64        │
-╞═════════╪═════════╪══════════╪════════════╪══════════════╡
-│ 77      ┆ 254     ┆ 0.043404 ┆ 3.2987     ┆ null         │
-└─────────┴─────────┴──────────┴────────────┴──────────────┘
+┌─────────┬─────────┬────────────┬────────────┬──────────────┐
+│ n_nodes ┆ n_edges ┆ density    ┆ avg_degree ┆ n_components │
+│ ---     ┆ ---     ┆ ---        ┆ ---        ┆ ---          │
+│ int64   ┆ int64   ┆ double     ┆ double     ┆ int64        │
+╞═════════╪═════════╪════════════╪════════════╪══════════════╡
+│ 77      ┆ 51      ┆ 0.00871497 ┆ 0.662338   ┆ null         │
+└─────────┴─────────┴────────────┴────────────┴──────────────┘
 shape: (5, 3)
 ┌────────────┬────────┬───────────┐
 │ id         ┆ degree ┆ component │
@@ -39,18 +39,18 @@ shape: (5, 3)
 │ string     ┆ uint32 ┆ uint32    │
 ╞════════════╪════════╪═══════════╡
 │ Marius     ┆ 9      ┆ 34        │
-│ Courfeyrac ┆ 8      ┆ 34        │
-│ Enjolras   ┆ 8      ┆ 34        │
 │ Valjean    ┆ 8      ┆ 34        │
+│ Enjolras   ┆ 8      ┆ 34        │
+│ Courfeyrac ┆ 8      ┆ 34        │
 │ Combeferre ┆ 8      ┆ 34        │
 └────────────┴────────┴───────────┘
 ```
 
-The filtered frame builds its own index on first use. The original frame keeps its index.
+The filtered frame uses the parent's index, with a mask of the kept edges. It keeps the parent's node set: `n_nodes` is still 77, and a node with no kept edge has degree 0. For only the nodes at an end of a kept edge, see [Over a subgraph](statistics.md#over-a-subgraph).
 
 ## A traversal result
 
-`hop` and `shortest_path` return an `EdgeFrame`. A kernel over it runs on the nodes the traversal reached, with the edges among them.
+`hop` and `shortest_path` return an `EdgeFrame`. A kernel over it runs on the subgraph the reached nodes induce. Its output still has a row for every node of the parent graph.
 
 A traversal over a filtered frame, such as `ur.hop(strong, n=2)`, follows only the edges the filter keeps. A kernel over its result stays inside the filtered graph too. `random_walk` over a filtered frame also takes only the kept edges.
 
@@ -103,7 +103,7 @@ print(ur.pagerank(grouped, weight=ur.col("w")).collect().to_dicts())
 [{'id': 0, 'pagerank': 0.18441687554671388}, {'id': 1, 'pagerank': 0.34117100648207455}, {'id': 2, 'pagerank': 0.47441211797121174}]
 ```
 
-The edges must keep their `src` and `dst` columns. A `select` or `group_by` that drops one raises `ColumnNotFoundError`, naming the step. A `rename` does not move a role: the frame's `src` and `dst` columns keep their names, so renaming one away raises the same error. The endpoints are read by name, so a step that writes new values into a `src` or `dst` column (a `rename` onto it, or a `with_columns` or `select` expression named like it) makes a new graph from those values, as a reshaping step does.
+The edges must keep their `src` and `dst` columns. A `select` or `group_by` that drops one raises `ColumnNotFoundError`, naming the step. A `rename` does not move a role: the frame's `src` and `dst` columns keep their names, so renaming one away raises the same error. The endpoints are read by name. A step that writes new values into a `src` or `dst` column makes a new graph from those values, as a reshaping step does. Examples are a `rename` onto the column, and a `with_columns` or `select` expression with its name.
 
 Where a `filter` sits decides which nodes stay:
 
@@ -112,7 +112,7 @@ Where a `filter` sits decides which nodes stay:
 
 `select`, `rename` and `with_columns` that leave the endpoints alone keep the rows, so they keep the graph; a filter or a weight after them reads the columns they leave.
 
-The graph of a reshaped frame is built on first use and cached for the session under a fingerprint of the edge plan and its inputs: the in-memory table, or a local file's size and modification time. Collecting the same reshaped frame again reuses it. A frame over a remote file (`s3://`, `https://`, ...) builds it on every collect. The cache holds the four most recently used reshaped graphs, each a whole graph index with the weights and filter masks computed over it, so it can hold as much memory as four indexes of the frame's size. It is freed when the process exits; there is no call to clear it.
+The graph of a reshaped frame is built on first use. It is cached for the session under a fingerprint of the edge plan and its inputs: the in-memory table, or a local file's size and modification time. Collecting the same reshaped frame again reuses it. A frame over a remote file (`s3://`, `https://`, ...) builds it on every collect. The cache holds the four most recently used reshaped graphs. Each is a whole graph index, with its weights and filter masks, so the cache can use as much memory as four indexes of the frame's size. It is freed when the process exits. There is no call to clear it.
 
 ## Several edge frames in one query
 

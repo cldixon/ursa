@@ -42,7 +42,7 @@ result = (
 )
 ```
 
-Steps 1 to 3 build a plan and do no work. Step 4 runs the plan as one query in the engine and returns the rows as Arrow data.
+Steps 1 to 3 build a plan and do no work. Step 4 runs the plan in the engine and returns the rows as Arrow data.
 
 ## Where the work happens
 
@@ -50,8 +50,8 @@ Ursa is three layers:
 
 | Layer | Language | Role |
 |---|---|---|
-| `ursa` | Python | The API you write. It builds a plan. |
-| `ursa-plan` | Rust | Turns the plan into one [DataFusion](https://datafusion.apache.org/) query. Graph operations are nodes in that query. |
+| `ursa` | Python | The API you write. Each frame method converts its arguments and calls into Rust. |
+| `ursa-plan` | Rust | Holds the plan, checks each step as you add it, and runs the plan with [DataFusion](https://datafusion.apache.org/). Graph operations are nodes in the plan. |
 | `ursa-core` | Rust | The graph index (CSR) and the algorithm kernels. Parallel, deterministic. |
 
 You never call the Rust layers directly. Data crosses the boundary as Arrow, without a copy.

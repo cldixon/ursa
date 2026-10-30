@@ -8,7 +8,7 @@ A scan reads a file inside `collect()`. The read pushes the projection into the 
 
 ```py
 ur.scan_edges(
-    path: str | list[str], *,
+    path: str | Path | list[str | Path], *,
     src: str, dst: str,
     storage_options: dict | None = None,
     store=None,
@@ -56,7 +56,7 @@ An HTTP URL must point at one file and must not carry a query string. A presigne
 
 ```py
 ur.scan_nodes(
-    path: str | list[str], *,
+    path: str | Path | list[str | Path], *,
     id: str,
     storage_options: dict | None = None,
     store=None,
