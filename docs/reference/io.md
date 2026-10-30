@@ -42,6 +42,8 @@ The CSV options apply to `.csv` files only. Each character option is one ASCII c
 
 A CSV file's column types are inferred from its first 1,000 rows. A value past them that does not parse as the inferred type raises an error at `collect()`. With a `null_value`, a value parses exactly as without one; only which fields are null differs.
 
+A column of numbers is `double` when one or more of its values is a float, in any spelling pyarrow reads as one: `1.5`, `+5`, `.5`, `5.`, `1e400` (read as `inf`), `-0` next to a float (read as `-0.0`), and `nan`, `inf` or `infinity` in any case, with or without a sign. Each value parses to the same bits as in pyarrow. A column of integers only, such as `1` and `-0`, is `int64`. A column with any other text in its first 1,000 rows is `string`, as is an integer past the `int64` range or a number with spaces around it.
+
 ```py
 edges = ur.scan_edges("edges.csv", src="from", dst="to", delimiter="\t", null_value="NA")
 ```

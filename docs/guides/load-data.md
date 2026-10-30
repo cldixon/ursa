@@ -162,6 +162,8 @@ edges = ur.scan_edges(
 
 `has_header=False` reads a file without a header row; its columns are then `column_1`, `column_2`, and so on. `quote` sets the quote character, and `escape` a character that makes the next one literal inside a quoted field. See [Input and output](../reference/io.md#urscan_edges) for every option.
 
+A CSV column's type comes from its first 1,000 rows. A column of numbers with one or more floats in it is `double`, whatever their spelling: `+5`, `1e400`, `nan` and `-Inf` read as pyarrow reads them. See [Input and output](../reference/io.md#urscan_edges) for the rules.
+
 `read_edges` and `read_nodes` are the eager forms. They return the rows at once.
 
 ### Object storage
