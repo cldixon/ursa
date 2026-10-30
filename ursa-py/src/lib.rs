@@ -29,7 +29,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_pyarrow::FromPyArrow;
 use pyo3::create_exception;
 use pyo3::exceptions::{
-    PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
+    PyException, PyNotImplementedError, PyOverflowError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 
@@ -116,15 +116,33 @@ create_exception!(
 /// avoid a direct `datafusion` dependency).
 fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
     let msg = e.to_string();
-    let lower = msg.to_lowercase();
+    engine_class(&msg)(ursa_plan::message::reword(&msg))
+}
+
+/// The class of an engine error, by its rendered message.
+fn engine_class(raw: &str) -> fn(String) -> PyErr {
+    let lower = raw.to_lowercase();
     if lower.contains("no field named")
         || (lower.contains("column") && lower.contains("not found"))
         || lower.contains("schema error")
     {
-        ColumnNotFoundError::new_err(msg)
+        |m| ColumnNotFoundError::new_err(m)
     } else {
-        ComputeError::new_err(msg)
+        |m| ComputeError::new_err(m)
     }
+}
+
+/// A DataFusion error as the Ursa exception [`to_pyerr`] gives, in Ursa's words
+/// ([`ursa_plan::message`]), with DataFusion's own text kept as its
+/// `__cause__` (a `RuntimeError`) when the two differ.
+fn engine_err(e: &ursa_plan::message::DataFusionError) -> PyErr {
+    let raw = e.to_string();
+    let message = ursa_plan::message::engine_message(e);
+    let err = engine_class(&raw)(message.clone());
+    if message != raw {
+        Python::attach(|py| err.set_cause(py, Some(PyRuntimeError::new_err(raw))));
+    }
+    err
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +267,7 @@ pub(crate) fn plan_err(e: PlanError) -> PyErr {
             err
         }),
         e @ PlanError::Invalid(_) => PyValueError::new_err(e.to_string()),
-        PlanError::Engine(e) => to_pyerr(e),
+        PlanError::Engine(e) => engine_err(&e),
         PlanError::Host(e) => match e.payload.downcast::<PyErr>() {
             Ok(err) => *err,
             Err(_) => ComputeError::new_err(e.message),
@@ -277,7 +295,7 @@ pub(crate) fn host_err(py: Python<'_>, err: PyErr) -> PlanError {
 #[pyfunction]
 #[pyo3(signature = (index, direction="out"))]
 fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>, direction: &str) -> PyResult<f64> {
-    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
+    let dir = parse_stat_direction("density", direction).map_err(to_pyerr)?;
     let topo = index.0.topo.clone();
     py.detach(move || density(&topo, dir).map_err(to_pyerr))
 }
@@ -292,7 +310,7 @@ fn graph_avg_path_length(
     sample: Option<f64>,
     direction: &str,
 ) -> PyResult<f64> {
-    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
+    let dir = parse_stat_direction("avg_path_length", direction).map_err(to_pyerr)?;
     let topo = index.0.topo.clone();
     py.detach(move || avg_path_length(&topo, sample, dir).map_err(to_pyerr))
 }
@@ -307,7 +325,7 @@ fn graph_diameter(
     approximate: bool,
     direction: &str,
 ) -> PyResult<i64> {
-    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
+    let dir = parse_stat_direction("diameter", direction).map_err(to_pyerr)?;
     let topo = index.0.topo.clone();
     py.detach(move || diameter(&topo, approximate, dir).map_err(to_pyerr))
 }

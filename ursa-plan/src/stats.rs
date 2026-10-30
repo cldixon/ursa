@@ -21,9 +21,9 @@ use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::connected_components_weak;
 use ursa_core::{Direction, EdgeMask, Topology};
 
-/// Parse a stat's `direction` argument (`"out"`, `"in"` or `"both"`).
-pub fn parse_stat_direction(d: &str) -> Result<Direction> {
-    Ok(crate::query::parse_direction(d)?.into())
+/// Parse the `direction` argument (`"out"`, `"in"` or `"both"`) of the stat `stat`.
+pub fn parse_stat_direction(stat: &str, d: &str) -> Result<Direction> {
+    Ok(crate::query::parse_direction(stat, d)?.into())
 }
 
 /// The edge count a stat reads under `dir`: the stored row count for `Out`/`In`,
@@ -538,7 +538,10 @@ mod tests {
 
     #[test]
     fn stat_direction_parses() {
-        assert_eq!(parse_stat_direction("both").unwrap(), Direction::Both);
-        assert!(parse_stat_direction("sideways").is_err());
+        assert_eq!(
+            parse_stat_direction("density", "both").unwrap(),
+            Direction::Both
+        );
+        assert!(parse_stat_direction("density", "sideways").is_err());
     }
 }

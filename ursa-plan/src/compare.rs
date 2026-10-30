@@ -11,7 +11,7 @@
 //! dispatches it:
 //!
 //! - operand families pyarrow has no kernel for are rejected
-//!   (`Function 'greater' has no kernel matching input types (int64, string)`);
+//!   (`cannot compare int64 with string (int64 > string); compare values of one type`);
 //! - timestamps, durations and times compare at the finer unit;
 //! - an integer meets a float as `float64`, checked to be exact (|v| <= 2^53),
 //!   and a `uint64` meets a signed integer as `int64`, checked to fit, with
@@ -268,20 +268,19 @@ fn resolve(op: &Operator, l: &DataType, r: &DataType) -> Result<Resolved> {
     })
 }
 
-/// pyarrow's error for operand types it has no comparison kernel for.
+/// The error for operand types that do not compare (pyarrow had no kernel).
 fn no_kernel(op: &Operator, l: &DataType, r: &DataType) -> DataFusionError {
-    let f = match op {
-        Operator::Eq => "equal",
-        Operator::NotEq => "not_equal",
-        Operator::Lt => "less",
-        Operator::LtEq => "less_equal",
-        Operator::Gt => "greater",
-        _ => "greater_equal",
+    let op = match op {
+        Operator::Eq => "==",
+        Operator::NotEq => "!=",
+        Operator::Lt => "<",
+        Operator::LtEq => "<=",
+        Operator::Gt => ">",
+        _ => ">=",
     };
+    let (l, r) = (pa_name(l), pa_name(r));
     DataFusionError::Execution(format!(
-        "Function '{f}' has no kernel matching input types ({}, {})",
-        pa_name(l),
-        pa_name(r)
+        "cannot compare {l} with {r} ({l} {op} {r}); compare values of one type"
     ))
 }
 
@@ -421,7 +420,9 @@ impl ScalarUDFImpl for CheckedCast {
             let check = |v: i128| -> Result<()> {
                 if v < lo || v > hi {
                     return Err(DataFusionError::Execution(format!(
-                        "Integer value {v} not in range: {lo} to {hi}"
+                        "the integer {v} does not fit the type both sides are compared as \
+                         (range {lo} to {hi}), so the comparison would not be exact; compare \
+                         with a value of the column's type"
                     )));
                 }
                 Ok(())
@@ -479,9 +480,9 @@ mod tests {
         let err = resolve(&Operator::Gt, &DataType::Int64, &DataType::Utf8)
             .err()
             .unwrap();
-        assert!(err
-            .to_string()
-            .contains("Function 'greater' has no kernel matching input types (int64, string)"));
+        assert!(err.to_string().contains(
+            "cannot compare int64 with string (int64 > string); compare values of one type"
+        ));
         assert!(resolve(&Operator::Eq, &DataType::Boolean, &DataType::Float64).is_err());
         let ts = |u, tz: Option<&str>| DataType::Timestamp(u, tz.map(Into::into));
         // aware vs naive: the same unit is the ValueError, units that differ no kernel.

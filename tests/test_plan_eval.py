@@ -175,7 +175,7 @@ def test_a_kernel_type_mismatch_is_a_compute_error():
     nodes = ur.from_arrow(TYPED, id="id")
     with pytest.raises(
         ur.ComputeError,
-        match=r"Function 'equal' has no kernel matching input types \(int64, string\)",
+        match=r"^cannot compare int64 with string \(int64 == string\); compare values of one type$",
     ):
         nodes.filter(ur.col("i") == "x").collect()
     with pytest.raises(
@@ -425,45 +425,51 @@ def test_comparisons_keep_the_same_rows_on_every_path(table, pred, kept, tmp_pat
         (
             _table(i=[1, 2]),
             ur.col("i") == "1",
-            r"'equal' has no kernel matching input types \(int64, string\)",
+            r"cannot compare int64 with string \(int64 == string\)",
         ),
-        (_table(f=[1.0, 2.0]), ur.col("f") > "1", r"'greater' has no kernel .* \(double, string\)"),
+        (
+            _table(f=[1.0, 2.0]),
+            ur.col("f") > "1",
+            r"cannot compare double with string \(double > string\)",
+        ),
         (
             _table(ts=pa.array([1, 2], pa.timestamp("us"))),
             ur.col("ts") > "2024-01-01",
-            r"'greater' has no kernel .* \(timestamp\[us\], string\)",
+            r"cannot compare timestamp\[us\] with string",
         ),
         (
             _table(dt=pa.array([datetime.date(2020, 1, 1)])),
             ur.col("dt") < "2020-01-02",
-            r"'less' has no kernel .* \(date32\[day\], string\)",
+            r"cannot compare date32\[day\] with string \(date32\[day\] < string\)",
         ),
-        (_table(i=[1, 2]), ur.col("i") == True, r"no kernel .* \(int64, bool\)"),  # noqa: E712
-        (_table(i=[1, 2]), ur.col("i") == [1, 2], r"no kernel .* \(int64, list<item: int64>\)"),
+        (_table(i=[1, 2]), ur.col("i") == True, r"cannot compare int64 with bool"),  # noqa: E712
+        (_table(i=[1, 2]), ur.col("i") == [1, 2], r"cannot compare int64 with list<item: int64>"),
         (
             _table(du=pa.array([1], pa.duration("s"))),
             ur.col("du") > 1,
-            r"no kernel .* \(duration\[s\], int64\)",
+            r"cannot compare duration\[s\] with int64",
         ),
         # lossy comparisons main refused: an int past 2^53 against a float, a
         # uint64 past 2^63 against a signed int
         (
             _table(i=[2**53 + 1, 2**53]),
             ur.col("i") == float(2**53),
-            r"Integer value 9007199254740993 not in range: -9007199254740992 to 9007199254740992",
+            r"the integer 9007199254740993 does not fit the type both sides are compared as "
+            r"\(range -9007199254740992 to 9007199254740992\)",
         ),
         (
             _table(u=pa.array([2**63 + 1, 5], pa.uint64())),
             ur.col("u") == 5,
-            r"Integer value 9223372036854775809 not in range: 0 to 9223372036854775807",
+            r"the integer 9223372036854775809 does not fit the type both sides are compared as "
+            r"\(range 0 to 9223372036854775807\)",
         ),
         # aware vs naive at different units: no kernel (the same unit is a ValueError)
         (
             _table(ts=pa.array([1, 2], pa.timestamp("ns", "Europe/Paris"))),
             ur.col("ts") > datetime.datetime(2020, 1, 1),
-            r"no kernel .* \(timestamp\[ns, tz=Europe/Paris\], timestamp\[us\]\)",
+            r"cannot compare timestamp\[ns, tz=Europe/Paris\] with timestamp\[us\]",
         ),
-        (_table(i=[1, 2]), (ur.col("i") / 0) > 1, r"Divide by zero"),
+        (_table(i=[1, 2]), (ur.col("i") / 0) > 1, r"division by zero in an integer expression"),
     ],
 )
 def test_comparisons_main_rejected_are_compute_errors_on_every_path(table, pred, message, tmp_path):

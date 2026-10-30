@@ -25,11 +25,17 @@ def capture(convert: Callable[..., Any], *args: Any) -> tuple[Any, BaseException
 
 
 # --- expressions -------------------------------------------------------------
-def expr(e: Any) -> dict[str, Any]:
+def expr(e: Any, where: str = "this argument") -> dict[str, Any]:
     """Serialize an ``Expr`` tree to the JSON grammar of ``ursa_plan::expr``:
     ``col`` / ``lit`` / ``binary`` / ``unary`` / ``agg`` / ``alias``, and the role
     references ``src`` / ``dst`` / ``id``, which the executor resolves to columns
-    for the context the expression runs in."""
+    for the context the expression runs in. A value that is no expression raises
+    the ``AttributeError`` reading it gave, naming ``where`` it was passed."""
+    if not (hasattr(e, "kind") and hasattr(e, "payload")):
+        raise AttributeError(
+            f"{where} takes an ursa expression, such as ur.col('x') or ur.col('x') > 1; "
+            f"got {e!r} ({type(e).__name__})"
+        )
     kind, p = e.kind, e.payload
     if kind == "col":
         return {"kind": "col", "name": p["name"]}
@@ -46,8 +52,8 @@ def expr(e: Any) -> dict[str, Any]:
     return {"kind": kind}
 
 
-def optional_expr(e: Any) -> dict[str, Any] | None:
-    return None if e is None else expr(e)
+def optional_expr(e: Any, where: str = "this argument") -> dict[str, Any] | None:
+    return None if e is None else expr(e, where)
 
 
 def column(e: Any) -> tuple[dict[str, Any], Any]:
@@ -58,16 +64,45 @@ def column(e: Any) -> tuple[dict[str, Any], Any]:
         return (expr(e) if hasattr(e, "kind") else {"kind": "unknown"}), None
     out: dict[str, Any] = {"kind": "graph"}
     edges = None
+    call = _verb_call(e.payload.get("verb"))
     for key, value in e.payload.items():
         if key == "edges":
-            edges = None if value is None else value._node
+            edges = None if value is None else edges_node(value, call)
         elif key in ("weight", "agg"):
-            out[key] = optional_expr(value)
+            out[key] = optional_expr(value, f"{call}({key}=)")
         elif key == "from_":
             out[key] = value is not None
         else:
             out[key] = value
     return out, edges
+
+
+def _verb_call(verb: Any) -> str:
+    """The call a graph verb is written as (``pagerank``, ``neighbors().agg``)."""
+    return "neighbors().agg" if verb == "neighbors_agg" else str(verb)
+
+
+def edges_node(edges: Any, call: str) -> Any:
+    """The plan of the edge frame a graph verb or traversal ``call`` runs over;
+    for a value that is no frame, the ``AttributeError`` reading its plan gave,
+    naming the call."""
+    node = getattr(edges, "_node", None)
+    if node is None:
+        raise AttributeError(
+            f"{call}() takes an EdgeFrame (the graph) as its edges; got {type(edges).__name__}"
+        )
+    return node
+
+
+def count(n: Any, call: str) -> int:
+    """A row count argument (``head(n)``, ``sample(n)``) as ``int(n)`` reads it,
+    with the exception ``int`` raised naming the call."""
+    try:
+        return int(n)
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(
+            f"{call} takes an integer row count; got {n!r} ({type(n).__name__})"
+        ) from None
 
 
 def _lit(value: Any) -> dict[str, Any]:
@@ -209,7 +244,24 @@ def select_items(columns: Any) -> list[Any]:
 
 
 def rename_mapping(mapping: Any) -> list[list[str]]:
-    return [[old, new] for old, new in dict(mapping).items()]
+    """The ``rename({old: new})`` pairs. A mapping ``dict()`` can't read, or a name
+    that is no string, raises the exception it always did (``dict()``'s, or the
+    plan's ``ValueError``/``TypeError``), worded for ``rename()``."""
+    try:
+        pairs = dict(mapping).items()
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(
+            f"rename() takes a dict of {{old: new}} column names; got {mapping!r} "
+            f"({type(mapping).__name__})"
+        ) from None
+    for name in (n for pair in pairs for n in pair):
+        if not isinstance(name, str):
+            json_like = name is None or isinstance(name, (bool, int, float, list, tuple, dict))
+            raise (ValueError if json_like or hasattr(name, "__index__") else TypeError)(
+                f"rename() maps column names to new names, both strings; got {name!r} "
+                f"({type(name).__name__})"
+            )
+    return [[old, new] for old, new in pairs]
 
 
 def sort_keys(by: Any, descending: Any) -> list[dict[str, Any]]:

@@ -68,6 +68,8 @@ def _sample(draw: tuple[int, Any], rows: int) -> list[int] | None:
     import random
 
     n, seed = draw
+    if n < 0:
+        raise ValueError(f"sample(n=) must be a non-negative row count; got {n}")
     if n >= rows:
         return None
     rng = random.Random(seed if seed is not None else _DEFAULT_SAMPLE_SEED)

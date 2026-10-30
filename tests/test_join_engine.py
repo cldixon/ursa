@@ -415,7 +415,7 @@ def test_a_left_side_error_comes_before_the_right_sides():
     left = ur.from_arrow(pa.table({"id": [0, 1], "a": [1, 2], "z": [0, 0]}), id="id")
     left = left.with_columns(q=ur.col("a") / ur.col("z"))
     right = ur.from_arrow(pa.table({"id": [0], "b": [1]}), id="id")
-    with pytest.raises(ur.ComputeError, match="Divide by zero"):
+    with pytest.raises(ur.ComputeError, match="division by zero in an integer expression"):
         left.join(right, on="id").collect()
     # What the plan alone shows is raised where the join is added (#193): a key
     # missing from the right side, even before the left side's run-time error.

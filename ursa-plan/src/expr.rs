@@ -150,19 +150,50 @@ fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option
 
 impl GraphVerb {
     /// A parameter typed as `T` (`None` when absent or null). A value of the wrong
-    /// type is an engine error, as for any malformed column spec.
-    pub fn param<T: serde::de::DeserializeOwned>(value: &Option<Value>) -> Result<Option<T>> {
+    /// type is an engine error naming the parameter
+    /// (`pagerank(max_iter=) must be a non-negative integer; got -1`).
+    pub fn param<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        value: &Option<Value>,
+    ) -> Result<Option<T>> {
         match value {
             None | Some(Value::Null) => Ok(None),
-            Some(v) => serde_json::from_value(v.clone())
-                .map(Some)
-                .map_err(|e| DataFusionError::Execution(format!("invalid columns spec: {e}"))),
+            Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|e| {
+                let e = e.to_string();
+                let want = if e.contains("expected f64") {
+                    "a number"
+                } else if e.contains("expected u32") {
+                    "a non-negative integer below 2**32"
+                } else if e.contains("expected u64") || e.contains("expected usize") {
+                    "a non-negative integer"
+                } else if e.contains("expected a string") {
+                    "a string"
+                } else {
+                    "a valid value"
+                };
+                DataFusionError::Execution(format!(
+                    "{}({name}=) must be {want}; got {}",
+                    self.call_name(),
+                    py_repr(v)
+                ))
+            }),
+        }
+    }
+
+    /// The call this verb is written as (`pagerank`, `neighbors().agg`).
+    pub fn call_name(&self) -> &str {
+        match self.verb.as_str() {
+            "neighbors_agg" => "neighbors().agg",
+            other => other,
         }
     }
 
     /// The `direction` parameter (`"out"` when absent).
     pub fn direction(&self) -> Result<String> {
-        Ok(Self::param::<String>(&self.direction)?.unwrap_or_else(|| "out".into()))
+        Ok(self
+            .param::<String>("direction", &self.direction)?
+            .unwrap_or_else(|| "out".into()))
     }
 
     /// Parse a `{"kind": "graph", ...}` node.
@@ -188,6 +219,17 @@ impl GraphVerb {
             return None;
         }
         operand.get("name")?.as_str()
+    }
+}
+
+/// A JSON argument as Python prints it (`'x'`, `1.5`, `True`, `None`).
+pub fn py_repr(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("{s:?}").replace('"', "'"),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        Value::Null => "None".into(),
+        other => other.to_string(),
     }
 }
 

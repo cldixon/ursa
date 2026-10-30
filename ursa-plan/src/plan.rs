@@ -278,8 +278,9 @@ pub enum ScanPath {
 }
 
 /// An integer argument, as given. The engine converts it where it reads it, with
-/// the errors a Python integer conversion gives (`OverflowError`, `TypeError`).
-/// A host value with no JSON form is sent as `{"type": <type name>}`.
+/// the exceptions a Python integer conversion raises (`OverflowError`,
+/// `TypeError`), each naming the argument (`name`, as `hop(n=)`). A host value
+/// with no JSON form is sent as `{"type": <type name>}`.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(transparent)]
 pub struct IntArg(pub Value);
@@ -309,18 +310,20 @@ impl IntArg {
             Value::Object(o) => o.get("type").and_then(Value::as_str).unwrap_or("object"),
         };
         Err(PlanError::Type(format!(
-            "argument '{name}': '{ty}' object cannot be interpreted as an integer"
+            "{name} must be an integer; got a {ty}"
         )))
     }
 
     /// As a `u64`/`usize` argument.
     pub fn u64(&self, name: &str) -> PlanResult<u64> {
         match self.int(name)? {
-            Some(i) if i < 0 => Err(PlanError::Overflow(
-                "can't convert negative int to unsigned".into(),
-            )),
+            Some(i) if i < 0 => Err(PlanError::Overflow(format!(
+                "{name} must be a non-negative integer; got {i}"
+            ))),
             Some(i) if i <= u64::MAX as i128 => Ok(i as u64),
-            _ => Err(PlanError::Overflow("int too big to convert".into())),
+            _ => Err(PlanError::Overflow(format!(
+                "{name} is too large; it must be below 2**64"
+            ))),
         }
     }
 
@@ -332,9 +335,12 @@ impl IntArg {
     pub fn u32(&self, name: &str) -> PlanResult<u32> {
         match self.int(name)? {
             Some(i) if (0..=u32::MAX as i128).contains(&i) => Ok(i as u32),
-            _ => Err(PlanError::Overflow(
-                "out of range integral type conversion attempted".into(),
-            )),
+            Some(i) if i < 0 => Err(PlanError::Overflow(format!(
+                "{name} must be a non-negative integer; got {i}"
+            ))),
+            _ => Err(PlanError::Overflow(format!(
+                "{name} is too large; it must be below 2**32"
+            ))),
         }
     }
 }
@@ -544,8 +550,16 @@ pub(crate) const COLUMN_OPS: [&str; 3] = ["select", "rename", "with_columns"];
 
 /// The message for a `with_columns` of a graph verb on an edge frame.
 pub(crate) const EDGE_WITH_COLUMNS: &str =
-    "collect() does not yet support the 'with_columns' step on an \
-     edge frame.";
+    "with_columns() of a graph verb is not supported on an edge frame; graph columns \
+     belong on the node frame: edges.nodes().with_columns(...).";
+
+/// The call a plan step is written as (`filter()`, `group_by().agg()`).
+pub(crate) fn step_call(op: &str) -> String {
+    match op {
+        "group_by_agg" => "group_by().agg()".into(),
+        other => format!("{other}()"),
+    }
+}
 
 impl EdgeInput {
     /// Split the edge plan into its [`EdgeView`], rejecting the edge plans a graph
@@ -1103,13 +1117,22 @@ impl fmt::Display for PlanError {
             | PlanError::Overflow(m)
             | PlanError::Wrapped { message: m, .. } => f.write_str(m),
             PlanError::Invalid(m) => write!(f, "invalid plan: {m}"),
-            PlanError::Engine(e) => write!(f, "{e}"),
+            PlanError::Engine(e) => f.write_str(&crate::message::engine_message(e)),
             PlanError::Host(e) => f.write_str(&e.message),
         }
     }
 }
 
-impl std::error::Error for PlanError {}
+impl std::error::Error for PlanError {
+    /// The engine error a user-facing message was worded from.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PlanError::Engine(e) => Some(e),
+            PlanError::Wrapped { cause, .. } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<DataFusionError> for PlanError {
     fn from(e: DataFusionError) -> Self {
@@ -1510,7 +1533,7 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
         let mut scratch = Scratch::default();
         let index = view_index(&view, inputs, &mut scratch)?;
         let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
-        let dir = parse_stat_direction(direction)?;
+        let dir = parse_stat_direction("describe", direction)?;
         let summary = describe_masked(&index.topo, mask.as_deref(), *full, dir)?;
         if steps.is_empty() {
             return Ok(Built::Rows(Rows::Batches(vec![summary])));
@@ -1571,7 +1594,9 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
             }
             _ if !is_tail(step) => {
                 return not_implemented(format!(
-                    "collect() does not yet support the '{op}' step in a composed pipeline."
+                    "{} is not supported at this point in the pipeline yet; collect() the frame \
+                     before it and build a new frame with ur.from_arrow(...) first.",
+                    step_call(op)
                 ));
             }
             _ => {}
@@ -1683,8 +1708,9 @@ fn leaf_steps<'a>(
             _ if is_tail(s) => {}
             _ => {
                 return not_implemented(format!(
-                    "collect() does not yet support the '{}' step after {leaf}.",
-                    s.op()
+                    "{} after {leaf} is not supported yet; collect() the result and build a new \
+                     frame from it with ur.from_arrow(...) first.",
+                    step_call(s.op())
                 ))
             }
         }
@@ -2033,7 +2059,16 @@ pub(crate) fn scalar_check(
         kind(v),
         "col" | "lit" | "binary" | "unary" | "src" | "dst" | "id" | "alias"
     ) {
-        return not_implemented(NON_GRAPH_COLUMN);
+        return not_implemented(if what == "with_columns()" {
+            NON_GRAPH_COLUMN.to_string()
+        } else {
+            format!(
+                "{what} takes column names or expressions over columns: ur.col(...), \
+                 ur.lit(...), and arithmetic and comparisons over them; got a value of another \
+                 kind (an aggregation belongs in group_by().agg(), a graph verb in \
+                 with_columns())."
+            )
+        });
     }
     check_literals(v, what)?;
     let v = resolve_roles(v, roles)?;
@@ -2272,9 +2307,11 @@ fn weight_columns(table: &[RecordBatch], columns: &[String]) -> PlanResult<Vec<R
         .filter(|c| schema.index_of(c).is_err())
         .collect();
     if !missing.is_empty() {
+        let have: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         return Err(PlanError::ColumnNotFound(format!(
-            "weight expression references unknown edge column(s): {}",
-            py_list(missing.into_iter())
+            "weight expression references unknown edge column(s): {}; the edges have {}",
+            py_list(missing.into_iter()),
+            py_list(have.iter())
         )));
     }
     let indices: Vec<usize> = columns
@@ -2492,8 +2529,8 @@ fn reached_nodes(
                 .into_iter()
                 .flatten()
                 .collect();
-            let n = n.u32("n")?;
-            let dir: ursa_core::Direction = parse_direction(direction)?.into();
+            let n = n.u32("hop(n=)")?;
+            let dir: ursa_core::Direction = parse_direction("hop", direction)?.into();
             reached = ursa_core::algo::k_hop_reached_masked(topo, within, &dense, n, dir);
         }
         Plan::ShortestPath {
@@ -2521,7 +2558,7 @@ fn reached_nodes(
                     )
                 }
             };
-            let dir: ursa_core::Direction = parse_direction(direction)?.into();
+            let dir: ursa_core::Direction = parse_direction("shortest_path", direction)?.into();
             let s = resolve_dense(ids, s.as_ref())?.into_iter().next().flatten();
             let t = resolve_dense(ids, t.as_ref())?.into_iter().next().flatten();
             let path = match (s, t) {
@@ -2692,7 +2729,9 @@ fn random_walk_frame(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanR
             _ if is_tail(s) => {}
             _ => {
                 return not_implemented(format!(
-                    "collect() does not yet support the '{op}' step after a random_walk."
+                    "{} after random_walk() is not supported yet; collect() the walk and build a \
+                     new frame from it with ur.from_arrow(...) first.",
+                    step_call(op)
                 ))
             }
         }
@@ -2712,9 +2751,9 @@ fn random_walk_frame(chain: &[&Plan], walk: &Plan, inputs: &dyn Inputs) -> PlanR
         index.ids,
         mask,
         starts.as_ref(),
-        n_steps.u32("steps")?,
-        walks_per_node.u32("walks_per_node")?,
-        seed_arg(seed, "seed")?,
+        n_steps.u32("random_walk(steps=)")?,
+        walks_per_node.u32("random_walk(walks_per_node=)")?,
+        seed_arg(seed, "random_walk(seed=)")?,
     )?;
     let frame = Frame::from_ordered(ctx, leaf);
     // Walk output columns are (walk_id, step, node); no role applies.
@@ -2766,9 +2805,15 @@ fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
                 steps.push(step);
             }
             _ => {
-                return not_implemented(format!(
-                    "collect() does not yet support the '{op}' step on an edge frame."
-                ))
+                return not_implemented(if op == "with_columns" {
+                    EDGE_WITH_COLUMNS.to_string()
+                } else {
+                    format!(
+                        "{} is not supported on an edge frame yet; collect() the edges and build \
+                         a new frame with ur.from_arrow(...) first.",
+                        step_call(op)
+                    )
+                })
             }
         }
     }
@@ -2814,7 +2859,7 @@ fn edge_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
                 index.ids,
                 mask,
                 seeds.as_ref(),
-                n.u32("n")?,
+                n.u32("hop(n=)")?,
                 direction,
             )?;
             Frame::from_ordered(ctx, leaf)
@@ -3134,7 +3179,7 @@ pub(crate) fn group_by_check(view: &dyn View, keys: &[String], aggs: &[AggSpec])
 
 /// A `head` count: a negative one keeps no rows, as a slice of that length did.
 fn head_n(n: &IntArg) -> PlanResult<usize> {
-    Ok(match n.int("n")? {
+    Ok(match n.int("head(n=)")? {
         Some(i) if i < 0 => 0,
         Some(i) => usize::try_from(i).unwrap_or(usize::MAX),
         None => usize::MAX,
@@ -3551,22 +3596,24 @@ fn check_step(step: &Plan, inputs: &dyn Inputs) -> PlanResult<()> {
 }
 
 /// Reject a literal the host could not put in JSON (`{"kind": "lit",
-/// "unrepresentable": <type>}`), with the error serializing it used to raise:
-/// a `TypeError` for a value of another type, an engine JSON error for a
-/// non-finite float. The host's own evaluator still reads the original value.
+/// "unrepresentable": <type>}`): a `TypeError` naming its type, or an engine
+/// error for a non-finite float. The host's own evaluator still reads the
+/// original value.
 pub(crate) fn check_literals(v: &Value, what: &str) -> PlanResult<()> {
     if kind(v) == "lit" {
         if let Some(ty) = v.get("unrepresentable").and_then(Value::as_str) {
             if ty == "float" {
                 return Err(PlanError::Engine(DataFusionError::Execution(format!(
-                    "invalid {what} expression JSON: NaN and infinity have no JSON form"
+                    "NaN and infinity are not supported as literals in a {what} expression"
                 ))));
             }
             if let Some(reason) = v.get("reason").and_then(Value::as_str) {
                 return Err(PlanError::Type(reason.to_string()));
             }
             return Err(PlanError::Type(format!(
-                "Object of type {ty} is not JSON serializable"
+                "a literal of type '{ty}' is not supported in a {what} expression; use a bool, \
+                 int, float, str or None, a date, time, datetime or timedelta, a Decimal or \
+                 bytes"
             )));
         }
     }
@@ -4331,24 +4378,30 @@ mod tests {
         assert_eq!(arg(serde_json::json!(true)).u32("n").unwrap(), 1);
         let msg = |e: PlanError| e.to_string();
         assert_eq!(
-            msg(arg(serde_json::json!(-1)).u64("n").unwrap_err()),
-            "can't convert negative int to unsigned"
+            msg(arg(serde_json::json!(-1)).u64("hop(n=)").unwrap_err()),
+            "hop(n=) must be a non-negative integer; got -1"
         );
         assert_eq!(
-            msg(arg(serde_json::json!(1e21)).u64("n").unwrap_err()),
-            "int too big to convert"
+            msg(arg(serde_json::json!(1e21)).u64("hop(n=)").unwrap_err()),
+            "hop(n=) is too large; it must be below 2**64"
         );
         assert_eq!(
-            msg(arg(serde_json::json!(-1)).u32("n").unwrap_err()),
-            "out of range integral type conversion attempted"
+            msg(arg(serde_json::json!(-1)).u32("hop(n=)").unwrap_err()),
+            "hop(n=) must be a non-negative integer; got -1"
+        );
+        assert_eq!(
+            msg(arg(serde_json::json!(1u64 << 40))
+                .u32("hop(n=)")
+                .unwrap_err()),
+            "hop(n=) is too large; it must be below 2**32"
         );
         assert!(matches!(
-            arg(serde_json::json!("x")).u64("seed"),
-            Err(PlanError::Type(m)) if m == "argument 'seed': 'str' object cannot be interpreted as an integer"
+            arg(serde_json::json!("x")).u64("random_walk(seed=)"),
+            Err(PlanError::Type(m)) if m == "random_walk(seed=) must be an integer; got a str"
         ));
         assert!(matches!(
             arg(serde_json::json!({"type": "Decimal"})).u64("seed"),
-            Err(PlanError::Type(m)) if m.contains("'Decimal' object")
+            Err(PlanError::Type(m)) if m.ends_with("got a Decimal")
         ));
     }
 

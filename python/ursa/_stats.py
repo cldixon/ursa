@@ -14,6 +14,7 @@ whole graph it gives the same value as ``"out"``.
 
 from __future__ import annotations
 
+from . import _ir
 from ._frames import EdgeFrame, NodeFrame, _native
 
 
@@ -46,7 +47,9 @@ def describe(edges: EdgeFrame, full: bool = False, direction: str = "out") -> No
     rather than derive node-keyed frames from it).
     """
     _check_direction("describe", direction)
-    return NodeFrame._wrap(_native().PlanNode.describe(edges._node, bool(full), direction))
+    return NodeFrame._wrap(
+        _native().PlanNode.describe(_ir.edges_node(edges, "describe"), bool(full), direction)
+    )
 
 
 def density(edges: EdgeFrame, direction: str = "out") -> float:
@@ -63,7 +66,7 @@ def density(edges: EdgeFrame, direction: str = "out") -> float:
     ``nx.density(G.to_undirected())`` for a graph without self-loops.
     """
     _check_direction("density", direction)
-    return float(_native().graph_density(edges._node.graph_index(), direction))
+    return float(_native().graph_density(_ir.edges_node(edges, "density").graph_index(), direction))
 
 
 def avg_path_length(edges: EdgeFrame, sample: float | None = None, direction: str = "out") -> float:
@@ -73,7 +76,11 @@ def avg_path_length(edges: EdgeFrame, sample: float | None = None, direction: st
     graph. ``sample`` (a fraction in (0, 1]) estimates from a subset of sources;
     omit for the exact mean."""
     _check_direction("avg_path_length", direction)
-    return float(_native().graph_avg_path_length(edges._node.graph_index(), sample, direction))
+    return float(
+        _native().graph_avg_path_length(
+            _ir.edges_node(edges, "avg_path_length").graph_index(), sample, direction
+        )
+    )
 
 
 def diameter(edges: EdgeFrame, approximate: bool = True, direction: str = "out") -> int:
@@ -83,4 +90,8 @@ def diameter(edges: EdgeFrame, approximate: bool = True, direction: str = "out")
     graph. ``approximate`` (default) is a lower-bound estimate; pass
     ``approximate=False`` for the exact value."""
     _check_direction("diameter", direction)
-    return int(_native().graph_diameter(edges._node.graph_index(), approximate, direction))
+    return int(
+        _native().graph_diameter(
+            _ir.edges_node(edges, "diameter").graph_index(), approximate, direction
+        )
+    )
