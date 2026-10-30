@@ -41,9 +41,9 @@ nodes = ur.NodeFrame(
 
 You get a `NodeFrame` in three ways:
 
-- `edges.nodes()` gives the distinct ids in `src` and `dst`, with no attributes. Add at least one column before you collect it.
+- `edges.nodes()` gives the distinct ids in `src` and `dst`, with no attributes.
 - The `NodeFrame(...)` constructor, `ur.scan_nodes(...)`, or an interop function gives a table you supply.
-- A standalone algorithm call such as `ur.pagerank(edges)` acts as a `NodeFrame` of `(id, pagerank)`.
+- A standalone algorithm call such as `ur.pagerank(edges)` is a `NodeFrame` of `(id, pagerank)`, with every frame method: `ur.pagerank(edges).join(ur.degree(edges), on="id")` works.
 
 When you call `nodes.with_columns(pagerank=ur.pagerank(edges))`, Ursa joins the computed values to your table by id. The join is a left join: every row of your table stays.
 

@@ -1,8 +1,10 @@
 //! Whole-graph scalar statistics.
 //!
-//! These are the spec's deliberate *eager* exceptions to laziness: they build the
-//! topology and return a plain number. `density` needs only node and edge counts;
-//! `diameter` / `avg_path_length` run BFS from a set of source nodes.
+//! `density` needs only node and edge counts; `diameter` / `avg_path_length` run
+//! BFS from a set of source nodes. Each runs over a subgraph view (#210): the
+//! parent's topology and an optional [`EdgeMask`] of the edge rows it keeps,
+//! as `describe` and every graph op read it. A plan runs them as a one-row frame
+//! ([`stat_batch`], the `ur.density(...)` family).
 //!
 //! Every stat takes a [`Direction`]. `Out` (the default everywhere) reads the rows
 //! as stored. `In` follows in-edges; over the whole graph it gives the same value
@@ -15,15 +17,77 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result};
+use serde::{Deserialize, Serialize};
 use ursa_core::algo::connected_components_weak;
 use ursa_core::{Direction, EdgeMask, Topology};
 
 /// Parse a stat's `direction` argument (`"out"`, `"in"` or `"both"`).
 pub fn parse_stat_direction(d: &str) -> Result<Direction> {
     Ok(crate::query::parse_direction(d)?.into())
+}
+
+/// A scalar whole-graph stat, as a plan names it: `ur.density`,
+/// `ur.avg_path_length` and `ur.diameter`, each a one-row frame of one column
+/// named after the stat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "stat", rename_all = "snake_case")]
+pub enum GraphStat {
+    Density,
+    AvgPathLength {
+        #[serde(default)]
+        sample: Option<f64>,
+    },
+    Diameter {
+        approximate: bool,
+    },
+}
+
+impl GraphStat {
+    /// The stat's name: its function's, and its column's.
+    pub fn name(&self) -> &'static str {
+        match self {
+            GraphStat::Density => "density",
+            GraphStat::AvgPathLength { .. } => "avg_path_length",
+            GraphStat::Diameter { .. } => "diameter",
+        }
+    }
+
+    /// The type of the stat's column.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            GraphStat::Diameter { .. } => DataType::Int64,
+            _ => DataType::Float64,
+        }
+    }
+}
+
+/// Parse `describe(nodes=)`: whether it describes only the touched nodes.
+/// `shown` is the argument as the caller wrote it, for the error; `None` for
+/// `nodes` is an argument that is not a string.
+pub fn parse_describe_nodes(nodes: Option<&str>, shown: &str) -> crate::PlanResult<bool> {
+    match nodes {
+        Some("all") => Ok(false),
+        Some("touched") => Ok(true),
+        _ => Err(crate::PlanError::Value(format!(
+            "describe(nodes={shown}) is not supported; use 'all' or 'touched'."
+        ))),
+    }
+}
+
+/// The nodes at an end of an edge row `mask` keeps, in node order.
+fn touched_nodes(topo: &Topology, mask: &EdgeMask) -> Vec<u32> {
+    let n = topo.n_nodes();
+    let mut seen = vec![false; n];
+    for u in 0..n as u32 {
+        topo.for_each_neighbor(u, Direction::Out, Some(mask), |v| {
+            seen[u as usize] = true;
+            seen[v as usize] = true;
+        });
+    }
+    (0..n as u32).filter(|&u| seen[u as usize]).collect()
 }
 
 /// The edge count a stat reads under `dir`: the stored row count for `Out`/`In`,
@@ -91,26 +155,38 @@ pub fn density(topology: &Topology, dir: Direction) -> Result<f64> {
 /// density and `avg_degree` the mean undirected degree (`2 * m_u / n`).
 /// `n_components` is always the weak (undirected) count.
 pub fn describe(topology: &Topology, full: bool, dir: Direction) -> Result<RecordBatch> {
-    describe_masked(topology, None, full, dir)
+    describe_masked(topology, None, full, dir, false)
 }
 
 /// [`describe`] over a subgraph view (#207): the parent's node set, and only the
 /// edge rows `mask` keeps for `n_edges`, `density`, `avg_degree` and
 /// `n_components` — what `degree` and the other graph ops read over the same
 /// view. `None` is the whole graph.
+///
+/// With `touched` (`describe(nodes="touched")`, #213) the node set is only the
+/// nodes at an end of a kept edge: `n_nodes` counts them, `density` and
+/// `avg_degree` divide by that count, and `n_components` leaves out the parent's
+/// other nodes (each its own component in the view). Over the whole graph every
+/// node is at an end of an edge, so it changes nothing there.
 pub fn describe_masked(
     topology: &Topology,
     mask: Option<&EdgeMask>,
     full: bool,
     dir: Direction,
+    touched: bool,
 ) -> Result<RecordBatch> {
-    let n_nodes = topology.n_nodes() as i64;
+    let all_nodes = topology.n_nodes();
+    let n = match mask {
+        Some(m) if touched => touched_nodes(topology, m).len(),
+        _ => all_nodes,
+    };
+    let n_nodes = n as i64;
     let edges = match mask {
         Some(m) => masked_edge_count(topology, m, dir),
         None => edge_count(topology, dir),
     };
     let n_edges = edges as i64;
-    let density = density_from(topology.n_nodes(), edges, dir);
+    let density = density_from(n, edges, dir);
     let endpoints_per_edge = if dir == Direction::Both { 2.0 } else { 1.0 };
     let avg_degree = if n_nodes == 0 {
         0.0
@@ -127,7 +203,8 @@ pub fn describe_masked(
                 distinct += 1;
             }
         }
-        Some(distinct)
+        // The untouched nodes are each a component of their own in the view.
+        Some(distinct - (all_nodes - n) as i64)
     } else {
         None
     };
@@ -189,7 +266,13 @@ struct ScanScratch {
 /// scratch (clean on entry, reset to clean on exit). The distances are integers,
 /// so the `f64` sum is exact and summing the reached set in discovery order
 /// matches the original `0..n` scan.
-fn bfs_fold_one(topo: &Topology, s: u32, dir: Direction, sc: &mut ScanScratch) -> (f64, u64, i32) {
+fn bfs_fold_one(
+    topo: &Topology,
+    s: u32,
+    dir: Direction,
+    mask: Option<&EdgeMask>,
+    sc: &mut ScanScratch,
+) -> (f64, u64, i32) {
     let ScanScratch {
         dist,
         frontier,
@@ -205,7 +288,7 @@ fn bfs_fold_one(topo: &Topology, s: u32, dir: Direction, sc: &mut ScanScratch) -
     while !frontier.is_empty() {
         next.clear();
         for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, None, |v| {
+            topo.for_each_neighbor(u, dir, mask, |v| {
                 if dist[v as usize] < 0 {
                     dist[v as usize] = level;
                     next.push(v);
@@ -234,13 +317,19 @@ fn bfs_fold_one(topo: &Topology, s: u32, dir: Direction, sc: &mut ScanScratch) -
 /// Run BFS from each source and fold the finite distances (`>= 1`, i.e. reachable
 /// and not the source itself). Returns `(sum, count, max)` over all reachable
 /// ordered pairs from the sampled sources — the shared core of both path stats.
+/// With a `mask`, the BFS follows only the edge rows it keeps.
 ///
 /// Each source's BFS is independent (O(n·m) overall), so they run in parallel
 /// (rayon), each rayon worker reusing one [`ScanScratch`]. Per-source partials are
 /// collected in source order and then folded sequentially, so the `sum` is reduced
 /// in a fixed order — the total is deterministic run to run regardless of thread
 /// scheduling.
-fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u64, i32) {
+fn bfs_source_scan(
+    topo: &Topology,
+    sources: &[u32],
+    dir: Direction,
+    mask: Option<&EdgeMask>,
+) -> (f64, u64, i32) {
     if dir != Direction::Out {
         // Build the cached transpose once, before the parallel scan requests it.
         topo.incoming();
@@ -255,7 +344,7 @@ fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u6
                 next: Vec::new(),
                 touched: Vec::new(),
             },
-            |sc, &s| bfs_fold_one(topo, s, dir, sc),
+            |sc, &s| bfs_fold_one(topo, s, dir, mask, sc),
         )
         .collect();
 
@@ -272,6 +361,24 @@ fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u6
     (sum, count, max)
 }
 
+/// The BFS sources a path stat may pick from: every node over the whole graph,
+/// or over a view only the nodes at an end of a kept edge (the others reach
+/// nothing and are reached by nothing).
+fn candidate_sources(topo: &Topology, mask: Option<&EdgeMask>) -> Option<Vec<u32>> {
+    mask.map(|m| touched_nodes(topo, m))
+}
+
+/// [`sample_sources`] over `candidates` (`None`: every node of `topo`).
+fn pick_sources(topo: &Topology, candidates: Option<&[u32]>, frac: Option<f64>) -> Vec<u32> {
+    match candidates {
+        None => sample_sources(topo.n_nodes(), frac),
+        Some(c) => sample_sources(c.len(), frac)
+            .into_iter()
+            .map(|i| c[i as usize])
+            .collect(),
+    }
+}
+
 /// Average shortest-path length over reachable ordered pairs, following edges in
 /// `dir` (`Both` ignores direction: the undirected value, which counts each
 /// unordered pair from both ends and so has the same mean as NetworkX's
@@ -280,8 +387,21 @@ fn bfs_source_scan(topo: &Topology, sources: &[u32], dir: Direction) -> (f64, u6
 /// subsample of sources. Disconnected graphs count only their reachable pairs; a
 /// graph with no reachable pair returns `0.0`.
 pub fn avg_path_length(topology: &Topology, sample: Option<f64>, dir: Direction) -> Result<f64> {
-    let sources = sample_sources(topology.n_nodes(), sample);
-    let (sum, count, _max) = bfs_source_scan(topology, &sources, dir);
+    avg_path_length_masked(topology, None, sample, dir)
+}
+
+/// [`avg_path_length`] over a subgraph view (#210): only the edge rows `mask`
+/// keeps are followed, and a sample draws its sources from the nodes at an end
+/// of a kept edge.
+pub fn avg_path_length_masked(
+    topology: &Topology,
+    mask: Option<&EdgeMask>,
+    sample: Option<f64>,
+    dir: Direction,
+) -> Result<f64> {
+    let candidates = candidate_sources(topology, mask);
+    let sources = pick_sources(topology, candidates.as_deref(), sample);
+    let (sum, count, _max) = bfs_source_scan(topology, &sources, dir, mask);
     Ok(if count == 0 { 0.0 } else { sum / count as f64 })
 }
 
@@ -291,16 +411,68 @@ pub fn avg_path_length(topology: &Topology, sample: Option<f64>, dir: Direction)
 /// `approximate=true` (the default) is a lower-bound estimate from a bounded
 /// deterministic sample of sources. Returns `0` when no pair is reachable.
 pub fn diameter(topology: &Topology, approximate: bool, dir: Direction) -> Result<i64> {
-    let n = topology.n_nodes();
+    diameter_masked(topology, None, approximate, dir)
+}
+
+/// [`diameter`] over a subgraph view (#210): only the edge rows `mask` keeps
+/// are followed, and the approximate estimate samples its sources from the
+/// nodes at an end of a kept edge.
+pub fn diameter_masked(
+    topology: &Topology,
+    mask: Option<&EdgeMask>,
+    approximate: bool,
+    dir: Direction,
+) -> Result<i64> {
+    let candidates = candidate_sources(topology, mask);
+    let n = candidates.as_ref().map_or(topology.n_nodes(), Vec::len);
     // Approximate: sample a bounded number of sources (deterministic stride).
-    let sources = if approximate && n > 0 {
-        let frac = (128.0 / n as f64).min(1.0);
-        sample_sources(n, Some(frac))
-    } else {
-        sample_sources(n, None)
-    };
-    let (_sum, _count, max) = bfs_source_scan(topology, &sources, dir);
+    let frac = (approximate && n > 0).then(|| (128.0 / n as f64).min(1.0));
+    let sources = pick_sources(topology, candidates.as_deref(), frac);
+    let (_sum, _count, max) = bfs_source_scan(topology, &sources, dir, mask);
     Ok(max as i64)
+}
+
+/// [`density`] over a subgraph view (#210): the parent's node count, and the
+/// edge rows `mask` keeps, as [`describe_masked`] reports it.
+pub fn density_masked(topology: &Topology, mask: Option<&EdgeMask>, dir: Direction) -> f64 {
+    let edges = match mask {
+        Some(m) => masked_edge_count(topology, m, dir),
+        None => edge_count(topology, dir),
+    };
+    density_from(topology.n_nodes(), edges, dir)
+}
+
+/// A scalar stat over a subgraph view, as its one-row frame: one non-null
+/// column named after the stat.
+pub fn stat_batch(
+    topology: &Topology,
+    mask: Option<&EdgeMask>,
+    stat: &GraphStat,
+    dir: Direction,
+) -> Result<RecordBatch> {
+    let value: ArrayRef = match stat {
+        GraphStat::Density => Arc::new(Float64Array::from(vec![density_masked(
+            topology, mask, dir,
+        )])),
+        GraphStat::AvgPathLength { sample } => {
+            Arc::new(Float64Array::from(vec![avg_path_length_masked(
+                topology, mask, *sample, dir,
+            )?]))
+        }
+        GraphStat::Diameter { approximate } => Arc::new(Int64Array::from(vec![diameter_masked(
+            topology,
+            mask,
+            *approximate,
+            dir,
+        )?])),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        stat.name(),
+        stat.data_type(),
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![value])
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 #[cfg(test)]
@@ -377,7 +549,7 @@ mod tests {
         let t = topo(&[0, 0, 1, 2], &[1, 2, 2, 3]);
         let mask = EdgeMask::from_bools(&[false, true, true, false]);
         let row = |dir| {
-            let b = describe_masked(&t, Some(&mask), true, dir).unwrap();
+            let b = describe_masked(&t, Some(&mask), true, dir, false).unwrap();
             let col = |name: &str| b.column(b.schema().index_of(name).unwrap()).clone();
             let i = |name: &str| {
                 col(name)
@@ -405,7 +577,7 @@ mod tests {
         assert_eq!(row(Direction::Both), (4, 2, 2.0 / 6.0, 1.0, 2));
         // No mask is the whole graph, as `describe` reports it.
         assert_eq!(
-            describe_masked(&t, None, true, Direction::Out).unwrap(),
+            describe_masked(&t, None, true, Direction::Out, false).unwrap(),
             describe(&t, true, Direction::Out).unwrap()
         );
     }
@@ -529,11 +701,121 @@ mod tests {
                     }
                     sum += ps;
                 }
-                let got = bfs_source_scan(&t, &sources, dir);
+                let got = bfs_source_scan(&t, &sources, dir, None);
                 assert_eq!(got.0.to_bits(), sum.to_bits(), "{dir:?}");
                 assert_eq!((got.1, got.2), (count, max), "{dir:?}");
             }
         }
+    }
+
+    #[test]
+    fn masked_stats_read_only_the_kept_edges() {
+        // #210: 0->1, 0->2, 1->2, 2->3 with 0->2 and 1->2 kept.
+        let t = topo(&[0, 0, 1, 2], &[1, 2, 2, 3]);
+        let mask = EdgeMask::from_bools(&[false, true, true, false]);
+        let m = Some(&mask);
+        assert_eq!(density_masked(&t, m, Direction::Out), 2.0 / 12.0);
+        assert_eq!(diameter_masked(&t, m, false, Direction::Out).unwrap(), 1);
+        assert_eq!(diameter_masked(&t, m, false, Direction::Both).unwrap(), 2);
+        assert_eq!(
+            avg_path_length_masked(&t, m, None, Direction::Out).unwrap(),
+            1.0
+        );
+        // No mask is the whole graph, bit for bit.
+        for dir in [Direction::Out, Direction::In, Direction::Both] {
+            assert_eq!(
+                density_masked(&t, None, dir).to_bits(),
+                density(&t, dir).unwrap().to_bits()
+            );
+            for frac in [None, Some(0.5)] {
+                assert_eq!(
+                    avg_path_length_masked(&t, None, frac, dir)
+                        .unwrap()
+                        .to_bits(),
+                    avg_path_length(&t, frac, dir).unwrap().to_bits()
+                );
+            }
+            for approximate in [false, true] {
+                assert_eq!(
+                    diameter_masked(&t, None, approximate, dir).unwrap(),
+                    diameter(&t, approximate, dir).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_masked_estimate_samples_the_touched_nodes() {
+        // A 1,000-node path with a 2-edge view far from node 0: the strided
+        // sample over all nodes would miss it.
+        let n = 1000i64;
+        let src: Vec<i64> = (0..n - 1).collect();
+        let dst: Vec<i64> = (1..n).collect();
+        let t = topo(&src, &dst);
+        let keep: Vec<bool> = (0..n - 1).map(|i| i == 700 || i == 701).collect();
+        let mask = EdgeMask::from_bools(&keep);
+        assert_eq!(touched_nodes(&t, &mask), vec![700, 701, 702]);
+        assert_eq!(
+            diameter_masked(&t, Some(&mask), true, Direction::Out).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn describe_touched_counts_only_the_nodes_of_kept_edges() {
+        use arrow::array::Float64Array;
+        let t = topo(&[0, 0, 1, 2], &[1, 2, 2, 3]);
+        let mask = EdgeMask::from_bools(&[false, true, true, false]);
+        let b = describe_masked(&t, Some(&mask), true, Direction::Out, true).unwrap();
+        let col = |name: &str| b.column(b.schema().index_of(name).unwrap()).clone();
+        let i = |name: &str| {
+            col(name)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        let f = |name: &str| {
+            col(name)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!((i("n_nodes"), i("n_edges"), i("n_components")), (3, 2, 1));
+        assert_eq!((f("density"), f("avg_degree")), (2.0 / 6.0, 2.0 / 3.0));
+        // Over the whole graph every node is touched.
+        assert_eq!(
+            describe_masked(&t, None, true, Direction::Out, true).unwrap(),
+            describe(&t, true, Direction::Out).unwrap()
+        );
+    }
+
+    #[test]
+    fn stat_batch_is_one_non_null_column() {
+        let t = topo(&[0, 1, 2], &[1, 2, 0]);
+        for (stat, ty) in [
+            (GraphStat::Density, DataType::Float64),
+            (GraphStat::AvgPathLength { sample: None }, DataType::Float64),
+            (GraphStat::Diameter { approximate: false }, DataType::Int64),
+        ] {
+            let b = stat_batch(&t, None, &stat, Direction::Out).unwrap();
+            assert_eq!(b.num_rows(), 1);
+            let field = b.schema().field(0).clone();
+            assert_eq!(
+                (field.name().as_str(), field.data_type()),
+                (stat.name(), &ty)
+            );
+            assert!(!field.is_nullable());
+        }
+    }
+
+    #[test]
+    fn describe_nodes_parses() {
+        assert!(!parse_describe_nodes(Some("all"), "'all'").unwrap());
+        assert!(parse_describe_nodes(Some("touched"), "'touched'").unwrap());
+        let e = parse_describe_nodes(None, "1").unwrap_err();
+        assert!(e.to_string().contains("describe(nodes=1) is not supported"));
     }
 
     #[test]

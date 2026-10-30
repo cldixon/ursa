@@ -10,8 +10,7 @@
 //!    own. The walk reads what a step's guards read and no more: the steps a
 //!    node frame's executor checks one by one are left out below the new step
 //!    (see `elides`), and a join's right side, which the walk never reaches, is
-//!    a stub, so a step's check does not grow with the chain before it. One is not raised here: `edges.nodes()` with no columns does not
-//!    collect, but a later `with_columns` makes it collect.
+//!    a stub, so a step's check does not grow with the chain before it.
 //! 2. **The columns.** Each step is checked against the columns the frame has
 //!    when the step runs, with the checks the executor's lowering makes
 //!    ([`crate::plan`]'s `*_check` functions, which the lowering itself calls):
@@ -35,7 +34,7 @@ use crate::lazy::{Column, ColumnExpr, Host, Kind, Lowering, Node, Op, Step};
 use crate::lower::How;
 use crate::plan::{
     check_literals, filter_check, group_by_check, py_list, py_str, rename_check, select_check,
-    sort_check, PlanError, PlanResult, View, BARE_NODES, NON_GRAPH_COLUMN,
+    sort_check, PlanError, PlanResult, View, NON_GRAPH_COLUMN,
 };
 
 /// A column's name and type (when known).
@@ -368,7 +367,7 @@ fn chain_info(node: &Arc<Node>) -> ChainInfo {
     let root = |op: &Op| match op {
         Op::Hop { .. } | Op::ShortestPath { .. } => Root::Traversal,
         Op::RandomWalk { .. } => Root::Walk,
-        Op::Describe { .. } => Root::Describe,
+        Op::Describe { .. } | Op::Stat { .. } => Root::Describe,
         _ => Root::Source,
     };
     let Some(input) = node.input() else {
@@ -426,12 +425,12 @@ pub(crate) fn shape_input(node: &Arc<Node>) -> Arc<Node> {
 }
 
 /// Whether a shape error is left to `collect()`: one a later step can replace
-/// or fix (`edges.nodes()` with no columns yet; the guard on the edges of a
-/// traversal before `nodes()`, which a first `with_columns` over those edges
-/// replaces with its own), or a source's paths, which a collect reads.
+/// (the guard on the edges of a traversal before `nodes()`, which a first
+/// `with_columns` over those edges replaces with its own), or a source's paths,
+/// which a collect reads.
 fn at_collect(node: &Node, message: &str) -> bool {
     use crate::plan::{MULTI_PATH_EDGES, MULTI_PATH_NODES};
-    if [BARE_NODES, MULTI_PATH_EDGES, MULTI_PATH_NODES].contains(&message) {
+    if [MULTI_PATH_EDGES, MULTI_PATH_NODES].contains(&message) {
         return true;
     }
     if !message.ends_with(crate::plan::STEPS_BEFORE_NODES) {
@@ -465,7 +464,7 @@ fn roles_of(node: &Node) -> Vec<(&'static str, String)> {
         Some(input) => input.info().chain.root,
         None => match node.op() {
             Op::RandomWalk { .. } => Root::Walk,
-            Op::Describe { .. } => Root::Describe,
+            Op::Describe { .. } | Op::Stat { .. } => Root::Describe,
             Op::Hop { .. } | Op::ShortestPath { .. } => Root::Traversal,
             _ => Root::Source,
         },
@@ -533,6 +532,7 @@ fn infer(node: &Arc<Node>, host: &dyn Host) -> PlanResult<Info> {
             ("avg_degree".into(), Some(DataType::Float64)),
             ("n_components".into(), Some(DataType::Int64)),
         ]),
+        Op::Stat { stat, .. } => known(vec![(stat.name().into(), Some(stat.data_type()))]),
         Op::Step { input, step, error } => {
             if error.is_some() {
                 return Ok(Info::default());
