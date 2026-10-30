@@ -32,9 +32,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   compare floats in the total order filters and `sort()` use: `-0.0` equals
   `0.0`, every NaN equals every NaN whatever its sign and payload, and NaN joins
   NaN. They compared raw bits, so the same column grouped one way and filtered
-  another. This covers `float16`, `float32`, `float64` and dictionary-encoded
-  floats, every join `how` (including right/outer key coalescing) and engine
-  frames. Nulls are unchanged: one group in `group_by` and `distinct`, and never
+  another. This covers top-level `float16`, `float32`, `float64` and
+  dictionary-of-float columns, every join `how` (including right/outer key
+  coalescing, where a right key fits the left type in total order: `-0.0` fits
+  an integer key as `0`) and engine frames. A float nested in a struct or list
+  column still compares by its bits. Nulls are unchanged: one group in `group_by` and `distinct`, and never
   a join match. A group or distinct row shows its first row's value, matching
   first-appearance row order; a joined row keeps its own key value, and an
   aggregate over a key column folds the original values. With `k = [-0.0, 0.0,

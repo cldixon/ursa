@@ -196,6 +196,10 @@ impl ScalarUDFImpl for Canonical {
             ));
         };
         Ok(match arg {
+            // A batch with nothing to change passes through.
+            ColumnarValue::Array(a) if noncanonical_rows(a.as_ref()).is_empty() => {
+                ColumnarValue::Array(a.clone())
+            }
             ColumnarValue::Array(a) => ColumnarValue::Array(canonicalize(a)),
             ColumnarValue::Scalar(s) => {
                 let a = canonicalize(&s.to_array()?);

@@ -301,3 +301,81 @@ def test_float32_and_float64_keys_join_in_total_order(how):
         "anti": [(3, None), (4, None)],
     }[how]
     assert pairs == want
+
+
+@pytest.mark.parametrize("how", ["right", "outer"])
+def test_a_right_key_fits_the_left_type_in_total_order(how):
+    # The #205 fit check compares canonical: -0.0 fits an integer key as 0.
+    left = ur.from_arrow(pa.table({"k": [0, 1], "a": [1, 2]}), id="a")
+    right = ur.from_arrow(pa.table({"k": [-0.0, 2.0], "b": [3, 4]}), id="b")
+    got = left.join(right, on="k", how=how).collect().to_arrow()
+    assert got.schema.field("k").type == pa.int64()
+    rows = list(zip(*[got.column(c).to_pylist() for c in ("k", "a", "b")], strict=True))
+    want = {
+        "right": [(0, 1, 3), (2, None, 4)],
+        "outer": [(0, 1, 3), (1, 2, None), (2, None, 4)],
+    }[how]
+    assert rows == want
+    # A NaN keeps fitting a narrower float whatever its payload.
+    left32 = ur.from_arrow(pa.table({"k": pa.array([1.0], pa.float32()), "a": [1]}), id="a")
+    payload = _f64(0x7FF8_0000_0000_0001)
+    right64 = ur.from_arrow(pa.table({"k": [payload, NEG_NAN, 1.0], "b": [3, 4, 5]}), id="b")
+    got = left32.join(right64, on="k", how=how).collect().to_arrow()
+    assert got.schema.field("k").type == pa.float32()
+    keys = got.column("k").to_pylist()
+    pairs = list(zip(got.column("a").to_pylist(), got.column("b").to_pylist(), strict=True))
+    if how == "right":
+        assert pairs == [(None, 3), (None, 4), (1, 5)]
+        assert [math.isnan(x) for x in keys] == [True, True, False]
+    else:
+        assert pairs == [(1, 5), (None, 3), (None, 4)]
+        assert [math.isnan(x) for x in keys] == [False, True, True]
+
+
+@pytest.mark.parametrize(
+    "k",
+    [
+        [-0.0, 0.0, -0.0, 0.0, NEG_NAN, math.nan],
+        [0.0, -0.0, 0.0, -0.0, math.nan, NEG_NAN],
+        [0.0, 0.0, -0.0, -0.0, _f64(0x7FF8_0000_0000_0007), NEG_NAN],
+    ],
+)
+def test_operands_over_a_tie_fold_as_without_a_float_key(k):
+    # The same rows grouped by the float key (canonical) and by an integer key
+    # (main's path, untouched) fold min/max/sum to the same bits: the operand
+    # keeps its original values, ties included, on every platform.
+    t = pa.table({"id": list(range(6)), "g": [1, 1, 1, 1, 2, 2], "k": k})
+    frame = ur.from_arrow(t, id="id")
+    aggs = {"s": col("k").sum(), "m": col("k").min(), "x": col("k").max(), "u": col("k").n_unique()}
+    by_key = frame.group_by("k").agg(**aggs).collect().to_arrow()
+    by_int = frame.group_by("g").agg(**aggs).collect().to_arrow()
+    assert by_key.num_rows == 2
+    for name in ("s", "m", "x"):
+        assert [_bits(v) for v in by_key.column(name).to_pylist()] == [
+            _bits(v) for v in by_int.column(name).to_pylist()
+        ], name
+    assert by_key.column("u").to_pylist() == by_int.column("u").to_pylist() == [1, 1]
+    assert [_bits(v) for v in by_key.column("k").to_pylist()] == [_bits(k[0]), _bits(k[4])]
+
+
+@pytest.mark.parametrize("value_type", [pa.float64(), pa.float32()])
+def test_distinct_after_a_join_over_dictionary_floats(value_type):
+    # A distinct over a join's output stays one plan (its floats canonical in
+    # the plan) and gives what it gives over the same rows collected first.
+    vals = [-0.0, 0.0, math.nan, NEG_NAN, None, 2.0, -0.0, 2.0]
+    k = pa.array(vals, value_type).dictionary_encode()
+    left = ur.from_arrow(pa.table({"id": list(range(8)), "k": k, "f": vals}), id="id")
+    right = ur.from_arrow(pa.table({"id": list(range(7, -1, -1)), "z": list(range(8))}), id="id")
+    joined = left.join(right, on="id").select("k", "f")
+    lazy = joined.distinct().collect().to_arrow()
+    rows = joined.collect().to_arrow()
+    rows = rows.append_column("rid", pa.array(range(rows.num_rows)))
+    run = ur.from_arrow(rows, id="rid").select("k", "f").distinct().collect().to_arrow()
+    assert lazy.num_rows == run.num_rows == 4
+    assert lazy.schema == run.schema
+    for c in ("k", "f"):
+        a = lazy.column(c).cast(value_type) if c == "k" else lazy.column(c)
+        b = run.column(c).cast(value_type) if c == "k" else run.column(c)
+        assert [_bits(x) for x in a.cast(pa.float64()).to_pylist()] == [
+            _bits(x) for x in b.cast(pa.float64()).to_pylist()
+        ], c
