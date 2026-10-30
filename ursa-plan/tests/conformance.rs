@@ -262,6 +262,7 @@ fn run_case(path: &Path) {
             PlanError::Engine(_) => "engine",
             PlanError::Invalid(_) => "invalid",
             PlanError::Host(_) => "host",
+            PlanError::Limit(_) => "limit",
         };
         assert_eq!(got_kind, kind, "{name}: {err}");
         let message = expect["message"].as_str().unwrap();

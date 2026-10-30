@@ -1450,7 +1450,7 @@ impl Rows {
 /// in-memory frame).
 pub fn execute(node: &Arc<Node>, host: &dyn Host) -> PlanResult<Rows> {
     let (plan, lowering) = Lowering::of(node);
-    crate::stack::for_steps(lowering.steps.len(), || {
+    crate::stack::for_steps("collect()", lowering.steps.len(), || {
         crate::plan::execute(&plan, &lowering.inputs(host, Mode::Run))
     })
 }
@@ -1463,7 +1463,7 @@ pub fn host_rows(rows: HostRows) -> Option<HostHandle> {
 /// The schema `collect()` returns, from a dry run.
 pub fn schema(node: &Arc<Node>, host: &dyn Host) -> PlanResult<SchemaRef> {
     let (plan, lowering) = Lowering::of(node);
-    crate::stack::for_steps(lowering.steps.len(), || {
+    crate::stack::for_steps("schema()", lowering.steps.len(), || {
         Ok(crate::plan::dry_run(&plan, &lowering.inputs(host, Mode::Dry))?.0)
     })
 }
@@ -1472,17 +1472,17 @@ pub fn schema(node: &Arc<Node>, host: &dyn Host) -> PlanResult<SchemaRef> {
 /// (for the eager whole-graph stats).
 pub fn graph_index(node: &Arc<Node>, host: &dyn Host) -> PlanResult<GraphIndex> {
     let (edges, lowering) = Lowering::edges_of(node);
-    crate::stack::for_steps(lowering.steps.len(), || {
+    crate::stack::for_steps("a graph statistic", lowering.steps.len(), || {
         crate::plan::require_index(&edges, &lowering.inputs(host, Mode::Run))
     })
 }
 
 /// `explain()`: the frame's plan tree, then the DataFusion plans a collect runs
 /// (from a dry run), optimized, and with `physical` their physical plans.
-pub fn explain(node: &Arc<Node>, host: &dyn Host, physical: bool) -> String {
+pub fn explain(node: &Arc<Node>, host: &dyn Host, physical: bool) -> PlanResult<String> {
     let (plan, lowering) = Lowering::of(node);
-    crate::stack::for_steps(lowering.steps.len(), || {
-        explain_plan(node, &plan, &lowering, host, physical)
+    crate::stack::for_steps("explain()", lowering.steps.len(), || {
+        Ok(explain_plan(node, &plan, &lowering, host, physical))
     })
 }
 
@@ -1657,7 +1657,7 @@ mod tests {
         let g = filter(&g, gt("deg", 0)).unwrap();
         assert_eq!(schema(&g, &TestHost).unwrap(), rows(&g)[0].schema());
         assert_eq!(schema(&e, &TestHost).unwrap(), rows(&e)[0].schema());
-        let text = explain(&g, &TestHost, true);
+        let text = explain(&g, &TestHost, true).unwrap();
         assert!(text.contains("with_columns(deg=degree"), "{text}");
         assert!(text.contains("DataFusion physical plan 1 of"), "{text}");
     }

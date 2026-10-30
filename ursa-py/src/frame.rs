@@ -623,9 +623,10 @@ impl PlanNode {
     }
 
     #[pyo3(signature = (physical=false))]
-    fn explain(&self, py: Python<'_>, physical: bool) -> String {
+    fn explain(&self, py: Python<'_>, physical: bool) -> PyResult<String> {
         let node = self.0.clone();
         py.detach(|| ursa_plan::lazy::explain(&node, &PyHost, physical))
+            .map_err(plan_err)
     }
 
     /// The checked graph index of this edge frame (for the eager stats).

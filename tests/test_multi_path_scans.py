@@ -150,18 +150,79 @@ def test_on_null_drop_counts_the_rows_of_every_path(files):
     assert got.equals(want)
 
 
-def test_paths_with_different_columns_raise_naming_the_path(files):
+def test_paths_with_different_columns_raise_naming_each_difference(files):
     pq.write_table(pa.table({"s": [1], "d": [2]}), files / "narrow.parquet")
     pq.write_table(pa.table({"s": [1], "d": [2], "w": [1]}), files / "int_w.parquet")
+    pq.write_table(
+        pa.table({"s": [1], "d": [2], "w": pa.array([1.0], pa.float64())}).cast(
+            pa.schema([("s", pa.int64()), ("d", pa.int64()), ("w", pa.float64(), False)])
+        ),
+        files / "required_w.parquet",
+    )
+    pq.write_table(
+        pa.table({"s": ["a"], "d": ["b"], "w": [1.0]}).cast(
+            pa.schema([("s", pa.large_string()), ("d", pa.string()), ("w", pa.float64())])
+        ),
+        files / "large.parquet",
+    )
     a = str(files / "a.parquet")
-    for other in ("narrow.parquet", "int_w.parquet"):
+    cases = {
+        "narrow.parquet": r'".*a.parquet" has the columns \[s, d, w\] and '
+        r'".*narrow.parquet" has \[s, d\]. Give every file the same columns',
+        "int_w.parquet": r'Column "w" is Float64 in ".*a.parquet" and Int64 in ".*int_w.parquet". '
+        r"Write the files with matching types",
+    }
+    for other, why in cases.items():
         e = ur.scan_edges([a, str(files / other)], src="s", dst="d")
-        with pytest.raises(
-            ur.ComputeError, match=rf"scan_edges\(\): .*{other}.* does not have the columns of"
-        ):
-            e.collect()
-        with pytest.raises(ur.ComputeError, match="w: Float64"):
-            ur.pagerank(e, weight=ur.col("w")).collect()
+        for run in (e.collect, lambda e=e: ur.pagerank(e, weight=ur.col("w")).collect()):
+            with pytest.raises(
+                ur.ComputeError,
+                match=r"scan_edges\(\): the paths in a list are read as one table, so each "
+                r"needs the same columns, with the same types, in the same order. " + why,
+            ):
+                run()
+    # Nullability may differ: the column is nullable in the union.
+    both = ur.scan_edges([a, str(files / "required_w.parquet")], src="s", dst="d")
+    assert both.collect().to_arrow().num_rows == 4
+    # string and large_string are different types, and named so.
+    strings = files / "strings.parquet"
+    pq.write_table(pa.table({"s": ["c"], "d": ["d"], "w": [2.0]}), strings)
+    e = ur.scan_edges([str(strings), str(files / "large.parquet")], src="s", dst="d")
+    with pytest.raises(ur.ComputeError, match=r'Column "s" is Utf8 in .* and LargeUtf8 in'):
+        e.collect()
+
+
+def test_csv_types_are_inferred_per_file(files):
+    # Each CSV path infers its own types: a column of ints in one file and of
+    # floats in the other is a type mismatch, named with what to do.
+    (files / "ints.csv").write_text("s,d,w\n1,2,1\n")
+    (files / "floats.csv").write_text("s,d,w\n2,3,0.5\n")
+    e = ur.scan_edges([str(files / "ints.csv"), str(files / "floats.csv")], src="s", dst="d")
+    with pytest.raises(ur.ComputeError, match=r'Column "w" is Int64 in .* write 1.0 for a float'):
+        e.collect()
+
+
+def test_tuples_and_pathlib_paths(files):
+    a, c = files / "a.parquet", files / "more/c.parquet"
+    want = ur.scan_edges([str(a), str(c)], src="s", dst="d").collect().to_arrow()
+    for path in ((str(a), str(c)), [a, c], (a, str(c))):
+        assert ur.read_edges(path, src="s", dst="d").to_arrow().equals(want)
+    one = ur.read_edges(a, src="s", dst="d").to_arrow()
+    assert one.equals(ur.read_edges(str(a), src="s", dst="d").to_arrow())
+    assert ur.read_nodes((a,), id="s").to_arrow().equals(pq.read_table(a))
+
+
+def test_paths_are_checked_where_the_scan_is_made(files):
+    # The error collect() raised for a path it cannot read, raised at the call.
+    msg = r'scan_edges supports .parquet and .csv in v0.1; got path "b.txt"'
+    with pytest.raises(ur.ComputeError, match=msg):
+        ur.read_edges((str(files / "a.parquet"), "b.txt"), src="s", dst="d")
+    with pytest.raises(ur.ComputeError, match="query string"):
+        ur.scan_edges("https://host/x.csv?token=1", src="s", dst="d")
+    with pytest.raises(TypeError, match=r"read_nodes\(\): a path must be a string or a pathlib"):
+        ur.read_nodes([str(files / "a.parquet"), 3], id="id")  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TypeError, match="got int"):
+        ur.scan_edges(3, src="s", dst="d")  # ty: ignore[invalid-argument-type]
 
 
 def test_an_empty_list_raises_where_the_scan_is_made():
@@ -169,6 +230,8 @@ def test_an_empty_list_raises_where_the_scan_is_made():
         ur.scan_edges([], src="s", dst="d")
     with pytest.raises(ValueError, match=r"scan_nodes\(\): the list of paths is empty"):
         ur.scan_nodes([], id="id")
+    with pytest.raises(ValueError, match=r"read_edges\(\): the list of paths is empty"):
+        ur.read_edges((), src="s", dst="d")
 
 
 def test_a_missing_path_in_a_list_raises(files):

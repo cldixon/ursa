@@ -159,3 +159,27 @@ def test_a_long_plan_serializes_on_a_small_stack():
         SMALL,
     )
     assert out == f"{STEPS}\n"
+
+
+def test_a_plan_past_the_stack_cap_raises_ursa_error():
+    # The stack a plan may reserve is capped (1 GiB, about 65,000 relational
+    # steps); past it the plan raises instead of reserving more.
+    out = _run(
+        """
+        def main():
+            chain = filters(mem, n=70_000)
+            for run in (chain.collect, chain.schema, chain.explain):
+                try:
+                    run()
+                except ur.UrsaError as e:
+                    assert "70000 relational steps" in str(e), e
+                    assert "Collect part of the chain" in str(e), e
+                else:
+                    raise AssertionError("no error")
+            short = filters(mem, n=100)
+            assert short.collect().to_arrow().equals(TABLE)
+            print("ok")
+        """,
+        SMALL,
+    )
+    assert out == "ok\n"

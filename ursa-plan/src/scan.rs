@@ -448,6 +448,12 @@ enum ScanFormat {
     Csv,
 }
 
+/// Whether `path` is a CSV file (`false`: Parquet), or the error a scan of it
+/// raises: the check a scan runs, for the host to run where the scan is made.
+pub fn is_csv(path: &str, verb: &str) -> Result<bool> {
+    Ok(matches!(detect_format(path, verb)?, ScanFormat::Csv))
+}
+
 fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
@@ -529,19 +535,10 @@ async fn open_scan(source: ScanSource<'_>, kind: &str) -> Result<DataFrame> {
         }
         let next = open_path(path, source, kind).await?;
         let (want, got) = (df.schema().as_arrow(), next.schema().as_arrow());
-        let columns = |s: &Schema| -> Vec<(String, DataType)> {
-            s.fields()
-                .iter()
-                .map(|f| (f.name().clone(), f.data_type().clone()))
-                .collect()
-        };
-        if columns(want) != columns(got) {
+        if let Some(why) = mismatch(want, got, first, path) {
             return Err(DataFusionError::Execution(format!(
-                "{kind}(): {path:?} does not have the columns of {first:?}. The paths in a \
-                 list are read as one table, so each needs the same column names and \
-                 types, in the same order: {first:?} has {}, {path:?} has {}.",
-                column_list(want),
-                column_list(got)
+                "{kind}(): the paths in a list are read as one table, so each needs the \
+                 same columns, with the same types, in the same order. {why}"
             )));
         }
         df = df.union(next)?;
@@ -549,14 +546,44 @@ async fn open_scan(source: ScanSource<'_>, kind: &str) -> Result<DataFrame> {
     Ok(df)
 }
 
-/// `name: type` for each column of `schema`, for an error message.
-fn column_list(schema: &Schema) -> String {
-    let columns: Vec<String> = schema
+/// How `got` (the schema of path `path`) differs from `want` (that of the
+/// list's first path, `first`) in a way a union cannot read as one table, with
+/// what to do: `None` when the columns and types match. Nullability may
+/// differ: the union's column is nullable if any path's is.
+fn mismatch(want: &Schema, got: &Schema, first: &str, path: &str) -> Option<String> {
+    let names =
+        |s: &Schema| -> Vec<String> { s.fields().iter().map(|f| f.name().clone()).collect() };
+    if names(want) != names(got) {
+        return Some(format!(
+            "{first:?} has the columns [{}] and {path:?} has [{}]. Give every file the \
+             same columns, or read each with its own scan.",
+            names(want).join(", "),
+            names(got).join(", ")
+        ));
+    }
+    let differ: Vec<String> = want
         .fields()
         .iter()
-        .map(|f| format!("{}: {}", f.name(), f.data_type()))
+        .zip(got.fields())
+        .filter(|(a, b)| a.data_type() != b.data_type())
+        .map(|(a, b)| {
+            format!(
+                "Column {:?} is {} in {first:?} and {} in {path:?}",
+                a.name(),
+                a.data_type(),
+                b.data_type()
+            )
+        })
         .collect();
-    format!("[{}]", columns.join(", "))
+    if differ.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}. Write the files with matching types (in a CSV file, a type is inferred \
+         from the values: write 1.0 for a float in every file), or read them into \
+         memory, cast the columns to one type and concatenate them.",
+        differ.join("; ")
+    ))
 }
 
 /// One path of a scan source, read as [`open_scan`] reads a single path.
@@ -571,46 +598,72 @@ async fn open_path(path: &str, source: ScanSource<'_>, kind: &str) -> Result<Dat
 /// `ctx.read_csv(path)` with `csv`'s options.
 ///
 /// DataFusion 54 applies a null pattern when it infers a CSV file's schema but
-/// not when it reads the rows, so a column with a `null_value` in it would infer
-/// as a number and then fail to parse. With a `null_value`, the schema is
-/// inferred with the pattern, the columns are read as text, and each becomes
-/// null where it holds the null value (or is empty, as without one) and is cast
-/// to its inferred type.
+/// not when it reads the rows (its `CsvSource` never hands the pattern to the
+/// arrow-csv reader), so a column with a `null_value` in it would infer as a
+/// number and then fail to parse. With a `null_value`, the schema is inferred
+/// as DataFusion infers it, with the pattern, and each file is read by the same
+/// arrow-csv reader DataFusion uses, with the same options and that schema,
+/// plus the pattern. Every value parses, or fails to, exactly as it does
+/// without a `null_value`; the only difference is which fields read as null.
+/// The files are read whole, one partition each, in path order, as a glob
+/// lists them. A dry run reads no rows.
 async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<DataFrame> {
-    use datafusion::common::Column;
-    use datafusion::functions::expr_fn::nullif;
-    use datafusion::logical_expr::{cast, lit, Expr};
-    let Some(null) = &csv.null_value else {
-        return ctx.read_csv(path, csv.read_options()).await;
+    use datafusion::datasource::MemTable;
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+    let options = csv.read_options();
+    let Some(pattern) = options.null_regex.clone() else {
+        return ctx.read_csv(path, options).await;
     };
     let inferred = ctx.read_csv(path, csv.read_options()).await?;
-    let inferred = inferred.schema().as_arrow().clone();
-    let text = Schema::new(
-        inferred
-            .fields()
-            .iter()
-            .map(|f| Field::new(f.name(), DataType::Utf8, true))
-            .collect::<Vec<_>>(),
-    );
-    let mut options = csv.read_options();
-    options.schema = Some(&text);
-    let df = ctx.read_csv(path, options).await?;
-    let columns: Vec<Expr> = inferred
-        .fields()
-        .iter()
-        .map(|f| {
-            let value = nullif(
-                Expr::Column(Column::new_unqualified(f.name())),
-                lit(null.as_str()),
-            );
-            let value = match f.data_type() {
-                DataType::Utf8 => value,
-                t => cast(value, t.clone()),
-            };
-            value.alias(f.name())
-        })
-        .collect();
-    df.select(columns)
+    let schema: SchemaRef = Arc::new(inferred.schema().as_arrow().clone());
+    let mut partitions: Vec<Vec<RecordBatch>> = vec![];
+    if !crate::dry::active() {
+        let null =
+            regex::Regex::new(&pattern).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let state = ctx.state();
+        let url = ListingTableUrl::parse(path)?;
+        let store = state.runtime_env().object_store(url.object_store())?;
+        let mut files = url
+            .list_all_files(&state, store.as_ref(), options.file_extension)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        files.sort_by(|a, b| a.location.cmp(&b.location));
+        for file in files {
+            let bytes = store
+                .get(&file.location)
+                .await
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?
+                .bytes()
+                .await
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+            // The reader DataFusion's `CsvSource::builder` makes, plus the pattern.
+            let mut reader = arrow::csv::ReaderBuilder::new(schema.clone())
+                .with_delimiter(csv.delimiter)
+                .with_batch_size(SCAN_BATCH_ROWS)
+                .with_header(csv.has_header)
+                .with_quote(csv.quote)
+                .with_truncated_rows(false)
+                .with_null_regex(null.clone());
+            if let Some(escape) = csv.escape {
+                reader = reader.with_escape(escape);
+            }
+            if let Some(comment) = csv.comment {
+                reader = reader.with_comment(comment);
+            }
+            let batches = reader
+                .build(std::io::Cursor::new(bytes))
+                .map_err(arrow_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(arrow_err)?;
+            partitions.push(batches);
+        }
+    }
+    if partitions.is_empty() {
+        partitions.push(vec![]);
+    }
+    ctx.read_table(Arc::new(MemTable::try_new(schema, partitions)?))
 }
 
 /// `ctx.read_parquet(path, ParquetReadOptions::default())`, with a column's
@@ -2208,8 +2261,10 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("does not have the columns of"), "{err}");
-        assert!(err.contains("w: Float64"), "{err}");
+        assert!(
+            err.contains("has the columns [from, to] and") && err.contains("has [from, to, w]"),
+            "{err}"
+        );
         let err = scan_edges_batch(many(&[]), "from", "to", &[]).unwrap_err();
         assert!(
             err.to_string().contains("the list of paths is empty"),

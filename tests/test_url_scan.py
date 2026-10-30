@@ -138,10 +138,10 @@ def test_http_url_with_query_string_is_rejected(http_root):
     # A query string on an http(s) URL is rejected clearly: the scan engine drops
     # the query before fetching, so a presigned/token URL would silently fetch the
     # unsigned path and fail. The error must point the user at the right tool.
+    # It raises where the scan is made (#216).
     _, base = http_root
-    edges = ur.scan_edges(f"{base}/edges.csv?token=abc123", src="s", dst="d")
     with pytest.raises(Exception) as exc:
-        edges.collect()
+        ur.scan_edges(f"{base}/edges.csv?token=abc123", src="s", dst="d")
     assert "query string" in str(exc.value)
 
 

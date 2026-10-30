@@ -16,19 +16,29 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   (comma-separated, a header row, `"` quotes, an empty field as null). The
   options are checked where the scan is made: each character option is one
   ASCII character other than a line break, the four must differ, and an
-  option on a scan with no `.csv` path raises `ValueError`. `null_value` reads
-  that text as null, as an empty field is read; DataFusion 54 applies a null
-  pattern when it infers a schema but not when it reads rows, so Ursa reads
-  such a file's columns as text and casts them to the inferred types itself.
-  Results match `pyarrow.csv` with the same options (#216).
+  option on a scan with no `.csv` path raises `ValueError`. `escape` applies
+  inside a quoted field, as in the CSV reader DataFusion uses; in an unquoted
+  field it is an ordinary character. `null_value` reads that text as null, as
+  an empty field is read. DataFusion 54 applies a null pattern when it infers
+  a schema but not when it reads rows, so with a `null_value` Ursa reads each
+  file with the same arrow-csv reader, options and inferred schema, plus the
+  pattern: every value parses (or fails to parse, with the same error) as it
+  does without a `null_value`; only which fields are null differs. Such a
+  file is read whole rather than in byte ranges. The tests compare each
+  layout with `pyarrow.csv` given the same options, with empty fields read as
+  null in both (`strings_can_be_null=True`) and pyarrow's headerless column
+  names (`f0`, `f1`, ...) renamed to Ursa's (`column_1`, `column_2`, ...) (#216).
 - A scan of a list of paths collects: the paths (files or globs) are read as
   one table, in the order given, as the files read into memory and
   concatenated would be. Every graph operation sees that table, weighted
   algorithms included: one index over the union of the files, with the
   weights read from the same rows. The reshaped-topology cache keys such a
-  scan by every file it reads. The paths must have the same columns and
-  types, and be on one store; otherwise `collect()` names the path that
-  differs (#216).
+  scan by every file it reads. A tuple works as a list, and a path may be a
+  `pathlib.Path`. The paths must have the same columns and types (their
+  nullability may differ), and be on one store; otherwise `collect()` names
+  each column that differs, its type in each file, and what to do. Each CSV
+  path infers its own types, so a column of `1`s in one file and `0.5`s in
+  another is such a difference, as it is for a glob (#216).
 
 - `frame.schema()` returns the schema `collect()` returns, as a
   `pyarrow.Schema` (names, types, nullability and metadata), on every frame:
@@ -49,17 +59,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 ### Changed
 
 - **Behaviour change:** an unknown keyword argument to `scan_edges`,
-  `scan_nodes`, `read_edges` or `read_nodes` raises Python's own
-  `TypeError` (`scan_edges() got an unexpected keyword argument 'x'`), as
-  `sink_csv` does. It raised `NotImplementedError: scan format options (...)
-  are not supported yet` (#216).
+  `scan_nodes`, `read_edges` or `read_nodes` raises `TypeError` naming the
+  function called (`read_edges() got an unexpected keyword argument 'foo'.`),
+  with the option to use for another library's name for one (`sep` and
+  `separator` → `delimiter`, `header` → `has_header`, `na_values` and
+  `null_values` → `null_value`, `quotechar` → `quote`, `escapechar` →
+  `escape`). It raised `NotImplementedError: scan format options (...) are
+  not supported yet` (#216).
+- **Behaviour change:** a scan's paths are checked where it is made. A path
+  with an extension a scan does not read, or an HTTP URL with a query string,
+  raises the error (class and message) `collect()` raised. A path that is
+  not a string, a `pathlib.Path` or a list or tuple of them raises
+  `TypeError` (#216).
 - `sample(n)` without a seed is documented as deterministic: it draws with a
   fixed default seed, so it keeps the same rows on every call and every run.
   Pass a different `seed` for a different draw. Results are unchanged (#216).
-- A scan whose path is neither a string nor a list of strings (a
-  `pathlib.Path`, say) still raises `NotImplementedError` at `collect()`; the
-  message now says to pass a string or a list of strings, instead of saying a
-  list is not supported (#216).
+- A `pathlib.Path` works as a scan path. It raised `NotImplementedError` at
+  `collect()` (#216).
 
 - Frames hold Rust plan objects (#193, the last item of #189). An `EdgeFrame`
   or `NodeFrame` holds one `ursa._ursa.PlanNode`, as a Polars `LazyFrame` holds
@@ -420,8 +436,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `explain()` and graph index build on a stack sized to it, since DataFusion's
   optimizer and planner recurse once per operator: a node frame filtered
   10,000 times after a graph column segfaulted on the default stack there.
-  Plans of up to 64 steps run as before. `collect()`, `schema()`, `explain()`
-  and graph ops over 20,000-step chains now work on a 256 KB thread stack.
+  Plans of up to 64 steps run as before; the stack a plan may reserve is
+  capped at 1 GiB (about 65,000 relational steps), past which `collect()`,
+  `schema()` and `explain()` raise `UrsaError` naming the limit and saying to
+  collect part of the chain first. `collect()`, `schema()`, `explain()` and
+  graph ops over 20,000-step chains now work on a 256 KB thread stack.
 
 - `group_by()` by a dictionary (categorical) column with `int8`, `int16`,
   `uint8` or `uint16` codes, and `distinct()` over one, raised "Dictionary key

@@ -1218,6 +1218,9 @@ pub enum PlanError {
     },
     /// A malformed plan.
     Invalid(String),
+    /// A plan past a limit Ursa sets (`ursa.UrsaError`), such as a chain too
+    /// long to run on one stack (#216).
+    Limit(String),
     /// An engine error from an executor.
     Engine(DataFusionError),
     /// An error the host raised while resolving an input.
@@ -1250,6 +1253,7 @@ impl fmt::Display for PlanError {
             | PlanError::Value(m)
             | PlanError::Type(m)
             | PlanError::Overflow(m)
+            | PlanError::Limit(m)
             | PlanError::Wrapped { message: m, .. } => f.write_str(m),
             PlanError::Invalid(m) => write!(f, "invalid plan: {m}"),
             PlanError::Engine(e) => write!(f, "{e}"),

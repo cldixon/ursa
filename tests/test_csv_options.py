@@ -11,6 +11,7 @@ with or without ``null_value``).
 from __future__ import annotations
 
 import io
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.csv as pacsv
@@ -225,3 +226,106 @@ def test_without_a_header_the_columns_are_numbered(tmp_path):
     e = ur.scan_edges(str(path), src="column_1", dst="column_2", has_header=False)
     assert e.schema().names == ["column_1", "column_2"]
     assert e.collect().to_arrow().num_rows == 2
+
+
+@pytest.mark.parametrize("w", ["NA", ""], ids=["null_value", "empty"])
+def test_a_column_with_no_values_reads_as_null_with_a_null_value(tmp_path, w):
+    # DataFusion types a column with no values in its sample `null`; it reads
+    # as nulls with `null_value` too, as it does without.
+    path = tmp_path / "e.csv"
+    path.write_text(f"s,d,w\n1,2,{w}\n2,3,{w}\n")
+    got = ur.read_edges(str(path), src="s", dst="d", null_value="NA").to_arrow()
+    assert got.schema.field("w").type == pa.null()
+    assert got.column("w").to_pylist() == [None, None]
+    if not w:
+        assert got.equals(ur.read_edges(str(path), src="s", dst="d").to_arrow())
+
+
+# Values of one column, past DataFusion's 1,000-row inference sample where the
+# last value differs, so it is parsed with the type the sample inferred.
+SAMPLE = 1000
+VALUES = {
+    "bool": ["true", "FALSE", "True"],
+    "bool_bad_past_sample": ["true"] * SAMPLE + ["yes"],
+    "bool_t_past_sample": ["false"] * SAMPLE + ["t"],
+    "int": ["1", "-2", "+3", "0"],
+    "int_float_past_sample": ["1"] * SAMPLE + ["1.5"],
+    "int_overflow_past_sample": ["1"] * SAMPLE + ["9223372036854775808"],
+    "float": ["1.5", "-0.0", "1e3", "2"],
+    "float_bad_past_sample": ["1.5"] * SAMPLE + ["abc"],
+    "timestamp": ["2020-01-01T00:00:00", "2020-01-02 10:30:00"],
+    "timestamp_bad_past_sample": ["2020-01-01T00:00:00"] * SAMPLE + ["2020-13-01T00:00:00"],
+    "date": ["2020-01-01", "2024-02-29"],
+    "date_bad_past_sample": ["2020-01-01"] * SAMPLE + ["2021-02-30"],
+    "strings": ["a", "", "NAN", "b"],
+}
+
+
+def _read(path, **opts):
+    """The table, or the error's class and message."""
+    try:
+        return ur.read_edges(str(path), src="s", dst="d", **opts).to_arrow()
+    except Exception as e:
+        return (type(e).__name__, str(e))
+
+
+@pytest.mark.parametrize("case", sorted(VALUES))
+def test_a_null_value_changes_only_which_fields_are_null(tmp_path, case):
+    # With a `null_value`, each type parses (and fails) exactly as without one.
+    values = VALUES[case]
+    rows = "".join(f"{i},{i + 1},{v}\n" for i, v in enumerate(values))
+    plain = tmp_path / "plain.csv"
+    plain.write_text("s,d,v\n" + rows)
+    assert _read(plain, null_value="NA") == _read(plain)
+    # The null value reads as an empty field would: NA in a few rows, against
+    # the same file with those fields empty.
+    marked = [("NA" if i in (1, len(values) - 2) else v) for i, v in enumerate(values)]
+    with_na = tmp_path / "na.csv"
+    with_na.write_text("s,d,v\n" + "".join(f"{i},{i + 1},{v}\n" for i, v in enumerate(marked)))
+    empty = tmp_path / "empty.csv"
+    empty.write_text(
+        "s,d,v\n" + "".join(f"{i},{i + 1},{'' if v == 'NA' else v}\n" for i, v in enumerate(marked))
+    )
+    assert _read(with_na, null_value="NA") == _read(empty)
+
+
+ALIASES = [
+    ("sep", "delimiter"),
+    ("separator", "delimiter"),
+    ("header", "has_header"),
+    ("na_values", "null_value"),
+    ("null_values", "null_value"),
+    ("quotechar", "quote"),
+    ("escapechar", "escape"),
+]
+
+
+@pytest.mark.parametrize(("alias", "option"), ALIASES)
+def test_another_librarys_option_name_says_which_to_use(alias, option):
+    for fn, kw in (
+        (ur.scan_edges, {"src": "s", "dst": "d"}),
+        (ur.read_edges, {"src": "s", "dst": "d"}),
+        (ur.scan_nodes, {"id": "s"}),
+        (ur.read_nodes, {"id": "s"}),
+    ):
+        msg = (
+            rf"^{fn.__name__}\(\) got an unexpected keyword argument '{alias}'; "
+            rf"use {option}= instead\.$"
+        )
+        with pytest.raises(TypeError, match=msg):
+            opts: dict[str, Any] = {**kw, alias: ";"}
+            fn("e.csv", **opts)
+
+
+def test_an_unknown_option_names_the_function_called():
+    with pytest.raises(
+        TypeError, match=r"^read_edges\(\) got an unexpected keyword argument 'foo'\.$"
+    ):
+        ur.read_edges("e.csv", src="s", dst="d", foo=1)
+
+
+def test_escape_applies_inside_a_quoted_field(tmp_path):
+    path = tmp_path / "e.csv"
+    path.write_text('s,d,label\n1,2,"a\\"b"\n2,3,plain\n')
+    got = ur.read_edges(str(path), src="s", dst="d", escape="\\").to_arrow()
+    assert got.column("label").to_pylist() == ['a"b', "plain"]
