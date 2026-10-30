@@ -40,7 +40,7 @@ The format comes from the file extension: `.parquet` or `.csv`. With the default
 
 The CSV options apply to `.csv` files only. Each character option is one ASCII character other than a line break, and `delimiter`, `quote`, `escape` and `comment` must all differ. Passing an option to a scan with no `.csv` path raises `ValueError`. An unknown keyword raises `TypeError`, and names the option to use for another library's name for one (`sep` → `delimiter`, `header` → `has_header`, `na_values` → `null_value`).
 
-A CSV file's column types are inferred from its first 1,000 rows. A value past them that does not parse as the inferred type raises an error at `collect()`. With a `null_value`, a value parses exactly as without one; only which fields are null differs.
+A CSV file's column types are inferred from its first 1,000 rows. A value past them that does not parse as the inferred type raises `ComputeError` at `collect()`. The message names the column, its type, the value and the value's line, and says what to do. See [Errors](errors.md#csv-values). With a `null_value`, a value parses exactly as without one; only which fields are null differs, and the error is the same.
 
 ```py
 edges = ur.scan_edges("edges.csv", src="from", dst="to", delimiter="\t", null_value="NA")

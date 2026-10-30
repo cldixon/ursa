@@ -44,6 +44,7 @@ A message names the step or the argument it is about, says what was wrong, and s
 | A call and a value it does not take | `hop(direction='up') is not supported; use one of 'out', 'in', 'both'` |
 | Operand types that do not combine | `cannot compare string with int64 (string > int64); compare values of one type` |
 | A scan and its path | `scan_edges('edges.parquet'): no file matches the path; check it (a glob must match at least one file)` |
+| A scan, a CSV column and a value | `scan_edges('g.csv'): column 'f' was inferred as bool from the first 1000 rows, but line 1002 has 'yes', which is not a valid bool. Fix the value, ...` |
 
 A `ColumnNotFoundError` names the step and the column, and lists the columns there are, in one of these shapes:
 
@@ -70,6 +71,20 @@ except ur.ComputeError as exc:
 ```
 
 The messages are part of the API: a change to one is listed in the changelog.
+
+### CSV values
+
+A CSV file's column types are inferred from its first 1,000 rows. A value that does not parse as its column's type raises `ComputeError` at `collect()`:
+
+```text
+scan_edges('g.csv'): column 'f' was inferred as bool from the first 1000 rows, but line 1002 has 'yes', which is not a valid bool. Fix the value, pass null_value='yes' if it marks a missing value, or read the file with pyarrow.csv (column_types=) and pass the table to ur.from_arrow().
+```
+
+- The type is in pyarrow's spelling: `bool`, `int64`, `double`, `date32[day]`, `timestamp[s]`.
+- The line counts the header as line 1. Each row is one line: a comment line, or a quoted value over several lines, is not counted.
+- The value is the first one in the file that does not parse, on any core count. A glob or a list of paths also names the file: `line 9 of 'data/b.csv'`.
+- The message is the same with or without `null_value`.
+- To keep a value that is not of the inferred type, read the file with `pyarrow.csv.read_csv` and `ConvertOptions(column_types=...)`, then pass the table to `ur.from_arrow()`.
 
 ## Other exceptions
 

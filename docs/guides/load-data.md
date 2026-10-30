@@ -162,6 +162,8 @@ edges = ur.scan_edges(
 
 `has_header=False` reads a file without a header row; its columns are then `column_1`, `column_2`, and so on. `quote` sets the quote character, and `escape` a character that makes the next one literal inside a quoted field. See [Input and output](../reference/io.md#urscan_edges) for every option.
 
+A CSV column's type is inferred from the first 1,000 rows. A later value that does not parse as that type raises `ComputeError` at `collect()`, with the column, the value and its line. Fix the value, or pass `null_value=` if the value marks a missing one. See [Errors](../reference/errors.md#csv-values).
+
 `read_edges` and `read_nodes` are the eager forms. They return the rows at once.
 
 ### Object storage

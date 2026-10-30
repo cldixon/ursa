@@ -291,10 +291,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     the function and the option to use (`read_edges() got an unexpected
     keyword argument 'sep'; use delimiter= instead.`). A stack too small for a
     plan raises `UrsaError: collect(): the frame's plan has N relational
-    steps, more than the 65280 one plan can run. …`. A CSV value past the
-    1,000-row inference sample that does not parse still reads `… Parser
-    error: Error while parsing value 'yes' as type 'Boolean' for column 2 at
-    line 1001. …`, from the CSV reader, with or without `null_value`.
+    steps, more than the 65280 one plan can run. …`;
+  - a CSV value that does not parse as its column's inferred type (#222):
+    `scan_edges('g.csv'): Parser error: Error while parsing value 'yes' as
+    type 'Boolean' for column 2 at line 1001. Row data: '[2,3,yes]'` →
+    `scan_edges('g.csv'): column 'f' was inferred as bool from the first 1000
+    rows, but line 1002 has 'yes', which is not a valid bool. Fix the value,
+    pass null_value='yes' if it marks a missing value, or read the file with
+    pyarrow.csv (column_types=) and pass the table to ur.from_arrow().` The
+    message names the column, its type in pyarrow's spelling (`bool`,
+    `int64`, `double`, `date32[day]`, `timestamp[s]`, ...), the value, and
+    the value's line in the file, counted from 1 with the header as line 1.
+    arrow-csv counted from 0, and from the start of each byte range when
+    DataFusion split a large file across cores, so its line depended on the
+    core count. Ursa now reads the failing column again, file by file in path
+    order, and reports the first value that does not parse. The value and
+    line are the same on any core count, and the message is the same with or
+    without `null_value`. A glob or a list of paths also names the file
+    (`line 9 of 'data/b.csv'`). When the engine's text for a timestamp has no
+    value, the message says `has a value that is not a valid timestamp[s]`.
+    The class is `ComputeError`, as before, and the engine's text is the
+    `__cause__`.
 - **Behaviour change:** a standalone graph verb is a full `NodeFrame` (#213).
   `ur.degree(e)`, `ur.pagerank(e)` and the other node-valued verbs called on
   their own are `edges.nodes().with_columns(<verb>=...)` with every frame
