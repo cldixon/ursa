@@ -168,14 +168,23 @@ _ALIASES = {
 }
 
 
-def _reject_unknown(step: str, unknown: dict[str, Any]) -> None:
+def _reject_unknown(step: str, unknown: dict[str, Any], roles: tuple[str, ...]) -> None:
     """Raise the ``TypeError`` for a keyword argument the scan does not take,
-    naming the option to use instead when it is another library's name for one."""
+    naming the option to use instead when it is another library's name for one,
+    or the closest one it takes when it looks like a typo of one. ``roles`` are
+    the scan's own keyword arguments besides the CSV options."""
     if not unknown:
         return
+    import difflib
+
     name = next(iter(unknown))
     hint = _ALIASES.get(name)
-    end = f"; use {hint}= instead." if hint else "."
+    if hint:
+        end = f"; use {hint}= instead."
+    else:
+        valid = [*roles, "storage_options", "store", *_CSV_DEFAULTS]
+        close = difflib.get_close_matches(name, valid, n=1)
+        end = f"; did you mean {close[0]}=?" if close else "."
     raise TypeError(f"{step}() got an unexpected keyword argument {name!r}{end}")
 
 
@@ -192,7 +201,7 @@ def _scan_edges(
 ) -> EdgeFrame:
     """``scan_edges`` / ``read_edges``: check the arguments (naming ``step`` in
     an error) and build the scan."""
-    _reject_unknown(step, unknown)
+    _reject_unknown(step, unknown, ("src", "dst", "on_null"))
     engine, any_csv = _scan_paths(step, "scan_edges", path)
     options = _csv_options(step, path, any_csv, csv)
     _validate_on_null(on_null)
@@ -210,7 +219,7 @@ def _scan_nodes(
     unknown: dict[str, Any],
 ) -> NodeFrame:
     """``scan_nodes`` / ``read_nodes``, as ``_scan_edges``."""
-    _reject_unknown(step, unknown)
+    _reject_unknown(step, unknown, ("id",))
     engine, any_csv = _scan_paths(step, "scan_nodes", path)
     options = _csv_options(step, path, any_csv, csv)
     spec = {"storage_options": storage_options, "store": store}

@@ -64,8 +64,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with the option to use for another library's name for one (`sep` and
   `separator` → `delimiter`, `header` → `has_header`, `na_values` and
   `null_values` → `null_value`, `quotechar` → `quote`, `escapechar` →
-  `escape`). It raised `NotImplementedError: scan format options (...) are
-  not supported yet` (#216).
+  `escape`), or the closest option it takes for a misspelling
+  (`delimter` → `did you mean delimiter=?`). It raised
+  `NotImplementedError: scan format options (...) are not supported yet`
+  (#216).
 - **Behaviour change:** a scan's paths are checked where it is made. A path
   with an extension a scan does not read, or an HTTP URL with a query string,
   raises the error (class and message) `collect()` raised. A path that is

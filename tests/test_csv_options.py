@@ -329,3 +329,30 @@ def test_escape_applies_inside_a_quoted_field(tmp_path):
     path.write_text('s,d,label\n1,2,"a\\"b"\n2,3,plain\n')
     got = ur.read_edges(str(path), src="s", dst="d", escape="\\").to_arrow()
     assert got.column("label").to_pylist() == ['a"b', "plain"]
+
+
+TYPOS = [
+    (ur.scan_edges, {"src": "s", "dst": "d"}, "delimter", "delimiter"),
+    (ur.read_edges, {"src": "s", "dst": "d"}, "null_valu", "null_value"),
+    (ur.scan_edges, {"src": "s", "dst": "d"}, "on_nul", "on_null"),
+    (ur.scan_edges, {"src": "s", "dst": "d"}, "storage_option", "storage_options"),
+    (ur.read_nodes, {"id": "s"}, "has_headers", "has_header"),
+    (ur.scan_nodes, {"id": "s"}, "comments", "comment"),
+]
+
+
+@pytest.mark.parametrize(("fn", "kw", "typo", "option"), TYPOS)
+def test_a_misspelled_option_suggests_the_closest(fn, kw, typo, option):
+    msg = (
+        rf"^{fn.__name__}\(\) got an unexpected keyword argument '{typo}'; "
+        rf"did you mean {option}=\?$"
+    )
+    with pytest.raises(TypeError, match=msg):
+        opts: dict[str, Any] = {**kw, typo: ";"}
+        fn("e.csv", **opts)
+
+
+def test_a_node_scan_does_not_suggest_an_edge_option():
+    # `on_null` is an edge scan's option: a node scan names no close match.
+    with pytest.raises(TypeError, match=r"argument 'on_nul'\.$"):
+        ur.scan_nodes("e.csv", id="s", on_nul="drop")
