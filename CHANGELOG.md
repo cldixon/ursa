@@ -692,6 +692,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Behaviour change:** a CSV column of numbers whose first 1,000 rows hold a
+  float spelling that arrow-csv's type inference reads as text (`+5`, `+.5`,
+  `Inf`, `-nan`, `NAN`, `Infinity` and the other cases and signs of `nan`,
+  `inf` and `infinity`) is `double`, as pyarrow reads it. It was `string`
+  (even its `1.5`s), so a weight column with one such value failed in a
+  weighted algorithm with a type error. Each value parses to pyarrow's bits:
+  `+5` is `5.0`, `-nan` keeps its sign. `1e400` (`inf`), `-0` next to a float
+  (`-0.0`), `nan`, `inf` and `-inf` already read as pyarrow reads them. A
+  column of integers only, or with any other text in it, keeps its type, and
+  so does every column without such a spelling. This holds with and without
+  a `null_value`. `nan` still reads as NaN, as before; pyarrow's default
+  options read it as null. Pass `null_value="nan"` to read it as null. A scan whose sample has a column of text reads that sample a
+  second time, to check its spellings (#221).
 - Long chains no longer crash the process (#216). `ur.degree` over 20,000
   chained filters segfaulted on the default stack (a recursive clone of the
   plan), and collecting a 20,000-step chain segfaulted on a 256 KB thread
