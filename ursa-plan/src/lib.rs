@@ -46,6 +46,7 @@ pub mod reshape;
 pub mod result;
 pub mod runtime;
 pub mod scan;
+mod stack;
 pub mod stats;
 pub mod topology;
 pub mod weight;

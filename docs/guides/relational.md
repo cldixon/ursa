@@ -248,7 +248,7 @@ shape: (2, 4)
 
 ## Distinct and sample
 
-`distinct()` removes duplicate rows. After a `select`, that is duplicates of the selected columns. `sample(n, seed=)` keeps `n` random rows.
+`distinct()` removes duplicate rows. After a `select`, that is duplicates of the selected columns. `sample(n, seed=)` keeps `n` random rows, in input order. The draw is deterministic: the same seed keeps the same rows, and without a seed a fixed default seed is used, so `sample(2)` keeps the same two rows every time. For a different draw, pass a different seed, for example `seed=random.randrange(2**32)`.
 
 ```python
 print(nodes.select("club").distinct().sort("club").collect())

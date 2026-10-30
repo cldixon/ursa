@@ -62,10 +62,10 @@ def test_to_polars_egress():
 
 
 def test_collect_over_unsupported_scan_format_errors_clearly():
-    # scan_edges resolves .parquet/.csv; an unsupported extension errors clearly.
-    edges = ur.scan_edges("edges.json", src="a", dst="b")
+    # scan_edges resolves .parquet/.csv; an unsupported extension errors clearly,
+    # where the scan is made (#216), with the error collect() raised.
     with pytest.raises(ur.UrsaError, match=r"only \.parquet and \.csv files can be scanned"):
-        ur.pagerank(edges).collect()
+        ur.scan_edges("edges.json", src="a", dst="b")
 
 
 def test_unwired_algorithm_errors_clearly():

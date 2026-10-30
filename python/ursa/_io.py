@@ -26,6 +26,8 @@ engine at ``collect()``.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, overload
 
 from ._frames import EdgeFrame, NodeFrame, _native
@@ -34,39 +36,240 @@ if TYPE_CHECKING:
     from ._result import MaterializedFrame
 
 
-def _reject_format_opts(format_opts: dict[str, Any]) -> None:
-    """Format options (e.g. a CSV ``delimiter=``) are not plumbed into the scan
-    yet, so accepting and dropping them would silently ignore the caller. Raise
-    instead until they are threaded through to the Rust scan."""
-    if format_opts:
-        keys = ", ".join(sorted(format_opts))
-        raise NotImplementedError(
-            f"scan format options ({keys}) are not supported yet; they would be "
-            "silently ignored. Only Parquet/CSV with default parsing is wired."
+# A CSV scan's options, with their defaults: how every CSV scan reads.
+_CSV_DEFAULTS: dict[str, Any] = {
+    "delimiter": ",",
+    "has_header": True,
+    "quote": '"',
+    "escape": None,
+    "null_value": None,
+    "comment": None,
+}
+
+
+def _csv_options(
+    step: str, path: Any, any_csv: bool, given: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Check a scan's CSV options and return the ones that differ from the
+    defaults, as the engine takes them (a character as its byte), or ``None``
+    when all are the defaults, so a default scan builds exactly as before.
+
+    Each character option is one ASCII character other than a line break, and
+    no two of ``delimiter``, ``quote``, ``escape`` and ``comment`` may be the
+    same character. The options only apply to a CSV file, so passing one to a
+    scan with no ``.csv`` path (``any_csv``) is an error rather than a silent
+    no-op."""
+    changed = [k for k, v in given.items() if not _is_default(v, _CSV_DEFAULTS[k])]
+    if not changed:
+        return None
+    has_header = given["has_header"]
+    if not isinstance(has_header, bool):
+        raise TypeError(f"{step}(): has_header must be True or False; got {has_header!r}.")
+    null_value = given["null_value"]
+    if null_value is not None and not isinstance(null_value, str):
+        raise TypeError(
+            f"{step}(): null_value must be a string or None; got {null_value!r}. "
+            "Pass the text a null field holds, such as 'NA'."
         )
+    chars: dict[str, str] = {}
+    for name in ("delimiter", "quote", "escape", "comment"):
+        value = given[name]
+        if value is None and name in ("escape", "comment"):
+            continue
+        if not isinstance(value, str) or len(value) != 1 or not value.isascii():
+            raise ValueError(
+                f"{step}(): {name} must be one ASCII character; got {value!r}. "
+                f"Pass a single character, such as {_CSV_EXAMPLE[name]!r}."
+            )
+        if value in "\r\n":
+            raise ValueError(
+                f"{step}(): {name} cannot be a line break; got {value!r}. "
+                "Rows end at a line break, so pick another character."
+            )
+        for other, seen in chars.items():
+            if seen == value:
+                raise ValueError(
+                    f"{step}(): {other} and {name} are both {value!r}; "
+                    "they must be different characters."
+                )
+        chars[name] = value
+    if not any_csv:
+        names = ", ".join(f"{k}=" for k in changed)
+        raise ValueError(
+            f"{step}(): the CSV options ({names}) only apply to .csv files, and "
+            f"{path!r} is not one. Remove them, or scan a .csv file."
+        )
+    out: dict[str, Any] = {}
+    for name in changed:
+        value = given[name]
+        out[name] = ord(value) if name in chars else value
+    return out
+
+
+def _is_default(value: Any, default: Any) -> bool:
+    """Whether an option was left at its default (``1`` is not ``True``)."""
+    return type(value) is type(default) and value == default
+
+
+# An example value for each character option, for its error message.
+_CSV_EXAMPLE = {"delimiter": ";", "quote": "'", "escape": "\\", "comment": "#"}
+
+
+def _scan_paths(step: str, verb: str, path: Any) -> tuple[str | list[str], bool]:
+    """A scan's path as the engine takes it, and whether any path is a CSV file.
+
+    A path is a string or an ``os.PathLike`` (a ``pathlib.Path``); several are a
+    list or tuple of them, read as one table in that order. Each path's format
+    is checked here, where the scan is made, with the error a ``collect()`` of it
+    would raise (``verb`` names the scan in it, as there)."""
+    if isinstance(path, (list, tuple)):
+        if not path:
+            raise ValueError(f"{step}(): the list of paths is empty. Pass at least one path.")
+        paths = [_one_path(step, p) for p in path]
+        engine: str | list[str] = paths
+    else:
+        engine = _one_path(step, path)
+        paths = [engine]
+    check = _native().check_scan_path
+    any_csv = False
+    for p in paths:
+        any_csv = check(p, verb) or any_csv
+    return engine, any_csv
+
+
+def _one_path(step: str, path: Any) -> str:
+    """One path as a string (an ``os.PathLike`` through ``os.fspath``)."""
+    import os
+
+    if isinstance(path, os.PathLike):
+        path = os.fspath(path)
+    if not isinstance(path, str):
+        raise TypeError(
+            f"{step}(): a path must be a string or a pathlib.Path, or a list of them; "
+            f"got {type(path).__name__}."
+        )
+    return path
+
+
+# Keyword arguments other libraries use, and the option each means here.
+_ALIASES = {
+    "sep": "delimiter",
+    "separator": "delimiter",
+    "delim": "delimiter",
+    "header": "has_header",
+    "na_values": "null_value",
+    "null_values": "null_value",
+    "na_value": "null_value",
+    "quotechar": "quote",
+    "quote_char": "quote",
+    "escapechar": "escape",
+    "escape_char": "escape",
+    "comment_char": "comment",
+}
+
+
+def _reject_unknown(step: str, unknown: dict[str, Any], roles: tuple[str, ...]) -> None:
+    """Raise the ``TypeError`` for a keyword argument the scan does not take,
+    naming the option to use instead when it is another library's name for one,
+    or the closest one it takes when it looks like a typo of one. ``roles`` are
+    the scan's own keyword arguments besides the CSV options."""
+    if not unknown:
+        return
+    import difflib
+
+    name = next(iter(unknown))
+    hint = _ALIASES.get(name)
+    if hint:
+        end = f"; use {hint}= instead."
+    else:
+        valid = [*roles, "storage_options", "store", *_CSV_DEFAULTS]
+        close = difflib.get_close_matches(name, valid, n=1)
+        end = f"; did you mean {close[0]}=?" if close else "."
+    raise TypeError(f"{step}() got an unexpected keyword argument {name!r}{end}")
+
+
+def _scan_edges(
+    step: str,
+    path: Any,
+    src: str,
+    dst: str,
+    storage_options: dict[str, Any] | None,
+    store: Any | None,
+    on_null: str,
+    csv: dict[str, Any],
+    unknown: dict[str, Any],
+) -> EdgeFrame:
+    """``scan_edges`` / ``read_edges``: check the arguments (naming ``step`` in
+    an error) and build the scan."""
+    _reject_unknown(step, unknown, ("src", "dst", "on_null"))
+    engine, any_csv = _scan_paths(step, "scan_edges", path)
+    options = _csv_options(step, path, any_csv, csv)
+    _validate_on_null(on_null)
+    spec = {"storage_options": storage_options, "store": store}
+    return EdgeFrame._wrap(_native().PlanNode.scan_edges(engine, src, dst, on_null, spec, options))
+
+
+def _scan_nodes(
+    step: str,
+    path: Any,
+    id: str,
+    storage_options: dict[str, Any] | None,
+    store: Any | None,
+    csv: dict[str, Any],
+    unknown: dict[str, Any],
+) -> NodeFrame:
+    """``scan_nodes`` / ``read_nodes``, as ``_scan_edges``."""
+    _reject_unknown(step, unknown, ("id",))
+    engine, any_csv = _scan_paths(step, "scan_nodes", path)
+    options = _csv_options(step, path, any_csv, csv)
+    spec = {"storage_options": storage_options, "store": store}
+    return NodeFrame._wrap(_native().PlanNode.scan_nodes(engine, id, spec, options))
+
+
+# A path, or several read as one table.
+Paths = str | os.PathLike[str] | Sequence[str | os.PathLike[str]]
 
 
 def scan_edges(
-    path: str | list[str],
+    path: Paths,
     *,
     src: str,
     dst: str,
     storage_options: dict[str, Any] | None = None,
     store: Any | None = None,
     on_null: str = "error",
-    **format_opts: Any,
+    delimiter: str = ",",
+    has_header: bool = True,
+    quote: str = '"',
+    escape: str | None = None,
+    null_value: str | None = None,
+    comment: str | None = None,
+    **unknown: Any,
 ) -> EdgeFrame:
     """Lazily scan an edge list from Parquet/CSV.
 
     ``path`` may be local, object storage (``s3://`` / ``gs://`` / ``az://``, globs
-    allowed), or a plain ``http(s)://`` URL for a single hosted file. ``src`` /
-    ``dst`` are role mappings, not renames. ``store`` accepts a pre-configured
-    ``obstore`` store in place of ``storage_options`` (both bind the same
-    underlying Rust ``object_store`` crate).
+    allowed), or a plain ``http(s)://`` URL for a single hosted file, as a string
+    or a ``pathlib.Path``. ``src`` / ``dst`` are role mappings, not renames.
+    ``store`` accepts a pre-configured ``obstore`` store in place of
+    ``storage_options`` (both bind the same underlying Rust ``object_store``
+    crate).
 
     ``on_null`` controls what happens to a row whose ``src`` or ``dst`` endpoint is
     null: ``"error"`` (default) raises, ``"drop"`` filters the row out (emitting a
     count) instead of failing the whole scan.
+
+    A list (or tuple) of paths reads every path (each a file or a glob) as one
+    table, in the order given, as if the files were read one after another and
+    concatenated. Each must have the same columns, with the same types.
+
+    The CSV options set how a ``.csv`` file parses: ``delimiter`` (one
+    character, ``","`` by default), ``has_header`` (``False`` names the columns
+    ``column_1``, ``column_2``, ...), ``quote`` (``'"'``), ``escape`` (inside a
+    quoted field, a character that makes the next one literal; none by
+    default), ``null_value`` (a text that reads as null, as an empty field
+    always does) and ``comment`` (lines starting with it are skipped; none by
+    default).
 
     HTTP note: a URL must point directly at the file (no query string — the scan
     drops it before fetching, so presigned/token URLs will not authenticate; use
@@ -74,35 +277,98 @@ def scan_edges(
     signed access). Over plain ``http://`` the request and data are unencrypted;
     treat the URL as untrusted input if it is ever caller-controlled.
     """
-    _reject_format_opts(format_opts)
-    _validate_on_null(on_null)
-    spec = {"storage_options": storage_options, "store": store}
-    return EdgeFrame._wrap(_native().PlanNode.scan_edges(path, src, dst, on_null, spec))
+    csv = {
+        "delimiter": delimiter,
+        "has_header": has_header,
+        "quote": quote,
+        "escape": escape,
+        "null_value": null_value,
+        "comment": comment,
+    }
+    return _scan_edges("scan_edges", path, src, dst, storage_options, store, on_null, csv, unknown)
 
 
 def scan_nodes(
-    path: str | list[str],
+    path: Paths,
     *,
     id: str,
     storage_options: dict[str, Any] | None = None,
     store: Any | None = None,
-    **format_opts: Any,
+    delimiter: str = ",",
+    has_header: bool = True,
+    quote: str = '"',
+    escape: str | None = None,
+    null_value: str | None = None,
+    comment: str | None = None,
+    **unknown: Any,
 ) -> NodeFrame:
     """Lazily scan a node/attribute table (local, object storage, or an
-    ``http(s)://`` URL); ``id`` is the id-role mapping."""
-    _reject_format_opts(format_opts)
-    spec = {"storage_options": storage_options, "store": store}
-    return NodeFrame._wrap(_native().PlanNode.scan_nodes(path, id, spec))
+    ``http(s)://`` URL); ``id`` is the id-role mapping. Paths and the CSV options
+    read as in ``scan_edges``."""
+    csv = {
+        "delimiter": delimiter,
+        "has_header": has_header,
+        "quote": quote,
+        "escape": escape,
+        "null_value": null_value,
+        "comment": comment,
+    }
+    return _scan_nodes("scan_nodes", path, id, storage_options, store, csv, unknown)
 
 
-def read_edges(path: str | list[str], **kwargs: Any) -> MaterializedFrame:
+def read_edges(
+    path: Paths,
+    *,
+    src: str,
+    dst: str,
+    storage_options: dict[str, Any] | None = None,
+    store: Any | None = None,
+    on_null: str = "error",
+    delimiter: str = ",",
+    has_header: bool = True,
+    quote: str = '"',
+    escape: str | None = None,
+    null_value: str | None = None,
+    comment: str | None = None,
+    **unknown: Any,
+) -> MaterializedFrame:
     """Eager convenience: ``scan_edges(...).collect()``."""
-    return scan_edges(path, **kwargs).collect()
+    csv = {
+        "delimiter": delimiter,
+        "has_header": has_header,
+        "quote": quote,
+        "escape": escape,
+        "null_value": null_value,
+        "comment": comment,
+    }
+    frame = _scan_edges("read_edges", path, src, dst, storage_options, store, on_null, csv, unknown)
+    return frame.collect()
 
 
-def read_nodes(path: str | list[str], **kwargs: Any) -> MaterializedFrame:
+def read_nodes(
+    path: Paths,
+    *,
+    id: str,
+    storage_options: dict[str, Any] | None = None,
+    store: Any | None = None,
+    delimiter: str = ",",
+    has_header: bool = True,
+    quote: str = '"',
+    escape: str | None = None,
+    null_value: str | None = None,
+    comment: str | None = None,
+    **unknown: Any,
+) -> MaterializedFrame:
     """Eager convenience: ``scan_nodes(...).collect()``."""
-    return scan_nodes(path, **kwargs).collect()
+    csv = {
+        "delimiter": delimiter,
+        "has_header": has_header,
+        "quote": quote,
+        "escape": escape,
+        "null_value": null_value,
+        "comment": comment,
+    }
+    return _scan_nodes("read_nodes", path, id, storage_options, store, csv, unknown).collect()
 
 
 @overload

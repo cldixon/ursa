@@ -266,6 +266,7 @@ pub(crate) fn plan_err(e: PlanError) -> PyErr {
         PlanError::Value(m) => PyValueError::new_err(m),
         PlanError::Type(m) => PyTypeError::new_err(m),
         PlanError::Overflow(m) => PyOverflowError::new_err(m),
+        PlanError::Limit(m) => UrsaError::new_err(m),
         PlanError::Wrapped { message, cause } => Python::attach(|py| {
             let err = PyNotImplementedError::new_err(message);
             err.set_cause(py, Some(plan_err(*cause)));
@@ -331,6 +332,19 @@ fn check_direction(verb: &str, direction: &Bound<'_, PyAny>) -> PyResult<()> {
     Err(PyValueError::new_err(msg))
 }
 
+/// Whether a scan path is a CSV file (`False`: Parquet), or the error a scan of
+/// it raises at `collect()` (an extension it does not read, a query string on
+/// an HTTP URL), raised where the scan is made (#216).
+#[pyfunction]
+fn check_scan_path(path: &str, verb: &str) -> PyResult<bool> {
+    let kind = if verb == "scan_nodes" {
+        "scan_nodes"
+    } else {
+        "scan_edges"
+    };
+    ursa_plan::scan::is_csv(path, kind).map_err(|e| engine_err(&e))
+}
+
 /// Raise the `ValueError` for an `on_null=` mode an edge source does not have.
 #[pyfunction]
 fn check_on_null(on_null: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -375,5 +389,6 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_agg_fn, m)?)?;
     m.add_function(wrap_pyfunction!(check_direction, m)?)?;
     m.add_function(wrap_pyfunction!(check_on_null, m)?)?;
+    m.add_function(wrap_pyfunction!(check_scan_path, m)?)?;
     Ok(())
 }

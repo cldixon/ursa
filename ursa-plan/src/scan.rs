@@ -48,6 +48,92 @@ use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
 use crate::parquet_stats::CheckedBounds;
 
+/// How a scan parses a CSV file (#216). The defaults are how a scan always read
+/// one: comma-separated, with a header row, `"` as the quote, no escape or
+/// comment character, and only an empty field read as null. A Parquet file
+/// ignores them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CsvOptions {
+    pub delimiter: u8,
+    pub has_header: bool,
+    pub quote: u8,
+    pub escape: Option<u8>,
+    pub comment: Option<u8>,
+    /// A field that reads as null, as an empty field does (see [`read_csv`]).
+    pub null_value: Option<String>,
+}
+
+impl Default for CsvOptions {
+    fn default() -> Self {
+        CsvOptions {
+            delimiter: b',',
+            has_header: true,
+            quote: b'"',
+            escape: None,
+            comment: None,
+            null_value: None,
+        }
+    }
+}
+
+impl CsvOptions {
+    pub fn is_default(&self) -> bool {
+        *self == CsvOptions::default()
+    }
+
+    /// DataFusion's read options for these: the null pattern matches an empty
+    /// field or the null value, literally.
+    fn read_options(&self) -> CsvReadOptions<'static> {
+        let mut options = CsvReadOptions::new()
+            .has_header(self.has_header)
+            .delimiter(self.delimiter)
+            .quote(self.quote);
+        options.escape = self.escape;
+        options.comment = self.comment;
+        options.null_regex = self
+            .null_value
+            .as_ref()
+            .map(|v| format!("^(?:{})?$", regex::escape(v)));
+        options
+    }
+}
+
+/// What a scan reads: its paths (each a file or a glob), read as one table in
+/// the order given; the store settings; and how a CSV file parses.
+#[derive(Clone, Copy)]
+pub struct ScanSource<'a> {
+    pub paths: &'a [String],
+    pub storage_options: &'a HashMap<String, String>,
+    pub csv: &'a CsvOptions,
+}
+
+impl<'a> ScanSource<'a> {
+    pub fn new(
+        paths: &'a [String],
+        storage_options: &'a HashMap<String, String>,
+        csv: &'a CsvOptions,
+    ) -> Self {
+        ScanSource {
+            paths,
+            storage_options,
+            csv,
+        }
+    }
+
+    /// The source as an error's label names it: `'edges.parquet'`, or a list
+    /// `['a.csv', 'b.csv']`.
+    fn shown(&self) -> String {
+        match self.paths {
+            [path] => format!("'{path}'"),
+            paths => {
+                let quoted: Vec<String> = paths.iter().map(|p| format!("'{p}'")).collect();
+                format!("[{}]", quoted.join(", "))
+            }
+        }
+    }
+}
+
 /// The object store for a scan `path`, with the `scheme://authority` base it is
 /// registered under. A schemeless (bare local) path parses as an error and needs
 /// no store — the default registry already serves the local filesystem. Remote
@@ -274,7 +360,18 @@ fn build_scan_state(
 /// modification time is too coarse to tell a same-size rewrite apart (see
 /// [`build_scan_state`]), or a path the scan can't list (it raises its own
 /// error when it runs).
-pub fn scan_identity(path: &str, opts: &HashMap<String, String>) -> Option<String> {
+///
+/// A list of paths is identified by each path's identity, in path order.
+pub fn scan_identity(paths: &[String], opts: &HashMap<String, String>) -> Option<String> {
+    let ids = paths
+        .iter()
+        .map(|p| path_identity(p, opts))
+        .collect::<Option<Vec<_>>>()?;
+    Some(ids.join(";"))
+}
+
+/// The identity of one path (see [`scan_identity`]).
+fn path_identity(path: &str, opts: &HashMap<String, String>) -> Option<String> {
     use datafusion::datasource::listing::ListingTableUrl;
     use futures::TryStreamExt;
     if Url::parse(path).is_ok_and(|u| u.scheme() != "file") {
@@ -356,6 +453,17 @@ enum ScanFormat {
     Csv,
 }
 
+/// Whether `path` is a CSV file (`false`: Parquet), or the error the scan `kind`
+/// (`scan_edges`) of it raises, labelled as that scan labels it: the check a
+/// scan runs, for the host to run where the scan is made.
+pub fn is_csv(path: &str, kind: &'static str) -> Result<bool> {
+    let paths = [path.to_string()];
+    let (opts, csv) = (HashMap::new(), CsvOptions::default());
+    let source = ScanSource::new(&paths, &opts, &csv);
+    let format = detect_format(path).map_err(in_scan(kind, source))?;
+    Ok(matches!(format, ScanFormat::Csv))
+}
+
 fn detect_format(path: &str) -> Result<ScanFormat> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
@@ -382,12 +490,16 @@ fn detect_format(path: &str) -> Result<ScanFormat> {
     ))
 }
 
-/// Label an error from the scan `kind` (`scan_edges`) of `path`:
-/// `scan_edges('edges.parquet'): no file found at ...`.
+/// Label an error from the scan `kind` (`scan_edges`) of `source`:
+/// `scan_edges('edges.parquet'): no file found at ...`, or for a list of paths
+/// `scan_edges(['a.csv', 'b.csv']): ...`.
 /// Only an error about the file is labelled: one from evaluating a pushed-down
 /// filter reads as it does on every other path.
-fn in_scan(kind: &'static str, path: &str) -> impl Fn(DataFusionError) -> DataFusionError {
-    let label = format!("{kind}('{path}')");
+fn in_scan(
+    kind: &'static str,
+    source: ScanSource<'_>,
+) -> impl Fn(DataFusionError) -> DataFusionError {
+    let label = format!("{kind}({})", source.shown());
     move |e| {
         if evaluation_error(&e) {
             e
@@ -478,16 +590,164 @@ const SCAN_BATCH_ROWS: usize = 1 << 17;
 /// extension names. The shared prologue of `scan_edges_batch` and
 /// `scan_nodes_batch` — each then applies its own projection and id canonicalization.
 ///
+/// Several paths read as one table, in the order given (#216): each path as
+/// one path reads, then their union. A union's partitions are its inputs'
+/// partitions in input order, so [`collect_in_file_order`] reads the rows in
+/// path order, then file order within a path, as the files read into memory
+/// one after another and concatenated would be. The paths must name the same
+/// columns with the same types, and be on one store.
+///
 /// `kind` (`"scan_edges"`/`"scan_nodes"`) only tunes the error message from
 /// [`detect_format`]. The returned `DataFrame` carries its own `Arc`-shared session
 /// state (including the registered store), so the local `SessionContext` need not
 /// outlive this call.
-async fn open_scan(path: &str, storage_options: &HashMap<String, String>) -> Result<DataFrame> {
-    let ctx = SessionContext::new_with_state(scan_state(path, storage_options)?);
+async fn open_scan(source: ScanSource<'_>) -> Result<DataFrame> {
+    let Some((first, rest)) = source.paths.split_first() else {
+        return Err(DataFusionError::Plan(
+            "the list of paths is empty; pass at least one path".to_string(),
+        ));
+    };
+    let mut df = open_path(first, source).await?;
+    let store = StoreKey::new(first, source.storage_options);
+    for path in rest {
+        if StoreKey::new(path, source.storage_options) != store {
+            return Err(DataFusionError::NotImplemented(format!(
+                "the paths in a list must be on one store, and '{first}' and '{path}' are \
+                 not; copy the files to one store, or read them into memory"
+            )));
+        }
+        let next = open_path(path, source).await?;
+        let (want, got) = (df.schema().as_arrow(), next.schema().as_arrow());
+        if let Some(why) = mismatch(want, got, first, path) {
+            return Err(DataFusionError::Execution(format!(
+                "the paths in a list are read as one table, so each needs the same columns, \
+                 with the same types, in the same order. {why}"
+            )));
+        }
+        df = df.union(next)?;
+    }
+    Ok(df)
+}
+
+/// How `got` (the schema of path `path`) differs from `want` (that of the
+/// list's first path, `first`) in a way a union cannot read as one table, with
+/// what to do: `None` when the columns and types match. Nullability may
+/// differ: the union's column is nullable if any path's is.
+fn mismatch(want: &Schema, got: &Schema, first: &str, path: &str) -> Option<String> {
+    let names =
+        |s: &Schema| -> Vec<String> { s.fields().iter().map(|f| f.name().clone()).collect() };
+    if names(want) != names(got) {
+        return Some(format!(
+            "'{first}' has the columns [{}] and '{path}' has [{}]. Give every file the \
+             same columns, or read each with its own scan.",
+            names(want).join(", "),
+            names(got).join(", ")
+        ));
+    }
+    let differ: Vec<String> = want
+        .fields()
+        .iter()
+        .zip(got.fields())
+        .filter(|(a, b)| a.data_type() != b.data_type())
+        .map(|(a, b)| {
+            format!(
+                "column '{}' is {} in '{first}' and {} in '{path}'",
+                a.name(),
+                crate::compare::pa_name(a.data_type()),
+                crate::compare::pa_name(b.data_type())
+            )
+        })
+        .collect();
+    if differ.is_empty() {
+        return None;
+    }
+    let mut differ = differ.join("; ");
+    differ[..1].make_ascii_uppercase();
+    Some(format!(
+        "{differ}. Write the files with matching types (in a CSV file, a type is inferred \
+         from the values: write 1.0 for a float in every file), or read them into \
+         memory, cast the columns to one type and concatenate them."
+    ))
+}
+
+/// One path of a scan source, read as [`open_scan`] reads a single path.
+async fn open_path(path: &str, source: ScanSource<'_>) -> Result<DataFrame> {
+    let ctx = SessionContext::new_with_state(scan_state(path, source.storage_options)?);
     Ok(match detect_format(path)? {
         ScanFormat::Parquet => read_parquet(&ctx, path).await?,
-        ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
+        ScanFormat::Csv => read_csv(&ctx, path, source.csv).await?,
     })
+}
+
+/// `ctx.read_csv(path)` with `csv`'s options.
+///
+/// DataFusion 54 applies a null pattern when it infers a CSV file's schema but
+/// not when it reads the rows (its `CsvSource` never hands the pattern to the
+/// arrow-csv reader), so a column with a `null_value` in it would infer as a
+/// number and then fail to parse. With a `null_value`, the schema is inferred
+/// as DataFusion infers it, with the pattern, and each file is read by the same
+/// arrow-csv reader DataFusion uses, with the same options and that schema,
+/// plus the pattern. Every value parses, or fails to, exactly as it does
+/// without a `null_value`; the only difference is which fields read as null.
+/// The files are read whole, one partition each, in path order, as a glob
+/// lists them. A dry run reads no rows.
+async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<DataFrame> {
+    use datafusion::datasource::MemTable;
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+    let options = csv.read_options();
+    let Some(pattern) = options.null_regex.clone() else {
+        return ctx.read_csv(path, options).await;
+    };
+    let inferred = ctx.read_csv(path, csv.read_options()).await?;
+    let schema: SchemaRef = Arc::new(inferred.schema().as_arrow().clone());
+    let mut partitions: Vec<Vec<RecordBatch>> = vec![];
+    if !crate::dry::active() {
+        let null =
+            regex::Regex::new(&pattern).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let state = ctx.state();
+        let url = ListingTableUrl::parse(path)?;
+        let store = state.runtime_env().object_store(url.object_store())?;
+        let mut files = url
+            .list_all_files(&state, store.as_ref(), options.file_extension)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        files.sort_by(|a, b| a.location.cmp(&b.location));
+        for file in files {
+            let bytes = store
+                .get(&file.location)
+                .await
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?
+                .bytes()
+                .await
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+            // The reader DataFusion's `CsvSource::builder` makes, plus the pattern.
+            let mut reader = arrow::csv::ReaderBuilder::new(schema.clone())
+                .with_delimiter(csv.delimiter)
+                .with_batch_size(SCAN_BATCH_ROWS)
+                .with_header(csv.has_header)
+                .with_quote(csv.quote)
+                .with_truncated_rows(false)
+                .with_null_regex(null.clone());
+            if let Some(escape) = csv.escape {
+                reader = reader.with_escape(escape);
+            }
+            if let Some(comment) = csv.comment {
+                reader = reader.with_comment(comment);
+            }
+            let batches = reader
+                .build(std::io::Cursor::new(bytes))
+                .map_err(arrow_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(arrow_err)?;
+            partitions.push(batches);
+        }
+    }
+    if partitions.is_empty() {
+        partitions.push(vec![]);
+    }
+    ctx.read_table(Arc::new(MemTable::try_new(schema, partitions)?))
 }
 
 /// `ctx.read_parquet(path, ParquetReadOptions::default())`, with a column's
@@ -574,26 +834,23 @@ async fn collect_in_file_order_with_plan(
 /// output column shares the scanned array. The one exception is an endpoint
 /// already named `src`/`dst`, whose canonical column carries that name already.
 pub fn scan_edges_batch(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     weight_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
-    scan_edges_batch_inner(path, src, dst, storage_options, weight_columns)
-        .map_err(in_scan("scan_edges", path))
+    scan_edges_batch_inner(source, src, dst, weight_columns).map_err(in_scan("scan_edges", source))
 }
 
 fn scan_edges_batch_inner(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     weight_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     log_scan("edges", weight_columns, 0);
     crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options).await?;
+        let df = open_scan(source).await?;
         check_endpoints(df.schema().as_arrow(), src, dst)?;
 
         // Project src, dst, then any weight columns not already among them.
@@ -666,10 +923,9 @@ fn scan_edges_batch_inner(
 /// both endpoints — as a scanned edge frame collects it (#160). See
 /// [`scan_edges_rows`], which also takes predicates to push into the scan.
 pub fn scan_edges_table(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     // A projection here always carries both endpoints.
@@ -677,7 +933,7 @@ pub fn scan_edges_table(
     if !columns.is_empty() {
         columns.extend([src.to_string(), dst.to_string()]);
     }
-    Ok(scan_edges_rows(path, src, dst, storage_options, &columns, &[], false)?.batches)
+    Ok(scan_edges_rows(source, src, dst, &columns, &[], false)?.batches)
 }
 
 /// An edge file's rows, read by [`scan_edges_rows`].
@@ -712,23 +968,14 @@ pub struct EdgeRows {
 /// projections ([`scan_edges_topology`], [`scan_edges_batch`]).
 #[allow(clippy::too_many_arguments)]
 pub fn scan_edges_rows(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
     drop_nulls: bool,
 ) -> Result<EdgeRows> {
-    let (rows, pushed, _) = scan_edges_rows_plan(
-        path,
-        src,
-        dst,
-        storage_options,
-        columns,
-        filters,
-        drop_nulls,
-    )?;
+    let (rows, pushed, _) = scan_edges_rows_plan(source, src, dst, columns, filters, drop_nulls)?;
     if pushed < filters.len() {
         return Err(DataFusionError::Execution(format!(
             "scan_edges: filter {pushed} reads a column the scan does not read"
@@ -742,60 +989,41 @@ pub fn scan_edges_rows(
 /// a filter over a column the file lacks raises the caller's own error.
 #[allow(clippy::too_many_arguments)]
 pub fn scan_edges_rows_pushing(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
     drop_nulls: bool,
 ) -> Result<(EdgeRows, usize)> {
-    let (rows, pushed, _) = scan_edges_rows_plan(
-        path,
-        src,
-        dst,
-        storage_options,
-        columns,
-        filters,
-        drop_nulls,
-    )?;
+    let (rows, pushed, _) = scan_edges_rows_plan(source, src, dst, columns, filters, drop_nulls)?;
     Ok((rows, pushed))
 }
 
 /// [`scan_edges_rows`], also returning the executed scan plan (for its metrics).
 #[allow(clippy::too_many_arguments)]
 fn scan_edges_rows_plan(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
     drop_nulls: bool,
 ) -> Result<(EdgeRows, usize, Arc<dyn ExecutionPlan>)> {
-    scan_edges_rows_plan_inner(
-        path,
-        src,
-        dst,
-        storage_options,
-        columns,
-        filters,
-        drop_nulls,
-    )
-    .map_err(in_scan("scan_edges", path))
+    scan_edges_rows_plan_inner(source, src, dst, columns, filters, drop_nulls)
+        .map_err(in_scan("scan_edges", source))
 }
 
 fn scan_edges_rows_plan_inner(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
     filters: &[Value],
     drop_nulls: bool,
 ) -> Result<(EdgeRows, usize, Arc<dyn ExecutionPlan>)> {
     crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options).await?;
+        let df = open_scan(source).await?;
         let schema = df.schema().as_arrow().clone();
         check_endpoints(&schema, src, dst)?;
         // Validate the endpoint types exactly as the graph build would.
@@ -1001,28 +1229,26 @@ pub struct ScannedTopology {
 /// the interner, which rejects them. Weighted scans keep using
 /// [`scan_edges_batch`], since their weight columns must outlive the build.
 pub fn scan_edges_topology(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     drop_nulls: bool,
 ) -> std::result::Result<ScannedTopology, ScanBuildError> {
-    scan_edges_topology_inner(path, src, dst, storage_options, drop_nulls).map_err(|e| match e {
-        ScanBuildError::Scan(e) => ScanBuildError::Scan(in_scan("scan_edges", path)(e)),
+    scan_edges_topology_inner(source, src, dst, drop_nulls).map_err(|e| match e {
+        ScanBuildError::Scan(e) => ScanBuildError::Scan(in_scan("scan_edges", source)(e)),
         e => e,
     })
 }
 
 fn scan_edges_topology_inner(
-    path: &str,
+    source: ScanSource<'_>,
     src: &str,
     dst: &str,
-    storage_options: &HashMap<String, String>,
     drop_nulls: bool,
 ) -> std::result::Result<ScannedTopology, ScanBuildError> {
     log_scan("index", &[], 0);
     let (interner, id_type, dropped) = crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options).await?;
+        let df = open_scan(source).await?;
         check_endpoints(df.schema().as_arrow(), src, dst)?;
         let df = df.select_columns(&[src, dst])?;
         let id_type = endpoint_id_type(df.schema().as_arrow())?;
@@ -1101,23 +1327,21 @@ fn scan_edges_topology_inner(
 /// LEFT-joined onto it by id — exactly like an in-memory `from_arrow(..., id=...)`
 /// table.
 pub fn scan_nodes_batch(
-    path: &str,
+    source: ScanSource<'_>,
     id: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
-    scan_nodes_batch_inner(path, id, storage_options, columns).map_err(in_scan("scan_nodes", path))
+    scan_nodes_batch_inner(source, id, columns).map_err(in_scan("scan_nodes", source))
 }
 
 fn scan_nodes_batch_inner(
-    path: &str,
+    source: ScanSource<'_>,
     id: &str,
-    storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     log_scan("nodes", columns, 0);
     crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options).await?;
+        let df = open_scan(source).await?;
 
         // Projection pushdown: read only the requested columns (must include id).
         // Empty means "all columns" (the attribute-table default).
@@ -1199,9 +1423,8 @@ impl NodeTableCache {
     /// scan.
     pub fn read(
         &self,
-        path: &str,
+        source: ScanSource<'_>,
         id: &str,
-        storage_options: &HashMap<String, String>,
         columns: Option<&[String]>,
     ) -> Result<Vec<RecordBatch>> {
         let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1220,12 +1443,12 @@ impl NodeTableCache {
             }
             (None, Some(want)) => Some(want.to_vec()),
         };
-        let batches = scan_nodes_batch(path, id, storage_options, read.as_deref().unwrap_or(&[]))?;
+        let batches = scan_nodes_batch(source, id, read.as_deref().unwrap_or(&[]))?;
         self.scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(out) = project(read.as_deref(), &batches, columns)? else {
             // A column the file lacks: the narrow read raises the scan's error.
-            return scan_nodes_batch(path, id, storage_options, columns.unwrap_or(&[]));
+            return scan_nodes_batch(source, id, columns.unwrap_or(&[]));
         };
         *table = Some((read, batches));
         Ok(out)
@@ -1283,6 +1506,23 @@ mod tests {
         HashMap::new()
     }
 
+    /// A scan of one path, with no storage options and the default CSV options.
+    fn one(path: &str) -> ScanSource<'static> {
+        many(&[path])
+    }
+
+    /// A scan of several paths, read as one table in this order.
+    fn many(paths: &[&str]) -> ScanSource<'static> {
+        static OPTS: OnceLock<HashMap<String, String>> = OnceLock::new();
+        static CSV: OnceLock<CsvOptions> = OnceLock::new();
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        ScanSource::new(
+            Box::leak(paths.into_boxed_slice()),
+            OPTS.get_or_init(HashMap::new),
+            CSV.get_or_init(CsvOptions::default),
+        )
+    }
+
     /// Write `n` edges `(i, i + 1)` to a Parquet file with many small row groups, so
     /// DataFusion splits the scan across several partitions.
     fn write_multi_row_group_parquet(path: &std::path::Path, n: i64) {
@@ -1316,13 +1556,13 @@ mod tests {
         let path = std::env::temp_dir().join("ursa_scan_test_topology.parquet");
         write_multi_row_group_parquet(&path, 2_000_000);
         let p = path.to_str().unwrap();
-        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_batch(one(p), "from", "to", &[]).unwrap();
         let pairs: Vec<(&dyn Array, &dyn Array)> = batches
             .iter()
             .map(|b| (b.column(0).as_ref(), b.column(1).as_ref()))
             .collect();
         let (topo, ids) = crate::build_topology_batches(&pairs).unwrap();
-        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
+        let scanned = scan_edges_topology(one(p), "from", "to", false).unwrap();
         assert_eq!(scanned.dropped, 0);
         assert_eq!(&scanned.ids.user_id_array(), &ids.user_id_array());
         assert_eq!(scanned.topo.out().offsets, topo.out().offsets);
@@ -1365,7 +1605,7 @@ mod tests {
         let pred = serde_json::json!({"kind": "binary", "op": ">=",
             "left": {"kind": "col", "name": "from"}, "right": {"kind": "lit", "value": 1_990_000}});
         let (rows, pushed, plan) =
-            scan_edges_rows_plan(p, "from", "to", &no_opts(), &[], &[pred], false).unwrap();
+            scan_edges_rows_plan(one(p), "from", "to", &[], &[pred], false).unwrap();
         assert_eq!(pushed, 1);
         let got: Vec<i64> = rows
             .batches
@@ -1386,7 +1626,7 @@ mod tests {
         // A filter that keeps nothing is an empty result, not an empty source.
         let none = serde_json::json!({"kind": "binary", "op": "<",
             "left": {"kind": "col", "name": "from"}, "right": {"kind": "lit", "value": 0}});
-        let rows = scan_edges_rows(p, "from", "to", &no_opts(), &[], &[none], false).unwrap();
+        let rows = scan_edges_rows(one(p), "from", "to", &[], &[none], false).unwrap();
         assert_eq!(rows.batches.len(), 1);
         assert_eq!(rows.batches[0].num_rows(), 0);
         assert_eq!(rows.batches[0].num_columns(), 2);
@@ -1408,32 +1648,26 @@ mod tests {
                 .collect()
         };
         let ab = cache
-            .read(p, "id", &no_opts(), Some(&cols(&["id", "a", "b"])))
+            .read(one(p), "id", Some(&cols(&["id", "a", "b"])))
             .unwrap();
         assert_eq!(names(&ab), ["id", "a", "b"]);
         // A subset, in another order, is served from the held table.
-        let ba = cache
-            .read(p, "id", &no_opts(), Some(&cols(&["b", "id"])))
-            .unwrap();
+        let ba = cache.read(one(p), "id", Some(&cols(&["b", "id"]))).unwrap();
         assert_eq!(names(&ba), ["b", "id"]);
         assert_eq!(cache.scans(), 1);
         // A new column widens the held table to the union.
-        let c = cache
-            .read(p, "id", &no_opts(), Some(&cols(&["id", "c"])))
-            .unwrap();
+        let c = cache.read(one(p), "id", Some(&cols(&["id", "c"]))).unwrap();
         assert_eq!(names(&c), ["id", "c"]);
         assert_eq!(cache.held(), Some(Some(cols(&["id", "a", "b", "c"]))));
         assert_eq!(cache.scans(), 2);
         // Every column, then any projection, read it once more at most.
-        let all = cache.read(p, "id", &no_opts(), None).unwrap();
+        let all = cache.read(one(p), "id", None).unwrap();
         assert_eq!(names(&all), ["id", "a", "b", "c"]);
-        cache
-            .read(p, "id", &no_opts(), Some(&cols(&["a", "id"])))
-            .unwrap();
+        cache.read(one(p), "id", Some(&cols(&["a", "id"]))).unwrap();
         assert_eq!(cache.scans(), 3);
         // A column the file lacks is the scan's own error.
         let err = cache
-            .read(p, "id", &no_opts(), Some(&cols(&["id", "nope"])))
+            .read(one(p), "id", Some(&cols(&["id", "nope"])))
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
         std::fs::remove_file(&path).ok();
@@ -1446,10 +1680,10 @@ mod tests {
         let p = path.to_str().unwrap();
         // Default: the null endpoint is an interning error, not a scan error.
         assert!(matches!(
-            scan_edges_topology(p, "from", "to", &no_opts(), false),
+            scan_edges_topology(one(p), "from", "to", false),
             Err(ScanBuildError::Build(IdError::Null))
         ));
-        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), true).unwrap();
+        let scanned = scan_edges_topology(one(p), "from", "to", true).unwrap();
         assert_eq!(scanned.dropped, 2);
         assert_eq!(scanned.topo.n_edges(), 2);
         assert_eq!(scanned.topo.n_nodes(), 3);
@@ -1479,11 +1713,11 @@ mod tests {
         w.close().unwrap();
         let p = path.to_str().unwrap();
 
-        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_batch(one(p), "from", "to", &[]).unwrap();
         assert_eq!(batches[0].column(0).data_type(), &DataType::Utf8);
-        let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
+        let scanned = scan_edges_topology(one(p), "from", "to", false).unwrap();
         assert_eq!((scanned.topo.n_nodes(), scanned.topo.n_edges()), (3, 3));
-        let nodes = scan_nodes_batch(p, "from", &no_opts(), &[]).unwrap();
+        let nodes = scan_nodes_batch(one(p), "from", &[]).unwrap();
         assert_eq!(nodes[0].column(0).data_type(), &DataType::Utf8);
         std::fs::remove_file(&path).ok();
     }
@@ -1524,12 +1758,12 @@ mod tests {
             let p = path.to_str().unwrap();
 
             let label = ["label".to_string()];
-            let batches = scan_edges_batch(p, "from", "to", &no_opts(), &label).unwrap();
+            let batches = scan_edges_batch(one(p), "from", "to", &label).unwrap();
             assert_eq!(batches[0].column(0).data_type(), &DataType::Utf8, "{name}");
             assert_eq!(batches[0].column(1).data_type(), &DataType::Utf8, "{name}");
             assert_eq!(batches[0].num_columns(), 3, "{name}");
-            let scanned = scan_edges_topology(p, "from", "to", &no_opts(), false).unwrap();
-            let nodes = scan_nodes_batch(p, "from", &no_opts(), &[]).unwrap();
+            let scanned = scan_edges_topology(one(p), "from", "to", false).unwrap();
+            let nodes = scan_nodes_batch(one(p), "from", &[]).unwrap();
             assert_eq!(nodes[0].column(0).data_type(), &DataType::Utf8, "{name}");
             // A string attribute is read as the file declares it, with views
             // turned into Utf8 for the pyarrow-side relational tail.
@@ -1541,7 +1775,7 @@ mod tests {
             assert_eq!(label_type, want_label, "{name}");
             // The relational table scan (#160) keeps every column under its own
             // name; views become Utf8 (endpoints too), a dictionary stays one.
-            let table = scan_edges_table(p, "from", "to", &no_opts(), &[]).unwrap();
+            let table = scan_edges_table(one(p), "from", "to", &[]).unwrap();
             let schema = table[0].schema();
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, ["from", "to", "label"], "{name}");
@@ -1567,8 +1801,7 @@ mod tests {
         let n: i64 = 2_000_000; // ~32 MB: above the 10 MB repartition threshold
         write_multi_row_group_parquet(&path, n);
         for _ in 0..5 {
-            let batches =
-                scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+            let batches = scan_edges_batch(one(path.to_str().unwrap()), "from", "to", &[]).unwrap();
             let mut next = 0i64;
             for b in &batches {
                 let src = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1579,8 +1812,7 @@ mod tests {
             }
             assert_eq!(next, n);
         }
-        let batches =
-            scan_edges_table(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_table(one(path.to_str().unwrap()), "from", "to", &[]).unwrap();
         let mut next = 0i64;
         for b in &batches {
             let src = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1628,7 +1860,7 @@ mod tests {
         let path = std::env::temp_dir().join("ursa_scan_test_edge_table.parquet");
         write_attr_edges_parquet(&path);
         let p = path.to_str().unwrap();
-        let batches = scan_edges_table(p, "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_table(one(p), "from", "to", &[]).unwrap();
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ["w", "from", "label", "to"]);
@@ -1647,14 +1879,14 @@ mod tests {
         // A projection reads the named columns plus both endpoints, in file order;
         // a name the file lacks is left for the caller's column check.
         let cols = ["label".to_string(), "nope".to_string()];
-        let batches = scan_edges_table(p, "from", "to", &no_opts(), &cols).unwrap();
+        let batches = scan_edges_table(one(p), "from", "to", &cols).unwrap();
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ["from", "label", "to"]);
 
         // A missing endpoint names the column; a non-id endpoint is rejected as
         // the graph build would reject it.
-        let err = scan_edges_table(p, "from", "nope", &no_opts(), &[]).unwrap_err();
+        let err = scan_edges_table(one(p), "from", "nope", &[]).unwrap_err();
         let msg = crate::message::engine_message(&err);
         assert!(
             msg.ends_with(
@@ -1663,7 +1895,7 @@ mod tests {
             "{msg}"
         );
         assert!(msg.starts_with("scan_edges('"), "{msg}");
-        let err = scan_edges_table(p, "from", "w", &no_opts(), &[]).unwrap_err();
+        let err = scan_edges_table(one(p), "from", "w", &[]).unwrap_err();
         let msg = crate::message::engine_message(&err);
         assert!(
             msg.contains("node ids must be an integer or string column; got double"),
@@ -1676,8 +1908,7 @@ mod tests {
     fn edge_table_scan_reads_every_csv_column() {
         let path = std::env::temp_dir().join("ursa_scan_test_edge_table.csv");
         std::fs::write(&path, "from,to,weight,label\n10,20,0.5,a\n20,30,0.9,b\n").unwrap();
-        let batches =
-            scan_edges_table(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_table(one(path.to_str().unwrap()), "from", "to", &[]).unwrap();
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ["from", "to", "weight", "label"]);
@@ -1694,7 +1925,7 @@ mod tests {
         write_attr_edges_parquet(&path);
         let p = path.to_str().unwrap();
         let cols = ["from".to_string(), "w".to_string()];
-        let batches = scan_edges_batch(p, "from", "to", &no_opts(), &cols).unwrap();
+        let batches = scan_edges_batch(one(p), "from", "to", &cols).unwrap();
         let schema = batches[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ["src", "dst", "w", "from"]);
@@ -1712,8 +1943,7 @@ mod tests {
         let path = std::env::temp_dir().join("ursa_scan_test_weight_endpoint.csv");
         std::fs::write(&path, "src,dst\n1,2\n2,3\n").unwrap();
         let cols = ["src".to_string()];
-        let batches =
-            scan_edges_batch(path.to_str().unwrap(), "src", "dst", &no_opts(), &cols).unwrap();
+        let batches = scan_edges_batch(one(path.to_str().unwrap()), "src", "dst", &cols).unwrap();
         assert_eq!(batches[0].num_columns(), 2);
         std::fs::remove_file(&path).ok();
     }
@@ -1729,8 +1959,7 @@ mod tests {
             writeln!(f, "10,20,0.5").unwrap();
             writeln!(f, "20,30,0.9").unwrap();
         }
-        let batches =
-            scan_edges_batch(path.to_str().unwrap(), "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_batch(one(path.to_str().unwrap()), "from", "to", &[]).unwrap();
         let batch = &batches[0];
         assert_eq!(batch.num_columns(), 2);
         let n: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1754,8 +1983,7 @@ mod tests {
             writeln!(f, "1,us,10").unwrap();
             writeln!(f, "2,eu,20").unwrap();
         }
-        let batches =
-            scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts(), &[]).unwrap();
+        let batches = scan_nodes_batch(one(path.to_str().unwrap()), "tower_id", &[]).unwrap();
         let batch = &batches[0];
         let n: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(n, 2);
@@ -1787,8 +2015,7 @@ mod tests {
             writeln!(f, "2,eu,20").unwrap();
         }
         let cols = vec!["tower_id".to_string(), "capacity".to_string()];
-        let batches =
-            scan_nodes_batch(path.to_str().unwrap(), "tower_id", &no_opts(), &cols).unwrap();
+        let batches = scan_nodes_batch(one(path.to_str().unwrap()), "tower_id", &cols).unwrap();
         let schema = batches[0].schema();
         assert_eq!(schema.fields().len(), 2);
         assert!(schema.index_of("tower_id").is_ok());
@@ -1810,7 +2037,7 @@ mod tests {
             writeln!(f, "2,3").unwrap();
         }
         let url = format!("file://{}", path.to_str().unwrap());
-        let batches = scan_edges_batch(&url, "from", "to", &no_opts(), &[]).unwrap();
+        let batches = scan_edges_batch(one(&url), "from", "to", &[]).unwrap();
         let n: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(n, 2);
         std::fs::remove_file(&path).ok();
@@ -1838,7 +2065,7 @@ mod tests {
     }
 
     fn scanned_sources(path: &str) -> Vec<i64> {
-        scan_edges_batch(path, "from", "to", &no_opts(), &[])
+        scan_edges_batch(one(path), "from", "to", &[])
             .unwrap()
             .iter()
             .flat_map(|b| {
@@ -2088,14 +2315,13 @@ mod tests {
                     write_float_parquet::<Float64Type>(&path, values.clone(), group);
                 }
                 let p = path.to_str().unwrap();
-                let rows = scan_edges_rows(p, "s", "d", &no_opts(), &[], &[], false).unwrap();
+                let rows = scan_edges_rows(one(p), "s", "d", &[], &[], false).unwrap();
                 assert_eq!(
                     float_bits(&rows.batches),
                     want,
                     "rows: case {i}, f32 {f32_col}"
                 );
-                let weighted =
-                    scan_edges_batch(p, "s", "d", &no_opts(), &["r".to_string()]).unwrap();
+                let weighted = scan_edges_batch(one(p), "s", "d", &["r".to_string()]).unwrap();
                 assert_eq!(
                     float_bits(&weighted),
                     want,
@@ -2104,5 +2330,119 @@ mod tests {
                 std::fs::remove_file(&path).ok();
             }
         }
+    }
+
+    /// The `from` column of every batch, in order.
+    fn sources_of(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let c = cast(b.column(0), &DataType::Int64).unwrap();
+                let c = c.as_any().downcast_ref::<Int64Array>().unwrap();
+                c.values().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_list_of_paths_reads_in_path_order() {
+        // #216: the paths are one table, the first path's rows first, whatever
+        // order the files sort in, through every read.
+        let dir = std::env::temp_dir().join("ursa_scan_test_list_order");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.parquet"), dir.join("b.parquet"));
+        write_multi_row_group_parquet(&a, 300_000);
+        write_edges_parquet(&b, &[-1, -2], &[-3, -4]);
+        let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+        let mut want = vec![-1, -2];
+        want.extend(0..300_000);
+        let source = many(&[b, a]);
+        assert_eq!(
+            sources_of(&scan_edges_batch(source, "from", "to", &[]).unwrap()),
+            want
+        );
+        let rows = scan_edges_rows(source, "from", "to", &[], &[], false).unwrap();
+        assert_eq!(sources_of(&rows.batches), want);
+        let nodes = scan_nodes_batch(source, "from", &[]).unwrap();
+        assert_eq!(sources_of(&nodes), want);
+        let scanned = scan_edges_topology(source, "from", "to", false).unwrap();
+        let one = scan_edges_topology(one(b), "from", "to", false).unwrap();
+        assert_eq!(scanned.topo.n_edges(), 300_002);
+        // The first path's ids are interned first.
+        assert_eq!(one.ids.len(), 4);
+        assert!(scanned.ids.len() > 300_000);
+
+        let ida = scan_identity(&[a.to_string()], &no_opts()).unwrap();
+        let idb = scan_identity(&[b.to_string()], &no_opts()).unwrap();
+        let both = scan_identity(&[b.to_string(), a.to_string()], &no_opts()).unwrap();
+        assert_eq!(both, format!("{idb};{ida}"));
+    }
+
+    #[test]
+    fn a_list_of_paths_needs_one_schema() {
+        let dir = std::env::temp_dir().join("ursa_scan_test_list_schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.parquet");
+        write_edges_parquet(&a, &[1], &[2]);
+        let c = dir.join("c.csv");
+        std::fs::write(&c, "from,to,w\n1,2,0.5\n").unwrap();
+        let (a, c) = (a.to_str().unwrap(), c.to_str().unwrap());
+        let err = scan_edges_rows(many(&[a, c]), "from", "to", &[], &[], false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("has the columns [from, to] and") && err.contains("has [from, to, w]"),
+            "{err}"
+        );
+        let err = scan_edges_batch(many(&[]), "from", "to", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("the list of paths is empty"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn csv_options_parse_the_file() {
+        let path = std::env::temp_dir().join("ursa_scan_test_csv_options.csv");
+        std::fs::write(&path, "# note\nfrom;to;w\n1;2;NA\n2;3;'1.5'\n").unwrap();
+        let p = path.to_str().unwrap();
+        let csv = CsvOptions {
+            delimiter: b';',
+            quote: b'\'',
+            comment: Some(b'#'),
+            null_value: Some("NA".into()),
+            ..CsvOptions::default()
+        };
+        let opts = no_opts();
+        let paths = [p.to_string()];
+        let source = ScanSource::new(&paths, &opts, &csv);
+        let rows = scan_edges_rows(source, "from", "to", &[], &[], false).unwrap();
+        let w = rows.batches[0].column_by_name("w").unwrap();
+        assert_eq!(w.data_type(), &DataType::Float64);
+        assert!(w.is_null(0));
+        assert_eq!(sources_of(&rows.batches), vec![1, 2]);
+        assert!(CsvOptions::default().is_default() && !csv.is_default());
+        // The defaults are DataFusion's own.
+        let d = CsvOptions::default().read_options();
+        let df = CsvReadOptions::default();
+        assert_eq!(
+            (
+                d.has_header,
+                d.delimiter,
+                d.quote,
+                d.escape,
+                d.comment,
+                d.null_regex
+            ),
+            (
+                df.has_header,
+                df.delimiter,
+                df.quote,
+                df.escape,
+                df.comment,
+                df.null_regex
+            )
+        );
     }
 }

@@ -126,7 +126,11 @@ class _Frame:
     limit = head
 
     def sample(self, n: int, *, seed: int | None = None) -> Self:
-        """Keep ``n`` random rows, reproducibly for a ``seed``, in input order."""
+        """Keep ``n`` random rows, reproducibly for a ``seed``, in input order.
+
+        The draw is deterministic: ``seed=None`` uses a fixed default seed, so it
+        keeps the same rows on every call and every run. Pass a different
+        ``seed`` for a different draw."""
         # sample changes the row set, so the frame starts a fresh topology index
         # (like distinct): a later graph op builds one from the sample.
         count, error = _ir.capture(_ir.count, n, "sample(n=)")

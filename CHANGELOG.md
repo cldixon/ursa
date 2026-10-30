@@ -10,6 +10,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Added
 
+- CSV options on `scan_edges`, `scan_nodes`, `read_edges` and `read_nodes`:
+  `delimiter`, `has_header`, `quote`, `escape`, `null_value` and `comment`,
+  passed to DataFusion's CSV reader. The defaults read a file as before
+  (comma-separated, a header row, `"` quotes, an empty field as null). The
+  options are checked where the scan is made: each character option is one
+  ASCII character other than a line break, the four must differ, and an
+  option on a scan with no `.csv` path raises `ValueError`. `escape` applies
+  inside a quoted field, as in the CSV reader DataFusion uses; in an unquoted
+  field it is an ordinary character. `null_value` reads that text as null, as
+  an empty field is read. DataFusion 54 applies a null pattern when it infers
+  a schema but not when it reads rows, so with a `null_value` Ursa reads each
+  file with the same arrow-csv reader, options and inferred schema, plus the
+  pattern: every value parses (or fails to parse, with the same error) as it
+  does without a `null_value`; only which fields are null differs. Such a
+  file is read whole rather than in byte ranges. The tests compare each
+  layout with `pyarrow.csv` given the same options, with empty fields read as
+  null in both (`strings_can_be_null=True`) and pyarrow's headerless column
+  names (`f0`, `f1`, ...) renamed to Ursa's (`column_1`, `column_2`, ...) (#216).
+- A scan of a list of paths collects: the paths (files or globs) are read as
+  one table, in the order given, as the files read into memory and
+  concatenated would be. Every graph operation sees that table, weighted
+  algorithms included: one index over the union of the files, with the
+  weights read from the same rows. The reshaped-topology cache keys such a
+  scan by every file it reads. A tuple works as a list, and a path may be a
+  `pathlib.Path`. The paths must have the same columns and types (their
+  nullability may differ), and be on one store; otherwise `collect()` names
+  each column that differs, its type in each file, and what to do. Each CSV
+  path infers its own types, so a column of `1`s in one file and `0.5`s in
+  another is such a difference, as it is for a glob (#216).
+
 - `ur.density`, `ur.avg_path_length` and `ur.diameter` take `lazy=True`, which
   returns a lazy one-row frame like `ur.describe`: one non-null column named
   after the stat (`density` and `avg_path_length` are `float64`, `diameter`
@@ -41,6 +71,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `benchmarks/README.md` describes comparing two commits (#187).
 
 ### Changed
+
+- **Behaviour change:** an unknown keyword argument to `scan_edges`,
+  `scan_nodes`, `read_edges` or `read_nodes` raises `TypeError` naming the
+  function called (`read_edges() got an unexpected keyword argument 'foo'.`),
+  with the option to use for another library's name for one (`sep` and
+  `separator` → `delimiter`, `header` → `has_header`, `na_values` and
+  `null_values` → `null_value`, `quotechar` → `quote`, `escapechar` →
+  `escape`), or the closest option it takes for a misspelling
+  (`delimter` → `did you mean delimiter=?`). It raised
+  `NotImplementedError: scan format options (...) are not supported yet`
+  (#216).
+- **Behaviour change:** a scan's paths are checked where it is made. A path
+  with an extension a scan does not read, or an HTTP URL with a query string,
+  raises the error (class and message) `collect()` raised. A path that is
+  not a string, a `pathlib.Path` or a list or tuple of them raises
+  `TypeError` (#216).
+- `sample(n)` without a seed is documented as deterministic: it draws with a
+  fixed default seed, so it keeps the same rows on every call and every run.
+  Pass a different `seed` for a different draw. Results are unchanged (#216).
+- A `pathlib.Path` works as a scan path. It raised `NotImplementedError` at
+  `collect()` (#216).
 
 - **Behaviour change:** `group_by` keys, `distinct`, `n_unique` and join keys
   compare floats in the total order filters and `sort()` use: `-0.0` equals
@@ -225,7 +276,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - Ursa's own messages lose the variant prefix DataFusion put before them
     (`Execution error: output column name 'id' is reserved …`, `This feature is
     not implemented: neighbors().agg() needs a node attribute table …`, and
-    the rest of the `weight expression …` and `neighbors().agg() …` family).
+    the rest of the `weight expression …` and `neighbors().agg() …` family);
+  - the scan messages #216 adds, in the same form (pinned in
+    `tests/test_error_messages.py`): a list of paths is labelled with the list
+    (`scan_edges(['a.csv', 'b.csv']): the paths in a list are read as one
+    table, so each needs the same columns, with the same types, in the same
+    order. Column 'w' is int64 in 'a.csv' and double in 'b.csv'. Write the
+    files with matching types …`, and `… 'a.parquet' has the columns [s, d, w]
+    and 'b.parquet' has [s, d]. Give every file the same columns …`; `… the
+    paths in a list must be on one store …`), the CSV options name the call
+    (`scan_edges(): delimiter must be one ASCII character; got ';;'. Pass a
+    single character, such as ';'.`, `read_edges(): the CSV options
+    (null_value=) only apply to .csv files, …`), and an unknown keyword names
+    the function and the option to use (`read_edges() got an unexpected
+    keyword argument 'sep'; use delimiter= instead.`). A stack too small for a
+    plan raises `UrsaError: collect(): the frame's plan has N relational
+    steps, more than the 65280 one plan can run. …`. A CSV value past the
+    1,000-row inference sample that does not parse still reads `… Parser
+    error: Error while parsing value 'yes' as type 'Boolean' for column 2 at
+    line 1001. …`, from the CSV reader, with or without `null_value`.
 - **Behaviour change:** a standalone graph verb is a full `NodeFrame` (#213).
   `ur.degree(e)`, `ur.pagerank(e)` and the other node-valued verbs called on
   their own are `edges.nodes().with_columns(<verb>=...)` with every frame
@@ -602,6 +671,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   part 1): its ~50 groups spread over 4 partitions only as evenly as they hash.
 
 ### Fixed
+
+- Long chains no longer crash the process (#216). `ur.degree` over 20,000
+  chained filters segfaulted on the default stack (a recursive clone of the
+  plan), and collecting a 20,000-step chain segfaulted on a 256 KB thread
+  stack (a recursive drop). A plan's inputs are now shared, so cloning a plan
+  copies one step, and dropped a step at a time; the reshaped-topology
+  fingerprint walks the chain in a loop; plan (de)serialization and `Debug`
+  move onto a heap-allocated stack segment when the thread's runs low. A
+  frame with more than 64 relational steps runs its `collect()`, `schema()`,
+  `explain()` and graph index build on a stack sized to it, since DataFusion's
+  optimizer and planner recurse once per operator: a node frame filtered
+  10,000 times after a graph column segfaulted on the default stack there.
+  Plans of up to 64 steps run as before; the stack a plan may reserve is
+  capped at 1 GiB (about 65,000 relational steps), past which `collect()`,
+  `schema()` and `explain()` raise `UrsaError` naming the limit and saying to
+  collect part of the chain first. `collect()`, `schema()`, `explain()` and
+  graph ops over 20,000-step chains now work on a 256 KB thread stack.
 
 - **Behaviour change:** `ur.density`, `ur.diameter` and `ur.avg_path_length`
   over a filtered edge frame or a `hop` / `shortest_path` result read its

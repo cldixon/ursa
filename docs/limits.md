@@ -1,18 +1,13 @@
 # Limits
 
-Ursa is version 0.4. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, the step that adds it raises `NotImplementedError` with a message that says what to change (a few, such as a scan of several files, raise when `collect()` reads them). Nothing is dropped silently.
-
-## Steps that do not run
-
-| Step | Status |
-|---|---|
-| CSV options on a scan, such as a delimiter | Not available. The file must be comma-separated with a header. |
+Ursa is version 0.4. The API is stable in shape, and some combinations of steps do not run yet. When a plan hits one, the step that adds it raises `NotImplementedError` with a message that says what to change (a few, such as a scan of files on different stores, raise when `collect()` reads them). Nothing is dropped silently.
 
 ## Combinations that do not run
 
 | Combination | Status |
 |---|---|
-| A weighted algorithm over a scan with several paths | Pass one path, or read the files into memory first. |
+| A frame with more than about 65,000 relational steps (counting the steps of the frames a graph column reads) | `collect()`, `schema()` and `explain()` raise `UrsaError`. Collect part of the chain and build the rest on its result. |
+| A scan of a list of paths on different stores (for example a local file and an `s3://` file) | Put the files on one store, or read them into memory first. |
 
 ## Scope
 

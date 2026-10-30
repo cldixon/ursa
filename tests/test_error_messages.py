@@ -474,6 +474,7 @@ def scan_cases(tmp: Path) -> dict:
     pq.write_table(NODES, tmp / "n.parquet")
     (tmp / "bad.parquet").write_bytes(b"not parquet at all")
     (tmp / "bad.csv").write_text('s,d\n1,2\n"x')
+    pq.write_table(EDGES.set_column(2, "w", pa.array([1, 2, 3, 4])), tmp / "e_int.parquet")
     p = lambda name: str(tmp / name)  # noqa: E731
     return {
         "missing": (
@@ -533,6 +534,64 @@ def scan_cases(tmp: Path) -> dict:
             ),
             TypeError,
             "storage_options= must be a dict of option names to string values; got {'region': 1}",
+        ),
+        # A list of paths, and the CSV options (#216).
+        "list_columns": (
+            lambda: ur.scan_edges([p("e.parquet"), p("n.parquet")], src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges(['{p('e.parquet')}', '{p('n.parquet')}']): the paths in a list are read "
+            "as one table, so each needs the same columns, with the same types, in the same "
+            f"order. '{p('e.parquet')}' has the columns [s, d, w] and '{p('n.parquet')}' has "
+            "[id, age, name]. Give every file the same columns, or read each with its own scan.",
+        ),
+        "list_types": (
+            lambda: ur.scan_edges([p("e.parquet"), p("e_int.parquet")], src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges(['{p('e.parquet')}', '{p('e_int.parquet')}']): the paths in a list are "
+            "read as one table, so each needs the same columns, with the same types, in the "
+            f"same order. Column 'w' is double in '{p('e.parquet')}' and int64 in "
+            f"'{p('e_int.parquet')}'. Write the files with matching types (in a CSV file, a type "
+            "is inferred from the values: write 1.0 for a float in every file), or read them "
+            "into memory, cast the columns to one type and concatenate them.",
+        ),
+        "list_stores": (
+            lambda: ur.scan_edges([p("e.parquet"), "s3://bucket/e.parquet"], src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges(['{p('e.parquet')}', 's3://bucket/e.parquet']): the paths in a list "
+            f"must be on one store, and '{p('e.parquet')}' and 's3://bucket/e.parquet' are not; "
+            "copy the files to one store, or read them into memory",
+        ),
+        "list_empty": (
+            lambda: ur.scan_edges([], src="s", dst="d"),
+            ValueError,
+            "scan_edges(): the list of paths is empty. Pass at least one path.",
+        ),
+        "path_type": (
+            lambda: ur.read_nodes(3, id="id"),  # ty: ignore[invalid-argument-type]
+            TypeError,
+            "read_nodes(): a path must be a string or a pathlib.Path, or a list of them; got int.",
+        ),
+        "csv_delimiter": (
+            lambda: ur.scan_edges(p("e.csv"), src="s", dst="d", delimiter=";;"),
+            ValueError,
+            "scan_edges(): delimiter must be one ASCII character; got ';;'. Pass a single "
+            "character, such as ';'.",
+        ),
+        "csv_on_parquet": (
+            lambda: ur.read_edges(p("e.parquet"), src="s", dst="d", null_value="NA"),
+            ValueError,
+            f"read_edges(): the CSV options (null_value=) only apply to .csv files, and "
+            f"'{p('e.parquet')}' is not one. Remove them, or scan a .csv file.",
+        ),
+        "csv_alias": (
+            lambda: ur.read_edges(p("e.csv"), src="s", dst="d", sep=";"),
+            TypeError,
+            "read_edges() got an unexpected keyword argument 'sep'; use delimiter= instead.",
+        ),
+        "csv_typo": (
+            lambda: ur.scan_nodes(p("e.csv"), id="s", delimter=";"),
+            TypeError,
+            "scan_nodes() got an unexpected keyword argument 'delimter'; did you mean delimiter=?",
         ),
     }
 

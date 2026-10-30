@@ -87,11 +87,13 @@ def test_neighbors_from_raises():
         edges.nodes().with_columns(x=expr).collect()
 
 
-def test_scan_format_opts_raise_at_construction():
-    with pytest.raises(NotImplementedError, match="format options"):
-        ur.scan_edges("edges.csv", src="s", dst="d", delimiter=";")
-    with pytest.raises(NotImplementedError, match="format options"):
-        ur.scan_nodes("nodes.csv", id="id", has_header=False)
+def test_unknown_scan_options_raise_at_construction():
+    # The CSV options are keyword arguments (#216); any other keyword is a
+    # TypeError where the scan is made, never silently dropped.
+    with pytest.raises(TypeError, match="unexpected keyword argument 'sep'"):
+        ur.scan_edges("edges.csv", src="s", dst="d", sep=";")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'header'"):
+        ur.scan_nodes("nodes.csv", id="id", header=False)
 
 
 def test_sink_csv_rejects_dropped_opts():
