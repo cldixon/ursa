@@ -226,9 +226,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - frames and edges: `AttributeError: 'str' object has no attribute 'kind'`
     → `filter() takes an ursa expression, such as ur.col('x') or
     ur.col('x') > 1; got 'age' (str)` (also `weight=`); `'NodeFrame' object has
-    no attribute 'nodes'` / `'int' object has no attribute '_node'` →
-    `pagerank() takes an EdgeFrame (the graph) as its edges; got NodeFrame`
-    (every verb, traversal and stat); `cannot pickle 'ursa._ursa.PlanNode'
+    no attribute 'nodes'` / `'int' object has no attribute '_node'` → a
+    `TypeError` that names the function, what it got and what to pass (every
+    verb, traversal and stat; see the edge-frame entry under Changed, #223);
+    `cannot pickle 'ursa._ursa.PlanNode'
     object` → `EdgeFrame objects cannot be pickled or deep-copied: a frame is a
     lazy plan over live data. …`; `argument 'src': 'int' object is not an
     instance of 'str'` → `src= must be a column name (a str); got 1 (int)`

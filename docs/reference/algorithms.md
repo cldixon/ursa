@@ -1,8 +1,10 @@
 # Algorithms
 
-Each function in this page takes an `EdgeFrame` as its first argument. Any other value raises `TypeError` where you call the function. See [Errors](errors.md#a-graph-function-given-something-other-than-an-edge-frame). The node-valued functions return an expression that is also a lazy `NodeFrame` of `(id, value)`. See [Expressions](../concepts/expressions.md#graph-algorithms-are-expressions).
+Each function in this page takes an `EdgeFrame` as its first argument. Any other value raises `TypeError` where you call the function. See [Errors](errors.md#a-graph-function-given-something-other-than-an-edge-frame). The node-valued functions return an expression that is also a lazy `NodeFrame` of `(id, value)`, with every [frame method](frames.md#shared-methods). Inside `with_columns(...)` it is a column. See [Expressions](../concepts/expressions.md#graph-algorithms-are-expressions).
 
-Every kernel is deterministic. The same input and the same parameters give the same output, on any number of threads. The kernels that use randomness take a `seed`.
+Over a filtered edge frame, a kernel runs on the subgraph view: the parent's nodes and the kept edges. Over a reshaped frame (`distinct`, `group_by().agg()`, a join, ...) it runs on the graph of the frame's rows. See [Work on a subgraph](../guides/subgraphs.md).
+
+Every kernel is deterministic. The same input and the same parameters give the same output, on any number of threads. The kernels that use randomness take a `seed`. `seed=None` uses a fixed default seed, so it also gives the same output on every call.
 
 ## Node-valued kernels
 
@@ -88,7 +90,7 @@ Community detection by Louvain modularity optimization, on the undirected view. 
 ur.neighbors(edges, direction: str = "out", from_=None).agg(expr, dtype: str = "f64")
 ```
 
-For each node, an aggregation of an attribute over its neighbours. `expr` is an [aggregation expression](expressions.md#aggregations), for example `ur.col("age").mean()`. The topology comes from `edges`. The attribute comes from the `NodeFrame` the expression runs in, or from `from_` if given.
+For each node, an aggregation of an attribute over its neighbours. `expr` is an [aggregation expression](expressions.md#aggregations), for example `ur.col("age").mean()`. The topology comes from `edges`. The attribute comes from the `NodeFrame` the expression runs in, which must be an attribute table, not `edges.nodes()`. `from_=` is not supported yet; see [Limits](../limits.md).
 
 `mean`, `sum`, `min`, and `max` need a numeric attribute. `count` and `n_unique` accept a string attribute too.
 
@@ -102,7 +104,7 @@ Traversals return an `EdgeFrame` or a `NodeFrame` with rows of their own. The sh
 ur.hop(edges, n: int = 1, direction: str = "out").from_(seeds) -> EdgeFrame
 ```
 
-The nodes within `n` hops of each seed. `seeds` is a list of ids. The result has one row per `(seed, reached)` pair, in the columns `src` and `dst`. `direction` is `"out"`, `"in"`, or `"both"`.
+The nodes within `n` hops of each seed. `seeds` is an iterable of ids, or a `NodeFrame` whose `id` column gives them. A seed that is not in the graph reaches nothing. The result has one row per `(seed, reached)` pair, in the columns `src` and `dst`. `direction` is `"out"`, `"in"`, or `"both"`.
 
 ### `ur.shortest_path`
 
@@ -118,7 +120,7 @@ One shortest path from `source` to `target`. The result has one row per edge on 
 ur.random_walk(edges, start, steps: int, walks_per_node: int = 1, seed: int | None = None) -> NodeFrame
 ```
 
-Random walks along out-edges. `start` is a list of ids. The result has the columns `walk_id`, `step`, and `node`, one row per position on each walk. A walk stops early at a node with no out-edges. `seed` makes the walks reproducible.
+Random walks along out-edges. `start` is an iterable of ids or a `NodeFrame`, as the seeds of `hop`. The result has the columns `walk_id`, `step`, and `node`, one row per position on each walk. A walk stops early at a node with no out-edges. `seed` makes the walks reproducible.
 
 ## The `direction` parameter
 

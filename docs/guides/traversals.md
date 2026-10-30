@@ -30,8 +30,8 @@ shape: (5, 2)
 │ 33    ┆ 0     │
 │ 0     ┆ 1     │
 │ 33    ┆ 1     │
-│ 33    ┆ 2     │
 │ 0     ┆ 2     │
+│ 33    ┆ 2     │
 └───────┴───────┘
 25 nodes within two hops of 0
 ```
@@ -96,7 +96,7 @@ A walk stops early at a node with no out-edges. `seed=` makes the walks reproduc
 
 ## Algorithms over a traversal
 
-A traversal result is an `EdgeFrame`, so a node-valued kernel can run over it. The kernel sees only the nodes the traversal reached. See [Work on a subgraph](subgraphs.md).
+A traversal result is an `EdgeFrame`, so a node-valued kernel can run over it. The kernel runs on the subgraph the reached nodes induce. A node outside it has no edges there, so its degree is 0. See [Work on a subgraph](subgraphs.md).
 
 ```python
 region = ur.hop(edges, n=1, direction="both").from_([0])

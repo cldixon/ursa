@@ -2,7 +2,7 @@
 
 ## When an error is raised
 
-A frame checks each step as you add it. A step that cannot run on the frame it is added to raises on that line, before anything runs: a column the frame does not have, two columns with one name, a comparison between types that do not compare, a role such as `ur.id()` on a frame without one, a join key missing from either side, or a combination of steps that does not run yet. The exception and its message are the ones `collect()` raised for them in earlier versions.
+A frame checks each step as you add it. A step that cannot run on its frame raises on that line, before anything runs. Examples are a column the frame does not have, two columns with one name, a comparison between types that do not compare, a role such as `ur.id()` on a frame without one, a join key missing from either side, and a combination of steps that does not run yet. The exception class is the one `collect()` raised for it in earlier versions.
 
 ```py
 nodes = ur.from_arrow({"id": [0, 1], "age": [31, 47]}, id="id")
@@ -12,9 +12,7 @@ except ur.ColumnNotFoundError as exc:
     print(exc)  # filter() references unknown column 'agee'; the frame has ['id', 'age'].
 ```
 
-Some errors depend on the rows, so `collect()` still raises them: a null endpoint, a value out of range for its type, an integer divide by zero, a seed that is not in the graph, a file that is missing or unreadable. A frame over `scan_edges` or `scan_nodes` is checked for its steps' shape when you build it, and for its columns when it runs, since its columns are the file's and the file can change in between.
-
-`edges.nodes()` with no columns yet does not collect, but you can still build on it: the `with_columns` after it gives it rows. Collecting it as it is raises `NotImplementedError`.
+Some errors depend on the rows or the files, so `collect()` still raises them: a null endpoint, a value out of range for its type, an integer divide by zero, an invalid value of a graph-verb parameter (`pagerank(damping=)`, `hop(n=)`), and a file that is missing or unreadable. A frame over `scan_edges` or `scan_nodes` is checked for the shape of its steps when you build it. Its columns are checked when it runs, because they come from the file, and the file can change in between.
 
 ## Engine errors
 
@@ -54,7 +52,7 @@ A `ColumnNotFoundError` names the step and the column, and lists the columns the
 | A weight | `weight expression references unknown edge column(s): ['x']; the edges have ['s', 'd']` |
 | A scan's role column | `scan_edges('edges.parquet'): src column 'x' not found in the file; it has ['s', 'd']` |
 | A role an earlier step removed | `a graph op needs the edge frame's src column 's', but select() removed it, ...` |
-| A column a scan's plan reads | `scan_nodes('nodes.parquet'): unknown column 'x'; the frame has ['id', 'age'].` |
+| A step's column on a scan, checked at `collect()` | `filter() references unknown column 'x'; the frame has ['id', 'age'].` |
 
 When Ursa translates an engine error, the engine's original text stays on the exception as its `__cause__`, a `RuntimeError`, so a bug report can include both:
 
@@ -77,7 +75,7 @@ The messages are part of the API: a change to one is listed in the changelog.
 |---|---|
 | `NotImplementedError` | The plan has a step, or a combination of steps, that does not run yet. Raised by the step that adds it. See [Limits](../limits.md). |
 | `ValueError` | An argument is invalid: an unknown `on_null` value, an edge tuple of the wrong length, two aggregations with one name, a `select` or `rename` that would give two columns one name, or a string argument given another type (`join(how=) must be a string; got 1`). Raised by the step that takes it. A `ColumnNotFoundError` is a `ValueError` too. |
-| `TypeError`, `OverflowError` | An integer argument is not an integer (`hop(n=) must be an integer; got a str`) or is out of range (`random_walk(steps=) must be a non-negative integer; got -1`), or a column role is not a name (`src= must be a column name (a str); got 1 (int)`). A frame cannot be pickled or deep-copied (`TypeError`). A graph function gets something other than an edge frame (`TypeError`, see below). |
+| `TypeError`, `OverflowError` | An integer argument is not an integer (`hop(n=) must be an integer; got a str`) or is out of range (`random_walk(steps=) must be a non-negative integer; got -1`). A column role is not a name (`src= must be a column name (a str); got 1 (int)`). A scan path is not a string or a `pathlib.Path`, or a scan gets an unknown keyword (`scan_edges() got an unexpected keyword argument 'sep'; use delimiter= instead.`). `join(other)` gets a value that is not a frame. A frame cannot be pickled or deep-copied. A graph function gets something other than an edge frame (see [below](#a-graph-function-given-something-other-than-an-edge-frame)). `bool(expr)`, and so `and`, `or`, `not` and `if` on an expression, raises `TypeError: the truth value of an ursa expression is ambiguous ...`. |
 | `KeyError` | A role column (`src=`, `dst=`, `id=`) is not in the table: `src column 'source' is not in the table; it has ['s', 'd']`. |
 | `AttributeError` | A value that is no expression where one is needed (`filter() takes an ursa expression ...`). |
 | `ModuleNotFoundError` | `to_polars()` is called without `polars` installed. The message names the `ursa-graph[polars]` extra. |
