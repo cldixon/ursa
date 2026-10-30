@@ -421,7 +421,7 @@ def test_a_left_side_error_comes_before_the_right_sides():
     left = ur.from_arrow(pa.table({"id": [0, 1], "a": [1, 2], "z": [0, 0]}), id="id")
     left = left.with_columns(q=ur.col("a") / ur.col("z"))
     right = ur.from_arrow(pa.table({"id": [0], "b": [1]}), id="id")
-    with pytest.raises(ur.ComputeError, match="Divide by zero"):
+    with pytest.raises(ur.ComputeError, match="division by zero in an integer expression"):
         left.join(right, on="id").collect()
     # What the plan alone shows is raised where the join is added (#193): a key
     # missing from the right side, even before the left side's run-time error.
@@ -457,7 +457,7 @@ def test_the_key_keeps_the_left_type(how, left_type, right_type):
 def test_a_right_key_the_left_type_cannot_hold_errors(how):
     left = ur.from_arrow(pa.table({"key": pa.array([1, 2], pa.uint64()), "a": [0, 1]}), id="a")
     right = ur.from_arrow(pa.table({"key": pa.array([2, -1], pa.int64()), "b": [0, 1]}), id="b")
-    with pytest.raises(ValueError, match=r"key 'key' keeps the left frame's type \(UInt64\)"):
+    with pytest.raises(ValueError, match=r"key 'key' keeps the left frame's type \(uint64\)"):
         left.join(right, on="key", how=how).collect()
     # inner and left never emit a right-only key.
     assert left.join(right, on="key").collect().to_dicts() == [{"key": 2, "a": 1, "b": 0}]

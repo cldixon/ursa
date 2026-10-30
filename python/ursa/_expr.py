@@ -93,6 +93,15 @@ class Expr:
 
     __hash__ = None  # type: ignore[assignment]  # Exprs are trees, not dict keys
 
+    def __bool__(self) -> bool:
+        # `==` builds an expression, so a truth test (`if a == b`, `x in [...]`,
+        # `a and b`) would always pass; raise instead, as Polars does.
+        raise TypeError(
+            "the truth value of an ursa expression is ambiguous: `==` and the other "
+            "comparisons build an expression rather than compare. Combine predicates "
+            "with &, | and ~ instead of and, or and not, and compare collected results."
+        )
+
     # -- aggregations (scoped pragmatically for v0.1) ------------------------
     def _agg(self, name: str) -> Expr:
         return Expr("agg", {"fn": name, "operand": self})

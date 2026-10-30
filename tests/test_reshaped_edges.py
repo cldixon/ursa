@@ -186,7 +186,10 @@ def test_edge_frame_with_columns_collects():
     got = _edges().with_columns(w2=ur.col("w") * 2, s2=ur.src() + 1).collect().to_arrow()
     assert got.column_names == ["s", "d", "w", "w2", "s2"]
     assert got.column("w2").to_pylist() == [w * 2 for w in EDGES.column("w").to_pylist()]
-    with pytest.raises(NotImplementedError, match="'with_columns' step on an edge frame"):
+    with pytest.raises(
+        NotImplementedError,
+        match=r"with_columns\(\) of a graph verb is not supported on an edge frame",
+    ):
         e = _edges()
         e.with_columns(d2=ur.degree(e)).collect()
 

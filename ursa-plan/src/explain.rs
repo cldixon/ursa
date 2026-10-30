@@ -8,6 +8,7 @@ use datafusion::logical_expr::LogicalPlan;
 use serde_json::Value;
 
 use crate::plan::{EdgeInput, Expr, Plan, SelectItem};
+use crate::stats::GraphStat;
 
 /// Append `plan`'s steps, its last step first, one per line at `depth`; the
 /// frames a step reads besides its input (a join's right side, a graph op's
@@ -36,7 +37,8 @@ pub fn tree(plan: &Plan, depth: usize, out: &mut String) {
             Plan::Hop { edges, .. }
             | Plan::ShortestPath { edges, .. }
             | Plan::RandomWalk { edges, .. }
-            | Plan::Describe { edges, .. } => {
+            | Plan::Describe { edges, .. }
+            | Plan::Stat { edges, .. } => {
                 let _ = writeln!(out, "{pad}  edges:");
                 edge_tree(edges, depth + 2, out);
             }
@@ -165,8 +167,26 @@ fn line(plan: &Plan) -> String {
                 .unwrap_or_default()
         ),
         Plan::Describe {
-            full, direction, ..
-        } => format!("describe(full={full}, direction={direction:?})"),
+            full,
+            direction,
+            touched,
+            ..
+        } => format!(
+            "describe(full={full}, direction={direction:?}{})",
+            if *touched { ", nodes=\"touched\"" } else { "" }
+        ),
+        Plan::Stat {
+            stat, direction, ..
+        } => match stat {
+            GraphStat::Density => format!("density(direction={direction:?})"),
+            GraphStat::AvgPathLength { sample } => format!(
+                "avg_path_length({}direction={direction:?})",
+                sample.map(|s| format!("sample={s}, ")).unwrap_or_default()
+            ),
+            GraphStat::Diameter { approximate } => {
+                format!("diameter(approximate={approximate}, direction={direction:?})")
+            }
+        },
         Plan::Invalid { .. } => "<invalid>".into(),
     };
     format!("{body}{invalid}")

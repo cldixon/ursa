@@ -105,7 +105,8 @@ fn object_store_for(
         }
         other => {
             return Err(DataFusionError::NotImplemented(format!(
-                "scan: unsupported URL scheme {other:?} (supported: file, s3, gs, az, http, https)"
+                "unsupported URL scheme '{other}'; use a local path or a file://, s3://, gs://, \
+                 az://, http:// or https:// URL"
             )))
         }
     };
@@ -114,7 +115,7 @@ fn object_store_for(
     // registers under the exact authority the read will look up — cloud buckets
     // have no port, so this is identical to the old `scheme://host` for them.
     let base = Url::parse(&url[..Position::BeforePath])
-        .map_err(|e| DataFusionError::Execution(format!("scan: bad object-store url: {e}")))?;
+        .map_err(|e| DataFusionError::Execution(format!("not a valid URL: {e}")))?;
     Ok(Some((base, store)))
 }
 
@@ -279,7 +280,7 @@ pub fn scan_identity(path: &str, opts: &HashMap<String, String>) -> Option<Strin
     if Url::parse(path).is_ok_and(|u| u.scheme() != "file") {
         return None;
     }
-    let ext = match detect_format(path, "scan").ok()? {
+    let ext = match detect_format(path).ok()? {
         ScanFormat::Parquet => ".parquet",
         ScanFormat::Csv => ".csv",
     };
@@ -355,7 +356,7 @@ enum ScanFormat {
     Csv,
 }
 
-fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
+fn detect_format(path: &str) -> Result<ScanFormat> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
         return Ok(ScanFormat::Parquet);
@@ -365,17 +366,85 @@ fn detect_format(path: &str, verb: &str) -> Result<ScanFormat> {
     }
     if let Ok(u) = Url::parse(path) {
         if matches!(u.scheme(), "http" | "https") && u.query().is_some() {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{verb}: an http(s) URL with a query string is not supported — the scan \
-                 drops the query before fetching, so a presigned/token URL would fetch the \
-                 unsigned path and fail. Point at a direct .parquet/.csv URL, or use \
-                 s3://gs://az:// with storage_options for signed access. got {path:?}"
-            )));
+            return Err(DataFusionError::NotImplemented(
+                "an http(s) URL with a query string is not supported — the scan drops the \
+                 query before fetching, so a presigned/token URL would fetch the unsigned \
+                 path and fail. Point at a direct .parquet/.csv URL, or use s3://, gs:// or \
+                 az:// with storage_options for signed access"
+                    .to_string(),
+            ));
         }
     }
-    Err(DataFusionError::NotImplemented(format!(
-        "{verb} supports .parquet and .csv in v0.1; got path {path:?}"
-    )))
+    Err(DataFusionError::NotImplemented(
+        "only .parquet and .csv files can be scanned; name a file (or a glob) with one of \
+         those extensions"
+            .to_string(),
+    ))
+}
+
+/// Label an error from the scan `kind` (`scan_edges`) of `path`:
+/// `scan_edges('edges.parquet'): no file found at ...`.
+/// Only an error about the file is labelled: one from evaluating a pushed-down
+/// filter reads as it does on every other path.
+fn in_scan(kind: &'static str, path: &str) -> impl Fn(DataFusionError) -> DataFusionError {
+    let label = format!("{kind}('{path}')");
+    move |e| {
+        if evaluation_error(&e) {
+            e
+        } else {
+            e.context(label.clone())
+        }
+    }
+}
+
+/// Whether `e` comes from evaluating an expression over the rows (a comparison,
+/// arithmetic), not from reading the file.
+fn evaluation_error(e: &DataFusionError) -> bool {
+    use arrow::error::ArrowError;
+    if let DataFusionError::ArrowError(a, _) = e.find_root() {
+        if matches!(
+            a.as_ref(),
+            ArrowError::DivideByZero
+                | ArrowError::ArithmeticOverflow(_)
+                | ArrowError::ComputeError(_)
+                | ArrowError::CastError(_)
+                | ArrowError::InvalidArgumentError(_)
+        ) {
+            return true;
+        }
+    }
+    let m = e.to_string();
+    [
+        "cannot compare ",
+        "does not fit the type",
+        "Cannot coerce",
+        "Cannot infer common argument",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+}
+
+/// The error for a role column (`src`, `id`) the file does not have.
+fn missing_column(role: &str, name: &str, schema: &Schema) -> DataFusionError {
+    let have: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("'{}'", f.name()))
+        .collect();
+    DataFusionError::Execution(format!(
+        "{role} column '{name}' not found in the file; it has [{}]",
+        have.join(", ")
+    ))
+}
+
+/// Check the file has the `src` and `dst` columns.
+fn check_endpoints(schema: &Schema, src: &str, dst: &str) -> Result<()> {
+    for (role, name) in [("src", src), ("dst", dst)] {
+        if schema.index_of(name).is_err() {
+            return Err(missing_column(role, name, schema));
+        }
+    }
+    Ok(())
 }
 
 /// The canonical Arrow type for a node-id column: any integer type collapses to
@@ -392,7 +461,8 @@ fn canonical_id_type(dt: &DataType) -> Result<DataType> {
         Utf8 | LargeUtf8 | Utf8View => Ok(Utf8),
         Dictionary(_, value) => canonical_id_type(value),
         other => Err(DataFusionError::NotImplemented(format!(
-            "node ids must be an integer or string column; {other:?} is not a supported id type"
+            "node ids must be an integer or string column; got {}",
+            crate::compare::pa_name(other)
         ))),
     }
 }
@@ -412,13 +482,9 @@ const SCAN_BATCH_ROWS: usize = 1 << 17;
 /// [`detect_format`]. The returned `DataFrame` carries its own `Arc`-shared session
 /// state (including the registered store), so the local `SessionContext` need not
 /// outlive this call.
-async fn open_scan(
-    path: &str,
-    storage_options: &HashMap<String, String>,
-    kind: &str,
-) -> Result<DataFrame> {
+async fn open_scan(path: &str, storage_options: &HashMap<String, String>) -> Result<DataFrame> {
     let ctx = SessionContext::new_with_state(scan_state(path, storage_options)?);
-    Ok(match detect_format(path, kind)? {
+    Ok(match detect_format(path)? {
         ScanFormat::Parquet => read_parquet(&ctx, path).await?,
         ScanFormat::Csv => ctx.read_csv(path, CsvReadOptions::default()).await?,
     })
@@ -514,9 +580,21 @@ pub fn scan_edges_batch(
     storage_options: &HashMap<String, String>,
     weight_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    scan_edges_batch_inner(path, src, dst, storage_options, weight_columns)
+        .map_err(in_scan("scan_edges", path))
+}
+
+fn scan_edges_batch_inner(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    weight_columns: &[String],
+) -> Result<Vec<RecordBatch>> {
     log_scan("edges", weight_columns, 0);
     crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options, "scan_edges").await?;
+        let df = open_scan(path, storage_options).await?;
+        check_endpoints(df.schema().as_arrow(), src, dst)?;
 
         // Project src, dst, then any weight columns not already among them.
         let mut proj: Vec<&str> = vec![src, dst];
@@ -533,13 +611,13 @@ pub fn scan_edges_batch(
         // 500M-edge target; the topology build consumes them as a stream (#60).
         let batches = collect_in_file_order(df).await?;
         if !dry && (batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0)) {
-            return Err(empty_edge_source(path));
+            return Err(empty_edge_source());
         }
 
         // The canonical id type is taken once from the read schema (identical across
         // the scan's batches) and every batch is canonicalized to it independently.
         let read_schema = if dry { dry_schema } else { batches[0].schema() };
-        let id_type = endpoint_id_type(&read_schema, path)?;
+        let id_type = endpoint_id_type(&read_schema)?;
         // Output layout: canonical src/dst, then each weight column by its own
         // name, as an index into the read batch. An endpoint requested as a weight
         // column (#154) points back at read column 0/1 (uncast).
@@ -695,22 +773,37 @@ fn scan_edges_rows_plan(
     filters: &[Value],
     drop_nulls: bool,
 ) -> Result<(EdgeRows, usize, Arc<dyn ExecutionPlan>)> {
+    scan_edges_rows_plan_inner(
+        path,
+        src,
+        dst,
+        storage_options,
+        columns,
+        filters,
+        drop_nulls,
+    )
+    .map_err(in_scan("scan_edges", path))
+}
+
+fn scan_edges_rows_plan_inner(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    columns: &[String],
+    filters: &[Value],
+    drop_nulls: bool,
+) -> Result<(EdgeRows, usize, Arc<dyn ExecutionPlan>)> {
     crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options, "scan_edges").await?;
+        let df = open_scan(path, storage_options).await?;
         let schema = df.schema().as_arrow().clone();
-        for end in [src, dst] {
-            if schema.index_of(end).is_err() {
-                return Err(DataFusionError::Execution(format!(
-                    "scan_edges: endpoint column {end:?} not found in edge file {path:?}"
-                )));
-            }
-        }
+        check_endpoints(&schema, src, dst)?;
         // Validate the endpoint types exactly as the graph build would.
         let ends = Schema::new(vec![
             schema.field_with_name(src)?.clone(),
             schema.field_with_name(dst)?.clone(),
         ]);
-        endpoint_id_type(&ends, path)?;
+        endpoint_id_type(&ends)?;
         // The endpoints are read when asked for, or to drop null-endpoint rows.
         let df = if columns.is_empty() {
             df
@@ -763,7 +856,7 @@ fn scan_edges_rows_plan(
                 !empty(&df.limit(0, Some(1))?.collect().await?)
             };
             if !any {
-                return Err(empty_edge_source(path));
+                return Err(empty_edge_source());
             }
         }
         let mut dropped = 0;
@@ -840,23 +933,25 @@ fn arrow_err(e: arrow::error::ArrowError) -> DataFusionError {
 }
 
 /// The error for an edge source that resolved to zero rows.
-fn empty_edge_source(path: &str) -> DataFusionError {
-    DataFusionError::Execution(format!(
-        "edge source {path:?} resolved but contained no rows; an empty edge set \
-         is not a graph in v0.1 (check the path/glob points at data with the \
-         given src/dst columns)"
-    ))
+fn empty_edge_source() -> DataFusionError {
+    DataFusionError::Execution(
+        "the file has no rows; an empty edge set is not a graph (check that the path or glob \
+         points at data with the given src/dst columns)"
+            .to_string(),
+    )
 }
 
 /// The canonical node-id type shared by the `src` and `dst` columns (fields 0 and
 /// 1 of `schema`). Both must canonicalize to the same family.
-fn endpoint_id_type(schema: &Schema, path: &str) -> Result<DataType> {
+fn endpoint_id_type(schema: &Schema) -> Result<DataType> {
     let src_type = canonical_id_type(schema.field(0).data_type())?;
     let dst_type = canonical_id_type(schema.field(1).data_type())?;
     if src_type != dst_type {
         return Err(DataFusionError::NotImplemented(format!(
-            "src and dst node-id columns must be the same type (both int or both string); \
-             got {src_type:?} and {dst_type:?} in {path:?}"
+            "the src and dst columns must have one id type (both integer or both string); got \
+             {} and {}",
+            crate::compare::pa_name(&src_type),
+            crate::compare::pa_name(&dst_type)
         )));
     }
     Ok(src_type)
@@ -912,11 +1007,25 @@ pub fn scan_edges_topology(
     storage_options: &HashMap<String, String>,
     drop_nulls: bool,
 ) -> std::result::Result<ScannedTopology, ScanBuildError> {
+    scan_edges_topology_inner(path, src, dst, storage_options, drop_nulls).map_err(|e| match e {
+        ScanBuildError::Scan(e) => ScanBuildError::Scan(in_scan("scan_edges", path)(e)),
+        e => e,
+    })
+}
+
+fn scan_edges_topology_inner(
+    path: &str,
+    src: &str,
+    dst: &str,
+    storage_options: &HashMap<String, String>,
+    drop_nulls: bool,
+) -> std::result::Result<ScannedTopology, ScanBuildError> {
     log_scan("index", &[], 0);
     let (interner, id_type, dropped) = crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options, "scan_edges").await?;
+        let df = open_scan(path, storage_options).await?;
+        check_endpoints(df.schema().as_arrow(), src, dst)?;
         let df = df.select_columns(&[src, dst])?;
-        let id_type = endpoint_id_type(df.schema().as_arrow(), path)?;
+        let id_type = endpoint_id_type(df.schema().as_arrow())?;
         if crate::dry::active() {
             return Ok::<_, ScanBuildError>((None, Some(id_type), 0));
         }
@@ -965,7 +1074,7 @@ pub fn scan_edges_topology(
         }
     };
     if interner.is_empty() && dropped == 0 {
-        return Err(empty_edge_source(path).into());
+        return Err(empty_edge_source().into());
     }
     let (ids, src_dense, dst_dense) = interner.finish();
     let topo = Topology::build(ids.len(), src_dense, dst_dense);
@@ -997,9 +1106,18 @@ pub fn scan_nodes_batch(
     storage_options: &HashMap<String, String>,
     columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    scan_nodes_batch_inner(path, id, storage_options, columns).map_err(in_scan("scan_nodes", path))
+}
+
+fn scan_nodes_batch_inner(
+    path: &str,
+    id: &str,
+    storage_options: &HashMap<String, String>,
+    columns: &[String],
+) -> Result<Vec<RecordBatch>> {
     log_scan("nodes", columns, 0);
     crate::runtime::block_on(async move {
-        let df = open_scan(path, storage_options, "scan_nodes").await?;
+        let df = open_scan(path, storage_options).await?;
 
         // Projection pushdown: read only the requested columns (must include id).
         // Empty means "all columns" (the attribute-table default).
@@ -1016,18 +1134,17 @@ pub fn scan_nodes_batch(
         let dry_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = collect_in_file_order(df).await?;
         if !dry && (batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0)) {
-            return Err(DataFusionError::Execution(format!(
-                "node source {path:?} resolved but contained no rows (check the path/glob \
-                 points at data with the given id column)"
-            )));
+            return Err(DataFusionError::Execution(
+                "the file has no rows (check that the path or glob points at data with the \
+                 given id column)"
+                    .to_string(),
+            ));
         }
 
         let read_schema = if dry { dry_schema } else { batches[0].schema() };
-        let id_idx = read_schema.index_of(id).map_err(|_| {
-            DataFusionError::Execution(format!(
-                "scan_nodes: id column {id:?} not found in node file {path:?}"
-            ))
-        })?;
+        let id_idx = read_schema
+            .index_of(id)
+            .map_err(|_| missing_column("id", id, &read_schema))?;
 
         // Canonicalize the id column (integer -> Int64, string -> Utf8); attribute
         // columns keep their file types, except that a `Utf8View` column (a file
@@ -1538,9 +1655,20 @@ mod tests {
         // A missing endpoint names the column; a non-id endpoint is rejected as
         // the graph build would reject it.
         let err = scan_edges_table(p, "from", "nope", &no_opts(), &[]).unwrap_err();
-        assert!(err.to_string().contains("\"nope\" not found"), "{err}");
+        let msg = crate::message::engine_message(&err);
+        assert!(
+            msg.ends_with(
+                "dst column 'nope' not found in the file; it has ['w', 'from', 'label', 'to']"
+            ),
+            "{msg}"
+        );
+        assert!(msg.starts_with("scan_edges('"), "{msg}");
         let err = scan_edges_table(p, "from", "w", &no_opts(), &[]).unwrap_err();
-        assert!(err.to_string().contains("not a supported id type"), "{err}");
+        let msg = crate::message::engine_message(&err);
+        assert!(
+            msg.contains("node ids must be an integer or string column; got double"),
+            "{msg}"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1849,21 +1977,21 @@ mod tests {
     fn detect_format_matches_extension_and_globs() {
         // Plain files + case-insensitive.
         assert!(matches!(
-            detect_format("edges.parquet", "scan_edges").unwrap(),
+            detect_format("edges.parquet").unwrap(),
             ScanFormat::Parquet
         ));
         assert!(matches!(
-            detect_format("/tmp/local/edges.CSV", "scan_edges").unwrap(),
+            detect_format("/tmp/local/edges.CSV").unwrap(),
             ScanFormat::Csv
         ));
         // An object-store glob keeps `?`/`*` as glob metacharacters (regression
         // guard: the query-stripping approach broke `part-?.parquet`).
         assert!(matches!(
-            detect_format("s3://bucket/part-?.parquet", "scan_edges").unwrap(),
+            detect_format("s3://bucket/part-?.parquet").unwrap(),
             ScanFormat::Parquet
         ));
         assert!(matches!(
-            detect_format("gs://bucket/*.csv", "scan_nodes").unwrap(),
+            detect_format("gs://bucket/*.csv").unwrap(),
             ScanFormat::Csv
         ));
     }
@@ -1872,7 +2000,7 @@ mod tests {
     fn detect_format_rejects_http_query_string_clearly() {
         // The engine drops the query before fetching, so a presigned/token URL
         // would silently fetch the unsigned path — reject it with a clear message.
-        let err = detect_format("https://host/data/edges.csv?token=abc123", "scan_edges");
+        let err = detect_format("https://host/data/edges.csv?token=abc123");
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("query string"));
     }

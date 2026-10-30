@@ -6,8 +6,9 @@ Two positioning rules from the spec:
   a hop is EdgeFrame -> EdgeFrame, so traversal composes.
 - **Node-valued algorithms** (``pagerank``, ``connected_components``,
   centralities, ...) are *dual-positioned*: the same kernel is either an
-  expression inside ``with_columns`` or a standalone call returning a NodeFrame
-  of ``(id, value)``. Both spellings lower to the same ``GraphAlgorithmNode``.
+  expression inside ``with_columns`` or, standalone, a NodeFrame of
+  ``(id, value)`` with every frame method. Both spellings lower to the same
+  ``GraphAlgorithmNode``.
 
 Topology is always threaded explicitly as the ``edges`` argument — there is no
 ambient graph. Direction is a per-op parameter; weight is any expression over
@@ -20,69 +21,84 @@ These build ``Expr("graph", ...)`` nodes and the frames' Rust plan objects;
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from typing import Any
 
 from . import _ir
 from ._expr import Expr
-from ._frames import EdgeFrame, NodeFrame, _native
+from ._frames import EdgeFrame, NodeFrame, _Frame, _GroupBy, _native
 
 
-class GraphExpr(Expr):
+class GraphExpr(Expr, NodeFrame):
     """A node-valued graph algorithm — the spec's *dual-positioned* kernel.
 
     Used inside ``with_columns(pr=ur.pagerank(edges))`` it reads as an expression
-    (the column definition). Used standalone it behaves as a lazy ``NodeFrame`` of
-    ``(id, value)``: any frame method promotes it to
-    ``edges.nodes().with_columns(<verb>=self)`` and delegates, so
-    ``ur.pagerank(edges).filter(...).sort(...).collect()`` composes like any frame.
+    (the column definition). Used standalone it *is* a lazy ``NodeFrame`` of
+    ``(id, value)``: ``edges.nodes().with_columns(<verb>=self)``, with every frame
+    method (``filter``, ``join``, ``group_by``, ``schema()``, ``explain()``, ...),
+    so ``ur.pagerank(edges).join(ur.degree(edges), on="id").sort(...)`` composes
+    like any frame. Its plan is built the first time a frame method needs it, so a
+    verb used as an expression never builds one.
     """
 
+    # Expr comes first in the MRO: its constructor, operators (``==`` builds an
+    # expression), ``repr`` and unhashability are the verb's. The frame methods
+    # that return a new frame are spelled out so they return a plain NodeFrame.
+
+    @functools.cached_property
+    def _node(self) -> Any:
+        return self._frame()._node
+
     def _frame(self) -> NodeFrame:
-        edges = self.payload["edges"]
-        return edges.nodes().with_columns(**{self.payload["verb"]: self})
+        return _verb_edges(self).nodes().with_columns(**{self.payload["verb"]: self})
+
+    def _as_frame(self) -> NodeFrame:
+        return NodeFrame._wrap(self._node)
 
     def filter(self, predicate: Any) -> NodeFrame:
-        return self._frame().filter(predicate)
-
-    def with_columns(self, **exprs: Any) -> NodeFrame:
-        return self._frame().with_columns(**exprs)
+        return self._as_frame().filter(predicate)
 
     def select(self, *columns: Any) -> NodeFrame:
-        return self._frame().select(*columns)
+        return self._as_frame().select(*columns)
+
+    def with_columns(self, **exprs: Any) -> NodeFrame:
+        return self._as_frame().with_columns(**exprs)
+
+    def rename(self, mapping: dict[str, str]) -> NodeFrame:
+        return self._as_frame().rename(mapping)
 
     def sort(self, by: Any, *more_by: Any, descending: bool | Sequence[bool] = False) -> NodeFrame:
-        return self._frame().sort(by, *more_by, descending=descending)
+        return self._as_frame().sort(by, *more_by, descending=descending)
 
     def head(self, n: int = 10) -> NodeFrame:
-        return self._frame().head(n)
+        return self._as_frame().head(n)
+
+    limit = head
+
+    def sample(self, n: int, *, seed: int | None = None) -> NodeFrame:
+        return self._as_frame().sample(n, seed=seed)
 
     def distinct(self) -> NodeFrame:
-        return self._frame().distinct()
+        return self._as_frame().distinct()
 
-    def collect(self) -> Any:
-        return self._frame().collect()
+    def group_by(self, *keys: Any) -> _GroupBy[NodeFrame]:  # ty: ignore[invalid-method-override]
+        return self._as_frame().group_by(*keys)
 
-    def to_polars(self) -> Any:
-        return self._frame().to_polars()
+    def join(self, other: _Frame, *, on: Any = None, how: str = "inner") -> NodeFrame:
+        return self._as_frame().join(other, on=on, how=how)
 
-    def to_arrow(self) -> Any:
-        return self._frame().to_arrow()
 
-    def to_dicts(self) -> list[dict[str, Any]]:
-        return self._frame().to_dicts()
-
-    def sink_parquet(self, path: str, **opts: Any) -> None:
-        self._frame().sink_parquet(path, **opts)
-
-    def sink_csv(self, path: str) -> None:
-        self._frame().sink_csv(path)
-
-    def explain(self, physical: bool = False) -> str:
-        return self._frame().explain(physical)
-
-    def schema(self) -> Any:
-        return self._frame().schema()
+def _verb_edges(e: GraphExpr) -> Any:
+    """The edge frame a standalone graph verb runs over; for a value with no
+    ``nodes()``, the ``AttributeError`` calling it gave, naming the verb."""
+    edges = e.payload["edges"]
+    if not hasattr(edges, "nodes"):
+        raise AttributeError(
+            f"{e.payload['verb']}() takes an EdgeFrame (the graph) as its edges; "
+            f"got {type(edges).__name__}"
+        )
+    return edges
 
 
 def _graph_expr(verb: str, **params: Any) -> GraphExpr:
@@ -114,8 +130,8 @@ class LayoutExpr(GraphExpr):
     computation and **runs the simulation once** (#115) — the two accessors pick
     different outputs of one result, not two results.
 
-    Used bare it behaves like the other dual-positioned kernels, promoting to a
-    NodeFrame of ``(id, x, y)``.
+    Used bare it is a NodeFrame of ``(id, x, y)``, like the other
+    dual-positioned kernels.
     """
 
     def _axis(self, field: int) -> GraphExpr:
@@ -132,8 +148,7 @@ class LayoutExpr(GraphExpr):
         return self._axis(1)
 
     def _frame(self) -> NodeFrame:
-        edges = self.payload["edges"]
-        return edges.nodes().with_columns(x=self.x, y=self.y)
+        return _verb_edges(self).nodes().with_columns(x=self.x, y=self.y)
 
 
 def _layout_expr(verb: str, **params: Any) -> LayoutExpr:
@@ -199,7 +214,10 @@ class _Hop:
         # references ``src``/``dst``. (The parent's role names aren't carried
         # through a traversal.)
         node = _native().PlanNode.hop(
-            self._edges._node, _ir.int_arg(self._n), self._direction, _seeds(self._seeds)
+            _ir.edges_node(self._edges, "hop"),
+            _ir.int_arg(self._n),
+            self._direction,
+            _seeds(self._seeds),
         )
         return EdgeFrame._wrap(node)
 
@@ -232,7 +250,11 @@ def shortest_path(
     # Result columns are literal ``src``/``dst`` (one row per edge on the path);
     # source/target resolve like hop seeds, as 1-element id sets.
     node = _native().PlanNode.shortest_path(
-        edges._node, [source], [target], _ir.optional_expr(weight), direction
+        _ir.edges_node(edges, "shortest_path"),
+        [source],
+        [target],
+        _ir.optional_expr(weight, "shortest_path(weight=)"),
+        direction,
     )
     return EdgeFrame._wrap(node)
 
@@ -247,7 +269,7 @@ def random_walk(
     """Random walks; a frame of ``(walk_id, step, node)`` — feeds node2vec-style
     embedding pipelines directly."""
     node = _native().PlanNode.random_walk(
-        edges._node,
+        _ir.edges_node(edges, "random_walk"),
         _seeds(start),
         _ir.int_arg(steps),
         _ir.int_arg(walks_per_node),
@@ -257,9 +279,9 @@ def random_walk(
 
 
 # --- node-valued algorithms (dual-positioned) ------------------------------
-# In `with_columns(...)` they read as expressions; called bare they return a
-# NodeFrame of (id, value) — the standalone spelling promotes the Expr to
-# `edges.nodes().with_columns(<verb>=self)` (see GraphExpr._frame).
+# In `with_columns(...)` they read as expressions; called bare they are a
+# NodeFrame of (id, value): `edges.nodes().with_columns(<verb>=self)` (see
+# GraphExpr._frame).
 
 
 def pagerank(

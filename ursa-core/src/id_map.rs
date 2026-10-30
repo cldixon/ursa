@@ -696,10 +696,9 @@ impl std::fmt::Display for IdError {
                 f,
                 "src and dst node-id columns must have the same type (both int64 or both string)"
             ),
-            IdError::Unsupported(t) => write!(
-                f,
-                "unsupported node-id type {t}; node ids must be int64 or string (Utf8)"
-            ),
+            IdError::Unsupported(t) => {
+                write!(f, "node ids must be an integer or string column; got {t}")
+            }
             IdError::LengthMismatch => {
                 write!(f, "src and dst columns must have the same length")
             }
@@ -727,7 +726,7 @@ fn id_kind(dt: &DataType) -> Result<IdKind, IdError> {
     match dt {
         DataType::Int64 => Ok(IdKind::Int64),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(IdKind::Utf8),
-        other => Err(IdError::Unsupported(format!("{other:?}"))),
+        other => Err(IdError::Unsupported(format!("{other:?}").to_lowercase())),
     }
 }
 
