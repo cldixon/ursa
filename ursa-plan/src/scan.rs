@@ -494,17 +494,18 @@ fn detect_format(path: &str) -> Result<ScanFormat> {
 /// `scan_edges('edges.parquet'): no file found at ...`, or for a list of paths
 /// `scan_edges(['a.csv', 'b.csv']): ...`.
 /// Only an error about the file is labelled: one from evaluating a pushed-down
-/// filter reads as it does on every other path.
-fn in_scan(
+/// filter reads as it does on every other path. A CSV value that does not
+/// parse as its column's type is located first ([`csv_value_error`]).
+fn in_scan<'a>(
     kind: &'static str,
-    source: ScanSource<'_>,
-) -> impl Fn(DataFusionError) -> DataFusionError {
+    source: ScanSource<'a>,
+) -> impl Fn(DataFusionError) -> DataFusionError + 'a {
     let label = format!("{kind}({})", source.shown());
     move |e| {
         if evaluation_error(&e) {
             e
         } else {
-            e.context(label.clone())
+            csv_value_error(e, source).context(label.clone())
         }
     }
 }
@@ -697,11 +698,9 @@ async fn open_path(path: &str, source: ScanSource<'_>) -> Result<DataFrame> {
 /// #221).
 async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<DataFrame> {
     use datafusion::datasource::MemTable;
-    use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
     let options = csv.read_options();
-    let inferred = ctx.read_csv(path, csv.read_options()).await?;
-    let widened = float_columns(ctx, path, &options, inferred.schema().as_arrow()).await?;
+    let (inferred, widened) = infer_csv(ctx, path, csv).await?;
     let Some(pattern) = options.null_regex.clone() else {
         return match widened {
             None => Ok(inferred),
@@ -716,15 +715,8 @@ async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<
     if !crate::dry::active() {
         let null =
             regex::Regex::new(&pattern).map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let state = ctx.state();
         let url = ListingTableUrl::parse(path)?;
-        let store = state.runtime_env().object_store(url.object_store())?;
-        let mut files = url
-            .list_all_files(&state, store.as_ref(), options.file_extension)
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        files.sort_by(|a, b| a.location.cmp(&b.location));
+        let (store, files) = csv_files(ctx, &url, options.file_extension).await?;
         for file in files {
             let bytes = store
                 .get(&file.location)
@@ -733,21 +725,7 @@ async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<
                 .bytes()
                 .await
                 .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
-            // The reader DataFusion's `CsvSource::builder` makes, plus the pattern.
-            let mut reader = arrow::csv::ReaderBuilder::new(schema.clone())
-                .with_delimiter(csv.delimiter)
-                .with_batch_size(SCAN_BATCH_ROWS)
-                .with_header(csv.has_header)
-                .with_quote(csv.quote)
-                .with_truncated_rows(false)
-                .with_null_regex(null.clone());
-            if let Some(escape) = csv.escape {
-                reader = reader.with_escape(escape);
-            }
-            if let Some(comment) = csv.comment {
-                reader = reader.with_comment(comment);
-            }
-            let batches = reader
+            let batches = csv_reader(schema.clone(), csv, Some(null.clone()))
                 .build(std::io::Cursor::new(bytes))
                 .map_err(arrow_err)?
                 .collect::<std::result::Result<Vec<_>, _>>()
@@ -759,6 +737,194 @@ async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<
         partitions.push(vec![]);
     }
     ctx.read_table(Arc::new(MemTable::try_new(schema, partitions)?))
+}
+
+/// The CSV `path` as DataFusion infers it with `csv`'s options, and the
+/// schema with #221's float columns ([`float_columns`]) when one is retyped.
+async fn infer_csv(
+    ctx: &SessionContext,
+    path: &str,
+    csv: &CsvOptions,
+) -> Result<(DataFrame, Option<Schema>)> {
+    let options = csv.read_options();
+    let inferred = ctx.read_csv(path, csv.read_options()).await?;
+    let widened = float_columns(ctx, path, &options, inferred.schema().as_arrow()).await?;
+    Ok((inferred, widened))
+}
+
+/// The schema a scan reads the CSV `path` with ([`infer_csv`]).
+async fn csv_schema(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<SchemaRef> {
+    let (inferred, widened) = infer_csv(ctx, path, csv).await?;
+    Ok(Arc::new(
+        widened.unwrap_or_else(|| inferred.schema().as_arrow().clone()),
+    ))
+}
+
+/// The reader DataFusion's `CsvSource::builder` makes for a CSV file with
+/// `schema` and `csv`'s options, plus the null pattern `null`.
+fn csv_reader(
+    schema: SchemaRef,
+    csv: &CsvOptions,
+    null: Option<regex::Regex>,
+) -> arrow::csv::ReaderBuilder {
+    let mut reader = arrow::csv::ReaderBuilder::new(schema)
+        .with_delimiter(csv.delimiter)
+        .with_batch_size(SCAN_BATCH_ROWS)
+        .with_header(csv.has_header)
+        .with_quote(csv.quote)
+        .with_truncated_rows(false);
+    if let Some(null) = null {
+        reader = reader.with_null_regex(null);
+    }
+    if let Some(escape) = csv.escape {
+        reader = reader.with_escape(escape);
+    }
+    if let Some(comment) = csv.comment {
+        reader = reader.with_comment(comment);
+    }
+    reader
+}
+
+/// The files `url` names with the extension `ext`, in path order, as a glob
+/// lists them, and their store.
+async fn csv_files(
+    ctx: &SessionContext,
+    url: &ListingTableUrl,
+    ext: &str,
+) -> Result<(Arc<dyn ObjectStore>, Vec<object_store::ObjectMeta>)> {
+    use futures::TryStreamExt;
+    let state = ctx.state();
+    let store = state.runtime_env().object_store(url.object_store())?;
+    let mut files = url
+        .list_all_files(&state, store.as_ref(), ext)
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    files.sort_by(|a, b| a.location.cmp(&b.location));
+    Ok((store, files))
+}
+
+/// The arrow-csv error under `e` for a value that does not parse as its
+/// column's type, if `e` is one.
+fn csv_parse_error(e: &DataFusionError) -> Option<&arrow::error::ArrowError> {
+    use arrow::error::ArrowError;
+    fn external<'a>(x: &'a (dyn std::error::Error + 'static)) -> Option<&'a ArrowError> {
+        if let Some(e) = x.downcast_ref::<DataFusionError>() {
+            csv_parse_error(e)
+        } else {
+            x.downcast_ref::<ArrowError>()
+                .filter(|a| crate::message::csv_parse_fields(a).is_some())
+        }
+    }
+    match e {
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            csv_parse_error(inner)
+        }
+        DataFusionError::Shared(inner) => csv_parse_error(inner),
+        DataFusionError::ArrowError(a, _) => match a.as_ref() {
+            ArrowError::ExternalError(x) => external(x.as_ref()),
+            a => crate::message::csv_parse_fields(a).map(|_| a),
+        },
+        DataFusionError::External(x) => external(x.as_ref()),
+        _ => None,
+    }
+}
+
+/// `e` as a [`CsvValueError`] when it is arrow-csv's error for a value that
+/// does not parse as its column's type; otherwise `e` as it is.
+///
+/// DataFusion may read a large file in byte ranges, in parallel, and arrow-csv
+/// counts lines from the start of a range. So the scan reads the failing column
+/// again, file by file in path order, with one reader per file, and reports
+/// the first value that does not parse, its line in its file, and the file. The
+/// message is the same on any core count, with or without a `null_value`.
+fn csv_value_error(e: DataFusionError, source: ScanSource<'_>) -> DataFusionError {
+    let Some(fields) = csv_parse_error(&e).and_then(crate::message::csv_parse_fields) else {
+        return e;
+    };
+    match crate::runtime::block_on(locate_csv_value(source, fields.column)) {
+        Ok(Ok(Some(found))) => DataFusionError::External(Box::new(found)),
+        _ => e,
+    }
+}
+
+/// The first value of column `column` in `source`'s CSV files that does not
+/// parse as the column's type (see [`csv_value_error`]), or `None` if every
+/// value parses.
+async fn locate_csv_value(
+    source: ScanSource<'_>,
+    column: usize,
+) -> Result<Option<crate::message::CsvValueError>> {
+    use object_store::ObjectStoreExt;
+    let options = source.csv.read_options();
+    let null = match &options.null_regex {
+        Some(pattern) => {
+            Some(regex::Regex::new(pattern).map_err(|e| DataFusionError::External(Box::new(e)))?)
+        }
+        None => None,
+    };
+    for path in source.paths {
+        let ctx = SessionContext::new_with_state(scan_state(path, source.storage_options)?);
+        let schema = csv_schema(&ctx, path, source.csv).await?;
+        let Some(field) = schema.fields().get(column).cloned() else {
+            return Ok(None);
+        };
+        let url = ListingTableUrl::parse(path)?;
+        let named = source.paths.len() > 1 || url.get_glob().is_some() || url.is_collection();
+        let (store, files) = csv_files(&ctx, &url, options.file_extension).await?;
+        for file in files {
+            let mut decoder = csv_reader(schema.clone(), source.csv, null.clone())
+                .with_projection(vec![column])
+                .build_decoder();
+            let mut chunks = store
+                .get(&file.location)
+                .await
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?
+                .into_stream();
+            let mut buf = None;
+            let failed = loop {
+                let bytes = match buf.take() {
+                    Some(bytes) => bytes,
+                    None => match chunks.next().await {
+                        Some(bytes) => {
+                            bytes.map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?
+                        }
+                        None => Default::default(),
+                    },
+                };
+                let decoded = decoder.decode(&bytes).map_err(arrow_err)?;
+                if decoded < bytes.len() {
+                    buf = Some(bytes.slice(decoded..));
+                }
+                // A batch is full, or the file has ended.
+                if decoded == 0 || decoder.capacity() == 0 {
+                    match decoder.flush() {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break None,
+                        Err(a) => break Some(a),
+                    }
+                }
+            };
+            let Some(a) = failed else { continue };
+            let Some(at) = crate::message::csv_parse_fields(&a) else {
+                return Err(arrow_err(a));
+            };
+            let file = named.then(|| match url.scheme() {
+                "file" => format!("/{}", file.location),
+                _ => format!("{}{}", url.object_store().as_str(), file.location),
+            });
+            return Ok(Some(crate::message::CsvValueError {
+                column: field.name().clone(),
+                data_type: field.data_type().clone(),
+                inferred_from: options.schema_infer_max_records,
+                value: at.value,
+                line: at.line + 1,
+                file,
+                source: a,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// How arrow-csv's inferer reads one CSV value: as text, an integer, or a float.

@@ -18,6 +18,7 @@ Ursa is version 0.4. The API is stable in shape, and some combinations of steps 
 
 - One machine, in memory. The graph index must fit in RAM.
 - Node ids are `int64` or `string`. One frame uses one kind.
+- A CSV scan infers each column's type from the first 1,000 rows. A scan cannot set a column's type. To read a column as another type, read the file with `pyarrow.csv` and pass the table to `ur.from_arrow()`.
 - There is no graph mutation. To change the graph, build a new frame.
 - There is no visualization. Positions and drawing are out of scope for 0.4.
 

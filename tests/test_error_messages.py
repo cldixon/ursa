@@ -693,6 +693,33 @@ def scan_cases(tmp: Path) -> dict:
     (tmp / "bad.csv").write_text('s,d\n1,2\n"x')
     pq.write_table(EDGES.set_column(2, "w", pa.array([1, 2, 3, 4])), tmp / "e_int.parquet")
     p = lambda name: str(tmp / name)  # noqa: E731
+    # A value past the 1,000 rows a CSV column's type is inferred from that
+    # does not parse as that type (#222), one file per inferred type.
+    for name, good, bad_value in [
+        ("bool", "true", "yes"),
+        ("int", "5", "5.5"),
+        ("float", "0.5", "abc"),
+        ("date", "2024-01-01", "2024-13-01"),
+        ("ts", "2024-01-01T00:00:00", "soon"),
+    ]:
+        rows = f"1,2,{good}\n" * 1000
+        (tmp / f"v_{name}.csv").write_text(f"s,d,f\n{rows}2,3,{bad_value}\n")
+    # `+5` is a float only #221's widening reads, so the column is double, not
+    # string, and the value after the sample does not parse.
+    (tmp / "v_widened.csv").write_text("s,d,f\n1,2,+5\n" + "1,2,1\n" * 999 + "2,3,abc\n")
+    (tmp / "g").mkdir(exist_ok=True)
+    (tmp / "g" / "a.csv").write_text("s,d,f\n" + "1,2,3\n" * 1100)
+    (tmp / "g" / "b.csv").write_text("s,d,f\n" + "1,2,3\n" * 1100 + "4,5,x\n")
+
+    def csv_value(path: str, ty: str, value: str, line: int = 1002, file: str = "") -> str:
+        at = f"line {line} of '{file}'" if file else f"line {line}"
+        return (
+            f"scan_edges({path}): column 'f' was inferred as {ty} from the first 1000 rows, "
+            f"but {at} has '{value}', which is not a valid {ty}. Fix the value, pass "
+            f"null_value='{value}' if it marks a missing value, or read the file with "
+            "pyarrow.csv (column_types=) and pass the table to ur.from_arrow()."
+        )
+
     return {
         "missing": (
             lambda: ur.scan_edges(p("missing.parquet"), src="s", dst="d"),
@@ -810,6 +837,65 @@ def scan_cases(tmp: Path) -> dict:
             TypeError,
             "scan_nodes() got an unexpected keyword argument 'delimter'; did you mean delimiter=?",
         ),
+        # A CSV value that does not parse as its column's inferred type (#222).
+        "csv_value_bool": (
+            lambda: ur.read_edges(p("v_bool.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges('{p('v_bool.csv')}'): column 'f' was inferred as bool from the first "
+            "1000 rows, but line 1002 has 'yes', which is not a valid bool. Fix the value, pass "
+            "null_value='yes' if it marks a missing value, or read the file with pyarrow.csv "
+            "(column_types=) and pass the table to ur.from_arrow().",
+        ),
+        "csv_value_bool_null_value": (
+            lambda: ur.read_edges(p("v_bool.csv"), src="s", dst="d", null_value="NA"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_bool.csv')}'", "bool", "yes"),
+        ),
+        "csv_value_int": (
+            lambda: ur.read_edges(p("v_int.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_int.csv')}'", "int64", "5.5"),
+        ),
+        "csv_value_float": (
+            lambda: ur.read_edges(p("v_float.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_float.csv')}'", "double", "abc"),
+        ),
+        "csv_value_date": (
+            lambda: ur.read_edges(p("v_date.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_date.csv')}'", "date32[day]", "2024-13-01"),
+        ),
+        "csv_value_timestamp": (
+            lambda: ur.read_edges(p("v_ts.csv"), src="s", dst="d", null_value="NA"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_ts.csv')}'", "timestamp[s]", "soon"),
+        ),
+        "csv_value_widened": (
+            lambda: ur.read_edges(p("v_widened.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_widened.csv')}'", "double", "abc"),
+        ),
+        "csv_value_widened_null_value": (
+            lambda: ur.read_edges(p("v_widened.csv"), src="s", dst="d", null_value="NA"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_widened.csv')}'", "double", "abc"),
+        ),
+        "csv_value_lazy": (
+            lambda: ur.scan_edges(p("v_float.csv"), src="s", dst="d").select("f"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_float.csv')}'", "double", "abc"),
+        ),
+        "csv_value_glob": (
+            lambda: ur.read_edges(p("g/*.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"'{p('g/*.csv')}'", "int64", "x", 1102, p("g/b.csv")),
+        ),
+        "csv_value_list": (
+            lambda: ur.read_edges([p("g/a.csv"), p("g/b.csv")], src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"['{p('g/a.csv')}', '{p('g/b.csv')}']", "int64", "x", 1102, p("g/b.csv")),
+        ),
     }
 
 
@@ -819,6 +905,40 @@ def test_scan_messages(tmp_path):
             run(build)
         assert str(info.value) == message, case
         assert not [t for t in LEAKS if t in message], case
+
+
+@pytest.mark.parametrize("null_value", [None, "NA"])
+def test_a_csv_value_error_keeps_the_engine_text_as_its_cause(tmp_path, null_value):
+    path = tmp_path / "g.csv"
+    path.write_text("s,d,f\n" + "1,2,true\n" * 1000 + "2,3,yes\n")
+    with pytest.raises(ur.ComputeError) as info:
+        ur.read_edges(str(path), src="s", dst="d", null_value=null_value)
+    cause = info.value.__cause__
+    assert isinstance(cause, RuntimeError)
+    assert (
+        "Error while parsing value 'yes' as type 'Boolean' for column 2 at line 1001. "
+        "Row data: '[2,3,yes]'" in str(cause)
+    )
+
+
+def test_a_csv_value_error_names_its_line_in_the_file(tmp_path):
+    """DataFusion reads a CSV file over 10 MiB in byte ranges, one per core, and
+    arrow-csv counts lines from the start of a range. The message counts them
+    from the start of the file, on any core count."""
+    path = tmp_path / "big.csv"
+    rows = [f"{i},{i + 1},{i}.5\n" for i in range(1_000_000)]
+    rows[900_000] = "900000,900001,oops\n"
+    path.write_text("s,d,f\n" + "".join(rows))
+    assert path.stat().st_size > 10 * 2**20
+    for null_value in (None, "NA"):
+        with pytest.raises(ur.ComputeError) as info:
+            ur.read_edges(str(path), src="s", dst="d", null_value=null_value)
+        assert str(info.value) == (
+            f"scan_edges('{path}'): column 'f' was inferred as double from the first 1000 "
+            "rows, but line 900002 has 'oops', which is not a valid double. Fix the value, "
+            "pass null_value='oops' if it marks a missing value, or read the file with "
+            "pyarrow.csv (column_types=) and pass the table to ur.from_arrow()."
+        )
 
 
 def test_an_engine_error_keeps_the_engine_text_as_its_cause():
