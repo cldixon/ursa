@@ -75,7 +75,9 @@ def _table(n: int = N) -> pa.Table:
 def _frames(t: pa.Table, tmp_path) -> dict[str, ur.NodeFrame]:
     path = tmp_path / "rows.parquet"
     pq.write_table(t, path, row_group_size=97)
-    ring = pa.table({"s": list(range(t.num_rows)), "d": [(i + 1) % t.num_rows for i in range(t.num_rows)]})
+    ring = pa.table(
+        {"s": list(range(t.num_rows)), "d": [(i + 1) % t.num_rows for i in range(t.num_rows)]}
+    )
     edges = ur.from_arrow(ring, src="s", dst="d")
     return {
         "memory": ur.from_arrow(t, id="id"),
@@ -107,11 +109,15 @@ def test_group_by_float_keys_in_total_order(tmp_path, keys):
             if key == "s":
                 assert got.column(key).to_pylist() == want, name
             else:
-                assert [_bits(x) for x in got.column(key).to_pylist()] == [_bits(x) for x in want], name
+                assert [_bits(x) for x in got.column(key).to_pylist()] == [
+                    _bits(x) for x in want
+                ], name
         # count, sum and n_unique per group, from the reference.
         groups: dict[tuple, list[int]] = {}
         for i in range(t.num_rows):
-            gid = tuple(_class(t.column(c)[i].as_py()) if c != "s" else t.column(c)[i].as_py() for c in keys)
+            gid = tuple(
+                _class(t.column(c)[i].as_py()) if c != "s" else t.column(c)[i].as_py() for c in keys
+            )
             groups.setdefault(gid, []).append(i)
         rows = list(groups.values())
         assert got.column("n").to_pylist() == [len(r) for r in rows], name
@@ -132,13 +138,25 @@ def test_group_by_shows_the_first_appearance_value():
 
 
 def test_a_float_aggregate_over_a_key_column_folds_the_original_values():
-    # The key groups canonical; a sum/min over the same column still sees -0.0.
-    t = pa.table({"id": [0, 1], "k": [-0.0, -0.0]})
-    got = ur.from_arrow(t, id="id").group_by("k").agg(s=col("k").sum(), m=col("k").min()).collect()
-    row = got.to_dicts()[0]
-    assert math.copysign(1, row["k"]) == -1
-    assert math.copysign(1, row["s"]) == -1
-    assert math.copysign(1, row["m"]) == -1
+    # The key groups canonical; a sum/min/max over the same column folds the
+    # original values, by pyarrow's rules (a sum starts at +0.0).
+    k = [-0.0, 0.0, -0.0, NEG_NAN, math.nan]
+    t = pa.table({"id": list(range(5)), "k": k})
+    aggs = {"s": col("k").sum(), "m": col("k").min(), "x": col("k").max()}
+    got = ur.from_arrow(t, id="id").group_by("k").agg(**aggs).collect().to_arrow()
+    assert [_bits(v) for v in got.column("k").to_pylist()] == [_bits(-0.0), _bits(NEG_NAN)]
+    for row, values in enumerate([k[:3], k[3:]]):
+        ref = (
+            pa.table({"g": [0] * len(values), "k": values})
+            .group_by("g", use_threads=False)
+            .aggregate([("k", "sum"), ("k", "min"), ("k", "max")])
+        )
+        for name, theirs in [("s", "k_sum"), ("m", "k_min"), ("x", "k_max")]:
+            ours, want = got.column(name)[row].as_py(), ref.column(theirs)[0].as_py()
+            if math.isnan(want):  # a NaN result's sign is the fold's own (as on main)
+                assert math.isnan(ours), (name, row)
+            else:
+                assert _bits(ours) == _bits(want), (name, row)
 
 
 def test_distinct_compares_every_float_column_in_total_order(tmp_path):
@@ -153,7 +171,9 @@ def test_distinct_compares_every_float_column_in_total_order(tmp_path):
             if c == "s":
                 assert got.column(c).to_pylist() == want
             else:
-                assert [_bits(x) for x in got.column(c).to_pylist()] == [_bits(x) for x in want], name
+                assert [_bits(x) for x in got.column(c).to_pylist()] == [_bits(x) for x in want], (
+                    name
+                )
 
 
 @pytest.mark.parametrize("value_type", [pa.float64(), pa.float32()])
@@ -172,7 +192,7 @@ def test_dictionary_float_keys(value_type):
         (False, 1.0),
     ]
     assert got.column("n").to_pylist() == [3, 2, 1, 1]
-    assert frame.select("k").distinct().collect().num_rows == 4
+    assert frame.select("k").distinct().collect().to_arrow().num_rows == 4
     t = t.append_column("g", pa.array([1] * 7))
     nu = ur.from_arrow(t, id="id").group_by("g").agg(u=col("k").n_unique()).collect()
     assert nu.to_dicts() == [{"g": 1, "u": 3}]
@@ -225,7 +245,9 @@ def _join_reference(left: pa.Table, right: pa.Table, how: str) -> list[tuple]:
 @pytest.mark.parametrize("how", HOWS)
 def test_float_join_keys_in_total_order(tmp_path, how):
     left = pa.table({"k": [POOL[(i * 5) % len(POOL)] for i in range(40)], "a": list(range(40))})
-    right = pa.table({"k": [POOL[(i * 7 + 2) % len(POOL)] for i in range(30)], "b": list(range(100, 130))})
+    right = pa.table(
+        {"k": [POOL[(i * 7 + 2) % len(POOL)] for i in range(30)], "b": list(range(100, 130))}
+    )
     want = _join_reference(left, right, how)
     lpath, rpath = tmp_path / "l.parquet", tmp_path / "r.parquet"
     pq.write_table(left, lpath, row_group_size=7)
@@ -249,7 +271,9 @@ def test_float_join_keys_in_total_order(tmp_path, how):
 
 def test_multi_key_join_with_a_float_key():
     left = pa.table({"k": [-0.0, NEG_NAN, 1.0, None], "s": ["x", "y", "x", "x"], "a": [1, 2, 3, 4]})
-    right = pa.table({"k": [0.0, math.nan, 1.0, None], "s": ["x", "y", "y", "x"], "b": [5, 6, 7, 8]})
+    right = pa.table(
+        {"k": [0.0, math.nan, 1.0, None], "s": ["x", "y", "y", "x"], "b": [5, 6, 7, 8]}
+    )
     got = ur.from_arrow(left, id="a").join(ur.from_arrow(right, id="b"), on=["k", "s"]).collect()
     assert [(r["a"], r["b"]) for r in got.to_dicts()] == [(1, 5), (2, 6)]
 

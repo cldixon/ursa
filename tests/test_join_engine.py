@@ -228,7 +228,7 @@ def test_float_keys_match_in_total_order():
     pairs = [(r["a"], r["b"]) for r in left.join(right, on="f").collect().to_dicts()]
     assert pairs == [(1, 7), (1, 9), (2, 7), (2, 9), (3, 6), (3, 10), (4, 8), (6, 6), (6, 10)]
     outer = left.join(right, on="f", how="outer").collect().to_arrow()
-    assert list(zip(outer.column("a").to_pylist(), outer.column("b").to_pylist())) == [
+    assert list(zip(outer.column("a").to_pylist(), outer.column("b").to_pylist(), strict=True)) == [
         (1, 7), (1, 9), (2, 7), (2, 9), (3, 6), (3, 10), (4, 8), (5, None), (6, 6), (6, 10)
     ]  # fmt: skip
     signs = [None if v is None else math.copysign(1, v) for v in outer.column("f").to_pylist()]
