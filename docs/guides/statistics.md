@@ -2,6 +2,8 @@
 
 Four functions describe the whole graph. `describe` is lazy and returns a one-row frame. `density`, `avg_path_length`, and `diameter` return a number, or with `lazy=True` a one-row frame like `describe`.
 
+Each takes the edge frame, not a node frame. `ur.density(ur.degree(edges))` raises `TypeError`: `ur.degree(edges)` is a node frame. Pass `edges`.
+
 ```python
 import ursa as ur
 

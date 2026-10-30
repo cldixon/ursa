@@ -52,6 +52,8 @@ nodes.with_columns(pr=ur.pagerank(edges))   # a column
 ur.pagerank(edges).sort("pagerank").head(5)  # a frame
 ```
 
+The frame is a node frame, not an edge frame. A function that takes `edges`, such as `ur.density` or `ur.pagerank`, raises `TypeError` if you give it one. Give it the edges the algorithm was built from.
+
 When one `with_columns` call names the same algorithm twice with the same parameters, the engine runs it once.
 
 ## Where a column resolves

@@ -1,6 +1,6 @@
 # Algorithms
 
-Each function in this page takes an `EdgeFrame` as its first argument. The node-valued functions return an expression that is also a lazy `NodeFrame` of `(id, value)`. See [Expressions](../concepts/expressions.md#graph-algorithms-are-expressions).
+Each function in this page takes an `EdgeFrame` as its first argument. Any other value raises `TypeError` where you call the function. See [Errors](errors.md#a-graph-function-given-something-other-than-an-edge-frame). The node-valued functions return an expression that is also a lazy `NodeFrame` of `(id, value)`. See [Expressions](../concepts/expressions.md#graph-algorithms-are-expressions).
 
 Every kernel is deterministic. The same input and the same parameters give the same output, on any number of threads. The kernels that use randomness take a `seed`.
 

@@ -83,15 +83,64 @@ def _verb_call(verb: Any) -> str:
 
 
 def edges_node(edges: Any, call: str) -> Any:
-    """The plan of the edge frame a graph verb or traversal ``call`` runs over;
-    for a value that is no frame, the ``AttributeError`` reading its plan gave,
-    naming the call."""
-    node = getattr(edges, "_node", None)
-    if node is None:
-        raise AttributeError(
-            f"{call}() takes an EdgeFrame (the graph) as its edges; got {type(edges).__name__}"
+    """The plan of the edge frame a graph verb, traversal or stat ``call`` runs
+    over. An argument that is no edge frame raises ``check_edges``'s error."""
+    return check_edges(edges, call)._node
+
+
+# The first plan step of the node frame `describe`, a stat or `random_walk`
+# returns: the call that made it, which the message names.
+_RESULT_CALLS = ("describe", "density", "avg_path_length", "diameter", "random_walk")
+
+
+def check_edges(edges: Any, call: str) -> Any:
+    """``edges`` if it is an edge frame: an ``EdgeFrame`` (a traversal result
+    included), the ``ur.hop(...)`` builder, or another object with a plan.
+    Otherwise a ``TypeError`` that names ``call``, says what ``edges`` is and
+    what to pass. Called where ``call`` is called, so a verb that is never
+    collected still raises."""
+    from ._frames import EdgeFrame, NodeFrame
+    from ._graph import GraphExpr, _Hop, _NeighborAgg
+    from ._result import MaterializedFrame
+
+    if isinstance(edges, (EdgeFrame, _Hop)):
+        return edges
+    if isinstance(edges, GraphExpr):
+        verb = _verb_call(edges.payload.get("verb"))
+        got = f"a node frame (ur.{verb}(...)); pass the edges the verb was built from"
+    elif isinstance(edges, NodeFrame):
+        ops = edges._node.ops()
+        if ops and ops[0] in _RESULT_CALLS:
+            got = f"a node frame (ur.{ops[0]}(...)); pass the edges it was built from"
+        elif ops[1:] == ["nodes"]:
+            got = "a node frame (edges.nodes()); pass the edge frame itself"
+        else:
+            got = f"a node frame (id column {edges.id_col!r}); pass an edge frame"
+    elif isinstance(edges, MaterializedFrame):
+        got = (
+            "a collected frame (MaterializedFrame); pass the lazy edge frame, or build one "
+            "from the result with ur.from_arrow(result.to_arrow(), src=, dst=)"
         )
-    return node
+    elif isinstance(edges, _NeighborAgg):
+        got = "ur.neighbors(...), which is no frame; pass the edges it was built from"
+    elif hasattr(edges, "_node"):
+        return edges
+    elif edges is None:
+        got = "None; pass an edge frame"
+    elif hasattr(edges, "kind") and hasattr(edges, "payload"):
+        got = "an expression, which is no frame; pass an edge frame"
+    elif type(edges).__module__.split(".")[0] in ("pyarrow", "polars", "pandas"):
+        module = type(edges).__module__.split(".")[0]
+        got = (
+            f"a {module} {type(edges).__name__}; build an edge frame from it with "
+            "ur.from_arrow(..., src=, dst=)"
+        )
+    else:
+        got = f"{type(edges).__name__}; pass an edge frame"
+    raise TypeError(
+        f"{call}() takes an edge frame (from ur.from_arrow(..., src=, dst=) or "
+        f"ur.scan_edges); got {got}."
+    )
 
 
 def count(n: Any, call: str) -> int:

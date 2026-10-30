@@ -72,6 +72,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Behaviour change:** every function that takes an edge frame checks it
+  where it is called: `density`, `avg_path_length`, `diameter`, `describe`,
+  each graph algorithm (`degree`, `pagerank`, `connected_components`,
+  `triangle_count`, `clustering_coefficient`, `betweenness`, `closeness`,
+  `label_propagation`, `louvain`), `neighbors`, `hop`, `shortest_path` and
+  `random_walk`. A node frame, a graph verb, a `describe`, stat or
+  `random_walk` result, a collected result, a table or any other value
+  raises `TypeError`, which names the function, what it got and what to
+  pass: `density() takes an edge frame (from ur.from_arrow(..., src=, dst=)
+  or ur.scan_edges); got a node frame (ur.degree(...)); pass the edges the
+  verb was built from.` Before, a frame raised `NotImplementedError` about a
+  call the user did not make (`with_columns() of a graph verb is not
+  supported on an edge frame ...`, or `collect() needs edges from
+  ur.from_arrow(...) ...`), and any other value raised `AttributeError`
+  (`density() takes an EdgeFrame (the graph) as its edges; got int`). A graph
+  algorithm raised only when its frame was used or collected; it now raises
+  where it is called, and the edges are checked before the other arguments.
+  An edge frame of any kind, a `hop` or `shortest_path` result included,
+  gives the same result as before (#223).
 - **Behaviour change:** an unknown keyword argument to `scan_edges`,
   `scan_nodes`, `read_edges` or `read_nodes` raises `TypeError` naming the
   function called (`read_edges() got an unexpected keyword argument 'foo'.`),

@@ -64,10 +64,9 @@ def describe(
     so the carried ``id_col`` is an unused placeholder (you collect the summary
     rather than derive node-keyed frames from it).
     """
+    edges_node = _ir.edges_node(edges, "describe")
     _check_direction("describe", direction)
-    return NodeFrame._wrap(
-        _native().PlanNode.describe(_ir.edges_node(edges, "describe"), bool(full), direction, nodes)
-    )
+    return NodeFrame._wrap(_native().PlanNode.describe(edges_node, bool(full), direction, nodes))
 
 
 @overload
@@ -91,8 +90,9 @@ def density(edges: EdgeFrame, direction: str = "out", *, lazy: bool = False) -> 
     Over a filtered edge frame or a traversal result it is the subgraph view's:
     the kept edges over the parent's ``n``, the ``density`` ``describe`` reports.
     """
+    edges_node = _ir.edges_node(edges, "density")
     _check_direction("density", direction)
-    frame = NodeFrame._wrap(_native().PlanNode.density(_ir.edges_node(edges, "density"), direction))
+    frame = NodeFrame._wrap(_native().PlanNode.density(edges_node, direction))
     return frame if lazy else float(_value(frame))
 
 
@@ -122,12 +122,9 @@ def avg_path_length(
     Over a filtered edge frame or a traversal result only the kept edges are
     followed, and a sample picks its sources among the nodes at an end of a
     kept edge."""
+    edges_node = _ir.edges_node(edges, "avg_path_length")
     _check_direction("avg_path_length", direction)
-    frame = NodeFrame._wrap(
-        _native().PlanNode.avg_path_length(
-            _ir.edges_node(edges, "avg_path_length"), sample, direction
-        )
-    )
+    frame = NodeFrame._wrap(_native().PlanNode.avg_path_length(edges_node, sample, direction))
     return frame if lazy else float(_value(frame))
 
 
@@ -152,8 +149,7 @@ def diameter(
     Over a filtered edge frame or a traversal result only the kept edges are
     followed, and the estimate picks its sources among the nodes at an end of a
     kept edge."""
+    edges_node = _ir.edges_node(edges, "diameter")
     _check_direction("diameter", direction)
-    frame = NodeFrame._wrap(
-        _native().PlanNode.diameter(_ir.edges_node(edges, "diameter"), approximate, direction)
-    )
+    frame = NodeFrame._wrap(_native().PlanNode.diameter(edges_node, approximate, direction))
     return frame if lazy else int(_value(frame))
