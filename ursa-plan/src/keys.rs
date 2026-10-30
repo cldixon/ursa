@@ -14,7 +14,6 @@
 //! This covers `float16`, `float32`, `float64` and dictionaries of them (over
 //! their values). Everything works on the bits, so it needs no float type.
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -38,24 +37,31 @@ pub fn is_float_key(dt: &DataType) -> bool {
     }
 }
 
-/// A float's canonical bits: every NaN the positive quiet NaN, `-0.0` as `0.0`.
-macro_rules! canon_fn {
-    ($name:ident, $u:ty, $exp:expr, $mant:expr, $nan:expr, $neg_zero:expr) => {
-        fn $name(b: $u) -> $u {
-            if b & $exp == $exp && b & $mant != 0 {
-                $nan
-            } else if b == $neg_zero {
-                0
-            } else {
-                b
+/// A float's bits, with what makes one canonical.
+trait FloatBits: Copy + PartialEq + arrow::datatypes::ArrowNativeType {
+    /// The canonical bits: every NaN the positive quiet NaN, `-0.0` as `0.0`.
+    fn canon(self) -> Self;
+}
+
+macro_rules! float_bits {
+    ($u:ty, $exp:expr, $mant:expr, $nan:expr, $neg_zero:expr) => {
+        impl FloatBits for $u {
+            #[inline(always)]
+            fn canon(self) -> $u {
+                if self & $exp == $exp && self & $mant != 0 {
+                    $nan
+                } else if self == $neg_zero {
+                    0
+                } else {
+                    self
+                }
             }
         }
     };
 }
-canon_fn!(canon16, u16, 0x7c00, 0x03ff, 0x7e00, 0x8000);
-canon_fn!(canon32, u32, 0x7f80_0000, 0x007f_ffff, 0x7fc0_0000, 1 << 31);
-canon_fn!(
-    canon64,
+float_bits!(u16, 0x7c00, 0x03ff, 0x7e00, 0x8000);
+float_bits!(u32, 0x7f80_0000, 0x007f_ffff, 0x7fc0_0000, 1 << 31);
+float_bits!(
     u64,
     0x7ff0_0000_0000_0000,
     0x000f_ffff_ffff_ffff,
@@ -64,32 +70,30 @@ canon_fn!(
 );
 
 /// The values of float array `a` (of type `F`) as their bits.
-fn bits<F: ArrowPrimitiveType, U: arrow::datatypes::ArrowNativeType>(a: &dyn Array) -> &[U] {
+fn bits<F: ArrowPrimitiveType, U: FloatBits>(a: &dyn Array) -> &[U] {
     a.as_primitive::<F>().values().inner().typed_data::<U>()
 }
 
-/// Float array `a` with every value mapped through `canon` on its bits.
-fn map_bits<F: ArrowPrimitiveType, U: arrow::datatypes::ArrowNativeType + PartialEq>(
-    a: &dyn Array,
-    canon: fn(U) -> U,
-) -> ArrayRef {
-    let out: Vec<U> = bits::<F, U>(a).iter().map(|&b| canon(b)).collect();
+/// The valid positions of float array `a` whose value is not canonical.
+fn changed<F: ArrowPrimitiveType, U: FloatBits>(a: &dyn Array) -> Vec<usize> {
+    let b = bits::<F, U>(a);
+    // A read-only pass first: most columns hold nothing to change.
+    if !b.iter().any(|&x| x.canon() != x) {
+        return vec![];
+    }
+    b.iter()
+        .enumerate()
+        .filter(|&(i, &x)| x.canon() != x && a.is_valid(i))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Float array `a` with every value made canonical.
+fn map_bits<F: ArrowPrimitiveType, U: FloatBits>(a: &dyn Array) -> ArrayRef {
+    let out: Vec<U> = bits::<F, U>(a).iter().map(|&x| x.canon()).collect();
     let len = out.len();
     let values = ScalarBuffer::<F::Native>::new(Buffer::from_vec(out), 0, len);
     Arc::new(PrimitiveArray::<F>::new(values, a.nulls().cloned()))
-}
-
-/// The positions in `bits` whose value `canon` changes, among the valid rows.
-fn changed<U: Copy + PartialEq>(
-    bits: &[U],
-    canon: fn(U) -> U,
-    valid: impl Fn(usize) -> bool,
-) -> Vec<usize> {
-    bits.iter()
-        .enumerate()
-        .filter(|&(i, &b)| canon(b) != b && valid(i))
-        .map(|(i, _)| i)
-        .collect()
 }
 
 /// The rows of float key `array` (see [`is_float_key`]) whose value is valid and
@@ -116,11 +120,10 @@ pub fn noncanonical_rows(array: &dyn Array) -> Vec<usize> {
             .map(|(r, _)| r)
             .collect();
     }
-    let valid = |i: usize| array.is_valid(i);
     match array.data_type() {
-        DataType::Float16 => changed(bits::<Float16Type, u16>(array), canon16, valid),
-        DataType::Float32 => changed(bits::<Float32Type, u32>(array), canon32, valid),
-        DataType::Float64 => changed(bits::<Float64Type, u64>(array), canon64, valid),
+        DataType::Float16 => changed::<Float16Type, u16>(array),
+        DataType::Float32 => changed::<Float32Type, u32>(array),
+        DataType::Float64 => changed::<Float64Type, u64>(array),
         _ => vec![],
     }
 }
@@ -133,9 +136,9 @@ pub fn canonicalize(array: &ArrayRef) -> ArrayRef {
             let d = array.as_any_dictionary();
             d.with_values(canonicalize(d.values()))
         }
-        DataType::Float16 => map_bits::<Float16Type, u16>(array.as_ref(), canon16),
-        DataType::Float32 => map_bits::<Float32Type, u32>(array.as_ref(), canon32),
-        DataType::Float64 => map_bits::<Float64Type, u64>(array.as_ref(), canon64),
+        DataType::Float16 => map_bits::<Float16Type, u16>(array.as_ref()),
+        DataType::Float32 => map_bits::<Float32Type, u32>(array.as_ref()),
+        DataType::Float64 => map_bits::<Float64Type, u64>(array.as_ref()),
         _ => array.clone(),
     }
 }
@@ -194,8 +197,19 @@ impl ScalarUDFImpl for Canonical {
 pub struct Originals {
     /// The original values, of the key's type.
     pub values: ArrayRef,
-    /// A row's ordinal to its value's position in `values`.
-    pub at: HashMap<u64, usize>,
+    /// Each changed row's ordinal and its value's position in `values`,
+    /// sorted by ordinal.
+    pub at: Vec<(u64, usize)>,
+}
+
+impl Originals {
+    /// The position in `values` of the row with ordinal `ord`, if it changed.
+    fn find(&self, ord: u64) -> Option<usize> {
+        self.at
+            .binary_search_by_key(&ord, |&(o, _)| o)
+            .ok()
+            .map(|i| self.at[i].1)
+    }
 }
 
 /// `key` (a canonical key column after an aggregate) with each row whose first
@@ -264,10 +278,10 @@ impl ScalarUDFImpl for Representative {
             .map(|r| {
                 match first
                     .is_valid(r)
-                    .then(|| self.originals.at.get(&first.value(r)))
+                    .then(|| self.originals.find(first.value(r)))
                     .flatten()
                 {
-                    Some(&j) => {
+                    Some(j) => {
                         any = true;
                         (1, j)
                     }
@@ -295,24 +309,30 @@ mod tests {
 
     #[test]
     fn canonical_bits() {
-        assert_eq!(canon64((-0.0f64).to_bits()), 0);
-        assert_eq!(canon64(neg_nan64(1).to_bits()), f64::NAN.to_bits());
-        assert_eq!(canon64(f64::NAN.to_bits()), f64::NAN.to_bits());
+        assert_eq!(FloatBits::canon((-0.0f64).to_bits()), 0);
+        assert_eq!(FloatBits::canon(neg_nan64(1).to_bits()), f64::NAN.to_bits());
+        assert_eq!(FloatBits::canon(f64::NAN.to_bits()), f64::NAN.to_bits());
         assert_eq!(
-            canon64(f64::NEG_INFINITY.to_bits()),
+            FloatBits::canon(f64::NEG_INFINITY.to_bits()),
             f64::NEG_INFINITY.to_bits()
         );
-        assert_eq!(canon64(f64::INFINITY.to_bits()), f64::INFINITY.to_bits());
-        assert_eq!(canon32((-0.0f32).to_bits()), 0);
         assert_eq!(
-            canon32(f32::from_bits(0xffc0_0001).to_bits()),
+            FloatBits::canon(f64::INFINITY.to_bits()),
+            f64::INFINITY.to_bits()
+        );
+        assert_eq!(FloatBits::canon((-0.0f32).to_bits()), 0);
+        assert_eq!(
+            FloatBits::canon(f32::from_bits(0xffc0_0001).to_bits()),
             f32::NAN.to_bits()
         );
-        assert_eq!(canon32(f32::INFINITY.to_bits()), f32::INFINITY.to_bits());
-        assert_eq!(canon16(0x8000), 0);
-        assert_eq!(canon16(0xfe01), 0x7e00);
-        assert_eq!(canon16(0x7c00), 0x7c00); // +inf
-        assert_eq!(canon16(0xfc00), 0xfc00); // -inf
+        assert_eq!(
+            FloatBits::canon(f32::INFINITY.to_bits()),
+            f32::INFINITY.to_bits()
+        );
+        assert_eq!(FloatBits::canon(0x8000u16), 0);
+        assert_eq!(FloatBits::canon(0xfe01u16), 0x7e00);
+        assert_eq!(FloatBits::canon(0x7c00u16), 0x7c00); // +inf
+        assert_eq!(FloatBits::canon(0xfc00u16), 0xfc00); // -inf
         assert_eq!((f32::NAN as f64).to_bits(), f64::NAN.to_bits());
     }
 

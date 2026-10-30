@@ -633,42 +633,65 @@ impl Frame {
         let schema = batches[0].schema();
         let o = schema.index_of(ord).map_err(arrow_err)?;
         let mut out = vec![];
-        let mut hidden_cols: Vec<usize> = vec![];
+        // Per batch, the hidden columns: a canonical copy where a row changes,
+        // else the column itself.
+        let mut hidden: Vec<Vec<ArrayRef>> = vec![vec![]; batches.len()];
         let mut taken = schema.as_ref().clone();
         for k in floats {
             let i = schema.index_of(k).map_err(arrow_err)?;
+            // Each batch on its own core: its canonical copy (or the column
+            // itself), and the original values of the rows that changed, with
+            // their ordinals.
+            use rayon::prelude::*;
+            type Changed = (ArrayRef, Option<(ArrayRef, Vec<u64>)>);
+            let per_batch: Vec<Changed> = batches
+                .par_iter()
+                .map(|b| -> Result<Changed> {
+                    let column = b.column(i);
+                    let rows = noncanonical_rows(column.as_ref());
+                    if rows.is_empty() {
+                        return Ok((column.clone(), None));
+                    }
+                    let ords = b
+                        .column(o)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| DataFusionError::Internal("an ordinal is UInt64".into()))?;
+                    let idx = UInt64Array::from_iter_values(rows.iter().map(|&r| r as u64));
+                    let piece = arrow::compute::take(column, &idx, None).map_err(arrow_err)?;
+                    let ords = rows.iter().map(|&r| ords.value(r)).collect();
+                    Ok((canonicalize(column), Some((piece, ords))))
+                })
+                .collect::<Result<_>>()?;
             let mut pieces: Vec<ArrayRef> = vec![];
-            let mut at = std::collections::HashMap::new();
-            for b in &batches {
-                let rows = noncanonical_rows(b.column(i).as_ref());
-                if rows.is_empty() {
-                    continue;
+            let mut at: Vec<(u64, usize)> = vec![];
+            let mut copies: Vec<ArrayRef> = Vec::with_capacity(batches.len());
+            for (copy, changed) in per_batch {
+                copies.push(copy);
+                if let Some((piece, ords)) = changed {
+                    let base = at.len();
+                    at.extend(ords.into_iter().enumerate().map(|(j, o)| (o, base + j)));
+                    pieces.push(piece);
                 }
-                let ords = b
-                    .column(o)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| DataFusionError::Internal("an ordinal is UInt64".into()))?;
-                let base: usize = pieces.iter().map(|p| p.len()).sum();
-                for (j, &r) in rows.iter().enumerate() {
-                    at.insert(ords.value(r), base + j);
-                }
-                let idx = UInt64Array::from_iter_values(rows.iter().map(|&r| r as u64));
-                pieces.push(arrow::compute::take(b.column(i), &idx, None).map_err(arrow_err)?);
             }
             if pieces.is_empty() {
                 continue;
             }
+            if !at.is_sorted_by_key(|&(o, _)| o) {
+                at.sort_unstable_by_key(|&(o, _)| o);
+            }
             let refs: Vec<&dyn Array> = pieces.iter().map(|p| p.as_ref()).collect();
             let values = arrow::compute::concat(&refs).map_err(arrow_err)?;
-            let hidden = fresh_name(&taken);
-            let field = schema.field(i).as_ref().clone().with_name(&hidden);
+            let name = fresh_name(&taken);
+            let field = schema.field(i).as_ref().clone().with_name(&name);
             let mut fields: Vec<Field> =
                 taken.fields().iter().map(|f| f.as_ref().clone()).collect();
             fields.push(field);
             taken = Schema::new_with_metadata(fields, taken.metadata().clone());
-            hidden_cols.push(i);
-            out.push((k.clone(), hidden, Arc::new(Originals { values, at })));
+            for (h, c) in hidden.iter_mut().zip(copies) {
+                h.push(c);
+            }
+            out.push((k.clone(), name, Arc::new(Originals { values, at })));
         }
         if out.is_empty() {
             return Ok(out);
@@ -676,9 +699,10 @@ impl Frame {
         let taken = Arc::new(taken);
         let batches = batches
             .into_iter()
-            .map(|b| {
+            .zip(hidden)
+            .map(|(b, h)| {
                 let mut cols = b.columns().to_vec();
-                cols.extend(hidden_cols.iter().map(|&i| canonicalize(b.column(i))));
+                cols.extend(h);
                 RecordBatch::try_new(taken.clone(), cols).map_err(arrow_err)
             })
             .collect::<Result<Vec<_>>>()?;
