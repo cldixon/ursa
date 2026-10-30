@@ -451,7 +451,7 @@ def test_the_key_keeps_the_left_type(how, left_type, right_type):
 def test_a_right_key_the_left_type_cannot_hold_errors(how):
     left = ur.from_arrow(pa.table({"key": pa.array([1, 2], pa.uint64()), "a": [0, 1]}), id="a")
     right = ur.from_arrow(pa.table({"key": pa.array([2, -1], pa.int64()), "b": [0, 1]}), id="b")
-    with pytest.raises(ValueError, match=r"key 'key' keeps the left frame's type \(UInt64\)"):
+    with pytest.raises(ValueError, match=r"key 'key' keeps the left frame's type \(uint64\)"):
         left.join(right, on="key", how=how).collect()
     # inner and left never emit a right-only key.
     assert left.join(right, on="key").collect().to_dicts() == [{"key": 2, "a": 1, "b": 0}]

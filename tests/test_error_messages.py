@@ -11,6 +11,7 @@ parity harnesses and checks every message they raise.
 from __future__ import annotations
 
 import copy
+import decimal
 import importlib
 import math
 import pickle
@@ -19,6 +20,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -48,6 +50,20 @@ LEAKS = (
     "Schema error:",
     "Internal error:",
     "invalid plan:",
+    "Cast error",
+    "Parquet error",
+    "Invalid argument error",
+    "Object Store error",
+    "External error",
+    "caused by",
+    "Cannot coerce",
+    "Cannot infer common argument",
+    "failed to match any signature",
+    "No field named",
+    "Utf8",
+    "Timestamp(",
+    "Dictionary(",
+    "Decimal128(",
 )
 
 
@@ -153,12 +169,12 @@ CASES = {
     "rename_value_type": (
         lambda: n().rename(bad({"age": 1})),
         ValueError,
-        "rename() maps column names to new names, both strings; got 1 (int)",
+        "a rename() column name must be a string; got 1",
     ),
     "rename_none": (
         lambda: n().rename(bad({"age": None})),
         ValueError,
-        "rename() maps column names to new names, both strings; got None (NoneType)",
+        "a rename() column name must be a string; got None",
     ),
     "rename_not_a_dict": (
         lambda: n().rename(bad(["age"])),
@@ -188,14 +204,14 @@ CASES = {
     "group_by_sum_of_strings": (
         lambda: n().group_by("age").agg(x=col("name").sum()),
         ur.ComputeError,
-        "group_by().agg(): sum() needs a numeric column; got a string column. Aggregate a "
-        "numeric column, or use count() or n_unique(), which take any column",
+        "sum() needs a numeric column, and got a string column; sum() and mean() take numbers "
+        "only, while min(), max(), count() and n_unique() take strings too",
     ),
     "group_by_mean_of_strings": (
         lambda: n().group_by("age").agg(x=col("name").mean()),
         ur.ComputeError,
-        "group_by().agg(): mean() needs a numeric column; got a string column. Aggregate a "
-        "numeric column, or use count() or n_unique(), which take any column",
+        "mean() needs a numeric column, and got a string column; sum() and mean() take numbers "
+        "only, while min(), max(), count() and n_unique() take strings too",
     ),
     "join_how_type": (
         lambda: n().join(n(), on="id", how=bad(1)),
@@ -205,8 +221,8 @@ CASES = {
     "join_key_types": (
         lambda: n().join(ur.from_arrow(pa.table({"id": ["a"], "z": [1]}), id="id"), on="id"),
         ur.ComputeError,
-        "the string 'a' cannot be read as int64; the values being matched have different "
-        "types, so cast one side to the other's type first",
+        "join(on=): the left and right keys have different types (the string 'a' cannot be "
+        "read as int64); cast one side's key to the other's type first",
     ),
     "pickle": (
         lambda: pickle.dumps(n()),
@@ -497,12 +513,121 @@ def test_an_engine_error_keeps_the_engine_text_as_its_cause():
     assert info.value.__cause__ is None
 
 
+@pytest.mark.parametrize(
+    ("build", "cls", "cause"),
+    [
+        # The class main raised, exactly: a rename name serde reads as a number.
+        (lambda: n().rename(bad({"age": decimal.Decimal(1)})), ValueError, RuntimeError),
+        (lambda: n().rename(bad({"age": np.float32(1)})), ValueError, RuntimeError),
+        (lambda: n().rename(bad({"age": object()})), TypeError, TypeError),
+        (lambda: n().rename(bad({"age": [object()]})), TypeError, TypeError),
+        (lambda: n().head(bad("x")), ValueError, ValueError),
+        (lambda: n().head(bad(b"x")), ValueError, ValueError),
+        (lambda: n().sample(bad(None)), TypeError, TypeError),
+        (lambda: n().join(n(), on="id", how=bad(1)), ValueError, RuntimeError),
+        (lambda: ur.pagerank(e(), damping=bad(object())), TypeError, TypeError),
+        (lambda: n().with_columns(x=col("age") / 0), ur.ComputeError, RuntimeError),
+        # A subclass is raised as it is, not reworded into its base class.
+        (lambda: n().filter(col("name") == "\ud800"), UnicodeEncodeError, None),
+        (lambda: n().head(bad(float("inf"))), OverflowError, None),
+    ],
+)
+def test_exception_classes_and_causes(build, cls, cause):
+    with pytest.raises(BaseException) as info:
+        run(build)
+    assert type(info.value) is cls
+    if cause is None:
+        assert info.value.__cause__ is None
+    else:
+        assert type(info.value.__cause__) is cause
+
+
+def repros(tmp: Path) -> dict:
+    """Errors from DataFusion and Arrow that a plan can reach: operand types that
+    do not combine (timestamps, dictionaries, decimals, lists), aggregation
+    signatures, casts, and storage."""
+    t = pa.table(
+        {
+            "id": [0, 1, 2],
+            "ts": pa.array([1, 2, 3], pa.timestamp("us")),
+            "tz": pa.array([1, 2, 3], pa.timestamp("ns", "UTC")),
+            "c": pa.array(["x", "y", "x"]).dictionary_encode(),
+            "dec": pa.array([decimal.Decimal("1.50"), None, None], pa.decimal128(10, 2)),
+            "s": ["a", "b", "c"],
+            "b": [True, False, True],
+            "l": pa.array([[1], [2], [3]]),
+        }
+    )
+    f = ur.from_arrow(t, id="id")
+    strs = ur.from_arrow(pa.table({"id": ["a"], "z": [1]}), id="id")
+    return {
+        "ts_plus_int": lambda: f.with_columns(x=col("ts") + 1),
+        "ts_times_ts": lambda: f.with_columns(x=col("ts") * col("ts")),
+        "tz_minus_str": lambda: f.with_columns(x=col("tz") - col("s")),
+        "dict_plus_int": lambda: f.with_columns(x=col("c") + 1),
+        "dec_times_dict": lambda: f.with_columns(x=col("dec") * col("c")),
+        "dec_div_str": lambda: f.with_columns(x=col("dec") / col("s")),
+        "list_plus_int": lambda: f.with_columns(x=col("l") + 1),
+        "bool_and_dict": lambda: f.filter(col("b") & col("c")),
+        "dict_or_ts": lambda: f.filter(col("c") | col("ts")),
+        "not_dict": lambda: f.filter(~col("c")),
+        "dict_gt_int": lambda: f.filter(col("c") > 1),
+        "ts_eq_dec": lambda: f.filter(col("ts") == col("dec")),
+        "sum_ts": lambda: f.group_by("s").agg(x=col("ts").sum()),
+        "mean_dict": lambda: f.group_by("s").agg(x=col("c").mean()),
+        "mean_list": lambda: f.group_by("s").agg(x=col("l").mean()),
+        "sum_str": lambda: f.group_by("id").agg(x=col("s").sum()),
+        "join_str_int": lambda: f.select("id", "s").join(strs, on="id"),
+        "join_int_str": lambda: strs.join(f.select("id", "s"), on="id"),
+        "attach_str_ids": lambda: strs.with_columns(dg=ur.degree(e())),
+        "missing_file": lambda: ur.scan_edges(str(tmp / "nope" / "e.parquet"), src="s", dst="d"),
+        "missing_glob": lambda: ur.scan_nodes(str(tmp / "*.parquet"), id="id"),
+        "http_refused": lambda: ur.scan_edges("http://127.0.0.1:1/e.parquet", src="s", dst="d"),
+        "http_query": lambda: ur.scan_edges("https://h.invalid/e.parquet?t=1", src="s", dst="d"),
+        "s3_bad_option": lambda: ur.scan_edges(
+            "s3://bucket/e.parquet", src="s", dst="d", storage_options={"not_an_option": "x"}
+        ),
+        "s3_bad_url": lambda: ur.scan_edges("s3://", src="s", dst="d"),
+    }
+
+
+def test_repro_messages(tmp_path):
+    """Each repro raises, in Ursa's words."""
+    for case, build in repros(tmp_path).items():
+        with pytest.raises(Exception) as info:
+            run(build)
+        message = str(info.value)
+        assert not [t for t in LEAKS if t in message], (case, message)
+    with pytest.raises(ur.ComputeError) as info:
+        run(repros(tmp_path)["join_str_int"])
+    assert str(info.value) == (
+        "join(on=): the left and right keys have different types (the string 'a' cannot be "
+        "read as int64); cast one side's key to the other's type first"
+    )
+    with pytest.raises(ur.ComputeError) as info:
+        run(repros(tmp_path)["attach_str_ids"])
+    assert str(info.value) == (
+        "with_columns(): the frame's id column and the graph's node ids have different types "
+        "(the string 'a' cannot be read as int64); build the frame with ids of the graph's id "
+        "type"
+    )
+    with pytest.raises(ur.ComputeError) as info:
+        run(repros(tmp_path)["dec_times_dict"])
+    assert str(info.value) == (
+        "cannot apply '*' to decimal128(10, 2) and dictionary<values=string, indices=int32, "
+        "ordered=0> (decimal128(10, 2) * dictionary<values=string, indices=int32, ordered=0>); "
+        "arithmetic needs numeric operands"
+    )
+
+
 PLAN_MATRIX = Path(__file__).resolve().parent.parent / "benchmarks" / "plan_matrix"
 
 
-def test_no_message_of_the_parity_plans_leaks_internals(tmp_path):
-    """Every plan of the parity harnesses (#191, #193): no error message any of
-    them raises shows the engine's internals."""
+def test_no_user_facing_message_leaks_internals(tmp_path):
+    """Every error the parity harnesses raise (`parity_191.py`,
+    `parity_191_joins.py`, `parity_191_reshaped.py`, which run each case through
+    `parity_193.py`'s runner), every pinned case above, every scan case and every
+    repro: no message shows the engine's internals."""
     sys.path.insert(0, str(PLAN_MATRIX))
     try:
         parity_191 = importlib.import_module("parity_191")
@@ -511,6 +636,7 @@ def test_no_message_of_the_parity_plans_leaks_internals(tmp_path):
     finally:
         sys.path.remove(str(PLAN_MATRIX))
     messages: dict[str, str] = {}
+    harness_cases = 0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for name, harness in [
@@ -522,7 +648,18 @@ def test_no_message_of_the_parity_plans_leaks_internals(tmp_path):
             harness.run_all(str(out))
             for rec in parity_191.load(str(out)).values():
                 if "message" in rec:
+                    harness_cases += 1
                     messages.setdefault(rec["message"], rec["case"])
-    assert messages, "the harnesses raise errors"
+        builds = {f"case:{k}": v[0] for k, v in CASES.items()}
+        builds |= {f"scan:{k}": v[0] for k, v in scan_cases(tmp_path).items()}
+        builds |= {f"repro:{k}": v for k, v in repros(tmp_path).items()}
+        for case, build in builds.items():
+            try:
+                run(build)
+            except Exception as exc:
+                messages.setdefault(str(exc), case)
+    # Every error case of the harnesses, and every other case, was checked.
+    assert harness_cases >= 1500, harness_cases
+    assert len(messages) >= 100, len(messages)
     leaking = {m: c for m, c in messages.items() if any(t in m for t in LEAKS)}
     assert not leaking

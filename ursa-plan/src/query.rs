@@ -468,8 +468,20 @@ pub fn attach_columns(
     // An id column the gather does not read: the hash LEFT join, which coerces
     // the key types, numbered for its order.
     let ord = crate::lower::fresh_name(&batches[0].schema());
-    let joined = attach_by_join(ctx, batches, id_col, graph, &ord)?;
-    crate::lower::Frame::from_numbered(ctx.clone(), joined, ord).collect()
+    let ids = |e: DataFusionError| {
+        if crate::message::mismatched_types(&e) {
+            e.context(
+                "with_columns(): the frame's id column and the graph's node ids have different \
+                 types ({}); build the frame with ids of the graph's id type",
+            )
+        } else {
+            e
+        }
+    };
+    let joined = attach_by_join(ctx, batches, id_col, graph, &ord).map_err(ids)?;
+    crate::lower::Frame::from_numbered(ctx.clone(), joined, ord)
+        .collect()
+        .map_err(ids)
 }
 
 /// The graph columns as one `(id, values...)` batch in dense order, computed on

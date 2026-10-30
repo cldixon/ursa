@@ -3064,9 +3064,11 @@ fn run_join(left: Frame, join: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> 
     if how == How::Right || how == How::Outer {
         if let Some((k, lt, rt)) = crate::lower::unfit_right_key(&left, &mut right, on)? {
             return Err(PlanError::Value(format!(
-                "join(on=): key {} keeps the left frame's type ({lt}), which can't hold \
-                 every value of the right frame's key ({rt}); cast one side first.",
-                py_str(&k)
+                "join(on=): key {} keeps the left frame's type ({}), which can't hold \
+                 every value of the right frame's key ({}); cast one side first.",
+                py_str(&k),
+                crate::compare::pa_name(&lt),
+                crate::compare::pa_name(&rt)
             )));
         }
     }

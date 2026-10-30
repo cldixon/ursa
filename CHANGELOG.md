@@ -51,14 +51,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     predicates (comparisons such as ur.col('a') > 1); got bool and int64` (and
     `'|'`); `… Int64 IS DISTINCT FROM Boolean` (from `~`) → `'~' negates a
     boolean predicate …; got int64`; `Function 'sum' failed to match any
-    signature, errors: …` → `group_by().agg(): sum() needs a numeric column;
-    got a string column. …` (and `mean()`); `Physical plan does not support
+    signature, errors: …` → `sum() needs a numeric column, and got a string
+    column; sum() and mean() take numbers only, while min(), max(), count()
+    and n_unique() take strings too` (and `mean()`, with the column's type;
+    another aggregation reads `<fn>() cannot aggregate a <type> column`);
+    `Cannot get result type for temporal operation Timestamp(µs) *
+    Timestamp(µs): …` → `cannot apply '*' to timestamp[us] and timestamp[us]
+    (…); this arithmetic is not defined for these types`; type names in these
+    messages are pyarrow's (`dictionary<values=string, …>`, `decimal128(10,
+    2)`, `timestamp[us]`), never DataFusion's (`Dictionary(Int32, Utf8)`);
+    `Physical plan does not support
     logical expression AggregateFunction(…)` (an aggregation in a weight) →
     `an aggregation (.sum(), .mean(), ...) is not allowed here; …`;
   - Arrow errors: `Arrow error: Divide by zero error` → `division by zero in an
     integer expression; …`; `Arrow error: Cast error: Cannot cast string 'a' to
-    value of Int64 type` (join or attach keys of different types) → `the string
-    'a' cannot be read as int64; …`; `Arrow error: Invalid argument error: must
+    value of Int64 type` → for join keys, `join(on=): the left and right keys
+    have different types (the string 'a' cannot be read as int64); cast one
+    side's key to the other's type first`, and for a graph column over a frame
+    whose ids are of another type, `with_columns(): the frame's id column and
+    the graph's node ids have different types (…); build the frame with ids of
+    the graph's id type`; `join(on=): key 'k' keeps the left frame's type
+    (Int64), which can't hold every value of the right frame's key (Utf8); …`
+    names the types `int64` and `string`; `Arrow error: Invalid argument error: must
     either specify a row count or at least one column` → `select() needs at
     least one column`;
   - schema errors: `Schema error: No field named x. Valid fields are
@@ -92,8 +106,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - plan arguments: `ValueError: invalid plan: invalid type: integer 1,
     expected a string` → `join(how=) must be a string; got 1` (also
     `hop(direction=)`, `shortest_path(direction=)`, `describe(direction=)`);
-    `rename({"a": 1})` → `rename() maps column names to new names, both
-    strings; got 1 (int)`; `rename(["a"])`/`rename(None)` → `rename() takes a
+    `rename({"a": 1})` → `a rename() column name must be a string; got 1`;
+    a plan argument of a type with no JSON form, `TypeError: Object of type X is
+    not JSON serializable` → `<argument> cannot take a value of type 'X'` (as
+    `pagerank(damping=) cannot take a value of type 'object'`), with the
+    original exception as its `__cause__`; `rename(["a"])`/`rename(None)` → `rename() takes a
     dict of {old: new} column names; got …`; `TypeError: Object of type X is
     not JSON serializable` (a filter literal) → `a literal of type 'X' is not
     supported in a filter expression; use a bool, int, float, str or None, …`;
@@ -138,6 +155,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     `scan: unsupported URL scheme "ftp" (…)` → `unsupported URL scheme 'ftp';
     use a local path or a file://, …`; `edge source "…" resolved but contained
     no rows; …` → `the file has no rows; …`;
+  - more scan and storage messages: `src and dst node-id columns must be the
+    same type (both int or both string); got Int64 and Utf8 in "…"` → `the src
+    and dst columns must have one id type (both integer or both string); got
+    int64 and string`; `node ids must be an integer or string column; Float64
+    is not a supported id type` → `node ids must be an integer or string
+    column; got double` (and `unsupported node-id type …; node ids must be
+    int64 or string (Utf8)` → `node ids must be an integer or string column;
+    got …`); `scan: bad object-store url: …` → `not a valid URL: …`; the http
+    query-string message loses its `scan_edges:` prefix and trailing `got
+    "…"` (the label names the scan and its path); object_store's `Generic HTTP
+    error: Error performing HEAD <url> in …, after 10 retries, … - HTTP error:
+    <cause>` → `could not read <url>: <cause>`, `Configuration key: 'k' is not
+    valid for store 'S3'.` → `storage_options key 'k' is not an option of the
+    S3 store; …`, and other `Generic S3 error: …` messages lose that prefix;
+  - classes: every class is as before, with one fix: an engine error is a
+    `ColumnNotFoundError` by its structure (a schema error, or Ursa's own
+    "column … not found"), so a storage error whose path holds the word
+    "column" (`s3://b/columns/x.parquet` not found) is now the `ComputeError`
+    it is. An exception that is a subclass (`UnicodeEncodeError` for a string
+    with no UTF-8 form) is raised as it is, and a reworded exception keeps the
+    one it replaced as its `__cause__`;
   - Ursa's own messages lose the variant prefix DataFusion put before them
     (`Execution error: output column name 'id' is reserved …`, `This feature is
     not implemented: neighbors().agg() needs a node attribute table …`, and

@@ -19,7 +19,7 @@ use std::sync::{Arc, PoisonError};
 use arrow::array::{make_array, ArrayData, ArrayRef, RecordBatch};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow_pyarrow::{FromPyArrow, ToPyArrow};
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
@@ -90,17 +90,23 @@ pub(crate) fn to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 /// `obj` as JSON for the argument `label` (`pagerank(damping=)`): [`to_value`],
 /// with its errors naming the argument.
+/// Only [`to_value`]'s own `TypeError`/`ValueError` is reworded, with the original
+/// as its `__cause__`; any other exception (a `UnicodeEncodeError` from a string
+/// that has no UTF-8 form, say) is raised as it is.
 fn arg_value(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<Value> {
     to_value(obj).map_err(|e| {
         Python::attach(|py| {
-            let msg = e.value(py).to_string();
-            if e.is_instance_of::<PyTypeError>(py) {
-                PyTypeError::new_err(format!("{label} {msg}"))
-            } else if e.is_instance_of::<PyValueError>(py) {
-                PyValueError::new_err(format!("{label} {msg}"))
+            let ty = e.get_type(py);
+            let msg = format!("{label} {}", e.value(py));
+            let new = if ty.is(py.get_type::<PyTypeError>()) {
+                PyTypeError::new_err(msg)
+            } else if ty.is(py.get_type::<PyValueError>()) {
+                PyValueError::new_err(msg)
             } else {
-                e
-            }
+                return e;
+            };
+            new.set_cause(py, Some(e));
+            new
         })
     })
 }
@@ -125,9 +131,16 @@ fn float_value(f: f64) -> PyResult<Value> {
 /// A Python value as a typed IR value (`serde` on its JSON), for the argument
 /// `label`, which its errors name.
 fn ir<T: serde::de::DeserializeOwned>(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<T> {
-    serde_json::from_value(arg_value(obj, label)?).map_err(|e| {
-        PyValueError::new_err(ursa_plan::message::serde_message(label, &e.to_string()))
-    })
+    serde_json::from_value(arg_value(obj, label)?).map_err(|e| serde_err(label, e))
+}
+
+/// The `ValueError` for an argument `label` the plan could not read, in Ursa's
+/// words, with serde's text as its `__cause__`.
+fn serde_err(label: &str, e: impl std::fmt::Display) -> PyErr {
+    let raw = e.to_string();
+    let err = PyValueError::new_err(ursa_plan::message::serde_message(label, &raw));
+    Python::attach(|py| err.set_cause(py, Some(PyRuntimeError::new_err(raw))));
+    err
 }
 
 /// A `with_columns` expression's JSON: a graph verb's parameters each labelled
@@ -408,12 +421,7 @@ impl PlanNode {
             Expr::default()
         } else {
             let v = arg_value(predicate, "filter()")?;
-            Expr::from_value(v).map_err(|e| {
-                PyValueError::new_err(ursa_plan::message::serde_message(
-                    "filter()",
-                    &e.to_string(),
-                ))
-            })?
+            Expr::from_value(v).map_err(|e| serde_err("filter()", e))?
         };
         self.step(Step::Filter(p), error)
     }
@@ -441,12 +449,7 @@ impl PlanNode {
         let mut out = Vec::with_capacity(columns.len());
         for (name, expr, edges) in columns {
             let v = column_value(&expr)?;
-            let expr = match Expr::from_value(v).map_err(|e| {
-                PyValueError::new_err(ursa_plan::message::serde_message(
-                    "with_columns()",
-                    &e.to_string(),
-                ))
-            })? {
+            let expr = match Expr::from_value(v).map_err(|e| serde_err("with_columns()", e))? {
                 Expr::Graph(verb) => ColumnExpr::Graph {
                     verb,
                     edges: edges.map(|e| e.0.clone()),

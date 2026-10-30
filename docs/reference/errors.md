@@ -23,7 +23,7 @@ The engine raises one of three exception types. They are ordinary exceptions, so
 | Type | Raised when |
 |---|---|
 | `ur.UrsaError` | The base class. Catch it to catch every engine error. |
-| `ur.ColumnNotFoundError` | A step names a column that the frame does not have: a `filter`, `select`, `with_columns`, `rename`, `sort`, `group_by` or `agg`. The message has one shape, `sort() references unknown column 'x'; the frame has [...]`. A subclass of both `UrsaError` and `ValueError`. |
+| `ur.ColumnNotFoundError` | A step names a column that the frame does not have: a `filter`, `select`, `with_columns`, `rename`, `sort`, `group_by` or `agg`, a `join` key, a weight's edge column, a role column a scan's file lacks, or a role column an earlier step removed. See the shapes below. A subclass of both `UrsaError` and `ValueError`. |
 | `ur.ComputeError` | A computation fails: an invalid parameter value, operand types that do not combine (`cannot compare string with int64 ...`), an integer division by zero, or a file a scan cannot read. A subclass of `UrsaError`. |
 
 ```py
@@ -44,6 +44,17 @@ A message names the step or the argument it is about, says what was wrong, and s
 | A call and a value it does not take | `hop(direction='up') is not supported; use one of 'out', 'in', 'both'` |
 | Operand types that do not combine | `cannot compare string with int64 (string > int64); compare values of one type` |
 | A scan and its path | `scan_edges('edges.parquet'): no file matches the path; check it (a glob must match at least one file)` |
+
+A `ColumnNotFoundError` names the step and the column, and lists the columns there are, in one of these shapes:
+
+| Where | Message |
+|---|---|
+| A step's column | `sort() references unknown column 'x'; the frame has ['id', 'age'].` |
+| A join key | `join(on=): key 'x' not in the left frame ['id', 'age'].` (or the right frame) |
+| A weight | `weight expression references unknown edge column(s): ['x']; the edges have ['s', 'd']` |
+| A scan's role column | `scan_edges('edges.parquet'): src column 'x' not found in the file; it has ['s', 'd']` |
+| A role an earlier step removed | `a graph op needs the edge frame's src column 's', but select() removed it, ...` |
+| A column a scan's plan reads | `scan_nodes('nodes.parquet'): unknown column 'x'; the frame has ['id', 'age'].` |
 
 When Ursa translates an engine error, the engine's original text stays on the exception as its `__cause__`, a `RuntimeError`, so a bug report can include both:
 

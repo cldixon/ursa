@@ -95,14 +95,17 @@ def edges_node(edges: Any, call: str) -> Any:
 
 
 def count(n: Any, call: str) -> int:
-    """A row count argument (``head(n)``, ``sample(n)``) as ``int(n)`` reads it,
-    with the exception ``int`` raised naming the call."""
+    """A row count argument (``head(n)``, ``sample(n)``) as ``int(n)`` reads it.
+    The ``TypeError``/``ValueError`` ``int`` raised is reworded to name the call and
+    chained to it; any other exception is raised as it is."""
     try:
         return int(n)
     except (TypeError, ValueError) as exc:
+        if type(exc) not in (TypeError, ValueError):
+            raise
         raise type(exc)(
             f"{call} takes an integer row count; got {n!r} ({type(n).__name__})"
-        ) from None
+        ) from exc
 
 
 def _lit(value: Any) -> dict[str, Any]:
@@ -244,23 +247,19 @@ def select_items(columns: Any) -> list[Any]:
 
 
 def rename_mapping(mapping: Any) -> list[list[str]]:
-    """The ``rename({old: new})`` pairs. A mapping ``dict()`` can't read, or a name
-    that is no string, raises the exception it always did (``dict()``'s, or the
-    plan's ``ValueError``/``TypeError``), worded for ``rename()``."""
+    """The ``rename({old: new})`` pairs. A mapping ``dict()`` can't read raises the
+    exception ``dict()`` raised, worded for ``rename()`` and chained to it; a name
+    that is no string is the plan's to reject (``a rename() column name must be a
+    string; got 1``)."""
     try:
         pairs = dict(mapping).items()
     except (TypeError, ValueError) as exc:
+        if type(exc) not in (TypeError, ValueError):
+            raise
         raise type(exc)(
             f"rename() takes a dict of {{old: new}} column names; got {mapping!r} "
             f"({type(mapping).__name__})"
-        ) from None
-    for name in (n for pair in pairs for n in pair):
-        if not isinstance(name, str):
-            json_like = name is None or isinstance(name, (bool, int, float, list, tuple, dict))
-            raise (ValueError if json_like or hasattr(name, "__index__") else TypeError)(
-                f"rename() maps column names to new names, both strings; got {name!r} "
-                f"({type(name).__name__})"
-            )
+        ) from exc
     return [[old, new] for old, new in pairs]
 
 

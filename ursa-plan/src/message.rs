@@ -4,16 +4,24 @@
 //! or one of Ursa's own messages carried in one. Its `Display` is for DataFusion's
 //! developers: it starts with a variant prefix (`Execution error: `, `Arrow error:
 //! `, ...), and DataFusion's own messages name its internals (the `?table?`
-//! qualifier, signature lists, logical expressions). [`engine_message`] gives the
-//! same error in Ursa's words: Ursa's own messages without the prefix, and the
-//! DataFusion and Arrow errors a plan can reach reworded to say what was wrong and
-//! what to do. The original error stays the source (`PlanError::source`, and the
-//! `__cause__` of the Python exception).
+//! qualifier, signature lists, logical expressions, its type names). [`engine_message`]
+//! gives the same error in Ursa's words: Ursa's own messages without the prefix,
+//! and the DataFusion and Arrow errors a plan can reach reworded to say what was
+//! wrong and what to do. Structured errors (a schema error, Arrow's divide by zero
+//! or cast error) are read from their fields; DataFusion's planner reports type
+//! errors as text, which is parsed. The original error stays the source
+//! (`PlanError::source`, and the `__cause__` of the Python exception).
 //!
-//! A [`DataFusionError::Context`] names the step an error belongs to; its label
-//! leads the message (`filter(): cannot compare ...`), unless the message already
-//! starts with a call (`join(on=): ...`).
+//! A [`DataFusionError::Context`] says where an error came from. Its label leads
+//! the message (`scan_edges('e.parquet'): no file matches the path ...`), unless
+//! the message already starts with a call (`join(on=): ...`). A label holding
+//! `{}` is a template the message is put into, for advice that depends on where
+//! the error came from (`join(on=): the left and right keys have different types
+//! ({}); ...`).
 
+use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
+use datafusion::common::SchemaError;
 pub use datafusion::error::DataFusionError;
 
 /// The prefixes DataFusion's and Arrow's `Display` put before a message.
@@ -36,6 +44,9 @@ const PREFIXES: &[&str] = &[
 /// The trailer DataFusion appends to an internal error.
 const BUG_TRAILER: &str = ".\nThis issue was likely caused by a bug in DataFusion's code";
 
+const DIVIDE_BY_ZERO: &str = "division by zero in an integer expression; divide by a float \
+     (e.g. / 2.0) to get inf or NaN instead, or filter out the zero divisors first";
+
 /// An engine error in Ursa's words (see the module docs).
 pub fn engine_message(e: &DataFusionError) -> String {
     match e {
@@ -49,12 +60,56 @@ pub fn engine_message(e: &DataFusionError) -> String {
                     .unwrap_or(&cause);
                 return format!("could not read the file as CSV: {cause}");
             }
+            if label.contains("{}") {
+                return label.replacen("{}", &engine_message(inner), 1);
+            }
             with_label(label, engine_message(inner))
         }
         DataFusionError::Shared(inner) => engine_message(inner),
         DataFusionError::Diagnostic(_, inner) => engine_message(inner),
+        DataFusionError::SchemaError(s, _) => schema_message(s),
+        DataFusionError::ArrowError(a, _) => {
+            arrow_message(a).unwrap_or_else(|| reword(&e.to_string()))
+        }
         other => reword(&other.to_string()),
     }
+}
+
+/// Whether an engine error is about a column the frame does not have (Python's
+/// `ColumnNotFoundError`): a schema error, or one of Ursa's own messages that
+/// says a column is not found. A message from storage (a missing object whose
+/// path holds the word "column") is not.
+pub fn is_column_not_found(e: &DataFusionError) -> bool {
+    match e {
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            is_column_not_found(inner)
+        }
+        DataFusionError::Shared(inner) => is_column_not_found(inner),
+        DataFusionError::SchemaError(..) => true,
+        DataFusionError::ObjectStore(_)
+        | DataFusionError::IoError(_)
+        | DataFusionError::ParquetError(_) => false,
+        other => says_column_not_found(&other.to_string()),
+    }
+}
+
+/// Whether `e` comes from values of one type read as another: Arrow's cast
+/// error, or DataFusion finding no common type for a comparison.
+pub fn mismatched_types(e: &DataFusionError) -> bool {
+    match e.find_root() {
+        DataFusionError::ArrowError(a, _) => matches!(a.as_ref(), ArrowError::CastError(_)),
+        root => root
+            .to_string()
+            .contains("Cannot infer common argument type for comparison"),
+    }
+}
+
+/// Whether a rendered message says a column is not found.
+pub fn says_column_not_found(m: &str) -> bool {
+    let lower = m.to_lowercase();
+    lower.contains("no field named")
+        || (lower.contains("column") && lower.contains("not found"))
+        || lower.contains("schema error")
 }
 
 /// `message` led by the step `label`, unless it already starts with a call.
@@ -75,6 +130,74 @@ fn names_a_call(message: &str) -> bool {
     !head.is_empty() && message[head.len()..].starts_with('(')
 }
 
+fn schema_message(s: &SchemaError) -> String {
+    match s {
+        SchemaError::FieldNotFound {
+            field,
+            valid_fields,
+        } => {
+            let have: Vec<String> = valid_fields
+                .iter()
+                .map(|c| crate::plan::py_str(&c.name))
+                .collect();
+            format!(
+                "unknown column {}; the frame has [{}].",
+                crate::plan::py_str(&field.name),
+                have.join(", ")
+            )
+        }
+        SchemaError::DuplicateQualifiedField { name, .. }
+        | SchemaError::DuplicateUnqualifiedField { name } => duplicate_column(name),
+        SchemaError::AmbiguousReference { field } => format!(
+            "the column name {} is ambiguous: two inputs have it; rename() one of them first",
+            crate::plan::py_str(&field.name)
+        ),
+    }
+}
+
+fn duplicate_column(name: &str) -> String {
+    format!(
+        "the result would have two columns named {}; give one of them another name \
+         (rename() or a different output name)",
+        crate::plan::py_str(name)
+    )
+}
+
+fn arrow_message(a: &ArrowError) -> Option<String> {
+    match a {
+        ArrowError::DivideByZero => Some(DIVIDE_BY_ZERO.into()),
+        ArrowError::CastError(m) => Some(cast_message(m)),
+        ArrowError::InvalidArgumentError(m)
+            if m.starts_with("must either specify a row count or at least one column") =>
+        {
+            Some("select() needs at least one column".into())
+        }
+        _ => None,
+    }
+}
+
+/// Arrow's cast error in Ursa's words. Where it came from (a join's keys, a graph
+/// column's ids) adds the advice, through a template context.
+fn cast_message(m: &str) -> String {
+    if let Some(rest) = m.strip_prefix("Cannot cast string ") {
+        if let Some((value, ty)) = rest.rsplit_once(" to value of ") {
+            let ty = type_name(ty.trim_end_matches(" type"));
+            return format!("the string {value} cannot be read as {ty}");
+        }
+    }
+    if let Some(rest) = m.strip_prefix("Casting from ") {
+        if let Some((from, to)) = rest.split_once(" to ") {
+            let to = to.trim_end_matches(" not supported");
+            return format!(
+                "a {} value cannot be converted to {}",
+                type_name(from),
+                type_name(to)
+            );
+        }
+    }
+    format!("a value cannot be converted: {m}")
+}
+
 /// Strip the variant prefixes from `raw` and reword what DataFusion and Arrow
 /// say in their own terms.
 pub fn reword(raw: &str) -> String {
@@ -84,7 +207,6 @@ pub fn reword(raw: &str) -> String {
     }
     let m = strip_prefixes(m);
     let m = translate(m).unwrap_or_else(|| m.to_string());
-    let m = m.replace("\"?table?\".", "").replace("?table?.", "");
     // A nested error DataFusion printed on its own line reads as one sentence.
     m.split("\ncaused by\n")
         .map(strip_prefixes)
@@ -97,10 +219,6 @@ fn strip_prefixes(mut m: &str) -> &str {
     while let Some(p) = PREFIXES.iter().find(|p| m.starts_with(**p)) {
         m = m[p.len()..].trim_start();
     }
-    // Parquet repeats its own prefix inside DataFusion's.
-    while let Some(rest) = m.strip_prefix("Parquet error: ") {
-        m = rest;
-    }
     m
 }
 
@@ -111,28 +229,59 @@ fn between<'a>(m: &'a str, start: &str, end: &str) -> Option<&'a str> {
     Some(&m[i..j])
 }
 
-/// A DataFusion type name (`Utf8`, `Int64`, ...) as Ursa's messages print types
-/// (pyarrow's spelling: `string`, `int64`, `double`, ...).
-fn type_name(t: &str) -> String {
-    match t.trim() {
-        "Utf8" | "LargeUtf8" => "string".into(),
-        "Utf8View" => "string_view".into(),
-        "Boolean" => "bool".into(),
-        "Float16" => "halffloat".into(),
-        "Float32" => "float".into(),
-        "Float64" => "double".into(),
-        "Binary" | "LargeBinary" | "BinaryView" => "binary".into(),
-        "Null" => "null".into(),
-        other if other.starts_with("Date32") => "date32[day]".into(),
-        other if other.starts_with("Date64") => "date64[ms]".into(),
-        other => other.to_lowercase(),
+/// A DataFusion type name (`Utf8`, `Dictionary(Int32, Utf8)`, `Timestamp(µs)`, ...)
+/// as Ursa's messages print types (pyarrow's spelling: `string`,
+/// `dictionary<values=string, ...>`, `timestamp[us]`, ...).
+pub fn type_name(t: &str) -> String {
+    let t = t.trim();
+    match t.parse::<DataType>() {
+        Ok(dt) => crate::compare::pa_name(&dt),
+        Err(_) => t.to_lowercase(),
     }
+}
+
+/// The binary operators DataFusion prints between two types, longest first.
+const BINARY_OPS: &[&str] = &[
+    " IS NOT DISTINCT FROM ",
+    " IS DISTINCT FROM ",
+    " AND ",
+    " OR ",
+    " <= ",
+    " >= ",
+    " != ",
+    " = ",
+    " < ",
+    " > ",
+    " + ",
+    " - ",
+    " * ",
+    " / ",
+    " % ",
+];
+
+/// `left op right` split at the first operator outside any brackets, so a type
+/// such as `Dictionary(Int32, Utf8)` or `Decimal128(10, 2)` stays whole.
+fn split_binary(s: &str) -> Option<(&str, &str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ if depth == 0 => {
+                if let Some(op) = BINARY_OPS.iter().find(|op| s[i..].starts_with(**op)) {
+                    return Some((&s[..i], op.trim(), &s[i + op.len()..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// An operator DataFusion printed, as Ursa's expressions spell it.
 fn op_symbol(op: &str) -> &str {
     match op {
-        "=" => "==",
+        "=" | "IS NOT DISTINCT FROM" => "==",
         "AND" => "&",
         "OR" => "|",
         other => other,
@@ -143,24 +292,23 @@ fn op_symbol(op: &str) -> &str {
 fn translate(m: &str) -> Option<String> {
     // An aggregation over a column of a type it does not take.
     if let Some(func) = between(m, "Function '", "' failed to match any signature") {
-        let fname = match func {
-            "avg" => "mean",
-            "count" => "count",
-            other => other,
-        };
         let got = between(m, "but received ", " (DataType")
-            .or_else(|| between(m, "received ", " "))
-            .map(|t| format!("; got a {} column", type_name(t)))
-            .unwrap_or_default();
-        return Some(format!(
-            "group_by().agg(): {fname}() needs a numeric column{got}. Aggregate a numeric \
-             column, or use count() or n_unique(), which take any column"
-        ));
+            .map(|t| format!(" a {} column", type_name(t)))
+            .unwrap_or_else(|| " this column".into());
+        return Some(match func {
+            "sum" | "avg" => {
+                let name = if func == "avg" { "mean" } else { "sum" };
+                format!(
+                    "{name}() needs a numeric column, and got{got}; sum() and mean() take \
+                     numbers only, while min(), max(), count() and n_unique() take strings too"
+                )
+            }
+            other => format!("{other}() cannot aggregate{got}"),
+        });
     }
     // Arithmetic over operands it does not apply to.
     if let Some(rest) = between(m, "Cannot coerce arithmetic expression ", " to valid types") {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if let [l, op, r] = parts.as_slice() {
+        if let Some((l, op, r)) = split_binary(rest) {
             let (l, r) = (type_name(l), type_name(r));
             return Some(format!(
                 "cannot apply '{op}' to {l} and {r} ({l} {op} {r}); arithmetic needs \
@@ -172,12 +320,11 @@ fn translate(m: &str) -> Option<String> {
     if let Some(rest) =
         m.strip_prefix("Cannot infer common argument type for logical boolean operation ")
     {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if let [l, op, r] = parts.as_slice() {
-            let op = op_symbol(op);
+        if let Some((l, op, r)) = split_binary(rest) {
             return Some(format!(
-                "'{op}' combines boolean predicates (comparisons such as ur.col('a') > 1); \
+                "'{}' combines boolean predicates (comparisons such as ur.col('a') > 1); \
                  got {} and {}",
+                op_symbol(op),
                 type_name(l),
                 type_name(r)
             ));
@@ -186,64 +333,82 @@ fn translate(m: &str) -> Option<String> {
     if let Some(rest) =
         m.strip_prefix("Cannot infer common argument type for comparison operation ")
     {
-        // `~x` is planned as `x IS DISTINCT FROM true`.
-        if let Some(t) = rest.strip_suffix(" IS DISTINCT FROM Boolean") {
+        if let Some((l, op, r)) = split_binary(rest) {
+            // `~x` is planned as `x IS DISTINCT FROM true`.
+            if op == "IS DISTINCT FROM" && r.trim() == "Boolean" {
+                return Some(format!(
+                    "'~' negates a boolean predicate (a comparison such as ur.col('a') > 1); \
+                     got {}",
+                    type_name(l)
+                ));
+            }
+            let (l, r) = (type_name(l), type_name(r));
+            let sym = op_symbol(op);
+            // A join matches its keys with `IS NOT DISTINCT FROM`; its context
+            // adds the advice.
+            return Some(if op == "IS NOT DISTINCT FROM" {
+                format!("cannot compare {l} with {r} ({l} {sym} {r})")
+            } else {
+                format!("cannot compare {l} with {r} ({l} {sym} {r}); compare values of one type")
+            });
+        }
+    }
+    if let Some(rest) = m.strip_prefix("Cannot get result type for temporal operation ") {
+        let ops = rest.split(": ").next().unwrap_or(rest);
+        if let Some((l, op, r)) = split_binary(ops) {
+            let (l, r) = (type_name(l), type_name(r));
             return Some(format!(
-                "'~' negates a boolean predicate (a comparison such as ur.col('a') > 1); \
-                 got {}",
-                type_name(t)
+                "cannot apply '{op}' to {l} and {r} ({l} {op} {r}); this arithmetic is not \
+                 defined for these types"
             ));
         }
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if let [l, op, r] = parts.as_slice() {
-            let (l, r, op) = (type_name(l), type_name(r), op_symbol(op));
+    }
+    // object_store's errors, reaching a store: the URL and what failed.
+    if let Some(rest) = m.strip_prefix("Generic ") {
+        if let Some((_, detail)) = rest.split_once(" error: ") {
+            if let Some(req) = detail.strip_prefix("Error performing ") {
+                let url = req.split_whitespace().nth(1).unwrap_or("");
+                let cause = detail
+                    .rsplit_once(" - ")
+                    .map_or("", |(_, c)| c)
+                    .trim_start_matches("HTTP error: ")
+                    .trim();
+                return Some(format!("could not read {url}: {cause}"));
+            }
+            return Some(detail.to_string());
+        }
+    }
+    if let Some(rest) = m.strip_prefix("Configuration key: ") {
+        if let Some((key, store)) = rest.split_once(" is not valid for store ") {
             return Some(format!(
-                "cannot compare {l} with {r} ({l} {op} {r}); compare values of one type"
+                "storage_options key {key} is not an option of the {} store; see the object \
+                 store's documentation for its keys",
+                store.trim_end_matches('.').trim_matches('\'')
             ));
         }
     }
     if m.starts_with("Divide by zero error") {
-        return Some(
-            "division by zero in an integer expression; divide by a float (e.g. / 2.0) to get \
-             inf or NaN instead, or filter out the zero divisors first"
-                .into(),
-        );
+        return Some(DIVIDE_BY_ZERO.into());
     }
+    // A schema error DataFusion printed into another message; the structured one
+    // is read from its fields (`schema_message`).
     if let Some(name) = m.strip_prefix("No field named ") {
-        let (name, valid) = match name.split_once(". Valid fields are ") {
-            Some((n, v)) => (n, Some(v.trim_end_matches('.'))),
-            None => (name.trim_end_matches('.'), None),
-        };
-        let name = unquote(name);
-        let have = valid
-            .map(|v| {
-                let cols: Vec<String> =
-                    v.split(", ").map(|c| format!("'{}'", unquote(c))).collect();
-                format!("; the frame has [{}]", cols.join(", "))
-            })
-            .unwrap_or_default();
-        return Some(format!("unknown column '{name}'{have}."));
+        let name = name.split(". ").next().unwrap_or(name);
+        return Some(format!(
+            "unknown column {}.",
+            crate::plan::py_str(&unquote(name))
+        ));
     }
     for marker in [
         "duplicate qualified field name ",
         "duplicate unqualified field name ",
     ] {
         if let Some(i) = m.find(marker) {
-            let name = unquote(m[i + marker.len()..].trim());
-            return Some(format!(
-                "the result would have two columns named '{name}'; give one of them \
-                 another name (rename() or a different output name)"
-            ));
+            return Some(duplicate_column(&unquote(m[i + marker.len()..].trim())));
         }
     }
-    if let Some(rest) = m.strip_prefix("Cast error: Cannot cast string ") {
-        if let Some((value, ty)) = rest.split_once(" to value of ") {
-            let ty = type_name(ty.trim_end_matches(" type"));
-            return Some(format!(
-                "the string {value} cannot be read as {ty}; the values being matched have \
-                 different types, so cast one side to the other's type first"
-            ));
-        }
+    if let Some(rest) = m.strip_prefix("Cast error: ") {
+        return Some(cast_message(rest));
     }
     if m.starts_with("must either specify a row count or at least one column") {
         return Some("select() needs at least one column".into());
@@ -324,7 +489,8 @@ pub fn serde_message(label: &str, e: &str) -> String {
     format!("{label} must be {want}; got {got}")
 }
 
-/// A name DataFusion printed, without its quotes and qualifier.
+/// A field name DataFusion printed (`"?table?".x`, `x`), without its quotes and
+/// qualifier.
 fn unquote(name: &str) -> String {
     let name = name.trim();
     let name = name.rsplit_once("\".").map(|(_, n)| n).unwrap_or(name);
@@ -335,9 +501,14 @@ fn unquote(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::Column;
 
     fn exec(m: &str) -> String {
         engine_message(&DataFusionError::Execution(m.into()))
+    }
+
+    fn plan(m: &str) -> String {
+        engine_message(&DataFusionError::Plan(m.into()))
     }
 
     #[test]
@@ -348,12 +519,29 @@ mod tests {
     }
 
     #[test]
-    fn rewords_datafusion_and_arrow_messages() {
-        let plan = |m: &str| engine_message(&DataFusionError::Plan(m.into()));
+    fn rewords_datafusion_type_errors() {
         assert_eq!(
             plan("Cannot coerce arithmetic expression Utf8 * Int64 to valid types"),
             "cannot apply '*' to string and int64 (string * int64); arithmetic needs numeric \
              operands"
+        );
+        assert_eq!(
+            plan(
+                "Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Int64 to valid \
+                 types"
+            ),
+            "cannot apply '+' to dictionary<values=string, indices=int32, ordered=0> and int64 \
+             (dictionary<values=string, indices=int32, ordered=0> + int64); arithmetic needs \
+             numeric operands"
+        );
+        assert_eq!(
+            plan(
+                "Cannot coerce arithmetic expression Decimal128(10, 2) * Dictionary(Int32, Utf8) \
+                 to valid types"
+            ),
+            "cannot apply '*' to decimal128(10, 2) and dictionary<values=string, indices=int32, \
+             ordered=0> (decimal128(10, 2) * dictionary<values=string, indices=int32, \
+             ordered=0>); arithmetic needs numeric operands"
         );
         assert_eq!(
             plan(
@@ -366,31 +554,91 @@ mod tests {
             plan("Cannot infer common argument type for comparison operation Int64 IS DISTINCT FROM Boolean"),
             "'~' negates a boolean predicate (a comparison such as ur.col('a') > 1); got int64"
         );
-        let schema = DataFusionError::SchemaError(
-            Box::new(datafusion::common::SchemaError::FieldNotFound {
-                field: Box::new(datafusion::common::Column::new_unqualified("nope")),
-                valid_fields: vec![
-                    datafusion::common::Column::new(Some("?table?"), "s"),
-                    datafusion::common::Column::new(Some("?table?"), "d"),
-                ],
-            }),
-            Box::new(None),
-        );
         assert_eq!(
-            engine_message(&schema),
-            "unknown column 'nope'; the frame has ['s', 'd']."
+            plan("Cannot infer common argument type for comparison operation Int64 IS NOT DISTINCT FROM Utf8"),
+            "cannot compare int64 with string (int64 == string)"
         );
-        let arrow =
-            DataFusionError::ArrowError(Box::new(arrow::error::ArrowError::DivideByZero), None);
-        assert!(engine_message(&arrow).starts_with("division by zero in an integer expression"));
         let sum = plan(
             "Internal error: Function 'sum' failed to match any signature, errors: Error during \
              planning: Function 'sum' requires Decimal, but received String (DataType: Utf8).",
         );
         assert!(
-            sum.starts_with("group_by().agg(): sum() needs a numeric column; got a string column"),
+            sum.starts_with("sum() needs a numeric column, and got a string column; "),
             "{sum}"
         );
+    }
+
+    #[test]
+    fn rewords_storage_and_temporal_errors() {
+        assert_eq!(
+            exec(
+                "Generic HTTP error: Error performing HEAD http://h:1/e.parquet in 2.06s, after \
+                 10 retries, max_retries: 10, retry_timeout: 180s  - HTTP error: error sending \
+                 request"
+            ),
+            "could not read http://h:1/e.parquet: error sending request"
+        );
+        assert_eq!(
+            exec("Configuration key: 'nope' is not valid for store 'S3'."),
+            "storage_options key 'nope' is not an option of the S3 store; see the object \
+             store's documentation for its keys"
+        );
+        assert_eq!(
+            plan(
+                "Cannot get result type for temporal operation Timestamp(µs) * Timestamp(µs): \
+                 Invalid argument error: Invalid timestamp arithmetic operation"
+            ),
+            "cannot apply '*' to timestamp[us] and timestamp[us] (timestamp[us] * \
+             timestamp[us]); this arithmetic is not defined for these types"
+        );
+    }
+
+    #[test]
+    fn reads_structured_errors_from_their_fields() {
+        let schema = DataFusionError::SchemaError(
+            Box::new(SchemaError::FieldNotFound {
+                field: Box::new(Column::new_unqualified("nope")),
+                valid_fields: vec![
+                    Column::new(Some("?table?"), "s, t"),
+                    Column::new(Some("?table?"), "?table?.d"),
+                ],
+            }),
+            Box::new(None),
+        );
+        // A name holding ", " or the qualifier's text stays whole.
+        assert_eq!(
+            engine_message(&schema),
+            "unknown column 'nope'; the frame has ['s, t', '?table?.d']."
+        );
+        assert!(is_column_not_found(&schema));
+        let dup = DataFusionError::SchemaError(
+            Box::new(SchemaError::DuplicateUnqualifiedField { name: "age".into() }),
+            Box::new(None),
+        );
+        assert!(engine_message(&dup).starts_with("the result would have two columns named 'age'"));
+        let arrow = |a| DataFusionError::ArrowError(Box::new(a), None);
+        assert_eq!(
+            engine_message(&arrow(ArrowError::DivideByZero)),
+            DIVIDE_BY_ZERO
+        );
+        assert_eq!(
+            engine_message(&arrow(ArrowError::CastError(
+                "Cannot cast string 'a' to value of Int64 type".into()
+            ))),
+            "the string 'a' cannot be read as int64"
+        );
+    }
+
+    #[test]
+    fn a_missing_object_is_not_a_missing_column() {
+        let e = DataFusionError::ObjectStore(Box::new(object_store::Error::NotFound {
+            path: "b/columns/x.parquet".into(),
+            source: "not found".into(),
+        }));
+        assert!(!is_column_not_found(&e));
+        assert!(is_column_not_found(&DataFusionError::Execution(
+            "src column 'x' not found in the file".into()
+        )));
     }
 
     #[test]
@@ -423,5 +671,8 @@ mod tests {
         let inner = DataFusionError::Execution("join(on=): key 'x' is missing".into());
         let e = DataFusionError::Context("join()".into(), Box::new(inner));
         assert_eq!(engine_message(&e), "join(on=): key 'x' is missing");
+        let inner = DataFusionError::Execution("x".into());
+        let e = DataFusionError::Context("a ({}) b".into(), Box::new(inner));
+        assert_eq!(engine_message(&e), "a (x) b");
     }
 }

@@ -33,6 +33,20 @@ LEAKS = (
     "Schema error:",
     "Internal error:",
     "invalid plan:",
+    "Cast error",
+    "Parquet error",
+    "Invalid argument error",
+    "Object Store error",
+    "External error",
+    "caused by",
+    "Cannot coerce",
+    "Cannot infer common argument",
+    "failed to match any signature",
+    "No field named",
+    "Utf8",
+    "Timestamp(",
+    "Dictionary(",
+    "Decimal128(",
 )
 
 
