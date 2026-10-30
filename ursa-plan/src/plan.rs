@@ -3812,6 +3812,257 @@ mod tests {
         assert!(!plan.contains("RepartitionExec"), "{plan}");
     }
 
+    fn specs(aggs: &[(&str, &str, &str)]) -> Vec<AggSpec> {
+        aggs.iter()
+            .map(|(o, f, c)| AggSpec {
+                output: o.to_string(),
+                func: f.to_string(),
+                column: c.to_string(),
+            })
+            .collect()
+    }
+
+    /// `group_by(keys).agg(aggs)` over `batches` on `p` partitions: the result's
+    /// schema and its rows (floats by their bits).
+    fn grouped_on(
+        p: usize,
+        batches: &[RecordBatch],
+        keys: &[&str],
+        aggs: &[AggSpec],
+    ) -> PlanResult<(arrow::datatypes::SchemaRef, Vec<String>)> {
+        use crate::lower::{session, Frame, TEST_PARTITIONS};
+        TEST_PARTITIONS.with(|c| c.set(Some(p)));
+        let run = || -> PlanResult<Vec<RecordBatch>> {
+            let mut f = Frame::from_batches(session(), batches.to_vec())?;
+            let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            group_by(&mut f, &keys, aggs)?;
+            Ok(f.collect()?)
+        };
+        let out = run();
+        TEST_PARTITIONS.with(|c| c.set(None));
+        let out = out?;
+        Ok((out[0].schema(), grouped_rows(&out)))
+    }
+
+    /// Batches whose dictionary column `cat` (keys of type `K`) has a
+    /// dictionary of its own per batch, `values` strings each, over `batches`
+    /// batches of 8192 rows; `same` gives every batch equal (not shared) values.
+    fn dictionary_batches<K: arrow::datatypes::ArrowDictionaryKeyType>(
+        batches: usize,
+        values: usize,
+        same: bool,
+    ) -> Vec<RecordBatch> {
+        use arrow::array::{
+            DictionaryArray, Float64Array, Int64Array, PrimitiveArray, StringArray,
+        };
+        use arrow::datatypes::{ArrowNativeType, Field, Schema};
+        let n = 8192;
+        let value_type = DataType::Dictionary(Box::new(K::DATA_TYPE), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("cat", value_type, true),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        (0..batches)
+            .map(|b| {
+                let keys: PrimitiveArray<K> = (0..n)
+                    .map(|i| {
+                        let key = (i * 7919 + b * 31) % values;
+                        (i % 97 != 0).then(|| K::Native::from_usize(key).unwrap())
+                    })
+                    .collect();
+                let names = StringArray::from_iter_values((0..values).map(|j| {
+                    if same {
+                        format!("v{j}")
+                    } else {
+                        format!("b{b}_{j}")
+                    }
+                }));
+                let cat = DictionaryArray::<K>::try_new(keys, Arc::new(names)).unwrap();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(
+                            (0..n).map(|i| ((i * 13 + b) % 50) as i64),
+                        )),
+                        Arc::new(cat),
+                        Arc::new(Float64Array::from_iter_values((0..n).map(|i| {
+                            (i as f64 + 0.1) * if i % 2 == 0 { 1e9 } else { -1e-3 }
+                        }))),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrow_dictionaries_spanning_many_chunks_aggregate_on_any_partition_count() {
+        use arrow::datatypes::{ArrowDictionaryKeyType, Int16Type, Int8Type, UInt8Type};
+        fn check<K: ArrowDictionaryKeyType>(values: usize) {
+            let cores = std::thread::available_parallelism().map_or(4, |c| c.get());
+            for same in [false, true] {
+                let batches = dictionary_batches::<K>(16, values, same);
+                let cases: Vec<(Vec<&str>, Vec<AggSpec>)> = vec![
+                    // The dictionary as an operand, alongside an ordered fold.
+                    (
+                        vec!["k"],
+                        specs(&[("s", "sum", "v"), ("c", "count", "cat")]),
+                    ),
+                    (
+                        vec!["k"],
+                        specs(&[("m", "max", "v"), ("u", "n_unique", "cat")]),
+                    ),
+                    (vec!["k"], specs(&[("c", "count", "cat")])),
+                    // The dictionary as a key, ordered and not.
+                    (vec!["cat"], specs(&[("s", "sum", "v")])),
+                    (vec!["cat"], specs(&[("n", "count", "v")])),
+                    (vec!["cat", "k"], specs(&[("s", "mean", "v")])),
+                ];
+                for (keys, aggs) in &cases {
+                    let want = grouped_on(1, &batches, keys, aggs).unwrap();
+                    let key_type = want.0.field_with_name("cat").map(|f| f.data_type().clone());
+                    if let Ok(DataType::Dictionary(k, _)) = &key_type {
+                        // A key's dictionary narrows back where its values fit
+                        // (each result batch carries its own dictionary): always
+                        // when every batch has the same values.
+                        let k = k.as_ref();
+                        assert!(
+                            *k == K::DATA_TYPE || (!same && *k == DataType::Int32),
+                            "{k}"
+                        );
+                    }
+                    for p in [3, 8, cores] {
+                        let got = grouped_on(p, &batches, keys, aggs).unwrap_or_else(|e| {
+                            panic!("{keys:?} {aggs:?} p={p} same={same} {}: {e}", K::DATA_TYPE)
+                        });
+                        assert_eq!(got.0, want.0, "{keys:?} {aggs:?} p={p} same={same}");
+                        assert_eq!(got.1, want.1, "{keys:?} {aggs:?} p={p} same={same}");
+                    }
+                }
+            }
+        }
+        // 16 dictionaries of 120 (int8) / 3000 (int16) values: more than the
+        // key type indexes once concatenated.
+        check::<Int8Type>(120);
+        check::<UInt8Type>(250);
+        check::<Int16Type>(3000);
+    }
+
+    #[test]
+    fn distinct_over_a_narrow_dictionary_spanning_many_dictionaries() {
+        use crate::lower::{session, Frame};
+        use arrow::datatypes::Int8Type;
+        for same in [false, true] {
+            let batches = dictionary_batches::<Int8Type>(16, 120, same);
+            let mut f = Frame::from_batches(session(), batches).unwrap();
+            f.project(vec![col_named("cat")]).unwrap();
+            f.distinct().unwrap();
+            let out = f.collect().unwrap();
+            let rows = grouped_rows(&out);
+            // Every value once, and the null, in first-appearance order.
+            assert_eq!(
+                rows.len(),
+                if same { 121 } else { 16 * 120 + 1 },
+                "same={same}"
+            );
+            let unique: std::collections::BTreeSet<&String> = rows.iter().collect();
+            assert_eq!(unique.len(), rows.len());
+            let key = match out[0].schema().field(0).data_type() {
+                DataType::Dictionary(k, _) => k.as_ref().clone(),
+                other => panic!("{other}"),
+            };
+            assert_eq!(
+                key,
+                if same {
+                    DataType::Int8
+                } else {
+                    DataType::Int32
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn float_and_string_keys_group_alike_on_any_partition_count() {
+        use arrow::array::{Float64Array, LargeStringArray, StringViewArray};
+        use arrow::datatypes::{Field, Schema};
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        let specials = [
+            f64::NAN,
+            neg_nan,
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.5,
+        ];
+        let n = 30_000usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("ls", DataType::LargeUtf8, true),
+            Field::new("sv", DataType::Utf8View, true),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let word = |i: usize| match i % 5 {
+            0 => None,
+            1 => Some(String::new()),
+            2 => Some("a".to_string()),
+            3 => Some(format!("a long string value past twelve bytes {}", i % 11)),
+            _ => Some(format!("k{}", i % 13)),
+        };
+        let batches: Vec<RecordBatch> = (0..n)
+            .step_by(7000)
+            .map(|s| {
+                let e = (s + 7000).min(n);
+                let r = s..e;
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Float64Array::from_iter(
+                            r.clone()
+                                .map(|i| (i % 29 != 0).then(|| specials[i * 31 % 7])),
+                        )),
+                        Arc::new(LargeStringArray::from_iter(r.clone().map(|i| word(i * 3)))),
+                        Arc::new(StringViewArray::from_iter(r.clone().map(|i| word(i * 7)))),
+                        Arc::new(Float64Array::from_iter_values(r.map(|i| {
+                            (i as f64).sqrt() * if i % 3 == 0 { -1e12 } else { 1.0 }
+                        }))),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let aggs = specs(&[
+            ("s", "sum", "v"),
+            ("m", "mean", "v"),
+            ("x", "max", "v"),
+            ("n", "count", "v"),
+        ]);
+        let cores = std::thread::available_parallelism().map_or(4, |c| c.get());
+        for keys in [vec!["f"], vec!["ls"], vec!["sv"], vec!["f", "ls", "sv"]] {
+            // One partition reads the rows unpartitioned, as before #204.
+            let want = grouped_on(1, &batches, &keys, &aggs).unwrap();
+            assert!(want.1.len() > 3, "{keys:?}");
+            for p in [3, 8, cores] {
+                let got = grouped_on(p, &batches, &keys, &aggs).unwrap();
+                assert_eq!(got.0, want.0, "{keys:?} p={p}");
+                assert_eq!(got.1, want.1, "{keys:?} p={p}");
+            }
+        }
+        // The float key keeps NaN signs and both zeros as their own groups, as
+        // the unpartitioned aggregate does, keyed by their bits.
+        let (_, rows) = grouped_on(4, &batches, &["f"], &aggs).unwrap();
+        let firsts: Vec<&str> = rows.iter().map(|r| r.split(',').next().unwrap()).collect();
+        for x in specials {
+            let bits = format!("{:#x}", x.to_bits());
+            assert!(
+                firsts.contains(&bits.as_str()) || x.is_nan(),
+                "{bits} {firsts:?}"
+            );
+        }
+    }
+
     #[test]
     fn python_reprs() {
         assert_eq!(py_str("a"), "'a'");

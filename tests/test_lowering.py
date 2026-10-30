@@ -10,6 +10,7 @@ plain frame over the same input gives, aggregations included, bit for bit.
 
 from __future__ import annotations
 
+import collections
 import math
 import struct
 
@@ -268,6 +269,64 @@ def test_integer_means_fold_in_order(engine):
     assert _bits(out.column("m").to_pylist()) == _bits(
         [want[k] for k in out.column("k").to_pylist()]
     )
+
+
+def _categorical_batches(key_type, values, same):
+    """16 batches of 8192 rows whose `cat` column has a dictionary per batch."""
+    rng = np.random.default_rng(0)
+    out = []
+    for b in range(16):
+        names = [f"v{j}" if same else f"b{b}_{j}" for j in range(values)]
+        codes = pa.array(rng.integers(0, values, 8192)).cast(key_type)
+        out.append(
+            pa.record_batch(
+                {
+                    "id": pa.array(np.arange(b * 8192, (b + 1) * 8192)),
+                    "k": pa.array(rng.integers(0, 50, 8192)),
+                    "cat": pa.DictionaryArray.from_arrays(codes, pa.array(names)),
+                    "v": pa.array(rng.random(8192)),
+                }
+            )
+        )
+    return pa.Table.from_batches(out)
+
+
+@pytest.mark.parametrize(("key_type", "values"), [(pa.int8(), 120), (pa.int16(), 3000)])
+@pytest.mark.parametrize("same", [False, True])
+def test_narrow_dictionaries_over_many_batches_aggregate(key_type, values, same):
+    # Each batch has its own dictionary: together more values than the key type
+    # indexes (unless they are the same values). An ordered fold beside the
+    # dictionary operand used to raise "Dictionary key bigger than the key type",
+    # and so did the dictionary as a group_by or distinct key, and two keys with
+    # more groups than the key type indexes.
+    t = _categorical_batches(key_type, values, same)
+    frame = ur.from_arrow(t, id="id")
+    out = frame.group_by("k").agg(s=col("v").sum(), c=col("cat").count()).collect().to_arrow()
+    want = t.group_by("k", use_threads=False).aggregate([("v", "sum"), ("cat", "count")])
+    sums = dict(zip(want.column("k").to_pylist(), want.column("v_sum").to_pylist(), strict=True))
+    counts = dict(
+        zip(want.column("k").to_pylist(), want.column("cat_count").to_pylist(), strict=True)
+    )
+    ks = out.column("k").to_pylist()
+    assert _bits(out.column("s").to_pylist()) == _bits([sums[k] for k in ks])
+    assert out.column("c").to_pylist() == [counts[k] for k in ks]
+    by_cat = frame.group_by("cat").agg(n=col("v").count()).collect().to_arrow()
+    decoded = t.column("cat").cast(pa.string()).to_pylist()
+    first = list(dict.fromkeys(decoded))
+    assert by_cat.column("cat").cast(pa.string()).to_pylist() == first
+    tally = collections.Counter(decoded)
+    assert by_cat.column("n").to_pylist() == [tally[x] for x in first]
+    distinct = frame.select("cat").distinct().collect().to_arrow()
+    assert distinct.column("cat").cast(pa.string()).to_pylist() == first
+    # Two keys: more groups than the key type indexes, over few values.
+    pairs = frame.group_by("cat", "k").agg(n=col("v").count()).collect().to_arrow()
+    plain = t.set_column(t.schema.get_field_index("cat"), "cat", t.column("cat").cast(pa.string()))
+    want_pairs = plain.group_by(["cat", "k"], use_threads=False).aggregate([("v", "count")])
+    assert pairs.num_rows == want_pairs.num_rows
+    assert sum(pairs.column("n").to_pylist()) == t.num_rows
+    if same:
+        assert by_cat.column("cat").type == pa.dictionary(key_type, pa.string())
+        assert pairs.column("cat").type == pa.dictionary(key_type, pa.string())
 
 
 @pytest.mark.parametrize("engine", [False, True])

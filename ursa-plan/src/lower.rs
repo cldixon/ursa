@@ -49,7 +49,7 @@
 //!   matches in left-frame order;
 //! - `outer`: `left`'s order, then the unmatched right rows in right-frame order.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array};
@@ -123,6 +123,10 @@ pub struct Frame {
     /// output of `group_by`, as it has always been (the plan marks a `count`, or
     /// a key that was never null, non-nullable).
     nullable: BTreeSet<String>,
+    /// Dictionary columns an aggregate widened to `Int32` keys (see
+    /// [`Frame::widen_dictionary_keys`]), with the type each had before: the
+    /// result narrows them back where the values fit.
+    widened: BTreeMap<String, DataType>,
 }
 
 impl Frame {
@@ -136,6 +140,7 @@ impl Frame {
             ord: None,
             in_order: true,
             nullable: BTreeSet::new(),
+            widened: BTreeMap::new(),
         };
         frame.set(batches)?;
         Ok(frame)
@@ -152,6 +157,7 @@ impl Frame {
             ord: None,
             in_order: true,
             nullable: BTreeSet::new(),
+            widened: BTreeMap::new(),
         }
     }
 
@@ -166,6 +172,7 @@ impl Frame {
             ord: Some(ord),
             in_order: false,
             nullable: BTreeSet::new(),
+            widened: BTreeMap::new(),
         }
     }
 
@@ -366,6 +373,17 @@ impl Frame {
         }
         let names: Vec<String> = exprs.iter().map(output_name).collect();
         self.nullable.retain(|n| names.contains(n));
+        // A widened column stays widened only where it is passed through.
+        let passed: BTreeSet<String> = exprs
+            .iter()
+            .filter(|e| match e {
+                Expr::Column(_) => true,
+                Expr::Alias(a) => matches!(a.expr.as_ref(), Expr::Column(_)),
+                _ => false,
+            })
+            .map(output_name)
+            .collect();
+        self.widened.retain(|n, _| passed.contains(n));
         self.select_exprs(exprs)
     }
 
@@ -393,6 +411,10 @@ impl Frame {
             .nullable
             .iter()
             .map(|n| lookup(n).unwrap_or_else(|| n.clone()))
+            .collect();
+        self.widened = std::mem::take(&mut self.widened)
+            .into_iter()
+            .map(|(n, t)| (lookup(&n).unwrap_or(n), t))
             .collect();
         self.project(exprs)
     }
@@ -507,9 +529,78 @@ impl Frame {
         self.ctx.read_table(Arc::new(table))
     }
 
+    /// Widen the group keys among `keys` that are dictionaries with a key type
+    /// narrower than `Int32` to `Int32` keys. The aggregate builds each output
+    /// batch's key dictionary from its groups, and with more groups than the
+    /// narrow type indexes (a second key multiplies them) that overflows, however
+    /// few values the dictionary has; the result narrows the keys back where its
+    /// values fit ([`narrow_dictionary_keys`]).
+    fn widen_dictionary_keys(&mut self, keys: &[String]) -> Result<()> {
+        let mut widen: Vec<(usize, DataType, DataType)> = vec![];
+        for (i, (_, f)) in self.schema.iter().enumerate() {
+            let DataType::Dictionary(k, v) = f.data_type() else {
+                continue;
+            };
+            if narrow_key_max(k).is_none() || !keys.contains(f.name()) {
+                continue;
+            }
+            let wide = DataType::Dictionary(Box::new(DataType::Int32), v.clone());
+            widen.push((i, f.data_type().clone(), wide));
+        }
+        if widen.is_empty() {
+            return Ok(());
+        }
+        for (i, original, _) in &widen {
+            let name = self.schema.field(*i).name().clone();
+            self.widened.entry(name).or_insert_with(|| original.clone());
+        }
+        if let Some(batches) = self.batches.take() {
+            let out = batches
+                .into_iter()
+                .map(|b| {
+                    let mut cols = b.columns().to_vec();
+                    let mut fields: Vec<Field> = b
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.as_ref().clone())
+                        .collect();
+                    for (i, _, wide) in &widen {
+                        cols[*i] = cast(&cols[*i], wide).map_err(arrow_err)?;
+                        fields[*i] = fields[*i].clone().with_data_type(wide.clone());
+                    }
+                    let schema = Schema::new_with_metadata(fields, b.schema().metadata().clone());
+                    RecordBatch::try_new(Arc::new(schema), cols).map_err(arrow_err)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return self.set(out);
+        }
+        let exprs: Vec<Expr> = self
+            .schema
+            .iter()
+            .enumerate()
+            .map(|(i, (q, f))| {
+                let e = Expr::Column(Column::from((q, f)));
+                match widen.iter().find(|(w, _, _)| *w == i) {
+                    Some((_, _, wide)) => Expr::Cast(datafusion::logical_expr::Cast::new(
+                        Box::new(e),
+                        wide.clone(),
+                    ))
+                    .alias(f.name()),
+                    None => e,
+                }
+            })
+            .collect();
+        let df = self.plan()?.select(exprs)?;
+        self.replace(df);
+        Ok(())
+    }
+
     /// `distinct`: one row per distinct row, at its first occurrence.
     pub fn distinct(&mut self) -> Result<()> {
         let ord = self.number()?;
+        let names: Vec<String> = self.user_columns().iter().map(output_name).collect();
+        self.widen_dictionary_keys(&names)?;
         let groups = self.user_columns();
         // The group's first position, under a new name (an aggregate over an
         // aggregate's output must not reuse its column names).
@@ -531,6 +622,8 @@ impl Frame {
         if ordered {
             self.reorder()?;
         }
+        let key_names: Vec<String> = keys.iter().map(output_name).collect();
+        self.widen_dictionary_keys(&key_names)?;
         let names: Vec<String> = keys.iter().chain(aggs.iter()).map(output_name).collect();
         let mut aggs = aggs;
         let first = fresh_name(self.schema.as_arrow());
@@ -617,9 +710,98 @@ impl Frame {
     pub fn collect(mut self) -> Result<Vec<RecordBatch>> {
         self.reorder()?;
         self.drop_ordinal()?;
-        let batches = self.run()?;
+        let batches = narrow_dictionary_keys(self.run()?, &self.widened)?;
         relax_nullability(batches, &self.nullable)
     }
+}
+
+/// The largest key a dictionary key type narrower than `Int32` can hold.
+fn narrow_key_max(key: &DataType) -> Option<usize> {
+    match key {
+        DataType::Int8 => Some(i8::MAX as usize),
+        DataType::Int16 => Some(i16::MAX as usize),
+        DataType::UInt8 => Some(u8::MAX as usize),
+        DataType::UInt16 => Some(u16::MAX as usize),
+        _ => None,
+    }
+}
+
+/// `batches` with each widened column back at its original type when its
+/// distinct values (across the batches, so the type doesn't depend on how the
+/// rows are cut) fit the key type: each batch by a key cast, else by
+/// re-encoding its values. A column with more distinct values stays `Int32`.
+fn narrow_dictionary_keys(
+    batches: Vec<RecordBatch>,
+    widened: &BTreeMap<String, DataType>,
+) -> Result<Vec<RecordBatch>> {
+    let mut batches = batches;
+    for (name, original) in widened {
+        let DataType::Dictionary(_, value) = original else {
+            continue;
+        };
+        let wide = DataType::Dictionary(Box::new(DataType::Int32), value.clone());
+        let Ok(i) = batches[0].schema().index_of(name) else {
+            continue;
+        };
+        if batches[0].schema().field(i).data_type() != &wide {
+            continue;
+        }
+        let max = match original {
+            DataType::Dictionary(k, _) => narrow_key_max(k),
+            _ => None,
+        };
+        let Some(max) = max else {
+            continue;
+        };
+        if distinct_values(&batches, i, value)? > max + 1 {
+            continue;
+        }
+        let narrow = |c: &ArrayRef| {
+            cast(c, original)
+                .or_else(|_| cast(c, value).and_then(|v| cast(&v, original)))
+                .ok()
+        };
+        let Some(cols) = batches
+            .iter()
+            .map(|b| narrow(b.column(i)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let schema = batches[0].schema();
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields[i] = fields[i].clone().with_data_type(original.clone());
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        batches = batches
+            .into_iter()
+            .zip(cols)
+            .map(|(b, c)| {
+                let mut cols = b.columns().to_vec();
+                cols[i] = c;
+                RecordBatch::try_new(schema.clone(), cols).map_err(arrow_err)
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+    Ok(batches)
+}
+
+/// The distinct non-null values of dictionary column `i` across `batches`.
+fn distinct_values(batches: &[RecordBatch], i: usize, value: &DataType) -> Result<usize> {
+    use arrow::row::{RowConverter, SortField};
+    let converter = RowConverter::new(vec![SortField::new(value.clone())]).map_err(arrow_err)?;
+    let mut seen = std::collections::HashSet::new();
+    for b in batches {
+        let values = cast(b.column(i), value).map_err(arrow_err)?;
+        let rows = converter
+            .convert_columns(std::slice::from_ref(&values))
+            .map_err(arrow_err)?;
+        for (r, row) in rows.iter().enumerate() {
+            if values.is_valid(r) {
+                seen.insert(row.owned());
+            }
+        }
+    }
+    Ok(seen.len())
 }
 
 /// `batches` with the columns named in `nullable` marked nullable.
@@ -725,7 +907,9 @@ impl Frame {
     pub fn materialize(&mut self) -> Result<()> {
         self.reorder()?;
         self.drop_ordinal()?;
-        let batches = relax_nullability(self.run()?, &self.nullable)?;
+        let batches = narrow_dictionary_keys(self.run()?, &self.widened)?;
+        let batches = relax_nullability(batches, &self.nullable)?;
+        self.widened.clear();
         self.set(batches)
     }
 }

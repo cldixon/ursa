@@ -13,6 +13,13 @@
 //! 3. partition `p` reads chunk 0's rows for `p`, then chunk 1's, and so on,
 //!    gathered into batches as the aggregate pulls them.
 //!
+//! A gathered batch spans several chunks only while they share their
+//! dictionaries (a dictionary column's values array): its dictionary columns are
+//! then the chunks' keys over those same values, so a gather never merges or
+//! concatenates dictionaries (which could overflow a narrow key type, as one
+//! partition reading many chunks would), and emits the dictionaries the input
+//! has, as a hash repartition of each batch does.
+//!
 //! So each partition holds its groups' rows in input order, every group lies in
 //! one partition, and the groups fold in parallel with each fold seeing exactly
 //! the sequence a single-threaded fold would.
@@ -25,8 +32,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, ArrayRef, AsArray, DictionaryArray, RecordBatch};
+use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::hash_utils::create_hashes;
@@ -57,6 +64,9 @@ fn arrow_err(e: arrow::error::ArrowError) -> DataFusionError {
 #[derive(Debug)]
 struct Chunk {
     batch: RecordBatch,
+    /// Chunks with the same `run`, consecutive, share every dictionary column's
+    /// values, so one batch can gather rows from all of them.
+    run: usize,
     /// `rows[offsets[p]..offsets[p + 1]]` are the chunk's rows for partition
     /// `p`, ascending.
     offsets: Vec<u32>,
@@ -70,7 +80,7 @@ impl Chunk {
 }
 
 /// Route a chunk's rows to `n` partitions by the hash of its `keys` columns.
-fn route(batch: RecordBatch, keys: &[usize], n: usize) -> Result<Chunk> {
+fn route(batch: RecordBatch, run: usize, keys: &[usize], n: usize) -> Result<Chunk> {
     let r = batch.num_rows();
     let arrays: Vec<ArrayRef> = keys.iter().map(|&k| batch.column(k).clone()).collect();
     let mut hashes = vec![0u64; r];
@@ -96,6 +106,7 @@ fn route(batch: RecordBatch, keys: &[usize], n: usize) -> Result<Chunk> {
     }
     Ok(Chunk {
         batch,
+        run,
         offsets,
         rows,
     })
@@ -118,9 +129,11 @@ pub fn read_partitioned(
                 .map(move |s| b.slice(s, CHUNK.min(b.num_rows() - s)))
         })
         .collect();
+    let runs = dictionary_runs(&pieces);
     let chunks = pieces
         .into_par_iter()
-        .map(|b| route(b, keys, n))
+        .zip(runs)
+        .map(|(b, run)| route(b, run, keys, n))
         .collect::<Result<Vec<_>>>()?;
     let table = PartitionedTable {
         schema,
@@ -129,6 +142,100 @@ pub fn read_partitioned(
         n,
     };
     ctx.read_table(Arc::new(table))
+}
+
+/// Each piece's run: a new one wherever a dictionary column's values differ
+/// from the previous piece's (by identity), and at every piece when a column
+/// holds dictionaries below its top level (a gather would merge those).
+fn dictionary_runs(pieces: &[RecordBatch]) -> Vec<usize> {
+    let Some(first) = pieces.first() else {
+        return vec![];
+    };
+    let schema = first.schema();
+    let dicts: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| matches!(schema.field(i).data_type(), DataType::Dictionary(..)))
+        .collect();
+    let nested = schema.fields().iter().any(|f| match f.data_type() {
+        DataType::Dictionary(_, v) => has_dictionary(v),
+        dt => has_dictionary(dt),
+    });
+    let mut run = 0;
+    let mut runs = Vec::with_capacity(pieces.len());
+    for (i, b) in pieces.iter().enumerate() {
+        if i > 0 {
+            let prev = &pieces[i - 1];
+            let same = !nested
+                && dicts.iter().all(|&c| {
+                    let (a, b) = (
+                        prev.column(c).as_any_dictionary(),
+                        b.column(c).as_any_dictionary(),
+                    );
+                    a.values().to_data().ptr_eq(&b.values().to_data())
+                });
+            if !same {
+                run += 1;
+            }
+        }
+        runs.push(run);
+    }
+    runs
+}
+
+/// Whether `dt` holds a dictionary anywhere.
+fn has_dictionary(dt: &DataType) -> bool {
+    match dt {
+        DataType::Dictionary(..) => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => has_dictionary(f.data_type()),
+        DataType::Struct(fs) => fs.iter().any(|f| has_dictionary(f.data_type())),
+        DataType::Union(fs, _) => fs.iter().any(|(_, f)| has_dictionary(f.data_type())),
+        DataType::RunEndEncoded(r, v) => {
+            has_dictionary(r.data_type()) || has_dictionary(v.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// `sources`' dictionary arrays (all over one values array) interleaved at
+/// `picks`: their keys interleaved, over those values.
+fn interleave_dictionary(sources: &[&dyn Array], picks: &[(usize, usize)]) -> Result<ArrayRef> {
+    use arrow::datatypes::*;
+    fn keys_over<K: ArrowDictionaryKeyType>(
+        sources: &[&dyn Array],
+        picks: &[(usize, usize)],
+    ) -> Result<ArrayRef> {
+        let dicts: Vec<&DictionaryArray<K>> =
+            sources.iter().map(|a| a.as_dictionary::<K>()).collect();
+        let keys: Vec<&dyn Array> = dicts.iter().map(|d| d.keys() as &dyn Array).collect();
+        let keys = arrow::compute::interleave(&keys, picks).map_err(arrow_err)?;
+        let keys = keys.as_primitive::<K>().clone();
+        let values = dicts[0].values().clone();
+        Ok(Arc::new(
+            DictionaryArray::<K>::try_new(keys, values).map_err(arrow_err)?,
+        ))
+    }
+    match sources[0].data_type() {
+        DataType::Dictionary(k, _) => match k.as_ref() {
+            DataType::Int8 => keys_over::<Int8Type>(sources, picks),
+            DataType::Int16 => keys_over::<Int16Type>(sources, picks),
+            DataType::Int32 => keys_over::<Int32Type>(sources, picks),
+            DataType::Int64 => keys_over::<Int64Type>(sources, picks),
+            DataType::UInt8 => keys_over::<UInt8Type>(sources, picks),
+            DataType::UInt16 => keys_over::<UInt16Type>(sources, picks),
+            DataType::UInt32 => keys_over::<UInt32Type>(sources, picks),
+            DataType::UInt64 => keys_over::<UInt64Type>(sources, picks),
+            k => Err(DataFusionError::Internal(format!(
+                "dictionary key type {k}"
+            ))),
+        },
+        dt => Err(DataFusionError::Internal(format!(
+            "{dt} is not a dictionary"
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -282,6 +389,9 @@ impl Batches {
             .map(|&k| {
                 let sources: Vec<&dyn Array> =
                     chunks.iter().map(|c| c.batch.column(k).as_ref()).collect();
+                if matches!(sources[0].data_type(), DataType::Dictionary(..)) {
+                    return interleave_dictionary(&sources, &picks);
+                }
                 arrow::compute::interleave(&sources, &picks).map_err(arrow_err)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -294,7 +404,8 @@ impl Iterator for Batches {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Skip the chunks with no rows here, then take chunks while the batch
-        // stays within CHUNK rows (at least one chunk's rows).
+        // stays within CHUNK rows (at least one chunk's rows) and within the
+        // first chunk's dictionary run.
         while self.next < self.chunks.len() && self.chunks[self.next].rows_for(self.p).is_empty() {
             self.next += 1;
         }
@@ -302,8 +413,9 @@ impl Iterator for Batches {
             return None;
         }
         let from = self.next;
+        let run = self.chunks[from].run;
         let mut rows = 0;
-        while self.next < self.chunks.len() {
+        while self.next < self.chunks.len() && self.chunks[self.next].run == run {
             let k = self.chunks[self.next].rows_for(self.p).len();
             if rows > 0 && rows + k > CHUNK {
                 break;

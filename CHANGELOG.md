@@ -291,6 +291,14 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- `group_by()` by a dictionary (categorical) column with `int8`, `int16`,
+  `uint8` or `uint16` codes, and `distinct()` over one, raised "Dictionary key
+  bigger than the key type" when the result had more groups than the codes
+  index: a key whose batches carry dictionaries of their own, or a second key
+  that multiplies the groups. The aggregate now indexes such a key with
+  `int32` codes and the result narrows them back to the column's type when its
+  values fit; a result with more distinct values than the type indexes keeps
+  `int32` codes.
 - `describe()` over a filtered edge frame reported the unfiltered graph: every
   edge was counted, while `degree()` over the same frame read the filter as a
   subgraph view. It now reads the same view: the parent's node set, and only
