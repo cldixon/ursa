@@ -36,6 +36,9 @@ import pyarrow.parquet as pq
 
 import ursa as ur
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # the shared #193 runner
+import parity_193
+
 warnings.simplefilter("ignore")
 col = ur.col
 NEG_NAN = float((np.array([0.0]) / np.array([0.0]))[0])
@@ -209,11 +212,7 @@ def encode(t: pa.Table) -> dict:
 
 
 def run(build, frame, c) -> dict:
-    try:
-        out = build(frame, c).collect().to_arrow()
-    except Exception as exc:
-        return {"error": type(exc).__name__, "message": str(exc)}
-    return encode(out)
+    return parity_193.run_case(lambda: build(frame, c), encode)
 
 
 def graph_cases() -> dict:
@@ -370,5 +369,7 @@ def compare(main_path: str, branch_path: str) -> None:
 if __name__ == "__main__":
     if sys.argv[1] == "run":
         run_all(sys.argv[2])
+    elif sys.argv[1] == "compare193":
+        sys.exit(1 if parity_193.compare(sys.argv[2], sys.argv[3]) else 0)
     else:
         compare(sys.argv[2], sys.argv[3])

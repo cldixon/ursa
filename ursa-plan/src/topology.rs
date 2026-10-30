@@ -44,6 +44,17 @@ pub fn build_topology_batches(
     Ok((Arc::new(topo), Arc::new(ids)))
 }
 
+/// An empty graph whose ids have the type a source of `id_type` endpoints gives
+/// (`Int64`, or one of the string types): what a dry run builds in place of a
+/// source's index ([`crate::dry`]).
+pub fn empty_topology(id_type: &arrow::datatypes::DataType) -> (Arc<Topology>, Arc<IdMap>) {
+    let empty = arrow::array::new_empty_array(id_type);
+    build_topology_batches(&[(empty.as_ref(), empty.as_ref())]).unwrap_or_else(|_| {
+        let ids = arrow::array::Int64Array::from(Vec::<i64>::new());
+        build_topology_batches(&[(&ids, &ids)]).expect("an empty int64 graph builds")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

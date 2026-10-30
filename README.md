@@ -79,8 +79,8 @@ Ursa is version 0.4 and in active development. The [Limits](https://cldixon.gith
 
 | Layer | Language | Role |
 |---|---|---|
-| `python/ursa` | Python | The API. Builds a plan. |
-| `ursa-plan` | Rust | Turns the plan into one DataFusion query, with graph operations as plan nodes. |
+| `python/ursa` | Python | The API: signatures and docs, converting your data to Arrow, getting results out. Each frame method calls into Rust. |
+| `ursa-plan` | Rust | The plan a frame holds: it validates each step as you add it, and runs the whole plan as one DataFusion query, with graph operations as plan nodes. |
 | `ursa-core` | Rust | The CSR topology index and the kernels. Parallel with `rayon`; compiles for `wasm32` without it. |
 | `ursa-py` | Rust | PyO3 bindings. Arrow crosses as zero-copy capsules; the GIL is released during compute. |
 

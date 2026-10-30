@@ -352,6 +352,34 @@ def mixed_separate():
     return best(q)
 
 
+def karate_pipeline(k: ur.EdgeFrame) -> ur.NodeFrame:
+    """A 20-step pipeline on karate: `nodes`, graph columns, then 18 relational steps."""
+    col = ur.col
+    f = k.nodes().with_columns(deg=ur.degree(k), pr=ur.pagerank(k))
+    f = f.filter(col("deg") > 0).with_columns(x=col("deg") * 2).filter(col("x") >= 2)
+    f = f.rename({"x": "y"}).with_columns(z=col("y") + col("deg"))
+    f = f.select("id", "deg", "pr", "y", "z").sort("pr", descending=True)
+    f = f.filter(col("z") > 1).with_columns(w=col("pr") * 100).head(30)
+    f = f.sort(["deg", "id"]).filter(col("w") > 0).rename({"w": "score"})
+    f = f.with_columns(t=col("score") / 2).distinct().sort("id")
+    return f.select("id", "deg", "score", "t").head(20)
+
+
+def pipeline_20_steps():
+    """Build and collect a 20-step pipeline on karate (seconds per pipeline, 300 runs)."""
+    k = ur.datasets.load_karate()
+    karate_pipeline(k).collect()
+    return once(lambda: [karate_pipeline(k).collect() for _ in range(300)]) / 300
+
+
+def build_1000_frames():
+    """Build 1,000 frames (50 times the 20-step pipeline) without collecting
+    (seconds per frame, that is per step)."""
+    k = ur.datasets.load_karate()
+    karate_pipeline(k)
+    return best(lambda: [karate_pipeline(k) for _ in range(50)], k=5) / 1000
+
+
 SCENARIOS: dict[str, Callable[[], float]] = {
     f.__name__: f
     for f in (
@@ -390,6 +418,8 @@ SCENARIOS: dict[str, Callable[[], float]] = {
         semi_degree_reingest,
         mixed_with_columns,
         mixed_separate,
+        pipeline_20_steps,
+        build_1000_frames,
     )
 }
 

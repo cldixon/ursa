@@ -3645,6 +3645,8 @@ dependencies = [
  "arrow",
  "arrow-pyarrow",
  "pyo3",
+ "serde",
+ "serde_json",
  "ursa-core",
  "ursa-plan",
 ]

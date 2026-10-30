@@ -30,6 +30,9 @@ arrow-pyarrow = { workspace = true }
 # needs a real interpreter to link against). It's behind the feature below, which
 # maturin turns on when building the extension.
 pyo3 = { workspace = true, features = ["abi3-py310"] }
+# The plan IR's argument values (the frame layer passes them as Python values).
+serde = "1"
+serde_json = "1"
 
 [features]
 # Enabled by maturin (see [tool.maturin] features in pyproject.toml) when building

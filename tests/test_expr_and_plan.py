@@ -37,16 +37,14 @@ def test_index_preservation_contract():
     edges = ur.scan_edges("g.parquet", src="a", dst="b")
     # with_columns preserves the index...
     kept = edges.with_columns(x=ur.col("a"))
-    assert kept._has_index is True
+    assert kept._index_build_cell is edges._index_build_cell
     # ...and so does filter: it is a subgraph view (#114) over the *unchanged* parent
     # topology — the dropped rows ride along as an edge mask, so no CSR rebuild.
     viewed = edges.filter(ur.col("w") > 0)
-    assert viewed._has_index is True
-    assert "preserved" in viewed.explain()
-    # A genuinely row-reshaping op (distinct/sample/join/group_by) still drops it.
+    assert viewed._index_build_cell is edges._index_build_cell
+    # A genuinely row-reshaping op (distinct/sample/join/group_by) starts a fresh one.
     dropped = edges.distinct()
-    assert dropped._has_index is False
-    assert "dropped" in dropped.explain()
+    assert dropped._index_build_cell is not edges._index_build_cell
 
 
 def test_reverse_is_metadata_only_role_swap():
@@ -75,5 +73,4 @@ def test_composed_pipeline_builds_lazy_plan():
         .head(20)
     )
     assert isinstance(nodes, ur.NodeFrame)
-    ops = [step.op for step in nodes._plan]
-    assert ops == ["scan_edges", "nodes", "with_columns", "sort", "head"]
+    assert nodes._node.ops() == ["scan_edges", "nodes", "with_columns", "sort", "head"]

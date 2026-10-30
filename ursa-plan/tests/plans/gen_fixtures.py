@@ -1,7 +1,7 @@
 """Regenerate the plan conformance fixtures (``ursa-plan/tests/plans/*.json``).
 
-Each case is a Python frame. ``serialize`` writes its plan, as ``collect()``
-would send it to ``run_plan``, and the fixture inputs its slots bind;
+Each case is a Python frame. ``serialize`` writes its plan, as the frame's Rust
+plan object lowers it for a collect, and the fixture inputs its slots bind;
 ``expect`` records what the frame's ``collect()`` returns (or the error it
 raises). ``expect`` uses only the public API, so it can run against any build,
 e.g. the release the fixtures should pin::
@@ -38,13 +38,13 @@ def _read(name: str) -> pa.Table:
 def edges(name: str) -> ur.EdgeFrame:
     table = _read(f"{name}_edges")
     frame = ur.from_arrow(table, src="src", dst="dst")
-    _SOURCES[id(frame._edge_attr_table)] = {"edges": name}
+    _SOURCES[id(frame._edge_table)] = {"edges": name}
     return frame
 
 
 def nodes(name: str) -> ur.NodeFrame:
     frame = ur.from_arrow(_read(f"{name}_nodes"), id="id")
-    _SOURCES[id(frame._attr_table)] = {"nodes": name}
+    _SOURCES[id(frame._node.source[0])] = {"nodes": name}
     return frame
 
 
@@ -220,10 +220,9 @@ def _cases() -> dict[str, tuple[str, Callable[[], Any]]]:
 
 
 def _input(obj: Any) -> dict[str, Any]:
-    for attr in ("_edge_attr_table", "_attr_table"):
-        source = _SOURCES.get(id(getattr(obj, attr, None)))
-        if source is not None:
-            return source
+    source = _SOURCES.get(id(obj))
+    if source is not None:
+        return source
     if isinstance(obj, list):
         return {"ids": obj}
     return {"unused": True}
@@ -234,14 +233,17 @@ def _path(name: str) -> Path:
 
 
 def serialize(only: list[str] | None = None) -> None:
-    from ursa._execute import _Host
-
     for name, (description, build) in _cases().items():
         if only and name not in only:
             continue
-        host = _Host()
-        plan = host.frame(build())
-        inputs = [_input(obj) for obj in host._slots]
+        try:
+            frame = build()
+        except Exception as exc:  # the step raises where it is added (#193)
+            print(f"{name}: not serialized, the frame does not build ({exc})")
+            continue
+        plan_json, slots = frame._node.lowered()
+        plan = json.loads(plan_json)
+        inputs = [_input(obj) for obj in slots]
         path = _path(name)
         expect = json.loads(path.read_text())["expect"] if path.exists() else None
         case = {"description": description, "inputs": inputs, "plan": plan, "expect": expect}

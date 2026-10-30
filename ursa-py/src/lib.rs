@@ -12,21 +12,21 @@
 //!
 //! ## Surface
 //!
-//! - `run_plan` — the one execution entry point: a serialized plan (see
-//!   `ursa_plan::plan`) and a host object in, the result batches out. The plan
-//!   reads its inputs (cached indexes, tables, masks, seeds) from the host by slot.
-//! - `build_index` / `scan_build_index` — build (and cache on the Python frame) the
-//!   CSR topology; every graph op over the frame reuses it.
-//! - `resolve_index` — the checked index of an edge plan, for the eager stats.
-//! - `NodeTableCache` — the scanned table of a `scan_nodes` frame, kept on the
-//!   frame and read through by the plan.
+//! - `PlanNode` — the plan object a Python frame holds (`ursa_plan::lazy`):
+//!   one method per frame step, each building and validating the next node in
+//!   Rust; `collect`, `schema`, `explain` and the frame's caches (`IndexCell`,
+//!   `NodeTableCache`) hang off it. See [`frame`].
+//! - `check_agg_fn` / `check_direction` / `check_on_null` — the engine's lists,
+//!   for the arguments the Python API checks as it is called.
+//! - `build_index` — build a CSR topology from edge batches (a test hook; frames
+//!   build their own index on first use).
 //! - `graph_density` / `graph_avg_path_length` / `graph_diameter` — eager
-//!   whole-graph statistics.
+//!   whole-graph statistics over `PlanNode.graph_index()`.
 
-use std::collections::HashMap;
+mod frame;
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch};
-use arrow_pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::array::{Array, RecordBatch};
+use arrow_pyarrow::FromPyArrow;
 use pyo3::create_exception;
 use pyo3::exceptions::{
     PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
@@ -38,13 +38,10 @@ use std::sync::Arc;
 use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 
-use ursa_plan::plan::{
-    count_topology_build, execute, topology_builds, EdgeInput, HostError, HostRows, Rows, Slot,
-};
+use ursa_plan::plan::{count_topology_build, topology_builds, HostError};
 use ursa_plan::{
     avg_path_length, build_topology_batches, density, diameter, parse_stat_direction,
-    require_index, scan_edges_topology, weight_cache_key, Inputs, Plan, PlanError, PlanResult,
-    ScanBuildError, ScannedTopology,
+    weight_cache_key, PlanError,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,14 +131,6 @@ fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
 // Real execution path: pyarrow in -> one DataFusion plan -> pyarrow out.
 // ---------------------------------------------------------------------------
 
-/// Import a pyarrow array into an Arrow `ArrayRef`. No type restriction — the id
-/// type (int64 or string) is discovered and validated in `ursa-core`
-/// (`IdMap::from_edge_arrays` / `dense_from_array`), so ids of either type flow
-/// through this one seam.
-fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
-    Ok(make_array(ArrayData::from_pyarrow_bound(obj)?))
-}
-
 /// A built graph index — the CSR `Topology` plus the `IdMap` — cached on the
 /// Python `EdgeFrame` and passed to every graph op over that frame, so the
 /// topology is built once instead of on every `collect()` (spec §index-
@@ -149,8 +138,8 @@ fn array_from_pyarrow(obj: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
 ///
 /// It also carries the weight vectors evaluated over the frame's edge rows, so a
 /// repeated weighted query evaluates its `weight=` expression once (#175).
-#[pyclass]
-struct GraphIndex(ursa_plan::GraphIndex);
+#[pyclass(frozen)]
+pub(crate) struct GraphIndex(pub(crate) ursa_plan::GraphIndex);
 
 impl GraphIndex {
     fn new(topo: Arc<Topology>, ids: Arc<IdMap>) -> Self {
@@ -183,7 +172,7 @@ impl GraphIndex {
 /// derivations, so repeated collects read the file once. Opaque to Python.
 #[pyclass]
 #[derive(Default)]
-struct NodeTableCache(Arc<ursa_plan::scan::NodeTableCache>);
+pub(crate) struct NodeTableCache(pub(crate) Arc<ursa_plan::scan::NodeTableCache>);
 
 #[pymethods]
 impl NodeTableCache {
@@ -226,37 +215,6 @@ fn build_index(py: Python<'_>, edges: &Bound<'_, PyAny>) -> PyResult<GraphIndex>
     Ok(GraphIndex::new(topo, ids))
 }
 
-/// Scan an edge file and build its graph index in one native call, returning the
-/// index and the number of null-endpoint rows dropped (always 0 unless
-/// `drop_nulls`, the `on_null="drop"` opt-in).
-///
-/// Equivalent to `build_index(scan_edges_arrow(...))` for an unweighted scan, but
-/// the scanned Arrow endpoints never accumulate: each batch is interned and freed
-/// as it is decoded (`scan_edges_topology`), which takes the 16 B/edge input out of
-/// the build's peak (#149). A weighted scan keeps the two-step path, since its
-/// weight columns must outlive the build.
-#[pyfunction]
-#[pyo3(signature = (path, src, dst, storage_options=None, drop_nulls=false))]
-fn scan_build_index(
-    py: Python<'_>,
-    path: &str,
-    src: &str,
-    dst: &str,
-    storage_options: Option<HashMap<String, String>>,
-    drop_nulls: bool,
-) -> PyResult<(GraphIndex, usize)> {
-    let opts = storage_options.unwrap_or_default();
-    let scanned = py.detach(|| {
-        scan_edges_topology(path, src, dst, &opts, drop_nulls).map_err(|e| match e {
-            ScanBuildError::Scan(e) => to_pyerr(e),
-            ScanBuildError::Build(e) => PyValueError::new_err(e.to_string()),
-        })
-    })?;
-    count_topology_build();
-    let ScannedTopology { topo, ids, dropped } = scanned;
-    Ok((GraphIndex::new(topo, ids), dropped))
-}
-
 /// Total topology builds so far (test/observability hook for the index contract).
 #[pyfunction]
 fn _topology_build_count() -> usize {
@@ -278,7 +236,7 @@ fn _scan_log(record: bool) -> Vec<(String, Vec<String>, usize)> {
 /// `NotImplementedError` (with the message the Python layer used to raise), an
 /// engine error through [`to_pyerr`], and a host error back to the exception the
 /// host raised.
-fn plan_err(e: PlanError) -> PyErr {
+pub(crate) fn plan_err(e: PlanError) -> PyErr {
     match e {
         PlanError::NotImplemented(m) => PyNotImplementedError::new_err(m),
         PlanError::ColumnNotFound(m) => ColumnNotFoundError::new_err(m),
@@ -300,7 +258,7 @@ fn plan_err(e: PlanError) -> PyErr {
 }
 
 /// Carry an exception the host raised through the plan executor unchanged.
-fn host_err(py: Python<'_>, err: PyErr) -> PlanError {
+pub(crate) fn host_err(py: Python<'_>, err: PyErr) -> PlanError {
     let message = err
         .value(py)
         .str()
@@ -312,161 +270,6 @@ fn host_err(py: Python<'_>, err: PyErr) -> PlanError {
         not_implemented,
         payload: Box::new(err),
     })
-}
-
-/// The Python host of a plan (`ursa._execute._Host`): each [`Inputs`] method calls
-/// the host method of the same name, with the GIL held for just that call.
-struct PyInputs {
-    host: Py<PyAny>,
-}
-
-impl PyInputs {
-    fn call<T>(
-        &self,
-        name: &str,
-        args: impl for<'py> pyo3::call::PyCallArgs<'py>,
-        convert: impl for<'py> FnOnce(&Bound<'py, PyAny>) -> PyResult<T>,
-    ) -> PlanResult<T> {
-        Python::attach(|py| {
-            let out = self.host.bind(py).call_method1(name, args);
-            out.and_then(|obj| convert(&obj))
-                .map_err(|e| host_err(py, e))
-        })
-    }
-}
-
-fn batch_list(obj: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
-    Vec::<RecordBatch>::from_pyarrow_bound(obj)
-}
-
-impl Inputs for PyInputs {
-    fn index(&self, frame: Slot) -> PlanResult<ursa_plan::GraphIndex> {
-        self.call("index", (frame,), |obj| {
-            Ok(obj.extract::<PyRef<'_, GraphIndex>>()?.0.clone())
-        })
-    }
-
-    fn built_index(&self, frame: Slot) -> PlanResult<Option<ursa_plan::GraphIndex>> {
-        self.call("built_index", (frame,), |obj| {
-            if obj.is_none() {
-                return Ok(None);
-            }
-            Ok(Some(obj.extract::<PyRef<'_, GraphIndex>>()?.0.clone()))
-        })
-    }
-
-    fn put_index(
-        &self,
-        frame: Slot,
-        index: ursa_plan::GraphIndex,
-    ) -> PlanResult<ursa_plan::GraphIndex> {
-        self.call("put_index", (frame, GraphIndex(index)), |obj| {
-            Ok(obj.extract::<PyRef<'_, GraphIndex>>()?.0.clone())
-        })
-    }
-
-    fn table(&self, frame: Slot) -> PlanResult<Option<Rows>> {
-        self.call("table", (frame,), |obj| {
-            if obj.is_none() {
-                return Ok(None);
-            }
-            host_rows(obj).map(Some)
-        })
-    }
-
-    fn storage_options(&self, frame: Slot) -> PlanResult<HashMap<String, String>> {
-        self.call("storage_options", (frame,), |obj| {
-            // With the message a native scan's own argument conversion gave.
-            obj.extract::<Option<HashMap<String, String>>>()
-                .map(Option::unwrap_or_default)
-                .map_err(|e| {
-                    let value = e.value(obj.py()).to_string();
-                    PyTypeError::new_err(format!("argument 'storage_options': {value}"))
-                })
-        })
-    }
-
-    fn node_cache(&self, frame: Slot) -> PlanResult<Arc<ursa_plan::scan::NodeTableCache>> {
-        self.call("node_cache", (frame,), |obj| {
-            Ok(obj.extract::<PyRef<'_, NodeTableCache>>()?.0.clone())
-        })
-    }
-
-    fn seeds(&self, slot: Slot) -> PlanResult<ArrayRef> {
-        self.call("seeds", (slot,), array_from_pyarrow)
-    }
-
-    fn sample(&self, step: Slot, rows: usize) -> PlanResult<Option<Vec<usize>>> {
-        self.call("sample", (step, rows), |obj| {
-            obj.extract::<Option<Vec<usize>>>()
-        })
-    }
-
-    fn batches(&self, rows: HostRows) -> PlanResult<Vec<RecordBatch>> {
-        let table = py_rows(rows);
-        self.call("batches", (table,), batch_list)
-    }
-
-    fn step_error(&self, step: Slot) -> PlanError {
-        // The host raises the error it stored for the step.
-        match self.call("step_error", (step,), |_| Ok(())) {
-            Err(e) => e,
-            Ok(()) => PlanError::Invalid(format!("step {step} has no stored error")),
-        }
-    }
-
-    fn warn_dropped(&self, n: usize) -> PlanResult<()> {
-        self.call("warn_dropped", (n,), |_| Ok(()))
-    }
-
-    fn identity(&self, frame: Slot) -> PlanResult<Option<String>> {
-        self.call("identity", (frame,), |obj| obj.extract::<Option<String>>())
-    }
-}
-
-/// A host table (a `pyarrow.Table`) the executor holds without converting it.
-fn host_rows(obj: &Bound<'_, PyAny>) -> PyResult<Rows> {
-    Ok(Rows::Host(Box::new(obj.clone().unbind())))
-}
-
-fn py_rows(rows: HostRows) -> Py<PyAny> {
-    *rows
-        .downcast::<Py<PyAny>>()
-        .expect("host rows come from this host")
-}
-
-/// Rows as the Python host takes them: its own table, or a batch list.
-fn rows_to_python(py: Python<'_>, rows: Rows) -> PyResult<Py<PyAny>> {
-    match rows {
-        Rows::Host(h) => Ok(py_rows(h)),
-        Rows::Batches(b) => b.to_pyarrow(py).map(Bound::unbind),
-    }
-}
-
-/// Execute a serialized plan (`ursa_plan::plan::Plan` as JSON) and return its
-/// result: a list of pyarrow `RecordBatch`es from the engine, or the
-/// `pyarrow.Table` the host finished it with. `host` resolves the plan's slots
-/// (see [`PyInputs`]). The GIL is released for the whole execution and taken
-/// back only for the host's callbacks.
-#[pyfunction]
-fn run_plan(py: Python<'_>, plan: &str, host: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let plan = Plan::from_json(plan).map_err(plan_err)?;
-    let inputs = PyInputs { host };
-    let rows = py.detach(|| execute(&plan, &inputs)).map_err(plan_err)?;
-    rows_to_python(py, rows)
-}
-
-/// The graph index of a serialized edge input (`ursa_plan::plan::EdgeInput`),
-/// after the checks a graph op over it needs. Backs the eager whole-graph stats,
-/// which run outside a plan.
-#[pyfunction]
-fn resolve_index(py: Python<'_>, edges: &str, host: Py<PyAny>) -> PyResult<GraphIndex> {
-    let edges = EdgeInput::from_json(edges).map_err(plan_err)?;
-    let inputs = PyInputs { host };
-    let index = py
-        .detach(|| require_index(&edges, &inputs))
-        .map_err(plan_err)?;
-    Ok(GraphIndex(index))
 }
 
 /// Whole-graph edge density (eager scalar). `direction` is out/in/both; `both`
@@ -509,6 +312,60 @@ fn graph_diameter(
     py.detach(move || diameter(&topo, approximate, dir).map_err(to_pyerr))
 }
 
+/// Raise the error for an aggregation the engine does not compute.
+#[pyfunction]
+fn check_agg_fn(func: &str) -> PyResult<()> {
+    ursa_plan::plan::check_agg_fn(func).map_err(plan_err)
+}
+
+/// Raise the `ValueError` for a `direction=` the verb or stat `verb` does not
+/// take (a verb that checks its direction in the engine takes any here).
+#[pyfunction]
+fn check_direction(verb: &str, direction: &Bound<'_, PyAny>) -> PyResult<()> {
+    let Some((allowed, stat)) = ursa_plan::plan::verb_directions(verb) else {
+        return Ok(());
+    };
+    let given = direction.extract::<String>().ok();
+    if given.as_deref().is_some_and(|d| allowed.contains(&d)) {
+        return Ok(());
+    }
+    let shown = direction.repr()?.to_string();
+    let msg = if stat {
+        format!("{verb}(direction={shown}) is not supported; use 'out', 'in', or 'both'.")
+    } else {
+        let options: Vec<String> = allowed.iter().map(|d| format!("'{d}'")).collect();
+        let hint = if given.as_deref() == Some("in") {
+            " ('in' is not supported here; to run it on the reversed graph, swap the src/dst \
+             roles when you build the frame)"
+        } else {
+            ""
+        };
+        format!(
+            "{verb}(direction={shown}) is not supported; use one of {}{hint}.",
+            options.join(", ")
+        )
+    };
+    Err(PyValueError::new_err(msg))
+}
+
+/// Raise the `ValueError` for an `on_null=` mode an edge source does not have.
+#[pyfunction]
+fn check_on_null(on_null: &Bound<'_, PyAny>) -> PyResult<()> {
+    let modes = ursa_plan::plan::ON_NULL_MODES;
+    if on_null
+        .extract::<String>()
+        .is_ok_and(|m| modes.contains(&m.as_str()))
+    {
+        return Ok(());
+    }
+    let options: Vec<String> = modes.iter().map(|m| format!("'{m}'")).collect();
+    Err(PyValueError::new_err(format!(
+        "on_null must be one of ({}); got {}.",
+        options.join(", "),
+        on_null.repr()?
+    )))
+}
+
 /// The `ursa-core` version — the simplest possible proof the native module loaded.
 #[pyfunction]
 fn __core_version() -> &'static str {
@@ -526,13 +383,15 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the cached graph index (built once per frame)
     m.add_class::<GraphIndex>()?;
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
-    m.add_function(wrap_pyfunction!(scan_build_index, m)?)?;
     m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
     m.add_function(wrap_pyfunction!(_scan_log, m)?)?;
     m.add_class::<NodeTableCache>()?;
-    // the one execution entry point
-    m.add_function(wrap_pyfunction!(run_plan, m)?)?;
-    m.add_function(wrap_pyfunction!(resolve_index, m)?)?;
+    // the plan object a frame holds
+    m.add_class::<frame::PlanNode>()?;
+    m.add_class::<frame::IndexCell>()?;
+    m.add_function(wrap_pyfunction!(check_agg_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(check_direction, m)?)?;
+    m.add_function(wrap_pyfunction!(check_on_null, m)?)?;
     m.add_function(wrap_pyfunction!(graph_density, m)?)?;
     m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;
     m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;

@@ -32,6 +32,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import parity_193
 from parity_191 import TMP, encode, load
 
 import ursa as ur
@@ -203,10 +204,7 @@ def cases() -> dict:
 
 
 def _record(name: str, build) -> dict:
-    try:
-        return {"case": name, **encode(build().collect().to_arrow())}
-    except Exception as exc:
-        return {"case": name, "error": type(exc).__name__, "message": str(exc)}
+    return {"case": name, **parity_193.run_case(build, encode)}
 
 
 def run_all(path: str) -> None:
@@ -323,4 +321,5 @@ if __name__ == "__main__":
         "run": lambda: run_all(sys.argv[2]),
         "compare": lambda: compare(*sys.argv[2:4]),
         "same": lambda: same(*sys.argv[2:4]),
+        "compare193": lambda: sys.exit(1 if parity_193.compare(*sys.argv[2:4]) else 0),
     }[sys.argv[1]]()

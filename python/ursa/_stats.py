@@ -14,16 +14,11 @@ whole graph it gives the same value as ``"out"``.
 
 from __future__ import annotations
 
-from ._frames import EdgeFrame, NodeFrame, _PlanStep
-
-_DIRECTIONS = ("out", "in", "both")
+from ._frames import EdgeFrame, NodeFrame, _native
 
 
 def _check_direction(fn: str, direction: str) -> str:
-    if direction not in _DIRECTIONS:
-        raise ValueError(
-            f"{fn}(direction={direction!r}) is not supported; use 'out', 'in', or 'both'."
-        )
+    _native().check_direction(fn, direction)
     return direction
 
 
@@ -51,10 +46,7 @@ def describe(edges: EdgeFrame, full: bool = False, direction: str = "out") -> No
     rather than derive node-keyed frames from it).
     """
     _check_direction("describe", direction)
-    return NodeFrame._construct(
-        id_col="__summary__",
-        plan=(_PlanStep("describe", {"full": full, "edges": edges, "direction": direction}),),
-    )
+    return NodeFrame._wrap(_native().PlanNode.describe(edges._node, bool(full), direction))
 
 
 def density(edges: EdgeFrame, direction: str = "out") -> float:
@@ -70,10 +62,8 @@ def density(edges: EdgeFrame, direction: str = "out") -> float:
     direction (reciprocal and parallel rows collapse, self-loops are dropped):
     ``nx.density(G.to_undirected())`` for a graph without self-loops.
     """
-    from ._execute import _graph_index, _native
-
     _check_direction("density", direction)
-    return float(_native().graph_density(_graph_index(edges), direction))
+    return float(_native().graph_density(edges._node.graph_index(), direction))
 
 
 def avg_path_length(edges: EdgeFrame, sample: float | None = None, direction: str = "out") -> float:
@@ -82,10 +72,8 @@ def avg_path_length(edges: EdgeFrame, sample: float | None = None, direction: st
     giving ``nx.average_shortest_path_length(G.to_undirected())`` on a connected
     graph. ``sample`` (a fraction in (0, 1]) estimates from a subset of sources;
     omit for the exact mean."""
-    from ._execute import _graph_index, _native
-
     _check_direction("avg_path_length", direction)
-    return float(_native().graph_avg_path_length(_graph_index(edges), sample, direction))
+    return float(_native().graph_avg_path_length(edges._node.graph_index(), sample, direction))
 
 
 def diameter(edges: EdgeFrame, approximate: bool = True, direction: str = "out") -> int:
@@ -94,7 +82,5 @@ def diameter(edges: EdgeFrame, approximate: bool = True, direction: str = "out")
     ignores direction, giving ``nx.diameter(G.to_undirected())`` on a connected
     graph. ``approximate`` (default) is a lower-bound estimate; pass
     ``approximate=False`` for the exact value."""
-    from ._execute import _graph_index, _native
-
     _check_direction("diameter", direction)
-    return int(_native().graph_diameter(_graph_index(edges), approximate, direction))
+    return int(_native().graph_diameter(edges._node.graph_index(), approximate, direction))

@@ -143,17 +143,21 @@ def test_a_graph_verb_as_a_predicate_is_not_a_boolean_predicate(frame):
         base.filter(ur.degree(e)).collect()
 
 
-@pytest.mark.parametrize("bad", ["serialize", "execute"])
-def test_join_right_side_errors_keep_their_cause(bad):
+@pytest.mark.parametrize("bad", ["build", "execute"])
+def test_join_right_side_errors_keep_their_cause(bad, tmp_path):
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    # A select of a non-expression fails parsing the right frame; a step on a
-    # traversal result's edges before nodes() fails its shape guard. Either way the
-    # right side's own error is the cause.
-    hop = ur.hop(e, 1).from_([0])
-    shape_guard = hop.head(2).nodes().with_columns(d=ur.degree(e))
-    right = n.select(3) if bad == "serialize" else shape_guard
-    with pytest.raises(NotImplementedError, match="could not materialize the right-hand") as exc:
-        n.join(right, on="id").collect()
+    # A bare `edges.nodes()` has no rows, which the plan alone shows, so the join is
+    # rejected where it is added (#193); a scan with an unsupported store= fails
+    # only when it reads. Either way the right side's own error is the cause.
+    if bad == "build":
+        with pytest.raises(NotImplementedError, match="could not materialize the right") as exc:
+            n.join(e.nodes(), on="id")
+    else:
+        path = tmp_path / "n.parquet"
+        pq.write_table(NODES, path)
+        right = ur.scan_nodes(str(path), id="id", store=object())
+        with pytest.raises(NotImplementedError, match="could not materialize the right") as exc:
+            n.join(right, on="id").collect()
     assert isinstance(exc.value.__cause__, NotImplementedError)
 
 

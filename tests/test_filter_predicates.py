@@ -169,14 +169,13 @@ def test_src_role_in_node_query_raises(tmp_path):
 
 
 def test_id_role_in_edge_query_raises():
-    # ur.id() has no meaning on a traversal's (src, dst) output.
-    pipeline = ur.hop(EDGES, 1).from_([1]).filter(ur.id() == 0)
+    # ur.id() has no meaning on a traversal's (src, dst) output: the filter is
+    # rejected where it is added (#193).
     with pytest.raises(NotImplementedError):
-        pipeline.collect()
+        ur.hop(EDGES, 1).from_([1]).filter(ur.id() == 0)
 
 
 def test_aggregation_in_predicate_raises():
     # aggregations belong in group_by().agg(), not a row predicate.
-    pipeline = ur.hop(EDGES, 1).from_([1]).filter(ur.col("src").sum() > 100)
     with pytest.raises((NotImplementedError, ur.UrsaError)):
-        pipeline.collect()
+        ur.hop(EDGES, 1).from_([1]).filter(ur.col("src").sum() > 100)

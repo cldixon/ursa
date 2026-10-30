@@ -25,8 +25,9 @@ as typed aliases) and scan-backed ones (``scan_edges``/``scan_nodes``, Parquet/C
 local or object storage) all execute end to end through the DataFusion plan and the
 ``ursa-core`` kernels. However a frame is built, it behaves identically thereafter.
 The relational surface — ``filter``/``sort``/``head``/``rename``/``distinct``/
-``sample``/``group_by().agg()``/``join`` — executes; only ``schema`` remains
-plan-only. ``ur.col`` & the expression dialect are pure Python and always
+``sample``/``group_by().agg()``/``join`` — executes, and each step is checked as
+it is added. ``schema()`` and ``explain()`` read the plan without running it.
+``ur.col`` & the expression dialect are pure Python and always
 available.
 """
 

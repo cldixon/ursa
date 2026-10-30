@@ -5,19 +5,21 @@ There is no ``Graph`` object. The EdgeFrame *is* the graph (designated ``src`` /
 attribute table with a designated ``id`` role that relates to it by join
 convention. A frame *is* a logical plan until ``.collect()``.
 
-Relational transformations accumulate onto an in-Python logical-plan chain
-(inspectable via ``.explain()``); ``collect`` and the ``to_*`` / ``sink_*`` egress
-execute it through the ``ursa-plan`` / DataFusion layer. Role tracking,
-``.nodes()``, ``.reverse()``, and the index-preservation contract are modelled
-here. A few relational verbs are still plan-only and raise a clear error when
-collected: ``schema()``, ``sample``, ``group_by().agg``, and ``join``.
+A frame holds one Rust plan object (``ursa._ursa.PlanNode``), as a Polars
+``LazyFrame`` does: each method converts its arguments (``_ir``), calls the plan
+object, which builds and validates the next step in Rust, and wraps the result
+in a new frame of the same type. A step that does not fit the frame (an unknown
+column, an unsupported shape) raises on the line that adds it. ``collect()``,
+``schema()`` and ``explain()`` run in Rust too, and so do the caches: a frame's
+topology index (with its weights, masks and symmetric views) lives on the Rust
+state it shares with the derivations that keep its rows.
 """
 
 from __future__ import annotations
 
-import threading
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+from . import _ir
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -27,99 +29,66 @@ if TYPE_CHECKING:
 
     from ._result import MaterializedFrame
 
-_ENGINE_TODO = (
-    "is not executable yet: it is modelled in the plan (so it composes and shows in "
-    ".explain()) but has no engine lowering. collect() and the to_*/sink_* egress "
-    "are wired; this particular verb is still plan-only."
-)
+
+def _native() -> Any:
+    from ._execute import _native as native
+
+    return native()
 
 
-class _BuildCell:
-    """A shared, mutable holder for a lazily-built, memoized artifact — an
-    EdgeFrame's topology index (which carries its weight and subgraph-mask
-    caches), or a NodeFrame's native scanned-table cache.
+class _CacheView:
+    """A read-only look at a cache that lives on a frame's Rust plan object."""
 
-    Two problems it solves (both from the perf review):
+    __slots__ = ("value",)
 
-    * **Forward-propagating the memo.** A frame and its property-preserving
-      derivations share *one* cell by reference, so an index (or scan) built via
-      any of them is visible to all — including derivations made *before* the
-      build. Snapshotting the value at derivation time (the old behaviour) missed
-      this direction, so ``e2 = edges.with_columns(...)`` then a collect on
-      ``edges`` then a collect on ``e2`` rebuilt an identical CSR.
-    * **Per-graph locking.** Each cell carries its own lock, so first-collect of
-      unrelated frames from different threads build concurrently instead of
-      serializing on a single module-global lock (the build releases the GIL and
-      can include a full file scan).
-
-    Structural ops that invalidate the source (filter/distinct on an EdgeFrame)
-    create a *fresh* cell, so the stale index is not carried across.
-    """
-
-    __slots__ = ("lock", "value")
-
-    def __init__(self, value: Any | None = None) -> None:
+    def __init__(self, value: Any) -> None:
         self.value = value
-        self.lock = threading.Lock()
-
-
-@dataclass(frozen=True)
-class _PlanStep:
-    """One logical operation in a frame's plan (kept human-readable for explain())."""
-
-    op: str
-    args: dict[str, Any] = field(default_factory=dict)
-
-    def __repr__(self) -> str:
-        inner = ", ".join(f"{k}={v!r}" for k, v in self.args.items())
-        return f"{self.op}({inner})"
 
 
 class _Frame:
     """Shared relational surface for both frame types.
 
-    ``_plan`` is the accumulated chain of logical steps. ``_has_index`` tracks the
-    index-preservation contract at the metadata level: property-only ops preserve
-    it, row-changing ops drop it (rebuilt lazily on the next graph op).
+    ``_node`` is the frame's plan: a Rust ``PlanNode``, its last step, holding the
+    steps before it.
     """
 
-    __slots__ = ("_has_index", "_plan")
-
-    def __init__(self, plan: tuple[_PlanStep, ...], has_index: bool) -> None:
-        self._plan = plan
-        self._has_index = has_index
+    __slots__ = ("_node",)
+    _node: Any
 
     # -- internal helpers ----------------------------------------------------
     # Chainable verbs return `Self`, so `EdgeFrame.filter(...)` stays an
     # `EdgeFrame` (and NodeFrame a NodeFrame) through a whole pipeline.
-    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> Self:
+    def _derive(self, node: Any) -> Self:
         new = self.__class__.__new__(self.__class__)
-        _Frame.__init__(
-            new,
-            (*self._plan, step),
-            has_index=self._has_index and not drops_index,
-        )
+        new._node = node
         return new
 
-    # -- relational verbs (property-preserving unless noted) -----------------
+    @classmethod
+    def _wrap(cls, node: Any) -> Any:
+        new = cls.__new__(cls)
+        new._node = node
+        return new
+
+    # -- relational verbs ----------------------------------------------------
     def filter(self, predicate: Any) -> Self:
-        # `filter` is now a **subgraph view** on an EdgeFrame (#114): the parent
+        # `filter` is a **subgraph view** on an EdgeFrame (#114): the parent
         # topology is unchanged — the dropped rows are expressed as an edge mask at
-        # execution time — so the cached index is *preserved* (drops_index=False,
-        # the default). A graph op on a filtered edge frame runs the parent CSR with
-        # that mask instead of rebuilding. (distinct/sample/join/group_by drop the
-        # index: a graph op over them builds one from their rows, cached by the
-        # engine under a fingerprint of the edge plan, #191.)
-        return self._extend(_PlanStep("filter", {"predicate": predicate}))
+        # execution time — so the frame keeps its parent's index. A graph op on a
+        # filtered edge frame runs the parent CSR with that mask instead of
+        # rebuilding. (distinct/sample/join/group_by start a fresh index: a graph op
+        # over them builds one from their rows, cached by the engine under a
+        # fingerprint of the edge plan, #191.)
+        return self._derive(self._node.filter(*_ir.capture(_ir.expr, predicate)))
 
     def select(self, *columns: Any) -> Self:
-        return self._extend(_PlanStep("select", {"columns": columns}))
+        return self._derive(self._node.select(*_ir.capture(_ir.select_items, columns)))
 
     def with_columns(self, **exprs: Any) -> Self:
-        return self._extend(_PlanStep("with_columns", {"exprs": exprs}))
+        columns = [(name, *_ir.column(e)) for name, e in exprs.items()]
+        return self._derive(self._node.with_columns(columns))
 
     def rename(self, mapping: dict[str, str]) -> Self:
-        return self._extend(_PlanStep("rename", {"mapping": mapping}))
+        return self._derive(self._node.rename(*_ir.capture(_ir.rename_mapping, mapping)))
 
     def sort(self, by: Any, *more_by: Any, descending: bool | Sequence[bool] = False) -> Self:
         """Sort rows by one or more columns, Polars-style.
@@ -137,11 +106,11 @@ class _Frame:
         node order, or the attribute table's row order when the frame has one;
         after a traversal it is the traversal's own output order. An empty key
         list, a ``descending`` list whose length differs from the keys, or an
-        unknown column raises an error at collect time.
+        unknown column raises an error where the sort is added.
         """
         if more_by:
             by = [*(by if isinstance(by, (list, tuple)) else [by]), *more_by]
-        return self._extend(_PlanStep("sort", {"by": by, "descending": descending}))
+        return self._derive(self._node.sort(*_ir.capture(_ir.sort_keys, by, descending)))
 
     def head(self, n: int = 10) -> Self:
         """Keep the first ``n`` rows.
@@ -152,19 +121,20 @@ class _Frame:
         own output order, and for a ``join`` the left rows in order, each followed
         by its matches in right-frame order.
         """
-        return self._extend(_PlanStep("head", {"n": n}))
+        return self._derive(self._node.head(*_ir.capture(int, n)))
 
     limit = head
 
     def sample(self, n: int, *, seed: int | None = None) -> Self:
         """Keep ``n`` random rows, reproducibly for a ``seed``, in input order."""
-        # sample changes the row set, so the cached topology index no longer matches
-        # (like distinct) — drop it so a later graph op rebuilds from the sample.
-        return self._extend(_PlanStep("sample", {"n": n, "seed": seed}), drops_index=True)
+        # sample changes the row set, so the frame starts a fresh topology index
+        # (like distinct): a later graph op builds one from the sample.
+        count, error = _ir.capture(int, n)
+        return self._derive(self._node.sample(count, _ir.int_arg(seed), (count, seed), error))
 
     def distinct(self) -> Self:
         """Remove duplicate rows; each kept row stays at its first occurrence."""
-        return self._extend(_PlanStep("distinct", {}), drops_index=True)
+        return self._derive(self._node.distinct())
 
     def group_by(self, *keys: Any) -> _GroupBy[Self]:
         """Group by ``keys``; ``.agg(...)`` returns one row per group, in order of
@@ -184,8 +154,8 @@ class _Frame:
         A null key matches nothing. This is a join between two arbitrary frames —
         distinct from the automatic attribute attach that
         ``edges.nodes().with_columns(...)`` does. A join changes the row/column set,
-        so the cached topology no longer matches (``drops_index=True``); a graph
-        algorithm over joined edges runs over the topology of the joined rows.
+        so the frame starts a fresh topology index; a graph algorithm over joined
+        edges runs over the topology of the joined rows.
 
         Rows come back in a fixed order. For ``inner``, ``left``, ``semi`` and
         ``anti``: this frame's rows in order, each followed by its matches in
@@ -195,24 +165,34 @@ class _Frame:
         ``other``'s unmatched rows in its order. A later ``sort`` breaks ties in
         that order.
         """
-        return self._extend(
-            _PlanStep("join", {"other": other, "on": on, "how": how}), drops_index=True
-        )
+        if not isinstance(other, _Frame):
+            raise TypeError(
+                "join(other): other must be an ursa frame (EdgeFrame/NodeFrame); "
+                f"got {type(other).__name__!r}."
+            )
+        on_keys, error = _ir.capture(_ir.join_keys, on)
+        return self._derive(self._node.join(other._node, on_keys, how, error))
 
     # -- inspection ----------------------------------------------------------
-    def explain(self) -> str:
-        lines = [f"  {i}: {step!r}" for i, step in enumerate(self._plan)]
-        idx = "index: preserved" if self._has_index else "index: dropped (rebuild lazily)"
-        return f"{self.__class__.__name__} plan [{idx}]\n" + "\n".join(lines)
+    def explain(self, physical: bool = False) -> str:
+        """The plan as text: the frame's steps as a tree, the schema it collects
+        to, and the DataFusion plans a collect runs (optimized; with
+        ``physical=True`` their physical plans too). Reads no rows and builds no
+        index. The text is for reading: its format is not a stable API."""
+        return self._node.explain(physical)
 
-    def schema(self) -> dict[str, str]:
-        raise NotImplementedError(f"schema() {_ENGINE_TODO}")
+    def schema(self) -> Any:
+        """The schema ``collect()`` returns, as a ``pyarrow.Schema`` (names, types
+        and nullability), without running the plan. A scan reads its file's
+        schema; nothing reads rows."""
+        return self._node.schema()
 
     # -- materialization / egress --------------------------------------------
-    # `collect()` is the one method each frame type implements; every egress form
-    # below routes through it, so EdgeFrame/NodeFrame need only override collect().
+    # `collect()` is the one method every egress form below routes through.
     def collect(self) -> MaterializedFrame:
-        raise NotImplementedError("collect() must be implemented by the frame subclass")
+        from ._result import MaterializedFrame
+
+        return MaterializedFrame(self._node.collect())
 
     def to_polars(self):  # -> polars.DataFrame
         """``collect()``, then a ``polars.DataFrame`` (zero-copy via Arrow).
@@ -240,7 +220,7 @@ class _Frame:
         self.collect().sink_csv(path)
 
     def __repr__(self) -> str:
-        return f"<{self.__class__.__name__} lazy; {len(self._plan)} step(s)>"
+        return f"<{self.__class__.__name__} lazy; {self._node.n_steps} step(s)>"
 
 
 _F = TypeVar("_F", bound=_Frame)
@@ -255,13 +235,12 @@ class _GroupBy(Generic[_F]):
         self._keys = keys
 
     def agg(self, *exprs: Any, **named: Any) -> _F:
-        # A grouped result replaces the schema, so (like sample/distinct/join) it
-        # drops the topology index — a fresh cell, so a graph op on the grouped
-        # frame runs over the grouped rows' topology, never a parent's index.
-        return self._frame._extend(
-            _PlanStep("group_by_agg", {"keys": self._keys, "exprs": exprs, "named": named}),
-            drops_index=True,
-        )
+        # A grouped result replaces the schema, so (like sample/distinct/join) the
+        # frame starts a fresh topology index: a graph op on the grouped frame
+        # runs over the grouped rows' topology, never a parent's index.
+        parsed, error = _ir.capture(_ir.group_agg, self._keys, exprs, named)
+        keys, aggs = parsed if parsed is not None else (None, None)
+        return self._frame._derive(self._frame._node.group_by_agg(keys, aggs, error))
 
 
 class EdgeFrame(_Frame):
@@ -272,28 +251,7 @@ class EdgeFrame(_Frame):
     names are preserved for round-tripping and exposed via ``src_col`` / ``dst_col``.
     """
 
-    # `_source` carries the actual in-memory Arrow endpoint arrays for frames
-    # built via `from_arrow`/`from_polars`. `_scan` carries a file-source spec
-    # ({path, src, dst}) for frames built via `scan_edges`; `collect()` resolves
-    # it through a DataFusion scan. A frame has at most one of them.
-    #
-    # `_index` is the built native topology index (a `GraphIndex` handle), lazily
-    # cached on first graph op and shared by every subsequent op over this frame
-    # (the spec's index-preservation contract). It rides the same preserve/drop
-    # rail as `_source`/`_scan`: property-only ops keep it, structural ops drop it.
-    # `_edge_table` retains the full in-memory edge table (all columns) for a
-    # `from_arrow`/`from_polars` frame, so a `weight=` expression over edge columns
-    # can be evaluated. It rides the same preserve/drop rail; scan frames have None.
-    # Subgraph-view edge masks are cached on the built index, keyed by the view
-    # (#175, #192).
-    __slots__ = (
-        "_dst_col",
-        "_edge_table",
-        "_index_cell",
-        "_scan",
-        "_source",
-        "_src_col",
-    )
+    __slots__ = ()
 
     def __init__(self, data: Any, *, src: str, dst: str, on_null: str = "error") -> None:
         """Build an EdgeFrame from in-memory data, inferring the Arrow schema.
@@ -326,158 +284,59 @@ class EdgeFrame(_Frame):
         if on_null == "drop":
             table, dropped = _drop_null_endpoint_rows(table, src, dst)
             _warn_dropped_endpoints(dropped)
-        source = _extract_edge_arrays(table, src, dst)
-        self._fill(
-            src_col=src,
-            dst_col=dst,
-            plan=(_PlanStep("from_arrow", {"src": src, "dst": dst}),),
-            has_index=True,
-            source=source,
-            scan=None,
-            index_cell=None,
-            edge_table=table,
-        )
-
-    def _fill(
-        self,
-        src_col: str,
-        dst_col: str,
-        plan: tuple[_PlanStep, ...],
-        has_index: bool,
-        source: tuple[Any, Any] | None,
-        scan: dict[str, Any] | None,
-        index_cell: _BuildCell | None,
-        edge_table: Any | None,
-    ) -> None:
-        """Assign every slot — the single place the layout is defined, shared by the
-        public ``__init__`` and the internal ``_construct`` factory so the two can
-        never drift. (A ``__new__``-built frame must set *all* slots or a later
-        access raises ``AttributeError`` rather than reading ``None``.)"""
-        self._plan = plan
-        self._has_index = has_index
-        self._src_col = src_col
-        self._dst_col = dst_col
-        self._source = source
-        self._scan = scan
-        # Property-preserving derivations pass the same cell (shared build);
-        # structural ones pass None so a fresh cell is created here.
-        self._index_cell = index_cell if index_cell is not None else _BuildCell()
-        self._edge_table = edge_table
-
-    @classmethod
-    def _construct(
-        cls,
-        src_col: str,
-        dst_col: str,
-        plan: tuple[_PlanStep, ...] = (),
-        has_index: bool = True,
-        source: tuple[Any, Any] | None = None,
-        scan: dict[str, Any] | None = None,
-        index_cell: _BuildCell | None = None,
-        edge_table: Any | None = None,
-    ) -> EdgeFrame:
-        """Internal factory: build a frame directly from plumbing (plan, source,
-        scan, cells) without the public data-normalizing ``__init__``. Every
-        non-user construction site — ingress (``scan_edges``), derivations
-        (``_extend`` / ``reverse``), traversals — goes through here."""
-        obj = cls.__new__(cls)
-        obj._fill(src_col, dst_col, plan, has_index, source, scan, index_cell, edge_table)
-        return obj
-
-    @property
-    def _index_build_cell(self) -> _BuildCell:
-        """The shared cell holding this frame's built topology index."""
-        return self._index_cell
-
-    @property
-    def _edge_arrays(self) -> tuple[Any, Any] | None:
-        """The (src, dst) Arrow arrays if this frame has an in-memory source."""
-        return self._source
-
-    @property
-    def _edge_attr_table(self) -> Any | None:
-        """The full in-memory edge table (all columns), for weight evaluation."""
-        return self._edge_table
-
-    @property
-    def _scan_spec(self) -> dict[str, Any] | None:
-        """The file-source spec if this frame was built via ``scan_edges``."""
-        return self._scan
+        endpoints = _extract_edge_arrays(table, src, dst)
+        self._node = _native().PlanNode.edge_table(table, endpoints, src, dst)
 
     @property
     def src_col(self) -> str:
         """Original column name playing the source role."""
-        return self._src_col
+        return self._node.src_col
 
     @property
     def dst_col(self) -> str:
         """Original column name playing the destination role."""
-        return self._dst_col
+        return self._node.dst_col
 
-    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> EdgeFrame:
-        # A row-changing op (filter/sample/distinct/join) invalidates the cached
-        # *topology index* — the CSR no longer matches the frame — so `drops_index`
-        # forces a fresh index cell (`has_index=False`, `index_cell=None`). A graph
-        # op on such a frame runs over the topology of its rows, which the engine
-        # builds and caches by a fingerprint of the edge plan (#191). The in-memory
-        # source / scan spec / edge table are **kept** regardless, so the plain
-        # (non-graph) collect path can still materialize the derived edge rows —
-        # e.g. `edges.filter(...).collect()` and `edges.join(...).collect()` work
-        # (closes #100). Dropping the *source* would defeat that without adding any
-        # safety the plan-based guard doesn't already provide.
-        return EdgeFrame._construct(
-            self._src_col,
-            self._dst_col,
-            (*self._plan, step),
-            has_index=self._has_index and not drops_index,
-            source=self._source,
-            scan=self._scan,
-            index_cell=None if drops_index else self._index_cell,
-            edge_table=self._edge_table,
-        )
+    @property
+    def _index_build_cell(self) -> Any:
+        """The frame's index cell (``.value``: its built ``GraphIndex`` or None),
+        shared with the derivations that keep its rows."""
+        return self._node.index_cell
+
+    _index_cell = _index_build_cell
+
+    @property
+    def _edge_table(self) -> Any | None:
+        """The source's whole in-memory edge table (None for a scan)."""
+        return self._node.source[0]
+
+    @property
+    def _edge_arrays(self) -> tuple[Any, Any] | None:
+        """The source's canonical ``(src, dst)`` endpoint arrays (in-memory)."""
+        return self._node.source[1]
+
+    @property
+    def _scan_spec(self) -> dict[str, Any] | None:
+        """A scan source's storage spec (``storage_options``, ``store``)."""
+        return self._node.source[2]
 
     def nodes(self) -> NodeFrame:
         """The distinct union of ``src`` and ``dst`` values, as a lazy NodeFrame."""
-        return NodeFrame._construct(
-            id_col="id",
-            plan=(*self._plan, _PlanStep("nodes", {"from": (self._src_col, self._dst_col)})),
-            edges=self,
-        )
+        return NodeFrame._wrap(self._node.nodes())
 
     def reverse(self) -> EdgeFrame:
         """Swap the src/dst roles. Metadata-only — no data movement.
 
-        The in-memory source arrays / scan spec are carried through with src and
-        dst swapped, so graph ops on the reversed frame build the transpose CSR
+        Graph ops on the reversed frame build the transpose CSR
         (``degree(edges.reverse(), 'out') == degree(edges, 'in')``). The index is
-        dropped and rebuilt on the swapped edges rather than reused (reusing the
-        parent topology with flipped direction is a future optimization)."""
-        src = self._source
-        scan = self._scan
-        return EdgeFrame._construct(
-            self._dst_col,
-            self._src_col,
-            (*self._plan, _PlanStep("reverse", {})),
-            has_index=False,  # transpose becomes the new "out" direction
-            source=(src[1], src[0]) if src is not None else None,
-            scan={**scan, "src": scan["dst"], "dst": scan["src"]} if scan is not None else None,
-            edge_table=self._edge_table,
-        )
-
-    # Plain edge frames and traversal results (ur.hop / ur.shortest_path) execute
-    # here, through the plan executor (see `_execute.collect`).
-    def collect(self) -> MaterializedFrame:
-        from ._execute import collect
-
-        return collect(self)
-
-    # to_polars / to_arrow / to_dicts / sink_* are inherited from _Frame (they
-    # route through collect()).
+        built afresh on the swapped edges rather than reused (reusing the parent
+        topology with flipped direction is a future optimization)."""
+        return EdgeFrame._wrap(self._node.reverse())
 
     def __repr__(self) -> str:
         return (
-            f"<EdgeFrame src={self._src_col!r} dst={self._dst_col!r} "
-            f"lazy; {len(self._plan)} step(s)>"
+            f"<EdgeFrame src={self.src_col!r} dst={self.dst_col!r} "
+            f"lazy; {self._node.n_steps} step(s)>"
         )
 
 
@@ -485,15 +344,13 @@ class NodeFrame(_Frame):
     """A frame with a designated ``id`` column. An attribute table for the graph;
     carries no topology index.
 
-    ``_source`` holds the in-memory Arrow attribute table (id + attribute columns)
-    for frames built via ``from_arrow``/``from_polars`` with ``id=``; ``_scan``
-    holds a file-source spec (``{path, id}``) for frames built via ``scan_nodes``,
-    which ``collect()`` materializes through a DataFusion scan. A frame has at most
-    one of them. ``collect()`` left-joins algorithm outputs onto the attribute
-    table by id. NodeFrames derived from ``edges.nodes()`` carry neither.
+    A frame built from an attribute table (``from_arrow``/``from_polars`` with
+    ``id=``, or ``scan_nodes``) runs its steps over that table; ``collect()``
+    left-joins algorithm outputs onto it by id. A frame from ``edges.nodes()`` has
+    the edge frame's node set instead.
     """
 
-    __slots__ = ("_attr_cell", "_edges", "_id_col", "_scan", "_seeds_cell", "_source")
+    __slots__ = ()
 
     def __init__(self, data: Any, *, id: str) -> None:
         """Build a NodeFrame (attribute table) from in-memory data.
@@ -504,97 +361,24 @@ class NodeFrame(_Frame):
         indistinguishable downstream from a ``from_arrow(..., id=)`` frame."""
         from ._io import _node_attr_table, _to_arrow_table
 
-        table = _to_arrow_table(data)
-        source = _node_attr_table(table, id)
-        self._fill(
-            id_col=id,
-            plan=(_PlanStep("from_arrow", {"id": id}),),
-            source=source,
-            scan=None,
-            attr_cell=None,
-        )
-
-    def _fill(
-        self,
-        id_col: str,
-        plan: tuple[_PlanStep, ...],
-        source: Any | None,
-        scan: dict[str, Any] | None,
-        attr_cell: _BuildCell | None,
-        edges: EdgeFrame | None = None,
-    ) -> None:
-        """Assign every slot; shared by ``__init__`` and ``_construct`` so the
-        layout can never drift (see ``EdgeFrame._fill``)."""
-        self._plan = plan
-        self._has_index = False
-        self._id_col = id_col
-        self._source = source
-        self._scan = scan
-        # Holds a scan_nodes frame's native table cache (see _BuildCell); carried
-        # across derivations so a scan-backed node file is read from disk once.
-        self._attr_cell = attr_cell if attr_cell is not None else _BuildCell()
-        # This frame's ids as a seed set, once a derived frame had to run to get
-        # them (frames are immutable, so they don't change).
-        self._seeds_cell = _BuildCell()
-        # The edge frame `edges.nodes()` was called on: the steps before `nodes`
-        # are its steps, and read its source.
-        self._edges = edges
-
-    @classmethod
-    def _construct(
-        cls,
-        id_col: str,
-        plan: tuple[_PlanStep, ...] = (),
-        source: Any | None = None,
-        scan: dict[str, Any] | None = None,
-        attr_cell: _BuildCell | None = None,
-        edges: EdgeFrame | None = None,
-    ) -> NodeFrame:
-        """Internal factory building a frame from plumbing without the public
-        data-normalizing ``__init__`` (see ``EdgeFrame._construct``)."""
-        obj = cls.__new__(cls)
-        obj._fill(id_col, plan, source, scan, attr_cell, edges)
-        return obj
-
-    @property
-    def _attr_build_cell(self) -> _BuildCell:
-        """The shared cell memoizing this frame's scanned attribute batch."""
-        return self._attr_cell
+        table = _node_attr_table(_to_arrow_table(data), id)
+        self._node = _native().PlanNode.node_table(table, id)
 
     @property
     def id_col(self) -> str:
         """Original column name playing the id role."""
-        return self._id_col
+        return self._node.id_col
 
     @property
-    def _attr_table(self) -> Any | None:
-        """The in-memory Arrow attribute table, if this frame has one."""
-        return self._source
+    def _attr_build_cell(self) -> _CacheView:
+        """A ``scan_nodes`` frame's scanned-table cache (``.value``), shared with
+        its derivations."""
+        return _CacheView(self._node.node_cache)
 
     @property
-    def _scan_spec(self) -> dict[str, Any] | None:
-        """The file-source spec if this frame was built via ``scan_nodes``."""
-        return self._scan
-
-    def _extend(self, step: _PlanStep, *, drops_index: bool = False) -> NodeFrame:
-        # Derivations preserve the source/scan, so they share the attr memo too:
-        # a filter/sort applies to the query, not to the raw scanned file.
-        return NodeFrame._construct(
-            self._id_col,
-            (*self._plan, step),
-            source=self._source,
-            scan=self._scan,
-            attr_cell=self._attr_cell,
-            edges=self._edges,
-        )
-
-    # Composed pipelines (with_columns of graph algorithms + filter/sort/head)
-    # execute here, returning the materialized result. to_polars / to_arrow /
-    # to_dicts / sink_* are inherited from _Frame (they route through collect()).
-    def collect(self) -> MaterializedFrame:
-        from ._execute import collect
-
-        return collect(self)
+    def _seeds_cell(self) -> _CacheView:
+        """This frame's ids as a seed set (``.value``), once it had to run."""
+        return _CacheView(self._node.cached_seeds)
 
     def __repr__(self) -> str:
-        return f"<NodeFrame id={self._id_col!r} lazy; {len(self._plan)} step(s)>"
+        return f"<NodeFrame id={self.id_col!r} lazy; {self._node.n_steps} step(s)>"

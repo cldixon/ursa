@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, overload
 
-from ._frames import EdgeFrame, NodeFrame, _PlanStep
+from ._frames import EdgeFrame, NodeFrame, _native
 
 if TYPE_CHECKING:
     from ._result import MaterializedFrame
@@ -76,31 +76,8 @@ def scan_edges(
     """
     _reject_format_opts(format_opts)
     _validate_on_null(on_null)
-    step = _PlanStep(
-        "scan_edges",
-        {
-            "path": path,
-            "src": src,
-            "dst": dst,
-            "storage_options": storage_options,
-            "store": store,
-            "on_null": on_null,
-            "format_opts": format_opts,
-        },
-    )
-    return EdgeFrame._construct(
-        src_col=src,
-        dst_col=dst,
-        plan=(step,),
-        scan={
-            "path": path,
-            "src": src,
-            "dst": dst,
-            "storage_options": storage_options,
-            "store": store,
-            "on_null": on_null,
-        },
-    )
+    spec = {"storage_options": storage_options, "store": store}
+    return EdgeFrame._wrap(_native().PlanNode.scan_edges(path, src, dst, on_null, spec))
 
 
 def scan_nodes(
@@ -114,21 +91,8 @@ def scan_nodes(
     """Lazily scan a node/attribute table (local, object storage, or an
     ``http(s)://`` URL); ``id`` is the id-role mapping."""
     _reject_format_opts(format_opts)
-    step = _PlanStep(
-        "scan_nodes",
-        {
-            "path": path,
-            "id": id,
-            "storage_options": storage_options,
-            "store": store,
-            "format_opts": format_opts,
-        },
-    )
-    return NodeFrame._construct(
-        id_col=id,
-        plan=(step,),
-        scan={"path": path, "id": id, "storage_options": storage_options, "store": store},
-    )
+    spec = {"storage_options": storage_options, "store": store}
+    return NodeFrame._wrap(_native().PlanNode.scan_nodes(path, id, spec))
 
 
 def read_edges(path: str | list[str], **kwargs: Any) -> MaterializedFrame:
@@ -401,14 +365,11 @@ def _node_attr_table(tbl: Any, id: str) -> Any:
     return tbl.set_column(idx, id, pa.chunked_array(canonical, type=canonical[0].type))
 
 
-_ON_NULL_MODES = ("error", "drop")
-
-
 def _validate_on_null(on_null: str) -> None:
     """``on_null`` accepts only ``"error"`` (the safe default — a null endpoint
-    raises) or ``"drop"`` (rows with a null src/dst are filtered out)."""
-    if on_null not in _ON_NULL_MODES:
-        raise ValueError(f"on_null must be one of {_ON_NULL_MODES}; got {on_null!r}.")
+    raises) or ``"drop"`` (rows with a null src/dst are filtered out); the engine
+    holds the list."""
+    _native().check_on_null(on_null)
 
 
 def _warn_dropped_endpoints(n: int) -> None:

@@ -107,7 +107,7 @@ impl OutputColumn {
         self.base_value_type() == DataType::Float64
     }
 
-    fn value_type(&self) -> DataType {
+    pub fn value_type(&self) -> DataType {
         match self.dtype() {
             // `F32` is only ever set on a float-valued column (query.rs validates), so
             // narrowing the base `Float64` to `Float32` is always well-typed.

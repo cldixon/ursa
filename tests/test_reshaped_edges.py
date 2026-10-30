@@ -380,9 +380,10 @@ def test_interleaved_edge_frames_keep_the_written_column_order(scalar, host):
 def test_a_topology_that_cannot_be_cached_is_built_once_per_query(monkeypatch):
     # With no table identity (as for a remote scan) nothing is cached; the node
     # set and the column of `ur.degree(e.distinct())` still share one build.
-    from ursa._execute import _Host, _native
+    from ursa import _execute
+    from ursa._execute import _native
 
-    monkeypatch.setattr(_Host, "identity", lambda self, slot: None)
+    monkeypatch.setattr(_execute, "_table_token", lambda table: None)
     e = _edges()
     for _ in range(2):
         before = _native()._topology_build_count()
