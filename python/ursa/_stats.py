@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, overload
 
+from . import _ir
 from ._frames import EdgeFrame, NodeFrame, _native
 
 
@@ -64,7 +65,9 @@ def describe(
     rather than derive node-keyed frames from it).
     """
     _check_direction("describe", direction)
-    return NodeFrame._wrap(_native().PlanNode.describe(edges._node, bool(full), direction, nodes))
+    return NodeFrame._wrap(
+        _native().PlanNode.describe(_ir.edges_node(edges, "describe"), bool(full), direction, nodes)
+    )
 
 
 @overload
@@ -89,7 +92,7 @@ def density(edges: EdgeFrame, direction: str = "out", *, lazy: bool = False) -> 
     the kept edges over the parent's ``n``, the ``density`` ``describe`` reports.
     """
     _check_direction("density", direction)
-    frame = NodeFrame._wrap(_native().PlanNode.density(edges._node, direction))
+    frame = NodeFrame._wrap(_native().PlanNode.density(_ir.edges_node(edges, "density"), direction))
     return frame if lazy else float(_value(frame))
 
 
@@ -120,7 +123,11 @@ def avg_path_length(
     followed, and a sample picks its sources among the nodes at an end of a
     kept edge."""
     _check_direction("avg_path_length", direction)
-    frame = NodeFrame._wrap(_native().PlanNode.avg_path_length(edges._node, sample, direction))
+    frame = NodeFrame._wrap(
+        _native().PlanNode.avg_path_length(
+            _ir.edges_node(edges, "avg_path_length"), sample, direction
+        )
+    )
     return frame if lazy else float(_value(frame))
 
 
@@ -146,5 +153,7 @@ def diameter(
     followed, and the estimate picks its sources among the nodes at an end of a
     kept edge."""
     _check_direction("diameter", direction)
-    frame = NodeFrame._wrap(_native().PlanNode.diameter(edges._node, approximate, direction))
+    frame = NodeFrame._wrap(
+        _native().PlanNode.diameter(_ir.edges_node(edges, "diameter"), approximate, direction)
+    )
     return frame if lazy else int(_value(frame))

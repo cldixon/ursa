@@ -784,8 +784,9 @@ fn check_weight_columns<'a>(
         return Ok(());
     }
     Err(PlanError::ColumnNotFound(format!(
-        "weight expression references unknown edge column(s): {}",
-        py_list(missing.into_iter())
+        "weight expression references unknown edge column(s): {}; the edges have {}",
+        py_list(missing.into_iter()),
+        py_list(cols.names().iter())
     )))
 }
 

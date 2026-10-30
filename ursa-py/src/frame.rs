@@ -19,7 +19,7 @@ use std::sync::{Arc, PoisonError};
 use arrow::array::{make_array, ArrayData, ArrayRef, RecordBatch};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow_pyarrow::{FromPyArrow, ToPyArrow};
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
@@ -84,8 +84,31 @@ pub(crate) fn to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
     let name = obj.get_type().name()?.to_string();
     Err(PyTypeError::new_err(format!(
-        "Object of type {name} is not JSON serializable"
+        "cannot take a value of type '{name}'"
     )))
+}
+
+/// `obj` as JSON for the argument `label` (`pagerank(damping=)`): [`to_value`],
+/// with its errors naming the argument.
+/// Only [`to_value`]'s own `TypeError`/`ValueError` is reworded, with the original
+/// as its `__cause__`; any other exception (a `UnicodeEncodeError` from a string
+/// that has no UTF-8 form, say) is raised as it is.
+fn arg_value(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<Value> {
+    to_value(obj).map_err(|e| {
+        Python::attach(|py| {
+            let ty = e.get_type(py);
+            let msg = format!("{label} {}", e.value(py));
+            let new = if ty.is(py.get_type::<PyTypeError>()) {
+                PyTypeError::new_err(msg)
+            } else if ty.is(py.get_type::<PyValueError>()) {
+                PyValueError::new_err(msg)
+            } else {
+                return e;
+            };
+            new.set_cause(py, Some(e));
+            new
+        })
+    })
 }
 
 fn int_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
@@ -102,17 +125,45 @@ fn int_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 fn float_value(f: f64) -> PyResult<Value> {
     serde_json::Number::from_f64(f)
         .map(Value::Number)
-        .ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "invalid plan: a plan argument is {f}, which has no JSON form"
-            ))
-        })
+        .ok_or_else(|| PyValueError::new_err(format!("must be a finite number; got {f}")))
 }
 
-/// A Python value as a typed IR value (`serde` on its JSON).
-fn ir<T: serde::de::DeserializeOwned>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
-    serde_json::from_value(to_value(obj)?)
-        .map_err(|e| PyValueError::new_err(format!("invalid plan: {e}")))
+/// A Python value as a typed IR value (`serde` on its JSON), for the argument
+/// `label`, which its errors name.
+fn ir<T: serde::de::DeserializeOwned>(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<T> {
+    serde_json::from_value(arg_value(obj, label)?).map_err(|e| serde_err(label, e))
+}
+
+/// The `ValueError` for an argument `label` the plan could not read, in Ursa's
+/// words, with serde's text as its `__cause__`.
+fn serde_err(label: &str, e: impl std::fmt::Display) -> PyErr {
+    let raw = e.to_string();
+    let err = PyValueError::new_err(ursa_plan::message::serde_message(label, &raw));
+    Python::attach(|py| err.set_cause(py, Some(PyRuntimeError::new_err(raw))));
+    err
+}
+
+/// A `with_columns` expression's JSON: a graph verb's parameters each labelled
+/// `{verb}({param}=)` for its errors, any other expression `with_columns()`.
+fn column_value(expr: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if let Ok(d) = expr.cast::<PyDict>() {
+        let verb = d.get_item("verb")?.and_then(|v| v.extract::<String>().ok());
+        if let Some(verb) = verb {
+            let call = if verb == "neighbors_agg" {
+                "neighbors().agg".to_string()
+            } else {
+                verb
+            };
+            let mut m = serde_json::Map::new();
+            for (k, v) in d.iter() {
+                let k: String = k.extract()?;
+                let value = arg_value(&v, &format!("{call}({k}=)"))?;
+                m.insert(k, value);
+            }
+            return Ok(Value::Object(m));
+        }
+    }
+    arg_value(expr, "with_columns()")
 }
 
 fn handle(obj: &Bound<'_, PyAny>) -> HostHandle {
@@ -129,10 +180,47 @@ fn error_handle(error: Option<&Bound<'_, PyAny>>) -> Option<HostHandle> {
     error.filter(|e| !e.is_none()).map(handle)
 }
 
-/// A string argument of the plan, with the plan parser's error for a value of
-/// another type.
-fn string_arg(obj: &Bound<'_, PyAny>) -> PyResult<String> {
-    ir::<String>(obj)
+/// A string argument of the plan (`label`, as `hop(direction=)`), with a
+/// `ValueError` naming it for a value of another type.
+fn string_arg(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<String> {
+    ir::<String>(obj, label)
+}
+
+/// An argument (`label`, as `diameter(approximate=)`) as `T`, with a `TypeError`
+/// naming it and what it takes (`want`) for a value of another type, chained to
+/// the conversion's own error.
+fn typed_arg<'a, 'py, T>(obj: &'a Bound<'py, PyAny>, label: &str, want: &str) -> PyResult<T>
+where
+    T: FromPyObject<'a, 'py>,
+    T::Error: Into<PyErr>,
+{
+    obj.extract::<T>().map_err(|e| {
+        let ty = obj
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let shown = obj.repr().map(|r| r.to_string()).unwrap_or_default();
+        let err = PyTypeError::new_err(format!("{label} must be {want}; got {shown} ({ty})"));
+        err.set_cause(obj.py(), Some(e.into()));
+        err
+    })
+}
+
+/// A column name argument (`label`, as `scan_edges(src=)`): a `TypeError` naming
+/// it for a value that is no string.
+fn name_arg(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<String> {
+    obj.extract::<String>().map_err(|_| {
+        let ty = obj
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let shown = obj.repr().map(|r| r.to_string()).unwrap_or_default();
+        PyTypeError::new_err(format!(
+            "{label} must be a column name (a str); got {shown} ({ty})"
+        ))
+    })
 }
 
 // --- the host --------------------------------------------------------------------
@@ -197,12 +285,14 @@ impl Host for PyHost {
                 ));
             }
             let opts = spec.get_item("storage_options")?;
-            // With the message a native scan's own argument conversion gave.
             opts.extract::<Option<HashMap<String, String>>>()
                 .map(Option::unwrap_or_default)
-                .map_err(|e| {
-                    let value = e.value(py).to_string();
-                    PyTypeError::new_err(format!("argument 'storage_options': {value}"))
+                .map_err(|_| {
+                    let shown = opts.repr().map(|r| r.to_string()).unwrap_or_default();
+                    PyTypeError::new_err(format!(
+                        "storage_options= must be a dict of option names to string values; \
+                         got {shown}"
+                    ))
                 })
         })
     }
@@ -259,8 +349,8 @@ fn stat_node(
     wrap(Node::graph(
         Op::Stat {
             edges: edges.0.clone(),
+            direction: string_arg(direction, &format!("{}(direction=)", stat.name()))?,
             stat,
-            direction: string_arg(direction)?,
         },
         &PyHost,
     ))
@@ -297,9 +387,11 @@ impl PlanNode {
     fn edge_table(
         table: &Bound<'_, PyAny>,
         endpoints: &Bound<'_, PyAny>,
-        src: &str,
-        dst: &str,
+        src: &Bound<'_, PyAny>,
+        dst: &Bound<'_, PyAny>,
     ) -> PyResult<PlanNode> {
+        let src = &name_arg(src, "src=")?;
+        let dst = &name_arg(dst, "dst=")?;
         let schema: SchemaRef = Arc::new(Schema::from_pyarrow_bound(&table.getattr("schema")?)?);
         wrap(Node::edge_table(
             handle(table),
@@ -313,7 +405,8 @@ impl PlanNode {
 
     /// An in-memory node (attribute) frame.
     #[staticmethod]
-    fn node_table(table: &Bound<'_, PyAny>, id: &str) -> PyResult<PlanNode> {
+    fn node_table(table: &Bound<'_, PyAny>, id: &Bound<'_, PyAny>) -> PyResult<PlanNode> {
+        let id = &name_arg(id, "id=")?;
         let schema: SchemaRef = Arc::new(Schema::from_pyarrow_bound(&table.getattr("schema")?)?);
         wrap(Node::node_table(handle(table), schema, id, &PyHost))
     }
@@ -322,15 +415,17 @@ impl PlanNode {
     #[staticmethod]
     fn scan_edges(
         path: &Bound<'_, PyAny>,
-        src: &str,
-        dst: &str,
+        src: &Bound<'_, PyAny>,
+        dst: &Bound<'_, PyAny>,
         on_null: &str,
         spec: &Bound<'_, PyAny>,
     ) -> PyResult<PlanNode> {
+        let src = name_arg(src, "scan_edges(src=)")?;
+        let dst = name_arg(dst, "scan_edges(dst=)")?;
         wrap(Node::scan_edges(
             scan_path(path),
-            src,
-            dst,
+            &src,
+            &dst,
             on_null,
             handle(spec),
             &PyHost,
@@ -341,10 +436,16 @@ impl PlanNode {
     #[staticmethod]
     fn scan_nodes(
         path: &Bound<'_, PyAny>,
-        id: &str,
+        id: &Bound<'_, PyAny>,
         spec: &Bound<'_, PyAny>,
     ) -> PyResult<PlanNode> {
-        wrap(Node::scan_nodes(scan_path(path), id, handle(spec), &PyHost))
+        let id = name_arg(id, "scan_nodes(id=)")?;
+        wrap(Node::scan_nodes(
+            scan_path(path),
+            &id,
+            handle(spec),
+            &PyHost,
+        ))
     }
 
     #[pyo3(signature = (predicate, error=None))]
@@ -356,8 +457,8 @@ impl PlanNode {
         let p = if error.is_some_and(|e| !e.is_none()) {
             Expr::default()
         } else {
-            let v = to_value(predicate)?;
-            Expr::from_value(v).map_err(|e| PyValueError::new_err(format!("invalid plan: {e}")))?
+            let v = arg_value(predicate, "filter()")?;
+            Expr::from_value(v).map_err(|e| serde_err("filter()", e))?
         };
         self.step(Step::Filter(p), error)
     }
@@ -371,7 +472,7 @@ impl PlanNode {
         let items: Vec<SelectItem> = if error.is_some_and(|e| !e.is_none()) {
             vec![]
         } else {
-            ir(items)?
+            ir(items, "a select() item")?
         };
         self.step(Step::Select(items), error)
     }
@@ -384,10 +485,8 @@ impl PlanNode {
     ) -> PyResult<PlanNode> {
         let mut out = Vec::with_capacity(columns.len());
         for (name, expr, edges) in columns {
-            let v = to_value(&expr)?;
-            let expr = match Expr::from_value(v)
-                .map_err(|e| PyValueError::new_err(format!("invalid plan: {e}")))?
-            {
+            let v = column_value(&expr)?;
+            let expr = match Expr::from_value(v).map_err(|e| serde_err("with_columns()", e))? {
                 Expr::Graph(verb) => ColumnExpr::Graph {
                     verb,
                     edges: edges.map(|e| e.0.clone()),
@@ -408,7 +507,7 @@ impl PlanNode {
         let mapping: Vec<(String, String)> = if error.is_some_and(|e| !e.is_none()) {
             vec![]
         } else {
-            ir(mapping)?
+            ir(mapping, "a rename() column name")?
         };
         self.step(Step::Rename(mapping), error)
     }
@@ -418,7 +517,7 @@ impl PlanNode {
         let by: Vec<SortKey> = if error.is_some_and(|e| !e.is_none()) {
             vec![]
         } else {
-            ir(by)?
+            ir(by, "a sort() key")?
         };
         self.step(Step::Sort(by), error)
     }
@@ -428,7 +527,7 @@ impl PlanNode {
         let n = if error.is_some_and(|e| !e.is_none()) {
             IntArg::default()
         } else {
-            IntArg(to_value(n)?)
+            IntArg(arg_value(n, "head(n=)")?)
         };
         self.step(Step::Head(n), error)
     }
@@ -447,7 +546,10 @@ impl PlanNode {
         let (n, seed) = if invalid {
             (IntArg::default(), None)
         } else {
-            (IntArg(to_value(n)?), Some(IntArg(to_value(seed)?)))
+            (
+                IntArg(arg_value(n, "sample(n=)")?),
+                Some(IntArg(arg_value(seed, "sample(seed=)")?)),
+            )
         };
         self.step(
             Step::Sample {
@@ -474,9 +576,9 @@ impl PlanNode {
         let on: Vec<String> = if error.is_some_and(|e| !e.is_none()) {
             vec![]
         } else {
-            ir(on)?
+            ir(on, "join(on=)")?
         };
-        let how = string_arg(how)?;
+        let how = string_arg(how, "join(how=)")?;
         self.step(
             Step::Join {
                 right: right.0.clone(),
@@ -498,7 +600,7 @@ impl PlanNode {
         let (keys, aggs): (Vec<String>, Vec<AggSpec>) = if invalid {
             (vec![], vec![])
         } else {
-            (ir(keys)?, ir(aggs)?)
+            (ir(keys, "group_by()")?, ir(aggs, "agg()")?)
         };
         self.step(Step::GroupByAgg { keys, aggs }, error)
     }
@@ -521,8 +623,8 @@ impl PlanNode {
         wrap(Node::graph(
             Op::Hop {
                 edges: edges.0.clone(),
-                n: IntArg(to_value(n)?),
-                direction: string_arg(direction)?,
+                n: IntArg(arg_value(n, "hop(n=)")?),
+                direction: string_arg(direction, "hop(direction=)")?,
                 seeds: seeds_of(seeds),
             },
             &PyHost,
@@ -540,7 +642,7 @@ impl PlanNode {
         let weight = if weight.is_none() {
             None
         } else {
-            Some(to_value(weight)?)
+            Some(arg_value(weight, "shortest_path(weight=)")?)
         };
         wrap(Node::graph(
             Op::ShortestPath {
@@ -548,7 +650,7 @@ impl PlanNode {
                 source: Seeds::Value(handle(source)),
                 target: Seeds::Value(handle(target)),
                 weight,
-                direction: string_arg(direction)?,
+                direction: string_arg(direction, "shortest_path(direction=)")?,
             },
             &PyHost,
         ))
@@ -566,9 +668,9 @@ impl PlanNode {
             Op::RandomWalk {
                 edges: edges.0.clone(),
                 start: seeds_of(start),
-                steps: IntArg(to_value(steps)?),
-                walks_per_node: IntArg(to_value(walks_per_node)?),
-                seed: Some(IntArg(to_value(seed)?)),
+                steps: IntArg(arg_value(steps, "random_walk(steps=)")?),
+                walks_per_node: IntArg(arg_value(walks_per_node, "random_walk(walks_per_node=)")?),
+                seed: Some(IntArg(arg_value(seed, "random_walk(seed=)")?)),
             },
             &PyHost,
         ))
@@ -588,7 +690,7 @@ impl PlanNode {
             Op::Describe {
                 edges: edges.0.clone(),
                 full,
-                direction: string_arg(direction)?,
+                direction: string_arg(direction, "describe(direction=)")?,
                 touched,
             },
             &PyHost,
@@ -606,9 +708,10 @@ impl PlanNode {
     #[pyo3(signature = (edges, sample, direction))]
     fn avg_path_length(
         edges: PyRef<'_, PlanNode>,
-        sample: Option<f64>,
+        sample: &Bound<'_, PyAny>,
         direction: &Bound<'_, PyAny>,
     ) -> PyResult<PlanNode> {
+        let sample = typed_arg(sample, "avg_path_length(sample=)", "a number or None")?;
         stat_node(edges, GraphStat::AvgPathLength { sample }, direction)
     }
 
@@ -616,9 +719,10 @@ impl PlanNode {
     #[staticmethod]
     fn diameter(
         edges: PyRef<'_, PlanNode>,
-        approximate: bool,
+        approximate: &Bound<'_, PyAny>,
         direction: &Bound<'_, PyAny>,
     ) -> PyResult<PlanNode> {
+        let approximate = typed_arg(approximate, "diameter(approximate=)", "a bool")?;
         stat_node(edges, GraphStat::Diameter { approximate }, direction)
     }
 

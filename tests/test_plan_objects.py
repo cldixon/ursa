@@ -251,7 +251,7 @@ def _bad_steps():
         (lambda: n.join(n, on="nope"), ur.ColumnNotFoundError, "not in the left frame"),
         (lambda: n.join(n, on="id"), ValueError, "duplicate column"),
         (lambda: n.join(n, on="id", how="cross"), NotImplementedError, "how='cross'"),
-        (lambda: n.filter(col("label") > 1), ur.ComputeError, "no kernel matching"),
+        (lambda: n.filter(col("label") > 1), ur.ComputeError, "cannot compare string with int64"),
         (lambda: n.filter(col("v")), NotImplementedError, "boolean predicate"),
         (lambda: n.filter(ur.src() == 1), NotImplementedError, "not available"),
         (lambda: hop.filter(ur.id() == 1), NotImplementedError, "not available"),
@@ -284,7 +284,7 @@ def _bad_steps():
         (
             lambda: ur.random_walk(e, start=[0], steps=2).with_columns(x=col("step")),
             NotImplementedError,
-            "after a random_walk",
+            "after random_walk\\(\\) is not supported yet",
         ),
     ]
 
@@ -311,7 +311,7 @@ def test_build_time_errors_are_the_ones_collect_raised():
 def test_what_only_the_rows_can_tell_still_raises_at_collect(tmp_path):
     n = _nodes()
     zero = n.with_columns(q=col("v") / (col("v") - col("v")))  # integer divide by zero
-    with pytest.raises(ur.ComputeError, match="Divide by zero"):
+    with pytest.raises(ur.ComputeError, match="division by zero in an integer expression"):
         zero.collect()
     nulls = ur.from_arrow(pa.table({"s": [0, None], "d": [1, 2]}), src="s", dst="d")
     degree = ur.degree(nulls)._frame()  # builds: the null is in the rows

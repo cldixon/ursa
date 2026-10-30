@@ -51,8 +51,7 @@ class GraphExpr(Expr, NodeFrame):
         return self._frame()._node
 
     def _frame(self) -> NodeFrame:
-        edges = self.payload["edges"]
-        return edges.nodes().with_columns(**{self.payload["verb"]: self})
+        return _verb_edges(self).nodes().with_columns(**{self.payload["verb"]: self})
 
     def _as_frame(self) -> NodeFrame:
         return NodeFrame._wrap(self._node)
@@ -88,6 +87,18 @@ class GraphExpr(Expr, NodeFrame):
 
     def join(self, other: _Frame, *, on: Any = None, how: str = "inner") -> NodeFrame:
         return self._as_frame().join(other, on=on, how=how)
+
+
+def _verb_edges(e: GraphExpr) -> Any:
+    """The edge frame a standalone graph verb runs over; for a value with no
+    ``nodes()``, the ``AttributeError`` calling it gave, naming the verb."""
+    edges = e.payload["edges"]
+    if not hasattr(edges, "nodes"):
+        raise AttributeError(
+            f"{e.payload['verb']}() takes an EdgeFrame (the graph) as its edges; "
+            f"got {type(edges).__name__}"
+        )
+    return edges
 
 
 def _graph_expr(verb: str, **params: Any) -> GraphExpr:
@@ -137,8 +148,7 @@ class LayoutExpr(GraphExpr):
         return self._axis(1)
 
     def _frame(self) -> NodeFrame:
-        edges = self.payload["edges"]
-        return edges.nodes().with_columns(x=self.x, y=self.y)
+        return _verb_edges(self).nodes().with_columns(x=self.x, y=self.y)
 
 
 def _layout_expr(verb: str, **params: Any) -> LayoutExpr:
@@ -204,7 +214,10 @@ class _Hop:
         # references ``src``/``dst``. (The parent's role names aren't carried
         # through a traversal.)
         node = _native().PlanNode.hop(
-            self._edges._node, _ir.int_arg(self._n), self._direction, _seeds(self._seeds)
+            _ir.edges_node(self._edges, "hop"),
+            _ir.int_arg(self._n),
+            self._direction,
+            _seeds(self._seeds),
         )
         return EdgeFrame._wrap(node)
 
@@ -237,7 +250,11 @@ def shortest_path(
     # Result columns are literal ``src``/``dst`` (one row per edge on the path);
     # source/target resolve like hop seeds, as 1-element id sets.
     node = _native().PlanNode.shortest_path(
-        edges._node, [source], [target], _ir.optional_expr(weight), direction
+        _ir.edges_node(edges, "shortest_path"),
+        [source],
+        [target],
+        _ir.optional_expr(weight, "shortest_path(weight=)"),
+        direction,
     )
     return EdgeFrame._wrap(node)
 
@@ -252,7 +269,7 @@ def random_walk(
     """Random walks; a frame of ``(walk_id, step, node)`` — feeds node2vec-style
     embedding pipelines directly."""
     node = _native().PlanNode.random_walk(
-        edges._node,
+        _ir.edges_node(edges, "random_walk"),
         _seeds(start),
         _ir.int_arg(steps),
         _ir.int_arg(walks_per_node),

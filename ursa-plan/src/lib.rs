@@ -33,6 +33,7 @@ pub mod infer;
 pub mod lazy;
 pub mod logical;
 pub mod lower;
+pub mod message;
 pub mod node;
 mod parquet_stats;
 mod partition;

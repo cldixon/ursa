@@ -87,9 +87,9 @@ def test_plain_sample_takes_any_seed_the_host_accepts(seed):
 @pytest.mark.parametrize(
     ("seed", "error", "match"),
     [
-        (-1, OverflowError, "can't convert negative int to unsigned"),
-        ("abc", TypeError, "'str' object cannot be interpreted as an integer"),
-        (2**70, OverflowError, "int too big to convert"),
+        (-1, OverflowError, "random_walk(seed=) must be a non-negative integer; got -1"),
+        ("abc", TypeError, "random_walk(seed=) must be an integer; got a str"),
+        (2**70, OverflowError, "random_walk(seed=) is too large; it must be below 2**64"),
     ],
 )
 def test_engine_sample_takes_any_seed_like_a_plain_frame(seed, error, match):
@@ -103,11 +103,13 @@ def test_engine_sample_takes_any_seed_like_a_plain_frame(seed, error, match):
     assert got == plain.sample(2, seed=seed).collect().to_dicts()
 
 
-def test_integer_argument_errors_are_unchanged():
+def test_integer_argument_errors_name_the_argument():
     e = _edges()
-    with pytest.raises(OverflowError, match="out of range integral type conversion"):
+    with pytest.raises(OverflowError, match=r"^hop\(n=\) must be a non-negative integer; got -1$"):
         ur.hop(e, -1).from_([0]).collect()
-    with pytest.raises(OverflowError, match="can't convert negative int to unsigned"):
+    with pytest.raises(
+        OverflowError, match=r"^random_walk\(seed=\) must be a non-negative integer; got -1$"
+    ):
         ur.random_walk(e, start=[0], steps=2, seed=-1).collect()
     # A negative head keeps no rows, on every path (#191).
     assert ur.degree(e).head(-1).collect().to_arrow().num_rows == 0
@@ -116,9 +118,11 @@ def test_integer_argument_errors_are_unchanged():
 
 def test_graph_parameter_errors_are_engine_errors():
     e = _edges()
-    with pytest.raises(ur.ComputeError, match="invalid columns spec: invalid value: integer `-1`"):
+    with pytest.raises(
+        ur.ComputeError, match=r"^louvain\(seed=\) must be a non-negative integer; got -1$"
+    ):
         ur.louvain(e, seed=-1).collect()
-    with pytest.raises(ur.ComputeError, match='invalid columns spec: invalid type: string "x"'):
+    with pytest.raises(ur.ComputeError, match=r"^pagerank\(damping=\) must be a number; got 'x'$"):
         ur.pagerank(e, damping="x").collect()  # ty: ignore[invalid-argument-type]
 
 
@@ -129,7 +133,9 @@ def test_connected_components_mode_none_is_rejected():
 
 def test_shape_guards_win_over_argument_errors():
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    with pytest.raises(NotImplementedError, match=r"'with_columns' step after describe\(\)"):
+    with pytest.raises(
+        NotImplementedError, match=r"^with_columns\(\) after describe\(\) is not supported yet"
+    ):
         ur.describe(e).with_columns(d=ur.degree(e)).sort([]).collect()
     with pytest.raises(NotImplementedError, match="join how='cross' is not supported"):
         n.join(n, how="cross").collect()

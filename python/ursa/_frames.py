@@ -78,7 +78,7 @@ class _Frame:
         # rebuilding. (distinct/sample/join/group_by start a fresh index: a graph op
         # over them builds one from their rows, cached by the engine under a
         # fingerprint of the edge plan, #191.)
-        return self._derive(self._node.filter(*_ir.capture(_ir.expr, predicate)))
+        return self._derive(self._node.filter(*_ir.capture(_ir.expr, predicate, "filter()")))
 
     def select(self, *columns: Any) -> Self:
         return self._derive(self._node.select(*_ir.capture(_ir.select_items, columns)))
@@ -121,7 +121,7 @@ class _Frame:
         own output order, and for a ``join`` the left rows in order, each followed
         by its matches in right-frame order.
         """
-        return self._derive(self._node.head(*_ir.capture(int, n)))
+        return self._derive(self._node.head(*_ir.capture(_ir.count, n, "head(n=)")))
 
     limit = head
 
@@ -129,7 +129,7 @@ class _Frame:
         """Keep ``n`` random rows, reproducibly for a ``seed``, in input order."""
         # sample changes the row set, so the frame starts a fresh topology index
         # (like distinct): a later graph op builds one from the sample.
-        count, error = _ir.capture(int, n)
+        count, error = _ir.capture(_ir.count, n, "sample(n=)")
         return self._derive(self._node.sample(count, _ir.int_arg(seed), (count, seed), error))
 
     def distinct(self) -> Self:
@@ -221,6 +221,23 @@ class _Frame:
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} lazy; {self._node.n_steps} step(s)>"
+
+    # A frame is a plan over live inputs (in-memory tables, files, caches), so it
+    # neither pickles nor deep-copies; a shallow copy shares the plan.
+    def __copy__(self) -> Self:
+        return self._derive(self._node)
+
+    def __deepcopy__(self, memo: Any) -> Any:
+        raise TypeError(self._no_pickle())
+
+    def __reduce__(self) -> Any:
+        raise TypeError(self._no_pickle())
+
+    def _no_pickle(self) -> str:
+        return (
+            f"{self.__class__.__name__} objects cannot be pickled or deep-copied: a frame is a "
+            "lazy plan over live data. Pickle its result instead (frame.to_arrow())."
+        )
 
 
 _F = TypeVar("_F", bound=_Frame)

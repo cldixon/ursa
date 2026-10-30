@@ -27,7 +27,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_pyarrow::FromPyArrow;
 use pyo3::create_exception;
 use pyo3::exceptions::{
-    PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
+    PyException, PyNotImplementedError, PyOverflowError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 
@@ -102,24 +102,52 @@ create_exception!(
      operation, or a kernel/engine error."
 );
 
-/// Map an engine error (a `DataFusionError`, or any other `Display` error the
-/// plan layer surfaces) to a typed, catchable exception in the Ursa hierarchy. A
-/// missing-column error becomes [`ColumnNotFoundError`]; everything else becomes
-/// [`ComputeError`]. Both subclass `UrsaError`. The classification is by rendered
-/// message rather than by matching internal `DataFusionError`/`SchemaError`
-/// variants, so it stays stable across engine version bumps (and lets this layer
-/// avoid a direct `datafusion` dependency).
+/// Map an engine error (any `Display` error the plan layer surfaces, such as a
+/// stat's) to a typed, catchable exception in the Ursa hierarchy, in Ursa's words
+/// with the original text as its `__cause__`. A missing-column error becomes
+/// [`ColumnNotFoundError`]; everything else becomes [`ComputeError`]. Both
+/// subclass `UrsaError`. A `DataFusionError` goes through [`engine_err`], which
+/// reads its structure instead.
 fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
-    let msg = e.to_string();
-    let lower = msg.to_lowercase();
-    if lower.contains("no field named")
-        || (lower.contains("column") && lower.contains("not found"))
-        || lower.contains("schema error")
-    {
-        ColumnNotFoundError::new_err(msg)
+    let raw = e.to_string();
+    let class = if ursa_plan::message::says_column_not_found(&raw) {
+        column_not_found
     } else {
-        ComputeError::new_err(msg)
-    }
+        compute
+    };
+    with_cause(class(ursa_plan::message::reword(&raw)), raw)
+}
+
+fn column_not_found(m: String) -> PyErr {
+    ColumnNotFoundError::new_err(m)
+}
+
+fn compute(m: String) -> PyErr {
+    ComputeError::new_err(m)
+}
+
+/// `err`, with the engine's own text `raw` as its `__cause__` (a `RuntimeError`)
+/// when its message was reworded from it.
+fn with_cause(err: PyErr, raw: String) -> PyErr {
+    Python::attach(|py| {
+        if err.value(py).to_string() != raw {
+            err.set_cause(py, Some(PyRuntimeError::new_err(raw)));
+        }
+    });
+    err
+}
+
+/// A DataFusion error as the Ursa exception [`to_pyerr`] gives, in Ursa's words
+/// ([`ursa_plan::message`]), classified by its structure
+/// ([`ursa_plan::message::is_column_not_found`]), with DataFusion's own text as
+/// its `__cause__`.
+fn engine_err(e: &ursa_plan::message::DataFusionError) -> PyErr {
+    let class = if ursa_plan::message::is_column_not_found(e) {
+        column_not_found
+    } else {
+        compute
+    };
+    with_cause(class(ursa_plan::message::engine_message(e)), e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +272,7 @@ pub(crate) fn plan_err(e: PlanError) -> PyErr {
             err
         }),
         e @ PlanError::Invalid(_) => PyValueError::new_err(e.to_string()),
-        PlanError::Engine(e) => to_pyerr(e),
+        PlanError::Engine(e) => engine_err(&e),
         PlanError::Host(e) => match e.payload.downcast::<PyErr>() {
             Ok(err) => *err,
             Err(_) => ComputeError::new_err(e.message),

@@ -30,24 +30,24 @@ impl GraphVerb {
     /// The direction of a kernel that takes `'out'` or `'both'` only (`pagerank`,
     /// `betweenness`). `'in'` is a hard error rather than a silent `'out'`.
     fn out_or_both(&self) -> Result<Direction> {
-        match parse_direction(&self.direction()?)? {
+        match parse_direction(self.call_name(), &self.direction()?)? {
             Direction::In => Err(DataFusionError::NotImplemented(format!(
-                "{} does not support direction='in'; use 'out' or 'both'",
-                self.verb
+                "{}(direction='in') is not supported; use one of 'out', 'both'",
+                self.call_name()
             ))),
             d => Ok(d),
         }
     }
 
     fn to_algo(&self) -> Result<GraphAlgo> {
-        let p = Self::param::<f64>;
-        let n = Self::param::<u32>;
-        let seed = Self::param::<u64>(&self.seed)?;
+        let p = |name: &str, v: &Option<serde_json::Value>| self.param::<f64>(name, v);
+        let n = |name: &str, v: &Option<serde_json::Value>| self.param::<u32>(name, v);
+        let seed = self.param::<u64>("seed", &self.seed)?;
         Ok(match self.verb.as_str() {
             "pagerank" => GraphAlgo::PageRank {
-                damping: p(&self.damping)?.unwrap_or(0.85),
-                max_iter: n(&self.max_iter)?.unwrap_or(30),
-                tol: p(&self.tol)?.unwrap_or(1e-6),
+                damping: p("damping", &self.damping)?.unwrap_or(0.85),
+                max_iter: n("max_iter", &self.max_iter)?.unwrap_or(30),
+                tol: p("tol", &self.tol)?.unwrap_or(1e-6),
                 direction: self.out_or_both()?,
             },
             "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
@@ -56,13 +56,13 @@ impl GraphVerb {
                     "layout_random" => LayoutKind::Random,
                     _ => LayoutKind::Circle,
                 },
-                iterations: n(&self.iterations)?.unwrap_or(300),
-                k: p(&self.k)?.unwrap_or(1.0),
-                gravity: p(&self.gravity)?.unwrap_or(0.02),
+                iterations: n("iterations", &self.iterations)?.unwrap_or(300),
+                k: p("k", &self.k)?.unwrap_or(1.0),
+                gravity: p("gravity", &self.gravity)?.unwrap_or(0.02),
                 seed,
             },
             "degree" => GraphAlgo::Degree {
-                direction: parse_direction(&self.direction()?)?,
+                direction: parse_direction(self.call_name(), &self.direction()?)?,
             },
             "connected_components" => GraphAlgo::ConnectedComponents {
                 strong: parse_cc_strong(self.mode.as_ref().map(|m| m.as_str().unwrap_or("")))?,
@@ -70,19 +70,19 @@ impl GraphVerb {
             "triangle_count" => GraphAlgo::TriangleCount,
             "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
             "closeness" => GraphAlgo::Closeness {
-                direction: parse_direction(&self.direction()?)?,
+                direction: parse_direction(self.call_name(), &self.direction()?)?,
             },
             "betweenness" => GraphAlgo::Betweenness {
-                sample: p(&self.sample)?,
+                sample: p("sample", &self.sample)?,
                 seed,
                 direction: self.out_or_both()?,
             },
             "label_propagation" => GraphAlgo::LabelPropagation {
-                max_iter: n(&self.max_iter)?.unwrap_or(20),
+                max_iter: n("max_iter", &self.max_iter)?.unwrap_or(20),
                 seed,
             },
             "louvain" => GraphAlgo::Louvain {
-                resolution: p(&self.resolution)?.unwrap_or(1.0),
+                resolution: p("resolution", &self.resolution)?.unwrap_or(1.0),
                 seed,
             },
             other => {
@@ -120,13 +120,15 @@ fn parse_output_dtype(dtype: Option<&str>) -> Result<OutputDtype> {
     }
 }
 
-pub(crate) fn parse_direction(d: &str) -> Result<Direction> {
+/// The `direction=` of the call `call` (`degree`, `hop`, ...).
+pub(crate) fn parse_direction(call: &str, d: &str) -> Result<Direction> {
     match d {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
         "both" => Ok(Direction::Both),
         other => Err(DataFusionError::NotImplemented(format!(
-            "direction must be 'out', 'in', or 'both'; got {other:?}"
+            "{call}(direction={}) is not supported; use one of 'out', 'in', 'both'",
+            crate::expr::py_repr(&serde_json::Value::String(other.into()))
         ))),
     }
 }
@@ -170,7 +172,7 @@ fn dense_attr_column(
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
     let attr_idx = schema.index_of(attr_col).map_err(|_| {
         DataFusionError::Execution(format!(
-            "neighbors().agg(): column {attr_col:?} not found in the node attribute table"
+            "neighbors().agg(): column '{attr_col}' not found in the node attribute table"
         ))
     })?;
 
@@ -190,7 +192,7 @@ fn dense_attr_column(
     if is_string && !matches!(agg, AggKind::NUnique | AggKind::Count) {
         return Err(DataFusionError::NotImplemented(format!(
             "neighbors().agg() with mean/sum/min/max needs a numeric attribute column; \
-             {attr_col:?} is a string column (only n_unique/count accept strings)"
+             '{attr_col}' is a string column (only n_unique/count accept strings)"
         )));
     }
 
@@ -230,8 +232,9 @@ fn dense_attr_column(
         } else {
             let attr_arr = cast(batch.column(attr_idx), &DataType::Float64).map_err(|_| {
                 DataFusionError::NotImplemented(format!(
-                    "neighbors().agg() supports numeric or string attribute columns in v0.1; \
-                     {attr_col:?} ({attr_dtype:?}) is neither"
+                    "neighbors().agg() aggregates a numeric or string attribute column; \
+                     '{attr_col}' is {}",
+                    crate::compare::pa_name(attr_dtype)
                 ))
             })?;
             let attr_arr = attr_arr.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -328,7 +331,7 @@ pub fn node_columns(
             let attr_col = spec.agg_column().ok_or_else(|| {
                 DataFusionError::Execution("neighbors().agg() is missing its column".into())
             })?;
-            let direction = parse_direction(&spec.direction()?)?;
+            let direction = parse_direction(spec.call_name(), &spec.direction()?)?;
             let agg = parse_agg(spec.agg_fn().unwrap_or("mean"))?;
             let attr = dense_attr_column(nodes_ref, nodes_id_name, attr_col, ids, agg)?;
             columns.push(OutputColumn::NeighborAgg {
@@ -386,7 +389,7 @@ pub fn node_columns(
                     Some(w)
                 }
             };
-            let field = GraphVerb::param::<usize>(&spec.field)?.unwrap_or(0);
+            let field = spec.param::<usize>("field", &spec.field)?.unwrap_or(0);
             // Only layout produces a second output; a field selector on anything
             // else is a caller mistake worth naming rather than silently ignoring.
             if field > 0 && !matches!(algo, GraphAlgo::Layout { .. }) {
@@ -465,8 +468,20 @@ pub fn attach_columns(
     // An id column the gather does not read: the hash LEFT join, which coerces
     // the key types, numbered for its order.
     let ord = crate::lower::fresh_name(&batches[0].schema());
-    let joined = attach_by_join(ctx, batches, id_col, graph, &ord)?;
-    crate::lower::Frame::from_numbered(ctx.clone(), joined, ord).collect()
+    let ids = |e: DataFusionError| {
+        if crate::message::mismatched_types(&e) {
+            e.context(
+                "with_columns(): the frame's id column and the graph's node ids have different \
+                 types ({}); build the frame with ids of the graph's id type",
+            )
+        } else {
+            e
+        }
+    };
+    let joined = attach_by_join(ctx, batches, id_col, graph, &ord).map_err(ids)?;
+    crate::lower::Frame::from_numbered(ctx.clone(), joined, ord)
+        .collect()
+        .map_err(ids)
 }
 
 /// The graph columns as one `(id, values...)` batch in dense order, computed on
@@ -503,7 +518,7 @@ pub fn hop_leaf(
     n: u32,
     direction: &str,
 ) -> Result<DataFrame> {
-    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+    let direction: ursa_core::Direction = parse_direction("hop", direction)?.into();
     // Resolve user-id seeds to dense indices; drop unknowns/nulls (kernel-consistent).
     let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
     Ok(extension(
@@ -529,7 +544,7 @@ pub fn path_leaf(
     weight: Option<&str>,
     edges: Option<Vec<RecordBatch>>,
 ) -> Result<crate::lower::Frame> {
-    let direction: ursa_core::Direction = parse_direction(direction)?.into();
+    let direction: ursa_core::Direction = parse_direction("shortest_path", direction)?.into();
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
     // index. An unknown (or absent) endpoint -> no path (an empty edge frame).
     let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
@@ -599,8 +614,15 @@ pub(crate) fn resolve_dense(
     ids: &IdMap,
     arr: &dyn Array,
 ) -> Result<Vec<Option<u32>>, DataFusionError> {
-    ids.dense_from_array(arr)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))
+    ids.dense_from_array(arr).map_err(|e| match e {
+        ursa_core::IdError::MixedTypes => DataFusionError::Execution(format!(
+            "the node ids given are {} but the graph's node ids are {}; pass ids of the \
+             graph's id type",
+            crate::compare::pa_name(arr.data_type()),
+            crate::compare::pa_name(&ids.user_type()),
+        )),
+        e => DataFusionError::Execution(e.to_string()),
+    })
 }
 
 /// The LEFT join of the node attribute table `batches` onto `graph` by id, with
