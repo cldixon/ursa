@@ -90,15 +90,8 @@ class GraphExpr(Expr, NodeFrame):
 
 
 def _verb_edges(e: GraphExpr) -> Any:
-    """The edge frame a standalone graph verb runs over; for a value with no
-    ``nodes()``, the ``AttributeError`` calling it gave, naming the verb."""
-    edges = e.payload["edges"]
-    if not hasattr(edges, "nodes"):
-        raise AttributeError(
-            f"{e.payload['verb']}() takes an EdgeFrame (the graph) as its edges; "
-            f"got {type(edges).__name__}"
-        )
-    return edges
+    """The edge frame a standalone graph verb runs over."""
+    return _ir.check_edges(e.payload["edges"], _ir._verb_call(e.payload["verb"]))
 
 
 def _graph_expr(verb: str, **params: Any) -> GraphExpr:
@@ -182,12 +175,12 @@ class _NeighborAgg:
 
 def neighbors(edges: EdgeFrame, direction: str = "out", from_: Any = None) -> _NeighborAgg:
     """Neighbour aggregation. Fused by the optimizer into a segmented CSR reduction."""
-    return _NeighborAgg(edges, direction, from_)
+    return _NeighborAgg(_ir.check_edges(edges, "neighbors"), direction, from_)
 
 
 def degree(edges: EdgeFrame, direction: str = "out") -> GraphExpr:
     """Per-node degree (UInt32). ``direction`` is 'out' | 'in' | 'both'."""
-    return _graph_expr("degree", edges=edges, direction=direction)
+    return _graph_expr("degree", edges=_ir.check_edges(edges, "degree"), direction=direction)
 
 
 class _Hop:
@@ -230,7 +223,7 @@ class _Hop:
 
 def hop(edges: EdgeFrame, n: int = 1, direction: str = "out") -> _Hop:
     """``n``-hop expansion. Returns a lazy EdgeFrame so traversal composes."""
-    return _Hop(edges, n, direction)
+    return _Hop(_ir.check_edges(edges, "hop"), n, direction)
 
 
 def shortest_path(
@@ -303,7 +296,7 @@ def pagerank(
     rows takes the smallest weight. ``"in"`` is not supported."""
     return _graph_expr(
         "pagerank",
-        edges=edges,
+        edges=_ir.check_edges(edges, "pagerank"),
         damping=damping,
         max_iter=max_iter,
         tol=tol,
@@ -321,18 +314,24 @@ def connected_components(edges: EdgeFrame, mode: str = "weak") -> GraphExpr:
     connected components: two nodes share a label only if each is reachable from the
     other following edge direction. Labels are arbitrary but stable ids (group nodes
     by label to get the components)."""
-    return _graph_expr("connected_components", edges=edges, mode=mode)
+    return _graph_expr(
+        "connected_components", edges=_ir.check_edges(edges, "connected_components"), mode=mode
+    )
 
 
 def triangle_count(edges: EdgeFrame) -> GraphExpr:
     """Per-node triangle count (treats edges as undirected)."""
-    return _graph_expr("triangle_count", edges=edges)
+    return _graph_expr("triangle_count", edges=_ir.check_edges(edges, "triangle_count"))
 
 
 def clustering_coefficient(edges: EdgeFrame, dtype: str = "f64") -> GraphExpr:
     """Local clustering coefficient (derived from triangles). ``dtype="f32"`` emits
     the coefficient column as 32-bit float."""
-    return _graph_expr("clustering_coefficient", edges=edges, dtype=dtype)
+    return _graph_expr(
+        "clustering_coefficient",
+        edges=_ir.check_edges(edges, "clustering_coefficient"),
+        dtype=dtype,
+    )
 
 
 def betweenness(
@@ -359,7 +358,7 @@ def betweenness(
     is not supported (over all pairs it equals ``"out"``)."""
     return _graph_expr(
         "betweenness",
-        edges=edges,
+        edges=_ir.check_edges(edges, "betweenness"),
         sample=sample,
         weight=weight,
         seed=seed,
@@ -380,7 +379,7 @@ def closeness(
     ``nx.closeness_centrality(G.to_undirected(), wf_improved=False)``."""
     return _graph_expr(
         "closeness",
-        edges=edges,
+        edges=_ir.check_edges(edges, "closeness"),
         weight=weight,
         dtype=dtype,
         direction=_check_direction("closeness", direction),
@@ -389,14 +388,25 @@ def closeness(
 
 def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> GraphExpr:
     """Community detection via label propagation."""
-    return _graph_expr("label_propagation", edges=edges, max_iter=max_iter, seed=seed)
+    return _graph_expr(
+        "label_propagation",
+        edges=_ir.check_edges(edges, "label_propagation"),
+        max_iter=max_iter,
+        seed=seed,
+    )
 
 
 def louvain(
     edges: EdgeFrame, weight: Expr | None = None, resolution: float = 1.0, seed: int | None = None
 ) -> GraphExpr:
     """Community detection via Louvain modularity optimization."""
-    return _graph_expr("louvain", edges=edges, weight=weight, resolution=resolution, seed=seed)
+    return _graph_expr(
+        "louvain",
+        edges=_ir.check_edges(edges, "louvain"),
+        weight=weight,
+        resolution=resolution,
+        seed=seed,
+    )
 
 
 # --- layout (multi-output) --------------------------------------------------
@@ -430,7 +440,12 @@ def layout_fr(
     successor.
     """
     return _layout_expr(
-        "layout_fr", edges=edges, iterations=iterations, k=k, gravity=gravity, seed=seed
+        "layout_fr",
+        edges=_ir.check_edges(edges, "layout_fr"),
+        iterations=iterations,
+        k=k,
+        gravity=gravity,
+        seed=seed,
     )
 
 
@@ -440,7 +455,9 @@ def layout_random(edges: EdgeFrame, k: float = 1.0, seed: int | None = None) -> 
     No two nodes coincide, which is what makes it a safe starting point for a force
     layout — two nodes at one point feel unbounded repulsion.
     """
-    return _layout_expr("layout_random", edges=edges, k=k, seed=seed)
+    return _layout_expr(
+        "layout_random", edges=_ir.check_edges(edges, "layout_random"), k=k, seed=seed
+    )
 
 
 def layout_circle(edges: EdgeFrame, k: float = 1.0) -> LayoutExpr:
@@ -449,4 +466,4 @@ def layout_circle(edges: EdgeFrame, k: float = 1.0) -> LayoutExpr:
     A baseline that is obviously not force-directed: if a figure looks the same
     under this and under ``layout_fr``, the force layout did not run.
     """
-    return _layout_expr("layout_circle", edges=edges, k=k)
+    return _layout_expr("layout_circle", edges=_ir.check_edges(edges, "layout_circle"), k=k)

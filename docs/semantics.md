@@ -8,7 +8,7 @@ The test suite checks every row of the table below against NetworkX on a seeded 
 
 1. **An `EdgeFrame` is directed.** `pagerank`, `betweenness`, `closeness`, `degree`, `hop`, `shortest_path`, and the whole-graph statistics follow out-edges unless you pass `direction=`. The undirected kernels (`triangle_count`, `clustering_coefficient`, weak components, `louvain`, `label_propagation`) read the rows as undirected. If your NetworkX graph is an undirected `nx.Graph`, see [Undirected graphs](#undirected-graphs).
 2. **Parallel edges are rows, and rows are kept.** Ursa does not merge two rows with the same endpoints. A NetworkX `Graph` or `DiGraph` merges them. On a graph with parallel edges, `pagerank` and `betweenness` differ from NetworkX. On a simple graph they match.
-3. **Outputs are deterministic.** Every kernel gives the same result on every run and on every thread count. The random kernels (`random_walk`, sampled `betweenness`, `louvain`, `label_propagation`) are reproducible from `seed=`.
+3. **Outputs are deterministic.** Every kernel gives the same result on every run and on every thread count. The random kernels (`random_walk`, sampled `betweenness`, `louvain`, `label_propagation`) take `seed=`. Without one they use a fixed default seed.
 
 ## Undirected graphs
 

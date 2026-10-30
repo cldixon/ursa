@@ -162,7 +162,9 @@ edges = ur.scan_edges(
 
 `has_header=False` reads a file without a header row; its columns are then `column_1`, `column_2`, and so on. `quote` sets the quote character, and `escape` a character that makes the next one literal inside a quoted field. See [Input and output](../reference/io.md#urscan_edges) for every option.
 
-A CSV column's type is inferred from the first 1,000 rows. A later value that does not parse as that type raises `ComputeError` at `collect()`, with the column, the value and its line. Fix the value, or pass `null_value=` if the value marks a missing one. See [Errors](../reference/errors.md#csv-values).
+A CSV column's type comes from its first 1,000 rows. A column of numbers with one or more floats in it is `double`. Spellings such as `+5`, `1e400` and `-Inf` are floats. `nan` reads as NaN, not as null as in pyarrow's defaults. To read it as null, pass `null_value="nan"`. See [Input and output](../reference/io.md#urscan_edges) for the rules.
+
+A later value that does not parse as its column's type raises `ComputeError` at `collect()`, with the column, the value and its line. Fix the value, or pass `null_value=` if the value marks a missing one. See [Errors](../reference/errors.md#csv-values).
 
 `read_edges` and `read_nodes` are the eager forms. They return the rows at once.
 

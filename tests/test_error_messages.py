@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import decimal
 import importlib
+import inspect
 import math
 import pickle
 import sys
@@ -26,6 +27,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import ursa as ur
+from ursa import _graph as ursa_graph
 
 col = ur.col
 
@@ -78,6 +80,14 @@ def e() -> ur.EdgeFrame:
 
 def n() -> ur.NodeFrame:
     return ur.from_arrow(NODES, id="id")
+
+
+def edges_message(call: str, got: str) -> str:
+    """The message of a graph function given something other than an edge frame."""
+    return (
+        f"{call}() takes an edge frame (from ur.from_arrow(..., src=, dst=) or ur.scan_edges); "
+        f"got {got}."
+    )
 
 
 def run(build):
@@ -301,8 +311,8 @@ CASES = {
     ),
     "verb_on_a_node_frame": (
         lambda: ur.pagerank(bad(n())),
-        AttributeError,
-        "pagerank() takes an EdgeFrame (the graph) as its edges; got NodeFrame",
+        TypeError,
+        edges_message("pagerank", "a node frame (id column 'id'); pass an edge frame"),
     ),
     "weight_not_an_expression": (
         lambda: ur.pagerank(e(), weight=bad("w")),
@@ -366,8 +376,8 @@ CASES = {
     ),
     "hop_not_edges": (
         lambda: ur.hop(bad(5), 1).from_([0]),
-        AttributeError,
-        "hop() takes an EdgeFrame (the graph) as its edges; got int",
+        TypeError,
+        edges_message("hop", "int; pass an edge frame"),
     ),
     "shortest_path_direction": (
         lambda: ur.shortest_path(e(), 0, 1, direction="x"),
@@ -386,8 +396,8 @@ CASES = {
     ),
     "density_not_edges": (
         lambda: ur.density(bad(5)),
-        AttributeError,
-        "density() takes an EdgeFrame (the graph) as its edges; got int",
+        TypeError,
+        edges_message("density", "int; pass an edge frame"),
     ),
     # --- #217: expressions, describe and the stats --------------------------
     "expression_truth_value": (
@@ -433,6 +443,130 @@ CASES = {
         ur.ColumnNotFoundError,
         "join(on=): key 'nope' not in the left frame ['id', 'degree'].",
     ),
+    # --- #223: a graph function given something other than an edge frame ----
+    # One case for each function that takes an edge frame, each with another kind
+    # of argument; `test_every_edges_argument_is_checked` runs every pair.
+    "density_of_a_verb": (
+        lambda: ur.density(bad(ur.degree(e()))),
+        TypeError,
+        edges_message(
+            "density", "a node frame (ur.degree(...)); pass the edges the verb was built from"
+        ),
+    ),
+    "density_lazy_of_a_verb_frame": (
+        lambda: ur.density(bad(ur.pagerank(e()).filter(col("pagerank") > 0)), lazy=True),
+        TypeError,
+        edges_message("density", "a node frame (id column 'id'); pass an edge frame"),
+    ),
+    "diameter_of_describe": (
+        lambda: ur.diameter(bad(ur.describe(e()))),
+        TypeError,
+        edges_message(
+            "diameter", "a node frame (ur.describe(...)); pass the edges it was built from"
+        ),
+    ),
+    "avg_path_length_of_a_walk": (
+        lambda: ur.avg_path_length(bad(ur.random_walk(e(), start=[0], steps=2))),
+        TypeError,
+        edges_message(
+            "avg_path_length",
+            "a node frame (ur.random_walk(...)); pass the edges it was built from",
+        ),
+    ),
+    "describe_of_a_stat": (
+        lambda: ur.describe(bad(ur.density(e(), lazy=True))),
+        TypeError,
+        edges_message(
+            "describe", "a node frame (ur.density(...)); pass the edges it was built from"
+        ),
+    ),
+    "degree_of_nodes": (
+        lambda: ur.degree(bad(e().nodes())),
+        TypeError,
+        edges_message("degree", "a node frame (edges.nodes()); pass the edge frame itself"),
+    ),
+    "connected_components_of_a_table": (
+        lambda: ur.connected_components(bad(EDGES)),
+        TypeError,
+        edges_message(
+            "connected_components",
+            "a pyarrow Table; build an edge frame from it with ur.from_arrow(..., src=, dst=)",
+        ),
+    ),
+    "triangle_count_of_a_result": (
+        lambda: ur.triangle_count(bad(e().collect())),
+        TypeError,
+        edges_message(
+            "triangle_count",
+            "a collected frame (MaterializedFrame); pass the lazy edge frame, or build one from "
+            "the result with ur.from_arrow(result.to_arrow(), src=, dst=)",
+        ),
+    ),
+    "clustering_coefficient_of_none": (
+        lambda: ur.clustering_coefficient(bad(None)),
+        TypeError,
+        edges_message("clustering_coefficient", "None; pass an edge frame"),
+    ),
+    "betweenness_of_an_expression": (
+        lambda: ur.betweenness(bad(col("s"))),
+        TypeError,
+        edges_message("betweenness", "an expression, which is no frame; pass an edge frame"),
+    ),
+    "closeness_of_a_string": (
+        lambda: ur.closeness(bad("edges.parquet")),
+        TypeError,
+        edges_message("closeness", "str; pass an edge frame"),
+    ),
+    "label_propagation_of_neighbors": (
+        lambda: ur.label_propagation(bad(ur.neighbors(e()))),
+        TypeError,
+        edges_message(
+            "label_propagation",
+            "ur.neighbors(...), which is no frame; pass the edges it was built from",
+        ),
+    ),
+    "louvain_of_a_verb": (
+        lambda: ur.louvain(bad(ur.louvain(e()))),
+        TypeError,
+        edges_message(
+            "louvain", "a node frame (ur.louvain(...)); pass the edges the verb was built from"
+        ),
+    ),
+    "neighbors_of_a_node_frame": (
+        lambda: n().with_columns(x=ur.neighbors(bad(n())).agg(col("age").mean())),
+        TypeError,
+        edges_message("neighbors", "a node frame (id column 'id'); pass an edge frame"),
+    ),
+    "verb_edges_checked_before_direction": (
+        lambda: ur.pagerank(bad(n()), direction="x"),
+        TypeError,
+        edges_message("pagerank", "a node frame (id column 'id'); pass an edge frame"),
+    ),
+    "stat_edges_checked_before_direction": (
+        lambda: ur.density(bad(n()), direction="x"),
+        TypeError,
+        edges_message("density", "a node frame (id column 'id'); pass an edge frame"),
+    ),
+    "shortest_path_of_a_verb": (
+        lambda: ur.shortest_path(bad(ur.closeness(e())), 0, 1),
+        TypeError,
+        edges_message(
+            "shortest_path",
+            "a node frame (ur.closeness(...)); pass the edges the verb was built from",
+        ),
+    ),
+    "random_walk_of_a_node_frame": (
+        lambda: ur.random_walk(bad(n()), start=[0], steps=2),
+        TypeError,
+        edges_message("random_walk", "a node frame (id column 'id'); pass an edge frame"),
+    ),
+    "hop_of_a_verb": (
+        lambda: ur.hop(bad(ur.degree(e()))),
+        TypeError,
+        edges_message(
+            "hop", "a node frame (ur.degree(...)); pass the edges the verb was built from"
+        ),
+    ),
     # --- sources -------------------------------------------------------------
     "src_not_a_name": (
         lambda: ur.from_arrow(EDGES, src=bad(1), dst="d"),
@@ -468,6 +602,89 @@ def test_messages(case):
     assert not [t for t in LEAKS if t in message]
 
 
+def edge_entry_points() -> dict[str, Any]:
+    """Every function, public or held back (the layouts), with an ``edges``
+    parameter typed ``EdgeFrame``: read from the modules, not listed by hand."""
+    from ursa import _interop, _io, _stats
+
+    found = {}
+    for module in (ur, ursa_graph, _stats, _io, _interop):
+        for name in dir(module):
+            fn = getattr(module, name)
+            if name.startswith("_") or not inspect.isfunction(fn):
+                continue
+            params = inspect.signature(fn).parameters
+            if [p.annotation for p in params.values()][:1] == ["EdgeFrame"]:
+                assert next(iter(params)) == "edges", name
+                found[name] = fn
+            else:
+                assert "EdgeFrame" not in [p.annotation for p in params.values()], name
+    return found
+
+
+# Values for the required arguments after `edges`. A new entry point with
+# another required argument fails `test_every_edges_argument_is_checked` until
+# it is added here.
+REQUIRED = {"source": 0, "target": 1, "start": [0], "steps": 2}
+
+NOT_EDGES = {
+    "node frame": n,
+    "edges.nodes()": lambda: e().nodes(),
+    "verb": lambda: ur.degree(e()),
+    "verb frame": lambda: ur.pagerank(e()).filter(col("pagerank") > 0),
+    "layout": lambda: ursa_graph.layout_circle(e()),
+    "walk": lambda: ur.random_walk(e(), start=[0], steps=2),
+    "describe": lambda: ur.describe(e()),
+    "lazy stat": lambda: ur.diameter(e(), lazy=True),
+    "collected": lambda: e().collect(),
+    "pyarrow table": lambda: EDGES,
+    "int": lambda: 5,
+    "None": lambda: None,
+    "str": lambda: "edges.parquet",
+    "neighbors builder": lambda: ur.neighbors(e()),
+    "expression": lambda: col("s"),
+}
+
+EDGES_KINDS = {
+    "edge frame": e,
+    "filtered": lambda: e().filter(col("w") > 1),
+    "reversed": lambda: e().reverse(),
+    "hop result": lambda: ur.hop(e(), 1).from_([0]),
+    "shortest_path result": lambda: ur.shortest_path(e(), 0, 2),
+    "hop builder": lambda: ur.hop(e(), 1),
+}
+
+
+def test_every_edges_argument_is_checked():
+    """Each function that takes an edge frame raises `TypeError` where it is
+    called when given anything else, naming itself; an edge frame of any kind
+    passes the check (#223)."""
+    entries = edge_entry_points()
+    assert {
+        "density", "diameter", "avg_path_length", "describe", "degree", "pagerank",
+        "connected_components", "triangle_count", "clustering_coefficient", "betweenness",
+        "closeness", "label_propagation", "louvain", "neighbors", "hop", "shortest_path",
+        "random_walk", "layout_fr", "layout_random", "layout_circle",
+    } <= set(entries)  # fmt: skip
+    for name, fn in entries.items():
+        params = inspect.signature(fn).parameters
+        required = [p for p in list(params)[1:] if params[p].default is inspect.Parameter.empty]
+        args = {p: REQUIRED[p] for p in required}
+        if "lazy" in params:
+            args["lazy"] = True
+        for kind, make in NOT_EDGES.items():
+            with pytest.raises(TypeError) as info:
+                fn(make(), **args)
+            message = str(info.value)
+            assert message.startswith(f"{name}() takes an edge frame ("), (name, kind, message)
+            assert not [t for t in LEAKS if t in message], (name, kind, message)
+        for kind, make in EDGES_KINDS.items():
+            try:
+                fn(make(), **args)
+            except Exception as exc:  # what main raised for it, as it was
+                assert "takes an edge frame" not in str(exc), (name, kind)
+
+
 def scan_cases(tmp: Path) -> dict:
     """Scan errors, whose messages name the scan and its path."""
     pq.write_table(EDGES, tmp / "e.parquet")
@@ -487,6 +704,9 @@ def scan_cases(tmp: Path) -> dict:
     ]:
         rows = f"1,2,{good}\n" * 1000
         (tmp / f"v_{name}.csv").write_text(f"s,d,f\n{rows}2,3,{bad_value}\n")
+    # `+5` is a float only #221's widening reads, so the column is double, not
+    # string, and the value after the sample does not parse.
+    (tmp / "v_widened.csv").write_text("s,d,f\n1,2,+5\n" + "1,2,1\n" * 999 + "2,3,abc\n")
     (tmp / "g").mkdir(exist_ok=True)
     (tmp / "g" / "a.csv").write_text("s,d,f\n" + "1,2,3\n" * 1100)
     (tmp / "g" / "b.csv").write_text("s,d,f\n" + "1,2,3\n" * 1100 + "4,5,x\n")
@@ -650,6 +870,16 @@ def scan_cases(tmp: Path) -> dict:
             lambda: ur.read_edges(p("v_ts.csv"), src="s", dst="d", null_value="NA"),
             ur.ComputeError,
             csv_value(f"'{p('v_ts.csv')}'", "timestamp[s]", "soon"),
+        ),
+        "csv_value_widened": (
+            lambda: ur.read_edges(p("v_widened.csv"), src="s", dst="d"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_widened.csv')}'", "double", "abc"),
+        ),
+        "csv_value_widened_null_value": (
+            lambda: ur.read_edges(p("v_widened.csv"), src="s", dst="d", null_value="NA"),
+            ur.ComputeError,
+            csv_value(f"'{p('v_widened.csv')}'", "double", "abc"),
         ),
         "csv_value_lazy": (
             lambda: ur.scan_edges(p("v_float.csv"), src="s", dst="d").select("f"),

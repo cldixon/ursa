@@ -692,14 +692,25 @@ async fn open_path(path: &str, source: ScanSource<'_>) -> Result<DataFrame> {
 /// without a `null_value`; the only difference is which fields read as null.
 /// The files are read whole, one partition each, in path order, as a glob
 /// lists them. A dry run reads no rows.
+///
+/// On both paths, a column DataFusion infers as text only because of a float
+/// spelling its inferer does not know reads as float64 ([`float_columns`],
+/// #221).
 async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<DataFrame> {
     use datafusion::datasource::MemTable;
     use object_store::ObjectStoreExt;
     let options = csv.read_options();
+    let (inferred, widened) = infer_csv(ctx, path, csv).await?;
     let Some(pattern) = options.null_regex.clone() else {
-        return ctx.read_csv(path, options).await;
+        return match widened {
+            None => Ok(inferred),
+            Some(schema) => ctx.read_csv(path, options.schema(&schema)).await,
+        };
     };
-    let schema = csv_schema(ctx, path, csv).await?;
+    let schema: SchemaRef = match widened {
+        None => Arc::new(inferred.schema().as_arrow().clone()),
+        Some(schema) => Arc::new(schema),
+    };
     let mut partitions: Vec<Vec<RecordBatch>> = vec![];
     if !crate::dry::active() {
         let null =
@@ -728,10 +739,25 @@ async fn read_csv(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<
     ctx.read_table(Arc::new(MemTable::try_new(schema, partitions)?))
 }
 
-/// The schema DataFusion infers for the CSV `path` with `csv`'s options.
-async fn csv_schema(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<SchemaRef> {
+/// The CSV `path` as DataFusion infers it with `csv`'s options, and the
+/// schema with #221's float columns ([`float_columns`]) when one is retyped.
+async fn infer_csv(
+    ctx: &SessionContext,
+    path: &str,
+    csv: &CsvOptions,
+) -> Result<(DataFrame, Option<Schema>)> {
+    let options = csv.read_options();
     let inferred = ctx.read_csv(path, csv.read_options()).await?;
-    Ok(Arc::new(inferred.schema().as_arrow().clone()))
+    let widened = float_columns(ctx, path, &options, inferred.schema().as_arrow()).await?;
+    Ok((inferred, widened))
+}
+
+/// The schema a scan reads the CSV `path` with ([`infer_csv`]).
+async fn csv_schema(ctx: &SessionContext, path: &str, csv: &CsvOptions) -> Result<SchemaRef> {
+    let (inferred, widened) = infer_csv(ctx, path, csv).await?;
+    Ok(Arc::new(
+        widened.unwrap_or_else(|| inferred.schema().as_arrow().clone()),
+    ))
 }
 
 /// The reader DataFusion's `CsvSource::builder` makes for a CSV file with
@@ -899,6 +925,191 @@ async fn locate_csv_value(
         }
     }
     Ok(None)
+}
+
+/// How arrow-csv's inferer reads one CSV value: as text, an integer, or a float.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    Text,
+    Int,
+    /// A float arrow-csv's inferer knows: `1.5`, `-1e3`, `nan`, `-inf`.
+    Float,
+    /// A float pyarrow reads that arrow-csv's inferer reads as text: a leading
+    /// `+` (`+5`), `Inf`, `-nan`, `Infinity` and the other cases of the names.
+    PyarrowFloat,
+}
+
+/// The spelling of one non-null CSV value. The first three cases are arrow-csv
+/// 58's `InferredDataType::update`, so a value is `Int` or `Float` exactly
+/// when arrow-csv would read it so; a value it reads as a date, a time or a
+/// boolean is `Text` here.
+fn spelling(s: &str) -> Spelling {
+    static INT: OnceLock<regex::Regex> = OnceLock::new();
+    static FLOAT: OnceLock<regex::Regex> = OnceLock::new();
+    static PYARROW: OnceLock<regex::Regex> = OnceLock::new();
+    let int = INT.get_or_init(|| regex::Regex::new(r"^-?(\d+)$").expect("valid regex"));
+    let float = FLOAT.get_or_init(|| {
+        regex::Regex::new(r"^-?((\d*\.\d+|\d+\.\d*)([eE][-+]?\d+)?|\d+([eE][-+]?\d+))$")
+            .expect("valid regex")
+    });
+    // pyarrow's float grammar: a sign, digits with an optional point (or a
+    // point and digits), an optional exponent; or a sign and nan, inf or
+    // infinity in any case.
+    let pyarrow = PYARROW.get_or_init(|| {
+        regex::Regex::new(
+            r"^[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|(?i:nan|inf|infinity))$",
+        )
+        .expect("valid regex")
+    });
+    if s.starts_with('"') {
+        Spelling::Text
+    } else if int.is_match(s) {
+        // arrow-csv reads an integer past int64 as text.
+        if s.len() >= 19 && s.parse::<i64>().is_err() {
+            Spelling::Text
+        } else {
+            Spelling::Int
+        }
+    } else if float.is_match(s) || matches!(s, "NaN" | "nan" | "inf" | "-inf") {
+        Spelling::Float
+    } else if pyarrow.is_match(s) {
+        Spelling::PyarrowFloat
+    } else {
+        Spelling::Text
+    }
+}
+
+/// `inferred` (the schema DataFusion infers for the CSV `path`) with each
+/// `string` column that is text only because of a pyarrow float spelling
+/// retyped `float64`, or `None` when no column is (#221).
+///
+/// arrow-csv's inferer reads `+5`, `Inf` or `-nan` as text, so one such value
+/// makes the whole column `string`, where pyarrow reads `double`. This reads
+/// the values DataFusion's inference read (the same files in the same order,
+/// cut into the same chunks, each parsed as arrow-csv parses it, up to the same
+/// record count) and retypes a column when every non-null value is a number
+/// and one or more is a [`Spelling::PyarrowFloat`]. A column that is text for
+/// any other reason, or not text, keeps its type. The float64 reader
+/// (lexical-core) parses each pyarrow spelling to the bits pyarrow gives.
+async fn float_columns(
+    ctx: &SessionContext,
+    path: &str,
+    options: &CsvReadOptions<'_>,
+    inferred: &Schema,
+) -> Result<Option<Schema>> {
+    use datafusion::datasource::file_format::csv::CsvFormat;
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+    // Per text column: (every value a number, a pyarrow spelling seen).
+    let mut columns: HashMap<String, (bool, bool)> = inferred
+        .fields()
+        .iter()
+        .filter(|f| f.data_type() == &DataType::Utf8)
+        .map(|f| (f.name().clone(), (true, false)))
+        .collect();
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let null = options
+        .null_regex
+        .as_deref()
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let is_null = |s: &str| match &null {
+        Some(r) => r.is_match(s),
+        None => s.is_empty(),
+    };
+    let csv_err = |e: csv::Error| DataFusionError::External(Box::new(e));
+    // As `ListingOptions::infer_schema` and `CsvFormat::infer_schema` read.
+    let state = ctx.state();
+    let url = ListingTableUrl::parse(path)?;
+    let store = state.runtime_env().object_store(url.object_store())?;
+    let files: Vec<_> = url
+        .list_all_files(&state, store.as_ref(), options.file_extension)
+        .await?
+        .try_filter(|f| futures::future::ready(f.size > 0))
+        .try_collect()
+        .await?;
+    let mut remaining = options.schema_infer_max_records;
+    'files: for file in files {
+        let bytes = store
+            .get(&file.location)
+            .await
+            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?
+            .into_stream()
+            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
+            .boxed();
+        let mut chunks = CsvFormat::default()
+            .read_to_delimited_chunks_from_stream(bytes)
+            .await;
+        let mut names: Vec<String> = vec![];
+        let mut first = true;
+        while let Some(chunk) = chunks.next().await.transpose()? {
+            // The reader arrow-csv's `Format::infer_schema` builds.
+            let header = first && options.has_header;
+            let mut reader = csv::ReaderBuilder::new();
+            reader
+                .has_headers(header)
+                .flexible(false)
+                .delimiter(options.delimiter)
+                .escape(options.escape)
+                .quote(options.quote);
+            if let Some(comment) = options.comment {
+                reader.comment(Some(comment));
+            }
+            let mut reader = reader.from_reader(&chunk[..]);
+            let headers = reader.headers().map_err(csv_err)?;
+            if first {
+                names = if header {
+                    headers.iter().map(str::to_string).collect()
+                } else {
+                    (1..=headers.len()).map(|i| format!("column_{i}")).collect()
+                };
+                first = false;
+            }
+            let mut record = csv::StringRecord::new();
+            let mut read = 0;
+            while read < remaining && reader.read_record(&mut record).map_err(csv_err)? {
+                read += 1;
+                for (name, value) in names.iter().zip(record.iter()) {
+                    let Some((numbers, pyarrow)) = columns.get_mut(name) else {
+                        continue;
+                    };
+                    if is_null(value) {
+                        continue;
+                    }
+                    match spelling(value) {
+                        Spelling::Text => *numbers = false,
+                        Spelling::PyarrowFloat => *pyarrow = true,
+                        Spelling::Int | Spelling::Float => {}
+                    }
+                }
+            }
+            remaining -= read;
+            if remaining == 0 {
+                break 'files;
+            }
+        }
+    }
+    if !columns
+        .values()
+        .any(|&(numbers, pyarrow)| numbers && pyarrow)
+    {
+        return Ok(None);
+    }
+    let fields: Vec<Field> = inferred
+        .fields()
+        .iter()
+        .map(|f| match columns.get(f.name()) {
+            Some(&(true, true)) => f.as_ref().clone().with_data_type(DataType::Float64),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    Ok(Some(Schema::new_with_metadata(
+        fields,
+        inferred.metadata().clone(),
+    )))
 }
 
 /// `ctx.read_parquet(path, ParquetReadOptions::default())`, with a column's
@@ -2551,6 +2762,72 @@ mod tests {
             err.to_string().contains("the list of paths is empty"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_pyarrow_float_spelling_is_a_float() {
+        use Spelling::*;
+        for (s, want) in [
+            ("1", Int),
+            ("-0", Int),
+            ("9223372036854775808", Text),
+            ("1.5", Float),
+            ("1e400", Float),
+            ("nan", Float),
+            ("-inf", Float),
+            ("+5", PyarrowFloat),
+            ("+.5", PyarrowFloat),
+            ("Inf", PyarrowFloat),
+            ("-nan", PyarrowFloat),
+            ("+Infinity", PyarrowFloat),
+            ("+9223372036854775808", PyarrowFloat),
+            ("true", Text),
+            ("2020-01-01", Text),
+            ("1e", Text),
+            ("++5", Text),
+            (" 5", Text),
+            ("inff", Text),
+            ("\"5", Text),
+            ("\u{0665}", Int), // arrow-csv's `\d` is Unicode
+            ("+\u{0665}", Text),
+        ] {
+            assert!(spelling(s) == want, "{s}");
+        }
+    }
+
+    #[test]
+    fn a_csv_column_with_a_pyarrow_float_spelling_reads_as_float64() {
+        // Both paths: the default and the `null_value` one (#221).
+        let path = std::env::temp_dir().join("ursa_scan_test_float_spellings.csv");
+        std::fs::write(&path, "from,to,w,t\n1,2,+5,+5\n2,3,Inf,a\n3,1,-nan,\n").unwrap();
+        let paths = [path.to_str().unwrap().to_string()];
+        let opts = no_opts();
+        for csv in [
+            CsvOptions::default(),
+            CsvOptions {
+                null_value: Some("NA".into()),
+                ..CsvOptions::default()
+            },
+        ] {
+            let source = ScanSource::new(&paths, &opts, &csv);
+            let rows = scan_edges_rows(source, "from", "to", &[], &[], false).unwrap();
+            let w = rows.batches[0].column_by_name("w").unwrap();
+            let w = w
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            let bits: Vec<u64> = w.values().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                bits,
+                [
+                    5f64.to_bits(),
+                    f64::INFINITY.to_bits(),
+                    0xfff8_0000_0000_0000
+                ]
+            );
+            let t = rows.batches[0].column_by_name("t").unwrap();
+            assert_eq!(t.data_type(), &DataType::Utf8);
+        }
     }
 
     #[test]

@@ -169,4 +169,4 @@ shape: (2, 2)
 
 ## Determinism
 
-Every kernel gives the same output on every run and on every thread count. The random kernels (`louvain`, `label_propagation`, sampled `betweenness`, `random_walk`) are reproducible from `seed=`. Without a seed, each call picks its own.
+Every kernel gives the same output on every run and on every thread count. The random kernels (`louvain`, `label_propagation`, sampled `betweenness`, `random_walk`) take `seed=`. Without one they use a fixed default seed, so they give the same output on every call. Pass a different seed for a different result.

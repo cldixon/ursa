@@ -24,6 +24,9 @@ serde_json = { version = "1", features = ["unbounded_depth"] }
 stacker = "0.1"
 # Matches a CSV scan's `null_value` literally (already in the tree via DataFusion).
 regex = "1"
+# Reads the CSV sample DataFusion infers types from (#221), as arrow-csv does
+# (already in the tree via arrow-csv).
+csv = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

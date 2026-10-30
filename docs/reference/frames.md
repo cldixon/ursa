@@ -30,7 +30,7 @@ The `src` and `dst` columns must have the same type: `int64` or `string`.
 |---|---|---|
 | `edges.nodes()` | `NodeFrame` | The graph's node set, as one `id` column. Lazy. It has the rows `with_columns(degree=ur.degree(edges))` has, in the same order, without the column: over a filtered frame or a traversal result the parent graph's whole node set, and after a reshaping step the nodes of its rows. For only the nodes a view touches, use `ur.describe(frame, nodes="touched")`. |
 | `edges.reverse()` | `EdgeFrame` | The same rows with the `src` and `dst` roles swapped. No data moves. |
-| `edges.collect()` | `MaterializedFrame` | The edge rows, after any `filter`, `sort`, `head`, `distinct`, `sample`, or `rename`. |
+| `edges.collect()` | `MaterializedFrame` | The edge rows, after the frame's steps. |
 
 `EdgeFrame` also has every [shared method](#shared-methods).
 
@@ -67,7 +67,7 @@ Without a `sort`, rows come back in input order, the same on every run and every
 
 | Method | Description |
 |---|---|
-| `.with_columns(**exprs)` | Adds one column per keyword. Each value is an [expression](expressions.md) or an algorithm, computed over the rows the steps before it leave. A keyword that names an existing column replaces it in place; other columns stay. An algorithm's column attaches to the rows by the node id column. |
+| `.with_columns(**exprs)` | Adds one column per keyword. Each value is an [expression](expressions.md) or an algorithm, computed over the rows the steps before it leave. A keyword that names an existing column replaces it in place; other columns stay. An algorithm's column attaches to the rows by the node id column. On an `EdgeFrame` an algorithm is not allowed: put graph columns on `edges.nodes()`. |
 | `.select(*columns)` | Keeps only the given columns, in the given order. Each item is a name, `ur.col(name)`, or an [expression](expressions.md), named by its `.alias()` or else by its first column. |
 | `.rename({old: new, ...})` | Renames columns. |
 
@@ -85,7 +85,7 @@ Without a `sort`, rows come back in input order, the same on every run and every
 
 | Method | Description |
 |---|---|
-| `.group_by(*keys).agg(*exprs, **named)` | Groups by one or more columns and computes [aggregations](expressions.md#aggregations). The output columns are the keys, then the aggregations. A float key groups in total order ([floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)): `-0.0` and `0.0` are one group, so are all NaNs, and the group shows its first row's value. |
+| `.group_by(*keys).agg(*exprs, **named)` | Groups by one or more columns and computes [aggregations](expressions.md#aggregations). The output columns are the keys, then the aggregations. A float key groups in total order ([floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)): `-0.0` and `0.0` are one group, so are all NaNs, and the group shows its first row's value. A float `sum`, `mean`, `min` or `max` folds each group's values in input order, so the result is the same, bit for bit, on any number of cores. |
 | `.join(other, *, on, how="inner")` | An equi-join with another frame on the shared key column or columns `on`. `how` is `"inner"`, `"left"`, `"right"`, `"outer"` (or `"full"`), `"semi"` or `"anti"`. `other` is any frame, a traversal or another join included. Any number of joins compose with the other steps, which run as written. A null key matches nothing; a float key matches in total order ([floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)). |
 
 ### Inspection
@@ -132,4 +132,5 @@ The result of `collect()`. It holds a chunked `pyarrow.Table`. You do not constr
 | `.to_dicts()` | A list of row dicts. |
 | `.sink_parquet(path, **opts)` | Writes a Parquet file. |
 | `.sink_csv(path)` | Writes a CSV file. |
+| `len(result)` | The number of rows. |
 | `repr(result)` | A table preview: the shape, the column names, the types, and the first 10 rows. |

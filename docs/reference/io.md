@@ -8,7 +8,7 @@ A scan reads a file inside `collect()`. The read pushes the projection into the 
 
 ```py
 ur.scan_edges(
-    path: str | list[str], *,
+    path: str | Path | list[str | Path], *,
     src: str, dst: str,
     storage_options: dict | None = None,
     store=None,
@@ -42,6 +42,18 @@ The CSV options apply to `.csv` files only. Each character option is one ASCII c
 
 A CSV file's column types are inferred from its first 1,000 rows. A value past them that does not parse as the inferred type raises `ComputeError` at `collect()`. The message names the column, its type, the value and the value's line, and says what to do. See [Errors](errors.md#csv-values). With a `null_value`, a value parses exactly as without one; only which fields are null differs, and the error is the same.
 
+A column of numbers is `double` when one or more of its values is a float. These spellings are floats:
+
+- `1.5`, `.5`, `5.` and `1e3`, with or without a sign, such as `+5` or `-.5`.
+- `1e400` and other values past the `double` range. They read as `inf` or `-inf`.
+- `nan`, `inf` and `infinity` in any case, with or without a sign, such as `NaN`, `-Inf` or `+nan`.
+
+Each float parses to the bits that pyarrow gives for it when it reads the value as a float. `-0` in a `double` column reads as `-0.0`, and `-nan` keeps its sign.
+
+A text such as `nan` reads as NaN, not as null. pyarrow's default options read `nan`, `NaN` and `null` as null. To read `nan` as null, pass `null_value="nan"`. It matches that spelling only.
+
+A column of integers only, such as `1` and `-0`, is `int64`. A column with other text in its first 1,000 rows is `string`. An integer past the `int64` range and a number with spaces around it are text.
+
 ```py
 edges = ur.scan_edges("edges.csv", src="from", dst="to", delimiter="\t", null_value="NA")
 ```
@@ -56,7 +68,7 @@ An HTTP URL must point at one file and must not carry a query string. A presigne
 
 ```py
 ur.scan_nodes(
-    path: str | list[str], *,
+    path: str | Path | list[str | Path], *,
     id: str,
     storage_options: dict | None = None,
     store=None,

@@ -1,6 +1,6 @@
 # Expressions
 
-An expression describes a column. You pass expressions to `with_columns`, `filter`, `sort`, `group_by().agg()`, and to the `weight=` parameter of an algorithm. Expressions are pure Python values. They do no work until `collect()`.
+An expression describes a column. You pass expressions to `with_columns`, `select`, `filter`, `sort`, `group_by().agg()`, and to the `weight=` parameter of an algorithm. They do no work until `collect()`.
 
 ## Column references
 
@@ -26,7 +26,7 @@ A plain Python number or string on one side of an operator becomes a literal. `u
 
 !!! note "Use `&`, `|`, and `~`"
 
-    Python's `and`, `or`, and `not` do not work on expressions. Use `&`, `|`, and `~`, and put parentheses around each comparison.
+    Python's `and`, `or`, and `not` do not work on expressions. An expression has no truth value: `bool(expr)`, and so `if expr:`, raises `TypeError`. Use `&`, `|`, and `~`, and put parentheses around each comparison.
 
 ## Aggregations
 
@@ -45,12 +45,15 @@ The aggregations are `mean`, `sum`, `min`, `max`, `count`, and `n_unique`. Add `
 `ur.pagerank(edges)` returns an expression that names an algorithm over `edges`. It has two uses:
 
 - Inside `with_columns`, it is the definition of a column.
-- On its own, it acts as a `NodeFrame` of `(id, pagerank)`. You can call `collect()`, `filter()`, `sort()`, or `head()` on it directly.
+- On its own, it is a `NodeFrame` of `(id, pagerank)`: `edges.nodes().with_columns(pagerank=...)`. Every frame method works on it, `join` and `group_by` included.
 
 ```py
-nodes.with_columns(pr=ur.pagerank(edges))   # a column
-ur.pagerank(edges).sort("pagerank").head(5)  # a frame
+nodes.with_columns(pr=ur.pagerank(edges))                # a column
+ur.pagerank(edges).sort("pagerank").head(5)               # a frame
+ur.pagerank(edges).join(ur.degree(edges), on="id")        # a join of two frames
 ```
+
+The frame is a node frame, not an edge frame. A function that takes `edges`, such as `ur.density` or `ur.pagerank`, raises `TypeError` if you give it one. Give it the edges the algorithm was built from.
 
 When one `with_columns` call names the same algorithm twice with the same parameters, the engine runs it once.
 
