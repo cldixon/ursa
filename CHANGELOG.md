@@ -42,6 +42,31 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Behaviour change:** `group_by` keys, `distinct`, `n_unique` and join keys
+  compare floats in the total order filters and `sort()` use: `-0.0` equals
+  `0.0`, every NaN equals every NaN whatever its sign and payload, and NaN joins
+  NaN. They compared raw bits, so the same column grouped one way and filtered
+  another. This covers top-level `float16`, `float32`, `float64` and
+  dictionary-of-float columns, every join `how` (including right/outer key
+  coalescing, where a right key fits the left type in total order: `-0.0` fits
+  an integer key as `0`) and engine frames. A float nested in a struct or list
+  column still compares by its bits. Nulls are unchanged: one group in `group_by` and `distinct`, and never
+  a join match. A group or distinct row shows its first row's value, matching
+  first-appearance row order; a joined row keeps its own key value, and an
+  aggregate over a key column folds the original values. With `k = [-0.0, 0.0,
+  NaN, -NaN, null]` (`-NaN` is what `0/0` gives on x86), `v = [1, 2, 3, 4, 5]`:
+
+  | call | before | after |
+  |---|---|---|
+  | `group_by("k").agg(s=col("v").sum())` | `-0.0: 1`, `0.0: 2`, `NaN: 3`, `-NaN: 4`, `null: 5` | `-0.0: 3`, `NaN: 7`, `null: 5` |
+  | `select("k").distinct()` | 5 rows | `-0.0, NaN, null` |
+  | `group_by(...).agg(u=col("k").n_unique())` | 4 | 2 |
+  | `join(other, on="k")`, `other.k = [0.0, NaN]` | `0.0` and `NaN` match once each | `-0.0` and `0.0` match `0.0`, `NaN` and `-NaN` match `NaN` |
+
+  Results without a `-0.0` or a NaN other than the positive quiet one are
+  unchanged, byte for byte. The key is canonicalized once, as a hidden copy,
+  before anything hashes it, so the parallel order-preserving partition (#212)
+  and the exact float folds are unchanged (#215).
 - **Behaviour change:** error messages no longer show the engine's internals
   (#214). A message names the step or argument, says what was wrong and what to
   do; no message contains DataFusion's `?table?` qualifier, a private
