@@ -215,7 +215,8 @@ def test_explain_runs_on_any_frame(tmp_path):
     missing = ur.scan_edges(str(tmp_path / "missing.parquet"), src="s", dst="d")
     for frame in (
         e,
-        e.nodes(),  # does not collect (no columns yet)
+        e.nodes(),
+        ur.hop(e, 1).from_([0]).head(1).nodes(),  # does not collect
         missing,  # its file does not exist
         ur.hop(e, 1).from_([0]),
         ur.describe(e),
@@ -223,7 +224,7 @@ def test_explain_runs_on_any_frame(tmp_path):
         ur.pagerank(e),  # a bare algorithm explains as its frame
     ):
         assert "plan:" in frame.explain()
-    assert "not available" in e.nodes().explain()
+    assert "not available" in ur.hop(e, 1).from_([0]).head(1).nodes().explain()
 
 
 # --- validation where a step is added ---------------------------------------------
@@ -242,7 +243,11 @@ def _bad_steps():
         (lambda: n.sort([]), ValueError, "at least one column"),
         (lambda: n.group_by("nope").agg(c=col("v").count()), ur.ColumnNotFoundError, "group_by"),
         (lambda: n.group_by("id").agg(c=col("nope").sum()), ur.ColumnNotFoundError, r"agg\(\)"),
-        (lambda: n.join(e.nodes(), on="id"), NotImplementedError, "right-hand frame"),
+        (
+            lambda: n.join(ur.hop(e, 1).from_([0]).head(1).nodes(), on="id"),
+            NotImplementedError,
+            "right-hand frame",
+        ),
         (lambda: n.join(n, on="nope"), ur.ColumnNotFoundError, "not in the left frame"),
         (lambda: n.join(n, on="id"), ValueError, "duplicate column"),
         (lambda: n.join(n, on="id", how="cross"), NotImplementedError, "how='cross'"),
@@ -320,10 +325,10 @@ def test_what_only_the_rows_can_tell_still_raises_at_collect(tmp_path):
     missing = ur.scan_edges(str(tmp_path / "missing.parquet"), src="s", dst="d")
     with pytest.raises(ur.UrsaError):
         ur.degree(missing).collect()
-    # A frame that only a later step makes collectable builds.
+    # A filter on a bare nodes() reads no column yet: it builds, and a later
+    # with_columns may add the column it reads (a bare one is its node set, #213).
     bare = _edges().nodes().filter(col("id") > 0)
-    with pytest.raises(NotImplementedError, match=r"bare edges\.nodes"):
-        bare.collect()
+    assert bare.collect().to_arrow().column("id").to_pylist() == [1, 2, 3]
     assert bare.with_columns(d=ur.degree(_edges())).collect().to_arrow().num_rows == 3
 
 

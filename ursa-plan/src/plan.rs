@@ -90,7 +90,7 @@ use crate::query::{
     walk_leaf, NodeColumn,
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, NodeTableCache};
-use crate::stats::{describe_masked, parse_stat_direction};
+use crate::stats::{describe_masked, parse_stat_direction, stat_batch, GraphStat};
 use crate::weight::{edge_weights, WeightCache};
 
 /// A numbered input the host resolves: a frame (its table, scan, index, mask) or
@@ -258,10 +258,20 @@ pub enum Plan {
         #[serde(default)]
         seed: Option<IntArg>,
     },
-    /// `ur.describe(edges, full, direction)`.
+    /// `ur.describe(edges, full, direction, nodes)`; `touched` is
+    /// `nodes="touched"`.
     Describe {
         edges: EdgeInput,
         full: bool,
+        direction: String,
+        #[serde(default)]
+        touched: bool,
+    },
+    /// `ur.density` / `ur.avg_path_length` / `ur.diameter` over `edges`: a
+    /// one-row frame of the stat.
+    Stat {
+        edges: EdgeInput,
+        stat: GraphStat,
         direction: String,
     },
     /// A frame the host could not serialize (a join's right side). Executing it
@@ -792,6 +802,7 @@ impl Plan {
             Plan::ShortestPath { .. } => "shortest_path",
             Plan::RandomWalk { .. } => "random_walk",
             Plan::Describe { .. } => "describe",
+            Plan::Stat { stat, .. } => stat.name(),
             Plan::Invalid { .. } => "invalid",
         }
     }
@@ -1175,13 +1186,6 @@ pub fn verb_directions(verb: &str) -> Option<(&'static [&'static str], bool)> {
 /// What an edge source does with a row whose endpoint is null.
 pub const ON_NULL_MODES: [&str; 2] = ["error", "drop"];
 
-/// The error collecting `edges.nodes()` with no columns raises: the one shape
-/// error a later step can fix (a `with_columns`), so it is never raised before
-/// a collect.
-pub(crate) const BARE_NODES: &str = "collect() on this NodeFrame needs a source (scan_nodes / \
-     from_arrow(id=...)) or a with_columns of graph algorithms; a bare edges.nodes() has no \
-     materializable node set yet.";
-
 /// The end of the error for relational steps on a traversal result's edges
 /// before `nodes()`. A later `with_columns` over those edges raises the graph
 /// op's own guard first, so it is not raised before a collect either.
@@ -1435,6 +1439,7 @@ pub(crate) fn is_node_frame(chain: &[&Plan]) -> bool {
                 | Plan::FromArrow { id: Some(_), .. }
                 | Plan::RandomWalk { .. }
                 | Plan::Describe { .. }
+                | Plan::Stat { .. }
         )
 }
 
@@ -1495,23 +1500,35 @@ fn is_tail(p: &Plan) -> bool {
 /// steps, lowered onto one frame.
 fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     let id_col = node_id_col(chain);
-    // describe() is a whole-graph summary, computed eagerly off the topology and
-    // wrapped as a one-row frame; steps written after it run on that row.
-    if let Some(Plan::Describe {
-        edges,
-        full,
-        direction,
-    }) = chain.first()
-    {
-        let steps = leaf_steps(chain, "describe()", inputs)?;
-        // The edges' subgraph view, as every graph op reads it (#207): the
-        // topology's node set, and only the edge rows its mask keeps.
+    // describe() and the scalar stats are whole-graph summaries, computed off
+    // the topology and wrapped as a one-row frame; steps written after them run
+    // on that row.
+    if let Some(leaf @ (Plan::Describe { edges, .. } | Plan::Stat { edges, .. })) = chain.first() {
+        let steps = leaf_steps(chain, &format!("{}()", leaf.op()), inputs)?;
+        // The edges' subgraph view, as every graph op reads it (#207, #210):
+        // the topology's node set, and only the edge rows its mask keeps.
         let view = edges.view()?;
         let mut scratch = Scratch::default();
         let index = view_index(&view, inputs, &mut scratch)?;
         let mask = edge_mask(&view, &index, inputs, &mut scratch)?;
-        let dir = parse_stat_direction(direction)?;
-        let summary = describe_masked(&index.topo, mask.as_deref(), *full, dir)?;
+        let summary = match leaf {
+            Plan::Describe {
+                full,
+                direction,
+                touched,
+                ..
+            } => {
+                let dir = parse_stat_direction(direction)?;
+                describe_masked(&index.topo, mask.as_deref(), *full, dir, *touched)?
+            }
+            Plan::Stat {
+                stat, direction, ..
+            } => {
+                let dir = parse_stat_direction(direction)?;
+                stat_batch(&index.topo, mask.as_deref(), stat, dir)?
+            }
+            _ => unreachable!("matched above"),
+        };
         if steps.is_empty() {
             return Ok(Built::Rows(Rows::Batches(vec![summary])));
         }
@@ -1623,9 +1640,18 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
 
     let roles = [("id", id_col.clone())];
     let Some(slot) = node_source_slot(chain) else {
-        // `edges.nodes()`: no rows until the first with_columns computes them.
-        if first_columns.is_none() {
-            return not_implemented(BARE_NODES);
+        // `edges.nodes()` with no graph column first: the node set alone
+        // (#213), then the steps written after it, in order.
+        let graph_first =
+            first_columns.is_some_and(|c| c.iter().any(|e| matches!(e.expr, Expr::Graph(_))));
+        if !graph_first {
+            let Some(edges) = nodes_input else {
+                return Err(PlanError::Invalid("a node frame with no rows".into()));
+            };
+            let frame = bare_node_set(edges, inputs)?;
+            return Ok(Built::frame(lower_node_steps(
+                frame, &steps, &roles, None, inputs,
+            )?));
         }
         let first = steps
             .iter()
@@ -1891,6 +1917,24 @@ fn node_set_frame(
     let before: Vec<String> = vec!["id".to_string()];
     scalar_columns(&mut frame, exprs, &before, &[("id", "id".to_string())])?;
     Ok(frame)
+}
+
+/// The node set of a bare `edges.nodes()`, as a one-column frame `id`: the rows
+/// `with_columns(degree=ur.degree(edges))` has, in the same order (the nodes
+/// of the topology the edges' view runs over), without the column.
+fn bare_node_set(edges: &Plan, inputs: &dyn Inputs) -> PlanResult<Frame> {
+    // The steps up to `nodes()` read through the edge frame's slot, which is
+    // its source's.
+    let frame = source_slot(&edges.chain()).unwrap_or(Slot::MAX);
+    let edges = EdgeInput {
+        plan: Box::new(edges.clone()),
+        frame,
+    };
+    let view = edges.view()?;
+    let index = view_index(&view, inputs, &mut Scratch::default())?;
+    let ctx = crate::lower::session();
+    let leaf = graph_leaf(&ctx, index.topo, index.ids, vec![], None);
+    Ok(Frame::from_ordered(ctx, leaf))
 }
 
 /// Attach one edge frame's graph columns to `frame`'s rows by the id column

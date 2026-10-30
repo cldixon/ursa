@@ -146,12 +146,13 @@ def test_a_graph_verb_as_a_predicate_is_not_a_boolean_predicate(frame):
 @pytest.mark.parametrize("bad", ["build", "execute"])
 def test_join_right_side_errors_keep_their_cause(bad, tmp_path):
     e, n = _edges(), ur.from_arrow(NODES, id="id")
-    # A bare `edges.nodes()` has no rows, which the plan alone shows, so the join is
-    # rejected where it is added (#193); a scan with an unsupported store= fails
-    # only when it reads. Either way the right side's own error is the cause.
+    # A step on a traversal's edges before `nodes()` does not collect, which the
+    # plan alone shows, so the join is rejected where it is added (#193); a scan
+    # with an unsupported store= fails only when it reads. Either way the right
+    # side's own error is the cause.
     if bad == "build":
         with pytest.raises(NotImplementedError, match="could not materialize the right") as exc:
-            n.join(e.nodes(), on="id")
+            n.join(ur.hop(e, 1).from_([0]).head(1).nodes(), on="id")
     else:
         path = tmp_path / "n.parquet"
         pq.write_table(NODES, path)

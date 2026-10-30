@@ -10,6 +10,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Added
 
+- `ur.density`, `ur.avg_path_length` and `ur.diameter` take `lazy=True`, which
+  returns a lazy one-row frame like `ur.describe`: one non-null column named
+  after the stat (`density` and `avg_path_length` are `float64`, `diameter`
+  `int64`), with `schema()`, `explain()` and the relational methods. Called as
+  before they still return a Python `float` / `int`: they now collect that
+  frame (#213).
+- `ur.describe(edges, nodes="touched")` describes only the nodes the view
+  touches, those at an end of a kept edge: over a filter or a traversal result,
+  `n_nodes` counts them, `density` and `avg_degree` divide by that count, and
+  `n_components` leaves the other nodes out. These are the figures a new frame
+  over the kept rows gives. The default, `nodes="all"`, keeps the parent's node
+  set as before; over a whole graph the two agree. Any other value raises
+  `ValueError: describe(nodes=...) is not supported; use 'all' or 'touched'.`
+  where `describe` is called (#213).
 - `frame.schema()` returns the schema `collect()` returns, as a
   `pyarrow.Schema` (names, types, nullability and metadata), on every frame:
   sources and scans, graph columns, joins, `group_by`, traversals, walks and
@@ -28,6 +42,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Behaviour change:** a standalone graph verb is a full `NodeFrame` (#213).
+  `ur.degree(e)`, `ur.pagerank(e)` and the other node-valued verbs called on
+  their own are `edges.nodes().with_columns(<verb>=...)` with every frame
+  method: `join`, `group_by`, `rename`, `sample` and `limit` now work (they
+  raised `AttributeError: 'GraphExpr' object has no attribute 'join'`), and
+  `isinstance(ur.degree(e), ur.NodeFrame)` is true, so a verb is also a
+  `join`'s right side and a seed set. The methods return a plain `NodeFrame`.
+  Inside `with_columns(...)` a verb is still an expression and builds no frame
+  of its own; its `repr` and operators are unchanged.
+- **Behaviour change:** `edges.nodes()` with no columns collects to its node
+  set: one `id` column, the rows `with_columns(degree=ur.degree(edges))` has in
+  the same order (the parent graph's nodes over a filtered frame, the nodes of
+  the rows after a reshaping step). Relational steps and joins after it run on
+  those rows, and a `join` whose right side is a bare `nodes()` now builds. It
+  raised `NotImplementedError: collect() on this NodeFrame needs a source ...`
+  (#213). A first `with_columns` of scalar expressions runs on that node set
+  too (`e.nodes().with_columns(y=ur.col("id") + 1)`), as do the steps before
+  and after it. Over a filtered frame or a traversal result the node set is
+  the parent graph's (`ur.hop(e, 1).from_([0]).nodes()` has every node), as
+  `degree` and `describe` read it; `describe(f, nodes="touched")` counts the
+  touched ones. The row is gone from `docs/limits.md`.
+- **Behaviour change:** an ursa expression has no truth value. `bool(expr)`
+  raises `TypeError: the truth value of an ursa expression is ambiguous ...`,
+  as Polars does, so `if ur.col("a") == 1:`, `ur.degree(e) in frames` and
+  `a and b` over expressions fail instead of always passing. `==` still builds
+  an expression; combine predicates with `&`, `|` and `~` (#213).
+- `ur.density`, `ur.avg_path_length` and `ur.diameter` run as plan nodes, as
+  `describe` does (`Plan::Stat`). `ursa._ursa.graph_density`,
+  `graph_avg_path_length`, `graph_diameter` and `PlanNode.graph_index` are gone.
+  Over a whole graph or a reshaped edge set the values are byte-identical.
 - Frames hold Rust plan objects (#193, the last item of #189). An `EdgeFrame`
   or `NodeFrame` holds one `ursa._ursa.PlanNode`, as a Polars `LazyFrame` holds
   its plan: each method converts its arguments, calls into Rust, which builds
@@ -85,8 +129,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   endpoint, an integer divide by zero, a value out of range, a right or outer
   join key the left type cannot hold, a missing or empty file, a scan's columns
   (the file is read then, and may change in between), `store=`, a scan of
-  several files, an invalid graph verb parameter value, and `edges.nodes()`
-  collected with no columns (a later `with_columns` makes it collect). When a
+  several files, and an invalid graph verb parameter value. When a
   plan has a step the plan alone shows is wrong and also an error only the rows
   show earlier in it, the step's error is now the one raised. A step on an edge
   frame is checked even where a later use reads only the frame's topology:
@@ -376,6 +419,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Behaviour change:** `ur.density`, `ur.diameter` and `ur.avg_path_length`
+  over a filtered edge frame or a `hop` / `shortest_path` result read its
+  subgraph view, as `describe` and every graph op do (#210). They used to
+  compute over the whole parent graph, ignoring the filter: on the issue's
+  repro `ur.density(f)` was 0.333 (now 0.1667), `ur.diameter(f,
+  approximate=False)` 2 (now 1) and `ur.avg_path_length(f)` 1.333 (now 1.0).
+  The view is the parent's node set and only the kept edges, so
+  `ur.density(f) == ur.describe(f).collect()["density"][0]`, and an exact path
+  stat equals its value over a new frame of the kept rows. A sampled estimate
+  (`avg_path_length(sample=)`, the default approximate `diameter`) picks its
+  sources among the nodes at an end of a kept edge. Since the view's filter
+  now runs, an error only the filter's rows show (an integer divide by zero) is
+  raised by the stat too.
 - `group_by()` by a dictionary (categorical) column with `int8`, `int16`,
   `uint8` or `uint16` codes, and `distinct()` over one, raised "Dictionary key
   bigger than the key type" when the result had more groups than the codes

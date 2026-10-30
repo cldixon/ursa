@@ -41,7 +41,7 @@ shape: (5, 7)
 
 ## As a table
 
-Called on its own, an algorithm is a lazy table of `(id, value)`. The row methods apply to it.
+Called on its own, an algorithm is a lazy `NodeFrame` of `(id, value)`: `edges.nodes().with_columns(<name>=...)`. Every frame method applies to it, `join`, `group_by`, `schema()` and `explain()` included. Inside `with_columns(...)` it is a column expression.
 
 ```python
 print(ur.betweenness(edges).sort("betweenness", descending=True).head(3).collect())
@@ -58,6 +58,24 @@ shape: (3, 2)
 │ 31    ┆ 5.08333     │
 │ 8     ┆ 2.25        │
 └───────┴─────────────┘
+```
+
+```python
+both = ur.degree(edges).join(ur.pagerank(edges), on="id")
+print(both.sort("pagerank", descending=True).head(3).collect())
+```
+
+```text
+shape: (3, 3)
+┌───────┬────────┬───────────┐
+│ id    ┆ degree ┆ pagerank  │
+│ ---   ┆ ---    ┆ ---       │
+│ int64 ┆ uint32 ┆ double    │
+╞═══════╪════════╪═══════════╡
+│ 33    ┆ 0      ┆ 0.259047  │
+│ 32    ┆ 1      ┆ 0.0954893 │
+│ 31    ┆ 2      ┆ 0.0459255 │
+└───────┴────────┴───────────┘
 ```
 
 ## The kernels
