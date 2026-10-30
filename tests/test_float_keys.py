@@ -138,25 +138,24 @@ def test_group_by_shows_the_first_appearance_value():
 
 
 def test_a_float_aggregate_over_a_key_column_folds_the_original_values():
-    # The key groups canonical; a sum/min/max over the same column folds the
-    # original values, by pyarrow's rules (a sum starts at +0.0).
-    k = [-0.0, 0.0, -0.0, NEG_NAN, math.nan]
+    # The key groups canonical; min/max over the same column fold the original
+    # values, so a group of -0.0 keys has min and max -0.0 (canonical values
+    # would give 0.0). A sum starts at +0.0, by pyarrow's rule. (No ties between
+    # -0.0 and 0.0 here: which one pyarrow's min/max returns differs by platform.)
+    k = [-0.0, -0.0, NEG_NAN, math.nan, 2.5]
     t = pa.table({"id": list(range(5)), "k": k})
     aggs = {"s": col("k").sum(), "m": col("k").min(), "x": col("k").max()}
     got = ur.from_arrow(t, id="id").group_by("k").agg(**aggs).collect().to_arrow()
-    assert [_bits(v) for v in got.column("k").to_pylist()] == [_bits(-0.0), _bits(NEG_NAN)]
-    for row, values in enumerate([k[:3], k[3:]]):
-        ref = (
-            pa.table({"g": [0] * len(values), "k": values})
-            .group_by("g", use_threads=False)
-            .aggregate([("k", "sum"), ("k", "min"), ("k", "max")])
-        )
-        for name, theirs in [("s", "k_sum"), ("m", "k_min"), ("x", "k_max")]:
-            ours, want = got.column(name)[row].as_py(), ref.column(theirs)[0].as_py()
-            if math.isnan(want):  # a NaN result's sign is the fold's own (as on main)
-                assert math.isnan(ours), (name, row)
-            else:
-                assert _bits(ours) == _bits(want), (name, row)
+    assert [_bits(v) for v in got.column("k").to_pylist()] == [
+        _bits(-0.0),
+        _bits(NEG_NAN),
+        _bits(2.5),
+    ]
+    assert _bits(got.column("m")[0].as_py()) == _bits(-0.0)
+    assert _bits(got.column("x")[0].as_py()) == _bits(-0.0)
+    assert got.column("s").to_pylist()[0] == 0.0
+    assert all(math.isnan(got.column(c)[1].as_py()) for c in ("s", "m", "x"))
+    assert [got.column(c)[2].as_py() for c in ("s", "m", "x")] == [2.5, 2.5, 2.5]
 
 
 def test_distinct_compares_every_float_column_in_total_order(tmp_path):
