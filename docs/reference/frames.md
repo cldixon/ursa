@@ -28,7 +28,7 @@ The `src` and `dst` columns must have the same type: `int64` or `string`.
 
 | Method | Returns | Description |
 |---|---|---|
-| `edges.nodes()` | `NodeFrame` | The distinct ids in `src` and `dst`, as one `id` column. Lazy. It has the rows `with_columns(degree=ur.degree(edges))` has, in the same order, without the column: over a filtered frame the parent graph's nodes, and after a reshaping step the nodes of its rows. |
+| `edges.nodes()` | `NodeFrame` | The graph's node set, as one `id` column. Lazy. It has the rows `with_columns(degree=ur.degree(edges))` has, in the same order, without the column: over a filtered frame or a traversal result the parent graph's whole node set, and after a reshaping step the nodes of its rows. For only the nodes a view touches, use `ur.describe(frame, nodes="touched")`. |
 | `edges.reverse()` | `EdgeFrame` | The same rows with the `src` and `dst` roles swapped. No data moves. |
 | `edges.collect()` | `MaterializedFrame` | The edge rows, after any `filter`, `sort`, `head`, `distinct`, `sample`, or `rename`. |
 

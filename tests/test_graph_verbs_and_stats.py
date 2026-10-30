@@ -50,6 +50,10 @@ def _bits(x):
     return x.hex() if isinstance(x, float) else x
 
 
+def _row(frame, **kw):
+    return ur.describe(frame, **kw).collect().to_dicts()[0]
+
+
 # --- 1. a standalone verb is a frame -----------------------------------------
 
 
@@ -340,11 +344,59 @@ def test_bare_nodes_reads_the_view_as_a_graph_column_does(tmp_path):
     assert scan.nodes().collect().to_arrow().equals(e.nodes().collect().to_arrow())
 
 
+def test_bare_nodes_takes_a_scalar_with_columns():
+    e = ur.from_arrow(_random_table(), src="s", dst="d")
+    got = e.nodes().with_columns(y=col("id") + 1)
+    ids = e.nodes().collect().to_arrow()["id"].to_pylist()
+    table = got.collect().to_arrow()
+    assert table.column_names == ["id", "y"]
+    assert table["y"].to_pylist() == [i + 1 for i in ids]
+    assert got.schema().equals(table.schema, check_metadata=True)
+    # Steps before it run first, and a later graph column attaches by id.
+    later = (
+        e.nodes()
+        .filter(col("id") > 3)
+        .with_columns(y=col("id") * 2)
+        .with_columns(d=ur.degree(e))
+        .collect()
+        .to_arrow()
+    )
+    want = _as_nodes(e).filter(col("id") > 3).collect().to_arrow()
+    assert later["id"].equals(want["id"])
+    assert later["d"].to_pylist() == want["degree"].to_pylist()
+    with pytest.raises(ur.ColumnNotFoundError, match="nope"):
+        e.nodes().with_columns(y=col("nope") + 1)
+
+
+def test_bare_nodes_over_a_traversal_is_the_parent_node_set():
+    # The view's node set, as degree and describe read it: all 4 nodes, not the
+    # 3 the hop reached. describe(nodes="touched") gives the touched ones.
+    e = _edges()
+    hop = ur.hop(e, 1).from_([0])
+    assert hop.nodes().collect().to_dicts() == [{"id": i} for i in [0, 1, 2, 3]]
+    assert (
+        hop.nodes()
+        .collect()
+        .to_arrow()
+        .equals(hop.nodes().with_columns(d=ur.degree(hop)).select("id").collect().to_arrow())
+    )
+    assert _row(hop, nodes="touched")["n_nodes"] == 3
+
+
+def test_an_expression_has_no_truth_value():
+    e = _edges()
+    with pytest.raises(TypeError, match="truth value of an ursa expression"):
+        bool(ur.degree(e) == 1)
+    with pytest.raises(TypeError, match="truth value"):
+        _ = ur.degree(e) in [e.nodes()]
+    with pytest.raises(TypeError, match="truth value"):
+        if col("a") > 1:
+            pass
+    with pytest.raises(TypeError, match="truth value"):
+        _ = col("a") and col("b")
+
+
 # --- 4. describe(nodes="touched") --------------------------------------------
-
-
-def _row(frame, **kw):
-    return ur.describe(frame, **kw).collect().to_dicts()[0]
 
 
 def test_describe_touched_on_the_repro():

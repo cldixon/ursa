@@ -241,6 +241,13 @@ def category(name: str, a: dict, b: dict) -> str:
         return "fixed (#210): a stat over a traversal reads its induced subgraph"
     if kind == "other" and what == "verb" and "has no attribute '_node'" in m:
         return "changed (#213): a stat over a standalone verb reads it as a node frame"
+    if (
+        kind in ("nodes", "nodes_filtered", "nodes_reshaped")
+        and what == "with_columns"
+        and m.startswith("with_columns() takes ursa expressions")
+        and "error" not in b
+    ):
+        return "lifted (#213): a scalar with_columns on a bare edges.nodes()"
     if kind in ("nodes", "nodes_filtered", "nodes_reshaped") and "bare edges.nodes()" in m:
         return "lifted (#213): a bare edges.nodes() collects to its node set"
     if kind == "verb" and "'GraphExpr' object has no attribute" in m:

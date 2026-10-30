@@ -57,7 +57,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the rows after a reshaping step). Relational steps and joins after it run on
   those rows, and a `join` whose right side is a bare `nodes()` now builds. It
   raised `NotImplementedError: collect() on this NodeFrame needs a source ...`
-  (#213). The row is gone from `docs/limits.md`.
+  (#213). A first `with_columns` of scalar expressions runs on that node set
+  too (`e.nodes().with_columns(y=ur.col("id") + 1)`), as do the steps before
+  and after it. Over a filtered frame or a traversal result the node set is
+  the parent graph's (`ur.hop(e, 1).from_([0]).nodes()` has every node), as
+  `degree` and `describe` read it; `describe(f, nodes="touched")` counts the
+  touched ones. The row is gone from `docs/limits.md`.
+- **Behaviour change:** an ursa expression has no truth value. `bool(expr)`
+  raises `TypeError: the truth value of an ursa expression is ambiguous ...`,
+  as Polars does, so `if ur.col("a") == 1:`, `ur.degree(e) in frames` and
+  `a and b` over expressions fail instead of always passing. `==` still builds
+  an expression; combine predicates with `&`, `|` and `~` (#213).
 - `ur.density`, `ur.avg_path_length` and `ur.diameter` run as plan nodes, as
   `describe` does (`Plan::Stat`). `ursa._ursa.graph_density`,
   `graph_avg_path_length`, `graph_diameter` and `PlanNode.graph_index` are gone.

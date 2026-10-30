@@ -41,7 +41,7 @@ nodes = ur.NodeFrame(
 
 You get a `NodeFrame` in three ways:
 
-- `edges.nodes()` gives the distinct ids in `src` and `dst`, with no attributes.
+- `edges.nodes()` gives the graph's node set as one `id` column, with no attributes. Over a filtered frame or a `hop` / `shortest_path` result, that is the parent graph's whole node set, as `degree` and `describe` read it; after a reshaping step (`distinct`, `head`, a join, ...) it is the nodes of the reshaped rows. For only the nodes a view touches, use `ur.describe(frame, nodes="touched")`, or build a frame from the collected rows.
 - The `NodeFrame(...)` constructor, `ur.scan_nodes(...)`, or an interop function gives a table you supply.
 - A standalone algorithm call such as `ur.pagerank(edges)` is a `NodeFrame` of `(id, pagerank)`, with every frame method: `ur.pagerank(edges).join(ur.degree(edges), on="id")` works.
 

@@ -843,21 +843,23 @@ fn node_set(
     host: &dyn Host,
 ) -> PlanResult<Info> {
     let groups = graph_groups(columns, host)?;
-    let Some(first) = columns.iter().find_map(|c| match &c.expr {
-        ColumnExpr::Graph {
-            edges: Some(edges), ..
-        } => Some(edges),
-        _ => None,
-    }) else {
-        return Err(PlanError::NotImplemented(NON_GRAPH_COLUMN.into()));
-    };
-    // The node set's ids: the first graph column's edges', unless steps on the
-    // edges `nodes()` was called on shape the node set.
     let chain = nodes.chain();
     let at = chain
         .iter()
         .position(|n| matches!(n.op(), Op::Nodes { .. }))
         .unwrap_or(0);
+    // The node set's ids: the first graph column's edges', or with none (#213)
+    // the edges `nodes()` was called on, unless steps on those shape the node
+    // set.
+    let first = columns.iter().find_map(|c| match &c.expr {
+        ColumnExpr::Graph {
+            edges: Some(edges), ..
+        } => Some(edges.as_ref()),
+        _ => None,
+    });
+    let Some(first) = first.or_else(|| at.checked_sub(1).map(|i| chain[i])) else {
+        return Err(PlanError::NotImplemented(NON_GRAPH_COLUMN.into()));
+    };
     let shaped = chain[..at].iter().skip(1).any(|n| {
         !matches!(
             n.op(),

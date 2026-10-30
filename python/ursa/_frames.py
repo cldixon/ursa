@@ -321,7 +321,16 @@ class EdgeFrame(_Frame):
         return self._node.source[2]
 
     def nodes(self) -> NodeFrame:
-        """The distinct union of ``src`` and ``dst`` values, as a lazy NodeFrame."""
+        """The graph's node set, as a lazy NodeFrame with one ``id`` column.
+
+        These are the rows ``nodes().with_columns(degree=ur.degree(edges))`` has,
+        in the same order: the distinct ``src`` and ``dst`` values of the graph
+        the frame's view runs over. Over a filtered frame or a ``hop`` /
+        ``shortest_path`` result that is the parent graph's whole node set, as
+        ``degree`` and ``describe`` read it; after a reshaping step (``distinct``,
+        ``head``, a join, ...) it is the nodes of the reshaped rows. For only the
+        nodes a view touches, use ``describe(frame, nodes="touched")`` or build a
+        frame from the collected rows."""
         return NodeFrame._wrap(self._node.nodes())
 
     def reverse(self) -> EdgeFrame:

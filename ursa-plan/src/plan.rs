@@ -1640,9 +1640,11 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
 
     let roles = [("id", id_col.clone())];
     let Some(slot) = node_source_slot(chain) else {
-        // `edges.nodes()` with no columns: the node set alone (#213), then the
-        // steps written after it.
-        if first_columns.is_none() {
+        // `edges.nodes()` with no graph column first: the node set alone
+        // (#213), then the steps written after it, in order.
+        let graph_first =
+            first_columns.is_some_and(|c| c.iter().any(|e| matches!(e.expr, Expr::Graph(_))));
+        if !graph_first {
             let Some(edges) = nodes_input else {
                 return Err(PlanError::Invalid("a node frame with no rows".into()));
             };
