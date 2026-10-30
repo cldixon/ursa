@@ -76,17 +76,17 @@ Without a `sort`, rows come back in input order, the same on every run and every
 | Method | Description |
 |---|---|
 | `.filter(predicate)` | Keeps the rows where the [expression](expressions.md) is true. On an `EdgeFrame` before `nodes()`, the filter selects a subgraph. |
-| `.sort(by, *more_by, descending=False)` | Sorts by one or more columns or [expressions](expressions.md). `by` is a column name, an expression, or a list of them, and `more_by` adds more. Later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column. A float column sorts NaN above every number, whatever its sign bit, and `-0.0` equal to `0.0` (see [NaN in comparisons](../semantics.md#nan-in-comparisons-and-sorts)). The sort is stable: rows that tie on every column keep their input order, on every run. After a graph algorithm that is node order, or the attribute table's row order when the frame has one; after a traversal it is the traversal's own output order. |
+| `.sort(by, *more_by, descending=False)` | Sorts by one or more columns or [expressions](expressions.md). `by` is a column name, an expression, or a list of them, and `more_by` adds more. Later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column. A float column sorts NaN above every number, whatever its sign bit, and `-0.0` equal to `0.0` (see [Floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)). The sort is stable: rows that tie on every column keep their input order, on every run. After a graph algorithm that is node order, or the attribute table's row order when the frame has one; after a traversal it is the traversal's own output order. |
 | `.head(n=10)` | Keeps the first `n` rows. `.limit(n)` is the same method. |
-| `.distinct()` | Removes duplicate rows. |
+| `.distinct()` | Removes duplicate rows. Floats compare in total order ([floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)): `-0.0` equals `0.0`, and every NaN equals every NaN. |
 | `.sample(n, *, seed=None)` | Keeps `n` random rows. `seed` makes the choice reproducible. |
 
 ### Groups and joins
 
 | Method | Description |
 |---|---|
-| `.group_by(*keys).agg(*exprs, **named)` | Groups by one or more columns and computes [aggregations](expressions.md#aggregations). The output columns are the keys, then the aggregations. |
-| `.join(other, *, on, how="inner")` | An equi-join with another frame on the shared key column or columns `on`. `how` is `"inner"`, `"left"`, `"right"`, `"outer"` (or `"full"`), `"semi"` or `"anti"`. `other` is any frame, a traversal or another join included. Any number of joins compose with the other steps, which run as written. |
+| `.group_by(*keys).agg(*exprs, **named)` | Groups by one or more columns and computes [aggregations](expressions.md#aggregations). The output columns are the keys, then the aggregations. A float key groups in total order ([floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)): `-0.0` and `0.0` are one group, so are all NaNs, and the group shows its first row's value. |
+| `.join(other, *, on, how="inner")` | An equi-join with another frame on the shared key column or columns `on`. `how` is `"inner"`, `"left"`, `"right"`, `"outer"` (or `"full"`), `"semi"` or `"anti"`. `other` is any frame, a traversal or another join included. Any number of joins compose with the other steps, which run as written. A null key matches nothing; a float key matches in total order ([floats](../semantics.md#floats-one-order-for-comparisons-sorts-and-keys)). |
 
 ### Inspection
 
