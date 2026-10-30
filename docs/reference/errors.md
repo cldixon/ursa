@@ -75,11 +75,27 @@ The messages are part of the API: a change to one is listed in the changelog.
 |---|---|
 | `NotImplementedError` | The plan has a step, or a combination of steps, that does not run yet. Raised by the step that adds it. See [Limits](../limits.md). |
 | `ValueError` | An argument is invalid: an unknown `on_null` value, an edge tuple of the wrong length, two aggregations with one name, a `select` or `rename` that would give two columns one name, or a string argument given another type (`join(how=) must be a string; got 1`). Raised by the step that takes it. A `ColumnNotFoundError` is a `ValueError` too. |
-| `TypeError`, `OverflowError` | An integer argument is not an integer (`hop(n=) must be an integer; got a str`) or is out of range (`random_walk(steps=) must be a non-negative integer; got -1`). A column role is not a name (`src= must be a column name (a str); got 1 (int)`). A scan path is not a string or a `pathlib.Path`, or a scan gets an unknown keyword (`scan_edges() got an unexpected keyword argument 'sep'; use delimiter= instead.`). `join(other)` gets a value that is not a frame. A frame cannot be pickled or deep-copied. `bool(expr)`, and so `and`, `or`, `not` and `if` on an expression, raises `TypeError: the truth value of an ursa expression is ambiguous ...`. |
+| `TypeError`, `OverflowError` | An integer argument is not an integer (`hop(n=) must be an integer; got a str`) or is out of range (`random_walk(steps=) must be a non-negative integer; got -1`). A column role is not a name (`src= must be a column name (a str); got 1 (int)`). A scan path is not a string or a `pathlib.Path`, or a scan gets an unknown keyword (`scan_edges() got an unexpected keyword argument 'sep'; use delimiter= instead.`). `join(other)` gets a value that is not a frame. A frame cannot be pickled or deep-copied. A graph function gets something other than an edge frame (see [below](#a-graph-function-given-something-other-than-an-edge-frame)). `bool(expr)`, and so `and`, `or`, `not` and `if` on an expression, raises `TypeError: the truth value of an ursa expression is ambiguous ...`. |
 | `KeyError` | A role column (`src=`, `dst=`, `id=`) is not in the table: `src column 'source' is not in the table; it has ['s', 'd']`. |
-| `AttributeError` | A value that is no expression where one is needed (`filter() takes an ursa expression ...`), or a graph verb given something other than an `EdgeFrame` as its edges. |
+| `AttributeError` | A value that is no expression where one is needed (`filter() takes an ursa expression ...`). |
 | `ModuleNotFoundError` | `to_polars()` is called without `polars` installed. The message names the `ursa-graph[polars]` extra. |
 | `RuntimeError` | A dataset download fails. See [Datasets](datasets.md#the-download-cache). |
+
+## A graph function given something other than an edge frame
+
+Each function that takes `edges` (the algorithms, `neighbors`, `hop`, `shortest_path`, `random_walk`, and the statistics) checks it where you call it. A node frame, a graph verb, a `describe` or `random_walk` result, a collected result, a table or any other value raises `TypeError`. The message names the function, says what it got, and says what to pass:
+
+```py
+edges = ur.from_arrow({"s": [0, 1], "d": [1, 0]}, src="s", dst="d")
+try:
+    ur.density(ur.degree(edges))
+except TypeError as exc:
+    print(exc)
+    # density() takes an edge frame (from ur.from_arrow(..., src=, dst=) or ur.scan_edges);
+    # got a node frame (ur.degree(...)); pass the edges the verb was built from.
+```
+
+An edge frame of any kind passes the check: a filtered or reshaped frame, `edges.reverse()`, and a `hop` or `shortest_path` result.
 
 ## Warnings
 

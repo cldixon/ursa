@@ -53,6 +53,8 @@ ur.pagerank(edges).sort("pagerank").head(5)               # a frame
 ur.pagerank(edges).join(ur.degree(edges), on="id")        # a join of two frames
 ```
 
+The frame is a node frame, not an edge frame. A function that takes `edges`, such as `ur.density` or `ur.pagerank`, raises `TypeError` if you give it one. Give it the edges the algorithm was built from.
+
 When one `with_columns` call names the same algorithm twice with the same parameters, the engine runs it once.
 
 ## Where a column resolves

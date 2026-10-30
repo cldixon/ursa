@@ -1,6 +1,6 @@
 # Algorithms
 
-Each function in this page takes an `EdgeFrame` as its first argument. The node-valued functions return an expression that is also a lazy `NodeFrame` of `(id, value)`, with every [frame method](frames.md#shared-methods). Inside `with_columns(...)` it is a column. See [Expressions](../concepts/expressions.md#graph-algorithms-are-expressions).
+Each function in this page takes an `EdgeFrame` as its first argument. Any other value raises `TypeError` where you call the function. See [Errors](errors.md#a-graph-function-given-something-other-than-an-edge-frame). The node-valued functions return an expression that is also a lazy `NodeFrame` of `(id, value)`, with every [frame method](frames.md#shared-methods). Inside `with_columns(...)` it is a column. See [Expressions](../concepts/expressions.md#graph-algorithms-are-expressions).
 
 Over a filtered edge frame, a kernel runs on the subgraph view: the parent's nodes and the kept edges. Over a reshaped frame (`distinct`, `group_by().agg()`, a join, ...) it runs on the graph of the frame's rows. See [Work on a subgraph](../guides/subgraphs.md).
 

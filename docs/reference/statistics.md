@@ -2,6 +2,8 @@
 
 Whole-graph values. Each is a lazy one-row frame. `describe` always returns the frame. `density`, `avg_path_length`, and `diameter` return a Python number by default: they collect the frame for you. Pass `lazy=True` to get the frame instead, which flows anywhere a frame flows.
 
+Each takes an edge frame. Any other value, such as a node frame or a graph verb, raises `TypeError` where you call the function. See [Errors](errors.md#a-graph-function-given-something-other-than-an-edge-frame).
+
 Each reads the same subgraph view as `degree` and the other graph ops. Over a filtered edge frame, that is the parent graph's nodes and only the rows the filter keeps. Over a `hop` or `shortest_path` result, it is the subgraph the reached nodes induce. After a reshaping step (`distinct`, `head`, a join, ...) a stat reads the graph of the reshaped rows, as a new frame over them would.
 
 Each takes `direction`: `"out"` (the default), `"in"`, or `"both"`. The default reads the rows as directed. `"both"` reads them as the simple undirected graph: one edge for each distinct pair of nodes joined by a row in either direction, with self-loops dropped. That is the value NetworkX gives for `G.to_undirected()`. `"in"` follows edges backward, and over the whole graph it gives the same value as `"out"`. See [Semantics vs NetworkX](../semantics.md#undirected-graphs).
