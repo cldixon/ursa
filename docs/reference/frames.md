@@ -79,7 +79,7 @@ Without a `sort`, rows come back in input order, the same on every run and every
 | `.sort(by, *more_by, descending=False)` | Sorts by one or more columns or [expressions](expressions.md). `by` is a column name, an expression, or a list of them, and `more_by` adds more. Later columns break ties in earlier ones. `descending` is one bool for every column, or a list with one bool per column. Nulls sort last for every column. A float column sorts NaN above every number, whatever its sign bit, and `-0.0` equal to `0.0` (see [NaN in comparisons](../semantics.md#nan-in-comparisons-and-sorts)). The sort is stable: rows that tie on every column keep their input order, on every run. After a graph algorithm that is node order, or the attribute table's row order when the frame has one; after a traversal it is the traversal's own output order. |
 | `.head(n=10)` | Keeps the first `n` rows. `.limit(n)` is the same method. |
 | `.distinct()` | Removes duplicate rows. |
-| `.sample(n, *, seed=None)` | Keeps `n` random rows. `seed` makes the choice reproducible. |
+| `.sample(n, *, seed=None)` | Keeps `n` random rows, in input order. The choice is reproducible: the same `seed` keeps the same rows. `seed=None` uses a fixed default seed, so it also keeps the same rows on every call and every run; pass a different seed for a different draw. |
 
 ### Groups and joins
 

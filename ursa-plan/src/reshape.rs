@@ -26,6 +26,7 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 
 use crate::expr::GraphVerb;
+use crate::scan::CsvOptions;
 use serde_json::Value;
 
 use crate::plan::{
@@ -227,13 +228,18 @@ impl Fingerprint<'_> {
         Ok(())
     }
 
-    fn scan(&mut self, frame: usize, path: &Option<ScanPath>) -> PlanResult<()> {
+    /// A scan: the identity of every file it reads, in path order (#216), and
+    /// how a CSV file parses when that is not the default.
+    fn scan(&mut self, frame: usize, path: &Option<ScanPath>, csv: &CsvOptions) -> PlanResult<()> {
+        if !csv.is_default() {
+            self.push(format!("csv {csv:?}"));
+        }
         let identity = match path {
-            Some(ScanPath::One(p)) => {
+            Some(path) => {
                 let opts = self.inputs.storage_options(frame)?;
-                crate::scan::scan_identity(p, &opts)
+                crate::scan::scan_identity(path.paths(), &opts)
             }
-            _ => None,
+            None => None,
         };
         match identity {
             Some(id) => self.push(format!("files {id}")),
@@ -259,15 +265,23 @@ impl Fingerprint<'_> {
         }
     }
 
+    /// A plan's steps, first to last. A step the host could not serialize stands
+    /// for itself and the steps below it: the plan raises its error.
     fn plan(&mut self, plan: &Plan) -> PlanResult<()> {
-        if plan.invalid() {
-            // A step the host could not serialize: the plan raises its error.
-            self.local(format!("invalid @{:?}", plan.step()));
-            return Ok(());
+        let chain = plan.chain();
+        let start = chain.iter().rposition(|p| p.invalid()).unwrap_or(0);
+        for (i, step) in chain[start..].iter().enumerate() {
+            if i == 0 && step.invalid() {
+                self.local(format!("invalid @{:?}", step.step()));
+                continue;
+            }
+            self.step(step)?;
         }
-        if let Some(input) = plan.input() {
-            self.plan(input)?;
-        }
+        Ok(())
+    }
+
+    /// One step, without its input.
+    fn step(&mut self, plan: &Plan) -> PlanResult<()> {
         let op = plan.op();
         match plan {
             Plan::ScanEdges {
@@ -276,13 +290,19 @@ impl Fingerprint<'_> {
                 src,
                 dst,
                 on_null,
+                csv,
             } => {
                 self.push(format!("{op} src={src:?} dst={dst:?} on_null={on_null:?}"));
-                self.scan(*frame, path)?;
+                self.scan(*frame, path, csv)?;
             }
-            Plan::ScanNodes { frame, path, id } => {
+            Plan::ScanNodes {
+                frame,
+                path,
+                id,
+                csv,
+            } => {
                 self.push(format!("{op} id={id:?}"));
-                self.scan(*frame, path)?;
+                self.scan(*frame, path, csv)?;
             }
             Plan::FromArrow {
                 frame,

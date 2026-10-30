@@ -28,6 +28,7 @@ use ursa_plan::lazy::{
     CellValue, Column, ColumnExpr, Host, HostHandle, Kind, Node, Op, Seeds, State, Step,
 };
 use ursa_plan::plan::{AggSpec, Expr, IntArg, Rows, ScanPath, SelectItem, SortKey};
+use ursa_plan::scan::CsvOptions;
 use ursa_plan::{PlanError, PlanResult};
 
 use crate::{host_err, plan_err, GraphIndex, NodeTableCache};
@@ -260,6 +261,16 @@ fn scan_path(path: &Bound<'_, PyAny>) -> Option<ScanPath> {
     path.extract::<Vec<String>>().ok().map(ScanPath::Many)
 }
 
+/// A scan's CSV options: a dict of the ones given (each character as its byte),
+/// or `None` for the defaults.
+fn csv_options(csv: Option<&Bound<'_, PyAny>>) -> PyResult<CsvOptions> {
+    match csv {
+        Some(c) if !c.is_none() => serde_json::from_value(to_value(c)?)
+            .map_err(|e| PyValueError::new_err(format!("invalid plan: {e}"))),
+        _ => Ok(CsvOptions::default()),
+    }
+}
+
 fn seeds_of(obj: &Bound<'_, PyAny>) -> Seeds {
     match obj.cast::<PlanNode>() {
         Ok(n) => Seeds::Frame(n.get().0.clone()),
@@ -302,14 +313,17 @@ impl PlanNode {
         wrap(Node::node_table(handle(table), schema, id, &PyHost))
     }
 
-    /// `ur.scan_edges`: `spec` is `{"storage_options": ..., "store": ...}`.
+    /// `ur.scan_edges`: `spec` is `{"storage_options": ..., "store": ...}`;
+    /// `csv` holds the CSV options given, checked by the caller.
     #[staticmethod]
+    #[pyo3(signature = (path, src, dst, on_null, spec, csv=None))]
     fn scan_edges(
         path: &Bound<'_, PyAny>,
         src: &str,
         dst: &str,
         on_null: &str,
         spec: &Bound<'_, PyAny>,
+        csv: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PlanNode> {
         wrap(Node::scan_edges(
             scan_path(path),
@@ -317,18 +331,27 @@ impl PlanNode {
             dst,
             on_null,
             handle(spec),
+            csv_options(csv)?,
             &PyHost,
         ))
     }
 
     /// `ur.scan_nodes`.
     #[staticmethod]
+    #[pyo3(signature = (path, id, spec, csv=None))]
     fn scan_nodes(
         path: &Bound<'_, PyAny>,
         id: &str,
         spec: &Bound<'_, PyAny>,
+        csv: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PlanNode> {
-        wrap(Node::scan_nodes(scan_path(path), id, handle(spec), &PyHost))
+        wrap(Node::scan_nodes(
+            scan_path(path),
+            id,
+            handle(spec),
+            csv_options(csv)?,
+            &PyHost,
+        ))
     }
 
     #[pyo3(signature = (predicate, error=None))]

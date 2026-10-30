@@ -177,7 +177,10 @@ fn expr(e: &Expr) -> String {
     match e {
         Expr::Scalar(v) => value(v),
         Expr::Graph(verb) => {
-            let v = serde_json::to_value(&**verb).unwrap_or(Value::Null);
+            // The edges are shown under the step, not as a parameter.
+            let mut params_of = (**verb).clone();
+            params_of.edges = None;
+            let v = serde_json::to_value(&params_of).unwrap_or(Value::Null);
             let mut params = vec![];
             if let Value::Object(m) = v {
                 for (k, p) in m {

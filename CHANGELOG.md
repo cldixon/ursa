@@ -10,6 +10,26 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Added
 
+- CSV options on `scan_edges`, `scan_nodes`, `read_edges` and `read_nodes`:
+  `delimiter`, `has_header`, `quote`, `escape`, `null_value` and `comment`,
+  passed to DataFusion's CSV reader. The defaults read a file as before
+  (comma-separated, a header row, `"` quotes, an empty field as null). The
+  options are checked where the scan is made: each character option is one
+  ASCII character other than a line break, the four must differ, and an
+  option on a scan with no `.csv` path raises `ValueError`. `null_value` reads
+  that text as null, as an empty field is read; DataFusion 54 applies a null
+  pattern when it infers a schema but not when it reads rows, so Ursa reads
+  such a file's columns as text and casts them to the inferred types itself.
+  Results match `pyarrow.csv` with the same options (#216).
+- A scan of a list of paths collects: the paths (files or globs) are read as
+  one table, in the order given, as the files read into memory and
+  concatenated would be. Every graph operation sees that table, weighted
+  algorithms included: one index over the union of the files, with the
+  weights read from the same rows. The reshaped-topology cache keys such a
+  scan by every file it reads. The paths must have the same columns and
+  types, and be on one store; otherwise `collect()` names the path that
+  differs (#216).
+
 - `frame.schema()` returns the schema `collect()` returns, as a
   `pyarrow.Schema` (names, types, nullability and metadata), on every frame:
   sources and scans, graph columns, joins, `group_by`, traversals, walks and
@@ -27,6 +47,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `benchmarks/README.md` describes comparing two commits (#187).
 
 ### Changed
+
+- **Behaviour change:** an unknown keyword argument to `scan_edges`,
+  `scan_nodes`, `read_edges` or `read_nodes` raises Python's own
+  `TypeError` (`scan_edges() got an unexpected keyword argument 'x'`), as
+  `sink_csv` does. It raised `NotImplementedError: scan format options (...)
+  are not supported yet` (#216).
+- `sample(n)` without a seed is documented as deterministic: it draws with a
+  fixed default seed, so it keeps the same rows on every call and every run.
+  Pass a different `seed` for a different draw. Results are unchanged (#216).
+- A scan whose path is neither a string nor a list of strings (a
+  `pathlib.Path`, say) still raises `NotImplementedError` at `collect()`; the
+  message now says to pass a string or a list of strings, instead of saying a
+  list is not supported (#216).
 
 - Frames hold Rust plan objects (#193, the last item of #189). An `EdgeFrame`
   or `NodeFrame` holds one `ursa._ursa.PlanNode`, as a Polars `LazyFrame` holds
@@ -375,6 +408,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   part 1): its ~50 groups spread over 4 partitions only as evenly as they hash.
 
 ### Fixed
+
+- Long chains no longer crash the process (#216). `ur.degree` over 20,000
+  chained filters segfaulted on the default stack (a recursive clone of the
+  plan), and collecting a 20,000-step chain segfaulted on a 256 KB thread
+  stack (a recursive drop). A plan's inputs are now shared, so cloning a plan
+  copies one step, and dropped a step at a time; the reshaped-topology
+  fingerprint walks the chain in a loop; plan (de)serialization and `Debug`
+  move onto a heap-allocated stack segment when the thread's runs low. A
+  frame with more than 64 relational steps runs its `collect()`, `schema()`,
+  `explain()` and graph index build on a stack sized to it, since DataFusion's
+  optimizer and planner recurse once per operator: a node frame filtered
+  10,000 times after a graph column segfaulted on the default stack there.
+  Plans of up to 64 steps run as before. `collect()`, `schema()`, `explain()`
+  and graph ops over 20,000-step chains now work on a 256 KB thread stack.
 
 - `group_by()` by a dictionary (categorical) column with `int8`, `int16`,
   `uint8` or `uint16` codes, and `distinct()` over one, raised "Dictionary key

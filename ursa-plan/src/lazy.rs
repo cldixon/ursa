@@ -38,9 +38,9 @@ use crate::expr::GraphVerb;
 use crate::infer::Info;
 use crate::plan::{
     pending, AggSpec, EdgeInput, Expr, GraphIndex, HostRows, Inputs, IntArg, NamedExpr, Plan,
-    PlanError, PlanResult, Rows, ScanPath, SelectItem, Slot, SortKey,
+    PlanError, PlanResult, Rows, ScanPath, SelectItem, Slot, SortKey, SubPlan,
 };
-use crate::scan::NodeTableCache;
+use crate::scan::{CsvOptions, NodeTableCache};
 
 /// An object the host owns (a table, an argument it could not convert, ...).
 pub type HostHandle = Arc<dyn Any + Send + Sync>;
@@ -103,10 +103,12 @@ pub enum Op {
         path: Option<ScanPath>,
         on_null: String,
         spec: HostHandle,
+        csv: CsvOptions,
     },
     ScanNodes {
         path: Option<ScanPath>,
         spec: HostHandle,
+        csv: CsvOptions,
     },
     /// A relational step. `error` is the host's error for arguments it could not
     /// convert (the step's arguments are then left out).
@@ -457,13 +459,14 @@ impl Node {
     }
 
     /// `ur.scan_edges(path, src=, dst=, on_null=)`; `spec` holds the storage
-    /// options.
+    /// options, `csv` how a CSV file parses.
     pub fn scan_edges(
         path: Option<ScanPath>,
         src: &str,
         dst: &str,
         on_null: &str,
         spec: HostHandle,
+        csv: CsvOptions,
         host: &dyn Host,
     ) -> PlanResult<Arc<Node>> {
         let kind = Kind::Edges {
@@ -474,6 +477,7 @@ impl Node {
             path,
             on_null: on_null.into(),
             spec,
+            csv,
         };
         Node::build(op, kind, Arc::default(), host)
     }
@@ -483,9 +487,10 @@ impl Node {
         path: Option<ScanPath>,
         id: &str,
         spec: HostHandle,
+        csv: CsvOptions,
         host: &dyn Host,
     ) -> PlanResult<Arc<Node>> {
-        let op = Op::ScanNodes { path, spec };
+        let op = Op::ScanNodes { path, spec, csv };
         Node::build(op, Kind::Nodes { id: id.into() }, Arc::default(), host)
     }
 
@@ -741,7 +746,7 @@ impl Lowering {
     fn edges(&mut self, node: &Arc<Node>) -> EdgeInput {
         let plan = self.frame(node);
         EdgeInput {
-            plan: Box::new(plan),
+            plan: SubPlan::new(plan),
             frame: self.frame_slot(node),
         }
     }
@@ -782,7 +787,7 @@ impl Lowering {
     }
 
     fn node(&mut self, node: &Arc<Node>, input: Option<Plan>, slot: Slot) -> Plan {
-        let input = || Box::new(input.expect("a step has an input"));
+        let input = || SubPlan::new(input.expect("a step has an input"));
         match &node.op {
             Op::FromArrow { .. } => {
                 let (src, dst, id) = match &node.kind {
@@ -796,7 +801,9 @@ impl Lowering {
                     id,
                 }
             }
-            Op::ScanEdges { path, on_null, .. } => {
+            Op::ScanEdges {
+                path, on_null, csv, ..
+            } => {
                 let (src, dst) = node.roles().unwrap_or(("src", "dst"));
                 Plan::ScanEdges {
                     frame: slot,
@@ -804,12 +811,14 @@ impl Lowering {
                     src: src.to_string(),
                     dst: dst.to_string(),
                     on_null: on_null.clone(),
+                    csv: csv.clone(),
                 }
             }
-            Op::ScanNodes { path, .. } => Plan::ScanNodes {
+            Op::ScanNodes { path, csv, .. } => Plan::ScanNodes {
                 frame: slot,
                 path: path.clone(),
                 id: node.id_col().unwrap_or("id").to_string(),
+                csv: csv.clone(),
             },
             Op::Nodes { .. } => Plan::Nodes { input: input() },
             Op::Reverse { .. } => Plan::Reverse { input: input() },
@@ -830,7 +839,7 @@ impl Lowering {
                 }
                 if let Step::Join { right, on, how } = step {
                     let input = input();
-                    let right = Box::new(if self.shape {
+                    let right = SubPlan::new(if self.shape {
                         Plan::Invalid {
                             step: self.handle(right),
                         }
@@ -986,7 +995,7 @@ impl Lowering {
 
 /// A relational step whose arguments the host could not convert: the step with
 /// its arguments left out, raising the host's error where it is read.
-fn invalid_step(step: &Step, input: Box<Plan>, handle: Option<Slot>) -> Plan {
+fn invalid_step(step: &Step, input: SubPlan, handle: Option<Slot>) -> Plan {
     let (invalid, step_h) = (true, handle);
     match step {
         Step::Filter(_) => Plan::Filter {
@@ -1231,17 +1240,18 @@ fn build_source_index(node: &Node, host: &dyn Host) -> PlanResult<GraphIndex> {
     let (src, dst) = node.roles().unwrap_or(("src", "dst"));
     match &source.op {
         Op::ScanEdges {
-            path: Some(ScanPath::One(path)),
+            path: Some(path),
             on_null,
             spec,
+            csv,
         } => {
             let opts = host.storage_options(spec)?;
-            let scanned =
-                crate::scan::scan_edges_topology(path, src, dst, &opts, on_null == "drop")
-                    .map_err(|e| match e {
-                        crate::ScanBuildError::Scan(e) => PlanError::Engine(e),
-                        crate::ScanBuildError::Build(e) => PlanError::Value(e.to_string()),
-                    })?;
+            let source = crate::scan::ScanSource::new(path.paths(), &opts, csv);
+            let scanned = crate::scan::scan_edges_topology(source, src, dst, on_null == "drop")
+                .map_err(|e| match e {
+                    crate::ScanBuildError::Scan(e) => PlanError::Engine(e),
+                    crate::ScanBuildError::Build(e) => PlanError::Value(e.to_string()),
+                })?;
             crate::plan::count_topology_build();
             if scanned.dropped > 0 {
                 host.warn_dropped(scanned.dropped)?;
@@ -1440,7 +1450,9 @@ impl Rows {
 /// in-memory frame).
 pub fn execute(node: &Arc<Node>, host: &dyn Host) -> PlanResult<Rows> {
     let (plan, lowering) = Lowering::of(node);
-    crate::plan::execute(&plan, &lowering.inputs(host, Mode::Run))
+    crate::stack::for_steps(lowering.steps.len(), || {
+        crate::plan::execute(&plan, &lowering.inputs(host, Mode::Run))
+    })
 }
 
 /// The host handle of rows [`execute`] left with the host.
@@ -1451,29 +1463,45 @@ pub fn host_rows(rows: HostRows) -> Option<HostHandle> {
 /// The schema `collect()` returns, from a dry run.
 pub fn schema(node: &Arc<Node>, host: &dyn Host) -> PlanResult<SchemaRef> {
     let (plan, lowering) = Lowering::of(node);
-    Ok(crate::plan::dry_run(&plan, &lowering.inputs(host, Mode::Dry))?.0)
+    crate::stack::for_steps(lowering.steps.len(), || {
+        Ok(crate::plan::dry_run(&plan, &lowering.inputs(host, Mode::Dry))?.0)
+    })
 }
 
 /// The graph index of an edge frame, after the checks a graph op over it needs
 /// (for the eager whole-graph stats).
 pub fn graph_index(node: &Arc<Node>, host: &dyn Host) -> PlanResult<GraphIndex> {
     let (edges, lowering) = Lowering::edges_of(node);
-    crate::plan::require_index(&edges, &lowering.inputs(host, Mode::Run))
+    crate::stack::for_steps(lowering.steps.len(), || {
+        crate::plan::require_index(&edges, &lowering.inputs(host, Mode::Run))
+    })
 }
 
 /// `explain()`: the frame's plan tree, then the DataFusion plans a collect runs
 /// (from a dry run), optimized, and with `physical` their physical plans.
 pub fn explain(node: &Arc<Node>, host: &dyn Host, physical: bool) -> String {
     let (plan, lowering) = Lowering::of(node);
+    crate::stack::for_steps(lowering.steps.len(), || {
+        explain_plan(node, &plan, &lowering, host, physical)
+    })
+}
+
+fn explain_plan(
+    node: &Arc<Node>,
+    plan: &Plan,
+    lowering: &Lowering,
+    host: &dyn Host,
+    physical: bool,
+) -> String {
     let mut out = String::new();
     out.push_str(match node.kind {
         Kind::Edges { .. } => "EdgeFrame",
         Kind::Nodes { .. } => "NodeFrame",
     });
     out.push_str(" plan:\n");
-    crate::explain::tree(&plan, 1, &mut out);
+    crate::explain::tree(plan, 1, &mut out);
     let inputs = lowering.inputs(host, Mode::Dry);
-    match crate::plan::dry_run(&plan, &inputs) {
+    match crate::plan::dry_run(plan, &inputs) {
         Ok((schema, plans)) => {
             crate::explain::schema(&schema, &mut out);
             crate::explain::datafusion(&plans, physical, &mut out);

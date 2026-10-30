@@ -89,7 +89,7 @@ use crate::query::{
     attach_columns, graph_leaf, hop_leaf, node_columns, parse_direction, path_leaf, resolve_dense,
     walk_leaf, NodeColumn,
 };
-use crate::scan::{scan_edges_batch, scan_edges_rows, NodeTableCache};
+use crate::scan::{scan_edges_batch, scan_edges_rows, CsvOptions, NodeTableCache, ScanSource};
 use crate::stats::{describe_masked, parse_stat_direction};
 use crate::weight::{edge_weights, WeightCache};
 
@@ -120,6 +120,9 @@ pub enum Plan {
         src: String,
         dst: String,
         on_null: String,
+        /// How a CSV file parses (#216).
+        #[serde(default, skip_serializing_if = "CsvOptions::is_default")]
+        csv: CsvOptions,
     },
     /// `ur.scan_nodes(path, id=)`.
     ScanNodes {
@@ -127,6 +130,8 @@ pub enum Plan {
         #[serde(default)]
         path: Option<ScanPath>,
         id: String,
+        #[serde(default, skip_serializing_if = "CsvOptions::is_default")]
+        csv: CsvOptions,
     },
     /// An in-memory Arrow table: an edge frame (`src`/`dst`) or a node frame (`id`).
     FromArrow {
@@ -139,7 +144,7 @@ pub enum Plan {
         id: Option<String>,
     },
     Filter {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         predicate: Expr,
         #[serde(default)]
@@ -148,7 +153,7 @@ pub enum Plan {
         invalid: bool,
     },
     Select {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         columns: Vec<SelectItem>,
         #[serde(default)]
@@ -157,11 +162,11 @@ pub enum Plan {
         invalid: bool,
     },
     WithColumns {
-        input: Box<Plan>,
+        input: SubPlan,
         columns: Vec<NamedExpr>,
     },
     Rename {
-        input: Box<Plan>,
+        input: SubPlan,
         /// `(old, new)` pairs, in the order given.
         #[serde(default)]
         mapping: Vec<(String, String)>,
@@ -171,7 +176,7 @@ pub enum Plan {
         invalid: bool,
     },
     Sort {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         by: Vec<SortKey>,
         #[serde(default)]
@@ -180,7 +185,7 @@ pub enum Plan {
         invalid: bool,
     },
     Head {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         n: IntArg,
         #[serde(default)]
@@ -189,7 +194,7 @@ pub enum Plan {
         invalid: bool,
     },
     Sample {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         n: IntArg,
         #[serde(default)]
@@ -200,15 +205,15 @@ pub enum Plan {
         invalid: bool,
     },
     Distinct {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         step: Option<Slot>,
         #[serde(default)]
         invalid: bool,
     },
     Join {
-        input: Box<Plan>,
-        right: Box<Plan>,
+        input: SubPlan,
+        right: SubPlan,
         #[serde(default)]
         on: Vec<String>,
         how: String,
@@ -218,7 +223,7 @@ pub enum Plan {
         invalid: bool,
     },
     GroupByAgg {
-        input: Box<Plan>,
+        input: SubPlan,
         #[serde(default)]
         keys: Vec<String>,
         #[serde(default)]
@@ -229,9 +234,9 @@ pub enum Plan {
         invalid: bool,
     },
     /// `edges.nodes()`: the node set of an edge plan.
-    Nodes { input: Box<Plan> },
+    Nodes { input: SubPlan },
     /// `edges.reverse()`: swap the src/dst roles.
-    Reverse { input: Box<Plan> },
+    Reverse { input: SubPlan },
     /// `ur.hop(edges, n, direction).from_(seeds)`.
     Hop {
         edges: EdgeInput,
@@ -269,12 +274,133 @@ pub enum Plan {
     Invalid { step: Slot },
 }
 
+/// A plan's input, or another plan a step holds (a join's right side, a graph
+/// node's edges).
+///
+/// Plans nest one level per step, so the derived walks would recurse as deep as
+/// a chain is long (#216). A `SubPlan` is shared, so cloning a plan copies one
+/// level, and it drops its chain a step at a time, so a chain of any length
+/// clones and drops on any thread stack. Serde and `Debug` still recurse, on a
+/// stack that grows onto the heap ([`crate::stack`]); [`Plan::from_json`]
+/// parses on one sized to the JSON.
+#[derive(Clone)]
+pub struct SubPlan(Option<Arc<Plan>>);
+
+impl SubPlan {
+    pub fn new(plan: Plan) -> SubPlan {
+        SubPlan(Some(Arc::new(plan)))
+    }
+}
+
+impl std::ops::Deref for SubPlan {
+    type Target = Plan;
+
+    fn deref(&self) -> &Plan {
+        // `None` only inside `drop`.
+        self.0.as_deref().expect("a sub-plan is set")
+    }
+}
+
+impl AsRef<Plan> for SubPlan {
+    fn as_ref(&self) -> &Plan {
+        self
+    }
+}
+
+impl Drop for SubPlan {
+    fn drop(&mut self) {
+        let mut stack: Vec<Arc<Plan>> = self.0.take().into_iter().collect();
+        while let Some(plan) = stack.pop() {
+            // A plan another holder still shares is left to that holder.
+            if let Some(mut plan) = Arc::into_inner(plan) {
+                plan.detach(&mut stack);
+            }
+        }
+    }
+}
+
+impl Plan {
+    /// Move every sub-plan this step holds onto `out`, leaving it without them,
+    /// so dropping it drops one level.
+    fn detach(&mut self, out: &mut Vec<Arc<Plan>>) {
+        let mut take = |s: &mut SubPlan| out.extend(s.0.take());
+        let exprs = |e: &mut Expr, take: &mut dyn FnMut(&mut SubPlan)| {
+            if let Expr::Graph(verb) = e {
+                if let Some(edges) = &mut verb.edges {
+                    take(&mut edges.plan);
+                }
+            }
+        };
+        match self {
+            Plan::ScanEdges { .. } | Plan::ScanNodes { .. } | Plan::FromArrow { .. } => {}
+            Plan::Invalid { .. } => {}
+            Plan::Filter {
+                input, predicate, ..
+            } => {
+                take(input);
+                exprs(predicate, &mut take);
+            }
+            Plan::WithColumns { input, columns } => {
+                take(input);
+                for c in columns {
+                    exprs(&mut c.expr, &mut take);
+                }
+            }
+            Plan::Join { input, right, .. } => {
+                take(input);
+                take(right);
+            }
+            Plan::Select { input, .. }
+            | Plan::Rename { input, .. }
+            | Plan::Sort { input, .. }
+            | Plan::Head { input, .. }
+            | Plan::Sample { input, .. }
+            | Plan::Distinct { input, .. }
+            | Plan::GroupByAgg { input, .. }
+            | Plan::Nodes { input }
+            | Plan::Reverse { input } => take(input),
+            Plan::Hop { edges, .. }
+            | Plan::ShortestPath { edges, .. }
+            | Plan::RandomWalk { edges, .. }
+            | Plan::Describe { edges, .. } => take(&mut edges.plan),
+        }
+    }
+}
+
+impl fmt::Debug for SubPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        crate::stack::grow(|| fmt::Debug::fmt(&**self, f))
+    }
+}
+
+impl serde::Serialize for SubPlan {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        crate::stack::grow(|| (**self).serialize(s))
+    }
+}
+
+impl<'de> Deserialize<'de> for SubPlan {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Plan::deserialize(d).map(SubPlan::new)
+    }
+}
+
 /// A scan path: one path (a glob included) or a list of them.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum ScanPath {
     One(String),
     Many(Vec<String>),
+}
+
+impl ScanPath {
+    /// The paths, in the order given.
+    pub fn paths(&self) -> &[String] {
+        match self {
+            ScanPath::One(p) => std::slice::from_ref(p),
+            ScanPath::Many(paths) => paths,
+        }
+    }
 }
 
 /// An integer argument, as given. The engine converts it where it reads it, with
@@ -416,11 +542,29 @@ impl serde::Serialize for Expr {
         match self {
             Expr::Scalar(v) => v.serialize(s),
             Expr::Graph(verb) => {
-                let mut v = serde_json::to_value(verb).map_err(serde::ser::Error::custom)?;
-                if let Value::Object(m) = &mut v {
-                    m.insert("kind".into(), Value::from("graph"));
+                // The verb's fields as a JSON object, plus `kind`. Its edges, a
+                // whole plan, are serialized in place rather than built into a
+                // `Value` first, which would nest (and drop) as deep as the plan.
+                use serde::ser::SerializeMap;
+                let mut shallow = (**verb).clone();
+                let edges = shallow.edges.take();
+                let mut v = serde_json::to_value(&shallow).map_err(serde::ser::Error::custom)?;
+                let Value::Object(m) = &mut v else {
+                    return v.serialize(s);
+                };
+                m.insert("kind".into(), Value::from("graph"));
+                if edges.is_some() {
+                    // A placeholder, so the entries keep the map's key order.
+                    m.insert("edges".into(), Value::Null);
                 }
-                v.serialize(s)
+                let mut map = s.serialize_map(Some(m.len()))?;
+                for (k, value) in m.iter() {
+                    match (k.as_str(), &edges) {
+                        ("edges", Some(edges)) => map.serialize_entry(k, edges)?,
+                        _ => map.serialize_entry(k, value)?,
+                    }
+                }
+                map.end()
             }
         }
     }
@@ -455,19 +599,21 @@ pub(crate) fn kind(v: &Value) -> &str {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeInput {
-    pub plan: Box<Plan>,
+    pub plan: SubPlan,
     pub frame: Slot,
 }
 
 impl EdgeInput {
     /// Parse an edge input from its JSON (as [`Plan::from_json`]).
     pub fn from_json(json: &str) -> PlanResult<EdgeInput> {
-        let mut de = serde_json::Deserializer::from_str(json);
-        de.disable_recursion_limit();
-        let edges =
-            EdgeInput::deserialize(&mut de).map_err(|e| PlanError::Invalid(e.to_string()))?;
-        de.end().map_err(|e| PlanError::Invalid(e.to_string()))?;
-        Ok(edges)
+        crate::stack::for_json(json, || {
+            let mut de = serde_json::Deserializer::from_str(json);
+            de.disable_recursion_limit();
+            let edges =
+                EdgeInput::deserialize(&mut de).map_err(|e| PlanError::Invalid(e.to_string()))?;
+            de.end().map_err(|e| PlanError::Invalid(e.to_string()))?;
+            Ok(edges)
+        })
     }
 }
 
@@ -863,12 +1009,15 @@ impl Plan {
 
     /// Parse a plan from its JSON. Plans nest one level per step, so the parser's
     /// recursion limit is lifted (the serializer's own limit is lower).
+    /// The parse runs on a stack sized to the JSON ([`crate::stack::for_json`]).
     pub fn from_json(json: &str) -> PlanResult<Plan> {
-        let mut de = serde_json::Deserializer::from_str(json);
-        de.disable_recursion_limit();
-        let plan = Plan::deserialize(&mut de).map_err(|e| PlanError::Invalid(e.to_string()))?;
-        de.end().map_err(|e| PlanError::Invalid(e.to_string()))?;
-        Ok(plan)
+        crate::stack::for_json(json, || {
+            let mut de = serde_json::Deserializer::from_str(json);
+            de.disable_recursion_limit();
+            let plan = Plan::deserialize(&mut de).map_err(|e| PlanError::Invalid(e.to_string()))?;
+            de.end().map_err(|e| PlanError::Invalid(e.to_string()))?;
+            Ok(plan)
+        })
     }
 }
 
@@ -1600,7 +1749,7 @@ fn node_frame(chain: &[&Plan], inputs: &dyn Inputs) -> PlanResult<Built> {
     let shaped_edges = nodes_input
         .filter(|_| !pre_nodes.is_empty() && !after_traversal)
         .map(|p| EdgeInput {
-            plan: Box::new(p.clone()),
+            plan: SubPlan::new(p.clone()),
             frame: Slot::MAX,
         });
     let shaped = shaped_edges.as_ref().map(EdgeInput::view).transpose()?;
@@ -2230,16 +2379,17 @@ fn prepare_weighted(
             let table = table.into_batches(inputs)?;
             weight_columns(&table, &columns).map(Some)
         }
-        Plan::ScanEdges { path, on_null, .. } => {
-            let path = single_path(
-                path,
-                "weighted algorithms over a multi-path scan_edges source are not supported yet.",
-            )?;
+        Plan::ScanEdges {
+            path, on_null, csv, ..
+        } => {
+            let paths = scan_paths(path, MULTI_PATH_EDGES)?;
             let opts = inputs.storage_options(frame)?;
             // The frame's own roles: a reversed scan reads its endpoints swapped,
-            // as its index was built.
+            // as its index was built. Several paths are read as one table, in
+            // path order, as the index is built from them (#216).
             let (src, dst) = &view.roles;
-            let mut batches = scan_edges_batch(path, src, dst, &opts, &columns)?;
+            let source = ScanSource::new(paths, &opts, csv);
+            let mut batches = scan_edges_batch(source, src, dst, &columns)?;
             if on_null == "drop" {
                 let dropped = drop_null_endpoints(&mut batches)?;
                 if dropped > 0 {
@@ -2307,21 +2457,21 @@ fn drop_null_endpoints(batches: &mut [RecordBatch]) -> PlanResult<usize> {
     Ok(dropped)
 }
 
-/// A scan's one path, or the error for a list of them (`msg`).
-pub(crate) fn single_path<'a>(path: &'a Option<ScanPath>, msg: &str) -> PlanResult<&'a str> {
+/// A scan's paths, or the error for a path the host could not read (`msg`).
+pub(crate) fn scan_paths<'a>(path: &'a Option<ScanPath>, msg: &str) -> PlanResult<&'a [String]> {
     match path {
-        Some(ScanPath::One(p)) => Ok(p),
-        _ => not_implemented(msg),
+        Some(path) => Ok(path.paths()),
+        None => not_implemented(msg),
     }
 }
 
 pub(crate) const MULTI_PATH_EDGES: &str =
-    "collect() over a scan_edges source supports a single string \
-     path (glob included) for now, not a list of paths.";
+    "collect() over a scan_edges source needs the path as a string, or a list of \
+     strings (globs included); convert other path objects with str().";
 
 pub(crate) const MULTI_PATH_NODES: &str =
-    "collect() over a scan_nodes source supports a single string \
-     path (glob included) for now, not a list of paths.";
+    "collect() over a scan_nodes source needs the path as a string, or a list of \
+     strings (globs included); convert other path objects with str().";
 
 /// The subgraph-view mask of a view over `index`, or `None` for the whole graph.
 fn edge_mask(
@@ -2622,15 +2772,15 @@ fn edge_rows(
             src,
             dst,
             on_null,
+            csv,
             ..
         } => {
-            let path = single_path(path, MULTI_PATH_EDGES)?;
+            let paths = scan_paths(path, MULTI_PATH_EDGES)?;
             let opts = inputs.storage_options(frame)?;
             let rows = scan_edges_rows(
-                path,
+                ScanSource::new(paths, &opts, csv),
                 src,
                 dst,
-                &opts,
                 columns.unwrap_or(&[]),
                 &[],
                 on_null == "drop",
@@ -2657,11 +2807,12 @@ fn node_rows(
     inputs: &dyn Inputs,
 ) -> PlanResult<Rows> {
     match chain[0] {
-        Plan::ScanNodes { path, id, .. } => {
-            let path = single_path(path, MULTI_PATH_NODES)?;
+        Plan::ScanNodes { path, id, csv, .. } => {
+            let paths = scan_paths(path, MULTI_PATH_NODES)?;
             let opts = inputs.storage_options(frame)?;
             let cache = inputs.node_cache(frame)?;
-            Ok(Rows::Batches(cache.read(path, id, &opts, columns)?))
+            let source = ScanSource::new(paths, &opts, csv);
+            Ok(Rows::Batches(cache.read(source, id, columns)?))
         }
         _ => inputs
             .table(frame)?
@@ -2887,9 +3038,10 @@ fn plain_edges_frame(
             src,
             dst,
             on_null,
+            csv,
             ..
         } => {
-            let path = single_path(path, MULTI_PATH_EDGES)?;
+            let paths = scan_paths(path, MULTI_PATH_EDGES)?;
             let opts = inputs.storage_options(slot)?;
             let drop_nulls = on_null == "drop";
             // The leading filters go into the scan, unless `on_null="drop"` must
@@ -2904,10 +3056,9 @@ fn plain_edges_frame(
                 }
             }
             let (rows, n_pushed) = crate::scan::scan_edges_rows_pushing(
-                path,
+                ScanSource::new(paths, &opts, csv),
                 src,
                 dst,
-                &opts,
                 needed.as_deref().unwrap_or(&[]),
                 &pushed,
                 drop_nulls,
@@ -3737,6 +3888,77 @@ pub(crate) fn py_value(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chain of `n` filters over an in-memory edge source, with a graph
+    /// column at the top whose edges are the chain again.
+    fn long_chain(n: usize) -> Plan {
+        let mut plan = Plan::FromArrow {
+            frame: 0,
+            src: Some("s".into()),
+            dst: Some("d".into()),
+            id: None,
+        };
+        for _ in 0..n {
+            plan = Plan::Filter {
+                input: SubPlan::new(plan),
+                predicate: Expr::Scalar(serde_json::json!({"kind": "lit", "value": true})),
+                step: None,
+                invalid: false,
+            };
+        }
+        let mut verb: GraphVerb =
+            serde_json::from_value(serde_json::json!({"verb": "degree"})).expect("a verb");
+        verb.edges = Some(EdgeInput {
+            plan: SubPlan::new(plan.clone()),
+            frame: 0,
+        });
+        Plan::WithColumns {
+            input: SubPlan::new(Plan::Nodes {
+                input: SubPlan::new(plan),
+            }),
+            columns: vec![NamedExpr {
+                name: "degree".into(),
+                expr: Expr::Graph(Box::new(verb)),
+            }],
+        }
+    }
+
+    /// Run `f` on a thread with a 256 KiB stack.
+    fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(f)
+            .expect("a thread")
+            .join()
+            .expect("no panic");
+    }
+
+    #[test]
+    fn a_long_chain_clones_drops_and_round_trips_on_a_small_stack() {
+        // #216: each of these recursed once per step and overflowed.
+        on_small_stack(|| {
+            let plan = long_chain(100_000);
+            let copy = plan.clone();
+            assert_eq!(copy.chain().len(), 100_003);
+            drop(plan);
+            let json = copy.to_json();
+            let back = Plan::from_json(&json).expect("parses");
+            assert_eq!(back.to_json(), json);
+            assert!(format!("{back:?}").len() > 100_000);
+            drop((copy, back));
+        });
+    }
+
+    #[test]
+    fn a_shared_sub_plan_outlives_the_plan_dropped_around_it() {
+        let plan = long_chain(10);
+        let Plan::WithColumns { input, .. } = &plan else {
+            unreachable!()
+        };
+        let input = input.clone();
+        drop(plan);
+        assert_eq!(input.chain().len(), 12);
+    }
 
     #[test]
     fn integer_means_fold_in_order_for_any_partition_count() {

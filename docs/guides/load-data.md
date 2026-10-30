@@ -145,7 +145,22 @@ nodes = ur.scan_nodes("nodes.csv", id="node_id")
 result = nodes.with_columns(pagerank=ur.pagerank(edges)).collect()
 ```
 
-The format comes from the file extension. A CSV file needs a header row. A glob reads several files as one table: `"edges/*.parquet"`.
+The format comes from the file extension. A glob reads several files as one table: `"edges/*.parquet"`. So does a list of paths, in the order given: `["2024.parquet", "2025.parquet"]`. The files must have the same columns.
+
+By default a CSV file is comma-separated with a header row. Keyword arguments read other layouts:
+
+```py
+edges = ur.scan_edges(
+    "edges.csv",
+    src="from_id",
+    dst="to_id",
+    delimiter=";",      # fields separated by ;
+    null_value="NA",    # NA reads as null, as an empty field does
+    comment="#",        # skip lines that start with #
+)
+```
+
+`has_header=False` reads a file without a header row; its columns are then `column_1`, `column_2`, and so on. `quote` and `escape` set the quote and escape characters. See [Input and output](../reference/io.md#urscan_edges) for every option.
 
 `read_edges` and `read_nodes` are the eager forms. They return the rows at once.
 
