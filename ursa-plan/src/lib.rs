@@ -30,6 +30,7 @@ pub mod eval;
 pub mod explain;
 pub mod expr;
 pub mod infer;
+pub mod keys;
 pub mod lazy;
 pub mod logical;
 pub mod lower;

@@ -604,17 +604,142 @@ impl Frame {
         Ok(())
     }
 
-    /// `distinct`: one row per distinct row, at its first occurrence.
+    /// Canonical hidden copies of the float key columns among `keys` (#215, see
+    /// [`crate::keys`]): one per column with a `-0.0` or a non-canonical NaN in
+    /// some row, appended to the rows, which this materializes. Each comes with
+    /// the original values of the rows it changed, by ordinal (`ord`), so the
+    /// aggregate over it can show a group's first-appearance value. A column
+    /// with nothing to change is left alone, and so is a frame with no float
+    /// key: those group exactly as they always did.
+    fn canonical_keys(
+        &mut self,
+        keys: &[String],
+        ord: &str,
+    ) -> Result<Vec<(String, String, Arc<crate::keys::Originals>)>> {
+        use crate::keys::{canonicalize, is_float_key, noncanonical_rows, Originals};
+        let floats: Vec<&String> = keys
+            .iter()
+            .filter(|k| {
+                self.schema
+                    .as_arrow()
+                    .field_with_name(k)
+                    .is_ok_and(|f| is_float_key(f.data_type()))
+            })
+            .collect();
+        if floats.is_empty() {
+            return Ok(vec![]);
+        }
+        let batches = self.run()?;
+        let schema = batches[0].schema();
+        let o = schema.index_of(ord).map_err(arrow_err)?;
+        let mut out = vec![];
+        let mut hidden_cols: Vec<usize> = vec![];
+        let mut taken = schema.as_ref().clone();
+        for k in floats {
+            let i = schema.index_of(k).map_err(arrow_err)?;
+            let mut pieces: Vec<ArrayRef> = vec![];
+            let mut at = std::collections::HashMap::new();
+            for b in &batches {
+                let rows = noncanonical_rows(b.column(i).as_ref());
+                if rows.is_empty() {
+                    continue;
+                }
+                let ords = b
+                    .column(o)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| DataFusionError::Internal("an ordinal is UInt64".into()))?;
+                let base: usize = pieces.iter().map(|p| p.len()).sum();
+                for (j, &r) in rows.iter().enumerate() {
+                    at.insert(ords.value(r), base + j);
+                }
+                let idx = UInt64Array::from_iter_values(rows.iter().map(|&r| r as u64));
+                pieces.push(arrow::compute::take(b.column(i), &idx, None).map_err(arrow_err)?);
+            }
+            if pieces.is_empty() {
+                continue;
+            }
+            let refs: Vec<&dyn Array> = pieces.iter().map(|p| p.as_ref()).collect();
+            let values = arrow::compute::concat(&refs).map_err(arrow_err)?;
+            let hidden = fresh_name(&taken);
+            let field = schema.field(i).as_ref().clone().with_name(&hidden);
+            let mut fields: Vec<Field> =
+                taken.fields().iter().map(|f| f.as_ref().clone()).collect();
+            fields.push(field);
+            taken = Schema::new_with_metadata(fields, taken.metadata().clone());
+            hidden_cols.push(i);
+            out.push((k.clone(), hidden, Arc::new(Originals { values, at })));
+        }
+        if out.is_empty() {
+            return Ok(out);
+        }
+        let taken = Arc::new(taken);
+        let batches = batches
+            .into_iter()
+            .map(|b| {
+                let mut cols = b.columns().to_vec();
+                cols.extend(hidden_cols.iter().map(|&i| canonicalize(b.column(i))));
+                RecordBatch::try_new(taken.clone(), cols).map_err(arrow_err)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.set(batches)?;
+        Ok(out)
+    }
+
+    /// The aggregate `df` with each canonical key (by its hidden name, as
+    /// [`Frame::canonical_keys`] gives it) shown as its group's first-appearance
+    /// value under the key's own name; `first` is the group's first ordinal.
+    fn show_first_keys(
+        df: DataFrame,
+        canon: &[(String, String, Arc<crate::keys::Originals>)],
+        first: &str,
+    ) -> Result<DataFrame> {
+        if canon.is_empty() {
+            return Ok(df);
+        }
+        let exprs: Vec<Expr> = df
+            .schema()
+            .iter()
+            .map(
+                |(q, f)| match canon.iter().find(|(_, h, _)| h == f.name()) {
+                    Some((name, hidden, originals)) => crate::keys::representative(
+                        col_named(hidden),
+                        col_named(first),
+                        originals.clone(),
+                    )
+                    .alias(name),
+                    None => Expr::Column(Column::from((q, f))),
+                },
+            )
+            .collect();
+        df.select(exprs)
+    }
+
+    /// `distinct`: one row per distinct row, at its first occurrence. Floats
+    /// compare canonical (#215): the row shows the first occurrence's values.
     pub fn distinct(&mut self) -> Result<()> {
         let ord = self.number()?;
         let names: Vec<String> = self.user_columns().iter().map(output_name).collect();
         self.widen_dictionary_keys(&names)?;
-        let groups = self.user_columns();
+        let canon = self.canonical_keys(&names, &ord)?;
+        let groups: Vec<Expr> = self
+            .user_columns()
+            .into_iter()
+            .filter(|c| !canon.iter().any(|(_, h, _)| *h == output_name(c)))
+            .map(|c| {
+                let name = output_name(&c);
+                match canon.iter().find(|(k, _, _)| *k == name) {
+                    Some((_, hidden, _)) => col_named(hidden),
+                    None => c,
+                }
+            })
+            .collect();
         // The group's first position, under a new name (an aggregate over an
         // aggregate's output must not reuse its column names).
         let first = fresh_name(self.schema.as_arrow());
         let input = self.aggregate_input(false, &[])?;
         let df = aggregate(input, groups, vec![min(col_named(&ord)).alias(&first)])?;
+        let df = Self::show_first_keys(df, &canon, &first)?;
         self.replace(df);
         self.ord = Some(first);
         self.in_order = false;
@@ -624,7 +749,8 @@ impl Frame {
     /// `group_by(keys).agg(aggs)`: one row per group, at its first input row.
     /// When an aggregate depends on the order of its values (`ordered`: a float
     /// fold), each group's rows reach the aggregate in input order, in one
-    /// partition, so a sum adds them in that order.
+    /// partition, so a sum adds them in that order. A float key groups canonical
+    /// (#215) and shows its group's first-appearance value.
     pub fn group_by(&mut self, keys: Vec<Expr>, aggs: Vec<Expr>, ordered: bool) -> Result<()> {
         let ord = self.number()?;
         if ordered {
@@ -632,12 +758,27 @@ impl Frame {
         }
         let key_names: Vec<String> = keys.iter().map(output_name).collect();
         self.widen_dictionary_keys(&key_names)?;
-        let names: Vec<String> = keys.iter().chain(aggs.iter()).map(output_name).collect();
+        let canon = self.canonical_keys(&key_names, &ord)?;
+        let keys: Vec<Expr> = keys
+            .into_iter()
+            .map(
+                |k| match canon.iter().find(|(n, _, _)| *n == output_name(&k)) {
+                    Some((_, hidden, _)) => col_named(hidden),
+                    None => k,
+                },
+            )
+            .collect();
+        let names: Vec<String> = key_names
+            .iter()
+            .cloned()
+            .chain(aggs.iter().map(output_name))
+            .collect();
         let mut aggs = aggs;
         let first = fresh_name(self.schema.as_arrow());
         aggs.push(min(col_named(&ord)).alias(&first));
         let input = self.aggregate_input(ordered, &keys)?;
         let df = aggregate(input, keys, aggs)?;
+        let df = Self::show_first_keys(df, &canon, &first)?;
         self.replace(df);
         self.ord = Some(first);
         self.in_order = false;
@@ -922,6 +1063,22 @@ impl Frame {
     }
 }
 
+impl Frame {
+    /// Whether float key column `name` may hold a value canonicalizing changes
+    /// (a `-0.0` or a non-canonical NaN, #215): checked on materialized rows,
+    /// assumed for a plan.
+    fn may_change_key(&self, name: &str) -> bool {
+        let Some(batches) = &self.batches else {
+            return true;
+        };
+        batches.iter().any(|b| {
+            b.schema()
+                .index_of(name)
+                .is_ok_and(|i| !crate::keys::noncanonical_rows(b.column(i).as_ref()).is_empty())
+        })
+    }
+}
+
 /// For a join whose keys can take the right key's value (`right`, `outer`): the
 /// first key whose values in `right` the left key's type cannot hold, with the
 /// two types. Each key keeps the left key's type in the output.
@@ -1007,8 +1164,46 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
         .collect::<std::result::Result<_, arrow::error::ArrowError>>()
         .map_err(arrow_err)?;
     let sentinel = |c: &str| on.iter().position(|k| k == c).map(|i| &sentinels[i]);
+    // A float key joins canonical (#215): each float side of it is matched by a
+    // canonical copy under a private name, and the output keeps the original
+    // values. A key where neither side holds a value canonicalizing changes
+    // joins on the columns themselves, as it always did.
+    let float_key = |f: &Frame, k: &str| {
+        f.schema()
+            .field_with_name(k)
+            .is_ok_and(|f| crate::keys::is_float_key(f.data_type()))
+    };
+    let mut left_canon: Vec<Option<String>> = vec![None; on.len()];
+    let mut right_canon: Vec<Option<String>> = vec![None; on.len()];
+    for (i, k) in on.iter().enumerate() {
+        let (lf, rf) = (float_key(&left, k), float_key(&right, k));
+        if (lf || rf) && (left.may_change_key(k) || right.may_change_key(k)) {
+            if lf {
+                left_canon[i] = Some(fresh_name_with(&taken, &format!("_lc{i}")));
+            }
+            if rf {
+                right_canon[i] = Some(fresh_name_with(&taken, &format!("_rc{i}")));
+            }
+        }
+    }
+    let canonical_copies = |canon: &[Option<String>], keys: &[String]| -> Vec<Expr> {
+        canon
+            .iter()
+            .zip(keys)
+            .filter_map(|(c, k)| {
+                c.as_ref()
+                    .map(|c| crate::keys::canonical_expr(col_named(k)).alias(c))
+            })
+            .collect()
+    };
 
-    let left_df = left.join_input(&l)?;
+    let mut left_df = left.join_input(&l)?;
+    if left_canon.iter().any(Option::is_some) {
+        let mut cols: Vec<Expr> = left_names.iter().map(|c| col_named(c)).collect();
+        cols.push(col_named(&l));
+        cols.extend(canonical_copies(&left_canon, on));
+        left_df = left_df.select(cols)?;
+    }
     let right_df = if how.keeps_right() {
         let df = right.join_input(&r)?;
         let mut cols: Vec<Expr> = right_names
@@ -1019,15 +1214,17 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
             })
             .collect();
         cols.push(col_named(&r));
+        cols.extend(canonical_copies(&right_canon, on));
         df.select(cols)?
     } else {
         // Only whether a row has a match is read: the keys, in any order.
         let mut right = right;
-        let keys: Vec<Expr> = on
+        let mut keys: Vec<Expr> = on
             .iter()
             .zip(&sentinels)
             .map(|(k, s)| col_named(k).alias(s))
             .collect();
+        keys.extend(canonical_copies(&right_canon, on));
         right.plan()?.select(keys)?
     };
     let join_type = match how {
@@ -1038,8 +1235,16 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
         How::Semi => JoinType::LeftSemi,
         How::Anti => JoinType::LeftAnti,
     };
-    let left_keys: Vec<&str> = on.iter().map(String::as_str).collect();
-    let right_keys: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+    let left_keys: Vec<&str> = on
+        .iter()
+        .zip(&left_canon)
+        .map(|(k, c)| c.as_deref().unwrap_or(k))
+        .collect();
+    let right_keys: Vec<&str> = sentinels
+        .iter()
+        .zip(&right_canon)
+        .map(|(s, c)| c.as_deref().unwrap_or(s))
+        .collect();
     let joined = left_df.join(right_df, join_type, &left_keys, &right_keys, None)?;
 
     let mut out: Vec<Expr> = left_names

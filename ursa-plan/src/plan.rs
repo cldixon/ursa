@@ -3354,6 +3354,8 @@ fn group_by(frame: &mut Frame, keys: &[String], aggs: &[AggSpec]) -> PlanResult<
             "min" => min(operand),
             "max" => max(operand),
             "count" => count(operand),
+            // Floats count canonical (#215): one -0.0/0.0, one NaN.
+            "n_unique" if dt.is_floating() => count_distinct(crate::keys::canonical_expr(operand)),
             "n_unique" => count_distinct(operand),
             other => return check_agg_fn(other),
         };
@@ -4434,5 +4436,408 @@ mod tests {
         assert!(err
             .to_string()
             .contains("dst column 'd', but select() removed it"));
+    }
+
+    // --- one float semantics for keys (#215) ---------------------------------
+
+    /// Float key values: NaN of both signs and several payloads, ±0.0, ±inf,
+    /// nulls and plain numbers.
+    fn key_pool() -> Vec<Option<f64>> {
+        vec![
+            Some(-0.0),
+            Some(1.5),
+            Some(0.0),
+            Some(f64::NAN),
+            Some(f64::from_bits(0xfff8_0000_0000_0001)),
+            None,
+            Some(f64::from_bits(0x7ff0_0000_0000_0005)),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::from_bits(0xfff8_0000_0000_0000)),
+            Some(-1.5),
+            Some(f64::from_bits(0x7ff8_dead_beef_0000)),
+        ]
+    }
+
+    /// The class a float key compares as: canonical bits, `None` for null.
+    fn key_class(v: Option<f64>) -> Option<u64> {
+        v.map(|x| if x.is_nan() { f64::NAN } else { x + 0.0 }.to_bits())
+    }
+
+    /// `n` rows of `(k, s, w, v)`: `k` and `w` drawn from [`key_pool`] (so a
+    /// group's first value varies), `s` a second key, `v` an integer-valued
+    /// float, cut into uneven batches; `k` cast to `key_type`.
+    fn float_key_batches(n: usize, key_type: &DataType) -> Vec<RecordBatch> {
+        use arrow::array::{Float64Array, StringArray};
+        let pool = key_pool();
+        let pick = |i: usize, m: usize| pool[(i.wrapping_mul(2_654_435_761) >> 7) % m];
+        let k: Vec<Option<f64>> = (0..n).map(|i| pick(i, pool.len())).collect();
+        let w: Vec<Option<f64>> = (0..n).map(|i| pick(i * 31 + 5, pool.len())).collect();
+        let s: Vec<String> = (0..n).map(|i| format!("s{}", (i * 7) % 3)).collect();
+        let v: Vec<f64> = (0..n).map(|i| (i % 101) as f64).collect();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", key_type.clone(), true),
+            arrow::datatypes::Field::new("s", DataType::Utf8, false),
+            arrow::datatypes::Field::new("w", DataType::Float64, true),
+            arrow::datatypes::Field::new("v", DataType::Float64, false),
+        ]));
+        let mut out = vec![];
+        let mut at = 0;
+        for size in [1usize, 7, 4096, 9000, 333, 8193, usize::MAX] {
+            let end = n.min(at.saturating_add(size));
+            if end <= at {
+                break;
+            }
+            let k64: ArrayRef = Arc::new(Float64Array::from(k[at..end].to_vec()));
+            let cols: Vec<ArrayRef> = vec![
+                arrow::compute::cast(&k64, key_type).unwrap(),
+                Arc::new(StringArray::from(s[at..end].to_vec())),
+                Arc::new(Float64Array::from(w[at..end].to_vec())),
+                Arc::new(Float64Array::from(v[at..end].to_vec())),
+            ];
+            out.push(RecordBatch::try_new(schema.clone(), cols).unwrap());
+            at = end;
+        }
+        out
+    }
+
+    /// Column `name` of `batches` as `float64` (each value by its bits), with
+    /// nulls.
+    fn as_f64(batches: &[RecordBatch], name: &str) -> Vec<Option<u64>> {
+        use arrow::array::Float64Array;
+        batches
+            .iter()
+            .flat_map(|b| {
+                let c = arrow::compute::cast(b.column_by_name(name).unwrap(), &DataType::Float64)
+                    .unwrap();
+                let c = c.as_any().downcast_ref::<Float64Array>().unwrap().clone();
+                (0..c.len())
+                    .map(|i| c.is_valid(i).then(|| c.value(i).to_bits()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn strings(batches: &[RecordBatch], name: &str) -> Vec<Option<String>> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let c = b.column_by_name(name).unwrap();
+                (0..c.len())
+                    .map(|i| {
+                        c.is_valid(i)
+                            .then(|| arrow::util::display::array_value_to_string(c, i).unwrap())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn class_of_bits(b: Option<u64>) -> Option<u64> {
+        key_class(b.map(f64::from_bits))
+    }
+
+    fn float_key_types() -> Vec<DataType> {
+        vec![
+            DataType::Float64,
+            DataType::Float32,
+            DataType::Float16,
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Float64)),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float32)),
+        ]
+    }
+
+    #[test]
+    fn float_keys_group_in_total_order_on_any_partition_count() {
+        use crate::lower::{session, Frame, TEST_PARTITIONS};
+        let n = 30_000;
+        let aggs = specs(&[
+            ("n", "count", "v"),
+            ("t", "sum", "v"),
+            ("u", "n_unique", "w"),
+        ]);
+        for key_type in float_key_types() {
+            let batches = float_key_batches(n, &key_type);
+            let k = as_f64(&batches, "k");
+            let s = strings(&batches, "s");
+            let w = as_f64(&batches, "w");
+            let v: Vec<f64> = as_f64(&batches, "v")
+                .into_iter()
+                .map(|b| f64::from_bits(b.unwrap()))
+                .collect();
+            for multi in [false, true] {
+                // The reference: groups by class in first-appearance order, each
+                // showing its first row's key bits.
+                type Group = (usize, usize, f64, std::collections::BTreeSet<Option<u64>>);
+                let mut order: Vec<(Option<u64>, Option<String>)> = vec![];
+                let mut groups: HashMap<(Option<u64>, Option<String>), Group> = HashMap::new();
+                for r in 0..n {
+                    let id = (class_of_bits(k[r]), multi.then(|| s[r].clone().unwrap()));
+                    let g = groups.entry(id.clone()).or_insert_with(|| {
+                        order.push(id.clone());
+                        (r, 0, 0.0, Default::default())
+                    });
+                    g.1 += 1;
+                    g.2 += v[r];
+                    if w[r].is_some() {
+                        g.3.insert(class_of_bits(w[r]));
+                    }
+                }
+                let want: Vec<String> = order
+                    .iter()
+                    .map(|id| {
+                        let (first, count, sum, uniq) = &groups[id];
+                        format!(
+                            "{:?},{:?},{count},{:#x},{}",
+                            k[*first],
+                            s[*first].as_ref().filter(|_| multi),
+                            sum.to_bits(),
+                            uniq.len()
+                        )
+                    })
+                    .collect();
+                for p in [1, 3, 8] {
+                    TEST_PARTITIONS.with(|c| c.set(Some(p)));
+                    let mut f = Frame::from_batches(session(), batches.clone()).unwrap();
+                    let keys: Vec<String> = if multi {
+                        vec!["k".into(), "s".into()]
+                    } else {
+                        vec!["k".into()]
+                    };
+                    group_by(&mut f, &keys, &aggs).unwrap();
+                    let out = f.collect().unwrap();
+                    TEST_PARTITIONS.with(|c| c.set(None));
+                    let schema = out[0].schema();
+                    assert_eq!(schema.field_with_name("k").unwrap().data_type(), &key_type);
+                    let (gk, gs, gn, gt, gu) = (
+                        as_f64(&out, "k"),
+                        strings(&out, "s"),
+                        strings(&out, "n"),
+                        as_f64(&out, "t"),
+                        strings(&out, "u"),
+                    );
+                    let got: Vec<String> = (0..gk.len())
+                        .map(|i| {
+                            format!(
+                                "{:?},{:?},{},{:#x},{}",
+                                gk[i],
+                                if multi { gs[i].clone() } else { None },
+                                gn[i].clone().unwrap(),
+                                gt[i].unwrap(),
+                                gu[i].clone().unwrap()
+                            )
+                        })
+                        .collect();
+                    assert_eq!(got, want, "key_type={key_type} multi={multi} p={p}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_compares_every_float_column_in_total_order() {
+        use crate::lower::{session, Frame, TEST_PARTITIONS};
+        let n = 30_000;
+        for key_type in float_key_types() {
+            let batches = float_key_batches(n, &key_type);
+            let (k, s, w) = (
+                as_f64(&batches, "k"),
+                strings(&batches, "s"),
+                as_f64(&batches, "w"),
+            );
+            let mut seen = std::collections::HashSet::new();
+            let want: Vec<String> = (0..n)
+                .filter(|&r| seen.insert((class_of_bits(k[r]), s[r].clone(), class_of_bits(w[r]))))
+                .map(|r| format!("{:?},{:?},{:?}", k[r], s[r], w[r]))
+                .collect();
+            for p in [1, 3, 8] {
+                TEST_PARTITIONS.with(|c| c.set(Some(p)));
+                let mut f = Frame::from_batches(session(), batches.clone()).unwrap();
+                f.project(vec![col_named("k"), col_named("s"), col_named("w")])
+                    .unwrap();
+                f.distinct().unwrap();
+                let out = f.collect().unwrap();
+                TEST_PARTITIONS.with(|c| c.set(None));
+                assert_eq!(
+                    out[0]
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| (f.name().clone(), f.data_type().clone()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ("k".to_string(), key_type.clone()),
+                        ("s".to_string(), DataType::Utf8),
+                        ("w".to_string(), DataType::Float64)
+                    ]
+                );
+                let (gk, gs, gw) = (as_f64(&out, "k"), strings(&out, "s"), as_f64(&out, "w"));
+                let got: Vec<String> = (0..gk.len())
+                    .map(|i| format!("{:?},{:?},{:?}", gk[i], gs[i], gw[i]))
+                    .collect();
+                assert_eq!(got, want, "key_type={key_type} p={p}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_join_keys_match_in_total_order_for_every_how() {
+        use crate::lower::{join, read_ordered, session, Frame, How, TEST_PARTITIONS};
+        use arrow::array::Int64Array;
+        let side = |n: usize, salt: usize, key_type: &DataType, value: &str| {
+            let b = float_key_batches(n, key_type);
+            let mut out = vec![];
+            let mut at = 0i64;
+            for b in b {
+                let rows = b.num_rows() as i64;
+                let vals: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    (at..at + rows).map(|i| i * 10 + salt as i64),
+                ));
+                at += rows;
+                let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                    b.schema().field(0).clone(),
+                    arrow::datatypes::Field::new(value, DataType::Int64, false),
+                ]));
+                out.push(RecordBatch::try_new(schema, vec![b.column(0).clone(), vals]).unwrap());
+            }
+            out
+        };
+        let hows = [
+            How::Inner,
+            How::Left,
+            How::Right,
+            How::Outer,
+            How::Semi,
+            How::Anti,
+        ];
+        for key_type in float_key_types() {
+            let (lb, rb) = (side(60, 1, &key_type, "a"), side(25, 2, &key_type, "b"));
+            let lk = as_f64(&lb, "k");
+            let rk = as_f64(&rb, "k");
+            let la: Vec<i64> = strings(&lb, "a")
+                .iter()
+                .map(|x| x.clone().unwrap().parse().unwrap())
+                .collect();
+            let rbv: Vec<i64> = strings(&rb, "b")
+                .iter()
+                .map(|x| x.clone().unwrap().parse().unwrap())
+                .collect();
+            let eq = |a: Option<u64>, b: Option<u64>| {
+                a.is_some() && class_of_bits(a) == class_of_bits(b)
+            };
+            for how in hows {
+                // The nested-loop reference: (key bits, a, b) per row, in the
+                // order the join guarantees; each row keeps its own key.
+                let mut want: Vec<(Option<u64>, Option<i64>, Option<i64>)> = vec![];
+                if how == How::Right {
+                    for (j, &k) in rk.iter().enumerate() {
+                        let m: Vec<usize> = (0..lk.len()).filter(|&i| eq(lk[i], k)).collect();
+                        if m.is_empty() {
+                            want.push((k, None, Some(rbv[j])));
+                        }
+                        want.extend(m.iter().map(|&i| (lk[i], Some(la[i]), Some(rbv[j]))));
+                    }
+                } else {
+                    for (i, &k) in lk.iter().enumerate() {
+                        let m: Vec<usize> = (0..rk.len()).filter(|&j| eq(k, rk[j])).collect();
+                        match how {
+                            How::Semi | How::Anti => {
+                                if m.is_empty() == (how == How::Anti) {
+                                    want.push((k, Some(la[i]), None));
+                                }
+                            }
+                            _ => {
+                                if m.is_empty() && how != How::Inner {
+                                    want.push((k, Some(la[i]), None));
+                                }
+                                want.extend(m.iter().map(|&j| (k, Some(la[i]), Some(rbv[j]))));
+                            }
+                        }
+                    }
+                    if how == How::Outer {
+                        for (j, &k) in rk.iter().enumerate() {
+                            if !lk.iter().any(|&l| eq(l, k)) {
+                                want.push((k, None, Some(rbv[j])));
+                            }
+                        }
+                    }
+                }
+                for p in [1, 3, 8] {
+                    TEST_PARTITIONS.with(|c| c.set(Some(p)));
+                    for lazy in [false, true] {
+                        let ctx = session();
+                        let frame = |b: &Vec<RecordBatch>| {
+                            if lazy {
+                                Frame::from_ordered(
+                                    ctx.clone(),
+                                    read_ordered(&ctx, b.clone()).unwrap(),
+                                )
+                            } else {
+                                Frame::from_batches(ctx.clone(), b.clone()).unwrap()
+                            }
+                        };
+                        let j = join(frame(&lb), frame(&rb), &["k".to_string()], how).unwrap();
+                        let out = j.collect().unwrap();
+                        assert_eq!(
+                            out[0].schema().field_with_name("k").unwrap().data_type(),
+                            &key_type
+                        );
+                        let gk = as_f64(&out, "k");
+                        let ga = strings(&out, "a");
+                        let gb = if how.keeps_right() {
+                            strings(&out, "b")
+                        } else {
+                            vec![None; gk.len()]
+                        };
+                        let got: Vec<_> = (0..gk.len())
+                            .map(|i| {
+                                (
+                                    gk[i],
+                                    ga[i].as_ref().map(|x| x.parse().unwrap()),
+                                    gb[i].as_ref().map(|x| x.parse().unwrap()),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(
+                            got, want,
+                            "key_type={key_type} how={how:?} p={p} lazy={lazy}"
+                        );
+                    }
+                    TEST_PARTITIONS.with(|c| c.set(None));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn float_keys_without_signed_zeros_or_odd_nans_group_as_before() {
+        // Nothing to canonicalize: the plan is the one main ran, no hidden key.
+        use crate::lower::{session, Frame};
+        use arrow::array::Float64Array;
+        let k: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            None,
+            Some(0.0),
+            Some(1.0),
+        ]));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", DataType::Float64, true),
+        ]));
+        let batches = vec![RecordBatch::try_new(schema, vec![k]).unwrap()];
+        let mut f = Frame::from_batches(session(), batches).unwrap();
+        group_by(&mut f, &["k".to_string()], &specs(&[("n", "count", "k")])).unwrap();
+        let text = f.physical_plan_text().unwrap();
+        assert!(!text.contains("ursa_first_key"), "{text}");
+        let out = f.collect().unwrap();
+        assert_eq!(
+            grouped_rows(&out),
+            vec![
+                "0x3ff0000000000000,2",
+                "0x7ff8000000000000,1",
+                "null,0",
+                "0x0,1"
+            ]
+        );
     }
 }
