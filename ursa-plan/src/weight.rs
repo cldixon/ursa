@@ -74,8 +74,9 @@ pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f
     let dt = physical.data_type(&schema)?;
     if !is_numeric(&dt) {
         return Err(DataFusionError::Execution(format!(
-            "weight expression must be numeric; it produced a column of type {dt:?} \
-             (a string or other non-numeric column cannot be a weight)"
+            "weight expression must be numeric; it produced a column of type {} \
+             (a string or other non-numeric column cannot be a weight)",
+            crate::compare::pa_name(&dt)
         )));
     }
 

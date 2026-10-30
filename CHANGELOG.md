@@ -40,6 +40,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   path infers its own types, so a column of `1`s in one file and `0.5`s in
   another is such a difference, as it is for a glob (#216).
 
+- `ur.density`, `ur.avg_path_length` and `ur.diameter` take `lazy=True`, which
+  returns a lazy one-row frame like `ur.describe`: one non-null column named
+  after the stat (`density` and `avg_path_length` are `float64`, `diameter`
+  `int64`), with `schema()`, `explain()` and the relational methods. Called as
+  before they still return a Python `float` / `int`: they now collect that
+  frame (#213).
+- `ur.describe(edges, nodes="touched")` describes only the nodes the view
+  touches, those at an end of a kept edge: over a filter or a traversal result,
+  `n_nodes` counts them, `density` and `avg_degree` divide by that count, and
+  `n_components` leaves the other nodes out. These are the figures a new frame
+  over the kept rows gives. The default, `nodes="all"`, keeps the parent's node
+  set as before; over a whole graph the two agree. Any other value raises
+  `ValueError: describe(nodes=...) is not supported; use 'all' or 'touched'.`
+  where `describe` is called (#213).
 - `frame.schema()` returns the schema `collect()` returns, as a
   `pyarrow.Schema` (names, types, nullability and metadata), on every frame:
   sources and scans, graph columns, joins, `group_by`, traversals, walks and
@@ -79,6 +93,195 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - A `pathlib.Path` works as a scan path. It raised `NotImplementedError` at
   `collect()` (#216).
 
+- **Behaviour change:** error messages no longer show the engine's internals
+  (#214). A message names the step or argument, says what was wrong and what to
+  do; no message contains DataFusion's `?table?` qualifier, a private
+  `__ursa_` column, serde's or pyo3's wording, or a DataFusion/Arrow variant
+  prefix (`Execution error:`, `Arrow error:`, `Error during planning:`,
+  `This feature is not implemented:`, `Schema error:`). Where Ursa rewords an
+  engine error, the engine's text is the exception's `__cause__` (a
+  `RuntimeError`); in Rust, `PlanError::source()` returns it. Every exception
+  class is unchanged, and so is every result. The messages that changed (old →
+  new; `…` is the rest of the new message):
+  - comparisons: `Function 'greater' has no kernel matching input types
+    (string, int64)` → `cannot compare string with int64 (string > int64);
+    compare values of one type` (every operator and type pair), and `Integer
+    value N not in range: LO to HI` → `the integer N does not fit the type both
+    sides are compared as (range LO to HI), so the comparison would not be
+    exact; …`;
+  - DataFusion's planning errors: `Error during planning: Cannot coerce
+    arithmetic expression Utf8 * Int64 to valid types` → `cannot apply '*' to
+    string and int64 (string * int64); arithmetic needs numeric operands`;
+    `… logical boolean operation Boolean AND Int64` → `'&' combines boolean
+    predicates (comparisons such as ur.col('a') > 1); got bool and int64` (and
+    `'|'`); `… Int64 IS DISTINCT FROM Boolean` (from `~`) → `'~' negates a
+    boolean predicate …; got int64`; `Function 'sum' failed to match any
+    signature, errors: …` → `sum() needs a numeric column, and got a string
+    column; sum() and mean() take numbers only, while min(), max(), count()
+    and n_unique() take strings too` (and `mean()`, with the column's type;
+    another aggregation reads `<fn>() cannot aggregate a <type> column`);
+    `Cannot get result type for temporal operation Timestamp(µs) *
+    Timestamp(µs): …` → `cannot apply '*' to timestamp[us] and timestamp[us]
+    (…); this arithmetic is not defined for these types`; type names in these
+    messages are pyarrow's (`dictionary<values=string, …>`, `decimal128(10,
+    2)`, `timestamp[us]`), never DataFusion's (`Dictionary(Int32, Utf8)`);
+    `Physical plan does not support
+    logical expression AggregateFunction(…)` (an aggregation in a weight) →
+    `an aggregation (.sum(), .mean(), ...) is not allowed here; …`;
+  - Arrow errors: `Arrow error: Divide by zero error` → `division by zero in an
+    integer expression; …`; `Arrow error: Cast error: Cannot cast string 'a' to
+    value of Int64 type` → for join keys, `join(on=): the left and right keys
+    have different types (the string 'a' cannot be read as int64); cast one
+    side's key to the other's type first`, and for a graph column over a frame
+    whose ids are of another type, `with_columns(): the frame's id column and
+    the graph's node ids have different types (…); build the frame with ids of
+    the graph's id type`; `join(on=): key 'k' keeps the left frame's type
+    (Int64), which can't hold every value of the right frame's key (Utf8); …`
+    names the types `int64` and `string`; `Arrow error: Invalid argument error: must
+    either specify a row count or at least one column` → `select() needs at
+    least one column`;
+  - schema errors: `Schema error: No field named x. Valid fields are
+    "?table?".a, …` → `unknown column 'x'; the frame has ['a', …].`, and
+    `Schema error: Schema contains duplicate qualified field name "?table?".a`
+    (a graph column named like an existing one) → `the result would have two
+    columns named 'a'; …`;
+  - graph verb arguments: `Execution error: invalid columns spec: invalid type:
+    string "x", expected f64` → `pagerank(damping=) must be a number; got 'x'`,
+    and `… invalid value: integer -1, expected u32` → `pagerank(max_iter=)
+    must be a non-negative integer below 2**32; got -1` (every parameter of
+    every verb); `ValueError: invalid plan: a plan argument is NaN, which has no
+    JSON form` → `pagerank(damping=) must be a finite number; got NaN`;
+    `This feature is not implemented: direction must be 'out', 'in', or 'both';
+    got "x"` → `degree(direction='x') is not supported; use one of 'out', 'in',
+    'both'` (also `closeness`, `neighbors().agg`, `hop`, `shortest_path`);
+    `weight expression must be numeric; it produced a column of type Utf8` →
+    `… of type string`; `weight expression references unknown edge column(s):
+    ['x']` gains `; the edges have [...]`;
+  - integer arguments: `argument 'n': 'str' object cannot be interpreted as an
+    integer` → `hop(n=) must be an integer; got a str`, `out of range integral
+    type conversion attempted` → `hop(n=) must be a non-negative integer; got
+    -1` or `hop(n=) is too large; it must be below 2**32`, `can't convert
+    negative int to unsigned` → `random_walk(seed=) must be a non-negative
+    integer; got -1`, `int too big to convert` → `… is too large; it must be
+    below 2**64` (also `random_walk(steps=)` and `walks_per_node=`);
+    `head("x")`/`sample("x")`: `invalid literal for int() with base 10: 'x'`
+    → `head(n=) takes an integer row count; got 'x' (str)`; `sample(-1)`:
+    `Sample larger than population or is negative` → `sample(n=) must be a
+    non-negative row count; got -1`;
+  - plan arguments: `ValueError: invalid plan: invalid type: integer 1,
+    expected a string` → `join(how=) must be a string; got 1` (also
+    `hop(direction=)`, `shortest_path(direction=)`, `describe(direction=)`);
+    `rename({"a": 1})` → `a rename() column name must be a string; got 1`;
+    a plan argument of a type with no JSON form, `TypeError: Object of type X is
+    not JSON serializable` → `<argument> cannot take a value of type 'X'` (as
+    `pagerank(damping=) cannot take a value of type 'object'`), with the
+    original exception as its `__cause__`; `rename(["a"])`/`rename(None)` → `rename() takes a
+    dict of {old: new} column names; got …`; `TypeError: Object of type X is
+    not JSON serializable` (a filter literal) → `a literal of type 'X' is not
+    supported in a filter expression; use a bool, int, float, str or None, …`;
+  - frames and edges: `AttributeError: 'str' object has no attribute 'kind'`
+    → `filter() takes an ursa expression, such as ur.col('x') or
+    ur.col('x') > 1; got 'age' (str)` (also `weight=`); `'NodeFrame' object has
+    no attribute 'nodes'` / `'int' object has no attribute '_node'` →
+    `pagerank() takes an EdgeFrame (the graph) as its edges; got NodeFrame`
+    (every verb, traversal and stat); `cannot pickle 'ursa._ursa.PlanNode'
+    object` → `EdgeFrame objects cannot be pickled or deep-copied: a frame is a
+    lazy plan over live data. …`; `argument 'src': 'int' object is not an
+    instance of 'str'` → `src= must be a column name (a str); got 1 (int)`
+    (`scan_edges(src=)` for a scan; `id=` raised `expected bytes, int found`);
+    `KeyError: 'Field "x" does not exist in schema'` → `src column 'x' is not
+    in the table; it has [...]`; `argument 'storage_options': …` →
+    `storage_options= must be a dict of option names to string values; got …`;
+  - seeds of another id type: `src and dst node-id columns must have the same
+    type (both int64 or both string)` → `the node ids given are string but the
+    graph's node ids are int64; pass ids of the graph's id type`;
+  - unsupported shapes, now raised where the step is added: `collect() does not
+    yet support the 'with_columns' step on an edge frame.` → `with_columns() of
+    a graph verb is not supported on an edge frame; graph columns belong on the
+    node frame: edges.nodes().with_columns(...).`; `… step after a
+    random_walk.` → `with_columns() after random_walk() is not supported yet;
+    collect() the walk and build a new frame from it with ur.from_arrow(...)
+    first.`; `… step after describe().` → `with_columns() after describe() …`;
+    `… step in a composed pipeline.` → `<step>() is not supported at this point
+    in the pipeline yet; …`; `select(col("x").sum())` named `with_columns()`
+    and now names `select()` (and `sort()`);
+  - scans, now led by the scan and its path (`scan_edges('edges.parquet'):
+    …`): `Error during planning: No files found at file:///…. Cannot infer
+    schema …` → `no file matches the path; check it (a glob must match at
+    least one file)`; `Execution error: scan_edges: endpoint column "x" not
+    found in edge file "…"` and `Schema error: No field named x …` → `src
+    column 'x' not found in the file; it has [...]` (`id column` for
+    `scan_nodes`); `Parquet error: Parquet error: Invalid Parquet file. Corrupt
+    footer` → `the file is not valid Parquet (corrupt footer)`; `Error when
+    processing CSV file …\ncaused by\nObject Store error: Generic
+    LineDelimiter error: …` → `could not read the file as CSV: …`; `This
+    feature is not implemented: scan_edges supports .parquet and .csv in v0.1;
+    got path "…"` → `only .parquet and .csv files can be scanned; …`;
+    `scan: unsupported URL scheme "ftp" (…)` → `unsupported URL scheme 'ftp';
+    use a local path or a file://, …`; `edge source "…" resolved but contained
+    no rows; …` → `the file has no rows; …`;
+  - more scan and storage messages: `src and dst node-id columns must be the
+    same type (both int or both string); got Int64 and Utf8 in "…"` → `the src
+    and dst columns must have one id type (both integer or both string); got
+    int64 and string`; `node ids must be an integer or string column; Float64
+    is not a supported id type` → `node ids must be an integer or string
+    column; got double` (and `unsupported node-id type …; node ids must be
+    int64 or string (Utf8)` → `node ids must be an integer or string column;
+    got …`); `scan: bad object-store url: …` → `not a valid URL: …`; the http
+    query-string message loses its `scan_edges:` prefix and trailing `got
+    "…"` (the label names the scan and its path); object_store's `Generic HTTP
+    error: Error performing HEAD <url> in …, after 10 retries, … - HTTP error:
+    <cause>` → `could not read <url>: <cause>`, `Configuration key: 'k' is not
+    valid for store 'S3'.` → `storage_options key 'k' is not an option of the
+    S3 store; …`, and other `Generic S3 error: …` messages lose that prefix;
+  - classes: every class is as before, with one fix: an engine error is a
+    `ColumnNotFoundError` by its structure (a schema error, or Ursa's own
+    "column … not found"), so a storage error whose path holds the word
+    "column" (`s3://b/columns/x.parquet` not found) is now the `ComputeError`
+    it is. An exception that is a subclass (`UnicodeEncodeError` for a string
+    with no UTF-8 form) is raised as it is, and a reworded exception keeps the
+    one it replaced as its `__cause__`;
+  - the stats as plan nodes (#217): a `sample=` or `approximate=` of the wrong
+    type, `argument 'sample': 'str' object cannot be converted to 'PyFloat'`
+    → `avg_path_length(sample=) must be a number or None; got 'x' (str)`, and
+    `diameter(approximate=) must be a bool; got 'x' (str)`. #217's own
+    messages (`bool(expr)`'s `TypeError`, `describe(nodes=...)`, the stats'
+    `direction=`, steps after a stat or on a bare `nodes()`) were already in
+    this form and are pinned by the tests;
+  - Ursa's own messages lose the variant prefix DataFusion put before them
+    (`Execution error: output column name 'id' is reserved …`, `This feature is
+    not implemented: neighbors().agg() needs a node attribute table …`, and
+    the rest of the `weight expression …` and `neighbors().agg() …` family).
+- **Behaviour change:** a standalone graph verb is a full `NodeFrame` (#213).
+  `ur.degree(e)`, `ur.pagerank(e)` and the other node-valued verbs called on
+  their own are `edges.nodes().with_columns(<verb>=...)` with every frame
+  method: `join`, `group_by`, `rename`, `sample` and `limit` now work (they
+  raised `AttributeError: 'GraphExpr' object has no attribute 'join'`), and
+  `isinstance(ur.degree(e), ur.NodeFrame)` is true, so a verb is also a
+  `join`'s right side and a seed set. The methods return a plain `NodeFrame`.
+  Inside `with_columns(...)` a verb is still an expression and builds no frame
+  of its own; its `repr` and operators are unchanged.
+- **Behaviour change:** `edges.nodes()` with no columns collects to its node
+  set: one `id` column, the rows `with_columns(degree=ur.degree(edges))` has in
+  the same order (the parent graph's nodes over a filtered frame, the nodes of
+  the rows after a reshaping step). Relational steps and joins after it run on
+  those rows, and a `join` whose right side is a bare `nodes()` now builds. It
+  raised `NotImplementedError: collect() on this NodeFrame needs a source ...`
+  (#213). A first `with_columns` of scalar expressions runs on that node set
+  too (`e.nodes().with_columns(y=ur.col("id") + 1)`), as do the steps before
+  and after it. Over a filtered frame or a traversal result the node set is
+  the parent graph's (`ur.hop(e, 1).from_([0]).nodes()` has every node), as
+  `degree` and `describe` read it; `describe(f, nodes="touched")` counts the
+  touched ones. The row is gone from `docs/limits.md`.
+- **Behaviour change:** an ursa expression has no truth value. `bool(expr)`
+  raises `TypeError: the truth value of an ursa expression is ambiguous ...`,
+  as Polars does, so `if ur.col("a") == 1:`, `ur.degree(e) in frames` and
+  `a and b` over expressions fail instead of always passing. `==` still builds
+  an expression; combine predicates with `&`, `|` and `~` (#213).
+- `ur.density`, `ur.avg_path_length` and `ur.diameter` run as plan nodes, as
+  `describe` does (`Plan::Stat`). `ursa._ursa.graph_density`,
+  `graph_avg_path_length`, `graph_diameter` and `PlanNode.graph_index` are gone.
+  Over a whole graph or a reshaped edge set the values are byte-identical.
 - Frames hold Rust plan objects (#193, the last item of #189). An `EdgeFrame`
   or `NodeFrame` holds one `ursa._ursa.PlanNode`, as a Polars `LazyFrame` holds
   its plan: each method converts its arguments, calls into Rust, which builds
@@ -136,8 +339,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   endpoint, an integer divide by zero, a value out of range, a right or outer
   join key the left type cannot hold, a missing or empty file, a scan's columns
   (the file is read then, and may change in between), `store=`, a scan of
-  several files, an invalid graph verb parameter value, and `edges.nodes()`
-  collected with no columns (a later `with_columns` makes it collect). When a
+  several files, and an invalid graph verb parameter value. When a
   plan has a step the plan alone shows is wrong and also an error only the rows
   show earlier in it, the step's error is now the one raised. A step on an edge
   frame is checked even where a later use reads only the frame's topology:
@@ -444,6 +646,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   collect part of the chain first. `collect()`, `schema()`, `explain()` and
   graph ops over 20,000-step chains now work on a 256 KB thread stack.
 
+- **Behaviour change:** `ur.density`, `ur.diameter` and `ur.avg_path_length`
+  over a filtered edge frame or a `hop` / `shortest_path` result read its
+  subgraph view, as `describe` and every graph op do (#210). They used to
+  compute over the whole parent graph, ignoring the filter: on the issue's
+  repro `ur.density(f)` was 0.333 (now 0.1667), `ur.diameter(f,
+  approximate=False)` 2 (now 1) and `ur.avg_path_length(f)` 1.333 (now 1.0).
+  The view is the parent's node set and only the kept edges, so
+  `ur.density(f) == ur.describe(f).collect()["density"][0]`, and an exact path
+  stat equals its value over a new frame of the kept rows. A sampled estimate
+  (`avg_path_length(sample=)`, the default approximate `diameter`) picks its
+  sources among the nodes at an end of a kept edge. Since the view's filter
+  now runs, an error only the filter's rows show (an integer divide by zero) is
+  raised by the stat too.
 - `group_by()` by a dictionary (categorical) column with `int8`, `int16`,
   `uint8` or `uint16` codes, and `distinct()` over one, raised "Dictionary key
   bigger than the key type" when the result had more groups than the codes

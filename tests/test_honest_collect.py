@@ -196,11 +196,13 @@ def test_plain_scan_with_head_tail(tmp_path):
 
 
 @native
-def test_edges_nodes_plain_collect_raises_clearly():
-    # bare edges.nodes() has no materializable node set yet — honest message.
+def test_edges_nodes_plain_collect_is_the_node_set():
+    # A bare edges.nodes() collects to its node set: one id column (#213).
     edges = _edges()
-    with pytest.raises(NotImplementedError, match="node set"):
-        edges.nodes().collect()
+    got = edges.nodes().collect().to_arrow()
+    assert got.column_names == ["id"]
+    want = edges.nodes().with_columns(d=ur.degree(edges)).select("id").collect().to_arrow()
+    assert got.equals(want)
 
 
 # --- #48: traversal composition boundaries ---------------------------------
@@ -223,6 +225,8 @@ def test_hop_of_hop_raises_traversal_message():
 @native
 def test_seed_from_derived_nodeframe_raises_seed_message():
     edges = _edges()
-    seed = edges.nodes().filter(ur.col("x") > 0)
+    # A node frame that does not collect: a step on a traversal's edges before
+    # nodes().
+    seed = ur.hop(edges, 1).from_([0]).head(1).nodes()
     with pytest.raises(NotImplementedError, match="seed"):
         ur.hop(edges, 1).from_(seed).collect()

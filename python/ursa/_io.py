@@ -624,11 +624,24 @@ def _node_attr_table(tbl: Any, id: str) -> Any:
     """
     import pyarrow as pa
 
+    id_col = _role_column(tbl, id, "id")
     idx = tbl.schema.get_field_index(id)
-    id_col = tbl.column(id)
     chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
     canonical = [_canonical_id_array(c) for c in chunks]
     return tbl.set_column(idx, id, pa.chunked_array(canonical, type=canonical[0].type))
+
+
+def _role_column(tbl: Any, name: Any, role: str) -> Any:
+    """The column ``name`` plays the ``role`` (``src``/``dst``/``id``) in: a
+    ``TypeError`` for a name that is no string, a ``KeyError`` naming the table's
+    columns for one it lacks."""
+    if not isinstance(name, str):
+        raise TypeError(
+            f"{role}= must be a column name (a str); got {name!r} ({type(name).__name__})"
+        )
+    if name not in tbl.column_names:
+        raise KeyError(f"{role} column {name!r} is not in the table; it has {tbl.column_names}")
+    return tbl.column(name)
 
 
 def _validate_on_null(on_null: str) -> None:
@@ -659,7 +672,7 @@ def _drop_null_endpoint_rows(tbl: Any, src: str, dst: str) -> tuple[Any, int]:
 
     # pyarrow.compute members are looked up by name (the type checker lacks its stubs).
     is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
-    mask = and_(is_valid(tbl.column(src)), is_valid(tbl.column(dst)))
+    mask = and_(is_valid(_role_column(tbl, src, "src")), is_valid(_role_column(tbl, dst, "dst")))
     kept = tbl.filter(mask)
     return kept, tbl.num_rows - kept.num_rows
 
@@ -679,8 +692,8 @@ def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None
     import pyarrow as pa
 
     arrays = []
-    for name in (src, dst):
-        column = tbl.column(name)
+    for role, name in (("src", src), ("dst", dst)):
+        column = _role_column(tbl, name, role)
         chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
         canonical = [_canonical_id_array(c) for c in chunks]
         arrays.append(pa.chunked_array(canonical, type=canonical[0].type))

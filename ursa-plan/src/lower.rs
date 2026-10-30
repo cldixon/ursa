@@ -127,7 +127,15 @@ pub struct Frame {
     /// [`Frame::widen_dictionary_keys`]), with the type each had before: the
     /// result narrows them back where the values fit.
     widened: BTreeMap<String, DataType>,
+    /// The advice for values of one type read as another when the plan runs
+    /// (a [`DataFusionError::Context`] template, see [`crate::message`]): a
+    /// join's keys of different types.
+    mismatch: Option<&'static str>,
 }
+
+/// The advice for a join's keys of different types.
+const JOIN_KEY_TYPES: &str = "join(on=): the left and right keys have different types ({}); \
+     cast one side's key to the other's type first";
 
 impl Frame {
     /// A frame over `batches` (at least one), in their order.
@@ -141,6 +149,7 @@ impl Frame {
             in_order: true,
             nullable: BTreeSet::new(),
             widened: BTreeMap::new(),
+            mismatch: None,
         };
         frame.set(batches)?;
         Ok(frame)
@@ -158,6 +167,7 @@ impl Frame {
             in_order: true,
             nullable: BTreeSet::new(),
             widened: BTreeMap::new(),
+            mismatch: None,
         }
     }
 
@@ -173,6 +183,7 @@ impl Frame {
             in_order: false,
             nullable: BTreeSet::new(),
             widened: BTreeMap::new(),
+            mismatch: None,
         }
     }
 
@@ -256,7 +267,11 @@ impl Frame {
             self.set(batches.clone())?;
             return Ok(batches);
         }
-        let mut batches = crate::runtime::block_on(df.collect())??;
+        let mismatch = self.mismatch;
+        let mut batches = crate::runtime::block_on(df.collect())?.map_err(|e| match mismatch {
+            Some(advice) if crate::message::mismatched_types(&e) => e.context(advice),
+            _ => e,
+        })?;
         batches.retain(|b| b.num_rows() > 0);
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(schema));
@@ -1078,7 +1093,9 @@ pub fn join(left: Frame, right: Frame, on: &[String], how: How) -> Result<Frame>
     };
     out.push(ord.alias(&combined));
     let df = joined.select(out)?;
-    Ok(Frame::from_numbered(ctx, df, combined))
+    let mut frame = Frame::from_numbered(ctx, df, combined);
+    frame.mismatch = Some(JOIN_KEY_TYPES);
+    Ok(frame)
 }
 
 /// The first `n` rows of `batches` (zero-copy), keeping at least one batch so the

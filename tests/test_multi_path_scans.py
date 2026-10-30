@@ -167,18 +167,19 @@ def test_paths_with_different_columns_raise_naming_each_difference(files):
     )
     a = str(files / "a.parquet")
     cases = {
-        "narrow.parquet": r'".*a.parquet" has the columns \[s, d, w\] and '
-        r'".*narrow.parquet" has \[s, d\]. Give every file the same columns',
-        "int_w.parquet": r'Column "w" is Float64 in ".*a.parquet" and Int64 in ".*int_w.parquet". '
-        r"Write the files with matching types",
+        "narrow.parquet": r"'[^']*a.parquet' has the columns \[s, d, w\] and "
+        r"'[^']*narrow.parquet' has \[s, d\]. Give every file the same columns",
+        "int_w.parquet": r"Column 'w' is double in '[^']*a.parquet' and int64 in "
+        r"'[^']*int_w.parquet'. Write the files with matching types",
     }
     for other, why in cases.items():
         e = ur.scan_edges([a, str(files / other)], src="s", dst="d")
         for run in (e.collect, lambda e=e: ur.pagerank(e, weight=ur.col("w")).collect()):
             with pytest.raises(
                 ur.ComputeError,
-                match=r"scan_edges\(\): the paths in a list are read as one table, so each "
-                r"needs the same columns, with the same types, in the same order. " + why,
+                match=rf"^scan_edges\(\['[^']*a.parquet', '[^']*{other}'\]\): the paths in a "
+                r"list are read as one table, so each needs the same columns, with the same "
+                r"types, in the same order. " + why,
             ):
                 run()
     # Nullability may differ: the column is nullable in the union.
@@ -188,7 +189,7 @@ def test_paths_with_different_columns_raise_naming_each_difference(files):
     strings = files / "strings.parquet"
     pq.write_table(pa.table({"s": ["c"], "d": ["d"], "w": [2.0]}), strings)
     e = ur.scan_edges([str(strings), str(files / "large.parquet")], src="s", dst="d")
-    with pytest.raises(ur.ComputeError, match=r'Column "s" is Utf8 in .* and LargeUtf8 in'):
+    with pytest.raises(ur.ComputeError, match=r"Column 's' is string in .* and large_string in"):
         e.collect()
 
 
@@ -198,7 +199,7 @@ def test_csv_types_are_inferred_per_file(files):
     (files / "ints.csv").write_text("s,d,w\n1,2,1\n")
     (files / "floats.csv").write_text("s,d,w\n2,3,0.5\n")
     e = ur.scan_edges([str(files / "ints.csv"), str(files / "floats.csv")], src="s", dst="d")
-    with pytest.raises(ur.ComputeError, match=r'Column "w" is Int64 in .* write 1.0 for a float'):
+    with pytest.raises(ur.ComputeError, match=r"Column 'w' is int64 in .* write 1.0 for a float"):
         e.collect()
 
 
@@ -214,7 +215,7 @@ def test_tuples_and_pathlib_paths(files):
 
 def test_paths_are_checked_where_the_scan_is_made(files):
     # The error collect() raised for a path it cannot read, raised at the call.
-    msg = r'scan_edges supports .parquet and .csv in v0.1; got path "b.txt"'
+    msg = r"^scan_edges\('b.txt'\): only \.parquet and \.csv files can be scanned"
     with pytest.raises(ur.ComputeError, match=msg):
         ur.read_edges((str(files / "a.parquet"), "b.txt"), src="s", dst="d")
     with pytest.raises(ur.ComputeError, match="query string"):

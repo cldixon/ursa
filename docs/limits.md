@@ -8,7 +8,6 @@ Ursa is version 0.4. The API is stable in shape, and some combinations of steps 
 |---|---|
 | A frame with more than about 65,000 relational steps (counting the steps of the frames a graph column reads) | `collect()`, `schema()` and `explain()` raise `UrsaError`. Collect part of the chain and build the rest on its result. |
 | A scan of a list of paths on different stores (for example a local file and an `s3://` file) | Put the files on one store, or read them into memory first. |
-| `edges.nodes().collect()` with no columns | Add a column first, for example `with_columns(degree=ur.degree(edges))`. |
 
 ## Scope
 

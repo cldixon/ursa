@@ -28,7 +28,7 @@ The `src` and `dst` columns must have the same type: `int64` or `string`.
 
 | Method | Returns | Description |
 |---|---|---|
-| `edges.nodes()` | `NodeFrame` | The distinct ids in `src` and `dst`. Lazy. |
+| `edges.nodes()` | `NodeFrame` | The graph's node set, as one `id` column. Lazy. It has the rows `with_columns(degree=ur.degree(edges))` has, in the same order, without the column: over a filtered frame or a traversal result the parent graph's whole node set, and after a reshaping step the nodes of its rows. For only the nodes a view touches, use `ur.describe(frame, nodes="touched")`. |
 | `edges.reverse()` | `EdgeFrame` | The same rows with the `src` and `dst` roles swapped. No data moves. |
 | `edges.collect()` | `MaterializedFrame` | The edge rows, after any `filter`, `sort`, `head`, `distinct`, `sample`, or `rename`. |
 
@@ -116,7 +116,7 @@ Some combinations of steps do not run yet. See [Limits](../limits.md).
 2. **Schema:** the columns `collect()` returns, with their Arrow types, marked `not null` where they hold no nulls by construction.
 3. **DataFusion plans:** the DataFusion logical plans a collect executes, in order, each optimized. A collect runs one plan for each stretch of steps between the points where it materializes rows (a graph algorithm, a sort, a join input), so a plan can have several; steps that run directly on materialized rows (a `filter`, a `head`) show no plan of their own. `explain(physical=True)` adds each one's physical plan.
 
-`explain()` reads no rows and builds no graph index; a scan reads its file's schema. On a frame that does not collect as it is, such as `edges.nodes()` with no columns yet, the DataFusion part says why. The text is for reading: its format is not a stable API and may change between versions. Use `schema()` for the columns programmatically.
+`explain()` reads no rows and builds no graph index; a scan reads its file's schema. On a frame that does not collect as it is, the DataFusion part says why. The text is for reading: its format is not a stable API and may change between versions. Use `schema()` for the columns programmatically.
 
 `schema()` and `explain()` cache nothing they read from a scan: each call lists the scan's files and reads their schema (a Parquet file's footer) again, so the result follows the files as they are now. For an `s3://`, `gs://`, `az://` or `http(s)://` path that is a network round trip per call.
 

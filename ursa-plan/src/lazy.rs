@@ -41,6 +41,7 @@ use crate::plan::{
     PlanError, PlanResult, Rows, ScanPath, SelectItem, Slot, SortKey, SubPlan,
 };
 use crate::scan::{CsvOptions, NodeTableCache};
+pub use crate::stats::GraphStat;
 
 /// An object the host owns (a table, an argument it could not convert, ...).
 pub type HostHandle = Arc<dyn Any + Send + Sync>;
@@ -146,6 +147,14 @@ pub enum Op {
     Describe {
         edges: Arc<Node>,
         full: bool,
+        direction: String,
+        /// `nodes="touched"`: only the nodes at an end of a kept edge.
+        touched: bool,
+    },
+    /// `ur.density` / `ur.avg_path_length` / `ur.diameter`: a one-row frame.
+    Stat {
+        edges: Arc<Node>,
+        stat: GraphStat,
         direction: String,
     },
 }
@@ -366,7 +375,7 @@ fn take_children(node: &mut Node, out: &mut Vec<Arc<Node>>) {
             take(edges);
             seeds(start, &mut take);
         }
-        Op::Describe { edges, .. } => take(edges),
+        Op::Describe { edges, .. } | Op::Stat { edges, .. } => take(edges),
     }
     if let Some(info) = node.info.take() {
         out.extend(info.pending.into_iter().flatten());
@@ -545,7 +554,7 @@ impl Node {
                 dst: "dst".into(),
             },
             Op::RandomWalk { .. } => Kind::Nodes { id: "node".into() },
-            Op::Describe { .. } => Kind::Nodes {
+            Op::Describe { .. } | Op::Stat { .. } => Kind::Nodes {
                 id: "__summary__".into(),
             },
             _ => return Err(PlanError::Invalid("not a graph node".into())),
@@ -607,6 +616,7 @@ impl Node {
             Op::ShortestPath { .. } => "shortest_path",
             Op::RandomWalk { .. } => "random_walk",
             Op::Describe { .. } => "describe",
+            Op::Stat { stat, .. } => stat.name(),
         }
     }
 
@@ -964,9 +974,20 @@ impl Lowering {
                 edges,
                 full,
                 direction,
+                touched,
             } => Plan::Describe {
                 edges: self.edges(edges),
                 full: *full,
+                direction: direction.clone(),
+                touched: *touched,
+            },
+            Op::Stat {
+                edges,
+                stat,
+                direction,
+            } => Plan::Stat {
+                edges: self.edges(edges),
+                stat: stat.clone(),
                 direction: direction.clone(),
             },
         }
@@ -1468,15 +1489,6 @@ pub fn schema(node: &Arc<Node>, host: &dyn Host) -> PlanResult<SchemaRef> {
     })
 }
 
-/// The graph index of an edge frame, after the checks a graph op over it needs
-/// (for the eager whole-graph stats).
-pub fn graph_index(node: &Arc<Node>, host: &dyn Host) -> PlanResult<GraphIndex> {
-    let (edges, lowering) = Lowering::edges_of(node);
-    crate::stack::for_steps("a graph statistic", lowering.steps.len(), || {
-        crate::plan::require_index(&edges, &lowering.inputs(host, Mode::Run))
-    })
-}
-
 /// `explain()`: the frame's plan tree, then the DataFusion plans a collect runs
 /// (from a dry run), optimized, and with `physical` their physical plans.
 pub fn explain(node: &Arc<Node>, host: &dyn Host, physical: bool) -> PlanResult<String> {
@@ -1663,11 +1675,18 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_node_set_builds_and_a_with_columns_makes_it_collect() {
+    fn a_bare_node_set_collects_and_a_with_columns_extends_it() {
         let e = edges();
         let nodes = e.nodes(&TestHost).unwrap();
+        // A bare node set is its ids (#213).
+        let ids = rows(&nodes);
+        assert_eq!(ids[0].schema().fields().len(), 1);
+        assert_eq!(schema(&nodes, &TestHost).unwrap(), ids[0].schema());
         let pending = filter(&nodes, gt("id", 0)).unwrap();
-        assert!(execute(&pending, &TestHost).is_err());
+        assert_eq!(
+            rows(&pending).iter().map(|b| b.num_rows()).sum::<usize>(),
+            2
+        );
         let g = pending
             .step(Step::WithColumns(vec![degree(&e)]), None, &TestHost)
             .unwrap();

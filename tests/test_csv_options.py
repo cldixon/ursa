@@ -262,11 +262,12 @@ VALUES = {
 
 
 def _read(path, **opts):
-    """The table, or the error's class and message."""
+    """The table, or the error's class and message (with the file's path, which
+    labels it, replaced by `<file>`)."""
     try:
         return ur.read_edges(str(path), src="s", dst="d", **opts).to_arrow()
     except Exception as e:
-        return (type(e).__name__, str(e))
+        return (type(e).__name__, str(e).replace(str(path), "<file>"))
 
 
 @pytest.mark.parametrize("case", sorted(VALUES))

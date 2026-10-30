@@ -20,8 +20,6 @@
 //!   for the arguments the Python API checks as it is called.
 //! - `build_index` — build a CSR topology from edge batches (a test hook; frames
 //!   build their own index on first use).
-//! - `graph_density` / `graph_avg_path_length` / `graph_diameter` — eager
-//!   whole-graph statistics over `PlanNode.graph_index()`.
 
 mod frame;
 
@@ -29,7 +27,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_pyarrow::FromPyArrow;
 use pyo3::create_exception;
 use pyo3::exceptions::{
-    PyException, PyNotImplementedError, PyOverflowError, PyTypeError, PyValueError,
+    PyException, PyNotImplementedError, PyOverflowError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 
@@ -39,10 +37,7 @@ use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 
 use ursa_plan::plan::{count_topology_build, topology_builds, HostError};
-use ursa_plan::{
-    avg_path_length, build_topology_batches, density, diameter, parse_stat_direction,
-    weight_cache_key, PlanError,
-};
+use ursa_plan::{build_topology_batches, weight_cache_key, PlanError};
 
 // ---------------------------------------------------------------------------
 // The Python exception hierarchy (#39.8).
@@ -107,24 +102,52 @@ create_exception!(
      operation, or a kernel/engine error."
 );
 
-/// Map an engine error (a `DataFusionError`, or any other `Display` error the
-/// plan layer surfaces) to a typed, catchable exception in the Ursa hierarchy. A
-/// missing-column error becomes [`ColumnNotFoundError`]; everything else becomes
-/// [`ComputeError`]. Both subclass `UrsaError`. The classification is by rendered
-/// message rather than by matching internal `DataFusionError`/`SchemaError`
-/// variants, so it stays stable across engine version bumps (and lets this layer
-/// avoid a direct `datafusion` dependency).
+/// Map an engine error (any `Display` error the plan layer surfaces, such as a
+/// stat's) to a typed, catchable exception in the Ursa hierarchy, in Ursa's words
+/// with the original text as its `__cause__`. A missing-column error becomes
+/// [`ColumnNotFoundError`]; everything else becomes [`ComputeError`]. Both
+/// subclass `UrsaError`. A `DataFusionError` goes through [`engine_err`], which
+/// reads its structure instead.
 fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
-    let msg = e.to_string();
-    let lower = msg.to_lowercase();
-    if lower.contains("no field named")
-        || (lower.contains("column") && lower.contains("not found"))
-        || lower.contains("schema error")
-    {
-        ColumnNotFoundError::new_err(msg)
+    let raw = e.to_string();
+    let class = if ursa_plan::message::says_column_not_found(&raw) {
+        column_not_found
     } else {
-        ComputeError::new_err(msg)
-    }
+        compute
+    };
+    with_cause(class(ursa_plan::message::reword(&raw)), raw)
+}
+
+fn column_not_found(m: String) -> PyErr {
+    ColumnNotFoundError::new_err(m)
+}
+
+fn compute(m: String) -> PyErr {
+    ComputeError::new_err(m)
+}
+
+/// `err`, with the engine's own text `raw` as its `__cause__` (a `RuntimeError`)
+/// when its message was reworded from it.
+fn with_cause(err: PyErr, raw: String) -> PyErr {
+    Python::attach(|py| {
+        if err.value(py).to_string() != raw {
+            err.set_cause(py, Some(PyRuntimeError::new_err(raw)));
+        }
+    });
+    err
+}
+
+/// A DataFusion error as the Ursa exception [`to_pyerr`] gives, in Ursa's words
+/// ([`ursa_plan::message`]), classified by its structure
+/// ([`ursa_plan::message::is_column_not_found`]), with DataFusion's own text as
+/// its `__cause__`.
+fn engine_err(e: &ursa_plan::message::DataFusionError) -> PyErr {
+    let class = if ursa_plan::message::is_column_not_found(e) {
+        column_not_found
+    } else {
+        compute
+    };
+    with_cause(class(ursa_plan::message::engine_message(e)), e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +273,7 @@ pub(crate) fn plan_err(e: PlanError) -> PyErr {
             err
         }),
         e @ PlanError::Invalid(_) => PyValueError::new_err(e.to_string()),
-        PlanError::Engine(e) => to_pyerr(e),
+        PlanError::Engine(e) => engine_err(&e),
         PlanError::Host(e) => match e.payload.downcast::<PyErr>() {
             Ok(err) => *err,
             Err(_) => ComputeError::new_err(e.message),
@@ -271,46 +294,6 @@ pub(crate) fn host_err(py: Python<'_>, err: PyErr) -> PlanError {
         not_implemented,
         payload: Box::new(err),
     })
-}
-
-/// Whole-graph edge density (eager scalar). `direction` is out/in/both; `both`
-/// is the undirected density.
-#[pyfunction]
-#[pyo3(signature = (index, direction="out"))]
-fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>, direction: &str) -> PyResult<f64> {
-    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
-    let topo = index.0.topo.clone();
-    py.detach(move || density(&topo, dir).map_err(to_pyerr))
-}
-
-/// Average shortest-path length over reachable ordered pairs (eager scalar).
-/// `sample` (a fraction) estimates from a subset of sources; omit for exact.
-#[pyfunction]
-#[pyo3(signature = (index, sample=None, direction="out"))]
-fn graph_avg_path_length(
-    py: Python<'_>,
-    index: PyRef<'_, GraphIndex>,
-    sample: Option<f64>,
-    direction: &str,
-) -> PyResult<f64> {
-    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
-    let topo = index.0.topo.clone();
-    py.detach(move || avg_path_length(&topo, sample, dir).map_err(to_pyerr))
-}
-
-/// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
-/// estimate; pass false for exact.
-#[pyfunction]
-#[pyo3(signature = (index, approximate, direction="out"))]
-fn graph_diameter(
-    py: Python<'_>,
-    index: PyRef<'_, GraphIndex>,
-    approximate: bool,
-    direction: &str,
-) -> PyResult<i64> {
-    let dir = parse_stat_direction(direction).map_err(to_pyerr)?;
-    let topo = index.0.topo.clone();
-    py.detach(move || diameter(&topo, approximate, dir).map_err(to_pyerr))
 }
 
 /// Raise the error for an aggregation the engine does not compute.
@@ -354,7 +337,12 @@ fn check_direction(verb: &str, direction: &Bound<'_, PyAny>) -> PyResult<()> {
 /// an HTTP URL), raised where the scan is made (#216).
 #[pyfunction]
 fn check_scan_path(path: &str, verb: &str) -> PyResult<bool> {
-    ursa_plan::scan::is_csv(path, verb).map_err(to_pyerr)
+    let kind = if verb == "scan_nodes" {
+        "scan_nodes"
+    } else {
+        "scan_edges"
+    };
+    ursa_plan::scan::is_csv(path, kind).map_err(|e| engine_err(&e))
 }
 
 /// Raise the `ValueError` for an `on_null=` mode an edge source does not have.
@@ -402,8 +390,5 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_direction, m)?)?;
     m.add_function(wrap_pyfunction!(check_on_null, m)?)?;
     m.add_function(wrap_pyfunction!(check_scan_path, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_density, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;
     Ok(())
 }
