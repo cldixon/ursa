@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(canon16(0xfe01), 0x7e00);
         assert_eq!(canon16(0x7c00), 0x7c00); // +inf
         assert_eq!(canon16(0xfc00), 0xfc00); // -inf
-        assert_eq!(f32::NAN as f64, f64::NAN);
+        assert_eq!((f32::NAN as f64).to_bits(), f64::NAN.to_bits());
     }
 
     #[test]

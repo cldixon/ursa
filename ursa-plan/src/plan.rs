@@ -4267,17 +4267,23 @@ mod tests {
                 assert_eq!(got.1, want.1, "{keys:?} p={p}");
             }
         }
-        // The float key keeps NaN signs and both zeros as their own groups, as
-        // the unpartitioned aggregate does, keyed by their bits.
+        // The float key groups in total order (#215): both zeros are one group,
+        // every NaN one group, each class once.
         let (_, rows) = grouped_on(4, &batches, &["f"], &aggs).unwrap();
-        let firsts: Vec<&str> = rows.iter().map(|r| r.split(',').next().unwrap()).collect();
-        for x in specials {
-            let bits = format!("{:#x}", x.to_bits());
-            assert!(
-                firsts.contains(&bits.as_str()) || x.is_nan(),
-                "{bits} {firsts:?}"
-            );
-        }
+        let classes: Vec<Option<u64>> = rows
+            .iter()
+            .map(|r| r.split(',').next().unwrap())
+            .filter(|c| *c != "null")
+            .map(|c| {
+                key_class(Some(f64::from_bits(
+                    u64::from_str_radix(&c[2..], 16).unwrap(),
+                )))
+            })
+            .collect();
+        let unique: BTreeSet<Option<u64>> = classes.iter().copied().collect();
+        assert_eq!(unique.len(), classes.len(), "{rows:?}");
+        let want: BTreeSet<Option<u64>> = specials.iter().map(|&x| key_class(Some(x))).collect();
+        assert_eq!(unique, want, "{rows:?}");
     }
 
     #[test]
@@ -4482,7 +4488,7 @@ mod tests {
             arrow::datatypes::Field::new("v", DataType::Float64, false),
         ]));
         let mut out = vec![];
-        let mut at = 0;
+        let mut at = 0usize;
         for size in [1usize, 7, 4096, 9000, 333, 8193, usize::MAX] {
             let end = n.min(at.saturating_add(size));
             if end <= at {
@@ -4611,7 +4617,7 @@ mod tests {
                     assert_eq!(schema.field_with_name("k").unwrap().data_type(), &key_type);
                     let (gk, gs, gn, gt, gu) = (
                         as_f64(&out, "k"),
-                        strings(&out, "s"),
+                        if multi { strings(&out, "s") } else { vec![] },
                         strings(&out, "n"),
                         as_f64(&out, "t"),
                         strings(&out, "u"),
