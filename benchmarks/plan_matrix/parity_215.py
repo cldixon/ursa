@@ -94,9 +94,19 @@ def load(path: str) -> dict:
     return {json.loads(line)["case"]: json.loads(line) for line in open(path)}
 
 
+def strip(rec: dict) -> dict:
+    """`rec` without how it ran, and with the harness's temporary directory
+    masked: each run writes its Parquet files to a fresh one, and an error
+    message names the file (#214)."""
+    return {
+        k: re.sub(r"/tmp/tmp\w+", "TMP", v) if isinstance(v, str) else v
+        for k, v in rec.items()
+        if k not in ("stage", "schema_api")
+    }
+
+
 def compare(main_path: str, branch_path: str, oracle_path: str) -> int:
     a, b, o = load(main_path), load(branch_path), load(oracle_path)
-    strip = lambda r: {k: v for k, v in r.items() if k not in ("stage", "schema_api")}  # noqa: E731
     cats: collections.Counter = collections.Counter()
     unexplained = []
     for k, x in a.items():
