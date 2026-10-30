@@ -42,7 +42,17 @@ The CSV options apply to `.csv` files only. Each character option is one ASCII c
 
 A CSV file's column types are inferred from its first 1,000 rows. A value past them that does not parse as the inferred type raises an error at `collect()`. With a `null_value`, a value parses exactly as without one; only which fields are null differs.
 
-A column of numbers is `double` when one or more of its values is a float, in any spelling pyarrow reads as one: `1.5`, `+5`, `.5`, `5.`, `1e400` (read as `inf`), `-0` next to a float (read as `-0.0`), and `nan`, `inf` or `infinity` in any case, with or without a sign. Each value parses to the same bits as in pyarrow. A column of integers only, such as `1` and `-0`, is `int64`. A column with any other text in its first 1,000 rows is `string`, as is an integer past the `int64` range or a number with spaces around it.
+A column of numbers is `double` when one or more of its values is a float. These spellings are floats:
+
+- `1.5`, `.5`, `5.` and `1e3`, with or without a sign, such as `+5` or `-.5`.
+- `1e400` and other values past the `double` range. They read as `inf` or `-inf`.
+- `nan`, `inf` and `infinity` in any case, with or without a sign, such as `NaN`, `-Inf` or `+nan`.
+
+Each float parses to the bits that pyarrow gives for it when it reads the value as a float. `-0` in a `double` column reads as `-0.0`, and `-nan` keeps its sign.
+
+A text such as `nan` reads as NaN, not as null. pyarrow's default options read `nan`, `NaN` and `null` as null. To read `nan` as null, pass `null_value="nan"`. It matches that spelling only.
+
+A column of integers only, such as `1` and `-0`, is `int64`. A column with other text in its first 1,000 rows is `string`. An integer past the `int64` range and a number with spaces around it are text.
 
 ```py
 edges = ur.scan_edges("edges.csv", src="from", dst="to", delimiter="\t", null_value="NA")
