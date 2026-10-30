@@ -139,15 +139,22 @@ struct CanonKey {
     shown: Shown,
 }
 
+impl CanonKey {
+    /// Whether `column` is one this key adds to the frame.
+    fn is_hidden(&self, column: &str) -> bool {
+        self.hidden == column || matches!(&self.shown, Shown::First { odd, .. } if odd == column)
+    }
+}
+
 /// How an aggregate over a canonical key shows the group's first-appearance
 /// value of the key.
 enum Shown {
     /// The rows were run: the original values of the rows canonicalizing
     /// changed, looked up by the group's first ordinal.
     Originals(Arc<crate::keys::Originals>),
-    /// The frame is a plan: the aggregate also computes `first_value(key ORDER
-    /// BY ordinal)`, under this name.
-    First(String),
+    /// The frame is a plan: the plan also carries [`crate::keys::odd_key`] of
+    /// the key under `odd`, and the aggregate its `min` under `first_odd`.
+    First { odd: String, first_odd: String },
 }
 
 impl Frame {
@@ -647,7 +654,7 @@ impl Frame {
             return Ok(vec![]);
         }
         let Some(batches) = self.batches.clone() else {
-            return self.canonical_keys_in_plan(&floats);
+            return self.canonical_keys_in_plan(&floats, ord);
         };
         let schema = batches[0].schema();
         let o = schema.index_of(ord).map_err(arrow_err)?;
@@ -735,11 +742,11 @@ impl Frame {
 
     /// [`Frame::canonical_keys`] for a frame that is still a plan: the rows are
     /// not run (a `distinct` after a join stays one plan, as before), so each
-    /// float key gets its canonical copy in the plan, and the aggregate carries
-    /// the group's first value of the key itself ([`Shown::First`]).
-    fn canonical_keys_in_plan(&mut self, floats: &[&String]) -> Result<Vec<CanonKey>> {
-        // The copies join the frame's columns; the first values are aggregate
-        // outputs, named apart from the group's first ordinal.
+    /// float key gets its canonical copy in the plan, and the aggregate finds
+    /// each group's first changed row ([`Shown::First`]).
+    fn canonical_keys_in_plan(&mut self, floats: &[&String], ord: &str) -> Result<Vec<CanonKey>> {
+        // The copies join the frame's columns; the packed first rows are
+        // aggregate outputs, named apart from the group's first ordinal.
         let mut taken = self.schema.as_arrow().clone();
         let mut fresh = |suffix: &str| {
             let name = fresh_name_with(&taken, suffix);
@@ -754,7 +761,10 @@ impl Frame {
             .map(|k| CanonKey {
                 name: (*k).clone(),
                 hidden: fresh(""),
-                shown: Shown::First(fresh("_fk")),
+                shown: Shown::First {
+                    odd: fresh(""),
+                    first_odd: fresh("_fk"),
+                },
             })
             .collect();
         let mut exprs: Vec<Expr> = self
@@ -762,26 +772,24 @@ impl Frame {
             .iter()
             .map(|(q, f)| Expr::Column(Column::from((q, f))))
             .collect();
-        exprs.extend(
-            out.iter()
-                .map(|c| crate::keys::canonical_expr(col_named(&c.name)).alias(&c.hidden)),
-        );
+        for c in &out {
+            exprs.push(crate::keys::canonical_expr(col_named(&c.name)).alias(&c.hidden));
+            if let Shown::First { odd, .. } = &c.shown {
+                exprs.push(crate::keys::odd_key(col_named(&c.name), col_named(ord)).alias(odd));
+            }
+        }
         let df = self.plan()?.select(exprs)?;
         self.replace(df);
         Ok(out)
     }
 
     /// The aggregates the canonical keys of a plan add ([`Shown::First`]): each
-    /// group's first value of the key, by `ord`.
-    fn first_key_aggs(canon: &[CanonKey], ord: &str) -> Vec<Expr> {
-        use datafusion::functions_aggregate::expr_fn::first_value;
+    /// group's first changed row, its ordinal and value packed.
+    fn first_key_aggs(canon: &[CanonKey]) -> Vec<Expr> {
         canon
             .iter()
             .filter_map(|c| match &c.shown {
-                Shown::First(first) => Some(
-                    first_value(col_named(&c.name), vec![col_named(ord).sort(true, false)])
-                        .alias(first),
-                ),
+                Shown::First { odd, first_odd } => Some(min(col_named(odd)).alias(first_odd)),
                 Shown::Originals(_) => None,
             })
             .collect()
@@ -794,26 +802,30 @@ impl Frame {
         if canon.is_empty() {
             return Ok(df);
         }
-        let is_first_value = |n: &str| {
+        let is_packed = |n: &str| {
             canon
                 .iter()
-                .any(|c| matches!(&c.shown, Shown::First(f) if f == n))
+                .any(|c| matches!(&c.shown, Shown::First { first_odd, .. } if first_odd == n))
+        };
+        let shown = |c: &CanonKey| match &c.shown {
+            Shown::Originals(originals) => crate::keys::representative(
+                col_named(&c.hidden),
+                col_named(first),
+                originals.clone(),
+            ),
+            Shown::First { first_odd, .. } => crate::keys::representative_of(
+                col_named(&c.hidden),
+                col_named(first),
+                col_named(first_odd),
+            ),
         };
         let exprs: Vec<Expr> = df
             .schema()
             .iter()
-            .filter(|(_, f)| !is_first_value(f.name()))
+            .filter(|(_, f)| !is_packed(f.name()))
             .map(
                 |(q, f)| match canon.iter().find(|c| &c.hidden == f.name()) {
-                    Some(c) => match &c.shown {
-                        Shown::Originals(originals) => crate::keys::representative(
-                            col_named(&c.hidden),
-                            col_named(first),
-                            originals.clone(),
-                        )
-                        .alias(&c.name),
-                        Shown::First(value) => col_named(value).alias(&c.name),
-                    },
+                    Some(c) => shown(c).alias(&c.name),
                     None => Expr::Column(Column::from((q, f))),
                 },
             )
@@ -831,7 +843,7 @@ impl Frame {
         let groups: Vec<Expr> = self
             .user_columns()
             .into_iter()
-            .filter(|c| !canon.iter().any(|k| k.hidden == output_name(c)))
+            .filter(|c| !canon.iter().any(|k| k.is_hidden(&output_name(c))))
             .map(|c| {
                 let name = output_name(&c);
                 match canon.iter().find(|k| k.name == name) {
@@ -845,7 +857,7 @@ impl Frame {
         let first = fresh_name(self.schema.as_arrow());
         let input = self.aggregate_input(false, &[])?;
         let mut aggs = vec![min(col_named(&ord)).alias(&first)];
-        aggs.extend(Self::first_key_aggs(&canon, &ord));
+        aggs.extend(Self::first_key_aggs(&canon));
         let df = aggregate(input, groups, aggs)?;
         let df = Self::show_first_keys(df, &canon, &first)?;
         self.replace(df);
@@ -882,7 +894,7 @@ impl Frame {
         let mut aggs = aggs;
         let first = fresh_name(self.schema.as_arrow());
         aggs.push(min(col_named(&ord)).alias(&first));
-        aggs.extend(Self::first_key_aggs(&canon, &ord));
+        aggs.extend(Self::first_key_aggs(&canon));
         let input = self.aggregate_input(ordered, &keys)?;
         let df = aggregate(input, keys, aggs)?;
         let df = Self::show_first_keys(df, &canon, &first)?;
@@ -1815,7 +1827,7 @@ mod tests {
                 // Lazy: the join runs inside the distinct's plan.
                 let text = f.physical_plan_text().unwrap();
                 assert_eq!(text.contains("HashJoinExec"), !run_first, "{text}");
-                assert_eq!(text.contains("first_value"), !run_first, "{text}");
+                assert_eq!(text.contains("ursa_odd_key"), !run_first, "{text}");
                 let out = f.collect().unwrap();
                 assert_eq!(out[0].schema().field(0).data_type(), &DataType::Float64);
                 assert_eq!(rows(&out), want, "p={p} run_first={run_first}");

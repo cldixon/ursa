@@ -317,6 +317,186 @@ impl ScalarUDFImpl for Representative {
     }
 }
 
+/// The bits of float key `array`'s value at each row, widened to `u64`, with
+/// the value type (a dictionary's values are read through its keys).
+fn row_bits(array: &dyn Array) -> Result<(Vec<u64>, DataType)> {
+    let values = match array.data_type() {
+        DataType::Dictionary(_, v) => arrow::compute::cast(array, v)?,
+        _ => arrow::array::make_array(array.to_data()),
+    };
+    let bits: Vec<u64> = match values.data_type() {
+        DataType::Float16 => bits::<Float16Type, u16>(values.as_ref())
+            .iter()
+            .map(|&b| b as u64)
+            .collect(),
+        DataType::Float32 => bits::<Float32Type, u32>(values.as_ref())
+            .iter()
+            .map(|&b| b as u64)
+            .collect(),
+        DataType::Float64 => bits::<Float64Type, u64>(values.as_ref()).to_vec(),
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "a float key, not {other}"
+            )))
+        }
+    };
+    Ok((bits, values.data_type().clone()))
+}
+
+/// Float values of type `dt` from their bits (widened to `u64`).
+fn from_bits(bits: &[u64], dt: &DataType) -> ArrayRef {
+    fn build<F: ArrowPrimitiveType, U: FloatBits>(bits: Vec<U>) -> ArrayRef {
+        let len = bits.len();
+        let values = ScalarBuffer::<F::Native>::new(Buffer::from_vec(bits), 0, len);
+        Arc::new(PrimitiveArray::<F>::new(values, None))
+    }
+    match dt {
+        DataType::Float16 => build::<Float16Type, u16>(bits.iter().map(|&b| b as u16).collect()),
+        DataType::Float32 => build::<Float32Type, u32>(bits.iter().map(|&b| b as u32).collect()),
+        _ => build::<Float64Type, u64>(bits.to_vec()),
+    }
+}
+
+/// For a frame that is still a plan: per row of float key `key`, its ordinal
+/// `ord` and its value's bits (16 bytes, both big-endian) where the value is
+/// not canonical, else null. The smallest of a group's (`min`) is its first
+/// changed row, which [`representative_of`] reads back.
+pub fn odd_key(key: Expr, ord: Expr) -> Expr {
+    ScalarUDF::new_from_impl(OddKey {
+        signature: Signature::any(2, Volatility::Immutable),
+    })
+    .call(vec![key, ord])
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct OddKey {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for OddKey {
+    fn name(&self) -> &str {
+        "ursa_odd_key"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Binary)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [key, ord] = args.args.as_slice() else {
+            return Err(DataFusionError::Internal(
+                "ursa_odd_key takes two arguments".into(),
+            ));
+        };
+        let n = args.number_rows;
+        let key = key.to_array(n)?;
+        let rows = noncanonical_rows(key.as_ref());
+        if rows.is_empty() {
+            return Ok(ColumnarValue::Array(arrow::array::new_null_array(
+                &DataType::Binary,
+                n,
+            )));
+        }
+        let ord = ord.to_array(n)?;
+        let ord = ord
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| DataFusionError::Internal("an ordinal is UInt64".into()))?;
+        let (bits, _) = row_bits(key.as_ref())?;
+        let mut out = arrow::array::BinaryBuilder::with_capacity(n, rows.len() * 16);
+        let mut next = rows.iter().peekable();
+        for (r, b) in bits.iter().enumerate() {
+            if next.peek() == Some(&&r) {
+                next.next();
+                let mut packed = [0u8; 16];
+                packed[..8].copy_from_slice(&ord.value(r).to_be_bytes());
+                packed[8..].copy_from_slice(&b.to_be_bytes());
+                out.append_value(packed);
+            } else {
+                out.append_null();
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// [`representative`] for a frame that was a plan: `key` (canonical, after the
+/// aggregate) showing the value packed in `odd` (the group's `min` of
+/// [`odd_key`]) where that row is the group's first (ordinal `first`).
+pub fn representative_of(key: Expr, first: Expr, odd: Expr) -> Expr {
+    ScalarUDF::new_from_impl(RepresentativeOf {
+        signature: Signature::any(3, Volatility::Immutable),
+    })
+    .call(vec![key, first, odd])
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RepresentativeOf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for RepresentativeOf {
+    fn name(&self) -> &str {
+        "ursa_first_key_of"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        Ok(args[0].clone())
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        Ok(args.arg_fields[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [key, first, odd] = args.args.as_slice() else {
+            return Err(DataFusionError::Internal(
+                "ursa_first_key_of takes three arguments".into(),
+            ));
+        };
+        let n = args.number_rows;
+        let key = key.to_array(n)?;
+        let (first, odd) = (first.to_array(n)?, odd.to_array(n)?);
+        let first = first
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| DataFusionError::Internal("an ordinal is UInt64".into()))?;
+        let odd = odd.as_binary::<i32>();
+        let mut bits = vec![];
+        let picks: Vec<(usize, usize)> = (0..n)
+            .map(|r| {
+                if odd.is_valid(r) && first.is_valid(r) {
+                    let packed = odd.value(r);
+                    let ord = u64::from_be_bytes(packed[..8].try_into().expect("8 bytes"));
+                    if ord == first.value(r) {
+                        bits.push(u64::from_be_bytes(packed[8..].try_into().expect("8 bytes")));
+                        return (1, bits.len() - 1);
+                    }
+                }
+                (0, r)
+            })
+            .collect();
+        if bits.is_empty() {
+            return Ok(ColumnarValue::Array(key));
+        }
+        let value_type = match key.data_type() {
+            DataType::Dictionary(_, v) => v.as_ref().clone(),
+            other => other.clone(),
+        };
+        let originals = arrow::compute::cast(&from_bits(&bits, &value_type), key.data_type())?;
+        let out = arrow::compute::interleave(&[key.as_ref(), originals.as_ref()], &picks)?;
+        Ok(ColumnarValue::Array(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
