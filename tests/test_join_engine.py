@@ -12,6 +12,8 @@ rows, which pins the row order each ``how`` guarantees:
 
 from __future__ import annotations
 
+import math
+
 import pyarrow as pa
 import pytest
 
@@ -212,10 +214,10 @@ def test_null_keys_never_match():
     ]
 
 
-def test_float_keys_match_by_their_bits():
-    # The hash join's equality, as for inner/left joins before: a float key
-    # matches the same bits, so 0.0 and -0.0 differ and a NaN matches a NaN of
-    # the same sign.
+def test_float_keys_match_in_total_order():
+    # One float semantics for keys (#215): -0.0 matches 0.0, every NaN matches
+    # every NaN whatever its sign, and a null matches nothing. Each row keeps its
+    # own key value.
     nan, neg_nan = float("nan"), -float("nan")
     left = ur.from_arrow(
         pa.table({"f": [0.0, -0.0, nan, 1.5, None, neg_nan], "a": [1, 2, 3, 4, 5, 6]}), id="a"
@@ -224,9 +226,13 @@ def test_float_keys_match_by_their_bits():
         pa.table({"f": [nan, 0.0, 1.5, -0.0, neg_nan], "b": [6, 7, 8, 9, 10]}), id="b"
     )
     pairs = [(r["a"], r["b"]) for r in left.join(right, on="f").collect().to_dicts()]
-    assert pairs == [(1, 7), (2, 9), (3, 6), (4, 8), (6, 10)]
-    outer = [(r["a"], r["b"]) for r in left.join(right, on="f", how="outer").collect().to_dicts()]
-    assert outer == [(1, 7), (2, 9), (3, 6), (4, 8), (5, None), (6, 10)]
+    assert pairs == [(1, 7), (1, 9), (2, 7), (2, 9), (3, 6), (3, 10), (4, 8), (6, 6), (6, 10)]
+    outer = left.join(right, on="f", how="outer").collect().to_arrow()
+    assert list(zip(outer.column("a").to_pylist(), outer.column("b").to_pylist(), strict=True)) == [
+        (1, 7), (1, 9), (2, 7), (2, 9), (3, 6), (3, 10), (4, 8), (5, None), (6, 6), (6, 10)
+    ]  # fmt: skip
+    signs = [None if v is None else math.copysign(1, v) for v in outer.column("f").to_pylist()]
+    assert signs == [1, 1, -1, -1, 1, 1, 1, None, -1, -1]
 
 
 @pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])

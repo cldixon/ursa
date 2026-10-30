@@ -93,6 +93,31 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - A `pathlib.Path` works as a scan path. It raised `NotImplementedError` at
   `collect()` (#216).
 
+- **Behaviour change:** `group_by` keys, `distinct`, `n_unique` and join keys
+  compare floats in the total order filters and `sort()` use: `-0.0` equals
+  `0.0`, every NaN equals every NaN whatever its sign and payload, and NaN joins
+  NaN. They compared raw bits, so the same column grouped one way and filtered
+  another. This covers top-level `float16`, `float32`, `float64` and
+  dictionary-of-float columns, every join `how` (including right/outer key
+  coalescing, where a right key fits the left type in total order: `-0.0` fits
+  an integer key as `0`) and engine frames. A float nested in a struct or list
+  column still compares by its bits. Nulls are unchanged: one group in `group_by` and `distinct`, and never
+  a join match. A group or distinct row shows its first row's value, matching
+  first-appearance row order; a joined row keeps its own key value, and an
+  aggregate over a key column folds the original values. With `k = [-0.0, 0.0,
+  NaN, -NaN, null]` (`-NaN` is what `0/0` gives on x86), `v = [1, 2, 3, 4, 5]`:
+
+  | call | before | after |
+  |---|---|---|
+  | `group_by("k").agg(s=col("v").sum())` | `-0.0: 1`, `0.0: 2`, `NaN: 3`, `-NaN: 4`, `null: 5` | `-0.0: 3`, `NaN: 7`, `null: 5` |
+  | `select("k").distinct()` | 5 rows | `-0.0, NaN, null` |
+  | `group_by(...).agg(u=col("k").n_unique())` | 4 | 2 |
+  | `join(other, on="k")`, `other.k = [0.0, NaN]` | `0.0` and `NaN` match once each | `-0.0` and `0.0` match `0.0`, `NaN` and `-NaN` match `NaN` |
+
+  Results without a `-0.0` or a NaN other than the positive quiet one are
+  unchanged, byte for byte. The key is canonicalized once, as a hidden copy,
+  before anything hashes it, so the parallel order-preserving partition (#212)
+  and the exact float folds are unchanged (#215).
 - **Behaviour change:** error messages no longer show the engine's internals
   (#214). A message names the step or argument, says what was wrong and what to
   do; no message contains DataFusion's `?table?` qualifier, a private
@@ -251,7 +276,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - Ursa's own messages lose the variant prefix DataFusion put before them
     (`Execution error: output column name 'id' is reserved …`, `This feature is
     not implemented: neighbors().agg() needs a node attribute table …`, and
-    the rest of the `weight expression …` and `neighbors().agg() …` family).
+    the rest of the `weight expression …` and `neighbors().agg() …` family);
+  - the scan messages #216 adds, in the same form (pinned in
+    `tests/test_error_messages.py`): a list of paths is labelled with the list
+    (`scan_edges(['a.csv', 'b.csv']): the paths in a list are read as one
+    table, so each needs the same columns, with the same types, in the same
+    order. Column 'w' is int64 in 'a.csv' and double in 'b.csv'. Write the
+    files with matching types …`, and `… 'a.parquet' has the columns [s, d, w]
+    and 'b.parquet' has [s, d]. Give every file the same columns …`; `… the
+    paths in a list must be on one store …`), the CSV options name the call
+    (`scan_edges(): delimiter must be one ASCII character; got ';;'. Pass a
+    single character, such as ';'.`, `read_edges(): the CSV options
+    (null_value=) only apply to .csv files, …`), and an unknown keyword names
+    the function and the option to use (`read_edges() got an unexpected
+    keyword argument 'sep'; use delimiter= instead.`). A stack too small for a
+    plan raises `UrsaError: collect(): the frame's plan has N relational
+    steps, more than the 65280 one plan can run. …`. A CSV value past the
+    1,000-row inference sample that does not parse still reads `… Parser
+    error: Error while parsing value 'yes' as type 'Boolean' for column 2 at
+    line 1001. …`, from the CSV reader, with or without `null_value`.
 - **Behaviour change:** a standalone graph verb is a full `NodeFrame` (#213).
   `ur.degree(e)`, `ur.pagerank(e)` and the other node-valued verbs called on
   their own are `edges.nodes().with_columns(<verb>=...)` with every frame
