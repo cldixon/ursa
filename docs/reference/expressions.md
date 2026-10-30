@@ -7,7 +7,7 @@ An expression is a value of type `ur.Expr`. See [Concepts: Expressions](../conce
 | Function | Expression |
 |---|---|
 | `ur.col(name: str)` | The column `name`. |
-| `ur.lit(value)` | A constant: a number, a string, or a boolean. |
+| `ur.lit(value)` | A constant: a `bool`, `int`, `float` (NaN and infinity included), `str` or `None`, a `date`, `time`, `datetime` or `timedelta`, a `numpy.datetime64` or `timedelta64` with a unit of a day or finer, a `Decimal`, or `bytes`. |
 | `ur.src()` | The source column of the ambient `EdgeFrame`. |
 | `ur.dst()` | The destination column of the ambient `EdgeFrame`. |
 | `ur.id()` | The id column of the ambient `NodeFrame`. |
@@ -23,6 +23,8 @@ An expression is a value of type `ur.Expr`. See [Concepts: Expressions](../conce
 | Boolean | `&`, `|`, `~` | boolean |
 
 Each operator accepts an expression or a plain Python value on either side. A plain value becomes a literal.
+
+An expression has no truth value. `bool(expr)` raises `TypeError`, so `and`, `or`, `not` and `if` do not work on expressions. Use `&`, `|` and `~`.
 
 A `filter` predicate is any boolean expression. A comparison can compare a column with a literal or with another column.
 
