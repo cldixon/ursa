@@ -25,7 +25,7 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
 
 use ursa_plan::lazy::{
-    CellValue, Column, ColumnExpr, Host, HostHandle, Kind, Node, Op, Seeds, State, Step,
+    CellValue, Column, ColumnExpr, GraphStat, Host, HostHandle, Kind, Node, Op, Seeds, State, Step,
 };
 use ursa_plan::plan::{AggSpec, Expr, IntArg, Rows, ScanPath, SelectItem, SortKey};
 use ursa_plan::{PlanError, PlanResult};
@@ -186,6 +186,27 @@ fn string_arg(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<String> {
     ir::<String>(obj, label)
 }
 
+/// An argument (`label`, as `diameter(approximate=)`) as `T`, with a `TypeError`
+/// naming it and what it takes (`want`) for a value of another type, chained to
+/// the conversion's own error.
+fn typed_arg<'a, 'py, T>(obj: &'a Bound<'py, PyAny>, label: &str, want: &str) -> PyResult<T>
+where
+    T: FromPyObject<'a, 'py>,
+    T::Error: Into<PyErr>,
+{
+    obj.extract::<T>().map_err(|e| {
+        let ty = obj
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let shown = obj.repr().map(|r| r.to_string()).unwrap_or_default();
+        let err = PyTypeError::new_err(format!("{label} must be {want}; got {shown} ({ty})"));
+        err.set_cause(obj.py(), Some(e.into()));
+        err
+    })
+}
+
 /// A column name argument (`label`, as `scan_edges(src=)`): a `TypeError` naming
 /// it for a value that is no string.
 fn name_arg(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<String> {
@@ -317,6 +338,22 @@ pub(crate) struct PlanNode(pub(crate) Arc<Node>);
 
 fn wrap(node: PlanResult<Arc<Node>>) -> PyResult<PlanNode> {
     node.map(PlanNode).map_err(plan_err)
+}
+
+/// A scalar stat's one-row frame over `edges`.
+fn stat_node(
+    edges: PyRef<'_, PlanNode>,
+    stat: GraphStat,
+    direction: &Bound<'_, PyAny>,
+) -> PyResult<PlanNode> {
+    wrap(Node::graph(
+        Op::Stat {
+            edges: edges.0.clone(),
+            direction: string_arg(direction, &format!("{}(direction=)", stat.name()))?,
+            stat,
+        },
+        &PyHost,
+    ))
 }
 
 fn scan_path(path: &Bound<'_, PyAny>) -> Option<ScanPath> {
@@ -644,15 +681,49 @@ impl PlanNode {
         edges: PyRef<'_, PlanNode>,
         full: bool,
         direction: &Bound<'_, PyAny>,
+        nodes: &Bound<'_, PyAny>,
     ) -> PyResult<PlanNode> {
+        let given = nodes.extract::<String>().ok();
+        let touched = ursa_plan::parse_describe_nodes(given.as_deref(), &nodes.repr()?.to_string())
+            .map_err(plan_err)?;
         wrap(Node::graph(
             Op::Describe {
                 edges: edges.0.clone(),
                 full,
                 direction: string_arg(direction, "describe(direction=)")?,
+                touched,
             },
             &PyHost,
         ))
+    }
+
+    /// `ur.density(edges, direction)`: a one-row frame of the stat.
+    #[staticmethod]
+    fn density(edges: PyRef<'_, PlanNode>, direction: &Bound<'_, PyAny>) -> PyResult<PlanNode> {
+        stat_node(edges, GraphStat::Density, direction)
+    }
+
+    /// `ur.avg_path_length(edges, sample, direction)`: a one-row frame.
+    #[staticmethod]
+    #[pyo3(signature = (edges, sample, direction))]
+    fn avg_path_length(
+        edges: PyRef<'_, PlanNode>,
+        sample: &Bound<'_, PyAny>,
+        direction: &Bound<'_, PyAny>,
+    ) -> PyResult<PlanNode> {
+        let sample = typed_arg(sample, "avg_path_length(sample=)", "a number or None")?;
+        stat_node(edges, GraphStat::AvgPathLength { sample }, direction)
+    }
+
+    /// `ur.diameter(edges, approximate, direction)`: a one-row frame.
+    #[staticmethod]
+    fn diameter(
+        edges: PyRef<'_, PlanNode>,
+        approximate: &Bound<'_, PyAny>,
+        direction: &Bound<'_, PyAny>,
+    ) -> PyResult<PlanNode> {
+        let approximate = typed_arg(approximate, "diameter(approximate=)", "a bool")?;
+        stat_node(edges, GraphStat::Diameter { approximate }, direction)
     }
 
     /// Run the plan: a list of pyarrow `RecordBatch`es, or the `pyarrow.Table`
@@ -684,14 +755,6 @@ impl PlanNode {
     fn explain(&self, py: Python<'_>, physical: bool) -> String {
         let node = self.0.clone();
         py.detach(|| ursa_plan::lazy::explain(&node, &PyHost, physical))
-    }
-
-    /// The checked graph index of this edge frame (for the eager stats).
-    fn graph_index(&self, py: Python<'_>) -> PyResult<GraphIndex> {
-        let node = self.0.clone();
-        py.detach(|| ursa_plan::lazy::graph_index(&node, &PyHost))
-            .map(GraphIndex)
-            .map_err(plan_err)
     }
 
     /// The plan as the conformance fixtures hold it: its JSON, and per slot the

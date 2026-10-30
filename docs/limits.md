@@ -13,7 +13,6 @@ Ursa is version 0.4. The API is stable in shape, and some combinations of steps 
 | Combination | Status |
 |---|---|
 | A weighted algorithm over a scan with several paths | Pass one path, or read the files into memory first. |
-| `edges.nodes().collect()` with no columns | Add a column first, for example `with_columns(degree=ur.degree(edges))`. |
 
 ## Scope
 

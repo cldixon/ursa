@@ -376,8 +376,18 @@ impl Fingerprint<'_> {
                 edges,
                 full,
                 direction,
+                touched,
             } => {
-                self.push(format!("{op} full={full} direction={direction:?}"));
+                let nodes = if *touched { " nodes=touched" } else { "" };
+                self.push(format!("{op} full={full} direction={direction:?}{nodes}"));
+                self.edges(edges)?;
+            }
+            Plan::Stat {
+                edges,
+                stat,
+                direction,
+            } => {
+                self.push(format!("{op} {stat:?} direction={direction:?}"));
                 self.edges(edges)?;
             }
             Plan::Invalid { step } => self.local(format!("invalid @{step}")),

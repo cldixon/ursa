@@ -389,6 +389,50 @@ CASES = {
         AttributeError,
         "density() takes an EdgeFrame (the graph) as its edges; got int",
     ),
+    # --- #217: expressions, describe and the stats --------------------------
+    "expression_truth_value": (
+        lambda: bool(col("age") == 1),
+        TypeError,
+        "the truth value of an ursa expression is ambiguous: `==` and the other comparisons "
+        "build an expression rather than compare. Combine predicates with &, | and ~ instead "
+        "of and, or and not, and compare collected results.",
+    ),
+    "describe_nodes": (
+        lambda: ur.describe(e(), nodes=bad("x")),
+        ValueError,
+        "describe(nodes='x') is not supported; use 'all' or 'touched'.",
+    ),
+    "stat_direction": (
+        lambda: ur.density(e(), direction="x", lazy=True),
+        ValueError,
+        "density(direction='x') is not supported; use 'out', 'in', or 'both'.",
+    ),
+    "stat_sample": (
+        lambda: ur.avg_path_length(e(), sample=bad("x")),
+        TypeError,
+        "avg_path_length(sample=) must be a number or None; got 'x' (str)",
+    ),
+    "stat_approximate": (
+        lambda: ur.diameter(e(), approximate=bad("x")),
+        TypeError,
+        "diameter(approximate=) must be a bool; got 'x' (str)",
+    ),
+    "stat_then_graph_column": (
+        lambda: ur.density(e(), lazy=True).with_columns(x=ur.degree(e())),
+        NotImplementedError,
+        "with_columns() after density() is not supported yet; collect() the result and build "
+        "a new frame from it with ur.from_arrow(...) first.",
+    ),
+    "bare_nodes_unknown_column": (
+        lambda: e().nodes().filter(col("nope") > 1),
+        ur.ColumnNotFoundError,
+        "filter() references unknown column 'nope'; the frame has ['id'].",
+    ),
+    "verb_frame_unknown_key": (
+        lambda: ur.degree(e()).join(n(), on="nope"),
+        ur.ColumnNotFoundError,
+        "join(on=): key 'nope' not in the left frame ['id', 'degree'].",
+    ),
     # --- sources -------------------------------------------------------------
     "src_not_a_name": (
         lambda: ur.from_arrow(EDGES, src=bad(1), dst="d"),
@@ -530,6 +574,8 @@ def test_an_engine_error_keeps_the_engine_text_as_its_cause():
         # A subclass is raised as it is, not reworded into its base class.
         (lambda: n().filter(col("name") == "\ud800"), UnicodeEncodeError, None),
         (lambda: n().head(bad(float("inf"))), OverflowError, None),
+        (lambda: ur.avg_path_length(e(), sample=bad("x")), TypeError, TypeError),
+        (lambda: ur.diameter(e(), approximate=bad("x")), TypeError, TypeError),
     ],
 )
 def test_exception_classes_and_causes(build, cls, cause):
@@ -588,6 +634,14 @@ def repros(tmp: Path) -> dict:
             "s3://bucket/e.parquet", src="s", dst="d", storage_options={"not_an_option": "x"}
         ),
         "s3_bad_url": lambda: ur.scan_edges("s3://", src="s", dst="d"),
+        "if_expression": lambda: 1 if col("a") > 1 else 0,
+        "describe_nodes_int": lambda: ur.describe(e(), nodes=bad(1)),
+        "stat_lazy_unknown": lambda: ur.avg_path_length(e(), lazy=True).select("nope"),
+        "stat_lazy_compare": lambda: ur.density(e(), lazy=True).filter(col("density") > "x"),
+        "stat_of_node_frame": lambda: ur.density(bad(f)),
+        "bare_nodes_compare": lambda: e().nodes().filter(col("id") > "x"),
+        "bare_nodes_arithmetic": lambda: e().nodes().with_columns(y=col("id") + "x"),
+        "verb_frame_group": lambda: ur.degree(e()).group_by("nope").agg(x=col("id").count()),
     }
 
 

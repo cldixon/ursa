@@ -20,8 +20,6 @@
 //!   for the arguments the Python API checks as it is called.
 //! - `build_index` — build a CSR topology from edge batches (a test hook; frames
 //!   build their own index on first use).
-//! - `graph_density` / `graph_avg_path_length` / `graph_diameter` — eager
-//!   whole-graph statistics over `PlanNode.graph_index()`.
 
 mod frame;
 
@@ -39,10 +37,7 @@ use ursa_core::topology::Topology;
 use ursa_core::IdMap;
 
 use ursa_plan::plan::{count_topology_build, topology_builds, HostError};
-use ursa_plan::{
-    avg_path_length, build_topology_batches, density, diameter, parse_stat_direction,
-    weight_cache_key, PlanError,
-};
+use ursa_plan::{build_topology_batches, weight_cache_key, PlanError};
 
 // ---------------------------------------------------------------------------
 // The Python exception hierarchy (#39.8).
@@ -300,46 +295,6 @@ pub(crate) fn host_err(py: Python<'_>, err: PyErr) -> PlanError {
     })
 }
 
-/// Whole-graph edge density (eager scalar). `direction` is out/in/both; `both`
-/// is the undirected density.
-#[pyfunction]
-#[pyo3(signature = (index, direction="out"))]
-fn graph_density(py: Python<'_>, index: PyRef<'_, GraphIndex>, direction: &str) -> PyResult<f64> {
-    let dir = parse_stat_direction("density", direction).map_err(to_pyerr)?;
-    let topo = index.0.topo.clone();
-    py.detach(move || density(&topo, dir).map_err(to_pyerr))
-}
-
-/// Average shortest-path length over reachable ordered pairs (eager scalar).
-/// `sample` (a fraction) estimates from a subset of sources; omit for exact.
-#[pyfunction]
-#[pyo3(signature = (index, sample=None, direction="out"))]
-fn graph_avg_path_length(
-    py: Python<'_>,
-    index: PyRef<'_, GraphIndex>,
-    sample: Option<f64>,
-    direction: &str,
-) -> PyResult<f64> {
-    let dir = parse_stat_direction("avg_path_length", direction).map_err(to_pyerr)?;
-    let topo = index.0.topo.clone();
-    py.detach(move || avg_path_length(&topo, sample, dir).map_err(to_pyerr))
-}
-
-/// Graph diameter (eager scalar). `approximate` (default true) is a lower-bound
-/// estimate; pass false for exact.
-#[pyfunction]
-#[pyo3(signature = (index, approximate, direction="out"))]
-fn graph_diameter(
-    py: Python<'_>,
-    index: PyRef<'_, GraphIndex>,
-    approximate: bool,
-    direction: &str,
-) -> PyResult<i64> {
-    let dir = parse_stat_direction("diameter", direction).map_err(to_pyerr)?;
-    let topo = index.0.topo.clone();
-    py.detach(move || diameter(&topo, approximate, dir).map_err(to_pyerr))
-}
-
 /// Raise the error for an aggregation the engine does not compute.
 #[pyfunction]
 fn check_agg_fn(func: &str) -> PyResult<()> {
@@ -420,8 +375,5 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_agg_fn, m)?)?;
     m.add_function(wrap_pyfunction!(check_direction, m)?)?;
     m.add_function(wrap_pyfunction!(check_on_null, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_density, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_avg_path_length, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_diameter, m)?)?;
     Ok(())
 }
