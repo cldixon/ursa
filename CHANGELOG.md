@@ -8,6 +8,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-31
+
 ### Added
 
 - CSV options on `scan_edges`, `scan_nodes`, `read_edges` and `read_nodes`:
@@ -1094,7 +1096,8 @@ Fixed a missing Arrow dependency.
 
 Initial release.
 
-[Unreleased]: https://github.com/cldixon/ursa/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/cldixon/ursa/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cldixon/ursa/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/cldixon/ursa/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/cldixon/ursa/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cldixon/ursa/compare/v0.2.0...v0.3.0
