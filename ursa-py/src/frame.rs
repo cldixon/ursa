@@ -208,6 +208,24 @@ where
     })
 }
 
+/// A `bool` argument named `name`, with the `TypeError` a `bool` parameter
+/// raised before pyo3 0.29 (`argument 'physical': 'str' object is not an
+/// instance of 'bool'`). pyo3 0.29 keeps the conversion's own message and adds
+/// the argument name as an exception note instead, which would change the
+/// message users see.
+fn bool_arg(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
+    obj.extract::<bool>().map_err(|e| {
+        let py = obj.py();
+        if e.get_type(py).is(py.get_type::<PyTypeError>()) {
+            let err = PyTypeError::new_err(format!("argument '{name}': {}", e.value(py)));
+            err.set_cause(py, e.cause(py));
+            err
+        } else {
+            e
+        }
+    })
+}
+
 /// A column name argument (`label`, as `scan_edges(src=)`): a `TypeError` naming
 /// it for a value that is no string.
 fn name_arg(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<String> {
@@ -770,8 +788,8 @@ impl PlanNode {
         schema.as_ref().to_pyarrow(py).map(Bound::unbind)
     }
 
-    #[pyo3(signature = (physical=false))]
-    fn explain(&self, py: Python<'_>, physical: bool) -> PyResult<String> {
+    fn explain(&self, py: Python<'_>, physical: &Bound<'_, PyAny>) -> PyResult<String> {
+        let physical = bool_arg(physical, "physical")?;
         let node = self.0.clone();
         py.detach(|| ursa_plan::lazy::explain(&node, &PyHost, physical))
             .map_err(plan_err)
