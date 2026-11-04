@@ -8,6 +8,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Changed
+
+- Source reading moved out of the `ursa-plan` crate into a new workspace
+  crate, `ursa-io`: Parquet and CSV scans, the CSV options and type
+  inference, the Parquet statistics guard, object-store and URL handling, and
+  building a topology from a scan. It does not depend on `ursa-plan`, so any
+  engine built on Ursa reads files as the DataFrame library does.
+  `ursa-plan` depends on it and re-exports what it used, so nothing else
+  changes: the Python API, results and error messages are the same (#233).
+
 ## [0.5.0] — 2026-10-31
 
 ### Added
