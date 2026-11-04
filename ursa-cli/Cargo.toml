@@ -1,0 +1,26 @@
+[package]
+name = "ursa-cli"
+description = "The ursa command-line tool: SQL over Parquet and CSV files, local or in object storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ursa"
+path = "src/main.rs"
+
+[dependencies]
+ursa-engine = { path = "../ursa-engine" }
+ursa-sql = { path = "../ursa-sql" }
+arrow = { workspace = true, features = ["prettyprint"] }
+datafusion = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Writes the gzip CSV fixture (already in the tree via DataFusion's compression).
+flate2 = "1"

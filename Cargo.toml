@@ -6,7 +6,7 @@
 #   ursa-py    — PyO3 bindings (thin)
 [workspace]
 resolver = "2"
-members = ["ursa-core", "ursa-plan", "ursa-py"]
+members = ["ursa-core", "ursa-plan", "ursa-py", "ursa-engine", "ursa-sql", "ursa-cli"]
 
 [workspace.package]
 version = "0.5.0"

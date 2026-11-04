@@ -1,0 +1,23 @@
+[package]
+name = "ursa-engine"
+description = "Ursa's SQL engine session: a DataFusion session that reads files by path, locally or in object storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+datafusion = { workspace = true }
+object_store = { workspace = true }
+url = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+# The glob type DataFusion's `ListingTableUrl` filters a listing with.
+glob = "0.3"
+# The lock type of `SessionContext::state_weak_ref` (already in the tree via DataFusion).
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"
