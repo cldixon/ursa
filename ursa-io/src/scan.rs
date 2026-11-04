@@ -24,7 +24,9 @@ use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingT
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::options::ReadOptions;
 use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::{execute_stream_partitioned, ExecutionPlan};
+use datafusion::physical_plan::{
+    execute_stream_partitioned, ExecutionPlan, StatisticsArgs, StatisticsContext,
+};
 use datafusion::prelude::{DataFrame, ParquetReadOptions, SessionContext};
 use futures::StreamExt;
 use url::Url;
@@ -344,7 +346,7 @@ async fn open_path(path: &str, source: ScanSource<'_>) -> Result<DataFrame> {
 
 /// `ctx.read_parquet(path, ParquetReadOptions::default())`, with a column's
 /// file-level min/max exact only where every row group backs them
-/// ([`CheckedBounds`], #202): DataFusion 54 would otherwise read a column whose
+/// ([`CheckedBounds`], #202): DataFusion (54 and 55) would otherwise read a column whose
 /// known values are all equal as that constant, the rows of a row group without
 /// bounds (all NaN, a long string) included. The table is built as
 /// `read_parquet` builds it, sharing the runtime's file statistics cache.
@@ -826,8 +828,8 @@ fn scan_edges_topology_inner(
         let plan = df.create_physical_plan().await?;
         // Parquet metadata gives the row count up front, so the dense endpoint
         // vectors are sized once; a CSV has no count and they grow as needed.
-        let hint = plan
-            .partition_statistics(None)?
+        let hint = StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())?
             .num_rows
             .get_value()
             .copied()
@@ -1752,7 +1754,7 @@ mod tests {
         // The scan config survives the clone.
         let state = scan_state("/tmp/a.parquet", &no_opts()).unwrap();
         let options = state.config().options();
-        assert_eq!(options.execution.batch_size, SCAN_BATCH_ROWS);
+        assert_eq!(options.execution.batch_size.get(), SCAN_BATCH_ROWS);
         assert!(!options.execution.enable_file_stream_work_stealing);
         assert!(!options.execution.parquet.schema_force_view_types);
     }

@@ -17,6 +17,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   engine built on Ursa reads files as the DataFrame library does.
   `ursa-plan` depends on it and re-exports what it used, so nothing else
   changes: the Python API, results and error messages are the same (#233).
+- Upgraded DataFusion 54 → 55.2, arrow, `arrow-pyarrow` and parquet 58 → 59.3
+  and pyo3 0.28 → 0.29 (object_store stays on 0.13, the line DataFusion 55
+  uses). Results, row order and error messages are unchanged.
+
+### Security
+
+- The upgrade clears RUSTSEC-2026-0435 (`thrift` 0.17, a parquet 58
+  dependency that parquet 59 no longer has) and RUSTSEC-2026-0176/0177
+  (`pyo3` 0.28), and drops `paste` (RUSTSEC-2024-0436) from the tree. Bumped
+  `zstd` 0.13.3 → 0.13.4, `zstd-safe` 7.2.4 → 7.4.0 and `zstd-sys` 2.0.16 →
+  2.1.2, the patched releases on the 0.13 line, for
+  RUSTSEC-2026-0391/0398/0403/0410. Their waivers are gone from `deny.toml`;
+  only `quick-xml` 0.39 (RUSTSEC-2026-0194/0195, via object_store 0.13)
+  remains waived.
 
 ## [0.5.0] — 2026-10-31
 

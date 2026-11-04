@@ -307,17 +307,17 @@ impl GroupsAccumulator for Folds {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
         // A group's rows are in one partition, in order, so its partial states
         // arrive in order; each one continues the fold where the last stopped.
+        // (DataFusion applies an aggregate's filter in the partial phase only.)
         self.grow(total_num_groups);
         let accs = values[0].as_primitive::<Float64Type>();
         let ns = values[1].as_primitive::<UInt64Type>();
         for (i, &g) in group_indices.iter().enumerate() {
             let k = ns.value(i);
-            if k == 0 || opt_filter.is_some_and(|f| !f.value(i) || f.is_null(i)) {
+            if k == 0 {
                 continue;
             }
             if self.n[g] == 0 {
@@ -346,6 +346,32 @@ impl GroupsAccumulator for Folds {
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let (values, n) = self.take(emit_to);
         Ok(vec![Arc::new(values), Arc::new(UInt64Array::from(n))])
+    }
+
+    /// Each row as the state a partial fold of that row alone would emit, so
+    /// merging the states in order folds exactly as [`Self::update_batch`] does.
+    /// (DataFusion calls this only when it skips a partial aggregation; the
+    /// lowering plans these aggregates single-partitioned, which has none.)
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let values = cast(&values[0], &DataType::Float64)?;
+        let values = values.as_primitive::<Float64Type>();
+        let (accs, ns): (Vec<Option<f64>>, Vec<u64>) = (0..values.len())
+            .map(|i| {
+                if values.is_null(i) || opt_filter.is_some_and(|f| !f.value(i) || f.is_null(i)) {
+                    (None, 0)
+                } else {
+                    (Some(step(self.agg, self.nulls, None, values.value(i))), 1)
+                }
+            })
+            .unzip();
+        Ok(vec![
+            Arc::new(Float64Array::from(accs)),
+            Arc::new(UInt64Array::from(ns)),
+        ])
     }
 
     fn size(&self) -> usize {

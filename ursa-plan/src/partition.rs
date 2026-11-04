@@ -37,6 +37,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::hash_utils::create_hashes;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -331,6 +332,14 @@ impl ExecutionPlan for PartitionedExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    // A leaf that evaluates no physical expressions.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

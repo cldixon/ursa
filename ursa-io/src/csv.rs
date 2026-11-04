@@ -75,7 +75,7 @@ impl CsvOptions {
 
 /// `ctx.read_csv(path)` with `csv`'s options.
 ///
-/// DataFusion 54 applies a null pattern when it infers a CSV file's schema but
+/// DataFusion (54 and 55) applies a null pattern when it infers a CSV file's schema but
 /// not when it reads the rows (its `CsvSource` never hands the pattern to the
 /// arrow-csv reader), so a column with a `null_value` in it would infer as a
 /// number and then fail to parse. With a `null_value`, the schema is inferred
@@ -434,9 +434,7 @@ async fn float_columns(
             .into_stream()
             .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
             .boxed();
-        let mut chunks = CsvFormat::default()
-            .read_to_delimited_chunks_from_stream(bytes)
-            .await;
+        let mut chunks = CsvFormat::default().read_to_delimited_chunks_from_stream(bytes);
         let mut names: Vec<String> = vec![];
         let mut first = true;
         while let Some(chunk) = chunks.next().await.transpose()? {

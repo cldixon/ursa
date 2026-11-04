@@ -13,9 +13,11 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::error::Result;
 use datafusion::execution::context::{QueryPlanner, SessionState};
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
@@ -36,7 +38,8 @@ impl ExtensionPlanner for GraphExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         _physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let any = node.as_any();
         if let Some(n) = any.downcast_ref::<GraphAlgorithmNode>() {
@@ -98,7 +101,7 @@ impl QueryPlanner for GraphQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(GraphExtensionPlanner)]);
