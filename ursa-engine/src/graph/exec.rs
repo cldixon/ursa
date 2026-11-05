@@ -37,8 +37,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, ArrayRef, Float64Array};
-use datafusion::arrow::compute::{cast, concat};
+use datafusion::arrow::array::{new_empty_array, Array, ArrayRef, Float64Array};
+use datafusion::arrow::compute::{cast, cast_with_options, concat, CastOptions};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
@@ -65,8 +65,10 @@ use ursa_core::IdError;
 use super::index::{file_identities, fingerprint, FileIdentity, GraphIndex, IndexCache, Weights};
 use super::kernels;
 use super::node::{
-    weight_column, GraphAlgorithmNode, Output, WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
+    weight_column, GraphAlgorithmNode, GraphTraversalNode, Output, WEIGHTED_DESTINATION,
+    WEIGHTED_SOURCE,
 };
+use super::traversal::{self, Traversal, TraversalParam, TraversalParamType};
 
 /// Plans Ursa's graph nodes.
 #[derive(Debug)]
@@ -83,42 +85,29 @@ impl ExtensionPlanner for GraphPlanner {
         _session_state: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if let Some(node) = node.as_any().downcast_ref::<GraphTraversalNode>() {
+            return plan_traversal(node, logical_inputs, physical_inputs).map(Some);
+        }
         let Some(node) = node.as_any().downcast_ref::<GraphAlgorithmNode>() else {
             return Ok(None);
         };
         let (source, destination) = node.endpoint_indices()?;
         let weighted = match (logical_inputs.get(1), physical_inputs.get(1)) {
             (Some(logical), Some(physical)) => {
-                let schema = logical.schema();
-                let column = |name: &str| schema.index_of_column_by_name(None, name);
-                let missing = |name: &str| {
-                    DataFusionError::Internal(format!("the weighted edge plan has no {name}"))
-                };
-                let weights = (0..node.weights.len())
-                    .map(|i| {
-                        let name = weight_column(i);
-                        column(&name).ok_or_else(|| missing(&name))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Some(WeightedInput {
-                    plan: Arc::clone(physical),
-                    source: column(WEIGHTED_SOURCE).ok_or_else(|| missing(WEIGHTED_SOURCE))?,
-                    destination: column(WEIGHTED_DESTINATION)
-                        .ok_or_else(|| missing(WEIGHTED_DESTINATION))?,
-                    weights,
-                    fingerprint: fingerprint(logical),
-                })
+                Some(weighted_input(logical, physical, node.weights.len())?)
             }
             _ => None,
         };
         Ok(Some(Arc::new(GraphAlgorithmExec::new(
             Shape {
-                graph: node.graph.clone(),
-                endpoints: (source, destination),
-                id_type: node.id_type.clone(),
+                edges: Edges {
+                    graph: node.graph.clone(),
+                    endpoints: (source, destination),
+                    id_type: node.id_type.clone(),
+                    fingerprint: fingerprint(logical_inputs[0]),
+                },
                 outputs: node.outputs.clone(),
                 per_node: node.per_node,
-                fingerprint: fingerprint(logical_inputs[0]),
                 display: node.display_outputs(),
                 schema: Arc::new(node.schema().as_arrow().clone()),
             },
@@ -126,6 +115,72 @@ impl ExtensionPlanner for GraphPlanner {
             weighted,
         ))))
     }
+}
+
+/// The weighted edge plan `physical` (planned from `logical`), with
+/// `n_weights` weight columns.
+fn weighted_input(
+    logical: &LogicalPlan,
+    physical: &Arc<dyn ExecutionPlan>,
+    n_weights: usize,
+) -> Result<WeightedInput> {
+    let schema = logical.schema();
+    let column = |name: &str| schema.index_of_column_by_name(None, name);
+    let missing =
+        |name: &str| DataFusionError::Internal(format!("the weighted edge plan has no {name}"));
+    let weights = (0..n_weights)
+        .map(|i| {
+            let name = weight_column(i);
+            column(&name).ok_or_else(|| missing(&name))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(WeightedInput {
+        plan: Arc::clone(physical),
+        source: column(WEIGHTED_SOURCE).ok_or_else(|| missing(WEIGHTED_SOURCE))?,
+        destination: column(WEIGHTED_DESTINATION).ok_or_else(|| missing(WEIGHTED_DESTINATION))?,
+        weights,
+        fingerprint: fingerprint(logical),
+    })
+}
+
+/// The exec of a traversal node.
+fn plan_traversal(
+    node: &GraphTraversalNode,
+    logical_inputs: &[&LogicalPlan],
+    physical_inputs: &[Arc<dyn ExecutionPlan>],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let expected = 1 + usize::from(node.weighted.is_some()) + node.nodes.len();
+    if logical_inputs.len() != expected || physical_inputs.len() != expected {
+        return Err(DataFusionError::Internal(format!(
+            "GraphTraversal has {expected} inputs; planned {}",
+            physical_inputs.len()
+        )));
+    }
+    let (source, destination) = node.endpoint_indices()?;
+    let mut next = 1;
+    let weighted = match node.weighted {
+        Some(_) => {
+            next += 1;
+            Some(weighted_input(logical_inputs[1], &physical_inputs[1], 1)?)
+        }
+        None => None,
+    };
+    Ok(Arc::new(GraphTraversalExec::new(
+        TraversalShape {
+            edges: Edges {
+                graph: node.graph.clone(),
+                endpoints: (source, destination),
+                id_type: node.id_type.clone(),
+                fingerprint: fingerprint(logical_inputs[0]),
+            },
+            traversal: node.traversal,
+            display: node.display_call(),
+            schema: Arc::new(node.schema().as_arrow().clone()),
+        },
+        Arc::clone(&physical_inputs[0]),
+        weighted,
+        physical_inputs[next..].to_vec(),
+    )))
 }
 
 /// A query planner whose physical planner knows Ursa's graph nodes.
@@ -145,17 +200,24 @@ impl QueryPlanner for UrsaQueryPlanner {
     }
 }
 
-/// What a [`GraphAlgorithmExec`] computes, besides its children.
+/// A graph node's edge input: where its endpoints are, and how its index is
+/// cached.
 #[derive(Debug, Clone)]
-struct Shape {
+struct Edges {
     graph: String,
     /// The source and destination columns of the first input.
     endpoints: (usize, usize),
     id_type: DataType,
-    outputs: Vec<Output>,
-    per_node: bool,
     /// The edge plan's fingerprint, or `None` if it cannot be cached.
     fingerprint: Option<String>,
+}
+
+/// What a [`GraphAlgorithmExec`] computes, besides its children.
+#[derive(Debug, Clone)]
+struct Shape {
+    edges: Edges,
+    outputs: Vec<Output>,
+    per_node: bool,
     /// The outputs as `EXPLAIN` shows them.
     display: String,
     schema: SchemaRef,
@@ -205,7 +267,7 @@ impl DisplayAs for GraphAlgorithmExec {
         write!(
             f,
             "GraphAlgorithmExec: graph={}, outputs=[{}]",
-            self.shape.graph, self.shape.display
+            self.shape.edges.graph, self.shape.display
         )
     }
 }
@@ -274,9 +336,9 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let schema = Arc::clone(&shape.schema);
         let run = async move {
             let (index, weights) = match weighted {
-                None => (unweighted_index(&shape, input, &context).await?, None),
+                None => (unweighted_index(&shape.edges, input, &context).await?, None),
                 Some(w) => {
-                    let (index, weights) = weighted_index(&shape, input, w, &context).await?;
+                    let (index, weights) = weighted_index(&shape.edges, input, w, &context).await?;
                     (index, Some(weights))
                 }
             };
@@ -302,6 +364,218 @@ impl ExecutionPlan for GraphAlgorithmExec {
     }
 }
 
+/// What a [`GraphTraversalExec`] computes, besides its children.
+#[derive(Debug, Clone)]
+struct TraversalShape {
+    edges: Edges,
+    traversal: Traversal,
+    /// The call as `EXPLAIN` shows it.
+    display: String,
+    schema: SchemaRef,
+}
+
+/// Builds or fetches a graph index from its first child's edge rows, reads
+/// the node ids its other children produce, and runs a traversal.
+#[derive(Debug)]
+pub struct GraphTraversalExec {
+    shape: TraversalShape,
+    input: Arc<dyn ExecutionPlan>,
+    weighted: Option<WeightedInput>,
+    /// One plan per node-id parameter, in the spec's order.
+    nodes: Vec<Arc<dyn ExecutionPlan>>,
+    properties: Arc<PlanProperties>,
+}
+
+impl GraphTraversalExec {
+    fn new(
+        shape: TraversalShape,
+        input: Arc<dyn ExecutionPlan>,
+        weighted: Option<WeightedInput>,
+        nodes: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&shape.schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Self {
+            shape,
+            input,
+            weighted,
+            nodes,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for GraphTraversalExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "GraphTraversalExec: graph={}, call={}",
+            self.shape.edges.graph, self.shape.display
+        )
+    }
+}
+
+impl ExecutionPlan for GraphTraversalExec {
+    fn name(&self) -> &str {
+        "GraphTraversalExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        let mut children = vec![&self.input];
+        children.extend(self.weighted.as_ref().map(|w| &w.plan));
+        children.extend(self.nodes.iter());
+        children
+    }
+
+    /// The edges are read in order (see [`GraphAlgorithmExec`]), and the node
+    /// ids in the order their query gives them, which sets the order of the
+    /// rows.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let expected = self.children().len();
+        if children.len() != expected {
+            return Err(DataFusionError::Internal(format!(
+                "GraphTraversalExec has {expected} children; got {}",
+                children.len()
+            )));
+        }
+        let mut children = children.into_iter();
+        let input = children.next().expect("checked above");
+        let weighted = self.weighted.clone().map(|w| WeightedInput {
+            plan: children.next().expect("checked above"),
+            ..w
+        });
+        Ok(Arc::new(Self::new(
+            self.shape.clone(),
+            input,
+            weighted,
+            children.collect(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "GraphTraversalExec has one partition; asked for {partition}"
+            )));
+        }
+        let shape = self.shape.clone();
+        let input = Arc::clone(&self.input);
+        let weighted = self.weighted.clone();
+        let node_plans = self.nodes.clone();
+        let schema = Arc::clone(&shape.schema);
+        let run = async move {
+            let (index, weights) = match weighted {
+                None => (unweighted_index(&shape.edges, input, &context).await?, None),
+                Some(w) => {
+                    let (index, weights) = weighted_index(&shape.edges, input, w, &context).await?;
+                    (index, Some(weights))
+                }
+            };
+            let spec = shape.traversal.spec();
+            let mut nodes = Vec::with_capacity(node_plans.len());
+            for (param, plan) in spec.node_params().zip(&node_plans) {
+                let batches = drain(plan, &[0], &context).await?;
+                nodes.push(node_ids(&shape, param, &index, batches)?);
+            }
+            tokio::task::spawn_blocking(move || {
+                let weights = weights.as_ref().map(|w| w[0].as_slice());
+                traversal::batch(
+                    &index.topology,
+                    &index.ids,
+                    &shape.traversal,
+                    &nodes,
+                    weights,
+                    shape.schema,
+                )
+            })
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("a graph kernel failed: {e}")))?
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(run),
+        )))
+    }
+}
+
+/// The ids a node-id input produced, as dense indexes of `index` (`None` for a
+/// null or an id not in the graph), cast to the graph's id type first.
+fn node_ids(
+    shape: &TraversalShape,
+    param: &TraversalParam,
+    index: &GraphIndex,
+    batches: Vec<Vec<ArrayRef>>,
+) -> Result<Vec<Option<u32>>> {
+    let (function, name, graph) = (shape.traversal.name(), param.name, &shape.edges.graph);
+    let id_type = index.ids.user_type();
+    let options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+    let arrays = batches
+        .iter()
+        .map(|b| {
+            cast_with_options(&b[0], &id_type, &options).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "{function}({name} =>): the values must be node ids of graph '{graph}', \
+                     which are {}: {}",
+                    id_kind(&id_type),
+                    crate::user_message(&DataFusionError::ArrowError(Box::new(e), None))
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+    let ids = match refs.as_slice() {
+        [] => new_empty_array(&id_type),
+        _ => concat(&refs)?,
+    };
+    if param.ty == TraversalParamType::Node && ids.len() > 1 {
+        return Err(DataFusionError::Execution(format!(
+            "{function}({name} =>) must be one node id; its query returned {} rows",
+            ids.len()
+        )));
+    }
+    index
+        .ids
+        .dense_from_array(ids.as_ref())
+        .map_err(|e| DataFusionError::Execution(format!("{function}({name} =>): {e}")))
+}
+
+/// How a message names an id type.
+fn id_kind(t: &DataType) -> &'static str {
+    match t {
+        DataType::Int64 => "integers",
+        _ => "strings",
+    }
+}
+
 /// Keeps a graph node's edge rows in the order the plan produces them.
 ///
 /// DataFusion's `EnforceDistribution` puts a round-robin repartition under an
@@ -324,10 +598,12 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|node| {
-            let Some(exec) = node.downcast_ref::<GraphAlgorithmExec>() else {
+            let is_graph = node.downcast_ref::<GraphAlgorithmExec>().is_some()
+                || node.downcast_ref::<GraphTraversalExec>().is_some();
+            if !is_graph {
                 return Ok(Transformed::no(node));
-            };
-            let children = exec
+            }
+            let children = node
                 .children()
                 .into_iter()
                 .map(|child| without_round_robin(Arc::clone(child)))
@@ -364,7 +640,7 @@ fn without_round_robin(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn Execution
 
 /// The index cache key for the edges `input` reads, if they can be cached.
 async fn index_key(
-    shape: &Shape,
+    shape: &Edges,
     input: &Arc<dyn ExecutionPlan>,
     context: &TaskContext,
 ) -> Result<Option<(String, Vec<FileIdentity>)>> {
@@ -376,7 +652,7 @@ async fn index_key(
 
 /// The index, cached or built from the endpoint-only input.
 async fn unweighted_index(
-    shape: &Shape,
+    shape: &Edges,
     input: Arc<dyn ExecutionPlan>,
     context: &Arc<TaskContext>,
 ) -> Result<Arc<GraphIndex>> {
@@ -401,7 +677,7 @@ async fn unweighted_index(
 /// The index and the weight columns, for a node that reads weights (see the
 /// module docs).
 async fn weighted_index(
-    shape: &Shape,
+    shape: &Edges,
     input: Arc<dyn ExecutionPlan>,
     weighted: WeightedInput,
     context: &Arc<TaskContext>,

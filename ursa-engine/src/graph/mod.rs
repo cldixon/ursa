@@ -33,6 +33,11 @@
 //! as a [`GraphAlgorithmNode`] whose child is the edge table ([`functions`],
 //! `relation`, `node`, `exec`), with the built index cached per session
 //! ([`IndexCache`]).
+//!
+//! Traversals (`hop`, `shortest_path`, `random_walk`) are table functions
+//! too, planned as a [`GraphTraversalNode`] over the same edge plan, with one
+//! more child per node-id argument (a list, or a subquery that runs when the
+//! node runs); see [`traversal`].
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -61,11 +66,14 @@ mod kernels;
 mod node;
 mod relation;
 mod session;
+pub mod traversal;
 
 pub use catalog_table::UrsaFunctions;
-pub use exec::{GraphAlgorithmExec, GraphPlanner, KeepEdgeOrder, UrsaQueryPlanner};
+pub use exec::{
+    GraphAlgorithmExec, GraphPlanner, GraphTraversalExec, KeepEdgeOrder, UrsaQueryPlanner,
+};
 pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache, Weights};
-pub use node::{GraphAlgorithmNode, Output};
+pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
 pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
 
 /// One graph, as `CREATE PROPERTY GRAPH` defined it.

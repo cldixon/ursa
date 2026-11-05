@@ -2,11 +2,16 @@
 //! the same parameters must give the same columns (names and types), the same
 //! ids and the same values, floats bit for bit.
 //!
+//! The traversals return rows of their own; those are compared in order, as
+//! the Python library returns them. The traversals' parameters and defaults
+//! are compared with the Python signatures the fixture records.
+//!
 //! The Python side is recorded in `fixtures/parity.json` by
 //! `fixtures/generate_parity.py`; see that script for how to regenerate it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array,
@@ -14,6 +19,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::TableReference;
 use serde_json::Value;
+use ursa_engine::graph::traversal;
 use ursa_engine::graph::{index_builds, registry_of, EdgeTable, GraphDef};
 use ursa_engine::new_session;
 
@@ -102,6 +108,43 @@ fn keyed(rows: Vec<Vec<Cell>>, per_node: bool) -> BTreeMap<Cell, Vec<Cell>> {
     map
 }
 
+/// The traversals take the Python library's parameters, by name, with its
+/// defaults, the node ids first.
+#[test]
+fn traversal_parameters_match_python() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity.json");
+    let document: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fixtures).unwrap()).unwrap();
+    let signatures = document["traversal_signatures"].as_object().unwrap();
+    assert_eq!(signatures.len(), traversal::TRAVERSALS.len());
+    for spec in traversal::TRAVERSALS {
+        let python: Vec<(String, Value)> = signatures[spec.name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p[0].as_str().unwrap().to_string(), p[1].clone()))
+            .collect();
+        let sql: Vec<(String, Value)> = spec
+            .params
+            .iter()
+            .map(|p| {
+                let default = match p.default {
+                    None => Value::from("<required>"),
+                    Some(ursa_core::catalog::Value::Null) => Value::Null,
+                    Some(ursa_core::catalog::Value::UInt(u)) => Value::from(u),
+                    Some(ursa_core::catalog::Value::Str(s)) => Value::from(s),
+                    Some(other) => panic!("{}: unexpected default {other:?}", spec.name),
+                };
+                (p.name.to_string(), default)
+            })
+            .collect();
+        assert_eq!(sql, python, "{}", spec.name);
+        // The node ids come first, as SQL lists them.
+        let first_other = spec.params.iter().position(|p| !p.takes_nodes()).unwrap();
+        assert!(spec.params[first_other..].iter().all(|p| !p.takes_nodes()));
+    }
+}
+
 #[tokio::test]
 async fn sql_matches_the_python_library() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity.json");
@@ -139,10 +182,15 @@ async fn sql_matches_the_python_library() {
 
     let mut functions = std::collections::BTreeSet::new();
     let mut weighted = 0;
+    let data_dir = data.canonicalize().unwrap();
     for case in cases {
         let function = case["function"].as_str().unwrap();
         let dataset = case["dataset"].as_str().unwrap();
-        let args = case["sql_args"].as_str().unwrap();
+        let args = case["sql_args"]
+            .as_str()
+            .unwrap()
+            .replace("{data}", &data_dir.display().to_string());
+        let args = args.as_str();
         functions.insert(function);
         weighted += usize::from(args.contains("weight =>"));
         let sql = if args.is_empty() {
@@ -150,8 +198,12 @@ async fn sql_matches_the_python_library() {
         } else {
             format!("SELECT * FROM {function}({dataset}, {args})")
         };
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let schema = batches[0].schema();
+        let frame = ctx.sql(&sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let schema = Arc::new(frame.schema().as_arrow().clone());
+        let batches = frame
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
         let columns: Vec<(String, String)> = schema
             .fields()
             .iter()
@@ -196,11 +248,18 @@ async fn sql_matches_the_python_library() {
                     .collect()
             })
             .collect();
-        assert_eq!(keyed(got, per_node), keyed(expected, per_node), "{sql}");
+        if traversal::lookup(function).is_some() {
+            assert_eq!(got, expected, "{sql}");
+        } else {
+            assert_eq!(keyed(got, per_node), keyed(expected, per_node), "{sql}");
+        }
     }
     // Every function SQL offers is covered, with weights.
     for f in ursa_engine::graph::functions::specs() {
         assert!(functions.contains(f.name), "no parity case for {}", f.name);
+    }
+    for t in traversal::TRAVERSALS {
+        assert!(functions.contains(t.name), "no parity case for {}", t.name);
     }
     assert!(weighted >= 5, "{weighted} weighted cases");
     // One index per dataset, however many functions ran over it, weighted or
