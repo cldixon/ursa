@@ -5,14 +5,15 @@
 //! `'edges/*.parquet'`, and the same over `s3://`, `gs://`, `az://` and
 //! `https://`, with object stores registered the first time a URL is read.
 //!
-//! Graphs are defined per session ([`graph`]). Their plan nodes and the
-//! `.ursa` database file arrive in later milestones (cldixon/ursa#232).
+//! Graphs are defined per session ([`graph`]). A session may have a `.ursa`
+//! database ([`database`]), which keeps its catalog between processes.
 
 use std::sync::Arc;
 
 use datafusion::catalog::DynamicFileCatalog;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
+pub mod database;
 pub mod error;
 mod file_table;
 pub mod graph;
@@ -32,6 +33,7 @@ pub fn new_session() -> SessionContext {
 /// turned on, so `SHOW TABLES` and `SHOW COLUMNS` work.
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     let config = graph::with_algorithms(graph::with_registry(config.with_information_schema(true)));
+    let config = database::with_database_slot(config);
     let ctx = SessionContext::new_with_config(config);
     // Graph schemas are added to and dropped from the unwrapped catalogs.
     graph::registry_of(&ctx).set_catalogs(Arc::clone(ctx.state().catalog_list()));

@@ -7,22 +7,29 @@
 //! (`ursa_engine::graph::check_ddl`). `CREATE PROPERTY GRAPH` and `DROP
 //! PROPERTY GRAPH` define graphs (see [`property_graph`] for the subset of
 //! SQL/PGQ supported); `SHOW GRAPHS` and `DESCRIBE GRAPH` describe them.
-//! `ATTACH` is recognised now and runs in a later milestone; until then it
-//! returns a "not supported yet" error naming the issue that delivers it.
+//!
+//! A session may have a `.ursa` database ([`database`]): [`open_session`]
+//! opens one, and `ATTACH 'club.ursa'` opens one in an in-memory session that
+//! has defined nothing yet. In such a session, statements that define or drop
+//! views, external tables and graphs are kept in the database's catalog file,
+//! and relative file paths are relative to the directory holding the file.
 
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
 
+pub mod database;
 mod graph_ddl;
 mod parser;
 pub mod property_graph;
 
+pub use database::open_session;
 pub use parser::{
     parse_sql, Attach, CreatePropertyGraph, DescribeGraph, DropPropertyGraph, UrsaParser,
     UrsaStatement, DEFAULT_RECURSION_LIMIT,
 };
+pub use ursa_engine::database::OpenOptions;
 
 /// Parse `sql` with the session's configured dialect and recursion limit.
 pub fn parse_sql_for(ctx: &SessionContext, sql: &str) -> Result<Vec<UrsaStatement>> {
@@ -34,12 +41,75 @@ pub fn parse_sql_for(ctx: &SessionContext, sql: &str) -> Result<Vec<UrsaStatemen
     UrsaParser::new(sql, dialect.as_ref(), options.recursion_limit.get())?.parse_statements()
 }
 
+/// [`parse_sql_for`], with each statement's text as written (see
+/// [`execute_with_text`]).
+pub fn parse_sql_with_text_for(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<(UrsaStatement, String)>> {
+    let options = ctx.state().config().options().sql_parser.clone();
+    let dialect = datafusion::sql::sqlparser::dialect::dialect_from_str(options.dialect)
+        .ok_or_else(|| {
+            DataFusionError::Configuration(format!("unknown SQL dialect '{}'", options.dialect))
+        })?;
+    UrsaParser::new(sql, dialect.as_ref(), options.recursion_limit.get())?
+        .parse_statements_with_text()
+}
+
 /// Run one statement on `ctx`. The returned frame is lazy for a query, and
 /// already applied for DDL (as with `SessionContext::sql`).
+///
+/// In a session with a database, a statement that defines an object is
+/// stored as its `Display` form; one whose `Display` does not parse back to
+/// the same statement (`CREATE EXTERNAL TABLE` with columns or options) needs
+/// [`execute_with_text`].
 pub async fn execute(ctx: &SessionContext, statement: UrsaStatement) -> Result<DataFrame> {
+    execute_inner(ctx, statement, None).await
+}
+
+/// [`execute`], with the statement's text as written (from
+/// [`parse_sql_with_text_for`]), which a database stores when the statement's
+/// `Display` does not round-trip.
+pub async fn execute_with_text(
+    ctx: &SessionContext,
+    statement: UrsaStatement,
+    text: &str,
+) -> Result<DataFrame> {
+    execute_inner(ctx, statement, Some(text)).await
+}
+
+async fn execute_inner(
+    ctx: &SessionContext,
+    statement: UrsaStatement,
+    text: Option<&str>,
+) -> Result<DataFrame> {
+    match ursa_engine::database::database(&ctx.state()) {
+        Some(db) => database::execute(ctx, &db, statement, text).await,
+        None => match statement {
+            UrsaStatement::Attach(attach) => database::attach(ctx, attach).await,
+            statement => run(ctx, statement).await,
+        },
+    }
+}
+
+/// Run one statement, leaving the database's catalog alone.
+pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Result<DataFrame> {
     match statement {
-        UrsaStatement::DataFusion(statement) => {
+        UrsaStatement::DataFusion(mut statement) => {
             let state = ctx.state();
+            // In a session with a database, a relative path is relative to
+            // the database's directory.
+            match statement.as_mut() {
+                DFStatement::CopyTo(copy) => {
+                    copy.target = ursa_engine::database::resolve_location(&state, &copy.target)
+                }
+                DFStatement::CreateExternalTable(table) => {
+                    for location in &mut table.locations {
+                        *location = ursa_engine::database::resolve_location(&state, location);
+                    }
+                }
+                _ => {}
+            }
             // A COPY target or external table location in object storage needs
             // its store registered before DataFusion plans the write or read.
             match statement.as_ref() {
@@ -61,42 +131,16 @@ pub async fn execute(ctx: &SessionContext, statement: UrsaStatement) -> Result<D
         UrsaStatement::DropPropertyGraph(statement) => graph_ddl::drop(ctx, statement),
         UrsaStatement::ShowGraphs => graph_ddl::show(ctx),
         UrsaStatement::DescribeGraph(statement) => graph_ddl::describe(ctx, statement).await,
-        other => Err(not_supported_yet(&other)),
+        // `execute` handles ATTACH before it gets here.
+        UrsaStatement::Attach(_) => Err(DataFusionError::Plan(
+            "ATTACH cannot run while replaying a database's catalog".into(),
+        )),
     }
-}
-
-/// The error for a recognised statement whose milestone has not landed.
-fn not_supported_yet(statement: &UrsaStatement) -> DataFusionError {
-    let planned = match statement {
-        UrsaStatement::Attach(_) => "#237",
-        UrsaStatement::DataFusion(_)
-        | UrsaStatement::CreatePropertyGraph(_)
-        | UrsaStatement::DropPropertyGraph(_)
-        | UrsaStatement::DescribeGraph(_)
-        | UrsaStatement::ShowGraphs => unreachable!("{} is supported", statement.kind()),
-    };
-    DataFusionError::NotImplemented(format!(
-        "{} is not supported yet (planned in {planned})",
-        statement.kind()
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn graph_statements_say_when_they_arrive() {
-        let ctx = ursa_engine::new_session();
-        for (sql, expected) in [(
-            "ATTACH 'club.ursa'",
-            "ATTACH is not supported yet (planned in #237)",
-        )] {
-            let statement = parse_sql_for(&ctx, sql).unwrap().remove(0);
-            let err = execute(&ctx, statement).await.unwrap_err();
-            assert_eq!(ursa_engine::user_message(&err), expected);
-        }
-    }
 
     #[tokio::test]
     async fn runs_datafusion_statements() {

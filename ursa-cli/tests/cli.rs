@@ -291,14 +291,11 @@ fn graphs_last_for_the_invocation() {
 }
 
 #[test]
-fn database_statements_are_not_supported_yet() {
-    assert_eq!(
-        err(ursa(&["-c", "ATTACH 'club.ursa'"])),
-        "Error: ATTACH is not supported yet (planned in #237)\n"
-    );
-
-    let e = err(ursa(&["club.ursa", "-c", "SELECT 1"]));
-    assert!(e.contains("planned in #237"), "{e}");
+fn only_ursa_files_are_databases() {
+    let e = err(ursa(&["query.sql", "-c", "SELECT 1"]));
+    assert!(e.contains("'query.sql' is not a database file"), "{e}");
+    let e = err(ursa(&["--readonly", "-c", "SELECT 1"]));
+    assert!(e.contains("--readonly"), "{e}");
 }
 
 #[test]
