@@ -502,7 +502,7 @@ impl ExecutionPlan for RandomWalkExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical::{Direction as PlanDirection, GraphAlgo};
+    use crate::logical::Call;
     use crate::result::OutputDtype;
     use crate::topology::build_topology;
     use arrow::array::Int64Array;
@@ -514,8 +514,8 @@ mod tests {
         let (topo, ids) = build_topology(&src, &dst).unwrap();
         let columns = Arc::new(vec![OutputColumn::Algo {
             name: "deg".to_string(),
-            algo: GraphAlgo::Degree {
-                direction: PlanDirection::Out,
+            algo: Call::Degree {
+                direction: Direction::Out,
             },
             weights: None,
             dtype: OutputDtype::F64,

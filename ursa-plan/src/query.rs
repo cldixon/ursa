@@ -15,10 +15,11 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Extension, JoinType, LogicalPlan};
 use datafusion::prelude::{DataFrame, SessionContext};
 use ursa_core::algo::AggKind;
+use ursa_core::catalog::{self, Arg, Expected, FunctionSpec, ParamError, ParamErrorKind, Shape};
 use ursa_core::{EdgeMask, IdMap, Topology};
 
 use crate::expr::GraphVerb;
-use crate::logical::{Direction, GraphAlgo, LayoutKind};
+use crate::logical::{Call, Direction};
 use crate::node::{GraphAlgorithmNode, HopNode, RandomWalkNode, ShortestPathNode};
 use crate::result::{path_schema, query_batch, OutputColumn, OutputDtype};
 use crate::weight::{edge_weights, WeightCache};
@@ -27,83 +28,133 @@ use crate::weight::{edge_weights, WeightCache};
 pub type NodeColumn = (String, GraphVerb);
 
 impl GraphVerb {
-    /// The direction of a kernel that takes `'out'` or `'both'` only (`pagerank`,
-    /// `betweenness`). `'in'` is a hard error rather than a silent `'out'`.
-    fn out_or_both(&self) -> Result<Direction> {
-        match parse_direction(self.call_name(), &self.direction()?)? {
-            Direction::In => Err(DataFusionError::NotImplemented(format!(
-                "{}(direction='in') is not supported; use one of 'out', 'both'",
-                self.call_name()
-            ))),
-            d => Ok(d),
-        }
+    /// The catalog spec of this verb (`None` for a verb that is not a
+    /// node-valued function).
+    fn spec(&self) -> Option<&'static FunctionSpec> {
+        catalog::lookup(&self.verb).filter(|s| s.shape == Shape::PerNode)
     }
 
-    fn to_algo(&self) -> Result<GraphAlgo> {
-        let p = |name: &str, v: &Option<serde_json::Value>| self.param::<f64>(name, v);
-        let n = |name: &str, v: &Option<serde_json::Value>| self.param::<u32>(name, v);
-        let seed = self.param::<u64>("seed", &self.seed)?;
-        Ok(match self.verb.as_str() {
-            "pagerank" => GraphAlgo::PageRank {
-                damping: p("damping", &self.damping)?.unwrap_or(0.85),
-                max_iter: n("max_iter", &self.max_iter)?.unwrap_or(30),
-                tol: p("tol", &self.tol)?.unwrap_or(1e-6),
-                direction: self.out_or_both()?,
-            },
-            "layout_fr" | "layout_random" | "layout_circle" => GraphAlgo::Layout {
-                kind: match self.verb.as_str() {
-                    "layout_fr" => LayoutKind::Fr,
-                    "layout_random" => LayoutKind::Random,
-                    _ => LayoutKind::Circle,
-                },
-                iterations: n("iterations", &self.iterations)?.unwrap_or(300),
-                k: p("k", &self.k)?.unwrap_or(1.0),
-                gravity: p("gravity", &self.gravity)?.unwrap_or(0.02),
-                seed,
-            },
-            "degree" => GraphAlgo::Degree {
-                direction: parse_direction(self.call_name(), &self.direction()?)?,
-            },
-            "connected_components" => GraphAlgo::ConnectedComponents {
-                strong: parse_cc_strong(self.mode.as_ref().map(|m| m.as_str().unwrap_or("")))?,
-            },
-            "triangle_count" => GraphAlgo::TriangleCount,
-            "clustering_coefficient" => GraphAlgo::ClusteringCoefficient,
-            "closeness" => GraphAlgo::Closeness {
-                direction: parse_direction(self.call_name(), &self.direction()?)?,
-            },
-            "betweenness" => GraphAlgo::Betweenness {
-                sample: p("sample", &self.sample)?,
-                seed,
-                direction: self.out_or_both()?,
-            },
-            "label_propagation" => GraphAlgo::LabelPropagation {
-                max_iter: n("max_iter", &self.max_iter)?.unwrap_or(20),
-                seed,
-            },
-            "louvain" => GraphAlgo::Louvain {
-                resolution: p("resolution", &self.resolution)?.unwrap_or(1.0),
-                seed,
-            },
-            other => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "graph algorithm {other:?} is not wired into the execution path"
-                )))
+    /// The verb's argument for the catalog parameter `name`, as given.
+    fn arg_value(&self, name: &str) -> Option<serde_json::Value> {
+        let field = match name {
+            // A neighbour aggregation's function comes from its agg expression.
+            "agg" => return self.agg_fn().map(serde_json::Value::from),
+            "damping" => &self.damping,
+            "max_iter" => &self.max_iter,
+            "tol" => &self.tol,
+            "direction" => &self.direction,
+            "sample" => &self.sample,
+            "resolution" => &self.resolution,
+            "seed" => &self.seed,
+            "mode" => &self.mode,
+            "iterations" => &self.iterations,
+            "k" => &self.k,
+            "gravity" => &self.gravity,
+            _ => return None,
+        };
+        field.clone()
+    }
+
+    /// Resolve the verb's arguments into a catalog [`Call`], with the catalog's
+    /// errors worded as the Python API words them.
+    ///
+    /// A null argument is the default, as Python's `None` is, except a null
+    /// `mode`, which is an invalid mode. The weight and the dtype are not part of
+    /// the call: [`node_columns`] reads them. `seed` is checked first and the
+    /// rest in the catalog's order, the order this engine has always reported
+    /// the first bad argument in.
+    pub(crate) fn to_call(&self) -> Result<Call> {
+        let Some(spec) = self.spec() else {
+            return Err(DataFusionError::NotImplemented(format!(
+                "graph algorithm {:?} is not wired into the execution path",
+                self.verb
+            )));
+        };
+        let seed_first = spec
+            .params
+            .iter()
+            .filter(|p| p.name == "seed")
+            .chain(spec.params.iter().filter(|p| p.name != "seed"));
+        let mut args: Vec<(&str, Arg)> = Vec::new();
+        for param in seed_first {
+            match self.arg_value(param.name) {
+                None => {}
+                Some(serde_json::Value::Null) if param.name != "mode" => {}
+                Some(v) => args.push((param.name, json_arg(&v))),
             }
-        })
+        }
+        spec.resolve(args)
+            .map(|r| r.call)
+            .map_err(|e| self.param_error(&e))
+    }
+
+    /// The Python API's message for a bad argument.
+    fn param_error(&self, e: &ParamError) -> DataFusionError {
+        let call = self.call_name();
+        let name = e.param.as_str();
+        let value = self.arg_value(name).unwrap_or(serde_json::Value::Null);
+        let shown = crate::expr::py_repr(&value);
+        match e.kind {
+            ParamErrorKind::Expected(expected) => {
+                let want = match expected {
+                    Expected::Number | Expected::NumberOrNull => "a number",
+                    Expected::FiniteNumber => "a finite number",
+                    Expected::Count => "a non-negative integer below 2**32",
+                    Expected::Seed => "a non-negative integer",
+                    Expected::Bool => "a bool",
+                };
+                DataFusionError::Execution(format!("{call}({name}=) must be {want}; got {shown}"))
+            }
+            ParamErrorKind::NotOneOf(accepted) if name == "direction" => {
+                let Some(d) = value.as_str() else {
+                    return DataFusionError::Execution(format!(
+                        "{call}(direction=) must be a string; got {shown}"
+                    ));
+                };
+                // A direction at all, but not one this verb takes ('in' for
+                // pagerank), names the ones it does; anything else names all three.
+                let options = if catalog::parse_direction(d).is_some() {
+                    accepted
+                } else {
+                    catalog::ALL_DIRECTIONS
+                };
+                let options: Vec<String> = options.iter().map(|o| format!("'{o}'")).collect();
+                DataFusionError::NotImplemented(format!(
+                    "{call}(direction={shown}) is not supported; use one of {}",
+                    options.join(", ")
+                ))
+            }
+            ParamErrorKind::NotOneOf(_) if name == "mode" => {
+                DataFusionError::NotImplemented(format!(
+                    "connected_components mode must be 'weak' or 'strong'; got {:?}",
+                    value.as_str().unwrap_or("")
+                ))
+            }
+            ParamErrorKind::NotOneOf(_) if name == "agg" => {
+                DataFusionError::NotImplemented(format!(
+                    "neighbours aggregation {:?} is not supported \
+                     (use mean/sum/min/max/count/n_unique)",
+                    value.as_str().unwrap_or("")
+                ))
+            }
+            _ => DataFusionError::Execution(e.to_string()),
+        }
     }
 }
 
-/// `connected_components` mode → the `strong` flag. `None`/`"weak"` → weak
-/// (undirected) components; `"strong"` → strongly-connected components. The Python
-/// layer already validates the mode, so an unexpected value here is a hard error.
-fn parse_cc_strong(mode: Option<&str>) -> Result<bool> {
-    match mode.unwrap_or("weak") {
-        "weak" => Ok(false),
-        "strong" => Ok(true),
-        other => Err(DataFusionError::NotImplemented(format!(
-            "connected_components mode must be 'weak' or 'strong'; got {other:?}"
-        ))),
+/// A JSON argument as the catalog reads it.
+fn json_arg(v: &serde_json::Value) -> Arg {
+    use serde_json::Value;
+    match v {
+        Value::Null => Arg::Null,
+        Value::Bool(b) => Arg::Bool(*b),
+        Value::Number(n) => match (n.as_u64(), n.as_i64()) {
+            (Some(u), _) => Arg::Int(u.into()),
+            (None, Some(i)) => Arg::Int(i.into()),
+            (None, None) => Arg::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        Value::String(s) => Arg::Str(s.clone()),
+        _ => Arg::Other,
     }
 }
 
@@ -122,29 +173,12 @@ fn parse_output_dtype(dtype: Option<&str>) -> Result<OutputDtype> {
 
 /// The `direction=` of the call `call` (`degree`, `hop`, ...).
 pub(crate) fn parse_direction(call: &str, d: &str) -> Result<Direction> {
-    match d {
-        "out" => Ok(Direction::Out),
-        "in" => Ok(Direction::In),
-        "both" => Ok(Direction::Both),
-        other => Err(DataFusionError::NotImplemented(format!(
+    catalog::parse_direction(d).ok_or_else(|| {
+        DataFusionError::NotImplemented(format!(
             "{call}(direction={}) is not supported; use one of 'out', 'in', 'both'",
-            crate::expr::py_repr(&serde_json::Value::String(other.into()))
-        ))),
-    }
-}
-
-fn parse_agg(name: &str) -> Result<AggKind> {
-    match name {
-        "mean" => Ok(AggKind::Mean),
-        "sum" => Ok(AggKind::Sum),
-        "min" => Ok(AggKind::Min),
-        "max" => Ok(AggKind::Max),
-        "count" => Ok(AggKind::Count),
-        "n_unique" => Ok(AggKind::NUnique),
-        other => Err(DataFusionError::NotImplemented(format!(
-            "neighbours aggregation {other:?} is not supported (use mean/sum/min/max/count/n_unique)"
-        ))),
-    }
+            crate::expr::py_repr(&serde_json::Value::String(d.into()))
+        ))
+    })
 }
 
 /// Gather a node-attribute column into a dense, IdMap-aligned vector of `f64`
@@ -285,7 +319,7 @@ pub fn verb_value_type(spec: &GraphVerb) -> Option<DataType> {
     }
     let column = OutputColumn::Algo {
         name: String::new(),
-        algo: spec.to_algo().ok()?,
+        algo: spec.to_call().ok()?,
         weights: None,
         dtype,
         field: 0,
@@ -331,33 +365,29 @@ pub fn node_columns(
             let attr_col = spec.agg_column().ok_or_else(|| {
                 DataFusionError::Execution("neighbors().agg() is missing its column".into())
             })?;
-            let direction = parse_direction(spec.call_name(), &spec.direction()?)?;
-            let agg = parse_agg(spec.agg_fn().unwrap_or("mean"))?;
+            let Call::NeighborAgg { direction, agg } = spec.to_call()? else {
+                unreachable!("neighbors_agg resolves to a neighbour aggregation")
+            };
             let attr = dense_attr_column(nodes_ref, nodes_id_name, attr_col, ids, agg)?;
             columns.push(OutputColumn::NeighborAgg {
                 name: name.clone(),
                 attr: Arc::new(attr),
-                direction: direction.into(),
+                direction,
                 agg,
                 dtype, // neighbour aggregation is always float-valued
             });
         } else {
-            // `to_algo` is the single place an unknown algorithm kind is rejected.
-            let algo = spec.to_algo()?;
+            // `to_call` is the single place an unknown algorithm kind is rejected.
+            let algo = spec.to_call()?;
+            let algo_spec = algo.spec();
             // A weight expression (over edge columns) is evaluated to one f64 per
             // edge row against the edge attribute batch; the kernel gathers it via
-            // edge_ids. Weighting is supported on pagerank/closeness/betweenness/
-            // louvain (checked below).
+            // edge_ids. Weighting is supported where the catalog lists a weight
+            // (checked below).
             let weights = match &spec.weight {
                 None => None,
                 Some(weight_json) => {
-                    if !matches!(
-                        algo,
-                        GraphAlgo::PageRank { .. }
-                            | GraphAlgo::Closeness { .. }
-                            | GraphAlgo::Betweenness { .. }
-                            | GraphAlgo::Louvain { .. }
-                    ) {
+                    if !algo_spec.weighted() {
                         return Err(DataFusionError::NotImplemented(format!(
                             "weight= is not supported for {:?}",
                             spec.verb
@@ -392,34 +422,34 @@ pub fn node_columns(
             let field = spec.param::<usize>("field", &spec.field)?.unwrap_or(0);
             // Only layout produces a second output; a field selector on anything
             // else is a caller mistake worth naming rather than silently ignoring.
-            if field > 0 && !matches!(algo, GraphAlgo::Layout { .. }) {
+            let n_outputs = algo_spec.outputs.len();
+            if field > 0 && n_outputs < 2 {
                 return Err(DataFusionError::NotImplemented(format!(
                     "{:?} emits a single column; field={field} has nothing to select",
                     spec.verb
                 )));
             }
-            if field > 1 {
+            if field >= n_outputs {
                 return Err(DataFusionError::NotImplemented(format!(
                     "a layout emits two columns (x=0, y=1); field={field} is out of range"
                 )));
             }
-            let column = OutputColumn::Algo {
-                name: name.clone(),
-                algo,
-                weights,
-                dtype,
-                field,
-            };
             // f32 narrowing is only meaningful for a float-valued column; requesting it
             // on an integer kernel (degree, components, triangle_count, ...) is a type
             // error, not a silent cast to a lossy float.
-            if dtype == OutputDtype::F32 && !column.is_float_valued() {
+            if dtype == OutputDtype::F32 && !algo_spec.narrows() {
                 return Err(DataFusionError::NotImplemented(format!(
                     "dtype='f32' is only supported for float-valued kernels; {:?} emits integers",
                     spec.verb
                 )));
             }
-            columns.push(column);
+            columns.push(OutputColumn::Algo {
+                name: name.clone(),
+                algo,
+                weights,
+                dtype,
+                field,
+            });
         }
     }
     Ok(columns)
@@ -518,7 +548,7 @@ pub fn hop_leaf(
     n: u32,
     direction: &str,
 ) -> Result<DataFrame> {
-    let direction: ursa_core::Direction = parse_direction("hop", direction)?.into();
+    let direction = parse_direction("hop", direction)?;
     // Resolve user-id seeds to dense indices; drop unknowns/nulls (kernel-consistent).
     let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
     Ok(extension(
@@ -544,7 +574,7 @@ pub fn path_leaf(
     weight: Option<&str>,
     edges: Option<Vec<RecordBatch>>,
 ) -> Result<crate::lower::Frame> {
-    let direction: ursa_core::Direction = parse_direction("shortest_path", direction)?.into();
+    let direction = parse_direction("shortest_path", direction)?;
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
     // index. An unknown (or absent) endpoint -> no path (an empty edge frame).
     let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
@@ -2393,7 +2423,7 @@ mod tests {
         let columns = vec![
             OutputColumn::Algo {
                 name: "deg".into(),
-                algo: GraphAlgo::Degree {
+                algo: Call::Degree {
                     direction: Direction::In,
                 },
                 weights: None,
@@ -2402,7 +2432,7 @@ mod tests {
             },
             OutputColumn::Algo {
                 name: "pr".into(),
-                algo: GraphAlgo::PageRank {
+                algo: Call::PageRank {
                     damping: 0.85,
                     max_iter: 30,
                     tol: 1e-6,

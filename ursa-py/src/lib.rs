@@ -244,6 +244,37 @@ fn _topology_build_count() -> usize {
     topology_builds()
 }
 
+/// The graph functions of the catalog in `ursa-core`, each as `(name,
+/// [(parameter, default)])` with the parameters in the Python API's order (a
+/// test hook: the Python signatures are checked against it).
+#[pyfunction]
+fn _graph_functions(py: Python<'_>) -> PyResult<GraphFunctions> {
+    use ursa_core::catalog::{Value, FUNCTIONS};
+    let default = |v: Value| -> PyResult<Py<PyAny>> {
+        Ok(match v {
+            Value::Null => py.None(),
+            Value::Bool(b) => b.into_pyobject(py)?.to_owned().into_any().unbind(),
+            Value::UInt(u) => u.into_pyobject(py)?.into_any().unbind(),
+            Value::Float(f) => f.into_pyobject(py)?.into_any().unbind(),
+            Value::Str(s) => s.into_pyobject(py)?.into_any().unbind(),
+        })
+    };
+    FUNCTIONS
+        .iter()
+        .map(|f| {
+            let params = f
+                .params
+                .iter()
+                .map(|p| Ok((p.name, default(p.default)?)))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok((f.name, params))
+        })
+        .collect()
+}
+
+/// What [`_graph_functions`] returns.
+type GraphFunctions = Vec<(&'static str, Vec<(&'static str, Py<PyAny>)>)>;
+
 /// Turn the native scan log on (clearing it) or off, returning what was recorded:
 /// `(kind, columns, filters pushed)` per scan (test/observability hook).
 #[pyfunction]
@@ -382,6 +413,7 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
     m.add_function(wrap_pyfunction!(_topology_build_count, m)?)?;
     m.add_function(wrap_pyfunction!(_scan_log, m)?)?;
+    m.add_function(wrap_pyfunction!(_graph_functions, m)?)?;
     m.add_class::<NodeTableCache>()?;
     // the plan object a frame holds
     m.add_class::<frame::PlanNode>()?;
