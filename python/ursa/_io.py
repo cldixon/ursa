@@ -505,15 +505,11 @@ def _to_arrow_table(data: Any) -> Any:
     dicts, a dict of equal-length columns, a ``polars.DataFrame``, a
     ``pandas.DataFrame``, or any object exposing the Arrow C-stream capsule.
 
-    ``string_view`` columns (what DataFusion, Athena and polars' Arrow C stream
-    hand back) become plain strings, as a scan reads them: see
-    ``_without_string_views``.
+    The engine then reads the table by the rules a scan uses
+    (``ursa._ursa.ingest_edges`` / ``ingest_nodes``, from ``ursa-io``):
+    ``string_view`` columns become plain strings, rows with a null endpoint are
+    dropped for ``on_null="drop"``, and the id columns are canonicalized.
     """
-    return _without_string_views(_as_arrow_table(data))
-
-
-def _as_arrow_table(data: Any) -> Any:
-    """The flavour dispatch behind ``_to_arrow_table``."""
     import sys
 
     import pyarrow as pa
@@ -546,104 +542,6 @@ def _as_arrow_table(data: Any) -> Any:
     )
 
 
-# The most character data an ``Utf8`` (i32-offset) array can address.
-_UTF8_MAX_BYTES = 2**31 - 1
-
-
-def _without_string_views(tbl: Any) -> Any:
-    """``tbl`` with each top-level ``string_view`` column cast to ``string``.
-
-    The Rust side reads string views natively, but the relational tail filters and
-    sorts with pyarrow compute, which has few string-view kernels (no ``take``, no
-    comparisons), so a view column there fails on the first ``filter``/``sort``.
-    Converting once at ingress keeps every frame on the types the whole pipeline
-    supports, and matches what a scan returns. A column whose chunks may hold more
-    than 2 GiB of character data goes to ``large_string`` instead, since a cast to
-    ``string`` past ``Utf8``'s i32 offsets fails (#152). Other columns are shared,
-    not copied."""
-    import pyarrow as pa
-    import pyarrow.types as pat
-
-    for i, field in enumerate(tbl.schema):
-        if not pat.is_string_view(field.type):
-            continue
-        column = tbl.column(i)
-        # ``nbytes`` (views plus data buffers) bounds the character data from above.
-        fits = all(chunk.nbytes <= _UTF8_MAX_BYTES for chunk in column.chunks)
-        target = pa.string() if fits else pa.large_string()
-        tbl = tbl.set_column(i, field.with_type(target), column.cast(target))
-    return tbl
-
-
-def _canonical_id_array(arr: Any) -> Any:
-    """Canonicalize a node-id array to a supported id type: any integer type to
-    int64 (the fast path), string ids passed through unchanged (covering
-    UUID-as-string). Raises ``TypeError`` for anything else — Ursa node ids are
-    int64 or string.
-
-    ``Utf8``, ``LargeUtf8`` and ``Utf8View`` (``string_view``, what DataFusion,
-    Athena and Polars hand back for strings) are all handled natively by the Rust
-    id map (via its ``StrView``), so none is cast here. A ``LargeUtf8 -> Utf8``
-    cast in particular would *panic* rather than error once the string data
-    exceeds the 2 GiB that ``Utf8``'s i32 offsets can address — the exact input a
-    large_string column exists to carry — so the cast is removed, not just
-    skipped. A dictionary-encoded column (a categorical) is decoded and then
-    canonicalized by its value type."""
-    import pyarrow as pa
-    import pyarrow.types as pat
-
-    t = arr.type
-    if pat.is_integer(t):
-        return arr.cast(pa.int64())
-    if _is_any_string(t):
-        return arr
-    if pat.is_dictionary(t) and (pat.is_integer(t.value_type) or _is_any_string(t.value_type)):
-        return _canonical_id_array(arr.dictionary_decode())
-    raise TypeError(f"node ids must be an integer or string column; got {t}")
-
-
-def _is_any_string(t: Any) -> bool:
-    """Whether an Arrow type is one of the string layouts (``string``,
-    ``large_string``, ``string_view``)."""
-    import pyarrow.types as pat
-
-    return pat.is_string(t) or pat.is_large_string(t) or pat.is_string_view(t)
-
-
-def _node_attr_table(tbl: Any, id: str) -> Any:
-    """The node attribute table (an already-normalized ``pyarrow.Table``) with its
-    id column canonicalized to int64 or string, chunk by chunk.
-
-    The table's chunks are kept as they are (no ``combine_chunks``), so attribute
-    columns are shared with the caller's table rather than copied. A 0-row table
-    stays a valid, empty table, so an empty node set is still a materializable
-    frame.
-
-    An unsupported id type or a missing ``id`` column raises immediately at
-    construction, so a typo'd column name is reported where the user made it.
-    """
-    import pyarrow as pa
-
-    id_col = _role_column(tbl, id, "id")
-    idx = tbl.schema.get_field_index(id)
-    chunks = id_col.chunks if id_col.num_chunks else [id_col.combine_chunks()]
-    canonical = [_canonical_id_array(c) for c in chunks]
-    return tbl.set_column(idx, id, pa.chunked_array(canonical, type=canonical[0].type))
-
-
-def _role_column(tbl: Any, name: Any, role: str) -> Any:
-    """The column ``name`` plays the ``role`` (``src``/``dst``/``id``) in: a
-    ``TypeError`` for a name that is no string, a ``KeyError`` naming the table's
-    columns for one it lacks."""
-    if not isinstance(name, str):
-        raise TypeError(
-            f"{role}= must be a column name (a str); got {name!r} ({type(name).__name__})"
-        )
-    if name not in tbl.column_names:
-        raise KeyError(f"{role} column {name!r} is not in the table; it has {tbl.column_names}")
-    return tbl.column(name)
-
-
 def _validate_on_null(on_null: str) -> None:
     """``on_null`` accepts only ``"error"`` (the safe default — a null endpoint
     raises) or ``"drop"`` (rows with a null src/dst are filtered out); the engine
@@ -661,40 +559,3 @@ def _warn_dropped_endpoints(n: int) -> None:
             f"on_null='drop': dropped {n} edge row(s) with a null src or dst endpoint.",
             stacklevel=2,
         )
-
-
-def _drop_null_endpoint_rows(tbl: Any, src: str, dst: str) -> tuple[Any, int]:
-    """Return ``(filtered_table, n_dropped)`` — rows whose ``src`` or ``dst``
-    endpoint is null are removed. The in-memory half of the ``on_null="drop"``
-    opt-in; filtering the whole table here keeps the endpoint arrays and the
-    retained edge table (for weights) row-aligned automatically."""
-    import pyarrow.compute as pc
-
-    # pyarrow.compute members are looked up by name (the type checker lacks its stubs).
-    is_valid, and_ = pc.is_valid, pc.and_  # ty: ignore[unresolved-attribute]
-    mask = and_(is_valid(_role_column(tbl, src, "src")), is_valid(_role_column(tbl, dst, "dst")))
-    kept = tbl.filter(mask)
-    return kept, tbl.num_rows - kept.num_rows
-
-
-def _extract_edge_arrays(tbl: Any, src: str, dst: str) -> tuple[Any, Any] | None:
-    """Pull the src/dst columns out of an already-normalized ``pyarrow.Table`` as
-    chunked arrays, canonicalized to a supported node-id type (int64 or string).
-
-    The chunks are kept as they are, not concatenated: an int64 or string column
-    is then shared with the retained edge table rather than copied, which would
-    double the endpoint memory for the life of the frame. ``_require_edges``
-    slices the build batches out of them.
-
-    An unsupported id type or a missing ``src``/``dst`` column raises immediately at
-    construction, so a typo'd column name is reported where the user made it.
-    """
-    import pyarrow as pa
-
-    arrays = []
-    for role, name in (("src", src), ("dst", dst)):
-        column = _role_column(tbl, name, role)
-        chunks = column.chunks if column.num_chunks else [column.combine_chunks()]
-        canonical = [_canonical_id_array(c) for c in chunks]
-        arrays.append(pa.chunked_array(canonical, type=canonical[0].type))
-    return (arrays[0], arrays[1])
