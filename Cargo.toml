@@ -2,16 +2,19 @@
 #
 # Layout mirrors the spec's crate split:
 #   ursa-core  — pure-Rust topology + algorithm kernels (arrow + rayon, NO DataFusion)
+#   ursa-io    — source reading: Parquet/CSV scans, CSV options, object_store (no plan types)
 #   ursa-plan  — DataFusion extensions: custom plan nodes + ExecutionPlans -> ursa-core
 #   ursa-py    — PyO3 bindings (thin)
+#   ursa-engine, ursa-sql, ursa-cli — the SQL engine and the `ursa` binary (#232)
 [workspace]
 resolver = "2"
-members = ["ursa-core", "ursa-plan", "ursa-py", "ursa-engine", "ursa-sql", "ursa-cli"]
+members = ["ursa-core", "ursa-io", "ursa-plan", "ursa-py", "ursa-engine", "ursa-sql", "ursa-cli"]
 
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.88"
+# DataFusion 55 needs Rust 1.94.
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cldixon/ursa"
 authors = ["Ursa contributors"]
@@ -20,20 +23,22 @@ authors = ["Ursa contributors"]
 # set together, not piecemeal. datafusion re-exports a specific arrow, and
 # `arrow-pyarrow` (the standalone Arrow<->Python interop crate, see below) pins the
 # pyo3 it was built against, so arrow/datafusion/object_store/pyo3 move in lockstep.
-# The current ceiling: pyo3 0.29 (which patches the residual pyo3 advisories waived
-# in deny.toml) needs arrow-pyarrow 59, only reachable via datafusion 55 — unreleased.
+# Today: datafusion 55.2 resolves arrow/parquet 59.3; arrow-pyarrow 59 pins pyo3
+# 0.29; datafusion 55 uses object_store 0.13. The ceiling: arrow 60 needs a
+# datafusion release built on it (none yet), and pyo3 0.30 needs an arrow-pyarrow
+# built on it (arrow-pyarrow 60 still pins pyo3 0.29).
 [workspace.dependencies]
-arrow = "58"
+arrow = "59"
 # Arrow<->Python (pyarrow) interop moved out of the `arrow` crate's `pyarrow`
 # feature into this standalone crate as of arrow 56; its version tracks `arrow`
 # and it pins the pyo3 it was built against.
-arrow-pyarrow = "58"
+arrow-pyarrow = "59"
 rayon = "1.10"
-datafusion = "54"
+datafusion = "55.2"
 # Cloud backends (S3/GCS/Azure) are enabled here so scan_edges/scan_nodes can read
 # from object storage. These features pull in an HTTP client + TLS (rustls) + XML.
 object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
-pyo3 = "0.28"
+pyo3 = "0.29"
 url = "2"
 # Seeded PRNG for the stochastic kernels (random_walk). ChaCha gives a portable,
 # reproducible stream so a fixed seed yields identical walks across runs/machines.

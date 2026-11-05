@@ -351,12 +351,18 @@ def test_a_long_pipeline_validates_each_step():
         f.filter(col("nope") > 0)
 
 
-def _per_step(build, steps: int) -> float:
-    best = float("inf")
-    for _ in range(3):
-        t = time.perf_counter()
-        build(steps)
-        best = min(best, time.perf_counter() - t)
+def _best_times(build, sizes: tuple[int, ...], rounds: int = 5) -> list[float]:
+    """The best time of ``build(n)`` for each size, the sizes interleaved round
+    by round. On a shared VM the same work can run up to 2x slower for tens of
+    milliseconds at a time (a pure-Python loop shows it too); timing each size
+    in its own back-to-back window let one such stretch cover every run of one
+    size and none of the other. Interleaved, a slow stretch hits both sizes."""
+    best = [float("inf")] * len(sizes)
+    for _ in range(rounds):
+        for i, n in enumerate(sizes):
+            t = time.perf_counter()
+            build(n)
+            best[i] = min(best[i], time.perf_counter() - t)
     return best
 
 
@@ -383,7 +389,7 @@ def _scalar_columns(n: int) -> None:
 def test_a_step_validates_in_time_independent_of_the_chain_before_it(build):
     # 4x the steps in well under 4x^2 the time: a step's validation reads its
     # input's, not the whole chain (or every column) again.
-    small, large = _per_step(build, 200), _per_step(build, 800)
+    small, large = _best_times(build, (200, 800))
     assert large < 6 * small, (small, large)
 
 

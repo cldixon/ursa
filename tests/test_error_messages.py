@@ -602,6 +602,24 @@ def test_messages(case):
     assert not [t for t in LEAKS if t in message]
 
 
+@pytest.mark.parametrize(
+    ("physical", "message"),
+    [
+        ("yes", "argument 'physical': 'str' object is not an instance of 'bool'"),
+        (1, "argument 'physical': 'int' object is not an instance of 'bool'"),
+        (None, "argument 'physical': 'None' is not an instance of 'bool'"),
+    ],
+)
+def test_explain_physical_not_a_bool(physical, message):
+    # The message a `bool` parameter raised before pyo3 0.29, which moved the
+    # argument name into an exception note; ursa-py keeps the old text.
+    frame = ur.from_arrow(EDGES, src="s", dst="d")
+    with pytest.raises(TypeError) as info:
+        frame.explain(physical=physical)
+    assert str(info.value) == message
+    assert not getattr(info.value, "__notes__", None)
+
+
 def edge_entry_points() -> dict[str, Any]:
     """Every function, public or held back (the layouts), with an ``edges``
     parameter typed ``EdgeFrame``: read from the modules, not listed by hand."""

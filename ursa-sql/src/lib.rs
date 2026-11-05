@@ -25,7 +25,7 @@ pub fn parse_sql_for(ctx: &SessionContext, sql: &str) -> Result<Vec<UrsaStatemen
         .ok_or_else(|| {
             DataFusionError::Configuration(format!("unknown SQL dialect '{}'", options.dialect))
         })?;
-    UrsaParser::new(sql, dialect.as_ref(), options.recursion_limit)?.parse_statements()
+    UrsaParser::new(sql, dialect.as_ref(), options.recursion_limit.get())?.parse_statements()
 }
 
 /// Run one statement on `ctx`. The returned frame is lazy for a query, and
@@ -41,8 +41,9 @@ pub async fn execute(ctx: &SessionContext, statement: UrsaStatement) -> Result<D
                     ursa_engine::ensure_object_store_for(state.runtime_env(), &copy.target).await?
                 }
                 DFStatement::CreateExternalTable(table) => {
-                    ursa_engine::ensure_object_store_for(state.runtime_env(), &table.location)
-                        .await?
+                    for location in &table.locations {
+                        ursa_engine::ensure_object_store_for(state.runtime_env(), location).await?
+                    }
                 }
                 _ => {}
             }

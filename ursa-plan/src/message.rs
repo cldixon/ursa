@@ -27,6 +27,7 @@ use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 use datafusion::common::SchemaError;
 pub use datafusion::error::DataFusionError;
+pub use ursa_io::csv::{csv_parse_fields, CsvParseFields, CsvValueError};
 
 /// The prefixes DataFusion's and Arrow's `Display` put before a message.
 const PREFIXES: &[&str] = &[
@@ -76,142 +77,37 @@ pub fn engine_message(e: &DataFusionError) -> String {
             arrow_message(a).unwrap_or_else(|| reword(&e.to_string()))
         }
         DataFusionError::External(x) => match x.downcast_ref::<CsvValueError>() {
-            Some(csv) => csv.message(),
+            Some(csv) => csv_value_message(csv),
             None => reword(&e.to_string()),
         },
         other => reword(&other.to_string()),
     }
 }
 
-/// A CSV value that does not parse as its column's inferred type (#222), as the
-/// scan located it. Its `Display` is the engine's text; [`engine_message`]
-/// gives it in Ursa's words.
-#[derive(Debug)]
-pub struct CsvValueError {
-    /// The column's name.
-    pub column: String,
-    /// The column's inferred type.
-    pub data_type: DataType,
-    /// How many rows the types are inferred from.
-    pub inferred_from: usize,
-    /// The value, when the engine's error has it.
-    pub value: Option<String>,
-    /// The line of the file, from 1. The header is line 1.
-    pub line: usize,
-    /// The file, when the scan's paths can name more than one.
-    pub file: Option<String>,
-    /// The engine's error.
-    pub source: ArrowError,
-}
-
-impl std::fmt::Display for CsvValueError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
-    }
-}
-
-impl std::error::Error for CsvValueError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl CsvValueError {
-    /// The error in Ursa's words.
-    pub fn message(&self) -> String {
-        let ty = crate::compare::pa_name(&self.data_type);
-        let at = match &self.file {
-            Some(file) => format!("line {} of {}", self.line, crate::plan::py_str(file)),
-            None => format!("line {}", self.line),
-        };
-        let (has, null_value) = match &self.value {
-            Some(v) => (
-                format!("has {}, which is not a valid {ty}", crate::plan::py_str(v)),
-                format!("null_value={}", crate::plan::py_str(v)),
-            ),
-            None => (
-                format!("has a value that is not a valid {ty}"),
-                "null_value=".to_string(),
-            ),
-        };
-        format!(
-            "column {} was inferred as {ty} from the first {} rows, but {at} {has}. Fix the \
-             value, pass {null_value} if it marks a missing value, or read the file with \
-             pyarrow.csv (column_types=) and pass the table to ur.from_arrow().",
-            crate::plan::py_str(&self.column),
-            self.inferred_from
-        )
-    }
-}
-
-/// What arrow-csv's error for a value that does not parse as its column's type
-/// says: [`csv_parse_fields`].
-#[derive(Debug, PartialEq, Eq)]
-pub struct CsvParseFields {
-    /// The column's index in the file.
-    pub column: usize,
-    /// arrow-csv's line: the record's index from 0, the header included.
-    pub line: usize,
-    /// The value, when the error has it.
-    pub value: Option<String>,
-}
-
-/// The fields of arrow-csv's error for a value that does not parse as its
-/// column's type, or `None` for any other error. Arrow carries them as text
-/// only (`ArrowError::ParseError`), in one of two fixed forms: one for a
-/// boolean or a number or a date, and one for a timestamp.
-pub fn csv_parse_fields(a: &ArrowError) -> Option<CsvParseFields> {
-    let ArrowError::ParseError(m) = a else {
-        return None;
+/// A CSV value error ([`CsvValueError`]) in Ursa's words.
+pub fn csv_value_message(e: &CsvValueError) -> String {
+    let ty = crate::compare::pa_name(&e.data_type);
+    let at = match &e.file {
+        Some(file) => format!("line {} of {}", e.line, crate::plan::py_str(file)),
+        None => format!("line {}", e.line),
     };
-    // `Error while parsing value '{value}' as type '{type}' for column {i} at
-    // line {n}. Row data: '{row}'`. The value may hold any text, so each
-    // `' as type '` is tried until the rest has this form.
-    if let Some(rest) = m.strip_prefix("Error while parsing value '") {
-        for (i, _) in rest.match_indices("' as type '") {
-            // The type's name has no quote in it.
-            let Some((ty, tail)) = rest[i + "' as type '".len()..].split_once("' for column ")
-            else {
-                continue;
-            };
-            if ty.contains('\'') {
-                continue;
-            }
-            let Some((column, tail)) = number_then(tail, " at line ") else {
-                continue;
-            };
-            let Some((line, _)) = number_then(tail, ". Row data: '") else {
-                continue;
-            };
-            return Some(CsvParseFields {
-                column,
-                line,
-                value: Some(rest[..i].to_string()),
-            });
-        }
-        return None;
-    }
-    // `Error parsing column {i} at line {n}: {cause}`, where the cause names
-    // the value unless the value's time zone or range was the problem.
-    let rest = m.strip_prefix("Error parsing column ")?;
-    let (column, rest) = number_then(rest, " at line ")?;
-    let (line, cause) = number_then(rest, ": ")?;
-    let value = cause
-        .strip_prefix("Parser error: Error parsing timestamp from '")
-        .and_then(|v| v.rsplit_once("': "))
-        .map(|(v, _)| v.to_string());
-    Some(CsvParseFields {
-        column,
-        line,
-        value,
-    })
-}
-
-/// The number `s` starts with, and the text after the `sep` that follows it.
-fn number_then<'a>(s: &'a str, sep: &str) -> Option<(usize, &'a str)> {
-    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
-    let rest = s[digits..].strip_prefix(sep)?;
-    Some((s[..digits].parse().ok()?, rest))
+    let (has, null_value) = match &e.value {
+        Some(v) => (
+            format!("has {}, which is not a valid {ty}", crate::plan::py_str(v)),
+            format!("null_value={}", crate::plan::py_str(v)),
+        ),
+        None => (
+            format!("has a value that is not a valid {ty}"),
+            "null_value=".to_string(),
+        ),
+    };
+    format!(
+        "column {} was inferred as {ty} from the first {} rows, but {at} {has}. Fix the \
+         value, pass {null_value} if it marks a missing value, or read the file with \
+         pyarrow.csv (column_types=) and pass the table to ur.from_arrow().",
+        crate::plan::py_str(&e.column),
+        e.inferred_from
+    )
 }
 
 /// Whether an engine error is about a column the frame does not have (Python's
@@ -801,49 +697,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_fields_of_a_csv_parse_error() {
-        let parse = |m: &str| csv_parse_fields(&ArrowError::ParseError(m.into()));
-        assert_eq!(
-            parse(
-                "Error while parsing value 'yes' as type 'Boolean' for column 2 at line 1001. \
-                 Row data: '[2,3,yes]'"
-            ),
-            Some(CsvParseFields {
-                column: 2,
-                line: 1001,
-                value: Some("yes".into())
-            })
-        );
-        // A value may hold the text that follows it.
-        assert_eq!(
-            parse(
-                "Error while parsing value 'a' as type 'x' for' as type 'Int64' for column 0 at \
-                 line 3. Row data: '[a' as type 'x' for]'"
-            )
-            .and_then(|f| f.value),
-            Some("a' as type 'x' for".into())
-        );
-        assert_eq!(
-            parse(
-                "Error parsing column 1 at line 7: Parser error: Error parsing timestamp from \
-                 'soon': timestamp must contain at least 10 characters"
-            ),
-            Some(CsvParseFields {
-                column: 1,
-                line: 7,
-                value: Some("soon".into())
-            })
-        );
-        assert_eq!(
-            parse("Error parsing column 1 at line 7: Parser error: Invalid timezone \"X\"")
-                .map(|f| f.value),
-            Some(None)
-        );
-        assert_eq!(parse("encountered unterminated string"), None);
-        assert_eq!(csv_parse_fields(&ArrowError::DivideByZero), None);
-    }
-
-    #[test]
     fn a_csv_value_error_names_the_column_and_what_to_do() {
         let e = |value: Option<&str>, file: Option<&str>| CsvValueError {
             column: "f".into(),
@@ -866,7 +719,7 @@ mod tests {
              (column_types=) and pass the table to ur.from_arrow()."
         );
         assert!(!is_column_not_found(&wrapped));
-        assert!(e(None, Some("/d/b.csv")).message().contains(
+        assert!(csv_value_message(&e(None, Some("/d/b.csv"))).contains(
             "but line 1002 of '/d/b.csv' has a value that is not a valid bool. Fix the value, \
              pass null_value= if"
         ));

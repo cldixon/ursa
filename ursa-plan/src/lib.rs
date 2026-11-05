@@ -3,8 +3,12 @@
 //! Where Ursa's graph operations become first-class citizens of a DataFusion
 //! query plan. This crate is the **single seam** between Ursa's Polars-shaped
 //! dialect and DataFusion: it owns the custom logical plan nodes, the physical
-//! `ExecutionPlan`s that call [`ursa_core`] kernels, the optimizer rules, and the
-//! scan/session/`object_store` plumbing.
+//! `ExecutionPlan`s that call [`ursa_core`] kernels, and the optimizer rules.
+//! Reading a source (Parquet/CSV scans, CSV options and inference, object
+//! stores) is in [`ursa_io`], which holds no plan types so every engine reads a
+//! file the same way; this crate re-exports what it uses ([`scan`],
+//! [`runtime`], [`dry`], [`topology`]) and adds the plan's own part, pushing
+//! filter steps into a scan.
 //!
 //! Keeping this seam in one crate is a deliberate architectural choice. The cost
 //! of choosing DataFusion over the Polars crates is *not* the graph kernels
@@ -25,7 +29,6 @@
 
 pub mod agg;
 pub mod compare;
-pub mod dry;
 pub mod eval;
 pub mod explain;
 pub mod expr;
@@ -36,7 +39,6 @@ pub mod logical;
 pub mod lower;
 pub mod message;
 pub mod node;
-mod parquet_stats;
 mod partition;
 pub mod physical;
 pub mod plan;
@@ -44,12 +46,12 @@ pub mod planner;
 pub mod query;
 pub mod reshape;
 pub mod result;
-pub mod runtime;
 pub mod scan;
 mod stack;
 pub mod stats;
-pub mod topology;
 pub mod weight;
+
+pub use ursa_io::{dry, runtime, topology};
 
 pub use logical::{Direction, GraphAlgo};
 pub use node::GraphAlgorithmNode;
