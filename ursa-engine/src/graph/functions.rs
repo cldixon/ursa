@@ -6,10 +6,15 @@
 //! accepted values and output types, shared with the Python library, so a call
 //! means the same thing in both. This module only adds SQL's choices:
 //!
-//! - **Which functions.** Every per-node function (algorithms and layouts) and
-//!   every statistic. The neighbour aggregation (`neighbors_agg`) reads a node
-//!   attribute, which has no natural place in a table function over a graph
-//!   yet, so SQL leaves it out.
+//! - **Which functions.** Every algorithm and every statistic. Two families
+//!   are left out ([`in_sql`]):
+//!   - the layouts (`layout_fr`, `layout_random`, `layout_circle`), hidden
+//!     until the visualization work, as they are from the Python library's
+//!     public API. A call fails as an unknown function would, and no message
+//!     or listing names them;
+//!   - the neighbour aggregation (`neighbors_agg`), which reads a node
+//!     attribute, which has no natural place in a table function over a graph
+//!     yet.
 //! - **No `dtype`.** SQL has `CAST`; a call never narrows its own column.
 //! - **`weight =>`** is an expression over the edge table's columns, planned by
 //!   the relation planner as a column of the node's edge plan, not a literal
@@ -31,9 +36,12 @@ pub const ALGORITHMS: &str = "algorithms";
 /// The function catalog as a table: `SELECT * FROM ursa_functions()`.
 pub const URSA_FUNCTIONS: &str = "ursa_functions";
 
-/// Whether SQL can call `spec` (see the module docs).
+/// Whether SQL can call `spec` (see the module docs). Everything the engine
+/// reads from `ursa_core::catalog` goes through this predicate, so a function
+/// it rejects is unknown to SQL: not callable, not suggested, not listed by
+/// `ursa_functions()`.
 fn in_sql(spec: &FunctionSpec) -> bool {
-    spec.family != Family::Aggregation
+    !matches!(spec.family, Family::Aggregation | Family::Layout)
 }
 
 /// The catalog function called `name`, if SQL can call it.
@@ -55,7 +63,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         .chain([ALGORITHMS])
 }
 
-/// Whether `spec` returns one row per node (an algorithm or a layout), as
+/// Whether `spec` returns one row per node (an algorithm), as
 /// opposed to one row for the whole graph (a statistic).
 pub fn is_per_node(spec: &FunctionSpec) -> bool {
     spec.shape == Shape::PerNode
@@ -465,6 +473,26 @@ mod tests {
     }
 
     #[test]
+    fn layouts_are_hidden() {
+        for name in ["layout_fr", "layout_random", "layout_circle"] {
+            assert!(catalog::lookup(name).is_some(), "{name} is in the catalog");
+            assert!(lookup(name).is_none(), "{name} is hidden from SQL");
+            assert!(names().all(|n| n != name));
+            assert!(specs().all(|s| s.name != name));
+        }
+        // No suggestion leads to a hidden name.
+        for typo in [
+            "layout_f",
+            "layout_frr",
+            "layout_randm",
+            "layout_circl",
+            "layout",
+        ] {
+            assert_eq!(did_you_mean(typo, names()), None, "{typo}");
+        }
+    }
+
+    #[test]
     fn signatures_show_defaults() {
         assert_eq!(
             signature(lookup("pagerank").unwrap()),
@@ -472,8 +500,8 @@ mod tests {
              direction => 'out')"
         );
         assert_eq!(
-            nested_signature(lookup("layout_fr").unwrap()),
-            "layout_fr(iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)"
+            nested_signature(lookup("louvain").unwrap()),
+            "louvain(weight => NULL, resolution => 1.0, seed => NULL)"
         );
     }
 

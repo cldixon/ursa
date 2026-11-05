@@ -863,9 +863,6 @@ betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
 label_propagation,algorithm,2,
 louvain,algorithm,3,
-layout_fr,layout,4,
-layout_random,layout,2,
-layout_circle,layout,1,
 density,statistic,1,out in both
 avg_path_length,statistic,2,out in both
 diameter,statistic,2,out in both

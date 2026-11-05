@@ -38,8 +38,8 @@ import ursa as ur
 from ursa import _graph
 
 # The layouts are held back from Python's public API (see ``ursa/__init__.py``)
-# but live in ``ursa._graph``; the SQL engine exposes them, so they are checked
-# against the same kernels here.
+# but live in ``ursa._graph``. SQL hides them too, so ``tests/parity.rs`` runs
+# their cases through the engine's internal path rather than as queries.
 
 OUT = Path(__file__).with_name("parity.json")
 
