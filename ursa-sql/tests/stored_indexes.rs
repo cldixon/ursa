@@ -129,10 +129,12 @@ fn in_dir(dir: &Path, sql: &str) -> String {
 const DEFINE: &str = "CREATE VIEW ties AS SELECT * FROM 'edges.parquet';
 CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));";
 
-/// `SHOW` reads only DataFusion's own settings; `df_settings` lists extensions'
-/// too, under their names without the prefix.
-const SHOW_LIMIT: &str =
-    "SELECT value FROM information_schema.df_settings WHERE name LIKE '%index_storage_limit'";
+const SHOW_LIMIT: &str = "SHOW ursa.index_storage_limit";
+
+/// The row `SHOW ursa.index_storage_limit` gives for `limit`.
+fn limit_row(limit: &str) -> [String; 1] {
+    [format!("ursa.index_storage_limit,{limit}")]
+}
 
 const QUERY: &str =
     "SELECT id, round(pagerank, 8) FROM pagerank(g) ORDER BY pagerank DESC, id LIMIT 10";
@@ -372,7 +374,7 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
     ok(&ctx, &set).await;
     assert_eq!(
         ok(&ctx, SHOW_LIMIT).await,
-        [ursa_engine::options::ByteSize(limit).to_string()]
+        limit_row(&ursa_engine::options::ByteSize(limit).to_string())
     );
     ok(&ctx, "SELECT count(*) FROM degree(b)").await;
     // Wait for b's write, then use g again, so b is the least recently used.
@@ -406,7 +408,7 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
     // An index larger than the limit on its own is not stored, and evicts
     // nothing.
     ok(&ctx, "SET ursa.index_storage_limit = '1KiB'").await;
-    assert_eq!(ok(&ctx, SHOW_LIMIT).await, ["1KiB"]);
+    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("1KiB"));
     ok(&ctx, "SELECT count(*) FROM degree(b)").await;
     ursa_engine::database::flush(&ctx.state());
     assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
@@ -414,7 +416,7 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
 
     // The setting lasts for the session only.
     let ctx = open(&fixture.db()).await;
-    assert_eq!(ok(&ctx, SHOW_LIMIT).await, ["4GiB"]);
+    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("4GiB"));
     let err = run(&ctx, "SET ursa.index_storage_limit = '8 gigs'")
         .await
         .unwrap_err();

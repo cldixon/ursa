@@ -8,6 +8,13 @@
 //!
 //! The Python side is recorded in `fixtures/parity.json` by
 //! `fixtures/generate_parity.py`; see that script for how to regenerate it.
+//!
+//! The layouts are hidden in SQL until the visualization work, as they are
+//! from Python's public API, so their cases cannot run as queries. They run
+//! through the engine's internal path instead: the edge rows read by the
+//! session, the index built by `ursa_io::build_topology_batches` as a graph
+//! node builds it, the call resolved by the engine's argument rules and
+//! evaluated by `ursa_core::catalog`'s dispatch, as a graph node evaluates it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,9 +23,13 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array,
 };
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::TableReference;
+use datafusion::prelude::SessionContext;
 use serde_json::Value;
+use ursa_core::catalog::{self, Evaluator, Family, Inputs, OutputDtype};
+use ursa_engine::graph::functions::{self, Literal};
 use ursa_engine::graph::traversal;
 use ursa_engine::graph::{index_builds, registry_of, EdgeTable, GraphDef};
 use ursa_engine::new_session;
@@ -108,6 +119,75 @@ fn keyed(rows: Vec<Vec<Cell>>, per_node: bool) -> BTreeMap<Cell, Vec<Cell>> {
     map
 }
 
+/// A layout case, which SQL does not offer, run through the engine's internal
+/// path (see the module docs): its columns and rows, as a query would return
+/// them.
+async fn hidden_layout(
+    ctx: &SessionContext,
+    function: &str,
+    dataset: &str,
+    args: &str,
+    id_type: &DataType,
+) -> (Vec<(String, String)>, Vec<Vec<Cell>>) {
+    let spec = catalog::lookup(function).unwrap();
+    assert_eq!(spec.family, Family::Layout, "{function}");
+    assert!(
+        functions::lookup(function).is_none(),
+        "{function} is hidden"
+    );
+    let literals: Vec<(String, Literal)> = args
+        .split(", ")
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            let (name, value) = a.split_once(" => ").unwrap();
+            (name.to_string(), Literal::Number(value.to_string()))
+        })
+        .collect();
+    let call = functions::resolve(spec, &literals).unwrap();
+
+    let batches = ctx
+        .sql(&format!("SELECT src, dst FROM {dataset}_edges"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let endpoints: Vec<(ArrayRef, ArrayRef)> = batches
+        .iter()
+        .map(|b| {
+            (
+                cast(b.column(0), id_type).unwrap(),
+                cast(b.column(1), id_type).unwrap(),
+            )
+        })
+        .collect();
+    let chunks: Vec<(&dyn Array, &dyn Array)> = endpoints
+        .iter()
+        .map(|(s, d)| (s.as_ref(), d.as_ref()))
+        .collect();
+    let (topology, ids) = ursa_io::build_topology_batches(&chunks).unwrap();
+
+    let mut eval = Evaluator::new(&topology, None);
+    let mut columns = vec![ids.user_id_array()];
+    let mut names = vec![("id".to_string(), pyarrow_name(id_type).to_string())];
+    for (field, output) in spec.outputs.iter().enumerate() {
+        let inputs = Inputs {
+            weights: None,
+            attribute: None,
+        };
+        let column = eval.column(&call, inputs, field, OutputDtype::F64).unwrap();
+        names.push((
+            output.name.to_string(),
+            pyarrow_name(column.data_type()).to_string(),
+        ));
+        columns.push(column);
+    }
+    let rows = (0..columns[0].len())
+        .map(|row| columns.iter().map(|c| sql_cell(c, row)).collect())
+        .collect();
+    (names, rows)
+}
+
 /// The traversals take the Python library's parameters, by name, with its
 /// defaults, the node ids first.
 #[test]
@@ -193,6 +273,41 @@ async fn sql_matches_the_python_library() {
         let args = args.as_str();
         functions.insert(function);
         weighted += usize::from(args.contains("weight =>"));
+        let expected_columns: Vec<(String, String)> = case["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c[0].as_str().unwrap().to_string(),
+                    c[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let expected: Vec<Vec<Cell>> = case["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(&expected_columns)
+                    .map(|(v, (_, t))| fixture_cell(v, t))
+                    .collect()
+            })
+            .collect();
+        if catalog::lookup(function).is_some_and(|s| s.family == Family::Layout) {
+            let id_type = match expected_columns[0].1.as_str() {
+                "int64" => DataType::Int64,
+                _ => DataType::Utf8,
+            };
+            let (columns, got) = hidden_layout(&ctx, function, dataset, args, &id_type).await;
+            let label = format!("{function}({dataset}, {args})");
+            assert_eq!(columns, expected_columns, "{label}: columns");
+            assert_eq!(keyed(got, true), keyed(expected, true), "{label}");
+            continue;
+        }
         let sql = if args.is_empty() {
             format!("SELECT * FROM {function}({dataset})")
         } else {
@@ -209,17 +324,6 @@ async fn sql_matches_the_python_library() {
             .iter()
             .map(|f| (f.name().clone(), pyarrow_name(f.data_type()).to_string()))
             .collect();
-        let expected_columns: Vec<(String, String)> = case["columns"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| {
-                (
-                    c[0].as_str().unwrap().to_string(),
-                    c[1].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
         assert_eq!(columns, expected_columns, "{sql}: columns");
         let per_node = columns[0].0 == "id";
 
@@ -235,19 +339,6 @@ async fn sql_matches_the_python_library() {
                 );
             }
         }
-        let expected: Vec<Vec<Cell>> = case["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| {
-                row.as_array()
-                    .unwrap()
-                    .iter()
-                    .zip(&expected_columns)
-                    .map(|(v, (_, t))| fixture_cell(v, t))
-                    .collect()
-            })
-            .collect();
         if traversal::lookup(function).is_some() {
             assert_eq!(got, expected, "{sql}");
         } else {
@@ -260,6 +351,13 @@ async fn sql_matches_the_python_library() {
     }
     for t in traversal::TRAVERSALS {
         assert!(functions.contains(t.name), "no parity case for {}", t.name);
+    }
+    // And every layout, through the internal path.
+    for f in catalog::FUNCTIONS
+        .iter()
+        .filter(|f| f.family == Family::Layout)
+    {
+        assert!(functions.contains(f.name), "no parity case for {}", f.name);
     }
     assert!(weighted >= 5, "{weighted} weighted cases");
     // One index per dataset, however many functions ran over it, weighted or

@@ -7,6 +7,8 @@
 //! (`ursa_engine::graph::check_ddl`). `CREATE PROPERTY GRAPH` and `DROP
 //! PROPERTY GRAPH` define graphs (see [`property_graph`] for the subset of
 //! SQL/PGQ supported); `SHOW GRAPHS` and `DESCRIBE GRAPH` describe them.
+//! `SHOW ursa.<setting>` shows one of Ursa's settings, and `SHOW ALL` lists
+//! them with DataFusion's (see `settings`).
 //!
 //! A session may have a `.ursa` database ([`database`]): [`open_session`]
 //! opens one, and `ATTACH 'club.ursa'` opens one in an in-memory session that
@@ -20,12 +22,14 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
+use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 
 pub mod database;
 mod graph_ddl;
 mod parser;
 mod paths;
 pub mod property_graph;
+mod settings;
 
 pub use database::open_session;
 pub use parser::{
@@ -112,6 +116,14 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
                     }
                 }
                 _ => {}
+            }
+            // `SHOW ursa.<setting>` and `SHOW ALL` with Ursa's settings.
+            if let DFStatement::Statement(inner) = statement.as_ref() {
+                if let SqlStatement::ShowVariable { variable } = inner.as_ref() {
+                    if let Some(frame) = settings::show(ctx, variable).await {
+                        return frame;
+                    }
+                }
             }
             let plan = state.statement_to_plan(*statement).await?;
             ursa_engine::graph::check_ddl(&state, &plan).await?;

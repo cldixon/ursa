@@ -127,7 +127,6 @@ async fn algorithms_equals_the_single_functions() {
              pagerank(direction => 'both', weight => weight), \
              cc => clustering_coefficient(), \
              triangle_count(), \
-             pos => layout_fr(seed => 3), \
              betweenness(weight => weight), \
              louvain(seed => 2)) \
          ORDER BY id",
@@ -136,17 +135,16 @@ async fn algorithms_equals_the_single_functions() {
     let separate = csv(
         &ctx,
         "SELECT p.id, pagerank, clustering_coefficient AS cc, triangle_count, \
-                l.x AS pos_x, l.y AS pos_y, betweenness, louvain \
+                betweenness, louvain \
          FROM pagerank(lesmis, direction => 'both', weight => weight) AS p \
          JOIN clustering_coefficient(lesmis) AS c ON c.id = p.id \
          JOIN triangle_count(lesmis) AS t ON t.id = p.id \
-         JOIN layout_fr(lesmis, seed => 3) AS l ON l.id = p.id \
          JOIN betweenness(lesmis, weight => weight) AS b ON b.id = p.id \
          JOIN louvain(lesmis, seed => 2) AS v ON v.id = p.id \
          ORDER BY p.id",
     )
     .await;
-    assert!(combined.starts_with("id,pagerank,cc,triangle_count,pos_x,pos_y,betweenness,louvain\n"));
+    assert!(combined.starts_with("id,pagerank,cc,triangle_count,betweenness,louvain\n"));
     assert_eq!(combined, separate);
     assert_eq!(combined.lines().count(), 78);
     // Weighted and unweighted calls, in one query or several, share the index.
@@ -159,7 +157,7 @@ async fn algorithms_names_its_columns() {
     let schema = table(
         &ctx,
         "DESCRIBE SELECT * FROM algorithms(karate, degree(), in_degree => degree(direction => \
-         'in'), layout_circle(), pos => layout_fr(), closeness())",
+         'in'), closeness(), c => closeness(direction => 'both'))",
     )
     .await
     .unwrap();
@@ -169,21 +167,11 @@ async fn algorithms_names_its_columns() {
         .filter_map(|l| l.split('|').nth(1).map(str::trim))
         .filter(|n| !n.is_empty())
         .collect();
-    assert_eq!(
-        names,
-        [
-            "id",
-            "degree",
-            "in_degree",
-            "x",
-            "y",
-            "pos_x",
-            "pos_y",
-            "closeness"
-        ]
-    );
+    assert_eq!(names, ["id", "degree", "in_degree", "closeness", "c"]);
     assert!(
-        schema.contains("| x           | Float32   | NO          |"),
+        schema
+            .lines()
+            .any(|l| l.contains("| closeness ") && l.contains("| Float64 ")),
         "{schema}"
     );
     // The columns are qualified by the function's name, as a table's are.
@@ -205,9 +193,9 @@ async fn algorithms_errors() {
              in_degree => degree(direction => 'in'), out_degree => degree()",
         ),
         (
-            "SELECT * FROM algorithms(karate, layout_fr(), layout_circle())",
-            "algorithms(): two columns are named 'x'; give each call its own name, as in \
-             in_degree => degree(direction => 'in'), out_degree => degree()",
+            "SELECT * FROM algorithms(karate, closeness(), closeness(direction => 'in'))",
+            "algorithms(): two columns are named 'closeness'; give each call its own name, as \
+             in in_degree => degree(direction => 'in'), out_degree => degree()",
         ),
         (
             "SELECT * FROM algorithms(karate, id => degree())",
@@ -227,8 +215,7 @@ async fn algorithms_errors() {
             "SELECT * FROM algorithms(karate, upper('x'))",
             "algorithms(): there is no graph function 'upper'. The graph functions are: degree, \
              pagerank, connected_components, triangle_count, clustering_coefficient, \
-             betweenness, closeness, label_propagation, louvain, layout_fr, layout_random, \
-             layout_circle",
+             betweenness, closeness, label_propagation, louvain",
         ),
         (
             "SELECT * FROM algorithms(karate, pagerank(0.9))",
@@ -589,9 +576,6 @@ betweenness,algorithm
 closeness,algorithm
 label_propagation,algorithm
 louvain,algorithm
-layout_fr,layout
-layout_random,layout
-layout_circle,layout
 density,statistic
 avg_path_length,statistic
 diameter,statistic
@@ -746,4 +730,65 @@ async fn every_function_runs_on_an_empty_graph() {
     ] {
         assert_eq!(csv(&ctx, sql).await, "n\n0\n", "{sql}");
     }
+}
+
+/// The layouts are hidden in SQL until the visualization work: a call fails
+/// as an unknown function does, and nothing suggests or lists them.
+#[tokio::test]
+async fn layouts_are_hidden() {
+    let ctx = session().await;
+    let per_node = "degree, pagerank, connected_components, triangle_count, \
+                    clustering_coefficient, betweenness, closeness, label_propagation, louvain";
+    let all = format!(
+        "{per_node}, density, avg_path_length, diameter, describe, hop, shortest_path, \
+         random_walk, algorithms"
+    );
+    let unknown =
+        |name: &str| format!("there is no graph function '{name}'. The graph functions are: {all}");
+    let unknown_nested = |name: &str| {
+        format!(
+            "algorithms(): there is no graph function '{name}'. The graph functions are: \
+             {per_node}"
+        )
+    };
+    for layout in ["layout_fr", "layout_random", "layout_circle"] {
+        for sql in [
+            format!("SELECT * FROM {layout}(karate)"),
+            format!("SELECT * FROM {layout}(karate, seed => 1)"),
+        ] {
+            assert_eq!(error(&ctx, &sql).await, unknown(layout), "{sql}");
+        }
+        for sql in [
+            format!("SELECT * FROM algorithms(karate, degree(), {layout}())"),
+            format!("SELECT * FROM algorithms(karate, pos => {layout}(seed => 1))"),
+        ] {
+            assert_eq!(error(&ctx, &sql).await, unknown_nested(layout), "{sql}");
+        }
+        // Without a graph argument it is not ours, and DataFusion says so.
+        let message = error(&ctx, &format!("SELECT * FROM {layout}()")).await;
+        assert!(!message.contains("did you mean"), "{message}");
+        assert_eq!(
+            csv(
+                &ctx,
+                &format!("SELECT count(*) AS n FROM ursa_functions() WHERE name = '{layout}'")
+            )
+            .await,
+            "n\n0\n"
+        );
+    }
+    // A near miss suggests no hidden name.
+    for typo in ["layout_f", "layout_frr", "layout_circl", "layout_randm"] {
+        let sql = format!("SELECT * FROM {typo}(karate)");
+        assert_eq!(error(&ctx, &sql).await, unknown(typo), "{sql}");
+        let sql = format!("SELECT * FROM algorithms(karate, {typo}())");
+        assert_eq!(error(&ctx, &sql).await, unknown_nested(typo), "{sql}");
+    }
+    assert_eq!(
+        csv(
+            &ctx,
+            "SELECT count(*) AS n FROM ursa_functions() WHERE family = 'layout'"
+        )
+        .await,
+        "n\n0\n"
+    );
 }

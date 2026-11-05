@@ -1,7 +1,8 @@
 //! `ursa_functions()`: the graph functions, as a table.
 //!
-//! One row per function SQL can call: every per-node function and statistic
-//! of `ursa_core::catalog`, then the traversals, then `algorithms`. The list columns are Arrow
+//! One row per function SQL can call: every algorithm and statistic of
+//! `ursa_core::catalog` that SQL offers (not the layouts, hidden until the
+//! visualization work; see [`functions`]), then the traversals, then `algorithms`. The list columns are Arrow
 //! lists and structs, not strings, so they stay usable both ways:
 //!
 //! - from SQL: `unnest(parameters)`, `array_has(directions, 'in')`,
@@ -14,7 +15,7 @@
 //! | column       | type                                                     |
 //! |--------------|----------------------------------------------------------|
 //! | `name`       | the function's name                                      |
-//! | `family`     | `algorithm`, `layout`, `statistic`, `traversal` or `combinator` |
+//! | `family`     | `algorithm`, `statistic`, `traversal` or `combinator` |
 //! | `summary`    | one line on what it computes                             |
 //! | `networkx`   | the NetworkX call it matches, or NULL                    |
 //! | `parameters` | list of {name, type, default, choices, doc}, call order  |
@@ -127,8 +128,7 @@ fn family_name(family: Family) -> &'static str {
 /// The summary of the `algorithms` row.
 const ALGORITHMS_SUMMARY: &str = "Several per-node functions over one index, one row per node: \
      algorithms(g, degree(direction => 'both'), community => louvain(seed => 1)). Each argument \
-     is a call with named parameters; its column is named by its key or after the function, and \
-     a layout gives x and y (key_x and key_y with a key).";
+     is a call with named parameters; its column is named by its key or after the function.";
 
 /// The rows of `ursa_functions()`.
 pub fn functions_batch() -> Result<RecordBatch> {

@@ -597,17 +597,18 @@ async fn errors_are_for_people() {
             "SELECT * FROM hops(karate, seeds => [0])",
             "there is no graph function 'hops'; did you mean 'hop'?",
         ),
-        // Execution: the values must be ids of the graph's type, and a path
-        // has one source.
+        // The values must be ids of the graph's type (see
+        // `node_id_type_errors_name_the_parameter`), and a path has one
+        // source.
         (
             "SELECT * FROM hop(karate, seeds => ['Valjean'])",
-            "hop(seeds =>): the values must be node ids of graph 'karate', which are integers: \
-             Cast error: Cannot cast string 'Valjean' to value of Int64 type",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got \
+             'Valjean'",
         ),
-        // A list is a VALUES list, which DataFusion coerces to one type.
+        // Each value of a list is cast on its own, not coerced to one type.
         (
             "SELECT * FROM hop(karate, seeds => [0, 'a'])",
-            "Cast error: Cannot cast string 'a' to value of Int64 type",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 'a'",
         ),
         (
             "SELECT * FROM shortest_path(karate, source => (SELECT id FROM karate.nodes), \
@@ -616,5 +617,110 @@ async fn errors_are_for_people() {
         ),
     ] {
         assert_eq!(error(&ctx, sql).await, expected, "{sql}");
+    }
+}
+
+/// Node ids not of the graph's id type, and not castable to it, name the
+/// function, the parameter, the id type and the offending value or type: at
+/// plan time for a list or a single value, and for a subquery's type; when
+/// the node runs for a subquery's values.
+#[tokio::test]
+async fn node_id_type_errors_name_the_parameter() {
+    let ctx = karate_and_lesmis().await;
+    let at_plan_time = [
+        // Mixed lists: each value is cast on its own.
+        (
+            "SELECT * FROM hop(karate, seeds => [0, 'a'])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 'a'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => ['a', 0])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 'a'",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, start => [1, 2, 'three'], steps => 2)",
+            "random_walk(start =>) must be node ids of graph 'karate', which are integers; got \
+             'three'",
+        ),
+        // One value.
+        (
+            "SELECT * FROM hop(karate, seeds => 'Valjean')",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got \
+             'Valjean'",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => 'a', target => 33)",
+            "shortest_path(source =>) must be a node id of graph 'karate', which is an \
+             integer; got 'a'",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => 0, target => 'b')",
+            "shortest_path(target =>) must be a node id of graph 'karate', which is an \
+             integer; got 'b'",
+        ),
+        // A type that does not cast to the id type.
+        (
+            "SELECT * FROM hop(karate, seeds => [[0, 1]])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got [0, 1], \
+             of type List(Int64)",
+        ),
+        (
+            "SELECT * FROM hop(lesmis, seeds => ['Valjean', {'a': 1}])",
+            "hop(seeds =>) must be node ids of graph 'lesmis', which are strings; got {'a': 1}, \
+             of type Struct(\"a\": Int64)",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT [0, 1]))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got a query \
+             of type List(Int64)",
+        ),
+        (
+            "SELECT * FROM random_walk(lesmis, start => (SELECT {'a': 1}), steps => 2)",
+            "random_walk(start =>) must be node ids of graph 'lesmis', which are strings; got \
+             a query of type Struct(\"a\": Int64)",
+        ),
+    ];
+    for (sql, expected) in at_plan_time {
+        let e = ctx
+            .sql(sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{sql} should fail at plan time"));
+        assert_eq!(user_message(&e), expected, "{sql}");
+    }
+
+    // A subquery's values are known when the node runs.
+    for (sql, expected) in [
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT 'Valjean'))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got \
+             'Valjean'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT * FROM (VALUES ('0'), ('1'), ('x'))))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 'x'",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => 0, target => (SELECT 'end'))",
+            "shortest_path(target =>) must be a node id of graph 'karate', which is an \
+             integer; got 'end'",
+        ),
+    ] {
+        let frame = ctx.sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let e = frame.collect().await.expect_err(sql);
+        assert_eq!(user_message(&e), expected, "{sql}");
+    }
+
+    // What casts still works: a string that is an integer, an integer for a
+    // string graph, NULL, and a mixed list whose values all cast.
+    for (sql, n) in [
+        ("SELECT * FROM hop(karate, seeds => ['0'])", 16),
+        // A repeated seed gives its rows twice.
+        ("SELECT * FROM hop(karate, seeds => [0, '0'])", 32),
+        ("SELECT * FROM hop(karate, seeds => [NULL, 0])", 16),
+        ("SELECT * FROM hop(karate, seeds => [-1 + 1])", 16),
+        ("SELECT * FROM hop(lesmis, seeds => [1])", 0),
+    ] {
+        assert_eq!(rows(&ctx, sql).await, n, "{sql}");
     }
 }

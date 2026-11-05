@@ -136,6 +136,22 @@ fn several_statements_print_each_result() {
 }
 
 #[test]
+fn show_ursa_settings() {
+    assert_eq!(
+        ok(ursa(&[
+            "-f",
+            "csv",
+            "-c",
+            "SHOW ursa.index_storage_limit; SET ursa.index_storage_limit = '1GiB'; \
+             SHOW ursa.index_storage_limit",
+        ])),
+        "name,value\nursa.index_storage_limit,4GiB\nname,value\nursa.index_storage_limit,1GiB\n"
+    );
+    let all = ok(ursa(&["-f", "csv", "-c", "SHOW ALL"]));
+    assert!(all.contains("\nursa.index_storage_limit,4GiB\n"), "{all}");
+}
+
+#[test]
 fn commands_and_files_run_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("q.sql");
@@ -863,9 +879,6 @@ betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
 label_propagation,algorithm,2,
 louvain,algorithm,3,
-layout_fr,layout,4,
-layout_random,layout,2,
-layout_circle,layout,1,
 density,statistic,1,out in both
 avg_path_length,statistic,2,out in both
 diameter,statistic,2,out in both

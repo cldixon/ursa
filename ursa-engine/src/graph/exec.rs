@@ -43,6 +43,7 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::TaskContext;
@@ -542,11 +543,11 @@ fn node_ids(
         .iter()
         .map(|b| {
             cast_with_options(&b[0], &id_type, &options).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "{function}({name} =>): the values must be node ids of graph '{graph}', \
-                     which are {}: {}",
-                    id_kind(&id_type),
+                let got = first_uncast(&b[0], &id_type).unwrap_or_else(|| {
                     crate::user_message(&DataFusionError::ArrowError(Box::new(e), None))
+                });
+                DataFusionError::Execution(traversal::not_node_ids(
+                    function, param, graph, &id_type, &got,
                 ))
             })
         })
@@ -568,12 +569,19 @@ fn node_ids(
         .map_err(|e| DataFusionError::Execution(format!("{function}({name} =>): {e}")))
 }
 
-/// How a message names an id type.
-fn id_kind(t: &DataType) -> &'static str {
-    match t {
-        DataType::Int64 => "integers",
-        _ => "strings",
+/// The first value of `values` that does not cast to `id_type`, as SQL writes
+/// it (`'Valjean'`, `2.5`), for a message.
+fn first_uncast(values: &ArrayRef, id_type: &DataType) -> Option<String> {
+    let lenient = cast(values, id_type).ok()?;
+    let row = (0..values.len()).find(|&i| values.is_valid(i) && lenient.is_null(i))?;
+    let mut value = ScalarValue::try_from_array(values, row).ok()?;
+    while let ScalarValue::Dictionary(_, inner) = value {
+        value = *inner;
     }
+    Some(match value.try_as_str() {
+        Some(Some(s)) => format!("'{}'", s.replace('\'', "''")),
+        _ => value.to_string(),
+    })
 }
 
 /// Keeps a graph node's edge rows in the order the plan produces them.
