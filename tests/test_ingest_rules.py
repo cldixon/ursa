@@ -23,6 +23,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _table(edges):
+    table = edges._edge_table
+    assert table is not None
+    return table
+
+
 def test_the_rules_are_not_in_python():
     for name in (
         "_without_string_views",
@@ -49,7 +55,9 @@ def test_the_rules_are_not_in_python():
 def test_endpoint_columns_are_canonical_ids(ids, want):
     rotated = pa.concat_arrays([ids[1:], ids[:1]])
     edges = ur.from_arrow(pa.table({"s": ids, "d": rotated}), src="s", dst="d")
-    src, dst = edges._edge_arrays
+    arrays = edges._edge_arrays
+    assert arrays is not None
+    src, dst = arrays
     assert src.type == dst.type == want
     nodes = ur.from_arrow(pa.table({"id": ids, "x": [1, 2, 3]}), id="id")
     assert nodes.collect().to_arrow().schema.field("id").type == want
@@ -64,7 +72,7 @@ def test_string_view_columns_read_as_strings():
         }
     )
     edges = ur.from_arrow(t, src="s", dst="d")
-    assert edges._edge_table.schema.types == [pa.string(), pa.string(), pa.string()]
+    assert _table(edges).schema.types == [pa.string(), pa.string(), pa.string()]
     nodes = ur.from_arrow(t.rename_columns(["id", "d", "tag"]), id="id")
     assert nodes.collect().to_arrow().schema.field("tag").type == pa.string()
 
@@ -127,7 +135,7 @@ def test_drop_counts_match_a_scan_of_the_same_rows(tmp_path):
         "on_null='drop': dropped 3 edge row(s) with a null src or dst endpoint.",
         "on_null='drop': dropped 3 edge row(s) with a null src or dst endpoint.",
     ]
-    assert mem._edge_table.num_rows == 2
+    assert _table(mem).num_rows == 2
 
 
 def test_no_rows_dropped_keeps_the_callers_columns():
@@ -135,5 +143,5 @@ def test_no_rows_dropped_keeps_the_callers_columns():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         edges = ur.from_arrow(t, src="s", dst="d", on_null="drop")
-    ours = edges._edge_table.column("w").chunks[0].buffers()[1]
+    ours = _table(edges).column("w").chunks[0].buffers()[1]
     assert ours.address == t.column("w").chunks[0].buffers()[1].address
