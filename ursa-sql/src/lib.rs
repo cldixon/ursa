@@ -11,8 +11,10 @@
 //! A session may have a `.ursa` database ([`database`]): [`open_session`]
 //! opens one, and `ATTACH 'club.ursa'` opens one in an in-memory session that
 //! has defined nothing yet. In such a session, statements that define or drop
-//! views, external tables and graphs are kept in the database's catalog file,
-//! and relative file paths are relative to the directory holding the file.
+//! views, external tables and graphs are kept in the database's catalog file.
+//! Relative file paths resolve against the current directory when a statement
+//! runs, as in DuckDB; a stored definition's paths are rewritten relative to
+//! the directory holding the file (see [`database`]).
 
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
@@ -22,6 +24,7 @@ use datafusion::sql::parser::Statement as DFStatement;
 pub mod database;
 mod graph_ddl;
 mod parser;
+mod paths;
 pub mod property_graph;
 
 pub use database::open_session;
@@ -95,21 +98,8 @@ async fn execute_inner(
 /// Run one statement, leaving the database's catalog alone.
 pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Result<DataFrame> {
     match statement {
-        UrsaStatement::DataFusion(mut statement) => {
+        UrsaStatement::DataFusion(statement) => {
             let state = ctx.state();
-            // In a session with a database, a relative path is relative to
-            // the database's directory.
-            match statement.as_mut() {
-                DFStatement::CopyTo(copy) => {
-                    copy.target = ursa_engine::database::resolve_location(&state, &copy.target)
-                }
-                DFStatement::CreateExternalTable(table) => {
-                    for location in &mut table.locations {
-                        *location = ursa_engine::database::resolve_location(&state, location);
-                    }
-                }
-                _ => {}
-            }
             // A COPY target or external table location in object storage needs
             // its store registered before DataFusion plans the write or read.
             match statement.as_ref() {

@@ -22,6 +22,18 @@
 //! same statement, and otherwise as the text the user wrote (DataFusion's
 //! `Display` for `CREATE EXTERNAL TABLE` leaves out columns and options).
 //!
+//! **Paths.** A relative path resolves against the current directory when a
+//! statement runs, as in DuckDB. Before a definition is stored, each local
+//! file path in it (see [`crate::paths`]) is rewritten relative to the
+//! database's directory, or made absolute when it is outside that directory;
+//! URLs are kept. In the stored-as-written case the paths are replaced in the
+//! text token by token, and the statement is refused if the result does not
+//! parse back to the rewritten statement. Replay resolves each stored relative
+//! path against the database's directory, so the catalog finds the same files
+//! from any directory, and a database moved with its data still does. (M3a
+//! stored paths as written and resolved them against the database's
+//! directory, so its files replay unchanged.)
+//!
 //! Views and tables share one namespace, keyed by their name resolved against
 //! the default catalog and schema; graphs have their own.
 
@@ -38,7 +50,7 @@ use ursa_engine::database::{self as db, Database, OpenOptions};
 use ursa_engine::graph;
 
 use crate::parser::{Attach, UrsaStatement};
-use crate::{graph_ddl, parse_sql_for, run};
+use crate::{graph_ddl, parse_sql_for, paths, run};
 
 /// What a statement does to the catalog.
 #[derive(Debug)]
@@ -94,7 +106,7 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
         let mut failed = Vec::new();
         let before = pending.len();
         for (index, sql) in pending {
-            if let Err(e) = replay_one(ctx, &sql).await {
+            if let Err(e) = replay_one(ctx, database, &sql).await {
                 failed.push((index, sql, e));
             }
         }
@@ -112,14 +124,19 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
     Ok(())
 }
 
-async fn replay_one(ctx: &SessionContext, sql: &str) -> Result<()> {
+/// Run one stored statement, its relative paths resolved against the
+/// database's directory, wherever the process runs.
+async fn replay_one(ctx: &SessionContext, database: &Database, sql: &str) -> Result<()> {
     let mut statements = parse_sql_for(ctx, sql)?;
     if statements.len() != 1 {
         return Err(DataFusionError::Plan(
             "a catalog entry must be exactly one statement".into(),
         ));
     }
-    let statement = statements.remove(0);
+    let mut statement = statements.remove(0);
+    paths::rewrite_locations(ctx, &mut statement, |location| {
+        database.replayed_location(location)
+    });
     if !matches!(effect(ctx, &statement)?, Effect::Define { .. }) {
         return Err(DataFusionError::Plan(format!(
             "a catalog entry must define a view, an external table or a graph, not run {}",
@@ -201,7 +218,7 @@ pub(crate) async fn execute(
         Effect::Define {
             key, if_not_exists, ..
         } => {
-            let stored = stored_text(ctx, &statement, text)?;
+            let stored = stored_text(ctx, database, &statement, text)?;
             let frame = run(ctx, statement).await?;
             let mut statements = database.statements();
             match position(ctx, &statements, &key) {
@@ -244,25 +261,55 @@ fn stored_key(ctx: &SessionContext, sql: &str) -> Option<Key> {
     }
 }
 
-/// The text to store for `statement`: its `Display` form if that parses back
-/// to the same statement, else the text as written.
+/// The text to store for `statement`, with its local file paths rewritten
+/// for the catalog ([`Database::stored_location`]): relative to the
+/// database's directory, or absolute outside it. That is the rewritten
+/// statement's `Display` form if it parses back to the same statement; else
+/// the text as written, with the paths replaced token by token
+/// ([`paths::rewrite_text`]), or an error if that cannot be done exactly.
 fn stored_text(
     ctx: &SessionContext,
+    database: &Database,
     statement: &UrsaStatement,
     text: Option<&str>,
 ) -> Result<String> {
-    let display = statement.to_string();
+    let cwd = std::env::current_dir().map_err(|e| {
+        DataFusionError::Execution(format!(
+            "cannot store this {} in {}: cannot read the current directory: {e}",
+            leading_words(statement),
+            database.name()
+        ))
+    })?;
+    let mut rewritten = statement.clone();
+    let replacements = paths::rewrite_locations(ctx, &mut rewritten, |location| {
+        database.stored_location(location, &cwd)
+    });
+    let display = rewritten.to_string();
     let round_trips = parse_sql_for(ctx, &display)
-        .map(|parsed| parsed.len() == 1 && parsed[0] == *statement)
+        .map(|parsed| parsed.len() == 1 && parsed[0] == rewritten)
         .unwrap_or(false);
     if round_trips {
         return Ok(display);
     }
-    text.map(str::to_string).ok_or_else(|| {
-        DataFusionError::Plan(format!(
+    let Some(text) = text else {
+        return Err(DataFusionError::Plan(format!(
             "cannot store this {} in the database without the text it was written as; run it \
              with ursa_sql::execute_with_text",
             leading_words(statement)
+        )));
+    };
+    if replacements.is_empty() {
+        return Ok(text.to_string());
+    }
+    paths::rewrite_text(ctx, text, &replacements, &rewritten).ok_or_else(|| {
+        let (old, new) = &replacements[0];
+        DataFusionError::Plan(format!(
+            "cannot store this {} in {}: its path '{old}' is stored as '{new}' (relative to the \
+             database's directory, {}), and the statement as written could not be rewritten \
+             exactly; write each path as stored, from the database's directory",
+            leading_words(statement),
+            database.name(),
+            database.dir().display()
         ))
     })
 }
