@@ -26,7 +26,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
@@ -443,6 +444,51 @@ pub fn not_node_ids(
     )
 }
 
+/// Whether values of type `from` may be node ids of a graph whose ids have
+/// type `id_type` (#271).
+///
+/// A node id is an integer or a string, whatever the graph's id type: on a
+/// graph with integer ids a string must then parse exactly as an integer
+/// (`'7'`, checked when the value is cast), and on a graph with string ids an
+/// integer becomes its decimal string, which loses nothing. Every other type
+/// is refused, even where Arrow would cast it: a float (`1.5`, or `2.0`), a
+/// boolean or a date as a seed is almost certainly a mistake, and casting it
+/// would quietly pick a node. NULL is accepted; it matches no node.
+pub fn is_node_id_type(from: &DataType, id_type: &DataType) -> bool {
+    debug_assert!(matches!(id_type, DataType::Int64 | DataType::Utf8));
+    match from {
+        DataType::Null | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
+        DataType::Dictionary(_, values) => is_node_id_type(values, id_type),
+        t => t.is_integer(),
+    }
+}
+
+/// Whether `text` is exactly an integer, as a string seed on a graph with
+/// integer ids must be (#271): digits, after an optional sign. Arrow's cast
+/// also takes surrounding whitespace (`' 1'`); a seed does not.
+pub fn is_integer_text(text: &str) -> bool {
+    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The row of the first value in `values` that the node-id rule (#271)
+/// refuses before any cast: any non-null value of a type node ids may not
+/// have, or a string that is not exactly an integer on a graph with integer
+/// ids. `None` when every value passes (it may still fail the cast: an integer
+/// string out of range).
+pub fn first_refused_node_id(values: &ArrayRef, id_type: &DataType) -> Option<usize> {
+    let valid = |i: &usize| values.is_valid(*i);
+    if !is_node_id_type(values.data_type(), id_type) {
+        return (0..values.len()).find(valid);
+    }
+    if id_type != &DataType::Int64 || values.data_type().is_integer() {
+        return None;
+    }
+    let text = cast(values, &DataType::Utf8).ok()?;
+    let text = text.as_string::<i32>();
+    (0..text.len()).find(|i| valid(i) && !is_integer_text(text.value(*i)))
+}
+
 /// Check one literal against a parameter, by the catalog's rules.
 fn check(spec: &TraversalSpec, name: &str, ty: ParamType, literal: &Literal) -> Result<Value> {
     let expected = |want: Expected| {
@@ -615,6 +661,38 @@ pub fn batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_id_rule() {
+        for ok in ["0", "7", "-3", "+12", "9223372036854775808"] {
+            assert!(is_integer_text(ok), "{ok}");
+        }
+        for refused in ["", "-", "1.5", "2.0", " 1", "1 ", "1e3", "0x10", "one"] {
+            assert!(!is_integer_text(refused), "{refused}");
+        }
+        for id_type in [DataType::Int64, DataType::Utf8] {
+            for ok in [
+                DataType::Null,
+                DataType::Int8,
+                DataType::UInt64,
+                DataType::Utf8View,
+            ] {
+                assert!(is_node_id_type(&ok, &id_type), "{ok}");
+            }
+            for refused in [DataType::Float64, DataType::Boolean, DataType::Date32] {
+                assert!(!is_node_id_type(&refused, &id_type), "{refused}");
+            }
+        }
+        let strings: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![
+            Some("1"),
+            None,
+            Some("2.0"),
+        ]));
+        assert_eq!(first_refused_node_id(&strings, &DataType::Int64), Some(2));
+        assert_eq!(first_refused_node_id(&strings, &DataType::Utf8), None);
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![None, Some(1.0)]));
+        assert_eq!(first_refused_node_id(&floats, &DataType::Int64), Some(1));
+    }
 
     fn call(name: &str, args: &[(&str, Literal)]) -> Result<Traversal> {
         let args: Vec<(String, Literal)> = args
