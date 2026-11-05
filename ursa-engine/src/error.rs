@@ -124,7 +124,9 @@ mod tests {
 
     use datafusion::common::tree_node::Transformed;
     use datafusion::common::DFSchema;
-    use datafusion::datasource::listing::{ListingTableConfig, ListingTableUrl};
+    use datafusion::datasource::listing::{
+        ListingTableConfig, ListingTableConfigExt, ListingTableUrl,
+    };
     use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
     use datafusion::optimizer::{Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule};
     use datafusion::prelude::SessionContext;
