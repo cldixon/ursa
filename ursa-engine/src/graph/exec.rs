@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{new_empty_array, Array, ArrayRef, Float64Array};
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::compute::{cast, cast_with_options, concat, CastOptions};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -50,12 +51,19 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::replace_children_if_necessary;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties, SendableRecordBatchStream, StatisticsArgs, StatisticsContext,
@@ -543,6 +551,15 @@ fn node_ids(
     let arrays = batches
         .iter()
         .map(|b| {
+            // No float, boolean or date, and a string must be exactly an
+            // integer on a graph with integer ids (#271).
+            if let Some(row) = traversal::first_refused_node_id(&b[0], &id_type) {
+                let got = sql_text(&b[0], row)
+                    .unwrap_or_else(|| format!("a value of type {}", b[0].data_type()));
+                return Err(DataFusionError::Execution(traversal::not_node_ids(
+                    function, param, graph, &id_type, &got,
+                )));
+            }
             cast_with_options(&b[0], &id_type, &options).map_err(|e| {
                 let got = first_uncast(&b[0], &id_type).unwrap_or_else(|| {
                     crate::user_message(&DataFusionError::ArrowError(Box::new(e), None))
@@ -575,6 +592,11 @@ fn node_ids(
 fn first_uncast(values: &ArrayRef, id_type: &DataType) -> Option<String> {
     let lenient = cast(values, id_type).ok()?;
     let row = (0..values.len()).find(|&i| values.is_valid(i) && lenient.is_null(i))?;
+    sql_text(values, row)
+}
+
+/// Row `row` of `values` as SQL writes it (`'Valjean'`, `2.5`).
+fn sql_text(values: &ArrayRef, row: usize) -> Option<String> {
     let mut value = ScalarValue::try_from_array(values, row).ok()?;
     while let ScalarValue::Dictionary(_, inner) = value {
         value = *inner;
@@ -585,7 +607,8 @@ fn first_uncast(values: &ArrayRef, id_type: &DataType) -> Option<String> {
     })
 }
 
-/// Keeps a graph node's edge rows in the order the plan produces them.
+/// Keeps a graph node's edge rows in the order the plan produces them, and
+/// gives them a fixed order where the plan has none.
 ///
 /// DataFusion's `EnforceDistribution` puts a round-robin repartition under an
 /// operator that benefits from parallel input, such as the `FilterExec` of a
@@ -594,9 +617,19 @@ fn first_uncast(values: &ArrayRef, id_type: &DataType) -> Option<String> {
 /// batches out of file order, changing dense ids (and so labels and float
 /// summation order) from what `ursa-io` gives the Python library. This rule
 /// runs after the default rules and removes every round-robin repartition
-/// below a [`GraphAlgorithmExec`]: a round-robin repartition only adds
-/// parallelism, so removing it never changes a result. Hash repartitions (a
-/// join's) are needed for correctness and stay.
+/// below a graph node: a round-robin repartition only adds parallelism, so
+/// removing it never changes a result.
+///
+/// What remains may still not preserve order: a join, an aggregate, a hash
+/// repartition, a merge of partitions or a `UNION` produces its rows in an
+/// order that can change between runs and thread counts (#263). Over such a
+/// plan, the rule sorts the edge rows by `(source, destination)`, and a
+/// weighted node's rows by their weights after that, so that rows that tie
+/// are identical in every column the node reads. A traversal's node-id
+/// inputs over such a plan are sorted by value. Order-preserving plans
+/// (scans, views over files, filters, projections) are left as they are,
+/// in file order. The sort is a `SortExec` under the node, so `EXPLAIN`
+/// shows it.
 #[derive(Debug)]
 pub struct KeepEdgeOrder;
 
@@ -607,15 +640,32 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|node| {
-            let is_graph = node.downcast_ref::<GraphAlgorithmExec>().is_some()
-                || node.downcast_ref::<GraphTraversalExec>().is_some();
-            if !is_graph {
-                return Ok(Transformed::no(node));
-            }
+            // The columns each child is sorted by, if its order is not fixed.
+            let keys: Vec<Vec<usize>> =
+                if let Some(exec) = node.downcast_ref::<GraphAlgorithmExec>() {
+                    let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
+                    keys.extend(exec.weighted.as_ref().map(weighted_keys));
+                    keys
+                } else if let Some(exec) = node.downcast_ref::<GraphTraversalExec>() {
+                    let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
+                    keys.extend(exec.weighted.as_ref().map(weighted_keys));
+                    keys.extend(exec.nodes.iter().map(|_| vec![0]));
+                    keys
+                } else {
+                    return Ok(Transformed::no(node));
+                };
             let children = node
                 .children()
                 .into_iter()
-                .map(|child| without_round_robin(Arc::clone(child)))
+                .zip(keys)
+                .map(|(child, keys)| {
+                    let child = without_round_robin(Arc::clone(child))?;
+                    if preserves_order(&child) {
+                        Ok(child)
+                    } else {
+                        sorted(child, &keys)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(Transformed::yes(replace_children_if_necessary(
                 Arc::clone(&node),
@@ -645,6 +695,72 @@ fn without_round_robin(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn Execution
         Ok(Transformed::no(node))
     })
     .map(|t| t.data)
+}
+
+/// The sort key of an edge input: its source, then its destination.
+fn endpoint_keys((source, destination): (usize, usize)) -> Vec<usize> {
+    vec![source, destination]
+}
+
+/// The sort key of a weighted edge input: its endpoints, then every weight,
+/// so rows that tie are the same in every column the node reads.
+fn weighted_keys(weighted: &WeightedInput) -> Vec<usize> {
+    let mut keys = endpoint_keys((weighted.source, weighted.destination));
+    keys.extend(&weighted.weights);
+    keys
+}
+
+/// Whether reading `plan`'s partitions in order gives its rows in an order
+/// that does not depend on the run or the thread count: true unless it has
+/// a join, an aggregate, a repartition, a merge of partitions or a union. A
+/// nested graph node emits its rows in a fixed order, whatever its inputs.
+fn preserves_order(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut preserves = true;
+    let _ = plan.apply(|node| {
+        if node.downcast_ref::<GraphAlgorithmExec>().is_some()
+            || node.downcast_ref::<GraphTraversalExec>().is_some()
+        {
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        let reorders = node.downcast_ref::<RepartitionExec>().is_some()
+            || node.downcast_ref::<CoalescePartitionsExec>().is_some()
+            || node.downcast_ref::<AggregateExec>().is_some()
+            || node.downcast_ref::<UnionExec>().is_some()
+            || node.downcast_ref::<InterleaveExec>().is_some()
+            || node.name().contains("Join");
+        if reorders {
+            preserves = false;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    preserves
+}
+
+/// `plan`'s rows sorted by the columns `keys`, ascending with nulls last,
+/// as one partition: each partition is sorted, then they are merged.
+fn sorted(plan: Arc<dyn ExecutionPlan>, keys: &[usize]) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let exprs = keys.iter().map(|&i| {
+        PhysicalSortExpr::new(
+            Arc::new(Column::new(schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )
+    });
+    let Some(ordering) = LexOrdering::new(exprs) else {
+        return Ok(plan);
+    };
+    let partitions = plan.output_partitioning().partition_count();
+    let sort =
+        Arc::new(SortExec::new(ordering.clone(), plan).with_preserve_partitioning(partitions > 1));
+    Ok(if partitions > 1 {
+        Arc::new(SortPreservingMergeExec::new(ordering, sort))
+    } else {
+        sort
+    })
 }
 
 /// The index cache key for the edges `input` reads, if they can be cached.
