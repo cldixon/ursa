@@ -1,7 +1,7 @@
 //! Parquet file statistics that claim exact bounds only where every row group
 //! has them (#202).
 //!
-//! DataFusion 54 merges a file's row-group min/max into file-level bounds and
+//! DataFusion (54 and 55) merges a file's row-group min/max into file-level bounds and
 //! marks them exact when one row group's exact bound equals the merged value,
 //! even if another row group carries no bound at all. Its Parquet opener then
 //! reads a column whose exact min equals its exact max (with no nulls) as that
