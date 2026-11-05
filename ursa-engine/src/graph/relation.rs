@@ -187,7 +187,7 @@ impl RelationPlanner for GraphFunctions {
 
 /// "there is no graph function 'pagerenk'; did you mean 'pagerank'?", with
 /// `prefix` before it (for a call nested in `algorithms()`).
-fn no_such_function<'a>(name: &str, prefix: &str, candidates: Vec<&'a str>) -> DataFusionError {
+fn no_such_function(name: &str, prefix: &str, candidates: Vec<&str>) -> DataFusionError {
     let hint = did_you_mean(name, candidates.iter().copied())
         .map(|s| format!("; did you mean '{s}'?"))
         .unwrap_or_else(|| format!(". The graph functions are: {}", candidates.join(", ")));
