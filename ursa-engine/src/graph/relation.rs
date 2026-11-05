@@ -336,6 +336,10 @@ impl GraphFunctions {
         context: &dyn RelationPlannerContext,
     ) -> Result<LogicalPlan> {
         let table = graph.edges.table.clone();
+        // A file path the graph opened when it was created.
+        if let Some(file) = self.registry.file_table(&graph.name, &table) {
+            return edge_projection(graph, provider_as_source(file));
+        }
         let source = self.table_source(&table, context).map_err(|e| {
             plan(format!(
                 "graph '{}': its edge table cannot be read: {}",

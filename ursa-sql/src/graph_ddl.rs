@@ -1,4 +1,5 @@
-//! Running `CREATE PROPERTY GRAPH` and `DROP PROPERTY GRAPH`.
+//! Running `CREATE PROPERTY GRAPH`, `DROP PROPERTY GRAPH`, `SHOW GRAPHS` and
+//! `DESCRIBE GRAPH`.
 //!
 //! Identifiers are normalized as DataFusion normalizes table names (unquoted
 //! names lower-cased, quoted names kept, unless
@@ -14,7 +15,7 @@ use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
 use ursa_engine::graph::{self, EdgeTable, GraphDef, VertexTable};
 
-use crate::parser::{CreatePropertyGraph, DropPropertyGraph};
+use crate::parser::{CreatePropertyGraph, DescribeGraph, DropPropertyGraph};
 use crate::property_graph::{EndpointDef, References};
 
 pub(crate) async fn create(
@@ -33,6 +34,15 @@ pub(crate) fn drop(ctx: &SessionContext, statement: DropPropertyGraph) -> Result
     let name = graph_name(statement.name, normalizes(ctx))?;
     graph::drop_graph(ctx, &name, statement.if_exists)?;
     empty(ctx)
+}
+
+pub(crate) fn show(ctx: &SessionContext) -> Result<DataFrame> {
+    ctx.read_batch(graph::show_graphs(&ctx.state())?)
+}
+
+pub(crate) async fn describe(ctx: &SessionContext, statement: DescribeGraph) -> Result<DataFrame> {
+    let name = graph_name(statement.name, normalizes(ctx))?;
+    ctx.read_batch(graph::describe_graph(&ctx.state(), &name).await?)
 }
 
 /// The definition `statement` makes, with its identifiers normalized.

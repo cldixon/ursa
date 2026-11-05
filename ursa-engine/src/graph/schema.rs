@@ -18,19 +18,27 @@
 //! The plan builders ([`edges_plan`], [`nodes_plan`] and their `_from`
 //! variants, which take table sources already resolved) are public so the graph
 //! algorithms can reuse them.
+//!
+//! When a table under the graph cannot be read (it was deregistered through
+//! the DataFusion API, say), `edges` and `nodes` are still listed, with the
+//! columns they last had, and fail with the reason when a query reads them.
+//! Session listings (`SHOW TABLES`, `information_schema`) look every table up,
+//! so an error here would break them for the whole session.
 
-use std::sync::{Arc, Weak};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{DataType, Schema};
-use datafusion::catalog::{SchemaProvider, TableProvider};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::catalog::{SchemaProvider, Session, TableProvider};
 use datafusion::common::{Column, JoinType, ScalarValue, TableReference};
-use datafusion::datasource::{provider_as_source, ViewTable};
+use datafusion::datasource::{provider_as_source, TableType, ViewTable};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr_fn::cast;
 use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
 use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
+use datafusion::physical_plan::ExecutionPlan;
 use parking_lot::RwLock;
 
 use super::{registry, GraphDef};
@@ -51,11 +59,17 @@ const VERTICES: &str = "__ursa_vertices";
 pub struct GraphSchema {
     graph: String,
     session: Weak<RwLock<SessionState>>,
+    /// The columns `edges` and `nodes` had when last planned.
+    last_columns: Mutex<HashMap<&'static str, SchemaRef>>,
 }
 
 impl GraphSchema {
     pub(crate) fn new(graph: String, session: Weak<RwLock<SessionState>>) -> Self {
-        Self { graph, session }
+        Self {
+            graph,
+            session,
+            last_columns: Mutex::default(),
+        }
     }
 }
 
@@ -66,9 +80,11 @@ impl SchemaProvider for GraphSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        if name != EDGES && name != NODES {
-            return Ok(None);
-        }
+        let name = match name {
+            EDGES => EDGES,
+            NODES => NODES,
+            _ => return Ok(None),
+        };
         let state = self
             .session
             .upgrade()
@@ -81,19 +97,72 @@ impl SchemaProvider for GraphSchema {
             edges_plan(&state, &def).await
         } else {
             nodes_plan(&state, &def).await
+        };
+        let mut last_columns = self.last_columns.lock().unwrap_or_else(|e| e.into_inner());
+        match plan {
+            Ok(plan) => {
+                let view = ViewTable::new(plan, None);
+                last_columns.insert(name, view.schema());
+                Ok(Some(Arc::new(view)))
+            }
+            Err(e) => Ok(Some(Arc::new(UnreadableTable {
+                schema: last_columns
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(Schema::empty())),
+                message: format!(
+                    "cannot read {}.{name}: {}",
+                    def.name,
+                    crate::user_message(&e)
+                ),
+            }))),
         }
-        .map_err(|e| {
-            DataFusionError::Plan(format!(
-                "cannot read {}.{name}: {}",
-                def.name,
-                crate::user_message(&e)
-            ))
-        })?;
-        Ok(Some(Arc::new(ViewTable::new(plan, None))))
     }
 
     fn table_exist(&self, name: &str) -> bool {
         name == EDGES || name == NODES
+    }
+}
+
+/// A graph table whose plan cannot be built: listed with the columns it last
+/// had, and failing with `message` when a query reads it.
+#[derive(Debug)]
+struct UnreadableTable {
+    schema: SchemaRef,
+    message: String,
+}
+
+#[async_trait]
+impl TableProvider for UnreadableTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan(self.message.clone()))
+    }
+}
+
+/// The table `table` names for graph `def`: one the graph opened from a file
+/// path when it was created, or else the table or view in `state`.
+pub async fn graph_table(
+    state: &SessionState,
+    def: &GraphDef,
+    table: &TableReference,
+) -> Result<Arc<dyn TableProvider>> {
+    match registry(state).file_table(&def.name, table) {
+        Some(provider) => Ok(provider),
+        None => resolve_table(state, table).await,
     }
 }
 
@@ -121,7 +190,7 @@ pub async fn lookup_table(
 
 /// The plan of `<graph>.edges`: a scan of the edge table, as it is now.
 pub async fn edges_plan(state: &SessionState, def: &GraphDef) -> Result<LogicalPlan> {
-    let edges = resolve_table(state, &def.edges.table).await?;
+    let edges = graph_table(state, def, &def.edges.table).await?;
     edges_plan_from(def, provider_as_source(edges))
 }
 
@@ -132,9 +201,9 @@ pub fn edges_plan_from(def: &GraphDef, edges: Arc<dyn TableSource>) -> Result<Lo
 
 /// The plan of `<graph>.nodes` (see the module docs).
 pub async fn nodes_plan(state: &SessionState, def: &GraphDef) -> Result<LogicalPlan> {
-    let edges = provider_as_source(resolve_table(state, &def.edges.table).await?);
+    let edges = provider_as_source(graph_table(state, def, &def.edges.table).await?);
     let vertices = match &def.vertices {
-        Some(v) => Some(provider_as_source(resolve_table(state, &v.table).await?)),
+        Some(v) => Some(provider_as_source(graph_table(state, def, &v.table).await?)),
         None => None,
     };
     nodes_plan_from(def, edges, vertices)

@@ -291,23 +291,11 @@ fn graphs_last_for_the_invocation() {
 }
 
 #[test]
-fn graph_and_database_statements_are_not_supported_yet() {
-    for (sql, message) in [
-        (
-            "DESCRIBE GRAPH karate",
-            "DESCRIBE GRAPH is not supported yet (planned in #236)",
-        ),
-        (
-            "SHOW GRAPHS",
-            "SHOW GRAPHS is not supported yet (planned in #236)",
-        ),
-        (
-            "ATTACH 'club.ursa'",
-            "ATTACH is not supported yet (planned in #237)",
-        ),
-    ] {
-        assert_eq!(err(ursa(&["-c", sql])), format!("Error: {message}\n"));
-    }
+fn database_statements_are_not_supported_yet() {
+    assert_eq!(
+        err(ursa(&["-c", "ATTACH 'club.ursa'"])),
+        "Error: ATTACH is not supported yet (planned in #237)\n"
+    );
 
     let e = err(ursa(&["club.ursa", "-c", "SELECT 1"]));
     assert!(e.contains("planned in #237"), "{e}");
@@ -420,4 +408,128 @@ fn graph_function_errors_are_for_people() {
         err(ursa(&["-c", &sql])),
         "Error: graph 'karte' does not exist; did you mean 'karate'?\n"
     );
+}
+
+/// Getting Started, "Find out what is available", after "Define a graph"
+/// (`ursa_functions()` comes with the function catalog).
+#[test]
+fn find_out_what_is_available_matches_getting_started() {
+    let sql = format!(
+        "{}
+         CREATE PROPERTY GRAPH karate_edges_only
+           EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+        define_karate()
+    );
+    let out = ok(ursa(&[
+        "-c",
+        &sql,
+        "-c",
+        "SHOW GRAPHS; DESCRIBE GRAPH karate;",
+    ]));
+    assert_eq!(
+        out,
+        "\
++-------------------+------------+--------+-------------+--------------+------------+
+| name              | edge_table | source | destination | vertex_table | vertex_key |
++-------------------+------------+--------+-------------+--------------+------------+
+| karate            | ties       | src    | dst         | members      | id         |
+| karate_edges_only | ties       | src    | dst         |              |            |
++-------------------+------------+--------+-------------+--------------+------------+
++------------+-------------+-----------+-------------+--------------+
+| table_name | column_name | data_type | role        | origin       |
++------------+-------------+-----------+-------------+--------------+
+| nodes      | id          | Int64     | node id     | members.id   |
+| nodes      | club        | Utf8      |             | members.club |
+| edges      | src         | Int64     | source      | ties.src     |
+| edges      | dst         | Int64     | destination | ties.dst     |
++------------+-------------+-----------+-------------+--------------+
+"
+    );
+
+    // As JSON, one object per row; NULLs are left out.
+    let out = ok(ursa(&[
+        "-f",
+        "json",
+        "-c",
+        &sql,
+        "-c",
+        "SHOW GRAPHS; DESC GRAPH karate_edges_only",
+    ]));
+    assert_eq!(
+        out,
+        "\
+[{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\"},\
+{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\"}]
+[{\"table_name\":\"nodes\",\"column_name\":\"id\",\"data_type\":\"Int64\",\"role\":\"node id\",\"origin\":\"ties.src, ties.dst\"},\
+{\"table_name\":\"edges\",\"column_name\":\"src\",\"data_type\":\"Int64\",\"role\":\"source\",\"origin\":\"ties.src\"},\
+{\"table_name\":\"edges\",\"column_name\":\"dst\",\"data_type\":\"Int64\",\"role\":\"destination\",\"origin\":\"ties.dst\"}]
+"
+    );
+
+    assert_eq!(
+        err(ursa(&["-c", &sql, "-c", "DESCRIBE GRAPH karat"])),
+        "Error: graph 'karat' does not exist; did you mean 'karate'?\n"
+    );
+}
+
+/// A graph over bare file paths, with no views: the florentine families.
+#[test]
+fn a_graph_over_file_paths() {
+    let data = "python/ursa/datasets/data";
+    let sql = format!(
+        "CREATE PROPERTY GRAPH florentine
+           EDGE TABLES ('{data}/florentine_edges.csv' SOURCE KEY (src) DESTINATION KEY (dst));
+         SHOW GRAPHS;
+         SELECT id, degree FROM degree(florentine, direction => 'both')
+         ORDER BY degree DESC, id LIMIT 3;
+         SELECT count(*) AS families FROM florentine.nodes;"
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++------------+--------------------------------------------------+--------+-------------+--------------+------------+
+| name       | edge_table                                       | source | destination | vertex_table | vertex_key |
++------------+--------------------------------------------------+--------+-------------+--------------+------------+
+| florentine | 'python/ursa/datasets/data/florentine_edges.csv' | src    | dst         |              |            |
++------------+--------------------------------------------------+--------+-------------+--------------+------------+
++----------+--------+
+| id       | degree |
++----------+--------+
+| Medici   | 6      |
+| Guadagni | 4      |
+| Strozzi  | 4      |
++----------+--------+
++----------+
+| families |
++----------+
+| 15       |
++----------+
+"
+    );
+}
+
+#[test]
+fn dropping_a_table_a_graph_uses_is_refused() {
+    let sql = format!("{} DROP VIEW ties", define_karate());
+    assert_eq!(
+        err(ursa(&["-c", &sql])),
+        "Error: cannot drop view 'ties': graph 'karate' uses it; drop property graph karate \
+         first\n"
+    );
+    let sql = format!(
+        "{} CREATE OR REPLACE VIEW members AS SELECT id AS member, club FROM members",
+        define_karate()
+    );
+    let e = err(ursa(&["-c", &sql]));
+    assert!(
+        e.starts_with("Error: cannot replace view 'members': graph 'karate' uses it"),
+        "{e}"
+    );
+    // After DROP PROPERTY GRAPH, the views can go, and SHOW TABLES works.
+    let sql = format!(
+        "{} DROP PROPERTY GRAPH karate; DROP VIEW ties; DROP VIEW members;
+         SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'public'",
+        define_karate()
+    );
+    assert_eq!(ok(ursa(&["-f", "csv", "-c", &sql])), "n\n0\n");
 }
