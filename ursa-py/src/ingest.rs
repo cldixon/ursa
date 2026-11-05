@@ -133,6 +133,14 @@ fn arrow_invalid(py: Python<'_>, msg: String) -> PyErr {
     }
 }
 
+/// What [`ingest_edges`] returns: the table, its `(src, dst)` id columns, and
+/// the rows dropped.
+type Ingested<'py> = (
+    Bound<'py, PyAny>,
+    (Bound<'py, PyAny>, Bound<'py, PyAny>),
+    usize,
+);
+
 /// An in-memory edge table as an `EdgeFrame` holds it: `(table, (src, dst),
 /// dropped)`. The table has its string views read as strings and, with
 /// `on_null="drop"`, its rows with a null endpoint removed (`dropped` counts
@@ -145,11 +153,7 @@ pub(crate) fn ingest_edges<'py>(
     src: Bound<'py, PyAny>,
     dst: Bound<'py, PyAny>,
     on_null: &str,
-) -> PyResult<(
-    Bound<'py, PyAny>,
-    (Bound<'py, PyAny>, Bound<'py, PyAny>),
-    usize,
-)> {
+) -> PyResult<Ingested<'py>> {
     let py = table.py();
     let mut table = without_string_views(table)?;
     let mut dropped = 0;
