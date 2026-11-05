@@ -43,6 +43,10 @@ def _topology_build_count() -> int: ...
 # pushed) per native scan since it was last turned on (test/observability hook).
 def _scan_log(record: bool) -> list[tuple[str, list[str], int]]: ...
 
+# The graph functions of the catalog in ursa-core: (name, [(parameter, default)])
+# in the Python API's order (test hook; the signatures are checked against it).
+def _graph_functions() -> list[tuple[str, list[tuple[str, Any]]]]: ...
+
 # The plan object a frame holds (ursa_plan::lazy::Node): each method builds the
 # next step in Rust, validates it there, and returns the new node. Step
 # arguments arrive as plan IR (Python values); `error` is the exception Python

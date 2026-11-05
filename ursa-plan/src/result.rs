@@ -7,47 +7,32 @@
 //! a single `(id, col_1, col_2, ...)` batch with dense→user id translation done
 //! once, here, at the boundary.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float32Array, Float64Array, Int64Array, UInt32Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
-    betweenness, betweenness_weighted, closeness_directed, closeness_weighted_directed,
-    clustering_from_triangles, connected_components_strong, connected_components_weak, degree,
-    k_hop_masked, label_propagation, layout_circle, layout_fr, layout_random, louvain,
-    louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles,
-    random_walk_masked, shortest_path_masked, shortest_path_weighted_with_cost_masked,
-    symmetric_view, symmetric_view_weighted, undirected_view, AggKind, LayoutParams,
-    PageRankParams, UndirectedView,
+    k_hop_masked, random_walk_masked, shortest_path_masked,
+    shortest_path_weighted_with_cost_masked, AggKind,
 };
+use ursa_core::catalog::{Evaluator, Inputs};
 use ursa_core::{Direction, EdgeMask, IdMap, Topology};
 
-use crate::logical::{Direction as PlanDirection, GraphAlgo, LayoutKind};
+use crate::logical::Call;
 
-/// The Arrow dtype a float-valued output column is emitted as (#117). Kernels
-/// always accumulate in `f64`; `F32` narrows the *emitted* column to halve wire and
-/// on-disk size (e.g. cached layout positions), where screen-space precision is far
-/// below `f64`'s 53 bits. Only legal on float-valued columns — validated where the
-/// column is built (`query.rs`); integer columns keep their `u32` type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputDtype {
-    #[default]
-    F64,
-    F32,
-}
+pub use ursa_core::catalog::OutputDtype;
 
 /// One requested output column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputColumn {
-    /// A node-valued algorithm over the topology. `weights` (an `f64` per edge
-    /// row, gathered via `edge_ids`) is present for a weighted algorithm. `dtype`
-    /// narrows a float-valued result to `f32` on emit (#117).
+    /// A node-valued algorithm or layout over the topology. `weights` (an `f64`
+    /// per edge row, gathered via `edge_ids`) is present for a weighted
+    /// algorithm. `dtype` narrows a float-valued result to `f32` on emit (#117).
     Algo {
         name: String,
-        algo: GraphAlgo,
+        algo: Call,
         weights: Option<Arc<Vec<f64>>>,
         dtype: OutputDtype,
         /// Which of the kernel's outputs this column takes.
@@ -81,30 +66,26 @@ impl OutputColumn {
         }
     }
 
-    /// The column's Arrow type *before* any `dtype` narrowing — `Float64` for a
-    /// float-valued kernel, `UInt32` for an integer-valued one. Public so `query.rs`
-    /// can reject a nonsensical `f32` request on an integer column at build time.
-    pub fn base_value_type(&self) -> DataType {
+    /// The call this column takes an output of.
+    fn call(&self) -> Call {
         match self {
-            OutputColumn::Algo { algo, .. } => match algo {
-                GraphAlgo::PageRank { .. }
-                | GraphAlgo::ClusteringCoefficient
-                | GraphAlgo::Closeness { .. }
-                | GraphAlgo::Betweenness { .. } => DataType::Float64,
-                // Positions are f32 at the source: the kernel computes in f32 and
-                // there is no wider value to narrow from, so `dtype` has nothing
-                // to do here.
-                GraphAlgo::Layout { .. } => DataType::Float32,
-                _ => DataType::UInt32,
+            OutputColumn::Algo { algo, .. } => *algo,
+            OutputColumn::NeighborAgg { direction, agg, .. } => Call::NeighborAgg {
+                direction: *direction,
+                agg: *agg,
             },
-            OutputColumn::NeighborAgg { .. } => DataType::Float64,
         }
     }
 
-    /// Whether this column emits a floating-point value (the only kind `f32` narrowing
-    /// applies to).
-    pub fn is_float_valued(&self) -> bool {
-        self.base_value_type() == DataType::Float64
+    /// The column's Arrow type *before* any `dtype` narrowing, as the catalog
+    /// declares the output.
+    pub fn base_value_type(&self) -> DataType {
+        let field = match self {
+            OutputColumn::Algo { field, .. } => *field,
+            OutputColumn::NeighborAgg { .. } => 0,
+        };
+        let outputs = self.call().spec().outputs;
+        outputs.get(field).unwrap_or(&outputs[0]).ty.data_type()
     }
 
     pub fn value_type(&self) -> DataType {
@@ -115,395 +96,27 @@ impl OutputColumn {
             OutputDtype::F64 => self.base_value_type(),
         }
     }
-}
 
-/// A canonical, hashable identity for one kernel computation (#115).
-///
-/// `GraphAlgo` carries `f64` parameters, so it is neither `Hash` nor `Eq`. Float
-/// fields are keyed on their bit patterns, which is exactly the equality wanted
-/// here: two columns share a computation only if they named literally the same
-/// parameters. Weights compare by `Arc` identity — the same notion
-/// `ShortestPathNode` already uses, and the same one the plan node's cache key
-/// applies to the mask.
-///
-/// The output `dtype` is deliberately **not** part of the key: it narrows on emit,
-/// after the kernel has run, so `f64` and `f32` spellings of one score share a
-/// single computation.
-#[derive(PartialEq, Eq, Hash)]
-struct KernelKey {
-    /// Which `GraphAlgo` variant.
-    tag: u8,
-    /// Bit-encoded scalar parameters, in a fixed per-variant order.
-    params: Vec<u64>,
-    /// The weight array by `Arc` identity; `None` for an unweighted kernel.
-    weights: Option<usize>,
-}
-
-/// A direction's stable code inside a [`KernelKey`].
-fn dir_code(d: PlanDirection) -> u64 {
-    match d {
-        PlanDirection::Out => 0,
-        PlanDirection::In => 1,
-        PlanDirection::Both => 2,
-    }
-}
-
-fn kernel_key(algo: &GraphAlgo, weights: Option<&Arc<Vec<f64>>>) -> KernelKey {
-    // Each optional parameter contributes a presence flag alongside its value, so
-    // `None` can never collide with a `Some` that happens to carry the same bits.
-    fn opt_f64(v: &Option<f64>) -> [u64; 2] {
-        match v {
-            Some(x) => [1, x.to_bits()],
-            None => [0, 0],
-        }
-    }
-    fn opt_u64(v: &Option<u64>) -> [u64; 2] {
-        match v {
-            Some(x) => [1, *x],
-            None => [0, 0],
-        }
-    }
-    let (tag, params): (u8, Vec<u64>) = match algo {
-        GraphAlgo::PageRank {
-            damping,
-            max_iter,
-            tol,
-            direction,
-        } => (
-            0,
-            vec![
-                damping.to_bits(),
-                *max_iter as u64,
-                tol.to_bits(),
-                dir_code(*direction),
-            ],
-        ),
-        GraphAlgo::ConnectedComponents { strong } => (1, vec![*strong as u64]),
-        GraphAlgo::Degree { direction } => (2, vec![dir_code(*direction)]),
-        GraphAlgo::TriangleCount => (3, Vec::new()),
-        GraphAlgo::ClusteringCoefficient => (4, Vec::new()),
-        GraphAlgo::Betweenness {
-            sample,
-            seed,
-            direction,
-        } => {
-            let mut p = Vec::from(opt_f64(sample));
-            p.extend(opt_u64(seed));
-            p.push(dir_code(*direction));
-            (5, p)
-        }
-        GraphAlgo::Closeness { direction } => (6, vec![dir_code(*direction)]),
-        GraphAlgo::LabelPropagation { max_iter, seed } => {
-            let mut p = vec![*max_iter as u64];
-            p.extend(opt_u64(seed));
-            (7, p)
-        }
-        GraphAlgo::Louvain { resolution, seed } => {
-            let mut p = vec![resolution.to_bits()];
-            p.extend(opt_u64(seed));
-            (8, p)
-        }
-        GraphAlgo::Layout {
-            kind,
-            iterations,
-            k,
-            gravity,
-            seed,
-        } => {
-            // `field` is deliberately absent: x and y must produce the *same* key,
-            // because sharing one simulation between them is the entire point.
-            let mut p = vec![
-                match kind {
-                    LayoutKind::Fr => 0,
-                    LayoutKind::Random => 1,
-                    LayoutKind::Circle => 2,
+    /// The column's array, from the query's shared evaluator.
+    fn array<'a>(&'a self, eval: &mut Evaluator<'a>) -> Result<ArrayRef> {
+        let (inputs, field) = match self {
+            OutputColumn::Algo { weights, field, .. } => (
+                Inputs {
+                    weights: weights.as_deref().map(Vec::as_slice),
+                    attribute: None,
                 },
-                *iterations as u64,
-                k.to_bits(),
-                gravity.to_bits(),
-            ];
-            p.extend(opt_u64(seed));
-            (9, p)
-        }
-    };
-    KernelKey {
-        tag,
-        params,
-        weights: weights.map(|w| Arc::as_ptr(w) as usize),
-    }
-}
-
-/// Per-query kernel evaluation, memoized (#115).
-///
-/// A query can name several output columns that rest on the same work, in two
-/// distinct ways — this handles both:
-///
-/// 1. **The same computation under two names.** `with_columns(a=pagerank(e),
-///    b=pagerank(e, dtype="f32"))` is one kernel run emitted twice; `dtype`
-///    narrows afterwards and so is not part of the key.
-/// 2. **Different kernels over a shared intermediate.** `triangle_count` and
-///    `clustering_coefficient` both rest on one sorted-adjacency intersection pass
-///    over one undirected view — the expensive half of each. Naming both in one
-///    `with_columns` used to do that work twice (and, under a mask, rebuild the
-///    masked undirected view twice as well, since only the *unmasked* view is
-///    cached on the topology).
-///
-/// Lives for exactly one `query_batch` call. That is what makes the keys sound:
-/// the topology and mask are fixed for its lifetime, so a key needs to encode only
-/// the algorithm and its parameters, not the graph they run over.
-struct KernelEval<'a> {
-    topo: &'a Topology,
-    mask: Option<&'a EdgeMask>,
-    /// Kernel results by computation key.
-    ///
-    /// A `Vec` per entry because a kernel may emit several columns from one
-    /// invocation — layout emits x and y. A repeat column is an `Arc` clone of an
-    /// element rather than a recomputation.
-    memo: HashMap<KernelKey, Arc<Vec<ArrayRef>>>,
-    /// The undirected view and its per-node triangle counts — the intermediate the
-    /// triangle-family kernels share. Computed at most once, on first use.
-    triangles: Option<(UndirectedView<'a>, Vec<u32>)>,
-    /// The masked unweighted symmetric (undirected) view the `direction="both"`
-    /// forms of `pagerank` / `betweenness` run over. Built at most once, on first
-    /// use, and shared between them; unmasked, the topology caches it instead.
-    symmetric: Option<Topology>,
-    /// The weighted symmetric views and their per-row weights, keyed by the
-    /// address of the weight column (fixed for the query, as in [`KernelKey`]), so
-    /// a weighted `pagerank` and `betweenness` over one column share the build.
-    symmetric_weighted: HashMap<usize, (Topology, Vec<f64>)>,
-}
-
-impl<'a> KernelEval<'a> {
-    fn new(topo: &'a Topology, mask: Option<&'a EdgeMask>) -> Self {
-        KernelEval {
-            topo,
-            mask,
-            memo: HashMap::new(),
-            triangles: None,
-            symmetric: None,
-            symmetric_weighted: HashMap::new(),
-        }
-    }
-
-    /// The unweighted symmetric view: the topology's cached one when unmasked,
-    /// otherwise built on first use.
-    fn symmetric(&mut self) -> &Topology {
-        let (topo, mask) = (self.topo, self.mask);
-        match mask {
-            None => topo.symmetric(),
-            Some(m) => self
-                .symmetric
-                .get_or_insert_with(|| symmetric_view(topo, Some(m))),
-        }
-    }
-
-    /// The weighted symmetric view over `weights`, built on first use.
-    fn symmetric_weighted(&mut self, weights: &[f64]) -> (&Topology, &[f64]) {
-        let (topo, mask) = (self.topo, self.mask);
-        let (sym, sw) = self
-            .symmetric_weighted
-            .entry(weights.as_ptr() as usize)
-            .or_insert_with(|| symmetric_view_weighted(topo, weights, mask));
-        (sym, sw)
-    }
-
-    /// The undirected view and per-node triangle counts, computed on first use.
-    fn triangles(&mut self) -> &(UndirectedView<'a>, Vec<u32>) {
-        if self.triangles.is_none() {
-            let view = undirected_view(self.topo, self.mask);
-            let counts = per_node_triangles(view.get());
-            self.triangles = Some((view, counts));
-        }
-        self.triangles
-            .as_ref()
-            .expect("the intermediate was just populated")
-    }
-
-    /// Run one kernel, returning every column it produces.
-    ///
-    /// One element for all but layout, which returns x and y from a single
-    /// simulation. Callers go through [`Self::column_array`], which memoizes.
-    fn compute(&mut self, algo: &GraphAlgo, weights: Option<&[f64]>) -> Vec<ArrayRef> {
-        let (topo, mask) = (self.topo, self.mask);
-        match algo {
-            GraphAlgo::Layout {
-                kind,
-                iterations,
-                k,
-                gravity,
-                seed,
-            } => {
-                let params = LayoutParams {
-                    iterations: *iterations,
-                    k: *k as f32,
-                    gravity: *gravity as f32,
-                    seed: *seed,
-                };
-                let (x, y) = match kind {
-                    LayoutKind::Fr => layout_fr(topo, mask, params),
-                    LayoutKind::Random => layout_random(topo, params),
-                    LayoutKind::Circle => layout_circle(topo, params),
-                };
-                vec![
-                    Arc::new(Float32Array::from(x)) as ArrayRef,
-                    Arc::new(Float32Array::from(y)) as ArrayRef,
-                ]
-            }
-            GraphAlgo::Degree { direction } => {
-                vec![
-                    Arc::new(UInt32Array::from(degree(topo, mask, (*direction).into())))
-                        as ArrayRef,
-                ]
-            }
-            GraphAlgo::PageRank {
-                damping,
-                max_iter,
-                tol,
-                direction,
-            } => {
-                let params = PageRankParams {
-                    damping: *damping,
-                    max_iter: *max_iter,
-                    tol: *tol,
-                };
-                // `Both` runs the unchanged directed kernel over the symmetric view
-                // (each undirected edge as two rows): NetworkX's `pagerank` on an
-                // undirected graph. `In` is rejected when the column is built.
-                let scores = match (direction, weights) {
-                    (PlanDirection::Both, Some(w)) => {
-                        let (sym, sw) = self.symmetric_weighted(w);
-                        pagerank_weighted(sym, sw, None, params)
-                    }
-                    (PlanDirection::Both, None) => pagerank(self.symmetric(), None, params),
-                    (_, Some(w)) => pagerank_weighted(topo, w, mask, params),
-                    (_, None) => pagerank(topo, mask, params),
-                };
-                vec![Arc::new(Float64Array::from(scores)) as ArrayRef]
-            }
-            GraphAlgo::ConnectedComponents { strong } => {
-                let labels = if *strong {
-                    connected_components_strong(topo, mask)
-                } else {
-                    connected_components_weak(topo, mask)
-                };
-                vec![Arc::new(UInt32Array::from(labels)) as ArrayRef]
-            }
-            // The triangle-family pair: both read the shared intermediate, so
-            // whichever is named first pays for the intersection pass and the other
-            // is a cheap derivation of it.
-            GraphAlgo::TriangleCount => {
-                if topo.n_nodes() == 0 {
-                    return vec![Arc::new(UInt32Array::from(Vec::<u32>::new())) as ArrayRef];
-                }
-                let (_, counts) = self.triangles();
-                vec![Arc::new(UInt32Array::from(counts.clone())) as ArrayRef]
-            }
-            GraphAlgo::ClusteringCoefficient => {
-                if topo.n_nodes() == 0 {
-                    return vec![Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef];
-                }
-                let (view, counts) = self.triangles();
-                vec![Arc::new(Float64Array::from(clustering_from_triangles(
-                    view.get(),
-                    counts,
-                ))) as ArrayRef]
-            }
-            GraphAlgo::Closeness { direction } => {
-                let dir: Direction = (*direction).into();
-                let scores = match weights {
-                    Some(w) => closeness_weighted_directed(topo, w, mask, dir),
-                    None => closeness_directed(topo, mask, dir),
-                };
-                vec![Arc::new(Float64Array::from(scores)) as ArrayRef]
-            }
-            GraphAlgo::Betweenness {
-                sample,
-                seed,
-                direction,
-            } => {
-                let scores = match (direction, weights) {
-                    // `Both`: Brandes over the symmetric view counts every unordered
-                    // pair twice (once from each end), so halve. NetworkX's
-                    // `betweenness_centrality(U, normalized=False)` on an undirected
-                    // graph applies the same halving.
-                    (PlanDirection::Both, w) => {
-                        let bc = match w {
-                            Some(w) => {
-                                let (sym, sw) = self.symmetric_weighted(w);
-                                betweenness_weighted(sym, sw, None, *sample, *seed)
-                            }
-                            None => betweenness(self.symmetric(), None, *sample, *seed),
-                        };
-                        bc.into_iter().map(|x| x * 0.5).collect()
-                    }
-                    (_, Some(w)) => betweenness_weighted(topo, w, mask, *sample, *seed),
-                    (_, None) => betweenness(topo, mask, *sample, *seed),
-                };
-                vec![Arc::new(Float64Array::from(scores)) as ArrayRef]
-            }
-            GraphAlgo::LabelPropagation { max_iter, seed } => vec![Arc::new(UInt32Array::from(
-                label_propagation(topo, mask, *max_iter, *seed),
-            )) as ArrayRef],
-            GraphAlgo::Louvain { resolution, seed } => {
-                let labels = match weights {
-                    Some(w) => louvain_weighted(topo, w, mask, *resolution, *seed),
-                    None => louvain(topo, mask, *resolution, *seed),
-                };
-                vec![Arc::new(UInt32Array::from(labels)) as ArrayRef]
-            }
-        }
-    }
-
-    /// The array for one output column, at its requested dtype.
-    ///
-    /// Narrowing happens *after* the memo, so two columns differing only in `dtype`
-    /// share the kernel run and diverge only at the cast.
-    fn column_array(&mut self, col: &OutputColumn) -> ArrayRef {
-        let base = match col {
-            OutputColumn::Algo {
-                algo,
-                weights,
-                field,
-                ..
-            } => {
-                let key = kernel_key(algo, weights.as_ref());
-                // Clone the hit out before computing: the borrow of `self.memo` must
-                // end before `compute` takes `&mut self`.
-                let outputs = match self.memo.get(&key).cloned() {
-                    Some(hit) => hit,
-                    None => {
-                        let arrays =
-                            Arc::new(self.compute(algo, weights.as_deref().map(Vec::as_slice)));
-                        self.memo.insert(key, Arc::clone(&arrays));
-                        arrays
-                    }
-                };
-                // A field past the kernel's output count is a plan-construction
-                // bug, not user input — query.rs only ever sets a field the kernel
-                // declares — so fall back to the first column rather than panic
-                // across the FFI.
-                Arc::clone(outputs.get(*field).unwrap_or(&outputs[0]))
-            }
-            // Not memoized: a neighbour aggregation is a single segmented CSR
-            // reduction — the cheapest column kind there is, so sharing one would
-            // buy less than the key it costs to build.
-            OutputColumn::NeighborAgg {
-                attr,
-                direction,
-                agg,
-                ..
-            } => Arc::new(Float64Array::from(neighbor_aggregate(
-                self.topo, attr, self.mask, *direction, *agg,
-            ))),
+                *field,
+            ),
+            OutputColumn::NeighborAgg { attr, .. } => (
+                Inputs {
+                    weights: None,
+                    attribute: Some(attr.as_slice()),
+                },
+                0,
+            ),
         };
-        match col.dtype() {
-            // Narrow the f64 kernel output to f32 (#117). Casting Float64 -> Float32 is
-            // infallible; the `expect` can only fire on a validation bug (f32 requested
-            // for a non-float column), which query.rs rejects before we get here.
-            OutputDtype::F32 => arrow::compute::cast(&base, &DataType::Float32)
-                .expect("narrowing a float column to f32 is infallible"),
-            OutputDtype::F64 => base,
-        }
+        eval.column(&self.call(), inputs, field, self.dtype())
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
     }
 }
 
@@ -525,16 +138,20 @@ pub fn query_schema(columns: &[OutputColumn], id_type: DataType) -> SchemaRef {
 /// to succeed; it returns `Result` rather than `expect`-panicking so a future
 /// column-length regression surfaces as a catchable engine error, not a process
 /// abort across the FFI.
-pub fn query_batch(
-    topo: &Topology,
+///
+/// The columns share one [`Evaluator`], so columns resting on the same work
+/// (one call under two names or dtypes, `triangle_count` with
+/// `clustering_coefficient`, a layout's `x` and `y`) pay for it once (#115).
+pub fn query_batch<'a>(
+    topo: &'a Topology,
     ids: &IdMap,
-    columns: &[OutputColumn],
-    mask: Option<&EdgeMask>,
+    columns: &'a [OutputColumn],
+    mask: Option<&'a EdgeMask>,
 ) -> Result<RecordBatch> {
-    let mut eval = KernelEval::new(topo, mask);
+    let mut eval = Evaluator::new(topo, mask);
     let mut arrays: Vec<ArrayRef> = vec![ids.user_id_array()];
     for col in columns {
-        arrays.push(eval.column_array(col));
+        arrays.push(col.array(&mut eval)?);
     }
     RecordBatch::try_new(query_schema(columns, ids.user_type()), arrays)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -681,8 +298,10 @@ pub fn walk_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical::Direction as PlanDirection;
     use crate::topology::build_topology;
+
+    // The sharing between columns (#115) is tested where it lives, on the
+    // evaluator in `ursa_core::catalog`; these test the batch around it.
 
     fn diamond() -> (Arc<Topology>, Arc<IdMap>) {
         let src = Int64Array::from(vec![0, 0, 1, 2]);
@@ -690,31 +309,37 @@ mod tests {
         build_topology(&src, &dst).unwrap()
     }
 
+    fn algo_col(name: &str, algo: Call, dtype: OutputDtype) -> OutputColumn {
+        OutputColumn::Algo {
+            name: name.to_string(),
+            algo,
+            weights: None,
+            dtype,
+            field: 0,
+        }
+    }
+
+    fn pagerank_algo() -> Call {
+        Call::PageRank {
+            damping: 0.85,
+            max_iter: 30,
+            tol: 1e-6,
+            direction: Direction::Out,
+        }
+    }
+
     #[test]
     fn multi_column_batch_is_aligned() {
         let (topo, ids) = diamond();
         let columns = vec![
-            OutputColumn::Algo {
-                name: "deg".to_string(),
-                algo: GraphAlgo::Degree {
-                    direction: PlanDirection::Out,
+            algo_col(
+                "deg",
+                Call::Degree {
+                    direction: Direction::Out,
                 },
-                weights: None,
-                dtype: OutputDtype::F64,
-                field: 0,
-            },
-            OutputColumn::Algo {
-                name: "pr".to_string(),
-                algo: GraphAlgo::PageRank {
-                    damping: 0.85,
-                    max_iter: 30,
-                    tol: 1e-6,
-                    direction: PlanDirection::Out,
-                },
-                weights: None,
-                dtype: OutputDtype::F64,
-                field: 0,
-            },
+                OutputDtype::F64,
+            ),
+            algo_col("pr", pagerank_algo(), OutputDtype::F64),
         ];
         let batch = query_batch(&topo, &ids, &columns, None).unwrap();
         assert_eq!(batch.num_columns(), 3); // id, deg, pr
@@ -725,21 +350,10 @@ mod tests {
 
     #[test]
     fn f32_dtype_narrows_a_float_column_to_float32_and_matches_f64() {
-        use arrow::array::{Float32Array, Float64Array};
+        use arrow::array::Float32Array;
 
         let (topo, ids) = diamond();
-        let pr = |dtype| OutputColumn::Algo {
-            name: "pr".to_string(),
-            algo: GraphAlgo::PageRank {
-                damping: 0.85,
-                max_iter: 30,
-                tol: 1e-6,
-                direction: PlanDirection::Out,
-            },
-            weights: None,
-            dtype,
-            field: 0,
-        };
+        let pr = |dtype| algo_col("pr", pagerank_algo(), dtype);
         let f64_batch = query_batch(&topo, &ids, &[pr(OutputDtype::F64)], None).unwrap();
         let f32_batch = query_batch(&topo, &ids, &[pr(OutputDtype::F32)], None).unwrap();
 
@@ -785,230 +399,27 @@ mod tests {
         assert!(msg.contains("f32"), "unexpected error: {msg}");
     }
 
-    // --- #115: sharing work across the columns of one query --------------------
-
-    fn algo_col(name: &str, algo: GraphAlgo, dtype: OutputDtype) -> OutputColumn {
-        OutputColumn::Algo {
+    #[test]
+    fn a_layout_fills_both_columns_from_one_run() {
+        let (topo, ids) = diamond();
+        let layout = Call::LayoutFr {
+            iterations: 20,
+            k: 1.0,
+            gravity: 0.02,
+            seed: Some(1),
+        };
+        let col = |name: &str, field| OutputColumn::Algo {
             name: name.to_string(),
-            algo,
-            weights: None,
-            dtype,
-            field: 0,
-        }
-    }
-
-    fn pagerank_algo() -> GraphAlgo {
-        GraphAlgo::PageRank {
-            damping: 0.85,
-            max_iter: 30,
-            tol: 1e-6,
-            direction: PlanDirection::Out,
-        }
-    }
-
-    /// A graph with actual triangles, so the triangle-family kernels have work to
-    /// share and non-trivial values to compare: the triangle 0-1-2, plus 3 hanging
-    /// off 0 (degree 1 -> clustering 0) and the chord 1-3.
-    fn triangly() -> (Arc<Topology>, Arc<IdMap>) {
-        let src = Int64Array::from(vec![0, 1, 2, 0, 1]);
-        let dst = Int64Array::from(vec![1, 2, 0, 3, 3]);
-        build_topology(&src, &dst).unwrap()
-    }
-
-    #[test]
-    fn two_columns_naming_one_kernel_share_a_single_run() {
-        let (topo, _ids) = diamond();
-        let mut eval = KernelEval::new(&topo, None);
-        let a = eval.column_array(&algo_col("a", pagerank_algo(), OutputDtype::F64));
-        let b = eval.column_array(&algo_col("b", pagerank_algo(), OutputDtype::F64));
-
-        assert_eq!(eval.memo.len(), 1, "one computation should be cached");
-        // The strongest available proof of sharing: both columns are literally the
-        // same allocation, so the second cannot have re-run the kernel.
-        assert!(Arc::ptr_eq(&a, &b));
-    }
-
-    #[test]
-    fn dtype_is_not_part_of_the_key_so_f64_and_f32_share_the_run() {
-        use arrow::array::{Float32Array, Float64Array};
-
-        let (topo, _ids) = diamond();
-        let mut eval = KernelEval::new(&topo, None);
-        let wide = eval.column_array(&algo_col("a", pagerank_algo(), OutputDtype::F64));
-        let narrow = eval.column_array(&algo_col("b", pagerank_algo(), OutputDtype::F32));
-
-        assert_eq!(eval.memo.len(), 1, "narrowing happens after the memo");
-        assert_eq!(narrow.data_type(), &DataType::Float32);
-
-        let wide = wide.as_any().downcast_ref::<Float64Array>().unwrap();
-        let narrow = narrow.as_any().downcast_ref::<Float32Array>().unwrap();
-        for i in 0..wide.len() {
-            assert_eq!(narrow.value(i), wide.value(i) as f32);
-        }
-    }
-
-    #[test]
-    fn differing_parameters_do_not_share_a_run() {
-        let (topo, _ids) = diamond();
-        let mut eval = KernelEval::new(&topo, None);
-        eval.column_array(&algo_col("a", pagerank_algo(), OutputDtype::F64));
-        eval.column_array(&algo_col(
-            "b",
-            GraphAlgo::PageRank {
-                damping: 0.5, // a different damping is a different computation
-                max_iter: 30,
-                tol: 1e-6,
-                direction: PlanDirection::Out,
-            },
-            OutputDtype::F64,
-        ));
-        // Also distinct: a different *variant* entirely.
-        eval.column_array(&algo_col(
-            "c",
-            GraphAlgo::Degree {
-                direction: PlanDirection::Out,
-            },
-            OutputDtype::F64,
-        ));
-        assert_eq!(eval.memo.len(), 3);
-    }
-
-    #[test]
-    fn an_optional_parameter_that_is_absent_never_collides_with_one_that_is_set() {
-        // seed=None and seed=Some(0) must key differently — the presence flag in
-        // `kernel_key` is what stops `None` and a zero-valued `Some` colliding.
-        let none = kernel_key(
-            &GraphAlgo::LabelPropagation {
-                max_iter: 20,
-                seed: None,
-            },
-            None,
-        );
-        let zero = kernel_key(
-            &GraphAlgo::LabelPropagation {
-                max_iter: 20,
-                seed: Some(0),
-            },
-            None,
-        );
-        assert!(none != zero);
-    }
-
-    fn layout_col(name: &str, field: usize) -> OutputColumn {
-        OutputColumn::Algo {
-            name: name.to_string(),
-            algo: GraphAlgo::Layout {
-                kind: LayoutKind::Fr,
-                iterations: 20,
-                k: 1.0,
-                gravity: 0.02,
-                seed: Some(1),
-            },
+            algo: layout,
             weights: None,
             dtype: OutputDtype::F64,
             field,
-        }
-    }
-
-    #[test]
-    fn a_layout_runs_once_for_both_of_its_columns() {
-        // The multi-output half of #115. `x` and `y` are two columns over one
-        // simulation, so the field selector must not reach the memo key — if it
-        // did, each axis would come from a *different* run of a stochastic layout
-        // and the drawing would be incoherent while every column still looked
-        // individually plausible.
-        let (topo, _ids) = diamond();
-        let mut eval = KernelEval::new(&topo, None);
-        let x = eval.column_array(&layout_col("x", 0));
-        let y = eval.column_array(&layout_col("y", 1));
-
-        assert_eq!(eval.memo.len(), 1, "x and y should share one cached run");
-        assert_eq!(x.data_type(), &DataType::Float32);
-        assert_eq!(y.data_type(), &DataType::Float32);
+        };
+        let batch = query_batch(&topo, &ids, &[col("x", 0), col("y", 1)], None).unwrap();
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Float32);
+        assert_eq!(batch.schema().field(2).data_type(), &DataType::Float32);
         // Distinct arrays selected out of one result, not the same array twice.
-        assert!(!Arc::ptr_eq(&x, &y));
-        assert_eq!(x.len(), y.len());
-    }
-
-    #[test]
-    fn layout_kinds_and_parameters_key_separately() {
-        let (topo, _ids) = diamond();
-        let mut eval = KernelEval::new(&topo, None);
-        eval.column_array(&layout_col("x", 0));
-        let mut circle = layout_col("c", 0);
-        if let OutputColumn::Algo { algo, .. } = &mut circle {
-            *algo = GraphAlgo::Layout {
-                kind: LayoutKind::Circle,
-                iterations: 20,
-                k: 1.0,
-                gravity: 0.02,
-                seed: Some(1),
-            };
-        }
-        eval.column_array(&circle);
-        assert_eq!(eval.memo.len(), 2, "a different layout is a different run");
-    }
-
-    #[test]
-    fn triangle_family_columns_share_one_intersection_pass() {
-        let (topo, _ids) = triangly();
-        let mut eval = KernelEval::new(&topo, None);
-
-        eval.column_array(&algo_col("tri", GraphAlgo::TriangleCount, OutputDtype::F64));
-        let first = eval.triangles.as_ref().unwrap().1.as_ptr();
-
-        eval.column_array(&algo_col(
-            "cc",
-            GraphAlgo::ClusteringCoefficient,
-            OutputDtype::F64,
-        ));
-        let second = eval.triangles.as_ref().unwrap().1.as_ptr();
-
-        // Same allocation backing both columns' triangle counts: the clustering
-        // column reused the pass the triangle column paid for.
-        assert_eq!(
-            first, second,
-            "clustering_coefficient re-ran the triangle pass"
-        );
-    }
-
-    /// The refactor that enabled the sharing split `clustering_coefficient` into
-    /// `per_node_triangles` + `clustering_from_triangles`. These pin the shared path
-    /// to the standalone kernels, masked and unmasked — the regression that would
-    /// matter most if the split were ever wrong.
-    #[test]
-    fn shared_path_matches_the_standalone_kernels() {
-        use arrow::array::Float64Array;
-        use ursa_core::algo::{clustering_coefficient, triangle_count};
-
-        let (topo, _ids) = triangly();
-        for mask in [
-            None,
-            Some(EdgeMask::from_bools(&[true, true, true, false, true])),
-        ] {
-            let mut eval = KernelEval::new(&topo, mask.as_ref());
-            let tri =
-                eval.column_array(&algo_col("tri", GraphAlgo::TriangleCount, OutputDtype::F64));
-            let cc = eval.column_array(&algo_col(
-                "cc",
-                GraphAlgo::ClusteringCoefficient,
-                OutputDtype::F64,
-            ));
-
-            let want_tri = triangle_count(&topo, mask.as_ref());
-            let want_cc = clustering_coefficient(&topo, mask.as_ref());
-
-            let tri = tri.as_any().downcast_ref::<UInt32Array>().unwrap();
-            let cc = cc.as_any().downcast_ref::<Float64Array>().unwrap();
-            assert_eq!(tri.values(), &want_tri[..], "triangle counts diverged");
-            // Exact equality, not approximate: the shared path must run the identical
-            // float operations, not merely a close approximation of them.
-            assert_eq!(
-                cc.values(),
-                &want_cc[..],
-                "clustering coefficients diverged"
-            );
-        }
+        assert!(!Arc::ptr_eq(batch.column(1), batch.column(2)));
     }
 
     #[test]
@@ -1019,8 +430,8 @@ mod tests {
         let dst = Int64Array::from(Vec::<i64>::new());
         let (topo, ids) = build_topology(&src, &dst).unwrap();
         let columns = vec![
-            algo_col("tri", GraphAlgo::TriangleCount, OutputDtype::F64),
-            algo_col("cc", GraphAlgo::ClusteringCoefficient, OutputDtype::F64),
+            algo_col("tri", Call::TriangleCount, OutputDtype::F64),
+            algo_col("cc", Call::ClusteringCoefficient, OutputDtype::F64),
         ];
         let batch = query_batch(&topo, &ids, &columns, None).unwrap();
         assert_eq!(batch.num_rows(), 0);
