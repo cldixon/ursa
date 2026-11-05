@@ -19,12 +19,19 @@
 //! an empty relation); a single id, `0`, is a one-row `VALUES`; a subquery,
 //! `(SELECT id FROM karate.nodes WHERE club = 'Officer')`, is planned as a
 //! derived table, so it is optimized with the rest of the query and reads its
-//! files only when the query runs. The values are cast to the graph's id type
-//! when the node runs.
+//! files only when the query runs.
+//!
+//! The values must be of the graph's id type or cast to it. A list's values
+//! and a single id are cast here, one value at a time (so `[0, 'a']` is not
+//! coerced to one type first), and a subquery's column type is checked here;
+//! a subquery's values are cast when the node runs. Either way a value that
+//! does not cast is named in the message: `hop(seeds =>) must be node ids of
+//! graph 'karate', which are integers; got 'a'`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use datafusion::arrow::compute::can_cast_types;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::default_table_source::provider_as_source;
 use datafusion::catalog::CatalogProviderList;
@@ -33,10 +40,12 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
+use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::TableSource;
 use datafusion::logical_expr::{
     EmptyRelation, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
 };
+use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::sql::sqlparser::ast::{
     self, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArguments, TableFactor,
     TableFunctionArgs, UnaryOperator, Value,
@@ -48,8 +57,8 @@ use super::functions::{
     self, did_you_mean, is_per_node, nested_signature, plan, signature, Literal, ALGORITHMS,
 };
 use super::node::{
-    weight_column, GraphAlgorithmNode, GraphTraversalNode, Output, WEIGHTED_DESTINATION,
-    WEIGHTED_SOURCE,
+    endpoint_id_type, weight_column, GraphAlgorithmNode, GraphTraversalNode, Output,
+    WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
 };
 use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
 use super::{GraphDef, GraphRegistry};
@@ -239,7 +248,7 @@ fn traversal_node(
     let mut weights = WeightSet::new(edges.schema().as_ref().clone());
     let mut literals = Vec::new();
     let node_params: Vec<&TraversalParam> = spec.node_params().collect();
-    let mut nodes: Vec<Option<(LogicalPlan, String)>> = vec![None; node_params.len()];
+    let mut nodes: Vec<Option<ast::Expr>> = vec![None; node_params.len()];
     let mut seen = HashSet::new();
     for arg in args {
         let FunctionArg::Named {
@@ -270,8 +279,7 @@ fn traversal_node(
                 .iter()
                 .position(|p| p.name == param.name)
                 .expect("a node parameter");
-            let written = expr.to_string();
-            nodes[i] = Some((node_input(spec, param, expr, context)?, written));
+            nodes[i] = Some(expr);
         } else if param.is_weight() {
             weights.add(f, expr, context)?;
         } else {
@@ -284,15 +292,27 @@ fn traversal_node(
             literals.push((name, value));
         }
     }
+    let nodes = node_params
+        .iter()
+        .zip(nodes)
+        .map(|(p, n)| n.ok_or_else(|| traversal::missing_param(spec, p)))
+        .collect::<Result<Vec<_>>>()?;
+    let edges = edge_inputs(graph, edges, weights)?;
+    // The node ids are checked against the graph's id type as they are
+    // planned, so the id type comes first.
+    let id_type = endpoint_id_type(&graph.name, &edges.input, &edges.source, &edges.destination)?;
+    let ids = NodeIds {
+        spec,
+        graph: &graph.name,
+        id_type: &id_type,
+    };
     let mut inputs = Vec::with_capacity(nodes.len());
     let mut written = Vec::with_capacity(nodes.len());
-    for (p, n) in node_params.iter().zip(nodes) {
-        let (plan, text) = n.ok_or_else(|| traversal::missing_param(spec, p))?;
-        inputs.push(Arc::new(plan));
-        written.push(text);
+    for (p, expr) in node_params.iter().zip(nodes) {
+        written.push(expr.to_string());
+        inputs.push(Arc::new(ids.input(p, expr, context)?));
     }
     let traversal = traversal::resolve(spec, &literals)?;
-    let edges = edge_inputs(graph, edges, weights)?;
     GraphTraversalNode::try_new(
         graph.name.clone(),
         traversal,
@@ -306,97 +326,152 @@ fn traversal_node(
     )
 }
 
-/// The plan of a traversal's node-id argument `expr` to `param`: one column
-/// (see the module docs).
-fn node_input(
-    spec: &TraversalSpec,
-    param: &TraversalParam,
-    expr: ast::Expr,
-    context: &mut dyn RelationPlannerContext,
-) -> Result<LogicalPlan> {
-    let (f, p) = (spec.name, param.name);
-    match expr {
-        ast::Expr::Subquery(query) => {
-            let subquery = context
-                .plan(TableFactor::Derived {
-                    lateral: false,
-                    subquery: query,
-                    alias: None,
-                    sample: None,
-                })
-                .map_err(|e| {
+/// Plans a traversal's node-id arguments, for the graph `graph` whose node
+/// ids have type `id_type`.
+struct NodeIds<'a> {
+    spec: &'static TraversalSpec,
+    graph: &'a str,
+    id_type: &'a DataType,
+}
+
+impl NodeIds<'_> {
+    /// The plan of the node-id argument `expr` to `param`: one column (see
+    /// the module docs).
+    fn input(
+        &self,
+        param: &TraversalParam,
+        expr: ast::Expr,
+        context: &mut dyn RelationPlannerContext,
+    ) -> Result<LogicalPlan> {
+        let (f, p) = (self.spec.name, param.name);
+        match expr {
+            ast::Expr::Subquery(query) => {
+                let subquery = context
+                    .plan(TableFactor::Derived {
+                        lateral: false,
+                        subquery: query,
+                        alias: None,
+                        sample: None,
+                    })
+                    .map_err(|e| {
+                        plan(format!(
+                            "{f}({p} =>): {}",
+                            crate::user_message(&e).replace('\n', " ")
+                        ))
+                    })?;
+                let columns = subquery.schema().fields().len();
+                if columns != 1 {
+                    return Err(plan(format!(
+                        "{f}({p} =>) must be a query of one column of node ids; it returns \
+                         {columns} columns"
+                    )));
+                }
+                // Its values are cast when the node runs; its type must allow
+                // that.
+                let ty = subquery.schema().field(0).data_type();
+                if !castable(ty, self.id_type) {
+                    return Err(self.not_ids(param, &format!("a query of type {ty}")));
+                }
+                Ok(subquery)
+            }
+            ast::Expr::Array(array) => {
+                if param.ty == TraversalParamType::Node {
+                    return Err(plan(format!(
+                        "{f}({p} =>) takes one node id, not a list; got {array}"
+                    )));
+                }
+                self.values(param, array.elem, context)
+            }
+            one => self.values(param, vec![one], context),
+        }
+    }
+
+    /// A `VALUES` plan of the node ids `elems`, one row each, each value
+    /// cast to the graph's id type here, one at a time, so a list of several
+    /// types (`[0, 'a']`) is checked value by value rather than coerced to
+    /// one type; an empty relation for none.
+    fn values(
+        &self,
+        param: &TraversalParam,
+        elems: Vec<ast::Expr>,
+        context: &mut dyn RelationPlannerContext,
+    ) -> Result<LogicalPlan> {
+        let (f, p) = (self.spec.name, param.name);
+        if elems.is_empty() {
+            let schema = Schema::new(vec![Field::new("id", DataType::Null, true)]);
+            return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(DFSchema::try_from(schema)?),
+            }));
+        }
+        let empty = Arc::new(DFSchema::empty());
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_schema(Arc::clone(&empty))
+                .build(),
+        );
+        let rows = elems
+            .into_iter()
+            .map(|e| {
+                let written = e.to_string();
+                let hint = match &e {
+                    ast::Expr::Identifier(i) => {
+                        format!(
+                            " (a string id is quoted: '{}')",
+                            i.value.replace('\'', "''")
+                        )
+                    }
+                    _ => String::new(),
+                };
+                let not_an_id = |err: DataFusionError| {
                     plan(format!(
-                        "{f}({p} =>): {}",
-                        crate::user_message(&e).replace('\n', " ")
+                        "{f}({p} =>): {written} is not a node id{hint}: {}",
+                        crate::user_message(&err).replace('\n', " ")
                     ))
-                })?;
-            let columns = subquery.schema().fields().len();
-            if columns != 1 {
-                return Err(plan(format!(
-                    "{f}({p} =>) must be a query of one column of node ids; it returns \
-                     {columns} columns"
-                )));
-            }
-            Ok(subquery)
-        }
-        ast::Expr::Array(array) => {
-            if param.ty == TraversalParamType::Node {
-                return Err(plan(format!(
-                    "{f}({p} =>) takes one node id, not a list; got {array}"
-                )));
-            }
-            id_values(f, p, array.elem, context)
-        }
-        one => id_values(f, p, vec![one], context),
+                };
+                // Constants are folded, so `-1` and `CAST(...)` are values.
+                let expr = context
+                    .sql_to_expr(e, &empty)
+                    .and_then(|expr| simplifier.simplify(expr))
+                    .map_err(not_an_id)?;
+                let ty = expr.get_type(&empty).map_err(not_an_id)?;
+                if !castable(&ty, self.id_type) {
+                    return Err(self.not_ids(param, &format!("{written}, of type {ty}")));
+                }
+                let expr = match expr {
+                    Expr::Literal(value, metadata) => {
+                        let value = value
+                            .cast_to(self.id_type)
+                            .map_err(|_| self.not_ids(param, &written))?;
+                        Expr::Literal(value, metadata)
+                    }
+                    // Not a constant (random() and the like): cast when the
+                    // node runs.
+                    other => other.cast_to(self.id_type, &empty)?,
+                };
+                Ok(vec![expr])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        LogicalPlanBuilder::values(rows).and_then(LogicalPlanBuilder::build)
+    }
+
+    /// The node ids given to `param` are not of the graph's id type: `got`
+    /// says what they are.
+    fn not_ids(&self, param: &TraversalParam, got: &str) -> DataFusionError {
+        plan(traversal::not_node_ids(
+            self.spec.name,
+            param,
+            self.graph,
+            self.id_type,
+            got,
+        ))
     }
 }
 
-/// A `VALUES` plan of the node ids `elems`, one row each; an empty relation
-/// for none.
-fn id_values(
-    f: &str,
-    p: &str,
-    elems: Vec<ast::Expr>,
-    context: &mut dyn RelationPlannerContext,
-) -> Result<LogicalPlan> {
-    if elems.is_empty() {
-        let schema = Schema::new(vec![Field::new("id", DataType::Null, true)]);
-        return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
-            produce_one_row: false,
-            schema: Arc::new(DFSchema::try_from(schema)?),
-        }));
-    }
-    let empty = DFSchema::empty();
-    let rows = elems
-        .into_iter()
-        .map(|e| {
-            let written = e.to_string();
-            let hint = match &e {
-                ast::Expr::Identifier(i) => {
-                    format!(
-                        " (a string id is quoted: '{}')",
-                        i.value.replace('\'', "''")
-                    )
-                }
-                _ => String::new(),
-            };
-            let expr = context.sql_to_expr(e, &empty).map_err(|err| {
-                plan(format!(
-                    "{f}({p} =>): {written} is not a node id{hint}: {}",
-                    crate::user_message(&err).replace('\n', " ")
-                ))
-            })?;
-            Ok(vec![expr])
-        })
-        .collect::<Result<Vec<_>>>()?;
-    LogicalPlanBuilder::values(rows)
-        .and_then(LogicalPlanBuilder::build)
-        .map_err(|e| {
-            plan(format!(
-                "{f}({p} =>): the node ids must have one type: {}",
-                crate::user_message(&e).replace('\n', " ")
-            ))
-        })
+/// Whether values of type `from` can be node ids of type `id_type`: NULL, or
+/// a type Arrow casts to it.
+fn castable(from: &DataType, id_type: &DataType) -> bool {
+    from == &DataType::Null || can_cast_types(from, id_type)
 }
 
 /// "there is no graph function 'pagerenk'; did you mean 'pagerank'?", with

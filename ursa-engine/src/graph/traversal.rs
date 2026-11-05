@@ -18,7 +18,8 @@
 //! non-negative integer or NULL, a direction one of the listed names). The
 //! node-id parameters are planned by the relation planner as child plans of
 //! the traversal node (see `relation`), and their values are cast to the
-//! graph's id type when the node runs.
+//! graph's id type: literals as they are planned, a subquery's values when
+//! the node runs ([`not_node_ids`] words the error for both).
 //!
 //! The kernels are `ursa_core::algo`'s, called exactly as `ursa-plan` calls
 //! them, so the rows are the Python library's, in the same order.
@@ -409,6 +410,37 @@ pub fn missing_param(spec: &TraversalSpec, param: &TraversalParam) -> DataFusion
         param.name,
         spec.signature()
     ))
+}
+
+/// "hop(seeds =>) must be node ids of graph 'karate', which are integers; got
+/// 'a'": a node-id argument that is not of the graph's id type and does not
+/// cast to it. `got` is the offending value as SQL writes it, or its type.
+pub fn not_node_ids(
+    function: &str,
+    param: &TraversalParam,
+    graph: &str,
+    id_type: &DataType,
+    got: &str,
+) -> String {
+    let (integer, string) = match param.ty {
+        TraversalParamType::Node => (
+            "a node id of graph '{graph}', which is an integer",
+            "a node id of graph '{graph}', which is a string",
+        ),
+        _ => (
+            "node ids of graph '{graph}', which are integers",
+            "node ids of graph '{graph}', which are strings",
+        ),
+    };
+    let expected = match id_type {
+        DataType::Int64 => integer,
+        _ => string,
+    }
+    .replace("{graph}", graph);
+    format!(
+        "{function}({} =>) must be {expected}; got {got}",
+        param.name
+    )
 }
 
 /// Check one literal against a parameter, by the catalog's rules.
