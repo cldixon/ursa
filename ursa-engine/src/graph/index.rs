@@ -27,7 +27,9 @@
 //! ([`IndexCache::get_or_build_stored`]), and an index built in a writable
 //! session is stored there (`crate::database::index_store`). Loads from disk
 //! are counted apart from builds ([`index_loads`], [`index_builds`]).
-//! Evaluated weights live only in memory.
+//! Evaluated weights are kept on the index in memory, and stored with it in
+//! the database (`crate::database::index_store`), so a weighted query over a
+//! stored index in a later process reads no edge rows.
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
@@ -58,6 +60,24 @@ pub struct GraphIndex {
     pub ids: Arc<IdMap>,
     /// Weights evaluated over the edge rows this index was built from.
     weights: WeightCache,
+    /// Weights stored with the index on disk, read on first use.
+    stored: Option<StoredWeights>,
+}
+
+/// Reads the weight columns stored under a key, one `f64` per edge row each
+/// (blocking: it reads a file). `None` if they cannot be read.
+pub type WeightReader = Box<dyn Fn(&str) -> Option<Vec<Vec<f64>>> + Send + Sync>;
+
+/// The weights stored with an index on disk: their keys, and how to read them.
+struct StoredWeights {
+    keys: Vec<String>,
+    read: WeightReader,
+}
+
+impl fmt::Debug for StoredWeights {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StoredWeights({} sets)", self.keys.len())
+    }
 }
 
 impl GraphIndex {
@@ -66,12 +86,54 @@ impl GraphIndex {
             topology,
             ids,
             weights: WeightCache::default(),
+            stored: None,
         }
     }
 
-    /// The weight columns stored under `key`, if they are.
+    /// This index, with the weight sets stored on disk under `keys`, which
+    /// `read` reads when one is first asked for.
+    pub fn with_stored_weights(mut self, keys: Vec<String>, read: WeightReader) -> Self {
+        if !keys.is_empty() {
+            self.stored = Some(StoredWeights { keys, read });
+        }
+        self
+    }
+
+    /// The weight columns stored under `key` in memory, if they are.
     pub fn weights(&self, key: &str) -> Option<Weights> {
         self.weights.get(key)
+    }
+
+    /// Whether weights are stored under `key` on disk.
+    pub fn has_stored_weights(&self, key: &str) -> bool {
+        self.stored
+            .as_ref()
+            .is_some_and(|s| s.keys.iter().any(|k| k == key))
+    }
+
+    /// The weight columns stored under `key`, in memory or else on disk, if
+    /// they are and have `n_columns` columns of one value per edge row. Read
+    /// from disk, they are kept in memory too. Blocking: it may read a file.
+    pub fn stored_weights(&self, key: &str, n_columns: usize) -> Option<Weights> {
+        if let Some(weights) = self.weights(key) {
+            return Some(weights);
+        }
+        if !self.has_stored_weights(key) {
+            return None;
+        }
+        let columns = (self.stored.as_ref()?.read)(key)?;
+        let n_edges = self.topology.n_edges();
+        if columns.len() != n_columns || columns.iter().any(|c| c.len() != n_edges) {
+            return None;
+        }
+        let weights: Weights = Arc::new(columns.into_iter().map(Arc::new).collect());
+        self.store_weights(key.to_string(), Arc::clone(&weights));
+        Some(weights)
+    }
+
+    /// Every set of weight columns held in memory, with its key.
+    pub fn weight_sets(&self) -> Vec<(String, Weights)> {
+        self.weights.all()
     }
 
     /// Store weight columns under `key`. They must be one per edge row of this
@@ -113,6 +175,14 @@ impl WeightCache {
         let weights = Arc::clone(&entry.1);
         entries.push(entry);
         Some(weights)
+    }
+
+    fn all(&self) -> Vec<(String, Weights)> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .map(|(k, w)| (k.clone(), Arc::clone(w)))
+            .collect()
     }
 
     fn put(&self, key: String, weights: Weights) {
