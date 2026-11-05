@@ -112,7 +112,48 @@ jobs:
       # stores and the multi-thread runtime are native-only dependencies; this fails
       # the moment one leaks onto the wasm32 build.
       - name: check the SQL engine on wasm32
-        run: cargo clippy -p ursa-sql --target wasm32-unknown-unknown --locked -- -D warnings
+        run: cargo clippy -p ursa-sql -p ursa-wasm --target wasm32-unknown-unknown --locked -- -D warnings
+
+  wasm:
+    # The SQL engine in the browser (#277): build ursa-wasm for wasm32, then run
+    # the Getting Started SQL in headless Chromium and in the native binary and
+    # require byte-identical output (ursa-wasm/tests/browser/parity.ts).
+    name: Browser (wasm32 parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Must match the wasm-bindgen crate version in Cargo.lock.
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.126
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Playwright and Chromium
+        run: |
+          bun add --no-save playwright
+          bunx playwright install --with-deps chromium
+
+      - name: Build the native binary
+        run: cargo build -p ursa-cli --locked
+
+      - name: Build ursa-wasm
+        run: |
+          cargo build -p ursa-wasm --target wasm32-unknown-unknown --profile wasm-test --locked
+          wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/wasm-test/ursa_wasm.wasm
+
+      - name: Parity with the native engine
+        run: bun ursa-wasm/tests/browser/parity.ts pkg target/debug/ursa
 
   pytest:
     name: Python (pytest, ${{ matrix.os }} py${{ matrix.python }})

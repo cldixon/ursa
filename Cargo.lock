@@ -591,8 +591,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -724,6 +726,16 @@ name = "compression-core"
 version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "const-oid"
@@ -3915,6 +3927,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "ursa-engine",
+]
+
+[[package]]
+name = "ursa-wasm"
+version = "0.6.0"
+dependencies = [
+ "arrow",
+ "chrono",
+ "console_error_panic_hook",
+ "datafusion",
+ "futures",
+ "js-sys",
+ "url",
+ "ursa-engine",
+ "ursa-sql",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
