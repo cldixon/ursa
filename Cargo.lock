@@ -3838,6 +3838,7 @@ name = "ursa-engine"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "crc32fast",
  "datafusion",
  "futures",
  "glob",

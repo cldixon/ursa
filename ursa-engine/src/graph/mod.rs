@@ -72,7 +72,7 @@ pub use catalog_table::UrsaFunctions;
 pub use exec::{
     GraphAlgorithmExec, GraphPlanner, GraphTraversalExec, KeepEdgeOrder, UrsaQueryPlanner,
 };
-pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache, Weights};
+pub use index::{index_builds, index_loads, FileIdentity, GraphIndex, IndexCache, Weights};
 pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
 pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
 

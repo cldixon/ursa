@@ -196,6 +196,32 @@ async fn run(
         }
         None => ursa_engine::new_session(),
     };
+    let result = run_session(ctx.clone(), sources, args, interactive, format_given).await;
+    // Finish storing the indexes this process built before it exits.
+    ursa_engine::database::flush(&ctx.state());
+    if std::env::var_os(INDEX_STATS_VAR).is_some() {
+        eprintln!(
+            "ursa: graph indexes built {}, loaded {}",
+            ursa_engine::graph::index_builds(&ctx),
+            ursa_engine::graph::index_loads(&ctx)
+        );
+    }
+    result
+}
+
+/// Set to print, on exit, how many graph indexes the process built and how
+/// many it loaded from the database (for tests and for checking that a
+/// database's stored indexes are used).
+const INDEX_STATS_VAR: &str = "URSA_INDEX_STATS";
+
+/// Run the init file, then the shell or the SQL given, on `ctx`.
+async fn run_session(
+    ctx: SessionContext,
+    sources: Vec<Source>,
+    args: &Args,
+    interactive: bool,
+    format_given: bool,
+) -> Result<(), DataFusionError> {
     let home = startup::home_dir();
     let init = startup::init_file(
         args.init.as_deref(),

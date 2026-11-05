@@ -683,6 +683,8 @@ pub enum IdError {
     /// The distinct string ids total more than `i32::MAX` bytes, beyond the `Utf8`
     /// id column's offset range.
     IdBytesOverflow,
+    /// An id appears twice in a list of distinct ids ([`IdMap::from_user_ids`]).
+    DuplicateId,
 }
 
 impl std::fmt::Display for IdError {
@@ -706,6 +708,9 @@ impl std::fmt::Display for IdError {
                 f,
                 "more than u32::MAX (~4.29B) distinct nodes; exceeds the dense-index cap"
             ),
+            IdError::DuplicateId => {
+                write!(f, "a node id appears twice in a list of distinct ids")
+            }
             IdError::IdBytesOverflow => write!(
                 f,
                 "the distinct string node ids total more than 2 GiB, beyond the Utf8 id column"
@@ -859,6 +864,43 @@ impl IdMap {
             interner.push(*src, *dst)?;
         }
         Ok(interner.finish())
+    }
+
+    /// Rebuild a map from its id column: `ids[i]` is the user id of dense node
+    /// `i`, as [`Self::user_id_array`] returned it. This is how a stored index
+    /// (the SQL engine's `.ursa` database) is read back. `ids` must be `Int64`
+    /// or a string type, with no nulls ([`IdError::Null`]) and no id twice
+    /// ([`IdError::DuplicateId`]).
+    pub fn from_user_ids(ids: &dyn Array) -> Result<Self, IdError> {
+        if ids.null_count() > 0 {
+            return Err(IdError::Null);
+        }
+        let mut map = match id_kind(ids.data_type())? {
+            IdKind::Int64 => {
+                let mut map = IdMap::new_int64();
+                if let IdMap::Int64 { to_dense, .. } = &mut map {
+                    to_dense.budget_rows(ids.len());
+                }
+                for (i, &id) in as_int64(ids).values().iter().enumerate() {
+                    if map.intern_i64(id)? as usize != i {
+                        return Err(IdError::DuplicateId);
+                    }
+                }
+                map
+            }
+            IdKind::Utf8 => {
+                let mut map = IdMap::new_utf8();
+                let view = StrView::new(ids);
+                for i in 0..view.len() {
+                    if map.intern_str(view.value(i))? as usize != i {
+                        return Err(IdError::DuplicateId);
+                    }
+                }
+                map
+            }
+        };
+        map.freeze();
+        Ok(map)
     }
 
     #[inline]
@@ -1597,5 +1639,39 @@ mod tests {
         let m = IdMap::from_ids([1, 2, 3]);
         let wrong = StringArray::from(vec!["1"]);
         assert_eq!(m.dense_from_array(&wrong), Err(IdError::MixedTypes));
+    }
+
+    #[test]
+    fn from_user_ids_rebuilds_the_map() {
+        let src = StringArray::from(vec!["b", "a", "b"]);
+        let dst = StringArray::from(vec!["a", "c", "c"]);
+        let (m, _, _) = IdMap::from_edge_arrays(&src, &dst).unwrap();
+        let back = IdMap::from_user_ids(m.user_id_array().as_ref()).unwrap();
+        assert_eq!(back.user_type(), DataType::Utf8);
+        assert_eq!(back.user_id_array().as_ref(), m.user_id_array().as_ref());
+        let probe = StringArray::from(vec!["c", "a", "z"]);
+        assert_eq!(
+            back.dense_from_array(&probe).unwrap(),
+            vec![Some(2), Some(1), None]
+        );
+
+        let ints = Int64Array::from(vec![7, -3, 1 << 40]);
+        let back = IdMap::from_user_ids(&ints).unwrap();
+        assert_eq!(back.len(), 3);
+        let probe = Int64Array::from(vec![1 << 40, 7]);
+        assert_eq!(
+            back.dense_from_array(&probe).unwrap(),
+            vec![Some(2), Some(0)]
+        );
+
+        let twice = Int64Array::from(vec![1, 2, 1]);
+        assert_eq!(
+            IdMap::from_user_ids(&twice).unwrap_err(),
+            IdError::DuplicateId
+        );
+        let null = Int64Array::from(vec![Some(1), None]);
+        assert_eq!(IdMap::from_user_ids(&null).unwrap_err(), IdError::Null);
+        let empty = Int64Array::from(Vec::<i64>::new());
+        assert!(IdMap::from_user_ids(&empty).unwrap().is_empty());
     }
 }

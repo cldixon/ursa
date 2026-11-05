@@ -21,6 +21,13 @@
 //! Concurrent requests for one key wait on one build, so several algorithms
 //! over one graph in one query share one index even when DataFusion runs
 //! their nodes at the same time.
+//!
+//! In a session with a `.ursa` database, a miss here looks in the database's
+//! stored indexes under the same full key before building
+//! ([`IndexCache::get_or_build_stored`]), and an index built in a writable
+//! session is stored there (`crate::database::index_store`). Loads from disk
+//! are counted apart from builds ([`index_loads`], [`index_builds`]).
+//! Evaluated weights live only in memory.
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
@@ -40,6 +47,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::future::BoxFuture;
 use object_store::ObjectStoreExt;
 use ursa_core::{IdMap, Topology};
+
+use crate::database::{database_of_config, IndexKey, IndexStore};
 
 /// A built graph: its topology, and the map from dense node indexes back to
 /// the edges' ids.
@@ -211,6 +220,7 @@ pub struct IndexCache {
     /// Bumped on every use, to find the least recently used slot.
     clock: AtomicU64,
     builds: AtomicU64,
+    loads: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -224,6 +234,12 @@ impl IndexCache {
     /// How many indexes this cache has built.
     pub fn builds(&self) -> u64 {
         self.builds.load(Ordering::Relaxed)
+    }
+
+    /// How many indexes this cache has loaded from the database's stored
+    /// indexes instead of building them.
+    pub fn loads(&self) -> u64 {
+        self.loads.load(Ordering::Relaxed)
     }
 
     /// Count a build made outside the cache (an index that cannot be shared).
@@ -241,9 +257,39 @@ impl IndexCache {
     }
 
     /// The index for `key` (a fingerprint and file identities), built by
-    /// `build` if it is not cached. With no fingerprint, always built.
+    /// `build` if it is not cached. With no fingerprint, always built. The
+    /// database's stored indexes are not consulted: see
+    /// [`Self::get_or_build_stored`].
     pub async fn get_or_build(
         &self,
+        key: Option<(String, Vec<FileIdentity>)>,
+        build: BoxFuture<'_, Result<GraphIndex>>,
+    ) -> Result<Arc<GraphIndex>> {
+        self.get_or_build_in(None, key, build).await
+    }
+
+    /// As [`Self::get_or_build`], and on a miss, the index stored under the
+    /// same full key in the database of the session `config` belongs to, if
+    /// it has one. An index built in a writable database is stored there, in
+    /// the background, within the session's `ursa.index_storage_limit`.
+    pub async fn get_or_build_stored(
+        &self,
+        config: &SessionConfig,
+        key: Option<(String, Vec<FileIdentity>)>,
+        build: BoxFuture<'_, Result<GraphIndex>>,
+    ) -> Result<Arc<GraphIndex>> {
+        let stored = database_of_config(config).map(|db| {
+            (
+                db.index_store(),
+                crate::options::index_storage_limit(config),
+            )
+        });
+        self.get_or_build_in(stored, key, build).await
+    }
+
+    async fn get_or_build_in(
+        &self,
+        stored: Option<(Arc<IndexStore>, u64)>,
         key: Option<(String, Vec<FileIdentity>)>,
         build: BoxFuture<'_, Result<GraphIndex>>,
     ) -> Result<Arc<GraphIndex>> {
@@ -251,6 +297,13 @@ impl IndexCache {
             self.builds.fetch_add(1, Ordering::Relaxed);
             return build.await.map(Arc::new);
         };
+        let stored = stored.map(|(store, limit)| {
+            (
+                store,
+                limit,
+                IndexKey::new(fingerprint.clone(), files.clone()),
+            )
+        });
         let cell = {
             let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             let used = self.clock.fetch_add(1, Ordering::Relaxed);
@@ -283,10 +336,26 @@ impl IndexCache {
             }
         };
         // A failed build leaves the cell empty, so the next query tries again.
-        let builds = &self.builds;
+        let (builds, loads) = (&self.builds, &self.loads);
         cell.get_or_try_init(|| async move {
+            if let Some((store, _, key)) = &stored {
+                let (store, key) = (Arc::clone(store), key.clone());
+                // Reading a file and checking it is blocking work.
+                let loaded = tokio::task::spawn_blocking(move || store.load(&key))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(index) = loaded {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    return Ok(index);
+                }
+            }
             builds.fetch_add(1, Ordering::Relaxed);
-            build.await.map(Arc::new)
+            let index = Arc::new(build.await?);
+            if let Some((store, limit, key)) = stored {
+                store.save(key, Arc::clone(&index), limit);
+            }
+            Ok(index)
         })
         .await
         .cloned()
@@ -304,5 +373,15 @@ pub fn index_builds(ctx: &SessionContext) -> u64 {
         .config()
         .get_extension::<IndexCache>()
         .map(|c| c.builds())
+        .unwrap_or(0)
+}
+
+/// How many graph indexes `ctx` has loaded from its database's stored
+/// indexes instead of building them: for tests of stored indexes.
+pub fn index_loads(ctx: &SessionContext) -> u64 {
+    ctx.state()
+        .config()
+        .get_extension::<IndexCache>()
+        .map(|c| c.loads())
         .unwrap_or(0)
 }
