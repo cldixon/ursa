@@ -52,14 +52,16 @@ def _seeds(seeds: Any) -> Any:
         raise NotImplementedError(
             "seed ids must be an iterable of node ids or a NodeFrame."
         ) from exc
-    # Infer the id type from the values: all strings -> string, otherwise int64.
-    # (bool is an int subclass, so exclude it from the integer path.)
-    if vals and all(isinstance(v, str) for v in vals):
-        return pa.array(vals, type=pa.string())
-    try:
-        return pa.array([int(v) for v in vals], type=pa.int64())
-    except (TypeError, ValueError) as exc:
-        raise NotImplementedError("seed ids must be all integers or all strings.") from exc
+    # The traversal verbs checked each id is an int or a str (#271). All ints ->
+    # int64; any str -> string, the ints as their digits. The plan fits the array
+    # to the graph's id type: a string of digits is an integer id, an integer is
+    # its string, and anything else is an error naming the id.
+    for v in vals:
+        if isinstance(v, bool) or not isinstance(v, (int, str)):
+            raise TypeError(f"seed ids must be integers or strings; got {v!r}")
+    if any(isinstance(v, str) for v in vals):
+        return pa.array([v if isinstance(v, str) else str(v) for v in vals], type=pa.string())
+    return pa.array(vals, type=pa.int64())
 
 
 def _sample(draw: tuple[int, Any], rows: int) -> list[int] | None:
