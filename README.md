@@ -73,7 +73,19 @@ Nothing after that line changes. See the [quickstart](https://cldixon.github.io/
 - **Your data, where it is.** Parquet and CSV, local or on S3, GCS, and Azure. Polars, pandas, pyarrow, NetworkX, NumPy, and SciPy in memory. Arrow in, Arrow out, with no copies.
 - **Results you can check.** Every kernel is deterministic on any thread count. Each one is [pinned to the NetworkX call it matches](https://cldixon.github.io/ursa/semantics/), and the test suite checks it.
 
-Ursa is version 0.4 and in active development. The [Limits](https://cldixon.github.io/ursa/limits/) page lists what does not run yet.
+Ursa is version 0.5 and in active development. The [Limits](https://cldixon.github.io/ursa/limits/) page lists what does not run yet.
+
+## Ursa SQL
+
+The same engine also runs as a SQL engine, through a command-line tool called `ursa`. It works like DuckDB: you point it at Parquet or CSV files, define a graph with `CREATE PROPERTY GRAPH`, and run algorithms as table functions.
+
+```sql
+CREATE VIEW ties AS SELECT * FROM 'karate_edges.csv';
+CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+SELECT * FROM pagerank(club, direction => 'both') ORDER BY pagerank DESC LIMIT 3;
+```
+
+Algorithms give the same values in SQL and in Python. Ursa SQL is not released yet; it will ship as `ursa-cli` 0.6. Until then, build it with `cargo install --git https://github.com/cldixon/ursa ursa-cli`. See the [SQL docs](https://cldixon.github.io/ursa/sql/).
 
 ## How it is built
 
@@ -84,6 +96,9 @@ Ursa is version 0.4 and in active development. The [Limits](https://cldixon.gith
 | `ursa-io` | Rust | Reading sources: Parquet and CSV scans (local or object storage) through DataFusion, with the CSV options and type inference. No plan types, so every engine reads a file the same way. |
 | `ursa-core` | Rust | The CSR topology index and the kernels. Parallel with `rayon`; compiles for `wasm32` without it. |
 | `ursa-py` | Rust | PyO3 bindings. Arrow crosses as zero-copy capsules; the GIL is released during compute. |
+| `ursa-engine` | Rust | The SQL engine: a DataFusion session with graph plan nodes, the graph catalog, the index cache and the `.ursa` database file. |
+| `ursa-sql` | Rust | Ursa's SQL statements (`CREATE PROPERTY GRAPH`, `SHOW GRAPHS`, `ATTACH`, …) on top of DataFusion's parser. |
+| `ursa-cli` | Rust | The `ursa` command-line tool and its interactive shell. |
 
 The design document is [`design/SPEC.md`](design/SPEC.md).
 

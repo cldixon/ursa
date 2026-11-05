@@ -4,6 +4,16 @@ Ursa is a SQL engine for graph analytics. It reads Parquet and CSV files where t
 
 ## Install
 
+!!! warning "Not released yet"
+
+    `ursa-cli` is not on crates.io yet, and there are no release downloads yet. Until the first release, build it from the repository:
+
+    ```bash
+    cargo install --git https://github.com/cldixon/ursa ursa-cli
+    ```
+
+    The instructions below are for after the release.
+
 Install with Cargo. You need Rust 1.94 or later:
 
 ```bash

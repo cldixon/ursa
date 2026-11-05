@@ -1,8 +1,14 @@
 # Ursa SQL
 
-!!! info "New in 0.6"
+!!! warning "Not released yet"
 
-    The SQL engine and the `ursa` command-line tool are new. This is their first release. The SQL surface may still change between minor versions; the [changelog](../changelog.md) records every change.
+    The SQL engine and the `ursa` command-line tool will first be released as `ursa-cli` 0.6. Until then, `cargo install ursa-cli` and the release downloads described in [Getting Started](getting-started.md#install) do not work yet. To try it now, build it from this repository:
+
+    ```bash
+    cargo install --git https://github.com/cldixon/ursa ursa-cli
+    ```
+
+    This is the SQL engine's first release, and its SQL surface may still change between minor versions. The [changelog](../changelog.md) records every change.
 
 Ursa SQL is a SQL engine for graph analytics, used through a command-line tool called `ursa`. It works like DuckDB. You point it at Parquet or CSV files, on your disk or in object storage, and query them with SQL. Graph algorithms are part of that SQL. Nothing needs converting or loading first.
 
