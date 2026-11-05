@@ -19,7 +19,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   changes: the Python API, results and error messages are the same (#233).
 - Upgraded DataFusion 54 → 55.2, arrow, `arrow-pyarrow` and parquet 58 → 59.3
   and pyo3 0.28 → 0.29 (object_store stays on 0.13, the line DataFusion 55
-  uses). Results, row order and error messages are unchanged.
+  uses). Results, row order and error messages are unchanged. Building from
+  source now needs Rust 1.94 or later (DataFusion 55's minimum; was 1.88).
 
 ### Security
 

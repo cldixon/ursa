@@ -12,7 +12,8 @@ members = ["ursa-core", "ursa-io", "ursa-plan", "ursa-py"]
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.88"
+# DataFusion 55 needs Rust 1.94.
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cldixon/ursa"
 authors = ["Ursa contributors"]

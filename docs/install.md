@@ -59,7 +59,7 @@ If `ur.__core_version__` is `None`, the compiled core did not load. Make sure yo
 
 ## Install from source
 
-A source install compiles the Rust core. You need a Rust toolchain (1.88 or later) and `maturin`.
+A source install compiles the Rust core. You need a Rust toolchain (1.94 or later) and `maturin`.
 
 ```bash
 git clone https://github.com/cldixon/ursa
