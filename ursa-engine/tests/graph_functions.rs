@@ -309,12 +309,14 @@ async fn planning_errors() {
         (
             "SELECT * FROM shortest_paths(karate)",
             "there is no graph function 'shortest_paths'. The graph functions are: degree, \
-             pagerank, connected_components, triangle_count, louvain",
+             pagerank, connected_components, triangle_count, clustering_coefficient, \
+             betweenness, closeness, label_propagation, louvain, layout_fr, layout_random, \
+             layout_circle, density, avg_path_length, diameter, describe, algorithms",
         ),
         (
             "SELECT * FROM pagerank(karate, dampng => 0.9)",
             "pagerank() has no parameter 'dampng'; did you mean 'damping'? Its parameters are: \
-             damping, max_iter, tol, direction",
+             damping, max_iter, tol, weight, direction",
         ),
         (
             "SELECT * FROM pagerank(karate, damping => 0.9, damping => 0.8)",
@@ -334,17 +336,18 @@ async fn planning_errors() {
         ),
         (
             "SELECT * FROM pagerank(karate, damping => 1 - 0.1)",
-            "pagerank(damping =>) must be a literal (a number, a string or NULL); got 1 - 0.1",
+            "pagerank(damping =>) must be a literal (a number, a string, a boolean or NULL); got \
+             1 - 0.1",
         ),
         (
             "SELECT * FROM pagerank()",
             "pagerank() needs a graph as its first argument: pagerank(<graph>, damping => 0.85, \
-             max_iter => 30, tol => 1e-6, direction => 'out')",
+             max_iter => 30, tol => 1e-6, weight => NULL, direction => 'out')",
         ),
         (
             "SELECT * FROM pagerank(damping => 0.9)",
             "pagerank() needs a graph as its first argument: pagerank(<graph>, damping => 0.85, \
-             max_iter => 30, tol => 1e-6, direction => 'out')",
+             max_iter => 30, tol => 1e-6, weight => NULL, direction => 'out')",
         ),
         (
             "SELECT * FROM pagerank('karate')",
@@ -358,7 +361,7 @@ async fn planning_errors() {
         (
             "SELECT * FROM pagerank(karate, 0.9)",
             "pagerank() takes its parameters by name, as name => value; got 0.9. Write \
-             pagerank(<graph>, damping => 0.85, max_iter => 30, tol => 1e-6, direction => 'out')",
+             pagerank(<graph>, damping => 0.85, max_iter => 30, tol => 1e-6, weight => NULL, direction => 'out')",
         ),
         (
             "SELECT * FROM triangle_count(karate, direction => 'both')",

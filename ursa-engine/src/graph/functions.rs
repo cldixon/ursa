@@ -1,178 +1,78 @@
-//! The graph functions: their names, parameters and defaults, and the
-//! [`Algorithm`] a call resolves to.
+//! The graph functions in SQL: which of `ursa_core::catalog`'s functions a
+//! query can call, how a call's SQL arguments become a catalog [`Call`], and
+//! the wording of every message about them.
 //!
-//! Parameter names, defaults and accepted values are those of the Python API
-//! (`python/ursa/_graph.py`, `docs/reference/algorithms.md`), so a call means
-//! the same thing in both. Each function returns `(id, <function name>)`.
+//! The catalog is the single source of truth for names, parameters, defaults,
+//! accepted values and output types, shared with the Python library, so a call
+//! means the same thing in both. This module only adds SQL's choices:
 //!
-//! `weight =>` arrives with M2 (#236): it becomes one more parameter, and the
-//! weight expression one more column of the edge plan under the graph node.
+//! - **Which functions.** Every per-node function (algorithms and layouts) and
+//!   every statistic. The neighbour aggregation (`neighbors_agg`) reads a node
+//!   attribute, which has no natural place in a table function over a graph
+//!   yet, so SQL leaves it out.
+//! - **No `dtype`.** SQL has `CAST`; a call never narrows its own column.
+//! - **`weight =>`** is an expression over the edge table's columns, planned by
+//!   the relation planner as a column of the node's edge plan, not a literal
+//!   resolved here.
+//! - **Messages**, worded for SQL: `pagerank(damping =>) must be a number; got
+//!   'high'`.
 
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 
-use datafusion::arrow::datatypes::DataType;
 use datafusion::error::{DataFusionError, Result};
-use ursa_core::Direction;
+use ursa_core::catalog::{
+    self, Arg, Call, Expected, Family, FunctionSpec, ParamError, ParamErrorKind, ParamSpec,
+    ParamType, Shape, Value,
+};
 
-/// A graph function's call, resolved: which kernel and its parameters.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Algorithm {
-    Degree {
-        direction: Direction,
-    },
-    PageRank {
-        damping: f64,
-        max_iter: u32,
-        tol: f64,
-        /// `Out` or `Both`; `In` is rejected when the call is planned.
-        direction: Direction,
-    },
-    ConnectedComponents {
-        /// `mode => 'strong'`; `'weak'` (the default) is `false`.
-        strong: bool,
-    },
-    TriangleCount,
-    Louvain {
-        resolution: f64,
-        /// `None`: the kernel's fixed default seed, as Python's `seed=None`.
-        seed: Option<u64>,
-    },
+/// The multi-algorithm table function: `algorithms(g, degree(), c => louvain())`.
+pub const ALGORITHMS: &str = "algorithms";
+
+/// The function catalog as a table: `SELECT * FROM ursa_functions()`.
+pub const URSA_FUNCTIONS: &str = "ursa_functions";
+
+/// Whether SQL can call `spec` (see the module docs).
+fn in_sql(spec: &FunctionSpec) -> bool {
+    spec.family != Family::Aggregation
 }
 
-impl Algorithm {
-    /// The function's name, which is also the name of its value column.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Algorithm::Degree { .. } => "degree",
-            Algorithm::PageRank { .. } => "pagerank",
-            Algorithm::ConnectedComponents { .. } => "connected_components",
-            Algorithm::TriangleCount => "triangle_count",
-            Algorithm::Louvain { .. } => "louvain",
-        }
-    }
-
-    /// The Arrow type of the value column, as the Python API emits it.
-    pub fn output_type(&self) -> DataType {
-        match self {
-            Algorithm::PageRank { .. } => DataType::Float64,
-            _ => DataType::UInt32,
-        }
-    }
-
-    /// A canonical identity: the variant and its parameters, floats by their
-    /// bits (so `Eq`, `Hash` and `Ord` agree, as plan nodes need).
-    fn key(&self) -> (u8, [u64; 4]) {
-        let dir = |d: &Direction| match d {
-            Direction::Out => 0,
-            Direction::In => 1,
-            Direction::Both => 2,
-        };
-        match self {
-            Algorithm::Degree { direction } => (0, [dir(direction), 0, 0, 0]),
-            Algorithm::PageRank {
-                damping,
-                max_iter,
-                tol,
-                direction,
-            } => (
-                1,
-                [
-                    damping.to_bits(),
-                    u64::from(*max_iter),
-                    tol.to_bits(),
-                    dir(direction),
-                ],
-            ),
-            Algorithm::ConnectedComponents { strong } => (2, [u64::from(*strong), 0, 0, 0]),
-            Algorithm::TriangleCount => (3, [0; 4]),
-            Algorithm::Louvain { resolution, seed } => (
-                4,
-                [
-                    resolution.to_bits(),
-                    u64::from(seed.is_some()),
-                    seed.unwrap_or(0),
-                    0,
-                ],
-            ),
-        }
-    }
+/// The catalog function called `name`, if SQL can call it.
+pub fn lookup(name: &str) -> Option<&'static FunctionSpec> {
+    catalog::lookup(name).filter(|s| in_sql(s))
 }
 
-impl Eq for Algorithm {}
-
-impl Hash for Algorithm {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key().hash(state)
-    }
+/// Every catalog function SQL can call, in catalog order.
+pub fn specs() -> impl Iterator<Item = &'static FunctionSpec> {
+    catalog::FUNCTIONS.iter().filter(|s| in_sql(s))
 }
 
-impl PartialOrd for Algorithm {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+/// The names of the graph table functions: the catalog's, then `algorithms`.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    specs().map(|s| s.name).chain([ALGORITHMS])
 }
 
-impl Ord for Algorithm {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key().cmp(&other.key())
-    }
+/// Whether `spec` returns one row per node (an algorithm or a layout), as
+/// opposed to one row for the whole graph (a statistic).
+pub fn is_per_node(spec: &FunctionSpec) -> bool {
+    spec.shape == Shape::PerNode
 }
 
-/// The call as SQL would spell it, every parameter shown: for `EXPLAIN`.
-impl fmt::Display for Algorithm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = self.name();
-        match self {
-            Algorithm::Degree { direction } => {
-                write!(f, "{name}(direction => '{}')", direction_name(*direction))
-            }
-            Algorithm::PageRank {
-                damping,
-                max_iter,
-                tol,
-                direction,
-            } => write!(
-                f,
-                "{name}(damping => {damping:?}, max_iter => {max_iter}, tol => {tol:?}, \
-                 direction => '{}')",
-                direction_name(*direction)
-            ),
-            Algorithm::ConnectedComponents { strong } => write!(
-                f,
-                "{name}(mode => '{}')",
-                if *strong { "strong" } else { "weak" }
-            ),
-            Algorithm::TriangleCount => write!(f, "{name}()"),
-            Algorithm::Louvain { resolution, seed } => {
-                write!(f, "{name}(resolution => {resolution:?}, seed => ")?;
-                match seed {
-                    Some(seed) => write!(f, "{seed})"),
-                    None => write!(f, "NULL)"),
-                }
-            }
-        }
-    }
+/// The parameters a SQL call can name, in the catalog's order: all but
+/// `dtype`.
+pub fn sql_params(spec: &FunctionSpec) -> impl Iterator<Item = &'static ParamSpec> {
+    let params: &'static [ParamSpec] = spec.params;
+    params.iter().filter(|p| p.ty != ParamType::Dtype)
 }
 
-fn direction_name(d: Direction) -> &'static str {
-    match d {
-        Direction::Out => "out",
-        Direction::In => "in",
-        Direction::Both => "both",
-    }
-}
-
-/// A literal argument as written: a (possibly signed) number, a string, or
-/// `NULL`.
+/// A literal argument as written: a (possibly signed) number, a string, a
+/// boolean or `NULL`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     /// The number's text, sign included, so it parses exactly as Python
     /// parses the same text.
     Number(String),
     String(String),
+    Boolean(bool),
     Null,
 }
 
@@ -181,192 +81,150 @@ impl fmt::Display for Literal {
         match self {
             Literal::Number(n) => write!(f, "{n}"),
             Literal::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
+            Literal::Boolean(b) => write!(f, "{b}"),
             Literal::Null => write!(f, "NULL"),
         }
     }
 }
 
-/// What a parameter accepts.
-#[derive(Debug, Clone, Copy)]
-enum Kind {
-    /// Any number (Python `float`, which takes an `int` too).
-    Float,
-    /// A non-negative integer below 2^32 (Python `int`, read as `u32`).
-    Count,
-    /// A non-negative integer, or `NULL` for the default (Python `int | None`).
-    Seed,
-    /// One of these strings.
-    Choice(&'static [&'static str]),
+impl Literal {
+    /// The catalog's view of the literal: an integer if the text is one, else
+    /// a float if it is one.
+    fn to_arg(&self) -> Arg {
+        match self {
+            Literal::Number(n) => n
+                .parse::<i128>()
+                .map(Arg::Int)
+                .or_else(|_| n.parse::<f64>().map(Arg::Float))
+                .unwrap_or(Arg::Other),
+            Literal::String(s) => Arg::Str(s.clone()),
+            Literal::Boolean(b) => Arg::Bool(*b),
+            Literal::Null => Arg::Null,
+        }
+    }
 }
 
-/// One parameter: its name, what it accepts, and its default as SQL writes it.
-#[derive(Debug, Clone, Copy)]
-pub struct Param {
-    pub name: &'static str,
-    kind: Kind,
-    pub default: &'static str,
+/// Resolve the literal arguments of a call to `spec` (names already
+/// normalized; `weight` already taken out by the caller) to a [`Call`].
+pub fn resolve(spec: &'static FunctionSpec, args: &[(String, Literal)]) -> Result<Call> {
+    if spec.narrows() {
+        if let Some((name, _)) = args.iter().find(|(n, _)| n == "dtype") {
+            let column = spec.outputs.first().map_or(spec.name, |o| o.name);
+            return Err(plan(format!(
+                "{}() has no parameter '{name}' in SQL; cast its column instead, for example \
+                 CAST({column} AS REAL)",
+                spec.name
+            )));
+        }
+    }
+    spec.resolve(args.iter().map(|(n, l)| (n.as_str(), l.to_arg())))
+        .map(|resolved| resolved.call)
+        .map_err(|e| param_error(spec, &e, args))
 }
 
-/// One graph function.
-#[derive(Debug)]
-pub struct FunctionSpec {
-    pub name: &'static str,
-    pub params: &'static [Param],
-    build: fn(&Args) -> Result<Algorithm>,
-}
-
-const ALL_DIRECTIONS: &[&str] = &["out", "in", "both"];
-
-/// The graph functions, by name. M1: cldixon/ursa#235.
-pub const FUNCTIONS: &[FunctionSpec] = &[
-    FunctionSpec {
-        name: "degree",
-        params: &[Param {
-            name: "direction",
-            kind: Kind::Choice(ALL_DIRECTIONS),
-            default: "'out'",
-        }],
-        build: |a| {
-            Ok(Algorithm::Degree {
-                direction: a.direction("direction")?,
-            })
-        },
-    },
-    FunctionSpec {
-        name: "pagerank",
-        params: &[
-            Param {
-                name: "damping",
-                kind: Kind::Float,
-                default: "0.85",
-            },
-            Param {
-                name: "max_iter",
-                kind: Kind::Count,
-                default: "30",
-            },
-            Param {
-                name: "tol",
-                kind: Kind::Float,
-                default: "1e-6",
-            },
-            Param {
-                name: "direction",
-                kind: Kind::Choice(&["out", "both"]),
-                default: "'out'",
-            },
-        ],
-        build: |a| {
-            Ok(Algorithm::PageRank {
-                damping: a.float("damping")?,
-                max_iter: a.count("max_iter")?,
-                tol: a.float("tol")?,
-                direction: a.direction("direction")?,
-            })
-        },
-    },
-    FunctionSpec {
-        name: "connected_components",
-        params: &[Param {
-            name: "mode",
-            kind: Kind::Choice(&["weak", "strong"]),
-            default: "'weak'",
-        }],
-        build: |a| {
-            Ok(Algorithm::ConnectedComponents {
-                strong: a.choice("mode")? == "strong",
-            })
-        },
-    },
-    FunctionSpec {
-        name: "triangle_count",
-        params: &[],
-        build: |_| Ok(Algorithm::TriangleCount),
-    },
-    FunctionSpec {
-        name: "louvain",
-        params: &[
-            Param {
-                name: "resolution",
-                kind: Kind::Float,
-                default: "1.0",
-            },
-            Param {
-                name: "seed",
-                kind: Kind::Seed,
-                default: "NULL",
-            },
-        ],
-        build: |a| {
-            Ok(Algorithm::Louvain {
-                resolution: a.float("resolution")?,
-                seed: a.seed("seed")?,
-            })
-        },
-    },
-];
-
-/// The graph function called `name`.
-pub fn lookup(name: &str) -> Option<&'static FunctionSpec> {
-    FUNCTIONS.iter().find(|f| f.name == name)
-}
-
-/// The names of the graph functions.
-pub fn names() -> impl Iterator<Item = &'static str> {
-    FUNCTIONS.iter().map(|f| f.name)
-}
-
-impl FunctionSpec {
-    /// Resolve a call's named arguments (`name => literal`, names already
-    /// normalized) against this function's parameters.
-    pub fn resolve(&'static self, args: Vec<(String, Literal)>) -> Result<Algorithm> {
-        let mut given = BTreeMap::new();
-        for (name, value) in args {
-            let Some(param) = self.params.iter().find(|p| p.name == name) else {
-                return Err(self.unknown_param(&name));
+/// A catalog [`ParamError`] in SQL's words.
+fn param_error(spec: &FunctionSpec, e: &ParamError, args: &[(String, Literal)]) -> DataFusionError {
+    let (f, p) = (spec.name, e.param.as_str());
+    let given = || {
+        args.iter()
+            .find(|(n, _)| n == p)
+            .map_or(Literal::Null, |(_, l)| l.clone())
+    };
+    match e.kind {
+        ParamErrorKind::Unknown => unknown_param(spec, p),
+        ParamErrorKind::Duplicate => plan(format!("{f}() was given '{p}' more than once")),
+        ParamErrorKind::Expected(want) => {
+            let want = match want {
+                Expected::Number => "a number",
+                Expected::FiniteNumber => "a finite number",
+                Expected::Count => "a non-negative integer below 2^32",
+                Expected::Seed => "a non-negative integer or NULL",
+                Expected::NumberOrNull => "a number or NULL",
+                Expected::Bool => "a boolean",
             };
-            if given.insert(param.name, value).is_some() {
-                return Err(plan(format!(
-                    "{}() was given '{}' more than once",
-                    self.name, param.name
-                )));
+            plan(format!("{f}({p} =>) must be {want}; got {}", given()))
+        }
+        ParamErrorKind::NotOneOf(options) => {
+            let options: Vec<String> = options.iter().map(|o| format!("'{o}'")).collect();
+            plan(format!(
+                "{f}({p} => {}) is not supported; use one of {}",
+                given(),
+                options.join(", ")
+            ))
+        }
+        ParamErrorKind::Expression => plan(format!(
+            "{f}({p} =>) takes an expression over the edge table's columns; got {}",
+            given()
+        )),
+    }
+}
+
+/// "pagerank() has no parameter 'dampng'; did you mean 'damping'? ...".
+pub fn unknown_param(spec: &FunctionSpec, name: &str) -> DataFusionError {
+    let names: Vec<&str> = sql_params(spec).map(|p| p.name).collect();
+    if names.is_empty() {
+        return plan(format!(
+            "{}() takes no parameters besides the graph; got '{name}'",
+            spec.name
+        ));
+    }
+    let hint = did_you_mean(name, names.iter().copied())
+        .map(|s| format!("; did you mean '{s}'?"))
+        .unwrap_or_else(|| ".".to_string());
+    plan(format!(
+        "{}() has no parameter '{name}'{hint} Its parameters are: {}",
+        spec.name,
+        names.join(", ")
+    ))
+}
+
+/// A catalog value as SQL writes it: `NULL`, `'out'`, `30`, `0.85`, `1e-6`.
+pub fn sql_value(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::UInt(u) => u.to_string(),
+        Value::Float(f) => format!("{f:?}"),
+        Value::Str(s) => format!("'{s}'"),
+    }
+}
+
+/// The parameters of `spec` at their defaults: `damping => 0.85, ...`.
+fn defaults(spec: &FunctionSpec) -> Vec<String> {
+    sql_params(spec)
+        .map(|p| format!("{} => {}", p.name, sql_value(&p.default)))
+        .collect()
+}
+
+/// `pagerank(<graph>, damping => 0.85, ...)`: the call with every parameter at
+/// its default, for messages.
+pub fn signature(spec: &FunctionSpec) -> String {
+    let mut parts = vec!["<graph>".to_string()];
+    parts.extend(defaults(spec));
+    format!("{}({})", spec.name, parts.join(", "))
+}
+
+/// `pagerank(damping => 0.85, ...)`: a call as written inside `algorithms()`.
+pub fn nested_signature(spec: &FunctionSpec) -> String {
+    format!("{}({})", spec.name, defaults(spec).join(", "))
+}
+
+/// The call as SQL would spell it, every literal parameter shown, and the
+/// weight when there is one: for `EXPLAIN`.
+pub fn display_call(call: &Call, weight: Option<&str>) -> String {
+    let values = call.values();
+    let parts: Vec<String> = sql_params(call.spec())
+        .filter_map(|p| {
+            if p.ty == ParamType::Weight {
+                return weight.map(|w| format!("{} => {w}", p.name));
             }
-        }
-        (self.build)(&Args {
-            function: self,
-            given,
-        })
-    }
-
-    fn unknown_param(&self, name: &str) -> DataFusionError {
-        if self.params.is_empty() {
-            return plan(format!(
-                "{}() takes no parameters besides the graph; got '{name}'",
-                self.name
-            ));
-        }
-        let names: Vec<&str> = self.params.iter().map(|p| p.name).collect();
-        let hint = did_you_mean(name, names.iter().copied())
-            .map(|s| format!("; did you mean '{s}'?"))
-            .unwrap_or_else(|| ".".to_string());
-        plan(format!(
-            "{}() has no parameter '{name}'{hint} Its parameters are: {}",
-            self.name,
-            names.join(", ")
-        ))
-    }
-
-    /// `pagerank(<graph>, damping => 0.85, ...)`: the call with every
-    /// parameter at its default, for messages.
-    pub fn signature(&self) -> String {
-        let mut parts = vec!["<graph>".to_string()];
-        parts.extend(
-            self.params
+            values
                 .iter()
-                .map(|p| format!("{} => {}", p.name, p.default)),
-        );
-        format!("{}({})", self.name, parts.join(", "))
-    }
+                .find(|(q, _)| q.name == p.name)
+                .map(|(_, v)| format!("{} => {}", p.name, sql_value(v)))
+        })
+        .collect();
+    format!("{}({})", call.name(), parts.join(", "))
 }
 
 /// A plan error.
@@ -383,118 +241,17 @@ pub fn did_you_mean<'a>(
     super::closest_name(name, candidates)
 }
 
-/// A call's arguments, read by parameter with its default.
-struct Args {
-    function: &'static FunctionSpec,
-    given: BTreeMap<&'static str, Literal>,
-}
-
-impl Args {
-    fn param(&self, name: &str) -> &'static Param {
-        self.function
-            .params
-            .iter()
-            .find(|p| p.name == name)
-            .expect("a function reads only its own parameters")
-    }
-
-    /// The literal for `name`: as given, or its default.
-    fn value(&self, name: &str) -> Literal {
-        match self.given.get(name) {
-            Some(v) => v.clone(),
-            None => default_literal(self.param(name)),
-        }
-    }
-
-    /// "pagerank(damping =>) must be a number; got 'x'", as Python words it.
-    fn wrong(&self, name: &str, want: &str, got: &Literal) -> DataFusionError {
-        plan(format!(
-            "{}({name} =>) must be {want}; got {got}",
-            self.function.name
-        ))
-    }
-
-    fn float(&self, name: &str) -> Result<f64> {
-        debug_assert!(matches!(self.param(name).kind, Kind::Float));
-        match self.value(name) {
-            Literal::Number(n) => n
-                .parse::<f64>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| self.wrong(name, "a finite number", &Literal::Number(n))),
-            other => Err(self.wrong(name, "a number", &other)),
-        }
-    }
-
-    fn integer(&self, name: &str, want: &str, max: u64) -> Result<Option<u64>> {
-        match self.value(name) {
-            Literal::Null => Ok(None),
-            Literal::Number(n) => match n.parse::<i128>() {
-                Ok(v) if (0..=i128::from(max)).contains(&v) => Ok(Some(v as u64)),
-                _ => Err(self.wrong(name, want, &Literal::Number(n))),
-            },
-            other => Err(self.wrong(name, want, &other)),
-        }
-    }
-
-    fn count(&self, name: &str) -> Result<u32> {
-        debug_assert!(matches!(self.param(name).kind, Kind::Count));
-        let want = "a non-negative integer below 2^32";
-        match self.integer(name, want, u64::from(u32::MAX))? {
-            Some(v) => Ok(v as u32),
-            None => Err(self.wrong(name, want, &Literal::Null)),
-        }
-    }
-
-    fn seed(&self, name: &str) -> Result<Option<u64>> {
-        debug_assert!(matches!(self.param(name).kind, Kind::Seed));
-        self.integer(name, "a non-negative integer or NULL", u64::MAX)
-    }
-
-    fn choice(&self, name: &str) -> Result<String> {
-        let Kind::Choice(allowed) = self.param(name).kind else {
-            unreachable!("{name} is not a choice")
-        };
-        let options: Vec<String> = allowed.iter().map(|a| format!("'{a}'")).collect();
-        let value = self.value(name);
-        match &value {
-            Literal::String(s) if allowed.contains(&s.as_str()) => Ok(s.clone()),
-            _ => Err(plan(format!(
-                "{}({name} => {value}) is not supported; use one of {}",
-                self.function.name,
-                options.join(", ")
-            ))),
-        }
-    }
-
-    fn direction(&self, name: &str) -> Result<Direction> {
-        Ok(match self.choice(name)?.as_str() {
-            "out" => Direction::Out,
-            "in" => Direction::In,
-            _ => Direction::Both,
-        })
-    }
-}
-
-/// A parameter's default as a literal.
-fn default_literal(param: &Param) -> Literal {
-    match param.default {
-        "NULL" => Literal::Null,
-        d if d.starts_with('\'') => Literal::String(d.trim_matches('\'').to_string()),
-        d => Literal::Number(d.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ursa_core::Direction;
 
-    fn call(name: &str, args: &[(&str, Literal)]) -> Result<Algorithm> {
-        lookup(name).unwrap().resolve(
-            args.iter()
-                .map(|(n, v)| (n.to_string(), v.clone()))
-                .collect(),
-        )
+    fn call(name: &str, args: &[(&str, Literal)]) -> Result<Call> {
+        let args: Vec<(String, Literal)> = args
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.clone()))
+            .collect();
+        resolve(lookup(name).unwrap(), &args)
     }
 
     fn num(n: &str) -> Literal {
@@ -505,7 +262,7 @@ mod tests {
         Literal::String(v.into())
     }
 
-    fn message(r: Result<Algorithm>) -> String {
+    fn message(r: Result<Call>) -> String {
         crate::user_message(&r.unwrap_err())
     }
 
@@ -513,7 +270,7 @@ mod tests {
     fn defaults_match_python() {
         assert_eq!(
             call("pagerank", &[]).unwrap(),
-            Algorithm::PageRank {
+            Call::PageRank {
                 damping: 0.85,
                 max_iter: 30,
                 tol: 1e-6,
@@ -522,24 +279,28 @@ mod tests {
         );
         assert_eq!(
             call("degree", &[]).unwrap(),
-            Algorithm::Degree {
+            Call::Degree {
                 direction: Direction::Out
             }
         );
         assert_eq!(
             call("connected_components", &[]).unwrap(),
-            Algorithm::ConnectedComponents { strong: false }
+            Call::ConnectedComponents { strong: false }
         );
         assert_eq!(
             call("louvain", &[]).unwrap(),
-            Algorithm::Louvain {
+            Call::Louvain {
                 resolution: 1.0,
                 seed: None
             }
         );
+        assert_eq!(call("triangle_count", &[]).unwrap(), Call::TriangleCount);
         assert_eq!(
-            call("triangle_count", &[]).unwrap(),
-            Algorithm::TriangleCount
+            call("diameter", &[]).unwrap(),
+            Call::Diameter {
+                approximate: true,
+                direction: Direction::Out
+            }
         );
     }
 
@@ -556,7 +317,7 @@ mod tests {
                 ]
             )
             .unwrap(),
-            Algorithm::PageRank {
+            Call::PageRank {
                 damping: 0.9,
                 max_iter: 100,
                 tol: 1e-10,
@@ -571,7 +332,7 @@ mod tests {
                 &[("seed", num("7")), ("resolution", num("-0.5"))]
             )
             .unwrap(),
-            Algorithm::Louvain {
+            Call::Louvain {
                 resolution: -0.5,
                 seed: Some(7)
             }
@@ -582,7 +343,18 @@ mod tests {
         );
         assert_eq!(
             call("connected_components", &[("mode", s("strong"))]).unwrap(),
-            Algorithm::ConnectedComponents { strong: true }
+            Call::ConnectedComponents { strong: true }
+        );
+        assert_eq!(
+            call("diameter", &[("approximate", Literal::Boolean(false))]).unwrap(),
+            Call::Diameter {
+                approximate: false,
+                direction: Direction::Out
+            }
+        );
+        assert_eq!(
+            call("betweenness", &[("sample", Literal::Null)]).unwrap(),
+            call("betweenness", &[]).unwrap()
         );
     }
 
@@ -591,12 +363,12 @@ mod tests {
         assert_eq!(
             message(call("pagerank", &[("dampng", num("0.9"))])),
             "pagerank() has no parameter 'dampng'; did you mean 'damping'? Its parameters are: \
-             damping, max_iter, tol, direction"
+             damping, max_iter, tol, weight, direction"
         );
         assert_eq!(
-            message(call("pagerank", &[("weight", num("1"))])),
-            "pagerank() has no parameter 'weight'. Its parameters are: damping, max_iter, tol, \
-             direction"
+            message(call("pagerank", &[("color", num("1"))])),
+            "pagerank() has no parameter 'color'. Its parameters are: damping, max_iter, tol, \
+             weight, direction"
         );
         assert_eq!(
             message(call("triangle_count", &[("direction", s("both"))])),
@@ -614,6 +386,10 @@ mod tests {
             "pagerank(damping =>) must be a number; got 'high'"
         );
         assert_eq!(
+            message(call("pagerank", &[("damping", num("1e999"))])),
+            "pagerank(damping =>) must be a finite number; got 1e999"
+        );
+        assert_eq!(
             message(call("pagerank", &[("max_iter", num("-1"))])),
             "pagerank(max_iter =>) must be a non-negative integer below 2^32; got -1"
         );
@@ -626,8 +402,20 @@ mod tests {
             "pagerank(max_iter =>) must be a non-negative integer below 2^32; got 4294967296"
         );
         assert_eq!(
+            message(call("pagerank", &[("max_iter", Literal::Null)])),
+            "pagerank(max_iter =>) must be a non-negative integer below 2^32; got NULL"
+        );
+        assert_eq!(
             message(call("louvain", &[("seed", num("-3"))])),
             "louvain(seed =>) must be a non-negative integer or NULL; got -3"
+        );
+        assert_eq!(
+            message(call("betweenness", &[("sample", s("half"))])),
+            "betweenness(sample =>) must be a number or NULL; got 'half'"
+        );
+        assert_eq!(
+            message(call("diameter", &[("approximate", num("1"))])),
+            "diameter(approximate =>) must be a boolean; got 1"
         );
         assert_eq!(
             message(call("pagerank", &[("direction", s("in"))])),
@@ -641,19 +429,58 @@ mod tests {
             message(call("connected_components", &[("mode", num("1"))])),
             "connected_components(mode => 1) is not supported; use one of 'weak', 'strong'"
         );
+        assert_eq!(
+            message(call("closeness", &[("dtype", s("f32"))])),
+            "closeness() has no parameter 'dtype' in SQL; cast its column instead, for example \
+             CAST(closeness AS REAL)"
+        );
+        assert_eq!(
+            message(call("degree", &[("dtype", s("f32"))])),
+            "degree() has no parameter 'dtype'. Its parameters are: direction"
+        );
     }
 
     #[test]
     fn suggests_names() {
         assert_eq!(did_you_mean("pagerenk", names()), Some("pagerank"));
-        assert_eq!(did_you_mean("closeness", names()), None);
+        assert_eq!(did_you_mean("closenes", names()), Some("closeness"));
+        assert_eq!(did_you_mean("algorithm", names()), Some("algorithms"));
+        assert_eq!(did_you_mean("shortest_paths", names()), None);
+        assert!(lookup("neighbors_agg").is_none());
     }
 
     #[test]
     fn signatures_show_defaults() {
         assert_eq!(
-            lookup("pagerank").unwrap().signature(),
-            "pagerank(<graph>, damping => 0.85, max_iter => 30, tol => 1e-6, direction => 'out')"
+            signature(lookup("pagerank").unwrap()),
+            "pagerank(<graph>, damping => 0.85, max_iter => 30, tol => 1e-6, weight => NULL, \
+             direction => 'out')"
+        );
+        assert_eq!(
+            nested_signature(lookup("layout_fr").unwrap()),
+            "layout_fr(iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)"
+        );
+    }
+
+    #[test]
+    fn explain_spells_the_call() {
+        let pagerank = call("pagerank", &[]).unwrap();
+        assert_eq!(
+            display_call(&pagerank, None),
+            "pagerank(damping => 0.85, max_iter => 30, tol => 1e-6, direction => 'out')"
+        );
+        assert_eq!(
+            display_call(&pagerank, Some("w")),
+            "pagerank(damping => 0.85, max_iter => 30, tol => 1e-6, weight => w, \
+             direction => 'out')"
+        );
+        assert_eq!(
+            display_call(&call("louvain", &[]).unwrap(), None),
+            "louvain(resolution => 1.0, seed => NULL)"
+        );
+        assert_eq!(
+            display_call(&call("triangle_count", &[]).unwrap(), None),
+            "triangle_count()"
         );
     }
 }
