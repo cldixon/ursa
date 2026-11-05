@@ -53,7 +53,7 @@ CREATE PROPERTY GRAPH karate
 ```
 
 - `VERTEX TABLES` is optional. Without it, the nodes are the edges' endpoints: `CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));`
-- Paths: `.parquet`, `.csv`, `.csv.gz`, `.csv.zst`, a directory, or a glob (`'edges/*.parquet'`). URLs work: `s3://`, `gs://`, `az://`, `https://`.
+- Paths: `.parquet`, `.csv`, `.csv.gz`, `.csv.zst`, a directory, or a glob (`'edges/*.parquet'`). URLs work: `s3://`, `gs://`, `az://`, `https://`. Credentials come from the environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`), AWS profiles (`AWS_PROFILE`, `~/.aws/`), gcloud's application default credentials, or the machine's role. There is no SQL statement for credentials. For a public S3 bucket, set `AWS_SKIP_SIGNATURE=true`.
 - The source and destination columns must have the same type, integer or string. Cast in the view if they don't.
 - A graph is a schema: `karate.edges` and `karate.nodes` are tables.
 - A subgraph is a graph over a view that filters the edges. Its nodes are only the endpoints of the kept edges.
