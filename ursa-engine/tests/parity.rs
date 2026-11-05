@@ -1,6 +1,6 @@
 //! The SQL engine against the Python library: the same graph functions with
-//! the same parameters must give the same ids, the same values (floats bit for
-//! bit) and the same column types.
+//! the same parameters must give the same columns (names and types), the same
+//! ids and the same values, floats bit for bit.
 //!
 //! The Python side is recorded in `fixtures/parity.json` by
 //! `fixtures/generate_parity.py`; see that script for how to regenerate it.
@@ -8,25 +8,23 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray, UInt32Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array,
+};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::TableReference;
 use serde_json::Value;
 use ursa_engine::graph::{index_builds, registry_of, EdgeTable, GraphDef};
 use ursa_engine::new_session;
 
-/// An id as the fixture writes it: a JSON integer or string.
+/// A value as the fixture writes it: an id or integer, a string id, a
+/// float's bits in hex, or null.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Id {
+enum Cell {
     Int(i64),
     Str(String),
-}
-
-/// A value as the fixture writes it: an integer, or a float's bits in hex.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Cell {
-    UInt(u64),
-    FloatBits(u64),
+    Bits(String),
+    Null,
 }
 
 /// The Python name of an Arrow type, as `pyarrow` prints it.
@@ -35,31 +33,73 @@ fn pyarrow_name(t: &DataType) -> &'static str {
         DataType::Int64 => "int64",
         DataType::Utf8 => "string",
         DataType::Float64 => "double",
+        DataType::Float32 => "float",
         DataType::UInt32 => "uint32",
         other => panic!("unexpected column type {other}"),
     }
 }
 
-fn expected_rows(case: &Value) -> BTreeMap<Id, Cell> {
-    let float = case["value_type"] == "double";
-    case["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            let id = match &row[0] {
-                Value::Number(n) => Id::Int(n.as_i64().unwrap()),
-                Value::String(s) => Id::Str(s.clone()),
-                other => panic!("bad id {other}"),
-            };
-            let cell = if float {
-                Cell::FloatBits(u64::from_str_radix(row[1].as_str().unwrap(), 16).unwrap())
+fn fixture_cell(v: &Value, pyarrow_type: &str) -> Cell {
+    match (v, pyarrow_type) {
+        (Value::Null, _) => Cell::Null,
+        (Value::String(s), "double" | "float") => Cell::Bits(s.clone()),
+        (Value::String(s), _) => Cell::Str(s.clone()),
+        (Value::Number(n), _) => Cell::Int(n.as_i64().unwrap()),
+        (other, _) => panic!("bad cell {other}"),
+    }
+}
+
+fn sql_cell(column: &ArrayRef, row: usize) -> Cell {
+    if column.is_null(row) {
+        return Cell::Null;
+    }
+    let any = column.as_any();
+    match column.data_type() {
+        DataType::Int64 => Cell::Int(any.downcast_ref::<Int64Array>().unwrap().value(row)),
+        DataType::UInt32 => Cell::Int(i64::from(
+            any.downcast_ref::<UInt32Array>().unwrap().value(row),
+        )),
+        DataType::Utf8 => Cell::Str(
+            any.downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Float64 => Cell::Bits(format!(
+            "{:016x}",
+            any.downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row)
+                .to_bits()
+        )),
+        DataType::Float32 => Cell::Bits(format!(
+            "{:08x}",
+            any.downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row)
+                .to_bits()
+        )),
+        other => panic!("unexpected column type {other}"),
+    }
+}
+
+/// Rows keyed by their `id` (the first cell) for a per-node result, whose row
+/// order SQL leaves open; in order for a one-row statistic.
+fn keyed(rows: Vec<Vec<Cell>>, per_node: bool) -> BTreeMap<Cell, Vec<Cell>> {
+    let n = rows.len();
+    let map: BTreeMap<Cell, Vec<Cell>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if per_node {
+                (row[0].clone(), row)
             } else {
-                Cell::UInt(row[1].as_u64().unwrap())
-            };
-            (id, cell)
+                (Cell::Int(i as i64), row)
+            }
         })
-        .collect()
+        .collect();
+    assert_eq!(map.len(), n, "a repeated id");
+    map
 }
 
 #[tokio::test]
@@ -68,7 +108,7 @@ async fn sql_matches_the_python_library() {
     let document: Value =
         serde_json::from_str(&std::fs::read_to_string(&fixtures).unwrap()).unwrap();
     let cases = document["cases"].as_array().unwrap();
-    assert!(cases.len() >= 20, "the fixture has {} cases", cases.len());
+    assert!(cases.len() >= 100, "the fixture has {} cases", cases.len());
 
     let ctx = new_session();
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../python/ursa/datasets/data");
@@ -97,10 +137,14 @@ async fn sql_matches_the_python_library() {
         });
     }
 
+    let mut functions = std::collections::BTreeSet::new();
+    let mut weighted = 0;
     for case in cases {
         let function = case["function"].as_str().unwrap();
         let dataset = case["dataset"].as_str().unwrap();
         let args = case["sql_args"].as_str().unwrap();
+        functions.insert(function);
+        weighted += usize::from(args.contains("weight =>"));
         let sql = if args.is_empty() {
             format!("SELECT * FROM {function}({dataset})")
         } else {
@@ -108,60 +152,63 @@ async fn sql_matches_the_python_library() {
         };
         let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
         let schema = batches[0].schema();
-        assert_eq!(
-            pyarrow_name(schema.field(0).data_type()),
-            case["id_type"],
-            "{sql}: id type"
-        );
-        assert_eq!(schema.field(1).name(), function, "{sql}");
-        assert_eq!(
-            pyarrow_name(schema.field(1).data_type()),
-            case["value_type"],
-            "{sql}: value type"
-        );
+        let columns: Vec<(String, String)> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                (
+                    f.name().clone(),
+                    pyarrow_name(f.data_type()).to_string(),
+                )
+            })
+            .collect();
+        let expected_columns: Vec<(String, String)> = case["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c[0].as_str().unwrap().to_string(),
+                    c[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(columns, expected_columns, "{sql}: columns");
+        let per_node = columns[0].0 == "id";
 
-        let mut got = BTreeMap::new();
+        let mut got = Vec::new();
         for batch in &batches {
-            let ids = batch.column(0);
-            let values = batch.column(1);
             for row in 0..batch.num_rows() {
-                let id = match ids.data_type() {
-                    DataType::Int64 => Id::Int(
-                        ids.as_any()
-                            .downcast_ref::<Int64Array>()
-                            .unwrap()
-                            .value(row),
-                    ),
-                    _ => Id::Str(
-                        ids.as_any()
-                            .downcast_ref::<StringArray>()
-                            .unwrap()
-                            .value(row)
-                            .to_string(),
-                    ),
-                };
-                let cell = match values.data_type() {
-                    DataType::Float64 => Cell::FloatBits(
-                        values
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .unwrap()
-                            .value(row)
-                            .to_bits(),
-                    ),
-                    _ => Cell::UInt(u64::from(
-                        values
-                            .as_any()
-                            .downcast_ref::<UInt32Array>()
-                            .unwrap()
-                            .value(row),
-                    )),
-                };
-                assert!(got.insert(id, cell).is_none(), "{sql}: a repeated id");
+                got.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|c| sql_cell(c, row))
+                        .collect::<Vec<_>>(),
+                );
             }
         }
-        assert_eq!(got, expected_rows(case), "{sql}");
+        let expected: Vec<Vec<Cell>> = case["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(&expected_columns)
+                    .map(|(v, (_, t))| fixture_cell(v, t))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(keyed(got, per_node), keyed(expected, per_node), "{sql}");
     }
-    // One index per dataset, however many functions ran over it.
+    // Every function SQL offers is covered, with weights.
+    for f in ursa_engine::graph::functions::specs() {
+        assert!(functions.contains(f.name), "no parity case for {}", f.name);
+    }
+    assert!(weighted >= 5, "{weighted} weighted cases");
+    // One index per dataset, however many functions ran over it, weighted or
+    // not.
     assert_eq!(index_builds(&ctx), datasets.len() as u64);
 }
