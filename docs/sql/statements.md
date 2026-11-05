@@ -81,7 +81,7 @@ Dropping a graph leaves its tables and views alone.
 
 ## SHOW GRAPHS
 
-Lists the graphs:
+Lists the graphs, one row each, with the edge table, its endpoint columns, and the vertex table and key if there is one:
 
 ```sql
 SHOW GRAPHS;
@@ -97,7 +97,7 @@ SHOW GRAPHS;
 
 ## DESCRIBE GRAPH
 
-Shows how a graph is defined:
+Lists the columns of a graph's two tables, `nodes` and `edges`: each column's type, its role in the graph, and the column it comes from:
 
 ```sql
 DESCRIBE GRAPH karate;
