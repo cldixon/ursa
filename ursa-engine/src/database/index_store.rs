@@ -45,7 +45,15 @@
 //! later process lists the chunk when it loads the index and reads it only
 //! when an algorithm asks for the in-adjacency, so a query that does not
 //! need it does not pay for it. The manifest's `size` counts the chunks, and
-//! a chunk that would take the store past the limit is not appended. A new entry replaces any entry with the same fingerprint (an index of
+//! a chunk that would take the store past the limit is not appended.
+//!
+//! **Evaluated weights** are stored the same way, one chunk per set, named by
+//! the weights' key (the weighted edge plan's fingerprint and the identity of
+//! the files it reads, which include the weight column's). They are used only
+//! with an index whose full key matched, and only under the same weights key,
+//! so a changed weight expression or source file is never served stale
+//! weights. A later process reads a set when a query asks for it, and reads
+//! no edge rows. They are evicted with their index, as part of its file. A new entry replaces any entry with the same fingerprint (an index of
 //! the same edges over an older version of a file), then entries are evicted,
 //! least recently used first, until the total is within the session's
 //! `ursa.index_storage_limit`. Never evicted: the entry just written, and an
@@ -65,7 +73,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::index_file::{self, Encoded, EncodedChunk, IndexKey, MainPart, CHUNK_INCOMING};
+use super::index_file::{
+    self, Encoded, EncodedChunk, IndexKey, MainPart, CHUNK_INCOMING, CHUNK_WEIGHTS,
+};
 use crate::graph::GraphIndex;
 
 /// The `format` field of the manifest.
@@ -139,8 +149,8 @@ struct State {
 struct Live {
     index: Weak<GraphIndex>,
     main: MainPart,
-    /// Whether the file has the in-adjacency's chunk.
-    incoming: bool,
+    /// The chunks the file has, by kind and name.
+    chunks: HashSet<(u32, Vec<u8>)>,
     /// The session's storage limit when it was loaded or stored.
     limit: u64,
 }
@@ -229,17 +239,36 @@ impl IndexStore {
         let mut state = self.state();
         match read {
             Ok(stored) => {
-                let incoming = index_file::has_chunk(&stored.chunks, CHUNK_INCOMING, b"");
-                let index = Arc::new(GraphIndex::new(
-                    Arc::new(stored.topology),
-                    Arc::new(stored.ids),
-                ));
+                let chunks = stored
+                    .chunks
+                    .iter()
+                    .map(|c| (c.kind, c.name.clone()))
+                    .collect();
+                let weights: Vec<index_file::ChunkInfo> = stored
+                    .chunks
+                    .into_iter()
+                    .filter(|c| c.kind == CHUNK_WEIGHTS)
+                    .collect();
+                let keys = weights
+                    .iter()
+                    .filter_map(|c| String::from_utf8(c.name.clone()).ok())
+                    .collect();
+                let (path, main) = (self.dir.join(&file), stored.main);
+                let n_edges = stored.topology.n_edges();
+                let read = Box::new(move |key: &str| {
+                    let chunk = weights.iter().find(|c| c.name == key.as_bytes())?;
+                    index_file::read_weights(&path, main, chunk, n_edges).ok()
+                });
+                let index = Arc::new(
+                    GraphIndex::new(Arc::new(stored.topology), Arc::new(stored.ids))
+                        .with_stored_weights(keys, read),
+                );
                 state.live.insert(
                     file.clone(),
                     Live {
                         index: Arc::downgrade(&index),
                         main: stored.main,
-                        incoming,
+                        chunks,
                         limit,
                     },
                 );
@@ -292,7 +321,8 @@ impl IndexStore {
 
     /// Wait for every write [`save`](Self::save) started, then append to
     /// each index file this process stored or loaded the parts of its index
-    /// built since (the in-adjacency), within the storage limit.
+    /// built since (the in-adjacency, evaluated weights), within the storage
+    /// limit.
     pub fn flush(&self) {
         let handles = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
         for handle in handles {
@@ -303,10 +333,10 @@ impl IndexStore {
         }
     }
 
-    /// Append the in-adjacency to every live index file that lacks it and
-    /// whose index has built it since. A failed append leaves the file as
-    /// it was (less any partial chunk); the in-adjacency is built again by
-    /// the next process that needs it.
+    /// Append to every live index file the in-adjacency and the weight sets
+    /// its index has built since and the file lacks. A failed append leaves
+    /// the file as it was (less any partial chunk); what it held is built
+    /// again by the next process that needs it.
     fn append_chunks(&self) {
         let mut state = self.state();
         self.ensure_loaded(&mut state);
@@ -314,38 +344,59 @@ impl IndexStore {
         let mut appended = Vec::new();
         for file in files {
             let live = &state.live[&file];
-            if live.incoming {
-                continue;
-            }
             let Some(index) = live.index.upgrade() else {
                 continue;
             };
-            let Some(incoming) = index.topology.incoming_if_built() else {
-                continue;
-            };
             let (main, limit) = (live.main, live.limit);
-            let Some(entry) = state.entries.iter().position(|e| e.file == file) else {
-                continue;
-            };
-            // Not past the limit on its own, as for a whole index.
-            let added = EncodedChunk::incoming(incoming, state.entries[entry].size).size();
-            if state.entries[entry].size + added > limit {
-                continue;
+            let mut todo: Vec<(u32, Vec<u8>)> = Vec::new();
+            if index.topology.incoming_if_built().is_some() {
+                todo.push((CHUNK_INCOMING, Vec::new()));
             }
-            let result = index_file::append_chunk(
-                &self.dir.join(&file),
-                main,
-                CHUNK_INCOMING,
-                b"",
-                |start| EncodedChunk::incoming(incoming, start),
+            let weight_sets = index.weight_sets();
+            todo.extend(
+                weight_sets
+                    .iter()
+                    .map(|(key, _)| (CHUNK_WEIGHTS, key.as_bytes().to_vec())),
             );
-            if let Ok(appended_len) = result {
-                if let Some(live) = state.live.get_mut(&file) {
-                    live.incoming = true;
+            todo.retain(|chunk| !live.chunks.contains(chunk));
+            for (kind, name) in todo {
+                let Some(entry) = state.entries.iter().position(|e| e.file == file) else {
+                    break;
+                };
+                let columns: Vec<&[f64]> = match kind {
+                    CHUNK_WEIGHTS => weight_sets
+                        .iter()
+                        .find(|(key, _)| key.as_bytes() == name.as_slice())
+                        .map(|(_, w)| w.iter().map(|c| c.as_slice()).collect())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let encode = |start| match kind {
+                    CHUNK_WEIGHTS => EncodedChunk::weights(
+                        std::str::from_utf8(&name).unwrap_or_default(),
+                        &columns,
+                        start,
+                    ),
+                    _ => EncodedChunk::incoming(
+                        index.topology.incoming_if_built().expect("checked above"),
+                        start,
+                    ),
+                };
+                // Not past the limit on its own, as for a whole index.
+                let size = state.entries[entry].size;
+                if size + encode(size).size() > limit {
+                    continue;
                 }
-                if let Some(len) = appended_len {
-                    state.entries[entry].size = len;
-                    appended.push(file.clone());
+                let result =
+                    index_file::append_chunk(&self.dir.join(&file), main, kind, &name, &encode);
+                if let Ok(appended_len) = result {
+                    if let Some(live) = state.live.get_mut(&file) {
+                        live.chunks.insert((kind, name));
+                    }
+                    if let Some(len) = appended_len {
+                        state.entries[entry].size = len;
+                        appended.push(file.clone());
+                    }
                 }
             }
         }
@@ -425,12 +476,16 @@ impl IndexStore {
             created: now,
             last_used: now,
         });
+        let chunks = incoming
+            .iter()
+            .map(|_| (CHUNK_INCOMING, Vec::new()))
+            .collect();
         state.live.insert(
             file.clone(),
             Live {
                 index: Arc::downgrade(index),
                 main,
-                incoming: incoming.is_some(),
+                chunks,
                 limit,
             },
         );

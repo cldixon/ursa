@@ -51,7 +51,10 @@
 //! ```
 //!
 //! Chunk kind 1 is the in-adjacency (no name; its offsets, targets and edge
-//! ids, as the out-adjacency's). A reader of the main part never reads the
+//! ids, as the out-adjacency's). Chunk kind 2 is a set of evaluated weights:
+//! its name is the weights' key (the weighted edge plan's fingerprint and the
+//! identity of the files it reads), and it holds one `f64` section (kind 10,
+//! `n_edges` values in edge-row order) per weight expression, in order. A reader of the main part never reads the
 //! chunks' arrays: it lists the chunks (their headers, names and tables, a
 //! few small reads), and reads a chunk's sections only when they are asked
 //! for, checking the main part's trailer and the chunk's data CRC first. The
@@ -114,6 +117,8 @@ const CHUNK_TRAILER_LEN: u64 = 48;
 
 /// The chunk kind of an in-adjacency.
 pub const CHUNK_INCOMING: u32 = 1;
+/// The chunk kind of a set of evaluated weights.
+pub const CHUNK_WEIGHTS: u32 = 2;
 
 const HEADER_LEN: u64 = 64;
 const TRAILER_LEN: u64 = 16;
@@ -131,6 +136,7 @@ const IN_EDGE_IDS: u32 = 6;
 const IDS_INT64: u32 = 7;
 const IDS_STR_OFFSETS: u32 = 8;
 const IDS_STR_BYTES: u32 = 9;
+const WEIGHTS_F64: u32 = 10;
 
 /// What an index is stored under: the edge plan's fingerprint and the
 /// identity of every file it reads.
@@ -204,6 +210,7 @@ impl IndexKey {
 /// part of the id column (which the id map hands out as an `Arc`).
 enum Data<'a> {
     U64(&'a [u64]),
+    F64(&'a [f64]),
     U32(&'a [u32]),
     /// The values of an `Int64Array`.
     Ints(Int64Array),
@@ -217,7 +224,7 @@ enum Data<'a> {
 impl Data<'_> {
     fn width(&self) -> u64 {
         match self {
-            Data::U64(_) | Data::Ints(_) => 8,
+            Data::U64(_) | Data::F64(_) | Data::Ints(_) => 8,
             Data::U32(_) | Data::StrOffsets(_) => 4,
             Data::StrBytes(_) => 1,
         }
@@ -226,6 +233,7 @@ impl Data<'_> {
     fn count(&self) -> u64 {
         (match self {
             Data::U64(v) => v.len(),
+            Data::F64(v) => v.len(),
             Data::U32(v) => v.len(),
             Data::Ints(a) => a.len(),
             Data::StrOffsets(a) => a.len() + 1,
@@ -387,6 +395,20 @@ impl<'a> EncodedChunk<'a> {
         )
     }
 
+    /// The chunk of the weight columns `columns` (one value per edge row
+    /// each), stored under `key`, to be written at `start`.
+    pub fn weights(key: &str, columns: &[&'a [f64]], start: u64) -> Self {
+        Self::new(
+            CHUNK_WEIGHTS,
+            key.as_bytes().to_vec(),
+            columns
+                .iter()
+                .map(|column| (WEIGHTS_F64, Data::F64(column)))
+                .collect(),
+            start,
+        )
+    }
+
     fn new(kind: u32, name: Vec<u8>, sections: Vec<(u32, Data<'a>)>, start: u64) -> Self {
         let mut at = start + CHUNK_HEADER_LEN;
         let sections = sections
@@ -502,6 +524,7 @@ impl<W: Write> Sink<W> {
     fn put_data(&mut self, data: &Data<'_>) -> io::Result<()> {
         match data {
             Data::U64(v) => self.put_all(v, |x| x.to_le_bytes()),
+            Data::F64(v) => self.put_all(v, |x| x.to_le_bytes()),
             Data::U32(v) => self.put_all(v, |x| x.to_le_bytes()),
             Data::Ints(a) => self.put_all(a.values(), |x| x.to_le_bytes()),
             Data::StrOffsets(a) => {
@@ -783,6 +806,23 @@ fn read_incoming(
     }
 }
 
+/// Read the weight columns in `chunk` of the file at `path`, for a topology
+/// of `n_edges` edges: one per section, in order.
+pub fn read_weights(
+    path: &Path,
+    main: MainPart,
+    chunk: &ChunkInfo,
+    n_edges: usize,
+) -> Result<Vec<Vec<f64>>, DecodeError> {
+    read_chunk(path, main, chunk)?
+        .into_iter()
+        .map(|(_, section)| match section {
+            Section::F64(values) if values.len() == n_edges => Ok(values),
+            _ => Err("the weights are malformed".to_string()),
+        })
+        .collect()
+}
+
 /// Append the chunk `encode` lays out (at the offset it is given) to the
 /// file at `path`, whose main part must still be `main`, after its last
 /// chunk that checks out; unless the file already has a chunk of `kind`
@@ -890,6 +930,7 @@ impl<R: Read> Source<R> {
                 Section::U32(self.values(n, u32::from_le_bytes)?)
             }
             (IDS_INT64, 8) => Section::I64(self.values(n, i64::from_le_bytes)?),
+            (WEIGHTS_F64, 8) => Section::F64(self.values(n, f64::from_le_bytes)?),
             (IDS_STR_OFFSETS, 4) => Section::I32(self.values(n, i32::from_le_bytes)?),
             (IDS_STR_BYTES, 1) => Section::Bytes(self.bytes(n)?),
             _ => {
@@ -903,6 +944,7 @@ impl<R: Read> Source<R> {
 /// One section, read.
 pub enum Section {
     U64(Vec<u64>),
+    F64(Vec<f64>),
     U32(Vec<u32>),
     I64(Vec<i64>),
     I32(Vec<i32>),
@@ -1302,6 +1344,32 @@ mod tests {
         let chunk = &read_file(&path, &key()).unwrap().chunks[0];
         assert!(read_chunk(&path, other, chunk).is_err());
         assert!(read_chunk(&path, main, chunk).is_ok());
+    }
+
+    #[test]
+    fn weight_chunks_round_trip_by_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (topology, ids) = built(ints(&[1, 2, 3]), ints(&[2, 3, 1]));
+        let main = write_main(&path, &topology, &ids);
+        let (a, b) = (vec![0.5, 1.0, f64::MAX], vec![2.0, 0.0, 1e-300]);
+        for (key, columns) in [("w1", vec![&a[..]]), ("w2", vec![&a[..], &b[..]])] {
+            let appended = append_chunk(&path, main, CHUNK_WEIGHTS, key.as_bytes(), |at| {
+                EncodedChunk::weights(key, &columns, at)
+            });
+            assert!(appended.unwrap().is_some());
+        }
+        let stored = read_file(&path, &key()).unwrap();
+        assert_eq!(stored.chunks.len(), 2);
+        let chunk = |name: &[u8]| stored.chunks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(
+            read_weights(&path, main, chunk(b"w1"), 3).unwrap(),
+            [a.clone()]
+        );
+        assert_eq!(read_weights(&path, main, chunk(b"w2"), 3).unwrap(), [a, b]);
+        // The wrong edge count is an error, never a short column.
+        assert!(read_weights(&path, main, chunk(b"w1"), 4).is_err());
     }
 
     #[test]
