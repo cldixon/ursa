@@ -2,8 +2,8 @@
 //!
 //! [`GraphPlanner`] maps a [`GraphAlgorithmNode`] to a [`GraphAlgorithmExec`]
 //! whose children are the planned edge plans. When it executes, it looks up
-//! the index in the session's [`IndexCache`]; on a miss it drains a child,
-//! partition by partition, and builds the index. Then it runs the calls and
+//! the index in the session's [`IndexCache`]; on a miss it reads a child,
+//! partition by partition, and builds the index as the rows arrive. Then it runs the calls and
 //! emits one batch.
 //!
 //! Row order matters to the index: dense node ids are given in first-seen
@@ -17,14 +17,15 @@
 //!
 //! Weights are looked up by edge row, so they must be in the order of the
 //! rows the index was built from. A weighted node reads only its weighted
-//! child (the endpoints and every weight expression, in one pass), and:
+//! child (the endpoints and every weight expression, in one pass, evaluating
+//! the weights a batch at a time as it goes), and:
 //!
 //! - on an index-cache miss, builds the index from those same rows, so the
 //!   weights line up by construction;
 //! - on a hit, checks that the rows' endpoints are the index's, row for row
 //!   (an edge plan over a join need not produce its rows in the same order
-//!   twice). If they are not, it builds a private index from these rows rather
-//!   than mis-assign a weight.
+//!   twice). If they are not, it reads the child again and builds a private
+//!   index from those rows rather than mis-assign a weight.
 //!
 //! Each distinct weight expression is evaluated once per node, cast to
 //! `Float64`, and checked as `ursa-plan` checks weights (no nulls, no negative
@@ -33,13 +34,13 @@
 //! identities, so the next query with the same weights reads no edges at all.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{new_empty_array, Array, ArrayRef, Float64Array};
 use datafusion::arrow::compute::{cast, cast_with_options, concat, CastOptions};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -57,11 +58,11 @@ use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties, SendableRecordBatchStream,
+    PlanProperties, SendableRecordBatchStream, StatisticsArgs, StatisticsContext,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use futures::{FutureExt, StreamExt};
-use ursa_core::IdError;
+use ursa_core::{EdgeInterner, IdError, Topology};
 
 use super::index::{file_identities, fingerprint, FileIdentity, GraphIndex, IndexCache, Weights};
 use super::kernels;
@@ -667,10 +668,8 @@ async fn unweighted_index(
     let build = {
         let (shape, input, context) = (shape.clone(), Arc::clone(&input), Arc::clone(context));
         async move {
-            let (source, destination) = shape.endpoints;
-            let batches = drain(&input, &[source, destination], &context).await?;
-            let endpoints = endpoint_columns(batches, &shape.id_type)?;
-            build_index(shape.graph, shape.id_type, Arc::new(endpoints)).await
+            let mut no_weights = WeightReader::new(&[], 0);
+            build_streamed(&shape, &input, shape.endpoints, &context, &mut no_weights).await
         }
     };
     match context.session_config().get_extension::<IndexCache>() {
@@ -713,65 +712,137 @@ async fn weighted_index(
         }
     }
 
-    let mut columns = vec![weighted.source, weighted.destination];
-    columns.extend(&weighted.weights);
-    let batches = drain(&weighted.plan, &columns, context).await?;
-    let mut weight_columns: Vec<Vec<ArrayRef>> = vec![Vec::new(); weighted.weights.len()];
-    let mut endpoints = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let mut batch = batch.into_iter();
-        let (source, destination) = (batch.next(), batch.next());
-        endpoints.push(vec![
-            source.expect("drained with the endpoints"),
-            destination.expect("drained with the endpoints"),
-        ]);
-        for (column, array) in weight_columns.iter_mut().zip(batch) {
-            column.push(array);
-        }
-    }
-    let endpoints = Arc::new(endpoint_columns(endpoints, &shape.id_type)?);
-
-    let build = |endpoints: Arc<Vec<(ArrayRef, ArrayRef)>>| {
-        build_index(shape.graph.clone(), shape.id_type.clone(), endpoints)
-    };
-    let built_here = Arc::new(AtomicBool::new(false));
-    let (index, shared) = match &cache {
+    let (index, weights, shared) = match &cache {
         Some(cache) => {
-            let flag = Arc::clone(&built_here);
-            let rows = Arc::clone(&endpoints);
+            // Weights read by this node's own build, if the cache ran it.
+            let slot = Arc::new(Mutex::new(None));
+            let build = {
+                let (shape, weighted) = (shape.clone(), weighted.clone());
+                let (context, slot) = (Arc::clone(context), Arc::clone(&slot));
+                async move {
+                    let (index, weights) = build_weighted(&shape, &weighted, &context).await?;
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(weights);
+                    Ok(index)
+                }
+            };
             let index = cache
-                .get_or_build_stored(
-                    context.session_config(),
-                    key,
-                    async move {
-                        flag.store(true, Ordering::Relaxed);
-                        build(rows).await
-                    }
-                    .boxed(),
-                )
+                .get_or_build_stored(context.session_config(), key, build.boxed())
                 .await?;
-            if built_here.load(Ordering::Relaxed) || aligned(&index, &endpoints)? {
-                (index, true)
-            } else {
-                // The cached index's rows are in another order: these weights
-                // belong to an index of these rows.
-                cache.record_build();
-                (Arc::new(build(Arc::clone(&endpoints)).await?), false)
+            let built_here = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            match built_here {
+                Some(weights) => (index, weights, true),
+                None => {
+                    let mut weights =
+                        WeightReader::new(&weighted.weights, index.topology.n_edges());
+                    if read_aligned(&index, &weighted, &shape.id_type, context, &mut weights)
+                        .await?
+                    {
+                        (index, weights, true)
+                    } else {
+                        // The cached index's rows are in another order: these
+                        // weights belong to an index of these rows.
+                        cache.record_build();
+                        let (private, weights) = build_weighted(shape, &weighted, context).await?;
+                        (Arc::new(private), weights, false)
+                    }
+                }
             }
         }
-        None => (Arc::new(build(Arc::clone(&endpoints)).await?), false),
+        None => {
+            let (index, weights) = build_weighted(shape, &weighted, context).await?;
+            (Arc::new(index), weights, false)
+        }
     };
 
-    let weights: Weights = Arc::new(
-        weight_columns
-            .iter()
-            .map(|columns| edge_weights(columns).map(Arc::new))
-            .collect::<Result<_>>()?,
-    );
+    let weights: Weights = Arc::new(weights.finish()?.into_iter().map(Arc::new).collect());
     if let (true, Some(weights_key)) = (shared, weights_key) {
         index.store_weights(weights_key, Arc::clone(&weights));
     }
     Ok((index, weights))
+}
+
+/// Build the index of the weighted rows, reading their weights in the same
+/// pass, so they line up by construction.
+async fn build_weighted(
+    shape: &Edges,
+    weighted: &WeightedInput,
+    context: &Arc<TaskContext>,
+) -> Result<(GraphIndex, WeightReader)> {
+    let mut weights = WeightReader::new(&weighted.weights, row_hint(&weighted.plan));
+    let endpoints = (weighted.source, weighted.destination);
+    let index = build_streamed(shape, &weighted.plan, endpoints, context, &mut weights).await?;
+    Ok((index, weights))
+}
+
+/// Read the weighted rows once, reading their weights, and say whether
+/// their endpoints are the rows `index` was built from, row for row. Stops
+/// at the first row that is not.
+async fn read_aligned(
+    index: &GraphIndex,
+    weighted: &WeightedInput,
+    id_type: &DataType,
+    context: &Arc<TaskContext>,
+    weights: &mut WeightReader,
+) -> Result<bool> {
+    let mut rows = RowCheck::new(index);
+    let plan = &weighted.plan;
+    for partition in 0..plan.output_partitioning().partition_count() {
+        let mut stream = plan.execute(partition, Arc::clone(context))?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let src = cast(batch.column(weighted.source), id_type)?;
+            let dst = cast(batch.column(weighted.destination), id_type)?;
+            if !rows.check(&src, &dst)? {
+                return Ok(false);
+            }
+            weights.push(&batch);
+        }
+    }
+    Ok(rows.complete())
+}
+
+/// The weight columns of a weighted node's rows, evaluated a batch at a
+/// time as the rows are read. The first bad weight is reported once every
+/// row has been read, after any error in building the index from those
+/// rows, as when the weights were evaluated after the build.
+struct WeightReader {
+    columns: Vec<usize>,
+    values: Vec<Vec<f64>>,
+    error: Option<DataFusionError>,
+}
+
+impl WeightReader {
+    /// A reader of the columns `columns`, sized for `rows` rows.
+    fn new(columns: &[usize], rows: usize) -> Self {
+        Self {
+            columns: columns.to_vec(),
+            values: columns.iter().map(|_| Vec::with_capacity(rows)).collect(),
+            error: None,
+        }
+    }
+
+    fn push(&mut self, batch: &RecordBatch) {
+        if self.error.is_some() {
+            return;
+        }
+        for (&c, values) in self.columns.iter().zip(&mut self.values) {
+            if let Err(e) = extend_weights(batch.column(c), values) {
+                self.error = Some(e);
+                return;
+            }
+        }
+    }
+
+    /// One `f64` per row read, per column, or the first bad weight.
+    fn finish(self) -> Result<Vec<Vec<f64>>> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self.values),
+        }
+    }
 }
 
 /// Every batch of `input`, partition by partition in order, as the columns
@@ -801,103 +872,258 @@ async fn drain(
     Ok(out)
 }
 
-/// Each batch's endpoints, cast to the node id type.
-fn endpoint_columns(
-    batches: Vec<Vec<ArrayRef>>,
-    id_type: &DataType,
-) -> Result<Vec<(ArrayRef, ArrayRef)>> {
-    batches
-        .into_iter()
-        .map(|batch| Ok((cast(&batch[0], id_type)?, cast(&batch[1], id_type)?)))
-        .collect()
+/// Rows the index build interns at a time. A scan's batches are 8,192 rows,
+/// and `EdgeInterner` resolves known ids in parallel only in larger chunks,
+/// so the build gathers batches up to this many rows first: what `ursa-io`'s
+/// scan does for the Python library (its `SCAN_BATCH_ROWS`). A chunk is
+/// 2 MiB of `Int64` endpoints.
+const INTERN_ROWS: usize = 1 << 17;
+
+/// Endpoint chunks gathered up to [`INTERN_ROWS`] rows, in row order.
+#[derive(Default)]
+struct Gather {
+    src: Vec<ArrayRef>,
+    dst: Vec<ArrayRef>,
+    rows: usize,
 }
 
-/// Build the index of `endpoints`, off the async workers.
-async fn build_index(
-    graph: String,
-    id_type: DataType,
-    endpoints: Arc<Vec<(ArrayRef, ArrayRef)>>,
-) -> Result<GraphIndex> {
-    let name = graph.clone();
-    tokio::task::spawn_blocking(move || {
-        let endpoints = endpoints.as_slice();
-        if endpoints.is_empty() {
-            let (topology, ids) = ursa_io::topology::empty_topology(&id_type);
-            return Ok(GraphIndex::new(topology, ids));
+impl Gather {
+    /// Add a chunk; once [`INTERN_ROWS`] rows are gathered, take them.
+    fn push(&mut self, src: ArrayRef, dst: ArrayRef) -> Result<Option<(ArrayRef, ArrayRef)>> {
+        self.rows += src.len();
+        self.src.push(src);
+        self.dst.push(dst);
+        if self.rows >= INTERN_ROWS {
+            self.take()
+        } else {
+            Ok(None)
         }
-        let chunks: Vec<(&dyn Array, &dyn Array)> = endpoints
-            .iter()
-            .map(|(s, d)| (s.as_ref(), d.as_ref()))
-            .collect();
-        let (topology, ids) =
-            ursa_io::build_topology_batches(&chunks).map_err(|e| build_error(&graph, e))?;
-        Ok(GraphIndex::new(topology, ids))
+    }
+
+    /// The rows gathered so far, as one chunk, if there are any.
+    fn take(&mut self) -> Result<Option<(ArrayRef, ArrayRef)>> {
+        self.rows = 0;
+        let (src, dst) = (std::mem::take(&mut self.src), std::mem::take(&mut self.dst));
+        Ok(match src.len() {
+            0 => None,
+            1 => src.into_iter().zip(dst).next(),
+            _ => {
+                let join = |arrays: &[ArrayRef]| {
+                    let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+                    concat(&refs)
+                };
+                Some((join(&src)?, join(&dst)?))
+            }
+        })
+    }
+}
+
+/// The index of everything `interner` was given; an empty graph of
+/// `id_type` ids if it was given no edges.
+fn finish_index(interner: EdgeInterner, id_type: &DataType) -> GraphIndex {
+    if interner.is_empty() {
+        let (topology, ids) = ursa_io::topology::empty_topology(id_type);
+        return GraphIndex::new(topology, ids);
+    }
+    let (ids, source, destination) = interner.finish();
+    let topology = Topology::build(ids.len(), source, destination);
+    GraphIndex::new(Arc::new(topology), Arc::new(ids))
+}
+
+/// The number of rows `plan` will produce, if its statistics say: sizes the
+/// interner, as `ursa-io`'s scan sizes it from the Parquet metadata.
+fn row_hint(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    StatisticsContext::new()
+        .compute(plan.as_ref(), &StatisticsArgs::new())
+        .ok()
+        .and_then(|s| s.num_rows.get_value().copied())
+        .unwrap_or(0)
+}
+
+/// What the reader hands the interning thread.
+enum Chunk {
+    Edges(ArrayRef, ArrayRef),
+    /// Every row has been read: build the index.
+    End,
+}
+
+/// Build the index of the edge rows `input` produces, interning each chunk
+/// as it is read rather than collecting every endpoint array first, so the
+/// Arrow input never accumulates: the build holds the dense endpoints and a
+/// chunk or two in flight, as `ursa-io`'s scan does. Reading (here) and
+/// interning (on a blocking thread) overlap. The rows are interned in the
+/// order [`drain`] would collect them, so the index is the one
+/// `ursa_io::build_topology_batches` gives over the collected rows. A
+/// weighted node's weights are read from the same rows (`weights`).
+async fn build_streamed(
+    shape: &Edges,
+    input: &Arc<dyn ExecutionPlan>,
+    (source, destination): (usize, usize),
+    context: &Arc<TaskContext>,
+    weights: &mut WeightReader,
+) -> Result<GraphIndex> {
+    let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
+    let hint = row_hint(input);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
+    let interning = tokio::task::spawn_blocking(move || -> Result<Option<GraphIndex>> {
+        let mut interner = EdgeInterner::with_capacity(hint);
+        while let Some(chunk) = rx.blocking_recv() {
+            match chunk {
+                Chunk::Edges(src, dst) => interner
+                    .push(src.as_ref(), dst.as_ref())
+                    .map_err(|e| build_error(&graph, e))?,
+                Chunk::End => return Ok(Some(finish_index(interner, &id_type))),
+            }
+        }
+        // The reader stopped before the end (its error is the one reported).
+        Ok(None)
+    });
+
+    let read = async {
+        let mut gather = Gather::default();
+        for partition in 0..input.output_partitioning().partition_count() {
+            let mut stream = input.execute(partition, Arc::clone(context))?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let src = cast(batch.column(source), &shape.id_type)?;
+                let dst = cast(batch.column(destination), &shape.id_type)?;
+                weights.push(&batch);
+                drop(batch);
+                if let Some((src, dst)) = gather.push(src, dst)? {
+                    if tx.send(Chunk::Edges(src, dst)).await.is_err() {
+                        // The interner stopped on an error: it is reported below.
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Some((src, dst)) = gather.take()? {
+            if tx.send(Chunk::Edges(src, dst)).await.is_err() {
+                return Ok(());
+            }
+        }
+        let _ = tx.send(Chunk::End).await;
+        Ok::<_, DataFusionError>(())
+    };
+    let read = read.await;
+    drop(tx);
+    let built = interning.await.map_err(|e| {
+        DataFusionError::Execution(format!("building graph '{}' failed: {e}", shape.graph))
+    })?;
+    read?;
+    built?.ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "building graph '{}' stopped before the last edge",
+            shape.graph
+        ))
     })
-    .await
-    .map_err(|e| DataFusionError::Execution(format!("building graph '{name}' failed: {e}")))?
+}
+
+/// Checks, a chunk at a time, that rows are the edge rows an index was
+/// built from, in order.
+struct RowCheck<'a> {
+    index: &'a GraphIndex,
+    /// Each row's endpoints as dense ids, from the CSR and its row
+    /// permutation.
+    source: Vec<u32>,
+    destination: Vec<u32>,
+    /// Rows checked so far.
+    start: usize,
+}
+
+impl<'a> RowCheck<'a> {
+    fn new(index: &'a GraphIndex) -> Self {
+        let topology = &index.topology;
+        let n = topology.n_edges();
+        let out = topology.out();
+        let (mut source, mut destination) = (vec![0u32; n], vec![0u32; n]);
+        for u in 0..topology.n_nodes() {
+            let slots = out.offsets[u] as usize..out.offsets[u + 1] as usize;
+            for slot in slots {
+                let row = out.edge_ids[slot] as usize;
+                source[row] = u as u32;
+                destination[row] = out.targets[slot];
+            }
+        }
+        Self {
+            index,
+            source,
+            destination,
+            start: 0,
+        }
+    }
+
+    /// Whether the next rows are `src` → `dst`. Each chunk's ids are
+    /// compared on their own, so no column of every row's ids is made.
+    fn check(&mut self, src: &ArrayRef, dst: &ArrayRef) -> Result<bool> {
+        let rows = self.start..self.start + src.len();
+        if rows.end > self.source.len() {
+            return Ok(false);
+        }
+        self.start = rows.end;
+        let ids = &self.index.ids;
+        let user_type = ids.user_type();
+        Ok(
+            ids.gather_user(&self.source[rows.clone()]).as_ref() == cast(src, &user_type)?.as_ref()
+                && ids.gather_user(&self.destination[rows]).as_ref()
+                    == cast(dst, &user_type)?.as_ref(),
+        )
+    }
+
+    /// Whether every row of the index has been checked.
+    fn complete(&self) -> bool {
+        self.start == self.source.len()
+    }
 }
 
 /// Whether `endpoints` are the edge rows `index` was built from, row for row.
+#[cfg(test)]
 fn aligned(index: &GraphIndex, endpoints: &[(ArrayRef, ArrayRef)]) -> Result<bool> {
-    let topology = &index.topology;
-    let n = topology.n_edges();
-    if endpoints.iter().map(|(s, _)| s.len()).sum::<usize>() != n {
-        return Ok(false);
-    }
-    if n == 0 {
-        return Ok(true);
-    }
-    // Each row's endpoints as dense ids, from the CSR and its row permutation.
-    let out = topology.out();
-    let (mut source, mut destination) = (vec![0u32; n], vec![0u32; n]);
-    for u in 0..topology.n_nodes() {
-        let slots = out.offsets[u] as usize..out.offsets[u + 1] as usize;
-        for slot in slots {
-            let row = out.edge_ids[slot] as usize;
-            source[row] = u as u32;
-            destination[row] = out.targets[slot];
+    let mut rows = RowCheck::new(index);
+    for (src, dst) in endpoints {
+        if !rows.check(src, dst)? {
+            return Ok(false);
         }
     }
-    let user_type = index.ids.user_type();
-    let given = |pick: fn(&(ArrayRef, ArrayRef)) -> &ArrayRef| -> Result<ArrayRef> {
-        let arrays = endpoints
-            .iter()
-            .map(|e| cast(pick(e), &user_type))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
-        Ok(concat(&refs)?)
-    };
-    Ok(
-        index.ids.gather_user(&source).as_ref() == given(|e| &e.0)?.as_ref()
-            && index.ids.gather_user(&destination).as_ref() == given(|e| &e.1)?.as_ref(),
-    )
+    Ok(rows.complete())
 }
 
 /// A weight expression's values, one `f64` per edge row, checked as
 /// `ursa-plan`'s `evaluate_weight` checks them, with its messages.
+#[cfg(test)]
 fn edge_weights(columns: &[ArrayRef]) -> Result<Vec<f64>> {
     let mut out = Vec::with_capacity(columns.iter().map(|c| c.len()).sum());
     for column in columns {
-        let column = cast(column, &DataType::Float64)?;
-        let column = column
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("cast to Float64 yields Float64Array");
-        if column.null_count() > 0 {
-            return Err(DataFusionError::Execution(
-                "weight expression produced a null value; weights must be non-null".into(),
-            ));
-        }
-        let values = column.values();
-        if let Some(&w) = values.iter().find(|&&w| w < 0.0) {
-            return Err(DataFusionError::Execution(format!(
-                "weight expression produced a negative value ({w}); weights must be \
-                 non-negative"
-            )));
-        }
-        out.extend_from_slice(values);
+        extend_weights(column, &mut out)?;
     }
     Ok(out)
+}
+
+/// Append one chunk of a weight expression's values to `out`, checked as
+/// `ursa-plan`'s `evaluate_weight` checks them, with its messages.
+fn extend_weights(column: &ArrayRef, out: &mut Vec<f64>) -> Result<()> {
+    let column = cast(column, &DataType::Float64)?;
+    let column = column
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("cast to Float64 yields Float64Array");
+    if column.null_count() > 0 {
+        return Err(DataFusionError::Execution(
+            "weight expression produced a null value; weights must be non-null".into(),
+        ));
+    }
+    let values = column.values();
+    if let Some(&w) = values.iter().find(|&&w| w < 0.0) {
+        return Err(DataFusionError::Execution(format!(
+            "weight expression produced a negative value ({w}); weights must be \
+             non-negative"
+        )));
+    }
+    out.extend_from_slice(values);
+    Ok(())
 }
 
 fn build_error(graph: &str, e: IdError) -> DataFusionError {

@@ -201,9 +201,7 @@ impl IndexStore {
                 .find(|e| e.key == *key)?
                 .file
         };
-        let read = std::fs::read(self.dir.join(&file))
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| index_file::decode(&bytes, key));
+        let read = index_file::read_file(&self.dir.join(&file), key);
         let mut state = self.state();
         match read {
             Ok((topology, ids)) => {
