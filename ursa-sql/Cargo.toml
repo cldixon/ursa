@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 ursa-engine = { path = "../ursa-engine" }
 datafusion = { workspace = true }
+# Opening a database may wait for another process's lock, off the async workers.
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

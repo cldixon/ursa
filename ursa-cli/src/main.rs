@@ -4,7 +4,11 @@
 //! ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
 //! ursa -f csv --file query.sql > out.csv
 //! echo "SELECT 1" | ursa
+//! ursa club.ursa -c "SELECT * FROM degree(karate)"
 //! ```
+//!
+//! With a database file (`club.ursa`), views, external tables and graphs are
+//! kept in it between runs; without one, the session is in memory.
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -27,9 +31,16 @@ use print::{has_columns, write_stream, OutputFormat};
     after_help = "Any file is a table: ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\""
 )]
 struct Args {
-    /// A database file (.ursa). Database files arrive in a later release (#237).
+    /// A database file (.ursa), created if it does not exist. It keeps the
+    /// views, external tables and graphs you define. Without one, ursa works in
+    /// memory.
     #[arg(value_name = "DATABASE")]
     database: Option<String>,
+
+    /// Open the database without changing it: statements that define or drop
+    /// anything are refused, and other processes may write it meanwhile.
+    #[arg(long = "readonly", requires = "database")]
+    readonly: bool,
 
     /// Run SQL and exit. Separate statements with ';'. May be repeated.
     #[arg(short = 'c', long = "command", value_name = "SQL")]
@@ -59,16 +70,12 @@ fn main() -> ExitCode {
     };
 
     if let Some(database) = &args.database {
-        return fail(&if database.ends_with(".ursa") {
-            "database files (.ursa) are not supported yet (planned in #237); run ursa without \
-             one to work in memory"
-                .to_string()
-        } else {
-            format!(
+        if !database.ends_with(".ursa") {
+            return fail(&format!(
                 "'{database}' is not a database file (those end in .ursa); to run SQL, use \
                  -c \"<sql>\" or --file <path>"
-            )
-        });
+            ));
+        }
     }
 
     let mut sources = sources_in_order(&args, &matches);
@@ -81,14 +88,6 @@ fn main() -> ExitCode {
             sources.push(Source::Stdin(sql));
         }
     }
-    if sources.is_empty() {
-        eprintln!(
-            "The interactive shell is not available yet (planned in #238).\n\
-             Run SQL with -c \"<sql>\", --file <path>, or on stdin. See ursa --help."
-        );
-        return ExitCode::SUCCESS;
-    }
-
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -96,7 +95,7 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => return fail(&format!("cannot start: {e}")),
     };
-    match runtime.block_on(run(sources, args.format)) {
+    match runtime.block_on(run(sources, &args)) {
         Ok(()) => ExitCode::SUCCESS,
         // A reader that stops early (`ursa … | head`) is not an error.
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
@@ -126,8 +125,27 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-async fn run(sources: Vec<Source>, format: OutputFormat) -> Result<(), DataFusionError> {
-    let ctx = ursa_engine::new_session();
+async fn run(sources: Vec<Source>, args: &Args) -> Result<(), DataFusionError> {
+    let format = args.format;
+    // Open (or create) the database even with no SQL to run, so `ursa
+    // club.ursa` makes the file, as Getting Started says.
+    let ctx = match &args.database {
+        Some(path) => {
+            let options = ursa_sql::OpenOptions {
+                read_only: args.readonly,
+                ..Default::default()
+            };
+            ursa_sql::open_session(path, &options).await?
+        }
+        None => ursa_engine::new_session(),
+    };
+    if sources.is_empty() {
+        eprintln!(
+            "The interactive shell is not available yet (planned in #238).\n\
+             Run SQL with -c \"<sql>\", --file <path>, or on stdin. See ursa --help."
+        );
+        return Ok(());
+    }
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let mut printed = 0;
@@ -153,12 +171,12 @@ async fn run_sql<W: Write>(
     out: &mut W,
     printed_before: usize,
 ) -> Result<usize, DataFusionError> {
-    let statements = ursa_sql::parse_sql_for(ctx, sql)?;
+    let statements = ursa_sql::parse_sql_with_text_for(ctx, sql)?;
     let config = ctx.state().config().options().format.clone();
     let options = (&config).try_into()?;
     let mut printed = 0;
-    for statement in statements {
-        let frame = ursa_sql::execute(ctx, statement).await?;
+    for (statement, text) in statements {
+        let frame = ursa_sql::execute_with_text(ctx, statement, &text).await?;
         let stream = frame.execute_stream().await?;
         if !has_columns(&stream.schema()) {
             continue;
