@@ -34,7 +34,7 @@ killed and recorded as ``timeout`` or ``memory``; a failing step is recorded
 as ``error`` with the end of its stderr. Nothing is dropped.
 
 Raw rows go to ``--out`` (CSV, appended with a run id), and a summary table is
-printed. Usage::
+printed (medians over ``--repeat`` runs). Usage::
 
     cargo build --release -p ursa-cli
     uv run --group bench python benchmarks/sql_scale/run.py \\
@@ -51,11 +51,12 @@ import os
 import platform
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -91,6 +92,7 @@ class Row:
     edges: int
     engine: str
     step: str
+    rep: int = 0
     status: str = "ok"
     wall_s: float = 0.0
     peak_rss_mb: float = 0.0
@@ -100,7 +102,6 @@ class Row:
     inner_s: float | None = None
     index_bytes: int | None = None
     note: str = ""
-    extra: dict = field(default_factory=dict, repr=False)
 
 
 def rss_mb(pid: int) -> float:
@@ -241,7 +242,7 @@ elif step == "algorithms":
 else:
     raise SystemExit(f"unknown step {step}")
 t2 = time.perf_counter()
-print(json.dumps({"rows": f.height, "import_s": t1 - t0, "inner_s": t2 - t1}))
+print(json.dumps({"rows": len(f), "import_s": t1 - t0, "inner_s": t2 - t1}))
 """
 
 STATS = re.compile(r"graph indexes built (\d+), loaded (\d+)")
@@ -262,7 +263,9 @@ def index_bytes(db: Path) -> int:
     return sum(p.stat().st_size for p in d.glob("*.idx")) if d.exists() else 0
 
 
-def run_dataset(name: str, args: argparse.Namespace, run_id: str, edges_count: int) -> list[Row]:
+def run_dataset(
+    name: str, args: argparse.Namespace, run_id: str, edges_count: int, rep: int
+) -> list[Row]:
     data, work = args.data.resolve(), args.work.resolve()
     edges = data / f"{name}.parquet"
     w = data / f"{name.rsplit('-', 1)[0]}-w.parquet"
@@ -289,7 +292,7 @@ def run_dataset(name: str, args: argparse.Namespace, run_id: str, edges_count: i
                 timeout=args.timeout,
                 mem_limit_mb=limit,
             )
-            row = Row(run_id, name, edges_count, "sql", step, status, wall, rss)
+            row = Row(run_id, name, edges_count, "sql", step, rep, status, wall, rss)
             if m := STATS.search(err):
                 row.built, row.loaded = int(m[1]), int(m[2])
             row.rows = first_number(out)
@@ -321,7 +324,7 @@ def run_dataset(name: str, args: argparse.Namespace, run_id: str, edges_count: i
                 timeout=args.timeout,
                 mem_limit_mb=limit,
             )
-            row = Row(run_id, name, edges_count, "python", step, status, wall, rss)
+            row = Row(run_id, name, edges_count, "python", step, rep, status, wall, rss)
             if status == "ok":
                 result = json.loads(out.strip().splitlines()[-1])
                 row.rows, row.inner_s = result["rows"], result["inner_s"]
@@ -341,20 +344,25 @@ def fmt_row(r: Row) -> str:
     )
 
 
-def cell(r: Row | None) -> str:
-    if r is None:
+def cell(rs: list[Row]) -> str:
+    """The median wall time and peak RSS of the repetitions, or the first failure."""
+    if not rs:
         return "-"
-    if r.status != "ok":
-        return f"{r.status.upper()} ({r.wall_s:.0f}s)"
-    return f"{r.wall_s:.2f}s / {r.peak_rss_mb:,.0f} MB"
+    if bad := [r for r in rs if r.status != "ok"]:
+        return f"{bad[0].status.upper()} ({bad[0].wall_s:.0f}s)"
+    wall = statistics.median(r.wall_s for r in rs)
+    rss = statistics.median(r.peak_rss_mb for r in rs)
+    return f"{wall:.2f}s / {rss:,.0f} MB"
 
 
 def summary(rows: list[Row]) -> str:
-    """One Markdown table per dataset: steps × engine, wall / peak RSS."""
+    """One Markdown table per dataset: steps × engine, median wall / peak RSS."""
     out = []
     for dataset in dict.fromkeys(r.dataset for r in rows):
         rs = [r for r in rows if r.dataset == dataset]
-        by = {(r.engine, r.step): r for r in rs}
+        by: dict[tuple[str, str], list[Row]] = {}
+        for r in rs:
+            by.setdefault((r.engine, r.step), []).append(r)
         idx = next((r.index_bytes for r in rs if r.index_bytes), None)
         out.append(f"\n### {dataset} ({rs[0].edges:,} edges)\n")
         if idx:
@@ -362,10 +370,10 @@ def summary(rows: list[Row]) -> str:
         out.append("| step | SQL | Python | SQL built/loaded |")
         out.append("|---|---|---|---|")
         for step in SQL_STEPS:
-            s, p = by.get(("sql", step)), by.get(("python", step))
-            if s is None and p is None:
+            s, p = by.get(("sql", step), []), by.get(("python", step), [])
+            if not s and not p:
                 continue
-            bl = f"{s.built}/{s.loaded}" if s and s.built is not None else ""
+            bl = f"{s[0].built}/{s[0].loaded}" if s and s[0].built is not None else ""
             out.append(f"| {step} | {cell(s)} | {cell(p)} | {bl} |")
     return "\n".join(out)
 
@@ -397,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mem-limit-gb", type=float, default=11, help="kill a step whose RSS passes this"
     )
+    parser.add_argument("--repeat", type=int, default=1, help="runs of every step (median)")
     parser.add_argument("--label", default="", help="free text stored with every row")
     args = parser.parse_args(argv)
     args.engines = set(args.engines.split(","))
@@ -420,18 +429,17 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[Row] = []
     for name in names:
         count = pq.ParquetFile(args.data / f"{name}.parquet").metadata.num_rows
-        rows.extend(run_dataset(name, args, run_id, count))
+        for rep in range(args.repeat):
+            rows.extend(run_dataset(name, args, run_id, count, rep))
 
-    fields = [f for f in Row.__dataclass_fields__ if f != "extra"]
+    fields = list(Row.__dataclass_fields__)
     new = not args.out.exists()
     with open(args.out, "a", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=[*fields, "label"])
         if new:
             writer.writeheader()
         for r in rows:
-            d = asdict(r)
-            d.pop("extra")
-            writer.writerow({**d, "label": args.label})
+            writer.writerow({**asdict(r), "label": args.label})
     print(summary(rows))
     return 0
 
