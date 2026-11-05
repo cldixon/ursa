@@ -277,3 +277,30 @@ scenario can swing 20–25% between identical runs, so treat a difference smalle
 than that scenario's noise as unconfirmed. A full pass takes about 6 minutes on
 `main` (Louvain at 500k edges dominates before #185, about 2 minutes) and
 about 3 minutes after.
+
+## SQL scale test (`sql_scale/`)
+
+A scale test of the `ursa` SQL binary, with the Python library alongside, at
+millions of edges. It is separate from the flywheel above: no comparison
+libraries, and its generator does not go through NetworkX.
+
+```bash
+# Seeded R-MAT (Graph500-style) edge lists as Parquet: int64 ids, a weighted
+# variant, and string ids up to --string-max. 20M edges take seconds.
+uv run --no-project --with numpy --with pyarrow \
+    python benchmarks/sql_scale/gen.py --out DATA --sizes 1M,5M,20M --weighted
+
+# Every step as its own process: the release binary for SQL, a fresh
+# interpreter for Python. Wall time and peak RSS per step, the index builds
+# and loads the CLI reports, and the stored index's size.
+cargo build --release -p ursa-cli
+uv sync --reinstall-package ursa-graph --group bench
+uv run --group bench python benchmarks/sql_scale/run.py \
+    --data DATA --work WORK --out results.csv --repeat 3
+```
+
+Keep `DATA` and `WORK` outside the repository. Each step has a timeout
+(`--timeout`) and a memory ceiling (`--mem-limit-gb`); a step that passes
+either is killed and recorded as `timeout` or `memory`, not dropped. Raw rows
+are appended to the CSV, and a Markdown summary of medians is printed.
+`--engines sql` skips the Python steps (and the Python build).

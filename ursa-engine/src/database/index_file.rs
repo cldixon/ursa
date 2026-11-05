@@ -36,8 +36,8 @@
 //! memory-mapped reader wants (each section is a ready `&[u32]`/`&[u64]` on a
 //! little-endian machine), need no dependency, and the string ids are already
 //! in Arrow's layout, so they become a `StringArray` without a copy once
-//! mapped. Version 1 reads the whole file into memory and copies the
-//! sections out.
+//! mapped. Version 1 reads the file once, front to back, decoding each
+//! section into its array as it goes ([`read_file`]).
 //!
 //! **Corruption.** A file is read only if its length matches the trailer, the
 //! CRC matches, the version is 1, the key matches the key asked for, every
@@ -45,7 +45,9 @@
 //! map (`ursa_core::Topology::from_parts`, `IdMap::from_user_ids`). Anything
 //! else is an error, which the store treats as a miss.
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
@@ -363,42 +365,126 @@ impl<W: Write> Sink<W> {
 /// Why a file could not be read as an index.
 pub type DecodeError = String;
 
+/// Read the index file at `path`, which must be stored under `key`.
+///
+/// The file is read once, front to back, straight into the arrays the index
+/// is made of, so a load holds the index and a small buffer, not the file's
+/// bytes as well. The key is checked before the sections are read, so a file
+/// for another key costs only its header; the checksum covers every byte and
+/// is checked before any array is used.
+pub fn read_file(path: &Path, key: &IndexKey) -> Result<(Topology, IdMap), DecodeError> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    decode_from(BufReader::with_capacity(BLOCK, file), len, key)
+}
+
 /// Read the index in `bytes`, which must be stored under `key`.
 pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeError> {
-    let len = bytes.len() as u64;
+    decode_from(bytes, bytes.len() as u64, key)
+}
+
+/// The most a read asks for at once, in bytes.
+const BLOCK: usize = 1 << 20;
+
+/// A reader that keeps a running CRC and position.
+struct Source<R> {
+    inner: R,
+    crc: crc32fast::Hasher,
+    at: u64,
+}
+
+impl<R: Read> Source<R> {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), DecodeError> {
+        self.inner.read_exact(buf).map_err(|e| match e.kind() {
+            io::ErrorKind::UnexpectedEof => "the file is truncated".to_string(),
+            _ => e.to_string(),
+        })?;
+        self.crc.update(buf);
+        self.at += buf.len() as u64;
+        Ok(())
+    }
+
+    fn bytes(&mut self, n: usize) -> Result<Vec<u8>, DecodeError> {
+        let mut buf = vec![0; n];
+        self.fill(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read and discard up to `offset`: padding, or a section this build
+    /// does not read.
+    fn skip_to(&mut self, offset: u64) -> Result<(), DecodeError> {
+        let mut buf = vec![0; BLOCK.min(offset.saturating_sub(self.at) as usize)];
+        while self.at < offset {
+            let n = ((offset - self.at) as usize).min(buf.len());
+            self.fill(&mut buf[..n])?;
+        }
+        Ok(())
+    }
+
+    /// `count` little-endian values, a block at a time.
+    fn values<T, const N: usize>(
+        &mut self,
+        count: usize,
+        le: fn([u8; N]) -> T,
+    ) -> Result<Vec<T>, DecodeError> {
+        let mut out = Vec::with_capacity(count);
+        let mut buf = vec![0; BLOCK.min(count * N)];
+        while out.len() < count {
+            let n = ((count - out.len()) * N).min(buf.len());
+            self.fill(&mut buf[..n])?;
+            out.extend(read(&buf[..n], le));
+        }
+        Ok(out)
+    }
+}
+
+/// One section, read.
+enum Section {
+    U64(Vec<u64>),
+    U32(Vec<u32>),
+    I64(Vec<i64>),
+    I32(Vec<i32>),
+    Bytes(Vec<u8>),
+}
+
+/// Read the index from `reader`, a file of `len` bytes stored under `key`.
+fn decode_from(
+    reader: impl Read,
+    len: u64,
+    key: &IndexKey,
+) -> Result<(Topology, IdMap), DecodeError> {
     if len < HEADER_LEN + TRAILER_LEN {
         return Err(format!("{len} bytes is too short for an index file"));
     }
-    if bytes[..8] != MAGIC {
+    let mut src = Source {
+        inner: reader,
+        crc: crc32fast::Hasher::new(),
+        at: 0,
+    };
+    let header = src.bytes(HEADER_LEN as usize)?;
+    if header[..8] != MAGIC {
         return Err("not an Ursa index file".into());
     }
-    let trailer = &bytes[(len - TRAILER_LEN) as usize..];
-    if trailer[12..] != END_MAGIC || u64_at(trailer, 0) != len {
-        return Err("the file is truncated".into());
-    }
-    let crc = u32::from_le_bytes(trailer[8..12].try_into().expect("4 bytes"));
-    if crc32fast::hash(&bytes[..(len - TRAILER_LEN) as usize]) != crc {
-        return Err("the checksum does not match".into());
-    }
-    let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+    let version = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
     if version != VERSION {
         return Err(format!(
             "index format version {version}; this build reads {VERSION}"
         ));
     }
-    let flags = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
-    let n_nodes = usize::try_from(u64_at(bytes, 16)).map_err(|e| e.to_string())?;
-    let n_edges = usize::try_from(u64_at(bytes, 24)).map_err(|e| e.to_string())?;
-    let key_len = u64_at(bytes, 32);
-    let n_sections = u32::from_le_bytes(bytes[40..44].try_into().expect("4 bytes")) as u64;
+    let flags = u32::from_le_bytes(header[12..16].try_into().expect("4 bytes"));
+    let n_nodes = usize::try_from(u64_at(&header, 16)).map_err(|e| e.to_string())?;
+    let n_edges = usize::try_from(u64_at(&header, 24)).map_err(|e| e.to_string())?;
+    let key_len = u64_at(&header, 32);
+    let n_sections = u32::from_le_bytes(header[40..44].try_into().expect("4 bytes")) as u64;
 
     let body = len - TRAILER_LEN;
     let key_end = HEADER_LEN
         .checked_add(key_len)
         .filter(|&end| end <= body)
         .ok_or("the key runs past the end of the file")?;
-    let stored: Value = serde_json::from_slice(&bytes[HEADER_LEN as usize..key_end as usize])
-        .map_err(|e| format!("the key is not JSON: {e}"))?;
+    let stored = src.bytes((key_end - HEADER_LEN) as usize)?;
+    let stored: Value =
+        serde_json::from_slice(&stored).map_err(|e| format!("the key is not JSON: {e}"))?;
     if IndexKey::from_json(&stored).as_ref() != Some(key) {
         return Err("the file holds an index for another key".into());
     }
@@ -409,41 +495,93 @@ pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeE
         .and_then(|n| n.checked_add(table))
         .filter(|&end| end <= body)
         .ok_or("the section table runs past the end of the file")?;
-    let mut sections: Vec<(u32, &[u8], u64)> = Vec::new();
-    for entry in bytes[table as usize..table_end as usize].chunks_exact(SECTION_ENTRY_LEN as usize)
-    {
+    src.skip_to(table)?;
+    let entries = src.bytes((table_end - table) as usize)?;
+    // (kind, width, offset, count), in file order. Sections are read in one
+    // pass, so they may not overlap.
+    let mut layout: Vec<(u32, u64, u64, u64)> = Vec::new();
+    for entry in entries.chunks_exact(SECTION_ENTRY_LEN as usize) {
         let kind = u32::from_le_bytes(entry[0..4].try_into().expect("4 bytes"));
         let width = u32::from_le_bytes(entry[4..8].try_into().expect("4 bytes")) as u64;
         let offset = u64_at(entry, 8);
         let count = u64_at(entry, 16);
-        let end = width
+        width
             .checked_mul(count)
             .and_then(|n| n.checked_add(offset))
             .filter(|&end| offset >= table_end && end <= body)
             .ok_or("a section runs past the end of the file")?;
-        sections.push((kind, &bytes[offset as usize..end as usize], width));
+        layout.push((kind, width, offset, count));
     }
-    let section = |kind: u32, width: u64, count: Option<usize>| -> Result<&[u8], DecodeError> {
-        let mut found = sections.iter().filter(|(k, _, _)| *k == kind);
-        let (_, data, w) = found
+    layout.sort_by_key(|&(_, _, offset, _)| offset);
+    if layout.windows(2).any(|w| w[0].2 + w[0].1 * w[0].3 > w[1].2) {
+        return Err("the sections overlap".into());
+    }
+
+    let mut sections: Vec<(u32, u64, u64, Section)> = Vec::new();
+    for (kind, width, offset, count) in layout {
+        src.skip_to(offset)?;
+        let n = count as usize;
+        let data = match (kind, width) {
+            (OUT_OFFSETS | IN_OFFSETS, 8) => Section::U64(src.values(n, u64::from_le_bytes)?),
+            (OUT_TARGETS | OUT_EDGE_IDS | IN_TARGETS | IN_EDGE_IDS, 4) => {
+                Section::U32(src.values(n, u32::from_le_bytes)?)
+            }
+            (IDS_INT64, 8) => Section::I64(src.values(n, i64::from_le_bytes)?),
+            (IDS_STR_OFFSETS, 4) => Section::I32(src.values(n, i32::from_le_bytes)?),
+            (IDS_STR_BYTES, 1) => Section::Bytes(src.bytes(n)?),
+            // A section this build does not read, or a known one of the
+            // wrong width (malformed, below): skip its bytes.
+            _ => {
+                src.skip_to(offset + width * count)?;
+                Section::Bytes(Vec::new())
+            }
+        };
+        sections.push((kind, width, count, data));
+    }
+    src.skip_to(body)?;
+    let crc = src.crc.clone().finalize();
+    let mut trailer = [0u8; TRAILER_LEN as usize];
+    src.fill(&mut trailer)?;
+    if trailer[12..] != END_MAGIC || u64_at(&trailer, 0) != len {
+        return Err("the file is truncated".into());
+    }
+    if u32::from_le_bytes(trailer[8..12].try_into().expect("4 bytes")) != crc {
+        return Err("the checksum does not match".into());
+    }
+
+    let mut take = |kind: u32, width: u64, count: Option<usize>| -> Result<Section, DecodeError> {
+        let mut found = sections.iter().filter(|(k, _, _, _)| *k == kind);
+        let (_, w, c, _) = found
             .next()
             .ok_or_else(|| format!("section {kind} is missing"))?;
         if found.next().is_some() || *w != width {
             return Err(format!("section {kind} is malformed"));
         }
-        if let Some(count) = count {
-            if data.len() as u64 != count as u64 * width {
-                return Err(format!("section {kind} has the wrong length"));
-            }
+        if count.is_some_and(|count| *c != count as u64) {
+            return Err(format!("section {kind} has the wrong length"));
         }
-        Ok(data)
+        let i = sections
+            .iter()
+            .position(|(k, _, _, _)| *k == kind)
+            .expect("found above");
+        Ok(sections.swap_remove(i).3)
     };
-    let adjacency = |kinds: [u32; 3]| -> Result<Adjacency, DecodeError> {
-        Ok(Adjacency {
-            offsets: read(section(kinds[0], 8, Some(n_nodes + 1))?, u64::from_le_bytes),
-            targets: read(section(kinds[1], 4, Some(n_edges))?, u32::from_le_bytes),
-            edge_ids: read(section(kinds[2], 4, Some(n_edges))?, u32::from_le_bytes),
-        })
+    let malformed = |kind: u32| format!("section {kind} is malformed");
+    let mut adjacency = |kinds: [u32; 3]| -> Result<Adjacency, DecodeError> {
+        match (
+            take(kinds[0], 8, Some(n_nodes + 1))?,
+            take(kinds[1], 4, Some(n_edges))?,
+            take(kinds[2], 4, Some(n_edges))?,
+        ) {
+            (Section::U64(offsets), Section::U32(targets), Section::U32(edge_ids)) => {
+                Ok(Adjacency {
+                    offsets,
+                    targets,
+                    edge_ids,
+                })
+            }
+            _ => Err(malformed(kinds[0])),
+        }
     };
     let out = adjacency([OUT_OFFSETS, OUT_TARGETS, OUT_EDGE_IDS])?;
     let incoming = match flags & FLAG_INCOMING {
@@ -453,14 +591,17 @@ pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeE
     let topology = Topology::from_parts(n_nodes, out, incoming)?;
 
     let ids: Arc<dyn Array> = if flags & FLAG_STRING_IDS == 0 {
-        let values = read(section(IDS_INT64, 8, Some(n_nodes))?, i64::from_le_bytes);
+        let Section::I64(values) = take(IDS_INT64, 8, Some(n_nodes))? else {
+            return Err(malformed(IDS_INT64));
+        };
         Arc::new(Int64Array::from(values))
     } else {
-        let offsets = read(
-            section(IDS_STR_OFFSETS, 4, Some(n_nodes + 1))?,
-            i32::from_le_bytes,
-        );
-        let data = section(IDS_STR_BYTES, 1, None)?;
+        let (Section::I32(offsets), Section::Bytes(data)) = (
+            take(IDS_STR_OFFSETS, 4, Some(n_nodes + 1))?,
+            take(IDS_STR_BYTES, 1, None)?,
+        ) else {
+            return Err(malformed(IDS_STR_OFFSETS));
+        };
         if offsets[0] != 0
             || offsets.windows(2).any(|w| w[0] > w[1])
             || offsets[n_nodes] as usize != data.len()
@@ -469,7 +610,7 @@ pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeE
         }
         let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
         Arc::new(
-            StringArray::try_new(offsets, Buffer::from(data.to_vec()), None)
+            StringArray::try_new(offsets, Buffer::from_vec(data), None)
                 .map_err(|e| format!("the string ids are malformed: {e}"))?,
         )
     };
@@ -485,11 +626,13 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 }
 
 /// The little-endian values in `bytes`.
-fn read<T, const N: usize>(bytes: &[u8], le: fn([u8; N]) -> T) -> Vec<T> {
+fn read<T, const N: usize>(
+    bytes: &[u8],
+    le: fn([u8; N]) -> T,
+) -> impl Iterator<Item = T> + use<'_, T, N> {
     bytes
         .chunks_exact(N)
-        .map(|c| le(c.try_into().expect("N bytes")))
-        .collect()
+        .map(move |c| le(c.try_into().expect("N bytes")))
 }
 
 #[cfg(test)]
