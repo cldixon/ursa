@@ -46,9 +46,13 @@ pub fn specs() -> impl Iterator<Item = &'static FunctionSpec> {
     catalog::FUNCTIONS.iter().filter(|s| in_sql(s))
 }
 
-/// The names of the graph table functions: the catalog's, then `algorithms`.
+/// The names of the graph table functions: the catalog's, the traversals,
+/// then `algorithms`.
 pub fn names() -> impl Iterator<Item = &'static str> {
-    specs().map(|s| s.name).chain([ALGORITHMS])
+    specs()
+        .map(|s| s.name)
+        .chain(super::traversal::TRAVERSALS.iter().map(|t| t.name))
+        .chain([ALGORITHMS])
 }
 
 /// Whether `spec` returns one row per node (an algorithm or a layout), as
@@ -133,17 +137,11 @@ fn param_error(spec: &FunctionSpec, e: &ParamError, args: &[(String, Literal)]) 
     match e.kind {
         ParamErrorKind::Unknown => unknown_param(spec, p),
         ParamErrorKind::Duplicate => plan(format!("{f}() was given '{p}' more than once")),
-        ParamErrorKind::Expected(want) => {
-            let want = match want {
-                Expected::Number => "a number",
-                Expected::FiniteNumber => "a finite number",
-                Expected::Count => "a non-negative integer below 2^32",
-                Expected::Seed => "a non-negative integer or NULL",
-                Expected::NumberOrNull => "a number or NULL",
-                Expected::Bool => "a boolean",
-            };
-            plan(format!("{f}({p} =>) must be {want}; got {}", given()))
-        }
+        ParamErrorKind::Expected(want) => plan(format!(
+            "{f}({p} =>) must be {}; got {}",
+            expected_text(want),
+            given()
+        )),
         ParamErrorKind::NotOneOf(options) => {
             let options: Vec<String> = options.iter().map(|o| format!("'{o}'")).collect();
             plan(format!(
@@ -156,6 +154,18 @@ fn param_error(spec: &FunctionSpec, e: &ParamError, args: &[(String, Literal)]) 
             "{f}({p} =>) takes an expression over the edge table's columns; got {}",
             given()
         )),
+    }
+}
+
+/// What a parameter expected, in SQL's words.
+pub(crate) fn expected_text(want: Expected) -> &'static str {
+    match want {
+        Expected::Number => "a number",
+        Expected::FiniteNumber => "a finite number",
+        Expected::Count => "a non-negative integer below 2^32",
+        Expected::Seed => "a non-negative integer or NULL",
+        Expected::NumberOrNull => "a number or NULL",
+        Expected::Bool => "a boolean",
     }
 }
 
@@ -445,7 +455,12 @@ mod tests {
         assert_eq!(did_you_mean("pagerenk", names()), Some("pagerank"));
         assert_eq!(did_you_mean("closenes", names()), Some("closeness"));
         assert_eq!(did_you_mean("algorithm", names()), Some("algorithms"));
-        assert_eq!(did_you_mean("shortest_paths", names()), None);
+        assert_eq!(
+            did_you_mean("shortest_paths", names()),
+            Some("shortest_path")
+        );
+        assert_eq!(did_you_mean("random_walks", names()), Some("random_walk"));
+        assert_eq!(did_you_mean("dijkstra", names()), None);
         assert!(lookup("neighbors_agg").is_none());
     }
 

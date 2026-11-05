@@ -713,6 +713,107 @@ fn subgraphs_match_getting_started() {
     );
 }
 
+/// Getting Started, "Traversals": the three queries, in the shell's table
+/// format.
+#[test]
+fn traversals_match_getting_started() {
+    // "Member 0 has 16 friends, so this returns 16 rows."
+    let sql = format!(
+        "{}
+         SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');",
+        define_karate()
+    );
+    let out = ok(ursa(&["-f", "csv", "-c", &sql]));
+    assert_eq!(out.lines().count(), 1 + 16, "{out}");
+    assert_eq!(out.lines().next(), Some("src,dst"));
+    assert!(out.lines().skip(1).all(|l| l.starts_with("0,")), "{out}");
+
+    let sql = format!(
+        "{}
+         SELECT * FROM hop(karate,
+                           seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
+                           n => 2);",
+        define_karate()
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++-----+-----+
+| src | dst |
++-----+-----+
+| 9   | 33  |
+| 14  | 32  |
+| 14  | 33  |
+| 15  | 32  |
+| 15  | 33  |
+| 18  | 32  |
+| 18  | 33  |
+| 20  | 32  |
+| 20  | 33  |
+| 22  | 32  |
+| 22  | 33  |
+| 23  | 25  |
+| 23  | 27  |
+| 23  | 29  |
+| 23  | 32  |
+| 23  | 33  |
+| 23  | 31  |
+| 24  | 25  |
+| 24  | 27  |
+| 24  | 31  |
+| 24  | 33  |
+| 24  | 32  |
+| 25  | 31  |
+| 25  | 32  |
+| 25  | 33  |
+| 26  | 29  |
+| 26  | 33  |
+| 26  | 32  |
+| 27  | 33  |
+| 28  | 31  |
+| 28  | 33  |
+| 28  | 32  |
+| 29  | 32  |
+| 29  | 33  |
+| 30  | 32  |
+| 30  | 33  |
+| 31  | 32  |
+| 31  | 33  |
+| 32  | 33  |
++-----+-----+
+"
+    );
+
+    let sql = format!(
+        "{}
+         SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'both');",
+        define_karate()
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++-----+-----+-----+------+
+| src | dst | hop | cost |
++-----+-----+-----+------+
+| 0   | 8   | 0   | 1.0  |
+| 8   | 33  | 1   | 2.0  |
++-----+-----+-----+------+
+"
+    );
+    assert_eq!(
+        err(ursa(&[
+            "-c",
+            &format!(
+                "{} SELECT * FROM algorithms(karate, hop(seeds => [0]))",
+                define_karate()
+            )
+        ])),
+        "Error: algorithms(): hop() is a traversal, which returns rows of its own, not one per \
+         node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], n => 1, \
+         direction => 'out')\n"
+    );
+}
+
 /// Getting Started, "Find out what is available": `ursa_functions()`, which
 /// an agent reads as JSON.
 #[test]
@@ -769,6 +870,9 @@ density,statistic,1,out in both
 avg_path_length,statistic,2,out in both
 diameter,statistic,2,out in both
 describe,statistic,3,out in both
+hop,traversal,3,out in both
+shortest_path,traversal,4,out in both
+random_walk,traversal,4,
 algorithms,combinator,0,
 "
     );
