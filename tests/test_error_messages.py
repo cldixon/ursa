@@ -384,6 +384,24 @@ CASES = {
         ur.ComputeError,
         "shortest_path(direction='x') is not supported; use one of 'out', 'in', 'both'",
     ),
+    "shortest_path_source_list": (
+        lambda: ur.shortest_path(e(), [0, 1], 2),
+        ValueError,
+        "shortest_path(source=) must be one node id; got 2 ids. Run one shortest_path per "
+        "pair, or use hop(...) for several seeds.",
+    ),
+    "shortest_path_target_list": (
+        lambda: ur.shortest_path(e(), 0, np.array([1, 2, 3])),
+        ValueError,
+        "shortest_path(target=) must be one node id; got 3 ids. Run one shortest_path per "
+        "pair, or use hop(...) for several seeds.",
+    ),
+    "shortest_path_empty_source": (
+        lambda: ur.shortest_path(e(), (), 2),
+        ValueError,
+        "shortest_path(source=) must be one node id; got 0 ids. Run one shortest_path per "
+        "pair, or use hop(...) for several seeds.",
+    ),
     "walk_steps": (
         lambda: ur.random_walk(e(), start=[0], steps=-1),
         OverflowError,

@@ -19,7 +19,8 @@ use datafusion::error::{DataFusionError, Result};
 use ursa_core::catalog::{Evaluator, Inputs, OutputDtype};
 
 use super::index::GraphIndex;
-use super::node::{id_type as id_type_of, Output};
+use super::node::Output;
+use super::traversal;
 
 /// The batch for `outputs` over `index`: `id` first when `per_node`, then one
 /// column per output. `weights` holds one column per weight expression, one
@@ -69,8 +70,8 @@ pub fn is_string(t: &DataType) -> bool {
 /// null or not a node of the graph is skipped, a null value leaves its node
 /// without one, numbers are read as `f64`, and strings (for `count` and
 /// `n_unique`, checked when the query is planned) as a code per distinct
-/// string. The ids are integers or strings, cast to the graph's id type as a
-/// traversal's node ids are. A node given two rows is an error: which one
+/// string. The ids follow the node-id rule of the traversals (#271): integers,
+/// or strings that are exactly an integer on a graph with integer ids. A node given two rows is an error: which one
 /// counts would depend on row order.
 pub fn node_values(
     index: &GraphIndex,
@@ -97,11 +98,13 @@ pub fn node_values(
     };
     for batch in batches {
         let (ids, values) = (&batch[0], &batch[1]);
-        if !(ids.data_type() == &DataType::Null || id_type_of(ids.data_type()).is_some()) {
-            return Err(wrong_id(format!("a column of type {}", ids.data_type())));
+        // The traversals' rule (#271): integers, or strings that are exactly
+        // an integer on a graph with integer ids.
+        if let Some(row) = traversal::first_refused_node_id(ids, &id_type) {
+            return Err(wrong_id(sql_text(ids, row)));
         }
         let user_ids = cast_with_options(ids, &id_type, &strict).map_err(|_| {
-            // The first id that does not cast, as SQL writes it.
+            // The first id that does not cast (out of range), as SQL writes it.
             let lenient = cast(ids, &id_type).ok();
             let row =
                 lenient.and_then(|l| (0..ids.len()).find(|&i| ids.is_valid(i) && l.is_null(i)));

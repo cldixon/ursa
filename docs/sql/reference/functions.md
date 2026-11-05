@@ -10,6 +10,8 @@ An algorithm or a statistic takes the graph as its first argument, then named pa
 
 A parameter's default is the SQL literal used when the parameter is left out. `required` means the call must give it. A `string` parameter with choices takes one of them, quoted: `direction => 'both'`. An `expression` parameter takes an expression over the edge table's columns: `weight => log10(1 + weight)`, or for `neighbors_agg`'s `attribute` over the node table's. A `query` parameter takes a subquery in parentheses.
 
+A `node ids` or `node id` parameter takes integers or strings: a list, a query of one column, or one value. On a graph with integer ids, a string must be an integer, such as `'7'`; floats (even `2.0`), booleans and dates are refused. On a graph with string ids, an integer is taken as its string. A NULL, or an id not in the graph, matches no node.
+
 ## Algorithms
 
 [`degree`](#degree) · [`pagerank`](#pagerank) · [`connected_components`](#connected_components) · [`triangle_count`](#triangle_count) · [`clustering_coefficient`](#clustering_coefficient) · [`betweenness`](#betweenness) · [`closeness`](#closeness) · [`label_propagation`](#label_propagation) · [`louvain`](#louvain)

@@ -16,6 +16,7 @@ same edges over the same parent id space.
 
 import math
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -135,6 +136,28 @@ def test_no_path_yields_an_all_excluded_region():
     sp = ur.shortest_path(e, 0, 99)  # unknown target -> no path -> empty reached set
     deg = _vals(ur.degree(sp, direction="both"), "degree")
     assert deg == {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [([0], 3), (0, (3,)), (np.array([0]), pa.array([3])), ([0], [3])],
+)
+def test_a_one_element_endpoint_sequence_is_that_id(source, target):
+    # A sequence holding exactly one id names that id (#252).
+    e = _graph()
+    want = ur.shortest_path(e, 0, 3).collect().to_dicts()
+    assert ur.shortest_path(e, source, target).collect().to_dicts() == want
+    assert want[-1]["dst"] == 3
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "param", "n"),
+    [([0, 1], 3, "source", 2), (0, [3, 4], "target", 2), ([], 3, "source", 0)],
+)
+def test_a_several_id_endpoint_raises(source, target, param, n):
+    # It used to run from the first id and ignore the rest (#252).
+    with pytest.raises(ValueError, match=rf"shortest_path\({param}=\) .* got {n} ids"):
+        ur.shortest_path(_graph(), source, target)
 
 
 # --- no rebuild + index sharing ---------------------------------------------

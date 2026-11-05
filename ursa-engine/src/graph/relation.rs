@@ -32,12 +32,15 @@
 //! derived table, so it is optimized with the rest of the query and reads its
 //! files only when the query runs.
 //!
-//! The values must be of the graph's id type or cast to it. A list's values
-//! and a single id are cast here, one value at a time (so `[0, 'a']` is not
-//! coerced to one type first), and a subquery's column type is checked here;
-//! a subquery's values are cast when the node runs. Either way a value that
-//! does not cast is named in the message: `hop(seeds =>) must be node ids of
-//! graph 'karate', which are integers; got 'a'`.
+//! The values must be integers or strings, and cast to the graph's id type: on
+//! a graph with integer ids a string must parse exactly as an integer, and
+//! floats (even `2.0`), booleans and dates are refused, though Arrow would
+//! cast them (#271). A list's values and a single id are checked and cast
+//! here, one value at a time (so `[0, 'a']` is not coerced to one type
+//! first), and a subquery's column type is checked here; a subquery's values
+//! are cast when the node runs. Either way a value that is refused is named in
+//! the message: `hop(seeds =>) must be node ids of graph 'karate', which are
+//! integers; got 'a'`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -71,8 +74,8 @@ use super::functions::{
 };
 use super::kernels;
 use super::node::{
-    endpoint_id_type, id_type as id_type_of, weight_column, GraphAlgorithmNode, GraphTraversalNode,
-    Output, WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
+    endpoint_id_type, weight_column, GraphAlgorithmNode, GraphTraversalNode, Output,
+    WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
 };
 use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
 use super::{GraphDef, GraphRegistry};
@@ -381,7 +384,7 @@ fn values_node(
         )));
     }
     let (ids, value) = (schema.field(0).data_type(), schema.field(1).data_type());
-    if !(ids == &DataType::Null || id_type_of(ids).is_some()) {
+    if !traversal::is_node_id_type(ids, &id_type) {
         let kind = match id_type {
             DataType::Int64 => "integers",
             _ => "strings",
@@ -566,10 +569,10 @@ impl NodeIds<'_> {
                          {columns} columns"
                     )));
                 }
-                // Its values are cast when the node runs; its type must allow
-                // that.
+                // Its values are cast when the node runs; its type must be
+                // one node ids may have.
                 let ty = subquery.schema().field(0).data_type();
-                if !castable(ty, self.id_type) {
+                if !traversal::is_node_id_type(ty, self.id_type) {
                     return Err(self.not_ids(param, &format!("a query of type {ty}")));
                 }
                 Ok(subquery)
@@ -638,8 +641,21 @@ impl NodeIds<'_> {
                 if !castable(&ty, self.id_type) {
                     return Err(self.not_ids(param, &format!("{written}, of type {ty}")));
                 }
+                // A float, a boolean or a date would cast, but is refused
+                // (#271): the value alone says what is wrong.
+                if !traversal::is_node_id_type(&ty, self.id_type) {
+                    return Err(self.not_ids(param, &written));
+                }
                 let expr = match expr {
                     Expr::Literal(value, metadata) => {
+                        // Exactly an integer: Arrow's cast would trim ' 1'.
+                        if let (DataType::Int64, Some(Some(text))) =
+                            (self.id_type, value.try_as_str())
+                        {
+                            if !traversal::is_integer_text(text) {
+                                return Err(self.not_ids(param, &written));
+                            }
+                        }
                         let value = value
                             .cast_to(self.id_type)
                             .map_err(|_| self.not_ids(param, &written))?;

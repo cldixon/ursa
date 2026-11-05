@@ -361,7 +361,12 @@ fn reference(rows: &[serde_json::Value]) -> String {
          of them, quoted: `direction => 'both'`. An `expression` parameter takes an \
          expression over the edge table's columns: `weight => log10(1 + weight)`, or for \
          `neighbors_agg`'s `attribute` over the node table's. A `query` parameter takes a \
-         subquery in parentheses.\n\n",
+         subquery in parentheses.\n\n\
+         A `node ids` or `node id` parameter takes integers or strings: a list, a query of \
+         one column, or one value. On a graph with integer ids, a string must be an integer, \
+         such as `'7'`; floats (even `2.0`), booleans and dates are refused. On a graph with \
+         string ids, an integer is taken as its string. A NULL, or an id not in the graph, \
+         matches no node.\n\n",
     );
     for (family, heading) in FAMILIES {
         let members: Vec<&serde_json::Value> = rows

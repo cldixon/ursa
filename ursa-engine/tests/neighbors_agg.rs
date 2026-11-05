@@ -161,6 +161,18 @@ async fn aggregates_over_each_nodes_neighbours() {
             .collect();
         assert_eq!(got, expected, "{agg}");
     }
+    // Values from a plan with no fixed row order (a union, a join) give the
+    // same result: one value per node, whatever the order.
+    assert_eq!(
+        hub(
+            &ctx,
+            "values => (SELECT id, capacity FROM people WHERE id < 2 UNION ALL \
+             SELECT p.id, p.capacity FROM people AS p JOIN people AS q ON p.id = q.id \
+             WHERE p.id >= 2), agg => 'mean', direction => 'in'"
+        )
+        .await,
+        hub(&ctx, &format!("{values}, agg => 'mean', direction => 'in'")).await
+    );
     // 'both' unions in- and out-neighbours: 0's are 1, 2, 3 and 1 again.
     assert_eq!(
         hub(
@@ -384,6 +396,17 @@ async fn errors_say_what_to_write() {
             "SELECT * FROM neighbors_agg(hub, values => (SELECT * FROM (VALUES (1, 1.0), \
              (1, 2.0))))",
             "neighbors_agg(values =>) gives node 1 more than one value; give each node one row",
+        ),
+        (
+            "SELECT * FROM neighbors_agg(hub, values => (SELECT * FROM (VALUES ('1', 1.0), \
+             ('1.5', 2.0))))",
+            "neighbors_agg(values =>): the first column must be node ids of graph 'hub', which \
+             are integers; got '1.5'",
+        ),
+        (
+            "SELECT * FROM neighbors_agg(hub, values => (SELECT * FROM (VALUES (2.0, 1.0))))",
+            "neighbors_agg(values =>): the first column must be node ids of graph 'hub', which \
+             are integers; got a column of type Float64",
         ),
         (
             "SELECT * FROM neighbors_agg(hub, values => (SELECT * FROM (VALUES ('1', 1.0), \
