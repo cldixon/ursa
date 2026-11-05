@@ -32,6 +32,8 @@
 //! values, with the same messages). Weights that line up with a cached index
 //! are stored on it, keyed by the weighted plan's fingerprint and file
 //! identities, so the next query with the same weights reads no edges at all.
+//! In a database, they are stored with the index on disk too, so a weighted
+//! query over a stored index in a later process reads no edges either.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -859,10 +861,11 @@ async fn weighted_index(
         )),
         None => None,
     };
+    let n_weights = weighted.weights.len();
     // Weights already evaluated over the cached index's rows: nothing to read.
     if let (Some(cache), Some(key), Some(weights_key)) = (&cache, &key, &weights_key) {
         if let Some(index) = cache.get(key) {
-            if let Some(weights) = index.weights(weights_key) {
+            if let Some(weights) = known_weights(&index, weights_key, n_weights).await {
                 return Ok((index, weights));
             }
         }
@@ -885,6 +888,14 @@ async fn weighted_index(
                 .get_or_build_stored(context.session_config(), key, build.boxed())
                 .await?;
             let built_here = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // A stored index may have these weights stored with it.
+            if built_here.is_none() {
+                if let Some(weights_key) = &weights_key {
+                    if let Some(weights) = known_weights(&index, weights_key, n_weights).await {
+                        return Ok((index, weights));
+                    }
+                }
+            }
             match built_here {
                 Some(weights) => (index, weights, true),
                 None => {
@@ -915,6 +926,23 @@ async fn weighted_index(
         index.store_weights(weights_key, Arc::clone(&weights));
     }
     Ok((index, weights))
+}
+
+/// The weights `index` holds under `key` (with `n_weights` columns), in
+/// memory or stored with it on disk.
+async fn known_weights(index: &Arc<GraphIndex>, key: &str, n_weights: usize) -> Option<Weights> {
+    if let Some(weights) = index.weights(key) {
+        return Some(weights);
+    }
+    if !index.has_stored_weights(key) {
+        return None;
+    }
+    let (index, key) = (Arc::clone(index), key.to_string());
+    // Reading a file is blocking work.
+    tokio::task::spawn_blocking(move || index.stored_weights(&key, n_weights))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Build the index of the weighted rows, reading their weights in the same
