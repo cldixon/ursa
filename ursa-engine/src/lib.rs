@@ -48,6 +48,7 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
         .with_session_id(session_id)
         .with_catalog_list(catalogs)
         .with_query_planner(graph::query_planner())
+        .with_physical_optimizer_rule(graph::edge_order_rule())
         .build()
         .into();
     graph::register_functions(&ctx).expect("registering a relation planner cannot fail");

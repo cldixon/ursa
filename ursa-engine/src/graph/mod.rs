@@ -53,6 +53,7 @@ pub use define::{
 pub use describe::{describe_graph, show_graphs};
 pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, GraphSchema};
 
+mod catalog_table;
 mod exec;
 pub mod functions;
 mod index;
@@ -61,11 +62,11 @@ mod node;
 mod relation;
 mod session;
 
-pub use exec::{GraphAlgorithmExec, GraphPlanner, UrsaQueryPlanner};
-pub use functions::Algorithm;
-pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache};
-pub use node::GraphAlgorithmNode;
-pub(crate) use session::{query_planner, register_functions, with_algorithms};
+pub use catalog_table::UrsaFunctions;
+pub use exec::{GraphAlgorithmExec, GraphPlanner, KeepEdgeOrder, UrsaQueryPlanner};
+pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache, Weights};
+pub use node::{GraphAlgorithmNode, Output};
+pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
 
 /// One graph, as `CREATE PROPERTY GRAPH` defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]

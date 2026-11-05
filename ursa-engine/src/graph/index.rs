@@ -23,7 +23,7 @@
 //! their nodes at the same time.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +47,73 @@ use ursa_core::{IdMap, Topology};
 pub struct GraphIndex {
     pub topology: Arc<Topology>,
     pub ids: Arc<IdMap>,
+    /// Weights evaluated over the edge rows this index was built from.
+    weights: WeightCache,
+}
+
+impl GraphIndex {
+    pub fn new(topology: Arc<Topology>, ids: Arc<IdMap>) -> Self {
+        Self {
+            topology,
+            ids,
+            weights: WeightCache::default(),
+        }
+    }
+
+    /// The weight columns stored under `key`, if they are.
+    pub fn weights(&self, key: &str) -> Option<Weights> {
+        self.weights.get(key)
+    }
+
+    /// Store weight columns under `key`. They must be one per edge row of this
+    /// index, in its edge-row order.
+    pub fn store_weights(&self, key: String, weights: Weights) {
+        self.weights.put(key, weights)
+    }
+}
+
+/// Weight columns, one `f64` per edge row each, in the order of a node's
+/// weight expressions.
+pub type Weights = Arc<Vec<Arc<Vec<f64>>>>;
+
+/// How many sets of weight columns an index keeps. Each column is one `f64`
+/// per edge (80 MB at 10M edges), so the bound is small, as in ursa-plan's
+/// `WeightCache`: enough for a few weightings alternating over one graph.
+const WEIGHT_CAPACITY: usize = 4;
+
+/// Evaluated weights, held on the index so they live exactly as long as the
+/// edge rows they were evaluated over. Keyed by the weighted edge plan's
+/// fingerprint and file identities (see `exec`), most recently used last.
+#[derive(Default)]
+struct WeightCache {
+    entries: Mutex<Vec<(String, Weights)>>,
+}
+
+impl fmt::Debug for WeightCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        write!(f, "WeightCache({} entries)", entries.len())
+    }
+}
+
+impl WeightCache {
+    fn get(&self, key: &str) -> Option<Weights> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let i = entries.iter().position(|(k, _)| k == key)?;
+        let entry = entries.remove(i);
+        let weights = Arc::clone(&entry.1);
+        entries.push(entry);
+        Some(weights)
+    }
+
+    fn put(&self, key: String, weights: Weights) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(k, _)| *k != key);
+        if entries.len() >= WEIGHT_CAPACITY {
+            entries.remove(0);
+        }
+        entries.push((key, weights));
+    }
 }
 
 /// The identity of one source file, as its store reports it.
@@ -157,6 +224,20 @@ impl IndexCache {
     /// How many indexes this cache has built.
     pub fn builds(&self) -> u64 {
         self.builds.load(Ordering::Relaxed)
+    }
+
+    /// Count a build made outside the cache (an index that cannot be shared).
+    pub fn record_build(&self) {
+        self.builds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The index for `key`, if it is built and cached; nothing is built.
+    pub fn get(&self, key: &(String, Vec<FileIdentity>)) -> Option<Arc<GraphIndex>> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = slots.get_mut(&key.0).filter(|s| s.files == key.1)?;
+        let index = slot.cell.get().cloned()?;
+        slot.used = self.clock.fetch_add(1, Ordering::Relaxed);
+        Some(index)
     }
 
     /// The index for `key` (a fingerprint and file identities), built by
