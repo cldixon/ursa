@@ -44,6 +44,14 @@ allow = [
     "Zlib",
     "bzip2-1.0.6",
 ]
+# Boost Software License (BSL-1.0), allowed only for the two crates that need it:
+# clipboard-win and error-code, which rustyline (the ursa shell's line editor,
+# MIT) pulls in on Windows only. Permissive and OSI-approved; kept as per-crate
+# exceptions so no other crate can bring it in unreviewed.
+exceptions = [
+    { allow = ["BSL-1.0"], crate = "clipboard-win" },
+    { allow = ["BSL-1.0"], crate = "error-code" },
+]
 
 [bans]
 # A large transitive tree (DataFusion / Arrow) legitimately pulls duplicate

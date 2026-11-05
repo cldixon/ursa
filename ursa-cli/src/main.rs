@@ -5,30 +5,41 @@
 //! ursa -f csv --file query.sql > out.csv
 //! echo "SELECT 1" | ursa
 //! ursa club.ursa -c "SELECT * FROM degree(karate)"
+//! ursa club.ursa          # the interactive shell
 //! ```
 //!
 //! With a database file (`club.ursa`), views, external tables and graphs are
-//! kept in it between runs; without one, the session is in memory.
+//! kept in it between runs; without one, the session is in memory. With no
+//! SQL to run and a terminal on stdin, `ursa` starts the shell ([`shell`],
+//! [`repl`]).
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use arrow::error::ArrowError;
+use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 
+mod input;
 mod print;
+mod repl;
+mod shell;
+mod startup;
 
 use print::{has_columns, write_stream, OutputFormat};
+use shell::{Flow, Shell};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "ursa",
     version,
     about = "SQL for graph analytics over Parquet and CSV files, local or in object storage.",
-    after_help = "Any file is a table: ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\""
+    after_help = "Any file is a table: ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"\n\
+                  With no SQL to run, ursa starts an interactive shell; enter .help there."
 )]
 struct Args {
     /// A database file (.ursa), created if it does not exist. It keeps the
@@ -53,6 +64,21 @@ struct Args {
     /// Output format.
     #[arg(short = 'f', long = "format", value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
+
+    /// Run the SQL and dot-commands in FILE at startup, before the shell's
+    /// prompt or the -c, --file or stdin SQL. Replaces ~/.ursarc. Also
+    /// spelled -init, as in DuckDB.
+    #[arg(long = "init", value_name = "FILE", conflicts_with = "no_init")]
+    init: Option<PathBuf>,
+
+    /// Run no init file, not even ~/.ursarc. Also spelled -no-init.
+    #[arg(long = "no-init")]
+    no_init: bool,
+
+    /// Keep no shell history. Otherwise it is kept in ~/.ursa_history, or in
+    /// the file $URSA_HISTORY names (set it empty to keep none).
+    #[arg(long = "no-history")]
+    no_history: bool,
 }
 
 /// Where SQL comes from, in the order given on the command line.
@@ -63,7 +89,7 @@ enum Source {
 }
 
 fn main() -> ExitCode {
-    let matches = Args::command().get_matches();
+    let matches = Args::command().get_matches_from(single_dash_longs(std::env::args_os()));
     let args = match Args::from_arg_matches(&matches) {
         Ok(args) => args,
         Err(e) => e.exit(),
@@ -79,7 +105,11 @@ fn main() -> ExitCode {
     }
 
     let mut sources = sources_in_order(&args, &matches);
-    if sources.is_empty() && !io::stdin().is_terminal() {
+    let interactive = sources.is_empty() && io::stdin().is_terminal();
+    if interactive && args.format == OutputFormat::Arrow {
+        return fail("the shell cannot show the arrow format; use -f arrow with -c or --file");
+    }
+    if sources.is_empty() && !interactive {
         let mut sql = String::new();
         if let Err(e) = io::stdin().read_to_string(&mut sql) {
             return fail(&format!("cannot read SQL from stdin: {e}"));
@@ -95,7 +125,8 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => return fail(&format!("cannot start: {e}")),
     };
-    match runtime.block_on(run(sources, &args)) {
+    let format_given = matches.value_source("format") == Some(ValueSource::CommandLine);
+    match runtime.block_on(run(sources, &args, interactive, format_given)) {
         Ok(()) => ExitCode::SUCCESS,
         // A reader that stops early (`ursa … | head`) is not an error.
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
@@ -120,13 +151,39 @@ fn sources_in_order(args: &Args, matches: &ArgMatches) -> Vec<Source> {
     sources.into_iter().map(|(_, source)| source).collect()
 }
 
+/// DuckDB spells its long options with one dash (`-init`); clap needs two.
+/// Rewrite `-init` and `-no-init`, except as the value of an option.
+fn single_dash_longs(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    const TAKE_VALUES: [&str; 6] = ["-c", "--command", "--file", "-f", "--format", "--init"];
+    let mut out: Vec<OsString> = Vec::new();
+    for arg in args {
+        let is_value = out.len() > 1
+            && out
+                .last()
+                .is_some_and(|previous| TAKE_VALUES.iter().any(|option| previous == option));
+        let rewritten = match arg.to_str() {
+            _ if is_value || out.is_empty() => arg,
+            Some("-init") => "--init".into(),
+            Some("-no-init") => "--no-init".into(),
+            Some(a) if a.starts_with("-init=") => format!("-{a}").into(),
+            _ => arg,
+        };
+        out.push(rewritten);
+    }
+    out
+}
+
 fn fail(message: &str) -> ExitCode {
     eprintln!("Error: {message}");
     ExitCode::FAILURE
 }
 
-async fn run(sources: Vec<Source>, args: &Args) -> Result<(), DataFusionError> {
-    let format = args.format;
+async fn run(
+    sources: Vec<Source>,
+    args: &Args,
+    interactive: bool,
+    format_given: bool,
+) -> Result<(), DataFusionError> {
     // Open (or create) the database even with no SQL to run, so `ursa
     // club.ursa` makes the file, as Getting Started says.
     let ctx = match &args.database {
@@ -139,14 +196,7 @@ async fn run(sources: Vec<Source>, args: &Args) -> Result<(), DataFusionError> {
         }
         None => ursa_engine::new_session(),
     };
-    if sources.is_empty() {
-        eprintln!(
-            "The interactive shell is not available yet (planned in #238).\n\
-             Run SQL with -c \"<sql>\", --file <path>, or on stdin. See ursa --help."
-        );
-        return Ok(());
-    }
-    let result = run_sources(&ctx, sources, format).await;
+    let result = run_session(ctx.clone(), sources, args, interactive, format_given).await;
     // Finish storing the indexes this process built before it exits.
     ursa_engine::database::flush(&ctx.state());
     if std::env::var_os(INDEX_STATS_VAR).is_some() {
@@ -164,11 +214,50 @@ async fn run(sources: Vec<Source>, args: &Args) -> Result<(), DataFusionError> {
 /// database's stored indexes are used).
 const INDEX_STATS_VAR: &str = "URSA_INDEX_STATS";
 
-async fn run_sources(
-    ctx: &SessionContext,
+/// Run the init file, then the shell or the SQL given, on `ctx`.
+async fn run_session(
+    ctx: SessionContext,
     sources: Vec<Source>,
-    format: OutputFormat,
+    args: &Args,
+    interactive: bool,
+    format_given: bool,
 ) -> Result<(), DataFusionError> {
+    let home = startup::home_dir();
+    let init = startup::init_file(
+        args.init.as_deref(),
+        args.no_init,
+        interactive,
+        home.as_deref(),
+    );
+    if !interactive && init.is_none() && sources.is_empty() {
+        return Ok(());
+    }
+    let mut shell = Shell::new(ctx, args.format, io::stdout(), io::stderr());
+    if interactive {
+        println!("{}", banner(args));
+    }
+    if let Some(init) = init {
+        if shell.run_file(&init).await == Flow::Exit {
+            return Ok(());
+        }
+        // `-f` given on the command line wins over a `.mode` in the file.
+        if format_given {
+            shell.set_mode(args.format);
+        }
+    }
+    if interactive {
+        let history = startup::history_file(
+            args.no_history,
+            std::env::var_os(startup::HISTORY_VAR),
+            home.as_deref(),
+        );
+        return repl::run(&mut shell, history)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)));
+    }
+
+    let format = shell.mode();
+    let ctx = shell.ctx().clone();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let mut printed = 0;
@@ -179,10 +268,23 @@ async fn run_sources(
                 DataFusionError::Execution(format!("cannot read '{}': {e}", path.display()))
             })?,
         };
-        printed += run_sql(ctx, &sql, format, &mut out, printed).await?;
+        printed += run_sql(&ctx, &sql, format, &mut out, printed).await?;
     }
     out.flush()?;
     Ok(())
+}
+
+/// The shell's first line: the version, and what the session is.
+fn banner(args: &Args) -> String {
+    let session = match &args.database {
+        Some(path) if args.readonly => format!("database {path} (read-only)"),
+        Some(path) => format!("database {path}"),
+        None => "in memory".to_string(),
+    };
+    format!(
+        "ursa {}, {session}. Enter .help for commands, .quit to exit.",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Parse all of `sql` (so a syntax error anywhere runs nothing), then run each
@@ -222,5 +324,59 @@ fn is_broken_pipe(err: &DataFusionError) -> bool {
             matches!(e.as_ref(), ArrowError::IoError(_, e) if e.kind() == io::ErrorKind::BrokenPipe)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rewrite(args: &[&str]) -> Vec<String> {
+        single_dash_longs(args.iter().map(OsString::from))
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn single_dash_init_is_rewritten() {
+        assert_eq!(
+            rewrite(&["ursa", "-init", "a.sql", "club.ursa"]),
+            ["ursa", "--init", "a.sql", "club.ursa"]
+        );
+        assert_eq!(rewrite(&["ursa", "-no-init"]), ["ursa", "--no-init"]);
+        assert_eq!(rewrite(&["ursa", "-init=a.sql"]), ["ursa", "--init=a.sql"]);
+        // Not as the value of an option.
+        assert_eq!(
+            rewrite(&["ursa", "-c", "-init", "--init", "-no-init"]),
+            ["ursa", "-c", "-init", "--init", "-no-init"]
+        );
+        // The program name is left alone.
+        assert_eq!(rewrite(&["-init"]), ["-init"]);
+    }
+
+    #[test]
+    fn flags_parse() {
+        let args =
+            Args::try_parse_from(rewrite(&["ursa", "-init", "a.sql", "--no-history"])).unwrap();
+        assert_eq!(args.init, Some(PathBuf::from("a.sql")));
+        assert!(args.no_history && !args.no_init);
+        assert!(Args::try_parse_from(["ursa", "--init", "a.sql", "--no-init"]).is_err());
+    }
+
+    #[test]
+    fn the_banner_names_the_session() {
+        let version = env!("CARGO_PKG_VERSION");
+        let args = Args::try_parse_from(["ursa"]).unwrap();
+        assert_eq!(
+            banner(&args),
+            format!("ursa {version}, in memory. Enter .help for commands, .quit to exit.")
+        );
+        let args = Args::try_parse_from(["ursa", "club.ursa", "--readonly"]).unwrap();
+        assert!(
+            banner(&args).starts_with(&format!("ursa {version}, database club.ursa (read-only).")),
+            "{}",
+            banner(&args)
+        );
     }
 }

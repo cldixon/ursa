@@ -215,7 +215,7 @@ fn attach_opens_a_database() {
 fn open_a_database_matches_getting_started() {
     let dir = karate_dir();
     let cwd = dir.path();
-    // `ursa club.ursa` creates the file (the shell itself arrives in #238).
+    // `ursa club.ursa` creates the file (with stdin not a terminal, it starts no shell).
     let out = ursa_in(cwd, &["club.ursa"]);
     assert!(out.status.success());
     assert!(cwd.join("club.ursa").is_file());
