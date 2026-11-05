@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://cldixon.github.io/ursa/"
+keywords = ["graph", "algorithms", "pagerank", "csr", "networkx"]
+categories = ["algorithms", "data-structures", "mathematics"]
 
 [lib]
 # The library has no `#[bench]`s; without this, `cargo bench -p ursa-core -- <criterion

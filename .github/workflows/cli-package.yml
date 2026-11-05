@@ -1,0 +1,72 @@
+name: CLI package
+
+# Proves the `ursa` binary still packages and runs, on pull requests that touch
+# the SQL engine's crates or their packaging: a release build for Linux
+# x86_64 (the same command release-cli.yml runs per platform), `ursa
+# --version`, one query, and a crates.io dry run of the five crates ursa-cli
+# needs. Publishes nothing.
+
+on:
+  pull_request:
+    paths:
+      - "ursa-cli/**"
+      - "ursa-sql/**"
+      - "ursa-engine/**"
+      - "ursa-io/**"
+      - "ursa-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/cli-package.yml"
+      - ".github/workflows/release-cli.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Release binary (Linux x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-unknown-linux-gnu
+
+      - name: Build
+        run: cargo build --release --locked -p ursa-cli
+
+      - name: ursa --version
+        run: |
+          expected=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
+          ./target/release/ursa --version
+          test "$(./target/release/ursa --version)" = "ursa $expected"
+
+      - name: Run a query
+        run: |
+          out=$(./target/release/ursa -f csv -c "
+            CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
+            CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+            SELECT id, degree FROM degree(karate, direction => 'both') ORDER BY degree DESC LIMIT 1;")
+          echo "$out"
+          test "$out" = "$(printf 'id,degree\n33,17')"
+
+      # Packages each crate as crates.io would receive it, resolving the
+      # unpublished ones against each other. --no-verify: the build above
+      # already compiled them.
+      - name: crates.io dry run
+        run: >
+          cargo publish --dry-run --no-verify --locked
+          -p ursa-core -p ursa-io -p ursa-engine -p ursa-sql -p ursa-cli
