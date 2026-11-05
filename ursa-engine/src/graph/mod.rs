@@ -15,6 +15,20 @@
 //! plans the edge table afresh, so a graph over a view of a file sees the
 //! file's current contents.
 //!
+//! An edge or vertex table may also be a file path or URL, as in `FROM`
+//! (`EDGE TABLES ('edges.csv' SOURCE KEY (src) DESTINATION KEY (dst))`). It is
+//! opened once, when the graph is created, as a listing table that the
+//! registry keeps for that graph ([`GraphRegistry::file_table`]); it is not
+//! registered under any name, so it never shows in a listing. Like a view over
+//! the file, it fixes the file's columns at that point and reads the file's
+//! current rows on every query.
+//!
+//! Tables a graph uses cannot be dropped, or replaced by ones the graph's
+//! definition no longer fits, while the graph exists ([`check_drop`],
+//! [`check_replace`]). If one disappears anyway (through the DataFusion API),
+//! `<graph>.nodes` and `<graph>.edges` fail when queried, and session listings
+//! keep working.
+//!
 //! Algorithms over a graph are table functions, `FROM pagerank(g)`, planned
 //! as a [`GraphAlgorithmNode`] whose child is the edge table ([`functions`],
 //! `relation`, `node`, `exec`), with the built index cached per session
@@ -23,15 +37,20 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use datafusion::catalog::CatalogProviderList;
+use datafusion::catalog::{CatalogProviderList, TableProvider};
 use datafusion::common::TableReference;
 use datafusion::execution::context::SessionState;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 mod define;
+mod describe;
 pub mod schema;
 
-pub use define::{closest_name, create_graph, drop_graph};
+pub use define::{
+    check_ddl, check_drop, check_drop_schema, check_replace, closest_name, create_graph,
+    drop_graph, unknown_graph,
+};
+pub use describe::{describe_graph, show_graphs};
 pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, GraphSchema};
 
 mod exec;
@@ -77,11 +96,21 @@ pub struct VertexTable {
     pub key: String,
 }
 
+/// A table a graph opened from a file path or URL when it was created.
+#[derive(Debug, Clone)]
+pub struct FileTable {
+    /// The table reference the definition names: the path, as written.
+    pub table: TableReference,
+    pub provider: Arc<dyn TableProvider>,
+}
+
 /// The graphs defined in one session, by name. Names are compared as given
 /// (the DDL normalizes identifiers the way DataFusion does for tables).
 #[derive(Debug, Default)]
 pub struct GraphRegistry {
     graphs: RwLock<BTreeMap<String, Arc<GraphDef>>>,
+    /// Per graph, the tables it opened from file paths (see the module docs).
+    files: RwLock<BTreeMap<String, Vec<FileTable>>>,
     /// The session's catalogs before the file-table wrapper: graph schemas are
     /// registered and dropped there (the wrapper cannot drop a schema).
     catalogs: OnceLock<Arc<dyn CatalogProviderList>>,
@@ -109,18 +138,45 @@ impl GraphRegistry {
 
     /// Add or replace `def`; returns the definition it replaced.
     pub fn put(&self, def: GraphDef) -> Option<Arc<GraphDef>> {
-        self.graphs
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(def.name.clone(), Arc::new(def))
+        self.put_with_files(def, Vec::new())
+    }
+
+    /// Add or replace `def`, with the tables it opened from file paths.
+    pub fn put_with_files(&self, def: GraphDef, files: Vec<FileTable>) -> Option<Arc<GraphDef>> {
+        let mut graphs = self.graphs.write().unwrap_or_else(|e| e.into_inner());
+        let mut all_files = self.files.write().unwrap_or_else(|e| e.into_inner());
+        if files.is_empty() {
+            all_files.remove(&def.name);
+        } else {
+            all_files.insert(def.name.clone(), files);
+        }
+        graphs.insert(def.name.clone(), Arc::new(def))
     }
 
     /// Remove the graph called `name`; returns it if it existed.
     pub fn remove(&self, name: &str) -> Option<Arc<GraphDef>> {
-        self.graphs
+        let mut graphs = self.graphs.write().unwrap_or_else(|e| e.into_inner());
+        self.files
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(name)
+            .remove(name);
+        graphs.remove(name)
+    }
+
+    /// The table graph `graph` opened from the file path `table`, if `table`
+    /// is one of its file tables.
+    pub fn file_table(
+        &self,
+        graph: &str,
+        table: &TableReference,
+    ) -> Option<Arc<dyn TableProvider>> {
+        self.files
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(graph)?
+            .iter()
+            .find(|f| &f.table == table)
+            .map(|f| Arc::clone(&f.provider))
     }
 
     /// Record the session's unwrapped catalog list (done by `new_session`).

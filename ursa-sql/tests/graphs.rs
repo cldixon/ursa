@@ -337,7 +337,8 @@ async fn drop_property_graph() {
     );
     assert_eq!(
         err(&ctx, "DROP PROPERTY GRAPH karate").await,
-        "graph 'karate' does not exist"
+        "graph 'karate' does not exist; no graphs are defined (define one with CREATE PROPERTY \
+         GRAPH)"
     );
     ok(&ctx, "DROP PROPERTY GRAPH IF EXISTS karate").await;
 
@@ -433,18 +434,6 @@ async fn a_graph_over_a_file_reads_its_current_contents() {
     std::fs::write(&file, "src,dst\n1,2\n2,3\n3,4\n").unwrap();
     assert_eq!(int(&ctx, "SELECT count(*) FROM g.edges").await, 3);
     assert_eq!(int(&ctx, "SELECT count(*) FROM g.nodes").await, 4);
-}
-
-#[tokio::test]
-async fn a_graph_over_a_dropped_view_says_so() {
-    let ctx = karate_session().await;
-    ok(&ctx, KARATE_EDGES_ONLY).await;
-    ok(&ctx, "DROP VIEW ties").await;
-    let message = err(&ctx, "SELECT * FROM karate_edges_only.edges").await;
-    assert!(
-        message.contains("cannot read karate_edges_only.edges: table 'ties' not found"),
-        "{message}"
-    );
 }
 
 #[tokio::test]
@@ -593,4 +582,443 @@ async fn a_graph_over_another_graphs_tables() {
         int(&ctx, "SELECT count(*) FROM again.nodes WHERE club IS NULL").await,
         0
     );
+}
+
+#[tokio::test]
+async fn dropping_a_view_a_graph_uses_is_refused() {
+    let ctx = karate_session().await;
+    ok(&ctx, KARATE).await;
+    ok(&ctx, KARATE_EDGES_ONLY).await;
+    assert_eq!(
+        err(&ctx, "DROP VIEW ties").await,
+        "cannot drop view 'ties': graphs 'karate', 'karate_edges_only' use it; drop property \
+         graphs karate, karate_edges_only first"
+    );
+    assert_eq!(
+        err(&ctx, "DROP VIEW IF EXISTS members").await,
+        "cannot drop view 'members': graph 'karate' uses it; drop property graph karate first"
+    );
+    // Qualified the same table is still refused.
+    assert!(err(&ctx, "DROP VIEW public.ties")
+        .await
+        .starts_with("cannot drop view 'public.ties'"));
+    assert_eq!(
+        err(&ctx, "DROP SCHEMA karate CASCADE").await,
+        "cannot drop schema 'karate': it holds the tables of graph 'karate'; drop the graph \
+         with DROP PROPERTY GRAPH karate"
+    );
+    // Nothing was dropped.
+    assert_eq!(int(&ctx, "SELECT count(*) FROM karate.edges").await, 78);
+
+    // A table too.
+    ok(
+        &ctx,
+        "CREATE TABLE t AS SELECT * FROM ties;
+         CREATE PROPERTY GRAPH g EDGE TABLES (t SOURCE KEY (src) DESTINATION KEY (dst))",
+    )
+    .await;
+    assert_eq!(
+        err(&ctx, "DROP TABLE t").await,
+        "cannot drop table 't': graph 'g' uses it; drop property graph g first"
+    );
+
+    // Once the graphs are gone, so can the tables be.
+    ok(
+        &ctx,
+        "DROP PROPERTY GRAPH karate;
+         DROP PROPERTY GRAPH karate_edges_only;
+         DROP PROPERTY GRAPH g;
+         DROP VIEW ties;
+         DROP VIEW members;
+         DROP TABLE t",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dropping_a_schema_holding_a_graphs_table_is_refused() {
+    let ctx = karate_session().await;
+    ok(
+        &ctx,
+        "CREATE SCHEMA club;
+         CREATE VIEW club.ties AS SELECT * FROM ties;
+         CREATE PROPERTY GRAPH g EDGE TABLES (club.ties SOURCE KEY (src) DESTINATION KEY (dst))",
+    )
+    .await;
+    assert_eq!(
+        err(&ctx, "DROP SCHEMA club CASCADE").await,
+        "cannot drop schema 'club': graph 'g' uses a table in it; drop property graph g first"
+    );
+    // `ties` in the default schema is another table.
+    ok(&ctx, "DROP VIEW ties").await;
+    assert_eq!(int(&ctx, "SELECT count(*) FROM g.edges").await, 78);
+}
+
+#[tokio::test]
+async fn replacing_a_view_a_graph_uses() {
+    let ctx = karate_session().await;
+    ok(&ctx, KARATE).await;
+
+    // A replacement the definition no longer fits is refused.
+    assert_eq!(
+        err(
+            &ctx,
+            "CREATE OR REPLACE VIEW ties AS SELECT src AS a, dst FROM karate.edges"
+        )
+        .await,
+        "cannot replace view 'ties': graph 'karate' uses it, and the new view does not fit its \
+         definition (SOURCE KEY column 'src' not found in table 'ties'; its columns are a, dst). \
+         Keep the columns the graph uses, or drop property graph karate first"
+    );
+    let message = err(
+        &ctx,
+        "CREATE OR REPLACE VIEW members AS SELECT CAST(id AS DOUBLE) AS id, club FROM members",
+    )
+    .await;
+    assert!(
+        message.starts_with("cannot replace view 'members': graph 'karate' uses it")
+            && message.contains("node ids must be integers or strings"),
+        "{message}"
+    );
+    assert!(err(
+        &ctx,
+        "CREATE OR REPLACE TABLE ties AS SELECT CAST(src AS VARCHAR) AS src, dst FROM karate.edges"
+    )
+    .await
+    .starts_with("cannot replace table 'ties': graph 'karate' uses it"));
+    assert_eq!(int(&ctx, "SELECT count(*) FROM karate.edges").await, 78);
+
+    // One that fits is allowed, and the graph reads it.
+    ok(
+        &ctx,
+        &format!(
+            "CREATE OR REPLACE VIEW ties AS SELECT * FROM '{}' WHERE src < 10",
+            data("karate_edges.csv").display()
+        ),
+    )
+    .await;
+    let expected = int(&ctx, "SELECT count(*) FROM ties").await;
+    assert!(expected < 78);
+    assert_eq!(
+        int(&ctx, "SELECT count(*) FROM karate.edges").await,
+        expected
+    );
+    assert_eq!(
+        int(&ctx, "SELECT count(*) FROM degree(karate) WHERE degree > 0").await,
+        int(&ctx, "SELECT count(DISTINCT src) FROM ties").await
+    );
+    // Replacing a table no graph uses is not checked.
+    ok(
+        &ctx,
+        "CREATE VIEW other AS SELECT 1 AS x; CREATE OR REPLACE VIEW other AS SELECT 2 AS y",
+    )
+    .await;
+}
+
+/// However a table under a graph disappears, session listings keep working,
+/// and queries of the graph say what is wrong.
+#[tokio::test]
+async fn a_graph_over_a_deregistered_view_keeps_listings_working() {
+    let ctx = karate_session().await;
+    ok(&ctx, KARATE_EDGES_ONLY).await;
+    // Not through SQL, which refuses: through the DataFusion API.
+    ctx.deregister_table("ties").unwrap();
+
+    let message = err(&ctx, "SELECT * FROM karate_edges_only.edges").await;
+    assert_eq!(
+        message,
+        "cannot read karate_edges_only.edges: table 'ties' not found"
+    );
+    let message = err(&ctx, "SELECT id FROM karate_edges_only.nodes").await;
+    assert_eq!(
+        message,
+        "cannot read karate_edges_only.nodes: table 'ties' not found"
+    );
+    let message = err(&ctx, "SELECT * FROM degree(karate_edges_only)").await;
+    assert!(message.contains("table 'ties' not found"), "{message}");
+    assert_eq!(
+        err(&ctx, "DESCRIBE GRAPH karate_edges_only").await,
+        "cannot describe graph 'karate_edges_only': table 'ties' not found"
+    );
+
+    let shown = pretty(&ok(&ctx, "SHOW TABLES").await);
+    assert!(
+        shown.contains("| karate_edges_only  | edges       | VIEW"),
+        "{shown}"
+    );
+    ok(&ctx, "SELECT * FROM information_schema.tables").await;
+    ok(&ctx, "SELECT * FROM information_schema.views").await;
+    // The graph's tables keep the columns they last had.
+    let columns = pretty(
+        &ok(
+            &ctx,
+            "SELECT table_name, column_name FROM information_schema.columns
+             WHERE table_schema = 'karate_edges_only' ORDER BY table_name, ordinal_position",
+        )
+        .await,
+    );
+    assert_eq!(
+        columns,
+        "\
++------------+-------------+
+| table_name | column_name |
++------------+-------------+
+| edges      | src         |
+| edges      | dst         |
+| nodes      | id          |
++------------+-------------+"
+    );
+    assert!(pretty(&ok(&ctx, "SHOW GRAPHS").await).contains("karate_edges_only"));
+
+    // Putting the view back mends the graph.
+    ok(
+        &ctx,
+        &format!(
+            "CREATE VIEW ties AS SELECT * FROM '{}'",
+            data("karate_edges.csv").display()
+        ),
+    )
+    .await;
+    assert_eq!(
+        int(&ctx, "SELECT count(*) FROM karate_edges_only.edges").await,
+        78
+    );
+}
+
+#[tokio::test]
+async fn show_graphs() {
+    let ctx = karate_session().await;
+    assert_eq!(
+        pretty(&ok(&ctx, "SHOW GRAPHS").await),
+        "\
++------+------------+--------+-------------+--------------+------------+
+| name | edge_table | source | destination | vertex_table | vertex_key |
++------+------------+--------+-------------+--------------+------------+
++------+------------+--------+-------------+--------------+------------+"
+    );
+    ok(&ctx, KARATE_EDGES_ONLY).await;
+    ok(&ctx, KARATE).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH florentine
+               EDGE TABLES ('{FLORENTINE}' SOURCE KEY (src) DESTINATION KEY (dst))"
+        ),
+    )
+    .await;
+    assert_eq!(
+        pretty(&ok(&ctx, "SHOW GRAPHS").await),
+        "\
++-------------------+-----------------------------------------------------+--------+-------------+--------------+------------+
+| name              | edge_table                                          | source | destination | vertex_table | vertex_key |
++-------------------+-----------------------------------------------------+--------+-------------+--------------+------------+
+| florentine        | '../python/ursa/datasets/data/florentine_edges.csv' | src    | dst         |              |            |
+| karate            | ties                                                | src    | dst         | members      | id         |
+| karate_edges_only | ties                                                | src    | dst         |              |            |
++-------------------+-----------------------------------------------------+--------+-------------+--------------+------------+"
+    );
+    // NULL, not an empty string, without a vertex table.
+    let batches = ok(&ctx, "SHOW GRAPHS").await;
+    assert!(batches[0].column(4).is_null(0));
+    assert!(!batches[0].column(4).is_null(1));
+}
+
+#[tokio::test]
+async fn describe_graph() {
+    let ctx = karate_session().await;
+    ok(&ctx, KARATE).await;
+    ok(&ctx, KARATE_EDGES_ONLY).await;
+    let karate = "\
++------------+-------------+-----------+-------------+--------------+
+| table_name | column_name | data_type | role        | origin       |
++------------+-------------+-----------+-------------+--------------+
+| nodes      | id          | Int64     | node id     | members.id   |
+| nodes      | club        | Utf8      |             | members.club |
+| edges      | src         | Int64     | source      | ties.src     |
+| edges      | dst         | Int64     | destination | ties.dst     |
++------------+-------------+-----------+-------------+--------------+";
+    assert_eq!(pretty(&ok(&ctx, "DESCRIBE GRAPH karate").await), karate);
+    // DESC, and the name normalized as a table name is.
+    assert_eq!(pretty(&ok(&ctx, "DESC GRAPH Karate").await), karate);
+    assert_eq!(
+        pretty(&ok(&ctx, "DESCRIBE GRAPH karate_edges_only").await),
+        "\
++------------+-------------+-----------+-------------+--------------------+
+| table_name | column_name | data_type | role        | origin             |
++------------+-------------+-----------+-------------+--------------------+
+| nodes      | id          | Int64     | node id     | ties.src, ties.dst |
+| edges      | src         | Int64     | source      | ties.src           |
+| edges      | dst         | Int64     | destination | ties.dst           |
++------------+-------------+-----------+-------------+--------------------+"
+    );
+    // `DESCRIBE graph` alone still describes a table called `graph`.
+    ok(&ctx, "CREATE VIEW graph AS SELECT 1 AS x").await;
+    assert!(pretty(&ok(&ctx, "DESCRIBE graph").await).contains("| x "));
+
+    assert_eq!(
+        err(&ctx, "DESCRIBE GRAPH karte").await,
+        "graph 'karte' does not exist; did you mean 'karate'?"
+    );
+    assert_eq!(
+        err(&ctx, "DESCRIBE GRAPH zebra").await,
+        "graph 'zebra' does not exist. The graphs are: karate, karate_edges_only"
+    );
+    let empty = ursa_engine::new_session();
+    assert_eq!(
+        err(&empty, "DESCRIBE GRAPH karate").await,
+        "graph 'karate' does not exist; no graphs are defined (define one with CREATE PROPERTY \
+         GRAPH)"
+    );
+}
+
+/// The Florentine families' marriages, as a path relative to this crate (where
+/// tests run).
+const FLORENTINE: &str = "../python/ursa/datasets/data/florentine_edges.csv";
+
+/// Florentine families: string ids, from a file path.
+#[tokio::test]
+async fn describe_graph_with_string_ids_over_a_file() {
+    let ctx = ursa_engine::new_session();
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH florentine
+               EDGE TABLES ('{FLORENTINE}' SOURCE KEY (src) DESTINATION KEY (dst))"
+        ),
+    )
+    .await;
+    assert_eq!(
+        pretty(&ok(&ctx, "DESCRIBE GRAPH florentine").await),
+        "\
++------------+-------------+-----------+-------------+------------------------------------------------------------------------------------------------------------------+
+| table_name | column_name | data_type | role        | origin                                                                                                           |
++------------+-------------+-----------+-------------+------------------------------------------------------------------------------------------------------------------+
+| nodes      | id          | Utf8      | node id     | '../python/ursa/datasets/data/florentine_edges.csv'.src, '../python/ursa/datasets/data/florentine_edges.csv'.dst |
+| edges      | src         | Utf8      | source      | '../python/ursa/datasets/data/florentine_edges.csv'.src                                                          |
+| edges      | dst         | Utf8      | destination | '../python/ursa/datasets/data/florentine_edges.csv'.dst                                                          |
++------------+-------------+-----------+-------------+------------------------------------------------------------------------------------------------------------------+"
+    );
+}
+
+#[tokio::test]
+async fn a_graph_over_bare_file_paths() {
+    let ctx = ursa_engine::new_session();
+    let nodes = data("karate_nodes.csv").display().to_string();
+    let edges = data("karate_edges.csv").display().to_string();
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH karate
+               VERTEX TABLES ('{nodes}' KEY (id))
+               EDGE TABLES ('{edges}' SOURCE KEY (src) REFERENCES '{nodes}' (id)
+                                      DESTINATION KEY (dst) REFERENCES '{nodes}' (id))"
+        ),
+    )
+    .await;
+    assert_eq!(int(&ctx, "SELECT count(*) FROM karate.nodes").await, 34);
+    assert_eq!(int(&ctx, "SELECT count(*) FROM karate.edges").await, 78);
+    assert_eq!(
+        pretty(
+            &ok(
+                &ctx,
+                "SELECT id, club, degree FROM karate.nodes
+                 JOIN degree(karate, direction => 'both') USING (id)
+                 ORDER BY degree DESC, id LIMIT 3"
+            )
+            .await
+        ),
+        "\
++----+---------+--------+
+| id | club    | degree |
++----+---------+--------+
+| 33 | Officer | 17     |
+| 0  | Mr. Hi  | 16     |
+| 32 | Officer | 12     |
++----+---------+--------+"
+    );
+    // The same values as a graph over views of the files.
+    ok(
+        &ctx,
+        &format!(
+            "CREATE VIEW ties AS SELECT * FROM '{edges}';
+             CREATE PROPERTY GRAPH karate_views EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))"
+        ),
+    )
+    .await;
+    assert_eq!(
+        pretty(&ok(&ctx, "SELECT * FROM pagerank(karate) ORDER BY id").await),
+        pretty(&ok(&ctx, "SELECT * FROM pagerank(karate_views) ORDER BY id").await)
+    );
+    // The file tables are not listed under any name.
+    let tables = pretty(
+        &ok(
+            &ctx,
+            "SELECT table_schema, table_name FROM information_schema.tables
+             WHERE table_schema <> 'information_schema' ORDER BY 1, 2",
+        )
+        .await,
+    );
+    assert_eq!(
+        tables,
+        "\
++--------------+------------+
+| table_schema | table_name |
++--------------+------------+
+| karate       | edges      |
+| karate       | nodes      |
+| karate_views | edges      |
+| karate_views | nodes      |
+| public       | ties       |
++--------------+------------+"
+    );
+}
+
+/// As a view over a file does, a graph over a file path reads the file's
+/// current rows on every query.
+#[tokio::test]
+async fn a_graph_over_a_file_path_reads_its_current_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("edges.csv");
+    std::fs::write(&file, "src,dst\n1,2\n2,3\n").unwrap();
+    let ctx = ursa_engine::new_session();
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (src) DESTINATION KEY (dst))",
+            file.display()
+        ),
+    )
+    .await;
+    assert_eq!(int(&ctx, "SELECT count(*) FROM g.nodes").await, 3);
+    assert_eq!(int(&ctx, "SELECT count(*) FROM degree(g)").await, 3);
+    std::fs::write(&file, "src,dst\n1,2\n2,3\n3,4\n").unwrap();
+    assert_eq!(int(&ctx, "SELECT count(*) FROM g.edges").await, 3);
+    assert_eq!(int(&ctx, "SELECT count(*) FROM g.nodes").await, 4);
+    assert_eq!(int(&ctx, "SELECT count(*) FROM degree(g)").await, 4);
+}
+
+#[tokio::test]
+async fn a_file_path_that_cannot_be_read_is_an_error_at_create() {
+    let ctx = ursa_engine::new_session();
+    assert_eq!(
+        err(
+            &ctx,
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('no/such/edges.csv' SOURCE KEY (src) DESTINATION KEY (dst))"
+        )
+        .await,
+        "no file found at 'no/such/edges.csv'"
+    );
+    let message = err(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            data("karate_edges.csv").display()
+        ),
+    )
+    .await;
+    assert!(
+        message.starts_with("SOURCE KEY column 'a' not found in table"),
+        "{message}"
+    );
+    assert!(registry_of(&ctx).all().is_empty());
 }

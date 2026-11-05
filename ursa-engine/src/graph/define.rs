@@ -4,21 +4,28 @@
 //! A definition is checked when it is created: its tables exist, the named
 //! columns exist in them, the endpoints have one node id type (an integer of
 //! any width, or a string), and the vertex key's type is compatible with it.
-//! The tables are read afresh by every query, so a later change to them (a
-//! dropped view, say) shows up as an error when the graph is next queried.
+//! A table given as a file path is opened then (see the [module
+//! docs](super)).
+//!
+//! The tables are read afresh by every query. [`check_ddl`] keeps them from
+//! being dropped, or replaced by ones the definition no longer fits, by SQL
+//! while a graph uses them.
 
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use datafusion::common::utils::datafusion_strsim::levenshtein;
-use datafusion::common::TableReference;
+use datafusion::common::{ResolvedTableReference, SchemaReference, TableReference};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::prelude::SessionContext;
 
-use super::schema::{lookup_table, GraphSchema, ID};
-use super::{registry, GraphDef};
+use super::schema::{graph_table, lookup_table, GraphSchema, EDGES, ID, NODES};
+use super::{registry, FileTable, GraphDef, GraphRegistry};
+use crate::file_table::open_file_table;
+use crate::paths::looks_like_location;
 
 /// The schema DataFusion reserves for `information_schema` views.
 const INFORMATION_SCHEMA: &str = "information_schema";
@@ -53,18 +60,266 @@ pub async fn create_graph(
         ));
     }
 
-    validate(&state, &def).await?;
+    let mut files = Vec::new();
+    let edges = open_table(&state, &def.edges.table, &mut files).await?;
+    let vertices = match &def.vertices {
+        Some(v) => Some(open_table(&state, &v.table, &mut files).await?),
+        None => None,
+    };
+    validate(
+        &def,
+        &edges.schema(),
+        vertices.as_ref().map(|v| v.schema()).as_deref(),
+    )?;
 
     let name = def.name.clone();
-    graphs.put(def);
+    graphs.put_with_files(def, files);
     let catalog = default_catalog_inner(&state)?;
-    if catalog.schema(&name).is_none() {
-        catalog.register_schema(
-            &name,
-            Arc::new(GraphSchema::new(name.clone(), ctx.state_weak_ref())),
-        )?;
+    let schema = match catalog.schema(&name) {
+        Some(schema) => schema,
+        None => {
+            let schema = Arc::new(GraphSchema::new(name.clone(), ctx.state_weak_ref()));
+            catalog.register_schema(&name, Arc::clone(&schema) as _)?;
+            schema
+        }
+    };
+    // Plan both tables once, so their columns are known to listings even if a
+    // table under the graph later disappears.
+    for table in [NODES, EDGES] {
+        schema.table(table).await?;
     }
     Ok(())
+}
+
+/// The table `table` names: a table or view in the session, or else, when it
+/// looks like a file path or URL, that file opened as a listing table (added
+/// to `files`).
+async fn open_table(
+    state: &SessionState,
+    table: &TableReference,
+    files: &mut Vec<FileTable>,
+) -> Result<Arc<dyn TableProvider>> {
+    if let Some(provider) = session_table(state, table).await? {
+        return Ok(provider);
+    }
+    if let TableReference::Bare { table: location } = table {
+        if looks_like_location(location) {
+            let provider = open_file_table(state, location).await?;
+            files.push(FileTable {
+                table: table.clone(),
+                provider: Arc::clone(&provider),
+            });
+            return Ok(provider);
+        }
+    }
+    find_table(state, table).await
+}
+
+/// The table or view `table` names in the session's catalogs, not opening
+/// files.
+async fn session_table(
+    state: &SessionState,
+    table: &TableReference,
+) -> Result<Option<Arc<dyn TableProvider>>> {
+    let Some(catalogs) = registry(state).catalogs().cloned() else {
+        return lookup_table(state, table).await;
+    };
+    let resolved = resolve(state, table);
+    match catalogs
+        .catalog(&resolved.catalog)
+        .and_then(|c| c.schema(&resolved.schema))
+    {
+        Some(schema) => schema.table(&resolved.table).await,
+        None => Ok(None),
+    }
+}
+
+/// The error for a graph that does not exist, with a suggestion.
+pub fn unknown_graph(name: &str, graphs: &GraphRegistry) -> DataFusionError {
+    let names = graphs.names();
+    let hint = match closest_name(name, names.iter().map(String::as_str)) {
+        Some(s) => format!("; did you mean '{s}'?"),
+        None if names.is_empty() => {
+            "; no graphs are defined (define one with CREATE PROPERTY GRAPH)".to_string()
+        }
+        None => format!(". The graphs are: {}", names.join(", ")),
+    };
+    DataFusionError::Plan(format!("graph '{name}' does not exist{hint}"))
+}
+
+/// Refuse a DDL statement, planned as `plan`, that would break a graph:
+///
+/// - `DROP TABLE` or `DROP VIEW` of a table a graph uses;
+/// - `DROP SCHEMA` of a graph's schema, or of a schema holding a table a graph
+///   uses;
+/// - `CREATE OR REPLACE` of a table a graph uses, by one whose columns the
+///   graph's definition no longer fits (see [`check_replace`]).
+///
+/// Every other plan passes.
+pub async fn check_ddl(state: &SessionState, plan: &LogicalPlan) -> Result<()> {
+    let LogicalPlan::Ddl(ddl) = plan else {
+        return Ok(());
+    };
+    match ddl {
+        DdlStatement::DropTable(drop) => check_drop(state, "table", &drop.name),
+        DdlStatement::DropView(drop) => check_drop(state, "view", &drop.name),
+        DdlStatement::DropCatalogSchema(drop) => check_drop_schema(state, &drop.name),
+        DdlStatement::CreateView(create) if create.or_replace => {
+            let schema = create.input.schema().as_arrow();
+            check_replace(state, "view", &create.name, Some(schema)).await
+        }
+        DdlStatement::CreateMemoryTable(create) if create.or_replace => {
+            let schema = create.input.schema().as_arrow();
+            check_replace(state, "table", &create.name, Some(schema)).await
+        }
+        DdlStatement::CreateExternalTable(create) if create.or_replace => {
+            // An empty schema is inferred from the files when the statement
+            // runs, so it cannot be checked here.
+            let schema = create.schema.as_arrow();
+            let known = (!schema.fields().is_empty()).then_some(schema);
+            check_replace(state, "table", &create.name, known).await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse to drop `table` (a `kind`: "table" or "view") while a graph uses it.
+pub fn check_drop(state: &SessionState, kind: &str, table: &TableReference) -> Result<()> {
+    let dropped = resolve(state, table);
+    let users = graphs_using(state, |t| t == &dropped);
+    if users.is_empty() {
+        return Ok(());
+    }
+    plan_err(format!(
+        "cannot drop {kind} '{table}': {}; drop {} first",
+        used_by(&users),
+        drop_statements(&users)
+    ))
+}
+
+/// Refuse to drop the schema `schema` while it is a graph's, or holds a table
+/// a graph uses.
+pub fn check_drop_schema(state: &SessionState, schema: &SchemaReference) -> Result<()> {
+    let options = &state.config_options().catalog;
+    let (catalog, name) = match schema {
+        SchemaReference::Bare { schema } => (options.default_catalog.as_str(), schema.as_ref()),
+        SchemaReference::Full { schema, catalog } => (catalog.as_ref(), schema.as_ref()),
+    };
+    if catalog == options.default_catalog && registry(state).get(name).is_some() {
+        return plan_err(format!(
+            "cannot drop schema '{name}': it holds the tables of graph '{name}'; drop the \
+             graph with DROP PROPERTY GRAPH {name}"
+        ));
+    }
+    let users = graphs_using(state, |t| {
+        t.catalog.as_ref() == catalog && t.schema.as_ref() == name
+    });
+    if users.is_empty() {
+        return Ok(());
+    }
+    plan_err(format!(
+        "cannot drop schema '{name}': {} a table in it; drop {} first",
+        if users.len() == 1 {
+            format!("graph '{}' uses", users[0].name)
+        } else {
+            used_by(&users).replace(" use it", " use")
+        },
+        drop_statements(&users)
+    ))
+}
+
+/// Refuse to replace `table` (a `kind`) by one with the columns `schema`
+/// while a graph uses it and its definition does not fit those columns.
+/// `None`: the new columns are not known yet, so the replacement is refused
+/// whenever a graph uses the table.
+pub async fn check_replace(
+    state: &SessionState,
+    kind: &str,
+    table: &TableReference,
+    schema: Option<&Schema>,
+) -> Result<()> {
+    let replaced = resolve(state, table);
+    let users = graphs_using(state, |t| t == &replaced);
+    if users.is_empty() {
+        return Ok(());
+    }
+    let Some(schema) = schema else {
+        return plan_err(format!(
+            "cannot replace {kind} '{table}' by one whose columns are not known yet: {}; \
+             drop {} first",
+            used_by(&users),
+            drop_statements(&users)
+        ));
+    };
+    let graphs = registry(state);
+    for def in &users {
+        let mut schemas = Vec::new();
+        for t in std::iter::once(&def.edges.table).chain(def.vertices.as_ref().map(|v| &v.table)) {
+            let schema =
+                if graphs.file_table(&def.name, t).is_none() && resolve(state, t) == replaced {
+                    Arc::new(schema.clone())
+                } else {
+                    graph_table(state, def, t).await?.schema()
+                };
+            schemas.push(schema);
+        }
+        if let Err(e) = validate(def, &schemas[0], schemas.get(1).map(|s| s.as_ref())) {
+            return plan_err(format!(
+                "cannot replace {kind} '{table}': graph '{}' uses it, and the new {kind} does \
+                 not fit its definition ({}). Keep the columns the graph uses, or drop \
+                 property graph {} first",
+                def.name,
+                crate::user_message(&e),
+                def.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The graphs with a session table (not a file path) for which `uses` holds.
+fn graphs_using(
+    state: &SessionState,
+    uses: impl Fn(&ResolvedTableReference) -> bool,
+) -> Vec<Arc<GraphDef>> {
+    let graphs = registry(state);
+    graphs
+        .all()
+        .into_iter()
+        .filter(|def| {
+            std::iter::once(&def.edges.table)
+                .chain(def.vertices.as_ref().map(|v| &v.table))
+                .any(|t| graphs.file_table(&def.name, t).is_none() && uses(&resolve(state, t)))
+        })
+        .collect()
+}
+
+/// "graph 'g' uses it" or "graphs 'g', 'h' use it".
+fn used_by(graphs: &[Arc<GraphDef>]) -> String {
+    let names: Vec<String> = graphs.iter().map(|g| format!("'{}'", g.name)).collect();
+    if names.len() == 1 {
+        format!("graph {} uses it", names[0])
+    } else {
+        format!("graphs {} use it", names.join(", "))
+    }
+}
+
+/// "property graph g" or "property graphs g, h".
+fn drop_statements(graphs: &[Arc<GraphDef>]) -> String {
+    let names: Vec<&str> = graphs.iter().map(|g| g.name.as_str()).collect();
+    if names.len() == 1 {
+        format!("property graph {}", names[0])
+    } else {
+        format!("property graphs {}", names.join(", "))
+    }
+}
+
+/// `table` with the session's default catalog and schema filled in.
+fn resolve(state: &SessionState, table: &TableReference) -> ResolvedTableReference {
+    let options = &state.config_options().catalog;
+    table
+        .clone()
+        .resolve(&options.default_catalog, &options.default_schema)
 }
 
 /// Drop the graph called `name` and its schema, as `DROP PROPERTY GRAPH
@@ -76,11 +331,7 @@ pub fn drop_graph(ctx: &SessionContext, name: &str, if_exists: bool) -> Result<(
         if if_exists {
             return Ok(());
         }
-        let names = graphs.names();
-        return plan_err(format!(
-            "graph '{name}' does not exist{}",
-            did_you_mean(name, names.iter().map(String::as_str))
-        ));
+        return Err(unknown_graph(name, &graphs));
     }
     let catalog = default_catalog_inner(&state)?;
     if catalog
@@ -114,12 +365,12 @@ fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -
         .unwrap_or_default()
 }
 
-/// Check that `def`'s tables and columns exist and have node id types.
-async fn validate(state: &SessionState, def: &GraphDef) -> Result<()> {
-    let edges = find_table(state, &def.edges.table).await?.schema();
+/// Check that `def`'s columns exist in its tables, whose columns are `edges`
+/// and `vertices`, and have node id types.
+fn validate(def: &GraphDef, edges: &Schema, vertices: Option<&Schema>) -> Result<()> {
     let table = &def.edges.table;
-    let source = column_type(&edges, table, &def.edges.source, "SOURCE KEY")?;
-    let destination = column_type(&edges, table, &def.edges.destination, "DESTINATION KEY")?;
+    let source = column_type(edges, table, &def.edges.source, "SOURCE KEY")?;
+    let destination = column_type(edges, table, &def.edges.destination, "DESTINATION KEY")?;
     if source != destination {
         return plan_err(format!(
             "the source and destination columns of edge table '{table}' must have the same \
@@ -135,11 +386,10 @@ async fn validate(state: &SessionState, def: &GraphDef) -> Result<()> {
         ));
     };
 
-    let Some(v) = &def.vertices else {
+    let (Some(v), Some(vertices)) = (&def.vertices, vertices) else {
         return Ok(());
     };
-    let vertices = find_table(state, &v.table).await?.schema();
-    let key = column_type(&vertices, &v.table, &v.key, "KEY")?;
+    let key = column_type(vertices, &v.table, &v.key, "KEY")?;
     match IdFamily::of(&key) {
         None => {
             return plan_err(format!(
