@@ -353,8 +353,8 @@ impl ExecutionPlan for GraphAlgorithmExec {
                 }
             };
             // The kernels are CPU-bound and parallel (rayon): keep them off
-            // the async workers.
-            tokio::task::spawn_blocking(move || {
+            // the async workers (inline in the browser, which has none).
+            crate::run_blocking(move || {
                 let weights = weights.as_deref().map_or(&[][..], Vec::as_slice);
                 kernels::batch(
                     &index,
@@ -513,7 +513,7 @@ impl ExecutionPlan for GraphTraversalExec {
                 let batches = drain(plan, &[0], &context).await?;
                 nodes.push(node_ids(&shape, param, &index, batches)?);
             }
-            tokio::task::spawn_blocking(move || {
+            crate::run_blocking(move || {
                 let weights = weights.as_ref().map(|w| w[0].as_slice());
                 traversal::batch(
                     &index.topology,
@@ -1081,6 +1081,11 @@ async fn build_streamed(
     let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
     let hint = row_hint(input);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
+
+    // Native: the interner runs on a blocking thread, so reading and interning
+    // overlap on two threads. It is spawned here, before the reader starts
+    // (`run_blocking` would start it only when awaited, after the reader).
+    #[cfg(not(target_arch = "wasm32"))]
     let interning = tokio::task::spawn_blocking(move || -> Result<Option<GraphIndex>> {
         let mut interner = EdgeInterner::with_capacity(hint);
         while let Some(chunk) = rx.blocking_recv() {
@@ -1094,8 +1099,28 @@ async fn build_streamed(
         // The reader stopped before the end (its error is the one reported).
         Ok(None)
     });
+    // The browser (wasm32) has one thread: the interner is a future polled
+    // alongside the reader, taking each chunk as it is sent. The channel's
+    // bound still keeps at most two chunks in flight, and the chunks arrive in
+    // the same order, so the index is the same (#278).
+    #[cfg(target_arch = "wasm32")]
+    let interning = async move {
+        let mut interner = EdgeInterner::with_capacity(hint);
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                Chunk::Edges(src, dst) => interner
+                    .push(src.as_ref(), dst.as_ref())
+                    .map_err(|e| build_error(&graph, e))?,
+                Chunk::End => return Ok(Some(finish_index(interner, &id_type))),
+            }
+        }
+        Ok::<_, DataFusionError>(None)
+    };
 
     let read = async {
+        // The reader owns the sender, so the interner sees the channel close
+        // when the reader stops, on an error as at the end.
+        let tx = tx;
         let mut gather = Gather::default();
         for partition in 0..input.output_partitioning().partition_count() {
             let mut stream = input.execute(partition, Arc::clone(context))?;
@@ -1124,11 +1149,16 @@ async fn build_streamed(
         let _ = tx.send(Chunk::End).await;
         Ok::<_, DataFusionError>(())
     };
-    let read = read.await;
-    drop(tx);
-    let built = interning.await.map_err(|e| {
-        DataFusionError::Execution(format!("building graph '{}' failed: {e}", shape.graph))
-    })?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let (read, built) = {
+        let read = read.await;
+        let built = interning.await.map_err(|e| {
+            DataFusionError::Execution(format!("building graph '{}' failed: {e}", shape.graph))
+        })?;
+        (read, built)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let (read, built) = futures::join!(read, interning);
     read?;
     built?.ok_or_else(|| {
         DataFusionError::Internal(format!(

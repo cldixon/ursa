@@ -13,7 +13,9 @@ keywords = ["sql", "graph", "datafusion", "analytics", "parquet"]
 categories = ["database-implementations", "algorithms"]
 
 [dependencies]
-ursa-core = { path = "../ursa-core", version = "0.5.0" }
+# `ursa-core`'s `rayon` feature is native only (below): in the browser the
+# kernels take their serial path, whose results are bit-identical (#278).
+ursa-core = { path = "../ursa-core", version = "0.5.0", default-features = false }
 ursa-io = { path = "../ursa-io", version = "0.5.0" }
 datafusion = { workspace = true }
 object_store = { workspace = true }
@@ -34,6 +36,7 @@ crc32fast = "1.5"
 
 # Native only: the local file system and cloud stores do not build for wasm32 (#278).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ursa-core = { path = "../ursa-core", version = "0.5.0", features = ["rayon"] }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 
 [dev-dependencies]

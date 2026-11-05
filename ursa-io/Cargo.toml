@@ -11,7 +11,9 @@ keywords = ["parquet", "csv", "graph", "datafusion", "object-store"]
 categories = ["database", "encoding"]
 
 [dependencies]
-ursa-core = { path = "../ursa-core", version = "0.5.0" }
+# `ursa-core`'s `rayon` feature is native only (below): in the browser the
+# kernels take their serial path, whose results are bit-identical (#278).
+ursa-core = { path = "../ursa-core", version = "0.5.0", default-features = false }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 rayon = { workspace = true }
@@ -31,6 +33,7 @@ csv = "1"
 # runtime the blocking scan entry points share (see `runtime.rs`). None of these
 # build for wasm32 (#278).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ursa-core = { path = "../ursa-core", version = "0.5.0", features = ["rayon"] }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 

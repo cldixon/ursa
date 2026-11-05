@@ -89,7 +89,7 @@ async fn open_into(ctx: &SessionContext, path: &Path, options: &OpenOptions) -> 
     let path = path.to_path_buf();
     let options = options.clone();
     // Opening may wait for another process's lock.
-    let database = tokio::task::spawn_blocking(move || Database::open(path, &options))
+    let database = ursa_engine::run_blocking(move || Database::open(path, &options))
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))??;
     let database = Arc::new(database);
