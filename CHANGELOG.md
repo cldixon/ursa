@@ -64,6 +64,14 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   and pyo3 0.28 → 0.29 (object_store stays on 0.13, the line DataFusion 55
   uses). Results, row order and error messages are unchanged. Building from
   source now needs Rust 1.94 or later (DataFusion 55's minimum; was 1.88).
+- **Behaviour change:** `shortest_path` takes one node id for `source` and
+  one for `target`. A list, tuple, array or other sequence of several ids (or
+  of none) raises `ValueError` where `shortest_path` is called, naming the
+  parameter and how many ids it got: `shortest_path(source=) must be one node
+  id; got 2 ids. …`. It raised `NotImplementedError: seed ids must be all
+  integers or all strings.` at `collect()`. A sequence of exactly one id is
+  that id, as the SQL engine reads it; it raised the same
+  `NotImplementedError` (#252).
 
 ### Security
 

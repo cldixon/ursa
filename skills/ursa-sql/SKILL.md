@@ -253,6 +253,16 @@ SELECT log(100) AS log, log10(100) AS log10, ln(100) AS ln;
 +-----+-------+-------------------+
 ```
 
+**A float, boolean or date as a node id.** `seeds`, `start`, `source` and `target` take integers or strings. On a graph with integer ids a string must be an integer (`'7'`), and nothing is rounded: `1.5`, `2.0` and `true` are refused. On a graph with string ids, an integer is taken as its string.
+
+```sql
+SELECT * FROM hop(karate, seeds => [1.5]);
+```
+
+```text
+Error: hop(seeds =>) must be node ids of graph 'karate', which are integers; got 1.5
+```
+
 **Other mistakes:**
 
 - A misspelled parameter or graph gets a "did you mean" suggestion. A wrong `direction` lists the accepted values.
