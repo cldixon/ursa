@@ -227,7 +227,7 @@ impl WeightSet {
         let context_error = |e: DataFusionError| {
             plan(format!(
                 "{function}(weight => {written}): {}",
-                crate::user_message(&e)
+                crate::user_message(&e).replace('\n', " ")
             ))
         };
         let expr = context
@@ -312,6 +312,11 @@ fn resolve_call(
                     };
                     weight = Some(weights.add(spec.name, expr, context).map_err(in_context)?);
                     continue;
+                }
+                // An unknown name is the better message than its value's form.
+                let known = name == "dtype" || functions::sql_params(spec).any(|p| p.name == name);
+                if !known {
+                    return Err(in_context(functions::unknown_param(spec, &name)));
                 }
                 let value = literal(&arg).ok_or_else(|| {
                     plan(format!(

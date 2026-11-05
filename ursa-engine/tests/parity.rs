@@ -155,12 +155,7 @@ async fn sql_matches_the_python_library() {
         let columns: Vec<(String, String)> = schema
             .fields()
             .iter()
-            .map(|f| {
-                (
-                    f.name().clone(),
-                    pyarrow_name(f.data_type()).to_string(),
-                )
-            })
+            .map(|f| (f.name().clone(), pyarrow_name(f.data_type()).to_string()))
             .collect();
         let expected_columns: Vec<(String, String)> = case["columns"]
             .as_array()

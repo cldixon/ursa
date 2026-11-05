@@ -622,3 +622,57 @@ fn build_error(graph: &str, e: IdError) -> DataFusionError {
         other => format!("graph '{graph}': {other}"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+
+    fn index(src: &dyn Array, dst: &dyn Array) -> GraphIndex {
+        let (topology, ids) = ursa_io::build_topology_batches(&[(src, dst)]).unwrap();
+        GraphIndex::new(topology, ids)
+    }
+
+    fn ints(v: &[i64]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+
+    #[test]
+    fn weights_line_up_only_with_the_rows_the_index_was_built_from() {
+        let (src, dst) = (ints(&[10, 20, 10, 30]), ints(&[20, 30, 30, 10]));
+        let built = index(src.as_ref(), dst.as_ref());
+        // The same rows, in two batches: aligned.
+        let split = vec![
+            (src.slice(0, 1), dst.slice(0, 1)),
+            (src.slice(1, 3), dst.slice(1, 3)),
+        ];
+        assert!(aligned(&built, &split).unwrap());
+        // The same edge set in another order: not.
+        let swapped = vec![(ints(&[20, 10, 10, 30]), ints(&[30, 20, 30, 10]))];
+        assert!(!aligned(&built, &swapped).unwrap());
+        // Fewer rows: not.
+        assert!(!aligned(&built, &split[1..]).unwrap());
+
+        let names = |v: &[&str]| Arc::new(StringArray::from(v.to_vec())) as ArrayRef;
+        let (s, d) = (names(&["a", "b"]), names(&["b", "c"]));
+        let built = index(s.as_ref(), d.as_ref());
+        assert!(aligned(&built, &[(Arc::clone(&s), Arc::clone(&d))]).unwrap());
+        assert!(!aligned(&built, &[(d, s)]).unwrap());
+    }
+
+    #[test]
+    fn weights_are_checked_as_ursa_plan_checks_them() {
+        let ok = edge_weights(&[ints(&[1, 2]), ints(&[0])]).unwrap();
+        assert_eq!(ok, vec![1.0, 2.0, 0.0]);
+        let negative = edge_weights(&[ints(&[1, -1])]).unwrap_err();
+        assert_eq!(
+            crate::user_message(&negative),
+            "weight expression produced a negative value (-1); weights must be non-negative"
+        );
+        let null: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        assert_eq!(
+            crate::user_message(&edge_weights(&[null]).unwrap_err()),
+            "weight expression produced a null value; weights must be non-null"
+        );
+    }
+}
