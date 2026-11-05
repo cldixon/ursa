@@ -550,7 +550,7 @@ pub fn hop_leaf(
 ) -> Result<DataFrame> {
     let direction = parse_direction("hop", direction)?;
     // Resolve user-id seeds to dense indices; drop unknowns/nulls (kernel-consistent).
-    let seeds_dense: Vec<u32> = resolve_dense(&ids, seeds)?.into_iter().flatten().collect();
+    let seeds_dense: Vec<u32> = resolve_seeds(&ids, seeds)?.into_iter().flatten().collect();
     Ok(extension(
         ctx,
         Arc::new(HopNode::new(topology, ids, seeds_dense, n, direction).with_mask(mask)),
@@ -627,7 +627,7 @@ pub fn walk_leaf(
     walks_per_node: u32,
     seed: Option<u64>,
 ) -> Result<DataFrame> {
-    let starts_dense: Vec<u32> = resolve_dense(&ids, starts)?.into_iter().flatten().collect();
+    let starts_dense: Vec<u32> = resolve_seeds(&ids, starts)?.into_iter().flatten().collect();
     Ok(extension(
         ctx,
         Arc::new(
@@ -652,7 +652,53 @@ pub(crate) fn resolve_endpoint(
             arr.len()
         )));
     }
-    Ok(resolve_dense(ids, arr)?.into_iter().next().flatten())
+    Ok(resolve_seeds(ids, arr)?.into_iter().next().flatten())
+}
+
+/// Resolve a traversal's seed ids (`seeds`, `source`, `target`, `start`) to
+/// dense indices, as [`resolve_dense`] does once they are fitted to the graph's
+/// id type (#271). On a graph of integer ids a string is the integer it spells
+/// exactly (`'7'`), and any other string is an error naming it; on a graph of
+/// string ids an integer is its decimal string, which loses nothing. Every
+/// other mismatch is [`resolve_dense`]'s error. Values that are neither
+/// integers nor strings (floats, booleans, dates) are refused by the host
+/// before they reach the plan.
+pub(crate) fn resolve_seeds(
+    ids: &IdMap,
+    arr: &dyn Array,
+) -> Result<Vec<Option<u32>>, DataFusionError> {
+    let cast_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+    let fitted: Option<ArrayRef> = match (ids.user_type(), arr.data_type()) {
+        (DataType::Int64, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
+            let strings = cast(&arrow::array::make_array(arr.to_data()), &DataType::Utf8)
+                .map_err(cast_err)?;
+            let strings = strings
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cast to Utf8 yields a StringArray");
+            let parsed = strings
+                .iter()
+                .map(|s| s.map(parse_id).transpose())
+                .collect::<Result<Int64Array, _>>()?;
+            Some(Arc::new(parsed))
+        }
+        (DataType::Utf8, t) if t.is_integer() => Some(
+            cast(&arrow::array::make_array(arr.to_data()), &DataType::Utf8).map_err(cast_err)?,
+        ),
+        _ => None,
+    };
+    resolve_dense(ids, fitted.as_deref().unwrap_or(arr))
+}
+
+/// A seed string on a graph of integer ids: the integer it spells exactly.
+fn parse_id(s: &str) -> Result<i64, DataFusionError> {
+    s.parse::<i64>().map_err(|_| {
+        DataFusionError::Execution(format!(
+            "the node id {} is not an integer, but the graph's node ids are int64; pass ids \
+             of the graph's id type",
+            crate::plan::py_str(s)
+        ))
+    })
 }
 
 /// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping
@@ -1369,6 +1415,41 @@ mod tests {
         let mut reached: Vec<i64> = dsts.values().to_vec();
         reached.sort_unstable();
         assert_eq!(reached, vec![1, 2]);
+    }
+
+    #[test]
+    fn seeds_fit_the_graphs_id_type() {
+        // An integer string on an integer graph is that integer; an integer on a
+        // string graph is its string (#271).
+        let (_, ints) = build(&Int64Array::from(vec![7, 8]), &Int64Array::from(vec![8, 9]));
+        let seeds = StringArray::from(vec![Some("8"), None, Some("-1")]);
+        let want = resolve_dense(&ints, &Int64Array::from(vec![Some(8), None, Some(-1)])).unwrap();
+        assert!(want[0].is_some());
+        assert_eq!(resolve_seeds(&ints, &seeds).unwrap(), want);
+        let (_, strings) = crate::topology::build_topology(
+            &StringArray::from(vec!["7", "x"]),
+            &StringArray::from(vec!["x", "8"]),
+        )
+        .unwrap();
+        let seeds = Int64Array::from(vec![8, 7, 9]);
+        let want = resolve_dense(&strings, &StringArray::from(vec!["8", "7", "9"])).unwrap();
+        assert!(want[0].is_some() && want[1].is_some());
+        assert_eq!(resolve_seeds(&strings, &seeds).unwrap(), want);
+    }
+
+    #[test]
+    fn a_seed_string_that_is_not_an_integer_is_refused() {
+        let (_, ints) = build(&Int64Array::from(vec![7]), &Int64Array::from(vec![8]));
+        for bad in ["x", "7.0", " 7", ""] {
+            let err = resolve_seeds(&ints, &StringArray::from(vec!["7", bad])).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Execution error: the node id '{bad}' is not an integer, but the graph's \
+                     node ids are int64; pass ids of the graph's id type"
+                )
+            );
+        }
     }
 
     #[test]
