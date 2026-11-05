@@ -10,6 +10,7 @@
 
 use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+use ursa_engine::error::matched;
 
 /// What a buffer of typed SQL is, so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +39,10 @@ pub fn status(sql: &str, dialect: &dyn Dialect) -> Status {
         }
         // A string, quoted name or block comment still open at the end:
         // the next line may close it.
-        Err(e) if e.message.contains("EOF") || e.message.starts_with("Unterminated") => {
+        Err(e)
+            if e.message.contains(matched::TOKENIZER_EOF)
+                || e.message.starts_with(matched::TOKENIZER_UNTERMINATED) =>
+        {
             Status::Incomplete
         }
         // Any other tokenizer error is the parser's to report, once the
