@@ -116,6 +116,16 @@ fn close(ctx: SessionContext) {
     drop(ctx);
 }
 
+/// `sql` with each quoted file name made a path into `dir`: a relative path
+/// would resolve against the test process's current directory.
+fn in_dir(dir: &Path, sql: &str) -> String {
+    sql.replace("'edges", &format!("'{}/edges", dir.display()))
+        .replace(
+            "'lesmis_edges.csv'",
+            &format!("'{}/lesmis_edges.csv'", dir.display()),
+        )
+}
+
 const DEFINE: &str = "CREATE VIEW ties AS SELECT * FROM 'edges.parquet';
 CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));";
 
@@ -139,7 +149,7 @@ impl Fixture {
         write_edges(&dir.path().join("edges.parquet"), n, 1);
         let fixture = Self { dir };
         let ctx = open(&fixture.db()).await;
-        ok(&ctx, DEFINE).await;
+        ok(&ctx, &in_dir(fixture.dir.path(), DEFINE)).await;
         close(ctx);
         fixture
     }
@@ -327,8 +337,8 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
     let ctx = open(&fixture.db()).await;
     ok(
         &ctx,
-        "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));
-         CREATE PROPERTY GRAPH c EDGE TABLES ('edges_c.parquet' SOURCE KEY (src) DESTINATION KEY (dst));",
+        &in_dir(dir, "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));
+         CREATE PROPERTY GRAPH c EDGE TABLES ('edges_c.parquet' SOURCE KEY (src) DESTINATION KEY (dst));"),
     )
     .await;
     // Learn each index's size. Out-degree never builds the in-adjacency, so
@@ -422,7 +432,7 @@ async fn an_index_a_running_query_holds_is_not_evicted() {
     let ctx = open(&fixture.db()).await;
     ok(
         &ctx,
-        "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));",
+        &in_dir(dir, "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));"),
     )
     .await;
     ok(&ctx, QUERY).await;
@@ -492,8 +502,11 @@ async fn indexes_without_a_stable_key_are_not_stored() {
     let ctx = open(&fixture.db()).await;
     ok(
         &ctx,
-        "CREATE VIEW sampled AS SELECT * FROM 'edges.parquet' WHERE random() >= 0;
+        &in_dir(
+            fixture.dir.path(),
+            "CREATE VIEW sampled AS SELECT * FROM 'edges.parquet' WHERE random() >= 0;
          CREATE PROPERTY GRAPH s EDGE TABLES (sampled SOURCE KEY (src) DESTINATION KEY (dst));",
+        ),
     )
     .await;
     ok(&ctx, "SELECT count(*) FROM degree(s)").await;
@@ -517,7 +530,7 @@ async fn string_ids_and_weights_work_with_a_loaded_index() {
     let query = "SELECT id, round(pagerank, 6) FROM pagerank(lesmis, weight => weight)
                  ORDER BY pagerank DESC, id LIMIT 5";
     let ctx = open(&db).await;
-    ok(&ctx, define).await;
+    ok(&ctx, &in_dir(dir.path(), define)).await;
     let expected = ok(&ctx, query).await;
     let unweighted = ok(
         &ctx,
