@@ -72,6 +72,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   integers or all strings.` at `collect()`. A sequence of exactly one id is
   that id, as the SQL engine reads it; it raised the same
   `NotImplementedError` (#252).
+- **Behaviour change:** a traversal's node ids (`hop(...).from_()`,
+  `random_walk(start=)`, `shortest_path(source=, target=)`) are integers or
+  strings, as in SQL. A float, a bool, a date or any other value raises
+  `TypeError` where the traversal is called (`hop(...).from_() must be node
+  ids, integers or strings; got 1.5`); it was converted with `int()`, so `1.5`
+  ran as `1` and `True` as `1`. Ids are fitted to the graph's id type when the
+  plan runs: on a graph of integer ids, a string that spells an integer
+  (`'7'`) is that integer, where a list of only strings raised; on a graph of
+  string ids, an integer is its string, where it raised. A string that is not
+  an integer, on a graph of integer ids, raises `ComputeError: the node id
+  'a' is not an integer, but the graph's node ids are int64; …`, which said
+  `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Security
 

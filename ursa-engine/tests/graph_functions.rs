@@ -310,8 +310,8 @@ async fn planning_errors() {
             "SELECT * FROM dijkstra(karate)",
             "there is no graph function 'dijkstra'. The graph functions are: degree, \
              pagerank, connected_components, triangle_count, clustering_coefficient, \
-             betweenness, closeness, label_propagation, louvain, density, avg_path_length, diameter, describe, hop, shortest_path, \
-             random_walk, algorithms",
+             betweenness, closeness, label_propagation, louvain, neighbors_agg, density, \
+             avg_path_length, diameter, describe, hop, shortest_path, random_walk, algorithms",
         ),
         (
             "SELECT * FROM shortest_paths(karate)",

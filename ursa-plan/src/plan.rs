@@ -86,8 +86,8 @@ use datafusion::logical_expr::Expr as DfExpr;
 use crate::expr::GraphVerb;
 use crate::lower::{col_named, Frame, How};
 use crate::query::{
-    attach_columns, graph_leaf, hop_leaf, node_columns, parse_direction, path_leaf, resolve_dense,
-    resolve_endpoint, walk_leaf, NodeColumn,
+    attach_columns, graph_leaf, hop_leaf, node_columns, parse_direction, path_leaf,
+    resolve_endpoint, resolve_seeds, walk_leaf, NodeColumn,
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, CsvOptions, NodeTableCache, ScanSource};
 use crate::stats::{describe_masked, parse_stat_direction, stat_batch, GraphStat};
@@ -2710,7 +2710,7 @@ fn reached_nodes(
             ..
         } => {
             let set = scratch.seed_set(*slot, inputs)?;
-            let dense: Vec<u32> = resolve_dense(ids, set.as_ref())?
+            let dense: Vec<u32> = resolve_seeds(ids, set.as_ref())?
                 .into_iter()
                 .flatten()
                 .collect();
