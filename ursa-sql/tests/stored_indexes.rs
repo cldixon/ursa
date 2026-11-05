@@ -331,12 +331,32 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
          CREATE PROPERTY GRAPH c EDGE TABLES ('edges_c.parquet' SOURCE KEY (src) DESTINATION KEY (dst));",
     )
     .await;
-    ok(&ctx, QUERY).await;
+    // Learn each index's size. Out-degree never builds the in-adjacency, so
+    // the sizes do not depend on when the background write runs.
+    for graph in ["g", "b", "c"] {
+        ok(&ctx, &format!("SELECT count(*) FROM degree({graph})")).await;
+    }
     close(ctx);
-    let size = read_manifest(&fixture.index_dir())[0].size;
+    let size_of = |name: &str| {
+        read_manifest(&fixture.index_dir())
+            .iter()
+            .find(|e| e.key.fingerprint.contains(name))
+            .unwrap()
+            .size
+    };
+    let (g, b, c) = (
+        size_of("/edges.parquet"),
+        size_of("edges_b.parquet"),
+        size_of("edges_c.parquet"),
+    );
+    // Start again from g alone.
+    std::fs::remove_dir_all(fixture.index_dir()).unwrap();
+    let ctx = open(&fixture.db()).await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    close(ctx);
 
-    // Room for two indexes of this size, not three.
-    let limit = size * 5 / 2;
+    // Room for g and either of b and c, not all three.
+    let limit = g + b.max(c);
     let set = format!("SET ursa.index_storage_limit = '{limit}'");
     let ctx = open(&fixture.db()).await;
     ok(&ctx, &set).await;
@@ -345,7 +365,8 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
         [ursa_engine::options::ByteSize(limit).to_string()]
     );
     ok(&ctx, "SELECT count(*) FROM degree(b)").await;
-    // Use g again, so b is the least recently used.
+    // Wait for b's write, then use g again, so b is the least recently used.
+    ursa_engine::database::flush(&ctx.state());
     ok(&ctx, "SELECT count(*) FROM degree(g)").await;
     assert_eq!(counts(&ctx), (1, 1));
     ursa_engine::database::flush(&ctx.state());
