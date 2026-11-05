@@ -43,6 +43,10 @@ allow = [
     # (bzip2-1.0.6), foldhash (Zlib). Both are OSI/FSF-approved permissive licenses.
     "Zlib",
     "bzip2-1.0.6",
+    # Boost Software License: clipboard-win and error-code, which rustyline
+    # (the ursa shell's line editor, MIT) uses on Windows only. Permissive and
+    # OSI-approved; the ASF lists it in Category A, as datafusion-cli uses it.
+    "BSL-1.0",
 ]
 
 [bans]

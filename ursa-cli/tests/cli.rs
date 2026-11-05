@@ -298,12 +298,67 @@ fn only_ursa_files_are_databases() {
     assert!(e.contains("--readonly"), "{e}");
 }
 
+/// With stdin not a terminal and empty, there is nothing to run (the shell
+/// starts only on a terminal; see tests/shell_pty.rs).
 #[test]
-fn no_sql_points_at_the_options() {
-    let out = ursa(&[]);
+fn no_sql_on_a_pipe_does_nothing() {
+    let out = ursa_with_stdin(&[], "");
     assert!(out.status.success());
-    let e = String::from_utf8(out.stderr).unwrap();
-    assert!(e.contains("interactive shell is not available yet"), "{e}");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+}
+
+/// `-init` runs first, before `-c`; dot-commands in it work, an error in it
+/// is printed and the rest runs.
+#[test]
+fn init_runs_before_the_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("setup.sql");
+    std::fs::write(
+        &init,
+        ".mode csv\nCREATE VIEW v AS SELECT 42 AS answer;\nSELECT nope;\n",
+    )
+    .unwrap();
+    let init = init.display().to_string();
+    for flag in ["-init", "--init"] {
+        let out = ursa(&[flag, &init, "-c", "SELECT * FROM v"]);
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "answer\n42\n");
+        let e = String::from_utf8(out.stderr).unwrap();
+        assert!(e.starts_with("Error: ") && e.lines().count() == 1, "{e}");
+    }
+    // -f on the command line wins over the file's .mode.
+    let out = ok(ursa(&[
+        "-init",
+        &init,
+        "-f",
+        "json",
+        "-c",
+        "SELECT * FROM v",
+    ]));
+    assert_eq!(out, "[{\"answer\":42}]\n");
+    // SQL on stdin too.
+    let out = ok(ursa_with_stdin(&["-init", &init], "SELECT * FROM v;"));
+    assert_eq!(out, "answer\n42\n");
+}
+
+/// `~/.ursarc` is for the shell: scripts do not read it.
+#[test]
+fn scripts_do_not_read_ursarc() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join(".ursarc"), ".mode csv\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ursa"))
+        .args(["-c", "SELECT 1 AS x"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok(out),
+        "+---+\n| x |\n+---+\n| 1 |\n+---+\n",
+        "~/.ursarc changed a script's output"
+    );
+    let e = err(ursa(&["-init", "x.sql", "-no-init", "-c", "SELECT 1"]));
+    assert!(e.contains("cannot be used with"), "{e}");
 }
 
 /// The Getting Started graph: `members` and `ties` over the karate files, and

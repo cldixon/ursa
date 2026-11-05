@@ -18,9 +18,15 @@ arrow = { workspace = true, features = ["prettyprint"] }
 datafusion = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal"] }
+# Line editing for the shell: the version datafusion-cli 54 uses.
+rustyline = "18.0"
 
 [dev-dependencies]
 tempfile = "3"
 # Writes the gzip CSV fixture (already in the tree via DataFusion's compression).
 flate2 = "1"
+
+# Drives the shell through a pseudo-terminal in tests/shell_pty.rs (Unix only).
+[target.'cfg(unix)'.dev-dependencies]
+rexpect = "0.7"
