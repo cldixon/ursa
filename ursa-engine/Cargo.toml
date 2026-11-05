@@ -24,6 +24,8 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "sync"] }
 # Reads and writes the .ursa catalog file (already in the tree via ursa-plan).
 serde_json = "1"
+# The checksum of a stored graph index (already in the tree via flate2).
+crc32fast = "1.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

@@ -8,7 +8,7 @@
 //! club.ursa          the catalog: the statements that defined each object
 //! club.ursa.d/       created on first use
 //!   lock             held while a process has the database open for writing
-//!   indexes/         (next) stored graph indexes, see `Database::index_dir`
+//!   indexes/         stored graph indexes: `manifest.json` and `<hash>.idx`
 //! ```
 //!
 //! This module owns the file, the sidecar directory and the lock. It stores
@@ -18,7 +18,7 @@
 //!
 //! A database is reached from the session config ([`database`],
 //! [`database_of_config`]), so any code holding the session state or a task
-//! context (the graph index cache, when it stores indexes) can find it.
+//! context (the graph index cache, which stores indexes in it) can find it.
 //!
 //! **Relative paths.** In a session with a database, a relative file path in
 //! SQL (in `FROM`, a graph's edge or vertex table, an external table's
@@ -36,8 +36,12 @@ use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionConfig;
 
 pub mod catalog_file;
+pub mod index_file;
+pub mod index_store;
 
 pub use catalog_file::{CatalogFile, FORMAT, VERSION};
+pub use index_file::IndexKey;
+pub use index_store::IndexStore;
 
 /// How long a writer waits for another process to close the database.
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -89,6 +93,8 @@ pub struct Database {
     _lock: Option<File>,
     /// The catalog's statements, as last read or written.
     statements: Mutex<Vec<String>>,
+    /// The stored graph indexes, opened on first use.
+    indexes: OnceLock<Arc<IndexStore>>,
 }
 
 impl Database {
@@ -127,6 +133,7 @@ impl Database {
                 read_only: true,
                 _lock: None,
                 statements: Mutex::new(catalog.statements),
+                indexes: OnceLock::new(),
             });
         }
 
@@ -165,6 +172,7 @@ impl Database {
             read_only: false,
             _lock: Some(lock),
             statements: Mutex::new(statements),
+            indexes: OnceLock::new(),
         })
     }
 
@@ -188,10 +196,26 @@ impl Database {
         &self.sidecar
     }
 
-    /// Where stored graph indexes go (`club.ursa.d/indexes`). Not created
-    /// yet: storing indexes is the next part of #237.
+    /// Where stored graph indexes go (`club.ursa.d/indexes`), created on
+    /// the first write.
     pub fn index_dir(&self) -> PathBuf {
         self.sidecar.join("indexes")
+    }
+
+    /// The database's stored graph indexes. A read-only database reads them
+    /// and never writes.
+    pub fn index_store(&self) -> Arc<IndexStore> {
+        Arc::clone(
+            self.indexes
+                .get_or_init(|| Arc::new(IndexStore::new(self.index_dir(), !self.read_only))),
+        )
+    }
+
+    /// Wait for stored-index writes still running.
+    pub fn flush(&self) {
+        if let Some(store) = self.indexes.get() {
+            store.flush();
+        }
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -235,6 +259,13 @@ impl Database {
             return location.to_string();
         }
         self.dir.join(location).to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Database {
+    /// Finish writing stored indexes before the lock is released.
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -322,6 +353,14 @@ pub fn database(state: &SessionState) -> Option<Arc<Database>> {
 /// context's `session_config()` reaches it too.
 pub fn database_of_config(config: &SessionConfig) -> Option<Arc<Database>> {
     config.get_extension::<DatabaseSlot>()?.get()
+}
+
+/// Wait for the session's stored-index writes, if it has a database. Call it
+/// before a process exits, so an index built by its last query is stored.
+pub fn flush(state: &SessionState) {
+    if let Some(db) = database(state) {
+        db.flush();
+    }
 }
 
 /// `location` as the session reads it: resolved against the database's

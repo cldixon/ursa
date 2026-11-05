@@ -392,7 +392,9 @@ async fn unweighted_index(
     match context.session_config().get_extension::<IndexCache>() {
         Some(cache) => {
             let key = index_key(shape, &input, context).await?;
-            cache.get_or_build(key, build.boxed()).await
+            cache
+                .get_or_build_stored(context.session_config(), key, build.boxed())
+                .await
         }
         None => build.await.map(Arc::new),
     }
@@ -454,7 +456,8 @@ async fn weighted_index(
             let flag = Arc::clone(&built_here);
             let rows = Arc::clone(&endpoints);
             let index = cache
-                .get_or_build(
+                .get_or_build_stored(
+                    context.session_config(),
                     key,
                     async move {
                         flag.store(true, Ordering::Relaxed);

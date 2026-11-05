@@ -64,7 +64,7 @@ mod session;
 
 pub use catalog_table::UrsaFunctions;
 pub use exec::{GraphAlgorithmExec, GraphPlanner, KeepEdgeOrder, UrsaQueryPlanner};
-pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache, Weights};
+pub use index::{index_builds, index_loads, FileIdentity, GraphIndex, IndexCache, Weights};
 pub use node::{GraphAlgorithmNode, Output};
 pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
 

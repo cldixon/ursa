@@ -17,6 +17,7 @@ pub mod database;
 pub mod error;
 mod file_table;
 pub mod graph;
+pub mod options;
 pub mod paths;
 pub mod stores;
 
@@ -33,7 +34,7 @@ pub fn new_session() -> SessionContext {
 /// turned on, so `SHOW TABLES` and `SHOW COLUMNS` work.
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     let config = graph::with_algorithms(graph::with_registry(config.with_information_schema(true)));
-    let config = database::with_database_slot(config);
+    let config = database::with_database_slot(options::with_options(config));
     let ctx = SessionContext::new_with_config(config);
     // Graph schemas are added to and dropped from the unwrapped catalogs.
     graph::registry_of(&ctx).set_catalogs(Arc::clone(ctx.state().catalog_list()));

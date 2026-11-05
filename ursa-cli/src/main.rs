@@ -146,6 +146,29 @@ async fn run(sources: Vec<Source>, args: &Args) -> Result<(), DataFusionError> {
         );
         return Ok(());
     }
+    let result = run_sources(&ctx, sources, format).await;
+    // Finish storing the indexes this process built before it exits.
+    ursa_engine::database::flush(&ctx.state());
+    if std::env::var_os(INDEX_STATS_VAR).is_some() {
+        eprintln!(
+            "ursa: graph indexes built {}, loaded {}",
+            ursa_engine::graph::index_builds(&ctx),
+            ursa_engine::graph::index_loads(&ctx)
+        );
+    }
+    result
+}
+
+/// Set to print, on exit, how many graph indexes the process built and how
+/// many it loaded from the database (for tests and for checking that a
+/// database's stored indexes are used).
+const INDEX_STATS_VAR: &str = "URSA_INDEX_STATS";
+
+async fn run_sources(
+    ctx: &SessionContext,
+    sources: Vec<Source>,
+    format: OutputFormat,
+) -> Result<(), DataFusionError> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let mut printed = 0;
@@ -156,7 +179,7 @@ async fn run(sources: Vec<Source>, args: &Args) -> Result<(), DataFusionError> {
                 DataFusionError::Execution(format!("cannot read '{}': {e}", path.display()))
             })?,
         };
-        printed += run_sql(&ctx, &sql, format, &mut out, printed).await?;
+        printed += run_sql(ctx, &sql, format, &mut out, printed).await?;
     }
     out.flush()?;
     Ok(())
