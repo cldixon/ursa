@@ -1351,13 +1351,15 @@ pub fn check_agg_fn(func: &str) -> PlanResult<()> {
 /// error is a stat's (`None` for a verb that checks its direction in the
 /// engine).
 pub fn verb_directions(verb: &str) -> Option<(&'static [&'static str], bool)> {
-    const ALL: &[&str] = &["out", "in", "both"];
-    match verb {
-        "pagerank" | "betweenness" => Some((&["out", "both"], false)),
-        "closeness" => Some((ALL, false)),
-        "describe" | "density" | "avg_path_length" | "diameter" => Some((ALL, true)),
-        _ => None,
-    }
+    // The verbs whose Python wrapper checks `direction=` at the call site; the
+    // others (`degree`, `neighbors`) check it in the engine. The accepted
+    // directions are the catalog's.
+    let stat = match verb {
+        "pagerank" | "betweenness" | "closeness" => false,
+        "describe" | "density" | "avg_path_length" | "diameter" => true,
+        _ => return None,
+    };
+    Some((ursa_core::catalog::lookup(verb)?.directions(), stat))
 }
 
 /// What an edge source does with a row whose endpoint is null.
@@ -2326,12 +2328,12 @@ pub(crate) fn node_source_slot(chain: &[&Plan]) -> Option<Slot> {
 /// The checks `_algo_column` ran on each graph column before it reached the engine.
 pub(crate) fn check_verb(verb: &GraphVerb) -> PlanResult<()> {
     let name = verb.verb.as_str();
-    if !EXECUTABLE.contains(&name) {
+    let Some(spec) = node_function(name) else {
         return not_implemented(format!(
             "the '{name}' kernel is not wired into the execution path yet (wired: {}).",
-            EXECUTABLE.join(", ")
+            verb_names(|_| true).join(", ")
         ));
-    }
+    };
     if name == "connected_components" {
         let mode = verb.mode.clone().unwrap_or_else(|| Value::from("weak"));
         if !matches!(mode.as_str(), Some("weak" | "strong")) {
@@ -2359,14 +2361,13 @@ pub(crate) fn check_verb(verb: &GraphVerb) -> PlanResult<()> {
         }
     }
     // A weight= on a verb that doesn't consume it would be silently ignored.
-    let weighted = ["pagerank", "closeness", "betweenness", "louvain"];
-    if verb.weight.is_some() && !weighted.contains(&name) {
+    if verb.weight.is_some() && !spec.weighted() {
         return not_implemented(format!("weight= is not supported for '{name}'."));
     }
     // Output dtype narrowing (#117). Positions are f32 at the source, so dtype has
     // no meaning on a layout; integer kernels have no f32 form.
     let dtype = verb.dtype.as_ref().filter(|d| !d.is_null());
-    if MULTI_OUTPUT_VERBS.contains(&name) && dtype.is_some() {
+    if spec.outputs.len() > 1 && dtype.is_some() {
         return not_implemented(format!(
             "'{name}' already emits f32 positions; dtype= has nothing to narrow."
         ));
@@ -2378,46 +2379,31 @@ pub(crate) fn check_verb(verb: &GraphVerb) -> PlanResult<()> {
                 py_value(dtype)
             ));
         }
-        if !FLOAT_VALUED_VERBS.contains(&name) {
+        if !spec.narrows() {
             return not_implemented(format!(
                 "dtype='f32' is only supported for float-valued kernels ({}); '{name}' \
                  emits integers.",
-                FLOAT_VALUED_VERBS.join(", ")
+                verb_names(|s| s.narrows()).join(", ")
             ));
         }
     }
     Ok(())
 }
 
-/// The graph verbs wired into execution, sorted.
-const EXECUTABLE: [&str; 13] = [
-    "betweenness",
-    "closeness",
-    "clustering_coefficient",
-    "connected_components",
-    "degree",
-    "label_propagation",
-    "layout_circle",
-    "layout_fr",
-    "layout_random",
-    "louvain",
-    "neighbors_agg",
-    "pagerank",
-    "triangle_count",
-];
+/// The catalog function a graph column (a `with_columns` verb) names: a
+/// per-node one (an algorithm, a layout or a neighbour aggregation).
+fn node_function(name: &str) -> Option<&'static ursa_core::catalog::FunctionSpec> {
+    ursa_core::catalog::lookup(name).filter(|s| s.shape == ursa_core::catalog::Shape::PerNode)
+}
 
-/// Kernels that emit more than one column from one run (#115).
-const MULTI_OUTPUT_VERBS: [&str; 3] = ["layout_circle", "layout_fr", "layout_random"];
-
-/// The kernels whose output is floating-point (the only ones `dtype="f32"` fits),
-/// sorted.
-const FLOAT_VALUED_VERBS: [&str; 5] = [
-    "betweenness",
-    "closeness",
-    "clustering_coefficient",
-    "neighbors_agg",
-    "pagerank",
-];
+/// The names of the per-node catalog functions `keep` holds for, sorted.
+fn verb_names(keep: impl Fn(&ursa_core::catalog::FunctionSpec) -> bool) -> Vec<&'static str> {
+    let mut names: Vec<&str> = ursa_core::catalog::names()
+        .filter(|n| node_function(n).is_some_and(&keep))
+        .collect();
+    names.sort_unstable();
+    names
+}
 
 /// The edge rows a weight reads: `columns` of the view's rows, aligned with its
 /// index's edge rows, or `None` when the index already caches every weight in
@@ -2729,7 +2715,7 @@ fn reached_nodes(
                 .flatten()
                 .collect();
             let n = n.u32("hop(n=)")?;
-            let dir: ursa_core::Direction = parse_direction("hop", direction)?.into();
+            let dir = parse_direction("hop", direction)?;
             reached = ursa_core::algo::k_hop_reached_masked(topo, within, &dense, n, dir);
         }
         Plan::ShortestPath {
@@ -2757,7 +2743,7 @@ fn reached_nodes(
                     )
                 }
             };
-            let dir: ursa_core::Direction = parse_direction("shortest_path", direction)?.into();
+            let dir = parse_direction("shortest_path", direction)?;
             let s = resolve_dense(ids, s.as_ref())?.into_iter().next().flatten();
             let t = resolve_dense(ids, t.as_ref())?.into_iter().next().flatten();
             let path = match (s, t) {

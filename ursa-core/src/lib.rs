@@ -23,6 +23,7 @@
 //! weighted, `k_hop`), neighbour aggregation, and `random_walk`.
 
 pub mod algo;
+pub mod catalog;
 pub mod id_map;
 pub(crate) mod parallel;
 pub mod topology;

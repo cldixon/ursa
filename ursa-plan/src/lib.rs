@@ -53,7 +53,7 @@ pub mod weight;
 
 pub use ursa_io::{dry, runtime, topology};
 
-pub use logical::{Direction, GraphAlgo};
+pub use logical::{Call, Direction};
 pub use node::GraphAlgorithmNode;
 pub use physical::GraphAlgorithmExec;
 pub use plan::{execute_plan, require_index, GraphIndex, Inputs, Plan, PlanError, PlanResult};
@@ -64,8 +64,7 @@ pub use scan::{
     ScannedTopology,
 };
 pub use stats::{
-    avg_path_length, avg_path_length_masked, density, density_masked, describe, describe_masked,
-    diameter, diameter_masked, parse_describe_nodes, parse_stat_direction, stat_batch, GraphStat,
+    describe_masked, parse_describe_nodes, parse_stat_direction, stat_batch, GraphStat,
 };
 pub use topology::{build_topology, build_topology_batches};
 pub use weight::{weight_cache_key, WeightCache};
