@@ -8,6 +8,40 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ## [Unreleased]
 
+### Added
+
+- **Ursa SQL 0.6: a SQL engine for graph analytics, and the `ursa`
+  command-line tool** (crate `ursa-cli`, version 0.6.0; the engine crates
+  are `ursa-engine` and `ursa-sql`). This is its first release. It is
+  versioned apart from the Python package.
+  - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
+    with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
+    and `https://` URLs. Built on DataFusion 55.2.
+  - Graphs are defined with SQL/PGQ `CREATE PROPERTY GRAPH`, with an
+    optional vertex table. A graph is a schema: `g.edges` and `g.nodes`.
+    `DROP PROPERTY GRAPH`, `SHOW GRAPHS` and `DESCRIBE GRAPH` manage them.
+  - Every algorithm and statistic of the Python library (not the layouts or
+    the neighbour aggregations) is a table function with named parameters
+    (`pagerank(g, damping => 0.9)`), with the same names, defaults and
+    values. `algorithms(g, …)` runs
+    several over one index in one call. `hop`, `random_walk` and
+    `shortest_path` are traversals, with seeds from a list or a subquery.
+    `weight =>` takes any expression over the edge columns.
+  - `SELECT * FROM ursa_functions()` lists every graph function with its
+    parameters, defaults, accepted values, outputs and NetworkX equivalent.
+  - A `.ursa` database file keeps views, external tables and graphs, and
+    stores the graph indexes it builds, so a later process does not rebuild
+    them. A changed source file is noticed and its index rebuilt. `ATTACH`,
+    `--readonly`, and `SET`/`SHOW ursa.index_storage_limit`.
+  - An interactive shell with DuckDB-style dot-commands, `-init` files,
+    `~/.ursarc` and history; output as table, CSV, TSV, JSON, NDJSON or
+    Arrow (`-f`); `ursa --version`.
+  - Docs: a new SQL section on the docs site, with a function reference
+    generated from `ursa_functions()`. Every SQL example in it runs in CI.
+  - An agent skill for writing Ursa SQL, in `skills/ursa-sql/`.
+  - Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, Apple
+    silicon) and Windows (x64) on the GitHub Releases page.
+
 ### Changed
 
 - Source reading moved out of the `ursa-plan` crate into a new workspace

@@ -183,6 +183,45 @@ pub struct Adjacency {
 }
 
 impl Adjacency {
+    /// Check that this is a well-formed adjacency over `n_nodes` nodes (see
+    /// [`Topology::from_parts`]). `which` names it in the message.
+    fn check(&self, n_nodes: usize, which: &str) -> Result<(), String> {
+        let m = self.targets.len();
+        let bad = |why: String| Err(format!("the {which}-adjacency {why}"));
+        if m > u32::MAX as usize {
+            return bad(format!("has {m} edges, beyond the u32 edge-id cap"));
+        }
+        if self.offsets.len() != n_nodes + 1 {
+            return bad(format!(
+                "has {} offsets for {n_nodes} nodes",
+                self.offsets.len()
+            ));
+        }
+        if self.edge_ids.len() != m {
+            return bad(format!(
+                "has {} edge ids for {m} edges",
+                self.edge_ids.len()
+            ));
+        }
+        if self.offsets[0] != 0 || self.offsets[n_nodes] != m as u64 {
+            return bad("has offsets that do not span its edges".into());
+        }
+        if self.offsets.windows(2).any(|w| w[0] > w[1]) {
+            return bad("has decreasing offsets".into());
+        }
+        if self.targets.iter().any(|&t| t as usize >= n_nodes) {
+            return bad("has a target out of range".into());
+        }
+        let mut seen = vec![false; m];
+        for &e in &self.edge_ids {
+            match seen.get_mut(e as usize) {
+                Some(s) if !*s => *s = true,
+                _ => return bad("has edge ids that are not a permutation of its edges".into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Counting sort grouping edges by `keys` (the grouping endpoint), recording
     /// the paired `other` endpoint and the original row index per slot. Dispatches
     /// to a parallel build above a size threshold; the parallel and serial builds
@@ -623,6 +662,60 @@ impl Topology {
         }
     }
 
+    /// Reassemble a topology from its parts: the out-adjacency, and the
+    /// in-adjacency if it was built. This is how a stored index (the SQL
+    /// engine's `.ursa` database) is read back; the parts are what
+    /// [`Topology::out`] and [`Topology::incoming_if_built`] returned for a
+    /// topology made by [`Topology::build`].
+    ///
+    /// The parts are checked, so malformed input is an error and never a later
+    /// out-of-bounds panic in a kernel: each adjacency has `n_nodes + 1`
+    /// non-decreasing offsets from 0 to its slot count, as many targets and edge
+    /// ids as slots, targets below `n_nodes`, and edge ids that are a
+    /// permutation of the edge rows; both directions have the same number of
+    /// edges. That the in-adjacency is the out-adjacency's transpose is not
+    /// checked (that would cost a transpose); a caller that cannot vouch for it
+    /// passes `None`, and it is rebuilt on demand.
+    pub fn from_parts(
+        n_nodes: usize,
+        out: Adjacency,
+        incoming: Option<Adjacency>,
+    ) -> Result<Topology, String> {
+        if n_nodes > u32::MAX as usize {
+            return Err(format!("{n_nodes} nodes is beyond the u32 dense-index cap"));
+        }
+        out.check(n_nodes, "out")?;
+        let n_edges = out.targets.len();
+        let inc = OnceLock::new();
+        if let Some(incoming) = incoming {
+            incoming.check(n_nodes, "in")?;
+            if incoming.targets.len() != n_edges {
+                return Err(format!(
+                    "the in-adjacency has {} edges; the out-adjacency has {n_edges}",
+                    incoming.targets.len()
+                ));
+            }
+            let _ = inc.set(incoming);
+        }
+        Ok(Topology {
+            n_nodes,
+            n_edges,
+            out,
+            inc,
+            undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: false,
+        })
+    }
+
+    /// The in-adjacency if it has been built, without building it.
+    pub fn incoming_if_built(&self) -> Option<&Adjacency> {
+        if self.self_transpose {
+            return Some(&self.out);
+        }
+        self.inc.get()
+    }
+
     #[inline]
     pub fn n_nodes(&self) -> usize {
         self.n_nodes
@@ -830,6 +923,63 @@ mod tests {
     /// 0 -> 1, 0 -> 2, 1 -> 2, 2 -> 0
     fn diamond() -> Topology {
         Topology::build(3, vec![0, 0, 1, 2], vec![1, 2, 2, 0])
+    }
+
+    fn adjacency(offsets: &[u64], targets: &[u32], edge_ids: &[u32]) -> Adjacency {
+        Adjacency {
+            offsets: offsets.to_vec(),
+            targets: targets.to_vec(),
+            edge_ids: edge_ids.to_vec(),
+        }
+    }
+
+    #[test]
+    fn parts_round_trip() {
+        let built = diamond();
+        assert!(built.incoming_if_built().is_none());
+        let incoming = built.incoming().clone();
+        let back = Topology::from_parts(3, built.out().clone(), Some(incoming.clone())).unwrap();
+        assert_eq!((back.n_nodes(), back.n_edges()), (3, 4));
+        assert_eq!(back.out().offsets, built.out().offsets);
+        assert_eq!(back.out().targets, built.out().targets);
+        assert_eq!(back.out().edge_ids, built.out().edge_ids);
+        assert_eq!(back.incoming_if_built().unwrap().targets, incoming.targets);
+        // Without the in-adjacency, it is rebuilt on demand, the same.
+        let lazy = Topology::from_parts(3, built.out().clone(), None).unwrap();
+        assert!(lazy.incoming_if_built().is_none());
+        assert_eq!(lazy.incoming().targets, incoming.targets);
+        assert_eq!(lazy.incoming().edge_ids, incoming.edge_ids);
+    }
+
+    #[test]
+    fn malformed_parts_are_errors() {
+        let ok = adjacency(&[0, 2, 3, 3], &[1, 2, 0], &[0, 1, 2]);
+        assert!(Topology::from_parts(3, ok.clone(), None).is_ok());
+        for (bad, why) in [
+            (adjacency(&[0, 2, 3], &[1, 2, 0], &[0, 1, 2]), "offsets"),
+            (adjacency(&[0, 2, 3, 4], &[1, 2, 0], &[0, 1, 2]), "span"),
+            (adjacency(&[1, 2, 3, 3], &[1, 2, 0], &[0, 1, 2]), "span"),
+            (
+                adjacency(&[0, 3, 2, 3], &[1, 2, 0], &[0, 1, 2]),
+                "decreasing",
+            ),
+            (adjacency(&[0, 2, 3, 3], &[1, 3, 0], &[0, 1, 2]), "target"),
+            (adjacency(&[0, 2, 3, 3], &[1, 2, 0], &[0, 1]), "edge ids"),
+            (
+                adjacency(&[0, 2, 3, 3], &[1, 2, 0], &[0, 1, 1]),
+                "permutation",
+            ),
+            (
+                adjacency(&[0, 2, 3, 3], &[1, 2, 0], &[0, 1, 3]),
+                "permutation",
+            ),
+        ] {
+            let err = Topology::from_parts(3, bad, None).unwrap_err();
+            assert!(err.contains(why), "{err}");
+        }
+        let short = adjacency(&[0, 1, 2, 2], &[1, 2], &[0, 1]);
+        let err = Topology::from_parts(3, ok, Some(short)).unwrap_err();
+        assert!(err.contains("in-adjacency has 2 edges"), "{err}");
     }
 
     #[cfg(feature = "rayon")]

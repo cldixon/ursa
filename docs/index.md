@@ -6,6 +6,10 @@ Ursa is a graph analytics library for Python. You write a query the way you writ
 
 There is no `Graph` object. An edge table *is* the graph. Every operation returns a table.
 
+!!! tip "New: Ursa SQL"
+
+    The same algorithms now run from SQL, in the `ursa` command-line tool. See [Ursa SQL](sql/index.md).
+
 ## Install
 
 ```bash
@@ -110,5 +114,6 @@ Nothing after that line changes.
 - [Quickstart](quickstart.md): a ten-minute session that uses most of the API.
 - [Guides](guides/index.md): one task per page, with code that runs.
 - [Reference](reference/index.md): every public name.
+- [Ursa SQL](sql/index.md): the same algorithms from SQL, with the `ursa` command-line tool.
 
 Ursa is version 0.4 and in active development. The [Limits](limits.md) page lists what does not run yet.

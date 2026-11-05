@@ -1,0 +1,41 @@
+[package]
+name = "ursa-cli"
+description = "The ursa command-line tool: SQL over Parquet and CSV files, local or in object storage."
+# The SQL engine and CLI are versioned on their own: 0.6 is their first
+# release. The Python package (ursa-graph) follows the workspace version.
+version = "0.6.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+homepage = "https://cldixon.github.io/ursa/sql/"
+documentation = "https://cldixon.github.io/ursa/sql/"
+keywords = ["sql", "graph", "cli", "parquet", "datafusion"]
+categories = ["command-line-utilities", "database", "algorithms"]
+
+[[bin]]
+name = "ursa"
+path = "src/main.rs"
+
+[dependencies]
+ursa-engine = { path = "../ursa-engine", version = "0.6.0" }
+ursa-sql = { path = "../ursa-sql", version = "0.6.0" }
+arrow = { workspace = true, features = ["prettyprint"] }
+datafusion = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal"] }
+# Line editing for the shell: the version datafusion-cli 54 uses.
+rustyline = "18.0"
+
+[dev-dependencies]
+tempfile = "3"
+# Reads `ursa -f json` in tests/docs.rs (the function reference generator).
+serde_json = "1"
+# Writes the gzip CSV fixture (already in the tree via DataFusion's compression).
+flate2 = "1"
+
+# Drives the shell through a pseudo-terminal in tests/shell_pty.rs (Unix only).
+[target.'cfg(unix)'.dev-dependencies]
+rexpect = "0.7"
