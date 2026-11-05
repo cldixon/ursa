@@ -1,7 +1,7 @@
 //! `ursa_functions()`: the graph functions, as a table.
 //!
 //! One row per function SQL can call: every per-node function and statistic
-//! of `ursa_core::catalog`, then `algorithms`. The list columns are Arrow
+//! of `ursa_core::catalog`, then the traversals, then `algorithms`. The list columns are Arrow
 //! lists and structs, not strings, so they stay usable both ways:
 //!
 //! - from SQL: `unnest(parameters)`, `array_has(directions, 'in')`,
@@ -14,7 +14,7 @@
 //! | column       | type                                                     |
 //! |--------------|----------------------------------------------------------|
 //! | `name`       | the function's name                                      |
-//! | `family`     | `algorithm`, `layout`, `statistic` or `combinator`       |
+//! | `family`     | `algorithm`, `layout`, `statistic`, `traversal` or `combinator` |
 //! | `summary`    | one line on what it computes                             |
 //! | `networkx`   | the NetworkX call it matches, or NULL                    |
 //! | `parameters` | list of {name, type, default, choices, doc}, call order  |
@@ -22,8 +22,11 @@
 //! | `outputs`    | list of {name, type, nullable}: its columns besides `id` |
 //!
 //! A parameter's `type` is how SQL writes it (`number`, `number or NULL`,
-//! `integer`, `integer or NULL`, `boolean`, `string`, `expression`), and its
-//! `default` is the literal SQL would write (`0.85`, `'out'`, `NULL`).
+//! `integer`, `integer or NULL`, `boolean`, `string`, `expression`, and for a
+//! traversal's node ids `node ids` or `node id`), and its `default` is the
+//! literal SQL would write (`0.85`, `'out'`, `NULL`), or `required`. A
+//! traversal's node-id output columns have the graph's id type, `Int64 or
+//! Utf8`.
 
 use std::sync::Arc;
 
@@ -38,6 +41,7 @@ use datafusion::error::Result;
 use ursa_core::catalog::{Family, ParamType};
 
 use super::functions::{self, plan, sql_value, ALGORITHMS, URSA_FUNCTIONS};
+use super::traversal::{OutputType, TraversalParamType, TRAVERSALS};
 
 /// The `ursa_functions()` table function.
 #[derive(Debug)]
@@ -194,6 +198,73 @@ pub fn functions_batch() -> Result<RecordBatch> {
             outs.field_builder::<BooleanBuilder>(2)
                 .expect("nullable")
                 .append_value(o.nullable);
+            outs.append(true);
+        }
+        outputs.append(true);
+    }
+
+    for spec in TRAVERSALS {
+        name.append_value(spec.name);
+        family.append_value("traversal");
+        summary.append_value(spec.summary);
+        networkx.append_option(spec.networkx);
+        let params = parameters.values();
+        for p in spec.params {
+            let (ty, choices): (&str, &[&str]) = match &p.ty {
+                TraversalParamType::Nodes => ("node ids", &[]),
+                TraversalParamType::Node => ("node id", &[]),
+                TraversalParamType::Param(ty) => (type_name(ty), ty.choices()),
+            };
+            params
+                .field_builder::<StringBuilder>(0)
+                .expect("name")
+                .append_value(p.name);
+            params
+                .field_builder::<StringBuilder>(1)
+                .expect("type")
+                .append_value(ty);
+            params
+                .field_builder::<StringBuilder>(2)
+                .expect("default")
+                .append_value(p.default.as_ref().map_or("required".to_string(), sql_value));
+            let choice_list = params
+                .field_builder::<ListBuilder<Box<dyn datafusion::arrow::array::ArrayBuilder>>>(3)
+                .expect("choices");
+            for c in choices {
+                choice_list
+                    .values()
+                    .as_any_mut()
+                    .downcast_mut::<StringBuilder>()
+                    .expect("choices are strings")
+                    .append_value(c);
+            }
+            choice_list.append(true);
+            params
+                .field_builder::<StringBuilder>(4)
+                .expect("doc")
+                .append_value(p.doc);
+            params.append(true);
+        }
+        parameters.append(true);
+        for d in spec.directions() {
+            directions.values().append_value(d);
+        }
+        directions.append(true);
+        let outs = outputs.values();
+        for o in spec.outputs {
+            let ty = match o.ty {
+                OutputType::Id => "Int64 or Utf8".to_string(),
+                other => other.data_type(&DataType::Null).to_string(),
+            };
+            outs.field_builder::<StringBuilder>(0)
+                .expect("name")
+                .append_value(o.name);
+            outs.field_builder::<StringBuilder>(1)
+                .expect("type")
+                .append_value(ty);
+            outs.field_builder::<BooleanBuilder>(2)
+                .expect("nullable")
+                .append_value(false);
             outs.append(true);
         }
         outputs.append(true);

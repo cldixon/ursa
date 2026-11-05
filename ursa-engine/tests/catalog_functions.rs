@@ -596,6 +596,9 @@ density,statistic
 avg_path_length,statistic
 diameter,statistic
 describe,statistic
+hop,traversal
+shortest_path,traversal
+random_walk,traversal
 algorithms,combinator
 "
     );
@@ -635,7 +638,54 @@ direction,string,'out'
             "SELECT name FROM ursa_functions() WHERE array_has(directions, 'in') ORDER BY name"
         )
         .await,
-        "name\navg_path_length\ncloseness\ndegree\ndensity\ndescribe\ndiameter\n"
+        "name\navg_path_length\ncloseness\ndegree\ndensity\ndescribe\ndiameter\nhop\n\
+         shortest_path\n"
+    );
+    // A traversal's node ids are required; its outputs have the graph's id
+    // type.
+    assert_eq!(
+        csv(
+            &ctx,
+            "SELECT name, p['name'] AS param, p['type'] AS type, p['default'] AS default \
+             FROM (SELECT name, unnest(parameters) AS p FROM ursa_functions() \
+                   WHERE family = 'traversal')"
+        )
+        .await,
+        "\
+name,param,type,default
+hop,seeds,node ids,required
+hop,n,integer,1
+hop,direction,string,'out'
+shortest_path,source,node id,required
+shortest_path,target,node id,required
+shortest_path,weight,expression,NULL
+shortest_path,direction,string,'out'
+random_walk,start,node ids,required
+random_walk,steps,integer,required
+random_walk,walks_per_node,integer,1
+random_walk,seed,integer or NULL,NULL
+"
+    );
+    assert_eq!(
+        csv(
+            &ctx,
+            "SELECT name, o['name'] AS output, o['type'] AS type \
+             FROM (SELECT name, unnest(outputs) AS o FROM ursa_functions() \
+                   WHERE family = 'traversal')"
+        )
+        .await,
+        "\
+name,output,type
+hop,src,Int64 or Utf8
+hop,dst,Int64 or Utf8
+shortest_path,src,Int64 or Utf8
+shortest_path,dst,Int64 or Utf8
+shortest_path,hop,Int64
+shortest_path,cost,Float64
+random_walk,walk_id,Int64
+random_walk,step,Int64
+random_walk,node,Int64 or Utf8
+"
     );
     assert_eq!(
         csv(
@@ -688,4 +738,12 @@ async fn every_function_runs_on_an_empty_graph() {
     let weighted = "SELECT count(*) AS n FROM algorithms(empty, pagerank(weight => weight), \
                     louvain(weight => weight), closeness(weight => weight))";
     assert_eq!(csv(&ctx, weighted).await, "n\n0\n");
+    for sql in [
+        "SELECT count(*) AS n FROM hop(empty, seeds => ['Valjean'], n => 2)",
+        "SELECT count(*) AS n FROM shortest_path(empty, source => 'Valjean', target => \
+         'Marius', weight => weight)",
+        "SELECT count(*) AS n FROM random_walk(empty, start => ['Valjean'], steps => 3)",
+    ] {
+        assert_eq!(csv(&ctx, sql).await, "n\n0\n", "{sql}");
+    }
 }

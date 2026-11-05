@@ -1,16 +1,31 @@
 //! Graph functions in `FROM`: `pagerank(g, direction => 'both')`,
-//! `density(g)`, and `algorithms(g, degree(), community => louvain(seed => 1))`.
+//! `density(g)`, `algorithms(g, degree(), community => louvain(seed => 1))`,
+//! and the traversals, `hop(g, seeds => [0], n => 2)`.
 //!
 //! [`GraphFunctions`] is a DataFusion `RelationPlanner`. It sees the call's
 //! syntax, so the first argument can be a bare graph name, the others named
-//! literals, `weight =>` an expression over the edge table's columns, and the
-//! arguments of `algorithms()` nested calls. It plans the call as a
-//! [`GraphAlgorithmNode`] over the graph's edge table.
+//! literals, `weight =>` an expression over the edge table's columns, the
+//! arguments of `algorithms()` nested calls, and a traversal's node ids a
+//! list, a subquery or one id. It plans an algorithm or statistic as a
+//! [`GraphAlgorithmNode`] over the graph's edge table, and a traversal as a
+//! [`GraphTraversalNode`] over the same edge table plus one child plan per
+//! node-id argument.
+//!
+//! ## Node ids as child plans
+//!
+//! A traversal's node ids are not values the planner reads: each node-id
+//! argument becomes a plan of one column under the traversal node, run when
+//! the node runs. A list literal, `[0, 33]`, is a `VALUES` plan (an empty list
+//! an empty relation); a single id, `0`, is a one-row `VALUES`; a subquery,
+//! `(SELECT id FROM karate.nodes WHERE club = 'Officer')`, is planned as a
+//! derived table, so it is optimized with the rest of the query and reads its
+//! files only when the query runs. The values are cast to the graph's id type
+//! when the node runs.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::default_table_source::provider_as_source;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::common::{Column, DFSchema, TableReference};
@@ -19,7 +34,9 @@ use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
 use datafusion::logical_expr::TableSource;
-use datafusion::logical_expr::{Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{
+    EmptyRelation, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
+};
 use datafusion::sql::sqlparser::ast::{
     self, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArguments, TableFactor,
     TableFunctionArgs, UnaryOperator, Value,
@@ -31,8 +48,10 @@ use super::functions::{
     self, did_you_mean, is_per_node, nested_signature, plan, signature, Literal, ALGORITHMS,
 };
 use super::node::{
-    weight_column, GraphAlgorithmNode, Output, WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
+    weight_column, GraphAlgorithmNode, GraphTraversalNode, Output, WEIGHTED_DESTINATION,
+    WEIGHTED_SOURCE,
 };
+use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
 use super::{GraphDef, GraphRegistry};
 
 /// Plans graph function calls in `FROM`.
@@ -56,6 +75,8 @@ enum Target {
     Function(&'static FunctionSpec),
     /// `algorithms(g, ...)`.
     Algorithms,
+    /// A traversal.
+    Traversal(&'static TraversalSpec),
 }
 
 impl Target {
@@ -63,6 +84,7 @@ impl Target {
         match self {
             Target::Function(spec) => spec.name,
             Target::Algorithms => ALGORITHMS,
+            Target::Traversal(spec) => spec.name,
         }
     }
 
@@ -71,6 +93,7 @@ impl Target {
         match self {
             Target::Function(spec) => signature(spec),
             Target::Algorithms => ALGORITHMS_SIGNATURE.to_string(),
+            Target::Traversal(spec) => spec.signature(),
         }
     }
 }
@@ -103,6 +126,8 @@ impl RelationPlanner for GraphFunctions {
             Target::Algorithms
         } else if let Some(spec) = functions::lookup(&function_name) {
             Target::Function(spec)
+        } else if let Some(spec) = traversal::lookup(&function_name) {
+            Target::Traversal(spec)
         } else {
             // Not ours, unless its first argument names a graph: then it is a
             // misspelled graph function.
@@ -165,24 +190,213 @@ impl RelationPlanner for GraphFunctions {
                 (outputs, is_per_node(spec))
             }
             Target::Algorithms => (algorithms(rest, context, &mut weights)?, true),
+            Target::Traversal(spec) => {
+                let node = traversal_node(spec, &graph, edges, rest, context)?;
+                let plan = LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                });
+                return planned(plan, target, alias);
+            }
         };
         let node = node(&graph, edges, weights, outputs, per_node)?;
         let plan = LogicalPlan::Extension(Extension {
             node: Arc::new(node),
         });
-        // Unaliased, the columns are qualified by the function's name, as a
-        // table's are by the table's, so `JOIN degree(g) USING (id)` can be
-        // followed by another join on `id`.
-        let plan = match alias {
-            Some(_) => plan,
-            None => LogicalPlanBuilder::from(plan)
-                .alias(target.name())?
-                .build()?,
-        };
-        Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
-            plan, alias,
-        ))))
+        planned(plan, target, alias)
     }
+}
+
+/// The planned relation for the graph node `plan`.
+fn planned(
+    plan: LogicalPlan,
+    target: Target,
+    alias: Option<ast::TableAlias>,
+) -> Result<RelationPlanning> {
+    // Unaliased, the columns are qualified by the function's name, as a
+    // table's are by the table's, so `JOIN degree(g) USING (id)` can be
+    // followed by another join on `id`.
+    let plan = match alias {
+        Some(_) => plan,
+        None => LogicalPlanBuilder::from(plan)
+            .alias(target.name())?
+            .build()?,
+    };
+    Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
+        plan, alias,
+    ))))
+}
+
+/// The node for a call to the traversal `spec` over the edge table `edges` of
+/// `graph`, with the arguments after the graph.
+fn traversal_node(
+    spec: &'static TraversalSpec,
+    graph: &GraphDef,
+    edges: LogicalPlan,
+    args: Vec<FunctionArg>,
+    context: &mut dyn RelationPlannerContext,
+) -> Result<GraphTraversalNode> {
+    let f = spec.name;
+    let mut weights = WeightSet::new(edges.schema().as_ref().clone());
+    let mut literals = Vec::new();
+    let node_params: Vec<&TraversalParam> = spec.node_params().collect();
+    let mut nodes: Vec<Option<(LogicalPlan, String)>> = vec![None; node_params.len()];
+    let mut seen = HashSet::new();
+    for arg in args {
+        let FunctionArg::Named {
+            name,
+            arg,
+            operator: FunctionArgOperator::RightArrow,
+        } = arg
+        else {
+            return Err(plan(format!(
+                "{f}() takes its parameters by name, as name => value; got {arg}. Write {}",
+                spec.signature()
+            )));
+        };
+        let name = context.normalize_ident(name);
+        let Some(param) = spec.param(&name) else {
+            return Err(traversal::unknown_param(spec, &name));
+        };
+        if !seen.insert(name.clone()) {
+            return Err(plan(format!("{f}() was given '{name}' more than once")));
+        }
+        let FunctionArgExpr::Expr(expr) = arg else {
+            return Err(plan(format!(
+                "{f}({name} =>) must be a value or an expression; got {arg}"
+            )));
+        };
+        if param.takes_nodes() {
+            let i = node_params
+                .iter()
+                .position(|p| p.name == param.name)
+                .expect("a node parameter");
+            let written = expr.to_string();
+            nodes[i] = Some((node_input(spec, param, expr, context)?, written));
+        } else if param.is_weight() {
+            weights.add(f, expr, context)?;
+        } else {
+            let arg = FunctionArgExpr::Expr(expr);
+            let value = literal(&arg).ok_or_else(|| {
+                plan(format!(
+                    "{f}({name} =>) must be a literal (a number, a string or NULL); got {arg}"
+                ))
+            })?;
+            literals.push((name, value));
+        }
+    }
+    let mut inputs = Vec::with_capacity(nodes.len());
+    let mut written = Vec::with_capacity(nodes.len());
+    for (p, n) in node_params.iter().zip(nodes) {
+        let (plan, text) = n.ok_or_else(|| traversal::missing_param(spec, p))?;
+        inputs.push(Arc::new(plan));
+        written.push(text);
+    }
+    let traversal = traversal::resolve(spec, &literals)?;
+    let edges = edge_inputs(graph, edges, weights)?;
+    GraphTraversalNode::try_new(
+        graph.name.clone(),
+        traversal,
+        Arc::new(edges.input),
+        edges.weighted,
+        edges.weights.into_iter().next(),
+        inputs,
+        written,
+        edges.source,
+        edges.destination,
+    )
+}
+
+/// The plan of a traversal's node-id argument `expr` to `param`: one column
+/// (see the module docs).
+fn node_input(
+    spec: &TraversalSpec,
+    param: &TraversalParam,
+    expr: ast::Expr,
+    context: &mut dyn RelationPlannerContext,
+) -> Result<LogicalPlan> {
+    let (f, p) = (spec.name, param.name);
+    match expr {
+        ast::Expr::Subquery(query) => {
+            let subquery = context
+                .plan(TableFactor::Derived {
+                    lateral: false,
+                    subquery: query,
+                    alias: None,
+                    sample: None,
+                })
+                .map_err(|e| {
+                    plan(format!(
+                        "{f}({p} =>): {}",
+                        crate::user_message(&e).replace('\n', " ")
+                    ))
+                })?;
+            let columns = subquery.schema().fields().len();
+            if columns != 1 {
+                return Err(plan(format!(
+                    "{f}({p} =>) must be a query of one column of node ids; it returns \
+                     {columns} columns"
+                )));
+            }
+            Ok(subquery)
+        }
+        ast::Expr::Array(array) => {
+            if param.ty == TraversalParamType::Node {
+                return Err(plan(format!(
+                    "{f}({p} =>) takes one node id, not a list; got {array}"
+                )));
+            }
+            id_values(f, p, array.elem, context)
+        }
+        one => id_values(f, p, vec![one], context),
+    }
+}
+
+/// A `VALUES` plan of the node ids `elems`, one row each; an empty relation
+/// for none.
+fn id_values(
+    f: &str,
+    p: &str,
+    elems: Vec<ast::Expr>,
+    context: &mut dyn RelationPlannerContext,
+) -> Result<LogicalPlan> {
+    if elems.is_empty() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Null, true)]);
+        return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::try_from(schema)?),
+        }));
+    }
+    let empty = DFSchema::empty();
+    let rows = elems
+        .into_iter()
+        .map(|e| {
+            let written = e.to_string();
+            let hint = match &e {
+                ast::Expr::Identifier(i) => {
+                    format!(
+                        " (a string id is quoted: '{}')",
+                        i.value.replace('\'', "''")
+                    )
+                }
+                _ => String::new(),
+            };
+            let expr = context.sql_to_expr(e, &empty).map_err(|err| {
+                plan(format!(
+                    "{f}({p} =>): {written} is not a node id{hint}: {}",
+                    crate::user_message(&err).replace('\n', " ")
+                ))
+            })?;
+            Ok(vec![expr])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    LogicalPlanBuilder::values(rows)
+        .and_then(LogicalPlanBuilder::build)
+        .map_err(|e| {
+            plan(format!(
+                "{f}({p} =>): the node ids must have one type: {}",
+                crate::user_message(&e).replace('\n', " ")
+            ))
+        })
 }
 
 /// "there is no graph function 'pagerenk'; did you mean 'pagerank'?", with
@@ -397,6 +611,13 @@ fn algorithms(
             _ => None,
         }
         .unwrap_or_else(|| function.name.to_string());
+        if let Some(t) = traversal::lookup(&name) {
+            return Err(plan(format!(
+                "{prefix}{name}() is a traversal, which returns rows of its own, not one per \
+                 node; call it on its own: SELECT * FROM {}",
+                t.signature()
+            )));
+        }
         let Some(spec) = functions::lookup(&name) else {
             return Err(no_such_function(&name, &prefix, per_node().collect()));
         };
@@ -488,6 +709,32 @@ fn node(
     outputs: Vec<Output>,
     per_node: bool,
 ) -> Result<GraphAlgorithmNode> {
+    let edges = edge_inputs(graph, edges, weights)?;
+    GraphAlgorithmNode::try_new(
+        graph.name.clone(),
+        Arc::new(edges.input),
+        edges.weighted,
+        edges.source,
+        edges.destination,
+        edges.weights,
+        outputs,
+        per_node,
+    )
+}
+
+/// A graph node's edge inputs: the edge table projected to the endpoints, and
+/// to the endpoints and weights when there are weights (see `node`).
+struct EdgeInputs {
+    input: LogicalPlan,
+    weighted: Option<Arc<LogicalPlan>>,
+    source: Expr,
+    destination: Expr,
+    /// The weight expressions, as written.
+    weights: Vec<String>,
+}
+
+/// The edge inputs of a node over the edge table `edges` of `graph`.
+fn edge_inputs(graph: &GraphDef, edges: LogicalPlan, weights: WeightSet) -> Result<EdgeInputs> {
     let table = graph.edges.table.clone();
     let column = |name: &str| Expr::Column(Column::new(Some(table.clone()), name));
     let (source, destination) = (
@@ -526,16 +773,13 @@ fn node(
             LogicalPlanBuilder::from(edges).project(exprs)?.build()?,
         ))
     };
-    GraphAlgorithmNode::try_new(
-        graph.name.clone(),
-        Arc::new(input),
+    Ok(EdgeInputs {
+        input,
         weighted,
         source,
         destination,
-        weights.written,
-        outputs,
-        per_node,
-    )
+        weights: weights.written,
+    })
 }
 
 impl GraphFunctions {

@@ -31,6 +31,7 @@ use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, UserDefinedLogi
 use ursa_core::catalog::Call;
 
 use super::functions::{display_call, plan};
+use super::traversal::Traversal;
 
 /// The source column of a node's weighted edge plan.
 pub const WEIGHTED_SOURCE: &str = "__ursa_source";
@@ -95,27 +96,7 @@ impl GraphAlgorithmNode {
         outputs: Vec<Output>,
         per_node: bool,
     ) -> Result<Self> {
-        let source_type = source.get_type(input.schema())?;
-        let destination_type = destination.get_type(input.schema())?;
-        let id_type = match (id_type(&source_type), id_type(&destination_type)) {
-            (Some(s), Some(d)) if s == d => s,
-            (Some(_), Some(_)) => {
-                return Err(plan(format!(
-                    "graph '{graph}': the source and destination columns must have one id type \
-                     (both integer or both string); got {source_type} and {destination_type}"
-                )))
-            }
-            (None, _) | (_, None) => {
-                let bad = if id_type(&source_type).is_none() {
-                    source_type
-                } else {
-                    destination_type
-                };
-                return Err(plan(format!(
-                    "graph '{graph}': node ids must be an integer or string column; got {bad}"
-                )));
-            }
-        };
+        let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
         let mut fields = Vec::new();
         if per_node {
             fields.push(Field::new("id", id_type.clone(), false));
@@ -141,16 +122,7 @@ impl GraphAlgorithmNode {
 
     /// The positions of the source and destination columns in the input.
     pub fn endpoint_indices(&self) -> Result<(usize, usize)> {
-        let index = |e: &Expr| -> Result<usize> {
-            match e {
-                Expr::Column(c) => self.input.schema().index_of_column(c),
-                other => Err(plan(format!(
-                    "graph '{}': an edge endpoint must be a column; got {other}",
-                    self.graph
-                ))),
-            }
-        };
-        Ok((index(&self.source)?, index(&self.destination)?))
+        endpoint_positions(&self.graph, &self.input, &self.source, &self.destination)
     }
 
     /// The outputs as SQL would spell them, for `EXPLAIN`: `name: call`, or
@@ -172,6 +144,54 @@ impl GraphAlgorithmNode {
             .collect();
         outputs.join(", ")
     }
+}
+
+/// The node id type of a graph whose edges `input` holds, with endpoint
+/// columns `source` and `destination`: both integer or both string.
+pub(crate) fn endpoint_id_type(
+    graph: &str,
+    input: &LogicalPlan,
+    source: &Expr,
+    destination: &Expr,
+) -> Result<DataType> {
+    let source_type = source.get_type(input.schema())?;
+    let destination_type = destination.get_type(input.schema())?;
+    match (id_type(&source_type), id_type(&destination_type)) {
+        (Some(s), Some(d)) if s == d => Ok(s),
+        (Some(_), Some(_)) => Err(plan(format!(
+            "graph '{graph}': the source and destination columns must have one id type \
+             (both integer or both string); got {source_type} and {destination_type}"
+        ))),
+        (None, _) | (_, None) => {
+            let bad = if id_type(&source_type).is_none() {
+                source_type
+            } else {
+                destination_type
+            };
+            Err(plan(format!(
+                "graph '{graph}': node ids must be an integer or string column; got {bad}"
+            )))
+        }
+    }
+}
+
+/// The positions of the endpoint columns `source` and `destination` in
+/// `input`.
+fn endpoint_positions(
+    graph: &str,
+    input: &LogicalPlan,
+    source: &Expr,
+    destination: &Expr,
+) -> Result<(usize, usize)> {
+    let index = |e: &Expr| -> Result<usize> {
+        match e {
+            Expr::Column(c) => input.schema().index_of_column(c),
+            other => Err(plan(format!(
+                "graph '{graph}': an edge endpoint must be a column; got {other}"
+            ))),
+        }
+    };
+    Ok((index(source)?, index(destination)?))
 }
 
 /// The node id type a column of `t` gives: integers as `Int64`, strings as
@@ -314,6 +334,265 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     }
 
     /// Filters on the output are about nodes, not edges: none moves below.
+    fn prevent_predicate_push_down_columns(&self) -> std::collections::HashSet<String> {
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+}
+
+/// Run a traversal (`hop`, `shortest_path`, `random_walk`) over the edges its
+/// first input produces.
+///
+/// Its inputs, in order:
+///
+/// 1. the edge rows projected to the endpoints, exactly as a
+///    [`GraphAlgorithmNode`]'s first input, so the two share one index;
+/// 2. for a weighted `shortest_path`, the weighted edge plan, as a
+///    [`GraphAlgorithmNode`]'s second input (with one weight column);
+/// 3. one plan per node-id parameter (`seeds`; `source` and `target`;
+///    `start`), each of one column: a `VALUES` list for a literal, or the
+///    planned subquery. They run when the node runs, never while the query is
+///    planned, and their values are cast to the graph's id type then.
+///
+/// The output is the traversal's own rows (see [`super::traversal`]).
+#[derive(Debug, Clone)]
+pub struct GraphTraversalNode {
+    /// The graph's name, for plans and messages.
+    pub graph: String,
+    pub traversal: Traversal,
+    /// The edge rows, projected to the endpoints.
+    pub input: Arc<LogicalPlan>,
+    /// The edge rows projected to the endpoints and the weight, for a
+    /// weighted shortest path.
+    pub weighted: Option<Arc<LogicalPlan>>,
+    /// The weight expression, as written, for `EXPLAIN`.
+    pub weight: Option<String>,
+    /// One plan per node-id parameter, in the spec's order.
+    pub nodes: Vec<Arc<LogicalPlan>>,
+    /// Each node-id argument as written, for `EXPLAIN`.
+    pub written: Vec<String>,
+    /// The source and destination of each edge: column references into
+    /// `input`.
+    pub source: Expr,
+    pub destination: Expr,
+    /// The node id type (see [`GraphAlgorithmNode::id_type`]).
+    pub id_type: DataType,
+    schema: DFSchemaRef,
+}
+
+impl GraphTraversalNode {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        graph: String,
+        traversal: Traversal,
+        input: Arc<LogicalPlan>,
+        weighted: Option<Arc<LogicalPlan>>,
+        weight: Option<String>,
+        nodes: Vec<Arc<LogicalPlan>>,
+        written: Vec<String>,
+        source: Expr,
+        destination: Expr,
+    ) -> Result<Self> {
+        let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
+        let spec = traversal.spec();
+        let expected = spec.node_params().count();
+        if nodes.len() != expected || written.len() != expected {
+            return Err(plan(format!(
+                "{}() takes {expected} node-id inputs; got {}",
+                spec.name,
+                nodes.len()
+            )));
+        }
+        if weighted.is_some() != weight.is_some() {
+            return Err(plan(format!(
+                "{}(): a weighted plan needs its weight expression",
+                spec.name
+            )));
+        }
+        for (p, n) in spec.node_params().zip(&nodes) {
+            let columns = n.schema().fields().len();
+            if columns != 1 {
+                return Err(plan(format!(
+                    "{}({} =>) must be one column of node ids; the query returns {columns} \
+                     columns",
+                    spec.name, p.name
+                )));
+            }
+        }
+        let schema = Arc::new(DFSchema::try_from(spec.schema(&id_type))?);
+        Ok(Self {
+            graph,
+            traversal,
+            input,
+            weighted,
+            weight,
+            nodes,
+            written,
+            source,
+            destination,
+            id_type,
+            schema,
+        })
+    }
+
+    /// The positions of the source and destination columns in the input.
+    pub fn endpoint_indices(&self) -> Result<(usize, usize)> {
+        endpoint_positions(&self.graph, &self.input, &self.source, &self.destination)
+    }
+
+    /// The call as SQL would spell it, for `EXPLAIN`.
+    pub(crate) fn display_call(&self) -> String {
+        self.traversal
+            .display(&self.written, self.weight.as_deref())
+    }
+}
+
+/// What identifies a traversal node besides its plans and expressions.
+type TraversalKey<'a> = (
+    &'a String,
+    &'a Traversal,
+    &'a Option<String>,
+    &'a Vec<String>,
+);
+
+impl GraphTraversalNode {
+    fn key(&self) -> TraversalKey<'_> {
+        (&self.graph, &self.traversal, &self.weight, &self.written)
+    }
+}
+
+// The schema and id type are derived from the other fields, so equality,
+// hashing and order leave them out.
+impl PartialEq for GraphTraversalNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+            && self.source == other.source
+            && self.destination == other.destination
+            && self.input == other.input
+            && self.weighted == other.weighted
+            && self.nodes == other.nodes
+    }
+}
+
+impl Eq for GraphTraversalNode {}
+
+impl Hash for GraphTraversalNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+        self.source.hash(state);
+        self.destination.hash(state);
+        self.input.hash(state);
+        self.weighted.hash(state);
+        self.nodes.hash(state);
+    }
+}
+
+impl PartialOrd for GraphTraversalNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.key().cmp(&other.key()) {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
+        match self.source.partial_cmp(&other.source)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
+        match self.destination.partial_cmp(&other.destination)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
+        match self.input.partial_cmp(&other.input)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
+        match self.weighted.partial_cmp(&other.weighted)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
+        self.nodes.partial_cmp(&other.nodes)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for GraphTraversalNode {
+    fn name(&self) -> &str {
+        "GraphTraversal"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        let mut inputs = vec![self.input.as_ref()];
+        inputs.extend(self.weighted.as_deref());
+        inputs.extend(self.nodes.iter().map(Arc::as_ref));
+        inputs
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
+
+    /// The endpoint columns, so DataFusion keeps them in the input.
+    fn expressions(&self) -> Vec<Expr> {
+        vec![self.source.clone(), self.destination.clone()]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "GraphTraversal: graph={}, edges=({}, {}), call={}",
+            self.graph,
+            self.source,
+            self.destination,
+            self.display_call()
+        )
+    }
+
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+        let [source, destination]: [Expr; 2] = exprs
+            .try_into()
+            .map_err(|_| plan("GraphTraversal takes two expressions".into()))?;
+        let weighted = usize::from(self.weighted.is_some());
+        let expected = 1 + weighted + self.nodes.len();
+        if inputs.len() != expected {
+            return Err(plan(format!(
+                "GraphTraversal takes {expected} inputs; got {}",
+                inputs.len()
+            )));
+        }
+        let mut inputs = inputs.into_iter().map(Arc::new);
+        let input = inputs.next().expect("checked above");
+        let weighted = (weighted == 1).then(|| inputs.next().expect("checked above"));
+        Self::try_new(
+            self.graph.clone(),
+            self.traversal,
+            input,
+            weighted,
+            self.weight.clone(),
+            inputs.collect(),
+            self.written.clone(),
+            source,
+            destination,
+        )
+    }
+
+    /// Both endpoints of the first input, every column of the weighted input,
+    /// and the one column of each node-id input.
+    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        let (source, destination) = self.endpoint_indices().ok()?;
+        let mut needed = vec![source, destination];
+        needed.sort_unstable();
+        needed.dedup();
+        let mut children = vec![needed];
+        if let Some(weighted) = &self.weighted {
+            children.push((0..weighted.schema().fields().len()).collect());
+        }
+        children.extend(self.nodes.iter().map(|_| vec![0]));
+        Some(children)
+    }
+
+    /// Filters on the output are about the traversal's rows, not the edges or
+    /// the node ids: none moves below.
     fn prevent_predicate_push_down_columns(&self) -> std::collections::HashSet<String> {
         self.schema
             .fields()

@@ -539,3 +539,20 @@ async fn string_ids_and_weights_work_with_a_loaded_index() {
     );
     assert_eq!(counts(&ctx), (0, 1));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn traversals_use_a_stored_index() {
+    let fixture = Fixture::new(20_000).await;
+    let hop = "SELECT count(*) FROM hop(g, seeds => [0, 1, 2], n => 2, direction => 'both')";
+    let path =
+        "SELECT count(*) FROM shortest_path(g, source => 0, target => 1, direction => 'both')";
+    let first = open(&fixture.db()).await;
+    let expected = (ok(&first, hop).await, ok(&first, path).await);
+    assert_eq!(counts(&first), (1, 0));
+    close(first);
+    assert_eq!(read_manifest(&fixture.index_dir()).len(), 1);
+
+    let second = open(&fixture.db()).await;
+    assert_eq!((ok(&second, hop).await, ok(&second, path).await), expected);
+    assert_eq!(counts(&second), (0, 1));
+}

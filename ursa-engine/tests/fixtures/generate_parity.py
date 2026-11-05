@@ -8,6 +8,12 @@ runs the same calls through SQL and compares column names, column types, ids
 and values exactly; floats are stored as the hex of their IEEE-754 bits (16
 digits for ``double``, 8 for ``float``), so the comparison is bit for bit.
 
+The traversals (``hop``, ``shortest_path``, ``random_walk``, #238) are cases
+too, with their rows in the Python library's order, and the file records the
+Python signatures of the traversals so the SQL engine's specs of them
+(``ursa-engine/src/graph/traversal.rs``) are held to the same names and
+defaults.
+
 Run it from the repository root, after building the Python package:
 
     uv sync --reinstall-package ursa-graph
@@ -19,6 +25,7 @@ when a kernel's output changes on purpose, or to add a case.
 
 from __future__ import annotations
 
+import inspect
 import json
 import struct
 from collections.abc import Callable
@@ -114,6 +121,145 @@ WEIGHTED_CALLS: list[tuple[str, dict[str, Any]]] = [
 WEIGHTED_DATASETS = {"lesmis"}
 
 
+# --- traversals ---------------------------------------------------------------
+# Each traversal case runs as ``SELECT * FROM <function>(<dataset>, <sql_args>)``
+# and as the Python call beside it. Their rows are compared in order: SQL
+# returns a traversal's rows in the order the Python library does.
+
+# Per dataset: two seeds, an id not in the graph, and two path endpoints.
+NODES: dict[str, dict[str, Any]] = {
+    "karate": {"seeds": [0, 33], "missing": 99, "path": (0, 26)},
+    "florentine": {
+        "seeds": ["Medici", "Strozzi"],
+        "missing": "Sforza",
+        "path": ("Acciaiuoli", "Strozzi"),
+    },
+    "lesmis": {
+        "seeds": ["Valjean", "Marius"],
+        "missing": "Javert2",
+        "path": ("Napoleon", "Marius"),
+    },
+}
+
+# The subquery SQL gives for Python's seed NodeFrame on karate; ``{data}`` is
+# the dataset directory, filled in by parity.rs.
+OFFICERS_SQL = "(SELECT id FROM '{data}/karate_nodes.csv' WHERE club = 'Officer')"
+
+
+def sql_list(values: list[Any]) -> str:
+    """``values`` as a SQL list literal."""
+    return "[" + ", ".join(sql_literal(v) for v in values) + "]"
+
+
+def hop(n: int, direction: str, seeds: Any) -> Callable[[Any], Any]:
+    return lambda edges: ur.hop(edges, n=n, direction=direction).from_(seeds)
+
+
+def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]:
+    """``(function, sql_args, python call over the edges)`` for ``dataset``."""
+    ids = NODES[dataset]
+    seeds, missing, (source, target) = ids["seeds"], ids["missing"], ids["path"]
+    cases: list[tuple[str, str, Callable[[Any], Any]]] = []
+    for n in (1, 2):
+        for direction in ("out", "in", "both"):
+            cases.append(
+                (
+                    "hop",
+                    f"seeds => {sql_list(seeds)}, n => {n}, direction => '{direction}'",
+                    hop(n, direction, seeds),
+                )
+            )
+    # One id; an id not in the graph and a repeated seed (#225: an unknown
+    # seed reaches nothing, a repeated one repeats its rows); no seeds.
+    cases.append(("hop", f"seeds => {sql_literal(seeds[0])}", hop(1, "out", [seeds[0]])))
+    repeated = [seeds[0], missing, seeds[0]]
+    cases.append(
+        (
+            "hop",
+            f"seeds => {sql_list(repeated)}, direction => 'both'",
+            hop(1, "both", repeated),
+        )
+    )
+    cases.append(("hop", "seeds => []", hop(1, "out", [])))
+    if dataset == "karate":
+        _, members = ur.datasets.load_karate(with_nodes=True)
+        officers = members.filter(ur.col("club") == "Officer")
+        cases.append(("hop", f"seeds => {OFFICERS_SQL}, n => 2", hop(2, "out", officers)))
+
+    for direction in ("out", "in", "both"):
+        cases.append(
+            (
+                "shortest_path",
+                f"source => {sql_literal(source)}, target => {sql_literal(target)}, "
+                f"direction => '{direction}'",
+                lambda edges, d=direction: ur.shortest_path(edges, source, target, direction=d),
+            )
+        )
+    # Back along the path: often no path one way.
+    cases.append(
+        (
+            "shortest_path",
+            f"source => {sql_literal(target)}, target => {sql_literal(source)}",
+            lambda edges: ur.shortest_path(edges, target, source),
+        )
+    )
+    cases.append(
+        (
+            "shortest_path",
+            f"source => {sql_literal(source)}, target => {sql_literal(missing)}",
+            lambda edges: ur.shortest_path(edges, source, missing),
+        )
+    )
+    if dataset in WEIGHTED_DATASETS:
+        for weight, direction in (("weight", "out"), ("weight * 2 + 1", "both")):
+            cases.append(
+                (
+                    "shortest_path",
+                    f"source => {sql_literal(source)}, target => {sql_literal(target)}, "
+                    f"weight => {weight}, direction => '{direction}'",
+                    lambda edges, w=weight, d=direction: ur.shortest_path(
+                        edges, source, target, weight=WEIGHTS[w](), direction=d
+                    ),
+                )
+            )
+
+    starts = [*seeds, missing]
+    cases.append(
+        (
+            "random_walk",
+            f"start => {sql_list(starts)}, steps => 4, walks_per_node => 2, seed => 7",
+            lambda edges: ur.random_walk(edges, starts, 4, walks_per_node=2, seed=7),
+        )
+    )
+    cases.append(
+        (
+            "random_walk",
+            f"start => {sql_literal(seeds[1])}, steps => 10",
+            lambda edges: ur.random_walk(edges, [seeds[1]], 10),
+        )
+    )
+    return cases
+
+
+def signatures() -> dict[str, list[list[Any]]]:
+    """Each traversal's parameters besides the edges, as ``[name, default]``,
+    the node ids first as SQL orders them; a required parameter's default is
+    ``"<required>"``. ``hop``'s seeds are ``.from_(seeds)``'s."""
+
+    def params(function: Callable[..., Any], skip: int) -> list[list[Any]]:
+        out = []
+        for p in list(inspect.signature(function).parameters.values())[skip:]:
+            default = "<required>" if p.default is inspect.Parameter.empty else p.default
+            out.append([p.name, default])
+        return out
+
+    return {
+        "hop": params(_graph._Hop.from_, 1) + params(ur.hop, 1),
+        "shortest_path": params(ur.shortest_path, 1),
+        "random_walk": params(ur.random_walk, 1),
+    }
+
+
 def sql_literal(value: Any) -> str:
     """``value`` as a SQL literal."""
     if isinstance(value, bool):
@@ -154,14 +300,17 @@ def encode(value: Any, type_: pa.DataType) -> Any:
 
 
 def case(dataset: str, csv: str, edges: Any, function: str, kwargs: dict[str, Any]) -> dict:
-    table = run(function, edges, kwargs)
+    return result(dataset, csv, function, sql_args(kwargs), run(function, edges, kwargs))
+
+
+def result(dataset: str, csv: str, function: str, args: str, table: pa.Table) -> dict:
     types = [field.type for field in table.schema]
     columns = [table.column(i).to_pylist() for i in range(table.num_columns)]
     return {
         "dataset": dataset,
         "csv": csv,
         "function": function,
-        "sql_args": sql_args(kwargs),
+        "sql_args": args,
         "columns": [[field.name, str(field.type)] for field in table.schema],
         "rows": [
             [encode(v, t) for v, t in zip(row, types, strict=True)]
@@ -177,10 +326,14 @@ def main() -> None:
         calls = CALLS + (WEIGHTED_CALLS if dataset in WEIGHTED_DATASETS else [])
         for function, kwargs in calls:
             cases.append(case(dataset, csv, edges, function, kwargs))
+        for function, args, call in traversal_cases(dataset):
+            table = call(edges).collect().to_arrow()
+            cases.append(result(dataset, csv, function, args, table))
     header = {
         "about": "Python library results for ursa-engine/tests/parity.rs; written by "
         "generate_parity.py (see its docstring). Floats are the hex of their IEEE-754 bits.",
         "ursa_version": ur.__version__,
+        "traversal_signatures": signatures(),
     }
     # One case per line, so a diff shows which cases changed.
     lines = [f" {json.dumps(k)}: {json.dumps(v)}," for k, v in header.items()]
