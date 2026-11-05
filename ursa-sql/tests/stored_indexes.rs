@@ -251,7 +251,8 @@ async fn a_corrupt_or_truncated_index_file_is_a_miss() {
     let expected = ok(&first, QUERY).await;
     close(first);
 
-    let damages: [(&str, fn(&mut Vec<u8>)); 4] = [
+    type Damage = fn(&mut Vec<u8>);
+    let damages: [(&str, Damage); 4] = [
         ("truncated", |b| b.truncate(b.len() / 2)),
         ("one byte flipped", |b| {
             let at = b.len() / 2;

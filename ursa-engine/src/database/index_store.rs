@@ -267,7 +267,7 @@ impl IndexStore {
     /// Write `index` under `key`, then update the manifest and evict.
     fn write(&self, key: &IndexKey, index: &Arc<GraphIndex>, limit: u64) -> std::io::Result<()> {
         let encoded = Encoded::new(key, &index.topology, &index.ids)?;
-        let size = encoded.len();
+        let size = encoded.file_size();
         if size > limit {
             return Ok(());
         }

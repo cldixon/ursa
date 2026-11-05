@@ -70,7 +70,7 @@ impl fmt::Display for ByteSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (name, scale) = UNITS
             .iter()
-            .find(|(_, scale)| self.0 != 0 && self.0 % scale == 0)
+            .find(|(_, scale)| self.0 != 0 && self.0.is_multiple_of(*scale))
             .copied()
             .unwrap_or(("B", 1));
         if name == "B" {

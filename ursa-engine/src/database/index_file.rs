@@ -262,7 +262,7 @@ impl<'a> Encoded<'a> {
     }
 
     /// The size of the file, in bytes.
-    pub fn len(&self) -> u64 {
+    pub fn file_size(&self) -> u64 {
         self.trailer_offset + TRAILER_LEN
     }
 
@@ -310,7 +310,7 @@ impl<'a> Encoded<'a> {
         sink.pad_to(self.trailer_offset)?;
         let crc = sink.crc.clone().finalize();
         let mut trailer = Vec::with_capacity(TRAILER_LEN as usize);
-        trailer.extend_from_slice(&self.len().to_le_bytes());
+        trailer.extend_from_slice(&self.file_size().to_le_bytes());
         trailer.extend_from_slice(&crc.to_le_bytes());
         trailer.extend_from_slice(&END_MAGIC);
         sink.put(&trailer)?;
@@ -518,7 +518,7 @@ mod tests {
         let encoded = Encoded::new(key, topology, ids).unwrap();
         let mut bytes = Vec::new();
         encoded.write_to(&mut bytes).unwrap();
-        assert_eq!(bytes.len() as u64, encoded.len());
+        assert_eq!(bytes.len() as u64, encoded.file_size());
         bytes
     }
 
