@@ -679,6 +679,62 @@ async fn node_id_type_errors_name_the_parameter() {
             "random_walk(start =>) must be node ids of graph 'lesmis', which are strings; got \
              a query of type Struct(\"a\": Int64)",
         ),
+        // Floats, booleans and dates would cast, but are refused (#271).
+        (
+            "SELECT * FROM hop(karate, seeds => [1.5])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 1.5",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0, 2.0])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 2.0",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => true)",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got true",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => 0, target => DATE '2020-01-01')",
+            "shortest_path(target =>) must be a node id of graph 'karate', which is an \
+             integer; got DATE '2020-01-01'",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, start => [CAST(1 AS DOUBLE)], steps => 2)",
+            "random_walk(start =>) must be node ids of graph 'karate', which are integers; got \
+             CAST(1 AS DOUBLE)",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [random()])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got \
+             random()",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT 1.0))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got a query \
+             of type Float64",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT id = 0 FROM karate.nodes))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got a query \
+             of type Boolean",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => ['1.5'])",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got '1.5'",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => ' 0', target => 33)",
+            "shortest_path(source =>) must be a node id of graph 'karate', which is an \
+             integer; got ' 0'",
+        ),
+        // On a graph with string ids too: an integer or a string.
+        (
+            "SELECT * FROM hop(lesmis, seeds => ['Valjean', 1.5])",
+            "hop(seeds =>) must be node ids of graph 'lesmis', which are strings; got 1.5",
+        ),
+        (
+            "SELECT * FROM hop(lesmis, seeds => [false])",
+            "hop(seeds =>) must be node ids of graph 'lesmis', which are strings; got false",
+        ),
     ];
     for (sql, expected) in at_plan_time {
         let e = ctx
@@ -705,14 +761,28 @@ async fn node_id_type_errors_name_the_parameter() {
             "shortest_path(target =>) must be a node id of graph 'karate', which is an \
              integer; got 'end'",
         ),
+        // A string must parse exactly as an integer (#271).
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT '1.5'))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got '1.5'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT * FROM (VALUES ('0'), ('2.0'))))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got '2.0'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT ' 1'))",
+            "hop(seeds =>) must be node ids of graph 'karate', which are integers; got ' 1'",
+        ),
     ] {
         let frame = ctx.sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         let e = frame.collect().await.expect_err(sql);
         assert_eq!(user_message(&e), expected, "{sql}");
     }
 
-    // What casts still works: a string that is an integer, an integer for a
-    // string graph, NULL, and a mixed list whose values all cast.
+    // What still works: an integer of any width, a string that is an
+    // integer, an integer for a string graph, NULL, and a mixed list whose
+    // values are all ids.
     for (sql, n) in [
         ("SELECT * FROM hop(karate, seeds => ['0'])", 16),
         // A repeated seed gives its rows twice.
@@ -720,6 +790,20 @@ async fn node_id_type_errors_name_the_parameter() {
         ("SELECT * FROM hop(karate, seeds => [NULL, 0])", 16),
         ("SELECT * FROM hop(karate, seeds => [-1 + 1])", 16),
         ("SELECT * FROM hop(lesmis, seeds => [1])", 0),
+        ("SELECT * FROM hop(lesmis, seeds => (SELECT 1))", 0),
+        (
+            "SELECT * FROM hop(karate, seeds => [CAST(0 AS TINYINT)])",
+            16,
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => (SELECT CAST(0 AS INT UNSIGNED)))",
+            16,
+        ),
+        ("SELECT * FROM hop(karate, seeds => (SELECT '0'))", 16),
+        (
+            "SELECT * FROM shortest_path(karate, source => '0', target => 33)",
+            2,
+        ),
     ] {
         assert_eq!(rows(&ctx, sql).await, n, "{sql}");
     }
