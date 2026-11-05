@@ -57,32 +57,58 @@ fn is_numeric(dt: &DataType) -> bool {
 /// non-negative — Dijkstra's requirement, and negatives are meaningless for
 /// weighted PageRank too).
 pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f64>> {
-    let value: serde_json::Value = serde_json::from_str(weight_json)
-        .map_err(|e| DataFusionError::Execution(format!("invalid weight expression JSON: {e}")))?;
-    let expr = parse_ursa_expr(&value)?;
-    let df_expr = lower(&expr)?;
-
     let Some(first) = edges.first() else {
+        lower_weight(weight_json)?;
         return Ok(Vec::new());
     };
-    let schema = first.schema();
-    let physical = SessionContext::new()
-        .create_physical_expr(df_expr, &DFSchema::try_from(schema.clone())?)?;
-    // Branch on the *declared* result type, not on cast success: casting a
-    // non-numeric column (e.g. a string weight= ur.col("region")) to Float64
-    // silently yields nulls, which would misreport as "produced a null value".
-    let dt = physical.data_type(&schema)?;
-    if !is_numeric(&dt) {
-        return Err(DataFusionError::Execution(format!(
-            "weight expression must be numeric; it produced a column of type {} \
-             (a string or other non-numeric column cannot be a weight)",
-            crate::compare::pa_name(&dt)
-        )));
-    }
-
+    let weight = CompiledWeight::new(weight_json, &first.schema())?;
     let total: usize = edges.iter().map(|b| b.num_rows()).sum();
     let mut out = Vec::with_capacity(total);
     for batch in edges {
+        weight.extend(batch, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// A weight expression's JSON, parsed and lowered to a DataFusion expression.
+fn lower_weight(weight_json: &str) -> Result<datafusion::logical_expr::Expr> {
+    let value: serde_json::Value = serde_json::from_str(weight_json)
+        .map_err(|e| DataFusionError::Execution(format!("invalid weight expression JSON: {e}")))?;
+    lower(&parse_ursa_expr(&value)?)
+}
+
+/// A weight expression compiled once for an edge schema, then evaluated a
+/// batch at a time ([`evaluate_weight`], and a scan read in a stream, #267).
+pub struct CompiledWeight {
+    physical: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+}
+
+impl CompiledWeight {
+    /// `weight_json` compiled against batches of `schema`. Errors if the
+    /// expression is unsupported, references an unknown column, or is not
+    /// numeric.
+    pub fn new(weight_json: &str, schema: &arrow::datatypes::SchemaRef) -> Result<Self> {
+        let df_expr = lower_weight(weight_json)?;
+        let physical = SessionContext::new()
+            .create_physical_expr(df_expr, &DFSchema::try_from(schema.as_ref().clone())?)?;
+        // Branch on the *declared* result type, not on cast success: casting a
+        // non-numeric column (e.g. a string weight= ur.col("region")) to Float64
+        // silently yields nulls, which would misreport as "produced a null value".
+        let dt = physical.data_type(schema)?;
+        if !is_numeric(&dt) {
+            return Err(DataFusionError::Execution(format!(
+                "weight expression must be numeric; it produced a column of type {} \
+                 (a string or other non-numeric column cannot be a weight)",
+                crate::compare::pa_name(&dt)
+            )));
+        }
+        Ok(Self { physical })
+    }
+
+    /// Append one `f64` per row of `batch` to `out`. Errors on a null or
+    /// negative weight.
+    pub fn extend(&self, batch: &RecordBatch, out: &mut Vec<f64>) -> Result<()> {
+        let physical = &self.physical;
         let col = physical.evaluate(batch)?.into_array(batch.num_rows())?;
         let col = cast(&col, &DataType::Float64)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
@@ -103,8 +129,8 @@ pub fn evaluate_weight(edges: &[RecordBatch], weight_json: &str) -> Result<Vec<f
             )));
         }
         out.extend_from_slice(values);
+        Ok(())
     }
-    Ok(out)
 }
 
 /// The weights for a weighted operation: `weight_json` evaluated over `edges`, one
@@ -191,6 +217,26 @@ impl WeightCache {
         entries.push((key.to_string(), w.clone()));
         Ok(w)
     }
+
+    /// Cache `weights`, evaluated by the caller for `key` (a weighted scan
+    /// evaluates them as it reads its rows, #267), as [`Self::get_or_eval`]
+    /// would on a miss: it counts as an evaluation, and an entry already cached
+    /// for `key` wins.
+    pub fn insert(&self, key: &str, weights: Arc<Vec<f64>>) -> Arc<Vec<f64>> {
+        self.evaluations.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, existing)) = entries.iter().find(|(k, _)| k == key) {
+            return existing.clone();
+        }
+        if entries.len() >= WEIGHT_CACHE_CAPACITY {
+            entries.remove(0);
+        }
+        entries.push((key.to_string(), weights.clone()));
+        weights
+    }
+
+    /// How many weight vectors a cache keeps.
+    pub const CAPACITY: usize = WEIGHT_CACHE_CAPACITY;
 
     /// Weight evaluations this cache has run (test/observability hook).
     pub fn evaluations(&self) -> usize {

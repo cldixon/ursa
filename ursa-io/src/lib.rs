@@ -38,8 +38,8 @@ pub use datafusion::error::DataFusionError;
 
 pub use self::csv::CsvOptions;
 pub use scan::{
-    scan_edges_batch, scan_edges_table, scan_edges_topology, scan_nodes_batch, ScanBuildError,
-    ScanSource, ScannedTopology,
+    scan_edges_batch, scan_edges_stream, scan_edges_table, scan_edges_topology, scan_nodes_batch,
+    ScanBuildError, ScanSource, ScannedTopology, StreamedEdges,
 };
 pub use topology::{build_topology, build_topology_batches};
 pub use types::pa_name;

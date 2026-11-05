@@ -435,13 +435,7 @@ fn scan_edges_batch_inner(
         check_endpoints(df.schema().as_arrow(), src, dst)?;
 
         // Project src, dst, then any weight columns not already among them.
-        let mut proj: Vec<&str> = vec![src, dst];
-        for c in weight_columns {
-            if !proj.contains(&c.as_str()) {
-                proj.push(c.as_str());
-            }
-        }
-        let df = df.select_columns(&proj)?;
+        let df = df.select_columns(&edge_projection(src, dst, weight_columns))?;
         let dry = crate::dry::active();
         let dry_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         // Keep the scan's batches separate (no `concat_batches` into one contiguous
@@ -455,10 +449,40 @@ fn scan_edges_batch_inner(
         // The canonical id type is taken once from the read schema (identical across
         // the scan's batches) and every batch is canonicalized to it independently.
         let read_schema = if dry { dry_schema } else { batches[0].schema() };
-        let id_type = endpoint_id_type(&read_schema)?;
-        // Output layout: canonical src/dst, then each weight column by its own
-        // name, as an index into the read batch. An endpoint requested as a weight
-        // column (#154) points back at read column 0/1 (uncast).
+        let layout = EdgeBatchLayout::new(&read_schema, src, dst, weight_columns)?;
+        if dry {
+            return Ok(vec![RecordBatch::new_empty(layout.schema)]);
+        }
+
+        // Canonicalize each batch independently, in parallel (rayon's collect keeps
+        // batch order). Consuming the list releases each batch after its cast, so a
+        // narrower integer or a view-typed string id column is converted batch by
+        // batch rather than all at once.
+        use rayon::prelude::*;
+        let out = batches
+            .into_par_iter()
+            .filter(|batch| batch.num_rows() > 0) // the non-empty guard above ensures ≥1 remains
+            .map(|batch| layout.canonical(&batch))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(out)
+    })?
+}
+
+/// How [`scan_edges_batch`] lays out a batch it read: `src` and `dst` cast to
+/// the canonical id type and renamed, then each weight column by its own name.
+struct EdgeBatchLayout {
+    id_type: DataType,
+    schema: SchemaRef,
+    /// The read column behind each output column after `dst`.
+    extra: Vec<usize>,
+}
+
+impl EdgeBatchLayout {
+    /// The layout of batches read as `read_schema` (`src`, `dst`, then the
+    /// weight columns that are not endpoints). An endpoint requested as a
+    /// weight column (#154) points back at read column 0/1 (uncast).
+    fn new(read_schema: &Schema, src: &str, dst: &str, weight_columns: &[String]) -> Result<Self> {
+        let id_type = endpoint_id_type(read_schema)?;
         let mut fields = vec![
             Field::new("src", id_type.clone(), true),
             Field::new("dst", id_type.clone(), true),
@@ -475,29 +499,33 @@ fn scan_edges_batch_inner(
                 extra.push(idx);
             }
         }
-        let out_schema = Arc::new(Schema::new(fields));
-        if dry {
-            return Ok(vec![RecordBatch::new_empty(out_schema)]);
-        }
+        Ok(Self {
+            id_type,
+            schema: Arc::new(Schema::new(fields)),
+            extra,
+        })
+    }
 
-        // Canonicalize each batch independently, in parallel (rayon's collect keeps
-        // batch order). Consuming the list releases each batch after its cast, so a
-        // narrower integer or a view-typed string id column is converted batch by
-        // batch rather than all at once.
-        use rayon::prelude::*;
-        let out = batches
-            .into_par_iter()
-            .filter(|batch| batch.num_rows() > 0) // the non-empty guard above ensures ≥1 remains
-            .map(|batch| {
-                let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
-                let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
-                let mut columns = vec![src_c, dst_c];
-                columns.extend(extra.iter().map(|&i| batch.column(i).clone()));
-                RecordBatch::try_new(out_schema.clone(), columns).map_err(arrow_err)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(out)
-    })?
+    /// A read batch in this layout.
+    fn canonical(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let src_c = cast(batch.column(0), &self.id_type).map_err(arrow_err)?;
+        let dst_c = cast(batch.column(1), &self.id_type).map_err(arrow_err)?;
+        let mut columns = vec![src_c, dst_c];
+        columns.extend(self.extra.iter().map(|&i| batch.column(i).clone()));
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(arrow_err)
+    }
+}
+
+/// The projection [`scan_edges_batch`] reads: `src`, `dst`, then each weight
+/// column not already among them.
+fn edge_projection<'a>(src: &'a str, dst: &'a str, weight_columns: &'a [String]) -> Vec<&'a str> {
+    let mut proj: Vec<&str> = vec![src, dst];
+    for c in weight_columns {
+        if !proj.contains(&c.as_str()) {
+            proj.push(c.as_str());
+        }
+    }
+    proj
 }
 
 /// Read an edge file as a table — every column, or the `columns` projection plus
@@ -847,6 +875,121 @@ fn scan_edges_topology_inner(
     Ok(ScannedTopology {
         topo: Arc::new(topo),
         ids: Arc::new(ids),
+        dropped,
+    })
+}
+
+/// The rows [`scan_edges_stream`] read.
+pub struct StreamedEdges {
+    /// The index, when the scan was asked to build one.
+    pub index: Option<(Arc<Topology>, Arc<IdMap>)>,
+    /// Rows read (after any null-endpoint rows were dropped).
+    pub rows: usize,
+    /// Rows dropped for a null endpoint (always 0 unless `drop_nulls`).
+    pub dropped: usize,
+}
+
+/// Scan an edge file for its endpoints and `weight_columns` as
+/// [`scan_edges_batch`] reads them, handing each batch to `visit` in row order
+/// and freeing it before the next is decoded; with `build`, interning each batch
+/// as it goes, as [`scan_edges_topology`] does.
+///
+/// This is how a weighted operation reads a file without holding it: `visit`
+/// evaluates the weights a batch at a time, so only the index and one `f64` per
+/// edge outlive the scan (#267). The batches `visit` sees are those
+/// [`scan_edges_batch`] returns (canonical `src`/`dst`, then the weight
+/// columns), less any row with a null endpoint when `drop_nulls`; the index is
+/// the one [`scan_edges_topology`] builds. Not for a dry run, which reads no
+/// rows: use [`scan_edges_batch`] then.
+pub fn scan_edges_stream(
+    source: ScanSource<'_>,
+    src: &str,
+    dst: &str,
+    weight_columns: &[String],
+    drop_nulls: bool,
+    build: bool,
+    visit: &mut dyn FnMut(&RecordBatch),
+) -> std::result::Result<StreamedEdges, ScanBuildError> {
+    scan_edges_stream_inner(source, src, dst, weight_columns, drop_nulls, build, visit).map_err(
+        |e| match e {
+            ScanBuildError::Scan(e) => ScanBuildError::Scan(in_scan("scan_edges", source)(e)),
+            e => e,
+        },
+    )
+}
+
+fn scan_edges_stream_inner(
+    source: ScanSource<'_>,
+    src: &str,
+    dst: &str,
+    weight_columns: &[String],
+    drop_nulls: bool,
+    build: bool,
+    visit: &mut dyn FnMut(&RecordBatch),
+) -> std::result::Result<StreamedEdges, ScanBuildError> {
+    log_scan("edges", weight_columns, 0);
+    let (interner, rows, dropped) = crate::runtime::block_on(async move {
+        let df = open_scan(source).await?;
+        check_endpoints(df.schema().as_arrow(), src, dst)?;
+        let df = df.select_columns(&edge_projection(src, dst, weight_columns))?;
+        let task_ctx = df.task_ctx();
+        let plan = df.create_physical_plan().await?;
+        let mut interner = if build {
+            let hint = StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())?
+                .num_rows
+                .get_value()
+                .copied()
+                .unwrap_or(0);
+            Some(EdgeInterner::with_capacity(hint))
+        } else {
+            None
+        };
+        let (mut rows, mut dropped) = (0, 0);
+        // Laid out as `scan_edges_batch` lays out its batches, from the first.
+        let mut layout: Option<EdgeBatchLayout> = None;
+        for mut stream in execute_stream_partitioned(plan, Arc::new(task_ctx))? {
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                if layout.is_none() {
+                    layout = Some(EdgeBatchLayout::new(
+                        &batch.schema(),
+                        src,
+                        dst,
+                        weight_columns,
+                    )?);
+                }
+                let layout = layout.as_ref().expect("set above");
+                let mut batch = layout.canonical(&batch)?;
+                if drop_nulls {
+                    let (kept, n) = crate::ids::drop_null_endpoint_rows(vec![batch], 0, 1)
+                        .map_err(arrow_err)?;
+                    dropped += n;
+                    batch = kept.into_iter().next().expect("one batch in, one out");
+                }
+                if let Some(interner) = interner.as_mut() {
+                    interner.push(batch.column(0), batch.column(1))?;
+                }
+                rows += batch.num_rows();
+                visit(&batch);
+            }
+        }
+        Ok::<_, ScanBuildError>((interner, rows, dropped))
+    })??;
+    if rows == 0 && dropped == 0 {
+        return Err(empty_edge_source().into());
+    }
+    let index = interner.map(|interner| {
+        let (ids, src_dense, dst_dense) = interner.finish();
+        let topo = Topology::build(ids.len(), src_dense, dst_dense);
+        (Arc::new(topo), Arc::new(ids))
+    });
+    Ok(StreamedEdges {
+        index,
+        rows,
         dropped,
     })
 }

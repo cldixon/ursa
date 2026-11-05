@@ -91,7 +91,7 @@ use crate::query::{
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, CsvOptions, NodeTableCache, ScanSource};
 use crate::stats::{describe_masked, parse_stat_direction, stat_batch, GraphStat};
-use crate::weight::{edge_weights, WeightCache};
+use crate::weight::{edge_weights, CompiledWeight, WeightCache};
 
 /// A numbered input the host resolves: a frame (its table, scan, index, mask) or
 /// a seed set.
@@ -2459,14 +2459,20 @@ fn prepare_weighted(
             // path order, as the index is built from them (#216).
             let (src, dst) = &view.roles;
             let source = ScanSource::new(paths, &opts, csv);
+            let drop = on_null == "drop";
+            let warned = match stream_scan_weights(view, source, drop, &columns, keys, inputs)? {
+                Streamed::Cached => return Ok(None),
+                Streamed::Read { warned } => warned,
+                Streamed::Skipped => false,
+            };
             let mut batches = scan_edges_batch(source, src, dst, &columns)?;
-            if on_null == "drop" {
+            if drop {
                 let dropped;
                 (batches, dropped) =
                     ursa_io::ids::drop_null_endpoint_rows(batches, 0, 1).map_err(|e| {
                         PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None))
                     })?;
-                if dropped > 0 {
+                if dropped > 0 && !warned {
                     inputs.warn_dropped(dropped)?;
                 }
             }
@@ -2486,6 +2492,112 @@ fn prepare_weighted(
         }
         _ => not_implemented(NO_SOURCE),
     }
+}
+
+/// What [`stream_scan_weights`] did.
+enum Streamed {
+    /// Every weight is cached on the frame's index, which is built.
+    Cached,
+    /// The rows were read (and the index built, if it was not), but a weight
+    /// did not evaluate: the caller reads the rows again, and the weight's
+    /// error is raised where it always was. `warned`: the dropped rows were
+    /// announced.
+    Read { warned: bool },
+    /// Nothing was read.
+    Skipped,
+}
+
+/// Read a scan's weighted rows a batch at a time, evaluating each weight in
+/// `keys` as the rows go by and building the frame's index from them if it
+/// is not built, so the rows are never held (#267). The weights are cached on
+/// the index, in edge-row order, as `node_columns` would evaluate them from
+/// the collected rows: the same batches, in the same order, so the same
+/// values.
+///
+/// Skipped for a dry run (which reads no rows), with no weight keys (a
+/// traversal reads its weights itself), or with more distinct weights than the
+/// index's cache keeps.
+fn stream_scan_weights(
+    view: &EdgeView<'_>,
+    source: ScanSource<'_>,
+    drop: bool,
+    columns: &[String],
+    keys: &[String],
+    inputs: &dyn Inputs,
+) -> PlanResult<Streamed> {
+    let mut distinct: Vec<&String> = Vec::new();
+    for k in keys {
+        if !distinct.contains(&k) {
+            distinct.push(k);
+        }
+    }
+    if distinct.is_empty() || distinct.len() > WeightCache::CAPACITY || crate::dry::active() {
+        return Ok(Streamed::Skipped);
+    }
+    let (frame, scope) = (view.frame, weight_scope(view));
+    let (src, dst) = (view.roles.0.as_str(), view.roles.1.as_str());
+    let built = inputs.built_index(frame)?;
+    let mut weights: Vec<(Option<CompiledWeight>, Vec<f64>)> =
+        distinct.iter().map(|_| (None, Vec::new())).collect();
+    let mut failed = false;
+    let mut visit = |batch: &RecordBatch| {
+        if failed {
+            return;
+        }
+        for ((compiled, values), key) in weights.iter_mut().zip(&distinct) {
+            if compiled.is_none() {
+                match CompiledWeight::new(key, &batch.schema()) {
+                    Ok(c) => *compiled = Some(c),
+                    Err(_) => {
+                        failed = true;
+                        return;
+                    }
+                }
+            }
+            let compiled = compiled.as_ref().expect("compiled above");
+            if compiled.extend(batch, values).is_err() {
+                failed = true;
+                return;
+            }
+        }
+    };
+    // A read that fails (an unknown column, an empty file, a null endpoint
+    // under on_null="error") is left to the collected read, which raises its
+    // error as it always has.
+    let Ok(streamed) = crate::scan::scan_edges_stream(
+        source,
+        src,
+        dst,
+        columns,
+        drop,
+        built.is_none(),
+        &mut visit,
+    ) else {
+        return Ok(Streamed::Skipped);
+    };
+    if streamed.dropped > 0 {
+        inputs.warn_dropped(streamed.dropped)?;
+    }
+    let index = match (built, streamed.index) {
+        (Some(index), _) => index,
+        (None, Some((topo, ids))) => {
+            count_topology_build();
+            inputs.put_index(frame, GraphIndex::new(topo, ids))?
+        }
+        (None, None) => return Err(PlanError::Invalid("a streamed scan built no index".into())),
+    };
+    let n_edges = index.topo.n_edges();
+    if failed || weights.iter().any(|(_, values)| values.len() != n_edges) {
+        return Ok(Streamed::Read {
+            warned: streamed.dropped > 0,
+        });
+    }
+    for ((_, values), key) in weights.into_iter().zip(distinct) {
+        index
+            .weights
+            .insert(&format!("{scope}{key}"), Arc::new(values));
+    }
+    Ok(Streamed::Cached)
 }
 
 /// `columns` of edge rows, for a weight; an unknown one is an error.
