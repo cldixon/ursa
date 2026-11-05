@@ -354,22 +354,9 @@ impl<O: Write, E: Write> Shell<O, E> {
         }
     }
 
-    /// `.functions`: `SELECT * FROM ursa_functions()`, once the function
-    /// catalog provides it.
+    /// `.functions`: `SELECT * FROM ursa_functions()`.
     async fn functions(&mut self) {
-        let available = self
-            .ctx
-            .state()
-            .table_functions()
-            .contains_key("ursa_functions");
-        if available {
-            self.run_sql("SELECT * FROM ursa_functions();").await;
-        } else {
-            self.say(
-                ".functions lists the graph functions with ursa_functions(), which is \
-                 available after #236 merges.",
-            );
-        }
+        self.run_sql("SELECT * FROM ursa_functions();").await;
     }
 
     /// The graphs' names, from `SHOW GRAPHS`.
@@ -830,16 +817,7 @@ mod tests {
         let mut shell = shell();
         let (out, err) = feed(&mut shell, &[".functions"]).await;
         assert_eq!(err, "");
-        if shell
-            .ctx()
-            .state()
-            .table_functions()
-            .contains_key("ursa_functions")
-        {
-            assert!(!out.is_empty());
-        } else {
-            assert!(out.contains("available after #236 merges"), "{out}");
-        }
+        assert!(out.contains("pagerank"), "{out}");
     }
 
     #[tokio::test]
