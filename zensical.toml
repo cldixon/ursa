@@ -48,6 +48,14 @@ nav = [
     { "Limits" = "limits.md" },
     { "Changelog" = "changelog.md" },
   ] },
+  { "SQL" = [
+    { "Overview" = "sql/index.md" },
+    { "Getting started" = "sql/getting-started.md" },
+    { "The database file" = "sql/database.md" },
+    { "The shell" = "sql/shell.md" },
+    { "Statements" = "sql/statements.md" },
+    { "Function reference" = "sql/reference/functions.md" },
+  ] },
 ]
 
 [project.theme]
