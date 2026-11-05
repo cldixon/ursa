@@ -134,7 +134,11 @@ NODES: dict[str, dict[str, Any]] = {
         "missing": "Sforza",
         "path": ("Acciaiuoli", "Strozzi"),
     },
-    "lesmis": {"seeds": ["Valjean", "Marius"], "missing": "Javert2", "path": ("Napoleon", "Marius")},
+    "lesmis": {
+        "seeds": ["Valjean", "Marius"],
+        "missing": "Javert2",
+        "path": ("Napoleon", "Marius"),
+    },
 }
 
 # The subquery SQL gives for Python's seed NodeFrame on karate; ``{data}`` is
