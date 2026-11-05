@@ -5,8 +5,8 @@
 //! `'edges/*.parquet'`, and the same over `s3://`, `gs://`, `az://` and
 //! `https://`, with object stores registered the first time a URL is read.
 //!
-//! Graphs, their plan nodes and the `.ursa` database file arrive in later
-//! milestones (cldixon/ursa#232).
+//! Graphs are defined per session ([`graph`]). Their plan nodes and the
+//! `.ursa` database file arrive in later milestones (cldixon/ursa#232).
 
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 pub mod error;
 mod file_table;
+pub mod graph;
 pub mod paths;
 pub mod stores;
 
@@ -30,7 +31,8 @@ pub fn new_session() -> SessionContext {
 /// A session with Ursa's file tables over `config`. `information_schema` is
 /// turned on, so `SHOW TABLES` and `SHOW COLUMNS` work.
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
-    let ctx = SessionContext::new_with_config(config.with_information_schema(true));
+    let config = graph::with_registry(config.with_information_schema(true));
+    let ctx = SessionContext::new_with_config(config);
     // As `SessionContext::enable_url_table` does, with Ursa's factory in place
     // of DataFusion's.
     let factory = Arc::new(file_table::FileTableFactory::default());
