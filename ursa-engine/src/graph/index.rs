@@ -338,10 +338,10 @@ impl IndexCache {
         // A failed build leaves the cell empty, so the next query tries again.
         let (builds, loads) = (&self.builds, &self.loads);
         cell.get_or_try_init(|| async move {
-            if let Some((store, _, key)) = &stored {
-                let (store, key) = (Arc::clone(store), key.clone());
+            if let Some((store, limit, key)) = &stored {
+                let (store, key, limit) = (Arc::clone(store), key.clone(), *limit);
                 // Reading a file and checking it is blocking work.
-                let loaded = tokio::task::spawn_blocking(move || store.load(&key))
+                let loaded = tokio::task::spawn_blocking(move || store.load(&key, limit))
                     .await
                     .ok()
                     .flatten();
