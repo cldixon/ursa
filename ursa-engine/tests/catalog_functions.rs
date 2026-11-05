@@ -576,6 +576,7 @@ betweenness,algorithm
 closeness,algorithm
 label_propagation,algorithm
 louvain,algorithm
+neighbors_agg,aggregation
 density,statistic
 avg_path_length,statistic
 diameter,statistic
@@ -740,8 +741,8 @@ async fn layouts_are_hidden() {
     let per_node = "degree, pagerank, connected_components, triangle_count, \
                     clustering_coefficient, betweenness, closeness, label_propagation, louvain";
     let all = format!(
-        "{per_node}, density, avg_path_length, diameter, describe, hop, shortest_path, \
-         random_walk, algorithms"
+        "{per_node}, neighbors_agg, density, avg_path_length, diameter, describe, hop, \
+         shortest_path, random_walk, algorithms"
     );
     let unknown =
         |name: &str| format!("there is no graph function '{name}'. The graph functions are: {all}");

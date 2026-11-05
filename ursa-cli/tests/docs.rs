@@ -331,9 +331,10 @@ fn code(text: &str) -> String {
     format!("`{text}`")
 }
 
-const FAMILIES: [(&str, &str); 4] = [
+const FAMILIES: [(&str, &str); 5] = [
     ("algorithm", "Algorithms"),
     ("statistic", "Statistics"),
+    ("aggregation", "Neighbour aggregation"),
     ("traversal", "Traversals"),
     ("combinator", "Combining functions"),
 ];
@@ -352,12 +353,15 @@ fn reference(rows: &[serde_json::Value]) -> String {
          `SELECT * FROM ursa_functions()`, so it matches the engine you run.\n\n\
          An algorithm or a statistic takes the graph as its first argument, then named \
          parameters with `=>`. It returns one row per node: the node's `id` and its output \
-         columns. A traversal returns edges or walks. `algorithms` runs several per-node \
-         functions in one call.\n\n\
+         columns. `neighbors_agg` does too, from a value per node it reads. A traversal \
+         returns edges or walks. `algorithms` runs several per-node functions in one \
+         call.\n\n\
          A parameter's default is the SQL literal used when the parameter is left out. \
          `required` means the call must give it. A `string` parameter with choices takes one \
          of them, quoted: `direction => 'both'`. An `expression` parameter takes an \
-         expression over the edge table's columns: `weight => log10(1 + weight)`.\n\n",
+         expression over the edge table's columns: `weight => log10(1 + weight)`, or for \
+         `neighbors_agg`'s `attribute` over the node table's. A `query` parameter takes a \
+         subquery in parentheses.\n\n",
     );
     for (family, heading) in FAMILIES {
         let members: Vec<&serde_json::Value> = rows

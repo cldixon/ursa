@@ -94,12 +94,21 @@ impl ExtensionPlanner for GraphPlanner {
             return Ok(None);
         };
         let (source, destination) = node.endpoint_indices()?;
-        let weighted = match (logical_inputs.get(1), physical_inputs.get(1)) {
-            (Some(logical), Some(physical)) => {
+        let weighted = match (
+            &node.weighted,
+            logical_inputs.get(1),
+            physical_inputs.get(1),
+        ) {
+            (Some(_), Some(logical), Some(physical)) => {
                 Some(weighted_input(logical, physical, node.weights.len())?)
             }
             _ => None,
         };
+        // A neighbour aggregation's node values are the last input.
+        let values = node
+            .values
+            .as_ref()
+            .and_then(|_| physical_inputs.last().cloned());
         Ok(Some(Arc::new(GraphAlgorithmExec::new(
             Shape {
                 edges: Edges {
@@ -115,6 +124,7 @@ impl ExtensionPlanner for GraphPlanner {
             },
             Arc::clone(&physical_inputs[0]),
             weighted,
+            values,
         ))))
     }
 }
@@ -244,11 +254,18 @@ pub struct GraphAlgorithmExec {
     shape: Shape,
     input: Arc<dyn ExecutionPlan>,
     weighted: Option<WeightedInput>,
+    /// A neighbour aggregation's node values: node ids, then values.
+    values: Option<Arc<dyn ExecutionPlan>>,
     properties: Arc<PlanProperties>,
 }
 
 impl GraphAlgorithmExec {
-    fn new(shape: Shape, input: Arc<dyn ExecutionPlan>, weighted: Option<WeightedInput>) -> Self {
+    fn new(
+        shape: Shape,
+        input: Arc<dyn ExecutionPlan>,
+        weighted: Option<WeightedInput>,
+        values: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&shape.schema)),
             Partitioning::UnknownPartitioning(1),
@@ -259,6 +276,7 @@ impl GraphAlgorithmExec {
             shape,
             input,
             weighted,
+            values,
             properties,
         }
     }
@@ -286,6 +304,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         let mut children = vec![&self.input];
         children.extend(self.weighted.as_ref().map(|w| &w.plan));
+        children.extend(self.values.as_ref());
         children
     }
 
@@ -319,7 +338,16 @@ impl ExecutionPlan for GraphAlgorithmExec {
             plan: children.next().expect("checked above"),
             ..w
         });
-        Ok(Arc::new(Self::new(self.shape.clone(), input, weighted)))
+        let values = self
+            .values
+            .as_ref()
+            .map(|_| children.next().expect("checked above"));
+        Ok(Arc::new(Self::new(
+            self.shape.clone(),
+            input,
+            weighted,
+            values,
+        )))
     }
 
     fn execute(
@@ -335,6 +363,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let shape = self.shape.clone();
         let input = Arc::clone(&self.input);
         let weighted = self.weighted.clone();
+        let values_plan = self.values.clone();
         let schema = Arc::clone(&shape.schema);
         let run = async move {
             let (index, weights) = match weighted {
@@ -344,6 +373,13 @@ impl ExecutionPlan for GraphAlgorithmExec {
                     (index, Some(weights))
                 }
             };
+            let values = match values_plan {
+                Some(plan) => {
+                    let batches = drain(&plan, &[0, 1], &context).await?;
+                    Some(kernels::node_values(&index, &shape.edges.graph, batches)?)
+                }
+                None => None,
+            };
             // The kernels are CPU-bound and parallel (rayon): keep them off
             // the async workers.
             tokio::task::spawn_blocking(move || {
@@ -352,6 +388,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
                     &index,
                     &shape.outputs,
                     weights,
+                    values.as_deref(),
                     shape.per_node,
                     shape.schema,
                 )

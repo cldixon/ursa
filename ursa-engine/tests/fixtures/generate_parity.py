@@ -8,6 +8,10 @@ runs the same calls through SQL and compares column names, column types, ids
 and values exactly; floats are stored as the hex of their IEEE-754 bits (16
 digits for ``double``, 8 for ``float``), so the comparison is bit for bit.
 
+The neighbour aggregation (``neighbors_agg``, #262) has cases too: SQL passes
+the values as a query (``values => (SELECT id, value FROM ...)``), Python as a
+node frame's column.
+
 The traversals (``hop``, ``shortest_path``, ``random_walk``, #238) are cases
 too, with their rows in the Python library's order, and the file records the
 Python signatures of the traversals so the SQL engine's specs of them
@@ -241,6 +245,64 @@ def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]
     return cases
 
 
+# --- neighbour aggregation ----------------------------------------------------
+# ``neighbors_agg`` reads a value per node. SQL passes them as a query of
+# ``(id, value)`` rows (``values =>``); Python aggregates a column of a node
+# frame. Each case's values are a frame both sides can build: the nodes'
+# ``degree(direction='both')``, which covers every node of the graph, and on
+# karate the ``club`` column of the node file, a string column. The Python
+# frame keeps ``id`` and the aggregate, the two columns SQL returns.
+
+# (SQL values query, Python node frame from the edges, value column)
+DEGREE_VALUES = (
+    "(SELECT id, degree FROM degree({dataset}, direction => 'both'))",
+    lambda edges: ur.from_arrow(ur.degree(edges, direction="both").collect().to_arrow(), id="id"),
+    "degree",
+)
+CLUB_VALUES = (
+    "(SELECT id, club FROM '{data}/karate_nodes.csv')",
+    lambda edges: ur.datasets.load_karate(with_nodes=True)[1],
+    "club",
+)
+
+# (values, agg, direction)
+NEIGHBOR_CASES: list[tuple[Any, str, str]] = [
+    (DEGREE_VALUES, "mean", "out"),
+    (DEGREE_VALUES, "mean", "in"),
+    (DEGREE_VALUES, "mean", "both"),
+    (DEGREE_VALUES, "sum", "both"),
+    (DEGREE_VALUES, "min", "in"),
+    (DEGREE_VALUES, "max", "out"),
+    (DEGREE_VALUES, "count", "out"),
+    (DEGREE_VALUES, "n_unique", "both"),
+]
+KARATE_NEIGHBOR_CASES: list[tuple[Any, str, str]] = [
+    (CLUB_VALUES, "n_unique", "both"),
+    (CLUB_VALUES, "count", "in"),
+]
+
+
+def neighbor_cases(dataset: str, csv: str, edges: Any) -> list[dict]:
+    """The ``neighbors_agg`` cases of ``dataset``."""
+    cases = NEIGHBOR_CASES + (KARATE_NEIGHBOR_CASES if dataset == "karate" else [])
+    out = []
+    for (sql_values, frame, column), agg, direction in cases:
+        expr = getattr(ur.col(column), agg)()
+        table = (
+            frame(edges)
+            .with_columns(neighbors_agg=ur.neighbors(edges, direction=direction).agg(expr))
+            .collect()
+            .to_arrow()
+            .select(["id", "neighbors_agg"])
+        )
+        args = (
+            f"values => {sql_values.replace('{dataset}', dataset)}, "
+            f"agg => '{agg}', direction => '{direction}'"
+        )
+        out.append(result(dataset, csv, "neighbors_agg", args, table))
+    return out
+
+
 def signatures() -> dict[str, list[list[Any]]]:
     """Each traversal's parameters besides the edges, as ``[name, default]``,
     the node ids first as SQL orders them; a required parameter's default is
@@ -329,6 +391,7 @@ def main() -> None:
         for function, args, call in traversal_cases(dataset):
             table = call(edges).collect().to_arrow()
             cases.append(result(dataset, csv, function, args, table))
+        cases.extend(neighbor_cases(dataset, csv, edges))
     header = {
         "about": "Python library results for ursa-engine/tests/parity.rs; written by "
         "generate_parity.py (see its docstring). Floats are the hex of their IEEE-754 bits.",

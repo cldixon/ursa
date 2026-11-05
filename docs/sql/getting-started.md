@@ -195,6 +195,54 @@ Each algorithm also works on its own, as in the previous section, and those resu
 
 All three algorithms run over one index of the graph. Ursa builds it the first time a query needs it and stores it in `club.ursa`. The next query, in this session or a later one, uses the stored index. If `karate_edges.csv` changes, Ursa notices and builds a new one.
 
+## Aggregate over neighbours
+
+`neighbors_agg` aggregates a value of each node over its neighbours. It returns one row per node. Take the karate members again. Some of them have friends in both clubs. This query counts them, by club:
+
+```sql
+SELECT club, count(*) AS members
+FROM karate.nodes
+JOIN neighbors_agg(karate, attribute => club, agg => 'n_unique', direction => 'both') USING (id)
+WHERE neighbors_agg = 2
+GROUP BY club
+ORDER BY club;
+```
+
+```text
++---------+---------+
+| club    | members |
++---------+---------+
+| Mr. Hi  | 6       |
+| Officer | 7       |
++---------+---------+
+```
+
+There are two ways to give the value of each node:
+
+- `attribute =>` takes an expression over the graph's node table.
+- `values =>` takes any query of two columns, node ids then values. The values can even come from another algorithm, like each member's friends' mean degree:
+
+```sql
+SELECT id, round(neighbors_agg, 2) AS friends_degree
+FROM neighbors_agg(karate,
+                   values => (SELECT id, degree FROM degree(karate, direction => 'both')),
+                   agg => 'mean', direction => 'both')
+ORDER BY friends_degree DESC, id
+LIMIT 3;
+```
+
+```text
++----+----------------+
+| id | friends_degree |
++----+----------------+
+| 11 | 16.0           |
+| 14 | 14.5           |
+| 15 | 14.5           |
++----+----------------+
+```
+
+The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. Strings take only `count` and `n_unique`. A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
+
 ## Direction
 
 Every edge is stored from `src` to `dst`. Algorithms that walk edges take a `direction`:
