@@ -31,6 +31,18 @@ tokio = { version = "1", features = ["rt", "sync"] }
 serde_json = "1"
 # The checksum of a stored graph index (already in the tree via flate2).
 crc32fast = "1.5"
+# AWS profile files for S3 credentials (#264), behind the `aws-profile`
+# feature. This is the AWS SDK's own loader, so static keys, SSO, assumed roles
+# and credential_process resolve as they do in the AWS CLI. Default features
+# are off, which drops its aws-lc TLS stack: SSO and STS calls go through
+# rustls with ring, which the tree already has.
+aws-config = { version = "1.8", default-features = false, features = ["rt-tokio", "sso", "credentials-process"], optional = true }
+aws-credential-types = { version = "1.2", optional = true }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-ring"], optional = true }
+
+[features]
+# S3 credentials from ~/.aws/config and ~/.aws/credentials (AWS_PROFILE).
+aws-profile = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-smithy-http-client"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
