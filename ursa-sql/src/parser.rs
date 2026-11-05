@@ -299,7 +299,7 @@ fn source_text(sql: &str, start: Location, end: Location) -> Option<String> {
 
 /// The byte offset of a tokenizer location (1-based line and column, columns
 /// counted in characters).
-fn byte_offset(sql: &str, at: Location) -> Option<usize> {
+pub(crate) fn byte_offset(sql: &str, at: Location) -> Option<usize> {
     if at.line == 0 || at.column == 0 {
         return None;
     }

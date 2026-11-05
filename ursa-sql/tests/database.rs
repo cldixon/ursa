@@ -9,8 +9,10 @@ use datafusion::prelude::SessionContext;
 use ursa_engine::database::{Database, OpenOptions};
 use ursa_sql::{execute_with_text, open_session, parse_sql_with_text_for};
 
-/// A temporary directory holding copies of the karate CSVs, so relative paths
-/// are relative to it and not to the process's working directory.
+/// A temporary directory holding copies of the karate CSVs. Statements name
+/// them by absolute path ([`here`]): a relative path would resolve against the
+/// test process's current directory, which tests cannot change safely. The
+/// CLI tests cover running from other directories.
 fn karate_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../python/ursa/datasets/data");
@@ -96,6 +98,17 @@ fn catalog(path: &Path) -> Vec<String> {
         .statements()
 }
 
+/// `sql` with each quoted `karate_…` file name made a path into `dir`.
+fn here(dir: &Path, sql: &str) -> String {
+    sql.replace("'karate_", &format!("'{}/karate_", dir.display()))
+}
+
+/// The karate views and graph, over the files in `dir`.
+fn define_karate(dir: &Path) -> String {
+    here(dir, &format!("{MEMBERS}; {TIES}; {KARATE}"))
+}
+
+/// The karate statements as stored: the paths relative to the database.
 const MEMBERS: &str = "CREATE VIEW members AS SELECT * FROM 'karate_nodes.csv'";
 const TIES: &str = "CREATE VIEW ties AS SELECT * FROM 'karate_edges.csv'";
 const KARATE: &str = "CREATE PROPERTY GRAPH karate VERTEX TABLES (members KEY (id)) EDGE TABLES \
@@ -125,7 +138,7 @@ async fn views_and_a_graph_round_trip() {
     let path = dir.path().join("club.ursa");
     let before = {
         let ctx = open(&path).await;
-        ok(&ctx, &format!("{MEMBERS}; {TIES}; {KARATE}")).await;
+        ok(&ctx, &define_karate(dir.path())).await;
         snapshot(&ctx).await
     };
     assert_eq!(catalog(&path), [MEMBERS, TIES, KARATE]);
@@ -145,12 +158,13 @@ async fn an_external_table_round_trips_as_written() {
     let dir = karate_dir();
     let path = dir.path().join("club.ursa");
     // DataFusion's Display for CREATE EXTERNAL TABLE drops the columns and
-    // options, so the statement is stored as written.
+    // options, so the statement is stored as written, its path replaced by
+    // the stored one.
     let create = "CREATE EXTERNAL TABLE edges (src BIGINT, dst BIGINT)\n  STORED AS CSV \
                   LOCATION 'karate_edges.csv' OPTIONS ('format.has_header' 'true')";
     let before = {
         let ctx = open(&path).await;
-        ok(&ctx, create).await;
+        ok(&ctx, &here(dir.path(), create)).await;
         ok(&ctx, "SELECT count(*) AS n, sum(src) AS s FROM edges").await
     };
     assert_eq!(before, ["n,s", "78,864"]);
@@ -177,11 +191,11 @@ async fn a_graph_over_bare_file_paths_round_trips() {
     let query = "SELECT club, count(*) AS n FROM k.nodes GROUP BY club ORDER BY club";
     let before = {
         let ctx = open(&path).await;
-        ok(&ctx, create).await;
+        ok(&ctx, &here(dir.path(), create)).await;
         ok(&ctx, query).await
     };
     assert_eq!(before, ["club,n", "Mr. Hi,17", "Officer,17"]);
-    assert_eq!(catalog(&path).len(), 1);
+    assert_eq!(catalog(&path), [create]);
     let ctx = open(&path).await;
     assert_eq!(ok(&ctx, query).await, before);
     assert_eq!(
@@ -195,11 +209,11 @@ async fn replace_is_in_place_and_drop_removes() {
     let dir = karate_dir();
     let path = dir.path().join("club.ursa");
     let ctx = open(&path).await;
-    ok(&ctx, &format!("{MEMBERS}; {TIES}; {KARATE}")).await;
+    ok(&ctx, &define_karate(dir.path())).await;
 
     let strong =
         "CREATE OR REPLACE VIEW members AS SELECT * FROM 'karate_nodes.csv' WHERE id < 100";
-    ok(&ctx, strong).await;
+    ok(&ctx, &here(dir.path(), strong)).await;
     assert_eq!(catalog(&path), [strong, TIES, KARATE]);
 
     // IF NOT EXISTS over an existing object keeps its statement.
@@ -241,7 +255,7 @@ async fn a_failed_statement_leaves_the_catalog_alone() {
     let dir = karate_dir();
     let path = dir.path().join("club.ursa");
     let ctx = open(&path).await;
-    ok(&ctx, &format!("{MEMBERS}; {TIES}; {KARATE}")).await;
+    ok(&ctx, &define_karate(dir.path())).await;
     let before = std::fs::read(&path).unwrap();
     err(&ctx, "CREATE VIEW nope AS SELECT * FROM 'missing.csv'").await;
     err(&ctx, "CREATE VIEW members AS SELECT 1").await;
@@ -257,7 +271,7 @@ async fn the_database_and_its_files_move_together() {
     std::fs::rename(karate_dir().keep(), &first).unwrap();
     {
         let ctx = open(&first.join("club.ursa")).await;
-        ok(&ctx, &format!("{MEMBERS}; {TIES}; {KARATE}")).await;
+        ok(&ctx, &define_karate(&first)).await;
     }
     let moved = parent.path().join("moved");
     std::fs::rename(&first, &moved).unwrap();
@@ -266,13 +280,7 @@ async fn the_database_and_its_files_move_together() {
         ok(&ctx, "SELECT count(*) AS n FROM karate.nodes").await,
         ["n", "34"]
     );
-    // A query's relative path is relative to the database too.
-    assert_eq!(
-        ok(&ctx, "SELECT count(*) AS n FROM 'karate_edges.csv'").await,
-        ["n", "78"]
-    );
-    ok(&ctx, "COPY (SELECT 1 AS x) TO 'out.csv'").await;
-    assert!(moved.join("out.csv").exists());
+    assert_eq!(catalog(&moved.join("club.ursa")), [MEMBERS, TIES, KARATE]);
 }
 
 #[tokio::test]
@@ -312,7 +320,7 @@ async fn read_only_sessions_refuse_ddl_and_take_no_lock() {
     let dir = karate_dir();
     let path = dir.path().join("club.ursa");
     let writer = open(&path).await;
-    ok(&writer, &format!("{MEMBERS}; {TIES}; {KARATE}")).await;
+    ok(&writer, &define_karate(dir.path())).await;
 
     // The writer still has it open.
     let reader = open_session(&path, &OpenOptions::read_only())
@@ -366,7 +374,7 @@ async fn attach_opens_a_database_in_an_empty_session() {
     let path = dir.path().join("club.ursa");
     {
         let ctx = open(&path).await;
-        ok(&ctx, &format!("{MEMBERS}; {TIES}; {KARATE}")).await;
+        ok(&ctx, &define_karate(dir.path())).await;
     }
     let attach = format!("ATTACH '{}'", path.display());
 
@@ -413,12 +421,17 @@ async fn a_catalog_that_does_not_replay_is_a_clear_error() {
     )
     .unwrap();
     let e = open_err(&path, &quick()).await;
+    // Replay looks for the file in the database's directory, and says where.
     assert_eq!(
         e,
         format!(
-            "cannot open {}: statement 1 of its catalog failed: no file found at 'gone.csv'\n  \
+            "cannot open {}: statement 1 of its catalog failed: no file found at '{}'\n  \
              the statement: CREATE VIEW v AS SELECT * FROM 'gone.csv'",
-            path.display()
+            path.display(),
+            std::path::absolute(dir.path())
+                .unwrap()
+                .join("gone.csv")
+                .display()
         )
     );
 }
@@ -445,4 +458,126 @@ fn serde_json_text(statements: &[&str]) -> String {
         "{{\"format\": \"ursa\", \"version\": 1, \"statements\": [{}]}}",
         quoted.join(", ")
     )
+}
+
+#[tokio::test]
+async fn paths_in_a_view_are_stored_relative_wherever_they_appear() {
+    let dir = karate_dir();
+    let path = dir.path().join("club.ursa");
+    let ctx = open(&path).await;
+    // A CTE, a join, a subquery, and single and double quotes.
+    let view = |d: &str| {
+        format!(
+            "CREATE VIEW pairs AS WITH m AS (SELECT * FROM \"{d}karate_nodes.csv\") \
+             SELECT count(*) AS n FROM m JOIN (SELECT * FROM '{d}karate_edges.csv') AS e \
+             ON m.id = e.src WHERE m.id IN (SELECT id FROM '{d}karate_nodes.csv')"
+        )
+    };
+    ok(&ctx, &view(&format!("{}/", dir.path().display()))).await;
+    // A quoted name that is a view stays the view.
+    ok(&ctx, "CREATE VIEW \"my.view\" AS SELECT 1 AS x").await;
+    ok(&ctx, "CREATE VIEW mine AS SELECT * FROM \"my.view\"").await;
+    assert_eq!(
+        catalog(&path),
+        [
+            view(""),
+            "CREATE VIEW \"my.view\" AS SELECT 1 AS x".into(),
+            "CREATE VIEW mine AS SELECT * FROM \"my.view\"".into(),
+        ]
+    );
+    let expected = ok(&ctx, "SELECT n FROM pairs").await;
+    assert_eq!(expected, ["n", "78"]);
+    drop(ctx);
+    let ctx = open(&path).await;
+    assert_eq!(ok(&ctx, "SELECT n FROM pairs").await, expected);
+    assert_eq!(ok(&ctx, "SELECT x FROM mine").await, ["x", "1"]);
+}
+
+#[tokio::test]
+async fn a_path_outside_the_database_directory_is_stored_absolute() {
+    let data = karate_dir();
+    let db_dir = tempfile::tempdir().unwrap();
+    let path = db_dir.path().join("club.ursa");
+    let ctx = open(&path).await;
+    ok(&ctx, &define_karate(data.path())).await;
+    let absolute = std::path::absolute(data.path()).unwrap();
+    assert_eq!(
+        catalog(&path),
+        [
+            here(&absolute, MEMBERS),
+            here(&absolute, TIES),
+            KARATE.into()
+        ]
+    );
+    drop(ctx);
+    let ctx = open(&path).await;
+    assert_eq!(
+        ok(&ctx, "SELECT count(*) AS n FROM karate.edges").await,
+        ["n", "78"]
+    );
+}
+
+#[tokio::test]
+async fn an_m3a_catalog_replays_unchanged() {
+    // M3a stored paths as written and resolved them against the database's
+    // directory: that is already the stored form.
+    let dir = karate_dir();
+    let path = dir.path().join("club.ursa");
+    let external = "CREATE EXTERNAL TABLE edges (src BIGINT, dst BIGINT)\n  STORED AS CSV \
+                    LOCATION 'karate_edges.csv' OPTIONS ('format.has_header' 'true')";
+    let bare = "CREATE PROPERTY GRAPH k EDGE TABLES ('karate_edges.csv' SOURCE KEY (src) \
+                DESTINATION KEY (dst))";
+    let statements = [MEMBERS, TIES, KARATE, external, bare];
+    let file = ursa_engine::database::CatalogFile {
+        statements: statements.iter().map(|s| s.to_string()).collect(),
+    };
+    std::fs::write(&path, file.to_text()).unwrap();
+    let ctx = open(&path).await;
+    assert_eq!(
+        ok(&ctx, "SELECT count(*) AS n FROM karate.edges").await,
+        ["n", "78"]
+    );
+    assert_eq!(
+        ok(&ctx, "SELECT count(*) AS n, sum(src) AS s FROM edges").await,
+        ["n,s", "78,864"]
+    );
+    assert_eq!(
+        ok(&ctx, "SELECT sum(degree) AS s FROM degree(k)").await,
+        ["s", "78"]
+    );
+    // Saving the catalog again keeps the old statements as they were.
+    ok(&ctx, "CREATE VIEW one AS SELECT 1 AS x").await;
+    let mut expected: Vec<String> = statements.iter().map(|s| s.to_string()).collect();
+    expected.push("CREATE VIEW one AS SELECT 1 AS x".into());
+    assert_eq!(catalog(&path), expected);
+}
+
+#[tokio::test]
+async fn an_external_table_whose_text_cannot_be_rewritten_exactly_is_refused() {
+    let dir = karate_dir();
+    let path = dir.path().join("club.ursa");
+    let ctx = open(&path).await;
+    // The path appears twice, once as an option's value: replacing both
+    // would change the option, so the statement is refused, not mis-stored.
+    let file = dir.path().join("karate_edges.csv");
+    let create = format!(
+        "CREATE EXTERNAL TABLE edges (src BIGINT, dst BIGINT) STORED AS CSV LOCATION '{f}' \
+         OPTIONS ('format.has_header' 'true', 'format.comment' '{f}')",
+        f = file.display()
+    );
+    let e = err(&ctx, &create).await;
+    assert_eq!(
+        e,
+        format!(
+            "cannot store this CREATE EXTERNAL TABLE in {}: its path '{}' is stored as \
+             'karate_edges.csv' (relative to the database's directory, {}), and the statement \
+             as written could not be rewritten exactly; write each path as stored, from the \
+             database's directory",
+            path.display(),
+            file.display(),
+            std::path::absolute(dir.path()).unwrap().display()
+        )
+    );
+    assert!(catalog(&path).is_empty());
+    err(&ctx, "SELECT * FROM edges").await;
 }

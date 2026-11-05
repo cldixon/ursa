@@ -78,31 +78,182 @@ const EXPECTED: &str = "\
 +----+--------+
 ";
 
-/// One process defines the graph; a second, run from another directory,
+/// `DEFINE` with each `karate_…` file named by `prefix` (`../db/data/`).
+fn define_from(prefix: &str) -> String {
+    DEFINE.replace("'karate_", &format!("'{prefix}karate_"))
+}
+
+/// The statements of the catalog file at `path`.
+fn catalog(path: &Path) -> Vec<String> {
+    ursa_engine::database::Database::open(path, &ursa_engine::database::OpenOptions::read_only())
+        .unwrap()
+        .statements()
+}
+
+/// A layout with three directories: `db/` holds the database, `work/` is
+/// where the first process runs, and the karate files are in `db/data/`
+/// (inside the database's directory) or `data/` (outside it).
+fn three_dirs(data_inside: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let parent = tempfile::tempdir().unwrap();
+    let db = parent.path().join("db");
+    let work = parent.path().join("work");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let data = if data_inside {
+        db.join("data")
+    } else {
+        parent.path().join("data")
+    };
+    std::fs::rename(karate_dir().keep(), &data).unwrap();
+    (parent, db, work)
+}
+
+/// One process, run from a directory other than the database's, defines the
+/// graph with relative paths into a third directory: they resolve against
+/// its current directory. A second process, run from yet another directory,
 /// queries it without defining anything.
 #[test]
 fn a_second_process_sees_what_the_first_defined() {
-    let dir = karate_dir();
-    let db = dir.path().join("club.ursa");
+    let (parent, db_dir, work) = three_dirs(true);
+    let define = define_from("../db/data/");
+    assert_eq!(ok(ursa_in(&work, &["../db/club.ursa", "-c", &define])), "");
+    // Stored relative to the database's directory.
+    let stored = catalog(&db_dir.join("club.ursa"));
+    assert_eq!(
+        stored[..2],
+        [
+            "CREATE VIEW members AS SELECT * FROM 'data/karate_nodes.csv'",
+            "CREATE VIEW ties AS SELECT * FROM 'data/karate_edges.csv'",
+        ]
+    );
+    let db = db_dir.join("club.ursa");
     let db = db.to_str().unwrap();
-    assert_eq!(ok(ursa_in(&elsewhere(), &[db, "-c", DEFINE])), "");
     assert_eq!(ok(ursa_in(&elsewhere(), &[db, "-c", QUERY])), EXPECTED);
-    assert!(dir.path().join("club.ursa.d/lock").is_file());
+    assert_eq!(ok(ursa_in(parent.path(), &[db, "-c", QUERY])), EXPECTED);
+    assert!(db_dir.join("club.ursa.d/lock").is_file());
 }
 
+/// A path outside the database's directory is stored absolute, and found
+/// from anywhere.
+#[test]
+fn a_path_outside_the_database_directory_is_stored_absolute() {
+    let (parent, db_dir, work) = three_dirs(false);
+    let define = define_from("../data/");
+    ok(ursa_in(&work, &["../db/club.ursa", "-c", &define]));
+    let data = std::fs::canonicalize(parent.path().join("data")).unwrap();
+    let stored = catalog(&db_dir.join("club.ursa"));
+    assert_eq!(
+        stored[0],
+        format!(
+            "CREATE VIEW members AS SELECT * FROM '{}'",
+            data.join("karate_nodes.csv").display()
+        )
+    );
+    let db = db_dir.join("club.ursa");
+    assert_eq!(
+        ok(ursa_in(&elsewhere(), &[db.to_str().unwrap(), "-c", QUERY])),
+        EXPECTED
+    );
+}
+
+/// A database moved with its data keeps working.
 #[test]
 fn a_database_moves_with_its_files() {
-    let parent = tempfile::tempdir().unwrap();
-    let first = parent.path().join("first");
-    std::fs::rename(karate_dir().keep(), &first).unwrap();
-    ok(ursa_in(&first, &["club.ursa", "-c", DEFINE]));
+    let (parent, db_dir, work) = three_dirs(true);
+    ok(ursa_in(
+        &work,
+        &["../db/club.ursa", "-c", &define_from("../db/data/")],
+    ));
     let moved = parent.path().join("moved");
-    std::fs::rename(&first, &moved).unwrap();
+    std::fs::rename(&db_dir, &moved).unwrap();
     let db = moved.join("club.ursa");
     assert_eq!(
         ok(ursa_in(&elsewhere(), &[db.to_str().unwrap(), "-c", QUERY])),
         EXPECTED
     );
+    assert_eq!(ok(ursa_in(&moved, &["club.ursa", "-c", QUERY])), EXPECTED);
+}
+
+/// In a session with a database, a query's relative path and a `COPY`
+/// target resolve against the current directory, not the database's.
+#[test]
+fn queries_and_copy_resolve_against_the_current_directory() {
+    let (parent, db_dir, work) = three_dirs(true);
+    let db = db_dir.join("club.ursa");
+    let db = db.to_str().unwrap();
+    let out = ok(ursa_in(
+        &work,
+        &[
+            db,
+            "-f",
+            "csv",
+            "-c",
+            "SELECT count(*) AS n FROM '../db/data/karate_edges.csv'; \
+             COPY (SELECT 1 AS x) TO 'out.csv'",
+        ],
+    ));
+    assert_eq!(out, "n\n78\ncount\n1\n");
+    assert!(work.join("out.csv").is_file());
+    assert!(!db_dir.join("out.csv").exists());
+    // A path relative to the database's directory is not found from
+    // elsewhere.
+    let e = err(ursa_in(
+        parent.path(),
+        &[db, "-c", "SELECT count(*) FROM 'data/karate_edges.csv'"],
+    ));
+    assert!(
+        e.contains("no file found at 'data/karate_edges.csv'"),
+        "{e}"
+    );
+    // An external table's LOCATION too; it is stored relative to the
+    // database, as written otherwise (its columns and options).
+    ok(ursa_in(
+        &work,
+        &[
+            db,
+            "-c",
+            "CREATE EXTERNAL TABLE edges (src BIGINT, dst BIGINT) STORED AS CSV \
+             LOCATION '../db/data/karate_edges.csv' OPTIONS ('format.has_header' 'true')",
+        ],
+    ));
+    assert_eq!(
+        catalog(&db_dir.join("club.ursa")),
+        [
+            "CREATE EXTERNAL TABLE edges (src BIGINT, dst BIGINT) STORED AS CSV \
+          LOCATION 'data/karate_edges.csv' OPTIONS ('format.has_header' 'true')"
+        ]
+    );
+    let out = ok(ursa_in(
+        &elsewhere(),
+        &[db, "-f", "csv", "-c", "SELECT count(*) AS n FROM edges"],
+    ));
+    assert_eq!(out, "n\n78\n");
+}
+
+/// A graph over bare file paths, defined from another directory.
+#[test]
+fn a_graph_over_file_paths_defined_from_another_directory() {
+    let (_parent, db_dir, work) = three_dirs(true);
+    let create = "CREATE PROPERTY GRAPH k VERTEX TABLES ('../db/data/karate_nodes.csv' KEY (id)) \
+                  EDGE TABLES ('../db/data/karate_edges.csv' SOURCE KEY (src) \
+                  REFERENCES '../db/data/karate_nodes.csv' (id) DESTINATION KEY (dst))";
+    ok(ursa_in(&work, &["../db/club.ursa", "-c", create]));
+    assert_eq!(
+        catalog(&db_dir.join("club.ursa")),
+        [create.replace("../db/data/", "data/")]
+    );
+    let db = db_dir.join("club.ursa");
+    let out = ok(ursa_in(
+        &elsewhere(),
+        &[
+            db.to_str().unwrap(),
+            "-f",
+            "csv",
+            "-c",
+            "SELECT sum(degree) AS s FROM degree(k)",
+        ],
+    ));
+    assert_eq!(out, "s\n78\n");
 }
 
 #[test]

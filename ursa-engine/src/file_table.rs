@@ -19,7 +19,6 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use parking_lot::RwLock;
 
-use crate::database::resolve_location;
 use crate::error::user_message;
 use crate::paths::{looks_like_location, table_url};
 use crate::stores::ensure_object_store;
@@ -55,14 +54,15 @@ impl UrlTableFactory for FileTableFactory {
 
 /// Open `location` (a path, glob, directory or URL) as a listing table. The
 /// format and compression come from the file extension; Hive-style partition
-/// directories (`year=2024/`) become columns. In a session with a database, a
-/// relative path is relative to the database's directory
-/// ([`crate::database::resolve_location`]).
+/// directories (`year=2024/`) become columns. A relative path is relative to
+/// the current directory, in a session with a database too: a stored
+/// definition's paths are made relative to the database's directory when it is
+/// stored, and resolved against it on replay (see [`crate::database`]).
 pub async fn open_file_table(
     state: &SessionState,
     location: &str,
 ) -> Result<Arc<dyn TableProvider>> {
-    let url = table_url(&resolve_location(state, location))?;
+    let url = table_url(location)?;
     ensure_object_store(state.runtime_env(), url.get_url()).await?;
     let config = ListingTableConfig::new(url)
         .infer_options(state)

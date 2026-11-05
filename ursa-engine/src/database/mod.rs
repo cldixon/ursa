@@ -20,14 +20,19 @@
 //! [`database_of_config`]), so any code holding the session state or a task
 //! context (the graph index cache, which stores indexes in it) can find it.
 //!
-//! **Relative paths.** In a session with a database, a relative file path in
-//! SQL (in `FROM`, a graph's edge or vertex table, an external table's
-//! `LOCATION`, a `COPY … TO` target) is resolved against the directory that
-//! holds the `.ursa` file ([`resolve_location`]), so a database and its data
-//! files can move together. The catalog keeps the path as written.
+//! **Relative paths** follow DuckDB. A relative file path in SQL (in `FROM`,
+//! a graph's edge or vertex table, an external table's `LOCATION`, a
+//! `COPY … TO` target) resolves against the current directory when the
+//! statement runs, with or without a database. When a definition is stored in
+//! the catalog, each of its local file paths is rewritten relative to the
+//! database's directory ([`Database::stored_location`]), or made absolute if
+//! it is outside that directory; replaying the catalog resolves the stored
+//! paths against the database's directory ([`Database::replayed_location`]).
+//! So a later process finds the same files from any directory, and a database
+//! and its data files can move together. URLs are never rewritten.
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -82,8 +87,8 @@ pub struct Database {
     name: String,
     /// The catalog file, absolute.
     path: PathBuf,
-    /// The directory holding the catalog file, absolute: relative paths in
-    /// SQL resolve against it.
+    /// The directory holding the catalog file, absolute: stored paths are
+    /// relative to it.
     dir: PathBuf,
     /// `club.ursa.d`, absolute.
     sidecar: PathBuf,
@@ -186,7 +191,8 @@ impl Database {
         &self.path
     }
 
-    /// The directory holding the catalog file: relative paths resolve here.
+    /// The directory holding the catalog file: stored relative paths are
+    /// relative to it.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -251,14 +257,42 @@ impl Database {
         Ok(())
     }
 
-    /// `location` resolved against the database's directory, if it is a
-    /// relative local path; anything else (a URL, an absolute path, `~/…`) as
-    /// given.
-    pub fn resolve(&self, location: &str) -> String {
-        if !is_relative_path(location) {
-            return location.to_string();
+    /// How the catalog stores `location`, written in a statement run from
+    /// `cwd`: a local path inside the database's directory becomes relative to
+    /// it, any other local path becomes absolute. `None` when the location is
+    /// stored as written: a URL, a `~/…` path, or a path already in its
+    /// stored form.
+    pub fn stored_location(&self, location: &str, cwd: &Path) -> Option<String> {
+        if !is_local_path(location) {
+            return None;
         }
-        self.dir.join(location).to_string_lossy().into_owned()
+        let absolute = normalize(&cwd.join(location));
+        let canonical_dir = std::fs::canonicalize(&self.dir).ok();
+        let inside = [Some(&self.dir), canonical_dir.as_ref()]
+            .into_iter()
+            .flatten()
+            .find_map(|dir| absolute.strip_prefix(dir).ok());
+        let mut stored = match inside {
+            Some(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+            Some(relative) => relative.to_string_lossy().into_owned(),
+            None => absolute.to_string_lossy().into_owned(),
+        };
+        keep_trailing_separator(location, &mut stored);
+        (stored != location).then_some(stored)
+    }
+
+    /// `location` from a stored statement as replay runs it: a relative local
+    /// path resolved against the database's directory; `None` for anything
+    /// else (a URL, an absolute path, `~/…`), which runs as stored.
+    pub fn replayed_location(&self, location: &str) -> Option<String> {
+        if !is_relative_path(location) {
+            return None;
+        }
+        let mut resolved = normalize(&self.dir.join(location))
+            .to_string_lossy()
+            .into_owned();
+        keep_trailing_separator(location, &mut resolved);
+        Some(resolved)
     }
 }
 
@@ -269,19 +303,53 @@ impl Drop for Database {
     }
 }
 
-/// Whether `location` is a relative local path (not a URL, not absolute, not
-/// starting with `~`).
-pub fn is_relative_path(location: &str) -> bool {
+/// Whether `location` is a local path (not a URL, not starting with `~`).
+pub fn is_local_path(location: &str) -> bool {
     if location.is_empty() || location.starts_with('~') {
         return false;
     }
-    if let Ok(url) = url::Url::parse(location) {
+    match url::Url::parse(location) {
         // A one-letter scheme is a Windows drive letter.
-        if url.scheme().len() > 1 {
-            return false;
+        Ok(url) => url.scheme().len() == 1,
+        Err(_) => true,
+    }
+}
+
+/// Whether `location` is a relative local path (not a URL, not absolute, not
+/// starting with `~`).
+pub fn is_relative_path(location: &str) -> bool {
+    is_local_path(location) && Path::new(location).is_relative()
+}
+
+/// `path` with `.` and `..` components removed lexically, without touching
+/// the filesystem (the path may be a glob, or not exist yet).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `..` at the root stays at the root.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other),
         }
     }
-    Path::new(location).is_relative()
+    out
+}
+
+/// A directory written with a trailing separator (`data/`) keeps it.
+fn keep_trailing_separator(original: &str, rewritten: &mut String) {
+    let separator = std::path::MAIN_SEPARATOR;
+    if (original.ends_with('/') || original.ends_with(separator))
+        && !rewritten.ends_with(['/', separator])
+    {
+        rewritten.push(separator);
+    }
 }
 
 /// Take the exclusive lock on `lock`, retrying until `timeout` has passed.
@@ -360,16 +428,6 @@ pub fn database_of_config(config: &SessionConfig) -> Option<Arc<Database>> {
 pub fn flush(state: &SessionState) {
     if let Some(db) = database(state) {
         db.flush();
-    }
-}
-
-/// `location` as the session reads it: resolved against the database's
-/// directory when the session has a database and `location` is a relative
-/// path, otherwise unchanged.
-pub fn resolve_location(state: &SessionState, location: &str) -> String {
-    match database(state) {
-        Some(db) => db.resolve(location),
-        None => location.to_string(),
     }
 }
 

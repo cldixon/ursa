@@ -110,22 +110,68 @@ fn newer_and_corrupt_files_are_refused() {
 }
 
 #[test]
-fn relative_paths_resolve_against_the_database_directory() {
+fn stored_paths_are_relative_to_the_database_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("club.ursa"), &quick()).unwrap();
+    let base = std::path::absolute(dir.path()).unwrap();
+    let elsewhere = base.join("work");
+    let stored = |location: &str, cwd: &Path| db.stored_location(location, cwd);
+
+    // Run from the database's directory, a relative path is already stored.
+    assert_eq!(stored("data/edges.csv", &base), None);
+    assert_eq!(stored("./data/edges.csv", &base).unwrap(), "data/edges.csv");
+    // Run from elsewhere, it is resolved there first.
+    assert_eq!(stored("edges.csv", &elsewhere).unwrap(), "work/edges.csv");
+    assert_eq!(stored("../data/*.csv", &elsewhere).unwrap(), "data/*.csv");
+    assert_eq!(stored("../data/", &elsewhere).unwrap(), "data/");
+    assert_eq!(stored("..", &elsewhere).unwrap(), ".");
+    // An absolute path inside the directory is stored relative.
+    let inside = base.join("data/edges.csv");
+    assert_eq!(
+        stored(inside.to_str().unwrap(), &elsewhere).unwrap(),
+        "data/edges.csv"
+    );
+    // A path outside it is stored absolute.
+    let outside = base.parent().unwrap().join("other/edges.csv");
+    assert_eq!(
+        stored("../../other/edges.csv", &elsewhere).unwrap(),
+        outside.to_string_lossy()
+    );
+    assert_eq!(stored(outside.to_str().unwrap(), &elsewhere), None);
+    for unchanged in [
+        "s3://bucket/edges.parquet",
+        "https://example.com/edges.csv",
+        "file:///tmp/x.csv",
+        "~/edges.csv",
+    ] {
+        assert_eq!(stored(unchanged, &elsewhere), None, "{unchanged}");
+    }
+}
+
+#[test]
+fn replay_resolves_stored_paths_against_the_database_directory() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("club.ursa"), &quick()).unwrap();
     let base = std::path::absolute(dir.path()).unwrap();
     assert_eq!(
-        db.resolve("data/edges.csv"),
+        db.replayed_location("data/edges.csv").unwrap(),
         base.join("data/edges.csv").to_string_lossy()
     );
-    assert_eq!(db.resolve("*.csv"), base.join("*.csv").to_string_lossy());
+    assert_eq!(
+        db.replayed_location("*.csv").unwrap(),
+        base.join("*.csv").to_string_lossy()
+    );
+    assert_eq!(
+        db.replayed_location("data/").unwrap(),
+        format!("{}/", base.join("data").display())
+    );
     for unchanged in [
         "/abs/edges.csv",
         "s3://bucket/edges.parquet",
         "file:///tmp/x.csv",
         "~/edges.csv",
     ] {
-        assert_eq!(db.resolve(unchanged), unchanged);
+        assert_eq!(db.replayed_location(unchanged), None, "{unchanged}");
     }
 }
 
@@ -134,7 +180,6 @@ fn a_session_reaches_its_database_through_the_config() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = crate::new_session();
     assert!(database(&ctx.state()).is_none());
-    assert_eq!(resolve_location(&ctx.state(), "x.csv"), "x.csv");
     let db = Arc::new(Database::open(dir.path().join("club.ursa"), &quick()).unwrap());
     slot(&ctx.state()).set(Arc::clone(&db)).unwrap();
     let state = ctx.state();
