@@ -1,0 +1,15 @@
+[package]
+name = "ursa-sql"
+description = "Ursa's SQL dialect: DataFusion's parser plus Ursa's own statements, and running them on an engine session."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ursa-engine = { path = "../ursa-engine" }
+datafusion = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
