@@ -463,7 +463,7 @@ fn graph_function_errors_are_for_people() {
 }
 
 /// Getting Started, "Find out what is available", after "Define a graph"
-/// (`ursa_functions()` comes with the function catalog).
+/// (`ursa_functions()` is in `ursa_functions_lists_the_catalog`).
 #[test]
 fn find_out_what_is_available_matches_getting_started() {
     let sql = format!(
@@ -584,4 +584,196 @@ fn dropping_a_table_a_graph_uses_is_refused() {
         define_karate()
     );
     assert_eq!(ok(ursa(&["-f", "csv", "-c", &sql])), "n\n0\n");
+}
+
+/// Getting Started, "Combine algorithms and attributes", as written: one
+/// `algorithms()` call, joined with `USING (id)`.
+#[test]
+fn combine_algorithms_and_attributes_with_algorithms() {
+    let sql = format!(
+        "{}
+         SELECT id, club, degree, triangles, community
+         FROM karate.nodes
+         JOIN algorithms(karate,
+                         degree(direction => 'both'),
+                         triangles => triangle_count(),
+                         community => louvain(seed => 1)) USING (id)
+         ORDER BY degree DESC
+         LIMIT 5;",
+        define_karate()
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++----+---------+--------+-----------+-----------+
+| id | club    | degree | triangles | community |
++----+---------+--------+-----------+-----------+
+| 33 | Officer | 17     | 15        | 2         |
+| 0  | Mr. Hi  | 16     | 18        | 0         |
+| 32 | Officer | 12     | 13        | 2         |
+| 2  | Mr. Hi  | 10     | 11        | 0         |
+| 1  | Mr. Hi  | 9      | 12        | 0         |
++----+---------+--------+-----------+-----------+
+"
+    );
+}
+
+/// Les Misérables, as Getting Started names it, from the workspace root.
+const LESMIS: &str =
+    "CREATE VIEW lesmis_edges AS SELECT * FROM 'python/ursa/datasets/data/lesmis_edges.csv';
+     CREATE PROPERTY GRAPH lesmis
+       EDGE TABLES (lesmis_edges SOURCE KEY (src) DESTINATION KEY (dst));";
+
+/// Getting Started, "Weights".
+#[test]
+fn weights_match_getting_started() {
+    let sql = format!(
+        "{LESMIS}
+         SELECT * FROM pagerank(lesmis, weight => weight, direction => 'both')
+         ORDER BY pagerank DESC
+         LIMIT 5;"
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++----------+----------------------+
+| id       | pagerank             |
++----------+----------------------+
+| Valjean  | 0.09956068175644767  |
+| Marius   | 0.051667656904091475 |
+| Myriel   | 0.03923416880292588  |
+| Cosette  | 0.03691018363299517  |
+| Enjolras | 0.036614491459848165 |
++----------+----------------------+
+"
+    );
+    // The page's second query returns all 77 characters, in six communities;
+    // ordered and cut to five rows it prints a table short enough for the page.
+    let sql =
+        format!("{LESMIS} SELECT * FROM louvain(lesmis, weight => log(1 + weight), seed => 7);");
+    let out = ok(ursa(&["-f", "csv", "-c", &sql]));
+    assert_eq!(out.lines().count(), 78, "{out}");
+    let communities: std::collections::BTreeSet<&str> = out
+        .lines()
+        .skip(1)
+        .map(|l| l.rsplit(',').next().unwrap())
+        .collect();
+    assert_eq!(communities.len(), 6, "{out}");
+    let sql = format!(
+        "{LESMIS}
+         SELECT * FROM louvain(lesmis, weight => log(1 + weight), seed => 7)
+         ORDER BY id
+         LIMIT 5;"
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++------------+---------+
+| id         | louvain |
++------------+---------+
+| Anzelma    | 3       |
+| Babet      | 3       |
+| Bahorel    | 5       |
+| Bamatabois | 1       |
+| BaronessT  | 4       |
++------------+---------+
+"
+    );
+    assert_eq!(
+        err(ursa(&[
+            "-c",
+            &format!("{LESMIS} SELECT * FROM pagerank(lesmis, weight => weight - 2)")
+        ])),
+        "Error: weight expression produced a negative value (-1); weights must be non-negative\n"
+    );
+}
+
+/// Getting Started, "Subgraphs".
+#[test]
+fn subgraphs_match_getting_started() {
+    let sql = format!(
+        "{LESMIS}
+         CREATE VIEW strong_ties AS SELECT * FROM lesmis_edges WHERE weight >= 3;
+
+         CREATE PROPERTY GRAPH lesmis_strong
+           EDGE TABLES (strong_ties SOURCE KEY (src) DESTINATION KEY (dst));
+
+         SELECT count(DISTINCT connected_components) AS groups
+         FROM connected_components(lesmis_strong);"
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++--------+
+| groups |
++--------+
+| 3      |
++--------+
+"
+    );
+}
+
+/// Getting Started, "Find out what is available": `ursa_functions()`, which
+/// an agent reads as JSON.
+#[test]
+fn ursa_functions_lists_the_catalog() {
+    let out = ok(ursa(&[
+        "-f",
+        "json",
+        "-c",
+        "SELECT * FROM ursa_functions() WHERE name = 'pagerank'",
+    ]));
+    assert_eq!(
+        out,
+        "[{\"name\":\"pagerank\",\"family\":\"algorithm\",\
+\"summary\":\"PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes.\",\
+\"networkx\":\"nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))\",\
+\"parameters\":[\
+{\"name\":\"damping\",\"type\":\"number\",\"default\":\"0.85\",\"choices\":[],\
+\"doc\":\"Probability of following an edge.\"},\
+{\"name\":\"max_iter\",\"type\":\"integer\",\"default\":\"30\",\"choices\":[],\
+\"doc\":\"Iteration cap.\"},\
+{\"name\":\"tol\",\"type\":\"number\",\"default\":\"1e-6\",\"choices\":[],\
+\"doc\":\"Convergence tolerance on the L1 change.\"},\
+{\"name\":\"weight\",\"type\":\"expression\",\"default\":\"NULL\",\"choices\":[],\
+\"doc\":\"A non-negative weight per edge; null is unweighted.\"},\
+{\"name\":\"direction\",\"type\":\"string\",\"default\":\"'out'\",\"choices\":[\"out\",\"both\"],\
+\"doc\":\"Follow the rows as stored, or read the graph as undirected.\"}],\
+\"directions\":[\"out\",\"both\"],\
+\"outputs\":[{\"name\":\"pagerank\",\"type\":\"Float64\",\"nullable\":false}]}]\n"
+    );
+    let out = ok(ursa(&[
+        "-f",
+        "csv",
+        "-c",
+        "SELECT name, family, cardinality(parameters) AS parameters, \
+         array_to_string(directions, ' ') AS directions FROM ursa_functions()",
+    ]));
+    assert_eq!(
+        out,
+        "\
+name,family,parameters,directions
+degree,algorithm,1,out in both
+pagerank,algorithm,5,out both
+connected_components,algorithm,1,
+triangle_count,algorithm,0,
+clustering_coefficient,algorithm,0,
+betweenness,algorithm,4,out both
+closeness,algorithm,2,out in both
+label_propagation,algorithm,2,
+louvain,algorithm,3,
+layout_fr,layout,4,
+layout_random,layout,2,
+layout_circle,layout,1,
+density,statistic,1,out in both
+avg_path_length,statistic,2,out in both
+diameter,statistic,2,out in both
+describe,statistic,3,out in both
+algorithms,combinator,0,
+"
+    );
+    assert_eq!(
+        err(ursa(&["-c", "SELECT * FROM ursa_functions('pagerank')"])),
+        "Error: ursa_functions() takes no arguments: SELECT * FROM ursa_functions()\n"
+    );
 }
