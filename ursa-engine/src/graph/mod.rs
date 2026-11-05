@@ -14,6 +14,11 @@
 //! A definition names tables; it does not copy or pin their rows. Every query
 //! plans the edge table afresh, so a graph over a view of a file sees the
 //! file's current contents.
+//!
+//! Algorithms over a graph are table functions, `FROM pagerank(g)`, planned
+//! as a [`GraphAlgorithmNode`] whose child is the edge table ([`functions`],
+//! `relation`, `node`, `exec`), with the built index cached per session
+//! ([`IndexCache`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -28,6 +33,20 @@ pub mod schema;
 
 pub use define::{closest_name, create_graph, drop_graph};
 pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, GraphSchema};
+
+mod exec;
+pub mod functions;
+mod index;
+mod kernels;
+mod node;
+mod relation;
+mod session;
+
+pub use exec::{GraphAlgorithmExec, GraphPlanner, UrsaQueryPlanner};
+pub use functions::Algorithm;
+pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache};
+pub use node::GraphAlgorithmNode;
+pub(crate) use session::{query_planner, register_functions, with_algorithms};
 
 /// One graph, as `CREATE PROPERTY GRAPH` defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
