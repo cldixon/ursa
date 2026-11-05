@@ -239,17 +239,39 @@ def shortest_path(
     selects minimum-cost (Dijkstra) over the edge-weight expression; omit it for
     unweighted BFS. For a weighted path ``cost`` is the summed edge weight (so the
     final row's ``cost`` is the total path cost); for an unweighted path it is the
-    hop count (``hop + 1``), kept for schema uniformity."""
+    hop count (``hop + 1``), kept for schema uniformity.
+
+    ``source`` and ``target`` are one node id each. A sequence holding exactly one
+    id is accepted too; one holding several (or none) raises ``ValueError``."""
     # Result columns are literal ``src``/``dst`` (one row per edge on the path);
     # source/target resolve like hop seeds, as 1-element id sets.
     node = _native().PlanNode.shortest_path(
         _ir.edges_node(edges, "shortest_path"),
-        [source],
-        [target],
+        [_one_endpoint(source, "source")],
+        [_one_endpoint(target, "target")],
         _ir.optional_expr(weight, "shortest_path(weight=)"),
         direction,
     )
     return EdgeFrame._wrap(node)
+
+
+def _one_endpoint(value: Any, param: str) -> Any:
+    """A ``shortest_path`` endpoint as one id: a sequence (any iterable but a
+    string) must hold exactly one, which is returned; anything else is returned
+    as given. A path has one source and one target, so a sequence of several ids
+    is refused rather than reduced to its first (#252)."""
+    if isinstance(value, (str, bytes, _Frame)) or not hasattr(value, "__iter__"):
+        return value
+    try:
+        ids = list(value)
+    except TypeError:  # an object that only looks iterable (a 0-d array)
+        return value
+    if len(ids) != 1:
+        raise ValueError(
+            f"shortest_path({param}=) must be one node id; got {len(ids)} ids. "
+            "Run one shortest_path per pair, or use hop(...) for several seeds."
+        )
+    return ids[0]
 
 
 def random_walk(

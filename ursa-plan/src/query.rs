@@ -577,8 +577,8 @@ pub fn path_leaf(
     let direction = parse_direction("shortest_path", direction)?;
     // source/target arrive as 1-element user-id arrays; resolve each to a dense
     // index. An unknown (or absent) endpoint -> no path (an empty edge frame).
-    let source = resolve_dense(&ids, source)?.into_iter().next().flatten();
-    let target = resolve_dense(&ids, target)?.into_iter().next().flatten();
+    let source = resolve_endpoint(&ids, source, "source")?;
+    let target = resolve_endpoint(&ids, target, "target")?;
     let (Some(source), Some(target)) = (source, target) else {
         let empty = RecordBatch::try_new(
             path_schema(ids.user_type()),
@@ -635,6 +635,24 @@ pub fn walk_leaf(
                 .with_mask(mask),
         ),
     ))
+}
+
+/// A `shortest_path` endpoint's dense index: `None` for an id not in the graph.
+/// The endpoint arrives as an id set of one id (none in a dry run). A path has
+/// one source and one target, so several are refused rather than reduced to
+/// the first (#252).
+pub(crate) fn resolve_endpoint(
+    ids: &IdMap,
+    arr: &dyn Array,
+    param: &str,
+) -> Result<Option<u32>, DataFusionError> {
+    if arr.len() > 1 {
+        return Err(DataFusionError::Execution(format!(
+            "shortest_path({param}=) must be one node id; got {} ids",
+            arr.len()
+        )));
+    }
+    Ok(resolve_dense(ids, arr)?.into_iter().next().flatten())
 }
 
 /// Resolve a user-id array to dense indices (`None` per unknown/null id), mapping
@@ -1351,6 +1369,24 @@ mod tests {
         let mut reached: Vec<i64> = dsts.values().to_vec();
         reached.sort_unstable();
         assert_eq!(reached, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_path_endpoint_of_several_ids_is_refused() {
+        // It used to run from the first id and ignore the rest (#252).
+        let src = Int64Array::from(vec![0, 1, 2]);
+        let dst = Int64Array::from(vec![1, 2, 3]);
+        let (t, ids) = build(&src, &dst);
+        let (s, tg) = (Int64Array::from(vec![0, 1]), Int64Array::from(vec![3]));
+        let ctx = query_session();
+        let err = path_leaf(&ctx, t, ids, None, &s, &tg, "out", None, None)
+            .err()
+            .expect("two sources are refused");
+        assert!(
+            err.to_string()
+                .contains("shortest_path(source=) must be one node id; got 2 ids"),
+            "{err}"
+        );
     }
 
     #[test]

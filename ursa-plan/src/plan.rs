@@ -87,7 +87,7 @@ use crate::expr::GraphVerb;
 use crate::lower::{col_named, Frame, How};
 use crate::query::{
     attach_columns, graph_leaf, hop_leaf, node_columns, parse_direction, path_leaf, resolve_dense,
-    walk_leaf, NodeColumn,
+    resolve_endpoint, walk_leaf, NodeColumn,
 };
 use crate::scan::{scan_edges_batch, scan_edges_rows, CsvOptions, NodeTableCache, ScanSource};
 use crate::stats::{describe_masked, parse_stat_direction, stat_batch, GraphStat};
@@ -2744,8 +2744,8 @@ fn reached_nodes(
                 }
             };
             let dir = parse_direction("shortest_path", direction)?;
-            let s = resolve_dense(ids, s.as_ref())?.into_iter().next().flatten();
-            let t = resolve_dense(ids, t.as_ref())?.into_iter().next().flatten();
+            let s = resolve_endpoint(ids, s.as_ref(), "source")?;
+            let t = resolve_endpoint(ids, t.as_ref(), "target")?;
             let path = match (s, t) {
                 (Some(s), Some(t)) => match weights {
                     None => ursa_core::algo::shortest_path_masked(topo, within, s, t, dir),
