@@ -1365,7 +1365,7 @@ mod tests {
         let chunk = |name: &[u8]| stored.chunks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             read_weights(&path, main, chunk(b"w1"), 3).unwrap(),
-            [a.clone()]
+            std::slice::from_ref(&a)
         );
         assert_eq!(read_weights(&path, main, chunk(b"w2"), 3).unwrap(), [a, b]);
         // The wrong edge count is an error, never a short column.

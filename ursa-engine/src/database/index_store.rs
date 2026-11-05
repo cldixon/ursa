@@ -388,7 +388,7 @@ impl IndexStore {
                     continue;
                 }
                 let result =
-                    index_file::append_chunk(&self.dir.join(&file), main, kind, &name, &encode);
+                    index_file::append_chunk(&self.dir.join(&file), main, kind, &name, encode);
                 if let Ok(appended_len) = result {
                     if let Some(live) = state.live.get_mut(&file) {
                         live.chunks.insert((kind, name));
