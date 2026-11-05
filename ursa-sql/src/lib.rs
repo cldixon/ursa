@@ -2,16 +2,20 @@
 //!
 //! [`parse_sql`] splits a string into [`UrsaStatement`]s. [`execute`] runs one
 //! on an engine session (see `ursa_engine::new_session`). Statements DataFusion
-//! knows are planned and run by DataFusion. Ursa's graph and database
-//! statements are recognised now and run in later milestones; until then they
-//! return a "not supported yet" error naming the issue that delivers them.
+//! knows are planned and run by DataFusion. `CREATE PROPERTY GRAPH` and `DROP
+//! PROPERTY GRAPH` define graphs (see [`property_graph`] for the subset of
+//! SQL/PGQ supported). Ursa's other graph and database statements are
+//! recognised now and run in later milestones; until then they return a "not
+//! supported yet" error naming the issue that delivers them.
 
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
 
+mod graph_ddl;
 mod parser;
+pub mod property_graph;
 
 pub use parser::{
     parse_sql, Attach, CreatePropertyGraph, DescribeGraph, DropPropertyGraph, UrsaParser,
@@ -50,6 +54,8 @@ pub async fn execute(ctx: &SessionContext, statement: UrsaStatement) -> Result<D
             let plan = state.statement_to_plan(*statement).await?;
             ctx.execute_logical_plan(plan).await
         }
+        UrsaStatement::CreatePropertyGraph(statement) => graph_ddl::create(ctx, *statement).await,
+        UrsaStatement::DropPropertyGraph(statement) => graph_ddl::drop(ctx, statement),
         other => Err(not_supported_yet(&other)),
     }
 }
@@ -57,10 +63,11 @@ pub async fn execute(ctx: &SessionContext, statement: UrsaStatement) -> Result<D
 /// The error for a recognised statement whose milestone has not landed.
 fn not_supported_yet(statement: &UrsaStatement) -> DataFusionError {
     let planned = match statement {
-        UrsaStatement::CreatePropertyGraph(_) | UrsaStatement::DropPropertyGraph(_) => "#235",
         UrsaStatement::DescribeGraph(_) | UrsaStatement::ShowGraphs => "#236",
         UrsaStatement::Attach(_) => "#237",
-        UrsaStatement::DataFusion(_) => unreachable!("DataFusion statements are supported"),
+        UrsaStatement::DataFusion(_)
+        | UrsaStatement::CreatePropertyGraph(_)
+        | UrsaStatement::DropPropertyGraph(_) => unreachable!("{} is supported", statement.kind()),
     };
     DataFusionError::NotImplemented(format!(
         "{} is not supported yet (planned in {planned})",
@@ -76,14 +83,6 @@ mod tests {
     async fn graph_statements_say_when_they_arrive() {
         let ctx = ursa_engine::new_session();
         for (sql, expected) in [
-            (
-                "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (a) DESTINATION KEY (b))",
-                "CREATE PROPERTY GRAPH is not supported yet (planned in #235)",
-            ),
-            (
-                "DROP PROPERTY GRAPH g",
-                "DROP PROPERTY GRAPH is not supported yet (planned in #235)",
-            ),
             (
                 "DESCRIBE GRAPH g",
                 "DESCRIBE GRAPH is not supported yet (planned in #236)",
