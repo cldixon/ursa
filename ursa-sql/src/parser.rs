@@ -15,6 +15,8 @@ use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::tokenizer::Token;
 
+use crate::property_graph::{parse_tables, EdgeTableDef, VertexTableDef};
+
 /// Same as sqlparser's and DataFusion's default.
 pub const DEFAULT_RECURSION_LIMIT: usize = 50;
 
@@ -24,7 +26,7 @@ pub enum UrsaStatement {
     /// Anything DataFusion parses: queries, DDL, `COPY … TO`, `SET`, `EXPLAIN`.
     DataFusion(Box<DFStatement>),
     /// `CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name …` (SQL/PGQ).
-    CreatePropertyGraph(CreatePropertyGraph),
+    CreatePropertyGraph(Box<CreatePropertyGraph>),
     /// `DROP PROPERTY GRAPH [IF EXISTS] name`.
     DropPropertyGraph(DropPropertyGraph),
     /// `DESCRIBE GRAPH name` (or `DESC GRAPH name`).
@@ -35,13 +37,17 @@ pub enum UrsaStatement {
     Attach(Attach),
 }
 
-/// `CREATE PROPERTY GRAPH`. Only the name is kept for now; the vertex and edge
-/// table clauses are parsed in M1 (#235).
+/// `CREATE PROPERTY GRAPH`: Ursa's subset of SQL/PGQ (see
+/// [`crate::property_graph`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePropertyGraph {
     pub name: ObjectName,
     pub or_replace: bool,
     pub if_not_exists: bool,
+    /// `VERTEX TABLES (…)`, which may be omitted.
+    pub vertices: Option<VertexTableDef>,
+    /// `EDGE TABLES (…)`.
+    pub edges: EdgeTableDef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +94,11 @@ impl fmt::Display for UrsaStatement {
                 if s.if_not_exists {
                     write!(f, "IF NOT EXISTS ")?;
                 }
-                write!(f, "{}", s.name)
+                write!(f, "{}", s.name)?;
+                if let Some(vertices) = &s.vertices {
+                    write!(f, " {vertices}")?;
+                }
+                write!(f, " {}", s.edges)
             }
             UrsaStatement::DropPropertyGraph(s) => {
                 write!(f, "DROP PROPERTY GRAPH ")?;
@@ -164,7 +174,7 @@ impl<'a> UrsaParser<'a> {
                 1
             };
             if self.word(at, "PROPERTY") && self.word(at + 1, "GRAPH") {
-                return Ok(self.parse_create_property_graph()?);
+                return self.parse_create_property_graph();
             }
         } else if self.word(0, "DROP") && self.word(1, "PROPERTY") && self.word(2, "GRAPH") {
             return Ok(self.parse_drop_property_graph()?);
@@ -218,20 +228,22 @@ impl<'a> UrsaParser<'a> {
         found
     }
 
-    fn parse_create_property_graph(&mut self) -> Result<UrsaStatement, ParserError> {
+    fn parse_create_property_graph(&mut self) -> Result<UrsaStatement> {
         self.df.parser.next_token(); // CREATE
         let or_replace = self.consume_words(&["OR", "REPLACE"]);
         self.consume_words(&["PROPERTY", "GRAPH"]);
         let if_not_exists = self.consume_words(&["IF", "NOT", "EXISTS"]);
         let name = self.df.parser.parse_object_name(false)?;
-        // The table clauses are M1's (#235). Skip them, up to the end of the
-        // statement, so the statement after them still parses.
-        self.skip_to_end_of_statement();
-        Ok(UrsaStatement::CreatePropertyGraph(CreatePropertyGraph {
-            name,
-            or_replace,
-            if_not_exists,
-        }))
+        let (vertices, edges) = parse_tables(&mut self.df.parser)?;
+        Ok(UrsaStatement::CreatePropertyGraph(Box::new(
+            CreatePropertyGraph {
+                name,
+                or_replace,
+                if_not_exists,
+                vertices,
+                edges,
+            },
+        )))
     }
 
     fn parse_drop_property_graph(&mut self) -> Result<UrsaStatement, ParserError> {
@@ -254,20 +266,6 @@ impl<'a> UrsaParser<'a> {
             None
         };
         Ok(UrsaStatement::Attach(Attach { path, alias }))
-    }
-
-    /// Advance to the `;` (not consumed) or the end of input that ends this
-    /// statement. The tokenizer has already kept `;` inside strings and quoted
-    /// identifiers out of the token stream.
-    fn skip_to_end_of_statement(&mut self) {
-        loop {
-            match self.df.parser.peek_token_ref().token {
-                Token::SemiColon | Token::EOF => return,
-                _ => {
-                    self.df.parser.next_token();
-                }
-            }
-        }
     }
 }
 

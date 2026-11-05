@@ -14,7 +14,6 @@
 //! A definition names tables; it does not copy or pin their rows. Every query
 //! plans the edge table afresh, so a graph over a view of a file sees the
 //! file's current contents.
-
 //!
 //! Algorithms over a graph are table functions, `FROM pagerank(g)`, planned
 //! as a [`GraphAlgorithmNode`] whose child is the edge table ([`functions`],
@@ -22,7 +21,18 @@
 //! ([`IndexCache`]).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+
+use datafusion::catalog::CatalogProviderList;
+use datafusion::common::TableReference;
+use datafusion::execution::context::SessionState;
+use datafusion::prelude::{SessionConfig, SessionContext};
+
+mod define;
+pub mod schema;
+
+pub use define::{closest_name, create_graph, drop_graph};
+pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, GraphSchema};
 
 mod exec;
 pub mod functions;
@@ -37,10 +47,6 @@ pub use functions::Algorithm;
 pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache};
 pub use node::GraphAlgorithmNode;
 pub(crate) use session::{query_planner, register_functions, with_algorithms};
-
-use datafusion::common::TableReference;
-use datafusion::execution::context::SessionState;
-use datafusion::prelude::{SessionConfig, SessionContext};
 
 /// One graph, as `CREATE PROPERTY GRAPH` defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +82,9 @@ pub struct VertexTable {
 #[derive(Debug, Default)]
 pub struct GraphRegistry {
     graphs: RwLock<BTreeMap<String, Arc<GraphDef>>>,
+    /// The session's catalogs before the file-table wrapper: graph schemas are
+    /// registered and dropped there (the wrapper cannot drop a schema).
+    catalogs: OnceLock<Arc<dyn CatalogProviderList>>,
 }
 
 impl GraphRegistry {
@@ -112,6 +121,15 @@ impl GraphRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name)
+    }
+
+    /// Record the session's unwrapped catalog list (done by `new_session`).
+    pub(crate) fn set_catalogs(&self, catalogs: Arc<dyn CatalogProviderList>) {
+        let _ = self.catalogs.set(catalogs);
+    }
+
+    pub(crate) fn catalogs(&self) -> Option<&Arc<dyn CatalogProviderList>> {
+        self.catalogs.get()
     }
 
     /// The names of all graphs, sorted: for "did you mean" suggestions.

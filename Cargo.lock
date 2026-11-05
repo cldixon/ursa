@@ -3791,6 +3791,7 @@ name = "ursa-sql"
 version = "0.5.0"
 dependencies = [
  "datafusion",
+ "tempfile",
  "tokio",
  "ursa-engine",
 ]
