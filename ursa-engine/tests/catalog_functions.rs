@@ -576,6 +576,7 @@ betweenness,algorithm
 closeness,algorithm
 label_propagation,algorithm
 louvain,algorithm
+neighbors_agg,aggregation
 density,statistic
 avg_path_length,statistic
 diameter,statistic
@@ -623,7 +624,7 @@ direction,string,'out'
         )
         .await,
         "name\navg_path_length\ncloseness\ndegree\ndensity\ndescribe\ndiameter\nhop\n\
-         shortest_path\n"
+         neighbors_agg\nshortest_path\n"
     );
     // A traversal's node ids are required; its outputs have the graph's id
     // type.
@@ -711,7 +712,13 @@ async fn every_function_runs_on_an_empty_graph() {
         .unwrap();
     put_graph(&ctx, "empty", "none");
     for f in ursa_engine::graph::functions::specs() {
-        let sql = format!("SELECT count(*) AS n FROM {}(empty)", f.name);
+        // A neighbour aggregation needs node values: none.
+        let args = if f.reads_attribute() {
+            ", values => (SELECT 'Valjean', 1.0)"
+        } else {
+            ""
+        };
+        let sql = format!("SELECT count(*) AS n FROM {}(empty{args})", f.name);
         let expected = if f.shape == ursa_core::catalog::Shape::PerNode {
             "n\n0\n"
         } else {
@@ -740,8 +747,8 @@ async fn layouts_are_hidden() {
     let per_node = "degree, pagerank, connected_components, triangle_count, \
                     clustering_coefficient, betweenness, closeness, label_propagation, louvain";
     let all = format!(
-        "{per_node}, density, avg_path_length, diameter, describe, hop, shortest_path, \
-         random_walk, algorithms"
+        "{per_node}, neighbors_agg, density, avg_path_length, diameter, describe, hop, \
+         shortest_path, random_walk, algorithms"
     );
     let unknown =
         |name: &str| format!("there is no graph function '{name}'. The graph functions are: {all}");

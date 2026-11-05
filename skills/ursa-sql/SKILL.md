@@ -153,6 +153,57 @@ ORDER BY id;
 +---------+-----------+
 ```
 
+## Neighbour aggregation: neighbors_agg()
+
+`neighbors_agg` aggregates a value of each node over its neighbours, and returns one row per node: `id` and `neighbors_agg` (a `DOUBLE`). There are two ways to give the values:
+
+- `values =>` takes a query of two columns, node ids then values.
+- `attribute =>` takes an expression over the graph's node table.
+
+```sql
+SELECT id, round(neighbors_agg, 2) AS friends_degree
+FROM neighbors_agg(karate,
+                   values => (SELECT id, degree FROM degree(karate, direction => 'both')),
+                   agg => 'mean', direction => 'both')
+ORDER BY friends_degree DESC, id
+LIMIT 3;
+```
+
+```text
++----+----------------+
+| id | friends_degree |
++----+----------------+
+| 11 | 16.0           |
+| 14 | 14.5           |
+| 15 | 14.5           |
++----+----------------+
+```
+
+```sql
+SELECT club, count(*) AS members
+FROM karate.nodes
+JOIN neighbors_agg(karate, attribute => club, agg => 'n_unique', direction => 'both') USING (id)
+WHERE neighbors_agg = 2
+GROUP BY club
+ORDER BY club;
+```
+
+```text
++---------+---------+
+| club    | members |
++---------+---------+
+| Mr. Hi  | 6       |
+| Officer | 7       |
++---------+---------+
+```
+
+- `agg`: `'mean'` (the default), `'sum'`, `'min'`, `'max'`, `'count'` or `'n_unique'`. String values take only `'count'` and `'n_unique'`.
+- `direction`: `'out'` (the default), `'in'` or `'both'`. With `'both'`, a neighbour joined by edges both ways counts twice.
+- What is skipped: a NULL value, a row whose id is not in the graph, and a node with no row.
+- A node with no neighbour values gets NULL for mean, min and max, and 0 for sum, count and n_unique.
+- Each node can have only one row in the values; a second row is an error.
+- `neighbors_agg` can't go inside `algorithms()`. Call it on its own and join on `id`.
+
 ## Traversals
 
 Traversals return edges or walk steps, not one row per node. A node-id argument takes a list literal (`[0, 1]`, `['Valjean']`), one id, or a subquery of one column:
@@ -229,14 +280,14 @@ Error: Ambiguous reference to unqualified field id
 
 Write `JOIN algorithms(karate, degree(), pagerank()) USING (id)` instead.
 
-**Layouts.** `layout_fr`, `layout_circle` and `layout_random` are not in SQL. Neither are the neighbour aggregations. The error lists what is:
+**Layouts.** `layout_fr`, `layout_circle` and `layout_random` are not in SQL. The error lists what is:
 
 ```sql
 SELECT * FROM layout_fr(karate);
 ```
 
 ```text
-Error: there is no graph function 'layout_fr'. The graph functions are: degree, pagerank, connected_components, triangle_count, clustering_coefficient, betweenness, closeness, label_propagation, louvain, density, avg_path_length, diameter, describe, hop, shortest_path, random_walk, algorithms
+Error: there is no graph function 'layout_fr'. The graph functions are: degree, pagerank, connected_components, triangle_count, clustering_coefficient, betweenness, closeness, label_propagation, louvain, neighbors_agg, density, avg_path_length, diameter, describe, hop, shortest_path, random_walk, algorithms
 ```
 
 **`log` is base 10.** In DataFusion, as in PostgreSQL and DuckDB, `log(x)` is the base-10 logarithm, not the natural one as in Python. Write `ln(x)` for the natural log, and `log10(x)` when you mean base 10, so the reader does not have to know:

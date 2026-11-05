@@ -1,9 +1,10 @@
 //! `ursa_functions()`: the graph functions, as a table.
 //!
-//! One row per function SQL can call: every algorithm and statistic of
-//! `ursa_core::catalog` that SQL offers (not the layouts, hidden until the
-//! visualization work; see [`functions`]), then the traversals, then `algorithms`. The list columns are Arrow
-//! lists and structs, not strings, so they stay usable both ways:
+//! One row per function SQL can call: every algorithm, statistic and
+//! aggregation of `ursa_core::catalog` that SQL offers (not the layouts,
+//! hidden until the visualization work; see [`functions`]), then the
+//! traversals, then `algorithms`. The list columns are Arrow lists and
+//! structs, not strings, so they stay usable both ways:
 //!
 //! - from SQL: `unnest(parameters)`, `array_has(directions, 'in')`,
 //!   `parameters[1]['default']`;
@@ -15,7 +16,7 @@
 //! | column       | type                                                     |
 //! |--------------|----------------------------------------------------------|
 //! | `name`       | the function's name                                      |
-//! | `family`     | `algorithm`, `statistic`, `traversal` or `combinator` |
+//! | `family`     | `algorithm`, `statistic`, `aggregation`, `traversal` or `combinator` |
 //! | `summary`    | one line on what it computes                             |
 //! | `networkx`   | the NetworkX call it matches, or NULL                    |
 //! | `parameters` | list of {name, type, default, choices, doc}, call order  |
@@ -23,8 +24,9 @@
 //! | `outputs`    | list of {name, type, nullable}: its columns besides `id` |
 //!
 //! A parameter's `type` is how SQL writes it (`number`, `number or NULL`,
-//! `integer`, `integer or NULL`, `boolean`, `string`, `expression`, and for a
-//! traversal's node ids `node ids` or `node id`), and its `default` is the
+//! `integer`, `integer or NULL`, `boolean`, `string`, `expression`, `query`
+//! for `neighbors_agg`'s values, and for a traversal's node ids `node ids` or
+//! `node id`), and its `default` is the
 //! literal SQL would write (`0.85`, `'out'`, `NULL`), or `required`. A
 //! traversal's node-id output columns have the graph's id type, `Int64 or
 //! Utf8`.
@@ -39,7 +41,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider};
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
-use ursa_core::catalog::{Family, ParamType};
+use ursa_core::catalog::Family;
 
 use super::functions::{self, plan, sql_value, ALGORITHMS, URSA_FUNCTIONS};
 use super::traversal::{OutputType, TraversalParamType, TRAVERSALS};
@@ -103,19 +105,6 @@ pub fn schema() -> SchemaRef {
     ]))
 }
 
-/// How SQL writes a value of a parameter of type `ty`.
-fn type_name(ty: &ParamType) -> &'static str {
-    match ty {
-        ParamType::Float => "number",
-        ParamType::OptionalFloat => "number or NULL",
-        ParamType::Count => "integer",
-        ParamType::Seed => "integer or NULL",
-        ParamType::Bool => "boolean",
-        ParamType::Choice(_) | ParamType::Direction(_) | ParamType::Dtype => "string",
-        ParamType::Weight | ParamType::Attribute => "expression",
-    }
-}
-
 fn family_name(family: Family) -> &'static str {
     match family {
         Family::Algorithm => "algorithm",
@@ -159,7 +148,7 @@ pub fn functions_batch() -> Result<RecordBatch> {
             params
                 .field_builder::<StringBuilder>(1)
                 .expect("type")
-                .append_value(type_name(&p.ty));
+                .append_value(functions::sql_type(p.name, p.ty));
             params
                 .field_builder::<StringBuilder>(2)
                 .expect("default")
@@ -179,7 +168,7 @@ pub fn functions_batch() -> Result<RecordBatch> {
             params
                 .field_builder::<StringBuilder>(4)
                 .expect("doc")
-                .append_value(p.doc);
+                .append_value(functions::sql_doc(p));
             params.append(true);
         }
         parameters.append(true);
@@ -213,7 +202,7 @@ pub fn functions_batch() -> Result<RecordBatch> {
             let (ty, choices): (&str, &[&str]) = match &p.ty {
                 TraversalParamType::Nodes => ("node ids", &[]),
                 TraversalParamType::Node => ("node id", &[]),
-                TraversalParamType::Param(ty) => (type_name(ty), ty.choices()),
+                TraversalParamType::Param(ty) => (functions::sql_type(p.name, *ty), ty.choices()),
             };
             params
                 .field_builder::<StringBuilder>(0)

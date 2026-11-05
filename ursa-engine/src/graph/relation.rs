@@ -11,6 +11,17 @@
 //! [`GraphTraversalNode`] over the same edge table plus one child plan per
 //! node-id argument.
 //!
+//! ## Node values as a child plan
+//!
+//! `neighbors_agg` reads one value per node, given as `values => (SELECT id,
+//! value FROM ...)`, a query of two columns, or as `attribute => <expr>`, an
+//! expression over the graph's node table, planned as `SELECT id, <expr> FROM
+//! <graph>.nodes`. Either becomes the node's last child (see
+//! [`GraphAlgorithmNode`]), planned as a derived table and run when the node
+//! runs, as a traversal's node ids are. Its column types are checked here: the
+//! ids integers or strings, the values numbers, or strings for `count` and
+//! `n_unique`.
+//!
 //! ## Node ids as child plans
 //!
 //! A traversal's node ids are not values the planner reads: each node-id
@@ -54,11 +65,14 @@ use datafusion::sql::sqlparser::ast::{
     TableFunctionArgs, UnaryOperator, Value,
 };
 use futures::FutureExt;
+use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Call, FunctionSpec};
 
 use super::functions::{
     self, did_you_mean, is_per_node, nested_signature, plan, signature, Literal, ALGORITHMS,
+    VALUES_QUERY,
 };
+use super::kernels;
 use super::node::{
     endpoint_id_type, weight_column, GraphAlgorithmNode, GraphTraversalNode, Output,
     WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
@@ -186,6 +200,16 @@ impl RelationPlanner for GraphFunctions {
         let edges = self.edge_table(&graph, context)?;
         let mut weights = WeightSet::new(edges.schema().as_ref().clone());
         let (outputs, per_node) = match target {
+            Target::Function(spec) if spec.reads_attribute() => {
+                let nodes = |c: &dyn RelationPlannerContext| {
+                    self.table_source(&TableReference::partial(graph.name.as_str(), "nodes"), c)
+                };
+                let node = values_node(spec, &graph, edges, rest, context, &nodes)?;
+                let plan = LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                });
+                return planned(plan, target, alias);
+            }
             Target::Function(spec) => {
                 let (call, weight) = resolve_call(spec, rest, context, &mut weights, "")?;
                 let outputs = spec
@@ -236,6 +260,182 @@ fn planned(
     Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
         plan, alias,
     ))))
+}
+
+/// Looks up a graph's node table, `<graph>.nodes`, as a table source.
+type NodeTable<'a> = dyn Fn(&dyn RelationPlannerContext) -> Result<Arc<dyn TableSource>> + 'a;
+
+/// The node for a call to `spec`, a function that reads node values
+/// (`neighbors_agg`), over the edge table `edges` of `graph`, with the
+/// arguments after the graph (see the module docs).
+fn values_node(
+    spec: &'static FunctionSpec,
+    graph: &GraphDef,
+    edges: LogicalPlan,
+    args: Vec<FunctionArg>,
+    context: &mut dyn RelationPlannerContext,
+    nodes: &NodeTable,
+) -> Result<GraphAlgorithmNode> {
+    let f = spec.name;
+    // `values =>` and `attribute =>` are plans; the rest are literals.
+    let mut values: Option<ast::Expr> = None;
+    let mut attribute: Option<ast::Expr> = None;
+    let mut literals = Vec::new();
+    for arg in args {
+        if let FunctionArg::Named {
+            name,
+            arg: FunctionArgExpr::Expr(expr),
+            operator: FunctionArgOperator::RightArrow,
+        } = &arg
+        {
+            let name = context.normalize_ident(name.clone());
+            let slot = match name.as_str() {
+                "values" => &mut values,
+                "attribute" => &mut attribute,
+                _ => {
+                    literals.push(arg);
+                    continue;
+                }
+            };
+            if slot.replace(expr.clone()).is_some() {
+                return Err(plan(format!("{f}() was given '{name}' more than once")));
+            }
+            continue;
+        }
+        literals.push(arg);
+    }
+    let mut weights = WeightSet::new(edges.schema().as_ref().clone());
+    let (call, _) = resolve_call(spec, literals, context, &mut weights, "")?;
+    let takes_strings = matches!(
+        call,
+        Call::NeighborAgg {
+            agg: AggKind::Count | AggKind::NUnique,
+            ..
+        }
+    );
+    let edges = edge_inputs(graph, edges, weights)?;
+    let id_type = endpoint_id_type(&graph.name, &edges.input, &edges.source, &edges.destination)?;
+    let in_param = |param: &'static str| {
+        move |e: DataFusionError| {
+            plan(format!(
+                "{f}({param} =>): {}",
+                crate::user_message(&e).replace('\n', " ")
+            ))
+        }
+    };
+    let (param, values) = match (values, attribute) {
+        (Some(_), Some(_)) => {
+            return Err(plan(format!(
+                "{f}() takes 'values' or 'attribute', not both: values => {VALUES_QUERY} is a \
+                 query of node ids and values, attribute => <expr> an expression over the \
+                 graph's node table"
+            )))
+        }
+        (None, None) => {
+            return Err(plan(format!(
+                "{f}() needs the value of each node: values => {VALUES_QUERY}, a query of node \
+                 ids and values, or attribute => <expr>, an expression over the graph's node \
+                 table. Write {}",
+                signature(spec)
+            )))
+        }
+        (Some(ast::Expr::Subquery(query)), None) => {
+            let values = context
+                .plan(TableFactor::Derived {
+                    lateral: false,
+                    subquery: query,
+                    alias: None,
+                    sample: None,
+                })
+                .map_err(in_param("values"))?;
+            ("values", values)
+        }
+        (Some(other), None) => {
+            return Err(plan(format!(
+                "{f}(values =>) must be a query of two columns, node ids then values, as \
+                 values => {VALUES_QUERY}; got {other}"
+            )))
+        }
+        // `SELECT id, <expr> FROM <graph>.nodes`, planned here: the node
+        // table is not among the tables the statement names, which are all a
+        // subquery could read.
+        (None, Some(expr)) => {
+            let table = TableReference::partial(graph.name.as_str(), "nodes");
+            let scan = LogicalPlanBuilder::scan(table.clone(), nodes(&*context)?, None)?.build()?;
+            let value = context
+                .sql_to_expr(expr, scan.schema())
+                .map_err(in_param("attribute"))?;
+            let values = LogicalPlanBuilder::from(scan)
+                .project(vec![
+                    Expr::Column(Column::new(Some(table), "id")),
+                    value.alias("value"),
+                ])
+                .and_then(LogicalPlanBuilder::build)
+                .map_err(in_param("attribute"))?;
+            ("attribute", values)
+        }
+    };
+    let schema = values.schema();
+    let columns = schema.fields().len();
+    if columns != 2 {
+        return Err(plan(format!(
+            "{f}({param} =>) must be a query of two columns, node ids then values; it returns \
+             {columns} columns"
+        )));
+    }
+    let (ids, value) = (schema.field(0).data_type(), schema.field(1).data_type());
+    if !traversal::is_node_id_type(ids, &id_type) {
+        let kind = match id_type {
+            DataType::Int64 => "integers",
+            _ => "strings",
+        };
+        return Err(plan(format!(
+            "{f}({param} =>): the first column must be node ids of graph '{}', which are \
+             {kind}; got a column of type {ids}",
+            graph.name
+        )));
+    }
+    if kernels::is_string(value) {
+        if !takes_strings {
+            let agg = call
+                .values()
+                .into_iter()
+                .find(|(p, _)| p.name == "agg")
+                .map(|(_, v)| functions::sql_value(&v))
+                .unwrap_or_default();
+            return Err(plan(format!(
+                "{f}(agg => {agg}) needs numbers, and the values are strings; only 'count' and \
+                 'n_unique' take strings"
+            )));
+        }
+    } else if !(value == &DataType::Null || can_cast_types(value, &DataType::Float64)) {
+        return Err(plan(format!(
+            "{f}({param} =>): the values must be numbers, or strings for 'count' and \
+             'n_unique'; got a column of type {value}"
+        )));
+    }
+    let outputs = spec
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(field, o)| Output {
+            name: o.name.to_string(),
+            call,
+            field,
+            weight: None,
+        })
+        .collect();
+    GraphAlgorithmNode::try_new(
+        graph.name.clone(),
+        Arc::new(edges.input),
+        None,
+        Some(Arc::new(values)),
+        edges.source,
+        edges.destination,
+        edges.weights,
+        outputs,
+        true,
+    )
 }
 
 /// The node for a call to the traversal `spec` over the edge table `edges` of
@@ -660,7 +860,7 @@ fn algorithms(
     let prefix = format!("{ALGORITHMS}(): ");
     let per_node = || {
         functions::specs()
-            .filter(|s| is_per_node(s))
+            .filter(|s| is_per_node(s) && !s.reads_attribute())
             .map(|s| s.name)
     };
     let mut outputs = Vec::new();
@@ -716,6 +916,13 @@ fn algorithms(
             return Err(plan(format!(
                 "{prefix}{name}() is a statistic, with one row for the whole graph, not one \
                  per node; call it on its own: SELECT * FROM {name}(<graph>)"
+            )));
+        }
+        if spec.reads_attribute() {
+            return Err(plan(format!(
+                "{prefix}{name}() reads node values, so it runs on its own: SELECT * FROM {}; \
+                 join its result on id",
+                signature(spec)
             )));
         }
         let modified = function.uses_odbc_syntax
@@ -805,6 +1012,7 @@ fn node(
         graph.name.clone(),
         Arc::new(edges.input),
         edges.weighted,
+        None,
         edges.source,
         edges.destination,
         edges.weights,
