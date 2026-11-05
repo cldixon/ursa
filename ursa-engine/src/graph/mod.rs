@@ -15,8 +15,28 @@
 //! plans the edge table afresh, so a graph over a view of a file sees the
 //! file's current contents.
 
+//!
+//! Algorithms over a graph are table functions, `FROM pagerank(g)`, planned
+//! as a [`GraphAlgorithmNode`] whose child is the edge table ([`functions`],
+//! `relation`, `node`, `exec`), with the built index cached per session
+//! ([`IndexCache`]).
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+
+mod exec;
+pub mod functions;
+mod index;
+mod kernels;
+mod node;
+mod relation;
+mod session;
+
+pub use exec::{GraphAlgorithmExec, GraphPlanner, UrsaQueryPlanner};
+pub use functions::Algorithm;
+pub use index::{index_builds, FileIdentity, GraphIndex, IndexCache};
+pub use node::GraphAlgorithmNode;
+pub(crate) use session::{query_planner, register_functions, with_algorithms};
 
 use datafusion::common::TableReference;
 use datafusion::execution::context::SessionState;

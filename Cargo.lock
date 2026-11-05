@@ -3729,9 +3729,12 @@ dependencies = [
  "glob",
  "object_store",
  "parking_lot",
+ "serde_json",
  "tempfile",
  "tokio",
  "url",
+ "ursa-core",
+ "ursa-io",
 ]
 
 [[package]]

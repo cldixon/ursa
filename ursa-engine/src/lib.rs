@@ -31,7 +31,9 @@ pub fn new_session() -> SessionContext {
 /// A session with Ursa's file tables over `config`. `information_schema` is
 /// turned on, so `SHOW TABLES` and `SHOW COLUMNS` work.
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
-    let config = graph::with_registry(config.with_information_schema(true));
+    let config = graph::with_algorithms(graph::with_registry(
+        config.with_information_schema(true),
+    ));
     let ctx = SessionContext::new_with_config(config);
     // As `SessionContext::enable_url_table` does, with Ursa's factory in place
     // of DataFusion's.
@@ -45,8 +47,10 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
         .into_state_builder()
         .with_session_id(session_id)
         .with_catalog_list(catalogs)
+        .with_query_planner(graph::query_planner())
         .build()
         .into();
+    graph::register_functions(&ctx).expect("registering a relation planner cannot fail");
     factory.attach(ctx.state_weak_ref());
     ctx
 }

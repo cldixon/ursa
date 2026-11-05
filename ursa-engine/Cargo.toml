@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ursa-core = { path = "../ursa-core" }
+ursa-io = { path = "../ursa-io" }
 datafusion = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
@@ -17,7 +19,12 @@ futures = "0.3"
 glob = "0.3"
 # The lock type of `SessionContext::state_weak_ref` (already in the tree via DataFusion).
 parking_lot = "0.12"
+# The graph index cache's single-flight cell, and running kernels off the async
+# workers (already in the tree via DataFusion).
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "3"
+# Reads the Python parity fixtures (already in the tree via ursa-plan).
+serde_json = "1"
