@@ -543,6 +543,15 @@ fn node_ids(
     let arrays = batches
         .iter()
         .map(|b| {
+            // No float, boolean or date, and a string must be exactly an
+            // integer on a graph with integer ids (#271).
+            if let Some(row) = traversal::first_refused_node_id(&b[0], &id_type) {
+                let got = sql_text(&b[0], row)
+                    .unwrap_or_else(|| format!("a value of type {}", b[0].data_type()));
+                return Err(DataFusionError::Execution(traversal::not_node_ids(
+                    function, param, graph, &id_type, &got,
+                )));
+            }
             cast_with_options(&b[0], &id_type, &options).map_err(|e| {
                 let got = first_uncast(&b[0], &id_type).unwrap_or_else(|| {
                     crate::user_message(&DataFusionError::ArrowError(Box::new(e), None))
@@ -575,6 +584,11 @@ fn node_ids(
 fn first_uncast(values: &ArrayRef, id_type: &DataType) -> Option<String> {
     let lenient = cast(values, id_type).ok()?;
     let row = (0..values.len()).find(|&i| values.is_valid(i) && lenient.is_null(i))?;
+    sql_text(values, row)
+}
+
+/// Row `row` of `values` as SQL writes it (`'Valjean'`, `2.5`).
+fn sql_text(values: &ArrayRef, row: usize) -> Option<String> {
     let mut value = ScalarValue::try_from_array(values, row).ok()?;
     while let ScalarValue::Dictionary(_, inner) = value {
         value = *inner;
