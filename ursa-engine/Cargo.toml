@@ -32,6 +32,10 @@ serde_json = "1"
 # The checksum of a stored graph index (already in the tree via flate2).
 crc32fast = "1.5"
 
+# Native only: the local file system and cloud stores do not build for wasm32 (#278).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "3"

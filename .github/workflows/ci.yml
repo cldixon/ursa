@@ -107,6 +107,13 @@ jobs:
       - name: check ursa-core on wasm32 (single-threaded)
         run: cargo check -p ursa-core --target wasm32-unknown-unknown --no-default-features --locked
 
+      # The SQL engine in the browser (#277, #278): ursa-sql and everything under it
+      # (ursa-engine, ursa-io, DataFusion) must keep building for wasm32. The cloud
+      # stores and the multi-thread runtime are native-only dependencies; this fails
+      # the moment one leaks onto the wasm32 build.
+      - name: check the SQL engine on wasm32
+        run: cargo clippy -p ursa-sql --target wasm32-unknown-unknown --locked -- -D warnings
+
   pytest:
     name: Python (pytest, ${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}

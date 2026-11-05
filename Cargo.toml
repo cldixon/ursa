@@ -35,9 +35,12 @@ arrow = "59"
 arrow-pyarrow = "59"
 rayon = "1.10"
 datafusion = "55.2"
-# Cloud backends (S3/GCS/Azure) are enabled here so scan_edges/scan_nodes can read
-# from object storage. These features pull in an HTTP client + TLS (rustls) + XML.
-object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+# The base set is what builds on every target, wasm32 included: the in-memory
+# store and the `http` store (on wasm32-unknown-unknown its client runs on the
+# browser's `fetch`). The local file system and the cloud backends (S3/GCS/Azure)
+# do not build for wasm32; each crate adds them for native targets only, under
+# `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` (#278).
+object_store = { version = "0.13", default-features = false, features = ["http"] }
 pyo3 = "0.29"
 url = "2"
 # Seeded PRNG for the stochastic kernels (random_walk). ChaCha gives a portable,
