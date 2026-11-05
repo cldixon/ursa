@@ -117,7 +117,7 @@ fn same_table(a: &TableReference, b: &TableReference) -> bool {
 }
 
 /// A graph's name: one identifier, since it is also a schema's name.
-fn graph_name(name: ObjectName, normalize: bool) -> Result<String> {
+pub(crate) fn graph_name(name: ObjectName, normalize: bool) -> Result<String> {
     let parts: Vec<Ident> = name
         .0
         .iter()
@@ -133,7 +133,7 @@ fn graph_name(name: ObjectName, normalize: bool) -> Result<String> {
     }
 }
 
-fn normalizes(ctx: &SessionContext) -> bool {
+pub(crate) fn normalizes(ctx: &SessionContext) -> bool {
     ctx.state()
         .config()
         .options()
@@ -142,7 +142,7 @@ fn normalizes(ctx: &SessionContext) -> bool {
 }
 
 /// The result of a DDL statement: no rows, no columns (as `CREATE VIEW`).
-fn empty(ctx: &SessionContext) -> Result<DataFrame> {
+pub(crate) fn empty(ctx: &SessionContext) -> Result<DataFrame> {
     Ok(DataFrame::new(
         ctx.state(),
         LogicalPlanBuilder::empty(false).build()?,

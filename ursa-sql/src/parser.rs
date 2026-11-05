@@ -13,7 +13,7 @@ use datafusion::sql::parser::{DFParser, DFParserBuilder, Statement as DFStatemen
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
 use datafusion::sql::sqlparser::parser::ParserError;
-use datafusion::sql::sqlparser::tokenizer::Token;
+use datafusion::sql::sqlparser::tokenizer::{Location, Token};
 
 use crate::property_graph::{parse_tables, EdgeTableDef, VertexTableDef};
 
@@ -128,6 +128,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<UrsaStatement>> {
 /// Ursa's parser: DataFusion's, with Ursa's statements recognised first.
 pub struct UrsaParser<'a> {
     df: DFParser<'a>,
+    /// The text being parsed, for [`Self::parse_statements_with_text`].
+    sql: String,
 }
 
 impl<'a> UrsaParser<'a> {
@@ -136,12 +138,26 @@ impl<'a> UrsaParser<'a> {
             .with_dialect(dialect)
             .with_recursion_limit(recursion_limit)
             .build()?;
-        Ok(Self { df })
+        Ok(Self {
+            df,
+            sql: sql.to_string(),
+        })
     }
 
     /// Parse every statement, separated by `;`. Empty statements are skipped.
     /// (The loop is `DFParser::parse_statements`, calling our `parse_statement`.)
     pub fn parse_statements(&mut self) -> Result<Vec<UrsaStatement>> {
+        Ok(self
+            .parse_statements_with_text()?
+            .into_iter()
+            .map(|(statement, _)| statement)
+            .collect())
+    }
+
+    /// [`Self::parse_statements`], with each statement's text as written
+    /// (from its first token to its last, without the `;`). A database file
+    /// stores this text when a statement's `Display` does not round-trip.
+    pub fn parse_statements_with_text(&mut self) -> Result<Vec<(UrsaStatement, String)>> {
         let mut statements = Vec::new();
         let mut expecting_delimiter = false;
         loop {
@@ -159,7 +175,11 @@ impl<'a> UrsaParser<'a> {
                 ))
                 .into());
             }
-            statements.push(self.parse_statement()?);
+            let start = next.span.start;
+            let statement = self.parse_statement()?;
+            let end = self.df.parser.get_current_token().span.end;
+            let text = source_text(&self.sql, start, end).unwrap_or_else(|| statement.to_string());
+            statements.push((statement, text));
             expecting_delimiter = true;
         }
         Ok(statements)
@@ -269,6 +289,33 @@ impl<'a> UrsaParser<'a> {
     }
 }
 
+/// The text of `sql` between two token locations, or `None` if a location is
+/// unknown (line 0) or outside the text.
+fn source_text(sql: &str, start: Location, end: Location) -> Option<String> {
+    let from = byte_offset(sql, start)?;
+    let to = byte_offset(sql, end)?;
+    (from < to).then(|| sql[from..to].trim().to_string())
+}
+
+/// The byte offset of a tokenizer location (1-based line and column, columns
+/// counted in characters).
+fn byte_offset(sql: &str, at: Location) -> Option<usize> {
+    if at.line == 0 || at.column == 0 {
+        return None;
+    }
+    let mut line_start = 0;
+    for _ in 1..at.line {
+        line_start += sql[line_start..].find('\n')? + 1;
+    }
+    let line = &sql[line_start..];
+    let column = usize::try_from(at.column - 1).ok()?;
+    match line.char_indices().nth(column) {
+        Some((offset, _)) => Some(line_start + offset),
+        None if line.chars().count() == column => Some(sql.len()),
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +408,26 @@ mod tests {
                 "CREATE PROPERTY GRAPH",
                 "SHOW GRAPHS",
                 "SQL statement"
+            ]
+        );
+    }
+
+    #[test]
+    fn statements_keep_their_text() {
+        let sql =
+            "SELECT 1;\n  CREATE EXTERNAL TABLE t (a INT)\n  STORED AS CSV LOCATION 'é.csv'  ;\
+                   CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (a) DESTINATION KEY (b))";
+        let statements = UrsaParser::new(sql, &GenericDialect {}, DEFAULT_RECURSION_LIMIT)
+            .unwrap()
+            .parse_statements_with_text()
+            .unwrap();
+        let texts: Vec<_> = statements.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "SELECT 1",
+                "CREATE EXTERNAL TABLE t (a INT)\n  STORED AS CSV LOCATION 'é.csv'",
+                "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (a) DESTINATION KEY (b))",
             ]
         );
     }
