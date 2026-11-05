@@ -259,6 +259,9 @@ fn planned(
     ))))
 }
 
+/// Looks up a graph's node table, `<graph>.nodes`, as a table source.
+type NodeTable<'a> = dyn Fn(&dyn RelationPlannerContext) -> Result<Arc<dyn TableSource>> + 'a;
+
 /// The node for a call to `spec`, a function that reads node values
 /// (`neighbors_agg`), over the edge table `edges` of `graph`, with the
 /// arguments after the graph (see the module docs).
@@ -268,7 +271,7 @@ fn values_node(
     edges: LogicalPlan,
     args: Vec<FunctionArg>,
     context: &mut dyn RelationPlannerContext,
-    nodes: &dyn Fn(&dyn RelationPlannerContext) -> Result<Arc<dyn TableSource>>,
+    nodes: &NodeTable,
 ) -> Result<GraphAlgorithmNode> {
     let f = spec.name;
     // `values =>` and `attribute =>` are plans; the rest are literals.
