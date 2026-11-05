@@ -41,6 +41,13 @@
 //! index a running query holds. An index larger than the limit on its own is
 //! not stored.
 //!
+//! **The in-adjacency.** An index is built with its out-adjacency; most
+//! algorithms (PageRank among them) then build the in-adjacency on first use.
+//! The write that follows a build starts before that, so it stores the
+//! out-adjacency only. [`IndexStore::flush`] then stores again any index this
+//! process stored or loaded without its in-adjacency and has built one for
+//! since, so a later process loads both instead of building one again.
+//!
 //! A read-only database reads the manifest afresh on each lookup (a writer
 //! may be changing it) and never writes.
 
@@ -120,6 +127,10 @@ struct State {
     /// Indexes this process loaded or stored, by file: an entry whose index
     /// a running query holds is not evicted (see `in_use`).
     live: HashMap<String, Weak<GraphIndex>>,
+    /// Indexes this process stored or loaded without their in-adjacency, by
+    /// file: the key and storage limit to store them again under if a query
+    /// builds it (see [`IndexStore::flush`]).
+    out_only: HashMap<String, (IndexKey, u64)>,
 }
 
 impl IndexStore {
@@ -189,8 +200,10 @@ impl IndexStore {
     }
 
     /// The stored index for `key`, if there is one whose full key matches
-    /// and whose file reads back whole. Blocking: it reads the file.
-    pub fn load(&self, key: &IndexKey) -> Option<Arc<GraphIndex>> {
+    /// and whose file reads back whole. Blocking: it reads the file. `limit`
+    /// is the session's storage limit, for storing the index again with its
+    /// in-adjacency (see [`Self::flush`]).
+    pub fn load(&self, key: &IndexKey, limit: u64) -> Option<Arc<GraphIndex>> {
         let file = if self.writable {
             let mut state = self.state();
             self.ensure_loaded(&mut state);
@@ -201,14 +214,15 @@ impl IndexStore {
                 .find(|e| e.key == *key)?
                 .file
         };
-        let read = std::fs::read(self.dir.join(&file))
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| index_file::decode(&bytes, key));
+        let read = index_file::read_file(&self.dir.join(&file), key);
         let mut state = self.state();
         match read {
             Ok((topology, ids)) => {
                 let index = Arc::new(GraphIndex::new(Arc::new(topology), Arc::new(ids)));
                 state.live.insert(file.clone(), Arc::downgrade(&index));
+                if self.writable && index.topology.incoming_if_built().is_none() {
+                    state.out_only.insert(file.clone(), (key.clone(), limit));
+                }
                 if self.writable {
                     let now = tick(&state.entries);
                     if let Some(entry) = state.entries.iter_mut().find(|e| e.file == file) {
@@ -256,11 +270,29 @@ impl IndexStore {
         }
     }
 
-    /// Wait for every write [`save`](Self::save) started.
+    /// Wait for every write [`save`](Self::save) started, then store again,
+    /// with its in-adjacency, each index this process stored or loaded
+    /// without one and has built one for since (see the module docs).
     pub fn flush(&self) {
         let handles = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
         for handle in handles {
             let _ = handle.join();
+        }
+        let again: Vec<_> = {
+            let mut state = self.state();
+            let State { out_only, live, .. } = &mut *state;
+            out_only
+                .drain()
+                .filter_map(|(file, (key, limit))| {
+                    let index = live.get(&file)?.upgrade()?;
+                    let built = index.topology.incoming_if_built().is_some();
+                    built.then_some((key, index, limit))
+                })
+                .collect()
+        };
+        for (key, index, limit) in again {
+            // As in `save`: a failed write leaves the store as it was.
+            let _ = self.write(&key, &index, limit);
         }
     }
 
@@ -309,6 +341,11 @@ impl IndexStore {
             last_used: now,
         });
         state.live.insert(file.clone(), Arc::downgrade(index));
+        if index.topology.incoming_if_built().is_none() {
+            state.out_only.insert(file.clone(), (key.clone(), limit));
+        } else {
+            state.out_only.remove(&file);
+        }
         removed.extend(evict(&mut state, &file, limit));
         state.live.retain(|_, index| index.strong_count() > 0);
         let saved = write_manifest(&self.dir, &state.entries);

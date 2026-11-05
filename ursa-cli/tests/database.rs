@@ -589,6 +589,18 @@ fn a_second_process_over_parquet_loads_the_index() {
     let (first, counts) = ursa_counting(cwd, &args);
     let first_time = started.elapsed();
     assert_eq!(counts, (1, 0));
+    // PageRank built the in-adjacency after the index was first written, so
+    // the process stored the index again with it (flag bit 1 in the header):
+    // the second process loads it rather than building it again.
+    let files: Vec<_> = std::fs::read_dir(cwd.join("club.ursa.d/indexes"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "idx"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let header = std::fs::read(&files[0]).unwrap();
+    let flags = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    assert_eq!(flags & 2, 2, "the in-adjacency is stored");
     let started = std::time::Instant::now();
     let (second, counts) = ursa_counting(cwd, &args);
     let second_time = started.elapsed();
