@@ -57,6 +57,8 @@ CREATE VIEW first_ties AS SELECT * FROM ties WHERE src < 10;
 CREATE PROPERTY GRAPH first EDGE TABLES (first_ties SOURCE KEY (src) DESTINATION KEY (dst));
 ```
 
+**Edge order.** The order of the edges decides the graph's internal node numbering, which in turn decides community label values and the last bits of floating-point results. Over a file, or a view that filters or projects one, Ursa reads the edges in file order, as the Python library does. A join, an aggregate or a `UNION` gives its rows in no fixed order, so over an edge table built with one of those, Ursa sorts the edges by `(source, destination)` before building the graph. Results are then the same on every run and any thread count. The same holds for a traversal's `seeds`: from a subquery with a join or an aggregate, they are sorted by value. `EXPLAIN` shows the sort as a `SortExec` under the graph function.
+
 `OR REPLACE` replaces a graph of the same name. `IF NOT EXISTS` does nothing if there is one. Defining a graph that exists without either is an error.
 
 SQL/PGQ allows more than Ursa supports so far: several vertex or edge tables, `LABEL`, `PROPERTIES`, `AS` aliases, an edge table `KEY`, and keys of more than one column. Each is recognized and refused with a message, never read as something else:
