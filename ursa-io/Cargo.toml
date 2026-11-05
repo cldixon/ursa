@@ -6,9 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://cldixon.github.io/ursa/"
+keywords = ["parquet", "csv", "graph", "datafusion", "object-store"]
+categories = ["database", "encoding"]
 
 [dependencies]
-ursa-core = { path = "../ursa-core" }
+ursa-core = { path = "../ursa-core", version = "0.5.0" }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 rayon = { workspace = true }

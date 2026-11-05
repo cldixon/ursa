@@ -1,0 +1,212 @@
+name: Release ursa-cli
+
+# Builds the `ursa` binary (the SQL engine's command-line tool, crate ursa-cli)
+# for five platforms, smoke-tests each build that can run on its runner, and,
+# for a release tag only, publishes the crates to crates.io and the archives to
+# a GitHub Release.
+#
+# Separate from release.yml, which releases the Python package (ursa-graph)
+# when a GitHub Release is published. The two never trigger each other: this
+# workflow runs on tags named ursa-cli-v*, and a release created here with the
+# workflow's GITHUB_TOKEN does not start other workflows. release.yml's publish
+# job also skips ursa-cli-v* releases, in case one is published by hand.
+#
+# Nothing is published until a person pushes a tag:
+#
+#   git tag ursa-cli-v0.6.0 && git push origin ursa-cli-v0.6.0
+#
+# The tag must match ursa-cli's version in ursa-cli/Cargo.toml, or the run
+# stops before building. `workflow_dispatch` builds and smoke-tests all five
+# targets as a dry run and publishes nothing.
+#
+# One-time setup (maintainer, repository Settings):
+#   - Secrets: CARGO_REGISTRY_TOKEN, a crates.io API token with the
+#     publish-new and publish-update scopes (crates.io -> Account Settings ->
+#     API Tokens). Store it as an environment secret of `crates-io` below.
+#   - Environments: create `crates-io`. Add yourself as a required reviewer
+#     so every publish waits for approval.
+#
+# Crates are published in dependency order, and a crate whose version is
+# already on crates.io is skipped, so a run can be re-run, and crates published
+# by hand first are not published twice.
+
+on:
+  push:
+    tags: ["ursa-cli-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: ursa-cli's version, and the tag
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
+          echo "ursa-cli version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "ursa-cli-v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match ursa-cli's version $version (expected ursa-cli-v$version)"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04, so the binary needs glibc 2.35 or later.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, native: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, native: true }
+          # macos-latest is Apple silicon; the Intel build cross-compiles there.
+          - { target: aarch64-apple-darwin, os: macos-latest, native: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, native: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, native: true }
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ursa-cli-v${{ needs.version.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p ursa-cli --target "$TARGET"
+
+      - name: Smoke test
+        if: matrix.native
+        shell: bash
+        run: |
+          bin="target/$TARGET/release/ursa"
+          "$bin" --version
+          test "$("$bin" --version)" = "ursa ${{ needs.version.outputs.version }}"
+          out=$("$bin" -f csv -c "
+            CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
+            CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+            SELECT count(*) AS n FROM pagerank(karate, direction => 'both');")
+          echo "$out"
+          test "$(echo "$out" | tr -d '\r' | tail -n 1)" = "34"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir "$ARCHIVE"
+          if [[ "$TARGET" == *windows* ]]; then exe=ursa.exe; else exe=ursa; fi
+          cp "target/$TARGET/release/$exe" ursa-cli/README.md LICENSE-MIT LICENSE-APACHE "$ARCHIVE/"
+          if [[ "$TARGET" == *windows* ]]; then
+            7z a "$ARCHIVE.zip" "$ARCHIVE" > /dev/null
+            file="$ARCHIVE.zip"
+          else
+            tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+            file="$ARCHIVE.tar.gz"
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$file" > "$file.sha256"
+          else
+            shasum -a 256 "$file" > "$file.sha256"
+          fi
+          cat "$file.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ursa-cli-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}.tar.gz
+            ${{ env.ARCHIVE }}.zip
+            ${{ env.ARCHIVE }}.*.sha256
+          if-no-files-found: error
+
+  crates:
+    name: Publish to crates.io
+    # Only for a tag; workflow_dispatch stops after building.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ursa-cli-v')
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Publish in dependency order
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # ursa-core and ursa-io carry the workspace version; ursa-engine,
+          # ursa-sql and ursa-cli carry the SQL engine's.
+          for crate in ursa-core ursa-io ursa-engine ursa-sql ursa-cli; do
+            version=$(cargo metadata --no-deps --format-version 1 --locked \
+              | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')
+            status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -A "ursa release workflow (github.com/cldixon/ursa)" \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            if [[ "$status" == "200" ]]; then
+              echo "$crate $version is already on crates.io; skipping"
+              continue
+            fi
+            echo "publishing $crate $version"
+            # cargo waits until the crate is in the index before returning, so
+            # the next crate can depend on it.
+            cargo publish --locked -p "$crate"
+          done
+
+  github-release:
+    name: GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ursa-cli-v')
+    needs: [version, build, crates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ursa-cli-*
+          merge-multiple: true
+          path: dist
+      - name: Create the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l dist
+          # --latest=false keeps the Python package's release as the
+          # repository's latest.
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest=false \
+            --title "ursa-cli $VERSION" \
+            --notes "The \`ursa\` command-line tool, version $VERSION: Ursa's SQL engine for graph analytics.
+
+          Install with \`cargo install ursa-cli\`, or download the archive for your platform below. Each archive holds the \`ursa\` binary; check it against its \`.sha256\` file.
+
+          Changes: see [CHANGELOG.md](https://github.com/cldixon/ursa/blob/$GITHUB_REF_NAME/CHANGELOG.md). Docs: https://cldixon.github.io/ursa/sql/"
