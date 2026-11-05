@@ -17,6 +17,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   engine built on Ursa reads files as the DataFrame library does.
   `ursa-plan` depends on it and re-exports what it used, so nothing else
   changes: the Python API, results and error messages are the same (#233).
+- The graph functions' specs and dispatch moved into `ursa-core`, as
+  `ursa_core::catalog`: each algorithm's, layout's, neighbour aggregation's
+  and statistic's parameters, defaults, accepted values, directions, output
+  columns and NetworkX equivalent, the validation of a call's arguments, and
+  the kernel dispatch (with the work sharing between `triangle_count` and
+  `clustering_coefficient`, the symmetric views and a layout's two columns).
+  `ursa-plan` resolves and runs every graph column through it, so the
+  DataFrame library and the SQL engine share one implementation. The Python
+  API, results, row order and error messages are unchanged (#236).
 - Upgraded DataFusion 54 → 55.2, arrow, `arrow-pyarrow` and parquet 58 → 59.3
   and pyo3 0.28 → 0.29 (object_store stays on 0.13, the line DataFusion 55
   uses). Results, row order and error messages are unchanged. Building from

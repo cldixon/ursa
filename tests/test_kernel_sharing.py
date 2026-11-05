@@ -14,7 +14,7 @@ shared within a query rather than recomputed per column:
 
 Sharing is not directly observable from Python — the proofs that a kernel ran once
 (`Arc::ptr_eq` on the emitted array, one entry in the memo, one triangle-count
-allocation reused) are Rust-side unit tests in `ursa-plan/src/result.rs`. What
+allocation reused) are Rust-side unit tests in `ursa-core/src/catalog/tests.rs`. What
 these tests pin is the property that matters to a user and would break loudly if
 the sharing were ever wrong: a shared column must equal the value the same kernel
 produces on its own. So each case computes the columns together and separately and
