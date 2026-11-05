@@ -155,6 +155,24 @@ jobs:
       - name: Parity with the native engine
         run: bun ursa-wasm/tests/browser/parity.ts pkg target/debug/ursa
 
+  web:
+    # The Ursa Shell's Worker (web/, #279): generate the binding types from
+    # cloudflare.config.ts with the cf CLI and type-check the Worker.
+    name: Ursa Shell (Worker type-check)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # cf runs on Node 22.18 or later.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+
   pytest:
     name: Python (pytest, ${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
