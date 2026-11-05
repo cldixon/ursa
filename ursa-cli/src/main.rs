@@ -16,7 +16,6 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 
 mod print;
-mod test_graphs;
 
 use print::{has_columns, write_stream, OutputFormat};
 
@@ -129,7 +128,6 @@ fn fail(message: &str) -> ExitCode {
 
 async fn run(sources: Vec<Source>, format: OutputFormat) -> Result<(), DataFusionError> {
     let ctx = ursa_engine::new_session();
-    test_graphs::register(&ctx)?;
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let mut printed = 0;

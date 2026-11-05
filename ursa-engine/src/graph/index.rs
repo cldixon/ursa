@@ -66,22 +66,18 @@ pub fn fingerprint(plan: &LogicalPlan) -> Option<String> {
     let mut rendered = plan.display_indent_schema().to_string();
     let mut cacheable = true;
     let _ = plan.apply_with_subqueries(|node| {
-        if node
-            .expressions()
-            .iter()
-            .any(|e| e.is_volatile())
-        {
+        if node.expressions().iter().any(|e| e.is_volatile()) {
             cacheable = false;
             return Ok(TreeNodeRecursion::Stop);
         }
         if let LogicalPlan::TableScan(scan) = node {
-            let listing = source_as_provider(&scan.source)
-                .ok()
-                .and_then(|p| p.downcast_ref::<ListingTable>().map(|t| {
+            let listing = source_as_provider(&scan.source).ok().and_then(|p| {
+                p.downcast_ref::<ListingTable>().map(|t| {
                     let paths: Vec<String> =
                         t.table_paths().iter().map(|p| p.to_string()).collect();
                     format!("{paths:?} {:?}", t.options())
-                }));
+                })
+            });
             match listing {
                 Some(listing) => {
                     let _ = write!(rendered, "\n{}: {listing}", scan.table_name);

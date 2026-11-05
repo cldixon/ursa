@@ -320,3 +320,104 @@ fn no_sql_points_at_the_options() {
     let e = String::from_utf8(out.stderr).unwrap();
     assert!(e.contains("interactive shell is not available yet"), "{e}");
 }
+
+/// The Getting Started graph: `members` and `ties` over the karate files, and
+/// `karate` over them.
+fn define_karate() -> String {
+    let data = "python/ursa/datasets/data";
+    format!(
+        "CREATE VIEW members AS SELECT * FROM '{data}/karate_nodes.csv';
+         CREATE VIEW ties    AS SELECT * FROM '{data}/karate_edges.csv';
+         CREATE PROPERTY GRAPH karate
+           VERTEX TABLES (members KEY (id))
+           EDGE TABLES (
+             ties SOURCE KEY (src) REFERENCES members (id)
+                  DESTINATION KEY (dst) REFERENCES members (id)
+           );"
+    )
+}
+
+/// Getting Started, "Run an algorithm".
+#[test]
+fn run_an_algorithm_matches_getting_started() {
+    let sql = format!(
+        "{}
+         SELECT id, round(pagerank, 4) AS pagerank
+         FROM pagerank(karate, direction => 'both')
+         ORDER BY pagerank DESC
+         LIMIT 5;",
+        define_karate()
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++----+----------+
+| id | pagerank |
++----+----------+
+| 33 | 0.1009   |
+| 0  | 0.097    |
+| 32 | 0.0717   |
+| 2  | 0.0571   |
+| 1  | 0.0529   |
++----+----------+
+"
+    );
+}
+
+/// Getting Started, "Combine algorithms and attributes", with the joins
+/// written with `ON`: DataFusion 55 cannot plan a chain of four `USING`
+/// joins (see `ursa-engine/tests/graph_functions.rs`).
+#[test]
+fn combine_algorithms_and_attributes() {
+    let sql = format!(
+        "{}
+         SELECT n.id, club, degree, triangle_count AS triangles, louvain AS community
+         FROM karate.nodes AS n
+         JOIN degree(karate, direction => 'both') AS d ON d.id = n.id
+         JOIN triangle_count(karate)               AS t ON t.id = n.id
+         JOIN louvain(karate, seed => 1)           AS l ON l.id = n.id
+         ORDER BY degree DESC
+         LIMIT 5;",
+        define_karate()
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++----+---------+--------+-----------+-----------+
+| id | club    | degree | triangles | community |
++----+---------+--------+-----------+-----------+
+| 33 | Officer | 17     | 15        | 2         |
+| 0  | Mr. Hi  | 16     | 18        | 0         |
+| 32 | Officer | 12     | 13        | 2         |
+| 2  | Mr. Hi  | 10     | 11        | 0         |
+| 1  | Mr. Hi  | 9      | 12        | 0         |
++----+---------+--------+-----------+-----------+
+"
+    );
+}
+
+/// One `USING` join per algorithm works as written: the function's columns
+/// are qualified by its name.
+#[test]
+fn an_algorithm_joins_using_id() {
+    let sql = format!(
+        "{}
+         SELECT id, club, degree FROM karate.nodes
+         JOIN degree(karate, direction => 'both') USING (id)
+         ORDER BY degree DESC, id LIMIT 2;",
+        define_karate()
+    );
+    assert_eq!(
+        ok(ursa(&["-f", "csv", "-c", &sql])),
+        "id,club,degree\n33,Officer,17\n0,Mr. Hi,16\n"
+    );
+}
+
+#[test]
+fn graph_function_errors_are_for_people() {
+    let sql = format!("{} SELECT * FROM pagerank(karte)", define_karate());
+    assert_eq!(
+        err(ursa(&["-c", &sql])),
+        "Error: graph 'karte' does not exist; did you mean 'karate'?\n"
+    );
+}

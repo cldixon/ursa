@@ -10,21 +10,24 @@ use std::sync::Arc;
 use datafusion::catalog::default_table_source::provider_as_source;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::common::{Column, TableReference};
-use datafusion::logical_expr::TableSource;
-use futures::FutureExt;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
+use datafusion::logical_expr::TableSource;
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::sqlparser::ast::{
     self, FunctionArg, FunctionArgExpr, FunctionArgOperator, TableFactor, TableFunctionArgs,
     UnaryOperator, Value,
 };
+use futures::FutureExt;
 
 use super::functions::{self, did_you_mean, plan, FunctionSpec, Literal};
 use super::node::GraphAlgorithmNode;
 use super::{GraphDef, GraphRegistry};
+
+/// A call's named arguments, names normalized, in the order written.
+type NamedArgs = Vec<(String, Literal)>;
 
 /// Plans graph function calls in `FROM`.
 #[derive(Debug)]
@@ -150,11 +153,10 @@ impl GraphFunctions {
         context: &dyn RelationPlannerContext,
     ) -> bool {
         match args.args.first() {
-            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Identifier(ident)))) => {
-                self.registry
-                    .get(&context.normalize_ident(ident.clone()))
-                    .is_some()
-            }
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Identifier(ident)))) => self
+                .registry
+                .get(&context.normalize_ident(ident.clone()))
+                .is_some(),
             _ => false,
         }
     }
@@ -165,7 +167,7 @@ impl GraphFunctions {
         spec: &FunctionSpec,
         args: TableFunctionArgs,
         context: &dyn RelationPlannerContext,
-    ) -> Result<(Arc<GraphDef>, Vec<(String, Literal)>)> {
+    ) -> Result<(Arc<GraphDef>, NamedArgs)> {
         let mut args = args.args.into_iter();
         let missing = || {
             plan(format!(
@@ -345,10 +347,11 @@ impl GraphFunctions {
     }
 }
 
+/// `<graph>.edges` (the DDL's plan of the edge table), projected to the endpoints.
 fn edge_projection(graph: &GraphDef, source: Arc<dyn TableSource>) -> Result<LogicalPlan> {
     let table = graph.edges.table.clone();
     let column = |name: &str| Expr::Column(Column::new(Some(table.clone()), name));
-    LogicalPlanBuilder::scan(table.clone(), source, None)?
+    LogicalPlanBuilder::from(super::edges_plan_from(graph, source)?)
         .project(vec![
             column(&graph.edges.source),
             column(&graph.edges.destination),

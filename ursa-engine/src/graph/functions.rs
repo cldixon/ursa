@@ -14,7 +14,6 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::utils::datafusion_strsim::levenshtein;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::Direction;
 
@@ -361,7 +360,11 @@ impl FunctionSpec {
     /// parameter at its default, for messages.
     pub fn signature(&self) -> String {
         let mut parts = vec!["<graph>".to_string()];
-        parts.extend(self.params.iter().map(|p| format!("{} => {}", p.name, p.default)));
+        parts.extend(
+            self.params
+                .iter()
+                .map(|p| format!("{} => {}", p.name, p.default)),
+        );
         format!("{}({})", self.name, parts.join(", "))
     }
 }
@@ -371,18 +374,13 @@ pub(crate) fn plan(message: String) -> DataFusionError {
     DataFusionError::Plan(message)
 }
 
-/// The closest of `candidates` to `name`, if one is close enough to be a typo.
+/// The closest of `candidates` to `name`, if one is close enough to be a typo
+/// (the graph DDL's rule, so every "did you mean" agrees).
 pub fn did_you_mean<'a>(
     name: &str,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<&'a str> {
-    let lower = name.to_lowercase();
-    candidates
-        .into_iter()
-        .map(|c| (levenshtein(&lower, &c.to_lowercase()), c))
-        .filter(|(d, c)| *d <= (c.len() / 3).max(1) || lower == c.to_lowercase())
-        .min_by_key(|(d, _)| *d)
-        .map(|(_, c)| c)
+    super::closest_name(name, candidates)
 }
 
 /// A call's arguments, read by parameter with its default.
@@ -539,7 +537,10 @@ mod tests {
                 seed: None
             }
         );
-        assert_eq!(call("triangle_count", &[]).unwrap(), Algorithm::TriangleCount);
+        assert_eq!(
+            call("triangle_count", &[]).unwrap(),
+            Algorithm::TriangleCount
+        );
     }
 
     #[test]
@@ -565,7 +566,11 @@ mod tests {
         // An integer is a number, as Python's float parameters take an int.
         assert!(call("pagerank", &[("damping", num("1"))]).is_ok());
         assert_eq!(
-            call("louvain", &[("seed", num("7")), ("resolution", num("-0.5"))]).unwrap(),
+            call(
+                "louvain",
+                &[("seed", num("7")), ("resolution", num("-0.5"))]
+            )
+            .unwrap(),
             Algorithm::Louvain {
                 resolution: -0.5,
                 seed: Some(7)
@@ -641,7 +646,6 @@ mod tests {
     #[test]
     fn suggests_names() {
         assert_eq!(did_you_mean("pagerenk", names()), Some("pagerank"));
-        assert_eq!(did_you_mean("PAGERANK", names()), Some("pagerank"));
         assert_eq!(did_you_mean("closeness", names()), None);
     }
 

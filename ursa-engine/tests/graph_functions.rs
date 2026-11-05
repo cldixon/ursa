@@ -249,8 +249,14 @@ async fn aliases_and_schema() {
     let schema = table(&ctx, "DESCRIBE SELECT * FROM pagerank(karate)")
         .await
         .unwrap();
-    assert!(schema.contains("| id          | Int64     | NO          |"), "{schema}");
-    assert!(schema.contains("| pagerank    | Float64   | NO          |"), "{schema}");
+    assert!(
+        schema.contains("| id          | Int64     | NO          |"),
+        "{schema}"
+    );
+    assert!(
+        schema.contains("| pagerank    | Float64   | NO          |"),
+        "{schema}"
+    );
     // Function and graph names are identifiers, normalized as table names are.
     table(&ctx, "SELECT * FROM PageRank(KARATE)").await.unwrap();
 }
@@ -258,7 +264,13 @@ async fn aliases_and_schema() {
 #[tokio::test]
 async fn string_ids_keep_their_type() {
     let ctx = new_session();
-    define(&ctx, "florentine", "marriages", &data("florentine_edges.csv")).await;
+    define(
+        &ctx,
+        "florentine",
+        "marriages",
+        &data("florentine_edges.csv"),
+    )
+    .await;
     let out = table(
         &ctx,
         "SELECT id, degree FROM degree(florentine, direction => 'both') \

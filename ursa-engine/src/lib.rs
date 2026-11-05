@@ -31,9 +31,7 @@ pub fn new_session() -> SessionContext {
 /// A session with Ursa's file tables over `config`. `information_schema` is
 /// turned on, so `SHOW TABLES` and `SHOW COLUMNS` work.
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
-    let config = graph::with_algorithms(graph::with_registry(
-        config.with_information_schema(true),
-    ));
+    let config = graph::with_algorithms(graph::with_registry(config.with_information_schema(true)));
     let ctx = SessionContext::new_with_config(config);
     // Graph schemas are added to and dropped from the unwrapped catalogs.
     graph::registry_of(&ctx).set_catalogs(Arc::clone(ctx.state().catalog_list()));
