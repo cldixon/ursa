@@ -224,18 +224,83 @@ fn errors_are_for_people() {
     assert!(out.stdout.is_empty());
 }
 
+/// Getting Started, "Define a graph", in one invocation. Getting Started omits
+/// the `ORDER BY`; it is here because row order is not guaranteed.
+#[test]
+fn define_a_graph_matches_getting_started() {
+    let data = "python/ursa/datasets/data";
+    let sql = format!(
+        "CREATE VIEW members AS SELECT * FROM '{data}/karate_nodes.csv';
+         CREATE VIEW ties    AS SELECT * FROM '{data}/karate_edges.csv';
+
+         CREATE PROPERTY GRAPH karate
+           VERTEX TABLES (members KEY (id))
+           EDGE TABLES (
+             ties SOURCE KEY (src) REFERENCES members (id)
+                  DESTINATION KEY (dst) REFERENCES members (id)
+           );
+
+         CREATE PROPERTY GRAPH karate_edges_only
+           EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+
+         SELECT * FROM karate.nodes ORDER BY id LIMIT 3;"
+    );
+    assert_eq!(
+        ok(ursa(&["-c", &sql])),
+        "\
++----+--------+
+| id | club   |
++----+--------+
+| 0  | Mr. Hi |
+| 1  | Mr. Hi |
+| 2  | Mr. Hi |
++----+--------+
+"
+    );
+}
+
+#[test]
+fn graphs_last_for_the_invocation() {
+    let define = format!(
+        "CREATE VIEW ties AS SELECT * FROM '{}';
+         CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
+        karate_edges()
+    );
+    let out = ok(ursa(&[
+        "-f",
+        "csv",
+        "-c",
+        &define,
+        "-c",
+        "SELECT count(*) AS nodes FROM g.nodes",
+        "-c",
+        "SELECT count(*) AS edges FROM g.edges; DROP PROPERTY GRAPH g",
+    ]));
+    assert_eq!(out, "nodes\n34\nedges\n78\n");
+
+    let e = err(ursa(&["-c", "SELECT * FROM g.nodes"]));
+    assert!(e.contains("g.nodes"), "{e}");
+    let e = err(ursa(&[
+        "-c",
+        "CREATE PROPERTY GRAPH g EDGE TABLES (ties AS t SOURCE KEY (src) DESTINATION KEY (dst))",
+    ]));
+    assert!(
+        e.starts_with("Error: table aliases (AS) are not supported yet"),
+        "{e}"
+    );
+}
+
 #[test]
 fn graph_and_database_statements_are_not_supported_yet() {
     for (sql, message) in [
         (
-            "CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
-            "CREATE PROPERTY GRAPH is not supported yet (planned in #235)",
-        ),
-        (
             "DESCRIBE GRAPH karate",
             "DESCRIBE GRAPH is not supported yet (planned in #236)",
         ),
-        ("SHOW GRAPHS", "SHOW GRAPHS is not supported yet (planned in #236)"),
+        (
+            "SHOW GRAPHS",
+            "SHOW GRAPHS is not supported yet (planned in #236)",
+        ),
         (
             "ATTACH 'club.ursa'",
             "ATTACH is not supported yet (planned in #237)",

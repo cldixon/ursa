@@ -33,6 +33,8 @@ pub fn new_session() -> SessionContext {
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     let config = graph::with_registry(config.with_information_schema(true));
     let ctx = SessionContext::new_with_config(config);
+    // Graph schemas are added to and dropped from the unwrapped catalogs.
+    graph::registry_of(&ctx).set_catalogs(Arc::clone(ctx.state().catalog_list()));
     // As `SessionContext::enable_url_table` does, with Ursa's factory in place
     // of DataFusion's.
     let factory = Arc::new(file_table::FileTableFactory::default());
