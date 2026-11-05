@@ -18,6 +18,13 @@ categories = ["command-line-utilities", "database", "algorithms"]
 name = "ursa"
 path = "src/main.rs"
 
+[features]
+default = ["aws-profile"]
+# Read S3 credentials from AWS profile files (~/.aws/config, ~/.aws/credentials,
+# AWS_PROFILE) through aws-config. Without it, S3 credentials come only from the
+# environment and the machine's role.
+aws-profile = ["ursa-engine/aws-profile"]
+
 [dependencies]
 ursa-engine = { path = "../ursa-engine", version = "0.6.0" }
 ursa-sql = { path = "../ursa-sql", version = "0.6.0" }
