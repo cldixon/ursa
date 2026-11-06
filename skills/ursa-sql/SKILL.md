@@ -57,7 +57,8 @@ CREATE PROPERTY GRAPH karate
 - The source and destination columns must have the same type, integer or string. Cast in the view if they don't.
 - A graph is a schema: `karate.edges` and `karate.nodes` are tables.
 - A subgraph is a graph over a view that filters the edges. Its nodes are only the endpoints of the kept edges.
-- Only one vertex table and one edge table per graph. No `LABEL` or `PROPERTIES`.
+- The syntax is SQL/PGQ's, so DuckPGQ graph definitions run as written. A graph can have several vertex and edge tables, `AS` names, `LABEL` and `PROPERTIES`. A vertex `KEY` can be left out: it is then the table's primary key, or the column the edges `REFERENCES`. Keys are one column.
+- An algorithm runs on one vertex table and one edge table. With one edge table the pair is implied (`pagerank(karate)`); otherwise name it after the graph, as DuckPGQ does: `pagerank(social, person, knows)`. A graph of several tables has no `nodes`/`edges` tables; query its tables by their own names.
 
 `DESCRIBE GRAPH` shows the two tables, their columns and where each comes from:
 

@@ -63,11 +63,7 @@ async fn session(partitions: usize) -> SessionContext {
     ] {
         registry_of(&ctx).put(GraphDef {
             name: graph.into(),
-            edges: EdgeTable {
-                table: TableReference::bare(edges),
-                source: "src".into(),
-                destination: "dst".into(),
-            },
+            edges: EdgeTable::new(TableReference::bare(edges), "src", "dst"),
             vertices: None,
         });
     }

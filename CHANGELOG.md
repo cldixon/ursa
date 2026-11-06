@@ -17,9 +17,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2.
-  - Graphs are defined with SQL/PGQ `CREATE PROPERTY GRAPH`, with an
-    optional vertex table. A graph is a schema: `g.edges` and `g.nodes`.
-    `DROP PROPERTY GRAPH`, `SHOW GRAPHS` and `DESCRIBE GRAPH` manage them.
+  - Graphs are defined with SQL/PGQ `CREATE PROPERTY GRAPH`: any number of
+    vertex and edge tables, `AS` names, `LABEL`, `PROPERTIES`, and a vertex
+    `KEY` that may be left out (the primary key, or the column the edges
+    `REFERENCES`, as DuckPGQ infers it), so DuckPGQ graph definitions run as
+    written (#295). Ursa adds optional vertex tables. A graph of one edge
+    table is a schema: `g.edges` and `g.nodes`. An algorithm runs on one
+    vertex table and one edge table, named as DuckPGQ names them when a graph
+    has several: `pagerank(g, person, knows)`. `DROP PROPERTY GRAPH`,
+    `SHOW GRAPHS` and `DESCRIBE [PROPERTY] GRAPH` manage them.
   - Every algorithm and statistic of the Python library (not the layouts or
     the neighbour aggregations) is a table function with named parameters
     (`pagerank(g, damping => 0.9)`), with the same names, defaults and

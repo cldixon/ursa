@@ -36,11 +36,7 @@ async fn session(path: &Path) -> SessionContext {
     .unwrap();
     registry_of(&ctx).put(GraphDef {
         name: "g".into(),
-        edges: EdgeTable {
-            table: TableReference::bare("ties"),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
+        edges: EdgeTable::new(TableReference::bare("ties"), "src", "dst"),
         vertices: None,
     });
     ctx

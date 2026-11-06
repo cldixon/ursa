@@ -20,15 +20,8 @@ fn data(file: &str) -> PathBuf {
 fn def(name: &str, edges: &str, vertices: Option<(&str, &str)>) -> GraphDef {
     GraphDef {
         name: name.into(),
-        edges: EdgeTable {
-            table: TableReference::bare(edges),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
-        vertices: vertices.map(|(table, key)| VertexTable {
-            table: TableReference::bare(table),
-            key: key.into(),
-        }),
+        edges: EdgeTable::new(TableReference::bare(edges), "src", "dst"),
+        vertices: vertices.map(|(table, key)| VertexTable::new(TableReference::bare(table), key)),
     }
 }
 

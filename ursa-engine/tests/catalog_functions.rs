@@ -23,11 +23,7 @@ fn data(file: &str) -> PathBuf {
 fn put_graph(ctx: &SessionContext, graph: &str, table: &str) {
     registry_of(ctx).put(GraphDef {
         name: graph.into(),
-        edges: EdgeTable {
-            table: TableReference::bare(table),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
+        edges: EdgeTable::new(TableReference::bare(table), "src", "dst"),
         vertices: None,
     });
 }

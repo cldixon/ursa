@@ -13,10 +13,10 @@ use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
-use ursa_engine::graph::{self, EdgeTable, GraphDef, VertexTable};
+use ursa_engine::graph::{self, EdgeSpec, EdgeTable, GraphSpec, Label, Properties, VertexSpec};
 
 use crate::parser::{CreatePropertyGraph, DescribeGraph, DropPropertyGraph};
-use crate::property_graph::{EndpointDef, References};
+use crate::property_graph::{EndpointDef, LabelDef, PropertiesDef, References};
 
 pub(crate) async fn create(
     ctx: &SessionContext,
@@ -45,64 +45,121 @@ pub(crate) async fn describe(ctx: &SessionContext, statement: DescribeGraph) -> 
     ctx.read_batch(graph::describe_graph(&ctx.state(), &name).await?)
 }
 
-/// The definition `statement` makes, with its identifiers normalized.
-fn graph_def(statement: CreatePropertyGraph, normalize: bool) -> Result<GraphDef> {
+/// The definition `statement` makes, with its identifiers normalized. Vertex
+/// keys left out are resolved by the engine, which can see the tables.
+fn graph_def(statement: CreatePropertyGraph, normalize: bool) -> Result<GraphSpec> {
     let normalizer = IdentNormalizer::new(normalize);
     let name = graph_name(statement.name, normalize)?;
-    let vertices = match statement.vertices {
-        Some(v) => Some(VertexTable {
-            table: object_name_to_table_reference(v.table, normalize)?,
-            key: normalizer.normalize(v.key),
-        }),
-        None => None,
-    };
-    let edge_table = object_name_to_table_reference(statement.edges.table, normalize)?;
-    let source = endpoint(statement.edges.source, "SOURCE", &vertices, normalize)?;
-    let destination = endpoint(
-        statement.edges.destination,
-        "DESTINATION",
-        &vertices,
-        normalize,
-    )?;
-    Ok(GraphDef {
+    let mut vertex_tables = Vec::new();
+    for v in statement.vertices {
+        let table = object_name_to_table_reference(v.table, normalize)?;
+        let element = element_name(v.alias, &table, &normalizer);
+        vertex_tables.push(VertexSpec {
+            labels: labels(v.labels, &element, &normalizer),
+            name: element,
+            table,
+            key: v.key.map(|k| normalizer.normalize(k)),
+        });
+    }
+    let mut edge_tables = Vec::new();
+    for e in statement.edges {
+        let table = object_name_to_table_reference(e.table, normalize)?;
+        let element = element_name(e.alias, &table, &normalizer);
+        let (source, source_vertex, source_column) = endpoint(e.source, &vertex_tables, normalize)?;
+        let (destination, destination_vertex, destination_column) =
+            endpoint(e.destination, &vertex_tables, normalize)?;
+        edge_tables.push(EdgeSpec {
+            edge: EdgeTable {
+                labels: labels(e.labels, &element, &normalizer),
+                name: element,
+                table,
+                source,
+                destination,
+                source_vertex,
+                destination_vertex,
+            },
+            source_column,
+            destination_column,
+        });
+    }
+    Ok(GraphSpec {
         name,
-        edges: EdgeTable {
-            table: edge_table,
-            source,
-            destination,
-        },
-        vertices,
+        vertex_tables,
+        edge_tables,
     })
 }
 
-/// The endpoint column, after checking that its `REFERENCES` (if any) names
-/// the vertex table and its key.
+/// An element table's name: its `AS` name, or else its table's name.
+fn element_name(
+    alias: Option<Ident>,
+    table: &TableReference,
+    normalizer: &IdentNormalizer,
+) -> String {
+    match alias {
+        Some(alias) => normalizer.normalize(alias),
+        None => table.table().to_string(),
+    }
+}
+
+/// The labels as written; the default label (`DEFAULT LABEL`, or a bare
+/// `PROPERTIES` clause) is named after the element table.
+fn labels(labels: Vec<LabelDef>, element: &str, normalizer: &IdentNormalizer) -> Vec<Label> {
+    labels
+        .into_iter()
+        .map(|label| {
+            let properties = match label.properties {
+                PropertiesDef::Default => Properties::AllColumns { except: Vec::new() },
+                PropertiesDef::AllColumns { except } => Properties::AllColumns {
+                    except: except
+                        .into_iter()
+                        .map(|c| normalizer.normalize(c))
+                        .collect(),
+                },
+                PropertiesDef::List(columns) => Properties::Columns(
+                    columns
+                        .into_iter()
+                        .map(|(column, alias)| {
+                            let column = normalizer.normalize(column);
+                            let name =
+                                alias.map_or_else(|| column.clone(), |a| normalizer.normalize(a));
+                            (column, name)
+                        })
+                        .collect(),
+                ),
+                PropertiesDef::None => Properties::None,
+            };
+            Label {
+                name: label
+                    .name
+                    .map_or_else(|| element.to_string(), |name| normalizer.normalize(name)),
+                properties,
+            }
+        })
+        .collect()
+}
+
+/// The endpoint column, the vertex table (element name) its `REFERENCES`
+/// names, and the column it references.
 fn endpoint(
     endpoint: EndpointDef,
-    side: &str,
-    vertices: &Option<VertexTable>,
+    vertices: &[VertexSpec],
     normalize: bool,
-) -> Result<String> {
-    let key = IdentNormalizer::new(normalize).normalize(endpoint.key);
+) -> Result<(String, Option<String>, Option<String>)> {
+    let normalizer = IdentNormalizer::new(normalize);
+    let key = normalizer.normalize(endpoint.key);
     let Some(References { table, column }) = endpoint.references else {
-        return Ok(key);
-    };
-    let Some(vertices) = vertices else {
-        return Err(DataFusionError::Plan(format!(
-            "{side} KEY ({key}) REFERENCES {table}, but the graph has no VERTEX TABLES; \
-             add VERTEX TABLES ({table} KEY ({column})) or drop the REFERENCES clause"
-        )));
+        return Ok((key, None, None));
     };
     let referenced = object_name_to_table_reference(table, normalize)?;
-    let column = IdentNormalizer::new(normalize).normalize(column);
-    if !same_table(&referenced, &vertices.table) || column != vertices.key {
-        return Err(DataFusionError::Plan(format!(
-            "{side} KEY ({key}) REFERENCES {referenced} ({column}), but the vertex table is \
-             {} KEY ({}); REFERENCES must name the vertex table and its key",
-            vertices.table, vertices.key
-        )));
-    }
-    Ok(key)
+    let column = normalizer.normalize(column);
+    // A vertex table by its element name, else by its table's name.
+    let vertex = vertices
+        .iter()
+        .find(|v| matches!(&referenced, TableReference::Bare { table } if table.as_ref() == v.name))
+        .or_else(|| vertices.iter().find(|v| same_table(&referenced, &v.table)))
+        .map(|v| v.name.clone())
+        .unwrap_or_else(|| referenced.table().to_string());
+    Ok((key, Some(vertex), Some(column)))
 }
 
 /// Whether two references name the same table: equal, or one is the other

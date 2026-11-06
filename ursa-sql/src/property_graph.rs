@@ -1,21 +1,32 @@
-//! The table clauses of `CREATE PROPERTY GRAPH`: the subset of SQL/PGQ Ursa
-//! supports, and clear errors for the rest.
+//! The table clauses of `CREATE PROPERTY GRAPH`: SQL/PGQ's element tables
+//! (#295).
 //!
 //! ```text
 //! CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name
-//!   [VERTEX TABLES ( table KEY (column) )]
-//!   EDGE TABLES (
-//!     table SOURCE KEY (column) [REFERENCES vertex_table (key)]
-//!           DESTINATION KEY (column) [REFERENCES vertex_table (key)]
-//!   )
+//!   [VERTEX TABLES ( vertex_table [, …] )]
+//!   [EDGE TABLES ( edge_table [, …] )]
+//!
+//! vertex_table := table [AS name] [KEY (column)] [labels]
+//! edge_table   := table [AS name] [KEY (column)]
+//!                 SOURCE KEY (column) [REFERENCES vertex (column)]
+//!                 DESTINATION KEY (column) [REFERENCES vertex (column)]
+//!                 [labels]
+//! labels       := properties                       -- the default label
+//!               | DEFAULT LABEL [properties]
+//!               | LABEL name [properties] [LABEL name [properties] …]
+//! properties   := PROPERTIES (column [AS name], …)
+//!               | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (column, …)]
+//!               | NO PROPERTIES
 //! ```
 //!
-//! SQL/PGQ allows more: several vertex and edge tables, `AS alias`, `LABEL`,
-//! `DEFAULT LABEL`, `PROPERTIES`, `NO PROPERTIES`, an edge table `KEY`,
-//! `SOURCE vertex_table` without `KEY`, and multi-column keys. Each is
-//! recognised and rejected as not supported yet, never parsed as something
-//! else. `NODE TABLES` and `RELATIONSHIP TABLES`, SQL/PGQ's synonyms, are
-//! accepted.
+//! At least one of the two clauses is needed. Ursa's relaxation stays: a graph
+//! may have no vertex tables, and then its nodes are its edges' endpoints. A
+//! vertex `KEY` may be left out: the engine takes the table's primary key, or
+//! the column the edges' `REFERENCES` name, as DuckPGQ does. `REFERENCES`
+//! names a vertex table by its element name (its `AS` name, or else the table's
+//! name). Still refused, with a clear error: multi-column keys, `SOURCE vertex`
+//! without `KEY`, and property expressions other than a column. `NODE TABLES`
+//! and `RELATIONSHIP TABLES`, SQL/PGQ's synonyms, are accepted.
 
 use std::fmt;
 
@@ -24,19 +35,27 @@ use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
 
-/// `VERTEX TABLES (table KEY (key))`.
+/// One entry of `VERTEX TABLES (…)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexTableDef {
     pub table: ObjectName,
-    pub key: Ident,
+    /// `AS name`.
+    pub alias: Option<Ident>,
+    /// `KEY (column)`; `None` when left out.
+    pub key: Option<Ident>,
+    pub labels: Vec<LabelDef>,
 }
 
-/// `EDGE TABLES (table SOURCE … DESTINATION …)`.
+/// One entry of `EDGE TABLES (…)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeTableDef {
     pub table: ObjectName,
+    pub alias: Option<Ident>,
+    /// The edge table's own `KEY (column)`, if given.
+    pub key: Option<Ident>,
     pub source: EndpointDef,
     pub destination: EndpointDef,
+    pub labels: Vec<LabelDef>,
 }
 
 /// `KEY (key) [REFERENCES table (column)]`, after `SOURCE` or `DESTINATION`.
@@ -46,26 +65,112 @@ pub struct EndpointDef {
     pub references: Option<References>,
 }
 
-/// `REFERENCES table (column)`.
+/// `REFERENCES vertex (column)`: a vertex table's element name or table name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct References {
     pub table: ObjectName,
     pub column: Ident,
 }
 
+/// One label of an element table and its properties. `name: None` is the
+/// default label (written `DEFAULT LABEL`, or implied by a bare `PROPERTIES`
+/// clause), which is the element table's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelDef {
+    pub name: Option<Ident>,
+    pub properties: PropertiesDef,
+}
+
+/// A label's properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertiesDef {
+    /// No properties clause: every column, as `ALL COLUMNS`.
+    Default,
+    /// `PROPERTIES [ARE] ALL COLUMNS [EXCEPT (…)]`.
+    AllColumns { except: Vec<Ident> },
+    /// `PROPERTIES (column [AS name], …)`.
+    List(Vec<(Ident, Option<Ident>)>),
+    /// `NO PROPERTIES`.
+    None,
+}
+
+fn comma_list<T: fmt::Display>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_labels(f: &mut fmt::Formatter<'_>, labels: &[LabelDef]) -> fmt::Result {
+    for label in labels {
+        match &label.name {
+            Some(name) => write!(f, " LABEL {name}")?,
+            None if label.properties == PropertiesDef::Default => write!(f, " DEFAULT LABEL")?,
+            None => {}
+        }
+        write!(f, "{}", label.properties)?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for PropertiesDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PropertiesDef::Default => Ok(()),
+            PropertiesDef::AllColumns { except } if except.is_empty() => {
+                write!(f, " PROPERTIES ARE ALL COLUMNS")
+            }
+            PropertiesDef::AllColumns { except } => {
+                write!(
+                    f,
+                    " PROPERTIES ARE ALL COLUMNS EXCEPT ({})",
+                    comma_list(except)
+                )
+            }
+            PropertiesDef::List(columns) => {
+                let items: Vec<String> = columns
+                    .iter()
+                    .map(|(column, alias)| match alias {
+                        Some(alias) => format!("{column} AS {alias}"),
+                        None => column.to_string(),
+                    })
+                    .collect();
+                write!(f, " PROPERTIES ({})", items.join(", "))
+            }
+            PropertiesDef::None => write!(f, " NO PROPERTIES"),
+        }
+    }
+}
+
 impl fmt::Display for VertexTableDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "VERTEX TABLES ({} KEY ({}))", self.table, self.key)
+        write!(f, "{}", self.table)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " AS {alias}")?;
+        }
+        if let Some(key) = &self.key {
+            write!(f, " KEY ({key})")?;
+        }
+        write_labels(f, &self.labels)
     }
 }
 
 impl fmt::Display for EdgeTableDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.table)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " AS {alias}")?;
+        }
+        if let Some(key) = &self.key {
+            write!(f, " KEY ({key})")?;
+        }
         write!(
             f,
-            "EDGE TABLES ({} SOURCE {} DESTINATION {})",
-            self.table, self.source, self.destination
-        )
+            " SOURCE {} DESTINATION {}",
+            self.source, self.destination
+        )?;
+        write_labels(f, &self.labels)
     }
 }
 
@@ -79,78 +184,109 @@ impl fmt::Display for EndpointDef {
     }
 }
 
-/// Why everything beyond the subset is rejected.
-const ONE_TABLE_EACH: &str = "Ursa graphs have one edge table and at most one vertex table";
+/// `VERTEX TABLES (…)` and `EDGE TABLES (…)`, as written after the graph's name.
+pub(crate) fn write_tables(
+    f: &mut fmt::Formatter<'_>,
+    vertices: &[VertexTableDef],
+    edges: &[EdgeTableDef],
+) -> fmt::Result {
+    if !vertices.is_empty() {
+        write!(f, " VERTEX TABLES ({})", comma_list(vertices))?;
+    }
+    if !edges.is_empty() {
+        write!(f, " EDGE TABLES ({})", comma_list(edges))?;
+    }
+    Ok(())
+}
+
+/// What a feature beyond the supported grammar is refused with.
+const NOT_SUPPORTED: &str = "not supported yet";
 
 /// Parse the table clauses, after the graph's name.
-pub(crate) fn parse_tables(p: &mut Parser) -> Result<(Option<VertexTableDef>, EdgeTableDef)> {
+pub(crate) fn parse_tables(p: &mut Parser) -> Result<(Vec<VertexTableDef>, Vec<EdgeTableDef>)> {
     let vertices =
         if consume_words(p, &["VERTEX", "TABLES"]) || consume_words(p, &["NODE", "TABLES"]) {
-            p.expect_token(&Token::LParen)?;
-            let vertices = parse_vertex_table(p)?;
-            if p.peek_token_ref().token == Token::Comma {
-                return unsupported(p, "several vertex tables are");
-            }
-            p.expect_token(&Token::RParen)?;
-            Some(vertices)
+            parse_list(p, parse_vertex_table)?
         } else {
-            None
+            Vec::new()
         };
-    if !(consume_words(p, &["EDGE", "TABLES"]) || consume_words(p, &["RELATIONSHIP", "TABLES"])) {
-        let expected = if vertices.is_some() {
-            "EDGE TABLES"
+    let edges =
+        if consume_words(p, &["EDGE", "TABLES"]) || consume_words(p, &["RELATIONSHIP", "TABLES"]) {
+            parse_list(p, parse_edge_table)?
+        } else if vertices.is_empty() {
+            return Ok(p.expected_ref("VERTEX TABLES or EDGE TABLES", p.peek_token_ref())?);
         } else {
-            "VERTEX TABLES or EDGE TABLES"
+            Vec::new()
         };
-        return Ok(p.expected_ref(expected, p.peek_token_ref())?);
-    }
-    p.expect_token(&Token::LParen)?;
-    let edges = parse_edge_table(p)?;
-    if p.peek_token_ref().token == Token::Comma {
-        return unsupported(p, "several edge tables are");
-    }
-    p.expect_token(&Token::RParen)?;
     if word(p, 0, "VERTEX") || word(p, 0, "NODE") {
         return unsupported(p, "VERTEX TABLES after EDGE TABLES is");
     }
     if word(p, 0, "EDGE") || word(p, 0, "RELATIONSHIP") {
-        return unsupported(p, "several EDGE TABLES clauses are");
+        return unsupported(p, "a second EDGE TABLES clause is");
     }
     Ok((vertices, edges))
 }
 
-fn parse_vertex_table(p: &mut Parser) -> Result<VertexTableDef> {
-    let table = p.parse_object_name(false)?;
-    reject_element_options(p)?;
-    if !consume_words(p, &["KEY"]) {
-        if matches!(p.peek_token_ref().token, Token::RParen | Token::Comma) {
-            return unsupported(
-                p,
-                "a vertex table without KEY is (name its key column with KEY (column))",
-            );
-        }
-        return Ok(p.expected_ref("KEY", p.peek_token_ref())?);
+/// `( item [, item …] )`.
+fn parse_list<T>(p: &mut Parser, item: fn(&mut Parser) -> Result<T>) -> Result<Vec<T>> {
+    p.expect_token(&Token::LParen)?;
+    let mut items = vec![item(p)?];
+    while p.consume_token(&Token::Comma) {
+        items.push(item(p)?);
     }
-    let key = parse_key(p)?;
-    reject_element_options(p)?;
-    Ok(VertexTableDef { table, key })
+    p.expect_token(&Token::RParen)?;
+    Ok(items)
+}
+
+/// `table [AS name]`.
+fn parse_element_name(p: &mut Parser) -> Result<(ObjectName, Option<Ident>)> {
+    let table = p.parse_object_name(false)?;
+    let alias = if consume_words(p, &["AS"]) {
+        Some(p.parse_identifier()?)
+    } else {
+        None
+    };
+    Ok((table, alias))
+}
+
+fn parse_vertex_table(p: &mut Parser) -> Result<VertexTableDef> {
+    let (table, alias) = parse_element_name(p)?;
+    let key = if consume_words(p, &["KEY"]) {
+        Some(parse_key(p)?)
+    } else {
+        None
+    };
+    let labels = parse_labels(p)?;
+    if !matches!(p.peek_token_ref().token, Token::RParen | Token::Comma) {
+        return Ok(p.expected_ref("KEY, LABEL, PROPERTIES, ',' or ')'", p.peek_token_ref())?);
+    }
+    Ok(VertexTableDef {
+        table,
+        alias,
+        key,
+        labels,
+    })
 }
 
 fn parse_edge_table(p: &mut Parser) -> Result<EdgeTableDef> {
-    let table = p.parse_object_name(false)?;
-    reject_element_options(p)?;
-    if word(p, 0, "KEY") {
-        return unsupported(p, "an edge table KEY is");
-    }
+    let (table, alias) = parse_element_name(p)?;
+    let key = if consume_words(p, &["KEY"]) {
+        Some(parse_key(p)?)
+    } else {
+        None
+    };
     expect_word(p, "SOURCE")?;
     let source = parse_endpoint(p, "SOURCE")?;
     expect_word(p, "DESTINATION")?;
     let destination = parse_endpoint(p, "DESTINATION")?;
-    reject_element_options(p)?;
+    let labels = parse_labels(p)?;
     Ok(EdgeTableDef {
         table,
+        alias,
+        key,
         source,
         destination,
+        labels,
     })
 }
 
@@ -178,6 +314,78 @@ fn parse_endpoint(p: &mut Parser, side: &str) -> Result<EndpointDef> {
     Ok(EndpointDef { key, references })
 }
 
+/// The label and property clauses of one element table.
+fn parse_labels(p: &mut Parser) -> Result<Vec<LabelDef>> {
+    if consume_words(p, &["DEFAULT", "LABEL"]) {
+        let properties = parse_properties(p)?;
+        return Ok(vec![LabelDef {
+            name: None,
+            properties,
+        }]);
+    }
+    let mut labels = Vec::new();
+    while consume_words(p, &["LABEL"]) {
+        let name = p.parse_identifier()?;
+        let properties = parse_properties(p)?;
+        labels.push(LabelDef {
+            name: Some(name),
+            properties,
+        });
+    }
+    if labels.is_empty() {
+        let properties = parse_properties(p)?;
+        if properties != PropertiesDef::Default {
+            labels.push(LabelDef {
+                name: None,
+                properties,
+            });
+        }
+    }
+    if word(p, 0, "LABELS") || word(p, 0, "DEFAULT") {
+        return unsupported(p, "this label clause is (write LABEL name, once per label)");
+    }
+    Ok(labels)
+}
+
+/// A properties clause, or `Default` when there is none.
+fn parse_properties(p: &mut Parser) -> Result<PropertiesDef> {
+    if consume_words(p, &["NO", "PROPERTIES"]) {
+        return Ok(PropertiesDef::None);
+    }
+    if !consume_words(p, &["PROPERTIES"]) {
+        return Ok(PropertiesDef::Default);
+    }
+    if consume_words(p, &["ARE", "ALL", "COLUMNS"]) || consume_words(p, &["ALL", "COLUMNS"]) {
+        let except = if consume_words(p, &["EXCEPT"]) {
+            parse_list(p, |p| Ok(p.parse_identifier()?))?
+        } else {
+            Vec::new()
+        };
+        return Ok(PropertiesDef::AllColumns { except });
+    }
+    let columns = parse_list(p, |p| {
+        let column = match &p.peek_token_ref().token {
+            Token::Word(_) => p.parse_identifier()?,
+            _ => {
+                return unsupported(p, "a property that is not a column is");
+            }
+        };
+        if !matches!(
+            p.peek_token_ref().token,
+            Token::Comma | Token::RParen | Token::Word(_)
+        ) {
+            return unsupported(p, "a property that is not a column is");
+        }
+        let alias = if consume_words(p, &["AS"]) {
+            Some(p.parse_identifier()?)
+        } else {
+            None
+        };
+        Ok((column, alias))
+    })?;
+    Ok(PropertiesDef::List(columns))
+}
+
 /// `(column)`: a key of exactly one column.
 fn parse_key(p: &mut Parser) -> Result<Ident> {
     p.expect_token(&Token::LParen)?;
@@ -192,28 +400,10 @@ fn parse_key(p: &mut Parser) -> Result<Ident> {
     Ok(column)
 }
 
-/// Reject SQL/PGQ's element table options: `AS alias`, `LABEL`, `DEFAULT
-/// LABEL`, `PROPERTIES`, `NO PROPERTIES`.
-fn reject_element_options(p: &mut Parser) -> Result<()> {
-    if word(p, 0, "AS") {
-        return unsupported(p, "table aliases (AS) are");
-    }
-    if word(p, 0, "LABEL") || (word(p, 0, "DEFAULT") && word(p, 1, "LABEL")) {
-        return unsupported(p, "labels (LABEL, DEFAULT LABEL) are");
-    }
-    if word(p, 0, "PROPERTIES") || (word(p, 0, "NO") && word(p, 1, "PROPERTIES")) {
-        return unsupported(
-            p,
-            "PROPERTIES clauses are (every column of the vertex and edge tables is a property)",
-        );
-    }
-    Ok(())
-}
-
-/// The error for a SQL/PGQ feature beyond Ursa's subset, at the next token.
+/// The error for a SQL/PGQ feature beyond what Ursa supports, at the next token.
 fn unsupported<T>(p: &Parser, what: &str) -> Result<T> {
     Err(DataFusionError::NotImplemented(format!(
-        "{what} not supported yet: {ONE_TABLE_EACH}{}",
+        "{what} {NOT_SUPPORTED}{}",
         p.peek_token_ref().span.start
     )))
 }
@@ -302,16 +492,101 @@ mod tests {
                 name: name(&["karate"]),
                 or_replace: false,
                 if_not_exists: false,
-                vertices: Some(VertexTableDef {
+                vertices: vec![VertexTableDef {
                     table: name(&["members"]),
-                    key: Ident::new("id"),
-                }),
-                edges: EdgeTableDef {
+                    alias: None,
+                    key: Some(Ident::new("id")),
+                    labels: Vec::new(),
+                }],
+                edges: vec![EdgeTableDef {
                     table: name(&["ties"]),
+                    alias: None,
+                    key: None,
                     source: endpoint("src", Some(("members", "id"))),
                     destination: endpoint("dst", Some(("members", "id"))),
-                },
+                    labels: Vec::new(),
+                }],
             }
+        );
+    }
+
+    #[test]
+    fn duckpgqs_graph_without_a_vertex_key() {
+        // DuckPGQ's own test graph: the key is inferred from the REFERENCES.
+        let g = create(
+            "CREATE PROPERTY GRAPH pg
+               VERTEX TABLES (Student)
+               EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id)
+                                 DESTINATION KEY (dst) REFERENCES Student (id))",
+        );
+        assert_eq!(g.vertices[0].key, None);
+        assert_eq!(g.vertices[0].table, name(&["Student"]));
+        // Vertex tables alone are a graph too.
+        let g = create("CREATE PROPERTY GRAPH v VERTEX TABLES (Student KEY (id))");
+        assert!(g.edges.is_empty());
+    }
+
+    #[test]
+    fn several_tables_aliases_labels_and_properties() {
+        let g = create(
+            "CREATE PROPERTY GRAPH social
+               VERTEX TABLES (
+                 people AS person KEY (id) LABEL person PROPERTIES (id, name AS full_name),
+                 posts KEY (pid) DEFAULT LABEL,
+                 tags NO PROPERTIES
+               )
+               EDGE TABLES (
+                 follows KEY (fid) SOURCE KEY (a) REFERENCES person (id)
+                                   DESTINATION KEY (b) REFERENCES person (id)
+                         LABEL knows LABEL follows PROPERTIES ARE ALL COLUMNS EXCEPT (fid),
+                 wrote SOURCE KEY (author) REFERENCES person (id)
+                       DESTINATION KEY (post) REFERENCES posts (pid)
+                       PROPERTIES ALL COLUMNS
+               )",
+        );
+        assert_eq!(g.vertices.len(), 3);
+        assert_eq!(g.edges.len(), 2);
+        let person = &g.vertices[0];
+        assert_eq!(person.alias, Some(Ident::new("person")));
+        assert_eq!(
+            person.labels,
+            vec![LabelDef {
+                name: Some(Ident::new("person")),
+                properties: PropertiesDef::List(vec![
+                    (Ident::new("id"), None),
+                    (Ident::new("name"), Some(Ident::new("full_name"))),
+                ]),
+            }]
+        );
+        assert_eq!(
+            g.vertices[1].labels,
+            vec![LabelDef {
+                name: None,
+                properties: PropertiesDef::Default
+            }]
+        );
+        assert_eq!(
+            g.vertices[2].labels,
+            vec![LabelDef {
+                name: None,
+                properties: PropertiesDef::None
+            }]
+        );
+        let follows = &g.edges[0];
+        assert_eq!(follows.key, Some(Ident::new("fid")));
+        assert_eq!(follows.labels.len(), 2);
+        assert_eq!(
+            follows.labels[1].properties,
+            PropertiesDef::AllColumns {
+                except: vec![Ident::new("fid")]
+            }
+        );
+        assert_eq!(
+            g.edges[1].labels,
+            vec![LabelDef {
+                name: None,
+                properties: PropertiesDef::AllColumns { except: Vec::new() }
+            }]
         );
     }
 
@@ -321,9 +596,9 @@ mod tests {
             "CREATE PROPERTY GRAPH karate_edges_only
                EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
         );
-        assert_eq!(g.vertices, None);
-        assert_eq!(g.edges.source, endpoint("src", None));
-        assert_eq!(g.edges.destination, endpoint("dst", None));
+        assert!(g.vertices.is_empty());
+        assert_eq!(g.edges[0].source, endpoint("src", None));
+        assert_eq!(g.edges[0].destination, endpoint("dst", None));
 
         // Keywords in any case; qualified and quoted names; REFERENCES on one side.
         let g = create(
@@ -334,15 +609,20 @@ mod tests {
         );
         assert!(g.or_replace && g.if_not_exists);
         assert_eq!(g.name.to_string(), r#""Social""#);
-        let vertices = g.vertices.unwrap();
-        assert_eq!(vertices.table.to_string(), r#"db.public."People""#);
-        assert_eq!(vertices.key, Ident::with_quote('"', "Id"));
-        assert_eq!(g.edges.table.to_string(), "db.follows");
+        assert_eq!(g.vertices[0].table.to_string(), r#"db.public."People""#);
+        assert_eq!(g.vertices[0].key, Some(Ident::with_quote('"', "Id")));
+        assert_eq!(g.edges[0].table.to_string(), "db.follows");
         assert_eq!(
-            g.edges.source.references.unwrap().table.to_string(),
+            g.edges[0]
+                .source
+                .references
+                .as_ref()
+                .unwrap()
+                .table
+                .to_string(),
             r#"db.public."People""#
         );
-        assert_eq!(g.edges.destination.references, None);
+        assert_eq!(g.edges[0].destination.references, None);
     }
 
     #[test]
@@ -350,8 +630,13 @@ mod tests {
         for sql in [
             GETTING_STARTED,
             "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (a) DESTINATION KEY (b))",
+            "CREATE PROPERTY GRAPH v VERTEX TABLES (s)",
             r#"CREATE OR REPLACE PROPERTY GRAPH IF NOT EXISTS "G" VERTEX TABLES (s.v KEY ("K"))
                EDGE TABLES (s.e SOURCE KEY (a) DESTINATION KEY (b) REFERENCES s.v ("K"))"#,
+            "CREATE PROPERTY GRAPH g VERTEX TABLES (p AS person KEY (id) LABEL person PROPERTIES \
+             (id, n AS name), q DEFAULT LABEL, r NO PROPERTIES, t PROPERTIES ARE ALL COLUMNS \
+             EXCEPT (x)) EDGE TABLES (e KEY (k) SOURCE KEY (a) REFERENCES person (id) \
+             DESTINATION KEY (b) REFERENCES q (id) LABEL knows LABEL likes NO PROPERTIES)",
         ] {
             let parsed = UrsaStatement::CreatePropertyGraph(Box::new(create(sql)));
             let printed = parsed.to_string();
@@ -373,65 +658,19 @@ mod tests {
     }
 
     #[test]
-    fn sql_pgq_beyond_the_subset_is_rejected() {
-        let not_supported = "not supported yet: Ursa graphs have one edge table and at most one \
-                             vertex table";
-        let properties =
-            "PROPERTIES clauses are (every column of the vertex and edge tables is a property)";
+    fn what_is_still_refused() {
         let multi_column =
             "multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column)";
         for (sql, what) in [
             (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (a KEY (id), b KEY (id))
-                   EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                "several vertex tables are",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d),
-                   f SOURCE KEY (s) DESTINATION KEY (d))",
-                "several edge tables are",
-            ),
-            (
                 "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))
                    EDGE TABLES (f SOURCE KEY (s) DESTINATION KEY (d))",
-                "several EDGE TABLES clauses are",
+                "a second EDGE TABLES clause is",
             ),
             (
                 "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))
                    VERTEX TABLES (v KEY (id))",
                 "VERTEX TABLES after EDGE TABLES is",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (members AS m KEY (id))
-                   EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                "table aliases (AS) are",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g EDGE TABLES (e AS ties SOURCE KEY (s) DESTINATION KEY (d))",
-                "table aliases (AS) are",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) LABEL person)
-                   EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                "labels (LABEL, DEFAULT LABEL) are",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d) DEFAULT LABEL)",
-                "labels (LABEL, DEFAULT LABEL) are",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) PROPERTIES (name))
-                   EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                properties,
-            ),
-            (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) PROPERTIES ARE ALL COLUMNS)
-                   EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                properties,
-            ),
-            (
-                "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d) NO PROPERTIES)",
-                properties,
             ),
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (a, b))
@@ -448,24 +687,27 @@ mod tests {
                 multi_column,
             ),
             (
-                "CREATE PROPERTY GRAPH g EDGE TABLES (e KEY (id) SOURCE KEY (s) DESTINATION KEY (d))",
-                "an edge table KEY is",
-            ),
-            (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id))
                    EDGE TABLES (e SOURCE v DESTINATION v)",
                 "SOURCE without KEY is (name the column with SOURCE KEY (column) REFERENCES \
                  vertex_table (key))",
             ),
             (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (v)
-                   EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                "a vertex table without KEY is (name its key column with KEY (column))",
+                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) PROPERTIES (upper(name)))",
+                "a property that is not a column is",
+            ),
+            (
+                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) PROPERTIES (a + b))",
+                "a property that is not a column is",
+            ),
+            (
+                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) LABEL a DEFAULT LABEL)",
+                "this label clause is (write LABEL name, once per label)",
             ),
         ] {
             let message = error(sql);
             assert!(
-                message.starts_with(&format!("{what} {not_supported} at Line: ")),
+                message.starts_with(&format!("{what} not supported yet at Line: ")),
                 "{sql}\n{message}"
             );
         }
@@ -477,10 +719,6 @@ mod tests {
             (
                 "CREATE PROPERTY GRAPH g",
                 "syntax error: Expected: VERTEX TABLES or EDGE TABLES, found: EOF",
-            ),
-            (
-                "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id))",
-                "syntax error: Expected: EDGE TABLES, found: EOF",
             ),
             (
                 "CREATE PROPERTY GRAPH g EDGE TABLES e SOURCE KEY (s) DESTINATION KEY (d)",
@@ -504,7 +742,7 @@ mod tests {
             ),
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v ID (id)) EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
-                "syntax error: Expected: KEY, found: ID at Line: 1, Column: 42",
+                "syntax error: Expected: KEY, LABEL, PROPERTIES, ',' or ')', found: ID at Line: 1, Column: 42",
             ),
         ] {
             assert_eq!(error(sql), expected, "{sql}");
