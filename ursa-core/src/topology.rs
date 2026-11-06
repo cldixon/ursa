@@ -13,6 +13,9 @@
 //! 3. **Directional laziness** — CSR gives out-neighbours; in-neighbours need the
 //!    transpose (CSC). The transpose is built on first demand and cached, so a
 //!    pull-based-PageRank-only pipeline never pays for the direction it never uses.
+//!    A topology read back from storage can instead be given an
+//!    [`IncomingLoader`] that reads a stored transpose on first demand (see
+//!    [`Topology::with_incoming_loader`]).
 //!
 //! Construction is a counting sort over the endpoint columns — serial for small
 //! graphs, and a byte-identical parallel counting sort (per-chunk histograms + a
@@ -20,7 +23,8 @@
 //!
 //! [`IdMap`]: crate::id_map::IdMap
 
-use std::sync::OnceLock;
+use std::fmt;
+use std::sync::{Mutex, OnceLock};
 
 use arrow::array::{Array, BooleanArray};
 
@@ -562,6 +566,32 @@ impl UndirectedCsr {
     }
 }
 
+/// Reads a stored in-adjacency on first demand: see
+/// [`Topology::with_incoming_loader`]. `None` means it could not be read, and
+/// the transpose is built instead.
+pub type IncomingLoader = Box<dyn FnOnce() -> Option<Adjacency> + Send>;
+
+/// The pending [`IncomingLoader`] of a topology, taken on first use.
+#[derive(Default)]
+struct LazyIncoming(Mutex<Option<IncomingLoader>>);
+
+impl fmt::Debug for LazyIncoming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pending = self
+            .0
+            .lock()
+            .map(|l| l.is_some())
+            .unwrap_or_else(|e| e.into_inner().is_some());
+        write!(f, "LazyIncoming(pending: {pending})")
+    }
+}
+
+impl LazyIncoming {
+    fn take(&self) -> Option<IncomingLoader> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
 /// The shared, immutable topology index.
 ///
 /// Lives on the `EdgeFrame` as `Arc<Topology>`. Property-only transformations
@@ -573,8 +603,12 @@ pub struct Topology {
     n_edges: usize,
     /// Out-adjacency, always built at construction (the common direction).
     out: Adjacency,
-    /// In-adjacency (transpose / CSC), built on first demand from the out-CSR.
+    /// In-adjacency (transpose / CSC), built on first demand from the out-CSR,
+    /// or read by `inc_loader` if there is one.
     inc: OnceLock<Adjacency>,
+    /// Reads a stored in-adjacency on first demand (see
+    /// [`Topology::with_incoming_loader`]).
+    inc_loader: LazyIncoming,
     /// Undirected sorted adjacency, built on first demand (triangle/clustering).
     undirected: OnceLock<UndirectedCsr>,
     /// The unmasked symmetric view (see [`Topology::symmetric`]), built on first
@@ -618,6 +652,7 @@ impl Topology {
             n_edges,
             out,
             inc: OnceLock::new(),
+            inc_loader: LazyIncoming::default(),
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
@@ -656,6 +691,7 @@ impl Topology {
                 edge_ids: (0..n_edges as u32).collect(),
             },
             inc: OnceLock::new(),
+            inc_loader: LazyIncoming::default(),
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: true,
@@ -702,13 +738,39 @@ impl Topology {
             n_edges,
             out,
             inc,
+            inc_loader: LazyIncoming::default(),
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
         })
     }
 
-    /// The in-adjacency if it has been built, without building it.
+    /// This topology, with its in-adjacency read by `loader` the first time
+    /// it is asked for ([`Topology::incoming`]) instead of transposed from the
+    /// out-CSR. This is how a stored index keeps its in-adjacency on disk until
+    /// an algorithm needs it.
+    ///
+    /// What the loader returns is checked as [`Topology::from_parts`] checks an
+    /// in-adjacency; if it is malformed, or the loader returns `None`, the
+    /// transpose is built as usual. As in `from_parts`, that it *is* the
+    /// transpose is the caller's to vouch for. Ignored if the in-adjacency is
+    /// already there, and on a symmetric view, whose transpose is itself.
+    pub fn with_incoming_loader(self, loader: IncomingLoader) -> Topology {
+        if self.inc.get().is_none() && !self.self_transpose {
+            *self.inc_loader.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(loader);
+        }
+        self
+    }
+
+    /// The stored in-adjacency `loader` reads, if it is well formed.
+    fn load_incoming(&self, loader: IncomingLoader) -> Option<Adjacency> {
+        let incoming = loader()?;
+        (incoming.targets.len() == self.n_edges && incoming.check(self.n_nodes, "in").is_ok())
+            .then_some(incoming)
+    }
+
+    /// The in-adjacency if it has been built (or loaded), without building or
+    /// loading it.
     pub fn incoming_if_built(&self) -> Option<&Adjacency> {
         if self.self_transpose {
             return Some(&self.out);
@@ -735,13 +797,17 @@ impl Topology {
     /// In-adjacency (destination → source). Built and cached on first call by
     /// transposing the out-CSR (see [`Adjacency::transpose`]): the same result the
     /// retained-endpoint build produced, without the permanent dense-endpoint
-    /// storage.
+    /// storage. A topology with an [`IncomingLoader`] reads it instead.
     pub fn incoming(&self) -> &Adjacency {
         if self.self_transpose {
             return &self.out;
         }
-        self.inc
-            .get_or_init(|| Adjacency::transpose(&self.out, self.n_nodes))
+        self.inc.get_or_init(|| {
+            self.inc_loader
+                .take()
+                .and_then(|loader| self.load_incoming(loader))
+                .unwrap_or_else(|| Adjacency::transpose(&self.out, self.n_nodes))
+        })
     }
 
     /// Undirected sorted adjacency (`out ∪ in`, self-loops dropped, deduplicated),
@@ -949,6 +1015,44 @@ mod tests {
         assert!(lazy.incoming_if_built().is_none());
         assert_eq!(lazy.incoming().targets, incoming.targets);
         assert_eq!(lazy.incoming().edge_ids, incoming.edge_ids);
+    }
+
+    #[test]
+    fn a_loader_supplies_the_in_adjacency_on_first_demand() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let built = diamond();
+        let incoming = built.incoming().clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lazy = {
+            let (calls, incoming) = (Arc::clone(&calls), incoming.clone());
+            Topology::from_parts(3, built.out().clone(), None)
+                .unwrap()
+                .with_incoming_loader(Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(incoming)
+                }))
+        };
+        // Not read until asked for.
+        assert!(lazy.incoming_if_built().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lazy.incoming().edge_ids, incoming.edge_ids);
+        assert_eq!(lazy.incoming().targets, incoming.targets);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(lazy.incoming_if_built().is_some());
+
+        // A loader that fails, or returns a malformed adjacency: transposed.
+        for loaded in [
+            None,
+            Some(adjacency(&[0, 1, 2, 3], &[2, 0, 0], &[3, 0, 1])),
+            Some(adjacency(&[0, 1, 3, 3], &[2, 0, 7], &[3, 0, 1, 2])),
+        ] {
+            let topo = Topology::from_parts(3, built.out().clone(), None)
+                .unwrap()
+                .with_incoming_loader(Box::new(move || loaded));
+            assert_eq!(topo.incoming().targets, incoming.targets);
+            assert_eq!(topo.incoming().edge_ids, incoming.edge_ids);
+        }
     }
 
     #[test]

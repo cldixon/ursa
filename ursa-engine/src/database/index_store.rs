@@ -34,7 +34,26 @@
 //! that built the index is not held up by the disk. [`IndexStore::flush`]
 //! waits for them; the database calls it when it closes (before it releases
 //! its lock), so a short `ursa -c` process does not exit with a write half
-//! done. A new entry replaces any entry with the same fingerprint (an index of
+//! done.
+//!
+//! **The in-adjacency** is built after the index, by the first algorithm that
+//! needs it (PageRank, in-degree, `direction => 'both'`), usually after the
+//! background write has started. So it is stored as a chunk of the index
+//! file (see `index_file`): with the index if it exists when the index is
+//! written, and otherwise appended by [`IndexStore::flush`], for every index
+//! this process stored or loaded whose in-adjacency has been built since. A
+//! later process lists the chunk when it loads the index and reads it only
+//! when an algorithm asks for the in-adjacency, so a query that does not
+//! need it does not pay for it. The manifest's `size` counts the chunks, and
+//! a chunk that would take the store past the limit is not appended.
+//!
+//! **Evaluated weights** are stored the same way, one chunk per set, named by
+//! the weights' key (the weighted edge plan's fingerprint and the identity of
+//! the files it reads, which include the weight column's). They are used only
+//! with an index whose full key matched, and only under the same weights key,
+//! so a changed weight expression or source file is never served stale
+//! weights. A later process reads a set when a query asks for it, and reads
+//! no edge rows. They are evicted with their index, as part of its file. A new entry replaces any entry with the same fingerprint (an index of
 //! the same edges over an older version of a file), then entries are evicted,
 //! least recently used first, until the total is within the session's
 //! `ursa.index_storage_limit`. Never evicted: the entry just written, and an
@@ -54,7 +73,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::index_file::{self, Encoded, IndexKey};
+use super::index_file::{
+    self, Encoded, EncodedChunk, IndexKey, MainPart, CHUNK_INCOMING, CHUNK_WEIGHTS,
+};
 use crate::graph::GraphIndex;
 
 /// The `format` field of the manifest.
@@ -118,8 +139,20 @@ struct State {
     loaded: bool,
     entries: Vec<Entry>,
     /// Indexes this process loaded or stored, by file: an entry whose index
-    /// a running query holds is not evicted (see `in_use`).
-    live: HashMap<String, Weak<GraphIndex>>,
+    /// a running query holds is not evicted (see `in_use`), and chunks built
+    /// since are appended to its file (see [`IndexStore::flush`]).
+    live: HashMap<String, Live>,
+}
+
+/// An index this process loaded or stored, and what its file holds.
+#[derive(Debug)]
+struct Live {
+    index: Weak<GraphIndex>,
+    main: MainPart,
+    /// The chunks the file has, by kind and name.
+    chunks: HashSet<(u32, Vec<u8>)>,
+    /// The session's storage limit when it was loaded or stored.
+    limit: u64,
 }
 
 impl IndexStore {
@@ -189,8 +222,9 @@ impl IndexStore {
     }
 
     /// The stored index for `key`, if there is one whose full key matches
-    /// and whose file reads back whole. Blocking: it reads the file.
-    pub fn load(&self, key: &IndexKey) -> Option<Arc<GraphIndex>> {
+    /// and whose file reads back whole. Blocking: it reads the file. `limit`
+    /// is the session's storage limit, for chunks appended to it later.
+    pub fn load(&self, key: &IndexKey, limit: u64) -> Option<Arc<GraphIndex>> {
         let file = if self.writable {
             let mut state = self.state();
             self.ensure_loaded(&mut state);
@@ -204,9 +238,40 @@ impl IndexStore {
         let read = index_file::read_file(&self.dir.join(&file), key);
         let mut state = self.state();
         match read {
-            Ok((topology, ids)) => {
-                let index = Arc::new(GraphIndex::new(Arc::new(topology), Arc::new(ids)));
-                state.live.insert(file.clone(), Arc::downgrade(&index));
+            Ok(stored) => {
+                let chunks = stored
+                    .chunks
+                    .iter()
+                    .map(|c| (c.kind, c.name.clone()))
+                    .collect();
+                let weights: Vec<index_file::ChunkInfo> = stored
+                    .chunks
+                    .into_iter()
+                    .filter(|c| c.kind == CHUNK_WEIGHTS)
+                    .collect();
+                let keys = weights
+                    .iter()
+                    .filter_map(|c| String::from_utf8(c.name.clone()).ok())
+                    .collect();
+                let (path, main) = (self.dir.join(&file), stored.main);
+                let n_edges = stored.topology.n_edges();
+                let read = Box::new(move |key: &str| {
+                    let chunk = weights.iter().find(|c| c.name == key.as_bytes())?;
+                    index_file::read_weights(&path, main, chunk, n_edges).ok()
+                });
+                let index = Arc::new(
+                    GraphIndex::new(Arc::new(stored.topology), Arc::new(stored.ids))
+                        .with_stored_weights(keys, read),
+                );
+                state.live.insert(
+                    file.clone(),
+                    Live {
+                        index: Arc::downgrade(&index),
+                        main: stored.main,
+                        chunks,
+                        limit,
+                    },
+                );
                 if self.writable {
                     let now = tick(&state.entries);
                     if let Some(entry) = state.entries.iter_mut().find(|e| e.file == file) {
@@ -254,18 +319,116 @@ impl IndexStore {
         }
     }
 
-    /// Wait for every write [`save`](Self::save) started.
+    /// Wait for every write [`save`](Self::save) started, then append to
+    /// each index file this process stored or loaded the parts of its index
+    /// built since (the in-adjacency, evaluated weights), within the storage
+    /// limit.
     pub fn flush(&self) {
         let handles = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
         for handle in handles {
             let _ = handle.join();
         }
+        if self.writable {
+            self.append_chunks();
+        }
     }
 
-    /// Write `index` under `key`, then update the manifest and evict.
+    /// Append to every live index file the in-adjacency and the weight sets
+    /// its index has built since and the file lacks. A failed append leaves
+    /// the file as it was (less any partial chunk); what it held is built
+    /// again by the next process that needs it.
+    fn append_chunks(&self) {
+        let mut state = self.state();
+        self.ensure_loaded(&mut state);
+        let files: Vec<String> = state.live.keys().cloned().collect();
+        let mut appended = Vec::new();
+        for file in files {
+            let live = &state.live[&file];
+            let Some(index) = live.index.upgrade() else {
+                continue;
+            };
+            let (main, limit) = (live.main, live.limit);
+            let mut todo: Vec<(u32, Vec<u8>)> = Vec::new();
+            if index.topology.incoming_if_built().is_some() {
+                todo.push((CHUNK_INCOMING, Vec::new()));
+            }
+            let weight_sets = index.weight_sets();
+            todo.extend(
+                weight_sets
+                    .iter()
+                    .map(|(key, _)| (CHUNK_WEIGHTS, key.as_bytes().to_vec())),
+            );
+            todo.retain(|chunk| !live.chunks.contains(chunk));
+            for (kind, name) in todo {
+                let Some(entry) = state.entries.iter().position(|e| e.file == file) else {
+                    break;
+                };
+                let columns: Vec<&[f64]> = match kind {
+                    CHUNK_WEIGHTS => weight_sets
+                        .iter()
+                        .find(|(key, _)| key.as_bytes() == name.as_slice())
+                        .map(|(_, w)| w.iter().map(|c| c.as_slice()).collect())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let encode = |start| match kind {
+                    CHUNK_WEIGHTS => EncodedChunk::weights(
+                        std::str::from_utf8(&name).unwrap_or_default(),
+                        &columns,
+                        start,
+                    ),
+                    _ => EncodedChunk::incoming(
+                        index.topology.incoming_if_built().expect("checked above"),
+                        start,
+                    ),
+                };
+                // Not past the limit on its own, as for a whole index.
+                let size = state.entries[entry].size;
+                if size + encode(size).size() > limit {
+                    continue;
+                }
+                let result =
+                    index_file::append_chunk(&self.dir.join(&file), main, kind, &name, encode);
+                if let Ok(appended_len) = result {
+                    if let Some(live) = state.live.get_mut(&file) {
+                        live.chunks.insert((kind, name));
+                    }
+                    if let Some(len) = appended_len {
+                        state.entries[entry].size = len;
+                        appended.push(file.clone());
+                    }
+                }
+            }
+        }
+        if !appended.is_empty() {
+            let limit = state
+                .live
+                .values()
+                .map(|l| l.limit)
+                .min()
+                .unwrap_or(u64::MAX);
+            let removed = evict(&mut state, &appended, limit);
+            let _ = write_manifest(&self.dir, &state.entries);
+            drop(state);
+            for gone in removed {
+                let _ = std::fs::remove_file(self.dir.join(gone));
+            }
+        }
+    }
+
+    /// Write `index` under `key`, then update the manifest and evict. The
+    /// in-adjacency, if it is built by now, is written as a chunk after the
+    /// main part.
     fn write(&self, key: &IndexKey, index: &Arc<GraphIndex>, limit: u64) -> std::io::Result<()> {
         let encoded = Encoded::new(key, &index.topology, &index.ids)?;
-        let size = encoded.file_size();
+        let incoming = index
+            .topology
+            .incoming_if_built()
+            .map(|incoming| EncodedChunk::incoming(incoming, encoded.file_size()))
+            .filter(|chunk| encoded.file_size() + chunk.size() <= limit);
+        let size = incoming
+            .as_ref()
+            .map_or(encoded.file_size(), EncodedChunk::end);
         if size > limit {
             return Ok(());
         }
@@ -276,15 +439,22 @@ impl IndexStore {
         let written = (|| {
             let out = File::create(&temp)?;
             let mut writer = BufWriter::with_capacity(1 << 20, out);
-            encoded.write_to(&mut writer)?;
+            let main = encoded.write_to(&mut writer)?;
+            if let Some(chunk) = &incoming {
+                chunk.write_to(&mut writer)?;
+            }
             let out = writer.into_inner().map_err(|e| e.into_error())?;
             out.sync_all()?;
-            std::fs::rename(&temp, &path)
+            std::fs::rename(&temp, &path)?;
+            Ok(main)
         })();
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&temp);
-            return Err(e);
-        }
+        let main = match written {
+            Ok(main) => main,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e);
+            }
+        };
 
         let mut state = self.state();
         self.ensure_loaded(&mut state);
@@ -306,9 +476,21 @@ impl IndexStore {
             created: now,
             last_used: now,
         });
-        state.live.insert(file.clone(), Arc::downgrade(index));
-        removed.extend(evict(&mut state, &file, limit));
-        state.live.retain(|_, index| index.strong_count() > 0);
+        let chunks = incoming
+            .iter()
+            .map(|_| (CHUNK_INCOMING, Vec::new()))
+            .collect();
+        state.live.insert(
+            file.clone(),
+            Live {
+                index: Arc::downgrade(index),
+                main,
+                chunks,
+                limit,
+            },
+        );
+        removed.extend(evict(&mut state, std::slice::from_ref(&file), limit));
+        state.live.retain(|_, live| live.index.strong_count() > 0);
         let saved = write_manifest(&self.dir, &state.entries);
         drop(state);
         for gone in removed {
@@ -328,7 +510,7 @@ impl Drop for IndexStore {
 /// Remove entries, least recently used first, until their total is at most
 /// `limit`, keeping `keep` and any index a running query holds. Returns the
 /// files of the entries removed.
-fn evict(state: &mut State, keep: &str, limit: u64) -> Vec<String> {
+fn evict(state: &mut State, keep: &[String], limit: u64) -> Vec<String> {
     let mut removed = Vec::new();
     let mut total: u64 = state.entries.iter().map(|e| e.size).sum();
     while total > limit {
@@ -336,7 +518,7 @@ fn evict(state: &mut State, keep: &str, limit: u64) -> Vec<String> {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.file != keep && !in_use(&state.live, &e.file))
+            .filter(|(_, e)| !keep.contains(&e.file) && !in_use(&state.live, &e.file))
             .min_by_key(|(_, e)| (e.last_used, e.created))
             .map(|(i, _)| i);
         let Some(i) = candidate else { break };
@@ -350,8 +532,9 @@ fn evict(state: &mut State, keep: &str, limit: u64) -> Vec<String> {
 /// Whether a running query holds the index stored in `file`: the session's
 /// index cache holds one reference to an index it keeps, and a query using it
 /// holds another.
-fn in_use(live: &HashMap<String, Weak<GraphIndex>>, file: &str) -> bool {
-    live.get(file).is_some_and(|index| index.strong_count() > 1)
+fn in_use(live: &HashMap<String, Live>, file: &str) -> bool {
+    live.get(file)
+        .is_some_and(|live| live.index.strong_count() > 1)
 }
 
 /// Now, in milliseconds since the Unix epoch, and after every time in

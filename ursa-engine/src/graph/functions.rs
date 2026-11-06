@@ -6,15 +6,18 @@
 //! accepted values and output types, shared with the Python library, so a call
 //! means the same thing in both. This module only adds SQL's choices:
 //!
-//! - **Which functions.** Every algorithm and every statistic. Two families
-//!   are left out ([`in_sql`]):
-//!   - the layouts (`layout_fr`, `layout_random`, `layout_circle`), hidden
-//!     until the visualization work, as they are from the Python library's
-//!     public API. A call fails as an unknown function would, and no message
-//!     or listing names them;
-//!   - the neighbour aggregation (`neighbors_agg`), which reads a node
-//!     attribute, which has no natural place in a table function over a graph
-//!     yet.
+//! - **Which functions.** Every algorithm, every statistic and the neighbour
+//!   aggregation. The layouts (`layout_fr`, `layout_random`,
+//!   `layout_circle`) are left out ([`in_sql`]), hidden until the
+//!   visualization work, as they are from the Python library's public API. A
+//!   call fails as an unknown function would, and no message or listing names
+//!   them.
+//! - **Node values.** The neighbour aggregation (`neighbors_agg`) reads one
+//!   value per node. SQL gives them as a query of `(id, value)` rows,
+//!   `values => (SELECT id, age FROM people)` ([`VALUES`], a parameter only
+//!   SQL has), or as an expression over the graph's node table, `attribute =>
+//!   age` (the catalog's `attribute`). Either is planned as a child of the
+//!   graph node, as a traversal's node ids are.
 //! - **No `dtype`.** SQL has `CAST`; a call never narrows its own column.
 //! - **`weight =>`** is an expression over the edge table's columns, planned by
 //!   the relation planner as a column of the node's edge plan, not a literal
@@ -41,7 +44,7 @@ pub const URSA_FUNCTIONS: &str = "ursa_functions";
 /// it rejects is unknown to SQL: not callable, not suggested, not listed by
 /// `ursa_functions()`.
 fn in_sql(spec: &FunctionSpec) -> bool {
-    !matches!(spec.family, Family::Aggregation | Family::Layout)
+    spec.family != Family::Layout
 }
 
 /// The catalog function called `name`, if SQL can call it.
@@ -69,11 +72,52 @@ pub fn is_per_node(spec: &FunctionSpec) -> bool {
     spec.shape == Shape::PerNode
 }
 
-/// The parameters a SQL call can name, in the catalog's order: all but
-/// `dtype`.
+/// `neighbors_agg(values => (SELECT id, value FROM ...))`: the node values as
+/// a query. SQL's alternative to the catalog's `attribute`, which in SQL is an
+/// expression over the graph's node table.
+pub const VALUES: ParamSpec = ParamSpec {
+    name: "values",
+    ty: ParamType::Attribute,
+    default: Value::Null,
+    doc: "A query of two columns, node ids then values: the value of each node. Give this or \
+          attribute.",
+};
+
+/// The SQL description of the catalog's `attribute` parameter.
+const ATTRIBUTE_DOC: &str =
+    "An expression over the graph's node table, the value of each node. Give this or values.";
+
+/// The parameters a SQL call can name: all but `dtype`, in the catalog's
+/// order, after [`VALUES`] for a function that reads node values.
 pub fn sql_params(spec: &FunctionSpec) -> impl Iterator<Item = &'static ParamSpec> {
     let params: &'static [ParamSpec] = spec.params;
-    params.iter().filter(|p| p.ty != ParamType::Dtype)
+    let values = spec.reads_attribute().then_some(&VALUES);
+    values
+        .into_iter()
+        .chain(params.iter().filter(|p| p.ty != ParamType::Dtype))
+}
+
+/// A parameter's one-line description, as SQL reads it.
+pub fn sql_doc(p: &ParamSpec) -> &'static str {
+    match (p.ty, p.name) {
+        (ParamType::Attribute, "attribute") => ATTRIBUTE_DOC,
+        _ => p.doc,
+    }
+}
+
+/// How SQL writes a value of parameter `name`, of type `ty`: `number`,
+/// `string`, `query` ...
+pub fn sql_type(name: &str, ty: ParamType) -> &'static str {
+    match ty {
+        ParamType::Float => "number",
+        ParamType::OptionalFloat => "number or NULL",
+        ParamType::Count => "integer",
+        ParamType::Seed => "integer or NULL",
+        ParamType::Bool => "boolean",
+        ParamType::Choice(_) | ParamType::Direction(_) | ParamType::Dtype => "string",
+        ParamType::Attribute if name == VALUES.name => "query",
+        ParamType::Weight | ParamType::Attribute => "expression",
+    }
 }
 
 /// A literal argument as written: a (possibly signed) number, a string, a
@@ -207,12 +251,21 @@ pub fn sql_value(value: &Value) -> String {
     }
 }
 
-/// The parameters of `spec` at their defaults: `damping => 0.85, ...`.
+/// The parameters of `spec` at their defaults: `damping => 0.85, ...`. Node
+/// values are shown as the query they take, and `attribute`, its
+/// alternative, is left out.
 fn defaults(spec: &FunctionSpec) -> Vec<String> {
     sql_params(spec)
-        .map(|p| format!("{} => {}", p.name, sql_value(&p.default)))
+        .filter_map(|p| match (p.ty, p.name) {
+            (ParamType::Attribute, "values") => Some(format!("{} => {VALUES_QUERY}", p.name)),
+            (ParamType::Attribute, _) => None,
+            _ => Some(format!("{} => {}", p.name, sql_value(&p.default))),
+        })
         .collect()
 }
+
+/// The form of a `values =>` argument, for messages.
+pub const VALUES_QUERY: &str = "(SELECT id, value FROM ...)";
 
 /// `pagerank(<graph>, damping => 0.85, ...)`: the call with every parameter at
 /// its default, for messages.
@@ -469,7 +522,35 @@ mod tests {
         );
         assert_eq!(did_you_mean("random_walks", names()), Some("random_walk"));
         assert_eq!(did_you_mean("dijkstra", names()), None);
-        assert!(lookup("neighbors_agg").is_none());
+        assert_eq!(did_you_mean("neighbor_agg", names()), Some("neighbors_agg"));
+    }
+
+    #[test]
+    fn neighbors_agg_takes_values_or_an_attribute() {
+        let spec = lookup("neighbors_agg").unwrap();
+        let params: Vec<&str> = sql_params(spec).map(|p| p.name).collect();
+        assert_eq!(params, ["values", "direction", "attribute", "agg"]);
+        assert_eq!(
+            signature(spec),
+            "neighbors_agg(<graph>, values => (SELECT id, value FROM ...), direction => 'out', \
+             agg => 'mean')"
+        );
+        assert_eq!(
+            call(
+                "neighbors_agg",
+                &[("agg", s("n_unique")), ("direction", s("both"))]
+            )
+            .unwrap(),
+            Call::NeighborAgg {
+                direction: Direction::Both,
+                agg: ursa_core::algo::AggKind::NUnique
+            }
+        );
+        assert_eq!(
+            message(call("neighbors_agg", &[("agg", s("median"))])),
+            "neighbors_agg(agg => 'median') is not supported; use one of 'mean', 'sum', 'min', \
+             'max', 'count', 'n_unique'"
+        );
     }
 
     #[test]

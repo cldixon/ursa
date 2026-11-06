@@ -40,6 +40,8 @@ pub fn expand_tilde(location: &str) -> String {
 /// expands them), or a URL whose path may contain a glob.
 pub fn table_url(location: &str) -> Result<ListingTableUrl> {
     let location = expand_tilde(location);
+    #[cfg(target_arch = "wasm32")]
+    let location = browser::resolve(&location)?;
     if let Some((base, pattern)) = split_url_glob(&location) {
         let url = Url::parse(base)
             .map_err(|e| DataFusionError::Plan(format!("'{location}' is not a valid URL: {e}")))?;
@@ -78,6 +80,50 @@ pub fn split_url_glob(location: &str) -> Option<(&str, &str)> {
     // `path` starts with '/', so there is always a separator before the glob.
     let split = path_start + path[..glob_at].rfind('/')? + 1;
     Some((&location[..split], &location[split..]))
+}
+
+/// Relative paths in the browser (wasm32).
+///
+/// The browser has no current directory, so a relative path such as
+/// `'karate_edges.csv'` resolves against a base URL the page sets, usually the
+/// directory its data is served from. The Getting Started SQL then runs there
+/// as written (#278).
+#[cfg(target_arch = "wasm32")]
+pub mod browser {
+    use std::sync::RwLock;
+
+    use datafusion::error::{DataFusionError, Result};
+    use url::Url;
+
+    static BASE_URL: RwLock<Option<Url>> = RwLock::new(None);
+
+    /// Set (or clear) the URL relative paths resolve against. A base that
+    /// names a directory should end in `/`, as in a browser.
+    pub fn set_base_url(base: Option<Url>) {
+        *BASE_URL.write().unwrap_or_else(|e| e.into_inner()) = base;
+    }
+
+    /// The URL relative paths resolve against, if one is set.
+    pub fn base_url() -> Option<Url> {
+        BASE_URL.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `location` as a URL: unchanged if it has a scheme, else joined to the
+    /// base URL.
+    pub(crate) fn resolve(location: &str) -> Result<String> {
+        if matches!(Url::parse(location), Ok(url) if url.scheme().len() > 1) {
+            return Ok(location.to_string());
+        }
+        let base = base_url().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "'{location}' is a relative path, and the browser has no current directory; \
+                 use an http:// or https:// URL"
+            ))
+        })?;
+        base.join(location).map(String::from).map_err(|e| {
+            DataFusionError::Plan(format!("'{location}' is not a valid path or URL: {e}"))
+        })
+    }
 }
 
 #[cfg(test)]

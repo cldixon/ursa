@@ -82,7 +82,11 @@ pub fn random_walk_masked(
                 if nbrs.is_empty() {
                     break; // dead end — the walk stops here
                 }
-                cur = nbrs[rng.gen_range(0..nbrs.len())];
+                // Sampled as a u64, not a usize: `gen_range` over usize draws
+                // 64 bits on 64-bit targets and 32 on wasm32, so the same seed
+                // would walk differently in the browser. On 64-bit targets this
+                // is the same draw as before, so native walks are unchanged.
+                cur = nbrs[rng.gen_range(0..nbrs.len() as u64) as usize];
                 walk_id.push(next_id);
                 step_col.push(s as i64);
                 node_col.push(cur);

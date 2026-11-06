@@ -104,7 +104,7 @@ Traversals return an `EdgeFrame` or a `NodeFrame` with rows of their own. The sh
 ur.hop(edges, n: int = 1, direction: str = "out").from_(seeds) -> EdgeFrame
 ```
 
-The nodes within `n` hops of each seed. `seeds` is an iterable of ids, or a `NodeFrame` whose `id` column gives them. A seed that is not in the graph reaches nothing. The result has one row per `(seed, reached)` pair, in the columns `src` and `dst`. `direction` is `"out"`, `"in"`, or `"both"`.
+The nodes within `n` hops of each seed. `seeds` is an iterable of ids, or a `NodeFrame` whose `id` column gives them. An id is an integer or a string. On a graph of integer ids, a string that spells an integer, such as `'7'`, is that integer, and any other string is an error. On a graph of string ids, an integer is its string. A float, a bool or any other value raises `TypeError`. A seed that is not in the graph reaches nothing. The result has one row per `(seed, reached)` pair, in the columns `src` and `dst`. `direction` is `"out"`, `"in"`, or `"both"`.
 
 ### `ur.shortest_path`
 
@@ -112,7 +112,7 @@ The nodes within `n` hops of each seed. `seeds` is an iterable of ids, or a `Nod
 ur.shortest_path(edges, source, target, weight=None, direction: str = "out") -> EdgeFrame
 ```
 
-One shortest path from `source` to `target`. The result has one row per edge on the path, in order, with the columns `src`, `dst`, `hop`, and `cost`. `hop` is the 0-based position. `cost` is the total cost from `source` to that edge's `dst`. Without `weight=`, the path has the fewest edges and `cost` is `hop + 1`. With `weight=`, the path has the least total weight (Dijkstra), and weights must not be negative. If there is no path, the result is empty.
+One shortest path from `source` to `target`. Each is one node id, given as a seed of `hop` is; a sequence holding exactly one id is that id, and a sequence of several raises `ValueError`. The result has one row per edge on the path, in order, with the columns `src`, `dst`, `hop`, and `cost`. `hop` is the 0-based position. `cost` is the total cost from `source` to that edge's `dst`. Without `weight=`, the path has the fewest edges and `cost` is `hop + 1`. With `weight=`, the path has the least total weight (Dijkstra), and weights must not be negative. If there is no path, the result is empty.
 
 ### `ur.random_walk`
 

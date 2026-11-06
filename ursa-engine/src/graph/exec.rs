@@ -32,6 +32,8 @@
 //! values, with the same messages). Weights that line up with a cached index
 //! are stored on it, keyed by the weighted plan's fingerprint and file
 //! identities, so the next query with the same weights reads no edges at all.
+//! In a database, they are stored with the index on disk too, so a weighted
+//! query over a stored index in a later process reads no edges either.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -102,12 +104,21 @@ impl ExtensionPlanner for GraphPlanner {
             return Ok(None);
         };
         let (source, destination) = node.endpoint_indices()?;
-        let weighted = match (logical_inputs.get(1), physical_inputs.get(1)) {
-            (Some(logical), Some(physical)) => {
+        let weighted = match (
+            &node.weighted,
+            logical_inputs.get(1),
+            physical_inputs.get(1),
+        ) {
+            (Some(_), Some(logical), Some(physical)) => {
                 Some(weighted_input(logical, physical, node.weights.len())?)
             }
             _ => None,
         };
+        // A neighbour aggregation's node values are the last input.
+        let values = node
+            .values
+            .as_ref()
+            .and_then(|_| physical_inputs.last().cloned());
         Ok(Some(Arc::new(GraphAlgorithmExec::new(
             Shape {
                 edges: Edges {
@@ -123,6 +134,7 @@ impl ExtensionPlanner for GraphPlanner {
             },
             Arc::clone(&physical_inputs[0]),
             weighted,
+            values,
         ))))
     }
 }
@@ -252,11 +264,18 @@ pub struct GraphAlgorithmExec {
     shape: Shape,
     input: Arc<dyn ExecutionPlan>,
     weighted: Option<WeightedInput>,
+    /// A neighbour aggregation's node values: node ids, then values.
+    values: Option<Arc<dyn ExecutionPlan>>,
     properties: Arc<PlanProperties>,
 }
 
 impl GraphAlgorithmExec {
-    fn new(shape: Shape, input: Arc<dyn ExecutionPlan>, weighted: Option<WeightedInput>) -> Self {
+    fn new(
+        shape: Shape,
+        input: Arc<dyn ExecutionPlan>,
+        weighted: Option<WeightedInput>,
+        values: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&shape.schema)),
             Partitioning::UnknownPartitioning(1),
@@ -267,6 +286,7 @@ impl GraphAlgorithmExec {
             shape,
             input,
             weighted,
+            values,
             properties,
         }
     }
@@ -294,6 +314,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         let mut children = vec![&self.input];
         children.extend(self.weighted.as_ref().map(|w| &w.plan));
+        children.extend(self.values.as_ref());
         children
     }
 
@@ -327,7 +348,16 @@ impl ExecutionPlan for GraphAlgorithmExec {
             plan: children.next().expect("checked above"),
             ..w
         });
-        Ok(Arc::new(Self::new(self.shape.clone(), input, weighted)))
+        let values = self
+            .values
+            .as_ref()
+            .map(|_| children.next().expect("checked above"));
+        Ok(Arc::new(Self::new(
+            self.shape.clone(),
+            input,
+            weighted,
+            values,
+        )))
     }
 
     fn execute(
@@ -343,6 +373,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let shape = self.shape.clone();
         let input = Arc::clone(&self.input);
         let weighted = self.weighted.clone();
+        let values_plan = self.values.clone();
         let schema = Arc::clone(&shape.schema);
         let run = async move {
             let (index, weights) = match weighted {
@@ -352,14 +383,22 @@ impl ExecutionPlan for GraphAlgorithmExec {
                     (index, Some(weights))
                 }
             };
+            let values = match values_plan {
+                Some(plan) => {
+                    let batches = drain(&plan, &[0, 1], &context).await?;
+                    Some(kernels::node_values(&index, &shape.edges.graph, batches)?)
+                }
+                None => None,
+            };
             // The kernels are CPU-bound and parallel (rayon): keep them off
-            // the async workers.
-            tokio::task::spawn_blocking(move || {
+            // the async workers (inline in the browser, which has none).
+            crate::run_blocking(move || {
                 let weights = weights.as_deref().map_or(&[][..], Vec::as_slice);
                 kernels::batch(
                     &index,
                     &shape.outputs,
                     weights,
+                    values.as_deref(),
                     shape.per_node,
                     shape.schema,
                 )
@@ -513,7 +552,7 @@ impl ExecutionPlan for GraphTraversalExec {
                 let batches = drain(plan, &[0], &context).await?;
                 nodes.push(node_ids(&shape, param, &index, batches)?);
             }
-            tokio::task::spawn_blocking(move || {
+            crate::run_blocking(move || {
                 let weights = weights.as_ref().map(|w| w[0].as_slice());
                 traversal::batch(
                     &index.topology,
@@ -645,6 +684,9 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
                 if let Some(exec) = node.downcast_ref::<GraphAlgorithmExec>() {
                     let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
                     keys.extend(exec.weighted.as_ref().map(weighted_keys));
+                    // A neighbour aggregation's values give one value per
+                    // node whatever their order: no sort.
+                    keys.extend(exec.values.as_ref().map(|_| vec![]));
                     keys
                 } else if let Some(exec) = node.downcast_ref::<GraphTraversalExec>() {
                     let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
@@ -819,10 +861,11 @@ async fn weighted_index(
         )),
         None => None,
     };
+    let n_weights = weighted.weights.len();
     // Weights already evaluated over the cached index's rows: nothing to read.
     if let (Some(cache), Some(key), Some(weights_key)) = (&cache, &key, &weights_key) {
         if let Some(index) = cache.get(key) {
-            if let Some(weights) = index.weights(weights_key) {
+            if let Some(weights) = known_weights(&index, weights_key, n_weights).await {
                 return Ok((index, weights));
             }
         }
@@ -845,6 +888,14 @@ async fn weighted_index(
                 .get_or_build_stored(context.session_config(), key, build.boxed())
                 .await?;
             let built_here = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // A stored index may have these weights stored with it.
+            if built_here.is_none() {
+                if let Some(weights_key) = &weights_key {
+                    if let Some(weights) = known_weights(&index, weights_key, n_weights).await {
+                        return Ok((index, weights));
+                    }
+                }
+            }
             match built_here {
                 Some(weights) => (index, weights, true),
                 None => {
@@ -875,6 +926,23 @@ async fn weighted_index(
         index.store_weights(weights_key, Arc::clone(&weights));
     }
     Ok((index, weights))
+}
+
+/// The weights `index` holds under `key` (with `n_weights` columns), in
+/// memory or stored with it on disk.
+async fn known_weights(index: &Arc<GraphIndex>, key: &str, n_weights: usize) -> Option<Weights> {
+    if let Some(weights) = index.weights(key) {
+        return Some(weights);
+    }
+    if !index.has_stored_weights(key) {
+        return None;
+    }
+    let (index, key) = (Arc::clone(index), key.to_string());
+    // Reading a file is blocking work.
+    crate::run_blocking(move || index.stored_weights(&key, n_weights))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Build the index of the weighted rows, reading their weights in the same
@@ -1081,6 +1149,11 @@ async fn build_streamed(
     let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
     let hint = row_hint(input);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
+
+    // Native: the interner runs on a blocking thread, so reading and interning
+    // overlap on two threads. It is spawned here, before the reader starts
+    // (`run_blocking` would start it only when awaited, after the reader).
+    #[cfg(not(target_arch = "wasm32"))]
     let interning = tokio::task::spawn_blocking(move || -> Result<Option<GraphIndex>> {
         let mut interner = EdgeInterner::with_capacity(hint);
         while let Some(chunk) = rx.blocking_recv() {
@@ -1094,8 +1167,28 @@ async fn build_streamed(
         // The reader stopped before the end (its error is the one reported).
         Ok(None)
     });
+    // The browser (wasm32) has one thread: the interner is a future polled
+    // alongside the reader, taking each chunk as it is sent. The channel's
+    // bound still keeps at most two chunks in flight, and the chunks arrive in
+    // the same order, so the index is the same (#278).
+    #[cfg(target_arch = "wasm32")]
+    let interning = async move {
+        let mut interner = EdgeInterner::with_capacity(hint);
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                Chunk::Edges(src, dst) => interner
+                    .push(src.as_ref(), dst.as_ref())
+                    .map_err(|e| build_error(&graph, e))?,
+                Chunk::End => return Ok(Some(finish_index(interner, &id_type))),
+            }
+        }
+        Ok::<_, DataFusionError>(None)
+    };
 
     let read = async {
+        // The reader owns the sender, so the interner sees the channel close
+        // when the reader stops, on an error as at the end.
+        let tx = tx;
         let mut gather = Gather::default();
         for partition in 0..input.output_partitioning().partition_count() {
             let mut stream = input.execute(partition, Arc::clone(context))?;
@@ -1124,11 +1217,16 @@ async fn build_streamed(
         let _ = tx.send(Chunk::End).await;
         Ok::<_, DataFusionError>(())
     };
-    let read = read.await;
-    drop(tx);
-    let built = interning.await.map_err(|e| {
-        DataFusionError::Execution(format!("building graph '{}' failed: {e}", shape.graph))
-    })?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let (read, built) = {
+        let read = read.await;
+        let built = interning.await.map_err(|e| {
+            DataFusionError::Execution(format!("building graph '{}' failed: {e}", shape.graph))
+        })?;
+        (read, built)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let (read, built) = futures::join!(read, interning);
     read?;
     built?.ok_or_else(|| {
         DataFusionError::Internal(format!(

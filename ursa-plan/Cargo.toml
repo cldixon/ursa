@@ -25,5 +25,5 @@ serde_json = { version = "1", features = ["unbounded_depth"] }
 stacker = "0.1"
 
 [dev-dependencies]
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }  # native only: ursa-plan does not target wasm32
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

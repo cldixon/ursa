@@ -1,0 +1,5 @@
+# getrandom 0.3 (in DataFusion's tree) picks its wasm32-unknown-unknown backend
+# from this cfg as well as from its `wasm_js` feature (set in ursa-io's wasm32
+# dependencies). Native builds are unaffected (#278).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

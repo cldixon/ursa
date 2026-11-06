@@ -15,6 +15,11 @@
 //! index. When the node runs with weights it reads only the second child (see
 //! [`super::exec`]).
 //!
+//! A neighbour aggregation (`neighbors_agg`) reads one value per node. Its
+//! node has one more child, last: the values, a plan of two columns, node ids
+//! then values (see [`GraphAlgorithmNode::values`]). Like a traversal's node
+//! ids, it runs when the node runs.
+//!
 //! The node's output is `id` (for per-node functions) plus one column per
 //! [`Output`]: one per algorithm, two per layout (`x` and `y`), and a
 //! statistic's columns, in one row and with no `id`.
@@ -67,6 +72,9 @@ pub struct GraphAlgorithmNode {
     /// The edge rows projected to the endpoints and the weights, when an
     /// output reads a weight (see the module docs).
     pub weighted: Option<Arc<LogicalPlan>>,
+    /// The node values a neighbour aggregation reads: a plan of two columns,
+    /// node ids then values.
+    pub values: Option<Arc<LogicalPlan>>,
     /// The source and destination of each edge: column references into
     /// `input`.
     pub source: Expr,
@@ -90,6 +98,7 @@ impl GraphAlgorithmNode {
         graph: String,
         input: Arc<LogicalPlan>,
         weighted: Option<Arc<LogicalPlan>>,
+        values: Option<Arc<LogicalPlan>>,
         source: Expr,
         destination: Expr,
         weights: Vec<String>,
@@ -97,6 +106,15 @@ impl GraphAlgorithmNode {
         per_node: bool,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
+        if let Some(values) = &values {
+            let columns = values.schema().fields().len();
+            if columns != 2 {
+                return Err(plan(format!(
+                    "the node values of graph '{graph}' must be two columns, node ids then \
+                     values; the query returns {columns}"
+                )));
+            }
+        }
         let mut fields = Vec::new();
         if per_node {
             fields.push(Field::new("id", id_type.clone(), false));
@@ -110,6 +128,7 @@ impl GraphAlgorithmNode {
             graph,
             input,
             weighted,
+            values,
             source,
             destination,
             weights,
@@ -219,6 +238,7 @@ impl PartialEq for GraphAlgorithmNode {
             && self.destination == other.destination
             && self.input == other.input
             && self.weighted == other.weighted
+            && self.values == other.values
     }
 }
 
@@ -231,6 +251,7 @@ impl Hash for GraphAlgorithmNode {
         self.destination.hash(state);
         self.input.hash(state);
         self.weighted.hash(state);
+        self.values.hash(state);
     }
 }
 
@@ -252,7 +273,11 @@ impl PartialOrd for GraphAlgorithmNode {
             Ordering::Equal => {}
             unequal => return Some(unequal),
         }
-        self.weighted.partial_cmp(&other.weighted)
+        match self.weighted.partial_cmp(&other.weighted)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
+        self.values.partial_cmp(&other.values)
     }
 }
 
@@ -264,6 +289,7 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     fn inputs(&self) -> Vec<&LogicalPlan> {
         let mut inputs = vec![self.input.as_ref()];
         inputs.extend(self.weighted.as_deref());
+        inputs.extend(self.values.as_deref());
         inputs
     }
 
@@ -291,7 +317,8 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
         let [source, destination]: [Expr; 2] = exprs
             .try_into()
             .map_err(|_| plan("GraphAlgorithm takes two expressions".into()))?;
-        let expected = 1 + usize::from(self.weighted.is_some());
+        let expected =
+            1 + usize::from(self.weighted.is_some()) + usize::from(self.values.is_some());
         if inputs.len() != expected {
             return Err(plan(format!(
                 "GraphAlgorithm takes {expected} inputs; got {}",
@@ -300,11 +327,13 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
         }
         let mut inputs = inputs.into_iter().map(Arc::new);
         let input = inputs.next().expect("checked above");
-        let weighted = inputs.next();
+        let weighted = self.weighted.as_ref().and_then(|_| inputs.next());
+        let values = self.values.as_ref().and_then(|_| inputs.next());
         Self::try_new(
             self.graph.clone(),
             input,
             weighted,
+            values,
             source,
             destination,
             self.weights.clone(),
@@ -314,7 +343,7 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     }
 
     /// Every output needs both endpoints and nothing else of the first input,
-    /// and every column of the weighted input.
+    /// every column of the weighted input, and both columns of the values.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let (source, destination) = self.endpoint_indices().ok()?;
         let mut needed = vec![source, destination];
@@ -323,6 +352,9 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
         let mut children = vec![needed];
         if let Some(weighted) = &self.weighted {
             children.push((0..weighted.schema().fields().len()).collect());
+        }
+        if self.values.is_some() {
+            children.push(vec![0, 1]);
         }
         Some(children)
     }

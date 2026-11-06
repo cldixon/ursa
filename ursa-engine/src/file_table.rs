@@ -19,7 +19,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use parking_lot::RwLock;
 
-use crate::error::user_message;
+use crate::error::{matched, user_message};
 use crate::paths::{looks_like_location, table_url};
 use crate::stores::ensure_object_store;
 
@@ -80,9 +80,9 @@ pub async fn open_file_table(
 /// Say why `location` could not be opened.
 fn explain(location: &str, err: &DataFusionError) -> DataFusionError {
     let message = user_message(err);
-    if message.contains("No files for table") {
+    if message.contains(matched::NO_FILES_FOR_TABLE) {
         DataFusionError::Plan(format!("no file found at '{location}'"))
-    } else if message.contains("No file_format found with extension") {
+    } else if message.contains(matched::NO_FILE_FORMAT_FOR_EXTENSION) {
         DataFusionError::Plan(format!(
             "cannot tell the format of '{location}' from its extension; Ursa reads .parquet, \
              .csv, .json and .arrow files, and compressed CSV and JSON (.gz, .bz2, .xz, .zst)"
