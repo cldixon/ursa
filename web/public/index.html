@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ursa Shell</title>
+  <meta name="description" content="Graph analytics in SQL, running entirely in your browser: Ursa's engine in WebAssembly over Parquet files.">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="modulepreload" href="/engine/ursa_wasm.js">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Ursa Shell</h1>
+    <p>Graph analytics in SQL, running entirely in your browser. Ursa's engine is compiled to WebAssembly; it reads the sample graphs below as Parquet over HTTP and runs the algorithms on your machine. Nothing is sent to a server.</p>
+  </header>
+
+  <main>
+    <div class="bar">
+      <select id="examples" aria-label="Example queries">
+        <option value="" selected disabled>Examples…</option>
+      </select>
+      <span class="hint">Ctrl / ⌘ + Enter to run</span>
+      <button id="run" disabled>Run</button>
+    </div>
+    <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
+    <p id="status" role="status">Loading the engine (about 5 MB)…</p>
+    <pre id="output" aria-live="polite"></pre>
+  </main>
+
+  <footer>
+    <h2>Datasets</h2>
+    <p>Defined at start: graphs <code>karate</code> (with a vertex table of members), <code>lesmis</code> (weighted) and <code>florentine</code>. Files can be read by name, e.g. <code>'karate_edges.parquet'</code>.</p>
+    <ul id="datasets"></ul>
+    <p id="licence" class="muted"></p>
+    <p class="muted">Ursa: <a href="https://github.com/cldixon/ursa">github.com/cldixon/ursa</a>. The SQL engine is not released yet.</p>
+  </footer>
+</body>
+</html>

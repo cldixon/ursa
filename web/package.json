@@ -1,0 +1,19 @@
+{
+  "name": "ursa-shell",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "cf": "1.0.0-beta.21",
+    "typescript": "6.0.3",
+    "wrangler": "4.152.0"
+  },
+  "scripts": {
+    "engine": "bun scripts/engine.ts",
+    "build": "bun scripts/build.ts",
+    "check": "cf workers types && tsc -p .",
+    "dev": "bun run build && cf dev",
+    "deploy": "bun run build && cf deploy",
+    "upload:data": "bun scripts/upload-data.ts",
+    "upload:engine": "bun scripts/upload-engine.ts"
+  }
+}
