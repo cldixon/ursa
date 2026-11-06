@@ -42,15 +42,19 @@
 //! the message: `hop(seeds =>) must be node ids of graph 'karate', which are
 //! integers; got 'a'`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::arrow::compute::can_cast_types;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::catalog::default_table_source::provider_as_source;
+use datafusion::catalog::default_table_source::{provider_as_source, source_as_provider};
+use datafusion::catalog::view::ViewTable;
 use datafusion::catalog::CatalogProviderList;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::SchemaError;
 use datafusion::common::{Column, DFSchema, TableReference};
+use datafusion::datasource::listing::ListingTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::expr_fn::cast;
 use datafusion::logical_expr::planner::{
@@ -64,7 +68,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::sql::sqlparser::ast::{
     self, visit_expressions_mut, FunctionArg, FunctionArgExpr, FunctionArgOperator,
-    FunctionArguments, TableFactor, TableFunctionArgs, UnaryOperator, Value, VisitMut,
+    FunctionArguments, TableFactor, TableFunctionArgs, UnaryOperator, Value, Visit, VisitMut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -1201,6 +1205,10 @@ impl GraphFunctions {
 
     /// `graph_table('<body>')`: SQL/PGQ's `GRAPH_TABLE ( body )` after Ursa's
     /// parser rewrote it (see [`super::pattern`]).
+    ///
+    /// The match is planned through the graph index where it can be (see
+    /// [`super::pattern`]'s module docs); if that plan cannot be made, it is
+    /// planned as joins, as it was before.
     fn plan_graph_table(
         &self,
         relation: TableFactor,
@@ -1223,19 +1231,172 @@ impl GraphFunctions {
         };
         let pattern = super::pattern::parse(&body)?;
         let graph = self.graph(&pattern.graph)?;
-        let source_of = |table: &TableReference, context: &dyn RelationPlannerContext| match self
-            .registry
-            .file_table(&graph.name, table)
-        {
+        let analysis = self.analyze(&pattern, &graph, context)?;
+        let plan = match analysis.usage == super::pattern::Usage::default() {
+            true => self.plan_match(&pattern, &graph, &analysis, context)?,
+            false => match self.plan_match(&pattern, &graph, &analysis, context) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    let joins = Analysis {
+                        usage: super::pattern::Usage::default(),
+                        ..analysis
+                    };
+                    self.plan_match(&pattern, &graph, &joins, context)?
+                }
+            },
+        };
+        let plan = LogicalPlanBuilder::from(plan);
+        let plan = match alias {
+            Some(_) => plan.build()?,
+            None => plan.alias(super::pattern::FUNCTION)?.build()?,
+        };
+        Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
+            plan, alias,
+        ))))
+    }
+
+    /// A table of `graph`, as a source to plan a scan of.
+    fn graph_source(
+        &self,
+        graph: &PropertyGraph,
+        table: &TableReference,
+        context: &dyn RelationPlannerContext,
+    ) -> Result<Arc<dyn TableSource>> {
+        match self.registry.file_table(&graph.name, table) {
             Some(provider) => Ok(provider_as_source(provider)),
             None => self.table_source(table, context),
+        }
+    }
+
+    /// What `pattern`'s conditions and `COLUMNS` read and bind, and the edge
+    /// tables whose index is kept between queries (see
+    /// [`super::pattern::Usage`]). The default usage (joins only) when the
+    /// query reads a column without naming its variable.
+    fn analyze(
+        &self,
+        pattern: &super::pattern::Pattern,
+        graph: &PropertyGraph,
+        context: &dyn RelationPlannerContext,
+    ) -> Result<Analysis> {
+        use super::pattern::Element;
+        let mut vars = BTreeSet::new();
+        let mut written = Vec::new();
+        for path in &pattern.paths {
+            for element in &path.elements {
+                let spec = match element {
+                    Element::Node(spec) | Element::Edge(spec, ..) => spec,
+                };
+                vars.extend(spec.var.clone());
+                written.extend(spec.condition.clone());
+            }
+        }
+        written.extend(pattern.condition.clone());
+        let paths: BTreeSet<String> = pattern.paths.iter().filter_map(|p| p.var.clone()).collect();
+        let normalize = |i: &ast::Ident| context.normalize_ident(i.clone());
+        let mut refs = Refs {
+            vars: &vars,
+            paths: &paths,
+            normalize: &normalize,
+            depth: 0,
+            reads: BTreeMap::new(),
+            opaque: false,
+            correlated: false,
+        };
+        let mut analysis = Analysis::default();
+        for text in &written {
+            let condition = parse_sql_expr(text)?;
+            for conjunct in conjuncts(&condition) {
+                refs.reads.clear();
+                refs.correlated = false;
+                let _ = conjunct.visit(&mut refs);
+                let read: Vec<String> = refs.reads.keys().cloned().collect();
+                for (var, read) in std::mem::take(&mut refs.reads) {
+                    merge_read(&mut analysis.usage.reads, var, read);
+                }
+                if let ([var], false) = (read.as_slice(), refs.correlated) {
+                    if let Some(property) = bound_property(conjunct, var, &normalize) {
+                        analysis
+                            .usage
+                            .bound
+                            .entry(var.clone())
+                            .or_default()
+                            .insert(property);
+                    }
+                    analysis
+                        .alone
+                        .entry(var.clone())
+                        .or_default()
+                        .push(conjunct.clone());
+                }
+            }
+        }
+        for item in parse_select_items(&pattern.columns)? {
+            refs.reads.clear();
+            match &item {
+                ast::SelectItem::UnnamedExpr(expr)
+                | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                    let _ = expr.visit(&mut refs);
+                }
+                ast::SelectItem::QualifiedWildcard(
+                    ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                    _,
+                ) => {
+                    if let Some(var) = name.0.last().and_then(|p| p.as_ident()) {
+                        refs.reads.insert(normalize(var), None);
+                    }
+                }
+                _ => refs.opaque = true,
+            }
+            for (var, read) in std::mem::take(&mut refs.reads) {
+                merge_read(&mut analysis.usage.reads, var, read);
+            }
+        }
+        if refs.opaque {
+            analysis.usage = super::pattern::Usage::default();
+            return Ok(analysis);
+        }
+        analysis.usage.enabled = true;
+        // The edge tables whose index is kept: they and the vertex tables
+        // their index is built with read only files.
+        for e in &graph.edge_tables {
+            let mut tables = vec![&e.table];
+            if let (Some(s), Some(d)) = (
+                graph.endpoint_vertex(e, true),
+                graph.endpoint_vertex(e, false),
+            ) {
+                tables.push(&s.table);
+                tables.push(&d.table);
+            }
+            let kept = tables.iter().all(|t| {
+                self.graph_source(graph, t, context)
+                    .is_ok_and(|source| reads_only_files(&source))
+            });
+            if kept {
+                analysis.usage.indexed.insert(e.table.clone());
+            }
+        }
+        Ok(analysis)
+    }
+
+    /// The plan of `pattern`'s match on `graph`, as `analysis` lets it be
+    /// planned: through the index where it can be, else as joins.
+    fn plan_match(
+        &self,
+        pattern: &super::pattern::Pattern,
+        graph: &PropertyGraph,
+        analysis: &Analysis,
+        context: &mut dyn RelationPlannerContext,
+    ) -> Result<LogicalPlan> {
+        use super::path_search::{END, START};
+        let source_of = |table: &TableReference, context: &dyn RelationPlannerContext| {
+            self.graph_source(graph, table, context)
         };
         let lowered = {
             let context: &dyn RelationPlannerContext = context;
             let schema_of = |table: &TableReference| -> Result<Arc<Schema>> {
                 Ok(source_of(table, context)?.schema())
             };
-            super::pattern::lower(&pattern, &graph, &schema_of)?
+            super::pattern::lower(pattern, graph, &schema_of, &analysis.usage)?
         };
         let mut conditions = lowered
             .conditions
@@ -1293,40 +1454,96 @@ impl GraphFunctions {
                 .unwrap_or(name);
             Expr::Column(Column::new(Some(var.as_str()), name))
         };
-
-        // The cross join of every variable's relation and every searched
-        // path, as one branch's input.
-        let mut from: Option<LogicalPlanBuilder> = None;
-        let mut relations = Vec::new();
-        for source in &lowered.sources {
-            relations.push(relation_of(source, context)?);
-        }
-        for segment in &lowered.segments {
-            let start = lowered
+        let source = |var: &str| {
+            lowered
                 .sources
                 .iter()
-                .find(|s| s.var == segment.start)
-                .expect("a segment starts at a node");
-            let start = relation_of(start, context)?;
-            // The start nodes: those the conditions on the start node alone keep.
+                .find(|s| s.var == var)
+                .expect("a node has a source")
+        };
+        // A node's key column's type, and its property names.
+        let key_of = |key: &super::pattern::VarColumn,
+                      context: &dyn RelationPlannerContext|
+         -> Result<(DataType, Vec<String>)> {
+            let s = source(&key.0);
+            let schema = source_of(&s.table, context)?.schema();
+            let key_type = schema.field_with_name(&key.1)?.data_type().clone();
+            let names = match &s.columns {
+                None => vec![key.1.clone()],
+                Some(columns) => columns
+                    .iter()
+                    .filter(|(c, _)| c == &key.1)
+                    .map(|(_, n)| n.clone())
+                    .collect(),
+            };
+            Ok((key_type, names))
+        };
+        // The distinct keys a node can have, as one column `START`: the
+        // values its conditions name, if they do (with `named_only`, only
+        // then), else its table's keys; either way, those the conditions on
+        // it alone keep.
+        let node_keys = |key: &super::pattern::VarColumn,
+                         named_only: bool,
+                         context: &mut dyn RelationPlannerContext|
+         -> Result<Option<LogicalPlan>> {
+            let var = key.0.as_str();
+            let alone = analysis.alone.get(var).map(Vec::as_slice).unwrap_or(&[]);
+            let (key_type, names) = key_of(key, &*context)?;
+            let named = named_keys(var, &key_type, &names, alone, context)?;
+            let (relation, skip) = match named {
+                Some((relation, skip)) => (relation, skip),
+                None if named_only => return Ok(None),
+                None => (relation_of(source(var), &*context)?, None),
+            };
             let mut keep = Vec::new();
-            for condition in &conditions {
-                for conjunct in conjuncts(condition) {
-                    if let Ok(expr) = context.sql_to_expr(conjunct.clone(), start.schema()) {
-                        keep.push(expr);
-                    }
+            for (i, conjunct) in alone.iter().enumerate() {
+                if Some(i) == skip {
+                    continue;
+                }
+                if let Ok(expr) = context.sql_to_expr(conjunct.clone(), relation.schema()) {
+                    keep.push(expr);
                 }
             }
-            let mut starts = LogicalPlanBuilder::from(start);
+            let mut keys = LogicalPlanBuilder::from(relation);
             if let Some(predicate) = keep.into_iter().reduce(Expr::and) {
-                starts = starts.filter(predicate)?;
+                keys = keys.filter(predicate)?;
             }
-            let starts = starts
-                .project(vec![
-                    column(&segment.start_key).alias(super::path_search::START)
-                ])?
-                .distinct()?
-                .build()?;
+            Ok(Some(
+                keys.project(vec![column(key).alias(START)])?
+                    .distinct()?
+                    .build()?,
+            ))
+        };
+
+        // The relations: every joined variable's, then every segment's.
+        let mut relations = Vec::new();
+        for source in lowered.sources.iter().filter(|s| s.joined) {
+            relations.push(relation_of(source, context)?);
+        }
+        let mut searches: Vec<LogicalPlan> = Vec::new();
+        for segment in &lowered.segments {
+            // The keys an earlier segment reached.
+            let after = |segment: usize, end: bool| -> Result<LogicalPlan> {
+                let column = if end { END } else { START };
+                LogicalPlanBuilder::from(searches[segment].clone())
+                    .project(vec![Expr::Column(Column::new(
+                        Some(lowered.segments[segment].var.as_str()),
+                        column,
+                    ))
+                    .alias(START)])?
+                    .distinct()?
+                    .build()
+            };
+            let starts = match segment.starts {
+                super::pattern::Starts::Node => node_keys(&segment.start_key, false, context)?
+                    .expect("a node's keys, named or not"),
+                super::pattern::Starts::After { segment, end } => after(segment, end)?,
+            };
+            let targets = match segment.targets {
+                None => None,
+                Some(super::pattern::Starts::Node) => node_keys(&segment.end_key, true, context)?,
+                Some(super::pattern::Starts::After { segment, end }) => Some(after(segment, end)?),
+            };
             let table = source_of(&segment.edges, context)?;
             let edge_column =
                 |name: &str| Expr::Column(Column::new(Some(segment.edges.clone()), name));
@@ -1380,10 +1597,12 @@ impl GraphFunctions {
                 Arc::new(edges),
                 vertices,
                 Arc::new(starts),
+                targets.map(Arc::new),
+                segment.known_only,
                 source,
                 destination,
             )?;
-            relations.push(
+            searches.push(
                 LogicalPlanBuilder::from(LogicalPlan::Extension(Extension {
                     node: Arc::new(node),
                 }))
@@ -1391,13 +1610,56 @@ impl GraphFunctions {
                 .build()?,
             );
         }
+        relations.extend(searches);
+        let mut from: Option<LogicalPlanBuilder> = None;
         for relation in relations {
             from = Some(match from {
                 None => LogicalPlanBuilder::from(relation),
                 Some(b) => b.cross_join(relation)?,
             });
         }
-        let base = from.expect("a pattern has a node").build()?;
+        let mut base = from.expect("a pattern has a node");
+        // A node that is not joined has its key under its own name: the
+        // segment column it is, cast back to the key's type.
+        if !lowered.aliases.is_empty() {
+            let mut projection: Vec<Expr> = base
+                .schema()
+                .iter()
+                .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+                .collect();
+            for alias in &lowered.aliases {
+                let segment = lowered
+                    .segments
+                    .iter()
+                    .find(|s| s.var == alias.column.0)
+                    .expect("an alias names a segment");
+                let key = if segment.start == alias.var {
+                    &segment.start_key
+                } else {
+                    &segment.end_key
+                };
+                let (key_type, names) = key_of(key, context)?;
+                let value = Expr::Column(Column::new(
+                    Some(alias.column.0.as_str()),
+                    alias.column.1.as_str(),
+                ));
+                let value = if value.get_type(base.schema())? == key_type {
+                    value
+                } else {
+                    cast(value, key_type)
+                };
+                for name in names {
+                    projection.push(
+                        value
+                            .clone()
+                            .alias_qualified(Some(alias.var.as_str()), name),
+                    );
+                }
+            }
+            base = base.project(projection)?;
+        }
+        let base = base.build()?;
+        let explain = |e: DataFusionError| explain_field_error(e, pattern, &base);
         let mut branches = Vec::new();
         for joins in &lowered.branches {
             let mut filter: Vec<Expr> = joins
@@ -1408,7 +1670,11 @@ impl GraphFunctions {
                 })
                 .collect();
             for condition in &conditions {
-                filter.push(context.sql_to_expr(condition.clone(), base.schema())?);
+                filter.push(
+                    context
+                        .sql_to_expr(condition.clone(), base.schema())
+                        .map_err(explain)?,
+                );
             }
             let mut branch = LogicalPlanBuilder::from(base.clone());
             if let Some(predicate) = filter.into_iter().reduce(Expr::and) {
@@ -1418,12 +1684,15 @@ impl GraphFunctions {
             let mut projection = Vec::new();
             for item in &columns {
                 match item {
-                    ast::SelectItem::UnnamedExpr(expr) => {
-                        projection.push(context.sql_to_expr(expr.clone(), &schema)?)
-                    }
+                    ast::SelectItem::UnnamedExpr(expr) => projection.push(
+                        context
+                            .sql_to_expr(expr.clone(), &schema)
+                            .map_err(explain)?,
+                    ),
                     ast::SelectItem::ExprWithAlias { expr, alias } => projection.push(
                         context
-                            .sql_to_expr(expr.clone(), &schema)?
+                            .sql_to_expr(expr.clone(), &schema)
+                            .map_err(explain)?
                             .alias(context.normalize_ident(alias.clone())),
                     ),
                     ast::SelectItem::QualifiedWildcard(
@@ -1457,18 +1726,44 @@ impl GraphFunctions {
             }
             branches.push(branch.project(projection)?.build()?);
         }
+        // The joins of an undirected edge are a UNION ALL, which names
+        // repeated columns `id_1`; a match whose undirected edges are all
+        // expanded keeps those names.
+        if branches.len() == 1 && lowered.union {
+            let branch = branches.pop().expect("one branch");
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            let mut renamed = false;
+            let projection: Vec<Expr> = branch
+                .schema()
+                .iter()
+                .map(|(q, f)| {
+                    let column = Expr::Column(Column::new(q.cloned(), f.name()));
+                    match counts.get_mut(f.name()) {
+                        Some(count) => {
+                            *count += 1;
+                            renamed = true;
+                            column.alias(format!("{}_{count}", f.name()))
+                        }
+                        None => {
+                            counts.insert(f.name().clone(), 0);
+                            column
+                        }
+                    }
+                })
+                .collect();
+            branches.push(match renamed {
+                true => LogicalPlanBuilder::from(branch)
+                    .project(projection)?
+                    .build()?,
+                false => branch,
+            });
+        }
         let mut branches = branches.into_iter();
         let mut plan = LogicalPlanBuilder::from(branches.next().expect("one branch at least"));
         for branch in branches {
             plan = plan.union(branch)?;
         }
-        let plan = match alias {
-            Some(_) => plan.build()?,
-            None => plan.alias(super::pattern::FUNCTION)?.build()?,
-        };
-        Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
-            plan, alias,
-        ))))
+        plan.build()
     }
 
     fn first_argument_is_a_graph(
@@ -1794,4 +2089,336 @@ impl GraphFunctions {
         })?;
         super::edges_plan_from(graph, source)
     }
+}
+
+/// What a `GRAPH_TABLE`'s conditions and `COLUMNS` read and bind (see
+/// [`GraphFunctions::analyze`]).
+#[derive(Debug, Clone, Default)]
+struct Analysis {
+    usage: super::pattern::Usage,
+    /// Per variable, the conjuncts of the conditions that read it alone.
+    alone: BTreeMap<String, Vec<ast::Expr>>,
+}
+
+/// Finds the variables and properties an expression reads.
+struct Refs<'a> {
+    /// The pattern's node and edge variables.
+    vars: &'a BTreeSet<String>,
+    /// Its path variables.
+    paths: &'a BTreeSet<String>,
+    normalize: &'a dyn Fn(&ast::Ident) -> String,
+    /// How many subqueries deep the visit is.
+    depth: usize,
+    /// Per variable, the properties read (`None`: all of them).
+    reads: BTreeMap<String, Option<BTreeSet<String>>>,
+    /// A column is read without its variable.
+    opaque: bool,
+    /// A subquery reads a variable.
+    correlated: bool,
+}
+
+impl ast::Visitor for Refs<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &ast::Query) -> ControlFlow<()> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &ast::Query) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &ast::Expr) -> ControlFlow<()> {
+        let mut read = |var: String, property: Option<String>| {
+            if self.depth > 0 {
+                self.correlated = true;
+            }
+            match property {
+                Some(p) => merge_read(&mut self.reads, var, Some(BTreeSet::from([p]))),
+                None => merge_read(&mut self.reads, var, None),
+            }
+        };
+        match expr {
+            ast::Expr::Identifier(ident) => {
+                let name = (self.normalize)(ident);
+                if self.vars.contains(&name) {
+                    read(name, None);
+                } else if self.depth == 0 && !self.paths.contains(&name) {
+                    self.opaque = true;
+                }
+            }
+            ast::Expr::CompoundIdentifier(parts) => {
+                let var = (self.normalize)(&parts[0]);
+                if self.vars.contains(&var) {
+                    match parts.as_slice() {
+                        [_, property] => read(var, Some((self.normalize)(property))),
+                        _ => read(var, None),
+                    }
+                }
+            }
+            // `count(a.*)`: every property of `a`.
+            ast::Expr::Function(f) => {
+                if let ast::FunctionArguments::List(list) = &f.args {
+                    for arg in &list.args {
+                        let (FunctionArg::Unnamed(e) | FunctionArg::Named { arg: e, .. }) = arg
+                        else {
+                            continue;
+                        };
+                        if let FunctionArgExpr::QualifiedWildcard(name) = e {
+                            match name.0.first().and_then(|p| p.as_ident()) {
+                                Some(var) if self.vars.contains(&(self.normalize)(var)) => {
+                                    read((self.normalize)(var), None)
+                                }
+                                _ => self.opaque = true,
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Note that `var` is read: `read`'s properties (`None`: all of them).
+fn merge_read(
+    reads: &mut BTreeMap<String, Option<BTreeSet<String>>>,
+    var: String,
+    read: Option<BTreeSet<String>>,
+) {
+    let entry = reads.entry(var).or_insert_with(|| Some(BTreeSet::new()));
+    match (entry.as_mut(), read) {
+        (Some(properties), Some(read)) => properties.extend(read),
+        (Some(_), None) => *entry = None,
+        (None, _) => {}
+    }
+}
+
+/// The property of `var` that `conjunct` limits to values it names, if it
+/// does: `var.p = <literal>`, `var.p IN (<literals>)` or `var.p IN (SELECT …)`.
+fn bound_property(
+    conjunct: &ast::Expr,
+    var: &str,
+    normalize: &dyn Fn(&ast::Ident) -> String,
+) -> Option<String> {
+    let property = |e: &ast::Expr| match e {
+        ast::Expr::CompoundIdentifier(parts) if parts.len() == 2 && normalize(&parts[0]) == var => {
+            Some(normalize(&parts[1]))
+        }
+        _ => None,
+    };
+    match conjunct {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } => property(left)
+            .filter(|_| is_literal(right))
+            .or_else(|| property(right).filter(|_| is_literal(left))),
+        ast::Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if !list.is_empty() && list.iter().all(is_literal) => property(expr),
+        ast::Expr::InSubquery {
+            expr,
+            negated: false,
+            ..
+        } => property(expr),
+        ast::Expr::Nested(inner) => bound_property(inner, var, normalize),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a number or a string, as written.
+fn is_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Value(v) => matches!(v.value, Value::Number(..) | Value::SingleQuotedString(_)),
+        ast::Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => matches!(expr.as_ref(), ast::Expr::Value(v) if matches!(v.value, Value::Number(..))),
+        ast::Expr::Nested(inner) => is_literal(inner),
+        _ => false,
+    }
+}
+
+/// The values the conjuncts on `var` alone name for its key, as the relation
+/// `var` of one row per value, the key (of `key_type`) under each of its
+/// property `names`: the candidates for its keys. Also which conjunct named
+/// them, when it need not be checked again (a subquery). `None` if no
+/// conjunct names them.
+fn named_keys(
+    var: &str,
+    key_type: &DataType,
+    names: &[String],
+    alone: &[ast::Expr],
+    context: &mut dyn RelationPlannerContext,
+) -> Result<Option<(LogicalPlan, Option<usize>)>> {
+    let Some(i) = alone.iter().position(|c| {
+        let normalize = |i: &ast::Ident| context.normalize_ident(i.clone());
+        bound_property(c, var, &normalize).is_some_and(|p| names.contains(&p))
+    }) else {
+        return Ok(None);
+    };
+    let fields: Vec<Field> = names
+        .iter()
+        .map(|n| Field::new(n, key_type.clone(), true))
+        .collect();
+    let schema = DFSchema::try_from_qualified_schema(var, &Schema::new(fields))?;
+    let mut conjunct = &alone[i];
+    while let ast::Expr::Nested(inner) = conjunct {
+        conjunct = inner;
+    }
+    let mut literal = |e: &ast::Expr| context.sql_to_expr(e.clone(), &schema);
+    let (values, skip) = match conjunct {
+        ast::Expr::BinaryOp { left, right, .. } => {
+            let value = if is_literal(right) { right } else { left };
+            let row = vec![literal(value)?];
+            (LogicalPlanBuilder::values(vec![row])?.build()?, None)
+        }
+        ast::Expr::InList { list, .. } => {
+            let rows = list
+                .iter()
+                .map(|e| Ok(vec![literal(e)?]))
+                .collect::<Result<Vec<_>>>()?;
+            (LogicalPlanBuilder::values(rows)?.build()?, None)
+        }
+        ast::Expr::InSubquery { .. } => match literal(conjunct)? {
+            Expr::InSubquery(s) if s.subquery.outer_ref_columns.is_empty() => {
+                (s.subquery.subquery.as_ref().clone(), Some(i))
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let value = Expr::Column(Column::from(values.schema().qualified_field(0)));
+    let value = Expr::TryCast(datafusion::logical_expr::TryCast::new(
+        Box::new(value),
+        key_type.clone(),
+    ));
+    let keys = LogicalPlanBuilder::from(values)
+        .project(names.iter().map(|n| value.clone().alias(n)))?
+        .alias(var)?
+        .build()?;
+    Ok(Some((keys, skip)))
+}
+
+/// Whether reading `source` reads only files, literal rows or nothing: what a
+/// graph index can be kept for between queries (see
+/// [`super::index::fingerprint`]).
+fn reads_only_files(source: &Arc<dyn TableSource>) -> bool {
+    let Ok(provider) = source_as_provider(source) else {
+        return false;
+    };
+    if provider.downcast_ref::<ListingTable>().is_some() {
+        return true;
+    }
+    match provider.downcast_ref::<ViewTable>() {
+        Some(view) => plan_reads_only_files(view.logical_plan()),
+        None => false,
+    }
+}
+
+fn plan_reads_only_files(plan: &LogicalPlan) -> bool {
+    let mut files = true;
+    let _ = plan.apply_with_subqueries(|node| {
+        let stable = !node.expressions().iter().any(|e| e.is_volatile())
+            && match node {
+                LogicalPlan::TableScan(scan) => reads_only_files(&scan.source),
+                _ => true,
+            };
+        if !stable {
+            files = false;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    files
+}
+
+/// `e`, said in the pattern's terms when it is a property a variable does
+/// not have: "node 'a' has no property 's'; its properties are …", rather
+/// than DataFusion's, which names Ursa's internal relations (#325).
+fn explain_field_error(
+    e: DataFusionError,
+    pattern: &super::pattern::Pattern,
+    base: &LogicalPlan,
+) -> DataFusionError {
+    use super::pattern::Element;
+    fn schema_error(e: &DataFusionError) -> Option<&SchemaError> {
+        match e {
+            DataFusionError::SchemaError(error, _) => Some(error.as_ref()),
+            DataFusionError::Diagnostic(_, e) | DataFusionError::Context(_, e) => schema_error(e),
+            DataFusionError::Collection(errors) => errors.iter().find_map(schema_error),
+            _ => None,
+        }
+    }
+    let Some(SchemaError::FieldNotFound { field, .. }) = schema_error(&e) else {
+        return e;
+    };
+    let mut nodes = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    let mut unnamed_edge = false;
+    for path in &pattern.paths {
+        for element in &path.elements {
+            match element {
+                Element::Node(spec) => nodes.extend(spec.var.clone()),
+                Element::Edge(spec, ..) => match &spec.var {
+                    Some(var) => {
+                        edges.insert(var.clone());
+                    }
+                    None => unnamed_edge = true,
+                },
+            }
+        }
+    }
+    let name = field.name();
+    let Some(var) = field.relation.as_ref().map(|r| r.table().to_string()) else {
+        let mut vars: Vec<&String> = nodes.iter().chain(&edges).collect();
+        vars.sort();
+        return plan(format!(
+            "in GRAPH_TABLE: '{name}' needs its variable, as {}.{name}",
+            vars.first().map(|v| v.as_str()).unwrap_or("a")
+        ));
+    };
+    let kind = if nodes.contains(&var) {
+        "node"
+    } else if edges.contains(&var) {
+        "edge"
+    } else {
+        let vars: Vec<&String> = nodes.iter().chain(&edges).collect();
+        return plan(format!(
+            "in GRAPH_TABLE: '{var}' is not a variable of the pattern; its variables are {}",
+            vars.iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    let mut properties: Vec<&str> = base
+        .schema()
+        .iter()
+        .filter(|(q, _)| q.is_some_and(|q| q.table() == var))
+        .map(|(_, f)| f.name().as_str())
+        .collect();
+    properties.sort();
+    properties.dedup();
+    let mut message = format!(
+        "in GRAPH_TABLE: {kind} '{var}' has no property '{name}'; its properties are {}",
+        if properties.is_empty() {
+            "none".to_string()
+        } else {
+            properties.join(", ")
+        }
+    );
+    if kind == "node" && unnamed_edge {
+        message.push_str(&format!(
+            ". To read an edge's columns, name the edge, as -[e]->, and write e.{name}"
+        ));
+    }
+    plan(message)
 }

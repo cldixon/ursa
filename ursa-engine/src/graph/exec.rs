@@ -76,6 +76,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -271,7 +272,7 @@ fn plan_path_search(
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let expected = 2 + usize::from(node.vertices.is_some());
+    let expected = 2 + usize::from(node.vertices.is_some()) + usize::from(node.targets.is_some());
     if physical_inputs.len() != expected || logical_inputs.len() != expected {
         return Err(DataFusionError::Internal(format!(
             "PathSearch has {expected} inputs; planned {}",
@@ -279,6 +280,7 @@ fn plan_path_search(
         )));
     }
     let vertices = vertex_input(node.vertices.is_some(), logical_inputs, physical_inputs, 1)?;
+    let starts = 1 + usize::from(vertices.is_some());
     Ok(Arc::new(PathSearchExec::new(
         PathShape {
             edges: Edges {
@@ -290,10 +292,14 @@ fn plan_path_search(
             },
             search: node.search,
             columns: node.columns,
+            known_only: node.known_only,
             schema: Arc::new(node.schema().as_arrow().clone()),
         },
         Arc::clone(&physical_inputs[0]),
-        Arc::clone(physical_inputs.last().expect("checked above")),
+        Arc::clone(&physical_inputs[starts]),
+        node.targets
+            .as_ref()
+            .map(|_| Arc::clone(&physical_inputs[starts + 1])),
     )))
 }
 
@@ -302,18 +308,22 @@ struct PathShape {
     edges: Edges,
     search: Search,
     columns: PathColumns,
+    known_only: bool,
     schema: SchemaRef,
 }
 
 /// Builds or fetches a graph index from its first child's edge rows, reads
-/// the start nodes its second child produces, and searches paths from them
-/// (see [`super::path_search`]).
+/// the start nodes its next child produces (and the targets its last, if it
+/// has them), and searches paths from them (see [`super::path_search`]).
+/// `EXPLAIN ANALYZE` shows how many path prefixes it extended (`expanded`).
 #[derive(Debug)]
 pub struct PathSearchExec {
     shape: PathShape,
     input: Arc<dyn ExecutionPlan>,
     starts: Arc<dyn ExecutionPlan>,
+    targets: Option<Arc<dyn ExecutionPlan>>,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl PathSearchExec {
@@ -321,6 +331,7 @@ impl PathSearchExec {
         shape: PathShape,
         input: Arc<dyn ExecutionPlan>,
         starts: Arc<dyn ExecutionPlan>,
+        targets: Option<Arc<dyn ExecutionPlan>>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&shape.schema)),
@@ -332,7 +343,9 @@ impl PathSearchExec {
             shape,
             input,
             starts,
+            targets,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -341,8 +354,14 @@ impl DisplayAs for PathSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "PathSearchExec: graph={}, search={}",
-            self.shape.edges.graph, self.shape.search
+            "PathSearchExec: graph={}, search={}{}",
+            self.shape.edges.graph,
+            self.shape.search,
+            if self.targets.is_some() {
+                ", targets"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -360,7 +379,12 @@ impl ExecutionPlan for PathSearchExec {
         let mut children = vec![&self.input];
         children.extend(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
         children.push(&self.starts);
+        children.extend(self.targets.as_ref());
         children
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -393,7 +417,8 @@ impl ExecutionPlan for PathSearchExec {
             ..v
         });
         let starts = children.next().expect("checked above");
-        Ok(Arc::new(Self::new(shape, input, starts)))
+        let targets = self.targets.as_ref().and_then(|_| children.next());
+        Ok(Arc::new(Self::new(shape, input, starts, targets)))
     }
 
     fn execute(
@@ -409,41 +434,33 @@ impl ExecutionPlan for PathSearchExec {
         let shape = self.shape.clone();
         let input = Arc::clone(&self.input);
         let starts = Arc::clone(&self.starts);
+        let targets = self.targets.clone();
         let schema = Arc::clone(&shape.schema);
+        let expanded = MetricBuilder::new(&self.metrics).counter("expanded", partition);
         let run = async move {
             let index = unweighted_index(&shape.edges, input, &context).await?;
-            let batches = drain(&starts, &[0], &context).await?;
-            let id_type = shape.edges.id_type.clone();
-            let mut columns = Vec::with_capacity(batches.len());
-            for batch in &batches {
-                columns.push(cast(batch[0].as_ref(), &id_type).map_err(|_| {
-                    DataFusionError::Plan(format!(
-                        "in GRAPH_TABLE: the start nodes' keys ({}) cannot be read as graph '{}''s node ids ({id_type})",
-                        batch[0].data_type(),
-                        shape.edges.graph
-                    ))
-                })?);
-            }
-            let starts: ArrayRef = if columns.is_empty() {
-                new_empty_array(&id_type)
-            } else {
-                let refs: Vec<&dyn Array> = columns.iter().map(|c| c.as_ref()).collect();
-                concat(&refs)?
+            let starts = search_keys(&starts, "start nodes", &shape, &context).await?;
+            let targets = match &targets {
+                Some(t) => Some(search_keys(t, "target nodes", &shape, &context).await?),
+                None => None,
             };
             let out_schema = Arc::clone(&shape.schema);
-            let batches = crate::run_blocking(move || {
+            let (batches, n) = crate::run_blocking(move || {
                 path_search::run(
                     &index.topology,
                     &index.ids,
                     &|e| index.edge_row(e),
                     &shape.search,
                     &starts,
+                    targets.as_ref(),
+                    shape.known_only,
                     shape.columns,
                     out_schema,
                 )
             })
             .await
             .map_err(|e| DataFusionError::Execution(format!("a path search failed: {e}")))??;
+            expanded.add(n);
             Ok::<_, DataFusionError>(futures::stream::iter(batches.into_iter().map(Ok)))
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -451,6 +468,34 @@ impl ExecutionPlan for PathSearchExec {
             futures::stream::once(run).try_flatten(),
         )))
     }
+}
+
+/// The one column of keys `plan` gives (a search's `what`: its start or
+/// target nodes), cast to the graph's node id type.
+async fn search_keys(
+    plan: &Arc<dyn ExecutionPlan>,
+    what: &str,
+    shape: &PathShape,
+    context: &Arc<TaskContext>,
+) -> Result<ArrayRef> {
+    let batches = drain(plan, &[0], context).await?;
+    let id_type = &shape.edges.id_type;
+    let mut columns = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        columns.push(cast(batch[0].as_ref(), id_type).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "in GRAPH_TABLE: the {what}' keys ({}) cannot be read as graph '{}''s node ids ({id_type})",
+                batch[0].data_type(),
+                shape.edges.graph
+            ))
+        })?);
+    }
+    Ok(if columns.is_empty() {
+        new_empty_array(id_type)
+    } else {
+        let refs: Vec<&dyn Array> = columns.iter().map(|c| c.as_ref()).collect();
+        concat(&refs)?
+    })
 }
 
 /// A query planner whose physical planner knows Ursa's graph nodes.
@@ -965,6 +1010,8 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
                     let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
                     keys.extend(exec.shape.edges.vertices.as_ref().map(|_| vec![0]));
                     keys.push(vec![0]);
+                    // The targets are a set: their order does not matter.
+                    keys.extend(exec.targets.as_ref().map(|_| vec![]));
                     keys
                 } else {
                     return Ok(Transformed::no(node));

@@ -43,8 +43,25 @@
 //! with a variable, a selector or a mode is one edge between two nodes for
 //! now. Label expressions (`|`, `&`, `!`) and parenthesized path patterns are
 //! refused with a message.
+//!
+//! ## Through the index
+//!
+//! A node is *bound* when a condition on it alone limits its key to values
+//! the query names: `a.id = 7`, `a.id IN (1, 2)` or `a.id IN (SELECT …)`.
+//! From a bound node, the fixed-length edges of its path are expanded
+//! through the graph index too, one [`Segment`] of exactly one edge each,
+//! outward from it: each segment starts from the keys the one before it
+//! reached ([`Starts::After`]), so only the edges at the nodes reached are
+//! read, never the whole edge table. A segment is a relation of edges as the
+//! join's is, one row per edge row, so the rows are the same. A node whose
+//! query reads only its key, at the end of a segment whose index's nodes are
+//! that node's table's keys, is not joined to its table at all: its key is
+//! the segment's column ([`Lowered::aliases`]). Edges stay joins when no node
+//! is bound, when the query reads an edge's columns, or when
+//! [`Usage::indexed`] does not list the edge table (its index could not be
+//! kept between queries).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::TableReference;
@@ -642,6 +659,9 @@ pub struct Source {
     pub table: TableReference,
     /// `None`: every column, under its own name.
     pub columns: Option<Vec<(String, String)>>,
+    /// Whether the match joins it: a node whose key is a segment's column
+    /// ([`Lowered::aliases`]) is read only for its start keys, if at all.
+    pub joined: bool,
 }
 
 /// A condition the lowering adds.
@@ -676,6 +696,53 @@ pub struct Segment {
     pub quantifier: Quantifier,
     pub selector: Selector,
     pub mode: Mode,
+    /// A fixed-length edge expanded through the index, not a searched path.
+    pub fixed: bool,
+    pub starts: Starts,
+    /// Whether the index's nodes are the start node's table's keys, so a
+    /// start that is not a node of the index is no node at all.
+    pub known_only: bool,
+    /// The keys the last node can have, when they are known: the values its
+    /// conditions name ([`Starts::Node`]: it is bound, see [`Usage::bound`]),
+    /// or the keys an earlier segment reached. The search's targets.
+    pub targets: Option<Starts>,
+}
+
+/// What the query reads and binds, from its conditions and `COLUMNS`: what
+/// decides which edges are expanded through the graph index (see the module
+/// docs). The default plans joins, as a pattern was planned before.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Usage {
+    /// Whether the rest was found: if not, every edge is joined and every
+    /// node too.
+    pub enabled: bool,
+    /// Per variable, the properties the query reads of it: `None` for all of
+    /// them (`v.*`). A variable that is not listed is not read.
+    pub reads: BTreeMap<String, Option<BTreeSet<String>>>,
+    /// Per variable with a condition on it alone that limits a property to
+    /// values the query names (`v.p = 1`, `v.p IN (…)`), those properties.
+    pub bound: BTreeMap<String, BTreeSet<String>>,
+    /// The edge tables whose index is kept between queries: the ones fixed
+    /// edges may be expanded on. Empty: every edge is joined.
+    pub indexed: BTreeSet<TableReference>,
+}
+
+/// Where a segment's start nodes come from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Starts {
+    /// The start node's keys that the conditions on it alone keep.
+    Node,
+    /// The keys an earlier segment reached: its last node's (`end`), or its
+    /// first's.
+    After { segment: usize, end: bool },
+}
+
+/// A node not joined to its table: its key is a segment's column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alias {
+    pub var: String,
+    /// The segment column its key is.
+    pub column: VarColumn,
 }
 
 /// A pattern resolved against a graph: what to scan and join.
@@ -685,11 +752,16 @@ pub struct Lowered {
     /// segments.
     pub sources: Vec<Source>,
     /// The edges searched on the graph index, joined to their end nodes in
-    /// every branch.
+    /// every branch. A segment's [`Starts::After`] names an earlier one.
     pub segments: Vec<Segment>,
+    /// The nodes whose sources are not joined: their keys are segment columns.
+    pub aliases: Vec<Alias>,
     /// One per orientation of the undirected edges: the joins of each branch
     /// of the `UNION ALL` (one branch when every edge has a direction).
     pub branches: Vec<Vec<Join>>,
+    /// Whether the match planned as joins would be a `UNION ALL`: it has an
+    /// undirected fixed edge, joined or not.
+    pub union: bool,
     /// The pattern's conditions as written: in elements, then after the paths.
     pub conditions: Vec<String>,
     /// The `COLUMNS` list as written.
@@ -702,6 +774,7 @@ pub fn lower(
     pattern: &Pattern,
     graph: &PropertyGraph,
     schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
+    usage: &Usage,
 ) -> Result<Lowered> {
     // Collect the variables, naming anonymous ones.
     let mut bindings: BTreeMap<String, Binding> = BTreeMap::new();
@@ -934,8 +1007,7 @@ pub fn lower(
             }
         }
     }
-    let mut segments = Vec::new();
-    for (s, path, selector, mode) in &searched {
+    for (s, _, selector, mode) in &searched {
         let step = &steps[*s];
         let quantifier = step.quantifier.unwrap_or(Quantifier::ONCE);
         let b = &bindings[&step.edge];
@@ -966,35 +1038,269 @@ pub fn lower(
                 ends.1.unwrap_or("?")
             ));
         }
-        let var = match path {
+    }
+    let is_searched = |i: usize| searched.iter().any(|(s, ..)| *s == i);
+
+    // Each node variable's columns, and its key's property names.
+    let mut node_columns: BTreeMap<&str, (TableReference, Option<Vec<(String, String)>>)> =
+        BTreeMap::new();
+    for var in &order {
+        let b = &bindings[var];
+        if b.is_edge {
+            continue;
+        }
+        let read = match b.vertex.as_ref().expect("resolved") {
+            VertexSource::Table(v) => (
+                v.table.clone(),
+                properties(&v.table, &v.labels(), &[v.key.as_str()], schema_of)?,
+            ),
+            VertexSource::Nodes => (
+                TableReference::partial(graph.name.as_str(), super::schema::NODES),
+                None,
+            ),
+        };
+        node_columns.insert(var.as_str(), read);
+    }
+    let key = |var: &str| -> VarColumn {
+        match bindings[var].vertex.as_ref().expect("resolved") {
+            VertexSource::Table(v) => (var.to_string(), v.key.clone()),
+            VertexSource::Nodes => (var.to_string(), super::schema::ID.to_string()),
+        }
+    };
+    let key_names = |var: &str| -> Vec<String> {
+        let (_, column) = key(var);
+        match &node_columns[var].1 {
+            None => vec![column],
+            Some(columns) => columns
+                .iter()
+                .filter(|(c, _)| *c == column)
+                .map(|(_, n)| n.clone())
+                .collect(),
+        }
+    };
+    // Bound: a condition on the node alone names the values of its key.
+    let is_bound = |var: &str| {
+        usage
+            .bound
+            .get(var)
+            .is_some_and(|ps| key_names(var).iter().any(|n| ps.contains(n)))
+    };
+    let reads_only_its_key = |var: &str| match usage.reads.get(var) {
+        _ if !usage.enabled => false,
+        None => true,
+        Some(None) => false,
+        Some(Some(ps)) => {
+            let names = key_names(var);
+            ps.iter().all(|p| names.contains(p))
+        }
+    };
+    // Whether the index of `e` has the keys of `var`'s table as its nodes.
+    let known = |e: &EdgeTable, var: &str| match bindings[var].vertex.as_ref().expect("resolved") {
+        VertexSource::Table(v) => {
+            graph
+                .endpoint_vertex(e, true)
+                .is_some_and(|t| t.name == v.name)
+                && graph
+                    .endpoint_vertex(e, false)
+                    .is_some_and(|t| t.name == v.name)
+        }
+        VertexSource::Nodes => graph.vertex_tables.is_empty() && graph.edge_tables.len() == 1,
+    };
+    // Whether the index of `e` keeps every edge a join of `e` to `var`'s
+    // table keeps: it drops edges to values that are no key of its ends'
+    // tables, so `var` must read one of them.
+    let in_index = |e: &EdgeTable, var: &str| match (
+        graph.endpoint_vertex(e, true),
+        graph.endpoint_vertex(e, false),
+    ) {
+        (Some(s), Some(d)) => {
+            vertex_table(&bindings[var]).is_some_and(|v| v.name == s.name || v.name == d.name)
+        }
+        _ => true,
+    };
+    let expandable = |i: usize| {
+        let step = &steps[i];
+        let b = &bindings[&step.edge];
+        let e = b.edge.expect("resolved");
+        !is_searched(i)
+            && b.conditions.is_empty()
+            && !usage.reads.contains_key(&step.edge)
+            && usage.indexed.contains(&e.table)
+            && in_index(e, &step.left)
+            && in_index(e, &step.right)
+    };
+
+    // From each bound node, the fixed edges of its path, outward, each from
+    // the keys the one before reached; and the searched edges on the way,
+    // from those keys too (see the module docs). (step, reversed, starts)
+    let mut planned: Vec<(usize, bool, Starts)> = Vec::new();
+    // Per node, where its keys come from, and the segment count when it
+    // was reached.
+    let mut reached: BTreeMap<String, (Starts, usize)> = BTreeMap::new();
+    for var in &order {
+        if !bindings[var].is_edge && is_bound(var) {
+            reached.insert(var.clone(), (Starts::Node, 0));
+        }
+    }
+    let mut done = vec![false; pattern.paths.len()];
+    loop {
+        let mut progress = false;
+        for (i, finished) in done.iter_mut().enumerate() {
+            if *finished {
+                continue;
+            }
+            let path_steps: Vec<usize> = (0..steps.len()).filter(|&s| steps[s].path == i).collect();
+            let Some(&first) = path_steps.first() else {
+                *finished = true;
+                continue;
+            };
+            let mut nodes = vec![steps[first].left.clone()];
+            nodes.extend(path_steps.iter().map(|&s| steps[s].right.clone()));
+            let Some(root) = nodes.iter().position(|n| reached.contains_key(n)) else {
+                continue;
+            };
+            *finished = true;
+            progress = true;
+            for (j, &s) in path_steps.iter().enumerate().skip(root) {
+                let Some(&(from, _)) = reached.get(&nodes[j]) else {
+                    break;
+                };
+                if !is_searched(s) && !expandable(s) {
+                    break;
+                }
+                planned.push((s, false, from));
+                let segment = planned.len() - 1;
+                reached
+                    .entry(nodes[j + 1].clone())
+                    .or_insert((Starts::After { segment, end: true }, planned.len()));
+            }
+            for j in (0..root).rev() {
+                let s = path_steps[j];
+                let Some(&(from, _)) = reached.get(&nodes[j + 1]) else {
+                    break;
+                };
+                // A search runs from its first node: it cannot be reversed.
+                if is_searched(s) || !expandable(s) {
+                    break;
+                }
+                planned.push((s, true, from));
+                let segment = planned.len() - 1;
+                reached
+                    .entry(nodes[j].clone())
+                    .or_insert((Starts::After { segment, end: true }, planned.len()));
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    // The searched edges no bound node reached run from their first node.
+    for (s, ..) in &searched {
+        if !planned.iter().any(|(p, ..)| p == s) {
+            planned.push((*s, false, Starts::Node));
+        }
+    }
+    let is_expanded = |i: usize| planned.iter().any(|(s, ..)| *s == i);
+
+    let reverse = |d: Direction| match d {
+        Direction::Right => Direction::Left,
+        Direction::Left => Direction::Right,
+        Direction::Any => Direction::Any,
+    };
+    let mut segments: Vec<Segment> = Vec::new();
+    for &(s, reversed, starts) in &planned {
+        let step = &steps[s];
+        let e = bindings[&step.edge].edge.expect("resolved");
+        let (start, end) = match reversed {
+            false => (step.left.clone(), step.right.clone()),
+            true => (step.right.clone(), step.left.clone()),
+        };
+        let search = searched.iter().find(|(x, ..)| *x == s);
+        let (path, selector, mode) = match search {
+            Some((_, path, selector, mode)) => (path.clone(), *selector, *mode),
+            None => (None, Selector::All, Mode::Walk),
+        };
+        let var = match &path {
             Some(p) => p.clone(),
             None => {
                 anonymous += 1;
                 format!("__ursa_{anonymous}")
             }
         };
+        // The keys the last node can have, when they are known by now.
+        let targets = match reached.get(&end) {
+            _ if is_bound(&end) => Some(Starts::Node),
+            Some(&(after @ Starts::After { .. }, when)) if when <= segments.len() => Some(after),
+            _ => None,
+        };
         segments.push(Segment {
             var,
-            path: path.clone(),
+            path,
             edges: e.table.clone(),
             source: e.source.clone(),
             destination: e.destination.clone(),
-            start: step.left.clone(),
-            start_key: (String::new(), String::new()),
-            end: step.right.clone(),
-            end_key: (String::new(), String::new()),
-            direction: step.direction,
-            quantifier,
-            selector: *selector,
-            mode: *mode,
+            known_only: known(e, &start),
+            start_key: key(&start),
+            start,
+            end_key: key(&end),
+            end,
+            direction: if reversed {
+                reverse(step.direction)
+            } else {
+                step.direction
+            },
+            quantifier: step.quantifier.unwrap_or(Quantifier::ONCE),
+            selector,
+            mode,
+            fixed: search.is_none(),
+            starts,
+            targets,
         });
     }
-    let is_searched = |i: usize| searched.iter().any(|(s, ..)| *s == i);
+
+    // Nodes the query reads only the key of, at the end of a segment whose
+    // index's nodes are their table's keys: their key is that segment's column.
+    let mut aliases: Vec<Alias> = Vec::new();
+    for var in &order {
+        if bindings[var].is_edge || !reads_only_its_key(var) {
+            continue;
+        }
+        let at = segments
+            .iter()
+            .zip(&planned)
+            .find_map(|(segment, &(s, ..))| {
+                let e = bindings[&steps[s].edge].edge.expect("resolved");
+                if !known(e, var) {
+                    return None;
+                }
+                let column = if &segment.start == var {
+                    super::path_search::START
+                } else if &segment.end == var {
+                    super::path_search::END
+                } else {
+                    return None;
+                };
+                Some((segment.var.clone(), column.to_string()))
+            });
+        if let Some(column) = at {
+            aliases.push(Alias {
+                var: var.clone(),
+                column,
+            });
+        }
+    }
+    // Where a node's key is read: its table's key column, or a segment's.
+    let at = |var: &str| -> VarColumn {
+        match aliases.iter().find(|a| a.var == var) {
+            Some(a) => a.column.clone(),
+            None => key(var),
+        }
+    };
 
     let undirected: Vec<usize> = steps
         .iter()
         .enumerate()
-        .filter(|(i, s)| s.direction == Direction::Any && !is_searched(*i))
+        .filter(|(i, s)| s.direction == Direction::Any && !is_expanded(*i))
         .map(|(i, _)| i)
         .collect();
     if undirected.len() > MAX_UNDIRECTED {
@@ -1005,7 +1311,7 @@ pub fn lower(
     let mut sources = Vec::new();
     for var in &order {
         let b = &bindings[var];
-        if b.is_edge && searched.iter().any(|(s, ..)| &steps[*s].edge == var) {
+        if b.is_edge && planned.iter().any(|(s, ..)| &steps[*s].edge == var) {
             continue;
         }
         let (table, columns) = if b.is_edge {
@@ -1016,50 +1322,33 @@ pub fn lower(
                 properties(&e.table, &e.labels(), &needed, schema_of)?,
             )
         } else {
-            match b.vertex.as_ref().expect("resolved") {
-                VertexSource::Table(v) => (
-                    v.table.clone(),
-                    properties(&v.table, &v.labels(), &[v.key.as_str()], schema_of)?,
-                ),
-                VertexSource::Nodes => (
-                    TableReference::partial(graph.name.as_str(), super::schema::NODES),
-                    None,
-                ),
-            }
+            node_columns[var.as_str()].clone()
         };
         sources.push(Source {
             var: var.clone(),
             table,
             columns,
+            joined: !aliases.iter().any(|a| &a.var == var),
         });
     }
-    let key = |var: &str| -> VarColumn {
-        match bindings[var].vertex.as_ref().expect("resolved") {
-            VertexSource::Table(v) => (var.to_string(), v.key.clone()),
-            VertexSource::Nodes => (var.to_string(), super::schema::ID.to_string()),
-        }
-    };
 
-    for segment in &mut segments {
-        segment.start_key = key(&segment.start);
-        segment.end_key = key(&segment.end);
-    }
     let mut branches = Vec::new();
     for mask in 0..(1usize << undirected.len()) {
         let mut joins = Vec::new();
         for segment in &segments {
             let column = |name: &str| (segment.var.clone(), name.to_string());
-            joins.push(Join::Equal(
-                column(super::path_search::START),
-                segment.start_key.clone(),
-            ));
-            joins.push(Join::Equal(
-                column(super::path_search::END),
-                segment.end_key.clone(),
-            ));
+            for (name, var) in [
+                (super::path_search::START, &segment.start),
+                (super::path_search::END, &segment.end),
+            ] {
+                let (a, b) = (column(name), at(var));
+                if a != b {
+                    joins.push(Join::Equal(a, b));
+                }
+            }
         }
         for (i, step) in steps.iter().enumerate() {
-            if is_searched(i) {
+            if is_expanded(i) {
                 continue;
             }
             let e = bindings[&step.edge].edge.expect("resolved");
@@ -1083,8 +1372,8 @@ pub fn lower(
             } else {
                 (&step.left, &step.right)
             };
-            joins.push(Join::Equal(src, key(from)));
-            joins.push(Join::Equal(dst, key(to)));
+            joins.push(Join::Equal(src, at(from)));
+            joins.push(Join::Equal(dst, at(to)));
         }
         branches.push(joins);
     }
@@ -1093,10 +1382,16 @@ pub fn lower(
         .flat_map(|var| bindings[var].conditions.iter().cloned())
         .collect();
     conditions.extend(pattern.condition.clone());
+    let union = steps
+        .iter()
+        .enumerate()
+        .any(|(i, s)| s.direction == Direction::Any && !is_searched(i));
     Ok(Lowered {
         sources,
         segments,
+        aliases,
         branches,
+        union,
         conditions,
         columns: pattern.columns.clone(),
     })
