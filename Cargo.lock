@@ -4443,6 +4443,8 @@ dependencies = [
  "datafusion",
  "futures",
  "js-sys",
+ "serde_json",
+ "tokio",
  "url",
  "ursa-engine",
  "ursa-sql",

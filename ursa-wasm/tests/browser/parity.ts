@@ -29,6 +29,17 @@ if (native.status !== 0) {
   process.exit(1);
 }
 
+// A query for the structured API: `run` then `export` as CSV, against `-f csv`.
+const EXPORT_SQL =
+  "CREATE VIEW t AS SELECT * FROM 'karate_edges.csv'; " +
+  "CREATE PROPERTY GRAPH k EDGE TABLES (t SOURCE KEY (src) DESTINATION KEY (dst)); " +
+  "SELECT * FROM pagerank(k, direction => 'both') ORDER BY id";
+const nativeCsv = spawnSync(resolve(ursaArg), ["-f", "csv", "-c", EXPORT_SQL], { cwd: data, encoding: "utf8" });
+if (nativeCsv.status !== 0) {
+  console.error("native ursa -f csv failed:\n" + nativeCsv.stderr);
+  process.exit(1);
+}
+
 // Browser.
 const server = startServer({ pkg: resolve(pkgArg), data });
 const browser = await chromium.launch();
@@ -47,7 +58,7 @@ setTimeout(() => {
   process.exit(1);
 }, 5 * 60_000).unref();
 await page.goto(server.url.href);
-const result = await page.evaluate(async (sql) => {
+const result = await page.evaluate(async ([sql, exportSql]) => {
   const t0 = performance.now();
   const mod = await import("/pkg/ursa_wasm.js");
   await mod.default();
@@ -62,11 +73,17 @@ const result = await page.evaluate(async (sql) => {
     const t3 = performance.now();
     await session.sql("SELECT count(*) FROM pagerank(karate)");
     const t4 = performance.now();
-    return { out, load: t1 - t0, script: t2 - t1, pagerankFirst: t3 - t2, pagerankWarm: t4 - t3, version: mod.version() };
+    // The structured API: run keeps the results; export writes one.
+    const other = new mod.Session();
+    const described = JSON.parse(await other.run(exportSql, 5));
+    const last = described.length - 1;
+    const csv = new TextDecoder().decode(other.export(last, "csv"));
+    const shape = { statements: described.length, columns: described[last].columns.map((c) => c.name), shown: described[last].rows.length, total: described[last].totalRows };
+    return { out, csv, shape, load: t1 - t0, script: t2 - t1, pagerankFirst: t3 - t2, pagerankWarm: t4 - t3, version: mod.version() };
   } catch (e) {
     return { error: String(e) };
   }
-}, script);
+}, [script, EXPORT_SQL]);
 await browser.close();
 server.stop(true);
 
@@ -79,6 +96,13 @@ console.log(
   `ursa-wasm ${result.version}: load+compile ${ms(result.load)}, whole script ${ms(result.script)}, ` +
     `pagerank(karate) ${ms(result.pagerankFirst)} then ${ms(result.pagerankWarm)}`,
 );
+const shapeOk =
+  JSON.stringify(result.shape) === JSON.stringify({ statements: 3, columns: ["id", "pagerank"], shown: 5, total: 34 });
+if (result.csv !== nativeCsv.stdout || !shapeOk) {
+  console.error(`FAIL: run/export: shape ${JSON.stringify(result.shape)}; CSV ${result.csv === nativeCsv.stdout ? "matches" : "differs from"} native -f csv`);
+  process.exit(1);
+}
+console.log("PASS: run() describes the results, and export() CSV is byte-identical to native -f csv");
 if (result.out === native.stdout) {
   console.log(`PASS: browser output is byte-identical to native (${native.stdout.length} bytes)`);
   process.exit(0);

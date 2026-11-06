@@ -12,8 +12,15 @@ static assets and an R2 bucket.
 
 ## Layout
 
-- `public/`: the page (`index.html`, `app.js`, `examples.js`) and the engine's
-  Web Worker (`engine-worker.js`, which also defines the sample graphs at start).
+- `public/`: the page (`index.html`, `app.js`, `examples.js`, `style.css`) and
+  the engine's Web Worker (`engine-worker.js`). The worker keeps three engine
+  sessions: the **workspace** (the editor's, with the sample graphs defined at
+  start), the **Tour**'s (empty at start, as the Getting Started page is) and a
+  **meta** one for the page's own lookups.
+- **The Tour** is built from `ursa-wasm/tests/getting_started.sql`, the fixture
+  the browser parity test runs: each `-- @step` there is a Tour step
+  (`scripts/tour.ts`, written to `dist/tour.json`). So every step is tested in
+  CI against the native engine. Running a step runs the steps before it first.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
   engine; everything else is a static asset.
@@ -54,8 +61,26 @@ bun run engine && bun run upload:engine -- --local && bun run upload:data -- --l
 bun run dev
 ```
 
+## Test
+
+`tests/e2e.ts` drives the page in headless Chromium against a running site
+(`cf dev`, or a deploy): every Tour step, example, Data action and function,
+downloads in each format, both views, history and shared links.
+
+```sh
+bun run dev                                   # in one terminal
+bun run test:e2e                              # in another; or: bun tests/e2e.ts <url> [screenshot dir]
+```
+
+It needs Playwright and Chromium (`bun add --no-save playwright && bunx playwright install chromium`).
+
 ## Datasets
 
-The library's bundled sample graphs (`python/ursa/datasets/data/`), each as CSV
-and as Parquet, with `manifest.json`. They are redistributed from NetworkX under
-its 3-clause BSD licence (see `python/ursa/datasets/LICENSES.md`).
+- The library's bundled sample graphs (`python/ursa/datasets/data/`), each as
+  CSV and as Parquet. They are redistributed from NetworkX under its 3-clause BSD
+  licence (see `python/ursa/datasets/LICENSES.md`).
+- `rmat_1m_edges.parquet`: a seeded R-MAT graph with 1,000,000 edges over
+  46,318 nodes, made by `benchmarks/sql_scale/gen.py`. Generated here, so it is
+  ours to publish (CC0).
+
+`manifest.json` lists every file with its size, source and licence.
