@@ -1,4 +1,4 @@
-//! `ursa`: SQL for graph analytics over Parquet and CSV files.
+//! `ursa`: SQL for graph analytics over Parquet, CSV, JSON and Arrow files.
 //!
 //! ```text
 //! ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
@@ -37,7 +37,7 @@ use shell::{Flow, Shell};
 #[command(
     name = "ursa",
     version,
-    about = "SQL for graph analytics over Parquet and CSV files, local or in object storage.",
+    about = "SQL for graph analytics over Parquet, CSV, JSON and Arrow files, local or in object storage.",
     after_help = "Any file is a table: ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"\n\
                   With no SQL to run, ursa starts an interactive shell; enter .help there."
 )]

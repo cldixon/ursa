@@ -1,6 +1,6 @@
 # Getting started with Ursa SQL
 
-Ursa is a SQL engine for graph analytics. It reads Parquet and CSV files where they are, on your disk or in object storage, and runs graph algorithms over them with SQL. There is no server and nothing to load first. An edge table is a graph.
+Ursa is a SQL engine for graph analytics. It reads Parquet, CSV, JSON and Arrow files where they are, on your disk or in object storage, and runs graph algorithms over them with SQL. There is no server and nothing to load first. An edge table is a graph.
 
 ## Install
 
@@ -91,7 +91,15 @@ ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
 +-----+-----+
 ```
 
-The format comes from the extension: `.parquet`, `.csv`, and compressed CSV (`.csv.gz`, `.csv.zst`). A directory or a glob reads every file in it: `'edges/*.parquet'`.
+The format comes from the extension: `.parquet`, `.csv`, `.json`, `.jsonl` and `.ndjson` (JSON, one object per line), and `.arrow`. CSV and JSON may be compressed (`.csv.gz`, `.jsonl.zst`). A directory or a glob reads every file in it: `'edges/*.parquet'`.
+
+`read_parquet`, `read_csv` and `read_json` read a file in the format they name, whatever its extension, with options, as in DuckDB:
+
+```bash
+ursa -c "SELECT * FROM read_csv('karate_edges.csv', header => true, delim => ',') LIMIT 3"
+```
+
+[Reading and writing files](statements.md#reading-and-writing-files) lists the options.
 
 ## Open a database
 
@@ -259,7 +267,7 @@ LIMIT 3;
 +----+----------------+
 ```
 
-The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. Strings take only `count` and `n_unique`. A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
+The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
 
 ## Direction
 
@@ -454,10 +462,18 @@ ursa club.ursa --format json -c "SELECT * FROM pagerank(karate) ORDER BY pageran
 ursa club.ursa --format csv -c "SELECT * FROM louvain(karate, seed => 1)" > communities.csv
 ```
 
-The formats are `table` (the default), `csv`, `tsv`, `json`, `ndjson` and `arrow`. To write a file from SQL, use `COPY`:
+The formats are `table` (the default), `csv`, `tsv`, `json`, `ndjson` and `arrow`. To write a file from SQL, use `COPY`. It prints how many rows it wrote:
 
 ```sql
 COPY (SELECT * FROM pagerank(karate)) TO 'pagerank.parquet';
+```
+
+```text
++-------+
+| count |
++-------+
+| 34    |
++-------+
 ```
 
 ## Find out what is available

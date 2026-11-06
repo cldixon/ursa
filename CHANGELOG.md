@@ -62,8 +62,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     installer for them that checks each download's SHA-256 checksum:
     `curl -fsSL https://cldixon.github.io/ursa/install.sh | sh`, or
     `irm https://cldixon.github.io/ursa/install.ps1 | iex` on Windows.
+- **Ursa SQL: DuckDB familiarity** (#313).
+  - `.jsonl` and `.ndjson` files, and compressed ones (`.jsonl.gz`,
+    `.ndjson.zst`, `.bz2`, `.xz`), are read as newline-delimited JSON, as
+    `.json` is, by path, glob, directory or URL. `COPY … TO 'out.jsonl'`
+    writes them.
+  - `read_parquet(path)`, `read_csv(path, header =>, delim =>, quote =>,
+    compression =>)` and `read_json(path, compression =>, format =>
+    'array')` read a file in the format they name, whatever its extension.
+    The path may be a glob, a directory, a URL or a list of paths; options
+    are named with `=>` or DuckDB's `=`. `read_csv_auto`, `read_json_auto`
+    and `read_ndjson` are other names. A view over one, in a database,
+    keeps its paths relative to the database file.
+  - `SHOW TABLES` leaves out `information_schema`'s own views.
+  - Docs: a "Differences from DuckDB" page, the file formats and `read_*`
+    functions in the statements page, and `COPY`'s row count.
 
 ### Changed
+
+- **Behaviour change (SQL):** `neighbors_agg`'s `count` and `n_unique`
+  return `UInt32`, as `degree` does, not `Float64`. `min` and `max` take
+  strings, dates, times and timestamps too, and return a value of the same
+  type (#313). The Python library is unchanged.
 
 - A weighted algorithm over `scan_edges` reads the file as a stream. It
   builds the index and evaluates the weights one batch at a time, so the

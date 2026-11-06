@@ -1,6 +1,6 @@
 # Statements
 
-Ursa runs the SQL that [DataFusion](https://datafusion.apache.org/user-guide/sql/index.html) runs: `SELECT`, joins, aggregates, window functions, `CREATE VIEW`, `CREATE EXTERNAL TABLE`, `COPY … TO`, `EXPLAIN`, `SET` and `SHOW`. This page covers the statements Ursa adds, for graphs, databases and settings.
+Ursa runs the SQL that [DataFusion](https://datafusion.apache.org/user-guide/sql/index.html) runs: `SELECT`, joins, aggregates, window functions, `CREATE VIEW`, `CREATE EXTERNAL TABLE`, `COPY … TO`, `EXPLAIN`, `SET` and `SHOW`. This page covers what Ursa adds: reading files, and statements for graphs, databases and settings.
 
 The examples on this page share one session. They start with two views over the karate club files:
 
@@ -8,6 +8,89 @@ The examples on this page share one session. They start with two views over the 
 CREATE VIEW members AS SELECT * FROM 'karate_nodes.csv';
 CREATE VIEW ties    AS SELECT * FROM 'karate_edges.csv';
 ```
+
+## Reading and writing files
+
+A file is a table: name it in `FROM`, with its path or URL in quotes. A relative path is relative to the current directory. The format comes from the extension:
+
+| Extension                        | Format                                    |
+| -------------------------------- | ----------------------------------------- |
+| `.parquet`                       | Parquet                                   |
+| `.csv`                           | CSV, with a header line                   |
+| `.json`, `.jsonl`, `.ndjson`     | JSON, one object per line (NDJSON)        |
+| `.arrow`                         | Arrow IPC                                 |
+
+CSV and JSON files may be compressed: `.csv.gz`, `.jsonl.zst`, and `.bz2` and `.xz` too. A directory or a glob (`'edges/*.parquet'`) reads every file in it with the extension of the first, and a `year=2024/` directory becomes a `year` column. `s3://`, `gs://`, `az://` and `https://` URLs work the same way.
+
+`COPY … TO` writes a file, in the format its extension names, and prints how many rows it wrote:
+
+```sql
+COPY (SELECT * FROM ties) TO 'ties.jsonl';
+```
+
+```text
++-------+
+| count |
++-------+
+| 78    |
++-------+
+```
+
+```sql
+SELECT count(*) AS ties FROM 'ties.jsonl';
+```
+
+```text
++------+
+| ties |
++------+
+| 78   |
++------+
+```
+
+`STORED AS CSV` (or `PARQUET`, `JSON`, `ARROW`) names the format when the extension does not.
+
+### read_parquet, read_csv and read_json
+
+`read_parquet`, `read_csv` and `read_json` read a file as `FROM 'path'` does, but in the format they name, whatever the extension, and with options. They take a path, a glob, a directory, a URL, or a list of them:
+
+```sql
+COPY (SELECT * FROM ties) TO 'ties.txt' STORED AS CSV OPTIONS ('format.delimiter' '|');
+SELECT count(*) AS ties FROM read_csv('ties.txt', delim => '|');
+COPY (SELECT * FROM ties) TO 'ties.json';
+SELECT count(*) AS both_files FROM read_json(['ties.jsonl', 'ties.json']);
+```
+
+```text
++-------+
+| count |
++-------+
+| 78    |
++-------+
++------+
+| ties |
++------+
+| 78   |
++------+
++-------+
+| count |
++-------+
+| 78    |
++-------+
++------------+
+| both_files |
++------------+
+| 156        |
++------------+
+```
+
+| Function       | Options                                                                                                   |
+| -------------- | --------------------------------------------------------------------------------------------------------- |
+| `read_parquet` | none                                                                                                      |
+| `read_csv`     | `header` (`true` or `false`), `delim` (one character; `sep` and `delimiter` are other names), `quote`, `compression` |
+| `read_json`    | `compression`; `format`: `'newline_delimited'` (the default) or `'array'`, for a file that holds one JSON array of objects |
+
+`compression` is `'auto'` (from the extension, the default), `'none'`, `'gzip'`, `'bzip2'`, `'xz'` or `'zstd'`. Options are named with `=>`, or with `=` as DuckDB writes them: `read_csv('ties.txt', header = false)`. `read_csv_auto` and `read_json_auto` are other names for `read_csv` and `read_json`, and `read_ndjson` is `read_json` for one object per line. A view over a `read_*` call, in a [database](database.md), keeps its paths relative to the database file, as a view over `'path'` does.
 
 ## CREATE PROPERTY GRAPH
 

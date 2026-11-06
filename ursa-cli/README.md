@@ -1,6 +1,6 @@
 # ursa-cli
 
-`ursa` is a SQL engine for graph analytics, used from the command line. It reads Parquet and CSV files where they are, on your disk or in object storage, and runs graph algorithms over them with SQL. There is no server and nothing to load first. An edge table is a graph.
+`ursa` is a SQL engine for graph analytics, used from the command line. It reads Parquet, CSV, JSON/NDJSON (`.json`, `.jsonl`, `.ndjson`) and Arrow files where they are, on your disk or in object storage, and runs graph algorithms over them with SQL. There is no server and nothing to load first. An edge table is a graph.
 
 On Linux or macOS, install the prebuilt binary with the install script:
 

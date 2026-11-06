@@ -272,7 +272,7 @@ neighbors_agg(graph, values => NULL, direction => 'out', attribute => NULL, agg 
 
 **Directions:** `'out'`, `'in'`, `'both'`
 
-**Returns:** `neighbors_agg` (Float64, may be NULL)
+**Returns:** `neighbors_agg` (Float64; UInt32 for count and n_unique; the values' type for min and max of strings, dates or times, may be NULL)
 
 ## Traversals
 
