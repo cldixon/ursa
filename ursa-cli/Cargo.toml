@@ -38,7 +38,7 @@ rustyline = "18.0"
 
 [dev-dependencies]
 tempfile = "3"
-# Reads `ursa -f json` in tests/docs.rs (the function reference generator).
+# Reads `ursa --format json` in tests/docs.rs (the function reference generator).
 serde_json = "1"
 # Writes the gzip CSV fixture (already in the tree via DataFusion's compression).
 flate2 = "1"

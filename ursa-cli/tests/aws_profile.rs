@@ -206,7 +206,7 @@ fn aws_home(credentials: &str, config: &str) -> tempfile::TempDir {
 fn ursa(home: &Path, s3: &FakeS3, env: &[(&str, &str)], sql: &str) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ursa"));
     command
-        .args(["-f", "csv", "-c", sql])
+        .args(["--format", "csv", "-c", sql])
         .env_clear()
         .env("HOME", home)
         .env("AWS_ENDPOINT", &s3.endpoint)

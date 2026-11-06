@@ -29,14 +29,14 @@ if (native.status !== 0) {
   process.exit(1);
 }
 
-// A query for the structured API: `run` then `export` as CSV, against `-f csv`.
+// A query for the structured API: `run` then `export` as CSV, against `--format csv`.
 const EXPORT_SQL =
   "CREATE VIEW t AS SELECT * FROM 'karate_edges.csv'; " +
   "CREATE PROPERTY GRAPH k EDGE TABLES (t SOURCE KEY (src) DESTINATION KEY (dst)); " +
   "SELECT * FROM pagerank(k, direction => 'both') ORDER BY id";
-const nativeCsv = spawnSync(resolve(ursaArg), ["-f", "csv", "-c", EXPORT_SQL], { cwd: data, encoding: "utf8" });
+const nativeCsv = spawnSync(resolve(ursaArg), ["--format", "csv", "-c", EXPORT_SQL], { cwd: data, encoding: "utf8" });
 if (nativeCsv.status !== 0) {
-  console.error("native ursa -f csv failed:\n" + nativeCsv.stderr);
+  console.error("native ursa --format csv failed:\n" + nativeCsv.stderr);
   process.exit(1);
 }
 
@@ -99,10 +99,10 @@ console.log(
 const shapeOk =
   JSON.stringify(result.shape) === JSON.stringify({ statements: 3, columns: ["id", "pagerank"], shown: 5, total: 34 });
 if (result.csv !== nativeCsv.stdout || !shapeOk) {
-  console.error(`FAIL: run/export: shape ${JSON.stringify(result.shape)}; CSV ${result.csv === nativeCsv.stdout ? "matches" : "differs from"} native -f csv`);
+  console.error(`FAIL: run/export: shape ${JSON.stringify(result.shape)}; CSV ${result.csv === nativeCsv.stdout ? "matches" : "differs from"} native --format csv`);
   process.exit(1);
 }
-console.log("PASS: run() describes the results, and export() CSV is byte-identical to native -f csv");
+console.log("PASS: run() describes the results, and export() CSV is byte-identical to native --format csv");
 if (result.out === native.stdout) {
   console.log(`PASS: browser output is byte-identical to native (${native.stdout.length} bytes)`);
   process.exit(0);
