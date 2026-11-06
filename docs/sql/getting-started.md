@@ -12,15 +12,33 @@ Ursa is a SQL engine for graph analytics. It reads Parquet and CSV files where t
     cargo install --git https://github.com/cldixon/ursa ursa-cli
     ```
 
-    The instructions below are for after the release.
+    The instructions below are for after the release. The install script works once `ursa-cli` 0.6.0 is out.
 
-Install with Cargo. You need Rust 1.94 or later:
+On Linux or macOS, run the install script:
+
+```bash
+curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
+```
+
+It downloads the newest `ursa` for your machine from the [releases page](https://github.com/cldixon/ursa/releases), checks it against its SHA-256 checksum, and puts it in `~/.local/bin`. It needs no `sudo`. If `~/.local/bin` is not on your `PATH`, it prints the line to add. To choose the version or the directory, set `URSA_VERSION` or `URSA_INSTALL_DIR` after the pipe:
+
+```bash
+curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.6.0 URSA_INSTALL_DIR=/opt/bin sh
+```
+
+On Windows, in PowerShell. This installs to `%LOCALAPPDATA%\ursa\bin` and adds it to your user `PATH`:
+
+```powershell
+irm https://cldixon.github.io/ursa/install.ps1 | iex
+```
+
+The prebuilt binaries cover Linux (x86_64 and aarch64, glibc 2.35 or later), macOS (Intel and Apple silicon) and Windows (x64). On anything else, install with Cargo. You need Rust 1.94 or later:
 
 ```bash
 cargo install ursa-cli
 ```
 
-Or download a prebuilt binary for Linux, macOS or Windows from the [releases page](https://github.com/cldixon/ursa/releases). Each release has one archive per platform:
+Or download a prebuilt binary yourself from the [releases page](https://github.com/cldixon/ursa/releases). Each release has one archive per platform:
 
 | Platform              | Archive                                              |
 | --------------------- | ---------------------------------------------------- |

@@ -41,7 +41,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     generated from `ursa_functions()`. Every SQL example in it runs in CI.
   - An agent skill for writing Ursa SQL, in `skills/ursa-sql/`.
   - Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, Apple
-    silicon) and Windows (x64) on the GitHub Releases page.
+    silicon) and Windows (x64) on the GitHub Releases page, and a one-line
+    installer for them that checks each download's SHA-256 checksum:
+    `curl -fsSL https://cldixon.github.io/ursa/install.sh | sh`, or
+    `irm https://cldixon.github.io/ursa/install.ps1 | iex` on Windows.
 
 ### Changed
 
