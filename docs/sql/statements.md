@@ -42,7 +42,8 @@ CREATE PROPERTY GRAPH karate
 ```
 
 - **An edge table** is any table or view. Each row is an edge from its `SOURCE KEY` column to its `DESTINATION KEY` column. The two columns must have the same type: integers or strings.
-- **A vertex table** gives nodes attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
+- **A vertex table** defines the nodes and gives them attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
+- **The node set.** With a vertex table, every key is a node, one with no edges included, and every algorithm, traversal and pattern runs on those nodes, in the table's order. An edge whose source or destination is not a key is left out, as DuckPGQ leaves it out; `describe` counts such edges in `n_dropped_edges`. A NULL key is no node, and a key given twice is one node.
 - **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
 - **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise. DuckPGQ's order, `Student PROPERTIES (id, name) LABEL Person`, gives `Person` those properties.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
@@ -61,7 +62,7 @@ SELECT count(*) AS edges FROM karate.edges;
 +-------+
 ```
 
-A graph over a view that filters edges is a subgraph. Its nodes are the endpoints of the edges it keeps:
+A graph over a view that filters edges is a subgraph. With a vertex table, its nodes are the vertex table's keys, those on no kept edge included; without one, they are the endpoints of the edges it keeps:
 
 ```sql
 CREATE VIEW first_ties AS SELECT * FROM ties WHERE src < 10;

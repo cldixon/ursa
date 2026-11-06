@@ -65,6 +65,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: a vertex table defines the graph's node set** (behaviour change,
+  #311). With `VERTEX TABLES`, every algorithm, statistic, traversal,
+  `neighbors_agg` and `GRAPH_TABLE` path search runs on the vertex table's
+  keys, as SQL/PGQ and DuckPGQ do: a node on no edge is a node (degree 0, a
+  row in every result, a seed that reaches nothing), and a subgraph over a
+  filtered edge view keeps every vertex, as a filtered edge frame in Python
+  keeps its parent's nodes (parity tests cover it). Before, the algorithms saw
+  only the edges' endpoints, so isolated vertices were missing and
+  `describe(g, nodes => 'all')` and `'touched'` agreed. An edge whose source or
+  destination is not a key is now left out, as DuckPGQ's inner join leaves it
+  out; `describe` reports how many in a new column, `n_dropped_edges` (0
+  without a vertex table). `g.nodes` lists the vertex table's rows only (it
+  used to add such endpoints with NULL attributes); `g.edges` is still every
+  row. Graphs without a vertex table are unchanged. The vertex keys are read
+  as one column, streamed and interned before the edges, and are part of a
+  stored index's key, so changing the vertex table rebuilds the index;
+  indexes stored before this change stay valid for graphs without a vertex
+  table.
 - A weighted algorithm over `scan_edges` reads the file as a stream. It
   builds the index and evaluates the weights one batch at a time, so the
   rows are never all held in memory. Before, it collected every row first.

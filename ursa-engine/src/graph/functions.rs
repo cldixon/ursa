@@ -29,8 +29,8 @@ use std::fmt;
 
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::catalog::{
-    self, Arg, Call, Expected, Family, FunctionSpec, ParamError, ParamErrorKind, ParamSpec,
-    ParamType, Shape, Value,
+    self, Arg, Call, ColumnType, Expected, Family, FunctionSpec, OutputSpec, ParamError,
+    ParamErrorKind, ParamSpec, ParamType, Shape, Value,
 };
 
 /// The multi-algorithm table function: `algorithms(g, degree(), c => louvain())`.
@@ -64,6 +64,26 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         .map(|s| s.name)
         .chain(super::traversal::TRAVERSALS.iter().map(|t| t.name))
         .chain([ALGORITHMS])
+}
+
+/// `describe`'s count of the edges left out of the graph because an endpoint
+/// is not a key of its vertex table (#311). SQL's own column: a Python graph
+/// has no vertex table, so it would always be 0 there.
+pub const N_DROPPED_EDGES: OutputSpec = OutputSpec {
+    name: "n_dropped_edges",
+    ty: ColumnType::Int64,
+    nullable: false,
+};
+
+/// The columns a call to `spec` returns in SQL, besides `id`: the catalog's,
+/// then for `describe` [`N_DROPPED_EDGES`]. An output's `field` indexes this
+/// list; past the catalog's own, the engine computes it (`kernels`).
+pub fn outputs(spec: &FunctionSpec) -> Vec<OutputSpec> {
+    let mut outputs = spec.outputs.to_vec();
+    if spec.name == "describe" {
+        outputs.push(N_DROPPED_EDGES);
+    }
+    outputs
 }
 
 /// Whether `spec` returns one row per node (an algorithm), as

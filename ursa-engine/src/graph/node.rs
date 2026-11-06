@@ -15,6 +15,11 @@
 //! index. When the node runs with weights it reads only the second child (see
 //! [`super::exec`]).
 //!
+//! A graph with a vertex table has its keys as its nodes (#311): the node
+//! then has one more child after the edge plans, the vertex table projected
+//! to its key ([`GraphAlgorithmNode::vertices`]). It runs when the node
+//! builds its index, before the edges.
+//!
 //! A neighbour aggregation (`neighbors_agg`) reads one value per node. Its
 //! node has one more child, last: the values, a plan of two columns, node ids
 //! then values (see [`GraphAlgorithmNode::values`]). Like a traversal's node
@@ -72,6 +77,9 @@ pub struct GraphAlgorithmNode {
     /// The edge rows projected to the endpoints and the weights, when an
     /// output reads a weight (see the module docs).
     pub weighted: Option<Arc<LogicalPlan>>,
+    /// The graph's vertex table projected to its key, one column, when it
+    /// has one: its keys are the graph's nodes (see the module docs).
+    pub vertices: Option<Arc<LogicalPlan>>,
     /// The node values a neighbour aggregation reads: a plan of two columns,
     /// node ids then values.
     pub values: Option<Arc<LogicalPlan>>,
@@ -98,6 +106,7 @@ impl GraphAlgorithmNode {
         graph: String,
         input: Arc<LogicalPlan>,
         weighted: Option<Arc<LogicalPlan>>,
+        vertices: Option<Arc<LogicalPlan>>,
         values: Option<Arc<LogicalPlan>>,
         source: Expr,
         destination: Expr,
@@ -106,6 +115,7 @@ impl GraphAlgorithmNode {
         per_node: bool,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
+        check_vertices(&graph, vertices.as_deref())?;
         if let Some(values) = &values {
             let columns = values.schema().fields().len();
             if columns != 2 {
@@ -120,7 +130,7 @@ impl GraphAlgorithmNode {
             fields.push(Field::new("id", id_type.clone(), false));
         }
         for o in &outputs {
-            let spec = o.call.spec().outputs[o.field];
+            let spec = super::functions::outputs(o.call.spec())[o.field];
             fields.push(Field::new(&o.name, spec.ty.data_type(), spec.nullable));
         }
         let schema = Arc::new(DFSchema::try_from(Schema::new(fields))?);
@@ -128,6 +138,7 @@ impl GraphAlgorithmNode {
             graph,
             input,
             weighted,
+            vertices,
             values,
             source,
             destination,
@@ -194,6 +205,16 @@ pub(crate) fn endpoint_id_type(
     }
 }
 
+/// A vertex input is one column: the keys of the graph's vertex table.
+pub(crate) fn check_vertices(graph: &str, vertices: Option<&LogicalPlan>) -> Result<()> {
+    match vertices.map(|v| v.schema().fields().len()) {
+        None | Some(1) => Ok(()),
+        Some(n) => Err(plan(format!(
+            "graph '{graph}': the vertex keys must be one column; got {n}"
+        ))),
+    }
+}
+
 /// The positions of the endpoint columns `source` and `destination` in
 /// `input`.
 fn endpoint_positions(
@@ -238,6 +259,7 @@ impl PartialEq for GraphAlgorithmNode {
             && self.destination == other.destination
             && self.input == other.input
             && self.weighted == other.weighted
+            && self.vertices == other.vertices
             && self.values == other.values
     }
 }
@@ -251,6 +273,7 @@ impl Hash for GraphAlgorithmNode {
         self.destination.hash(state);
         self.input.hash(state);
         self.weighted.hash(state);
+        self.vertices.hash(state);
         self.values.hash(state);
     }
 }
@@ -277,6 +300,10 @@ impl PartialOrd for GraphAlgorithmNode {
             Ordering::Equal => {}
             unequal => return Some(unequal),
         }
+        match self.vertices.partial_cmp(&other.vertices)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
         self.values.partial_cmp(&other.values)
     }
 }
@@ -289,6 +316,7 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     fn inputs(&self) -> Vec<&LogicalPlan> {
         let mut inputs = vec![self.input.as_ref()];
         inputs.extend(self.weighted.as_deref());
+        inputs.extend(self.vertices.as_deref());
         inputs.extend(self.values.as_deref());
         inputs
     }
@@ -317,8 +345,10 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
         let [source, destination]: [Expr; 2] = exprs
             .try_into()
             .map_err(|_| plan("GraphAlgorithm takes two expressions".into()))?;
-        let expected =
-            1 + usize::from(self.weighted.is_some()) + usize::from(self.values.is_some());
+        let expected = 1
+            + usize::from(self.weighted.is_some())
+            + usize::from(self.vertices.is_some())
+            + usize::from(self.values.is_some());
         if inputs.len() != expected {
             return Err(plan(format!(
                 "GraphAlgorithm takes {expected} inputs; got {}",
@@ -328,11 +358,13 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
         let mut inputs = inputs.into_iter().map(Arc::new);
         let input = inputs.next().expect("checked above");
         let weighted = self.weighted.as_ref().and_then(|_| inputs.next());
+        let vertices = self.vertices.as_ref().and_then(|_| inputs.next());
         let values = self.values.as_ref().and_then(|_| inputs.next());
         Self::try_new(
             self.graph.clone(),
             input,
             weighted,
+            vertices,
             values,
             source,
             destination,
@@ -343,7 +375,8 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     }
 
     /// Every output needs both endpoints and nothing else of the first input,
-    /// every column of the weighted input, and both columns of the values.
+    /// every column of the weighted input, the vertex key, and both columns of
+    /// the values.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let (source, destination) = self.endpoint_indices().ok()?;
         let mut needed = vec![source, destination];
@@ -352,6 +385,9 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
         let mut children = vec![needed];
         if let Some(weighted) = &self.weighted {
             children.push((0..weighted.schema().fields().len()).collect());
+        }
+        if self.vertices.is_some() {
+            children.push(vec![0]);
         }
         if self.values.is_some() {
             children.push(vec![0, 1]);
@@ -378,7 +414,9 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
 ///    [`GraphAlgorithmNode`]'s first input, so the two share one index;
 /// 2. for a weighted `shortest_path`, the weighted edge plan, as a
 ///    [`GraphAlgorithmNode`]'s second input (with one weight column);
-/// 3. one plan per node-id parameter (`seeds`; `source` and `target`;
+/// 3. for a graph with a vertex table, its keys, as a
+///    [`GraphAlgorithmNode`]'s;
+/// 4. one plan per node-id parameter (`seeds`; `source` and `target`;
 ///    `start`), each of one column: a `VALUES` list for a literal, or the
 ///    planned subquery. They run when the node runs, never while the query is
 ///    planned, and their values are cast to the graph's id type then.
@@ -394,6 +432,8 @@ pub struct GraphTraversalNode {
     /// The edge rows projected to the endpoints and the weight, for a
     /// weighted shortest path.
     pub weighted: Option<Arc<LogicalPlan>>,
+    /// The graph's vertex keys (see [`GraphAlgorithmNode::vertices`]).
+    pub vertices: Option<Arc<LogicalPlan>>,
     /// The weight expression, as written, for `EXPLAIN`.
     pub weight: Option<String>,
     /// One plan per node-id parameter, in the spec's order.
@@ -416,6 +456,7 @@ impl GraphTraversalNode {
         traversal: Traversal,
         input: Arc<LogicalPlan>,
         weighted: Option<Arc<LogicalPlan>>,
+        vertices: Option<Arc<LogicalPlan>>,
         weight: Option<String>,
         nodes: Vec<Arc<LogicalPlan>>,
         written: Vec<String>,
@@ -423,6 +464,7 @@ impl GraphTraversalNode {
         destination: Expr,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
+        check_vertices(&graph, vertices.as_deref())?;
         let spec = traversal.spec();
         let expected = spec.node_params().count();
         if nodes.len() != expected || written.len() != expected {
@@ -454,6 +496,7 @@ impl GraphTraversalNode {
             traversal,
             input,
             weighted,
+            vertices,
             weight,
             nodes,
             written,
@@ -499,6 +542,7 @@ impl PartialEq for GraphTraversalNode {
             && self.destination == other.destination
             && self.input == other.input
             && self.weighted == other.weighted
+            && self.vertices == other.vertices
             && self.nodes == other.nodes
     }
 }
@@ -512,6 +556,7 @@ impl Hash for GraphTraversalNode {
         self.destination.hash(state);
         self.input.hash(state);
         self.weighted.hash(state);
+        self.vertices.hash(state);
         self.nodes.hash(state);
     }
 }
@@ -538,6 +583,10 @@ impl PartialOrd for GraphTraversalNode {
             Ordering::Equal => {}
             unequal => return Some(unequal),
         }
+        match self.vertices.partial_cmp(&other.vertices)? {
+            Ordering::Equal => {}
+            unequal => return Some(unequal),
+        }
         self.nodes.partial_cmp(&other.nodes)
     }
 }
@@ -550,6 +599,7 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
     fn inputs(&self) -> Vec<&LogicalPlan> {
         let mut inputs = vec![self.input.as_ref()];
         inputs.extend(self.weighted.as_deref());
+        inputs.extend(self.vertices.as_deref());
         inputs.extend(self.nodes.iter().map(Arc::as_ref));
         inputs
     }
@@ -579,7 +629,8 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
             .try_into()
             .map_err(|_| plan("GraphTraversal takes two expressions".into()))?;
         let weighted = usize::from(self.weighted.is_some());
-        let expected = 1 + weighted + self.nodes.len();
+        let vertices = usize::from(self.vertices.is_some());
+        let expected = 1 + weighted + vertices + self.nodes.len();
         if inputs.len() != expected {
             return Err(plan(format!(
                 "GraphTraversal takes {expected} inputs; got {}",
@@ -589,11 +640,13 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
         let mut inputs = inputs.into_iter().map(Arc::new);
         let input = inputs.next().expect("checked above");
         let weighted = (weighted == 1).then(|| inputs.next().expect("checked above"));
+        let vertices = (vertices == 1).then(|| inputs.next().expect("checked above"));
         Self::try_new(
             self.graph.clone(),
             self.traversal,
             input,
             weighted,
+            vertices,
             self.weight.clone(),
             inputs.collect(),
             self.written.clone(),
@@ -603,7 +656,7 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
     }
 
     /// Both endpoints of the first input, every column of the weighted input,
-    /// and the one column of each node-id input.
+    /// the vertex key, and the one column of each node-id input.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let (source, destination) = self.endpoint_indices().ok()?;
         let mut needed = vec![source, destination];
@@ -612,6 +665,9 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
         let mut children = vec![needed];
         if let Some(weighted) = &self.weighted {
             children.push((0..weighted.schema().fields().len()).collect());
+        }
+        if self.vertices.is_some() {
+            children.push(vec![0]);
         }
         children.extend(self.nodes.iter().map(|_| vec![0]));
         Some(children)

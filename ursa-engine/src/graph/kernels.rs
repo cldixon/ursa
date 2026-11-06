@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array};
 use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{DataType, Float64Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -41,6 +41,11 @@ pub fn batch(
     // The evaluator memoizes by weight address: the columns outlive it.
     let mut eval = Evaluator::new(&index.topology, None);
     for o in outputs {
+        // An output of the SQL engine's own (`functions::outputs`).
+        if o.field >= o.call.spec().outputs.len() {
+            columns.push(engine_output(index, o)?);
+            continue;
+        }
         let inputs = Inputs {
             weights: o.weight.map(|i| weights[i].as_slice()),
             attribute: o.call.spec().reads_attribute().then_some(values).flatten(),
@@ -52,6 +57,22 @@ pub fn batch(
     }
     RecordBatch::try_new(schema, columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// An output the SQL engine adds to a catalog function's
+/// (`functions::outputs`): `describe`'s `n_dropped_edges`.
+fn engine_output(index: &GraphIndex, o: &Output) -> Result<ArrayRef> {
+    let spec = o.call.spec();
+    match super::functions::outputs(spec).get(o.field) {
+        Some(out) if out.name == super::functions::N_DROPPED_EDGES.name => {
+            let n = i64::try_from(index.n_dropped()).unwrap_or(i64::MAX);
+            Ok(std::sync::Arc::new(Int64Array::from(vec![n])))
+        }
+        _ => Err(DataFusionError::Internal(format!(
+            "{} has no output {}",
+            spec.name, o.field
+        ))),
+    }
 }
 
 /// Whether a column of type `t` holds strings.

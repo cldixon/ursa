@@ -16,9 +16,10 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    Array, ArrayRef, Int64Array, LargeStringArray, StringArray, StringBuilder, StringViewArray,
+    Array, ArrayRef, BooleanBufferBuilder, Int64Array, LargeStringArray, StringArray,
+    StringBuilder, StringViewArray,
 };
-use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+use arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
@@ -33,6 +34,17 @@ use std::hash::BuildHasher;
 /// The id type is fixed by the first chunk; later chunks must match it
 /// ([`IdError::MixedTypes`]). Dense ids follow first-seen order across all chunks.
 /// Finishing with no chunks yields an empty `Int64` map.
+///
+/// **A fixed node set.** A graph whose nodes are given apart from its edges (the
+/// SQL engine's vertex table) interns them first, with
+/// [`EdgeInterner::push_nodes`], then fixes the set with
+/// [`EdgeInterner::close_nodes`]. Its nodes then take the dense ids `0..n` in
+/// the order given, nodes on no edge included, and an edge whose source or
+/// destination is not a node (or is null) is dropped rather than interned, as
+/// an inner join of the edges with the nodes would drop it.
+/// [`EdgeInterner::n_dropped`] counts them, and [`EdgeInterner::kept_rows`]
+/// says which rows were kept, for anything read per edge row alongside them
+/// (weights).
 #[derive(Debug)]
 pub struct EdgeInterner {
     map: Option<IdMap>,
@@ -40,6 +52,14 @@ pub struct EdgeInterner {
     rows_hint: usize,
     src_dense: Vec<u32>,
     dst_dense: Vec<u32>,
+    /// Whether the node set is fixed (see the type's docs).
+    closed: bool,
+    /// Edge rows pushed since the node set was fixed, dropped ones included.
+    rows: usize,
+    /// One bit per edge row pushed since the node set was fixed, set when the
+    /// row was kept; started at the first dropped row.
+    kept: Option<BooleanBufferBuilder>,
+    dropped: u64,
 }
 
 impl EdgeInterner {
@@ -53,7 +73,141 @@ impl EdgeInterner {
             rows_hint: n_edges,
             src_dense: Vec::with_capacity(n_edges),
             dst_dense: Vec::with_capacity(n_edges),
+            closed: false,
+            rows: 0,
+            kept: None,
+            dropped: 0,
         }
+    }
+
+    /// Intern one chunk of node ids, in order, before any edge: each id not
+    /// seen yet takes the next dense id. A null is not a node and is skipped;
+    /// an id given twice is one node. The id type is fixed as by
+    /// [`Self::push`], whose edges must then have the same type.
+    pub fn push_nodes(&mut self, ids: &dyn Array) -> Result<(), IdError> {
+        if self.closed || !self.src_dense.is_empty() {
+            return Err(IdError::NodesAfterEdges);
+        }
+        let kind = id_kind(ids.data_type())?;
+        let map = self.map.get_or_insert_with(|| kind.new_map());
+        match (kind, &*map) {
+            (IdKind::Int64, IdMap::Int64 { .. }) => {
+                if let IdMap::Int64 { to_dense, .. } = map {
+                    to_dense.budget_rows(self.rows_hint.max(ids.len()));
+                }
+                let a = as_int64(ids);
+                if a.null_count() == 0 {
+                    for &id in a.values().iter() {
+                        map.intern_i64(id)?;
+                    }
+                } else {
+                    for id in a.iter().flatten() {
+                        map.intern_i64(id)?;
+                    }
+                }
+            }
+            (IdKind::Utf8, IdMap::Utf8 { .. }) => {
+                let view = StrView::new(ids);
+                for i in 0..view.len() {
+                    if !view.is_null(i) {
+                        map.intern_str(view.value(i))?;
+                    }
+                }
+            }
+            _ => return Err(IdError::MixedTypes),
+        }
+        Ok(())
+    }
+
+    /// Fix the node set: from now on [`Self::push`] drops an edge whose source
+    /// or destination is not a node given to [`Self::push_nodes`] (see the
+    /// type's docs).
+    pub fn close_nodes(&mut self) {
+        self.closed = true;
+    }
+
+    /// Edges dropped because an endpoint is not a node (see the type's docs).
+    pub fn n_dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Which of the edge rows pushed since [`Self::close_nodes`] were kept, one
+    /// bit per row in order; `None` if every row was.
+    pub fn kept_rows(&mut self) -> Option<BooleanBuffer> {
+        self.kept.as_mut().map(|k| k.finish())
+    }
+
+    /// The edges of one chunk whose endpoints are both nodes, appended in row
+    /// order; the others are dropped and counted. The map is only read, so the
+    /// lookups run in parallel on a long chunk.
+    fn push_closed(
+        &mut self,
+        src: &dyn Array,
+        dst: &dyn Array,
+        kind: IdKind,
+    ) -> Result<(), IdError> {
+        let map = self.map.get_or_insert_with(|| kind.new_map());
+        match (kind, &*map) {
+            (IdKind::Int64, IdMap::Int64 { .. }) | (IdKind::Utf8, IdMap::Utf8 { .. }) => {}
+            _ => return Err(IdError::MixedTypes),
+        }
+        let len = src.len();
+        let (mut s, mut d) = (vec![MISS; len], vec![MISS; len]);
+        {
+            let map = &*map;
+            // The dense id of each row from `start` of `arr`; MISS for a null or
+            // an id that is not a node.
+            let lookup = |arr: &dyn Array, out: &mut [u32], start: usize| match map {
+                IdMap::Int64 { to_dense, .. } => {
+                    let a = as_int64(arr);
+                    for (k, o) in out.iter_mut().enumerate() {
+                        let i = start + k;
+                        if a.is_valid(i) {
+                            *o = to_dense.get(a.value(i)).unwrap_or(MISS);
+                        }
+                    }
+                }
+                IdMap::Utf8 { ids, .. } => {
+                    let a = StrView::new(arr);
+                    for (k, o) in out.iter_mut().enumerate() {
+                        let i = start + k;
+                        if !a.is_null(i) {
+                            *o = ids.get(a.value(i)).unwrap_or(MISS);
+                        }
+                    }
+                }
+            };
+            const CHUNK: usize = 4096;
+            for (out, arr) in [(&mut s[..], src), (&mut d[..], dst)] {
+                if intern_in_parallel(len) {
+                    use crate::parallel::*;
+                    out.par_chunks_mut(CHUNK)
+                        .enumerate()
+                        .for_each(|(c, out)| lookup(arr, out, c * CHUNK));
+                } else {
+                    lookup(arr, out, 0);
+                }
+            }
+        }
+        for i in 0..len {
+            let keep = s[i] != MISS && d[i] != MISS;
+            if keep {
+                self.src_dense.push(s[i]);
+                self.dst_dense.push(d[i]);
+            } else {
+                self.dropped += 1;
+                if self.kept.is_none() {
+                    let mut kept = BooleanBufferBuilder::new(self.rows_hint.max(self.rows + len));
+                    kept.append_n(self.rows + i, true);
+                    self.kept = Some(kept);
+                }
+            }
+            if let Some(kept) = &mut self.kept {
+                kept.append(keep);
+            }
+        }
+        self.rows += len;
+        Ok(())
     }
 
     /// Edges interned so far.
@@ -78,10 +232,10 @@ impl EdgeInterner {
             (IdKind::Utf8, IdKind::Utf8) => IdKind::Utf8,
             _ => return Err(IdError::MixedTypes),
         };
-        let map = self.map.get_or_insert_with(|| match kind {
-            IdKind::Int64 => IdMap::new_int64(),
-            IdKind::Utf8 => IdMap::new_utf8(),
-        });
+        if self.closed {
+            return self.push_closed(src, dst, kind);
+        }
+        let map = self.map.get_or_insert_with(|| kind.new_map());
         let (sd, dd) = (&mut self.src_dense, &mut self.dst_dense);
         if let IdMap::Int64 { to_dense, .. } = map {
             to_dense.budget_rows(self.rows_hint.max(sd.len() + src.len()));
@@ -685,6 +839,9 @@ pub enum IdError {
     IdBytesOverflow,
     /// An id appears twice in a list of distinct ids ([`IdMap::from_user_ids`]).
     DuplicateId,
+    /// Nodes were given to an [`EdgeInterner`] after its first edge, or after
+    /// its node set was fixed.
+    NodesAfterEdges,
 }
 
 impl std::fmt::Display for IdError {
@@ -711,6 +868,9 @@ impl std::fmt::Display for IdError {
             IdError::DuplicateId => {
                 write!(f, "a node id appears twice in a list of distinct ids")
             }
+            IdError::NodesAfterEdges => {
+                write!(f, "nodes must be given before the first edge")
+            }
             IdError::IdBytesOverflow => write!(
                 f,
                 "the distinct string node ids total more than 2 GiB, beyond the Utf8 id column"
@@ -722,9 +882,19 @@ impl std::fmt::Display for IdError {
 impl std::error::Error for IdError {}
 
 /// Which supported family an Arrow id column belongs to.
+#[derive(Clone, Copy)]
 enum IdKind {
     Int64,
     Utf8,
+}
+
+impl IdKind {
+    fn new_map(self) -> IdMap {
+        match self {
+            IdKind::Int64 => IdMap::new_int64(),
+            IdKind::Utf8 => IdMap::new_utf8(),
+        }
+    }
 }
 
 fn id_kind(dt: &DataType) -> Result<IdKind, IdError> {
@@ -1055,6 +1225,64 @@ impl IdMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fixed_node_set_keeps_isolated_nodes_and_drops_dangling_edges() {
+        let mut interner = EdgeInterner::with_capacity(4);
+        interner
+            .push_nodes(&Int64Array::from(vec![
+                Some(5),
+                Some(1),
+                None,
+                Some(9),
+                Some(1),
+            ]))
+            .unwrap();
+        interner.close_nodes();
+        // 1->5 kept; 1->7 (7 is no node) dropped; 9->5 kept; null->1 dropped.
+        interner
+            .push(
+                &Int64Array::from(vec![Some(1), Some(1), Some(9), None]),
+                &Int64Array::from(vec![Some(5), Some(7), Some(5), Some(1)]),
+            )
+            .unwrap();
+        assert_eq!(interner.n_dropped(), 2);
+        let kept = interner.kept_rows().unwrap();
+        assert_eq!(
+            kept.iter().collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
+        assert!(interner.push_nodes(&Int64Array::from(vec![3])).is_err());
+        let (map, sd, dd) = interner.finish();
+        // The nodes in the order given, 9 with no edge to itself still a node.
+        let ids = map.user_id_array();
+        let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ids.values(), &[5, 1, 9]);
+        assert_eq!((sd, dd), (vec![1, 2], vec![0, 0]));
+
+        // Strings, and nothing dropped: no kept bitmap.
+        let mut interner = EdgeInterner::with_capacity(1);
+        interner
+            .push_nodes(&StringArray::from(vec!["a", "b", "c"]))
+            .unwrap();
+        interner.close_nodes();
+        interner
+            .push(&StringArray::from(vec!["c"]), &StringArray::from(vec!["a"]))
+            .unwrap();
+        assert_eq!(interner.n_dropped(), 0);
+        assert!(interner.kept_rows().is_none());
+        let (map, sd, dd) = interner.finish();
+        assert_eq!((map.len(), sd, dd), (3, vec![2], vec![0]));
+
+        // Edges of another type than the nodes.
+        let mut interner = EdgeInterner::with_capacity(1);
+        interner.push_nodes(&StringArray::from(vec!["a"])).unwrap();
+        interner.close_nodes();
+        assert_eq!(
+            interner.push(&Int64Array::from(vec![1]), &Int64Array::from(vec![1])),
+            Err(IdError::MixedTypes)
+        );
+    }
 
     #[test]
     fn interns_int_ids_in_first_seen_order() {

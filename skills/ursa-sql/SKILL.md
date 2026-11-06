@@ -56,7 +56,8 @@ CREATE PROPERTY GRAPH karate
 - Paths: `.parquet`, `.csv`, `.csv.gz`, `.csv.zst`, a directory, or a glob (`'edges/*.parquet'`). URLs work: `s3://`, `gs://`, `az://`, `https://`. Credentials come from the environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`), AWS profiles (`AWS_PROFILE`, `~/.aws/`), gcloud's application default credentials, or the machine's role. There is no SQL statement for credentials. For a public S3 bucket, set `AWS_SKIP_SIGNATURE=true`.
 - The source and destination columns must have the same type, integer or string. Cast in the view if they don't.
 - A graph is a schema: `karate.edges` and `karate.nodes` are tables.
-- A subgraph is a graph over a view that filters the edges. Its nodes are only the endpoints of the kept edges.
+- With `VERTEX TABLES`, the vertex table's keys are the nodes: a node on no edge is still a node (degree 0, a row in every algorithm's result). An edge whose source or destination is not a key is dropped, as in DuckPGQ; `describe(g)` counts them in `n_dropped_edges`. `g.nodes` lists exactly the nodes the algorithms see; `g.edges` is every row of the edge table.
+- A subgraph is a graph over a view that filters the edges. With the parent's `VERTEX TABLES`, it keeps every node (as a Python filtered frame does); without, its nodes are only the endpoints of the kept edges. `describe(g, nodes => 'touched')` counts only the nodes on a kept edge.
 - The syntax is SQL/PGQ's, so DuckPGQ graph definitions run as written. A graph can have several vertex and edge tables, `AS` names, `LABEL` and `PROPERTIES`. A vertex `KEY` can be left out: it is then the table's primary key, or the column the edges `REFERENCES`. Keys are one column.
 - An algorithm runs on one vertex table and one edge table. With one edge table the pair is implied (`pagerank(karate)`); otherwise name it after the graph, as DuckPGQ does: `pagerank(social, person, knows)`. A graph of several tables has no `nodes`/`edges` tables; query its tables by their own names.
 
@@ -401,9 +402,9 @@ SELECT * FROM describe(karate, direction => 'both', full => true);
 ```
 
 ```text
-+---------+---------+---------------------+-------------------+--------------+
-| n_nodes | n_edges | density             | avg_degree        | n_components |
-+---------+---------+---------------------+-------------------+--------------+
-| 34      | 78      | 0.13903743315508021 | 4.588235294117647 | 1            |
-+---------+---------+---------------------+-------------------+--------------+
++---------+---------+---------------------+-------------------+--------------+-----------------+
+| n_nodes | n_edges | density             | avg_degree        | n_components | n_dropped_edges |
++---------+---------+---------------------+-------------------+--------------+-----------------+
+| 34      | 78      | 0.13903743315508021 | 4.588235294117647 | 1            | 0               |
++---------+---------+---------------------+-------------------+--------------+-----------------+
 ```

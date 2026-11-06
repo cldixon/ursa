@@ -13,6 +13,20 @@
 //! stealing, so a file's edges arrive in the file's own order on any thread
 //! count, as `ursa-io` reads them for the Python library.
 //!
+//! ## A vertex table
+//!
+//! A graph with a vertex table has its keys as its nodes (#311). Its node has
+//! one more child, the keys ([`GraphAlgorithmNode::vertices`]), which the
+//! build reads first: each key takes the next dense id, in the table's order,
+//! so a node on no edge is a node all the same. The edges are read after,
+//! and an edge whose source or destination is not a key is dropped, as an
+//! inner join of the edges with the vertex table drops it (DuckPGQ's CSR is
+//! built that way). The index counts them ([`GraphIndex::n_dropped`]), for
+//! `describe`, and keeps which rows it kept, so weights read row by row line
+//! up with the kept edges and a path's edges are still the edge table's rows.
+//! The keys' plan is part of the index's cache key: its fingerprint, and the
+//! identity of the files it reads, so a changed vertex table builds afresh.
+//!
 //! ## Weights
 //!
 //! Weights are looked up by edge row, so they must be in the order of the
@@ -39,9 +53,11 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{new_empty_array, Array, ArrayRef, Float64Array};
+use datafusion::arrow::array::{new_empty_array, Array, ArrayRef, BooleanArray, Float64Array};
+use datafusion::arrow::buffer::BooleanBuffer;
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::compute::{cast, cast_with_options, concat, CastOptions};
+use datafusion::arrow::compute::{filter, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
@@ -108,16 +124,24 @@ impl ExtensionPlanner for GraphPlanner {
             return Ok(None);
         };
         let (source, destination) = node.endpoint_indices()?;
+        let mut next = 1;
         let weighted = match (
             &node.weighted,
-            logical_inputs.get(1),
-            physical_inputs.get(1),
+            logical_inputs.get(next),
+            physical_inputs.get(next),
         ) {
             (Some(_), Some(logical), Some(physical)) => {
+                next += 1;
                 Some(weighted_input(logical, physical, node.weights.len())?)
             }
             _ => None,
         };
+        let vertices = vertex_input(
+            node.vertices.is_some(),
+            logical_inputs,
+            physical_inputs,
+            next,
+        )?;
         // A neighbour aggregation's node values are the last input.
         let values = node
             .values
@@ -130,6 +154,7 @@ impl ExtensionPlanner for GraphPlanner {
                     endpoints: (source, destination),
                     id_type: node.id_type.clone(),
                     fingerprint: fingerprint(logical_inputs[0]),
+                    vertices,
                 },
                 outputs: node.outputs.clone(),
                 per_node: node.per_node,
@@ -140,6 +165,27 @@ impl ExtensionPlanner for GraphPlanner {
             weighted,
             values,
         ))))
+    }
+}
+
+/// The vertex keys input at `at`, if the node has one.
+fn vertex_input(
+    has: bool,
+    logical_inputs: &[&LogicalPlan],
+    physical_inputs: &[Arc<dyn ExecutionPlan>],
+    at: usize,
+) -> Result<Option<VertexInput>> {
+    if !has {
+        return Ok(None);
+    }
+    match (logical_inputs.get(at), physical_inputs.get(at)) {
+        (Some(logical), Some(physical)) => Ok(Some(VertexInput {
+            plan: Arc::clone(physical),
+            fingerprint: fingerprint(logical),
+        })),
+        _ => Err(DataFusionError::Internal(
+            "a graph node's vertex keys were not planned".to_string(),
+        )),
     }
 }
 
@@ -175,7 +221,10 @@ fn plan_traversal(
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let expected = 1 + usize::from(node.weighted.is_some()) + node.nodes.len();
+    let expected = 1
+        + usize::from(node.weighted.is_some())
+        + usize::from(node.vertices.is_some())
+        + node.nodes.len();
     if logical_inputs.len() != expected || physical_inputs.len() != expected {
         return Err(DataFusionError::Internal(format!(
             "GraphTraversal has {expected} inputs; planned {}",
@@ -191,6 +240,13 @@ fn plan_traversal(
         }
         None => None,
     };
+    let vertices = vertex_input(
+        node.vertices.is_some(),
+        logical_inputs,
+        physical_inputs,
+        next,
+    )?;
+    next += usize::from(vertices.is_some());
     Ok(Arc::new(GraphTraversalExec::new(
         TraversalShape {
             edges: Edges {
@@ -198,6 +254,7 @@ fn plan_traversal(
                 endpoints: (source, destination),
                 id_type: node.id_type.clone(),
                 fingerprint: fingerprint(logical_inputs[0]),
+                vertices,
             },
             traversal: node.traversal,
             display: node.display_call(),
@@ -214,12 +271,14 @@ fn plan_path_search(
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let [input, starts] = physical_inputs else {
+    let expected = 2 + usize::from(node.vertices.is_some());
+    if physical_inputs.len() != expected || logical_inputs.len() != expected {
         return Err(DataFusionError::Internal(format!(
-            "PathSearch has 2 inputs; planned {}",
+            "PathSearch has {expected} inputs; planned {}",
             physical_inputs.len()
         )));
-    };
+    }
+    let vertices = vertex_input(node.vertices.is_some(), logical_inputs, physical_inputs, 1)?;
     Ok(Arc::new(PathSearchExec::new(
         PathShape {
             edges: Edges {
@@ -227,13 +286,14 @@ fn plan_path_search(
                 endpoints: node.endpoint_indices()?,
                 id_type: node.id_type.clone(),
                 fingerprint: fingerprint(logical_inputs[0]),
+                vertices,
             },
             search: node.search,
             columns: node.columns,
             schema: Arc::new(node.schema().as_arrow().clone()),
         },
-        Arc::clone(input),
-        Arc::clone(starts),
+        Arc::clone(&physical_inputs[0]),
+        Arc::clone(physical_inputs.last().expect("checked above")),
     )))
 }
 
@@ -297,11 +357,14 @@ impl ExecutionPlan for PathSearchExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input, &self.starts]
+        let mut children = vec![&self.input];
+        children.extend(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
+        children.push(&self.starts);
+        children
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false, false]
+        vec![false; self.children().len()]
     }
 
     fn apply_expressions(
@@ -315,10 +378,22 @@ impl ExecutionPlan for PathSearchExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input, starts]: [Arc<dyn ExecutionPlan>; 2] = children.try_into().map_err(|_| {
-            DataFusionError::Internal("PathSearchExec has two children".to_string())
-        })?;
-        Ok(Arc::new(Self::new(self.shape.clone(), input, starts)))
+        let expected = self.children().len();
+        if children.len() != expected {
+            return Err(DataFusionError::Internal(format!(
+                "PathSearchExec has {expected} children; got {}",
+                children.len()
+            )));
+        }
+        let mut children = children.into_iter();
+        let input = children.next().expect("checked above");
+        let mut shape = self.shape.clone();
+        shape.edges.vertices = shape.edges.vertices.map(|v| VertexInput {
+            plan: children.next().expect("checked above"),
+            ..v
+        });
+        let starts = children.next().expect("checked above");
+        Ok(Arc::new(Self::new(shape, input, starts)))
     }
 
     fn execute(
@@ -360,6 +435,7 @@ impl ExecutionPlan for PathSearchExec {
                 path_search::run(
                     &index.topology,
                     &index.ids,
+                    &|e| index.edge_row(e),
                     &shape.search,
                     &starts,
                     shape.columns,
@@ -403,6 +479,16 @@ struct Edges {
     endpoints: (usize, usize),
     id_type: DataType,
     /// The edge plan's fingerprint, or `None` if it cannot be cached.
+    fingerprint: Option<String>,
+    /// The graph's vertex keys, if it has a vertex table.
+    vertices: Option<VertexInput>,
+}
+
+/// A graph node's vertex keys: a plan of one column (see the module docs).
+#[derive(Debug, Clone)]
+struct VertexInput {
+    plan: Arc<dyn ExecutionPlan>,
+    /// The keys' plan's fingerprint, or `None` if it cannot be cached.
     fingerprint: Option<String>,
 }
 
@@ -486,6 +572,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         let mut children = vec![&self.input];
         children.extend(self.weighted.as_ref().map(|w| &w.plan));
+        children.extend(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
         children.extend(self.values.as_ref());
         children
     }
@@ -520,16 +607,16 @@ impl ExecutionPlan for GraphAlgorithmExec {
             plan: children.next().expect("checked above"),
             ..w
         });
+        let mut shape = self.shape.clone();
+        shape.edges.vertices = shape.edges.vertices.map(|v| VertexInput {
+            plan: children.next().expect("checked above"),
+            ..v
+        });
         let values = self
             .values
             .as_ref()
             .map(|_| children.next().expect("checked above"));
-        Ok(Arc::new(Self::new(
-            self.shape.clone(),
-            input,
-            weighted,
-            values,
-        )))
+        Ok(Arc::new(Self::new(shape, input, weighted, values)))
     }
 
     fn execute(
@@ -652,6 +739,7 @@ impl ExecutionPlan for GraphTraversalExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         let mut children = vec![&self.input];
         children.extend(self.weighted.as_ref().map(|w| &w.plan));
+        children.extend(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
         children.extend(self.nodes.iter());
         children
     }
@@ -687,8 +775,13 @@ impl ExecutionPlan for GraphTraversalExec {
             plan: children.next().expect("checked above"),
             ..w
         });
+        let mut shape = self.shape.clone();
+        shape.edges.vertices = shape.edges.vertices.map(|v| VertexInput {
+            plan: children.next().expect("checked above"),
+            ..v
+        });
         Ok(Arc::new(Self::new(
-            self.shape.clone(),
+            shape,
             input,
             weighted,
             children.collect(),
@@ -837,7 +930,8 @@ fn sql_text(values: &ArrayRef, row: usize) -> Option<String> {
 /// plan, the rule sorts the edge rows by `(source, destination)`, and a
 /// weighted node's rows by their weights after that, so that rows that tie
 /// are identical in every column the node reads. A traversal's node-id
-/// inputs over such a plan are sorted by value. Order-preserving plans
+/// inputs over such a plan are sorted by value, and so are a graph's vertex
+/// keys, which set the order of its nodes. Order-preserving plans
 /// (scans, views over files, filters, projections) are left as they are,
 /// in file order. The sort is a `SortExec` under the node, so `EXPLAIN`
 /// shows it.
@@ -856,6 +950,7 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
                 if let Some(exec) = node.downcast_ref::<GraphAlgorithmExec>() {
                     let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
                     keys.extend(exec.weighted.as_ref().map(weighted_keys));
+                    keys.extend(exec.shape.edges.vertices.as_ref().map(|_| vec![0]));
                     // A neighbour aggregation's values give one value per
                     // node whatever their order: no sort.
                     keys.extend(exec.values.as_ref().map(|_| vec![]));
@@ -863,10 +958,14 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
                 } else if let Some(exec) = node.downcast_ref::<GraphTraversalExec>() {
                     let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
                     keys.extend(exec.weighted.as_ref().map(weighted_keys));
+                    keys.extend(exec.shape.edges.vertices.as_ref().map(|_| vec![0]));
                     keys.extend(exec.nodes.iter().map(|_| vec![0]));
                     keys
                 } else if let Some(exec) = node.downcast_ref::<PathSearchExec>() {
-                    vec![endpoint_keys(exec.shape.edges.endpoints), vec![0]]
+                    let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
+                    keys.extend(exec.shape.edges.vertices.as_ref().map(|_| vec![0]));
+                    keys.push(vec![0]);
+                    keys
                 } else {
                     return Ok(Transformed::no(node));
                 };
@@ -980,16 +1079,34 @@ fn sorted(plan: Arc<dyn ExecutionPlan>, keys: &[usize]) -> Result<Arc<dyn Execut
     })
 }
 
-/// The index cache key for the edges `input` reads, if they can be cached.
+/// The index cache key for the edges `input` reads, if they can be cached:
+/// with a vertex table, the keys' plan and files too, so a change to the
+/// vertex table builds the index afresh.
 async fn index_key(
     shape: &Edges,
     input: &Arc<dyn ExecutionPlan>,
     context: &TaskContext,
 ) -> Result<Option<(String, Vec<FileIdentity>)>> {
-    Ok(match &shape.fingerprint {
-        Some(f) => Some((f.clone(), file_identities(input, context).await?)),
-        None => None,
-    })
+    let Some(edges) = &shape.fingerprint else {
+        return Ok(None);
+    };
+    let mut files = file_identities(input, context).await?;
+    let fingerprint = match &shape.vertices {
+        None => edges.clone(),
+        Some(VertexInput {
+            fingerprint: None, ..
+        }) => return Ok(None),
+        Some(VertexInput {
+            plan,
+            fingerprint: Some(vertices),
+        }) => {
+            files.extend(file_identities(plan, context).await?);
+            files.sort();
+            files.dedup();
+            format!("{edges}\n-- vertex keys --\n{vertices}")
+        }
+    };
+    Ok(Some((fingerprint, files)))
 }
 
 /// The index, cached or built from the endpoint-only input.
@@ -1076,9 +1193,7 @@ async fn weighted_index(
                 None => {
                     let mut weights =
                         WeightReader::new(&weighted.weights, index.topology.n_edges());
-                    if read_aligned(&index, &weighted, &shape.id_type, context, &mut weights)
-                        .await?
-                    {
+                    if read_aligned(&index, &weighted, shape, context, &mut weights).await? {
                         (index, weights, true)
                     } else {
                         // The cached index's rows are in another order: these
@@ -1139,21 +1254,32 @@ async fn build_weighted(
 async fn read_aligned(
     index: &GraphIndex,
     weighted: &WeightedInput,
-    id_type: &DataType,
+    shape: &Edges,
     context: &Arc<TaskContext>,
     weights: &mut WeightReader,
 ) -> Result<bool> {
+    let id_type = &shape.id_type;
     let mut rows = RowCheck::new(index);
     let plan = &weighted.plan;
     for partition in 0..plan.output_partitioning().partition_count() {
         let mut stream = plan.execute(partition, Arc::clone(context))?;
         while let Some(batch) = stream.next().await {
-            let batch = batch?;
+            let mut batch = batch?;
+            let mut src = cast(batch.column(weighted.source), id_type)?;
+            let mut dst = cast(batch.column(weighted.destination), id_type)?;
+            // With a vertex table, the index holds only the edges between
+            // keys: skip the others, as the build did.
+            if shape.vertices.is_some() {
+                let keep = between_nodes(index, &src, &dst)?;
+                if keep.true_count() < keep.len() {
+                    batch = filter_record_batch(&batch, &keep)?;
+                    src = filter(&src, &keep)?;
+                    dst = filter(&dst, &keep)?;
+                }
+            }
             if batch.num_rows() == 0 {
                 continue;
             }
-            let src = cast(batch.column(weighted.source), id_type)?;
-            let dst = cast(batch.column(weighted.destination), id_type)?;
             if !rows.check(&src, &dst)? {
                 return Ok(false);
             }
@@ -1161,6 +1287,22 @@ async fn read_aligned(
         }
     }
     Ok(rows.complete())
+}
+
+/// Which edges `src` -> `dst` (of the index's id type) join two nodes of
+/// `index`.
+fn between_nodes(index: &GraphIndex, src: &ArrayRef, dst: &ArrayRef) -> Result<BooleanArray> {
+    let lookup = |a: &ArrayRef| {
+        index
+            .ids
+            .dense_from_array(a.as_ref())
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
+    };
+    let (s, d) = (lookup(src)?, lookup(dst)?);
+    Ok(s.iter()
+        .zip(&d)
+        .map(|(s, d)| Some(s.is_some() && d.is_some()))
+        .collect())
 }
 
 /// The weight columns of a weighted node's rows, evaluated a batch at a
@@ -1192,6 +1334,14 @@ impl WeightReader {
                 self.error = Some(e);
                 return;
             }
+        }
+    }
+
+    /// Keep only the rows `kept` marks, one bit per row read.
+    fn keep(&mut self, kept: &BooleanBuffer) {
+        for values in &mut self.values {
+            let mut bits = kept.iter();
+            values.retain(|_| bits.next().unwrap_or(false));
         }
     }
 
@@ -1278,15 +1428,16 @@ impl Gather {
 }
 
 /// The index of everything `interner` was given; an empty graph of
-/// `id_type` ids if it was given no edges.
-fn finish_index(interner: EdgeInterner, id_type: &DataType) -> GraphIndex {
-    if interner.is_empty() {
-        let (topology, ids) = ursa_io::topology::empty_topology(id_type);
-        return GraphIndex::new(topology, ids);
-    }
+/// `id_type` ids if it was given no node and no edge.
+fn finish_index(mut interner: EdgeInterner, id_type: &DataType) -> GraphIndex {
+    let (n_dropped, kept) = (interner.n_dropped(), interner.kept_rows());
     let (ids, source, destination) = interner.finish();
+    if ids.is_empty() {
+        let (topology, ids) = ursa_io::topology::empty_topology(id_type);
+        return GraphIndex::new(topology, ids).with_dropped(n_dropped, kept);
+    }
     let topology = Topology::build(ids.len(), source, destination);
-    GraphIndex::new(Arc::new(topology), Arc::new(ids))
+    GraphIndex::new(Arc::new(topology), Arc::new(ids)).with_dropped(n_dropped, kept)
 }
 
 /// The number of rows `plan` will produce, if its statistics say: sizes the
@@ -1301,9 +1452,37 @@ fn row_hint(plan: &Arc<dyn ExecutionPlan>) -> usize {
 
 /// What the reader hands the interning thread.
 enum Chunk {
+    /// Vertex keys, before any edge.
+    Nodes(ArrayRef),
+    /// Every vertex key has been read: the node set is fixed.
+    NodesDone,
     Edges(ArrayRef, ArrayRef),
     /// Every row has been read: build the index.
     End,
+}
+
+/// Hand one chunk to `interner` (see [`build_streamed`]); the index once
+/// every row has been read.
+fn take_chunk(
+    interner: &mut EdgeInterner,
+    chunk: Chunk,
+    graph: &str,
+    id_type: &DataType,
+) -> Result<Option<GraphIndex>> {
+    match chunk {
+        Chunk::Nodes(keys) => interner
+            .push_nodes(keys.as_ref())
+            .map_err(|e| build_error(graph, e))?,
+        Chunk::NodesDone => interner.close_nodes(),
+        Chunk::Edges(src, dst) => interner
+            .push(src.as_ref(), dst.as_ref())
+            .map_err(|e| build_error(graph, e))?,
+        Chunk::End => {
+            let interner = std::mem::replace(interner, EdgeInterner::with_capacity(0));
+            return Ok(Some(finish_index(interner, id_type)));
+        }
+    }
+    Ok(None)
 }
 
 /// Build the index of the edge rows `input` produces, interning each chunk
@@ -1313,7 +1492,9 @@ enum Chunk {
 /// interning (on a blocking thread) overlap. The rows are interned in the
 /// order [`drain`] would collect them, so the index is the one
 /// `ursa_io::build_topology_batches` gives over the collected rows. A
-/// weighted node's weights are read from the same rows (`weights`).
+/// weighted node's weights are read from the same rows (`weights`), and with
+/// a vertex table kept only for the edges kept (see the module docs), whose
+/// keys are read first.
 async fn build_streamed(
     shape: &Edges,
     input: &Arc<dyn ExecutionPlan>,
@@ -1332,11 +1513,8 @@ async fn build_streamed(
     let interning = tokio::task::spawn_blocking(move || -> Result<Option<GraphIndex>> {
         let mut interner = EdgeInterner::with_capacity(hint);
         while let Some(chunk) = rx.blocking_recv() {
-            match chunk {
-                Chunk::Edges(src, dst) => interner
-                    .push(src.as_ref(), dst.as_ref())
-                    .map_err(|e| build_error(&graph, e))?,
-                Chunk::End => return Ok(Some(finish_index(interner, &id_type))),
+            if let Some(index) = take_chunk(&mut interner, chunk, &graph, &id_type)? {
+                return Ok(Some(index));
             }
         }
         // The reader stopped before the end (its error is the one reported).
@@ -1350,11 +1528,8 @@ async fn build_streamed(
     let interning = async move {
         let mut interner = EdgeInterner::with_capacity(hint);
         while let Some(chunk) = rx.recv().await {
-            match chunk {
-                Chunk::Edges(src, dst) => interner
-                    .push(src.as_ref(), dst.as_ref())
-                    .map_err(|e| build_error(&graph, e))?,
-                Chunk::End => return Ok(Some(finish_index(interner, &id_type))),
+            if let Some(index) = take_chunk(&mut interner, chunk, &graph, &id_type)? {
+                return Ok(Some(index));
             }
         }
         Ok::<_, DataFusionError>(None)
@@ -1364,6 +1539,25 @@ async fn build_streamed(
         // The reader owns the sender, so the interner sees the channel close
         // when the reader stops, on an error as at the end.
         let tx = tx;
+        if let Some(vertices) = &shape.vertices {
+            let keys = &vertices.plan;
+            for partition in 0..keys.output_partitioning().partition_count() {
+                let mut stream = keys.execute(partition, Arc::clone(context))?;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let keys = cast(batch.column(0), &shape.id_type)?;
+                    if tx.send(Chunk::Nodes(keys)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            if tx.send(Chunk::NodesDone).await.is_err() {
+                return Ok(());
+            }
+        }
         let mut gather = Gather::default();
         for partition in 0..input.output_partitioning().partition_count() {
             let mut stream = input.execute(partition, Arc::clone(context))?;
@@ -1403,12 +1597,16 @@ async fn build_streamed(
     #[cfg(target_arch = "wasm32")]
     let (read, built) = futures::join!(read, interning);
     read?;
-    built?.ok_or_else(|| {
+    let index = built?.ok_or_else(|| {
         DataFusionError::Internal(format!(
             "building graph '{}' stopped before the last edge",
             shape.graph
         ))
-    })
+    })?;
+    if let Some(kept) = index.kept_rows() {
+        weights.keep(kept);
+    }
+    Ok(index)
 }
 
 /// Checks, a chunk at a time, that rows are the edge rows an index was

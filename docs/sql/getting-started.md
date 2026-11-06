@@ -127,7 +127,7 @@ CREATE PROPERTY GRAPH karate
   );
 ```
 
-Every row of `ties` is an edge from `src` to `dst`. Every row of `members` is a node, keyed by `id`.
+Every row of `ties` is an edge from `src` to `dst`. Every row of `members` is a node, keyed by `id`. The node table defines the graph's nodes, as in SQL/PGQ and DuckPGQ: a member with no ties is a node all the same, of degree 0, and every algorithm returns a row for it. A tie whose `src` or `dst` is not an `id` of `members` is left out of the graph, and `describe` counts such ties in its `n_dropped_edges` column.
 
 The node table is optional. Without it, the nodes are the endpoints of the edges:
 
@@ -343,7 +343,44 @@ FROM connected_components(lesmis_strong);
 +--------+
 ```
 
-The nodes of a subgraph are the endpoints of the edges it keeps. A character whose every tie is weaker than 3 is not in `lesmis_strong`.
+Without a node table, the nodes of a subgraph are the endpoints of the edges it keeps. A character whose every tie is weaker than 3 is not in `lesmis_strong`.
+
+With a node table, the node table defines the nodes, so a subgraph keeps every one of them, as a filtered edge frame in Python keeps its parent's nodes. This subgraph of the karate club keeps the ties from members 5 and up. Ten members, 0 to 4 among them, have no ties left, and are still nodes:
+
+```sql
+CREATE VIEW late_ties AS SELECT * FROM ties WHERE src >= 5;
+
+CREATE PROPERTY GRAPH karate_late
+  VERTEX TABLES (members KEY (id))
+  EDGE TABLES (
+    late_ties SOURCE KEY (src) REFERENCES members (id)
+              DESTINATION KEY (dst) REFERENCES members (id)
+  );
+
+SELECT n_nodes, n_edges FROM describe(karate_late);
+```
+
+```text
++---------+---------+
+| n_nodes | n_edges |
++---------+---------+
+| 34      | 41      |
++---------+---------+
+```
+
+`nodes => 'touched'` describes only the nodes at an end of a kept edge:
+
+```sql
+SELECT n_nodes, n_edges FROM describe(karate_late, nodes => 'touched');
+```
+
+```text
++---------+---------+
+| n_nodes | n_edges |
++---------+---------+
+| 24      | 41      |
++---------+---------+
+```
 
 ## Traversals
 

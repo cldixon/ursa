@@ -29,15 +29,55 @@ pub struct Description {
 
 /// The nodes at an end of an edge row `mask` keeps, in node order.
 pub fn touched_nodes(topo: &Topology, mask: &EdgeMask) -> Vec<u32> {
+    let seen = on_an_edge(topo, Some(mask));
+    (0..topo.n_nodes() as u32)
+        .filter(|&u| seen[u as usize])
+        .collect()
+}
+
+/// Per node, whether it is at an end of an edge row `mask` keeps (`None`:
+/// any edge row).
+fn on_an_edge(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<bool> {
     let n = topo.n_nodes();
     let mut seen = vec![false; n];
-    for u in 0..n as u32 {
-        topo.for_each_neighbor(u, Direction::Out, Some(mask), |v| {
-            seen[u as usize] = true;
-            seen[v as usize] = true;
-        });
+    match mask {
+        Some(mask) => {
+            for u in 0..n as u32 {
+                topo.for_each_neighbor(u, Direction::Out, Some(mask), |v| {
+                    seen[u as usize] = true;
+                    seen[v as usize] = true;
+                });
+            }
+        }
+        None => {
+            let out = topo.out();
+            for u in 0..n {
+                if out.offsets[u + 1] > out.offsets[u] {
+                    seen[u] = true;
+                }
+            }
+            for &v in out.targets.iter() {
+                seen[v as usize] = true;
+            }
+        }
     }
-    (0..n as u32).filter(|&u| seen[u as usize]).collect()
+    seen
+}
+
+/// The nodes at an end of an edge row `mask` keeps (`None`: any edge row), in
+/// node order; `None` when that is every node. A graph whose nodes are given
+/// apart from its edges (the SQL engine's vertex table) can have nodes on no
+/// edge with no mask at all.
+fn touched(topo: &Topology, mask: Option<&EdgeMask>) -> Option<Vec<u32>> {
+    let seen = on_an_edge(topo, mask);
+    if mask.is_none() && seen.iter().all(|&s| s) {
+        return None;
+    }
+    Some(
+        (0..topo.n_nodes() as u32)
+            .filter(|&u| seen[u as usize])
+            .collect(),
+    )
 }
 
 /// The edge count a statistic reads under `dir` over the view `mask` keeps:
@@ -91,8 +131,9 @@ pub fn density(topo: &Topology, mask: Option<&EdgeMask>, dir: Direction) -> f64 
 ///
 /// With `touched` the node set is only the nodes at an end of a kept edge:
 /// `n_nodes` counts them, `density` and `avg_degree` divide by that count, and
-/// `n_components` leaves out the parent's other nodes. Over the whole graph it
-/// changes nothing.
+/// `n_components` leaves out the parent's other nodes. Over a whole graph of
+/// edges it changes nothing; over a graph with nodes on no edge (a vertex
+/// table's), it leaves those out.
 pub fn describe(
     topo: &Topology,
     mask: Option<&EdgeMask>,
@@ -101,9 +142,9 @@ pub fn describe(
     touched: bool,
 ) -> Description {
     let all_nodes = topo.n_nodes();
-    let n = match mask {
-        Some(m) if touched => touched_nodes(topo, m).len(),
-        _ => all_nodes,
+    let n = match touched {
+        true => self::touched(topo, mask).map_or(all_nodes, |t| t.len()),
+        false => all_nodes,
     };
     let n_nodes = n as i64;
     let edges = edge_count(topo, mask, dir);
@@ -263,11 +304,11 @@ pub(crate) fn bfs_source_scan(
     (sum, count, max)
 }
 
-/// The BFS sources a path statistic may pick from: every node over the whole
-/// graph, or over a view only the nodes at an end of a kept edge (the others
-/// reach nothing and are reached by nothing).
+/// The BFS sources a path statistic may pick from: the nodes at an end of a
+/// kept edge (the others reach nothing and are reached by nothing); `None`
+/// when that is every node, as over a whole graph of edges.
 fn candidate_sources(topo: &Topology, mask: Option<&EdgeMask>) -> Option<Vec<u32>> {
-    mask.map(|m| touched_nodes(topo, m))
+    touched(topo, mask)
 }
 
 /// [`sample_sources`] over `candidates` (`None`: every node of `topo`).
@@ -284,7 +325,7 @@ fn pick_sources(topo: &Topology, candidates: Option<&[u32]>, frac: Option<f64>) 
 /// Average shortest-path length over reachable ordered pairs, following edges
 /// in `dir` (`Both` ignores direction). `sample=None` is exact (BFS from every
 /// node); `Some(frac)` estimates from a deterministic strided subsample of
-/// sources, drawn from the nodes at an end of a kept edge under a mask. A graph
+/// sources, drawn from the nodes at an end of a kept edge. A graph
 /// with no reachable pair gives `0.0`.
 pub fn avg_path_length(
     topo: &Topology,

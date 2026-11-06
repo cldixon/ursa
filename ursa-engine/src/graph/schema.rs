@@ -14,10 +14,12 @@
 //!   - without a vertex table, the distinct non-null endpoints (`source` and
 //!     `destination` values) of the edges;
 //!   - with one, every row of the vertex table (its key renamed to `id`,
-//!     followed by its other columns), plus every endpoint that is not a key
-//!     of the vertex table, with NULL attributes. When the key and the
-//!     endpoints have different types (`Int32` and `Int64`, `Utf8` and a
-//!     dictionary), `id` has their common type, a dictionary as its values.
+//!     followed by its other columns), and nothing else: the vertex table
+//!     defines the node set, as in SQL/PGQ and DuckPGQ, and an edge whose
+//!     source or destination is not one of its keys is dropped by the
+//!     algorithms (#311). When the key and the endpoints have different types
+//!     (`Int32` and `Int64`, `Utf8` and a dictionary), `id` has their common
+//!     type, a dictionary as its values.
 //!
 //! The plan builders ([`edges_plan`], [`nodes_plan`] and their `_from`
 //! variants, which take table sources already resolved) are public so the graph
@@ -35,13 +37,13 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{SchemaProvider, Session, TableProvider};
-use datafusion::common::{Column, JoinType, ScalarValue, TableReference};
+use datafusion::common::{Column, TableReference};
 use datafusion::datasource::{provider_as_source, TableType, ViewTable};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr_fn::cast;
 use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
-use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
+use datafusion::logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 use datafusion::physical_plan::ExecutionPlan;
 use parking_lot::RwLock;
 
@@ -53,10 +55,6 @@ pub const EDGES: &str = "edges";
 pub const NODES: &str = "nodes";
 /// The node id column of `<graph>.nodes`.
 pub const ID: &str = "id";
-
-/// Qualifiers used inside the `nodes` plan.
-const ENDPOINTS: &str = "__ursa_endpoints";
-const VERTICES: &str = "__ursa_vertices";
 
 /// The schema of one graph: its `edges` and `nodes` tables.
 #[derive(Debug)]
@@ -291,36 +289,10 @@ pub fn nodes_plan_from(
             .iter()
             .map(|f| Expr::Column(Column::new(Some(vertex_def.table.clone()), f.name()))),
     );
-    let vertex_rows = LogicalPlanBuilder::scan(vertex_def.table.clone(), vertices, None)?
+    // Only the vertex table's rows: an endpoint that is not one of its keys
+    // is no node, and its edges are dropped (#311).
+    LogicalPlanBuilder::scan(vertex_def.table.clone(), vertices, None)?
         .project(vertex_exprs)?
-        .build()?;
-
-    // The endpoints that are not keys of the vertex table, with NULL attributes.
-    let keys = LogicalPlanBuilder::from(vertex_rows.clone())
-        .project(vec![col(ID)])?
-        .alias(VERTICES)?
-        .build()?;
-    let mut missing_exprs = vec![col(Column::new(Some(ENDPOINTS), ID)).alias(ID)];
-    for f in &others {
-        missing_exprs.push(lit(ScalarValue::try_from(f.data_type())?).alias(f.name()));
-    }
-    let missing = endpoints(def, &edges)?
-        .project(vec![cast_to(col(ID), &endpoint_type, &id_type).alias(ID)])?
-        .alias(ENDPOINTS)?
-        .join(
-            keys,
-            JoinType::LeftAnti,
-            (
-                vec![Column::new(Some(ENDPOINTS), ID)],
-                vec![Column::new(Some(VERTICES), ID)],
-            ),
-            None,
-        )?
-        .project(missing_exprs)?
-        .build()?;
-
-    LogicalPlanBuilder::from(vertex_rows)
-        .union(missing)?
         .build()
 }
 
@@ -418,6 +390,8 @@ mod tests {
             ]
         );
 
+        // The vertex table's rows only: 'w', an endpoint that is not a key,
+        // is no node (#311).
         let batches = ctx
             .sql("SELECT id, age FROM social.nodes ORDER BY id")
             .await
@@ -434,7 +408,6 @@ mod tests {
 +----+-----+
 | id | age |
 +----+-----+
-| w  |     |
 | x  | 30  |
 | y  | 40  |
 | z  | 50  |
