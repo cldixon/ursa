@@ -383,7 +383,8 @@ async fn show_tables_lists_the_graph_tables() {
 +--------------+------------+"
     );
     let shown = pretty(&ok(&ctx, "SHOW TABLES").await);
-    assert!(shown.contains("| karate             | nodes "), "{shown}");
+    assert!(shown.contains("| karate       | nodes "), "{shown}");
+    assert!(!shown.contains("information_schema"), "{shown}");
     let columns = pretty(&ok(&ctx, "SHOW COLUMNS FROM karate.nodes").await);
     assert!(columns.contains("club"), "{columns}");
 }
@@ -751,7 +752,7 @@ async fn a_graph_over_a_deregistered_view_keeps_listings_working() {
 
     let shown = pretty(&ok(&ctx, "SHOW TABLES").await);
     assert!(
-        shown.contains("| karate_edges_only  | edges       | VIEW"),
+        shown.contains("| karate_edges_only | edges      | VIEW"),
         "{shown}"
     );
     ok(&ctx, "SELECT * FROM information_schema.tables").await;
