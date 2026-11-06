@@ -8,7 +8,7 @@ ursa
 ```
 
 ```text
-ursa 0.6.0, database club.ursa. Enter .help for commands, .quit to exit.
+ursa 0.7.0, database club.ursa. Enter .help for commands, .quit to exit.
 ursa>
 ```
 

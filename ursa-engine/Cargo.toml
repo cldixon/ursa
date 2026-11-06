@@ -3,7 +3,7 @@ name = "ursa-engine"
 description = "Ursa's SQL engine session: a DataFusion session that reads files by path, locally or in object storage."
 # The SQL engine and CLI are versioned on their own: 0.6 is their first
 # release. The Python package (ursa-graph) follows the workspace version.
-version = "0.7.0-dev"
+version = "0.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,8 +15,8 @@ categories = ["database-implementations", "algorithms"]
 [dependencies]
 # `ursa-core`'s `rayon` feature is native only (below): in the browser the
 # kernels take their serial path, whose results are bit-identical (#278).
-ursa-core = { path = "../ursa-core", version = "0.7.0-dev", default-features = false }
-ursa-io = { path = "../ursa-io", version = "0.7.0-dev" }
+ursa-core = { path = "../ursa-core", version = "0.7.0", default-features = false }
+ursa-io = { path = "../ursa-io", version = "0.7.0" }
 datafusion = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
@@ -48,7 +48,7 @@ aws-profile = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-smithy-htt
 
 # Native only: the local file system and cloud stores do not build for wasm32 (#278).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ursa-core = { path = "../ursa-core", version = "0.7.0-dev", features = ["rayon"] }
+ursa-core = { path = "../ursa-core", version = "0.7.0", features = ["rayon"] }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 
 [dev-dependencies]
