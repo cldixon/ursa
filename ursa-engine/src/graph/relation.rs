@@ -1111,36 +1111,120 @@ impl GraphFunctions {
         };
         let pattern = super::pattern::parse(&body)?;
         let graph = self.graph(&pattern.graph)?;
-        let sql = {
+        let source_of = |table: &TableReference, context: &dyn RelationPlannerContext| match self
+            .registry
+            .file_table(&graph.name, table)
+        {
+            Some(provider) => Ok(provider_as_source(provider)),
+            None => self.table_source(table, context),
+        };
+        let lowered = {
             let context: &dyn RelationPlannerContext = context;
             let schema_of = |table: &TableReference| -> Result<Arc<Schema>> {
-                let source = match self.registry.file_table(&graph.name, table) {
-                    Some(provider) => provider_as_source(provider),
-                    None => self.table_source(table, context)?,
-                };
-                Ok(source.schema())
+                Ok(source_of(table, context)?.schema())
             };
             super::pattern::lower(&pattern, &graph, &schema_of)?
         };
-        let query = Parser::new(&GenericDialect {})
-            .try_with_sql(&sql)
-            .and_then(|mut p| p.parse_query())
-            .map_err(|e| {
-                DataFusionError::Internal(format!(
-                    "GRAPH_TABLE's query does not parse ({e}): {sql}"
-                ))
-            })?;
-        let plan = context.plan(TableFactor::Derived {
-            lateral: false,
-            subquery: query,
-            alias: None,
-            sample: None,
-        })?;
+        let conditions = lowered
+            .conditions
+            .iter()
+            .map(|c| parse_sql_expr(c))
+            .collect::<Result<Vec<_>>>()?;
+        let columns = parse_select_items(&lowered.columns)?;
+
+        // The cross join of every variable's relation, as one branch's input.
+        let mut from: Option<LogicalPlanBuilder> = None;
+        for source in &lowered.sources {
+            let table = source_of(&source.table, context)?;
+            let mut scan = LogicalPlanBuilder::scan(source.table.clone(), table, None)?;
+            if let Some(columns) = &source.columns {
+                scan = scan.project(columns.iter().map(|(column, name)| {
+                    Expr::Column(Column::new_unqualified(column)).alias(name)
+                }))?;
+            }
+            let relation = scan.alias(source.var.as_str())?.build()?;
+            from = Some(match from {
+                None => LogicalPlanBuilder::from(relation),
+                Some(b) => b.cross_join(relation)?,
+            });
+        }
+        let base = from.expect("a pattern has a node").build()?;
+        // A join column under the name its variable's relation gives it.
+        let column = |(var, name): &super::pattern::VarColumn| {
+            let source = lowered.sources.iter().find(|s| &s.var == var);
+            let name = source
+                .and_then(|s| s.columns.as_ref())
+                .and_then(|columns| columns.iter().find(|(c, _)| c == name).map(|(_, n)| n))
+                .unwrap_or(name);
+            Expr::Column(Column::new(Some(var.as_str()), name))
+        };
+        let mut branches = Vec::new();
+        for joins in &lowered.branches {
+            let mut filter: Vec<Expr> = joins
+                .iter()
+                .map(|join| match join {
+                    super::pattern::Join::Equal(a, b) => column(a).eq(column(b)),
+                    super::pattern::Join::NotEqual(a, b) => column(a).not_eq(column(b)),
+                })
+                .collect();
+            for condition in &conditions {
+                filter.push(context.sql_to_expr(condition.clone(), base.schema())?);
+            }
+            let mut branch = LogicalPlanBuilder::from(base.clone());
+            if let Some(predicate) = filter.into_iter().reduce(Expr::and) {
+                branch = branch.filter(predicate)?;
+            }
+            let schema = branch.schema().clone();
+            let mut projection = Vec::new();
+            for item in &columns {
+                match item {
+                    ast::SelectItem::UnnamedExpr(expr) => {
+                        projection.push(context.sql_to_expr(expr.clone(), &schema)?)
+                    }
+                    ast::SelectItem::ExprWithAlias { expr, alias } => projection.push(
+                        context
+                            .sql_to_expr(expr.clone(), &schema)?
+                            .alias(context.normalize_ident(alias.clone())),
+                    ),
+                    ast::SelectItem::QualifiedWildcard(
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                        _,
+                    ) => {
+                        let var = context.normalize_ident(
+                            name.0
+                                .last()
+                                .and_then(|p| p.as_ident().cloned())
+                                .unwrap_or_else(|| ast::Ident::new(name.to_string())),
+                        );
+                        let columns: Vec<Expr> = schema
+                            .iter()
+                            .filter(|(q, _)| q.is_some_and(|q| q.table() == var))
+                            .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+                            .collect();
+                        if columns.is_empty() {
+                            return Err(plan(format!(
+                                "in GRAPH_TABLE: COLUMNS ({var}.*) names no variable '{var}'"
+                            )));
+                        }
+                        projection.extend(columns);
+                    }
+                    other => {
+                        return Err(plan(format!(
+                        "in GRAPH_TABLE: COLUMNS takes expressions, as a.name AS name; got {other}"
+                    )))
+                    }
+                }
+            }
+            branches.push(branch.project(projection)?.build()?);
+        }
+        let mut branches = branches.into_iter();
+        let mut plan = LogicalPlanBuilder::from(branches.next().expect("one branch at least"));
+        for branch in branches {
+            plan = plan.union(branch)?;
+        }
         let plan = match alias {
-            Some(_) => plan,
-            None => LogicalPlanBuilder::from(plan)
-                .alias(super::pattern::FUNCTION)?
-                .build()?,
+            Some(_) => plan.build()?,
+            None => plan.alias(super::pattern::FUNCTION)?.build()?,
         };
         Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
             plan, alias,
@@ -1251,6 +1335,22 @@ impl GraphFunctions {
         };
         Err(plan(format!("graph '{name}' does not exist{hint}")))
     }
+}
+
+/// One SQL expression, as written in a GRAPH_TABLE pattern.
+fn parse_sql_expr(text: &str) -> Result<ast::Expr> {
+    Parser::new(&GenericDialect {})
+        .try_with_sql(text)
+        .and_then(|mut p| p.parse_expr())
+        .map_err(|e| plan(format!("in GRAPH_TABLE: {e} in '{text}'")))
+}
+
+/// The `COLUMNS` list, as SQL select items.
+fn parse_select_items(text: &str) -> Result<Vec<ast::SelectItem>> {
+    Parser::new(&GenericDialect {})
+        .try_with_sql(text)
+        .and_then(|mut p| p.parse_comma_separated(Parser::parse_select_item))
+        .map_err(|e| plan(format!("in GRAPH_TABLE: {e} in COLUMNS ({text})")))
 }
 
 /// The error for `graph_table(…)` called other than as Ursa's parser writes it.

@@ -22,7 +22,7 @@ A pattern is nodes in parentheses and edges in brackets. `COLUMNS` says what eac
 ```sql
 SELECT *
 FROM GRAPH_TABLE (karate
-  MATCH (a)-[e]->(b)
+  MATCH (a)-[e]-(b)
   WHERE a.club = 'Officer' AND b.club = 'Mr. Hi'
   COLUMNS (a.id AS officer, b.id AS member)
 )
@@ -30,10 +30,24 @@ ORDER BY officer, member;
 ```
 
 ```text
-OUTPUT_1
++---------+--------+
+| officer | member |
++---------+--------+
+| 9       | 2      |
+| 27      | 2      |
+| 28      | 2      |
+| 30      | 1      |
+| 30      | 8      |
+| 31      | 0      |
+| 32      | 2      |
+| 32      | 8      |
+| 33      | 8      |
+| 33      | 13     |
+| 33      | 19     |
++---------+--------+
 ```
 
-Each match binds `a` to a node, `e` to an edge from it and `b` to the node the edge goes to. `a.club` is a property of `a`: a column of its vertex table. The result is a table like any other: filter it, join it, aggregate it, or define a view over it.
+Each match binds `a` to a node, `e` to an edge between it and `b`, and `b` to the node at the edge's other end: these are the friendships between the two clubs. `-[e]-` follows an edge either way; `-[e]->` would only follow it from `a` to `b`, the way the edge table stores it. `a.club` is a property of `a`: a column of its vertex table. The result is a table like any other: filter it, join it, aggregate it, or define a view over it.
 
 ## The pattern
 
@@ -71,7 +85,15 @@ LIMIT 5;
 ```
 
 ```text
-OUTPUT_2
++------------------+
+| friend_of_friend |
++------------------+
+| 1                |
+| 2                |
+| 3                |
+| 4                |
+| 5                |
++------------------+
 ```
 
 ## With graph algorithms
@@ -87,7 +109,13 @@ LIMIT 3;
 ```
 
 ```text
-OUTPUT_3
++----+----------+
+| id | pagerank |
++----+----------+
+| 32 | 0.0717   |
+| 31 | 0.0372   |
+| 23 | 0.0315   |
++----+----------+
 ```
 
 ## What is not supported yet

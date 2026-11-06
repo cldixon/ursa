@@ -233,6 +233,35 @@ FROM hop(karate,
 - `shortest_path(g, source =>, target =>, weight =>, direction =>)`: one edge per row with `hop` and `cost`. Exactly one source and one target.
 - `random_walk(g, start =>, steps =>, walks_per_node =>, seed =>)`: one row per step.
 
+## Pattern matching: GRAPH_TABLE
+
+SQL/PGQ's `GRAPH_TABLE` finds node-and-edge patterns and returns a table. Write it as you would for any SQL/PGQ engine (DuckPGQ queries run as written). Member 0's friends, by club:
+
+```sql
+SELECT b.club, count(*) AS ties
+FROM GRAPH_TABLE (karate
+  MATCH (a WHERE a.id = 0)-[e]-(b)
+  COLUMNS (b.club AS club)
+) b
+GROUP BY b.club
+ORDER BY b.club;
+```
+
+```text
++---------+------+
+| club    | ties |
++---------+------+
+| Mr. Hi  | 15   |
+| Officer | 1    |
++---------+------+
+```
+
+- Nodes are `(var:label WHERE …)`, edges `-[var:label WHERE …]->`, `<-[…]-`, or `-[…]-` (either way; each mutual tie is two matches). `->`, `<-`, `-` with no variable.
+- `COLUMNS (…)` is required. Properties are the element table's columns (or its `PROPERTIES`).
+- Several paths share variables: `MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)`.
+- Labels pick the table in a graph of several tables; without one, a variable takes the table its edges `REFERENCES`. Ambiguous patterns are refused with a request for a label.
+- Not yet: `->*`/`{1,3}` quantifiers, path variables `p = …`, `ANY SHORTEST`, `:a|b`.
+
 ## The .ursa database file
 
 `ursa club.ursa` creates or opens a database. It keeps views, external tables and graphs, and the graph indexes Ursa builds. Rerunning a query in a new process loads the stored index instead of rebuilding it, and a changed source file is noticed and rebuilt.

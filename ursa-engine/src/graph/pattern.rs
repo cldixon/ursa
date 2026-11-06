@@ -3,9 +3,10 @@
 //! Ursa's parser rewrites `GRAPH_TABLE ( body )` into `graph_table('body')`;
 //! the relation planner hands the body here. [`parse`] reads it into a
 //! [`Pattern`]; [`lower`] resolves each variable to one of the graph's element
-//! tables and writes an ordinary query over them, which the planner plans as
-//! a derived table. So DataFusion plans the match as joins, with every
-//! optimisation it has.
+//! tables and says what to join: a [`Lowered`] match, which the planner
+//! builds as a logical plan (scans of the element tables, equality
+//! conditions, the pattern's conditions and `COLUMNS`). DataFusion's
+//! optimizer turns the equalities into hash joins.
 //!
 //! Supported (fixed-length patterns):
 //!
@@ -21,8 +22,8 @@
 //! spec    := [var] [:label | IS label] [WHERE condition]
 //! ```
 //!
-//! Conditions and `COLUMNS` are SQL over the variables (`a.name`), and reach
-//! the query as written. A label names an element table: by its name or one of
+//! Conditions and `COLUMNS` are SQL expressions over the variables
+//! (`a.name`); each variable is a relation of that name. A label names an element table: by its name or one of
 //! its labels. A variable without one gets the only table it can be: from the
 //! edges next to it and their `REFERENCES`, or because the graph has one table
 //! of that kind; otherwise the pattern is refused, never guessed.
@@ -30,14 +31,13 @@
 //! Each variable reads its element table's properties: every column, or what
 //! its labels' `PROPERTIES` clauses give, under their property names. An
 //! undirected edge `-[e]-` matches both orientations of each edge (a self-loop
-//! once): the query is a `UNION ALL` with one branch per orientation, so every
+//! once): the match is a `UNION ALL` with one branch per orientation, so every
 //! join stays an equality join.
 //!
 //! Variable-length paths, path variables, `ANY SHORTEST` and label
 //! expressions (`|`, `&`, `!`) are refused with a message (#297).
 
 use std::collections::BTreeMap;
-use std::fmt::Write;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::TableReference;
@@ -152,7 +152,9 @@ impl<'a> Tokens<'a> {
     /// What the next token is, for an error: "'x' (at character 12)" or "the end".
     fn found(&self) -> String {
         match self.tokens.get(self.at) {
-            Some((token, start, _)) => format!("'{token}' (at character {} of the pattern)", start + 1),
+            Some((token, start, _)) => {
+                format!("'{token}' (at character {} of the pattern)", start + 1)
+            }
             None => "the end".to_string(),
         }
     }
@@ -273,10 +275,7 @@ pub fn parse(body: &str) -> Result<Pattern> {
     };
     t.expect(&Token::RParen, "')' to close COLUMNS")?;
     if t.peek(0).is_some() {
-        return pattern_err(format!(
-            "unexpected {} after COLUMNS (…)",
-            t.found()
-        ));
+        return pattern_err(format!("unexpected {} after COLUMNS (…)", t.found()));
     }
     Ok(Pattern {
         graph,
@@ -324,7 +323,9 @@ fn parse_spec(t: &mut Tokens, close: &Token) -> Result<Spec> {
             t.peek(0),
             Some(Token::Pipe | Token::Ampersand | Token::ExclamationMark | Token::Mod)
         ) {
-            return pattern_err("label expressions (|, &, !, %) are not supported yet; use one label (#297)");
+            return pattern_err(
+                "label expressions (|, &, !, %) are not supported yet; use one label (#297)",
+            );
         }
     }
     if t.is_word(0, "WHERE") {
@@ -441,13 +442,48 @@ struct Step {
     direction: Direction,
 }
 
-/// The query a pattern means over `graph`. `schema_of` gives a table's
-/// columns (for properties).
+/// A column of a variable: (variable, column).
+pub type VarColumn = (String, String);
+
+/// What a variable reads: an element table (or the graph's `nodes` table),
+/// all its columns or `columns` as (column, property name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Source {
+    pub var: String,
+    pub table: TableReference,
+    /// `None`: every column, under its own name.
+    pub columns: Option<Vec<(String, String)>>,
+}
+
+/// A condition the lowering adds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Join {
+    Equal(VarColumn, VarColumn),
+    /// Not equal: keeps a self-loop out of an undirected edge's reverse branch.
+    NotEqual(VarColumn, VarColumn),
+}
+
+/// A pattern resolved against a graph: what to scan and join.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lowered {
+    /// One per variable, in order of appearance.
+    pub sources: Vec<Source>,
+    /// One per orientation of the undirected edges: the joins of each branch
+    /// of the `UNION ALL` (one branch when every edge has a direction).
+    pub branches: Vec<Vec<Join>>,
+    /// The pattern's conditions as written: in elements, then after the paths.
+    pub conditions: Vec<String>,
+    /// The `COLUMNS` list as written.
+    pub columns: String,
+}
+
+/// Resolve `pattern` against `graph`. `schema_of` gives a table's columns
+/// (for properties).
 pub fn lower(
     pattern: &Pattern,
     graph: &PropertyGraph,
     schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
-) -> Result<String> {
+) -> Result<Lowered> {
     // Collect the variables, naming anonymous ones.
     let mut bindings: BTreeMap<String, Binding> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -477,7 +513,11 @@ pub fn lower(
             if binding.is_edge != is_edge {
                 return pattern_err(format!("'{var}' is used for both a node and an edge"));
             }
-            if is_edge && (binding.label.is_some() || !binding.conditions.is_empty() || steps.iter().any(|s: &Step| s.edge == var)) {
+            if is_edge
+                && (binding.label.is_some()
+                    || !binding.conditions.is_empty()
+                    || steps.iter().any(|s: &Step| s.edge == var))
+            {
                 return pattern_err(format!(
                     "edge variable '{var}' appears twice; an edge variable binds one edge"
                 ));
@@ -516,7 +556,11 @@ pub fn lower(
     for (var, b) in bindings.iter_mut() {
         let Some(label) = &b.label else { continue };
         if b.is_edge {
-            let tables: Vec<&EdgeTable> = graph.edge_tables.iter().filter(|e| e.answers_to(label)).collect();
+            let tables: Vec<&EdgeTable> = graph
+                .edge_tables
+                .iter()
+                .filter(|e| e.answers_to(label))
+                .collect();
             match tables.as_slice() {
                 [only] => b.edge = Some(only),
                 [] => return pattern_err(format!(
@@ -528,7 +572,11 @@ pub fn lower(
                 )),
             }
         } else {
-            let tables: Vec<&VertexTable> = graph.vertex_tables.iter().filter(|v| v.answers_to(label)).collect();
+            let tables: Vec<&VertexTable> = graph
+                .vertex_tables
+                .iter()
+                .filter(|v| v.answers_to(label))
+                .collect();
             match tables.as_slice() {
                 [only] => b.vertex = Some(VertexSource::Table(only)),
                 [] => return pattern_err(format!(
@@ -562,11 +610,16 @@ pub fn lower(
                     }
                 }
                 Some(e) => {
-                    let (from, to) = (graph.endpoint_vertex(e, true), graph.endpoint_vertex(e, false));
+                    let (from, to) = (
+                        graph.endpoint_vertex(e, true),
+                        graph.endpoint_vertex(e, false),
+                    );
                     let (l, r) = match step.direction {
                         Direction::Right => (from, to),
                         Direction::Left => (to, from),
-                        Direction::Any if from.map(|v| &v.name) == to.map(|v| &v.name) => (from, to),
+                        Direction::Any if from.map(|v| &v.name) == to.map(|v| &v.name) => {
+                            (from, to)
+                        }
                         Direction::Any => (None, None),
                     };
                     for (var, table) in [(&step.left, l), (&step.right, r)] {
@@ -587,6 +640,7 @@ pub fn lower(
     }
 
     // What is still open: the graph's only table of its kind, or a refusal.
+    // Edges first: labelling an edge usually tells its nodes too.
     for (var, b) in bindings.iter_mut() {
         if b.is_edge && b.edge.is_none() {
             match graph.edge_tables.as_slice() {
@@ -600,6 +654,8 @@ pub fn lower(
                 )),
             }
         }
+    }
+    for (var, b) in bindings.iter_mut() {
         if !b.is_edge && b.vertex.is_none() {
             match graph.vertex_tables.as_slice() {
                 [only] => b.vertex = Some(VertexSource::Table(only)),
@@ -618,7 +674,6 @@ pub fn lower(
         }
     }
 
-    // FROM items, one per variable.
     let undirected: Vec<usize> = steps
         .iter()
         .enumerate()
@@ -633,34 +688,45 @@ pub fn lower(
     let mut sources = Vec::new();
     for var in &order {
         let b = &bindings[var];
-        let alias = quote(var);
-        let source = if b.is_edge {
+        let (table, columns) = if b.is_edge {
             let e = b.edge.expect("resolved");
             let needed = [e.source.as_str(), e.destination.as_str()];
-            element_source(&e.table, &e.labels(), &needed, schema_of)?
+            (
+                e.table.clone(),
+                properties(&e.table, &e.labels(), &needed, schema_of)?,
+            )
         } else {
             match b.vertex.as_ref().expect("resolved") {
-                VertexSource::Table(v) => element_source(&v.table, &v.labels(), &[v.key.as_str()], schema_of)?,
-                VertexSource::Nodes => format!("{}.{}", quote(&graph.name), quote(super::schema::NODES)),
+                VertexSource::Table(v) => (
+                    v.table.clone(),
+                    properties(&v.table, &v.labels(), &[v.key.as_str()], schema_of)?,
+                ),
+                VertexSource::Nodes => (
+                    TableReference::partial(graph.name.as_str(), super::schema::NODES),
+                    None,
+                ),
             }
         };
-        sources.push(format!("{source} AS {alias}"));
+        sources.push(Source {
+            var: var.clone(),
+            table,
+            columns,
+        });
     }
-    let key = |var: &str| -> String {
+    let key = |var: &str| -> VarColumn {
         match bindings[var].vertex.as_ref().expect("resolved") {
-            VertexSource::Table(v) => format!("{}.{}", quote(var), quote(&v.key)),
-            VertexSource::Nodes => format!("{}.{}", quote(var), quote(super::schema::ID)),
+            VertexSource::Table(v) => (var.to_string(), v.key.clone()),
+            VertexSource::Nodes => (var.to_string(), super::schema::ID.to_string()),
         }
     };
 
-    // One branch per orientation of the undirected edges.
     let mut branches = Vec::new();
     for mask in 0..(1usize << undirected.len()) {
-        let mut conditions = Vec::new();
+        let mut joins = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let e = bindings[&step.edge].edge.expect("resolved");
-            let src = format!("{}.{}", quote(&step.edge), quote(&e.source));
-            let dst = format!("{}.{}", quote(&step.edge), quote(&e.destination));
+            let src = (step.edge.clone(), e.source.clone());
+            let dst = (step.edge.clone(), e.destination.clone());
             let reversed = match step.direction {
                 Direction::Right => false,
                 Direction::Left => true,
@@ -669,30 +735,32 @@ pub fn lower(
                     let reversed = mask & (1 << bit) != 0;
                     if reversed {
                         // A self-loop matches once, in the forward branch.
-                        conditions.push(format!("{src} <> {dst}"));
+                        joins.push(Join::NotEqual(src.clone(), dst.clone()));
                     }
                     reversed
                 }
             };
-            let (from, to) = if reversed { (&step.right, &step.left) } else { (&step.left, &step.right) };
-            conditions.push(format!("{src} = {}", key(from)));
-            conditions.push(format!("{dst} = {}", key(to)));
+            let (from, to) = if reversed {
+                (&step.right, &step.left)
+            } else {
+                (&step.left, &step.right)
+            };
+            joins.push(Join::Equal(src, key(from)));
+            joins.push(Join::Equal(dst, key(to)));
         }
-        for var in &order {
-            for condition in &bindings[var].conditions {
-                conditions.push(format!("({condition})"));
-            }
-        }
-        if let Some(condition) = &pattern.condition {
-            conditions.push(format!("({condition})"));
-        }
-        let mut branch = format!("SELECT {} FROM {}", pattern.columns, sources.join(", "));
-        if !conditions.is_empty() {
-            let _ = write!(branch, " WHERE {}", conditions.join(" AND "));
-        }
-        branches.push(branch);
+        branches.push(joins);
     }
-    Ok(branches.join(" UNION ALL "))
+    let mut conditions: Vec<String> = order
+        .iter()
+        .flat_map(|var| bindings[var].conditions.iter().cloned())
+        .collect();
+    conditions.extend(pattern.condition.clone());
+    Ok(Lowered {
+        sources,
+        branches,
+        conditions,
+        columns: pattern.columns.clone(),
+    })
 }
 
 /// The vertex table a variable is bound to, if it is bound to one.
@@ -727,20 +795,20 @@ fn fits(
     }
 }
 
-/// An element table as a FROM item reading its properties: the table itself
-/// when every label exposes every column, else a query of its properties
-/// under their names, plus the `needed` key or endpoint columns.
-fn element_source(
+/// The columns an element table exposes, as (column, property name): `None`
+/// when every label exposes every column under its own name; else its
+/// labels' properties, plus the `needed` key or endpoint columns.
+fn properties(
     table: &TableReference,
     labels: &[Label],
     needed: &[&str],
     schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
-) -> Result<String> {
+) -> Result<Option<Vec<(String, String)>>> {
     let all = labels
         .iter()
         .all(|l| matches!(&l.properties, Properties::AllColumns { except } if except.is_empty()));
     if all {
-        return Ok(table.to_quoted_string());
+        return Ok(None);
     }
     let schema = schema_of(table)?;
     let mut items: Vec<(String, String)> = Vec::new(); // (column, property)
@@ -767,15 +835,7 @@ fn element_source(
             items.push((column.to_string(), column.to_string()));
         }
     }
-    let list: Vec<String> = items
-        .iter()
-        .map(|(column, name)| format!("{} AS {}", quote(column), quote(name)))
-        .collect();
-    Ok(format!("(SELECT {} FROM {})", list.join(", "), table.to_quoted_string()))
-}
-
-fn quote(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
+    Ok(Some(items))
 }
 
 fn names<'a>(names: impl Iterator<Item = &'a str>) -> String {
@@ -832,7 +892,10 @@ mod tests {
             p.paths[0],
             vec![
                 Element::Node(spec(Some("a"), Some("person"), Some("a.age > (1 + 2)"))),
-                Element::Edge(spec(Some("k"), Some("knows"), Some("k.since > 2000")), Direction::Right),
+                Element::Edge(
+                    spec(Some("k"), Some("knows"), Some("k.since > 2000")),
+                    Direction::Right
+                ),
                 Element::Node(spec(Some("b"), Some("person"), None)),
             ]
         );
@@ -853,22 +916,45 @@ mod tests {
             .collect();
         assert_eq!(
             directions,
-            vec![Direction::Any, Direction::Any, Direction::Right, Direction::Left]
+            vec![
+                Direction::Any,
+                Direction::Any,
+                Direction::Right,
+                Direction::Left
+            ]
         );
     }
 
     #[test]
     fn refuses_what_is_not_supported_yet_and_reports_errors() {
         for (body, expected) in [
-            ("g MATCH p = (a)-[e]->(b) COLUMNS (a.id)", "path variables (p = …) are not supported yet"),
-            ("g MATCH ANY SHORTEST (a)-[e]->(b) COLUMNS (a.id)", "ANY/ALL SHORTEST paths are not supported yet"),
+            (
+                "g MATCH p = (a)-[e]->(b) COLUMNS (a.id)",
+                "path variables (p = …) are not supported yet",
+            ),
+            (
+                "g MATCH ANY SHORTEST (a)-[e]->(b) COLUMNS (a.id)",
+                "ANY/ALL SHORTEST paths are not supported yet",
+            ),
             ("g MATCH (a)-[e]->*(b) COLUMNS (a.id)", "quantified edges"),
-            ("g MATCH (a)-[e]->{1,3}(b) COLUMNS (a.id)", "quantified edges"),
+            (
+                "g MATCH (a)-[e]->{1,3}(b) COLUMNS (a.id)",
+                "quantified edges",
+            ),
             ("g MATCH (a:x|y) COLUMNS (a.id)", "label expressions"),
             ("g MATCH (a)-[e]->(b)", "a GRAPH_TABLE needs COLUMNS (…)"),
-            ("g (a) COLUMNS (a.id)", "expected MATCH after the graph's name, found '('"),
-            ("g MATCH (a)-[e]=>(b) COLUMNS (a.id)", "expected '->' or '-' after ']'"),
-            ("g MATCH (a b c) COLUMNS (a.id)", "expected a variable, ':label', WHERE or ')'"),
+            (
+                "g (a) COLUMNS (a.id)",
+                "expected MATCH after the graph's name, found '('",
+            ),
+            (
+                "g MATCH (a)-[e]=>(b) COLUMNS (a.id)",
+                "expected '->' or '-' after ']'",
+            ),
+            (
+                "g MATCH (a b c) COLUMNS (a.id)",
+                "expected a variable, ':label', WHERE or ')'",
+            ),
             ("g MATCH (a) COLUMNS (a.id) extra", "unexpected 'extra'"),
             ("g MATCH (a) COLUMNS ()", "COLUMNS (…) lists nothing"),
         ] {

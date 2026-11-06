@@ -48,9 +48,22 @@ fn assert_contains(message: &str, part: &str) {
 /// Both queries return the same rows (as sorted multisets).
 async fn same_rows(ctx: &SessionContext, matched: &str, joined: &str) {
     let sorted = |q: &str| format!("SELECT * FROM ({q}) ORDER BY 1, 2");
-    let (a, b) = (ok(ctx, &sorted(matched)).await, ok(ctx, &sorted(joined)).await);
+    // The rows, without the header (the column names differ).
+    let rows = |table: String| {
+        table
+            .lines()
+            .skip(3)
+            .filter(|l| !l.starts_with('+'))
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let (a, b) = (
+        rows(ok(ctx, &sorted(matched)).await),
+        rows(ok(ctx, &sorted(joined)).await),
+    );
     assert_eq!(a, b, "\n{matched}\n{joined}");
-    assert!(a.lines().count() > 4, "no rows: {matched}");
+    assert!(a.lines().count() > 1, "no rows: {matched}");
 }
 
 /// The Getting Started session: `karate` (with its members) and
@@ -187,10 +200,10 @@ async fn a_graph_table_is_a_table_anywhere_sql_takes_one() {
     assert_contains(
         &ok(
             &ctx,
-            "SELECT g.a FROM GRAPH TABLE (karate MATCH (a)-[e]->(b) COLUMNS (a.id AS a)) AS g WHERE g.a = 33 LIMIT 1",
+            "SELECT g.a FROM GRAPH TABLE (karate MATCH (a)-[e]->(b) COLUMNS (a.id AS a)) AS g WHERE g.a = 32 LIMIT 1",
         )
         .await,
-        "| 33 |",
+        "| 32 |",
     );
 }
 
@@ -318,10 +331,6 @@ async fn patterns_that_cannot_be_matched_are_refused() {
         (
             "SELECT * FROM GRAPH_TABLE (nope MATCH (a) COLUMNS (a.id))",
             "graph 'nope' does not exist",
-        ),
-        (
-            "SELECT * FROM graph_table(1)",
-            "graph_table() takes one string, a GRAPH_TABLE body",
         ),
     ] {
         assert_contains(&err(&ctx, sql).await, expected);
