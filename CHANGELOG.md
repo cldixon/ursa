@@ -16,7 +16,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   versioned apart from the Python package.
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
-    and `https://` URLs. Built on DataFusion 55.2.
+    and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
+    queries work: `FROM t [WHERE …]` is `SELECT * FROM t …` (#306).
   - Graphs are defined with SQL/PGQ `CREATE PROPERTY GRAPH`: any number of
     vertex and edge tables, `AS` names, `LABEL`, `PROPERTIES`, and a vertex
     `KEY` that may be left out (the primary key, or the column the edges
