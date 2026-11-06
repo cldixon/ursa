@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 ursa-core = { path = "../ursa-core" }
 ursa-plan = { path = "../ursa-plan" }
+# The node-id rules an in-memory table is read by, shared with every scan.
+ursa-io = { path = "../ursa-io" }
 # Zero-copy Arrow interchange with Python (FromPyArrow / ToPyArrow via the C data
 # interface). As of arrow 56 this lives in the standalone `arrow-pyarrow` crate
 # (the `arrow` crate's `pyarrow` feature was removed); it pins the pyo3 it was

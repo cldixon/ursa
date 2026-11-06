@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::{Array, RecordBatch};
-use arrow::compute::kernels::boolean::{and, is_not_null};
 use arrow::compute::{cast, filter};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DFSchema;
@@ -33,6 +32,7 @@ use url::Url;
 use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
 use crate::csv::{csv_value_error, read_csv, CsvOptions};
+use crate::ids::{self, unview_field, EndpointTypeError};
 use crate::parquet_stats::CheckedBounds;
 use crate::store::{scan_state, StoreKey};
 use crate::types::pa_name;
@@ -224,24 +224,11 @@ fn check_endpoints(schema: &Schema, src: &str, dst: &str) -> Result<()> {
     Ok(())
 }
 
-/// The canonical Arrow type for a node-id column: any integer type collapses to
-/// `Int64` (the fast path), `Utf8`/`LargeUtf8`/`Utf8View` to `Utf8` (string ids,
-/// covering UUID-as-string). A Parquet file whose Arrow schema says string_view
-/// (as DataFusion writes it) arrives as `Utf8View`. A dictionary
-/// column (a Parquet file written from a pyarrow/pandas categorical keeps that
-/// type in its embedded Arrow schema) canonicalizes by its value type; the cast
-/// decodes it. Any other type is not a supported node-id type.
+/// The canonical Arrow type for a node-id column (see [`ids::canonical_id_type`]),
+/// or the error for a type that cannot hold ids.
 fn canonical_id_type(dt: &DataType) -> Result<DataType> {
-    use DataType::*;
-    match dt {
-        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ok(Int64),
-        Utf8 | LargeUtf8 | Utf8View => Ok(Utf8),
-        Dictionary(_, value) => canonical_id_type(value),
-        other => Err(DataFusionError::NotImplemented(format!(
-            "node ids must be an integer or string column; got {}",
-            pa_name(other)
-        ))),
-    }
+    ids::canonical_id_type(dt)
+        .ok_or_else(|| DataFusionError::NotImplemented(ids::id_type_message(&pa_name(dt))))
 }
 
 /// Rows per scanned batch. DataFusion's default (8,192) makes the index build
@@ -659,16 +646,7 @@ fn scan_edges_rows_inner<F>(
         let mut dropped = 0;
         if drop_nulls {
             let (s, d) = (read_schema.index_of(src)?, read_schema.index_of(dst)?);
-            for b in &mut batches {
-                let keep = and(
-                    &is_not_null(b.column(s)).map_err(arrow_err)?,
-                    &is_not_null(b.column(d)).map_err(arrow_err)?,
-                )
-                .map_err(arrow_err)?;
-                let kept = arrow::compute::filter_record_batch(b, &keep).map_err(arrow_err)?;
-                dropped += b.num_rows() - kept.num_rows();
-                *b = kept;
-            }
+            (batches, dropped) = ids::drop_null_endpoint_rows(batches, s, d).map_err(arrow_err)?;
         }
         let base = batches
             .first()
@@ -687,14 +665,6 @@ fn scan_edges_rows_inner<F>(
         log_scan("table", columns, pushed);
         Ok((EdgeRows { batches, dropped }, pushed, plan))
     })?
-}
-
-/// `f` with a `Utf8View` type replaced by `Utf8` (see [`scan_nodes_batch`]).
-fn unview_field(f: &Field) -> Field {
-    match f.data_type() {
-        DataType::Utf8View => Field::new(f.name(), DataType::Utf8, f.is_nullable()),
-        _ => f.clone(),
-    }
 }
 
 /// Cast each non-empty batch to `out_schema` column by column, passing through
@@ -741,17 +711,18 @@ fn empty_edge_source() -> DataFusionError {
 /// The canonical node-id type shared by the `src` and `dst` columns (fields 0 and
 /// 1 of `schema`). Both must canonicalize to the same family.
 fn endpoint_id_type(schema: &Schema) -> Result<DataType> {
-    let src_type = canonical_id_type(schema.field(0).data_type())?;
-    let dst_type = canonical_id_type(schema.field(1).data_type())?;
-    if src_type != dst_type {
-        return Err(DataFusionError::NotImplemented(format!(
+    let (src, dst) = (schema.field(0).data_type(), schema.field(1).data_type());
+    ids::endpoint_id_type(src, dst).map_err(|e| match e {
+        EndpointTypeError::NotAnId(t) => {
+            DataFusionError::NotImplemented(ids::id_type_message(&pa_name(&t)))
+        }
+        EndpointTypeError::Mixed(src, dst) => DataFusionError::NotImplemented(format!(
             "the src and dst columns must have one id type (both integer or both string); got \
              {} and {}",
-            pa_name(&src_type),
-            pa_name(&dst_type)
-        )));
-    }
-    Ok(src_type)
+            pa_name(&src),
+            pa_name(&dst)
+        )),
+    })
 }
 
 /// Why [`scan_edges_topology`] failed: reading the file, or interning its edges
@@ -843,12 +814,12 @@ fn scan_edges_topology_inner(
                 let src_c = cast(batch.column(0), &id_type).map_err(arrow_err)?;
                 let dst_c = cast(batch.column(1), &id_type).map_err(arrow_err)?;
                 drop(batch);
-                if drop_nulls && (src_c.null_count() > 0 || dst_c.null_count() > 0) {
-                    let keep = and(
-                        &is_not_null(&src_c).map_err(arrow_err)?,
-                        &is_not_null(&dst_c).map_err(arrow_err)?,
-                    )
-                    .map_err(arrow_err)?;
+                let keep = if drop_nulls {
+                    ids::endpoint_mask(&src_c, &dst_c).map_err(arrow_err)?
+                } else {
+                    None
+                };
+                if let Some(keep) = keep {
                     let src_c = filter(&src_c, &keep).map_err(arrow_err)?;
                     let dst_c = filter(&dst_c, &keep).map_err(arrow_err)?;
                     dropped += keep.len() - src_c.len();

@@ -2461,7 +2461,11 @@ fn prepare_weighted(
             let source = ScanSource::new(paths, &opts, csv);
             let mut batches = scan_edges_batch(source, src, dst, &columns)?;
             if on_null == "drop" {
-                let dropped = drop_null_endpoints(&mut batches)?;
+                let dropped;
+                (batches, dropped) =
+                    ursa_io::ids::drop_null_endpoint_rows(batches, 0, 1).map_err(|e| {
+                        PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None))
+                    })?;
                 if dropped > 0 {
                     inputs.warn_dropped(dropped)?;
                 }
@@ -2508,25 +2512,6 @@ fn weight_columns(table: &[RecordBatch], columns: &[String]) -> PlanResult<Vec<R
         .map(|b| b.project(&indices))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None)))
-}
-
-/// Remove the rows of `batches` (src/dst first) with a null endpoint; the number
-/// removed.
-fn drop_null_endpoints(batches: &mut [RecordBatch]) -> PlanResult<usize> {
-    use arrow::compute::kernels::boolean::{and, is_not_null};
-    let arrow = |e| PlanError::Engine(DataFusionError::ArrowError(Box::new(e), None));
-    let mut dropped = 0;
-    for b in batches.iter_mut() {
-        let keep = and(
-            &is_not_null(b.column(0)).map_err(arrow)?,
-            &is_not_null(b.column(1)).map_err(arrow)?,
-        )
-        .map_err(arrow)?;
-        let kept = arrow::compute::filter_record_batch(b, &keep).map_err(arrow)?;
-        dropped += b.num_rows() - kept.num_rows();
-        *b = kept;
-    }
-    Ok(dropped)
 }
 
 /// A scan's paths, or the error for a path the host could not read (`msg`).

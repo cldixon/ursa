@@ -4403,6 +4403,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ursa-core",
+ "ursa-io",
  "ursa-plan",
 ]
 
