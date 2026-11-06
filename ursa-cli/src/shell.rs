@@ -276,7 +276,7 @@ impl<O: Write, E: Write> Shell<O, E> {
         match OutputFormat::from_str(arg, true) {
             Ok(OutputFormat::Arrow) => self.error(
                 "the shell cannot show the arrow format; to write an Arrow stream, run \
-                 ursa -f arrow -c \"<sql>\" > out.arrows",
+                 ursa --format arrow -c \"<sql>\" > out.arrows",
             ),
             Ok(mode) => self.mode = mode,
             Err(_) => self.error(&format!(

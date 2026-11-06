@@ -8,7 +8,7 @@
 //!
 //! - from SQL: `unnest(parameters)`, `array_has(directions, 'in')`,
 //!   `parameters[1]['default']`;
-//! - as JSON (`ursa -f json`), where they are real arrays and objects an agent
+//! - as JSON (`ursa --format json`), where they are real arrays and objects an agent
 //!   reads without parsing a format of ours.
 //!
 //! Columns:

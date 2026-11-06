@@ -4,7 +4,9 @@ name: CLI package
 # the SQL engine's crates or their packaging: a release build for Linux
 # x86_64 (the same command release-cli.yml runs per platform), `ursa
 # --version`, one query, and a crates.io dry run of the five crates ursa-cli
-# needs. Publishes nothing.
+# needs. Publishes nothing. Also tests the one-line installers (docs/install.sh
+# and docs/install.ps1) against that binary, packaged as a release and served
+# locally.
 
 on:
   pull_request:
@@ -18,6 +20,8 @@ on:
       - "Cargo.lock"
       - ".github/workflows/cli-package.yml"
       - ".github/workflows/release-cli.yml"
+      - "docs/install.sh"
+      - "docs/install.ps1"
   workflow_dispatch:
 
 concurrency:
@@ -56,12 +60,20 @@ jobs:
 
       - name: Run a query
         run: |
-          out=$(./target/release/ursa -f csv -c "
+          out=$(./target/release/ursa --format csv -c "
             CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
             CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
             SELECT id, degree FROM degree(karate, direction => 'both') ORDER BY degree DESC LIMIT 1;")
           echo "$out"
           test "$out" = "$(printf 'id,degree\n33,17')"
+
+      # Packages the binary as release-cli.yml does, serves it with python3 -m
+      # http.server, and runs install.sh (under sh, dash and bash) and
+      # install.ps1 (pwsh) against it: a pinned and a newest-version install, a
+      # bad checksum that must be refused, and a few error cases. Also runs
+      # shellcheck. The runner has shellcheck and pwsh installed.
+      - name: Installers
+        run: sh ursa-cli/tests/installers.sh target/release/ursa
 
       # Packages each crate as crates.io would receive it, resolving the
       # unpublished ones against each other. --no-verify: the build above

@@ -89,21 +89,24 @@ fn query_a_file_matches_getting_started() {
 #[test]
 fn output_formats() {
     let sql = format!("SELECT * FROM '{}' LIMIT 2", karate_edges());
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &sql])), "src,dst\n0,1\n0,2\n");
     assert_eq!(
-        ok(ursa(&["-f", "tsv", "-c", &sql])),
+        ok(ursa(&["--format", "csv", "-c", &sql])),
+        "src,dst\n0,1\n0,2\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "tsv", "-c", &sql])),
         "src\tdst\n0\t1\n0\t2\n"
     );
     assert_eq!(
-        ok(ursa(&["-f", "json", "-c", &sql])),
+        ok(ursa(&["--format", "json", "-c", &sql])),
         "[{\"src\":0,\"dst\":1},{\"src\":0,\"dst\":2}]\n"
     );
     assert_eq!(
-        ok(ursa(&["-f", "ndjson", "-c", &sql])),
+        ok(ursa(&["--format", "ndjson", "-c", &sql])),
         "{\"src\":0,\"dst\":1}\n{\"src\":0,\"dst\":2}\n"
     );
     // An Arrow IPC stream starts with the continuation marker.
-    let arrow = ursa(&["-f", "arrow", "-c", &sql]);
+    let arrow = ursa(&["--format", "arrow", "-c", &sql]);
     assert!(arrow.status.success());
     assert_eq!(&arrow.stdout[..4], &[0xff, 0xff, 0xff, 0xff]);
 }
@@ -115,11 +118,21 @@ fn empty_results_keep_their_header() {
         "+---+\n| x |\n+---+\n+---+\n"
     );
     assert_eq!(
-        ok(ursa(&["-f", "csv", "-c", "SELECT 1 AS x WHERE false"])),
+        ok(ursa(&[
+            "--format",
+            "csv",
+            "-c",
+            "SELECT 1 AS x WHERE false"
+        ])),
         "x\n"
     );
     assert_eq!(
-        ok(ursa(&["-f", "json", "-c", "SELECT 1 AS x WHERE false"])),
+        ok(ursa(&[
+            "--format",
+            "json",
+            "-c",
+            "SELECT 1 AS x WHERE false"
+        ])),
         "[]\n"
     );
 }
@@ -132,14 +145,17 @@ fn several_statements_print_each_result() {
          SELECT max(dst) AS top FROM ties;",
         karate_edges()
     );
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &sql])), "edges\n78\ntop\n33\n");
+    assert_eq!(
+        ok(ursa(&["--format", "csv", "-c", &sql])),
+        "edges\n78\ntop\n33\n"
+    );
 }
 
 #[test]
 fn show_ursa_settings() {
     assert_eq!(
         ok(ursa(&[
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SHOW ursa.index_storage_limit; SET ursa.index_storage_limit = '1GiB'; \
@@ -147,7 +163,7 @@ fn show_ursa_settings() {
         ])),
         "name,value\nursa.index_storage_limit,4GiB\nname,value\nursa.index_storage_limit,1GiB\n"
     );
-    let all = ok(ursa(&["-f", "csv", "-c", "SHOW ALL"]));
+    let all = ok(ursa(&["--format", "csv", "-c", "SHOW ALL"]));
     assert!(all.contains("\nursa.index_storage_limit,4GiB\n"), "{all}");
 }
 
@@ -158,7 +174,7 @@ fn commands_and_files_run_in_order() {
     std::fs::write(&file, "SELECT 2 AS b;\n").unwrap();
     let file = file.display().to_string();
     let out = ok(ursa(&[
-        "-f",
+        "--format",
         "csv",
         "-c",
         "SELECT 1 AS a",
@@ -170,10 +186,31 @@ fn commands_and_files_run_in_order() {
     assert_eq!(out, "a\n1\nb\n2\nc\n3\n");
 }
 
+/// `-f` runs a file, as in DuckDB and psql.
+#[test]
+fn short_f_runs_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("q.sql");
+    std::fs::write(&file, "SELECT 2 AS b;\n").unwrap();
+    let file = file.display().to_string();
+    assert_eq!(ok(ursa(&["--format", "csv", "-f", &file])), "b\n2\n");
+}
+
+/// `ursa -f json` reads like the old spelling of `--format json`; say so.
+#[test]
+fn short_f_with_a_format_name_points_to_format() {
+    let message = err(ursa(&["-f", "json", "-c", "SELECT 1"]));
+    assert!(
+        message.contains("cannot read 'json'")
+            && message.contains("to choose the output format, use --format json"),
+        "{message}"
+    );
+}
+
 #[test]
 fn sql_from_stdin() {
     let sql = format!("SELECT count(*) AS n FROM '{}';", karate_edges());
-    let out = ursa_with_stdin(&["-f", "csv"], &sql);
+    let out = ursa_with_stdin(&["--format", "csv"], &sql);
     assert_eq!(ok(out), "n\n78\n");
 }
 
@@ -185,9 +222,12 @@ fn copy_to_parquet_and_read_it_back() {
         "COPY (SELECT * FROM '{}' WHERE src = 0) TO '{target}'",
         karate_edges()
     );
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &copy])), "count\n16\n");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &copy])), "count\n16\n");
     let read = format!("SELECT count(*) AS n, max(dst) AS top FROM '{target}'");
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &read])), "n,top\n16,31\n");
+    assert_eq!(
+        ok(ursa(&["--format", "csv", "-c", &read])),
+        "n,top\n16,31\n"
+    );
 }
 
 #[test]
@@ -207,7 +247,7 @@ fn gzip_csv() {
         "SELECT sum(dst) AS s, count(*) AS n FROM '{}'",
         path.display()
     );
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &sql])), "s,n\n3,3\n");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &sql])), "s,n\n3,3\n");
 }
 
 #[test]
@@ -217,9 +257,9 @@ fn local_glob_and_directory() {
     std::fs::write(dir.path().join("b.csv"), "src,dst\n1,2\n2,3\n").unwrap();
     let root = dir.path().display();
     let glob = format!("SELECT count(*) AS n FROM '{root}/*.csv'");
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &glob])), "n\n3\n");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &glob])), "n\n3\n");
     let directory = format!("SELECT count(*) AS n FROM '{root}/'");
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &directory])), "n\n3\n");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &directory])), "n\n3\n");
 }
 
 #[test]
@@ -283,7 +323,7 @@ fn graphs_last_for_the_invocation() {
         karate_edges()
     );
     let out = ok(ursa(&[
-        "-f",
+        "--format",
         "csv",
         "-c",
         &define,
@@ -343,11 +383,11 @@ fn init_runs_before_the_sql() {
         let e = String::from_utf8(out.stderr).unwrap();
         assert!(e.starts_with("Error: ") && e.lines().count() == 1, "{e}");
     }
-    // -f on the command line wins over the file's .mode.
+    // --format on the command line wins over the file's .mode.
     let out = ok(ursa(&[
         "-init",
         &init,
-        "-f",
+        "--format",
         "json",
         "-c",
         "SELECT * FROM v",
@@ -464,7 +504,7 @@ fn an_algorithm_joins_using_id() {
         define_karate()
     );
     assert_eq!(
-        ok(ursa(&["-f", "csv", "-c", &sql])),
+        ok(ursa(&["--format", "csv", "-c", &sql])),
         "id,club,degree\n33,Officer,17\n0,Mr. Hi,16\n"
     );
 }
@@ -516,7 +556,7 @@ fn find_out_what_is_available_matches_getting_started() {
 
     // As JSON, one object per row; NULLs are left out.
     let out = ok(ursa(&[
-        "-f",
+        "--format",
         "json",
         "-c",
         &sql,
@@ -599,7 +639,7 @@ fn dropping_a_table_a_graph_uses_is_refused() {
          SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'public'",
         define_karate()
     );
-    assert_eq!(ok(ursa(&["-f", "csv", "-c", &sql])), "n\n0\n");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &sql])), "n\n0\n");
 }
 
 /// Getting Started, "Combine algorithms and attributes", as written: one
@@ -667,7 +707,7 @@ fn weights_match_getting_started() {
     // ordered and cut to five rows it prints a table short enough for the page.
     let sql =
         format!("{LESMIS} SELECT * FROM louvain(lesmis, weight => log(1 + weight), seed => 7);");
-    let out = ok(ursa(&["-f", "csv", "-c", &sql]));
+    let out = ok(ursa(&["--format", "csv", "-c", &sql]));
     assert_eq!(out.lines().count(), 78, "{out}");
     let communities: std::collections::BTreeSet<&str> = out
         .lines()
@@ -739,7 +779,7 @@ fn traversals_match_getting_started() {
          SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');",
         define_karate()
     );
-    let out = ok(ursa(&["-f", "csv", "-c", &sql]));
+    let out = ok(ursa(&["--format", "csv", "-c", &sql]));
     assert_eq!(out.lines().count(), 1 + 16, "{out}");
     assert_eq!(out.lines().next(), Some("src,dst"));
     assert!(out.lines().skip(1).all(|l| l.starts_with("0,")), "{out}");
@@ -835,7 +875,7 @@ fn traversals_match_getting_started() {
 #[test]
 fn ursa_functions_lists_the_catalog() {
     let out = ok(ursa(&[
-        "-f",
+        "--format",
         "json",
         "-c",
         "SELECT * FROM ursa_functions() WHERE name = 'pagerank'",
@@ -860,7 +900,7 @@ fn ursa_functions_lists_the_catalog() {
 \"outputs\":[{\"name\":\"pagerank\",\"type\":\"Float64\",\"nullable\":false}]}]\n"
     );
     let out = ok(ursa(&[
-        "-f",
+        "--format",
         "csv",
         "-c",
         "SELECT name, family, cardinality(parameters) AS parameters, \

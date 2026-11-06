@@ -26,11 +26,11 @@ The shell starts only when there is no SQL to run and the input is a terminal. T
 
 ```bash
 ursa club.ursa -c "SELECT * FROM degree(karate)"   # one or more statements
-ursa club.ursa --file query.sql                    # a file of SQL
+ursa club.ursa -f query.sql                        # a file of SQL (or --file)
 echo "SHOW GRAPHS;" | ursa club.ursa               # SQL on stdin
 ```
 
-`-c` and `--file` may be repeated; they run in the order given. If any statement fails, `ursa` prints the error, stops, and exits with status 1.
+`-c` and `-f` (`--file`) may be repeated; they run in the order given. If any statement fails, `ursa` prints the error, stops, and exits with status 1.
 
 Add `--readonly` to open a database without changing it. See [the database file](database.md#read-only-and-sharing).
 
@@ -73,17 +73,17 @@ Error: unknown command '.grpahs'; did you mean '.graphs'? Enter .help for the li
 
 ## Output modes
 
-The shell prints `table` by default. `.mode csv`, `.mode tsv`, `.mode json` and `.mode ndjson` switch it. On the command line, `-f` sets the mode for the shell and for `-c` alike:
+The shell prints `table` by default. `.mode csv`, `.mode tsv`, `.mode json` and `.mode ndjson` switch it. On the command line, `--format` sets the mode for the shell and for `-c` alike:
 
 ```bash
-ursa club.ursa -f json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 2"
+ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 2"
 ```
 
 ```text
 [{"id":0,"degree":16},{"id":1,"degree":8}]
 ```
 
-`-f arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `--file`, and only for one query that returns rows.
+`--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows.
 
 ## Init files
 
@@ -97,7 +97,7 @@ SET datafusion.execution.batch_size = 4096;
 
 `-init FILE` runs `FILE` instead of `~/.ursarc`. `-no-init` runs neither. They are spelled with one dash, as in DuckDB; `--init` and `--no-init` work too.
 
-`~/.ursarc` is read only by the interactive shell. `-c`, `--file` and SQL on stdin skip it, so a script gives the same output whoever runs it. `-init FILE` runs for those too, before their SQL. A `-f` given on the command line wins over a `.mode` in the init file.
+`~/.ursarc` is read only by the interactive shell. `-c`, `--file` and SQL on stdin skip it, so a script gives the same output whoever runs it. `-init FILE` runs for those too, before their SQL. A `--format` given on the command line wins over a `.mode` in the init file.
 
 `.read FILE` runs a file the same way, from the prompt.
 
