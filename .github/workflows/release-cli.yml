@@ -108,7 +108,7 @@ jobs:
           bin="target/$TARGET/release/ursa"
           "$bin" --version
           test "$("$bin" --version)" = "ursa ${{ needs.version.outputs.version }}"
-          out=$("$bin" -f csv -c "
+          out=$("$bin" --format csv -c "
             CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
             CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
             SELECT count(*) AS n FROM pagerank(karate, direction => 'both');")

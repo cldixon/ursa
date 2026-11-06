@@ -185,7 +185,7 @@ fn queries_and_copy_resolve_against_the_current_directory() {
         &work,
         &[
             db,
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT count(*) AS n FROM '../db/data/karate_edges.csv'; \
@@ -225,7 +225,13 @@ fn queries_and_copy_resolve_against_the_current_directory() {
     );
     let out = ok(ursa_in(
         &elsewhere(),
-        &[db, "-f", "csv", "-c", "SELECT count(*) AS n FROM edges"],
+        &[
+            db,
+            "--format",
+            "csv",
+            "-c",
+            "SELECT count(*) AS n FROM edges",
+        ],
     ));
     assert_eq!(out, "n\n78\n");
 }
@@ -247,7 +253,7 @@ fn a_graph_over_file_paths_defined_from_another_directory() {
         &elsewhere(),
         &[
             db.to_str().unwrap(),
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT sum(degree) AS s FROM degree(k)",
@@ -269,7 +275,7 @@ fn readonly_refuses_ddl() {
         &[
             "--readonly",
             db,
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT count(*) AS n FROM karate.edges",
@@ -315,7 +321,7 @@ fn tables_with_data_are_refused() {
     let out = ok(ursa_in(
         dir.path(),
         &[
-            "-f",
+            "--format",
             "csv",
             "-c",
             "CREATE TABLE t AS SELECT 1 AS x; INSERT INTO t VALUES (2); SELECT sum(x) AS s FROM t",
@@ -348,7 +354,7 @@ fn attach_opens_a_database() {
     let out = ok(ursa_in(
         &elsewhere(),
         &[
-            "-f",
+            "--format",
             "csv",
             "-c",
             &format!(
@@ -410,7 +416,7 @@ fn open_a_database_matches_getting_started() {
             cwd,
             &[
                 "club.ursa",
-                "-f",
+                "--format",
                 "csv",
                 "-c",
                 "SELECT count(*) AS n FROM karate_edges_only.nodes"
@@ -584,7 +590,7 @@ fn a_second_process_over_parquet_loads_the_index() {
     );
     let query = "SELECT id, round(pagerank, 8) AS pagerank FROM pagerank(g)
                  ORDER BY pagerank DESC, id LIMIT 3";
-    let args = ["club.ursa", "-f", "csv", "-c", query];
+    let args = ["club.ursa", "--format", "csv", "-c", query];
     let started = std::time::Instant::now();
     let (first, counts) = ursa_counting(cwd, &args);
     let first_time = started.elapsed();

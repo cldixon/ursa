@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
-//! ursa -f csv --file query.sql > out.csv
+//! ursa --format csv -f query.sql > out.csv
 //! echo "SELECT 1" | ursa
 //! ursa club.ursa -c "SELECT * FROM degree(karate)"
 //! ursa club.ursa          # the interactive shell
@@ -58,11 +58,11 @@ struct Args {
     command: Vec<String>,
 
     /// Run the SQL in a file and exit. May be repeated.
-    #[arg(long = "file", value_name = "PATH")]
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
     file: Vec<PathBuf>,
 
     /// Output format.
-    #[arg(short = 'f', long = "format", value_enum, default_value_t = OutputFormat::Table)]
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
 
     /// Run the SQL and dot-commands in FILE at startup, before the shell's
@@ -107,7 +107,7 @@ fn main() -> ExitCode {
     let mut sources = sources_in_order(&args, &matches);
     let interactive = sources.is_empty() && io::stdin().is_terminal();
     if interactive && args.format == OutputFormat::Arrow {
-        return fail("the shell cannot show the arrow format; use -f arrow with -c or --file");
+        return fail("the shell cannot show the arrow format; use --format arrow with -c or -f");
     }
     if sources.is_empty() && !interactive {
         let mut sql = String::new();
@@ -149,6 +149,22 @@ fn sources_in_order(args: &Args, matches: &ArgMatches) -> Vec<Source> {
     let mut sources: Vec<(usize, Source)> = commands.chain(files).collect();
     sources.sort_by_key(|(index, _)| *index);
     sources.into_iter().map(|(_, source)| source).collect()
+}
+
+/// `-f` runs a file, as in DuckDB and psql. A missing file named like an
+/// output format (`ursa -f json`) was most likely meant as `--format`.
+fn format_hint(path: &std::path::Path) -> String {
+    use clap::ValueEnum;
+    let name = path.to_string_lossy();
+    let is_format = OutputFormat::value_variants().iter().any(|f| {
+        f.to_possible_value()
+            .is_some_and(|v| v.matches(&name, true))
+    });
+    if is_format && !path.exists() {
+        format!("; to choose the output format, use --format {name}")
+    } else {
+        String::new()
+    }
 }
 
 /// DuckDB spells its long options with one dash (`-init`); clap needs two.
@@ -265,7 +281,11 @@ async fn run_session(
         let sql = match source {
             Source::Command(sql) | Source::Stdin(sql) => sql,
             Source::File(path) => std::fs::read_to_string(&path).map_err(|e| {
-                DataFusionError::Execution(format!("cannot read '{}': {e}", path.display()))
+                DataFusionError::Execution(format!(
+                    "cannot read '{}': {e}{}",
+                    path.display(),
+                    format_hint(&path)
+                ))
             })?,
         };
         printed += run_sql(&ctx, &sql, format, &mut out, printed).await?;
@@ -308,7 +328,7 @@ async fn run_sql<W: Write>(
         }
         if format == OutputFormat::Arrow && printed_before + printed > 0 {
             return Err(DataFusionError::Plan(
-                "-f arrow writes a single result; run one query that returns rows".into(),
+                "--format arrow writes a single result; run one query that returns rows".into(),
             ));
         }
         write_stream(format, stream, out, &options).await?;

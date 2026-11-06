@@ -447,11 +447,11 @@ Ursa reads profiles through `aws-config`, the AWS SDK's own configuration loader
 
 ## Output
 
-The shell prints tables. From the command line, choose a format with `-f`:
+The shell prints tables. From the command line, choose a format with `--format`:
 
 ```bash
-ursa club.ursa -f json -c "SELECT * FROM pagerank(karate) ORDER BY pagerank DESC LIMIT 3"
-ursa club.ursa -f csv  -c "SELECT * FROM louvain(karate, seed => 1)" > communities.csv
+ursa club.ursa --format json -c "SELECT * FROM pagerank(karate) ORDER BY pagerank DESC LIMIT 3"
+ursa club.ursa --format csv -c "SELECT * FROM louvain(karate, seed => 1)" > communities.csv
 ```
 
 The formats are `table` (the default), `csv`, `tsv`, `json`, `ndjson` and `arrow`. To write a file from SQL, use `COPY`:
