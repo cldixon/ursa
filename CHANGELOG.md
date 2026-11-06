@@ -29,7 +29,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - SQL/PGQ pattern matching: `GRAPH_TABLE (g MATCH (a)-[e]->(b) WHERE …
     COLUMNS (…))` with labels, every edge direction, element and pattern
     conditions, and several paths sharing variables, planned as joins
-    (#296). Variable-length paths and `ANY SHORTEST` come next (#297).
+    (#296). Quantified edges (`-[e]->{1,3}`, `->*`, `+`, `?`), path
+    variables, `ANY SHORTEST`, `ALL SHORTEST`, `SHORTEST k`, the path modes
+    `TRAIL`, `SIMPLE` and `ACYCLIC`, and `path_length(p)`, `vertices(p)`,
+    `edges(p)` and `element_id(p)`, searched breadth-first on the graph
+    index rather than joined; among equally short paths, the one whose edges
+    come first in the edge table (#297).
   - Every algorithm and statistic of the Python library (not the layouts or
     the neighbour aggregations) is a table function with named parameters
     (`pagerank(g, damping => 0.9)`), with the same names, defaults and

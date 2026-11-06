@@ -322,7 +322,7 @@ async fn patterns_that_cannot_be_matched_are_refused() {
         ),
         (
             "SELECT * FROM GRAPH_TABLE (social MATCH (a:person)-[e:knows]->*(b) COLUMNS (a.id))",
-            "quantified edges (*, +, ?, {m,n}) are not supported yet",
+            "has no upper bound, so its walks are endless",
         ),
         (
             "SELECT * FROM GRAPH_TABLE (social MATCH (a:person))",
