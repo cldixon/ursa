@@ -268,7 +268,7 @@ neighbors_agg(graph, values => NULL, direction => 'out', attribute => NULL, agg 
 | `values` | query | `NULL` | – | A query of two columns, node ids then values: the value of each node. Give this or attribute. |
 | `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
 | `attribute` | expression | `NULL` | – | An expression over the graph's node table, the value of each node. Give this or values. |
-| `agg` | string | `'mean'` | `'mean'`, `'sum'`, `'min'`, `'max'`, `'count'`, `'n_unique'` | The aggregation; mean/sum/min/max need a numeric attribute. |
+| `agg` | string | `'mean'` | `'mean'`, `'sum'`, `'min'`, `'max'`, `'count'`, `'n_unique'` | The aggregation; mean and sum need numbers, and min and max take numbers, strings, dates or times. count and n_unique return integers. |
 
 **Directions:** `'out'`, `'in'`, `'both'`
 
