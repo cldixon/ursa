@@ -411,7 +411,7 @@ impl IndexCache {
             if let Some((store, limit, key)) = &stored {
                 let (store, key, limit) = (Arc::clone(store), key.clone(), *limit);
                 // Reading a file and checking it is blocking work.
-                let loaded = tokio::task::spawn_blocking(move || store.load(&key, limit))
+                let loaded = crate::run_blocking(move || store.load(&key, limit))
                     .await
                     .ok()
                     .flatten();

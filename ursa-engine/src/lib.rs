@@ -13,14 +13,17 @@ use std::sync::Arc;
 use datafusion::catalog::DynamicFileCatalog;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
+mod blocking;
 pub mod database;
 pub mod error;
 mod file_table;
 pub mod graph;
 pub mod options;
 pub mod paths;
+pub mod serial;
 pub mod stores;
 
+pub use blocking::{run_blocking, BlockingError};
 pub use error::user_message;
 pub use file_table::open_file_table;
 pub use stores::{ensure_object_store, ensure_object_store_for};
@@ -32,7 +35,14 @@ pub fn new_session() -> SessionContext {
 
 /// A session with Ursa's file tables over `config`. `information_schema` is
 /// turned on, so `SHOW TABLES` and `SHOW COLUMNS` work.
+///
+/// In the browser (wasm32) the session plans for one partition. DataFusion runs
+/// each extra partition as a spawned Tokio task, and the browser build has no
+/// runtime to spawn on; its futures are driven from JavaScript's event loop, as
+/// in DataFusion's own `wasmtest` crate (#278).
 pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
+    #[cfg(target_arch = "wasm32")]
+    let config = config.with_target_partitions(1);
     let config = graph::with_algorithms(graph::with_registry(config.with_information_schema(true)));
     let config = database::with_database_slot(options::with_options(config));
     let ctx = SessionContext::new_with_config(config);
@@ -46,14 +56,16 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
         Arc::clone(&factory) as _,
     ));
     let session_id = ctx.session_id();
-    let ctx: SessionContext = ctx
+    let ctx = ctx
         .into_state_builder()
         .with_session_id(session_id)
         .with_catalog_list(catalogs)
         .with_query_planner(graph::query_planner())
-        .with_physical_optimizer_rule(graph::edge_order_rule())
-        .build()
-        .into();
+        .with_physical_optimizer_rule(graph::edge_order_rule());
+    // In the browser, last: every plan runs on the task that polls it.
+    #[cfg(target_arch = "wasm32")]
+    let ctx = ctx.with_physical_optimizer_rule(Arc::new(serial::SingleTask));
+    let ctx: SessionContext = ctx.build().into();
     graph::register_functions(&ctx).expect("registering a relation planner cannot fail");
     factory.attach(ctx.state_weak_ref());
     ctx
