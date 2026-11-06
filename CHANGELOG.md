@@ -129,6 +129,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   of the five differ. A development build's `ursa --version` names its commit,
   for example `ursa 0.7.0-dev (a1b2c3d4e)`. Releases publish to crates.io by
   Trusted Publishing, with no stored API token.
+- `ursa-cli` releases can start from GitHub: Actions -> Release ursa-cli ->
+  Run workflow on `main`, with `release` and the version. The run builds and
+  tests every target, then tags the commit it built; publishing still waits
+  for the maintainer's approval. Pushing a tag works as before.
 - **Behaviour change:** `.functions` lists each graph function's name,
   family and the first sentence of its summary; before, it printed every
   column of `ursa_functions()`, too wide to read. A statement that returns

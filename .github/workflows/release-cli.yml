@@ -11,14 +11,24 @@ name: Release ursa-cli
 # workflow's GITHUB_TOKEN does not start other workflows. release.yml's publish
 # job also skips ursa-cli-v* releases, in case one is published by hand.
 #
-# Nothing is published until a person pushes a tag:
+# Two ways to release, after the release PR (all five crates at the new
+# version) is merged into main:
 #
-#   git tag ursa-cli-v0.7.0 && git push origin ursa-cli-v0.7.0
+#   - From GitHub, no local git needed: Actions -> Release ursa-cli -> Run
+#     workflow, on main, with `release` ticked and `version` set (e.g. 0.7.0).
+#     The run checks the version, builds and smoke-tests every target, and only
+#     then creates the tag ursa-cli-v<version> on the commit it built.
+#   - By pushing the tag yourself: git tag ursa-cli-v0.7.0 && git push origin
+#     ursa-cli-v0.7.0.
 #
-# The tag must match ursa-cli's version in ursa-cli/Cargo.toml, and ursa-core,
+# Either way, publishing to crates.io waits for a person's approval of the
+# `crates-io` environment, and the GitHub Release is made after that. Run
+# without `release`, the workflow builds and smoke-tests all five targets as a
+# dry run and publishes nothing.
+#
+# The version must match ursa-cli's in ursa-cli/Cargo.toml, and ursa-core,
 # ursa-io, ursa-engine and ursa-sql must be at the same version, or the run
-# stops before building. `workflow_dispatch` builds and smoke-tests all five
-# targets as a dry run and publishes nothing.
+# stops before building.
 #
 # One-time setup (maintainer):
 #   - GitHub, repository Settings -> Environments: `crates-io`, with yourself as
@@ -38,6 +48,15 @@ on:
   push:
     tags: ["ursa-cli-v*"]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Release: tag, publish to crates.io (after approval) and make the GitHub Release. Unticked, a dry run."
+        type: boolean
+        default: false
+      version:
+        description: "The version to release, e.g. 0.7.0. Must match ursa-cli/Cargo.toml. Needed with release."
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -55,17 +74,48 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # "true" for a tag push, or a dispatch with `release`.
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - name: ursa-cli's version, and the tag
         id: version
         shell: bash
+        env:
+          RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+          WANTED: ${{ inputs.version }}
         run: |
           version=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
           echo "ursa-cli version: $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          publish=false
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            publish=true
+          elif [[ "$RELEASE" == "true" ]]; then
+            # A release from the Actions tab: on main, at the version asked for,
+            # and not released already.
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::release from main only (this run is on $GITHUB_REF)"
+              exit 1
+            fi
+            if [[ "${WANTED#v}" != "$version" ]]; then
+              echo "::error::asked to release '$WANTED', but ursa-cli/Cargo.toml on this commit is $version. Merge the release PR first, or ask for $version"
+              exit 1
+            fi
+            if [[ "$version" == *-* ]]; then
+              echo "::error::$version is a development version; the release PR sets the release version"
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/ursa-cli-v$version" > /dev/null; then
+              echo "::error::the tag ursa-cli-v$version already exists; $version is released"
+              exit 1
+            fi
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "publish: $publish"
           if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "ursa-cli-v$version" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match ursa-cli's version $version (expected ursa-cli-v$version)"
             exit 1
@@ -162,11 +212,38 @@ jobs:
             ${{ env.ARCHIVE }}.*.sha256
           if-no-files-found: error
 
+  tag:
+    name: Tag the release
+    # A release from the Actions tab: tag the commit that was just built, once
+    # every target built and passed its smoke test. (A tag pushed by a person
+    # already exists.) A tag pushed with the workflow's token does not start
+    # another run of this workflow.
+    if: github.event_name == 'workflow_dispatch' && needs.version.outputs.publish == 'true'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and push the tag
+        shell: bash
+        env:
+          TAG: ursa-cli-v${{ needs.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "ursa-cli ${TAG#ursa-cli-v}" "$GITHUB_SHA"
+          git push origin "$TAG"
+
   crates:
     name: Publish to crates.io
-    # Only for a tag; workflow_dispatch stops after building.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ursa-cli-v')
-    needs: [version, build]
+    # A tag push, or a release from the Actions tab once it is tagged. A dry
+    # run stops after building.
+    if: >-
+      always() && needs.version.outputs.publish == 'true'
+      && needs.build.result == 'success'
+      && (needs.tag.result == 'success' || needs.tag.result == 'skipped')
+    needs: [version, build, tag]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -205,7 +282,7 @@ jobs:
 
   github-release:
     name: GitHub Release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ursa-cli-v')
+    if: always() && needs.version.outputs.publish == 'true' && needs.crates.result == 'success'
     needs: [version, build, crates]
     runs-on: ubuntu-latest
     permissions:
@@ -221,11 +298,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
+          TAG: ursa-cli-v${{ needs.version.outputs.version }}
         run: |
           ls -l dist
           # --latest=false keeps the Python package's release as the
           # repository's latest.
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --latest=false \
@@ -234,4 +312,4 @@ jobs:
 
           Install with \`curl -fsSL https://cldixon.github.io/ursa/install.sh | sh\` on Linux or macOS, \`irm https://cldixon.github.io/ursa/install.ps1 | iex\` in PowerShell on Windows, or \`cargo install ursa-cli\`. Or download the archive for your platform below. Each archive holds the \`ursa\` binary; check it against its \`.sha256\` file.
 
-          Changes: see [CHANGELOG.md](https://github.com/cldixon/ursa/blob/$GITHUB_REF_NAME/CHANGELOG.md). Docs: https://cldixon.github.io/ursa/sql/"
+          Changes: see [CHANGELOG.md](https://github.com/cldixon/ursa/blob/$TAG/CHANGELOG.md). Docs: https://cldixon.github.io/ursa/sql/"
