@@ -58,7 +58,7 @@ const AFTER_HELP: &str = concat!(
 #[derive(Debug, Parser)]
 #[command(
     name = "ursa",
-    version,
+    version = env!("URSA_VERSION"),
     about = "SQL for graph analytics over Parquet and CSV files, local or in object storage.",
     after_help = AFTER_HELP
 )]
@@ -349,7 +349,7 @@ fn banner(args: &Args) -> String {
     };
     format!(
         "ursa {}, {session}. Enter .help for commands, .quit to exit.",
-        env!("CARGO_PKG_VERSION")
+        env!("URSA_VERSION")
     )
 }
 
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_banner_names_the_session() {
-        let version = env!("CARGO_PKG_VERSION");
+        let version = env!("URSA_VERSION");
         let args = Args::try_parse_from(["ursa"]).unwrap();
         assert_eq!(
             banner(&args),

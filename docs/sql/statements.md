@@ -11,6 +11,10 @@ CREATE VIEW ties    AS SELECT * FROM 'karate_edges.csv';
 
 ## CREATE PROPERTY GRAPH
 
+!!! info "New in 0.7"
+
+    0.6.0 accepts one vertex table with a `KEY` and one edge table. Several tables, optional `KEY`, `AS` names, `LABEL` and `PROPERTIES` (DuckPGQ's syntax included) arrive in `ursa-cli` 0.7.
+
 Defines a graph over vertex tables and edge tables. The syntax is SQL/PGQ's, the property graph part of the SQL standard, so a graph definition written for another SQL/PGQ engine, such as DuckPGQ, runs here too:
 
 ```text
@@ -73,6 +77,10 @@ CREATE PROPERTY GRAPH first EDGE TABLES (first_ties SOURCE KEY (src) DESTINATION
 `OR REPLACE` replaces a graph of the same name. `IF NOT EXISTS` does nothing if there is one. Defining a graph that exists without either is an error.
 
 ### Several tables
+
+!!! info "New in 0.7"
+
+    Graphs of several tables arrive in `ursa-cli` 0.7.
 
 A graph can have any number of vertex and edge tables. Here members follow each other and write posts:
 
