@@ -251,11 +251,11 @@ async fn sql_matches_the_python_library() {
         .unwrap();
         registry_of(&ctx).put(GraphDef {
             name: dataset.into(),
-            edges: EdgeTable {
-                table: TableReference::bare(format!("{dataset}_edges")),
-                source: "src".into(),
-                destination: "dst".into(),
-            },
+            edges: EdgeTable::new(
+                TableReference::bare(format!("{dataset}_edges")),
+                "src",
+                "dst",
+            ),
             vertices: None,
         });
     }

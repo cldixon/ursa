@@ -2,8 +2,12 @@
 //!
 //! Each graph registers a [`GraphSchema`] in the default catalog under its
 //! name. Its two tables are views ([`ViewTable`]s) whose plans are built from
-//! the graph's [`GraphDef`] every time a query names them, so they always read
-//! the current contents of the tables (and files) the graph is defined over.
+//! the graph's implied pair ([`PropertyGraph::default_pair`]: its edge table
+//! and the vertex table that edge table refers to) every time a query names
+//! them, so they always read the current contents of the tables (and files)
+//! the graph is defined over. A graph with several vertex or edge tables has no
+//! implied pair, and so no `nodes` or `edges` table: its element tables are
+//! session tables already, and `MATCH` reads across them.
 //!
 //! - `edges` is the edge table: every row and column, unchanged.
 //! - `nodes` is one row per node, the node id in a column named `id`:
@@ -41,7 +45,7 @@ use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, 
 use datafusion::physical_plan::ExecutionPlan;
 use parking_lot::RwLock;
 
-use super::{registry, GraphDef};
+use super::{registry, GraphDef, PropertyGraph};
 
 /// The name of a graph's edge table in its schema.
 pub const EDGES: &str = "edges";
@@ -71,12 +75,29 @@ impl GraphSchema {
             last_columns: Mutex::default(),
         }
     }
+
+    /// The graph, if the session and the graph still exist.
+    fn graph(&self) -> Option<(SessionState, std::sync::Arc<PropertyGraph>)> {
+        let state = self.session.upgrade()?.read().clone();
+        let graph = registry(&state).get(&self.graph)?;
+        Some((state, graph))
+    }
+
+    /// Whether the graph has `nodes` and `edges` tables (an implied pair).
+    fn has_tables(&self) -> bool {
+        self.graph()
+            .is_some_and(|(_, graph)| graph.default_pair().is_some())
+    }
 }
 
 #[async_trait]
 impl SchemaProvider for GraphSchema {
     fn table_names(&self) -> Vec<String> {
-        vec![EDGES.to_string(), NODES.to_string()]
+        if self.has_tables() {
+            vec![EDGES.to_string(), NODES.to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -90,7 +111,10 @@ impl SchemaProvider for GraphSchema {
             .upgrade()
             .map(|state| state.read().clone())
             .ok_or_else(|| DataFusionError::Internal("the session has been dropped".into()))?;
-        let Some(def) = registry(&state).get(&self.graph) else {
+        let Some(def) = registry(&state)
+            .get(&self.graph)
+            .and_then(|graph| graph.default_pair())
+        else {
             return Ok(None);
         };
         let plan = if name == EDGES {
@@ -120,7 +144,7 @@ impl SchemaProvider for GraphSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        name == EDGES || name == NODES
+        (name == EDGES || name == NODES) && self.has_tables()
     }
 }
 
@@ -153,14 +177,14 @@ impl TableProvider for UnreadableTable {
     }
 }
 
-/// The table `table` names for graph `def`: one the graph opened from a file
-/// path when it was created, or else the table or view in `state`.
+/// The table `table` names for the graph called `graph`: one the graph opened
+/// from a file path when it was created, or else the table or view in `state`.
 pub async fn graph_table(
     state: &SessionState,
-    def: &GraphDef,
+    graph: &str,
     table: &TableReference,
 ) -> Result<Arc<dyn TableProvider>> {
-    match registry(state).file_table(&def.name, table) {
+    match registry(state).file_table(graph, table) {
         Some(provider) => Ok(provider),
         None => resolve_table(state, table).await,
     }
@@ -190,7 +214,7 @@ pub async fn lookup_table(
 
 /// The plan of `<graph>.edges`: a scan of the edge table, as it is now.
 pub async fn edges_plan(state: &SessionState, def: &GraphDef) -> Result<LogicalPlan> {
-    let edges = graph_table(state, def, &def.edges.table).await?;
+    let edges = graph_table(state, &def.name, &def.edges.table).await?;
     edges_plan_from(def, provider_as_source(edges))
 }
 
@@ -201,9 +225,11 @@ pub fn edges_plan_from(def: &GraphDef, edges: Arc<dyn TableSource>) -> Result<Lo
 
 /// The plan of `<graph>.nodes` (see the module docs).
 pub async fn nodes_plan(state: &SessionState, def: &GraphDef) -> Result<LogicalPlan> {
-    let edges = provider_as_source(graph_table(state, def, &def.edges.table).await?);
+    let edges = provider_as_source(graph_table(state, &def.name, &def.edges.table).await?);
     let vertices = match &def.vertices {
-        Some(v) => Some(provider_as_source(graph_table(state, def, &v.table).await?)),
+        Some(v) => Some(provider_as_source(
+            graph_table(state, &def.name, &v.table).await?,
+        )),
         None => None,
     };
     nodes_plan_from(def, edges, vertices)
@@ -368,15 +394,8 @@ mod tests {
 
         let def = GraphDef {
             name: "social".into(),
-            edges: EdgeTable {
-                table: TableReference::bare("follows"),
-                source: "a".into(),
-                destination: "b".into(),
-            },
-            vertices: Some(VertexTable {
-                table: TableReference::bare("people"),
-                key: "name".into(),
-            }),
+            edges: EdgeTable::new(TableReference::bare("follows"), "a", "b"),
+            vertices: Some(VertexTable::new(TableReference::bare("people"), "name")),
         };
         create_graph(&ctx, def.clone(), false, false).await.unwrap();
 

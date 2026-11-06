@@ -11,16 +11,25 @@ CREATE VIEW ties    AS SELECT * FROM 'karate_edges.csv';
 
 ## CREATE PROPERTY GRAPH
 
-Defines a graph over an edge table, and optionally a vertex table. The syntax is a subset of SQL/PGQ, the property graph part of the SQL standard:
+Defines a graph over vertex tables and edge tables. The syntax is SQL/PGQ's, the property graph part of the SQL standard, so a graph definition written for another SQL/PGQ engine, such as DuckPGQ, runs here too:
 
 ```text
 CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name
-  [VERTEX TABLES ( table KEY (column) )]
-  EDGE TABLES (
-    table SOURCE KEY (column) [REFERENCES vertex_table (column)]
-          DESTINATION KEY (column) [REFERENCES vertex_table (column)]
-  )
+  [VERTEX TABLES ( vertex_table [, …] )]
+  [EDGE TABLES ( edge_table [, …] )]
+
+vertex_table := table [AS name] [KEY (column)] [labels]
+edge_table   := table [AS name] [KEY (column)]
+                SOURCE KEY (column) [REFERENCES vertex_table (column)]
+                DESTINATION KEY (column) [REFERENCES vertex_table (column)]
+                [labels]
+labels       := DEFAULT LABEL [properties] | LABEL name [properties] [LABEL name [properties] …] | properties
+properties   := PROPERTIES (column [AS name], …)
+              | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (column, …)]
+              | NO PROPERTIES
 ```
+
+The graph most of these pages use has one vertex table and one edge table:
 
 ```sql
 CREATE PROPERTY GRAPH karate
@@ -31,12 +40,13 @@ CREATE PROPERTY GRAPH karate
   );
 ```
 
-- **The edge table** is any table or view. Each row is an edge from its `SOURCE KEY` column to its `DESTINATION KEY` column. The two columns must have the same type: integers or strings.
-- **The vertex table** is optional. It gives the nodes attributes, keyed by its `KEY` column. The graph's nodes are the vertex table's keys plus the endpoints of the edges. Without a vertex table, the nodes are the endpoints of the edges.
-- **`REFERENCES`** names the vertex table and its key. It is optional, and when given it must match `VERTEX TABLES`.
+- **An edge table** is any table or view. Each row is an edge from its `SOURCE KEY` column to its `DESTINATION KEY` column. The two columns must have the same type: integers or strings.
+- **A vertex table** gives nodes attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
+- **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
+- **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
 
-A graph is a schema with two tables. `karate.edges` holds the edge table's rows. `karate.nodes` holds one row per node, with the vertex table's columns:
+A graph with one edge table and at most one vertex table is a schema with two tables. `karate.edges` holds the edge table's rows. `karate.nodes` holds one row per node, with the vertex table's columns:
 
 ```sql
 SELECT count(*) AS edges FROM karate.edges;
@@ -61,15 +71,58 @@ CREATE PROPERTY GRAPH first EDGE TABLES (first_ties SOURCE KEY (src) DESTINATION
 
 `OR REPLACE` replaces a graph of the same name. `IF NOT EXISTS` does nothing if there is one. Defining a graph that exists without either is an error.
 
-SQL/PGQ allows more than Ursa supports so far: several vertex or edge tables, `LABEL`, `PROPERTIES`, `AS` aliases, an edge table `KEY`, and keys of more than one column. Each is recognized and refused with a message, never read as something else:
+### Several tables
+
+A graph can have any number of vertex and edge tables. Here members follow each other and write posts:
 
 ```sql
-CREATE PROPERTY GRAPH labelled
-  EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst) LABEL knows);
+CREATE VIEW posts AS SELECT * FROM (VALUES (100, 'hello'), (101, 'graphs')) t(pid, title);
+CREATE VIEW wrote AS SELECT * FROM (VALUES (0, 100), (33, 101)) t(author, post);
+CREATE PROPERTY GRAPH club
+  VERTEX TABLES (
+    members AS person LABEL person PROPERTIES (id, club),
+    posts
+  )
+  EDGE TABLES (
+    ties SOURCE KEY (src) REFERENCES person (id)
+         DESTINATION KEY (dst) REFERENCES person (id) LABEL knows,
+    wrote SOURCE KEY (author) REFERENCES person (id)
+          DESTINATION KEY (post) REFERENCES posts (pid)
+  );
+```
+
+Neither vertex table names its `KEY`: each is the column the edges reference. A graph of several tables has no `nodes` and `edges` tables; its tables are queried by their own names.
+
+**An algorithm runs on one vertex table and one edge table**, as in DuckPGQ. With one edge table, as in `karate`, the pair is implied. Otherwise name it after the graph, by table name or label:
+
+```sql
+SELECT id, round(pagerank, 4) AS pagerank
+FROM pagerank(club, person, knows, direction => 'both')
+ORDER BY pagerank DESC
+LIMIT 3;
 ```
 
 ```text
-Error: labels (LABEL, DEFAULT LABEL) are not supported yet: Ursa graphs have one edge table and at most one vertex table at Line: 2, Column: 60
++----+----------+
+| id | pagerank |
++----+----------+
+| 33 | 0.1009   |
+| 0  | 0.097    |
+| 32 | 0.0717   |
++----+----------+
+```
+
+The edge table must connect one vertex table to itself: `wrote`, from members to posts, is not a graph an algorithm can run on.
+
+Keys of more than one column, and properties that are expressions rather than columns, are not supported yet. Each is refused with a message, never read as something else:
+
+```sql
+CREATE PROPERTY GRAPH pairs
+  EDGE TABLES (ties SOURCE KEY (src, dst) DESTINATION KEY (dst));
+```
+
+```text
+Error: multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column) not supported yet at Line: 2, Column: 36
 ```
 
 ## DROP PROPERTY GRAPH
@@ -83,7 +136,7 @@ Dropping a graph leaves its tables and views alone.
 
 ## SHOW GRAPHS
 
-Lists the graphs, one row each, with the edge table, its endpoint columns, and the vertex table and key if there is one:
+Lists the graphs, one row per edge table, with its endpoint columns, and the vertex table and key its endpoints refer to:
 
 ```sql
 SHOW GRAPHS;
@@ -93,13 +146,15 @@ SHOW GRAPHS;
 +--------+------------+--------+-------------+--------------+------------+
 | name   | edge_table | source | destination | vertex_table | vertex_key |
 +--------+------------+--------+-------------+--------------+------------+
+| club   | ties       | src    | dst         | members      | id         |
+| club   | wrote      | author | post        | members      | id         |
 | karate | ties       | src    | dst         | members      | id         |
 +--------+------------+--------+-------------+--------------+------------+
 ```
 
 ## DESCRIBE GRAPH
 
-Lists the columns of a graph's two tables, `nodes` and `edges`: each column's type, its role in the graph, and the column it comes from:
+Lists the columns of a graph's two tables, `nodes` and `edges`: each column's type, its role in the graph, and the column it comes from. For a graph of several tables, it lists each table's columns instead. `DESCRIBE PROPERTY GRAPH`, DuckPGQ's spelling, works too:
 
 ```sql
 DESCRIBE GRAPH karate;

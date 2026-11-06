@@ -78,7 +78,7 @@ use super::node::{
     WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
 };
 use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
-use super::{GraphDef, GraphRegistry};
+use super::{GraphDef, GraphRegistry, PropertyGraph};
 
 /// Plans graph function calls in `FROM`.
 #[derive(Debug)]
@@ -1096,7 +1096,10 @@ impl GraphFunctions {
         }
     }
 
-    /// The graph a call names first, and the arguments after it.
+    /// The graph a call names first (the pair it runs on), and the arguments
+    /// after it. As in DuckPGQ, `f(g, vertex_table, edge_table)` names the pair
+    /// in a graph with several element tables; with one edge table, `f(g)`
+    /// implies it (#295).
     fn graph_argument(
         &self,
         target: Target,
@@ -1129,11 +1132,47 @@ impl GraphFunctions {
             }
             Some(_) => return Err(missing()),
         };
-        Ok((graph, args.collect()))
+        // DuckPGQ's positional (vertex table, edge table). In algorithms(),
+        // whose other arguments are calls, a bare name is taken as one only if
+        // the graph has an element table by that name, so a call written
+        // without parentheses (`algorithms(g, degree)`) keeps its own error.
+        let mut args = args.peekable();
+        let mut labels = Vec::new();
+        while let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Identifier(ident)))) =
+            args.peek()
+        {
+            if matches!(target, Target::Algorithms) {
+                let label = context.normalize_ident(ident.clone());
+                if graph.vertex_table(&label).is_none() && graph.edge_table(&label).is_none() {
+                    break;
+                }
+            }
+            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Identifier(ident)))) =
+                args.next()
+            else {
+                unreachable!("peeked")
+            };
+            labels.push(context.normalize_ident(ident));
+        }
+        let pair = match labels.as_slice() {
+            [] => graph.pair(None, None)?,
+            [vertex, edge] => graph.pair(Some(vertex), Some(edge))?,
+            _ => {
+                return Err(plan(format!(
+                    "{name}() takes a graph, optionally followed by a vertex table and an edge \
+                     table ({name}({}, <vertex table>, <edge table>)), then named parameters; \
+                     got {} name{} after the graph",
+                    graph.name,
+                    labels.len(),
+                    if labels.len() == 1 { "" } else { "s" }
+                )))
+            }
+        };
+        Ok((Arc::new(pair), args.collect()))
     }
 
     /// The graph called `name`.
-    fn graph(&self, name: &str) -> Result<Arc<GraphDef>> {
+    fn graph(&self, name: &str) -> Result<Arc<PropertyGraph>> {
         if let Some(graph) = self.registry.get(name) {
             return Ok(graph);
         }

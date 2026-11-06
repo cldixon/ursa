@@ -298,10 +298,10 @@ fn graphs_last_for_the_invocation() {
     assert!(e.contains("g.nodes"), "{e}");
     let e = err(ursa(&[
         "-c",
-        "CREATE PROPERTY GRAPH g EDGE TABLES (ties AS t SOURCE KEY (src) DESTINATION KEY (dst))",
+        "CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src, x) DESTINATION KEY (dst))",
     ]));
     assert!(
-        e.starts_with("Error: table aliases (AS) are not supported yet"),
+        e.starts_with("Error: multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column) not supported yet"),
         "{e}"
     );
 }

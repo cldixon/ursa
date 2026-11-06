@@ -50,11 +50,7 @@ async fn weighted_session(path: &Path, csv: &Path) -> SessionContext {
     .unwrap();
     registry_of(&ctx).put(GraphDef {
         name: "w".into(),
-        edges: EdgeTable {
-            table: TableReference::bare("scenes"),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
+        edges: EdgeTable::new(TableReference::bare("scenes"), "src", "dst"),
         vertices: None,
     });
     ctx

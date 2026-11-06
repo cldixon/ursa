@@ -29,11 +29,7 @@ async fn define(ctx: &SessionContext, graph: &str, view: &str, path: &Path) {
     .unwrap();
     registry_of(ctx).put(GraphDef {
         name: graph.into(),
-        edges: EdgeTable {
-            table: TableReference::bare(view),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
+        edges: EdgeTable::new(TableReference::bare(view), "src", "dst"),
         vertices: None,
     });
 }
@@ -204,11 +200,7 @@ async fn a_filtered_view_is_a_subgraph_with_its_own_index() {
         .unwrap();
     registry_of(&ctx).put(GraphDef {
         name: "near".into(),
-        edges: EdgeTable {
-            table: TableReference::bare("near"),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
+        edges: EdgeTable::new(TableReference::bare("near"), "src", "dst"),
         vertices: None,
     });
     let out = table(
@@ -410,11 +402,7 @@ async fn an_empty_edge_set_has_no_nodes() {
         .unwrap();
     registry_of(&ctx).put(GraphDef {
         name: "empty".into(),
-        edges: EdgeTable {
-            table: TableReference::bare("none"),
-            source: "src".into(),
-            destination: "dst".into(),
-        },
+        edges: EdgeTable::new(TableReference::bare("none"), "src", "dst"),
         vertices: None,
     });
     for f in [

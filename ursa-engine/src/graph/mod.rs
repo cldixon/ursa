@@ -53,7 +53,7 @@ pub mod schema;
 
 pub use define::{
     check_ddl, check_drop, check_drop_schema, check_replace, closest_name, create_graph,
-    drop_graph, unknown_graph,
+    drop_graph, unknown_graph, EdgeSpec, GraphSpec, VertexSpec,
 };
 pub use describe::{describe_graph, show_graphs};
 pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, GraphSchema};
@@ -76,33 +76,316 @@ pub use index::{index_builds, index_loads, FileIdentity, GraphIndex, IndexCache,
 pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
 pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
 
-/// One graph, as `CREATE PROPERTY GRAPH` defined it.
+/// One graph, as `CREATE PROPERTY GRAPH` defined it: its vertex and edge
+/// tables (SQL/PGQ's element tables), with their keys resolved (#295).
+///
+/// `MATCH` spans every table. An algorithm runs on one vertex table and one
+/// edge table, a [`GraphDef`], as in DuckPGQ: see [`PropertyGraph::pair`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyGraph {
+    /// The graph's name: also the name of the schema holding its `nodes` and
+    /// `edges` tables (when it has one implied pair; see [`Self::pair`]).
+    pub name: String,
+    pub vertex_tables: Vec<VertexTable>,
+    pub edge_tables: Vec<EdgeTable>,
+}
+
+/// A graph as an algorithm sees it: one edge table, and the vertex table its
+/// endpoints refer to, if any. A whole graph before #295; now one pair of a
+/// [`PropertyGraph`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphDef {
-    /// The graph's name: also the name of the schema holding its `nodes` and
-    /// `edges` tables.
+    /// The graph's name.
     pub name: String,
     pub edges: EdgeTable,
-    /// The vertex table, if the definition has `VERTEX TABLES`.
+    /// The vertex table, if the pair has one.
     pub vertices: Option<VertexTable>,
 }
 
-/// The edge table: each row is an edge from `source` to `destination`.
+/// An edge table: each row is an edge from `source` to `destination`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeTable {
+    /// Its element name: the `AS` name, or else the table's name.
+    pub name: String,
     pub table: TableReference,
     /// `SOURCE KEY (column)`.
     pub source: String,
     /// `DESTINATION KEY (column)`.
     pub destination: String,
+    /// The vertex table (element name) `SOURCE … REFERENCES`, if any.
+    pub source_vertex: Option<String>,
+    /// The vertex table (element name) `DESTINATION … REFERENCES`, if any.
+    pub destination_vertex: Option<String>,
+    pub labels: Vec<Label>,
 }
 
-/// The vertex table: each row is a node, keyed by `key`.
+/// A vertex table: each row is a node, keyed by `key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexTable {
+    /// Its element name: the `AS` name, or else the table's name.
+    pub name: String,
     pub table: TableReference,
-    /// `KEY (column)`.
+    /// `KEY (column)`, or the key inferred when `KEY` was left out.
     pub key: String,
+    pub labels: Vec<Label>,
+}
+
+/// A label of an element table, and the properties it exposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Label {
+    pub name: String,
+    pub properties: Properties,
+}
+
+/// The properties a label exposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Properties {
+    /// Every column but `except`: no properties clause, or `PROPERTIES ARE
+    /// ALL COLUMNS [EXCEPT (…)]`.
+    AllColumns { except: Vec<String> },
+    /// `PROPERTIES (column [AS name], …)`: (column, property name) pairs.
+    Columns(Vec<(String, String)>),
+    /// `NO PROPERTIES`.
+    None,
+}
+
+impl Label {
+    /// The default label of an element table: its name, with every column.
+    pub fn default_for(element: &str) -> Self {
+        Label {
+            name: element.to_string(),
+            properties: Properties::AllColumns { except: Vec::new() },
+        }
+    }
+}
+
+/// An element table's labels, or its default label when none were written.
+fn labels_or_default<'a>(labels: &'a [Label], name: &str) -> std::borrow::Cow<'a, [Label]> {
+    if labels.is_empty() {
+        std::borrow::Cow::Owned(vec![Label::default_for(name)])
+    } else {
+        std::borrow::Cow::Borrowed(labels)
+    }
+}
+
+impl VertexTable {
+    /// A vertex table named after its table, with its default label.
+    pub fn new(table: impl Into<TableReference>, key: impl Into<String>) -> Self {
+        let table = table.into();
+        VertexTable {
+            name: table.table().to_string(),
+            table,
+            key: key.into(),
+            labels: Vec::new(),
+        }
+    }
+
+    /// Its labels, the default one if none were written.
+    pub fn labels(&self) -> std::borrow::Cow<'_, [Label]> {
+        labels_or_default(&self.labels, &self.name)
+    }
+
+    /// Whether `label` names this table: its element name or one of its labels.
+    pub fn answers_to(&self, label: &str) -> bool {
+        self.name.eq_ignore_ascii_case(label)
+            || self
+                .labels
+                .iter()
+                .any(|l| l.name.eq_ignore_ascii_case(label))
+    }
+}
+
+impl EdgeTable {
+    /// An edge table named after its table, with its default label and no
+    /// `REFERENCES`.
+    pub fn new(
+        table: impl Into<TableReference>,
+        source: impl Into<String>,
+        destination: impl Into<String>,
+    ) -> Self {
+        let table = table.into();
+        EdgeTable {
+            name: table.table().to_string(),
+            table,
+            source: source.into(),
+            destination: destination.into(),
+            source_vertex: None,
+            destination_vertex: None,
+            labels: Vec::new(),
+        }
+    }
+
+    /// Its labels, the default one if none were written.
+    pub fn labels(&self) -> std::borrow::Cow<'_, [Label]> {
+        labels_or_default(&self.labels, &self.name)
+    }
+
+    /// Whether `label` names this table: its element name or one of its labels.
+    pub fn answers_to(&self, label: &str) -> bool {
+        self.name.eq_ignore_ascii_case(label)
+            || self
+                .labels
+                .iter()
+                .any(|l| l.name.eq_ignore_ascii_case(label))
+    }
+}
+
+/// A graph of one pair: what every graph was before #295.
+impl From<GraphDef> for PropertyGraph {
+    fn from(def: GraphDef) -> Self {
+        PropertyGraph {
+            name: def.name,
+            vertex_tables: def.vertices.into_iter().collect(),
+            edge_tables: vec![def.edges],
+        }
+    }
+}
+
+impl PropertyGraph {
+    /// Every table the graph reads, vertex tables first.
+    pub fn tables(&self) -> impl Iterator<Item = &TableReference> {
+        self.vertex_tables
+            .iter()
+            .map(|v| &v.table)
+            .chain(self.edge_tables.iter().map(|e| &e.table))
+    }
+
+    /// The vertex table called (or labelled) `label`.
+    pub fn vertex_table(&self, label: &str) -> Option<&VertexTable> {
+        self.vertex_tables
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(label))
+            .or_else(|| self.vertex_tables.iter().find(|v| v.answers_to(label)))
+    }
+
+    /// The edge table called (or labelled) `label`.
+    pub fn edge_table(&self, label: &str) -> Option<&EdgeTable> {
+        self.edge_tables
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(label))
+            .or_else(|| self.edge_tables.iter().find(|e| e.answers_to(label)))
+    }
+
+    /// The vertex table an endpoint of `edge` refers to: its `REFERENCES`, or
+    /// without one, the graph's only vertex table (`None` if it has none).
+    pub fn endpoint_vertex(&self, edge: &EdgeTable, source: bool) -> Option<&VertexTable> {
+        let named = if source {
+            &edge.source_vertex
+        } else {
+            &edge.destination_vertex
+        };
+        match named {
+            Some(name) => self.vertex_tables.iter().find(|v| &v.name == name),
+            None if self.vertex_tables.len() == 1 => self.vertex_tables.first(),
+            None => None,
+        }
+    }
+
+    /// The pair an algorithm runs on: an edge table, and the vertex table both
+    /// its endpoints refer to (if any), as DuckPGQ's `pagerank(g, vertex,
+    /// edge)`. With no labels the pair is implied when the graph has one edge
+    /// table: every graph before #295 has one.
+    pub fn pair(
+        &self,
+        vertex: Option<&str>,
+        edge: Option<&str>,
+    ) -> datafusion::error::Result<GraphDef> {
+        use datafusion::error::DataFusionError;
+        let plan_err = |m: String| Err(DataFusionError::Plan(m));
+        let edges = match edge {
+            Some(label) => match self.edge_table(label) {
+                Some(e) => e,
+                None => {
+                    let names: Vec<&str> =
+                        self.edge_tables.iter().map(|e| e.name.as_str()).collect();
+                    return plan_err(format!(
+                        "graph '{}' has no edge table '{label}'; its edge tables are {}",
+                        self.name,
+                        if names.is_empty() {
+                            "none".to_string()
+                        } else {
+                            names.join(", ")
+                        }
+                    ));
+                }
+            },
+            None => match self.edge_tables.as_slice() {
+                [only] => only,
+                [] => {
+                    return plan_err(format!(
+                        "graph '{}' has no edge tables, so there is nothing for an algorithm to \
+                         run on",
+                        self.name
+                    ))
+                }
+                several => {
+                    let names: Vec<&str> = several.iter().map(|e| e.name.as_str()).collect();
+                    return plan_err(format!(
+                        "graph '{}' has {} edge tables ({}); name the vertex and edge table to \
+                         run on, as in pagerank({}, <vertex table>, <edge table>)",
+                        self.name,
+                        several.len(),
+                        names.join(", "),
+                        self.name
+                    ));
+                }
+            },
+        };
+        let source = self.endpoint_vertex(edges, true);
+        let destination = self.endpoint_vertex(edges, false);
+        if let (Some(s), Some(d)) = (source, destination) {
+            if s.name != d.name {
+                return plan_err(format!(
+                    "edge table '{}' of graph '{}' goes from vertex table '{}' to '{}'; an \
+                     algorithm runs on edges between one vertex table",
+                    edges.name, self.name, s.name, d.name
+                ));
+            }
+        }
+        let vertices = source.or(destination);
+        if let Some(label) = vertex {
+            let Some(asked) = self.vertex_table(label) else {
+                let names: Vec<&str> = self.vertex_tables.iter().map(|v| v.name.as_str()).collect();
+                return plan_err(format!(
+                    "graph '{}' has no vertex table '{label}'; its vertex tables are {}",
+                    self.name,
+                    if names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                ));
+            };
+            if vertices.is_some_and(|v| v.name != asked.name) {
+                return plan_err(format!(
+                    "edge table '{}' of graph '{}' connects vertex table '{}', not '{}'",
+                    edges.name,
+                    self.name,
+                    vertices.map(|v| v.name.as_str()).unwrap_or_default(),
+                    asked.name
+                ));
+            }
+            return Ok(GraphDef {
+                name: self.name.clone(),
+                edges: edges.clone(),
+                vertices: Some(asked.clone()),
+            });
+        }
+        Ok(GraphDef {
+            name: self.name.clone(),
+            edges: edges.clone(),
+            vertices: vertices.cloned(),
+        })
+    }
+
+    /// The implied pair, when there is one: the graph's `nodes` and `edges`
+    /// tables are this pair's.
+    pub fn default_pair(&self) -> Option<GraphDef> {
+        if self.vertex_tables.len() > 1 {
+            return None;
+        }
+        self.pair(None, None).ok()
+    }
 }
 
 /// A table a graph opened from a file path or URL when it was created.
@@ -117,7 +400,7 @@ pub struct FileTable {
 /// (the DDL normalizes identifiers the way DataFusion does for tables).
 #[derive(Debug, Default)]
 pub struct GraphRegistry {
-    graphs: RwLock<BTreeMap<String, Arc<GraphDef>>>,
+    graphs: RwLock<BTreeMap<String, Arc<PropertyGraph>>>,
     /// Per graph, the tables it opened from file paths (see the module docs).
     files: RwLock<BTreeMap<String, Vec<FileTable>>>,
     /// The session's catalogs before the file-table wrapper: graph schemas are
@@ -127,7 +410,7 @@ pub struct GraphRegistry {
 
 impl GraphRegistry {
     /// The graph called `name`.
-    pub fn get(&self, name: &str) -> Option<Arc<GraphDef>> {
+    pub fn get(&self, name: &str) -> Option<Arc<PropertyGraph>> {
         self.graphs
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -136,7 +419,7 @@ impl GraphRegistry {
     }
 
     /// Every graph, sorted by name.
-    pub fn all(&self) -> Vec<Arc<GraphDef>> {
+    pub fn all(&self) -> Vec<Arc<PropertyGraph>> {
         self.graphs
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -146,12 +429,16 @@ impl GraphRegistry {
     }
 
     /// Add or replace `def`; returns the definition it replaced.
-    pub fn put(&self, def: GraphDef) -> Option<Arc<GraphDef>> {
-        self.put_with_files(def, Vec::new())
+    pub fn put(&self, def: impl Into<PropertyGraph>) -> Option<Arc<PropertyGraph>> {
+        self.put_with_files(def.into(), Vec::new())
     }
 
     /// Add or replace `def`, with the tables it opened from file paths.
-    pub fn put_with_files(&self, def: GraphDef, files: Vec<FileTable>) -> Option<Arc<GraphDef>> {
+    pub fn put_with_files(
+        &self,
+        def: PropertyGraph,
+        files: Vec<FileTable>,
+    ) -> Option<Arc<PropertyGraph>> {
         let mut graphs = self.graphs.write().unwrap_or_else(|e| e.into_inner());
         let mut all_files = self.files.write().unwrap_or_else(|e| e.into_inner());
         if files.is_empty() {
@@ -163,7 +450,7 @@ impl GraphRegistry {
     }
 
     /// Remove the graph called `name`; returns it if it existed.
-    pub fn remove(&self, name: &str) -> Option<Arc<GraphDef>> {
+    pub fn remove(&self, name: &str) -> Option<Arc<PropertyGraph>> {
         let mut graphs = self.graphs.write().unwrap_or_else(|e| e.into_inner());
         self.files
             .write()
@@ -235,14 +522,10 @@ mod tests {
         let ctx = crate::new_session();
         let graphs = registry_of(&ctx);
         assert!(graphs.all().is_empty());
-        graphs.put(GraphDef {
+        graphs.put(PropertyGraph {
             name: "g".into(),
-            edges: EdgeTable {
-                table: TableReference::bare("e"),
-                source: "a".into(),
-                destination: "b".into(),
-            },
-            vertices: None,
+            vertex_tables: Vec::new(),
+            edge_tables: vec![EdgeTable::new(TableReference::bare("e"), "a", "b")],
         });
         // The registry is shared by every handle on the session.
         assert_eq!(registry_of(&ctx).names(), vec!["g".to_string()]);

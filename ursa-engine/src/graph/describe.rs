@@ -10,42 +10,62 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 
 use super::define::unknown_graph;
-use super::schema::{edges_plan, nodes_plan, EDGES, ID, NODES};
-use super::{registry, GraphDef, GraphRegistry};
+use super::schema::{edges_plan, graph_table, nodes_plan, EDGES, ID, NODES};
+use super::{registry, GraphRegistry, PropertyGraph};
 
-/// `SHOW GRAPHS`: one row per graph, sorted by name, with its definition.
+/// `SHOW GRAPHS`: one row per edge table of each graph (one row for a graph
+/// with no edge tables), sorted by graph name, with its definition.
 ///
-/// | column         | value                                                |
-/// | -------------- | ---------------------------------------------------- |
-/// | `name`         | the graph's name                                     |
-/// | `edge_table`   | the edge table (a file path in single quotes)        |
-/// | `source`       | its `SOURCE KEY` column                              |
-/// | `destination`  | its `DESTINATION KEY` column                         |
-/// | `vertex_table` | the vertex table, or NULL without `VERTEX TABLES`    |
-/// | `vertex_key`   | the vertex table's `KEY` column, or NULL without one |
+/// | column         | value                                                     |
+/// | -------------- | --------------------------------------------------------- |
+/// | `name`         | the graph's name                                          |
+/// | `edge_table`   | the edge table (a file path in single quotes), or NULL    |
+/// | `source`       | its `SOURCE KEY` column                                   |
+/// | `destination`  | its `DESTINATION KEY` column                              |
+/// | `vertex_table` | the vertex table its endpoints refer to, or NULL          |
+/// | `vertex_key`   | that vertex table's key column, or NULL                   |
+///
+/// A graph with one edge table and at most one vertex table, as every graph
+/// before #295, has one row, as before.
 pub fn show_graphs(state: &SessionState) -> Result<RecordBatch> {
     let graphs = registry(state);
-    let all = graphs.all();
-    let column = |value: &dyn Fn(&GraphDef) -> Option<String>| -> ArrayRef {
-        Arc::new(all.iter().map(|g| value(g)).collect::<StringArray>())
-    };
-    let columns = vec![
-        column(&|g| Some(g.name.clone())),
-        column(&|g| Some(table_name(&graphs, g, &g.edges.table))),
-        column(&|g| Some(g.edges.source.clone())),
-        column(&|g| Some(g.edges.destination.clone())),
-        column(&|g| {
-            g.vertices
-                .as_ref()
-                .map(|v| table_name(&graphs, g, &v.table))
-        }),
-        column(&|g| g.vertices.as_ref().map(|v| v.key.clone())),
-    ];
+    let mut rows: Vec<[Option<String>; 6]> = Vec::new();
+    for g in graphs.all() {
+        if g.edge_tables.is_empty() {
+            for v in &g.vertex_tables {
+                rows.push([
+                    Some(g.name.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(table_name(&graphs, &g, &v.table)),
+                    Some(v.key.clone()),
+                ]);
+            }
+            continue;
+        }
+        for e in &g.edge_tables {
+            let vertex = g
+                .endpoint_vertex(e, true)
+                .or_else(|| g.endpoint_vertex(e, false));
+            rows.push([
+                Some(g.name.clone()),
+                Some(table_name(&graphs, &g, &e.table)),
+                Some(e.source.clone()),
+                Some(e.destination.clone()),
+                vertex.map(|v| table_name(&graphs, &g, &v.table)),
+                vertex.map(|v| v.key.clone()),
+            ]);
+        }
+    }
+    let columns = (0..6)
+        .map(|i| Arc::new(rows.iter().map(|r| r[i].clone()).collect::<StringArray>()) as ArrayRef)
+        .collect();
     let schema = Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
-        Field::new("edge_table", DataType::Utf8, false),
-        Field::new("source", DataType::Utf8, false),
-        Field::new("destination", DataType::Utf8, false),
+        Field::new("edge_table", DataType::Utf8, true),
+        Field::new("source", DataType::Utf8, true),
+        Field::new("destination", DataType::Utf8, true),
         Field::new("vertex_table", DataType::Utf8, true),
         Field::new("vertex_key", DataType::Utf8, true),
     ]);
@@ -66,16 +86,24 @@ pub fn show_graphs(state: &SessionState) -> Result<RecordBatch> {
 /// `origin` of `nodes.id` is the vertex table's key, or without a vertex
 /// table, the edge endpoints (`ties.src, ties.dst`). So the rows hold the whole
 /// definition, and every row has the same shape.
+///
+/// A graph with several vertex or edge tables has no `nodes` and `edges`
+/// tables: its rows are each element table's columns instead, `table_name`
+/// being the element name and `role` one of `key`, `source` (`→ vertex`) and
+/// `destination` (`→ vertex`).
 pub async fn describe_graph(state: &SessionState, name: &str) -> Result<RecordBatch> {
     let graphs = registry(state);
-    let def = graphs
+    let graph = graphs
         .get(name)
         .ok_or_else(|| unknown_graph(name, &graphs))?;
-    let edge_table = table_name(&graphs, &def, &def.edges.table);
+    let Some(def) = graph.default_pair() else {
+        return describe_elements(state, &graphs, &graph).await;
+    };
+    let edge_table = table_name(&graphs, &graph, &def.edges.table);
     let vertex_table = def
         .vertices
         .as_ref()
-        .map(|v| (table_name(&graphs, &def, &v.table), &v.key));
+        .map(|v| (table_name(&graphs, &graph, &v.table), &v.key));
 
     let unreadable = |e: DataFusionError| {
         DataFusionError::Plan(format!(
@@ -121,6 +149,78 @@ pub async fn describe_graph(state: &SessionState, name: &str) -> Result<RecordBa
         ));
     }
 
+    describe_batch(rows)
+}
+
+/// [`describe_graph`] for a graph with several element tables.
+async fn describe_elements(
+    state: &SessionState,
+    graphs: &GraphRegistry,
+    graph: &PropertyGraph,
+) -> Result<RecordBatch> {
+    let unreadable = |e: DataFusionError| {
+        DataFusionError::Plan(format!(
+            "cannot describe graph '{}': {}",
+            graph.name,
+            crate::user_message(&e)
+        ))
+    };
+    let mut rows: Vec<[Option<String>; 5]> = Vec::new();
+    for v in &graph.vertex_tables {
+        let schema = graph_table(state, &graph.name, &v.table)
+            .await
+            .map_err(unreadable)?
+            .schema();
+        let table = table_name(graphs, graph, &v.table);
+        for field in schema.fields() {
+            let role = (field.name() == &v.key).then_some("key");
+            rows.push(row(
+                &v.name,
+                field.name(),
+                field.data_type(),
+                role,
+                format!("{table}.{}", field.name()),
+            ));
+        }
+    }
+    for e in &graph.edge_tables {
+        let schema = graph_table(state, &graph.name, &e.table)
+            .await
+            .map_err(unreadable)?
+            .schema();
+        let table = table_name(graphs, graph, &e.table);
+        let target = |source: bool| {
+            graph
+                .endpoint_vertex(e, source)
+                .map(|v| format!(" \u{2192} {}", v.name))
+                .unwrap_or_default()
+        };
+        let (source, destination) = (
+            format!("source{}", target(true)),
+            format!("destination{}", target(false)),
+        );
+        for field in schema.fields() {
+            let column = field.name();
+            let both = format!("{source}, {destination}");
+            let role = match (column == &e.source, column == &e.destination) {
+                (true, true) => Some(both.as_str()),
+                (true, false) => Some(source.as_str()),
+                (false, true) => Some(destination.as_str()),
+                (false, false) => None,
+            };
+            rows.push(row(
+                &e.name,
+                column,
+                field.data_type(),
+                role,
+                format!("{table}.{column}"),
+            ));
+        }
+    }
+    describe_batch(rows)
+}
+
+fn describe_batch(rows: Vec<[Option<String>; 5]>) -> Result<RecordBatch> {
     let columns = (0..5)
         .map(|i| Arc::new(rows.iter().map(|r| r[i].clone()).collect::<StringArray>()) as ArrayRef)
         .collect();
@@ -152,8 +252,8 @@ fn row(
 
 /// `table` as the definition names it; a file path in single quotes, as it is
 /// written in SQL.
-fn table_name(graphs: &GraphRegistry, def: &GraphDef, table: &TableReference) -> String {
-    if graphs.file_table(&def.name, table).is_some() {
+fn table_name(graphs: &GraphRegistry, graph: &PropertyGraph, table: &TableReference) -> String {
+    if graphs.file_table(&graph.name, table).is_some() {
         format!("'{}'", table.table().replace('\'', "''"))
     } else {
         table.to_string()

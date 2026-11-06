@@ -72,13 +72,14 @@ pub(crate) fn rewrite_locations(
             _ => {}
         },
         UrsaStatement::CreatePropertyGraph(graph) => {
-            let mut names = vec![&mut graph.edges.table];
-            if let Some(vertices) = &mut graph.vertices {
-                names.push(&mut vertices.table);
-            }
-            for endpoint in [&mut graph.edges.source, &mut graph.edges.destination] {
-                if let Some(references) = &mut endpoint.references {
-                    names.push(&mut references.table);
+            let mut names: Vec<&mut ObjectName> =
+                graph.vertices.iter_mut().map(|v| &mut v.table).collect();
+            for edges in &mut graph.edges {
+                names.push(&mut edges.table);
+                for endpoint in [&mut edges.source, &mut edges.destination] {
+                    if let Some(references) = &mut endpoint.references {
+                        names.push(&mut references.table);
+                    }
                 }
             }
             for name in names {

@@ -15,7 +15,7 @@ use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token};
 
-use crate::property_graph::{parse_tables, EdgeTableDef, VertexTableDef};
+use crate::property_graph::{parse_tables, write_tables, EdgeTableDef, VertexTableDef};
 
 /// Same as sqlparser's and DataFusion's default.
 pub const DEFAULT_RECURSION_LIMIT: usize = 50;
@@ -44,10 +44,10 @@ pub struct CreatePropertyGraph {
     pub name: ObjectName,
     pub or_replace: bool,
     pub if_not_exists: bool,
-    /// `VERTEX TABLES (…)`, which may be omitted.
-    pub vertices: Option<VertexTableDef>,
-    /// `EDGE TABLES (…)`.
-    pub edges: EdgeTableDef,
+    /// `VERTEX TABLES (…)`: empty when the clause is left out.
+    pub vertices: Vec<VertexTableDef>,
+    /// `EDGE TABLES (…)`: empty when the clause is left out.
+    pub edges: Vec<EdgeTableDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +95,7 @@ impl fmt::Display for UrsaStatement {
                     write!(f, "IF NOT EXISTS ")?;
                 }
                 write!(f, "{}", s.name)?;
-                if let Some(vertices) = &s.vertices {
-                    write!(f, " {vertices}")?;
-                }
-                write!(f, " {}", s.edges)
+                write_tables(f, &s.vertices, &s.edges)
             }
             UrsaStatement::DropPropertyGraph(s) => {
                 write!(f, "DROP PROPERTY GRAPH ")?;
@@ -204,6 +201,16 @@ impl<'a> UrsaParser<'a> {
         {
             // `DESCRIBE graph` alone still describes a table named `graph`.
             for _ in 0..2 {
+                self.df.parser.next_token();
+            }
+            let name = self.df.parser.parse_object_name(false)?;
+            return Ok(UrsaStatement::DescribeGraph(DescribeGraph { name }));
+        } else if (self.word(0, "DESCRIBE") || self.word(0, "DESC"))
+            && self.word(1, "PROPERTY")
+            && self.word(2, "GRAPH")
+        {
+            // DuckPGQ's spelling of `DESCRIBE GRAPH`.
+            for _ in 0..3 {
                 self.df.parser.next_token();
             }
             let name = self.df.parser.parse_object_name(false)?;

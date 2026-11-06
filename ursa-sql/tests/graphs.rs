@@ -116,8 +116,8 @@ async fn a_graph_with_a_vertex_table() {
 +-----+-----+"
     );
     let def = registry_of(&ctx).get("karate").unwrap();
-    assert_eq!(def.edges.table.to_string(), "ties");
-    assert_eq!(def.vertices.as_ref().unwrap().key, "id");
+    assert_eq!(def.edge_tables[0].table.to_string(), "ties");
+    assert_eq!(def.vertex_tables[0].key, "id");
 }
 
 #[tokio::test]
@@ -280,7 +280,11 @@ async fn or_replace_and_if_not_exists() {
         "CREATE PROPERTY GRAPH IF NOT EXISTS karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
     )
     .await;
-    assert!(registry_of(&ctx).get("karate").unwrap().vertices.is_some());
+    assert!(!registry_of(&ctx)
+        .get("karate")
+        .unwrap()
+        .vertex_tables
+        .is_empty());
 
     // OR REPLACE replaces it.
     ok(
@@ -288,7 +292,11 @@ async fn or_replace_and_if_not_exists() {
         "CREATE OR REPLACE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
     )
     .await;
-    assert!(registry_of(&ctx).get("karate").unwrap().vertices.is_none());
+    assert!(registry_of(&ctx)
+        .get("karate")
+        .unwrap()
+        .vertex_tables
+        .is_empty());
     let batches = ok(&ctx, "SELECT * FROM karate.nodes").await;
     assert_eq!(batches[0].schema().fields().len(), 1);
 
@@ -488,13 +496,13 @@ async fn definitions_are_checked_when_created() {
         (
             "CREATE PROPERTY GRAPH g VERTEX TABLES (named KEY (name))
                EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
-            "the key of vertex table 'named' (name) is Utf8View, but the edge endpoints are Int64; \
+            "the key of vertex table 'named' (name) is Utf8View, but the endpoints of edge table 'ties' are Int64; \
              both must be integers or both strings",
         ),
         (
             "CREATE PROPERTY GRAPH g VERTEX TABLES (members KEY (club))
                EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
-            "the key of vertex table 'members' (club) is Utf8, but the edge endpoints are Int64; \
+            "the key of vertex table 'members' (club) is Utf8, but the endpoints of edge table 'ties' are Int64; \
              both must be integers or both strings",
         ),
         (
