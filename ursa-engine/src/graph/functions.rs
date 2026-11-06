@@ -107,6 +107,11 @@ pub const VALUES: ParamSpec = ParamSpec {
 const ATTRIBUTE_DOC: &str =
     "An expression over the graph's node table, the value of each node. Give this or values.";
 
+/// `neighbors_agg`'s `agg` in SQL, where `min` and `max` also take strings,
+/// dates and times.
+const AGG_DOC: &str = "The aggregation; mean and sum need numbers, and min and max take numbers, \
+     strings, dates or times. count and n_unique return integers.";
+
 /// The parameters a SQL call can name: all but `dtype`, in the catalog's
 /// order, after [`VALUES`] for a function that reads node values.
 pub fn sql_params(spec: &FunctionSpec) -> impl Iterator<Item = &'static ParamSpec> {
@@ -121,6 +126,7 @@ pub fn sql_params(spec: &FunctionSpec) -> impl Iterator<Item = &'static ParamSpe
 pub fn sql_doc(p: &ParamSpec) -> &'static str {
     match (p.ty, p.name) {
         (ParamType::Attribute, "attribute") => ATTRIBUTE_DOC,
+        (ParamType::Choice(_), "agg") => AGG_DOC,
         _ => p.doc,
     }
 }

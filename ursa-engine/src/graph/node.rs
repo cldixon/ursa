@@ -131,7 +131,14 @@ impl GraphAlgorithmNode {
         }
         for o in &outputs {
             let spec = super::functions::outputs(o.call.spec())[o.field];
-            fields.push(Field::new(&o.name, spec.ty.data_type(), spec.nullable));
+            // A neighbour aggregation's type depends on its values' type.
+            let ty = match (&o.call, &values) {
+                (Call::NeighborAgg { agg, .. }, Some(values)) => {
+                    super::kernels::neighbors_agg_type(*agg, values.schema().field(1).data_type())
+                }
+                _ => spec.ty.data_type(),
+            };
+            fields.push(Field::new(&o.name, ty, spec.nullable));
         }
         let schema = Arc::new(DFSchema::try_from(Schema::new(fields))?);
         Ok(Self {

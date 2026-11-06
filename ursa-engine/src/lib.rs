@@ -2,8 +2,10 @@
 //!
 //! [`new_session`] builds a DataFusion [`SessionContext`] on which a file is a
 //! table: `SELECT * FROM 'edges.parquet'`, `'edges.csv.gz'`, `'edges/'`,
-//! `'edges/*.parquet'`, and the same over `s3://`, `gs://`, `az://` and
-//! `https://`, with object stores registered the first time a URL is read.
+//! `'edges/*.parquet'`, `'events.jsonl'`, and the same over `s3://`, `gs://`,
+//! `az://` and `https://`, with object stores registered the first time a URL
+//! is read. `read_parquet`, `read_csv` and `read_json` read the same with
+//! options ([`read_functions`]).
 //!
 //! Graphs are defined per session ([`graph`]). A session may have a `.ursa`
 //! database ([`database`]), which keeps its catalog between processes.
@@ -20,12 +22,13 @@ mod file_table;
 pub mod graph;
 pub mod options;
 pub mod paths;
+pub mod read_functions;
 pub mod serial;
 pub mod stores;
 
 pub use blocking::{run_blocking, BlockingError};
 pub use error::user_message;
-pub use file_table::open_file_table;
+pub use file_table::{open_file_table, open_files, FileFormat, FileOptions};
 pub use stores::{ensure_object_store, ensure_object_store_for};
 
 /// A session with Ursa's defaults.
@@ -45,6 +48,7 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     let config = config.with_target_partitions(1);
     let config = graph::with_algorithms(graph::with_registry(config.with_information_schema(true)));
     let config = database::with_database_slot(options::with_options(config));
+    let config = read_functions::with_read_tables(config);
     let ctx = SessionContext::new_with_config(config);
     // Graph schemas are added to and dropped from the unwrapped catalogs.
     graph::registry_of(&ctx).set_catalogs(Arc::clone(ctx.state().catalog_list()));
@@ -65,8 +69,18 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     // In the browser, last: every plan runs on the task that polls it.
     #[cfg(target_arch = "wasm32")]
     let ctx = ctx.with_physical_optimizer_rule(Arc::new(serial::SingleTask));
-    let ctx: SessionContext = ctx.build().into();
+    let mut state = ctx.build();
+    for ext in ["jsonl", "ndjson"] {
+        state
+            .register_file_format(Arc::new(file_table::JsonLines(ext)), false)
+            .expect("registering a file format cannot fail");
+    }
+    let ctx: SessionContext = state.into();
     graph::register_functions(&ctx).expect("registering a relation planner cannot fail");
+    let reads = read_functions::ReadFunctions::new(ctx.state().config())
+        .expect("the session config has a place for read_* tables");
+    ctx.register_relation_planner(Arc::new(reads))
+        .expect("registering a relation planner cannot fail");
     factory.attach(ctx.state_weak_ref());
     ctx
 }

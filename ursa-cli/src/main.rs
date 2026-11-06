@@ -1,4 +1,4 @@
-//! `ursa`: SQL for graph analytics over Parquet and CSV files.
+//! `ursa`: SQL for graph analytics over Parquet, CSV, JSON and Arrow files.
 //!
 //! ```text
 //! ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
@@ -59,7 +59,7 @@ const AFTER_HELP: &str = concat!(
 #[command(
     name = "ursa",
     version = env!("URSA_VERSION"),
-    about = "SQL for graph analytics over Parquet and CSV files, local or in object storage.",
+    about = "SQL for graph analytics over Parquet, CSV, JSON and Arrow files, local or in object storage.",
     after_help = AFTER_HELP
 )]
 struct Args {

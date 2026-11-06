@@ -1,6 +1,6 @@
 [package]
 name = "ursa-cli"
-description = "The ursa command-line tool: SQL over Parquet and CSV files, local or in object storage."
+description = "The ursa command-line tool: SQL over Parquet, CSV, JSON and Arrow files, local or in object storage."
 # The SQL engine and CLI are versioned on their own: 0.6 is their first
 # release. The Python package (ursa-graph) follows the workspace version.
 version = "0.7.0-dev"

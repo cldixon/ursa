@@ -55,6 +55,7 @@ nav = [
     { "The shell" = "sql/shell.md" },
     { "Statements" = "sql/statements.md" },
     { "Pattern matching" = "sql/pattern-matching.md" },
+    { "Differences from DuckDB" = "sql/duckdb.md" },
     { "Function reference" = "sql/reference/functions.md" },
   ] },
 ]

@@ -494,6 +494,33 @@ async fn paths_in_a_view_are_stored_relative_wherever_they_appear() {
 }
 
 #[tokio::test]
+async fn paths_in_read_functions_are_stored_relative() {
+    let dir = karate_dir();
+    let path = dir.path().join("club.ursa");
+    let ctx = open(&path).await;
+    let statements = |d: &str| {
+        [
+            format!(
+                "CREATE VIEW members AS SELECT * FROM read_csv('{d}karate_nodes.csv', \
+                 header => true)"
+            ),
+            format!(
+                "CREATE VIEW ties AS SELECT * FROM read_csv(['{d}karate_edges.csv'], \
+                 delim => ',')"
+            ),
+        ]
+    };
+    let [members, ties] = statements(&format!("{}/", dir.path().display()));
+    ok(&ctx, &format!("{members}; {ties}; {KARATE}")).await;
+    let [members, ties] = statements("");
+    assert_eq!(catalog(&path), [members, ties, KARATE.to_string()]);
+    let expected = snapshot(&ctx).await;
+    drop(ctx);
+    let ctx = open(&path).await;
+    assert_eq!(snapshot(&ctx).await, expected);
+}
+
+#[tokio::test]
 async fn a_path_outside_the_database_directory_is_stored_absolute() {
     let data = karate_dir();
     let db_dir = tempfile::tempdir().unwrap();

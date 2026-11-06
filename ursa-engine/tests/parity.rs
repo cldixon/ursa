@@ -1,6 +1,8 @@
 //! The SQL engine against the Python library: the same graph functions with
 //! the same parameters must give the same columns (names and types), the same
-//! ids and the same values, floats bit for bit.
+//! ids and the same values, floats bit for bit. The one exception is
+//! `neighbors_agg`'s `count` and `n_unique`, integers in SQL and whole floats
+//! in Python ([`as_counts`]).
 //!
 //! The traversals return rows of their own; those are compared in order, as
 //! the Python library returns them. The traversals' parameters and defaults
@@ -98,6 +100,39 @@ fn sql_cell(column: &ArrayRef, row: usize) -> Cell {
         )),
         other => panic!("unexpected column type {other}"),
     }
+}
+
+/// Python's whole-float `double` columns as the `uint32` counts SQL returns:
+/// each value must be a whole number, which the count then is.
+fn as_counts(
+    columns: Vec<(String, String)>,
+    rows: Vec<Vec<Cell>>,
+) -> (Vec<(String, String)>, Vec<Vec<Cell>>) {
+    let doubles: Vec<bool> = columns.iter().map(|(_, t)| t == "double").collect();
+    let columns = columns
+        .into_iter()
+        .map(|(name, t)| match t.as_str() {
+            "double" => (name, "uint32".to_string()),
+            _ => (name, t),
+        })
+        .collect();
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .zip(&doubles)
+                .map(|(cell, &double)| match (cell, double) {
+                    (Cell::Bits(bits), true) => {
+                        let x = f64::from_bits(u64::from_str_radix(&bits, 16).unwrap());
+                        assert_eq!(x.fract(), 0.0, "a count of {x}");
+                        Cell::Int(x as i64)
+                    }
+                    (cell, _) => cell,
+                })
+                .collect()
+        })
+        .collect();
+    (columns, rows)
 }
 
 /// Rows keyed by their `id` (the first cell) for a per-node result, whose row
@@ -327,6 +362,15 @@ async fn sql_matches_the_python_library() {
                     .collect()
             })
             .collect();
+        // One deliberate difference: SQL's `neighbors_agg` counts are
+        // integers (`UInt32`, as `degree`), where Python's are whole floats.
+        let counts = function == "neighbors_agg"
+            && (args.contains("'count'") || args.contains("'n_unique'"));
+        let (expected_columns, expected) = if counts {
+            as_counts(expected_columns, expected)
+        } else {
+            (expected_columns, expected)
+        };
         if catalog::lookup(function).is_some_and(|s| s.family == Family::Layout) {
             let id_type = match expected_columns[0].1.as_str() {
                 "int64" => DataType::Int64,
