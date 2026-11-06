@@ -8,14 +8,17 @@
 //! `direction => 'both'` forms, a layout's `x` and `y`, and a call repeated
 //! under two names.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray};
-use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
+use datafusion::arrow::array::{make_comparator, Array, ArrayRef, AsArray, UInt32Array};
+use datafusion::arrow::compute::{
+    cast, cast_with_options, concat, sort_to_indices, take, CastOptions, SortOptions,
+};
 use datafusion::arrow::datatypes::{DataType, Float64Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
+use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Evaluator, Inputs, OutputDtype};
 
 use super::index::GraphIndex;
@@ -25,12 +28,15 @@ use super::traversal;
 /// The batch for `outputs` over `index`: `id` first when `per_node`, then one
 /// column per output. `weights` holds one column per weight expression, one
 /// `f64` per edge row in the order the index was built from; `values` one
-/// value per node, in dense order, for a neighbour aggregation.
+/// value per node, in dense order, for a neighbour aggregation. A column whose
+/// type in `schema` is not the kernel's `Float64` is converted to it: a count
+/// to an integer, the `min` or `max` of values read by order back to a value
+/// (see [`neighbors_agg_type`]).
 pub fn batch(
     index: &GraphIndex,
     outputs: &[Output],
     weights: &[std::sync::Arc<Vec<f64>>],
-    values: Option<&[Option<f64>]>,
+    values: Option<&NodeValues>,
     per_node: bool,
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
@@ -43,15 +49,127 @@ pub fn batch(
     for o in outputs {
         let inputs = Inputs {
             weights: o.weight.map(|i| weights[i].as_slice()),
-            attribute: o.call.spec().reads_attribute().then_some(values).flatten(),
+            attribute: o
+                .call
+                .spec()
+                .reads_attribute()
+                .then_some(values.map(|v| v.values.as_slice()))
+                .flatten(),
         };
         let column = eval
             .column(&o.call, inputs, o.field, OutputDtype::F64)
             .map_err(|e| DataFusionError::Internal(format!("{}: {e}", o.call.name())))?;
-        columns.push(column);
+        let to = schema.field(columns.len()).data_type();
+        let ordered = values.and_then(|v| v.ordered.as_ref());
+        columns.push(retype(column, to, ordered)?);
     }
     RecordBatch::try_new(schema, columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// `column`, a kernel's `Float64`, as type `to`: an integer count cast, or
+/// the index of a value in `ordered` (the `min` or `max` of values read by
+/// order) taken from it.
+fn retype(column: ArrayRef, to: &DataType, ordered: Option<&ArrayRef>) -> Result<ArrayRef> {
+    if column.data_type() == to {
+        return Ok(column);
+    }
+    match ordered {
+        Some(ordered) if ordered.data_type() == to => {
+            let positions: UInt32Array = column
+                .as_primitive::<Float64Type>()
+                .iter()
+                .map(|p| p.map(|p| p as u32))
+                .collect();
+            Ok(take(ordered.as_ref(), &positions, None)?)
+        }
+        _ => Ok(cast(&column, to)?),
+    }
+}
+
+/// The type of `neighbors_agg`'s column for `agg` over values of type
+/// `value`: `UInt32` for `count` and `n_unique`, as `degree`'s; the values'
+/// type for the `min` or `max` of values read by order (strings, dates,
+/// times and timestamps, see [`is_ordered`]); else `Float64`.
+pub fn neighbors_agg_type(agg: AggKind, value: &DataType) -> DataType {
+    match agg {
+        AggKind::Count | AggKind::NUnique => DataType::UInt32,
+        AggKind::Min | AggKind::Max if is_ordered(value) => ordered_type(value),
+        _ => DataType::Float64,
+    }
+}
+
+/// Whether node values of type `t` are read by their order, not as numbers:
+/// strings, dates, times, timestamps and durations.
+pub fn is_ordered(t: &DataType) -> bool {
+    match t {
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(..)
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_) => true,
+        DataType::Dictionary(_, value) => is_ordered(value),
+        t => is_string(t),
+    }
+}
+
+/// The type node values of type `t` (read by order) are kept as: strings as
+/// `Utf8`, a dictionary as its values.
+fn ordered_type(t: &DataType) -> DataType {
+    match t {
+        DataType::Dictionary(_, value) => ordered_type(value),
+        t if is_string(t) => DataType::Utf8,
+        t => t.clone(),
+    }
+}
+
+/// A neighbour aggregation's node values, one per node in dense order.
+#[derive(Debug)]
+pub struct NodeValues {
+    /// Each node's value as the kernels read it: a number, or for values read
+    /// by order, the index of its value in `ordered`.
+    pub values: Vec<Option<f64>>,
+    /// For values read by order ([`is_ordered`]): the distinct values,
+    /// sorted, so the order of two indexes is that of their values.
+    pub ordered: Option<ArrayRef>,
+}
+
+/// For each row of `columns` (values read by order), the index of its value
+/// among the distinct values, sorted; and those values.
+fn order_codes(columns: &[&ArrayRef]) -> Result<(Vec<Vec<Option<f64>>>, ArrayRef)> {
+    let to = ordered_type(columns[0].data_type());
+    let cast_columns = columns
+        .iter()
+        .map(|c| cast(c, &to))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let refs: Vec<&dyn Array> = cast_columns.iter().map(|c| c.as_ref()).collect();
+    let all = concat(&refs)?;
+    let sorted = sort_to_indices(&all, None, None)?;
+    let compare = make_comparator(all.as_ref(), all.as_ref(), SortOptions::default())?;
+    let mut codes: Vec<Option<f64>> = vec![None; all.len()];
+    let mut distinct: Vec<u32> = Vec::new();
+    for &row in sorted.values() {
+        if all.is_null(row as usize) {
+            continue;
+        }
+        let new = distinct
+            .last()
+            .is_none_or(|&last| compare(last as usize, row as usize) != Ordering::Equal);
+        if new {
+            distinct.push(row);
+        }
+        codes[row as usize] = Some((distinct.len() - 1) as f64);
+    }
+    let ordered = take(all.as_ref(), &UInt32Array::from(distinct), None)?;
+    let mut per_column = Vec::with_capacity(columns.len());
+    let mut rest = codes.as_slice();
+    for c in columns {
+        let (head, tail) = rest.split_at(c.len());
+        per_column.push(head.to_vec());
+        rest = tail;
+    }
+    Ok((per_column, ordered))
 }
 
 /// Whether a column of type `t` holds strings.
@@ -68,16 +186,17 @@ pub fn is_string(t: &DataType) -> bool {
 ///
 /// As the Python library reads a node frame's column: a row whose id is
 /// null or not a node of the graph is skipped, a null value leaves its node
-/// without one, numbers are read as `f64`, and strings (for `count` and
-/// `n_unique`, checked when the query is planned) as a code per distinct
-/// string. The ids follow the node-id rule of the traversals (#271): integers,
+/// without one, and numbers are read as `f64`. Strings, dates, times and
+/// timestamps (for `count`, `n_unique`, `min` and `max`, checked when the
+/// query is planned) are read by order: as the index of the value among the
+/// distinct values, sorted. The ids follow the node-id rule of the traversals (#271): integers,
 /// or strings that are exactly an integer on a graph with integer ids. A node given two rows is an error: which one
 /// counts would depend on row order.
 pub fn node_values(
     index: &GraphIndex,
     graph: &str,
     batches: Vec<Vec<ArrayRef>>,
-) -> Result<Vec<Option<f64>>> {
+) -> Result<NodeValues> {
     let id_type = index.ids.user_type();
     let wrong_id = |got: String| {
         let kind = match id_type {
@@ -91,7 +210,16 @@ pub fn node_values(
     };
     let mut out: Vec<Option<f64>> = vec![None; index.ids.len()];
     let mut given = vec![false; out.len()];
-    let mut codes: HashMap<String, f64> = HashMap::new();
+    let by_order = batches
+        .first()
+        .is_some_and(|b| is_ordered(b[1].data_type()));
+    let (mut codes, ordered) = if by_order {
+        let columns: Vec<&ArrayRef> = batches.iter().map(|b| &b[1]).collect();
+        let (codes, ordered) = order_codes(&columns)?;
+        (codes.into_iter(), Some(ordered))
+    } else {
+        (Vec::new().into_iter(), None)
+    };
     let strict = CastOptions {
         safe: false,
         ..CastOptions::default()
@@ -117,16 +245,8 @@ pub fn node_values(
             .ids
             .dense_from_array(user_ids.as_ref())
             .map_err(|e| DataFusionError::Execution(format!("neighbors_agg(values =>): {e}")))?;
-        let value_of: Box<dyn Fn(usize) -> Option<f64>> = if is_string(values.data_type()) {
-            let text = cast(values, &DataType::Utf8)?;
-            let text = text.as_string::<i32>().clone();
-            let mut row_codes = Vec::with_capacity(text.len());
-            for i in 0..text.len() {
-                row_codes.push(text.is_valid(i).then(|| {
-                    let next = codes.len() as f64;
-                    *codes.entry(text.value(i).to_string()).or_insert(next)
-                }));
-            }
+        let value_of: Box<dyn Fn(usize) -> Option<f64>> = if by_order {
+            let row_codes = codes.next().unwrap_or_default();
             Box::new(move |i| row_codes[i])
         } else {
             let numbers = cast(values, &DataType::Float64)?;
@@ -146,7 +266,10 @@ pub fn node_values(
             out[node] = value_of(row);
         }
     }
-    Ok(out)
+    Ok(NodeValues {
+        values: out,
+        ordered,
+    })
 }
 
 /// Row `row` of `values` as SQL writes it (`'Valjean'`, `2.5`).

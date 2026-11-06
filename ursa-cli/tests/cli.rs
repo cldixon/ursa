@@ -251,6 +251,124 @@ fn gzip_csv() {
 }
 
 #[test]
+fn json_lines_by_extension() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let dir = tempfile::tempdir().unwrap();
+    let lines = "{\"src\": 0, \"dst\": 1}\n{\"src\": 1, \"dst\": 2}\n";
+    std::fs::create_dir(dir.path().join("parts")).unwrap();
+    for name in [
+        "edges.json",
+        "edges.jsonl",
+        "edges.ndjson",
+        "parts/a.jsonl",
+        "parts/b.jsonl",
+    ] {
+        std::fs::write(dir.path().join(name), lines).unwrap();
+    }
+    let mut gz = GzEncoder::new(
+        std::fs::File::create(dir.path().join("edges.jsonl.gz")).unwrap(),
+        Compression::default(),
+    );
+    gz.write_all(lines.as_bytes()).unwrap();
+    gz.finish().unwrap();
+    let root = dir.path().display();
+    for location in [
+        "edges.json",
+        "edges.jsonl",
+        "edges.ndjson",
+        "edges.jsonl.gz",
+        "parts/*.jsonl",
+        "parts/",
+    ] {
+        let sql = format!("SELECT count(*) AS n, max(dst) AS top FROM '{root}/{location}'");
+        let n = if location.starts_with("parts") { 4 } else { 2 };
+        assert_eq!(
+            ok(ursa(&["--format", "csv", "-c", &sql])),
+            format!("n,top\n{n},2\n"),
+            "{location}"
+        );
+    }
+    // COPY writes .jsonl as it writes .json.
+    let copy = format!("COPY (SELECT 7 AS x) TO '{root}/out.jsonl'");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &copy])), "count\n1\n");
+    let read = format!("SELECT x FROM '{root}/out.jsonl'");
+    assert_eq!(ok(ursa(&["--format", "csv", "-c", &read])), "x\n7\n");
+}
+
+#[test]
+fn read_functions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("edges.txt"), "0|1\n1|2\n2|0\n").unwrap();
+    std::fs::write(dir.path().join("a.csv"), "src,dst\n0,1\n").unwrap();
+    std::fs::write(dir.path().join("b.csv"), "src,dst\n1,2\n2,3\n").unwrap();
+    std::fs::write(
+        dir.path().join("array.json"),
+        "[{\"src\": 0, \"dst\": 5}, {\"src\": 1, \"dst\": 6}]",
+    )
+    .unwrap();
+    let root = dir.path().display();
+    let csv = |sql: String| ok(ursa(&["--format", "csv", "-c", &sql]));
+    assert_eq!(
+        csv(format!(
+            "SELECT sum(column_2) AS s FROM read_csv('{root}/edges.txt', header => false, \
+             delim => '|')"
+        )),
+        "s\n3\n"
+    );
+    // DuckDB's `name = value` too.
+    assert_eq!(
+        csv(format!(
+            "SELECT count(*) AS n FROM read_csv('{root}/edges.txt', header = false, sep = '|')"
+        )),
+        "n\n3\n"
+    );
+    assert_eq!(
+        csv(format!(
+            "SELECT count(*) AS n FROM read_csv(['{root}/a.csv', '{root}/b.csv'])"
+        )),
+        "n\n3\n"
+    );
+    assert_eq!(
+        csv(format!(
+            "SELECT count(*) AS n FROM read_csv('{root}/*.csv')"
+        )),
+        "n\n3\n"
+    );
+    assert_eq!(
+        csv(format!(
+            "SELECT sum(dst) AS s FROM read_json('{root}/array.json', format => 'array')"
+        )),
+        "s\n11\n"
+    );
+    // In a subquery, a CTE and a view.
+    assert_eq!(
+        csv(format!(
+            "CREATE VIEW e AS SELECT * FROM read_csv('{root}/a.csv'); \
+             WITH b AS (SELECT * FROM read_csv('{root}/b.csv')) \
+             SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM b) AS n"
+        )),
+        "n\n3\n"
+    );
+    assert_eq!(
+        err(ursa(&[
+            "-c",
+            &format!("SELECT * FROM read_cvs('{root}/a.csv')")
+        ])),
+        "Error: there is no table function 'read_cvs'; did you mean 'read_csv'?\n"
+    );
+    assert_eq!(
+        err(ursa(&[
+            "-c",
+            &format!("SELECT * FROM read_csv('{root}/a.csv', qoute => '\"')")
+        ])),
+        "Error: read_csv() has no option 'qoute'; did you mean 'quote'? (it takes header, \
+         delim, sep, delimiter, quote, compression)\n"
+    );
+}
+
+#[test]
 fn local_glob_and_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.csv"), "src,dst\n0,1\n").unwrap();

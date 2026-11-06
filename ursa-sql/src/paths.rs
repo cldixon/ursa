@@ -7,7 +7,9 @@
 //!
 //! - in `CREATE VIEW`, every table in its query named by a quoted name that
 //!   reads as a location (`FROM 'karate_edges.csv'`, `JOIN "data/x.parquet"`),
-//!   in subqueries, joins and CTEs too;
+//!   in subqueries, joins and CTEs too, and the paths of every `read_*` call
+//!   in it (`read_csv('karate_edges.csv')`, `read_parquet(['a.parquet',
+//!   'b.parquet'])`);
 //! - in `CREATE EXTERNAL TABLE`, its `LOCATION`s;
 //! - in `CREATE PROPERTY GRAPH`, a vertex or edge table (or a `REFERENCES`
 //!   table) named by such a name.
@@ -27,7 +29,8 @@ use datafusion::common::TableReference;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    visit_relations_mut, Ident, ObjectName, ObjectNamePart, Statement as SQLStatement,
+    visit_relations_mut, Ident, ObjectName, ObjectNamePart, Statement as SQLStatement, TableFactor,
+    VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::dialect::dialect_from_str;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
@@ -67,6 +70,7 @@ pub(crate) fn rewrite_locations(
                         }
                         ControlFlow::<()>::Continue(())
                     });
+                    let _ = view.query.visit(&mut ReadCalls(&mut rewrite));
                 }
             }
             _ => {}
@@ -91,6 +95,20 @@ pub(crate) fn rewrite_locations(
         _ => {}
     }
     changed
+}
+
+/// Visits the paths of the `read_*` calls in a query.
+struct ReadCalls<F>(F);
+
+impl<F: FnMut(&mut String)> VisitorMut for ReadCalls<F> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        for path in ursa_engine::read_functions::paths_mut(factor) {
+            (self.0)(path);
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// The identifier of `name` if it names a file: one quoted part that reads

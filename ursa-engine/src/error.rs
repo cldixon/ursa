@@ -24,16 +24,6 @@ use datafusion::sql::sqlparser::parser::ParserError;
 /// Ursa's wrappers, and check the text is still there: when an upgrade changes
 /// the wording, they fail and name the string to update.
 pub mod matched {
-    /// In the error `ListingTableConfig::infer_options` returns when a
-    /// location lists no file (an internal error). Ursa says "no file found
-    /// at '…'" instead (`file_table.rs`).
-    pub const NO_FILES_FOR_TABLE: &str = "No files for table";
-
-    /// In the error `ListingTableConfig::infer_options` returns for a file
-    /// whose extension names no format it knows. Ursa lists the formats it
-    /// reads instead (`file_table.rs`).
-    pub const NO_FILE_FORMAT_FOR_EXTENSION: &str = "No file_format found with extension";
-
     /// The start of the context DataFusion's optimizer puts on a rule's error
     /// (`Optimizer rule '…' failed`). Which rule failed is DataFusion's
     /// business: [`super::user_message`] drops it and keeps the cause.
@@ -124,9 +114,6 @@ mod tests {
 
     use datafusion::common::tree_node::Transformed;
     use datafusion::common::DFSchema;
-    use datafusion::datasource::listing::{
-        ListingTableConfig, ListingTableConfigExt, ListingTableUrl,
-    };
     use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
     use datafusion::optimizer::{Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule};
     use datafusion::prelude::SessionContext;
@@ -134,43 +121,6 @@ mod tests {
     use datafusion::sql::sqlparser::tokenizer::Tokenizer;
 
     use super::*;
-
-    /// What `ListingTableConfig::infer_options` says about `location`, which
-    /// must fail: the first step of opening a file as a table, as
-    /// `file_table.rs` does.
-    async fn infer_options_error(location: &std::path::Path) -> String {
-        let ctx = SessionContext::new();
-        let url = ListingTableUrl::parse(location.to_str().unwrap()).unwrap();
-        let err = ListingTableConfig::new(url)
-            .infer_options(&ctx.state())
-            .await
-            .expect_err("infer_options fails");
-        err.to_string()
-    }
-
-    #[tokio::test]
-    async fn datafusion_still_says_no_files_for_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let message = infer_options_error(dir.path()).await;
-        assert!(
-            message.contains(matched::NO_FILES_FOR_TABLE),
-            "DataFusion's message for a location with no file changed; update \
-             matched::NO_FILES_FOR_TABLE: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn datafusion_still_says_no_file_format_for_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("notes.txt");
-        std::fs::write(&file, "hello\n").unwrap();
-        let message = infer_options_error(&file).await;
-        assert!(
-            message.contains(matched::NO_FILE_FORMAT_FOR_EXTENSION),
-            "DataFusion's message for an unknown extension changed; update \
-             matched::NO_FILE_FORMAT_FOR_EXTENSION: {message}"
-        );
-    }
 
     /// An optimizer rule that always fails.
     #[derive(Debug)]

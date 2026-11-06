@@ -570,7 +570,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
                     &index,
                     &shape.outputs,
                     weights,
-                    values.as_deref(),
+                    values.as_ref(),
                     shape.per_node,
                     shape.schema,
                 )
