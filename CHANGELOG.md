@@ -62,8 +62,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     installer for them that checks each download's SHA-256 checksum:
     `curl -fsSL https://cldixon.github.io/ursa/install.sh | sh`, or
     `irm https://cldixon.github.io/ursa/install.ps1 | iex` on Windows.
+- **`ursa` for agents and scripts** (#312):
+  - `-f` files, `-c` and SQL on stdin take dot-commands, as `-init` files
+    and `.read` do, and as in DuckDB: `.timer on`, `.mode csv`, `.read`. In
+    a script, `.quit` and `.exit` end the run with status 0, and an unknown
+    dot-command is an error. With `--format arrow`, a dot-command's text
+    (the timer's, say) goes to stderr, so stdout stays one Arrow stream.
+  - `ursa --skill` prints the agent skill (`skills/ursa-sql/SKILL.md`),
+    built into the binary. `--help` ends with examples, a
+    `CREATE PROPERTY GRAPH` line, `ursa_functions()`, `--format json`,
+    `--skill` and the docs URL; the shell's `.help` and the installers point
+    to the docs too.
+  - `.functions NAME` shows one function's summary, its parameters one a
+    line (type, default, what it does, the values it takes) and its output
+    columns. A name that is not a function gets a suggestion.
+  - DuckDB statements Ursa does not have (`SUMMARIZE`, `PIVOT`, `UNPIVOT`,
+    `INSTALL`, `LOAD`, `PRAGMA`) and the `USING SAMPLE` clause are refused
+    with what to write instead, not with a parser error.
 
 ### Changed
+
+- **Behaviour change:** `.functions` lists each graph function's name,
+  family and the first sentence of its summary; before, it printed every
+  column of `ursa_functions()`, too wide to read. A statement that returns
+  rows prints its
+  header even with no rows, and DDL and `SET` print nothing; a test now
+  holds every kind of statement to that (#312).
+- `CREATE PROPERTY GRAPH` errors put their hint after the main clause:
+  "multi-column keys are not supported yet at Line: 2, Column: 36; KEY,
+  SOURCE KEY, DESTINATION KEY and REFERENCES take one column". Before, the
+  hint sat in parentheses in the middle of the sentence (#312).
 
 - A weighted algorithm over `scan_edges` reads the file as a stream. It
   builds the index and evaluates the weights one batch at a time, so the

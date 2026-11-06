@@ -41,11 +41,10 @@ const SKILL: &str = include_str!("ursa-sql-skill.md");
 /// The end of `--help`.
 const AFTER_HELP: &str = concat!(
     "Examples:\n",
-    "  ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"   any file is a table\n",
-    "  ursa --format json -c \"SELECT * FROM ursa_functions()\"\n",
-    "                                         JSON for programs: the graph functions\n",
-    "  ursa club.ursa -f query.sql            SQL and dot-commands from a file\n",
-    "  ursa club.ursa                         the shell; enter .help there\n",
+    "  ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"         # any file is a table\n",
+    "  ursa --format json -c \"SELECT * FROM ursa_functions()\"  # JSON, for programs\n",
+    "  ursa club.ursa -f query.sql                             # SQL and dot-commands\n",
+    "  ursa club.ursa                                          # the shell (.help)\n",
     "\n",
     "An edge table is a graph:\n",
     "  CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));\n",
