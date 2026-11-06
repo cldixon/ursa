@@ -12,6 +12,9 @@
 //! - [`csv`]: [`csv::CsvOptions`], CSV type inference (#216, #221) and the
 //!   location of a value that does not parse (#222).
 //! - [`store`]: object-store backends for a URL and the session a scan runs on.
+//! - [`ids`]: the node-id rules every source shares: which column types hold
+//!   ids and what they canonicalize to, `string_view` columns read as
+//!   strings, and rows with a null endpoint dropped (#269).
 //! - [`topology`]: Arrow endpoint columns to a topology index.
 //! - [`runtime`]: the process-wide Tokio runtime blocking reads run on.
 //! - [`dry`]: dry runs, which read a file's schema but no rows.
@@ -23,6 +26,7 @@
 
 pub mod csv;
 pub mod dry;
+pub mod ids;
 mod parquet_stats;
 pub mod runtime;
 pub mod scan;
