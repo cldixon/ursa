@@ -25,6 +25,7 @@ mod degree;
 mod hop;
 mod label_prop;
 mod layout;
+mod linked;
 mod louvain;
 mod neighbor_agg;
 mod pagerank;
