@@ -11,9 +11,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 ### Added
 
 - **Ursa SQL 0.6: a SQL engine for graph analytics, and the `ursa`
-  command-line tool** (crate `ursa-cli`, version 0.6.0; the engine crates
-  are `ursa-engine` and `ursa-sql`). This is its first release. It is
-  versioned apart from the Python package.
+  command-line tool** (crate `ursa-cli`, released as 0.6.0 on 2026-11-06;
+  the engine crates are `ursa-engine` and `ursa-sql`). This is its first
+  release. It is versioned apart from the Python package. Changes on `main`
+  since then arrive in `ursa-cli` 0.7.0.
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
@@ -83,6 +84,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   stored index's key, so changing the vertex table rebuilds the index;
   indexes stored before this change stay valid for graphs without a vertex
   table.
+- **The five crates `ursa-cli` installs from crates.io** (`ursa-core`,
+  `ursa-io`, `ursa-engine`, `ursa-sql`, `ursa-cli`) are released together at
+  one version, now `0.7.0-dev`. `ursa-core` and `ursa-io` no longer follow the
+  Python package's version, and the release workflow refuses a tag where any
+  of the five differ. A development build's `ursa --version` names its commit,
+  for example `ursa 0.7.0-dev (a1b2c3d4e)`. Releases publish to crates.io by
+  Trusted Publishing, with no stored API token.
 - A weighted algorithm over `scan_edges` reads the file as a stream. It
   builds the index and evaluates the weights one batch at a time, so the
   rows are never all held in memory. Before, it collected every row first.

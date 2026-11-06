@@ -11,6 +11,10 @@ CREATE VIEW ties    AS SELECT * FROM 'karate_edges.csv';
 
 ## CREATE PROPERTY GRAPH
 
+!!! info "New in 0.7"
+
+    0.6.0 accepts one vertex table with a `KEY` and one edge table. Several tables, optional `KEY`, `AS` names, `LABEL` and `PROPERTIES` (DuckPGQ's syntax included) arrive in `ursa-cli` 0.7.
+
 Defines a graph over vertex tables and edge tables. The syntax is SQL/PGQ's, the property graph part of the SQL standard, so a graph definition written for another SQL/PGQ engine, such as DuckPGQ, runs here too:
 
 ```text
@@ -43,7 +47,7 @@ CREATE PROPERTY GRAPH karate
 
 - **An edge table** is any table or view. Each row is an edge from its `SOURCE KEY` column to its `DESTINATION KEY` column. The two columns must have the same type: integers or strings.
 - **A vertex table** defines the nodes and gives them attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
-- **The node set.** With a vertex table, every key is a node, one with no edges included, and every algorithm, traversal and pattern runs on those nodes, in the table's order. An edge whose source or destination is not a key is left out, as DuckPGQ leaves it out; `describe` counts such edges in `n_dropped_edges`. A NULL key is no node, and a key given twice is one node.
+- **The node set** (new in 0.7; in 0.6.0 the algorithms see only the edges' endpoints). With a vertex table, every key is a node, one with no edges included, and every algorithm, traversal and pattern runs on those nodes, in the table's order. An edge whose source or destination is not a key is left out, as DuckPGQ leaves it out; `describe` counts such edges in `n_dropped_edges`. A NULL key is no node, and a key given twice is one node.
 - **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
 - **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise. DuckPGQ's order, `Student PROPERTIES (id, name) LABEL Person`, gives `Person` those properties.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
@@ -74,6 +78,10 @@ CREATE PROPERTY GRAPH first EDGE TABLES (first_ties SOURCE KEY (src) DESTINATION
 `OR REPLACE` replaces a graph of the same name. `IF NOT EXISTS` does nothing if there is one. Defining a graph that exists without either is an error.
 
 ### Several tables
+
+!!! info "New in 0.7"
+
+    Graphs of several tables arrive in `ursa-cli` 0.7.
 
 A graph can have any number of vertex and edge tables. Here members follow each other and write posts:
 

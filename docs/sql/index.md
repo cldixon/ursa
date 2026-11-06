@@ -1,14 +1,8 @@
 # Ursa SQL
 
-!!! warning "Not released yet"
+!!! info "Versions"
 
-    The SQL engine and the `ursa` command-line tool will first be released as `ursa-cli` 0.6. Until then, the install script, `cargo install ursa-cli` and the release downloads described in [Getting Started](getting-started.md#install) do not work yet. To try it now, build it from this repository:
-
-    ```bash
-    cargo install --git https://github.com/cldixon/ursa ursa-cli
-    ```
-
-    This is the SQL engine's first release, and its SQL surface may still change between minor versions. The [changelog](../changelog.md) records every change.
+    The newest release is `ursa-cli` 0.6.0; see [Getting Started](getting-started.md#install) to install it. Features marked **New in 0.7** are on `main` and arrive in the next release; to use them now, build from the repository with `cargo install --git https://github.com/cldixon/ursa ursa-cli`. The SQL surface may still change between minor versions, and the [changelog](../changelog.md) records every change.
 
 Ursa SQL is a SQL engine for graph analytics, used through a command-line tool called `ursa`. It works like DuckDB. You point it at Parquet or CSV files, on your disk or in object storage, and query them with SQL. Graph algorithms are part of that SQL. Nothing needs converting or loading first.
 
@@ -73,7 +67,7 @@ Both run the same kernels, from one catalog of algorithms. The same graph and th
 A few things differ:
 
 - **Row order.** A SQL result has no order unless you write `ORDER BY`. The Python library returns rows in a fixed order.
-- **Subgraph nodes.** A filtered edge frame in Python keeps the parent's nodes. A SQL graph's nodes are its vertex table's keys, as SQL/PGQ defines them, so a subgraph over a filtered view with the parent's vertex table keeps them too, and gives the same results as the Python frame. Without a vertex table, a SQL graph's nodes are the endpoints of the edges it keeps. In both, `describe(g, nodes => 'touched')` describes only the nodes at an end of a kept edge.
+- **Subgraph nodes** (new in 0.7). A filtered edge frame in Python keeps the parent's nodes. A SQL graph's nodes are its vertex table's keys, as SQL/PGQ defines them, so a subgraph over a filtered view with the parent's vertex table keeps them too, and gives the same results as the Python frame. Without a vertex table, a SQL graph's nodes are the endpoints of the edges it keeps. In both, `describe(g, nodes => 'touched')` describes only the nodes at an end of a kept edge.
 - **Edges to no node.** A SQL edge whose source or destination is not a key of the vertex table is left out of the graph, as in DuckPGQ; `describe` counts them in `n_dropped_edges`, a column the Python library's `describe` does not have.
 - **Layouts.** These are in the Python library only, for now.
 - **Neighbour aggregation.** Python aggregates a column of a node frame: `ur.neighbors(edges).agg(ur.col("age").mean())`. SQL takes the values as a query, or as a column of the graph's node table: `neighbors_agg(g, values => (SELECT id, age FROM people), agg => 'mean')`.

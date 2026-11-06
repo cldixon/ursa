@@ -3,7 +3,7 @@ name = "ursa-cli"
 description = "The ursa command-line tool: SQL over Parquet and CSV files, local or in object storage."
 # The SQL engine and CLI are versioned on their own: 0.6 is their first
 # release. The Python package (ursa-graph) follows the workspace version.
-version = "0.6.0"
+version = "0.7.0-dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,8 +26,8 @@ default = ["aws-profile"]
 aws-profile = ["ursa-engine/aws-profile"]
 
 [dependencies]
-ursa-engine = { path = "../ursa-engine", version = "0.6.0" }
-ursa-sql = { path = "../ursa-sql", version = "0.6.0" }
+ursa-engine = { path = "../ursa-engine", version = "0.7.0-dev" }
+ursa-sql = { path = "../ursa-sql", version = "0.7.0-dev" }
 arrow = { workspace = true, features = ["prettyprint"] }
 datafusion = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }

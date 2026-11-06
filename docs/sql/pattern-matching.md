@@ -1,5 +1,9 @@
 # Pattern matching
 
+!!! info "New in 0.7"
+
+    `GRAPH_TABLE` arrives in `ursa-cli` 0.7. It is not in 0.6.0; until 0.7 is released, build `ursa` from the repository to use it: `cargo install --git https://github.com/cldixon/ursa ursa-cli`.
+
 `GRAPH_TABLE` finds patterns of nodes and edges in a graph and returns them as a table. It is SQL/PGQ's pattern matching, the part of the SQL standard for property graphs, so a `GRAPH_TABLE` query written for another SQL/PGQ engine, such as DuckPGQ, runs here too.
 
 The examples on this page share one session. They use the karate club graph from [Getting started](getting-started.md):

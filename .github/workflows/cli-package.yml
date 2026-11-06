@@ -55,8 +55,22 @@ jobs:
         run: |
           expected=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
-          ./target/release/ursa --version
-          test "$(./target/release/ursa --version)" = "ursa $expected"
+          got=$(./target/release/ursa --version)
+          echo "$got"
+          # A development version also names its commit: "ursa 0.7.0-dev (a1b2c3d4e)".
+          case "$expected" in
+            *-*) [[ "$got" == "ursa $expected ("*")" ]] ;;
+            *) test "$got" = "ursa $expected" ;;
+          esac
+
+      - name: The published crates share one version
+        run: |
+          # ursa-cli needs these from crates.io; a release publishes them together.
+          versions=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '
+            .packages[] | select(.name | IN("ursa-core","ursa-io","ursa-engine","ursa-sql","ursa-cli"))
+            | "\(.name) \(.version)"')
+          echo "$versions"
+          test "$(echo "$versions" | cut -d' ' -f2 | sort -u | wc -l)" -eq 1
 
       - name: Run a query
         run: |
