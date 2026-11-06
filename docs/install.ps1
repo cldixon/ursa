@@ -135,4 +135,6 @@
     Write-Host ''
     Write-Host 'Try it:'
     Write-Host '  ursa -c "SELECT 42"'
+    Write-Host ''
+    Write-Host 'Docs: https://cldixon.github.io/ursa/sql/'
 }

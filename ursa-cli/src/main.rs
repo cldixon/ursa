@@ -11,14 +11,14 @@
 //! With a database file (`club.ursa`), views, external tables and graphs are
 //! kept in it between runs; without one, the session is in memory. With no
 //! SQL to run and a terminal on stdin, `ursa` starts the shell ([`shell`],
-//! [`repl`]).
+//! [`repl`]). `-c`, `-f` and stdin run through the shell too, so they may hold
+//! dot-commands (`.timer on`, `.mode csv`, `.read FILE`), as in DuckDB.
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use arrow::error::ArrowError;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use datafusion::error::DataFusionError;
@@ -30,16 +30,38 @@ mod repl;
 mod shell;
 mod startup;
 
-use print::{has_columns, write_stream, OutputFormat};
+use print::{is_broken_pipe, OutputFormat};
 use shell::{Flow, Shell};
+
+/// The agent skill for writing Ursa SQL, which `--skill` prints: a copy of
+/// `skills/ursa-sql/SKILL.md` kept in the crate, so the published crate has
+/// it too (tests/cli.rs checks that the two match).
+const SKILL: &str = include_str!("ursa-sql-skill.md");
+
+/// The end of `--help`.
+const AFTER_HELP: &str = concat!(
+    "Examples:\n",
+    "  ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"   any file is a table\n",
+    "  ursa --format json -c \"SELECT * FROM ursa_functions()\"\n",
+    "                                         JSON for programs: the graph functions\n",
+    "  ursa club.ursa -f query.sql            SQL and dot-commands from a file\n",
+    "  ursa club.ursa                         the shell; enter .help there\n",
+    "\n",
+    "An edge table is a graph:\n",
+    "  CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));\n",
+    "  SELECT * FROM pagerank(g) ORDER BY pagerank DESC LIMIT 5;\n",
+    "\n",
+    "SELECT * FROM ursa_functions() lists the graph functions and their parameters.\n",
+    "ursa --skill prints a guide to writing Ursa SQL, for coding agents.\n",
+    "Docs: https://cldixon.github.io/ursa/sql/",
+);
 
 #[derive(Debug, Parser)]
 #[command(
     name = "ursa",
     version,
     about = "SQL for graph analytics over Parquet and CSV files, local or in object storage.",
-    after_help = "Any file is a table: ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"\n\
-                  With no SQL to run, ursa starts an interactive shell; enter .help there."
+    after_help = AFTER_HELP
 )]
 struct Args {
     /// A database file (.ursa), created if it does not exist. It keeps the
@@ -57,7 +79,7 @@ struct Args {
     #[arg(short = 'c', long = "command", value_name = "SQL")]
     command: Vec<String>,
 
-    /// Run the SQL in a file and exit. May be repeated.
+    /// Run the SQL and dot-commands in a file and exit. May be repeated.
     #[arg(short = 'f', long = "file", value_name = "PATH")]
     file: Vec<PathBuf>,
 
@@ -79,6 +101,11 @@ struct Args {
     /// the file $URSA_HISTORY names (set it empty to keep none).
     #[arg(long = "no-history")]
     no_history: bool,
+
+    /// Print a guide to writing Ursa SQL, for coding agents (an agent skill,
+    /// in Markdown), and exit.
+    #[arg(long = "skill")]
+    skill: bool,
 }
 
 /// Where SQL comes from, in the order given on the command line.
@@ -94,6 +121,11 @@ fn main() -> ExitCode {
         Ok(args) => args,
         Err(e) => e.exit(),
     };
+    if args.skill {
+        // A reader that stops early (`ursa --skill | head`) is not an error.
+        let _ = io::stdout().write_all(SKILL.as_bytes());
+        return ExitCode::SUCCESS;
+    }
 
     if let Some(database) = &args.database {
         if !database.ends_with(".ursa") {
@@ -127,7 +159,9 @@ fn main() -> ExitCode {
     };
     let format_given = matches.value_source("format") == Some(ValueSource::CommandLine);
     match runtime.block_on(run(sources, &args, interactive, format_given)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        // The shell has printed the error.
+        Ok(false) => ExitCode::FAILURE,
         // A reader that stops early (`ursa … | head`) is not an error.
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => fail(&ursa_engine::user_message(&e)),
@@ -194,12 +228,14 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Run the session. `Ok(false)` when a statement failed (the error is
+/// printed).
 async fn run(
     sources: Vec<Source>,
     args: &Args,
     interactive: bool,
     format_given: bool,
-) -> Result<(), DataFusionError> {
+) -> Result<bool, DataFusionError> {
     // Open (or create) the database even with no SQL to run, so `ursa
     // club.ursa` makes the file, as Getting Started says.
     let ctx = match &args.database {
@@ -231,13 +267,18 @@ async fn run(
 const INDEX_STATS_VAR: &str = "URSA_INDEX_STATS";
 
 /// Run the init file, then the shell or the SQL given, on `ctx`.
+///
+/// Errors in the init file are printed and it goes on, as in the shell.
+/// The SQL given (`-c`, `-f`, stdin) is a script: each source is read as if
+/// typed, dot-commands included, and the first error stops everything
+/// ([`Shell::stop_on_error`]).
 async fn run_session(
     ctx: SessionContext,
     sources: Vec<Source>,
     args: &Args,
     interactive: bool,
     format_given: bool,
-) -> Result<(), DataFusionError> {
+) -> Result<bool, DataFusionError> {
     let home = startup::home_dir();
     let init = startup::init_file(
         args.init.as_deref(),
@@ -246,15 +287,22 @@ async fn run_session(
         home.as_deref(),
     );
     if !interactive && init.is_none() && sources.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
-    let mut shell = Shell::new(ctx, args.format, io::stdout(), io::stderr());
+    // The shell flushes after each result and message; a script's output is
+    // buffered in between.
+    let out: Box<dyn Write> = if interactive {
+        Box::new(io::stdout())
+    } else {
+        Box::new(io::BufWriter::new(io::stdout()))
+    };
+    let mut shell = Shell::new(ctx, args.format, out, io::stderr());
     if interactive {
         println!("{}", banner(args));
     }
     if let Some(init) = init {
         if shell.run_file(&init).await == Flow::Exit {
-            return Ok(());
+            return Ok(true);
         }
         // `-f` given on the command line wins over a `.mode` in the file.
         if format_given {
@@ -267,18 +315,15 @@ async fn run_session(
             std::env::var_os(startup::HISTORY_VAR),
             home.as_deref(),
         );
-        return repl::run(&mut shell, history)
+        repl::run(&mut shell, history)
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)));
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        return Ok(true);
     }
 
-    let format = shell.mode();
-    let ctx = shell.ctx().clone();
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    let mut printed = 0;
+    shell.stop_on_error();
     for source in sources {
-        let sql = match source {
+        let text = match source {
             Source::Command(sql) | Source::Stdin(sql) => sql,
             Source::File(path) => std::fs::read_to_string(&path).map_err(|e| {
                 DataFusionError::Execution(format!(
@@ -288,10 +333,12 @@ async fn run_session(
                 ))
             })?,
         };
-        printed += run_sql(&ctx, &sql, format, &mut out, printed).await?;
+        // `.quit` or `.exit` in a script ends it, and the run, without error.
+        if shell.run_text(&text).await == Flow::Exit {
+            break;
+        }
     }
-    out.flush()?;
-    Ok(())
+    Ok(!shell.failed())
 }
 
 /// The shell's first line: the version, and what the session is.
@@ -305,46 +352,6 @@ fn banner(args: &Args) -> String {
         "ursa {}, {session}. Enter .help for commands, .quit to exit.",
         env!("CARGO_PKG_VERSION")
     )
-}
-
-/// Parse all of `sql` (so a syntax error anywhere runs nothing), then run each
-/// statement and print its result. Returns how many results were printed.
-async fn run_sql<W: Write>(
-    ctx: &SessionContext,
-    sql: &str,
-    format: OutputFormat,
-    out: &mut W,
-    printed_before: usize,
-) -> Result<usize, DataFusionError> {
-    let statements = ursa_sql::parse_sql_with_text_for(ctx, sql)?;
-    let config = ctx.state().config().options().format.clone();
-    let options = (&config).try_into()?;
-    let mut printed = 0;
-    for (statement, text) in statements {
-        let frame = ursa_sql::execute_with_text(ctx, statement, &text).await?;
-        let stream = frame.execute_stream().await?;
-        if !has_columns(&stream.schema()) {
-            continue;
-        }
-        if format == OutputFormat::Arrow && printed_before + printed > 0 {
-            return Err(DataFusionError::Plan(
-                "--format arrow writes a single result; run one query that returns rows".into(),
-            ));
-        }
-        write_stream(format, stream, out, &options).await?;
-        printed += 1;
-    }
-    Ok(printed)
-}
-
-fn is_broken_pipe(err: &DataFusionError) -> bool {
-    match err {
-        DataFusionError::IoError(e) => e.kind() == io::ErrorKind::BrokenPipe,
-        DataFusionError::ArrowError(e, _) => {
-            matches!(e.as_ref(), ArrowError::IoError(_, e) if e.kind() == io::ErrorKind::BrokenPipe)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

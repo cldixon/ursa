@@ -220,10 +220,18 @@ pub(crate) fn parse_tables(p: &mut Parser) -> Result<(Vec<VertexTableDef>, Vec<E
             Vec::new()
         };
     if word(p, 0, "VERTEX") || word(p, 0, "NODE") {
-        return unsupported(p, "VERTEX TABLES after EDGE TABLES is");
+        return unsupported(
+            p,
+            "VERTEX TABLES after EDGE TABLES is",
+            "write VERTEX TABLES first",
+        );
     }
     if word(p, 0, "EDGE") || word(p, 0, "RELATIONSHIP") {
-        return unsupported(p, "a second EDGE TABLES clause is");
+        return unsupported(
+            p,
+            "a second EDGE TABLES clause is",
+            "list every edge table in one EDGE TABLES (…)",
+        );
     }
     Ok((vertices, edges))
 }
@@ -296,10 +304,8 @@ fn parse_endpoint(p: &mut Parser, side: &str) -> Result<EndpointDef> {
         if matches!(p.peek_token_ref().token, Token::Word(_)) {
             return unsupported(
                 p,
-                &format!(
-                    "{side} without KEY is (name the column with {side} KEY (column) \
-                     REFERENCES vertex_table (key))"
-                ),
+                &format!("{side} without KEY is"),
+                &format!("name the column with {side} KEY (column) REFERENCES vertex_table (key)"),
             );
         }
         return Ok(p.expected_ref("KEY", p.peek_token_ref())?);
@@ -347,7 +353,11 @@ fn parse_labels(p: &mut Parser) -> Result<Vec<LabelDef>> {
         });
     }
     if word(p, 0, "LABELS") || word(p, 0, "DEFAULT") {
-        return unsupported(p, "this label clause is (write LABEL name, once per label)");
+        return unsupported(
+            p,
+            "this label clause is",
+            "write LABEL name, once per label",
+        );
     }
     Ok(labels)
 }
@@ -372,14 +382,22 @@ fn parse_properties(p: &mut Parser) -> Result<PropertiesDef> {
         let column = match &p.peek_token_ref().token {
             Token::Word(_) => p.parse_identifier()?,
             _ => {
-                return unsupported(p, "a property that is not a column is");
+                return unsupported(
+                    p,
+                    "a property that is not a column is",
+                    "compute it in a view, and list the view's column",
+                );
             }
         };
         if !matches!(
             p.peek_token_ref().token,
             Token::Comma | Token::RParen | Token::Word(_)
         ) {
-            return unsupported(p, "a property that is not a column is");
+            return unsupported(
+                p,
+                "a property that is not a column is",
+                "compute it in a view, and list the view's column",
+            );
         }
         let alias = if consume_words(p, &["AS"]) {
             Some(p.parse_identifier()?)
@@ -396,19 +414,21 @@ fn parse_key(p: &mut Parser) -> Result<Ident> {
     p.expect_token(&Token::LParen)?;
     let column = p.parse_identifier()?;
     if p.peek_token_ref().token == Token::Comma {
-        return unsupported(
-            p,
-            "multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column)",
-        );
+        return unsupported(p, "multi-column keys are", ONE_COLUMN_KEYS);
     }
     p.expect_token(&Token::RParen)?;
     Ok(column)
 }
 
-/// The error for a SQL/PGQ feature beyond what Ursa supports, at the next token.
-fn unsupported<T>(p: &Parser, what: &str) -> Result<T> {
+/// The hint for a key of more than one column.
+const ONE_COLUMN_KEYS: &str = "KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column";
+
+/// The error for a SQL/PGQ feature beyond what Ursa supports, at the next
+/// token: "`what` not supported yet at Line: …, Column: …; `hint`". The hint
+/// comes after the main clause, so the sentence reads straight.
+fn unsupported<T>(p: &Parser, what: &str, hint: &str) -> Result<T> {
     Err(DataFusionError::NotImplemented(format!(
-        "{what} {NOT_SUPPORTED}{}",
+        "{what} {NOT_SUPPORTED}{}; {hint}",
         p.peek_token_ref().span.start
     )))
 }
@@ -667,18 +687,27 @@ mod tests {
 
     #[test]
     fn what_is_still_refused() {
-        let multi_column =
-            "multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column)";
-        for (sql, what) in [
+        let multi_column = ("multi-column keys are", ONE_COLUMN_KEYS);
+        let expression = (
+            "a property that is not a column is",
+            "compute it in a view, and list the view's column",
+        );
+        for (sql, (what, hint)) in [
             (
                 "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))
                    EDGE TABLES (f SOURCE KEY (s) DESTINATION KEY (d))",
-                "a second EDGE TABLES clause is",
+                (
+                    "a second EDGE TABLES clause is",
+                    "list every edge table in one EDGE TABLES (…)",
+                ),
             ),
             (
                 "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))
                    VERTEX TABLES (v KEY (id))",
-                "VERTEX TABLES after EDGE TABLES is",
+                (
+                    "VERTEX TABLES after EDGE TABLES is",
+                    "write VERTEX TABLES first",
+                ),
             ),
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (a, b))
@@ -697,25 +726,29 @@ mod tests {
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id))
                    EDGE TABLES (e SOURCE v DESTINATION v)",
-                "SOURCE without KEY is (name the column with SOURCE KEY (column) REFERENCES \
-                 vertex_table (key))",
+                (
+                    "SOURCE without KEY is",
+                    "name the column with SOURCE KEY (column) REFERENCES vertex_table (key)",
+                ),
             ),
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) PROPERTIES (upper(name)))",
-                "a property that is not a column is",
+                expression,
             ),
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) PROPERTIES (a + b))",
-                "a property that is not a column is",
+                expression,
             ),
             (
                 "CREATE PROPERTY GRAPH g VERTEX TABLES (v KEY (id) LABEL a DEFAULT LABEL)",
-                "this label clause is (write LABEL name, once per label)",
+                ("this label clause is", "write LABEL name, once per label"),
             ),
         ] {
             let message = error(sql);
+            // The main clause, then where, then the hint.
             assert!(
-                message.starts_with(&format!("{what} not supported yet at Line: ")),
+                message.starts_with(&format!("{what} not supported yet at Line: "))
+                    && message.ends_with(&format!("; {hint}")),
                 "{sql}\n{message}"
             );
         }

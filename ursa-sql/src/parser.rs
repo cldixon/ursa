@@ -8,12 +8,12 @@
 
 use std::fmt;
 
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::parser::{DFParser, DFParserBuilder, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
 use datafusion::sql::sqlparser::parser::ParserError;
-use datafusion::sql::sqlparser::tokenizer::{Location, Token};
+use datafusion::sql::sqlparser::tokenizer::{Location, Token, Tokenizer};
 
 use crate::property_graph::{parse_tables, write_tables, EdgeTableDef, VertexTableDef};
 
@@ -125,6 +125,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<UrsaStatement>> {
 /// Ursa's parser: DataFusion's, with Ursa's statements recognised first.
 pub struct UrsaParser<'a> {
     df: DFParser<'a>,
+    dialect: &'a dyn Dialect,
     /// The text being parsed, for [`Self::parse_statements_with_text`].
     sql: String,
 }
@@ -140,7 +141,7 @@ impl<'a> UrsaParser<'a> {
             .with_dialect(dialect)
             .with_recursion_limit(recursion_limit)
             .build()?;
-        Ok(Self { df, sql })
+        Ok(Self { df, dialect, sql })
     }
 
     /// Parse every statement, separated by `;`. Empty statements are skipped.
@@ -157,6 +158,17 @@ impl<'a> UrsaParser<'a> {
     /// (from its first token to its last, without the `;`). A database file
     /// stores this text when a statement's `Display` does not round-trip.
     pub fn parse_statements_with_text(&mut self) -> Result<Vec<(UrsaStatement, String)>> {
+        self.parse_all().map_err(|e| match e {
+            // A syntax error in a statement that uses DuckDB's `USING SAMPLE`
+            // says what to write instead.
+            DataFusionError::SQL(..) if self.uses_sample_clause() => {
+                DataFusionError::NotImplemented(USING_SAMPLE.to_string())
+            }
+            e => e,
+        })
+    }
+
+    fn parse_all(&mut self) -> Result<Vec<(UrsaStatement, String)>> {
         let mut statements = Vec::new();
         let mut expecting_delimiter = false;
         loop {
@@ -186,6 +198,9 @@ impl<'a> UrsaParser<'a> {
 
     /// Parse one statement.
     pub fn parse_statement(&mut self) -> Result<UrsaStatement> {
+        if let Some(message) = self.duckdb_statement() {
+            return Err(DataFusionError::NotImplemented(message.to_string()));
+        }
         if self.word(0, "CREATE") {
             let at = if self.word(1, "OR") && self.word(2, "REPLACE") {
                 3
@@ -228,6 +243,39 @@ impl<'a> UrsaParser<'a> {
         Ok(UrsaStatement::DataFusion(Box::new(
             self.df.parse_statement()?,
         )))
+    }
+
+    /// The refusal for a DuckDB statement Ursa does not have, if the next
+    /// statement is one (see [`DUCKDB_STATEMENTS`]).
+    fn duckdb_statement(&self) -> Option<&'static str> {
+        DUCKDB_STATEMENTS
+            .iter()
+            .find(|(word, _)| self.word(0, word))
+            .filter(|(word, _)| !(*word == "LOAD" && self.word(1, "DATA")))
+            .map(|(_, message)| *message)
+    }
+
+    /// Whether the text holds `USING SAMPLE`, outside quotes and comments.
+    /// Only called once parsing has failed, so a statement that parses pays
+    /// nothing for it.
+    fn uses_sample_clause(&self) -> bool {
+        let Ok(tokens) = Tokenizer::new(self.dialect, &self.sql).tokenize() else {
+            return false;
+        };
+        let is = |token: &Token, word: &str| {
+            matches!(token, Token::Word(w) if w.quote_style.is_none()
+                && w.value.eq_ignore_ascii_case(word))
+        };
+        let mut words = tokens
+            .iter()
+            .filter(|t| !matches!(t, Token::Whitespace(_)))
+            .peekable();
+        while let Some(token) = words.next() {
+            if is(token, "USING") && words.peek().is_some_and(|next| is(next, "SAMPLE")) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether the `n`th token ahead is the unquoted word `word`, in any case.
@@ -297,6 +345,46 @@ impl<'a> UrsaParser<'a> {
         Ok(UrsaStatement::Attach(Attach { path, alias }))
     }
 }
+
+/// DuckDB statements Ursa does not have, by their first word, with what to
+/// write instead. Without these, sqlparser's own error ("Expected: an SQL
+/// statement, found: SUMMARIZE") or DataFusion's ("Unsupported SQL
+/// statement") would be all a user, or an agent that knows DuckDB, sees.
+const DUCKDB_STATEMENTS: &[(&str, &str)] = &[
+    (
+        "SUMMARIZE",
+        "SUMMARIZE is not supported; use DESCRIBE t for the columns and their types, and \
+         SELECT count(*), min(c), max(c), avg(c) FROM t for a column's statistics",
+    ),
+    (
+        "PIVOT",
+        "PIVOT is not supported; use GROUP BY with one aggregate per column, as \
+         sum(x) FILTER (WHERE k = 'a') AS a",
+    ),
+    (
+        "UNPIVOT",
+        "UNPIVOT is not supported; use UNION ALL of one SELECT per column",
+    ),
+    (
+        "INSTALL",
+        "INSTALL is not supported: Ursa has no extensions; Parquet, CSV, JSON and object \
+         storage are built in",
+    ),
+    (
+        "LOAD",
+        "LOAD is not supported: Ursa has no extensions; Parquet, CSV, JSON and object \
+         storage are built in",
+    ),
+    (
+        "PRAGMA",
+        "PRAGMA is not supported; use SHOW ALL, SHOW name or SET name = value for settings, \
+         and SELECT * FROM ursa_functions() for the graph functions",
+    ),
+];
+
+/// The refusal for DuckDB's `USING SAMPLE` clause.
+const USING_SAMPLE: &str =
+    "USING SAMPLE is not supported; use ORDER BY random() LIMIT n for a sample of n rows";
 
 /// The text of `sql` between two token locations, or `None` if a location is
 /// unknown (line 0) or outside the text.
@@ -445,5 +533,47 @@ mod tests {
     fn missing_delimiter_is_a_syntax_error() {
         let err = parse_sql("SHOW GRAPHS SELECT 1").unwrap_err();
         assert!(err.to_string().contains("end of statement"), "{err}");
+    }
+
+    #[test]
+    fn duckdb_statements_say_what_to_write_instead() {
+        let message = |sql: &str| parse_sql(sql).unwrap_err().to_string();
+        for (sql, start) in [
+            ("SUMMARIZE t", "SUMMARIZE is not supported; use DESCRIBE t"),
+            ("summarize SELECT 1", "SUMMARIZE is not supported;"),
+            (
+                "PIVOT t ON k USING sum(x)",
+                "PIVOT is not supported; use GROUP BY",
+            ),
+            ("UNPIVOT t ON a, b", "UNPIVOT is not supported;"),
+            (
+                "INSTALL httpfs",
+                "INSTALL is not supported: Ursa has no extensions",
+            ),
+            (
+                "LOAD httpfs",
+                "LOAD is not supported: Ursa has no extensions",
+            ),
+            ("PRAGMA version", "PRAGMA is not supported; use SHOW ALL"),
+            (
+                "SELECT * FROM t USING SAMPLE 10",
+                "USING SAMPLE is not supported;",
+            ),
+            (
+                "SELECT * FROM t USING SAMPLE 10%",
+                "USING SAMPLE is not supported;",
+            ),
+            (
+                "SELECT 1; SELECT * FROM (SELECT * FROM t USING SAMPLE 5 ROWS)",
+                "USING SAMPLE is not supported; use ORDER BY random() LIMIT n",
+            ),
+        ] {
+            let message = message(sql);
+            assert!(message.contains(start), "{sql}\n{message}");
+        }
+        // Not when the words are data, or when the error is elsewhere.
+        assert!(parse_sql("SELECT 'USING SAMPLE' AS summarize").is_ok());
+        let message = message("SELEC 'USING SAMPLE'");
+        assert!(message.contains("Expected: an SQL statement"), "{message}");
     }
 }
