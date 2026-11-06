@@ -25,8 +25,11 @@ use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::aws::{resolve_bucket_region, AmazonS3Builder};
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::azure::MicrosoftAzureBuilder;
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use object_store::{ClientOptions, ObjectStore};
@@ -67,6 +70,7 @@ pub async fn build_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>> {
         DataFusionError::Execution(format!("cannot connect to {base}: {e}"))
     };
     let store: Arc<dyn ObjectStore> = match url.scheme() {
+        #[cfg(not(target_arch = "wasm32"))]
         "s3" | "s3a" => {
             let mut builder = AmazonS3Builder::from_env().with_url(url.as_str());
             // The region a profile names, used when the environment names
@@ -102,12 +106,14 @@ pub async fn build_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>> {
             }
             Arc::new(builder.build().map_err(failed)?)
         }
+        #[cfg(not(target_arch = "wasm32"))]
         "gs" | "gcs" => Arc::new(
             GoogleCloudStorageBuilder::from_env()
                 .with_url(url.as_str())
                 .build()
                 .map_err(failed)?,
         ),
+        #[cfg(not(target_arch = "wasm32"))]
         "az" | "azure" | "abfs" | "abfss" | "adl" => Arc::new(
             MicrosoftAzureBuilder::from_env()
                 .with_url(url.as_str())
@@ -123,6 +129,13 @@ pub async fn build_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>> {
                 .build()
                 .map_err(failed)?,
         ),
+        #[cfg(target_arch = "wasm32")]
+        other @ ("s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs" | "abfss" | "adl") => {
+            return Err(DataFusionError::Plan(format!(
+                "'{other}://' URLs are not available in the browser build; use an http:// or \
+                 https:// URL"
+            )))
+        }
         other => {
             return Err(DataFusionError::Plan(format!(
                 "Ursa cannot read '{other}://' URLs; use a local path or an s3://, gs://, az://, \
@@ -134,6 +147,7 @@ pub async fn build_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>> {
 }
 
 /// Whether any of the environment variables `keys` is set and not empty.
+#[cfg(not(target_arch = "wasm32"))]
 fn env_set(keys: &[&str]) -> bool {
     keys.iter()
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))

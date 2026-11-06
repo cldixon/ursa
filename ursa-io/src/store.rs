@@ -20,10 +20,14 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::http::HttpBuilder;
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use url::{Position, Url};
@@ -45,9 +49,13 @@ pub(crate) fn object_store_for(
         Err(_) => return Ok(None), // bare local path (e.g. "/tmp/x.csv" or "edges.csv")
     };
     let scheme = url.scheme();
+    #[cfg(target_arch = "wasm32")]
+    let _ = opts; // only the cloud backends, which wasm32 leaves out, read them
     let opt_err = |e: object_store::Error| DataFusionError::Execution(e.to_string());
     let store: Arc<dyn ObjectStore> = match scheme {
+        #[cfg(not(target_arch = "wasm32"))]
         "file" => Arc::new(LocalFileSystem::new()),
+        #[cfg(not(target_arch = "wasm32"))]
         "s3" | "s3a" => {
             let mut b = AmazonS3Builder::from_env().with_url(path);
             for (k, v) in opts {
@@ -55,6 +63,7 @@ pub(crate) fn object_store_for(
             }
             Arc::new(b.build().map_err(opt_err)?)
         }
+        #[cfg(not(target_arch = "wasm32"))]
         "gs" => {
             let mut b = GoogleCloudStorageBuilder::from_env().with_url(path);
             for (k, v) in opts {
@@ -62,6 +71,7 @@ pub(crate) fn object_store_for(
             }
             Arc::new(b.build().map_err(opt_err)?)
         }
+        #[cfg(not(target_arch = "wasm32"))]
         "az" | "azure" | "abfs" | "abfss" | "adl" => {
             let mut b = MicrosoftAzureBuilder::from_env().with_url(path);
             for (k, v) in opts {
@@ -84,6 +94,13 @@ pub(crate) fn object_store_for(
                     .build()
                     .map_err(opt_err)?,
             )
+        }
+        #[cfg(target_arch = "wasm32")]
+        other @ ("file" | "s3" | "s3a" | "gs" | "az" | "azure" | "abfs" | "abfss" | "adl") => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "'{other}://' URLs are not available in the browser build; use an http:// or \
+                 https:// URL"
+            )))
         }
         other => {
             return Err(DataFusionError::NotImplemented(format!(
