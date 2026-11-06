@@ -69,19 +69,32 @@ pub async fn write_stream<W: Write>(
             } else {
                 b'\t'
             };
+            // arrow-csv turns an I/O error into text (`CsvError("Broken
+            // pipe")`), so the sink records a broken pipe itself, and it is
+            // returned as one: `ursa --format csv … | head` then ends quietly.
+            let mut sink = BrokenPipeAware::new(&mut *out);
             let mut writer = CsvWriterBuilder::new()
                 .with_header(true)
                 .with_delimiter(delimiter)
-                .build(&mut *out);
+                .build(&mut sink);
             let mut wrote = false;
+            let mut written = Ok(());
             while let Some(batch) = stream.next().await {
-                writer.write(&batch?)?;
+                written = writer.write(&batch?);
+                if written.is_err() {
+                    break;
+                }
                 wrote = true;
             }
-            if !wrote {
+            if written.is_ok() && !wrote {
                 // An empty batch still writes the header row.
-                writer.write(&RecordBatch::new_empty(schema))?;
+                written = writer.write(&RecordBatch::new_empty(schema));
             }
+            drop(writer);
+            if sink.broken {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+            }
+            written?;
         }
         OutputFormat::Json => {
             let mut writer = ArrayWriter::new(&mut *out);
@@ -109,6 +122,43 @@ pub async fn write_stream<W: Write>(
     }
     out.flush()?;
     Ok(())
+}
+
+/// A writer that remembers whether a write failed with a broken pipe, for
+/// writers (arrow-csv) that do not pass the `io::Error` through.
+struct BrokenPipeAware<W> {
+    inner: W,
+    broken: bool,
+}
+
+impl<W: Write> BrokenPipeAware<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            broken: false,
+        }
+    }
+
+    fn note<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(e) = &result {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                self.broken = true;
+            }
+        }
+        result
+    }
+}
+
+impl<W: Write> Write for BrokenPipeAware<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let result = self.inner.write(buf);
+        self.note(result)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = self.inner.flush();
+        self.note(result)
+    }
 }
 
 /// Whether a result has anything to print. DDL and `SET` return no columns.
