@@ -24,6 +24,7 @@ edge_table   := table [AS name] [KEY (column)]
                 DESTINATION KEY (column) [REFERENCES vertex_table (column)]
                 [labels]
 labels       := DEFAULT LABEL [properties] | LABEL name [properties] [LABEL name [properties] …] | properties
+              | properties LABEL name [LABEL name …]
 properties   := PROPERTIES (column [AS name], …)
               | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (column, …)]
               | NO PROPERTIES
@@ -43,7 +44,7 @@ CREATE PROPERTY GRAPH karate
 - **An edge table** is any table or view. Each row is an edge from its `SOURCE KEY` column to its `DESTINATION KEY` column. The two columns must have the same type: integers or strings.
 - **A vertex table** gives nodes attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
 - **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
-- **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise.
+- **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise. DuckPGQ's order, `Student PROPERTIES (id, name) LABEL Person`, gives `Person` those properties.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
 
 A graph with one edge table and at most one vertex table is a schema with two tables. `karate.edges` holds the edge table's rows. `karate.nodes` holds one row per node, with the vertex table's columns:

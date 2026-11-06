@@ -21,7 +21,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     vertex and edge tables, `AS` names, `LABEL`, `PROPERTIES`, and a vertex
     `KEY` that may be left out (the primary key, or the column the edges
     `REFERENCES`, as DuckPGQ infers it), so DuckPGQ graph definitions run as
-    written (#295). Ursa adds optional vertex tables. A graph of one edge
+    written (#295), DuckPGQ's `PROPERTIES (…) LABEL x` order included
+    (#307). Ursa adds optional vertex tables. A graph of one edge
     table is a schema: `g.edges` and `g.nodes`. An algorithm runs on one
     vertex table and one edge table, named as DuckPGQ names them when a graph
     has several: `pagerank(g, person, knows)`. `DROP PROPERTY GRAPH`,
