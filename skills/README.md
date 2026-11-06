@@ -8,7 +8,7 @@ Skills that teach a coding agent to use Ursa. Each skill is a folder with a `SKI
 
 ## Install
 
-The agent also needs the `ursa` binary on its `PATH`: `cargo install ursa-cli`, or a binary from the [releases page](https://github.com/cldixon/ursa/releases).
+The agent also needs the `ursa` binary on its `PATH`: `curl -fsSL https://cldixon.github.io/ursa/install.sh | sh` on Linux or macOS (`irm https://cldixon.github.io/ursa/install.ps1 | iex` in PowerShell on Windows), `cargo install ursa-cli`, or a binary from the [releases page](https://github.com/cldixon/ursa/releases).
 
 **Claude Code.** Copy the folder into your skills directory, for one project or for all of them:
 
