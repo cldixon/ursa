@@ -58,7 +58,8 @@ A few things differ:
 
 - **Row order.** A SQL result has no order unless you write `ORDER BY`. The Python library returns rows in a fixed order.
 - **Subgraph nodes.** A SQL graph over a filtered view has the endpoints of the edges it keeps, as SQL/PGQ defines it. A filtered edge frame in Python keeps the parent's nodes.
-- **Layouts and neighbour aggregations.** These are in the Python library only, for now.
+- **Layouts.** These are in the Python library only, for now.
+- **Neighbour aggregation.** Python aggregates a column of a node frame: `ur.neighbors(edges).agg(ur.col("age").mean())`. SQL takes the values as a query, or as a column of the graph's node table: `neighbors_agg(g, values => (SELECT id, age FROM people), agg => 'mean')`.
 
 ## Where to go next
 

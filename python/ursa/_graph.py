@@ -22,6 +22,7 @@ These build ``Expr("graph", ...)`` nodes and the frames' Rust plan objects;
 from __future__ import annotations
 
 import functools
+import operator
 from collections.abc import Sequence
 from typing import Any
 
@@ -105,9 +106,45 @@ def _check_direction(verb: str, direction: str) -> str:
     return direction
 
 
-def _seeds(seeds: Any) -> Any:
-    """A seed set for the plan: a NodeFrame's plan, or the value as given."""
-    return seeds._node if isinstance(seeds, NodeFrame) else seeds
+def _seeds(seeds: Any, label: str) -> Any:
+    """A seed set for the plan: a NodeFrame's plan, or the ids given, checked
+    with :func:`_node_id` (``label`` names the argument in the error). An
+    iterable is read here, once; anything else is passed on as given, and
+    ``collect()`` says what is wrong with it."""
+    if isinstance(seeds, NodeFrame):
+        return seeds._node
+    if seeds is None or isinstance(seeds, (str, bytes, _Frame)):
+        return seeds
+    try:
+        ids = list(seeds)
+    except TypeError:
+        return seeds
+    return [_node_id(v, label) for v in ids]
+
+
+def _node_id(value: Any, label: str, one: bool = False) -> Any:
+    """``value`` as a node id: an integer or a string (#271).
+
+    Graph ids are integers or strings, and a value of any other type is refused
+    rather than converted: ``1.5`` would become ``1``, ``True`` would become
+    ``1``. A float, a bool, a date or anything else raises ``TypeError``,
+    whichever id type the graph has. An integer-like value (a NumPy integer)
+    becomes an ``int``, and an Arrow scalar its Python value. Whether an id
+    fits the graph's id type is checked when the plan runs: a string that is
+    an integer, such as ``'7'``, is that integer on a graph of integer ids, and
+    an integer is its string on a graph of string ids."""
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, bool) and getattr(getattr(value, "dtype", None), "kind", "") != "b":
+        try:
+            return operator.index(value)
+        except TypeError:
+            pass
+    if one:
+        raise TypeError(f"{label} must be a node id, an integer or a string; got {value!r}")
+    raise TypeError(f"{label} must be node ids, integers or strings; got {value!r}")
 
 
 class LayoutExpr(GraphExpr):
@@ -210,7 +247,7 @@ class _Hop:
             _ir.edges_node(self._edges, "hop"),
             _ir.int_arg(self._n),
             self._direction,
-            _seeds(self._seeds),
+            _seeds(self._seeds, "hop(...).from_()"),
         )
         return EdgeFrame._wrap(node)
 
@@ -256,22 +293,22 @@ def shortest_path(
 
 
 def _one_endpoint(value: Any, param: str) -> Any:
-    """A ``shortest_path`` endpoint as one id: a sequence (any iterable but a
-    string) must hold exactly one, which is returned; anything else is returned
-    as given. A path has one source and one target, so a sequence of several ids
-    is refused rather than reduced to its first (#252)."""
+    """A ``shortest_path`` endpoint as one id, checked with :func:`_node_id`: a
+    sequence (any iterable but a string) must hold exactly one. A path has one
+    source and one target, so a sequence of several ids is refused rather than
+    reduced to its first (#252)."""
     if isinstance(value, (str, bytes, _Frame)) or not hasattr(value, "__iter__"):
-        return value
+        return _node_id(value, f"shortest_path({param}=)", one=True)
     try:
         ids = list(value)
     except TypeError:  # an object that only looks iterable (a 0-d array)
-        return value
+        return _node_id(value, f"shortest_path({param}=)", one=True)
     if len(ids) != 1:
         raise ValueError(
             f"shortest_path({param}=) must be one node id; got {len(ids)} ids. "
             "Run one shortest_path per pair, or use hop(...) for several seeds."
         )
-    return ids[0]
+    return _node_id(ids[0], f"shortest_path({param}=)", one=True)
 
 
 def random_walk(
@@ -285,7 +322,7 @@ def random_walk(
     embedding pipelines directly."""
     node = _native().PlanNode.random_walk(
         _ir.edges_node(edges, "random_walk"),
-        _seeds(start),
+        _seeds(start, "random_walk(start=)"),
         _ir.int_arg(steps),
         _ir.int_arg(walks_per_node),
         _ir.int_arg(seed),

@@ -11,6 +11,7 @@ parity harnesses and checks every message they raise.
 from __future__ import annotations
 
 import copy
+import datetime
 import decimal
 import importlib
 import inspect
@@ -371,8 +372,40 @@ CASES = {
     "hop_seed_type": (
         lambda: ur.hop(e(), 1).from_(["a"]),
         ur.ComputeError,
-        "the node ids given are string but the graph's node ids are int64; pass ids of the "
-        "graph's id type",
+        "the node id 'a' is not an integer, but the graph's node ids are int64; pass ids of "
+        "the graph's id type",
+    ),
+    "hop_seed_float": (
+        lambda: ur.hop(e(), 1).from_([0, 1.5]),
+        TypeError,
+        "hop(...).from_() must be node ids, integers or strings; got 1.5",
+    ),
+    "hop_seed_bool": (
+        lambda: ur.hop(e(), 1).from_([True]),
+        TypeError,
+        "hop(...).from_() must be node ids, integers or strings; got True",
+    ),
+    "walk_start_float": (
+        lambda: ur.random_walk(e(), start=np.array([2.0]), steps=2),
+        TypeError,
+        "random_walk(start=) must be node ids, integers or strings; got np.float64(2.0)",
+    ),
+    "shortest_path_source_float": (
+        lambda: ur.shortest_path(e(), 0.0, 1),
+        TypeError,
+        "shortest_path(source=) must be a node id, an integer or a string; got 0.0",
+    ),
+    "shortest_path_target_date": (
+        lambda: ur.shortest_path(e(), 0, [datetime.date(2026, 1, 1)]),
+        TypeError,
+        "shortest_path(target=) must be a node id, an integer or a string; got "
+        "datetime.date(2026, 1, 1)",
+    ),
+    "shortest_path_source_string": (
+        lambda: ur.shortest_path(e(), "1x", 2),
+        ur.ComputeError,
+        "the node id '1x' is not an integer, but the graph's node ids are int64; pass ids of "
+        "the graph's id type",
     ),
     "hop_not_edges": (
         lambda: ur.hop(bad(5), 1).from_([0]),

@@ -6,9 +6,9 @@
 
 Every graph function Ursa's SQL engine offers. The page is generated from `SELECT * FROM ursa_functions()`, so it matches the engine you run.
 
-An algorithm or a statistic takes the graph as its first argument, then named parameters with `=>`. It returns one row per node: the node's `id` and its output columns. A traversal returns edges or walks. `algorithms` runs several per-node functions in one call.
+An algorithm or a statistic takes the graph as its first argument, then named parameters with `=>`. It returns one row per node: the node's `id` and its output columns. `neighbors_agg` does too, from a value per node it reads. A traversal returns edges or walks. `algorithms` runs several per-node functions in one call.
 
-A parameter's default is the SQL literal used when the parameter is left out. `required` means the call must give it. A `string` parameter with choices takes one of them, quoted: `direction => 'both'`. An `expression` parameter takes an expression over the edge table's columns: `weight => log10(1 + weight)`.
+A parameter's default is the SQL literal used when the parameter is left out. `required` means the call must give it. A `string` parameter with choices takes one of them, quoted: `direction => 'both'`. An `expression` parameter takes an expression over the edge table's columns: `weight => log10(1 + weight)`, or for `neighbors_agg`'s `attribute` over the node table's. A `query` parameter takes a subquery in parentheses.
 
 A `node ids` or `node id` parameter takes integers or strings: a list, a query of one column, or one value. On a graph with integer ids, a string must be an integer, such as `'7'`; floats (even `2.0`), booleans and dates are refused. On a graph with string ids, an integer is taken as its string. A NULL, or an id not in the graph, matches no node.
 
@@ -250,6 +250,29 @@ describe(graph, full => false, direction => 'out', nodes => 'all')
 **Returns:** One row: `n_nodes` (Int64), `n_edges` (Int64), `density` (Float64), `avg_degree` (Float64), `n_components` (Int64, may be NULL)
 
 **NetworkX:** `U.number_of_edges(), nx.density(U) and the mean degree (both)`
+
+## Neighbour aggregation
+
+[`neighbors_agg`](#neighbors_agg)
+
+### neighbors_agg
+
+A node attribute aggregated over each node's neighbours.
+
+```text
+neighbors_agg(graph, values => NULL, direction => 'out', attribute => NULL, agg => 'mean')
+```
+
+| Parameter | Type | Default | Choices | Description |
+|---|---|---|---|---|
+| `values` | query | `NULL` | – | A query of two columns, node ids then values: the value of each node. Give this or attribute. |
+| `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
+| `attribute` | expression | `NULL` | – | An expression over the graph's node table, the value of each node. Give this or values. |
+| `agg` | string | `'mean'` | `'mean'`, `'sum'`, `'min'`, `'max'`, `'count'`, `'n_unique'` | The aggregation; mean/sum/min/max need a numeric attribute. |
+
+**Directions:** `'out'`, `'in'`, `'both'`
+
+**Returns:** `neighbors_agg` (Float64, may be NULL)
 
 ## Traversals
 

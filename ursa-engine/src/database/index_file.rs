@@ -2,32 +2,71 @@
 //!
 //! A file holds one built index, the CSR topology and the id map, under the
 //! full key it was built for (the edge plan's fingerprint and the identity of
-//! every source file). Version 1, all integers little-endian:
+//! every source file), followed by optional **chunks**: parts of the index
+//! that are built later, or that only some queries need, such as the
+//! in-adjacency. Version 2, all integers little-endian.
+//!
+//! The **main part** comes first:
 //!
 //! ```text
 //! offset  size  field
 //!      0     8  magic            "URSAIDX\0"
-//!      8     4  version          1
-//!     12     4  flags            bit 0: string ids; bit 1: in-adjacency stored
+//!      8     4  version          2
+//!     12     4  flags            bit 0: string ids
 //!     16     8  n_nodes
 //!     24     8  n_edges
 //!     32     8  key_len          bytes of the key that follows the header
 //!     40     4  n_sections
-//!     44    20  reserved (zero)
+//!     44     4  reserved (zero)
+//!     48     8  main_len         bytes of the main part, trailer included
+//!     56     8  reserved (zero)
 //!     64     …  key              JSON: {"fingerprint": …, "files": [{…}, …]}
 //!      …     …  section table    at the next multiple of 8; 24 bytes a section:
 //!                                kind u32, element width u32, offset u64, count u64
 //!      …     …  sections         each at a multiple of 64 from the file's start
-//!      …    16  trailer          at the next multiple of 8: file length u64,
+//!      …    16  trailer          at the next multiple of 8: main_len u64,
 //!                                CRC-32 of every byte before the trailer u32,
 //!                                "XDIU"
 //! ```
 //!
-//! Sections, in this order: the out-adjacency's offsets (`u64`, `n_nodes + 1`),
-//! targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`); the
-//! in-adjacency's three, if it was built when the index was stored; then the
-//! ids, either `i64` values (`n_nodes`) or, for string ids, Arrow-style `i32`
-//! offsets (`n_nodes + 1`, from 0) and UTF-8 bytes.
+//! Its sections, in this order: the out-adjacency's offsets (`u64`,
+//! `n_nodes + 1`), targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`);
+//! then the ids, either `i64` values (`n_nodes`) or, for string ids,
+//! Arrow-style `i32` offsets (`n_nodes + 1`, from 0) and UTF-8 bytes.
+//!
+//! **Chunks** follow the main part, one after another, each appended in
+//! place once what it holds exists (see `IndexStore`):
+//!
+//! ```text
+//!      0    16  header           "CHNK", kind u32, end u64 (the chunk's end
+//!                                offset in the file)
+//!     16     …  sections         each at a multiple of 64 from the file's start
+//!      …     …  name             bytes naming what the chunk holds (may be empty)
+//!      …     …  section table    at the next multiple of 8, as in the main part
+//!      …    48  trailer          kind u32, n_sections u32, start u64,
+//!                                name offset u64, name length u64,
+//!                                data CRC u32 (the header and sections),
+//!                                meta CRC u32 (name, table and the 36 bytes
+//!                                of the trailer before it), "KNHC", zero u32
+//! ```
+//!
+//! Chunk kind 1 is the in-adjacency (no name; its offsets, targets and edge
+//! ids, as the out-adjacency's). Chunk kind 2 is a set of evaluated weights:
+//! its name is the weights' key (the weighted edge plan's fingerprint and the
+//! identity of the files it reads), and it holds one `f64` section (kind 10,
+//! `n_edges` values in edge-row order) per weight expression, in order. A reader of the main part never reads the
+//! chunks' arrays: it lists the chunks (their headers, names and tables, a
+//! few small reads), and reads a chunk's sections only when they are asked
+//! for, checking the main part's trailer and the chunk's data CRC first. The
+//! in-adjacency is read this way the first time an algorithm asks for it
+//! (`Topology::with_incoming_loader`).
+//!
+//! **Appending.** A chunk is written after the last chunk that checks out,
+//! so a chunk cut short by a crash is overwritten by the next append, and a
+//! reader stops listing at the first chunk that does not check out.
+//! Appending never changes the bytes of the main part or of an earlier
+//! chunk, so a reader in another process (`--readonly`) never sees them
+//! change.
 //!
 //! **Why raw arrays, not Arrow IPC.** The arrays have different lengths and
 //! no schema: an IPC stream would need one record batch per array, or padding
@@ -36,18 +75,24 @@
 //! memory-mapped reader wants (each section is a ready `&[u32]`/`&[u64]` on a
 //! little-endian machine), need no dependency, and the string ids are already
 //! in Arrow's layout, so they become a `StringArray` without a copy once
-//! mapped. Version 1 reads the file once, front to back, decoding each
-//! section into its array as it goes ([`read_file`]).
+//! mapped. The main part is read once, front to back, decoding each section
+//! into its array as it goes ([`read_file`]).
 //!
-//! **Corruption.** A file is read only if its length matches the trailer, the
-//! CRC matches, the version is 1, the key matches the key asked for, every
-//! section lies within the file, and the arrays form a valid topology and id
-//! map (`ursa_core::Topology::from_parts`, `IdMap::from_user_ids`). Anything
-//! else is an error, which the store treats as a miss.
+//! **Corruption.** The main part is read only if its length matches the
+//! trailer, the CRC matches, the version is 2, the key matches the key asked
+//! for, every section lies within it, and the arrays form a valid topology and
+//! id map (`ursa_core::Topology::from_parts`, `IdMap::from_user_ids`).
+//! Anything else is an error, which the store treats as a miss. A chunk that
+//! does not check out is ignored, and what it held is rebuilt when needed.
+//!
+//! **Version 1** files (the in-adjacency, if any, inside the main part) are
+//! not read: they are a miss like any other unreadable file, so the index is
+//! built again once and stored as version 2 in their place.
 
-use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
@@ -62,7 +107,18 @@ pub const MAGIC: [u8; 8] = *b"URSAIDX\0";
 /// The last bytes of every index file.
 const END_MAGIC: [u8; 4] = *b"XDIU";
 /// The index file version this build reads and writes.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+/// The first bytes of every chunk.
+const CHUNK_MAGIC: [u8; 4] = *b"CHNK";
+/// The last bytes but four of every chunk's trailer.
+const CHUNK_END_MAGIC: [u8; 4] = *b"KNHC";
+const CHUNK_HEADER_LEN: u64 = 16;
+const CHUNK_TRAILER_LEN: u64 = 48;
+
+/// The chunk kind of an in-adjacency.
+pub const CHUNK_INCOMING: u32 = 1;
+/// The chunk kind of a set of evaluated weights.
+pub const CHUNK_WEIGHTS: u32 = 2;
 
 const HEADER_LEN: u64 = 64;
 const TRAILER_LEN: u64 = 16;
@@ -70,7 +126,6 @@ const SECTION_ENTRY_LEN: u64 = 24;
 const SECTION_ALIGN: u64 = 64;
 
 const FLAG_STRING_IDS: u32 = 1;
-const FLAG_INCOMING: u32 = 2;
 
 const OUT_OFFSETS: u32 = 1;
 const OUT_TARGETS: u32 = 2;
@@ -81,6 +136,7 @@ const IN_EDGE_IDS: u32 = 6;
 const IDS_INT64: u32 = 7;
 const IDS_STR_OFFSETS: u32 = 8;
 const IDS_STR_BYTES: u32 = 9;
+const WEIGHTS_F64: u32 = 10;
 
 /// What an index is stored under: the edge plan's fingerprint and the
 /// identity of every file it reads.
@@ -154,6 +210,7 @@ impl IndexKey {
 /// part of the id column (which the id map hands out as an `Arc`).
 enum Data<'a> {
     U64(&'a [u64]),
+    F64(&'a [f64]),
     U32(&'a [u32]),
     /// The values of an `Int64Array`.
     Ints(Int64Array),
@@ -167,7 +224,7 @@ enum Data<'a> {
 impl Data<'_> {
     fn width(&self) -> u64 {
         match self {
-            Data::U64(_) | Data::Ints(_) => 8,
+            Data::U64(_) | Data::F64(_) | Data::Ints(_) => 8,
             Data::U32(_) | Data::StrOffsets(_) => 4,
             Data::StrBytes(_) => 1,
         }
@@ -176,6 +233,7 @@ impl Data<'_> {
     fn count(&self) -> u64 {
         (match self {
             Data::U64(v) => v.len(),
+            Data::F64(v) => v.len(),
             Data::U32(v) => v.len(),
             Data::Ints(a) => a.len(),
             Data::StrOffsets(a) => a.len() + 1,
@@ -208,7 +266,8 @@ pub struct Encoded<'a> {
 }
 
 impl<'a> Encoded<'a> {
-    /// Lay out `topology` and `ids` under `key`. Nothing is written yet.
+    /// Lay out the main part of `topology` and `ids` under `key` (not the
+    /// in-adjacency: see [`EncodedChunk::incoming`]). Nothing is written yet.
     pub fn new(key: &IndexKey, topology: &'a Topology, ids: &'a IdMap) -> io::Result<Self> {
         let id_array = ids.user_id_array();
         let mut flags = 0;
@@ -218,14 +277,6 @@ impl<'a> Encoded<'a> {
             (OUT_TARGETS, Data::U32(&out.targets)),
             (OUT_EDGE_IDS, Data::U32(&out.edge_ids)),
         ];
-        if let Some(incoming) = topology.incoming_if_built() {
-            flags |= FLAG_INCOMING;
-            sections.extend([
-                (IN_OFFSETS, Data::U64(&incoming.offsets)),
-                (IN_TARGETS, Data::U32(&incoming.targets)),
-                (IN_EDGE_IDS, Data::U32(&incoming.edge_ids)),
-            ]);
-        }
         // Cloning an Arrow array clones `Arc`s to its buffers, not the ids.
         if let Some(ints) = id_array.as_any().downcast_ref::<Int64Array>() {
             sections.push((IDS_INT64, Data::Ints(ints.clone())));
@@ -263,13 +314,13 @@ impl<'a> Encoded<'a> {
         })
     }
 
-    /// The size of the file, in bytes.
+    /// The size of the main part, in bytes.
     pub fn file_size(&self) -> u64 {
         self.trailer_offset + TRAILER_LEN
     }
 
-    /// Write the file to `out`.
-    pub fn write_to(&self, out: impl Write) -> io::Result<()> {
+    /// Write the main part to `out`. Returns its identity.
+    pub fn write_to(&self, out: impl Write) -> io::Result<MainPart> {
         let mut sink = Sink {
             out,
             crc: crc32fast::Hasher::new(),
@@ -283,31 +334,18 @@ impl<'a> Encoded<'a> {
         header.extend_from_slice(&self.n_edges.to_le_bytes());
         header.extend_from_slice(&(self.key.len() as u64).to_le_bytes());
         header.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&self.file_size().to_le_bytes());
         header.resize(HEADER_LEN as usize, 0);
         sink.put(&header)?;
         sink.put(&self.key)?;
         sink.pad_to(self.table_offset)?;
         for (kind, data, offset) in &self.sections {
-            let mut entry = Vec::with_capacity(SECTION_ENTRY_LEN as usize);
-            entry.extend_from_slice(&kind.to_le_bytes());
-            entry.extend_from_slice(&(data.width() as u32).to_le_bytes());
-            entry.extend_from_slice(&offset.to_le_bytes());
-            entry.extend_from_slice(&data.count().to_le_bytes());
-            sink.put(&entry)?;
+            sink.put(&section_entry(*kind, data, *offset))?;
         }
         for (_, data, offset) in &self.sections {
             sink.pad_to(*offset)?;
-            match data {
-                Data::U64(v) => sink.put_all(v, |x| x.to_le_bytes())?,
-                Data::U32(v) => sink.put_all(v, |x| x.to_le_bytes())?,
-                Data::Ints(a) => sink.put_all(a.values(), |x| x.to_le_bytes())?,
-                Data::StrOffsets(a) => {
-                    let offsets = a.value_offsets();
-                    let base = offsets[0];
-                    sink.put_all(offsets, |x| (x - base).to_le_bytes())?
-                }
-                Data::StrBytes(a) => sink.put(str_bytes(a))?,
-            }
+            sink.put_data(data)?;
         }
         sink.pad_to(self.trailer_offset)?;
         let crc = sink.crc.clone().finalize();
@@ -316,8 +354,146 @@ impl<'a> Encoded<'a> {
         trailer.extend_from_slice(&crc.to_le_bytes());
         trailer.extend_from_slice(&END_MAGIC);
         sink.put(&trailer)?;
+        sink.out.flush()?;
+        Ok(MainPart {
+            len: self.file_size(),
+            crc,
+        })
+    }
+}
+
+/// The identity of a file's main part: its length and CRC. A chunk is read
+/// from, or appended to, a file only while its main part is still this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainPart {
+    pub len: u64,
+    pub crc: u32,
+}
+
+/// A chunk laid out for writing at a given offset of a file.
+pub struct EncodedChunk<'a> {
+    kind: u32,
+    name: Vec<u8>,
+    start: u64,
+    sections: Vec<(u32, Data<'a>, u64)>,
+    name_offset: u64,
+    table_offset: u64,
+}
+
+impl<'a> EncodedChunk<'a> {
+    /// The chunk of the in-adjacency `incoming`, to be written at `start`.
+    pub fn incoming(incoming: &'a Adjacency, start: u64) -> Self {
+        Self::new(
+            CHUNK_INCOMING,
+            Vec::new(),
+            vec![
+                (IN_OFFSETS, Data::U64(&incoming.offsets)),
+                (IN_TARGETS, Data::U32(&incoming.targets)),
+                (IN_EDGE_IDS, Data::U32(&incoming.edge_ids)),
+            ],
+            start,
+        )
+    }
+
+    /// The chunk of the weight columns `columns` (one value per edge row
+    /// each), stored under `key`, to be written at `start`.
+    pub fn weights(key: &str, columns: &[&'a [f64]], start: u64) -> Self {
+        Self::new(
+            CHUNK_WEIGHTS,
+            key.as_bytes().to_vec(),
+            columns
+                .iter()
+                .map(|column| (WEIGHTS_F64, Data::F64(column)))
+                .collect(),
+            start,
+        )
+    }
+
+    fn new(kind: u32, name: Vec<u8>, sections: Vec<(u32, Data<'a>)>, start: u64) -> Self {
+        let mut at = start + CHUNK_HEADER_LEN;
+        let sections = sections
+            .into_iter()
+            .map(|(kind, data)| {
+                at = align(at, SECTION_ALIGN);
+                let offset = at;
+                at += data.width() * data.count();
+                (kind, data, offset)
+            })
+            .collect();
+        let name_offset = at;
+        let table_offset = align(name_offset + name.len() as u64, 8);
+        Self {
+            kind,
+            name,
+            start,
+            sections,
+            name_offset,
+            table_offset,
+        }
+    }
+
+    fn trailer_offset(&self) -> u64 {
+        self.table_offset + SECTION_ENTRY_LEN * self.sections.len() as u64
+    }
+
+    /// The offset just past the chunk: the file's length once it is written.
+    pub fn end(&self) -> u64 {
+        self.trailer_offset() + CHUNK_TRAILER_LEN
+    }
+
+    /// The chunk's size, in bytes.
+    pub fn size(&self) -> u64 {
+        self.end() - self.start
+    }
+
+    /// Write the chunk to `out`, which is at its start.
+    pub fn write_to(&self, out: impl Write) -> io::Result<()> {
+        let mut sink = Sink {
+            out,
+            crc: crc32fast::Hasher::new(),
+            at: self.start,
+        };
+        let mut header = Vec::with_capacity(CHUNK_HEADER_LEN as usize);
+        header.extend_from_slice(&CHUNK_MAGIC);
+        header.extend_from_slice(&self.kind.to_le_bytes());
+        header.extend_from_slice(&self.end().to_le_bytes());
+        sink.put(&header)?;
+        for (_, data, offset) in &self.sections {
+            sink.pad_to(*offset)?;
+            sink.put_data(data)?;
+        }
+        sink.pad_to(self.name_offset)?;
+        let data_crc = std::mem::replace(&mut sink.crc, crc32fast::Hasher::new()).finalize();
+        sink.put(&self.name)?;
+        sink.pad_to(self.table_offset)?;
+        for (kind, data, offset) in &self.sections {
+            sink.put(&section_entry(*kind, data, *offset))?;
+        }
+        let mut trailer = Vec::with_capacity(CHUNK_TRAILER_LEN as usize);
+        trailer.extend_from_slice(&self.kind.to_le_bytes());
+        trailer.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
+        trailer.extend_from_slice(&self.start.to_le_bytes());
+        trailer.extend_from_slice(&self.name_offset.to_le_bytes());
+        trailer.extend_from_slice(&(self.name.len() as u64).to_le_bytes());
+        trailer.extend_from_slice(&data_crc.to_le_bytes());
+        sink.crc.update(&trailer);
+        let meta_crc = sink.crc.clone().finalize();
+        trailer.extend_from_slice(&meta_crc.to_le_bytes());
+        trailer.extend_from_slice(&CHUNK_END_MAGIC);
+        trailer.extend_from_slice(&[0; 4]);
+        sink.out.write_all(&trailer)?;
         sink.out.flush()
     }
+}
+
+/// A section table entry.
+fn section_entry(kind: u32, data: &Data<'_>, offset: u64) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(SECTION_ENTRY_LEN as usize);
+    entry.extend_from_slice(&kind.to_le_bytes());
+    entry.extend_from_slice(&(data.width() as u32).to_le_bytes());
+    entry.extend_from_slice(&offset.to_le_bytes());
+    entry.extend_from_slice(&data.count().to_le_bytes());
+    entry
 }
 
 /// A writer that keeps a running CRC and position.
@@ -344,6 +520,22 @@ impl<W: Write> Sink<W> {
         Ok(())
     }
 
+    /// Write one section's array.
+    fn put_data(&mut self, data: &Data<'_>) -> io::Result<()> {
+        match data {
+            Data::U64(v) => self.put_all(v, |x| x.to_le_bytes()),
+            Data::F64(v) => self.put_all(v, |x| x.to_le_bytes()),
+            Data::U32(v) => self.put_all(v, |x| x.to_le_bytes()),
+            Data::Ints(a) => self.put_all(a.values(), |x| x.to_le_bytes()),
+            Data::StrOffsets(a) => {
+                let offsets = a.value_offsets();
+                let base = offsets[0];
+                self.put_all(offsets, |x| (x - base).to_le_bytes())
+            }
+            Data::StrBytes(a) => self.put(str_bytes(a)),
+        }
+    }
+
     /// Write `values` little-endian, a block at a time.
     fn put_all<T: Copy, const N: usize>(
         &mut self,
@@ -365,22 +557,304 @@ impl<W: Write> Sink<W> {
 /// Why a file could not be read as an index.
 pub type DecodeError = String;
 
-/// Read the index file at `path`, which must be stored under `key`.
-///
-/// The file is read once, front to back, straight into the arrays the index
-/// is made of, so a load holds the index and a small buffer, not the file's
-/// bytes as well. The key is checked before the sections are read, so a file
-/// for another key costs only its header; the checksum covers every byte and
-/// is checked before any array is used.
-pub fn read_file(path: &Path, key: &IndexKey) -> Result<(Topology, IdMap), DecodeError> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let len = file.metadata().map_err(|e| e.to_string())?.len();
-    decode_from(BufReader::with_capacity(BLOCK, file), len, key)
+/// An index read from its file.
+pub struct Stored {
+    /// With a loader for the in-adjacency, if the file has its chunk.
+    pub topology: Topology,
+    pub ids: IdMap,
+    pub main: MainPart,
+    /// The chunks that check out, in file order.
+    pub chunks: Vec<ChunkInfo>,
 }
 
-/// Read the index in `bytes`, which must be stored under `key`.
+/// Whether `chunks` has one of `kind` named `name`.
+pub fn has_chunk(chunks: &[ChunkInfo], kind: u32, name: &[u8]) -> bool {
+    chunks.iter().any(|c| c.kind == kind && c.name == name)
+}
+
+/// How many in-adjacencies have been read from index files, in this process.
+static INCOMING_READS: AtomicU64 = AtomicU64::new(0);
+
+/// How many in-adjacencies this process has read from index files: for
+/// tests that an algorithm read one, or did not.
+pub fn incoming_reads() -> u64 {
+    INCOMING_READS.load(Ordering::Relaxed)
+}
+
+/// Read the index file at `path`, which must be stored under `key`.
+///
+/// The main part is read once, front to back, straight into the arrays the
+/// index is made of, so a load holds the index and a small buffer, not the
+/// file's bytes as well. The key is checked before the sections are read, so
+/// a file for another key costs only its header; the checksum covers every
+/// byte of the main part and is checked before any array is used. The chunks
+/// are only listed; the in-adjacency's is read when the topology is first
+/// asked for it.
+pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let (topology, ids, main) = decode_from(BufReader::with_capacity(BLOCK, &file), len, key)?;
+    let (chunks, _) = list_chunks(&mut file, main.len, len);
+    let topology = match chunks.iter().find(|c| c.kind == CHUNK_INCOMING) {
+        Some(chunk) => {
+            let (path, chunk) = (path.to_path_buf(), chunk.clone());
+            let (n_nodes, n_edges) = (topology.n_nodes(), topology.n_edges());
+            topology.with_incoming_loader(Box::new(move || {
+                let incoming = read_incoming(&path, main, &chunk, n_nodes, n_edges).ok()?;
+                INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+                Some(incoming)
+            }))
+        }
+        None => topology,
+    };
+    Ok(Stored {
+        topology,
+        ids,
+        main,
+        chunks,
+    })
+}
+
+/// Read the main part of the index in `bytes`, which must be stored under
+/// `key`. Chunks are not read.
 pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeError> {
-    decode_from(bytes, bytes.len() as u64, key)
+    decode_from(bytes, bytes.len() as u64, key).map(|(topology, ids, _)| (topology, ids))
+}
+
+/// One chunk of a file, as listed: where it is and what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkInfo {
+    pub kind: u32,
+    pub name: Vec<u8>,
+    pub start: u64,
+    pub end: u64,
+    /// The end of its header and sections, which the data CRC covers.
+    data_end: u64,
+    data_crc: u32,
+    /// (kind, width, offset, count), in file order.
+    sections: Vec<(u32, u64, u64, u64)>,
+}
+
+/// The chunks of a file of `len` bytes whose main part is `main_len` bytes,
+/// in file order, as far as they check out; and the offset where the next
+/// chunk goes (the end of the last chunk that checks out). Only the chunks'
+/// headers, names, tables and trailers are read.
+pub fn list_chunks<R: Read + Seek>(file: &mut R, main_len: u64, len: u64) -> (Vec<ChunkInfo>, u64) {
+    let mut chunks = Vec::new();
+    let mut at = main_len;
+    while let Some(chunk) = chunk_at(file, at, len) {
+        at = chunk.end;
+        chunks.push(chunk);
+    }
+    (chunks, at)
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+/// The chunk at `start` of a file of `len` bytes, if one is there whole and
+/// its header, name, table and trailer check out.
+fn chunk_at<R: Read + Seek>(file: &mut R, start: u64, len: u64) -> Option<ChunkInfo> {
+    let read = |file: &mut R, at: u64, n: u64| -> Option<Vec<u8>> {
+        file.seek(SeekFrom::Start(at)).ok()?;
+        let mut buf = vec![0; usize::try_from(n).ok()?];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+    if len.saturating_sub(start) < CHUNK_HEADER_LEN + CHUNK_TRAILER_LEN {
+        return None;
+    }
+    let header = read(file, start, CHUNK_HEADER_LEN)?;
+    let end = u64_at(&header, 8);
+    if header[..4] != CHUNK_MAGIC || end > len || end < start + CHUNK_HEADER_LEN + CHUNK_TRAILER_LEN
+    {
+        return None;
+    }
+    let kind = u32_at(&header, 4);
+    let trailer_offset = end - CHUNK_TRAILER_LEN;
+    let trailer = read(file, trailer_offset, CHUNK_TRAILER_LEN)?;
+    let n_sections = u32_at(&trailer, 4) as u64;
+    let name_offset = u64_at(&trailer, 16);
+    let name_len = u64_at(&trailer, 24);
+    let table_offset = align(name_offset.checked_add(name_len)?, 8);
+    if trailer[40..44] != CHUNK_END_MAGIC
+        || u32_at(&trailer, 0) != kind
+        || u64_at(&trailer, 8) != start
+        || name_offset < start + CHUNK_HEADER_LEN
+        || n_sections
+            .checked_mul(SECTION_ENTRY_LEN)?
+            .checked_add(table_offset)?
+            != trailer_offset
+    {
+        return None;
+    }
+    let meta = read(file, name_offset, trailer_offset - name_offset)?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&meta);
+    crc.update(&trailer[..36]);
+    if crc.finalize() != u32_at(&trailer, 36) {
+        return None;
+    }
+    let name = meta[..name_len as usize].to_vec();
+    let table = &meta[(table_offset - name_offset) as usize..];
+    let mut sections = Vec::new();
+    for entry in table.chunks_exact(SECTION_ENTRY_LEN as usize) {
+        let (kind, width) = (u32_at(entry, 0), u32_at(entry, 4) as u64);
+        let (offset, count) = (u64_at(entry, 8), u64_at(entry, 16));
+        width
+            .checked_mul(count)
+            .and_then(|n| n.checked_add(offset))
+            .filter(|&e| offset >= start + CHUNK_HEADER_LEN && e <= name_offset)?;
+        sections.push((kind, width, offset, count));
+    }
+    sections.sort_by_key(|&(_, _, offset, _)| offset);
+    if sections
+        .windows(2)
+        .any(|w| w[0].2 + w[0].1 * w[0].3 > w[1].2)
+    {
+        return None;
+    }
+    Some(ChunkInfo {
+        kind,
+        name,
+        start,
+        end,
+        data_end: name_offset,
+        data_crc: u32_at(&trailer, 32),
+        sections,
+    })
+}
+
+/// Check that the file `file` still has the main part `main`.
+fn check_main(file: &mut File, main: MainPart) -> Result<(), DecodeError> {
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    if len < main.len || main.len < HEADER_LEN + TRAILER_LEN {
+        return Err("the file's main part has changed".into());
+    }
+    let mut trailer = [0u8; TRAILER_LEN as usize];
+    file.seek(SeekFrom::Start(main.len - TRAILER_LEN))
+        .and_then(|_| file.read_exact(&mut trailer))
+        .map_err(|e| e.to_string())?;
+    if u64_at(&trailer, 0) != main.len || u32_at(&trailer, 8) != main.crc {
+        return Err("the file's main part has changed".into());
+    }
+    Ok(())
+}
+
+/// Read the sections of `chunk` from the file at `path`, whose main part
+/// must still be `main`. Every byte the data CRC covers is read and checked.
+pub fn read_chunk(
+    path: &Path,
+    main: MainPart,
+    chunk: &ChunkInfo,
+) -> Result<Vec<(u32, Section)>, DecodeError> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    check_main(&mut file, main)?;
+    if file.metadata().map_err(|e| e.to_string())?.len() < chunk.end {
+        return Err("the file is shorter than the chunk".into());
+    }
+    file.seek(SeekFrom::Start(chunk.start))
+        .map_err(|e| e.to_string())?;
+    let mut src = Source {
+        inner: BufReader::with_capacity(BLOCK, file),
+        crc: crc32fast::Hasher::new(),
+        at: chunk.start,
+    };
+    let mut sections = Vec::with_capacity(chunk.sections.len());
+    for &(kind, width, offset, count) in &chunk.sections {
+        src.skip_to(offset)?;
+        sections.push((kind, src.section(kind, width, offset, count)?));
+    }
+    src.skip_to(chunk.data_end)?;
+    if src.crc.finalize() != chunk.data_crc {
+        return Err("the chunk's checksum does not match".into());
+    }
+    Ok(sections)
+}
+
+/// Read the in-adjacency in `chunk` of the file at `path`, for a topology
+/// of `n_nodes` nodes and `n_edges` edges.
+fn read_incoming(
+    path: &Path,
+    main: MainPart,
+    chunk: &ChunkInfo,
+    n_nodes: usize,
+    n_edges: usize,
+) -> Result<Adjacency, DecodeError> {
+    let mut sections = read_chunk(path, main, chunk)?;
+    let mut take = |kind: u32| {
+        let i = sections
+            .iter()
+            .position(|(k, _)| *k == kind)
+            .ok_or_else(|| format!("section {kind} is missing"))?;
+        Ok::<_, DecodeError>(sections.swap_remove(i).1)
+    };
+    match (take(IN_OFFSETS)?, take(IN_TARGETS)?, take(IN_EDGE_IDS)?) {
+        (Section::U64(offsets), Section::U32(targets), Section::U32(edge_ids))
+            if offsets.len() == n_nodes + 1
+                && targets.len() == n_edges
+                && edge_ids.len() == n_edges =>
+        {
+            Ok(Adjacency {
+                offsets,
+                targets,
+                edge_ids,
+            })
+        }
+        _ => Err("the in-adjacency is malformed".into()),
+    }
+}
+
+/// Read the weight columns in `chunk` of the file at `path`, for a topology
+/// of `n_edges` edges: one per section, in order.
+pub fn read_weights(
+    path: &Path,
+    main: MainPart,
+    chunk: &ChunkInfo,
+    n_edges: usize,
+) -> Result<Vec<Vec<f64>>, DecodeError> {
+    read_chunk(path, main, chunk)?
+        .into_iter()
+        .map(|(_, section)| match section {
+            Section::F64(values) if values.len() == n_edges => Ok(values),
+            _ => Err("the weights are malformed".to_string()),
+        })
+        .collect()
+}
+
+/// Append the chunk `encode` lays out (at the offset it is given) to the
+/// file at `path`, whose main part must still be `main`, after its last
+/// chunk that checks out; unless the file already has a chunk of `kind`
+/// named `name`. Returns the file's new length, or `None` if the chunk was
+/// there already.
+pub fn append_chunk<'a>(
+    path: &Path,
+    main: MainPart,
+    kind: u32,
+    name: &[u8],
+    encode: impl FnOnce(u64) -> EncodedChunk<'a>,
+) -> io::Result<Option<u64>> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    check_main(&mut file, main).map_err(io::Error::other)?;
+    let len = file.metadata()?.len();
+    let (chunks, at) = list_chunks(&mut file, main.len, len);
+    if has_chunk(&chunks, kind, name) {
+        return Ok(None);
+    }
+    let chunk = encode(at);
+    debug_assert_eq!((chunk.kind, chunk.name.as_slice()), (kind, name));
+    // What follows the last chunk that checks out (one cut short by a
+    // crash) is dropped first, so the file never ends in bytes that do not.
+    if len > at {
+        file.set_len(at)?;
+    }
+    file.seek(SeekFrom::Start(at))?;
+    let mut out = BufWriter::with_capacity(1 << 20, &file);
+    chunk.write_to(&mut out)?;
+    out.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(Some(chunk.end()))
 }
 
 /// The most a read asks for at once, in bytes.
@@ -438,9 +912,39 @@ impl<R: Read> Source<R> {
     }
 }
 
+impl<R: Read> Source<R> {
+    /// The section of `kind` at `offset` (where the source is): `count`
+    /// values of `width` bytes. A section this build does not read, or a
+    /// known one of the wrong width, is skipped and comes back empty.
+    fn section(
+        &mut self,
+        kind: u32,
+        width: u64,
+        offset: u64,
+        count: u64,
+    ) -> Result<Section, DecodeError> {
+        let n = usize::try_from(count).map_err(|e| e.to_string())?;
+        Ok(match (kind, width) {
+            (OUT_OFFSETS | IN_OFFSETS, 8) => Section::U64(self.values(n, u64::from_le_bytes)?),
+            (OUT_TARGETS | OUT_EDGE_IDS | IN_TARGETS | IN_EDGE_IDS, 4) => {
+                Section::U32(self.values(n, u32::from_le_bytes)?)
+            }
+            (IDS_INT64, 8) => Section::I64(self.values(n, i64::from_le_bytes)?),
+            (WEIGHTS_F64, 8) => Section::F64(self.values(n, f64::from_le_bytes)?),
+            (IDS_STR_OFFSETS, 4) => Section::I32(self.values(n, i32::from_le_bytes)?),
+            (IDS_STR_BYTES, 1) => Section::Bytes(self.bytes(n)?),
+            _ => {
+                self.skip_to(offset + width * count)?;
+                Section::Bytes(Vec::new())
+            }
+        })
+    }
+}
+
 /// One section, read.
-enum Section {
+pub enum Section {
     U64(Vec<u64>),
+    F64(Vec<f64>),
     U32(Vec<u32>),
     I64(Vec<i64>),
     I32(Vec<i32>),
@@ -452,7 +956,7 @@ fn decode_from(
     reader: impl Read,
     len: u64,
     key: &IndexKey,
-) -> Result<(Topology, IdMap), DecodeError> {
+) -> Result<(Topology, IdMap, MainPart), DecodeError> {
     if len < HEADER_LEN + TRAILER_LEN {
         return Err(format!("{len} bytes is too short for an index file"));
     }
@@ -476,8 +980,12 @@ fn decode_from(
     let n_edges = usize::try_from(u64_at(&header, 24)).map_err(|e| e.to_string())?;
     let key_len = u64_at(&header, 32);
     let n_sections = u32::from_le_bytes(header[40..44].try_into().expect("4 bytes")) as u64;
+    let main_len = u64_at(&header, 48);
+    if main_len > len || main_len < HEADER_LEN + TRAILER_LEN {
+        return Err("the file is truncated".into());
+    }
 
-    let body = len - TRAILER_LEN;
+    let body = main_len - TRAILER_LEN;
     let key_end = HEADER_LEN
         .checked_add(key_len)
         .filter(|&end| end <= body)
@@ -520,35 +1028,23 @@ fn decode_from(
     let mut sections: Vec<(u32, u64, u64, Section)> = Vec::new();
     for (kind, width, offset, count) in layout {
         src.skip_to(offset)?;
-        let n = count as usize;
-        let data = match (kind, width) {
-            (OUT_OFFSETS | IN_OFFSETS, 8) => Section::U64(src.values(n, u64::from_le_bytes)?),
-            (OUT_TARGETS | OUT_EDGE_IDS | IN_TARGETS | IN_EDGE_IDS, 4) => {
-                Section::U32(src.values(n, u32::from_le_bytes)?)
-            }
-            (IDS_INT64, 8) => Section::I64(src.values(n, i64::from_le_bytes)?),
-            (IDS_STR_OFFSETS, 4) => Section::I32(src.values(n, i32::from_le_bytes)?),
-            (IDS_STR_BYTES, 1) => Section::Bytes(src.bytes(n)?),
-            // A section this build does not read, or a known one of the
-            // wrong width (malformed, below): skip its bytes.
-            _ => {
-                src.skip_to(offset + width * count)?;
-                Section::Bytes(Vec::new())
-            }
-        };
+        // A section this build does not read, or a known one of the wrong
+        // width (malformed, below), comes back empty.
+        let data = src.section(kind, width, offset, count)?;
         sections.push((kind, width, count, data));
     }
     src.skip_to(body)?;
     let crc = src.crc.clone().finalize();
     let mut trailer = [0u8; TRAILER_LEN as usize];
     src.fill(&mut trailer)?;
-    if trailer[12..] != END_MAGIC || u64_at(&trailer, 0) != len {
+    if trailer[12..] != END_MAGIC || u64_at(&trailer, 0) != main_len {
         return Err("the file is truncated".into());
     }
     if u32::from_le_bytes(trailer[8..12].try_into().expect("4 bytes")) != crc {
         return Err("the checksum does not match".into());
     }
 
+    let main = MainPart { len: main_len, crc };
     let mut take = |kind: u32, width: u64, count: Option<usize>| -> Result<Section, DecodeError> {
         let mut found = sections.iter().filter(|(k, _, _, _)| *k == kind);
         let (_, w, c, _) = found
@@ -584,11 +1080,7 @@ fn decode_from(
         }
     };
     let out = adjacency([OUT_OFFSETS, OUT_TARGETS, OUT_EDGE_IDS])?;
-    let incoming = match flags & FLAG_INCOMING {
-        0 => None,
-        _ => Some(adjacency([IN_OFFSETS, IN_TARGETS, IN_EDGE_IDS])?),
-    };
-    let topology = Topology::from_parts(n_nodes, out, incoming)?;
+    let topology = Topology::from_parts(n_nodes, out, None)?;
 
     let ids: Arc<dyn Array> = if flags & FLAG_STRING_IDS == 0 {
         let Section::I64(values) = take(IDS_INT64, 8, Some(n_nodes))? else {
@@ -618,7 +1110,7 @@ fn decode_from(
     if ids.len() != n_nodes {
         return Err("the id map does not match the topology".into());
     }
-    Ok((topology, ids))
+    Ok((topology, ids, main))
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -686,14 +1178,9 @@ mod tests {
             ids.user_id_array().as_ref()
         );
 
-        // With the in-adjacency built, it is stored too.
-        let incoming = topology.incoming().clone();
-        let (back, _) = decode(&encode(&key(), &topology, &ids), &key()).unwrap();
-        assert_eq!(back.incoming_if_built().unwrap().targets, incoming.targets);
-        assert_eq!(
-            back.incoming_if_built().unwrap().edge_ids,
-            incoming.edge_ids
-        );
+        // The in-adjacency is never part of the main part.
+        topology.incoming();
+        assert_eq!(encode(&key(), &topology, &ids), bytes);
 
         let strs = |v: &[&str]| Arc::new(StringArray::from(v.to_vec())) as ArrayRef;
         let (topology, ids) = built(strs(&["a", "bé", "a"]), strs(&["bé", "c", "c"]));
@@ -746,6 +1233,155 @@ mod tests {
             &key()
         )
         .is_err());
+    }
+
+    /// Write the main part of `topology` to `path`; its identity.
+    fn write_main(path: &Path, topology: &Topology, ids: &IdMap) -> MainPart {
+        let encoded = Encoded::new(&key(), topology, ids).unwrap();
+        let mut file = File::create(path).unwrap();
+        encoded.write_to(&mut file).unwrap()
+    }
+
+    #[test]
+    fn the_in_adjacency_is_appended_and_read_on_first_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (topology, ids) = built(
+            ints(&[10, 20, 10, 30, 20, 40]),
+            ints(&[20, 30, 30, 10, 40, 10]),
+        );
+        let main = write_main(&path, &topology, &ids);
+        assert_eq!(main.len, std::fs::metadata(&path).unwrap().len());
+
+        // No chunk: the transpose is built, nothing is read.
+        let reads = incoming_reads();
+        let stored = read_file(&path, &key()).unwrap();
+        assert!(stored.chunks.is_empty());
+        assert_eq!(
+            stored.topology.incoming().targets,
+            topology.incoming().targets
+        );
+        assert_eq!(incoming_reads(), reads);
+
+        // Appended once; a second append finds it there.
+        let incoming = topology.incoming().clone();
+        let end = append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(end, std::fs::metadata(&path).unwrap().len());
+        let again = append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        });
+        assert_eq!(again.unwrap(), None);
+
+        let stored = read_file(&path, &key()).unwrap();
+        assert_eq!(stored.chunks.len(), 1);
+        assert_eq!(stored.main, main);
+        same(&topology, &stored.topology);
+        // Listed, not read, until asked for.
+        assert!(stored.topology.incoming_if_built().is_none());
+        let back = stored.topology.incoming();
+        assert!(incoming_reads() > reads);
+        assert_eq!(
+            (&back.offsets, &back.targets, &back.edge_ids),
+            (&incoming.offsets, &incoming.targets, &incoming.edge_ids)
+        );
+        // The main part reads the same with or without the chunk.
+        let bytes = std::fs::read(&path).unwrap();
+        let (main_only, _) = decode(&bytes, &key()).unwrap();
+        same(&topology, &main_only);
+    }
+
+    #[test]
+    fn a_damaged_chunk_is_ignored_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (topology, ids) = built(ints(&[1, 2, 3, 1]), ints(&[2, 3, 1, 3]));
+        let main = write_main(&path, &topology, &ids);
+        let incoming = topology.incoming().clone();
+        let end = append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap()
+        .unwrap();
+        let good = std::fs::read(&path).unwrap();
+
+        // A flipped byte in the chunk's arrays: listed, but its data CRC
+        // fails, so the transpose is built instead, the same.
+        let mut bytes = good.clone();
+        bytes[main.len as usize + 64] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        assert_eq!(stored.chunks.len(), 1);
+        assert!(read_chunk(&path, main, &stored.chunks[0]).is_err());
+        assert_eq!(stored.topology.incoming().targets, incoming.targets);
+        assert_eq!(stored.topology.incoming().edge_ids, incoming.edge_ids);
+
+        // A chunk cut short (a crash mid-append): not listed, and the next
+        // append writes over it.
+        std::fs::write(&path, &good[..good.len() - 10]).unwrap();
+        assert!(read_file(&path, &key()).unwrap().chunks.is_empty());
+        let again = append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap();
+        assert_eq!(again, Some(end));
+        assert_eq!(std::fs::read(&path).unwrap(), good);
+
+        // Another main part: nothing is appended or read.
+        let other = MainPart {
+            crc: main.crc ^ 1,
+            ..main
+        };
+        assert!(append_chunk(&path, other, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .is_err());
+        let chunk = &read_file(&path, &key()).unwrap().chunks[0];
+        assert!(read_chunk(&path, other, chunk).is_err());
+        assert!(read_chunk(&path, main, chunk).is_ok());
+    }
+
+    #[test]
+    fn weight_chunks_round_trip_by_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (topology, ids) = built(ints(&[1, 2, 3]), ints(&[2, 3, 1]));
+        let main = write_main(&path, &topology, &ids);
+        let (a, b) = (vec![0.5, 1.0, f64::MAX], vec![2.0, 0.0, 1e-300]);
+        for (key, columns) in [("w1", vec![&a[..]]), ("w2", vec![&a[..], &b[..]])] {
+            let appended = append_chunk(&path, main, CHUNK_WEIGHTS, key.as_bytes(), |at| {
+                EncodedChunk::weights(key, &columns, at)
+            });
+            assert!(appended.unwrap().is_some());
+        }
+        let stored = read_file(&path, &key()).unwrap();
+        assert_eq!(stored.chunks.len(), 2);
+        let chunk = |name: &[u8]| stored.chunks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(
+            read_weights(&path, main, chunk(b"w1"), 3).unwrap(),
+            std::slice::from_ref(&a)
+        );
+        assert_eq!(read_weights(&path, main, chunk(b"w2"), 3).unwrap(), [a, b]);
+        // The wrong edge count is an error, never a short column.
+        assert!(read_weights(&path, main, chunk(b"w1"), 4).is_err());
+    }
+
+    #[test]
+    fn a_version_1_file_is_not_read() {
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (topology, ids) = built(ints(&[1, 2]), ints(&[2, 3]));
+        let mut bytes = encode(&key(), &topology, &ids);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            decode(&bytes, &key()).unwrap_err(),
+            "index format version 1; this build reads 2"
+        );
     }
 
     #[test]
