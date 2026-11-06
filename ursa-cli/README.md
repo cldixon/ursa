@@ -38,6 +38,8 @@ LIMIT 5;
 
 Graphs are defined with SQL/PGQ `CREATE PROPERTY GRAPH`. Algorithms and traversals are table functions with named parameters. `SELECT * FROM ursa_functions()` lists them all. A `.ursa` database file keeps your views, graphs and the graph indexes Ursa builds, so the next session starts where you left off.
 
+For scripts and programs, `ursa -c "<sql>"`, `ursa -f script.sql` and SQL on stdin run and exit; a script may use the shell's dot-commands (`.mode`, `.timer on`, `.read`), as in DuckDB. `--format json` writes results for a program to read. `ursa --skill` prints a guide to writing Ursa SQL for coding agents, and `ursa --help` ends with where to start.
+
 The engine is built on [Apache DataFusion](https://datafusion.apache.org/). It runs the same algorithms as Ursa's Python library ([`ursa-graph`](https://pypi.org/project/ursa-graph/)) and gives the same values.
 
 - Documentation: <https://cldixon.github.io/ursa/sql/>

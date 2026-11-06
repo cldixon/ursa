@@ -127,7 +127,7 @@ The format comes from the extension, or from `STORED AS PARQUET`. Options go in 
 **Not supported:**
 
 - `SUMMARIZE`;
-- `USING SAMPLE`. DataFusion accepts `TABLESAMPLE` but ignores it and reads every row, so don't rely on it;
+- `USING SAMPLE` and `TABLESAMPLE`. Both are refused with an error; for a sample of n rows, use `ORDER BY random() LIMIT n`;
 - `ORDER BY ALL`;
 - `PRAGMA`, `INSTALL` and `LOAD`. Ursa has no extensions: object storage, Parquet, CSV and JSON are built in;
 - `ATTACH … AS`. A session has one database.

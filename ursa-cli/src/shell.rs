@@ -7,6 +7,10 @@
 //! editing, history, Ctrl-C) is in [`crate::repl`]; `-init` files and
 //! `~/.ursarc` run through [`Shell::run_file`], like `.read`.
 //!
+//! `-c`, `-f` and SQL on stdin run through [`Shell::run_text`] too, so a
+//! script may hold dot-commands, as in DuckDB. A script session is made with
+//! [`Shell::stop_on_error`]: its first error ends it (see that method).
+//!
 //! The dot-commands follow DuckDB's shell where it has the same command.
 
 use std::io::Write;
@@ -22,14 +26,35 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
 
 use crate::input::{self, Status};
-use crate::print::{has_columns, write_stream, OutputFormat};
+use crate::print::{has_columns, is_broken_pipe, write_stream, OutputFormat};
 
 /// What the caller does after a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Continue,
-    /// `.quit` or `.exit`.
+    /// `.quit` or `.exit`; or, in a script, an error, or a reader that
+    /// closed the output.
     Exit,
+}
+
+/// `.functions`: each graph function's name, family and the first sentence
+/// of its summary (`.functions NAME` shows the rest).
+const FUNCTIONS: &str = "SELECT name, family, \
+     CASE WHEN strpos(summary, '. ') > 0 THEN split_part(summary, '. ', 1) || '.' \
+          ELSE summary END AS summary \
+     FROM ursa_functions();";
+
+/// The docs, which `.help` and `ursa --help` point to.
+pub const DOCS_URL: &str = "https://cldixon.github.io/ursa/sql/";
+
+/// One step of a script: a dot-command, or SQL that ends with a `;` (or ends
+/// the script).
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Command(String),
+    /// The SQL, and how many lines of the script come before it (to report
+    /// a syntax error at the script's line, not the statement's).
+    Sql(String, usize),
 }
 
 /// How deeply `.read` may nest, so a file that reads itself stops.
@@ -42,8 +67,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (".exit", "", "Exit the shell (also Ctrl-D)"),
     (
         ".functions",
-        "",
-        "List the graph functions and their parameters",
+        "[NAME]",
+        "List the graph functions, or show one's parameters",
     ),
     (".graphs", "", "List the graphs (SHOW GRAPHS)"),
     (".help", "", "Show this message"),
@@ -73,6 +98,14 @@ pub struct Shell<O: Write, E: Write> {
     buffer: String,
     /// How many `.read`s (or init files) are running.
     depth: usize,
+    /// A script: the first error ends the session.
+    stop_on_error: bool,
+    /// A script's error has ended the session.
+    failed: bool,
+    /// The reader of the output has gone (`ursa … | head`): stop quietly.
+    closed: bool,
+    /// How many results have been written, for `--format arrow`'s one.
+    results: usize,
     out: O,
     err: E,
 }
@@ -85,15 +118,28 @@ impl<O: Write, E: Write> Shell<O, E> {
             timer: false,
             buffer: String::new(),
             depth: 0,
+            stop_on_error: false,
+            failed: false,
+            closed: false,
+            results: 0,
             out,
             err,
         }
     }
 
-    pub fn ctx(&self) -> &SessionContext {
-        &self.ctx
+    /// Run as a script (`-c`, `-f`, stdin) from now on: the first error is
+    /// printed and ends the session, with [`Self::failed`] set, and SQL
+    /// given to [`Self::run_text`] is parsed whole before any of it runs.
+    pub fn stop_on_error(&mut self) {
+        self.stop_on_error = true;
     }
 
+    /// Whether a script stopped on an error.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    #[cfg(test)]
     pub fn mode(&self) -> OutputFormat {
         self.mode
     }
@@ -115,26 +161,58 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// Take one line of input. A line starting with `.` is a dot-command
     /// unless it continues a statement.
     pub async fn feed(&mut self, line: &str) -> Flow {
-        if self.buffer.is_empty() && line.trim_start().starts_with('.') {
-            return self.command(line.trim()).await;
+        // The SQL is taken from the buffer before it runs, so a query
+        // cancelled with Ctrl-C leaves nothing behind.
+        let dialect = self.dialect();
+        let step = next_step(&mut self.buffer, line, dialect.as_ref());
+        match step {
+            Some(step) => self.run_step(step).await,
+            None => Flow::Continue,
         }
-        self.buffer.push_str(line);
-        self.buffer.push('\n');
-        match input::status(&self.buffer, self.dialect().as_ref()) {
-            Status::Empty => self.buffer.clear(),
-            Status::Incomplete => {}
-            Status::Complete => {
-                // Taken before running, so a query cancelled with Ctrl-C
-                // leaves nothing behind.
-                let sql = std::mem::take(&mut self.buffer);
-                self.run_sql(&sql).await;
+    }
+
+    async fn run_step(&mut self, step: Step) -> Flow {
+        let flow = match step {
+            Step::Command(line) => self.command(&line).await,
+            Step::Sql(sql, offset) => {
+                self.run_sql(&sql, offset).await;
+                Flow::Continue
+            }
+        };
+        if self.failed || self.closed {
+            Flow::Exit
+        } else {
+            flow
+        }
+    }
+
+    /// Run text of SQL and dot-commands, a line at a time, as typed. A last
+    /// statement without a `;` runs too. Errors are printed and the text goes
+    /// on, unless this is a script ([`Self::stop_on_error`]): then all of its
+    /// SQL is parsed first, so a syntax error anywhere runs none of it, and
+    /// the first error stops it.
+    pub async fn run_text(&mut self, text: &str) -> Flow {
+        let steps = steps(text, self.dialect().as_ref());
+        if self.stop_on_error {
+            for step in &steps {
+                if let Step::Sql(sql, offset) = step {
+                    if let Err(e) = ursa_sql::parse_sql_with_text_for(&self.ctx, sql) {
+                        self.error(&shift_lines(&ursa_engine::user_message(&e), *offset));
+                        return Flow::Exit;
+                    }
+                }
+            }
+        }
+        for step in steps {
+            if Box::pin(self.run_step(step)).await == Flow::Exit {
+                return Flow::Exit;
             }
         }
         Flow::Continue
     }
 
-    /// Run a file of SQL and dot-commands, as `.read` does. A last statement
-    /// without a `;` runs too. Errors are printed and the file goes on.
+    /// Run a file of SQL and dot-commands, as `.read` does (see
+    /// [`Self::run_text`]).
     pub async fn run_file(&mut self, path: &Path) -> Flow {
         if self.depth >= MAX_READ_DEPTH {
             self.error(&format!(
@@ -150,21 +228,10 @@ impl<O: Write, E: Write> Shell<O, E> {
                 return Flow::Continue;
             }
         };
-        // The file's statements are its own: whatever was being typed waits.
-        let typed = std::mem::take(&mut self.buffer);
+        // The file's statements are its own: whatever was being typed waits
+        // (run_text does not touch the buffer).
         self.depth += 1;
-        let mut flow = Flow::Continue;
-        for line in text.lines() {
-            flow = Box::pin(self.feed(line)).await;
-            if flow == Flow::Exit {
-                break;
-            }
-        }
-        let rest = std::mem::replace(&mut self.buffer, typed);
-        if flow == Flow::Continue && input::status(&rest, self.dialect().as_ref()) != Status::Empty
-        {
-            self.run_sql(&rest).await;
-        }
+        let flow = Box::pin(self.run_text(&text)).await;
         self.depth -= 1;
         flow
     }
@@ -178,21 +245,44 @@ impl<O: Write, E: Write> Shell<O, E> {
     fn error(&mut self, message: &str) {
         let _ = writeln!(self.err, "Error: {message}");
         let _ = self.err.flush();
-    }
-
-    fn say(&mut self, message: &str) {
-        let _ = writeln!(self.out, "{message}");
-        let _ = self.out.flush();
-    }
-
-    /// Parse all of `sql`, then run each statement and print its result. The
-    /// first error is printed and the rest of `sql` is skipped.
-    async fn run_sql(&mut self, sql: &str) {
-        if let Err(e) = Box::pin(self.try_run_sql(sql)).await {
-            self.error(&ursa_engine::user_message(&e));
+        if self.stop_on_error {
+            self.failed = true;
         }
     }
 
+    /// Print a line that is not a result: a dot-command's answer or the
+    /// timer's. With `--format arrow` it goes to the error stream, so the
+    /// output stays one Arrow stream.
+    fn say(&mut self, message: &str) {
+        self.write_text(&format!("{message}\n"));
+    }
+
+    fn write_text(&mut self, text: &str) {
+        let written = if self.mode == OutputFormat::Arrow {
+            write!(self.err, "{text}").and_then(|()| self.err.flush())
+        } else {
+            write!(self.out, "{text}").and_then(|()| self.out.flush())
+        };
+        if written.is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
+            self.closed = true;
+        }
+    }
+
+    /// Parse all of `sql`, then run each statement and print its result. The
+    /// first error is printed and the rest of `sql` is skipped. `offset`
+    /// lines came before `sql` in its script.
+    async fn run_sql(&mut self, sql: &str, offset: usize) {
+        match Box::pin(self.try_run_sql(sql)).await {
+            Ok(()) => {}
+            // A reader that stops early (`ursa … | head`) is not an error.
+            Err(e) if is_broken_pipe(&e) => self.closed = true,
+            Err(e) => self.error(&shift_lines(&ursa_engine::user_message(&e), offset)),
+        }
+    }
+
+    /// Run `sql`'s statements. A statement that returns columns prints a
+    /// result, with its header even when there are no rows; one that returns
+    /// none (DDL, `SET`) prints nothing, as in DuckDB.
     async fn try_run_sql(&mut self, sql: &str) -> Result<()> {
         let statements = ursa_sql::parse_sql_with_text_for(&self.ctx, sql)?;
         for (statement, text) in statements {
@@ -200,9 +290,16 @@ impl<O: Write, E: Write> Shell<O, E> {
             let frame = ursa_sql::execute_with_text(&self.ctx, statement, &text).await?;
             let stream = frame.execute_stream().await?;
             if has_columns(&stream.schema()) {
+                if self.mode == OutputFormat::Arrow && self.results > 0 {
+                    return Err(DataFusionError::Plan(
+                        "--format arrow writes a single result; run one query that returns rows"
+                            .into(),
+                    ));
+                }
                 let config = self.ctx.state().config().options().format.clone();
                 let options = (&config).try_into()?;
                 write_stream(self.mode, stream, &mut self.out, &options).await?;
+                self.results += 1;
             }
             if self.timer {
                 let seconds = start.elapsed().as_secs_f64();
@@ -232,14 +329,14 @@ impl<O: Write, E: Write> Shell<O, E> {
                 _ => self.error("usage: .timer on|off"),
             },
             ".tables" => self.tables().await,
-            ".graphs" => self.run_sql("SHOW GRAPHS;").await,
+            ".graphs" => self.run_sql("SHOW GRAPHS;", 0).await,
             ".describe" => self.describe(arg).await,
             ".read" => match path_arg(arg) {
                 Some(path) => return self.run_file(&path).await,
                 None => self.error("usage: .read FILE"),
             },
             ".open" => self.open(arg).await,
-            ".functions" => self.functions().await,
+            ".functions" => self.functions(arg).await,
             _ => {
                 let message = match did_you_mean(name) {
                     Some(command) => format!(
@@ -263,8 +360,14 @@ impl<O: Write, E: Write> Shell<O, E> {
             let usage = format!("{name} {args}");
             text.push_str(&format!("{usage:<22}{help}\n"));
         }
-        let _ = write!(self.out, "{text}");
-        let _ = self.out.flush();
+        text.push_str(&format!(
+            "\nAny file is a table: SELECT * FROM 'edges.csv' LIMIT 3;\n\
+             An edge table is a graph:\n  \
+             CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));\n\
+             SELECT * FROM ursa_functions(); lists the graph functions (as .functions does).\n\
+             Docs: {DOCS_URL}\n"
+        ));
+        self.write_text(&text);
     }
 
     fn mode_command(&mut self, arg: &str) {
@@ -306,7 +409,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             catalog = quote_literal(&options.default_catalog),
             excluded = excluded.join(", "),
         );
-        self.run_sql(&sql).await;
+        self.run_sql(&sql, 0).await;
     }
 
     /// `.describe NAME`: `DESCRIBE GRAPH` for a graph, `DESCRIBE` otherwise.
@@ -332,7 +435,7 @@ impl<O: Write, E: Write> Shell<O, E> {
         } else {
             format!("DESCRIBE {name};")
         };
-        self.run_sql(&sql).await;
+        self.run_sql(&sql, 0).await;
     }
 
     /// `.open FILE.ursa`: `ATTACH`, with its rules (only in a session that
@@ -354,33 +457,145 @@ impl<O: Write, E: Write> Shell<O, E> {
         }
     }
 
-    /// `.functions`: `SELECT * FROM ursa_functions()`.
-    async fn functions(&mut self) {
-        self.run_sql("SELECT * FROM ursa_functions();").await;
+    /// `.functions`: the name, family and summary of each graph function
+    /// (from `ursa_functions()`). `.functions NAME`: one function's
+    /// parameters and outputs.
+    async fn functions(&mut self, name: &str) {
+        let name = name.trim_end_matches(';').trim();
+        if name.is_empty() {
+            return self.run_sql(FUNCTIONS, 0).await;
+        }
+        match Box::pin(self.describe_function(name)).await {
+            Ok(text) => self.write_text(&text),
+            Err(e) => self.error(&ursa_engine::user_message(&e)),
+        }
     }
 
-    /// The graphs' names, from `SHOW GRAPHS`.
+    /// `.functions NAME`, as text.
+    async fn describe_function(&self, name: &str) -> Result<String> {
+        let literal = quote_literal(name);
+        let found = self
+            .rows(&format!(
+                "SELECT name, family, summary, networkx FROM ursa_functions() \
+                 WHERE lower(name) = lower({literal})"
+            ))
+            .await?;
+        let Some([name, family, summary, networkx]) = found.first().map(|row| &row[..]) else {
+            let names: Vec<String> = self
+                .rows("SELECT name FROM ursa_functions()")
+                .await?
+                .into_iter()
+                .map(|mut row| row.remove(0))
+                .collect();
+            let hint = match closest(name, names.iter().map(String::as_str)) {
+                Some(close) => format!("did you mean '{close}'? "),
+                None => String::new(),
+            };
+            return Err(DataFusionError::Plan(format!(
+                "no graph function named '{name}'; {hint}.functions lists them"
+            )));
+        };
+        let literal = quote_literal(name);
+        let mut text = format!("{name} ({family})\n{summary}\n");
+        if !networkx.is_empty() {
+            text.push_str(&format!("NetworkX: {networkx}\n"));
+        }
+        let parameters = self
+            .rows(&format!(
+                "SELECT p['name'], p['type'], p['default'], array_to_string(p['choices'], ', '), \
+                        p['doc'] \
+                 FROM (SELECT unnest(parameters) AS p FROM ursa_functions() \
+                       WHERE name = {literal})"
+            ))
+            .await?;
+        text.push_str("\nParameters, after the graph, as name => value:\n");
+        if parameters.is_empty() {
+            text.push_str("  none\n");
+        }
+        let width = |rows: &[Vec<String>], i: usize| rows.iter().map(|r| r[i].len()).max();
+        let name_width = width(&parameters, 0).unwrap_or(0);
+        let type_width = width(&parameters, 1).unwrap_or(0);
+        let default = |default: &str| match default {
+            "required" => default.to_string(),
+            _ => format!("default {default}"),
+        };
+        let default_width = parameters
+            .iter()
+            .map(|row| default(&row[2]).len())
+            .max()
+            .unwrap_or(0);
+        for row in &parameters {
+            let [name, kind, value, choices, doc] = &row[..] else {
+                continue;
+            };
+            let value = default(value);
+            let mut line = format!(
+                "  {name:<name_width$}  {kind:<type_width$}  {value:<default_width$}  {doc}"
+            );
+            if !choices.is_empty() {
+                line.push_str(&format!(" One of: {choices}."));
+            }
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+        let outputs = self
+            .rows(&format!(
+                "SELECT o['name'], o['type'] \
+                 FROM (SELECT unnest(outputs) AS o FROM ursa_functions() WHERE name = {literal})"
+            ))
+            .await?;
+        text.push_str("\nOutput columns:\n");
+        let name_width = width(&outputs, 0).unwrap_or(0);
+        for row in &outputs {
+            if let [name, kind] = &row[..] {
+                text.push_str(&format!("  {name:<name_width$}  {kind}\n"));
+            }
+        }
+        Ok(text)
+    }
+
+    /// The graphs' names, from `SHOW GRAPHS` (its first column).
     async fn graph_names(&self) -> Result<Vec<String>> {
-        let mut statements = ursa_sql::parse_sql_with_text_for(&self.ctx, "SHOW GRAPHS")?;
+        Ok(self
+            .rows("SHOW GRAPHS")
+            .await?
+            .into_iter()
+            .map(|mut row| row.remove(0))
+            .collect())
+    }
+
+    /// The rows of a query, each value as text (a null as "").
+    async fn rows(&self, sql: &str) -> Result<Vec<Vec<String>>> {
+        let mut statements = ursa_sql::parse_sql_with_text_for(&self.ctx, sql)?;
         let (statement, text) = statements.remove(0);
         let batches = ursa_sql::execute_with_text(&self.ctx, statement, &text)
             .await?
             .collect()
             .await?;
-        let mut names = Vec::new();
+        let mut rows = Vec::new();
         for batch in batches {
-            let column = batch.column_by_name("name").ok_or_else(|| {
-                DataFusionError::Internal("SHOW GRAPHS has no 'name' column".into())
-            })?;
-            let column = cast(column, &DataType::Utf8)?;
-            let column = column.as_string::<i32>();
-            names.extend(
-                (0..column.len())
-                    .filter(|&i| column.is_valid(i))
-                    .map(|i| column.value(i).to_string()),
-            );
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| cast(column, &DataType::Utf8))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for i in 0..batch.num_rows() {
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.as_string::<i32>();
+                            if column.is_valid(i) {
+                                column.value(i).to_string()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect(),
+                );
+            }
         }
-        Ok(names)
+        Ok(rows)
     }
 }
 
@@ -406,15 +621,100 @@ fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// The next step, once `line` is added to the SQL typed so far (`buffer`):
+/// a line that starts with `.` is a dot-command unless it continues a
+/// statement, and SQL is a step once it ends with `;`.
+fn next_step(buffer: &mut String, line: &str, dialect: &dyn Dialect) -> Option<Step> {
+    if buffer.is_empty() && line.trim_start().starts_with('.') {
+        return Some(Step::Command(line.trim().to_string()));
+    }
+    let continues = !buffer.is_empty();
+    buffer.push_str(line);
+    buffer.push('\n');
+    // An unfinished statement stays unfinished until a line has a `;`, or
+    // closes a comment the `;` came before. Skipping the tokenizer for the
+    // other lines keeps a long statement (a big INSERT, a row a line) from
+    // being read again for every line.
+    if continues && !line.contains(';') && !line.contains("*/") {
+        return None;
+    }
+    match input::status(buffer, dialect) {
+        Status::Empty => {
+            buffer.clear();
+            None
+        }
+        Status::Incomplete => None,
+        Status::Complete => Some(Step::Sql(std::mem::take(buffer), 0)),
+    }
+}
+
+/// The steps of a script, as if typed a line at a time. Unfinished SQL at the
+/// end is a step too.
+fn steps(text: &str, dialect: &dyn Dialect) -> Vec<Step> {
+    let mut buffer = String::new();
+    let mut steps = Vec::new();
+    let mut lines = 0;
+    for line in text.lines() {
+        lines += 1;
+        if let Some(step) = next_step(&mut buffer, line, dialect) {
+            steps.push(with_offset(step, lines));
+        }
+    }
+    if input::status(&buffer, dialect) != Status::Empty {
+        steps.push(with_offset(Step::Sql(buffer, 0), lines));
+    }
+    steps
+}
+
+/// `step`, which ends at line `last` of its script, with its offset set.
+fn with_offset(step: Step, last: usize) -> Step {
+    match step {
+        Step::Sql(sql, _) => {
+            let offset = last - sql.matches('\n').count();
+            Step::Sql(sql, offset)
+        }
+        command => command,
+    }
+}
+
+/// `message` with each "Line: N" (sqlparser's location) moved `offset` lines
+/// on, so it names the line of the script rather than of the statement.
+fn shift_lines(message: &str, offset: usize) -> String {
+    const LINE: &str = "Line: ";
+    if offset == 0 {
+        return message.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = message;
+    while let Some(at) = rest.find(LINE) {
+        let (before, after) = rest.split_at(at + LINE.len());
+        out.push_str(before);
+        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        match after[..digits].parse::<usize>() {
+            Ok(line) => out.push_str(&(line + offset).to_string()),
+            Err(_) => out.push_str(&after[..digits]),
+        }
+        rest = &after[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The dot-command closest to `name`, if one is close enough to be a typo.
 pub fn did_you_mean(name: &str) -> Option<&'static str> {
+    closest(name, COMMANDS.iter().map(|(command, _, _)| *command))
+}
+
+/// The candidate closest to `name`, ignoring case, if one is close enough to
+/// be a typo.
+fn closest<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let name = name.to_ascii_lowercase();
-    COMMANDS
-        .iter()
-        .map(|(command, _, _)| (*command, edit_distance(&name, command)))
-        .filter(|(command, distance)| *distance <= 2.max(command.len() / 3))
+    candidates
+        .into_iter()
+        .map(|candidate| (candidate, edit_distance(&name, candidate)))
+        .filter(|(candidate, distance)| *distance <= 2.max(candidate.len() / 3))
         .min_by_key(|(_, distance)| *distance)
-        .map(|(command, _)| command)
+        .map(|(candidate, _)| candidate)
 }
 
 /// Levenshtein distance, in characters.
@@ -818,6 +1118,196 @@ mod tests {
         let (out, err) = feed(&mut shell, &[".functions"]).await;
         assert_eq!(err, "");
         assert!(out.contains("pagerank"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn functions_lists_name_family_and_summary() {
+        let mut shell = shell();
+        shell.set_mode(OutputFormat::Csv);
+        let (out, err) = feed(&mut shell, &[".functions"]).await;
+        assert_eq!(err, "");
+        assert!(out.starts_with("name,family,summary\n"), "{out}");
+        assert!(
+            out.contains("\ndegree,algorithm,Per-node degree.\n"),
+            "{out}"
+        );
+        // The first sentence of a summary only.
+        let hop = out.lines().find(|l| l.starts_with("hop,")).unwrap();
+        assert!(!hop.contains("A seed is not its own row"), "{hop}");
+    }
+
+    #[tokio::test]
+    async fn functions_name_shows_one_function() {
+        let mut shell = shell();
+        let (out, err) = feed(&mut shell, &[".functions PageRank"]).await;
+        assert_eq!(err, "");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "pagerank (algorithm)", "{out}");
+        assert!(lines[1].starts_with("PageRank"), "{out}");
+        assert!(out.contains("\nParameters, after the graph, as name => value:\n"));
+        // One parameter a line: name, type, default, doc, choices.
+        let direction = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("direction "))
+            .unwrap();
+        assert!(
+            direction.contains("string") && direction.contains("default 'out'"),
+            "{direction}"
+        );
+        assert!(direction.ends_with("One of: out, both."), "{direction}");
+        assert!(lines.iter().any(|l| l.trim_start().starts_with("damping ")));
+        assert!(
+            out.ends_with("\nOutput columns:\n  pagerank  Float64\n"),
+            "{out}"
+        );
+        // A required parameter says so.
+        let (out, _) = feed(&mut shell, &[".functions hop"]).await;
+        assert!(out.contains("  seeds      node ids  required "), "{out}");
+    }
+
+    #[tokio::test]
+    async fn functions_name_suggests_a_close_one() {
+        let mut shell = shell();
+        let (out, err) = feed(&mut shell, &[".functions pagerenk"]).await;
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "Error: no graph function named 'pagerenk'; did you mean 'pagerank'? .functions \
+             lists them\n"
+        );
+        let (_, err) = feed(&mut shell, &[".functions frobnicate"]).await;
+        assert_eq!(
+            err,
+            "Error: no graph function named 'frobnicate'; .functions lists them\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn help_points_to_graphs_functions_and_docs() {
+        let mut shell = shell();
+        let (out, _) = feed(&mut shell, &[".help"]).await;
+        for needle in [
+            "CREATE PROPERTY GRAPH g EDGE TABLES",
+            "SELECT * FROM ursa_functions();",
+            DOCS_URL,
+        ] {
+            assert!(out.contains(needle), "{needle} missing from:\n{out}");
+        }
+    }
+
+    #[test]
+    fn scripts_split_into_steps_with_their_lines() {
+        let dialect = GenericDialect {};
+        let script = ".timer on\n\
+                      -- a note\n\
+                      SELECT 1;\n\
+                      \n\
+                      SELECT\n  2;  SELECT 3;\n\
+                      .mode csv\n\
+                      SELECT 'a\n.b' AS s;\n\
+                      SELECT 4";
+        assert_eq!(
+            steps(script, &dialect),
+            [
+                Step::Command(".timer on".into()),
+                Step::Sql("SELECT 1;\n".into(), 2),
+                Step::Sql("SELECT\n  2;  SELECT 3;\n".into(), 4),
+                Step::Command(".mode csv".into()),
+                Step::Sql("SELECT 'a\n.b' AS s;\n".into(), 7),
+                Step::Sql("SELECT 4\n".into(), 9),
+            ]
+        );
+        // A statement closed by a comment's end, after its `;`.
+        assert_eq!(
+            steps("SELECT 1; /* a\nnote */\nSELECT 2;", &dialect),
+            [
+                Step::Sql("SELECT 1; /* a\nnote */\n".into(), 0),
+                Step::Sql("SELECT 2;\n".into(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn syntax_errors_name_the_scripts_line() {
+        assert_eq!(
+            shift_lines("Expected: x, found: y at Line: 1, Column: 5", 3),
+            "Expected: x, found: y at Line: 4, Column: 5"
+        );
+        assert_eq!(shift_lines("at Line: 2", 0), "at Line: 2");
+        assert_eq!(shift_lines("no location", 7), "no location");
+    }
+
+    #[tokio::test]
+    async fn a_script_stops_at_its_first_error() {
+        let mut shell = shell();
+        shell.set_mode(OutputFormat::Csv);
+        shell.stop_on_error();
+        let flow = shell
+            .run_text("SELECT 1 AS a;\nSELECT nope;\nSELECT 2 AS b;\n")
+            .await;
+        assert_eq!(flow, Flow::Exit);
+        assert!(shell.failed());
+        let (out, err) = take(&mut shell);
+        assert_eq!(out, "a\n1\n");
+        assert!(
+            err.starts_with("Error: ") && err.lines().count() == 1,
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_syntax_error_anywhere_in_a_script_runs_none_of_it() {
+        let mut shell = shell();
+        shell.stop_on_error();
+        let flow = shell
+            .run_text(".mode csv\nSELECT 1 AS a;\n\nSELECT\n  2 FROM t WHERE;\n")
+            .await;
+        assert_eq!(flow, Flow::Exit);
+        let (out, err) = take(&mut shell);
+        assert_eq!(out, "");
+        assert!(err.contains("at Line: 5, Column: "), "{err}");
+        // Not even the dot-commands before it.
+        assert_eq!(shell.mode(), OutputFormat::Table);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_command_fails_a_script() {
+        let mut shell = shell();
+        shell.stop_on_error();
+        assert_eq!(shell.run_text(".tabels\nSELECT 1;\n").await, Flow::Exit);
+        assert!(shell.failed());
+        let (out, err) = take(&mut shell);
+        assert_eq!(out, "");
+        assert!(err.contains("did you mean '.tables'?"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn with_arrow_only_the_result_goes_to_the_output() {
+        let mut shell = Shell::new(
+            ursa_engine::new_session(),
+            OutputFormat::Arrow,
+            Vec::new(),
+            Vec::new(),
+        );
+        shell.stop_on_error();
+        let flow = shell.run_text(".timer on\n.mode\nSELECT 1 AS a;\n").await;
+        assert_eq!(flow, Flow::Continue);
+        let out = std::mem::take(&mut shell.out);
+        let err = String::from_utf8(std::mem::take(&mut shell.err)).unwrap();
+        // An Arrow IPC stream starts with its continuation marker.
+        assert!(out.starts_with(&[0xff, 0xff, 0xff, 0xff]), "{out:?}");
+        assert!(
+            err.starts_with("The output mode is arrow.\nRun Time: "),
+            "{err}"
+        );
+        // A second result is refused.
+        assert_eq!(shell.run_text("SELECT 2 AS b;").await, Flow::Exit);
+        let (out, err) = take(&mut shell);
+        assert_eq!(out, "");
+        assert!(
+            err.contains("--format arrow writes a single result"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

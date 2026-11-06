@@ -29,6 +29,7 @@
 set -eu
 
 REPO="cldixon/ursa"
+DOCS_URL="https://cldixon.github.io/ursa/sql/"
 
 say() {
     printf '%s\n' "$*"
@@ -193,6 +194,8 @@ main() {
             say ""
             say "Try it:"
             say "  ursa -c \"SELECT 42\""
+            say ""
+            say "Docs: $DOCS_URL"
             ;;
         *)
             case "${SHELL:-}" in
@@ -213,6 +216,8 @@ main() {
             say ""
             say "Then try it:"
             say "  ursa -c \"SELECT 42\""
+            say ""
+            say "Docs: $DOCS_URL"
             ;;
     esac
 }

@@ -459,7 +459,8 @@ fn graphs_last_for_the_invocation() {
         "CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src, x) DESTINATION KEY (dst))",
     ]));
     assert!(
-        e.starts_with("Error: multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column) not supported yet"),
+        e.starts_with("Error: multi-column keys are not supported yet at Line: ")
+            && e.ends_with("; KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column\n"),
         "{e}"
     );
 }
@@ -1052,4 +1053,290 @@ algorithms,combinator,0,
         err(ursa(&["-c", "SELECT * FROM ursa_functions('pagerank')"])),
         "Error: ursa_functions() takes no arguments: SELECT * FROM ursa_functions()\n"
     );
+}
+
+/// `-f` files and stdin take dot-commands, as `-init` and `.read` do (and as
+/// DuckDB's do).
+#[test]
+fn scripts_take_dot_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = dir.path().join("inner.sql");
+    std::fs::write(&inner, "SELECT 2 AS b;\n").unwrap();
+    let script = dir.path().join("q.sql");
+    std::fs::write(
+        &script,
+        format!(
+            ".timer on\n.mode csv\nSELECT 1 AS a;\n.read {}\n",
+            inner.display()
+        ),
+    )
+    .unwrap();
+    let out = ok(ursa(&["-f", &script.display().to_string()]));
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 6, "{out}");
+    assert_eq!(&lines[..2], ["a", "1"]);
+    assert!(lines[2].starts_with("Run Time: "), "{out}");
+    assert_eq!(&lines[3..5], ["b", "2"]);
+    assert!(lines[5].starts_with("Run Time: "), "{out}");
+
+    // On stdin too.
+    let out = ok(ursa_with_stdin(&[], ".mode json\nSELECT 1 AS a;\n"));
+    assert_eq!(out, "[{\"a\":1}]\n");
+    let out = ok(ursa_with_stdin(&[], ".help\n"));
+    assert!(out.contains(".functions [NAME]"), "{out}");
+    // And in -c.
+    let out = ok(ursa(&["-c", ".mode csv", "-c", "SELECT 3 AS c"]));
+    assert_eq!(out, "c\n3\n");
+}
+
+/// `.quit` and `.exit` end a script, and the run, without error.
+#[test]
+fn quit_ends_a_script() {
+    let out = ok(ursa_with_stdin(
+        &["--format", "csv"],
+        "SELECT 1 AS a;\n.exit\nSELECT 2 AS b;\n",
+    ));
+    assert_eq!(out, "a\n1\n");
+    let out = ok(ursa(&[
+        "--format",
+        "csv",
+        "-c",
+        ".quit",
+        "-c",
+        "SELECT 2 AS b",
+    ]));
+    assert_eq!(out, "");
+}
+
+/// A script stops at its first error, which names the script's line; a
+/// syntax error anywhere in a file or -c runs none of it.
+#[test]
+fn a_script_stops_at_its_first_error() {
+    let out = ursa_with_stdin(
+        &["--format", "csv"],
+        "SELECT 1 AS a;\nSELECT * FROM nowhere;\nSELECT 2 AS b;\n",
+    );
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "a\n1\n");
+    let message = String::from_utf8(out.stderr).unwrap();
+    assert!(message.contains("nowhere"), "{message}");
+
+    let out = ursa_with_stdin(
+        &["--format", "csv"],
+        ".mode json\nSELECT 1 AS a;\n\nSELECT 2\n  FROM t WHERE;\n",
+    );
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let message = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        message.starts_with("Error: syntax error: ") && message.contains("at Line: 5, Column: "),
+        "{message}"
+    );
+
+    // An unknown dot-command is an error too.
+    let e = err(ursa(&["-c", ".tabels", "-c", "SELECT 1"]));
+    assert!(e.contains("did you mean '.tables'?"), "{e}");
+}
+
+/// With --format arrow, the output is one Arrow stream: the timer and other
+/// dot-command text go to stderr.
+#[test]
+fn arrow_scripts_keep_the_stream_clean() {
+    let out = ursa(&[
+        "--format",
+        "arrow",
+        "-c",
+        ".timer on",
+        "-c",
+        "SELECT 1 AS a",
+    ]);
+    assert!(out.status.success());
+    assert!(out.stdout.starts_with(&[0xff, 0xff, 0xff, 0xff]));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.starts_with("Run Time: "), "{stderr}");
+    let e = err(ursa(&[
+        "--format",
+        "arrow",
+        "-c",
+        "SELECT 1 AS a",
+        "-c",
+        "SELECT 2 AS b",
+    ]));
+    assert!(e.contains("--format arrow writes a single result"), "{e}");
+}
+
+/// Never silent: a statement that returns rows prints a result, with its
+/// header even when there are none; a statement that returns no columns
+/// (DDL, SET) prints nothing, as in DuckDB; anything else fails with a
+/// message. (NDJSON has no header, so it prints nothing for no rows.)
+#[test]
+fn every_statement_prints_a_result_or_nothing_by_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("out.csv").display().to_string();
+    let edges = karate_edges();
+    let graph = "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2)) AS t(src, dst); \
+                 CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))";
+    // (setup, statement, the result's header, or None for no result)
+    let cases: Vec<(&str, String, Option<&str>)> = vec![
+        ("", "SELECT 1 AS x WHERE false".into(), Some("x")),
+        ("", "FROM (SELECT 1 AS x) WHERE x > 1".into(), Some("x")),
+        (
+            "",
+            format!("FROM '{edges}' WHERE src > 1000"),
+            Some("src,dst"),
+        ),
+        (
+            "",
+            "WITH a AS (SELECT 1 AS x) SELECT * FROM a WHERE x = 2".into(),
+            Some("x"),
+        ),
+        ("", "VALUES (1) EXCEPT VALUES (1)".into(), Some("column1")),
+        (
+            "",
+            "SHOW GRAPHS".into(),
+            Some("name,edge_table,source,destination"),
+        ),
+        (
+            "",
+            "SHOW datafusion.execution.batch_size".into(),
+            Some("name,value"),
+        ),
+        (
+            "",
+            "SHOW ursa.index_storage_limit".into(),
+            Some("name,value"),
+        ),
+        (
+            "",
+            "DESCRIBE SELECT 1 AS x".into(),
+            Some("column_name,data_type"),
+        ),
+        (
+            "",
+            format!("COPY (SELECT 1 AS x WHERE false) TO '{target}'"),
+            Some("count"),
+        ),
+        ("", "EXPLAIN SELECT 1".into(), Some("plan_type,plan")),
+        (
+            "",
+            "SELECT name FROM ursa_functions() WHERE name = 'none'".into(),
+            Some("name"),
+        ),
+        (
+            graph,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (a)-[e]->(b) WHERE a.id > 100 \
+             COLUMNS (a.id AS a))"
+                .into(),
+            Some("a"),
+        ),
+        (
+            graph,
+            "SELECT * FROM hop(g, seeds => [100])".into(),
+            Some("src,dst"),
+        ),
+        (
+            graph,
+            "DESCRIBE GRAPH g".into(),
+            Some("table_name,column_name"),
+        ),
+        // DDL and SET: nothing, as in DuckDB.
+        ("", "CREATE VIEW v AS SELECT 1 AS x".into(), None),
+        (
+            "",
+            "CREATE TABLE t AS SELECT 1 AS x WHERE false".into(),
+            None,
+        ),
+        (
+            "",
+            "SET datafusion.execution.batch_size = 1024".into(),
+            None,
+        ),
+        ("", graph.into(), None),
+        (graph, "DROP PROPERTY GRAPH g".into(), None),
+        (graph, "DROP VIEW IF EXISTS nothing".into(), None),
+    ];
+    for (setup, statement, header) in &cases {
+        let mut args = vec!["--format", "csv"];
+        if !setup.is_empty() {
+            args.extend(["-c", setup]);
+        }
+        args.extend(["-c", statement]);
+        let out = ursa(&args);
+        assert!(
+            out.status.success(),
+            "{statement}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        match header {
+            Some(header) => assert!(
+                stdout.starts_with(header) && stdout.ends_with('\n'),
+                "{statement} printed:\n{stdout}"
+            ),
+            None => assert_eq!(stdout, "", "{statement}"),
+        }
+        // The table and JSON formats print something for a result too.
+        if header.is_some() {
+            for format in ["table", "json"] {
+                let mut args = vec!["--format", format];
+                if !setup.is_empty() {
+                    args.extend(["-c", setup]);
+                }
+                args.extend(["-c", statement]);
+                let stdout = ok(ursa(&args));
+                assert!(!stdout.trim().is_empty(), "{statement} ({format})");
+            }
+        }
+    }
+    // What does not parse, or cannot run, fails with a message.
+    for statement in ["SELEC 1", "SELECT * FROM nowhere", "SUMMARIZE ties"] {
+        let e = err(ursa(&["-c", statement]));
+        assert!(e.starts_with("Error: "), "{statement}: {e}");
+    }
+}
+
+/// DuckDB statements Ursa does not have say what to write instead.
+#[test]
+fn duckdb_only_syntax_says_what_to_use() {
+    let e = err(ursa(&["-c", "SUMMARIZE t"]));
+    assert!(
+        e.starts_with("Error: SUMMARIZE is not supported; use DESCRIBE t"),
+        "{e}"
+    );
+    let e = err(ursa(&["-c", "SELECT * FROM t USING SAMPLE 10"]));
+    assert!(
+        e.starts_with("Error: USING SAMPLE is not supported; use ORDER BY random() LIMIT n"),
+        "{e}"
+    );
+}
+
+/// `--skill` prints the agent skill, the copy in the crate of
+/// skills/ursa-sql/SKILL.md. The crate is published on its own, so it
+/// carries a copy; this test keeps the copy current.
+#[test]
+fn skill_prints_the_agent_skill() {
+    let skill = std::fs::read_to_string(workspace().join("skills/ursa-sql/SKILL.md")).unwrap();
+    let copy = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ursa-sql-skill.md");
+    assert!(
+        std::fs::read_to_string(&copy).unwrap() == skill,
+        "{} is out of date: copy skills/ursa-sql/SKILL.md over it",
+        copy.display()
+    );
+    assert_eq!(ok(ursa(&["--skill"])), skill);
+}
+
+/// `--help` ends with where to go next: the docs, a graph, the function
+/// catalog, JSON for programs and the skill.
+#[test]
+fn help_points_onward() {
+    let help = ok(ursa(&["--help"]));
+    for needle in [
+        "https://cldixon.github.io/ursa/sql/",
+        "CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+        "SELECT * FROM ursa_functions()",
+        "--format json",
+        "ursa --skill",
+    ] {
+        assert!(help.contains(needle), "{needle} missing from:\n{help}");
+    }
 }
