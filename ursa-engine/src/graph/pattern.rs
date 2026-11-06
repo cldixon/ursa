@@ -8,7 +8,7 @@
 //! conditions, the pattern's conditions and `COLUMNS`). DataFusion's
 //! optimizer turns the equalities into hash joins.
 //!
-//! Supported (fixed-length patterns):
+//! Supported:
 //!
 //! ```text
 //! GRAPH_TABLE ( graph
@@ -16,10 +16,13 @@
 //!   [WHERE condition]
 //!   COLUMNS ( expression [AS name], … ) )
 //!
-//! path    := node (edge node)*
-//! node    := ( [var] [:label | IS label] [WHERE condition] )
-//! edge    := -[ spec ]->  |  <-[ spec ]-  |  -[ spec ]-  |  ->  |  <-  |  -
-//! spec    := [var] [:label | IS label] [WHERE condition]
+//! path       := [var =] [selector] [mode [PATH | PATHS]] node (edge node)*
+//! selector   := ANY SHORTEST | ALL SHORTEST | ANY [k] | SHORTEST k | ALL
+//! mode       := WALK | TRAIL | SIMPLE | ACYCLIC
+//! node       := ( [var] [:label | IS label] [WHERE condition] )
+//! edge       := (-[ spec ]->  |  <-[ spec ]-  |  -[ spec ]-  |  ->  |  <-  |  -) [quantifier]
+//! quantifier := * | + | ? | {n} | {m,n} | {m,} | {,n}
+//! spec       := [var] [:label | IS label] [WHERE condition]
 //! ```
 //!
 //! Conditions and `COLUMNS` are SQL expressions over the variables
@@ -34,8 +37,12 @@
 //! once): the match is a `UNION ALL` with one branch per orientation, so every
 //! join stays an equality join.
 //!
-//! Variable-length paths, path variables, `ANY SHORTEST` and label
-//! expressions (`|`, `&`, `!`) are refused with a message (#297).
+//! A quantified edge, and the edge of a path with a path variable, a selector
+//! or a mode, is not joined: it is a [`Segment`], searched on the graph index
+//! (see [`super::path_search`]), and joined to the nodes at its ends. A path
+//! with a variable, a selector or a mode is one edge between two nodes for
+//! now. Label expressions (`|`, `&`, `!`) and parenthesized path patterns are
+//! refused with a message.
 
 use std::collections::BTreeMap;
 
@@ -58,18 +65,71 @@ const MAX_UNDIRECTED: usize = 3;
 pub struct Pattern {
     /// The graph's name, as written.
     pub graph: String,
-    pub paths: Vec<Vec<Element>>,
+    pub paths: Vec<PathPattern>,
     /// The pattern's `WHERE` condition, as written.
     pub condition: Option<String>,
     /// The `COLUMNS` list, as written (without its parentheses).
     pub columns: String,
 }
 
+/// One path of a `MATCH`: `[p =] [selector] [mode] (a)-[e]->…(b)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathPattern {
+    /// The path variable, `p` in `p = …`.
+    pub var: Option<String>,
+    pub selector: Selector,
+    pub mode: Mode,
+    /// Nodes and edges alternate, starting and ending with a node.
+    pub elements: Vec<Element>,
+}
+
+/// Which of a pair of nodes' paths a path keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+pub enum Selector {
+    /// No selector (or `ALL`): every path.
+    All,
+    /// `ANY SHORTEST`, `ANY`, `ANY k` and `SHORTEST k`: the `k` shortest
+    /// paths, the first by edge row among paths as short (see [`super::path_search`]).
+    Shortest(u32),
+    /// `ALL SHORTEST`: every path as short as the shortest.
+    AllShortest,
+}
+
+/// Which walks a path may be (SQL/PGQ's path modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+pub enum Mode {
+    /// Any walk: nodes and edges may repeat (the default).
+    Walk,
+    /// No edge twice.
+    Trail,
+    /// No node twice, except that the last may be the first.
+    Simple,
+    /// No node twice.
+    Acyclic,
+}
+
+/// An edge's quantifier: how many times it repeats, `{min,max}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+pub struct Quantifier {
+    pub min: u32,
+    /// `None`: no upper bound.
+    pub max: Option<u32>,
+}
+
+impl Quantifier {
+    /// An edge without a quantifier: exactly once.
+    pub const ONCE: Quantifier = Quantifier {
+        min: 1,
+        max: Some(1),
+    };
+}
+
 /// One element of a path: nodes and edges alternate, starting with a node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Element {
     Node(Spec),
-    Edge(Spec, Direction),
+    /// An edge, with its quantifier if it has one.
+    Edge(Spec, Direction, Option<Quantifier>),
 }
 
 /// A node or edge: `[var] [:label] [WHERE condition]`.
@@ -80,7 +140,7 @@ pub struct Spec {
     pub condition: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
 pub enum Direction {
     /// `-[e]->`: from the node on the left to the node on the right.
     Right,
@@ -285,23 +345,104 @@ pub fn parse(body: &str) -> Result<Pattern> {
     })
 }
 
-/// A path: a node, then edges and nodes.
-fn parse_path(t: &mut Tokens) -> Result<Vec<Element>> {
-    if matches!(t.peek(0), Some(Token::Word(_))) && t.peek(1) == Some(&Token::Eq) {
+/// A path: `[p =] [selector] [mode [PATH | PATHS]]`, then a node, then edges
+/// and nodes.
+fn parse_path(t: &mut Tokens) -> Result<PathPattern> {
+    let var = if matches!(t.peek(0), Some(Token::Word(_))) && t.peek(1) == Some(&Token::Eq) {
+        let var = t.identifier("a path variable")?;
+        t.next();
+        Some(var)
+    } else {
+        None
+    };
+    let selector = parse_selector(t)?;
+    let mode = if t.is_word(0, "WALK") {
+        Some(Mode::Walk)
+    } else if t.is_word(0, "TRAIL") {
+        Some(Mode::Trail)
+    } else if t.is_word(0, "SIMPLE") {
+        Some(Mode::Simple)
+    } else if t.is_word(0, "ACYCLIC") {
+        Some(Mode::Acyclic)
+    } else {
+        None
+    };
+    if mode.is_some() {
+        t.next();
+    }
+    if t.is_word(0, "PATH") || t.is_word(0, "PATHS") {
+        t.next();
+    }
+    if t.peek(0) == Some(&Token::LParen) && t.peek(1) == Some(&Token::LParen) {
         return pattern_err(
-            "path variables (p = …) are not supported yet; they come with shortest paths (#297)",
+            "parenthesized path patterns, as ((a)-[e]->(b))*, are not supported yet; quantify an edge instead, as (a)-[e]->*(b)",
         );
     }
-    if t.is_word(0, "ANY") || t.is_word(0, "ALL") || t.is_word(0, "SHORTEST") {
-        return pattern_err("ANY/ALL SHORTEST paths are not supported yet (#297)");
+    let mut elements = vec![Element::Node(parse_node(t)?)];
+    while let Some((spec, direction, quantifier)) = parse_edge(t)? {
+        elements.push(Element::Edge(spec, direction, quantifier));
+        elements.push(Element::Node(parse_node(t)?));
     }
-    let mut path = vec![Element::Node(parse_node(t)?)];
-    while let Some(direction_and_spec) = parse_edge(t)? {
-        let (spec, direction) = direction_and_spec;
-        path.push(Element::Edge(spec, direction));
-        path.push(Element::Node(parse_node(t)?));
+    Ok(PathPattern {
+        var,
+        selector,
+        mode: mode.unwrap_or(Mode::Walk),
+        elements,
+    })
+}
+
+/// `ANY SHORTEST`, `ALL SHORTEST`, `ANY [k]`, `SHORTEST k`, `ALL`, or none.
+fn parse_selector(t: &mut Tokens) -> Result<Selector> {
+    let count = |t: &mut Tokens, what: &str| -> Result<Option<u32>> {
+        let Some(Token::Number(n, _)) = t.peek(0) else {
+            return Ok(None);
+        };
+        let k = n.parse::<u32>().ok().filter(|&k| k > 0).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "in GRAPH_TABLE: {what} takes a whole number of paths above 0; got {n}"
+            ))
+        })?;
+        t.next();
+        Ok(Some(k))
+    };
+    if t.is_word(0, "ANY") && t.is_word(1, "SHORTEST") {
+        t.next();
+        t.next();
+        if matches!(t.peek(0), Some(Token::Number(..))) {
+            return pattern_err(
+                "ANY SHORTEST keeps one path; for several, write SHORTEST k, as SHORTEST 3",
+            );
+        }
+        return Ok(Selector::Shortest(1));
     }
-    Ok(path)
+    if t.is_word(0, "ALL") && t.is_word(1, "SHORTEST") {
+        t.next();
+        t.next();
+        return Ok(Selector::AllShortest);
+    }
+    if t.is_word(0, "ANY") {
+        t.next();
+        return Ok(Selector::Shortest(count(t, "ANY")?.unwrap_or(1)));
+    }
+    if t.is_word(0, "SHORTEST") {
+        t.next();
+        let Some(k) = count(t, "SHORTEST")? else {
+            return pattern_err(format!(
+                "SHORTEST takes a number of paths, as SHORTEST 3; found {}",
+                t.found()
+            ));
+        };
+        if t.is_word(0, "GROUP") || t.is_word(0, "GROUPS") {
+            return pattern_err(
+                "SHORTEST k GROUP is not supported yet; use SHORTEST k or ALL SHORTEST",
+            );
+        }
+        return Ok(Selector::Shortest(k));
+    }
+    if t.is_word(0, "ALL") {
+        t.next();
+    }
+    Ok(Selector::All)
 }
 
 fn parse_node(t: &mut Tokens) -> Result<Spec> {
@@ -345,33 +486,18 @@ fn parse_spec(t: &mut Tokens, close: &Token) -> Result<Spec> {
     Ok(spec)
 }
 
-/// An edge, if one is next: `-[…]->`, `<-[…]-`, `-[…]-`, `->`, `<-` or `-`.
-fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction)>> {
-    let quantified = |t: &Tokens| {
-        matches!(
-            t.peek(0),
-            Some(Token::Mul | Token::Plus | Token::Placeholder(_) | Token::LBrace)
-        )
-    };
-    let refuse_quantifier = |t: &Tokens| -> Result<()> {
-        if quantified(t) {
-            return pattern_err(
-                "quantified edges (*, +, ?, {m,n}) are not supported yet; variable-length paths come with #297",
-            );
-        }
-        Ok(())
-    };
+/// An edge, if one is next: `-[…]->`, `<-[…]-`, `-[…]-`, `->`, `<-` or `-`,
+/// and its quantifier, if it has one.
+fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction, Option<Quantifier>)>> {
     let edge = match (t.peek(0), t.peek(1)) {
         // Abbreviated edges.
         (Some(Token::Arrow), _) => {
             t.next();
-            refuse_quantifier(t)?;
             (Spec::default(), Direction::Right)
         }
         (Some(Token::Lt), Some(Token::Minus)) if t.peek(2) != Some(&Token::LBracket) => {
             t.next();
             t.next();
-            refuse_quantifier(t)?;
             (Spec::default(), Direction::Left)
         }
         (Some(Token::Minus), Some(Token::LBracket)) => {
@@ -381,6 +507,11 @@ fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction)>> {
             t.expect(&Token::RBracket, "']' to close the edge")?;
             let direction = match t.next() {
                 Some(Token::Arrow) => Direction::Right,
+                // `- >`, as DuckPGQ also reads it.
+                Some(Token::Minus) if t.peek(0) == Some(&Token::Gt) => {
+                    t.next();
+                    Direction::Right
+                }
                 Some(Token::Minus) => Direction::Any,
                 Some(Token::LongArrow) => {
                     return pattern_err("expected '->' or '-' after ']', found '->>'")
@@ -393,7 +524,6 @@ fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction)>> {
                     ));
                 }
             };
-            refuse_quantifier(t)?;
             (spec, direction)
         }
         (Some(Token::Lt), Some(Token::Minus)) => {
@@ -403,17 +533,73 @@ fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction)>> {
             let spec = parse_spec(t, &Token::RBracket)?;
             t.expect(&Token::RBracket, "']' to close the edge")?;
             t.expect(&Token::Minus, "'-' after ']'")?;
-            refuse_quantifier(t)?;
             (spec, Direction::Left)
         }
         (Some(Token::Minus), _) => {
             t.next();
-            refuse_quantifier(t)?;
             (Spec::default(), Direction::Any)
         }
         _ => return Ok(None),
     };
-    Ok(Some(edge))
+    let quantifier = parse_quantifier(t)?;
+    Ok(Some((edge.0, edge.1, quantifier)))
+}
+
+/// `*`, `+`, `?`, `{n}`, `{m,n}`, `{m,}`, `{,n}` or `{,}`, if one is next.
+fn parse_quantifier(t: &mut Tokens) -> Result<Option<Quantifier>> {
+    let q = |min, max| Ok(Some(Quantifier { min, max }));
+    match t.peek(0) {
+        Some(Token::Mul) => {
+            t.next();
+            q(0, None)
+        }
+        Some(Token::Plus) => {
+            t.next();
+            q(1, None)
+        }
+        Some(Token::Placeholder(p)) if p == "?" => {
+            t.next();
+            q(0, Some(1))
+        }
+        Some(Token::LBrace) => {
+            t.next();
+            let bound = |t: &mut Tokens| -> Result<Option<u32>> {
+                match t.peek(0) {
+                    Some(Token::Number(n, _)) => {
+                        let n = n.parse::<u32>().map_err(|_| {
+                            DataFusionError::Plan(format!(
+                                "in GRAPH_TABLE: a quantifier's bounds are whole numbers from 0; got {n}"
+                            ))
+                        })?;
+                        t.next();
+                        Ok(Some(n))
+                    }
+                    _ => Ok(None),
+                }
+            };
+            let min = bound(t)?;
+            let max = if t.eat(&Token::Comma) {
+                bound(t)?
+            } else if min.is_some() {
+                min
+            } else {
+                return pattern_err(format!(
+                    "expected a number or ',' in the quantifier, found {}",
+                    t.found()
+                ));
+            };
+            t.expect(&Token::RBrace, "'}' to close the quantifier")?;
+            let min = min.unwrap_or(0);
+            if max.is_some_and(|max| max < min) {
+                return pattern_err(format!(
+                    "the quantifier's lower bound {min} is above its upper bound {}",
+                    max.unwrap()
+                ));
+            }
+            q(min, max)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Where a vertex variable reads from.
@@ -440,6 +626,9 @@ struct Step {
     edge: String,
     right: String,
     direction: Direction,
+    quantifier: Option<Quantifier>,
+    /// The path it is in.
+    path: usize,
 }
 
 /// A column of a variable: (variable, column).
@@ -463,11 +652,41 @@ pub enum Join {
     NotEqual(VarColumn, VarColumn),
 }
 
+/// An edge searched on the graph index rather than joined: a quantified
+/// edge, or the edge of a path with a path variable, a selector or a mode.
+/// It is a relation of paths, named `var`, with the columns of
+/// [`super::path_search`]: the path's first and last node, its length, and
+/// its nodes and edges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    /// The relation's name: the path variable, or an unnamed one.
+    pub var: String,
+    /// The path variable, if the path has one.
+    pub path: Option<String>,
+    /// The edge table, and its source and destination columns.
+    pub edges: TableReference,
+    pub source: String,
+    pub destination: String,
+    /// The node variables at its two ends, and their keys.
+    pub start: String,
+    pub start_key: VarColumn,
+    pub end: String,
+    pub end_key: VarColumn,
+    pub direction: Direction,
+    pub quantifier: Quantifier,
+    pub selector: Selector,
+    pub mode: Mode,
+}
+
 /// A pattern resolved against a graph: what to scan and join.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lowered {
-    /// One per variable, in order of appearance.
+    /// One per variable, in order of appearance, except the edges searched as
+    /// segments.
     pub sources: Vec<Source>,
+    /// The edges searched on the graph index, joined to their end nodes in
+    /// every branch.
+    pub segments: Vec<Segment>,
     /// One per orientation of the undirected edges: the joins of each branch
     /// of the `UNION ALL` (one branch when every edge has a direction).
     pub branches: Vec<Vec<Join>>,
@@ -489,12 +708,13 @@ pub fn lower(
     let mut order: Vec<String> = Vec::new();
     let mut steps = Vec::new();
     let mut anonymous = 0;
-    for path in &pattern.paths {
-        let mut previous: Option<(String, Direction, String)> = None; // (left node, direction, edge)
-        for element in path {
+    for (path_index, path) in pattern.paths.iter().enumerate() {
+        // (left node, direction, edge, quantifier)
+        let mut previous: Option<(String, Direction, String, Option<Quantifier>)> = None;
+        for element in &path.elements {
             let (spec, is_edge) = match element {
                 Element::Node(spec) => (spec, false),
-                Element::Edge(spec, _) => (spec, true),
+                Element::Edge(spec, _, _) => (spec, true),
             };
             let var = match &spec.var {
                 Some(v) => v.clone(),
@@ -534,19 +754,21 @@ pub fn lower(
             binding.conditions.extend(spec.condition.clone());
             match element {
                 Element::Node(_) => {
-                    if let Some((left, direction, edge)) = previous.take() {
+                    if let Some((left, direction, edge, quantifier)) = previous.take() {
                         steps.push(Step {
                             left,
                             edge,
                             right: var.clone(),
                             direction,
+                            quantifier,
+                            path: path_index,
                         });
                     }
-                    previous = Some((var, Direction::Right, String::new()));
+                    previous = Some((var, Direction::Right, String::new(), None));
                 }
-                Element::Edge(_, direction) => {
-                    let (left, _, _) = previous.take().expect("a path starts with a node");
-                    previous = Some((left, *direction, var));
+                Element::Edge(_, direction, quantifier) => {
+                    let (left, ..) = previous.take().expect("a path starts with a node");
+                    previous = Some((left, *direction, var, *quantifier));
                 }
             }
         }
@@ -674,10 +896,105 @@ pub fn lower(
         }
     }
 
+    // The edges searched on the index: quantified edges, and the edge of a
+    // path with a variable, a selector or a mode.
+    let mut searched: Vec<(usize, Option<String>, Selector, Mode)> = Vec::new(); // (step, path var, …)
+    for (i, path) in pattern.paths.iter().enumerate() {
+        let edges: Vec<usize> = (0..steps.len()).filter(|&s| steps[s].path == i).collect();
+        let whole = path.var.is_some() || path.selector != Selector::All || path.mode != Mode::Walk;
+        if let Some(var) = &path.var {
+            if bindings.contains_key(var)
+                || pattern.paths[..i]
+                    .iter()
+                    .any(|p| p.var.as_ref() == Some(var))
+            {
+                return pattern_err(format!(
+                    "'{var}' names a path and another variable; give the path its own name"
+                ));
+            }
+        }
+        if whole && edges.len() > 1 {
+            return pattern_err(
+                "a path with a path variable, ANY/ALL SHORTEST or a path mode must be one edge between two nodes for now, as p = ANY SHORTEST (a)-[e]->*(b)",
+            );
+        }
+        if whole && edges.is_empty() {
+            if path.var.is_some() {
+                return pattern_err(
+                    "a path variable needs a path with an edge, as p = (a)-[e]->*(b)",
+                );
+            }
+            continue;
+        }
+        for s in edges {
+            if whole {
+                searched.push((s, path.var.clone(), path.selector, path.mode));
+            } else if steps[s].quantifier.is_some() {
+                searched.push((s, None, Selector::All, Mode::Walk));
+            }
+        }
+    }
+    let mut segments = Vec::new();
+    for (s, path, selector, mode) in &searched {
+        let step = &steps[*s];
+        let quantifier = step.quantifier.unwrap_or(Quantifier::ONCE);
+        let b = &bindings[&step.edge];
+        let e = b.edge.expect("resolved");
+        let edge = describe_var(&step.edge, true);
+        if !b.conditions.is_empty() {
+            return pattern_err(format!(
+                "{edge} is quantified or in a searched path, so it stands for several edges; a condition on it is not supported yet"
+            ));
+        }
+        if *selector == Selector::All && *mode == Mode::Walk && quantifier.max.is_none() {
+            return pattern_err(format!(
+                "{edge} has no upper bound, so its walks are endless; give it one, as {{1,3}}, keep the shortest with ANY SHORTEST, or use TRAIL, SIMPLE or ACYCLIC"
+            ));
+        }
+        let ends = (
+            graph.endpoint_vertex(e, true).map(|v| v.name.as_str()),
+            graph.endpoint_vertex(e, false).map(|v| v.name.as_str()),
+        );
+        if ends.0 != ends.1
+            && (quantifier.min != 1
+                || quantifier.max != Some(1)
+                || step.direction == Direction::Any)
+        {
+            return pattern_err(format!(
+                "{edge} joins two vertex tables ({} and {}), so it cannot repeat, be undirected or match no edge; only a quantified edge within one vertex table can",
+                ends.0.unwrap_or("?"),
+                ends.1.unwrap_or("?")
+            ));
+        }
+        let var = match path {
+            Some(p) => p.clone(),
+            None => {
+                anonymous += 1;
+                format!("__ursa_{anonymous}")
+            }
+        };
+        segments.push(Segment {
+            var,
+            path: path.clone(),
+            edges: e.table.clone(),
+            source: e.source.clone(),
+            destination: e.destination.clone(),
+            start: step.left.clone(),
+            start_key: (String::new(), String::new()),
+            end: step.right.clone(),
+            end_key: (String::new(), String::new()),
+            direction: step.direction,
+            quantifier,
+            selector: *selector,
+            mode: *mode,
+        });
+    }
+    let is_searched = |i: usize| searched.iter().any(|(s, ..)| *s == i);
+
     let undirected: Vec<usize> = steps
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.direction == Direction::Any)
+        .filter(|(i, s)| s.direction == Direction::Any && !is_searched(*i))
         .map(|(i, _)| i)
         .collect();
     if undirected.len() > MAX_UNDIRECTED {
@@ -688,6 +1005,9 @@ pub fn lower(
     let mut sources = Vec::new();
     for var in &order {
         let b = &bindings[var];
+        if b.is_edge && searched.iter().any(|(s, ..)| &steps[*s].edge == var) {
+            continue;
+        }
         let (table, columns) = if b.is_edge {
             let e = b.edge.expect("resolved");
             let needed = [e.source.as_str(), e.destination.as_str()];
@@ -720,10 +1040,28 @@ pub fn lower(
         }
     };
 
+    for segment in &mut segments {
+        segment.start_key = key(&segment.start);
+        segment.end_key = key(&segment.end);
+    }
     let mut branches = Vec::new();
     for mask in 0..(1usize << undirected.len()) {
         let mut joins = Vec::new();
+        for segment in &segments {
+            let column = |name: &str| (segment.var.clone(), name.to_string());
+            joins.push(Join::Equal(
+                column(super::path_search::START),
+                segment.start_key.clone(),
+            ));
+            joins.push(Join::Equal(
+                column(super::path_search::END),
+                segment.end_key.clone(),
+            ));
+        }
         for (i, step) in steps.iter().enumerate() {
+            if is_searched(i) {
+                continue;
+            }
             let e = bindings[&step.edge].edge.expect("resolved");
             let src = (step.edge.clone(), e.source.clone());
             let dst = (step.edge.clone(), e.destination.clone());
@@ -757,6 +1095,7 @@ pub fn lower(
     conditions.extend(pattern.condition.clone());
     Ok(Lowered {
         sources,
+        segments,
         branches,
         conditions,
         columns: pattern.columns.clone(),
@@ -877,6 +1216,16 @@ mod tests {
         }
     }
 
+    fn edges(path: &PathPattern) -> Vec<(Direction, Option<Quantifier>)> {
+        path.elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Edge(_, d, q) => Some((*d, *q)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn parses_a_pattern() {
         let p = parse(
@@ -889,31 +1238,26 @@ mod tests {
         assert_eq!(p.condition.as_deref(), Some("a.name <> b.name"));
         assert_eq!(p.columns, "a.name AS a, concat(b.name, ')') AS b");
         assert_eq!(
-            p.paths[0],
+            p.paths[0].elements,
             vec![
                 Element::Node(spec(Some("a"), Some("person"), Some("a.age > (1 + 2)"))),
                 Element::Edge(
                     spec(Some("k"), Some("knows"), Some("k.since > 2000")),
-                    Direction::Right
+                    Direction::Right,
+                    None
                 ),
                 Element::Node(spec(Some("b"), Some("person"), None)),
             ]
         );
         assert_eq!(
-            p.paths[1],
+            p.paths[1].elements,
             vec![
                 Element::Node(spec(Some("b"), None, None)),
-                Element::Edge(spec(Some("w"), None, None), Direction::Left),
+                Element::Edge(spec(Some("w"), None, None), Direction::Left, None),
                 Element::Node(spec(Some("c"), None, None)),
             ]
         );
-        let directions: Vec<Direction> = p.paths[2]
-            .iter()
-            .filter_map(|e| match e {
-                Element::Edge(_, d) => Some(*d),
-                _ => None,
-            })
-            .collect();
+        let directions: Vec<Direction> = edges(&p.paths[2]).into_iter().map(|e| e.0).collect();
         assert_eq!(
             directions,
             vec![
@@ -923,23 +1267,102 @@ mod tests {
                 Direction::Left
             ]
         );
+        assert_eq!(p.paths[0].selector, Selector::All);
+        assert_eq!(p.paths[0].mode, Mode::Walk);
+    }
+
+    #[test]
+    fn parses_quantifiers_selectors_and_modes() {
+        let q = |min, max| Some(Quantifier { min, max });
+        for (path, expected) in [
+            ("(a)-[e]->*(b)", (Direction::Right, q(0, None))),
+            ("(a)-[e]-> *(b)", (Direction::Right, q(0, None))),
+            ("(a)-[e]- > *(b)", (Direction::Right, q(0, None))),
+            ("(a)-[e]->+(b)", (Direction::Right, q(1, None))),
+            ("(a)<-[e]-?(b)", (Direction::Left, q(0, Some(1)))),
+            ("(a)-[e]-*(b)", (Direction::Any, q(0, None))),
+            ("(a)->{2}(b)", (Direction::Right, q(2, Some(2)))),
+            ("(a)-[e]->{1,3}(b)", (Direction::Right, q(1, Some(3)))),
+            ("(a)-[e]->{2,}(b)", (Direction::Right, q(2, None))),
+            ("(a)-[e]->{,3}(b)", (Direction::Right, q(0, Some(3)))),
+            ("(a)-[e]->{,}(b)", (Direction::Right, q(0, None))),
+            ("(a)-[e]->(b)", (Direction::Right, None)),
+        ] {
+            let p = parse(&format!("g MATCH {path} COLUMNS (a.id)")).unwrap();
+            assert_eq!(edges(&p.paths[0]), vec![expected], "{path}");
+        }
+        for (path, var, selector, mode) in [
+            (
+                "p = ANY SHORTEST (a)-[e]->*(b)",
+                Some("p"),
+                Selector::Shortest(1),
+                Mode::Walk,
+            ),
+            ("ANY (a)-[e]->*(b)", None, Selector::Shortest(1), Mode::Walk),
+            (
+                "ANY 2 TRAIL (a)-[e]->*(b)",
+                None,
+                Selector::Shortest(2),
+                Mode::Trail,
+            ),
+            (
+                "q = SHORTEST 3 PATHS (a)-[e]->*(b)",
+                Some("q"),
+                Selector::Shortest(3),
+                Mode::Walk,
+            ),
+            (
+                "ALL SHORTEST ACYCLIC PATH (a)-[e]->*(b)",
+                None,
+                Selector::AllShortest,
+                Mode::Acyclic,
+            ),
+            (
+                "ALL SIMPLE (a)-[e]->{1,2}(b)",
+                None,
+                Selector::All,
+                Mode::Simple,
+            ),
+            (
+                "p = WALK (a)-[e]->{1,2}(b)",
+                Some("p"),
+                Selector::All,
+                Mode::Walk,
+            ),
+        ] {
+            let p = parse(&format!("g MATCH {path} COLUMNS (a.id)")).unwrap();
+            let path0 = &p.paths[0];
+            assert_eq!(
+                (path0.var.as_deref(), path0.selector, path0.mode),
+                (var, selector, mode),
+                "{path}"
+            );
+        }
     }
 
     #[test]
     fn refuses_what_is_not_supported_yet_and_reports_errors() {
         for (body, expected) in [
             (
-                "g MATCH p = (a)-[e]->(b) COLUMNS (a.id)",
-                "path variables (p = …) are not supported yet",
+                "g MATCH ANY SHORTEST 5 (a)-[e]->*(b) COLUMNS (a.id)",
+                "for several, write SHORTEST k",
             ),
             (
-                "g MATCH ANY SHORTEST (a)-[e]->(b) COLUMNS (a.id)",
-                "ANY/ALL SHORTEST paths are not supported yet",
+                "g MATCH SHORTEST (a)-[e]->*(b) COLUMNS (a.id)",
+                "SHORTEST takes a number",
             ),
-            ("g MATCH (a)-[e]->*(b) COLUMNS (a.id)", "quantified edges"),
+            ("g MATCH SHORTEST 0 (a)-[e]->*(b) COLUMNS (a.id)", "above 0"),
             (
-                "g MATCH (a)-[e]->{1,3}(b) COLUMNS (a.id)",
-                "quantified edges",
+                "g MATCH (a)-[e]->{3,1}(b) COLUMNS (a.id)",
+                "lower bound 3 is above its upper bound 1",
+            ),
+            (
+                "g MATCH (a)-[e]->{x}(b) COLUMNS (a.id)",
+                "expected a number or ','",
+            ),
+            (
+                "g MATCH ((a)-[e]->(b))* COLUMNS (a.id)",
+                "parenthesized path patterns",
             ),
             ("g MATCH (a:x|y) COLUMNS (a.id)", "label expressions"),
             ("g MATCH (a)-[e]->(b)", "a GRAPH_TABLE needs COLUMNS (…)"),

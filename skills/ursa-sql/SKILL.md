@@ -260,7 +260,10 @@ ORDER BY b.club;
 - `COLUMNS (…)` is required. Properties are the element table's columns (or its `PROPERTIES`).
 - Several paths share variables: `MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)`.
 - Labels pick the table in a graph of several tables; without one, a variable takes the table its edges `REFERENCES`. Ambiguous patterns are refused with a request for a label.
-- Not yet: `->*`/`{1,3}` quantifiers, path variables `p = …`, `ANY SHORTEST`, `:a|b`.
+- Quantifiers go after the edge: `-[e]->{1,3}`, `->*`, `-[e]-+`, `?`, `{2,}`. Name the path and pick paths per pair of end nodes: `MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b)` (also `ALL SHORTEST`, `SHORTEST k`; modes `TRAIL`, `SIMPLE`, `ACYCLIC`). In `COLUMNS`: `path_length(p)`, `vertices(p)` (node keys), `edges(p)` (edge rows from 0), `element_id(p)`.
+- Ties between equally short paths go to the path whose edges come first in the edge table. Without a selector, an unbounded quantifier needs `TRAIL`, `SIMPLE` or `ACYCLIC`.
+- Put conditions on the first node of a quantified edge: the search starts from the nodes they keep.
+- Not yet: a path variable, selector or mode on a path of several edges; conditions inside a quantified edge; `:a|b`.
 
 ## The .ursa database file
 
