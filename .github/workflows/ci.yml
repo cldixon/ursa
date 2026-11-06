@@ -89,8 +89,8 @@ jobs:
 
       # The SQL engine (#232): the engine session, the parser, and the `ursa`
       # binary's integration tests (which read python/ursa/datasets/data).
-      - name: test engine + sql + cli
-        run: cargo test -p ursa-engine -p ursa-sql -p ursa-cli --locked
+      - name: test engine + sql + cli + wasm (natively)
+        run: cargo test -p ursa-engine -p ursa-sql -p ursa-cli -p ursa-wasm --locked
 
       # Ensures ursa-py (PyO3 extension) also compiles.
       - name: check workspace

@@ -10,30 +10,85 @@
   <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <header>
-    <h1>Ursa Shell</h1>
-    <p>Graph analytics in SQL, running entirely in your browser. Ursa's engine is compiled to WebAssembly; it reads the sample graphs below as Parquet over HTTP and runs the algorithms on your machine. Nothing is sent to a server.</p>
+  <header class="top">
+    <div class="brand">
+      <h1>Ursa Shell</h1>
+      <p>Graph analytics in SQL, running entirely in your browser.</p>
+    </div>
+    <span id="engine" class="chip" role="status">Loading the engine (about 5 MB)…</span>
+    <nav class="links">
+      <a href="https://github.com/cldixon/ursa">GitHub</a>
+      <a href="https://cldixon.github.io/ursa/sql/">SQL docs</a>
+    </nav>
   </header>
 
-  <main>
-    <div class="bar">
-      <select id="examples" aria-label="Example queries">
-        <option value="" selected disabled>Examples…</option>
-      </select>
-      <span class="hint">Ctrl / ⌘ + Enter to run</span>
-      <button id="run" disabled>Run</button>
-    </div>
-    <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
-    <p id="status" role="status">Loading the engine (about 5 MB)…</p>
-    <pre id="output" aria-live="polite"></pre>
-  </main>
+  <div class="layout">
+    <aside class="side">
+      <div class="tabs" role="tablist" aria-label="Panels">
+        <button role="tab" data-panel="tour" aria-selected="true">Tour</button>
+        <button role="tab" data-panel="examples" aria-selected="false">Examples</button>
+        <button role="tab" data-panel="data" aria-selected="false">Data</button>
+        <button role="tab" data-panel="functions" aria-selected="false">Functions</button>
+        <button role="tab" data-panel="history" aria-selected="false">History</button>
+      </div>
+      <section id="panel-tour" class="panel" role="tabpanel">
+        <p class="muted">The <a href="https://cldixon.github.io/ursa/sql/getting-started/">Getting Started</a> page, step by step, in its own session. Running a step runs the steps before it first.</p>
+        <ol id="tour" class="steps"></ol>
+      </section>
+      <section id="panel-examples" class="panel" role="tabpanel" hidden>
+        <p class="muted">Queries over the graphs defined in the workspace.</p>
+        <ul id="examples" class="list"></ul>
+      </section>
+      <section id="panel-data" class="panel" role="tabpanel" hidden>
+        <h2>Graphs</h2>
+        <p class="muted">Defined in the workspace at start, over the Parquet files below.</p>
+        <ul id="graphs" class="list"></ul>
+        <h2>Files</h2>
+        <p class="muted">Read any of them by name: <code>SELECT * FROM 'karate_edges.parquet'</code>.</p>
+        <ul id="files" class="list"></ul>
+        <p id="licence" class="muted small"></p>
+      </section>
+      <section id="panel-functions" class="panel" role="tabpanel" hidden>
+        <input id="function-filter" type="search" placeholder="Filter functions" aria-label="Filter functions">
+        <div id="functions"><p class="muted">Loading…</p></div>
+      </section>
+      <section id="panel-history" class="panel" role="tabpanel" hidden>
+        <p class="muted">Queries you ran, newest first. Kept in this browser only.</p>
+        <ol id="history" class="list"></ol>
+        <button id="clear-history" class="quiet">Clear history</button>
+      </section>
+    </aside>
 
-  <footer>
-    <h2>Datasets</h2>
-    <p>Defined at start: graphs <code>karate</code> (with a vertex table of members), <code>lesmis</code> (weighted) and <code>florentine</code>. Files can be read by name, e.g. <code>'karate_edges.parquet'</code>.</p>
-    <ul id="datasets"></ul>
-    <p id="licence" class="muted"></p>
-    <p class="muted">Ursa: <a href="https://github.com/cldixon/ursa">github.com/cldixon/ursa</a>. The SQL engine is not released yet.</p>
-  </footer>
+    <main class="work">
+      <div class="toolbar">
+        <span id="session" class="chip session" title="The session the editor runs in">Workspace</span>
+        <span class="hint">Ctrl / ⌘ + Enter runs (the selection, if any)</span>
+        <button id="share" class="quiet" title="Copy a link that runs this query">Copy link</button>
+        <button id="run" class="primary" disabled>Run</button>
+      </div>
+      <textarea id="sql" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
+
+      <section class="results" aria-label="Results">
+        <div class="results-bar">
+          <div id="result-tabs" class="result-tabs" role="tablist" aria-label="Statements"></div>
+          <div class="result-actions">
+            <div class="segmented" role="group" aria-label="View">
+              <button id="view-table" aria-pressed="true">Table</button>
+              <button id="view-text" aria-pressed="false">Text</button>
+            </div>
+            <select id="download" aria-label="Download this result" disabled>
+              <option value="" selected>Download…</option>
+              <option value="csv">CSV</option>
+              <option value="parquet">Parquet</option>
+              <option value="json">JSON</option>
+              <option value="arrow">Arrow IPC</option>
+            </select>
+          </div>
+        </div>
+        <p id="status" class="status" role="status"></p>
+        <div id="output" class="output" aria-live="polite"></div>
+      </section>
+    </main>
+  </div>
 </body>
 </html>

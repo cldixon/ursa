@@ -1,4 +1,13 @@
-// The example queries in the shell's picker. The first is the one the editor opens with.
+// The graphs the engine worker defines in the workspace at start (keep in step
+// with SETUP in engine-worker.js).
+export const GRAPHS = [
+  { name: "karate", description: "Zachary's karate club: 34 members, 78 friendships, with each member's club." },
+  { name: "lesmis", description: "Les Misérables: 77 characters, 254 weighted co-appearances." },
+  { name: "florentine", description: "Florentine families: 15 families, 20 marriage ties." },
+  { name: "rmat", description: "A synthetic power-law graph: 1,000,000 edges over 46,318 nodes (R-MAT, seed 42)." },
+];
+
+// The examples panel. The first is the one the editor opens with.
 export const EXAMPLES = [
   {
     title: "Who holds the karate club together?",
@@ -53,6 +62,31 @@ GROUP BY 1 ORDER BY members DESC;`,
     sql: `SHOW GRAPHS;
 DESCRIBE GRAPH karate;
 SELECT * FROM describe(karate);`,
+  },
+  {
+    title: "A million edges: PageRank",
+    sql: `-- The first query over rmat reads 3.8 MB of Parquet and builds its index;
+-- run it again and only the algorithm runs.
+SELECT id, round(pagerank, 6) AS pagerank
+FROM pagerank(rmat)
+ORDER BY pagerank DESC
+LIMIT 10;`,
+  },
+  {
+    title: "A million edges: components and communities",
+    sql: `SELECT count(DISTINCT connected_components) AS components
+FROM connected_components(rmat);
+SELECT louvain AS community, count(*) AS members
+FROM louvain(rmat, seed => 1)
+GROUP BY 1 ORDER BY members DESC LIMIT 10;`,
+  },
+  {
+    title: "A million edges: degree distribution",
+    sql: `SELECT degree, count(*) AS nodes
+FROM degree(rmat, direction => 'both')
+GROUP BY degree
+ORDER BY degree
+LIMIT 25;`,
   },
   {
     title: "Every function",
