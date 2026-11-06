@@ -29,7 +29,7 @@ fn a_session_in_the_shell() {
 
     p.exp_string(&format!(
         "ursa {}, database club.ursa.",
-        env!("CARGO_PKG_VERSION")
+        env!("URSA_VERSION")
     ))
     .unwrap();
     p.exp_string("ursa> ").unwrap();
