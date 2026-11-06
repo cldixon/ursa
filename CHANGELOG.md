@@ -44,6 +44,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- A weighted algorithm over `scan_edges` reads the file as a stream. It
+  builds the index and evaluates the weights one batch at a time, so the
+  rows are never all held in memory. Before, it collected every row first.
+  Weighted PageRank on a 20M-edge R-MAT graph now peaks at 615 MB, down
+  from about 1,040 MB; the SQL engine peaks at 589 MB. Results are
+  bit-identical (#267).
 - The node-id rules for an in-memory table now run in Rust, in
   `ursa_io::ids`, the same code a scan and the SQL engine use. These rules
   are: which column types hold ids and what they canonicalize to,
