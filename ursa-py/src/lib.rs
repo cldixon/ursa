@@ -18,10 +18,13 @@
 //!   `NodeTableCache`) hang off it. See [`frame`].
 //! - `check_agg_fn` / `check_direction` / `check_on_null` — the engine's lists,
 //!   for the arguments the Python API checks as it is called.
+//! - `ingest_edges` / `ingest_nodes` — an in-memory table as a frame's
+//!   source, by `ursa_io::ids`' rules (see [`ingest`]).
 //! - `build_index` — build a CSR topology from edge batches (a test hook; frames
 //!   build their own index on first use).
 
 mod frame;
+mod ingest;
 
 use arrow::array::{Array, RecordBatch};
 use arrow_pyarrow::FromPyArrow;
@@ -422,5 +425,8 @@ fn _ursa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_direction, m)?)?;
     m.add_function(wrap_pyfunction!(check_on_null, m)?)?;
     m.add_function(wrap_pyfunction!(check_scan_path, m)?)?;
+    // an in-memory table becoming a frame's source
+    m.add_function(wrap_pyfunction!(ingest::ingest_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(ingest::ingest_nodes, m)?)?;
     Ok(())
 }

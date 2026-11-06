@@ -214,16 +214,10 @@ fn endpoint_positions(
 }
 
 /// The node id type a column of `t` gives: integers as `Int64`, strings as
-/// `Utf8` (as `ursa-io` canonicalizes a scan's endpoints), or `None` if `t`
-/// cannot hold node ids.
+/// `Utf8`, or `None` if `t` cannot hold node ids. The rule every source shares
+/// (`ursa_io::ids`), so a graph's ids are the Python library's.
 pub(crate) fn id_type(t: &DataType) -> Option<DataType> {
-    use DataType::*;
-    match t {
-        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Some(Int64),
-        Utf8 | LargeUtf8 | Utf8View => Some(Utf8),
-        Dictionary(_, value) => id_type(value),
-        _ => None,
-    }
+    ursa_io::ids::canonical_id_type(t)
 }
 
 /// What identifies a node besides its plans and expressions.
