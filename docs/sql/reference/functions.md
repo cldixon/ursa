@@ -247,7 +247,7 @@ describe(graph, full => false, direction => 'out', nodes => 'all')
 
 **Directions:** `'out'`, `'in'`, `'both'`
 
-**Returns:** One row: `n_nodes` (Int64), `n_edges` (Int64), `density` (Float64), `avg_degree` (Float64), `n_components` (Int64, may be NULL)
+**Returns:** One row: `n_nodes` (Int64), `n_edges` (Int64), `density` (Float64), `avg_degree` (Float64), `n_components` (Int64, may be NULL), `n_dropped_edges` (Int64)
 
 **NetworkX:** `U.number_of_edges(), nx.density(U) and the mean degree (both)`
 
