@@ -309,15 +309,9 @@ impl View for Cols {
 }
 
 /// The node-id type a graph over endpoints of type `dt` has (`Int64` or
-/// `Utf8`, as the id map keeps them), or `None` for a type that is no id.
-pub fn canonical_id_type(dt: &DataType) -> Option<DataType> {
-    match dt {
-        t if t.is_integer() => Some(DataType::Int64),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some(DataType::Utf8),
-        DataType::Dictionary(_, value) => canonical_id_type(value),
-        _ => None,
-    }
-}
+/// `Utf8`, as the id map keeps them), or `None` for a type that is no id: the
+/// rule every source shares, [`ursa_io::ids::canonical_id_type`].
+pub use ursa_io::ids::canonical_id_type;
 
 /// Validate a node just built (see the module docs): its [`Info`], or the error
 /// a collect of it would raise first.

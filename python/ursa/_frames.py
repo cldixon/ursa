@@ -292,20 +292,14 @@ class EdgeFrame(_Frame):
         built via ``from_arrow`` / ``from_polars`` / ``from_pandas`` or a
         ``scan_edges`` file — the load-bearing "same from here on" guarantee.
         """
-        from ._io import (
-            _drop_null_endpoint_rows,
-            _extract_edge_arrays,
-            _to_arrow_table,
-            _validate_on_null,
-            _warn_dropped_endpoints,
-        )
+        from ._io import _to_arrow_table, _validate_on_null, _warn_dropped_endpoints
 
         _validate_on_null(on_null)
-        table = _to_arrow_table(data)
-        if on_null == "drop":
-            table, dropped = _drop_null_endpoint_rows(table, src, dst)
-            _warn_dropped_endpoints(dropped)
-        endpoints = _extract_edge_arrays(table, src, dst)
+        # The engine reads the table (ursa_io's rules, #269): string views as
+        # strings, null-endpoint rows dropped for on_null="drop", and the
+        # endpoint columns canonicalized to node ids.
+        table, endpoints, dropped = _native().ingest_edges(_to_arrow_table(data), src, dst, on_null)
+        _warn_dropped_endpoints(dropped)
         self._node = _native().PlanNode.edge_table(table, endpoints, src, dst)
 
     @property
@@ -389,9 +383,9 @@ class NodeFrame(_Frame):
         dict, polars / pandas DataFrame, pyarrow Table/RecordBatch); ``id`` is the
         id-role mapping. Stored as one canonical Arrow attribute table, so it is
         indistinguishable downstream from a ``from_arrow(..., id=)`` frame."""
-        from ._io import _node_attr_table, _to_arrow_table
+        from ._io import _to_arrow_table
 
-        table = _node_attr_table(_to_arrow_table(data), id)
+        table = _native().ingest_nodes(_to_arrow_table(data), id)
         self._node = _native().PlanNode.node_table(table, id)
 
     @property

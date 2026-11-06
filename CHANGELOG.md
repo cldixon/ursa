@@ -44,6 +44,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- The node-id rules for an in-memory table now run in Rust, in
+  `ursa_io::ids`, the same code a scan and the SQL engine use. These rules
+  are: which column types hold ids and what they canonicalize to,
+  `string_view` columns read as strings, and the rows `on_null="drop"`
+  removes. Before, `python/ursa/_io.py` held its own copy. Errors, warnings
+  and drop counts are unchanged. With `on_null="drop"` and no null
+  endpoints, the table's columns are no longer copied (#269).
 - Source reading moved out of the `ursa-plan` crate into a new workspace
   crate, `ursa-io`: Parquet and CSV scans, the CSV options and type
   inference, the Parquet statistics guard, object-store and URL handling, and
