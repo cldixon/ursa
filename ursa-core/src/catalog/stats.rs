@@ -51,10 +51,8 @@ fn on_an_edge(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<bool> {
         }
         None => {
             let out = topo.out();
-            for u in 0..n {
-                if out.offsets[u + 1] > out.offsets[u] {
-                    seen[u] = true;
-                }
+            for (s, w) in seen.iter_mut().zip(out.offsets.windows(2)) {
+                *s = w[1] > w[0];
             }
             for &v in out.targets.iter() {
                 seen[v as usize] = true;

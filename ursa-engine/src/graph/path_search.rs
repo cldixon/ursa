@@ -186,6 +186,7 @@ pub struct PathSearchNode {
 }
 
 impl PathSearchNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         graph: String,
         search: Search,
