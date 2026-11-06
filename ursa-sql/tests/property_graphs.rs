@@ -92,6 +92,68 @@ async fn duckpgqs_graph_runs_as_written() {
 }
 
 #[tokio::test]
+async fn duckpgqs_properties_before_label_run_as_written() {
+    let ctx = ursa_engine::new_session();
+    ok(&ctx, STUDENTS).await;
+    ok(
+        &ctx,
+        "CREATE TABLE School AS SELECT * FROM (VALUES ('VU', 0, 'University'), ('UVA', 1, 'University'))
+           t(name, Id, Kind);
+         CREATE TABLE StudyAt AS SELECT * FROM (VALUES (0, 0), (1, 0), (2, 1), (3, 1), (4, 1))
+           t(personId, schoolId)",
+    )
+    .await;
+    // DuckPGQ's shortest_path.test and subpath_match.test, as written (#307).
+    ok(
+        &ctx,
+        "CREATE PROPERTY GRAPH pg
+         VERTEX TABLES (
+             Student PROPERTIES ( id, name ) LABEL Person,
+             School LABEL SCHOOL
+             )
+         EDGE TABLES (
+             know    SOURCE KEY ( src ) REFERENCES Student ( id )
+                     DESTINATION KEY ( dst ) REFERENCES Student ( id )
+                     PROPERTIES ( edge ) LABEL Knows,
+             studyAt SOURCE KEY ( personId ) REFERENCES Student ( id )
+                     DESTINATION KEY ( SchoolId ) REFERENCES School ( id )
+                     LABEL StudyAt
+             )",
+    )
+    .await;
+    // Person has the properties written before it, and only those.
+    assert_eq!(
+        ok(
+            &ctx,
+            "SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.id = 0) COLUMNS (a.*))"
+        )
+        .await,
+        ok(&ctx, "SELECT 0 AS id, 'Daniel' AS name").await
+    );
+    assert_eq!(
+        ok(
+            &ctx,
+            "SELECT * FROM GRAPH_TABLE (pg
+               MATCH (a:Person)-[k:Knows WHERE k.edge = 10]->(b:Person)
+               COLUMNS (a.id AS a_id, b.id AS b_id))"
+        )
+        .await,
+        ok(&ctx, "SELECT 0 AS a_id, 1 AS b_id").await
+    );
+    assert_eq!(
+        ok(
+            &ctx,
+            "SELECT * FROM GRAPH_TABLE (pg
+               MATCH (a:Person)-[s:StudyAt]->(b:School)
+               WHERE a.name = 'Daniel'
+               COLUMNS (a.name AS name, b.name AS school))"
+        )
+        .await,
+        ok(&ctx, "SELECT 'Daniel' AS name, 'VU' AS school").await
+    );
+}
+
+#[tokio::test]
 async fn a_vertex_key_comes_from_key_then_the_primary_key_then_references() {
     let ctx = ursa_engine::new_session();
     ok(&ctx, STUDENTS).await;

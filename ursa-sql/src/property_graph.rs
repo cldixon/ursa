@@ -14,6 +14,7 @@
 //! labels       := properties                       -- the default label
 //!               | DEFAULT LABEL [properties]
 //!               | LABEL name [properties] [LABEL name [properties] …]
+//!               | properties LABEL name [LABEL name …]   (DuckPGQ's order)
 //! properties   := PROPERTIES (column [AS name], …)
 //!               | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (column, …)]
 //!               | NO PROPERTIES
@@ -323,23 +324,27 @@ fn parse_labels(p: &mut Parser) -> Result<Vec<LabelDef>> {
             properties,
         }]);
     }
+    // DuckPGQ writes the properties first: `PROPERTIES (id, name) LABEL
+    // person` gives `person` those properties (#307). A label with its own
+    // properties clause keeps it.
+    let leading = parse_properties(p)?;
     let mut labels = Vec::new();
     while consume_words(p, &["LABEL"]) {
         let name = p.parse_identifier()?;
-        let properties = parse_properties(p)?;
+        let properties = match parse_properties(p)? {
+            PropertiesDef::Default => leading.clone(),
+            own => own,
+        };
         labels.push(LabelDef {
             name: Some(name),
             properties,
         });
     }
-    if labels.is_empty() {
-        let properties = parse_properties(p)?;
-        if properties != PropertiesDef::Default {
-            labels.push(LabelDef {
-                name: None,
-                properties,
-            });
-        }
+    if labels.is_empty() && leading != PropertiesDef::Default {
+        labels.push(LabelDef {
+            name: None,
+            properties: leading,
+        });
     }
     if word(p, 0, "LABELS") || word(p, 0, "DEFAULT") {
         return unsupported(p, "this label clause is (write LABEL name, once per label)");
@@ -637,6 +642,9 @@ mod tests {
              (id, n AS name), q DEFAULT LABEL, r NO PROPERTIES, t PROPERTIES ARE ALL COLUMNS \
              EXCEPT (x)) EDGE TABLES (e KEY (k) SOURCE KEY (a) REFERENCES person (id) \
              DESTINATION KEY (b) REFERENCES q (id) LABEL knows LABEL likes NO PROPERTIES)",
+            // DuckPGQ's order: the properties, then the label they belong to.
+            "CREATE PROPERTY GRAPH g VERTEX TABLES (s PROPERTIES (id, name) LABEL person, \
+             t PROPERTIES (x) LABEL a LABEL b NO PROPERTIES)",
         ] {
             let parsed = UrsaStatement::CreatePropertyGraph(Box::new(create(sql)));
             let printed = parsed.to_string();
