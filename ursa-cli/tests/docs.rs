@@ -282,7 +282,7 @@ const REGENERATE: &str = "URSA_BLESS=1 cargo test -p ursa-cli --test docs functi
 #[test]
 fn function_reference_is_current() {
     let output = Command::new(env!("CARGO_BIN_EXE_ursa"))
-        .args(["-f", "json", "-c", "SELECT * FROM ursa_functions()"])
+        .args(["--format", "json", "-c", "SELECT * FROM ursa_functions()"])
         .stdin(Stdio::null())
         .output()
         .expect("ursa runs");

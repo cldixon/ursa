@@ -56,7 +56,7 @@ jobs:
 
       - name: Run a query
         run: |
-          out=$(./target/release/ursa -f csv -c "
+          out=$(./target/release/ursa --format csv -c "
             CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
             CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
             SELECT id, degree FROM degree(karate, direction => 'both') ORDER BY degree DESC LIMIT 1;")
