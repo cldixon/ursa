@@ -29,11 +29,14 @@ In a database that already has graphs, list them with `SHOW GRAPHS;` and inspect
 ursa -c "SELECT * FROM 'edges.csv' LIMIT 3"            # in memory
 ursa club.ursa --format json -c "SELECT * FROM degree(g)"  # a database file, JSON out
 ursa club.ursa -f query.sql                             # SQL from a file (--file)
+ursa --skill                                            # this guide, for the version installed
 ```
 
 - Use `--format json` (an array of objects) or `--format ndjson` whenever you read results yourself. `--format csv` for files. The default `table` is for people.
 - Separate statements in one `-c` with `;`. They run in order.
-- On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix.
+- A `-f` file or stdin may hold the shell's dot-commands, one a line, as in DuckDB: `.mode json`, `.timer on`, `.read other.sql`, `.functions pagerank` (one function's parameters, one a line). A syntax error anywhere in a file runs none of it; otherwise the first error stops the run.
+- A statement that returns rows prints a header even with no rows. DDL (`CREATE`, `DROP`) and `SET` print nothing.
+- On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix. DuckDB-only syntax (`SUMMARIZE`, `USING SAMPLE`, `PIVOT`, `PRAGMA`) is refused with what to write instead.
 - With no `-c`, `--file` or stdin, `ursa` starts an interactive shell and waits for input. Don't start it from an agent.
 
 ## Define a graph from files

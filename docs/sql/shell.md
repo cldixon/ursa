@@ -30,7 +30,29 @@ ursa club.ursa -f query.sql                        # a file of SQL (or --file)
 echo "SHOW GRAPHS;" | ursa club.ursa               # SQL on stdin
 ```
 
-`-c` and `-f` (`--file`) may be repeated; they run in the order given. If any statement fails, `ursa` prints the error, stops, and exits with status 1.
+`-c` and `-f` (`--file`) may be repeated; they run in the order given. If any statement fails, `ursa` prints the error, stops, and exits with status 1. A syntax error anywhere in a `-c`, a file or stdin runs none of it.
+
+A script may hold dot-commands too, one a line, as at the prompt and as in DuckDB:
+
+```text
+.timer on
+.mode csv
+SELECT count(*) AS edges FROM 'karate_edges.csv';
+```
+
+```bash
+ursa -f q.sql
+```
+
+```text
+edges
+78
+Run Time: 0.004s
+```
+
+`.read FILE` in a script runs another script. In a script, `.quit` and `.exit` end the run there, with status 0. An unknown dot-command is an error, as a failing statement is. With `--format arrow`, the output is one Arrow stream: text a dot-command prints, such as the timer's, goes to stderr instead.
+
+Statements that return rows always print a result, with its header even when there are no rows. Statements that return no columns, which are DDL (`CREATE`, `DROP`) and `SET`, print nothing, as in DuckDB. In `ndjson`, which has no header, a result with no rows prints nothing.
 
 Add `--readonly` to open a database without changing it. See [the database file](database.md#read-only-and-sharing).
 
@@ -45,7 +67,7 @@ Ctrl-C cancels the current input or query; Ctrl-D exits.
 
 .describe NAME        Describe a graph, table or view
 .exit                 Exit the shell (also Ctrl-D)
-.functions            List the graph functions and their parameters
+.functions [NAME]     List the graph functions, or show one's parameters
 .graphs               List the graphs (SHOW GRAPHS)
 .help                 Show this message
 .mode MODE            Set the output mode: table, csv, tsv, json or ndjson
@@ -54,15 +76,38 @@ Ctrl-C cancels the current input or query; Ctrl-D exits.
 .read FILE            Run the SQL and dot-commands in FILE
 .tables               List the tables and views
 .timer on|off         Show how long each statement takes
+
+Any file is a table: SELECT * FROM 'edges.csv' LIMIT 3;
+An edge table is a graph:
+  CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+SELECT * FROM ursa_functions(); lists the graph functions (as .functions does).
+Docs: https://cldixon.github.io/ursa/sql/
 ```
 
 | Command           | Same as                                    |
 | ----------------- | ------------------------------------------ |
 | `.graphs`         | `SHOW GRAPHS;`                             |
 | `.describe karate` | `DESCRIBE GRAPH karate;` for a graph, `DESCRIBE t;` for a table or view |
-| `.functions`      | `SELECT * FROM ursa_functions();`          |
+| `.functions`      | `SELECT name, family, summary FROM ursa_functions();`, with the first sentence of each summary |
 | `.open club.ursa` | `ATTACH 'club.ursa';`                      |
 | `.tables`         | a query on `information_schema.tables`, without the graphs' own tables |
+
+`.functions NAME` shows one function: its summary, then its parameters one a line (name, type, default, what it does, and the values it takes), then its output columns:
+
+```text
+ursa> .functions degree
+degree (algorithm)
+Per-node degree.
+NetworkX: G.out_degree() (in: G.in_degree(); both: U.degree() on a simple graph)
+
+Parameters, after the graph, as name => value:
+  direction  string  default 'out'  Follow out-edges, in-edges, or both (the undirected view). One of: out, in, both.
+
+Output columns:
+  degree  UInt32
+```
+
+A name that is not a function gets a suggestion, as a mistyped command does. `SELECT * FROM ursa_functions()` has the same information as columns, for programs.
 
 `.mode` with no argument shows the current mode. `.timer` with no argument shows whether the timer is on. A mistyped command gets a suggestion:
 
@@ -100,6 +145,15 @@ SET datafusion.execution.batch_size = 4096;
 `~/.ursarc` is read only by the interactive shell. `-c`, `--file` and SQL on stdin skip it, so a script gives the same output whoever runs it. `-init FILE` runs for those too, before their SQL. A `--format` given on the command line wins over a `.mode` in the init file.
 
 `.read FILE` runs a file the same way, from the prompt.
+
+## For coding agents
+
+`ursa --skill` prints a guide to writing Ursa SQL, in Markdown: an [agent skill](https://github.com/cldixon/ursa/tree/main/skills/ursa-sql) built into the binary, so it always matches the version you run. An agent can read it before writing queries, or you can save it where your agent loads skills, for example for Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills/ursa-sql
+ursa --skill > ~/.claude/skills/ursa-sql/SKILL.md
+```
 
 ## History
 
