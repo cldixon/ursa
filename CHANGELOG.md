@@ -175,6 +175,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   'a' is not an integer, but the graph's node ids are int64; …`, which said
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
+### Fixed
+
+- `ursa --format csv … | head` (and `tsv`) ends quietly with status 0 once
+  the reader is gone, as the other formats do. Before, it printed "Error: Csv
+  error: Broken pipe" and exited 1 (#317).
+
 ### Security
 
 - The upgrade clears RUSTSEC-2026-0435 (`thrift` 0.17, a parquet 58

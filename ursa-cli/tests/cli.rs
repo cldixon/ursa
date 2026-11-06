@@ -207,6 +207,38 @@ fn short_f_with_a_format_name_points_to_format() {
     );
 }
 
+/// `ursa --format csv … | head`: once the reader is gone, ursa stops
+/// quietly with status 0, in every format (#317).
+#[cfg(unix)]
+#[test]
+fn a_closed_pipe_ends_quietly_in_every_format() {
+    use std::io::{BufRead, BufReader};
+    let sql = "SELECT value, value * 2 AS twice FROM generate_series(1, 300000)";
+    for format in ["csv", "tsv", "table", "json", "ndjson"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ursa"))
+            .args(["--format", format, "-c", sql])
+            .current_dir(workspace())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ursa runs");
+        let mut first = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut first)
+            .unwrap();
+        // The reader is dropped here: the pipe closes with output pending.
+        let out = child.wait_with_output().unwrap();
+        assert!(!first.is_empty(), "{format}: no first line");
+        assert!(
+            out.status.success(),
+            "{format}: exit {:?}, stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{format}");
+    }
+}
+
 #[test]
 fn sql_from_stdin() {
     let sql = format!("SELECT count(*) AS n FROM '{}';", karate_edges());
