@@ -13,7 +13,7 @@ CREATE VIEW ties    AS SELECT * FROM 'karate_edges.csv';
 
 !!! info "New in 0.7"
 
-    `.jsonl` and `.ndjson` files, `read_parquet`, `read_csv` and `read_json`, and `SHOW TABLES` without `information_schema` arrive in `ursa-cli` 0.7. 0.6.0 reads `.parquet`, `.csv`, `.json` and `.arrow` files by path.
+    `.jsonl` and `.ndjson` files, `read_parquet`, `read_csv` and `read_json`, and `SHOW TABLES` without `information_schema` are new in `ursa-cli` 0.7. 0.6.0 reads `.parquet`, `.csv`, `.json` and `.arrow` files by path.
 
 A file is a table: name it in `FROM`, with its path or URL in quotes. A relative path is relative to the current directory. The format comes from the extension:
 
@@ -100,7 +100,7 @@ SELECT count(*) AS both_files FROM read_json(['ties.jsonl', 'ties.json']);
 
 !!! info "New in 0.7"
 
-    0.6.0 accepts one vertex table with a `KEY` and one edge table. Several tables, optional `KEY`, `AS` names, `LABEL` and `PROPERTIES` (DuckPGQ's syntax included) arrive in `ursa-cli` 0.7.
+    0.6.0 accepts one vertex table with a `KEY` and one edge table. Several tables, optional `KEY`, `AS` names, `LABEL` and `PROPERTIES` (DuckPGQ's syntax included) are new in `ursa-cli` 0.7.
 
 Defines a graph over vertex tables and edge tables. The syntax is SQL/PGQ's, the property graph part of the SQL standard, so a graph definition written for another SQL/PGQ engine, such as DuckPGQ, runs here too:
 
@@ -168,7 +168,7 @@ CREATE PROPERTY GRAPH first EDGE TABLES (first_ties SOURCE KEY (src) DESTINATION
 
 !!! info "New in 0.7"
 
-    Graphs of several tables arrive in `ursa-cli` 0.7.
+    Graphs of several tables are new in `ursa-cli` 0.7.
 
 A graph can have any number of vertex and edge tables. Here members follow each other and write posts:
 

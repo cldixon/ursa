@@ -2,7 +2,7 @@
 
 !!! info "Versions"
 
-    The newest release is `ursa-cli` 0.6.0; see [Getting Started](getting-started.md#install) to install it. Features marked **New in 0.7** are on `main` and arrive in the next release; to use them now, build from the repository with `cargo install --git https://github.com/cldixon/ursa ursa-cli`. The SQL surface may still change between minor versions, and the [changelog](../changelog.md) records every change.
+    The newest release is `ursa-cli` 0.7.0; see [Getting Started](getting-started.md#install) to install or upgrade it. Features marked **New in 0.7** need 0.7 or later (`ursa --version` says which you have). The SQL surface may still change between minor versions, and the [changelog](../changelog.md) records every change.
 
 Ursa SQL is a SQL engine for graph analytics, used through a command-line tool called `ursa`. It works like DuckDB. You point it at Parquet, CSV, JSON or Arrow files, on your disk or in object storage, and query them with SQL. Graph algorithms are part of that SQL. Nothing needs converting or loading first.
 
@@ -40,7 +40,7 @@ On Windows, in PowerShell:
 irm https://cldixon.github.io/ursa/install.ps1 | iex
 ```
 
-Or `cargo install ursa-cli`, or a prebuilt binary from the [releases page](https://github.com/cldixon/ursa/releases). [Getting started](getting-started.md#install) has the details. These work once `ursa-cli` 0.6.0 is released.
+Or `cargo install ursa-cli`, or a prebuilt binary from the [releases page](https://github.com/cldixon/ursa/releases). [Getting started](getting-started.md#install) has the details.
 
 ## What it is
 
