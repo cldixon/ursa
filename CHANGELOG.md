@@ -26,6 +26,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     vertex table and one edge table, named as DuckPGQ names them when a graph
     has several: `pagerank(g, person, knows)`. `DROP PROPERTY GRAPH`,
     `SHOW GRAPHS` and `DESCRIBE [PROPERTY] GRAPH` manage them.
+  - SQL/PGQ pattern matching: `GRAPH_TABLE (g MATCH (a)-[e]->(b) WHERE …
+    COLUMNS (…))` with labels, every edge direction, element and pattern
+    conditions, and several paths sharing variables, planned as joins
+    (#296). Variable-length paths and `ANY SHORTEST` come next (#297).
   - Every algorithm and statistic of the Python library (not the layouts or
     the neighbour aggregations) is a table function with named parameters
     (`pagerank(g, damping => 0.9)`), with the same names, defaults and

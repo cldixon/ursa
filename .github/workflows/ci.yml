@@ -61,6 +61,12 @@ jobs:
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
+    # Line tables only: full debug info for every test binary of the workspace
+    # filled the runner's disk and crashed the linker (signal 7, Bus error).
+    # Backtraces keep their file and line numbers.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 

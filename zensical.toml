@@ -54,6 +54,7 @@ nav = [
     { "The database file" = "sql/database.md" },
     { "The shell" = "sql/shell.md" },
     { "Statements" = "sql/statements.md" },
+    { "Pattern matching" = "sql/pattern-matching.md" },
     { "Function reference" = "sql/reference/functions.md" },
   ] },
 ]
