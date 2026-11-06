@@ -146,7 +146,7 @@ async fn a_graph_without_a_vertex_table() {
 }
 
 #[tokio::test]
-async fn an_endpoint_missing_from_the_vertex_table_is_a_node_without_attributes() {
+async fn an_endpoint_missing_from_the_vertex_table_is_no_node() {
     let ctx = karate_session().await;
     ok(
         &ctx,
@@ -155,7 +155,9 @@ async fn an_endpoint_missing_from_the_vertex_table_is_a_node_without_attributes(
            EDGE TABLES (more_ties SOURCE KEY (src) DESTINATION KEY (dst))",
     )
     .await;
-    assert_eq!(int(&ctx, "SELECT count(*) FROM g.nodes").await, 35);
+    // The vertex table defines the nodes (#311): 99 is none, and the edge to
+    // it is dropped, and counted.
+    assert_eq!(int(&ctx, "SELECT count(*) FROM g.nodes").await, 34);
     assert_eq!(
         pretty(&ok(&ctx, "SELECT * FROM g.nodes WHERE id >= 33 ORDER BY id").await),
         "\
@@ -163,13 +165,14 @@ async fn an_endpoint_missing_from_the_vertex_table_is_a_node_without_attributes(
 | id | club    |
 +----+---------+
 | 33 | Officer |
-| 99 |         |
 +----+---------+"
     );
+    assert_eq!(int(&ctx, "SELECT count(*) FROM degree(g)").await, 34);
     assert_eq!(
-        int(&ctx, "SELECT count(*) FROM g.nodes WHERE club IS NULL").await,
+        int(&ctx, "SELECT n_dropped_edges FROM describe(g)").await,
         1
     );
+    assert_eq!(int(&ctx, "SELECT count(*) FROM g.edges").await, 79);
 }
 
 #[tokio::test]
@@ -214,9 +217,14 @@ async fn string_ids() {
                                   DESTINATION KEY (dst) REFERENCES families (name))",
     )
     .await;
+    // Its rows only: Medici is no node (#311).
     assert_eq!(
         int(&ctx, "SELECT count(*) FROM florentine_families.nodes").await,
-        expected
+        int(&ctx, "SELECT count(*) FROM families").await
+    );
+    assert_eq!(
+        int(&ctx, "SELECT count(*) FROM degree(florentine_families)").await,
+        int(&ctx, "SELECT count(*) FROM families").await
     );
     assert_eq!(
         pretty(
@@ -230,7 +238,6 @@ async fn string_ids() {
 +---------+---------+
 | id      | letters |
 +---------+---------+
-| Medici  |         |
 | Strozzi | 7       |
 +---------+---------+"
     );

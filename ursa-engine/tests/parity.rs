@@ -33,7 +33,7 @@ use serde_json::Value;
 use ursa_core::catalog::{self, Evaluator, Family, Inputs, OutputDtype};
 use ursa_engine::graph::functions::{self, Literal};
 use ursa_engine::graph::traversal;
-use ursa_engine::graph::{index_builds, registry_of, EdgeTable, GraphDef};
+use ursa_engine::graph::{index_builds, registry_of, EdgeTable, GraphDef, VertexTable};
 use ursa_engine::new_session;
 
 /// A value as the fixture writes it: an id or integer, a string id, a
@@ -278,12 +278,42 @@ async fn sql_matches_the_python_library() {
         }
         datasets.push(dataset);
         let path = data.join(case["csv"].as_str().unwrap());
+        // A view (#311): the dataset's edges filtered, over a vertex table of
+        // the whole dataset's nodes in its node order, as Python's filtered
+        // frame keeps them (see generate_parity.py).
+        let view = &document["views"][dataset];
+        let filter = match view["filter"].as_str() {
+            Some(condition) => format!(" WHERE {condition}"),
+            None => String::new(),
+        };
         ctx.sql(&format!(
-            "CREATE VIEW {dataset}_edges AS SELECT * FROM '{}'",
+            "CREATE VIEW {dataset}_edges AS SELECT * FROM '{}'{filter}",
             path.display()
         ))
         .await
         .unwrap();
+        let vertices = match view["vertices"].as_array() {
+            Some(ids) => {
+                let rows: Vec<String> = ids
+                    .iter()
+                    .map(|id| match id {
+                        Value::String(s) => format!("('{}')", s.replace('\'', "''")),
+                        other => format!("({other})"),
+                    })
+                    .collect();
+                ctx.sql(&format!(
+                    "CREATE VIEW {dataset}_vertices AS SELECT * FROM (VALUES {}) t(id)",
+                    rows.join(", ")
+                ))
+                .await
+                .unwrap();
+                Some(VertexTable::new(
+                    TableReference::bare(format!("{dataset}_vertices")),
+                    "id",
+                ))
+            }
+            None => None,
+        };
         registry_of(&ctx).put(GraphDef {
             name: dataset.into(),
             edges: EdgeTable::new(
@@ -291,7 +321,7 @@ async fn sql_matches_the_python_library() {
                 "src",
                 "dst",
             ),
-            vertices: None,
+            vertices,
         });
     }
 
@@ -358,6 +388,15 @@ async fn sql_matches_the_python_library() {
             format!("SELECT * FROM {function}({dataset}, {args})")
         };
         let frame = ctx.sql(&sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        // describe's n_dropped_edges is SQL's own (a Python graph has no
+        // vertex table to drop edges by): compare the columns Python has.
+        let frame = match frame
+            .schema()
+            .index_of_column_by_name(None, "n_dropped_edges")
+        {
+            Some(_) if function == "describe" => frame.drop_columns(&["n_dropped_edges"]).unwrap(),
+            _ => frame,
+        };
         let schema = Arc::new(frame.schema().as_arrow().clone());
         let batches = frame
             .collect()
@@ -404,6 +443,12 @@ async fn sql_matches_the_python_library() {
         assert!(functions.contains(f.name), "no parity case for {}", f.name);
     }
     assert!(weighted >= 5, "{weighted} weighted cases");
+    // And graphs with isolated nodes: a vertex table over a filtered view.
+    let views = datasets
+        .iter()
+        .filter(|d| document["views"].get(**d).is_some())
+        .count();
+    assert!(views >= 2, "{views} graphs with isolated nodes");
     // One index per dataset, however many functions ran over it, weighted or
     // not.
     assert_eq!(index_builds(&ctx), datasets.len() as u64);

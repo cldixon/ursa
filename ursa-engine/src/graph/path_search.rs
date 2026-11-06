@@ -69,7 +69,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use ursa_core::{IdMap, Topology};
 
-use super::node::endpoint_id_type;
+use super::node::{check_vertices, endpoint_id_type};
 use super::pattern::{Direction, Mode, Quantifier, Selector};
 
 /// The path's first node.
@@ -175,6 +175,9 @@ pub struct PathSearchNode {
     pub search: Search,
     pub columns: PathColumns,
     pub input: Arc<LogicalPlan>,
+    /// The keys of the vertex tables the edges connect, one column, when they
+    /// have them: the graph's nodes, as an algorithm's (#311).
+    pub vertices: Option<Arc<LogicalPlan>>,
     pub starts: Arc<LogicalPlan>,
     pub source: Expr,
     pub destination: Expr,
@@ -183,16 +186,19 @@ pub struct PathSearchNode {
 }
 
 impl PathSearchNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         graph: String,
         search: Search,
         columns: PathColumns,
         input: Arc<LogicalPlan>,
+        vertices: Option<Arc<LogicalPlan>>,
         starts: Arc<LogicalPlan>,
         source: Expr,
         destination: Expr,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
+        check_vertices(&graph, vertices.as_deref())?;
         if columns.elements && id_type != DataType::Int64 {
             return Err(DataFusionError::Plan(format!(
                 "in GRAPH_TABLE: element_id(p) lists node keys and edge rows together, so it needs integer node keys; graph '{graph}' has {id_type} keys: use vertices(p) and edges(p)"
@@ -204,6 +210,7 @@ impl PathSearchNode {
             search,
             columns,
             input,
+            vertices,
             starts,
             source,
             destination,
@@ -231,6 +238,7 @@ impl PartialEq for PathSearchNode {
             && self.search == other.search
             && self.columns == other.columns
             && self.input == other.input
+            && self.vertices == other.vertices
             && self.starts == other.starts
             && self.source == other.source
             && self.destination == other.destination
@@ -245,6 +253,7 @@ impl Hash for PathSearchNode {
         self.search.hash(state);
         self.columns.hash(state);
         self.input.hash(state);
+        self.vertices.hash(state);
         self.starts.hash(state);
     }
 }
@@ -263,7 +272,10 @@ impl UserDefinedLogicalNodeCore for PathSearchNode {
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input, &self.starts]
+        let mut inputs = vec![self.input.as_ref()];
+        inputs.extend(self.vertices.as_deref());
+        inputs.push(&self.starts);
+        inputs
     }
 
     fn schema(&self) -> &DFSchemaRef {
@@ -283,20 +295,35 @@ impl UserDefinedLogicalNodeCore for PathSearchNode {
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        let [input, starts]: [LogicalPlan; 2] = inputs
-            .try_into()
-            .map_err(|_| DataFusionError::Internal("PathSearch has two inputs".to_string()))?;
+        let expected = 2 + usize::from(self.vertices.is_some());
+        if inputs.len() != expected {
+            return Err(DataFusionError::Internal(format!(
+                "PathSearch has {expected} inputs; got {}",
+                inputs.len()
+            )));
+        }
+        let mut inputs = inputs.into_iter().map(Arc::new);
+        let input = inputs.next().expect("checked above");
+        let vertices = self.vertices.as_ref().and_then(|_| inputs.next());
+        let starts = inputs.next().expect("checked above");
         Ok(Self {
-            input: Arc::new(input),
-            starts: Arc::new(starts),
+            input,
+            vertices,
+            starts,
             ..self.clone()
         })
     }
 
-    /// Both inputs are read whole: the endpoints, and the one start column.
+    /// Every input is read whole: the endpoints, the vertex key, and the one
+    /// start column.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let (source, destination) = self.endpoint_indices().ok()?;
-        Some(vec![vec![source, destination], vec![0]])
+        let mut children = vec![vec![source, destination]];
+        if self.vertices.is_some() {
+            children.push(vec![0]);
+        }
+        children.push(vec![0]);
+        Some(children)
     }
 
     /// A filter on the paths cannot move into the edges or the starts.
@@ -454,6 +481,8 @@ struct Rows<'a> {
     /// The starts, then every node of the index, as user ids: what the
     /// node references index.
     values: ArrayRef,
+    /// The edge table's row of an edge of the index.
+    edge_row: &'a dyn Fn(u32) -> u64,
 }
 
 impl<'a> Rows<'a> {
@@ -462,6 +491,7 @@ impl<'a> Rows<'a> {
         starts: &'a ArrayRef,
         columns: PathColumns,
         schema: SchemaRef,
+        edge_row: &'a dyn Fn(u32) -> u64,
     ) -> Result<Self> {
         let values = if ids.is_empty() {
             Arc::clone(starts)
@@ -481,6 +511,7 @@ impl<'a> Rows<'a> {
             edge_values: Vec::new(),
             batches: Vec::new(),
             values,
+            edge_row,
         })
     }
 
@@ -500,7 +531,9 @@ impl<'a> Rows<'a> {
             self.vertex_offsets.push(self.vertex_values.len() as i32);
         }
         if self.columns.edges || self.columns.elements {
-            self.edge_values.extend(edges.iter().map(|&e| e as i64));
+            let edge_row = self.edge_row;
+            self.edge_values
+                .extend(edges.iter().map(|&e| edge_row(e) as i64));
             self.edge_offsets.push(self.edge_values.len() as i32);
         }
         if self.start_rows.len() >= BATCH_ROWS {
@@ -591,10 +624,13 @@ impl<'a> Rows<'a> {
 }
 
 /// Run `search` from each of `starts` (keys of the graph's id type, each
-/// once) on the index `topology`/`ids`; the rows of [`schema`].
+/// once) on the index `topology`/`ids`; the rows of [`schema`]. `edge_row`
+/// gives the edge table's row of an edge of the index (see
+/// [`super::GraphIndex::edge_row`]).
 pub fn run(
     topology: &Topology,
     ids: &IdMap,
+    edge_row: &dyn Fn(u32) -> u64,
     search: &Search,
     starts: &ArrayRef,
     columns: PathColumns,
@@ -603,7 +639,7 @@ pub fn run(
     let dense = ids
         .dense_from_array(starts.as_ref())
         .map_err(|e| DataFusionError::Execution(format!("in GRAPH_TABLE: {e}")))?;
-    let mut rows = Rows::new(ids, starts, columns, schema)?;
+    let mut rows = Rows::new(ids, starts, columns, schema, edge_row)?;
     let Quantifier { min, max } = search.quantifier;
     let restricted = search.mode != Mode::Walk;
     let pruned = !restricted
@@ -770,7 +806,16 @@ mod tests {
         };
         let schema = Arc::new(super::schema(&DataType::Int64, columns));
         let starts: ArrayRef = Arc::new(Int64Array::from(starts.to_vec()));
-        let batches = run(&topology, &ids, &s, &starts, columns, schema).unwrap();
+        let batches = run(
+            &topology,
+            &ids,
+            &|e| u64::from(e),
+            &s,
+            &starts,
+            columns,
+            schema,
+        )
+        .unwrap();
         let mut out = Vec::new();
         for b in batches {
             let v = b.column(3).as_list::<i32>();

@@ -19,7 +19,8 @@
 //!     40     4  n_sections
 //!     44     4  reserved (zero)
 //!     48     8  main_len         bytes of the main part, trailer included
-//!     56     8  reserved (zero)
+//!     56     8  n_dropped        edge rows left out (see below); zero before
+//!                                #311, and for a graph with no vertex table
 //!     64     …  key              JSON: {"fingerprint": …, "files": [{…}, …]}
 //!      …     …  section table    at the next multiple of 8; 24 bytes a section:
 //!                                kind u32, element width u32, offset u64, count u64
@@ -33,6 +34,15 @@
 //! `n_nodes + 1`), targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`);
 //! then the ids, either `i64` values (`n_nodes`) or, for string ids,
 //! Arrow-style `i32` offsets (`n_nodes + 1`, from 0) and UTF-8 bytes.
+//!
+//! A graph with a vertex table leaves out the edge rows whose source or
+//! destination is not one of its keys (#311). When it left some out, the
+//! header counts them (`n_dropped`) and one more section (kind 11, bytes)
+//! says which rows of the edge plan were kept: one bit per row,
+//! `n_edges + n_dropped` of them, least significant bit first, as an Arrow
+//! boolean buffer. Its key includes the vertex table's, so no file written
+//! before #311 is ever read for such a graph; a file of a graph without one
+//! is read as before, with nothing left out.
 //!
 //! **Chunks** follow the main part, one after another, each appended in
 //! place once what it holds exists (see `IndexStore`):
@@ -96,7 +106,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
-use datafusion::arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
 use serde_json::{json, Value};
 use ursa_core::{Adjacency, IdMap, Topology};
 
@@ -137,6 +147,7 @@ const IDS_INT64: u32 = 7;
 const IDS_STR_OFFSETS: u32 = 8;
 const IDS_STR_BYTES: u32 = 9;
 const WEIGHTS_F64: u32 = 10;
+const KEPT_ROWS: u32 = 11;
 
 /// What an index is stored under: the edge plan's fingerprint and the
 /// identity of every file it reads.
@@ -219,6 +230,8 @@ enum Data<'a> {
     StrOffsets(StringArray),
     /// The bytes of a `StringArray` its offsets span.
     StrBytes(StringArray),
+    /// Bytes, as they are.
+    Bytes(Buffer),
 }
 
 impl Data<'_> {
@@ -226,7 +239,7 @@ impl Data<'_> {
         match self {
             Data::U64(_) | Data::F64(_) | Data::Ints(_) => 8,
             Data::U32(_) | Data::StrOffsets(_) => 4,
-            Data::StrBytes(_) => 1,
+            Data::StrBytes(_) | Data::Bytes(_) => 1,
         }
     }
 
@@ -238,6 +251,7 @@ impl Data<'_> {
             Data::Ints(a) => a.len(),
             Data::StrOffsets(a) => a.len() + 1,
             Data::StrBytes(a) => str_bytes(a).len(),
+            Data::Bytes(b) => b.len(),
         }) as u64
     }
 }
@@ -259,6 +273,7 @@ pub struct Encoded<'a> {
     flags: u32,
     n_nodes: u64,
     n_edges: u64,
+    n_dropped: u64,
     key: Vec<u8>,
     sections: Vec<(u32, Data<'a>, u64)>,
     table_offset: u64,
@@ -269,6 +284,18 @@ impl<'a> Encoded<'a> {
     /// Lay out the main part of `topology` and `ids` under `key` (not the
     /// in-adjacency: see [`EncodedChunk::incoming`]). Nothing is written yet.
     pub fn new(key: &IndexKey, topology: &'a Topology, ids: &'a IdMap) -> io::Result<Self> {
+        Self::with_dropped(key, topology, ids, 0, None)
+    }
+
+    /// [`Self::new`], for an index that left out `n_dropped` edge rows,
+    /// `kept` saying which it kept (see the module docs).
+    pub fn with_dropped(
+        key: &IndexKey,
+        topology: &'a Topology,
+        ids: &'a IdMap,
+        n_dropped: u64,
+        kept: Option<&BooleanBuffer>,
+    ) -> io::Result<Self> {
         let id_array = ids.user_id_array();
         let mut flags = 0;
         let out = topology.out();
@@ -290,6 +317,13 @@ impl<'a> Encoded<'a> {
                 id_array.data_type()
             )));
         }
+        let n_dropped = match kept {
+            Some(kept) if n_dropped > 0 => {
+                sections.push((KEPT_ROWS, Data::Bytes(kept.sliced())));
+                n_dropped
+            }
+            _ => 0,
+        };
 
         let key = key.to_json().to_string().into_bytes();
         let table_offset = align(HEADER_LEN + key.len() as u64, 8);
@@ -307,6 +341,7 @@ impl<'a> Encoded<'a> {
             flags,
             n_nodes: topology.n_nodes() as u64,
             n_edges: topology.n_edges() as u64,
+            n_dropped,
             key,
             sections,
             table_offset,
@@ -336,6 +371,7 @@ impl<'a> Encoded<'a> {
         header.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
         header.extend_from_slice(&[0; 4]);
         header.extend_from_slice(&self.file_size().to_le_bytes());
+        header.extend_from_slice(&self.n_dropped.to_le_bytes());
         header.resize(HEADER_LEN as usize, 0);
         sink.put(&header)?;
         sink.put(&self.key)?;
@@ -533,6 +569,7 @@ impl<W: Write> Sink<W> {
                 self.put_all(offsets, |x| (x - base).to_le_bytes())
             }
             Data::StrBytes(a) => self.put(str_bytes(a)),
+            Data::Bytes(b) => self.put(b.as_slice()),
         }
     }
 
@@ -557,11 +594,21 @@ impl<W: Write> Sink<W> {
 /// Why a file could not be read as an index.
 pub type DecodeError = String;
 
+/// The edge rows an index left out, and which it kept: nothing left out and
+/// `None` for a graph with no vertex table (see the module docs).
+#[derive(Debug, Clone, Default)]
+pub struct Dropped {
+    pub n_dropped: u64,
+    pub kept: Option<BooleanBuffer>,
+}
+
 /// An index read from its file.
 pub struct Stored {
     /// With a loader for the in-adjacency, if the file has its chunk.
     pub topology: Topology,
     pub ids: IdMap,
+    /// The edge rows left out, and which were kept (see the module docs).
+    pub dropped: Dropped,
     pub main: MainPart,
     /// The chunks that check out, in file order.
     pub chunks: Vec<ChunkInfo>,
@@ -593,7 +640,8 @@ pub fn incoming_reads() -> u64 {
 pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
-    let (topology, ids, main) = decode_from(BufReader::with_capacity(BLOCK, &file), len, key)?;
+    let (topology, ids, main, dropped) =
+        decode_from(BufReader::with_capacity(BLOCK, &file), len, key)?;
     let (chunks, _) = list_chunks(&mut file, main.len, len);
     let topology = match chunks.iter().find(|c| c.kind == CHUNK_INCOMING) {
         Some(chunk) => {
@@ -610,6 +658,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
     Ok(Stored {
         topology,
         ids,
+        dropped,
         main,
         chunks,
     })
@@ -618,7 +667,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
 /// Read the main part of the index in `bytes`, which must be stored under
 /// `key`. Chunks are not read.
 pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeError> {
-    decode_from(bytes, bytes.len() as u64, key).map(|(topology, ids, _)| (topology, ids))
+    decode_from(bytes, bytes.len() as u64, key).map(|(topology, ids, _, _)| (topology, ids))
 }
 
 /// One chunk of a file, as listed: where it is and what it holds.
@@ -932,7 +981,7 @@ impl<R: Read> Source<R> {
             (IDS_INT64, 8) => Section::I64(self.values(n, i64::from_le_bytes)?),
             (WEIGHTS_F64, 8) => Section::F64(self.values(n, f64::from_le_bytes)?),
             (IDS_STR_OFFSETS, 4) => Section::I32(self.values(n, i32::from_le_bytes)?),
-            (IDS_STR_BYTES, 1) => Section::Bytes(self.bytes(n)?),
+            (IDS_STR_BYTES | KEPT_ROWS, 1) => Section::Bytes(self.bytes(n)?),
             _ => {
                 self.skip_to(offset + width * count)?;
                 Section::Bytes(Vec::new())
@@ -956,7 +1005,7 @@ fn decode_from(
     reader: impl Read,
     len: u64,
     key: &IndexKey,
-) -> Result<(Topology, IdMap, MainPart), DecodeError> {
+) -> Result<(Topology, IdMap, MainPart, Dropped), DecodeError> {
     if len < HEADER_LEN + TRAILER_LEN {
         return Err(format!("{len} bytes is too short for an index file"));
     }
@@ -981,6 +1030,7 @@ fn decode_from(
     let key_len = u64_at(&header, 32);
     let n_sections = u32::from_le_bytes(header[40..44].try_into().expect("4 bytes")) as u64;
     let main_len = u64_at(&header, 48);
+    let n_dropped = u64_at(&header, 56);
     if main_len > len || main_len < HEADER_LEN + TRAILER_LEN {
         return Err("the file is truncated".into());
     }
@@ -1110,7 +1160,27 @@ fn decode_from(
     if ids.len() != n_nodes {
         return Err("the id map does not match the topology".into());
     }
-    Ok((topology, ids, main))
+    let dropped = match n_dropped {
+        0 => Dropped::default(),
+        n_dropped => {
+            let rows = usize::try_from(n_dropped)
+                .ok()
+                .and_then(|d| d.checked_add(n_edges))
+                .ok_or("the kept rows are malformed")?;
+            let Section::Bytes(bits) = take(KEPT_ROWS, 1, Some(rows.div_ceil(8)))? else {
+                return Err(malformed(KEPT_ROWS));
+            };
+            let kept = BooleanBuffer::new(Buffer::from_vec(bits), 0, rows);
+            if kept.count_set_bits() != n_edges {
+                return Err("the kept rows do not match the edges".into());
+            }
+            Dropped {
+                n_dropped,
+                kept: Some(kept),
+            }
+        }
+    };
+    Ok((topology, ids, main, dropped))
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -1198,6 +1268,25 @@ mod tests {
         for i in 0..n_sections {
             assert_eq!(u64_at(&bytes, table + 24 * i + 8) % 64, 0);
         }
+    }
+
+    #[test]
+    fn the_rows_a_vertex_table_left_out_round_trip() {
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (topology, ids) = built(ints(&[1, 2]), ints(&[2, 3]));
+        // Rows 0 and 3 of four were kept, rows 1 and 2 left out.
+        let kept = BooleanBuffer::from(vec![true, false, false, true]);
+        let encoded = Encoded::with_dropped(&key(), &topology, &ids, 2, Some(&kept)).unwrap();
+        let mut bytes = Vec::new();
+        encoded.write_to(&mut bytes).unwrap();
+        let (back, _, _, dropped) = decode_from(&bytes[..], bytes.len() as u64, &key()).unwrap();
+        same(&topology, &back);
+        assert_eq!(dropped.n_dropped, 2);
+        assert_eq!(dropped.kept, Some(kept));
+        // A file with nothing left out has no such section, as before #311.
+        let plain = encode(&key(), &topology, &ids);
+        let (_, _, _, none) = decode_from(&plain[..], plain.len() as u64, &key()).unwrap();
+        assert_eq!((none.n_dropped, none.kept), (0, None));
     }
 
     #[test]

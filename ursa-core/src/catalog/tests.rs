@@ -813,6 +813,37 @@ fn describe_over_a_view_reads_only_the_kept_edges() {
 }
 
 #[test]
+fn nodes_on_no_edge_count_unless_touched() {
+    // A graph whose nodes were given apart from its edges: 0->1, 1->2, and
+    // nodes 3 and 4 on no edge. As a view that keeps 0->1 and 1->2 of a
+    // graph with the edge 3->4 would read it.
+    let t = topo(5, &[0, 1], &[1, 2]);
+    let all = stats::describe(&t, None, true, Direction::Out, false);
+    assert_eq!(
+        (all.n_nodes, all.n_edges, all.n_components),
+        (5, 2, Some(3))
+    );
+    let touched = stats::describe(&t, None, true, Direction::Out, true);
+    assert_eq!(
+        (touched.n_nodes, touched.n_edges, touched.n_components),
+        (3, 2, Some(1))
+    );
+    let parent = topo(5, &[0, 1, 3], &[1, 2, 4]);
+    let mask = EdgeMask::from_bools(&[true, true, false]);
+    for touched in [false, true] {
+        let d = stats::describe(&parent, Some(&mask), true, Direction::Out, touched);
+        assert_eq!(d, stats::describe(&t, None, true, Direction::Out, touched));
+    }
+    // The path statistics start only from nodes on an edge, as over a view.
+    for sample in [None, Some(0.5)] {
+        assert_eq!(
+            stats::avg_path_length(&t, None, sample, Direction::Out).to_bits(),
+            stats::avg_path_length(&parent, Some(&mask), sample, Direction::Out).to_bits()
+        );
+    }
+}
+
+#[test]
 fn path_statistics() {
     let tri = topo(3, &[0, 1, 2], &[1, 2, 0]);
     // 6 reachable ordered pairs, distances {1,2} x3 -> mean 1.5

@@ -11,7 +11,10 @@
 //! - **the identity of every file the plan reads**: its location, size,
 //!   modification time and e-tag, from the object store's metadata when the
 //!   node executes (a `HEAD` per file, not DataFusion's listing cache, which
-//!   can be stale).
+//!   can be stale);
+//! - for a graph with a vertex table, whose keys are its nodes (#311), **the
+//!   keys' plan's fingerprint and the identity of the files it reads** too,
+//!   so a change to the vertex table builds afresh.
 //!
 //! Rewriting a file changes its identity, so the next query builds afresh.
 //! An edge plan that reads anything other than files, literal rows or nothing
@@ -34,8 +37,9 @@
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use datafusion::arrow::buffer::BooleanBuffer;
 use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::listing::ListingTable;
@@ -54,10 +58,22 @@ use crate::database::{database_of_config, IndexKey, IndexStore};
 
 /// A built graph: its topology, and the map from dense node indexes back to
 /// the edges' ids.
+///
+/// A graph with a vertex table has the vertex table's keys as its nodes, in
+/// the table's order, and only the edges whose endpoints are both keys (see
+/// `ursa_core::EdgeInterner`): its edge ids number the edges kept, and
+/// [`Self::edge_row`] maps them back to rows of the edge table.
 #[derive(Debug)]
 pub struct GraphIndex {
     pub topology: Arc<Topology>,
     pub ids: Arc<IdMap>,
+    /// Edge rows dropped because an endpoint is not a node.
+    n_dropped: u64,
+    /// Which edge rows were kept, one bit per row of the edge plan, when any
+    /// was dropped.
+    kept: Option<BooleanBuffer>,
+    /// Per edge id, its row in the edge plan, when any row was dropped.
+    rows: OnceLock<Vec<u64>>,
     /// Weights evaluated over the edge rows this index was built from.
     weights: WeightCache,
     /// Weights stored with the index on disk, read on first use.
@@ -85,8 +101,42 @@ impl GraphIndex {
         Self {
             topology,
             ids,
+            n_dropped: 0,
+            kept: None,
+            rows: OnceLock::new(),
             weights: WeightCache::default(),
             stored: None,
+        }
+    }
+
+    /// This index, built from edge rows of which `kept` says which were kept
+    /// (`None`: all of them), `n_dropped` having been dropped.
+    pub fn with_dropped(mut self, n_dropped: u64, kept: Option<BooleanBuffer>) -> Self {
+        self.n_dropped = n_dropped;
+        self.kept = kept.filter(|_| n_dropped > 0);
+        self
+    }
+
+    /// Edge rows dropped because an endpoint is not a node of the graph's
+    /// vertex table.
+    pub fn n_dropped(&self) -> u64 {
+        self.n_dropped
+    }
+
+    /// Which rows of the edge plan were kept, one bit per row, if any was
+    /// dropped.
+    pub fn kept_rows(&self) -> Option<&BooleanBuffer> {
+        self.kept.as_ref()
+    }
+
+    /// The row of the edge plan edge `edge` was read from: the edge id itself
+    /// when no row was dropped.
+    pub fn edge_row(&self, edge: u32) -> u64 {
+        match &self.kept {
+            None => u64::from(edge),
+            Some(kept) => self
+                .rows
+                .get_or_init(|| kept.set_indices().map(|i| i as u64).collect())[edge as usize],
         }
     }
 

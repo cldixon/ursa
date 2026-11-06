@@ -133,7 +133,8 @@ CREATE PROPERTY GRAPH karate
 ```
 
 - **An edge table** is any table or view. Each row is an edge from its `SOURCE KEY` column to its `DESTINATION KEY` column. The two columns must have the same type: integers or strings.
-- **A vertex table** gives nodes attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
+- **A vertex table** defines the nodes and gives them attributes, keyed by its `KEY` column. `KEY` can be left out: the key is then the table's primary key, or else the column the edge tables' `REFERENCES` name. Ursa adds one relaxation to the standard: vertex tables are optional, and without one the nodes are the endpoints of the edges.
+- **The node set** (new in 0.7; in 0.6.0 the algorithms see only the edges' endpoints). With a vertex table, every key is a node, one with no edges included, and every algorithm, traversal and pattern runs on those nodes, in the table's order. An edge whose source or destination is not a key is left out, as DuckPGQ leaves it out; `describe` counts such edges in `n_dropped_edges`. A NULL key is no node, and a key given twice is one node.
 - **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
 - **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise. DuckPGQ's order, `Student PROPERTIES (id, name) LABEL Person`, gives `Person` those properties.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
@@ -152,14 +153,14 @@ SELECT count(*) AS edges FROM karate.edges;
 +-------+
 ```
 
-A graph over a view that filters edges is a subgraph. Its nodes are the endpoints of the edges it keeps:
+A graph over a view that filters edges is a subgraph. With a vertex table, its nodes are the vertex table's keys, those on no kept edge included; without one, they are the endpoints of the edges it keeps:
 
 ```sql
 CREATE VIEW first_ties AS SELECT * FROM ties WHERE src < 10;
 CREATE PROPERTY GRAPH first EDGE TABLES (first_ties SOURCE KEY (src) DESTINATION KEY (dst));
 ```
 
-**Edge order.** The order of the edges decides the graph's internal node numbering, which in turn decides community label values and the last bits of floating-point results. Over a file, or a view that filters or projects one, Ursa reads the edges in file order, as the Python library does. A join, an aggregate or a `UNION` gives its rows in no fixed order, so over an edge table built with one of those, Ursa sorts the edges by `(source, destination)` before building the graph. Results are then the same on every run and any thread count. The same holds for a traversal's `seeds`: from a subquery with a join or an aggregate, they are sorted by value. `EXPLAIN` shows the sort as a `SortExec` under the graph function.
+**Edge order.** The order of the edges decides the graph's internal node numbering, which in turn decides community label values and the last bits of floating-point results. With a vertex table, the nodes are numbered in the vertex table's order instead, as DuckPGQ numbers them, so the same edges with and without a vertex table can differ in those label values and last bits; a vertex table that lists the nodes in the order the edges first name them gives the Python library's results exactly. A vertex table that is not read in a fixed order (a join, an aggregate) is sorted by its key. Over a file, or a view that filters or projects one, Ursa reads the edges in file order, as the Python library does. A join, an aggregate or a `UNION` gives its rows in no fixed order, so over an edge table built with one of those, Ursa sorts the edges by `(source, destination)` before building the graph. Results are then the same on every run and any thread count. The same holds for a traversal's `seeds`: from a subquery with a join or an aggregate, they are sorted by value. `EXPLAIN` shows the sort as a `SortExec` under the graph function.
 
 `OR REPLACE` replaces a graph of the same name. `IF NOT EXISTS` does nothing if there is one. Defining a graph that exists without either is an error.
 

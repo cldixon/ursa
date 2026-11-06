@@ -184,7 +184,7 @@ pub fn functions_batch() -> Result<RecordBatch> {
         }
         directions.append(true);
         let outs = outputs.values();
-        for o in spec.outputs {
+        for o in functions::outputs(spec) {
             outs.field_builder::<StringBuilder>(0)
                 .expect("name")
                 .append_value(o.name);

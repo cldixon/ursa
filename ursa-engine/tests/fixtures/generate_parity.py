@@ -12,6 +12,14 @@ The neighbour aggregation (``neighbors_agg``, #262) has cases too: SQL passes
 the values as a query (``values => (SELECT id, value FROM ...)``), Python as a
 node frame's column.
 
+Graphs with isolated nodes (#311) are cases too: a **view** is a filter of a
+dataset's edges that leaves some nodes on no kept edge. Python runs it as a
+filtered edge frame, which keeps the parent graph's whole node set; SQL as a
+graph over the filtered edges with a vertex table of the parent's nodes, in
+the parent's node order (``views`` in the file), which defines the same node
+set. Every algorithm, statistic, traversal and neighbour aggregation runs on
+the views; the layouts do not.
+
 The traversals (``hop``, ``shortest_path``, ``random_walk``, #238) are cases
 too, with their rows in the Python library's order, and the file records the
 Python signatures of the traversals so the SQL engine's specs of them
@@ -52,6 +60,15 @@ DATASETS = [
     ("karate", "karate_edges.csv", ur.datasets.load_karate),  # integer ids
     ("florentine", "florentine_edges.csv", ur.datasets.load_florentine),  # string ids
     ("lesmis", "lesmis_edges.csv", ur.datasets.load_lesmis),  # string ids, a weight column
+]
+
+# (view, dataset, SQL condition on the edges, the same as a Python expression):
+# subgraphs that leave nodes isolated (see the module docs).
+VIEWS: list[tuple[str, str, str, Callable[[], Any]]] = [
+    # Members 0 to 4 are on no kept edge (every edge goes from a lower id).
+    ("karate_view", "karate", "src >= 5", lambda: ur.col("src") >= 5),
+    # The characters whose every tie has weight 1 are on none.
+    ("lesmis_view", "lesmis", "weight >= 2", lambda: ur.col("weight") >= 2),
 ]
 
 # Weight expressions, as SQL writes them and as the Python API builds them.
@@ -160,7 +177,8 @@ def hop(n: int, direction: str, seeds: Any) -> Callable[[Any], Any]:
 
 
 def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]:
-    """``(function, sql_args, python call over the edges)`` for ``dataset``."""
+    """``(function, sql_args, python call over the edges)`` for ``dataset`` (a
+    view's are its dataset's)."""
     ids = NODES[dataset]
     seeds, missing, (source, target) = ids["seeds"], ids["missing"], ids["path"]
     cases: list[tuple[str, str, Callable[[Any], Any]]] = []
@@ -284,7 +302,7 @@ KARATE_NEIGHBOR_CASES: list[tuple[Any, str, str]] = [
 
 def neighbor_cases(dataset: str, csv: str, edges: Any) -> list[dict]:
     """The ``neighbors_agg`` cases of ``dataset``."""
-    cases = NEIGHBOR_CASES + (KARATE_NEIGHBOR_CASES if dataset == "karate" else [])
+    cases = NEIGHBOR_CASES + (KARATE_NEIGHBOR_CASES if dataset.startswith("karate") else [])
     out = []
     for (sql_values, frame, column), agg, direction in cases:
         expr = getattr(ur.col(column), agg)()
@@ -383,8 +401,10 @@ def result(dataset: str, csv: str, function: str, args: str, table: pa.Table) ->
 
 def main() -> None:
     cases = []
+    loaded = {}
     for dataset, csv, load in DATASETS:
         edges = load()
+        loaded[dataset] = (csv, edges)
         calls = CALLS + (WEIGHTED_CALLS if dataset in WEIGHTED_DATASETS else [])
         for function, kwargs in calls:
             cases.append(case(dataset, csv, edges, function, kwargs))
@@ -392,11 +412,27 @@ def main() -> None:
             table = call(edges).collect().to_arrow()
             cases.append(result(dataset, csv, function, args, table))
         cases.extend(neighbor_cases(dataset, csv, edges))
+    views = {}
+    for view, dataset, condition, expr in VIEWS:
+        csv, parent = loaded[dataset]
+        edges = parent.filter(expr())
+        # The parent's nodes, in its node order: the SQL graph's vertex table.
+        vertices = ur.degree(parent).collect().to_arrow().column("id").to_pylist()
+        views[view] = {"csv": csv, "filter": condition, "vertices": vertices}
+        calls = CALLS + (WEIGHTED_CALLS if dataset in WEIGHTED_DATASETS else [])
+        for function, kwargs in calls:
+            if function not in LAYOUTS:
+                cases.append(case(view, csv, edges, function, kwargs))
+        for function, args, call in traversal_cases(dataset):
+            table = call(edges).collect().to_arrow()
+            cases.append(result(view, csv, function, args, table))
+        cases.extend(neighbor_cases(view, csv, edges))
     header = {
         "about": "Python library results for ursa-engine/tests/parity.rs; written by "
         "generate_parity.py (see its docstring). Floats are the hex of their IEEE-754 bits.",
         "ursa_version": ur.__version__,
         "traversal_signatures": signatures(),
+        "views": views,
     }
     # One case per line, so a diff shows which cases changed.
     lines = [f" {json.dumps(k)}: {json.dumps(v)}," for k, v in header.items()]

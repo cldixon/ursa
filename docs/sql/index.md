@@ -67,7 +67,8 @@ Both run the same kernels, from one catalog of algorithms. The same graph and th
 A few things differ:
 
 - **Row order.** A SQL result has no order unless you write `ORDER BY`. The Python library returns rows in a fixed order.
-- **Subgraph nodes.** A SQL graph over a filtered view has the endpoints of the edges it keeps, as SQL/PGQ defines it. A filtered edge frame in Python keeps the parent's nodes.
+- **Subgraph nodes** (new in 0.7). A filtered edge frame in Python keeps the parent's nodes. A SQL graph's nodes are its vertex table's keys, as SQL/PGQ defines them, so a subgraph over a filtered view with the parent's vertex table keeps them too, and gives the same results as the Python frame when the vertex table lists the nodes in the parent's order (a graph numbers its nodes in its vertex table's order; see [edge order](statements.md)). Without a vertex table, a SQL graph's nodes are the endpoints of the edges it keeps. In both, `describe(g, nodes => 'touched')` describes only the nodes at an end of a kept edge.
+- **Edges to no node.** A SQL edge whose source or destination is not a key of the vertex table is left out of the graph, as in DuckPGQ; `describe` counts them in `n_dropped_edges`, a column the Python library's `describe` does not have.
 - **Layouts.** These are in the Python library only, for now.
 - **Neighbour aggregation.** Python aggregates a column of a node frame: `ur.neighbors(edges).agg(ur.col("age").mean())`. SQL takes the values as a query, or as a column of the graph's node table: `neighbors_agg(g, values => (SELECT id, age FROM people), agg => 'mean')`.
 

@@ -275,11 +275,11 @@ async fn statistics_return_one_row() {
         .await
         .unwrap(),
         "\
-+---------+---------+---------------------+-------------------+--------------+
-| n_nodes | n_edges | density             | avg_degree        | n_components |
-+---------+---------+---------------------+-------------------+--------------+
-| 34      | 78      | 0.13903743315508021 | 4.588235294117647 | 1            |
-+---------+---------+---------------------+-------------------+--------------+"
++---------+---------+---------------------+-------------------+--------------+-----------------+
+| n_nodes | n_edges | density             | avg_degree        | n_components | n_dropped_edges |
++---------+---------+---------------------+-------------------+--------------+-----------------+
+| 34      | 78      | 0.13903743315508021 | 4.588235294117647 | 1            | 0               |
++---------+---------+---------------------+-------------------+--------------+-----------------+"
     );
     // Without `full`, n_components is NULL, as in Python.
     assert_eq!(
@@ -320,11 +320,15 @@ async fn statistics_return_one_row() {
         .await
         .unwrap();
     assert!(
-        schema.contains("| n_components | Int64     | YES         |"),
+        schema.contains("| n_components    | Int64     | YES         |"),
         "{schema}"
     );
     assert!(
-        schema.contains("| n_nodes      | Int64     | NO          |"),
+        schema.contains("| n_nodes         | Int64     | NO          |"),
+        "{schema}"
+    );
+    assert!(
+        schema.contains("| n_dropped_edges | Int64     | NO          |"),
         "{schema}"
     );
     for (sql, expected) in [
@@ -682,6 +686,7 @@ n_edges,Int64,false
 density,Float64,false
 avg_degree,Float64,false
 n_components,Int64,true
+n_dropped_edges,Int64,false
 "
     );
     // Nothing SQL cannot call is listed, and dtype is not a SQL parameter.

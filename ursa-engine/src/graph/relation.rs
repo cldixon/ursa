@@ -52,6 +52,7 @@ use datafusion::catalog::default_table_source::provider_as_source;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::expr_fn::cast;
 use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
@@ -82,7 +83,7 @@ use super::node::{
 };
 use super::path_search::{PathColumns, PathSearchNode, Search};
 use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
-use super::{GraphDef, GraphRegistry, PropertyGraph};
+use super::{GraphDef, GraphRegistry, PropertyGraph, VertexTable};
 
 /// Plans graph function calls in `FROM`.
 #[derive(Debug)]
@@ -205,13 +206,14 @@ impl RelationPlanner for GraphFunctions {
         }
         let (graph, rest) = self.graph_argument(target, args, context)?;
         let edges = self.edge_table(&graph, context)?;
+        let vertices = self.vertex_keys(&graph, context)?;
         let mut weights = WeightSet::new(edges.schema().as_ref().clone());
         let (outputs, per_node) = match target {
             Target::Function(spec) if spec.reads_attribute() => {
                 let nodes = |c: &dyn RelationPlannerContext| {
                     self.table_source(&TableReference::partial(graph.name.as_str(), "nodes"), c)
                 };
-                let node = values_node(spec, &graph, edges, rest, context, &nodes)?;
+                let node = values_node(spec, &graph, edges, vertices, rest, context, &nodes)?;
                 let plan = LogicalPlan::Extension(Extension {
                     node: Arc::new(node),
                 });
@@ -219,8 +221,7 @@ impl RelationPlanner for GraphFunctions {
             }
             Target::Function(spec) => {
                 let (call, weight) = resolve_call(spec, rest, context, &mut weights, "")?;
-                let outputs = spec
-                    .outputs
+                let outputs = functions::outputs(spec)
                     .iter()
                     .enumerate()
                     .map(|(field, o)| Output {
@@ -234,14 +235,14 @@ impl RelationPlanner for GraphFunctions {
             }
             Target::Algorithms => (algorithms(rest, context, &mut weights)?, true),
             Target::Traversal(spec) => {
-                let node = traversal_node(spec, &graph, edges, rest, context)?;
+                let node = traversal_node(spec, &graph, edges, vertices, rest, context)?;
                 let plan = LogicalPlan::Extension(Extension {
                     node: Arc::new(node),
                 });
                 return planned(plan, target, alias);
             }
         };
-        let node = node(&graph, edges, weights, outputs, per_node)?;
+        let node = node(&graph, edges, vertices, weights, outputs, per_node)?;
         let plan = LogicalPlan::Extension(Extension {
             node: Arc::new(node),
         });
@@ -275,10 +276,12 @@ type NodeTable<'a> = dyn Fn(&dyn RelationPlannerContext) -> Result<Arc<dyn Table
 /// The node for a call to `spec`, a function that reads node values
 /// (`neighbors_agg`), over the edge table `edges` of `graph`, with the
 /// arguments after the graph (see the module docs).
+#[allow(clippy::too_many_arguments)]
 fn values_node(
     spec: &'static FunctionSpec,
     graph: &GraphDef,
     edges: LogicalPlan,
+    vertices: Option<LogicalPlan>,
     args: Vec<FunctionArg>,
     context: &mut dyn RelationPlannerContext,
     nodes: &NodeTable,
@@ -321,7 +324,7 @@ fn values_node(
             ..
         }
     );
-    let edges = edge_inputs(graph, edges, weights)?;
+    let edges = edge_inputs(graph, edges, vertices, weights)?;
     let id_type = endpoint_id_type(&graph.name, &edges.input, &edges.source, &edges.destination)?;
     let in_param = |param: &'static str| {
         move |e: DataFusionError| {
@@ -427,8 +430,7 @@ fn values_node(
              'count', 'n_unique', 'min' and 'max'; got a column of type {value}"
         )));
     }
-    let outputs = spec
-        .outputs
+    let outputs = functions::outputs(spec)
         .iter()
         .enumerate()
         .map(|(field, o)| Output {
@@ -442,6 +444,7 @@ fn values_node(
         graph.name.clone(),
         Arc::new(edges.input),
         None,
+        edges.vertices,
         Some(Arc::new(values)),
         edges.source,
         edges.destination,
@@ -457,6 +460,7 @@ fn traversal_node(
     spec: &'static TraversalSpec,
     graph: &GraphDef,
     edges: LogicalPlan,
+    vertices: Option<LogicalPlan>,
     args: Vec<FunctionArg>,
     context: &mut dyn RelationPlannerContext,
 ) -> Result<GraphTraversalNode> {
@@ -513,7 +517,7 @@ fn traversal_node(
         .zip(nodes)
         .map(|(p, n)| n.ok_or_else(|| traversal::missing_param(spec, p)))
         .collect::<Result<Vec<_>>>()?;
-    let edges = edge_inputs(graph, edges, weights)?;
+    let edges = edge_inputs(graph, edges, vertices, weights)?;
     // The node ids are checked against the graph's id type as they are
     // planned, so the id type comes first.
     let id_type = endpoint_id_type(&graph.name, &edges.input, &edges.source, &edges.destination)?;
@@ -534,6 +538,7 @@ fn traversal_node(
         traversal,
         Arc::new(edges.input),
         edges.weighted,
+        edges.vertices,
         edges.weights.into_iter().next(),
         inputs,
         written,
@@ -1016,15 +1021,17 @@ fn algorithms(
 fn node(
     graph: &GraphDef,
     edges: LogicalPlan,
+    vertices: Option<LogicalPlan>,
     weights: WeightSet,
     outputs: Vec<Output>,
     per_node: bool,
 ) -> Result<GraphAlgorithmNode> {
-    let edges = edge_inputs(graph, edges, weights)?;
+    let edges = edge_inputs(graph, edges, vertices, weights)?;
     GraphAlgorithmNode::try_new(
         graph.name.clone(),
         Arc::new(edges.input),
         edges.weighted,
+        edges.vertices,
         None,
         edges.source,
         edges.destination,
@@ -1035,18 +1042,26 @@ fn node(
 }
 
 /// A graph node's edge inputs: the edge table projected to the endpoints, and
-/// to the endpoints and weights when there are weights (see `node`).
+/// to the endpoints and weights when there are weights (see `node`); and the
+/// vertex keys, when the graph has a vertex table.
 struct EdgeInputs {
     input: LogicalPlan,
     weighted: Option<Arc<LogicalPlan>>,
+    vertices: Option<Arc<LogicalPlan>>,
     source: Expr,
     destination: Expr,
     /// The weight expressions, as written.
     weights: Vec<String>,
 }
 
-/// The edge inputs of a node over the edge table `edges` of `graph`.
-fn edge_inputs(graph: &GraphDef, edges: LogicalPlan, weights: WeightSet) -> Result<EdgeInputs> {
+/// The edge inputs of a node over the edge table `edges` of `graph`, whose
+/// vertex keys are `vertices` if it has a vertex table.
+fn edge_inputs(
+    graph: &GraphDef,
+    edges: LogicalPlan,
+    vertices: Option<LogicalPlan>,
+    weights: WeightSet,
+) -> Result<EdgeInputs> {
     let table = graph.edges.table.clone();
     let column = |name: &str| Expr::Column(Column::new(Some(table.clone()), name));
     let (source, destination) = (
@@ -1067,6 +1082,10 @@ fn edge_inputs(graph: &GraphDef, edges: LogicalPlan, weights: WeightSet) -> Resu
         .project(vec![source.clone(), destination.clone()])
         .map_err(no_endpoints)?
         .build()?;
+    if let (Some(keys), Some(v)) = (&vertices, &graph.vertices) {
+        let id_type = endpoint_id_type(&graph.name, &input, &source, &destination)?;
+        check_key_type(&graph.name, &v.table, keys, &id_type)?;
+    }
     let weighted = if weights.exprs.is_empty() {
         None
     } else {
@@ -1088,13 +1107,98 @@ fn edge_inputs(graph: &GraphDef, edges: LogicalPlan, weights: WeightSet) -> Resu
     Ok(EdgeInputs {
         input,
         weighted,
+        vertices: vertices.map(Arc::new),
         source,
         destination,
         weights: weights.written,
     })
 }
 
+/// The keys of the vertex tables `tables` (each once), as one column of the
+/// node id type `id_type`, each table's keys in its own order: the nodes of a
+/// graph with a vertex table (#311). `source_of` gives a table's source.
+fn keys_plan(
+    tables: &[&VertexTable],
+    id_type: &DataType,
+    source_of: &dyn Fn(&TableReference) -> Result<Arc<dyn TableSource>>,
+) -> Result<Option<LogicalPlan>> {
+    let mut plan: Option<LogicalPlanBuilder> = None;
+    for v in tables {
+        let key = Expr::Column(Column::new(Some(v.table.clone()), &v.key));
+        let scan = LogicalPlanBuilder::scan(v.table.clone(), source_of(&v.table)?, None)?;
+        let key_type = key.get_type(scan.schema())?;
+        let key = match key_type == *id_type {
+            true => key,
+            false => cast(key, id_type.clone()),
+        };
+        let keys = scan.project(vec![key.alias(VERTEX_KEY)])?.build()?;
+        plan = Some(match plan {
+            None => LogicalPlanBuilder::from(keys),
+            Some(p) => p.union(keys)?,
+        });
+    }
+    plan.map(LogicalPlanBuilder::build).transpose()
+}
+
+/// The column of a graph node's vertex keys.
+const VERTEX_KEY: &str = "__ursa_key";
+
+/// The vertex keys `keys` (of the vertex table `table` of `graph`) are node
+/// ids of the endpoints' type `id_type`: both integers or both strings.
+fn check_key_type(
+    graph: &str,
+    table: &TableReference,
+    keys: &LogicalPlan,
+    id_type: &DataType,
+) -> Result<()> {
+    let key_type = keys.schema().field(0).data_type();
+    if super::node::id_type(key_type).as_ref() == Some(id_type) {
+        return Ok(());
+    }
+    Err(plan(format!(
+        "graph '{graph}': the key of vertex table '{table}' is {key_type}, but the edge \
+         endpoints are {id_type}; both must be integers or both strings"
+    )))
+}
+
 impl GraphFunctions {
+    /// The keys of `graph`'s vertex table, one column, if it has one: the
+    /// graph's nodes (#311). Not yet cast to the node id type: the node casts
+    /// them when it runs.
+    fn vertex_keys(
+        &self,
+        graph: &GraphDef,
+        context: &dyn RelationPlannerContext,
+    ) -> Result<Option<LogicalPlan>> {
+        let Some(v) = &graph.vertices else {
+            return Ok(None);
+        };
+        let source = match self.registry.file_table(&graph.name, &v.table) {
+            Some(provider) => provider_as_source(provider),
+            None => self.table_source(&v.table, context).map_err(|e| {
+                plan(format!(
+                    "graph '{}': its vertex table cannot be read: {}",
+                    graph.name,
+                    crate::user_message(&e)
+                ))
+            })?,
+        };
+        let key = Expr::Column(Column::new(Some(v.table.clone()), &v.key));
+        let plan = LogicalPlanBuilder::scan(v.table.clone(), source, None)?
+            .project(vec![key.alias(VERTEX_KEY)])
+            .map_err(|e| {
+                plan(format!(
+                    "graph '{}': the vertex table '{}' has no key column '{}': {}",
+                    graph.name,
+                    v.table,
+                    v.key,
+                    crate::user_message(&e)
+                ))
+            })?
+            .build()?;
+        Ok(Some(plan))
+    }
+
     /// `graph_table('<body>')`: SQL/PGQ's `GRAPH_TABLE ( body )` after Ursa's
     /// parser rewrote it (see [`super::pattern`]).
     fn plan_graph_table(
@@ -1233,6 +1337,33 @@ impl GraphFunctions {
             let edges = LogicalPlanBuilder::scan(segment.edges.clone(), table, None)?
                 .project(vec![source.clone(), destination.clone()])?
                 .build()?;
+            // The nodes the search runs over: the keys of the vertex tables
+            // the edges connect, as an algorithm's (#311). An edge table with
+            // an end that refers to no vertex table has its endpoints as nodes.
+            let element = graph.edge_tables.iter().find(|e| {
+                e.table == segment.edges
+                    && e.source == segment.source
+                    && e.destination == segment.destination
+            });
+            let ends = element.map(|e| {
+                (
+                    graph.endpoint_vertex(e, true),
+                    graph.endpoint_vertex(e, false),
+                )
+            });
+            let vertices = match ends {
+                Some((Some(s), Some(d))) => {
+                    let id_type = endpoint_id_type(&graph.name, &edges, &source, &destination)?;
+                    let tables = if s.name == d.name {
+                        vec![s]
+                    } else {
+                        vec![s, d]
+                    };
+                    let source_of = |t: &TableReference| source_of(t, &*context);
+                    keys_plan(&tables, &id_type, &source_of)?.map(Arc::new)
+                }
+                _ => None,
+            };
             let node = PathSearchNode::try_new(
                 graph.name.clone(),
                 Search {
@@ -1247,6 +1378,7 @@ impl GraphFunctions {
                     .and_then(|p| used.get(p).copied())
                     .unwrap_or_default(),
                 Arc::new(edges),
+                vertices,
                 Arc::new(starts),
                 source,
                 destination,

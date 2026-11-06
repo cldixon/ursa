@@ -261,6 +261,7 @@ impl IndexStore {
                 });
                 let index = Arc::new(
                     GraphIndex::new(Arc::new(stored.topology), Arc::new(stored.ids))
+                        .with_dropped(stored.dropped.n_dropped, stored.dropped.kept)
                         .with_stored_weights(keys, read),
                 );
                 state.live.insert(
@@ -420,7 +421,13 @@ impl IndexStore {
     /// in-adjacency, if it is built by now, is written as a chunk after the
     /// main part.
     fn write(&self, key: &IndexKey, index: &Arc<GraphIndex>, limit: u64) -> std::io::Result<()> {
-        let encoded = Encoded::new(key, &index.topology, &index.ids)?;
+        let encoded = Encoded::with_dropped(
+            key,
+            &index.topology,
+            &index.ids,
+            index.n_dropped(),
+            index.kept_rows(),
+        )?;
         let incoming = index
             .topology
             .incoming_if_built()
