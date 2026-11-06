@@ -42,7 +42,8 @@
 //! the message: `hop(seeds =>) must be node ids of graph 'karate', which are
 //! integers; got 'a'`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::arrow::compute::can_cast_types;
@@ -61,8 +62,8 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::sql::sqlparser::ast::{
-    self, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArguments, TableFactor,
-    TableFunctionArgs, UnaryOperator, Value,
+    self, visit_expressions_mut, FunctionArg, FunctionArgExpr, FunctionArgOperator,
+    FunctionArguments, TableFactor, TableFunctionArgs, UnaryOperator, Value, VisitMut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -79,6 +80,7 @@ use super::node::{
     endpoint_id_type, weight_column, GraphAlgorithmNode, GraphTraversalNode, Output,
     WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
 };
+use super::path_search::{PathColumns, PathSearchNode, Search};
 use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
 use super::{GraphDef, GraphRegistry, PropertyGraph};
 
@@ -1125,16 +1127,44 @@ impl GraphFunctions {
             };
             super::pattern::lower(&pattern, &graph, &schema_of)?
         };
-        let conditions = lowered
+        let mut conditions = lowered
             .conditions
             .iter()
             .map(|c| parse_sql_expr(c))
             .collect::<Result<Vec<_>>>()?;
-        let columns = parse_select_items(&lowered.columns)?;
+        let mut columns = parse_select_items(&lowered.columns)?;
+        // Path functions (`path_length(p)`) read their path's relation.
+        let paths: Vec<String> = lowered
+            .segments
+            .iter()
+            .filter_map(|s| s.path.clone())
+            .collect();
+        let mut used: HashMap<String, PathColumns> = HashMap::new();
+        for condition in &mut conditions {
+            path_functions(condition, &paths, &mut used, context)?;
+        }
+        for item in &mut columns {
+            // An unnamed path function is named as written: `path_length(p)`.
+            if let ast::SelectItem::UnnamedExpr(expr @ ast::Expr::Function(_)) = item {
+                let written = expr.to_string();
+                let function = written.split('(').next().unwrap_or("").to_lowercase();
+                if super::path_search::FUNCTIONS
+                    .iter()
+                    .any(|(f, _)| *f == function)
+                {
+                    *item = ast::SelectItem::ExprWithAlias {
+                        expr: expr.clone(),
+                        alias: ast::Ident::with_quote('"', written),
+                    };
+                }
+            }
+            path_functions(item, &paths, &mut used, context)?;
+        }
 
-        // The cross join of every variable's relation, as one branch's input.
-        let mut from: Option<LogicalPlanBuilder> = None;
-        for source in &lowered.sources {
+        // One variable's relation: its element table, aliased by the variable.
+        let relation_of = |source: &super::pattern::Source,
+                           context: &dyn RelationPlannerContext|
+         -> Result<LogicalPlan> {
             let table = source_of(&source.table, context)?;
             let mut scan = LogicalPlanBuilder::scan(source.table.clone(), table, None)?;
             if let Some(columns) = &source.columns {
@@ -1142,13 +1172,8 @@ impl GraphFunctions {
                     Expr::Column(Column::new_unqualified(column)).alias(name)
                 }))?;
             }
-            let relation = scan.alias(source.var.as_str())?.build()?;
-            from = Some(match from {
-                None => LogicalPlanBuilder::from(relation),
-                Some(b) => b.cross_join(relation)?,
-            });
-        }
-        let base = from.expect("a pattern has a node").build()?;
+            scan.alias(source.var.as_str())?.build()
+        };
         // A join column under the name its variable's relation gives it.
         let column = |(var, name): &super::pattern::VarColumn| {
             let source = lowered.sources.iter().find(|s| &s.var == var);
@@ -1158,6 +1183,83 @@ impl GraphFunctions {
                 .unwrap_or(name);
             Expr::Column(Column::new(Some(var.as_str()), name))
         };
+
+        // The cross join of every variable's relation and every searched
+        // path, as one branch's input.
+        let mut from: Option<LogicalPlanBuilder> = None;
+        let mut relations = Vec::new();
+        for source in &lowered.sources {
+            relations.push(relation_of(source, context)?);
+        }
+        for segment in &lowered.segments {
+            let start = lowered
+                .sources
+                .iter()
+                .find(|s| s.var == segment.start)
+                .expect("a segment starts at a node");
+            let start = relation_of(start, context)?;
+            // The start nodes: those the conditions on the start node alone keep.
+            let mut keep = Vec::new();
+            for condition in &conditions {
+                for conjunct in conjuncts(condition) {
+                    if let Ok(expr) = context.sql_to_expr(conjunct.clone(), start.schema()) {
+                        keep.push(expr);
+                    }
+                }
+            }
+            let mut starts = LogicalPlanBuilder::from(start);
+            if let Some(predicate) = keep.into_iter().reduce(Expr::and) {
+                starts = starts.filter(predicate)?;
+            }
+            let starts = starts
+                .project(vec![
+                    column(&segment.start_key).alias(super::path_search::START)
+                ])?
+                .distinct()?
+                .build()?;
+            let table = source_of(&segment.edges, context)?;
+            let edge_column =
+                |name: &str| Expr::Column(Column::new(Some(segment.edges.clone()), name));
+            let (source, destination) = (
+                edge_column(&segment.source),
+                edge_column(&segment.destination),
+            );
+            let edges = LogicalPlanBuilder::scan(segment.edges.clone(), table, None)?
+                .project(vec![source.clone(), destination.clone()])?
+                .build()?;
+            let node = PathSearchNode::try_new(
+                graph.name.clone(),
+                Search {
+                    direction: segment.direction,
+                    quantifier: segment.quantifier,
+                    selector: segment.selector,
+                    mode: segment.mode,
+                },
+                segment
+                    .path
+                    .as_ref()
+                    .and_then(|p| used.get(p).copied())
+                    .unwrap_or_default(),
+                Arc::new(edges),
+                Arc::new(starts),
+                source,
+                destination,
+            )?;
+            relations.push(
+                LogicalPlanBuilder::from(LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                }))
+                .alias(segment.var.as_str())?
+                .build()?,
+            );
+        }
+        for relation in relations {
+            from = Some(match from {
+                None => LogicalPlanBuilder::from(relation),
+                Some(b) => b.cross_join(relation)?,
+            });
+        }
+        let base = from.expect("a pattern has a node").build()?;
         let mut branches = Vec::new();
         for joins in &lowered.branches {
             let mut filter: Vec<Expr> = joins
@@ -1334,6 +1436,87 @@ impl GraphFunctions {
             None => format!(". The graphs are: {}", names.join(", ")),
         };
         Err(plan(format!("graph '{name}' does not exist{hint}")))
+    }
+}
+
+/// The parts of `expr` joined by `AND`.
+fn conjuncts(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match expr {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = conjuncts(left);
+            parts.extend(conjuncts(right));
+            parts
+        }
+        ast::Expr::Nested(inner) => conjuncts(inner),
+        other => vec![other],
+    }
+}
+
+/// Rewrite each path function in `node` (`path_length(p)`, `vertices(p)`,
+/// `edges(p)`, `element_id(p)`) to the column of `p`'s relation it reads,
+/// and note in `used` which columns each path needs.
+fn path_functions<V: VisitMut>(
+    node: &mut V,
+    paths: &[String],
+    used: &mut HashMap<String, PathColumns>,
+    context: &dyn RelationPlannerContext,
+) -> Result<()> {
+    let flow = visit_expressions_mut(node, |expr: &mut ast::Expr| {
+        let ast::Expr::Function(f) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let [name] = f.name.0.as_slice() else {
+            return ControlFlow::Continue(());
+        };
+        let Some(name) = name.as_ident() else {
+            return ControlFlow::Continue(());
+        };
+        let function = name.value.to_lowercase();
+        let Some((_, column)) = super::path_search::FUNCTIONS
+            .iter()
+            .find(|(f, _)| *f == function)
+        else {
+            return ControlFlow::Continue(());
+        };
+        let arg = match &f.args {
+            FunctionArguments::List(list) => match list.args.as_slice() {
+                [FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Identifier(i)))] => {
+                    Some(context.normalize_ident(i.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(path) = arg.filter(|a| paths.contains(a)) else {
+            return ControlFlow::Break(plan(format!(
+                "in GRAPH_TABLE: {function}() takes a path variable, as {function}(p) for MATCH p = (a)-[e]->*(b){}",
+                if paths.is_empty() {
+                    String::new()
+                } else {
+                    format!("; the paths are {}", paths.join(", "))
+                }
+            )));
+        };
+        let needs = used.entry(path.clone()).or_default();
+        match *column {
+            super::path_search::VERTICES => needs.vertices = true,
+            super::path_search::EDGES => needs.edges = true,
+            super::path_search::ELEMENTS => needs.elements = true,
+            _ => {}
+        }
+        *expr = ast::Expr::CompoundIdentifier(vec![
+            ast::Ident::with_quote('"', path),
+            ast::Ident::with_quote('"', *column),
+        ]);
+        ControlFlow::Continue(())
+    });
+    match flow {
+        ControlFlow::Break(e) => Err(e),
+        ControlFlow::Continue(()) => Ok(()),
     }
 }
 

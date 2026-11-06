@@ -118,6 +118,121 @@ LIMIT 3;
 +----+----------+
 ```
 
+## Paths of any length
+
+A quantifier after an edge repeats it: `-[e]->{1,3}` is one to three edges, `*` is any number (none included), `+` one or more, `?` none or one, and `{2}`, `{2,}` and `{,3}` are what they look like. `MATCH p = …` names the path, so `COLUMNS` can ask about it. How far member 16 is from member 26, and the way:
+
+```sql
+SELECT *
+FROM GRAPH_TABLE (karate
+  MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26)
+  COLUMNS (path_length(p) AS steps, vertices(p) AS members, edges(p) AS ties)
+);
+```
+
+```text
++-------+-----------------------+--------------------+
+| steps | members               | ties               |
++-------+-----------------------+--------------------+
+| 5     | [16, 5, 0, 8, 33, 26] | [39, 4, 7, 43, 67] |
++-------+-----------------------+--------------------+
+```
+
+A path has four functions: `path_length(p)` is its number of edges, `vertices(p)` its nodes' keys from first to last, `edges(p)` its edges' rows in the edge table (counted from 0), and `element_id(p)` the two alternating, as DuckPGQ lists them (it needs integer keys).
+
+How many members are each number of steps from member 0:
+
+```sql
+SELECT steps, count(*) AS members
+FROM GRAPH_TABLE (karate
+  MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]-*(b)
+  COLUMNS (path_length(p) AS steps)
+)
+GROUP BY steps
+ORDER BY steps;
+```
+
+```text
++-------+---------+
+| steps | members |
++-------+---------+
+| 0     | 1       |
+| 1     | 16      |
+| 2     | 9       |
+| 3     | 8       |
++-------+---------+
+```
+
+### Which paths
+
+A selector, after `p =`, says which of a pair of nodes' paths to keep:
+
+| selector | keeps, for each first and last node |
+|---|---|
+| none, or `ALL` | every path |
+| `ANY SHORTEST`, or `ANY` | one shortest path |
+| `SHORTEST k`, or `ANY k` | the `k` shortest paths |
+| `ALL SHORTEST` | every path as short as the shortest |
+
+When several paths are as short, they are ordered by their edges' rows in the edge table: the path whose first edge comes first, then its second, and so on. `ANY SHORTEST` keeps the first, so the same query always picks the same path.
+
+Every shortest way from member 16 to member 26:
+
+```sql
+SELECT *
+FROM GRAPH_TABLE (karate
+  MATCH p = ALL SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26)
+  COLUMNS (vertices(p) AS members)
+)
+ORDER BY members;
+```
+
+```text
++------------------------+
+| members                |
++------------------------+
+| [16, 5, 0, 8, 33, 26]  |
+| [16, 5, 0, 13, 33, 26] |
+| [16, 5, 0, 19, 33, 26] |
+| [16, 5, 0, 31, 33, 26] |
+| [16, 6, 0, 8, 33, 26]  |
+| [16, 6, 0, 13, 33, 26] |
+| [16, 6, 0, 19, 33, 26] |
+| [16, 6, 0, 31, 33, 26] |
++------------------------+
+```
+
+A path mode, after the selector, says what a path may repeat: `WALK` (the default) anything, `TRAIL` no edge, `ACYCLIC` no node, and `SIMPLE` no node except that it may end where it started. Without a selector, a path of unbounded length needs one of the last three, or its walks would never end. The paths from member 0 along the ties as stored, each member at most once:
+
+```sql
+SELECT count(*) AS paths
+FROM GRAPH_TABLE (karate
+  MATCH ACYCLIC (a WHERE a.id = 0)-[e]->+(b)
+  COLUMNS (b.id)
+);
+```
+
+```text
++-------+
+| paths |
++-------+
+| 113   |
++-------+
+```
+
+The bounds count edges, and a shortest path of at least one edge from a node back to itself is a cycle, as the SQL standard defines it. DuckPGQ leaves those out; `WHERE a.id <> b.id` does the same here.
+
+### How it runs
+
+A quantified edge is not a chain of joins. It is a breadth-first search on the graph's index, the one `hop` and `shortest_path` use, starting from the nodes that the first node's conditions keep. A condition on the first node makes the search small. A quantified edge can sit between fixed ones, as in `(s:school)<-[:studyat]-(a)-[:knows]->{1,3}(b)`.
+
 ## What is not supported yet
 
-Paths of variable length (`-[e]->*`, `-[e]->{1,3}`), path variables (`p = …`), `ANY SHORTEST`, and label expressions (`:a|b`) are refused with a message: they come next ([#297](https://github.com/cldixon/ursa/issues/297)). `COLUMNS` is required. `GRAPH TABLE`, in two words, works too.
+These are refused with a message:
+
+- a path variable, selector or path mode on a path of more than one edge;
+- a condition inside a quantified edge, or an edge variable of one in `COLUMNS` (use `edges(p)`);
+- a quantified edge between two vertex tables;
+- label expressions (`:a|b`) and parenthesized path patterns (`((a)-[e]->(b))*`).
+
+`COLUMNS` is required. `GRAPH TABLE`, in two words, works too.
