@@ -76,7 +76,7 @@ async fn students() -> SessionContext {
          CREATE TABLE school AS SELECT * FROM (VALUES ('VU', 0), ('UVA', 1)) AS t(name, id);
          CREATE TABLE studyat AS SELECT * FROM (VALUES (0, 0), (1, 0), (2, 1), (3, 1), (4, 1)) AS t(personid, schoolid);
          CREATE PROPERTY GRAPH pg
-           VERTEX TABLES (student LABEL person PROPERTIES (id, name), school LABEL school)
+           VERTEX TABLES (student PROPERTIES (id, name) LABEL person, school LABEL school)
            EDGE TABLES (
              know SOURCE KEY (src) REFERENCES student (id)
                   DESTINATION KEY (dst) REFERENCES student (id) LABEL knows,
