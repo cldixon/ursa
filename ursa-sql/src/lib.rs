@@ -25,6 +25,7 @@ use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 
 pub mod database;
+mod from_first;
 mod graph_ddl;
 pub mod graph_table;
 mod parser;

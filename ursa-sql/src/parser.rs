@@ -134,6 +134,8 @@ impl<'a> UrsaParser<'a> {
         // SQL/PGQ's GRAPH_TABLE ( … ), which sqlparser cannot parse, becomes
         // the table function graph_table('…') first (see `graph_table`).
         let sql = crate::graph_table::rewrite_graph_tables(sql, dialect);
+        // DuckDB's `FROM t [WHERE …]` becomes `SELECT * FROM t [WHERE …]`.
+        let sql = crate::from_first::rewrite_from_first(&sql, dialect);
         let df = DFParserBuilder::new(sql.as_str())
             .with_dialect(dialect)
             .with_recursion_limit(recursion_limit)
