@@ -118,8 +118,11 @@ struct ReadCall {
 /// call's text, with how many statements are using each.
 #[derive(Debug, Default)]
 pub struct ReadTables {
-    tables: Mutex<HashMap<String, (Arc<dyn TableProvider>, usize)>>,
+    tables: Mutex<HashMap<String, Shared>>,
 }
+
+/// A call's table, and how many statements being planned use it.
+type Shared = (Arc<dyn TableProvider>, usize);
 
 /// `config` with a place for the tables of `read_*` calls.
 pub(crate) fn with_read_tables(config: SessionConfig) -> SessionConfig {
