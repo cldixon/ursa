@@ -64,6 +64,8 @@ use datafusion::sql::sqlparser::ast::{
     self, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArguments, TableFactor,
     TableFunctionArgs, UnaryOperator, Value,
 };
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use futures::FutureExt;
 use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Call, FunctionSpec};
@@ -148,6 +150,9 @@ impl RelationPlanner for GraphFunctions {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
         let function_name = context.normalize_ident(ident.clone());
+        if function_name == super::pattern::FUNCTION {
+            return self.plan_graph_table(relation, context);
+        }
         let target = if function_name == ALGORITHMS {
             Target::Algorithms
         } else if let Some(spec) = functions::lookup(&function_name) {
@@ -1082,6 +1087,66 @@ fn edge_inputs(graph: &GraphDef, edges: LogicalPlan, weights: WeightSet) -> Resu
 }
 
 impl GraphFunctions {
+    /// `graph_table('<body>')`: SQL/PGQ's `GRAPH_TABLE ( body )` after Ursa's
+    /// parser rewrote it (see [`super::pattern`]).
+    fn plan_graph_table(
+        &self,
+        relation: TableFactor,
+        context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        let TableFactor::Table {
+            args: Some(args),
+            alias,
+            ..
+        } = relation
+        else {
+            unreachable!("matched by the caller")
+        };
+        let body = match args.args.as_slice() {
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(v)))] => match &v.value {
+                Value::SingleQuotedString(s) => s.clone(),
+                _ => return Err(graph_table_usage()),
+            },
+            _ => return Err(graph_table_usage()),
+        };
+        let pattern = super::pattern::parse(&body)?;
+        let graph = self.graph(&pattern.graph)?;
+        let sql = {
+            let context: &dyn RelationPlannerContext = context;
+            let schema_of = |table: &TableReference| -> Result<Arc<Schema>> {
+                let source = match self.registry.file_table(&graph.name, table) {
+                    Some(provider) => provider_as_source(provider),
+                    None => self.table_source(table, context)?,
+                };
+                Ok(source.schema())
+            };
+            super::pattern::lower(&pattern, &graph, &schema_of)?
+        };
+        let query = Parser::new(&GenericDialect {})
+            .try_with_sql(&sql)
+            .and_then(|mut p| p.parse_query())
+            .map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "GRAPH_TABLE's query does not parse ({e}): {sql}"
+                ))
+            })?;
+        let plan = context.plan(TableFactor::Derived {
+            lateral: false,
+            subquery: query,
+            alias: None,
+            sample: None,
+        })?;
+        let plan = match alias {
+            Some(_) => plan,
+            None => LogicalPlanBuilder::from(plan)
+                .alias(super::pattern::FUNCTION)?
+                .build()?,
+        };
+        Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
+            plan, alias,
+        ))))
+    }
+
     fn first_argument_is_a_graph(
         &self,
         args: &TableFunctionArgs,
@@ -1186,6 +1251,15 @@ impl GraphFunctions {
         };
         Err(plan(format!("graph '{name}' does not exist{hint}")))
     }
+}
+
+/// The error for `graph_table(…)` called other than as Ursa's parser writes it.
+fn graph_table_usage() -> DataFusionError {
+    DataFusionError::Plan(
+        "graph_table() takes one string, a GRAPH_TABLE body; write \
+         GRAPH_TABLE (graph MATCH (a)-[e]->(b) COLUMNS (a.id, b.id))"
+            .to_string(),
+    )
 }
 
 /// "pagerank('g')" names a graph by a string; say how to write it.

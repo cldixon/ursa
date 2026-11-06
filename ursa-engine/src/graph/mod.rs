@@ -64,6 +64,7 @@ pub mod functions;
 mod index;
 mod kernels;
 mod node;
+pub mod pattern;
 mod relation;
 mod session;
 pub mod traversal;

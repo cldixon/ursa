@@ -131,14 +131,14 @@ pub struct UrsaParser<'a> {
 
 impl<'a> UrsaParser<'a> {
     pub fn new(sql: &str, dialect: &'a dyn Dialect, recursion_limit: usize) -> Result<Self> {
-        let df = DFParserBuilder::new(sql)
+        // SQL/PGQ's GRAPH_TABLE ( … ), which sqlparser cannot parse, becomes
+        // the table function graph_table('…') first (see `graph_table`).
+        let sql = crate::graph_table::rewrite_graph_tables(sql, dialect);
+        let df = DFParserBuilder::new(sql.as_str())
             .with_dialect(dialect)
             .with_recursion_limit(recursion_limit)
             .build()?;
-        Ok(Self {
-            df,
-            sql: sql.to_string(),
-        })
+        Ok(Self { df, sql })
     }
 
     /// Parse every statement, separated by `;`. Empty statements are skipped.
