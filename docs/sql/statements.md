@@ -131,7 +131,7 @@ CREATE PROPERTY GRAPH pairs
 ```
 
 ```text
-Error: multi-column keys are (KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column) not supported yet at Line: 2, Column: 36
+Error: multi-column keys are not supported yet at Line: 2, Column: 36; KEY, SOURCE KEY, DESTINATION KEY and REFERENCES take one column
 ```
 
 ## DROP PROPERTY GRAPH

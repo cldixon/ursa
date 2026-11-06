@@ -134,6 +134,7 @@ for shell in $shells; do
     grep -q "Checksum OK" "$work/out" || fail "$shell: no checksum line: $(cat "$work/out")"
     grep -qF "export PATH=\"$dir:\$PATH\"" "$work/out" || fail "$shell: no PATH hint: $(cat "$work/out")"
     grep -qF 'ursa -c "SELECT 42"' "$work/out" || fail "$shell: no next step: $(cat "$work/out")"
+    grep -qF "Docs: https://cldixon.github.io/ursa/sql/" "$work/out" || fail "$shell: no docs link: $(cat "$work/out")"
     pass "$shell: installs ursa $version into a new directory, with a PATH hint"
 done
 cat "$work/out"
@@ -148,6 +149,7 @@ env -i PATH="$dir:$base_path" HOME="$work/home" URSA_INSTALL_DIR="$dir" \
 [ "$("$dir/ursa" --version)" = "$full" ] || fail "reinstalled ursa is broken"
 [ "$(ls -i "$dir/ursa")" != "$before" ] || fail "reinstall did not replace the file"
 ! grep -q "not on your PATH" "$work/out" || fail "PATH hint printed with the directory on PATH"
+grep -qF "Docs: https://cldixon.github.io/ursa/sql/" "$work/out" || fail "no docs link with the directory on PATH: $(cat "$work/out")"
 [ "$(ls -A "$dir")" = ursa ] || fail "reinstall left files behind: $(ls -A "$dir")"
 pass "reinstalls over an existing ursa, atomically, with no PATH hint when on PATH"
 
@@ -262,6 +264,7 @@ EOF
     [ "$("$dir/ursa.exe" --version)" = "$full" ] || fail "install.ps1: wrong binary"
     grep -q "Checksum OK" "$work/out" || fail "install.ps1: no checksum line: $(cat "$work/out")"
     grep -qF "Installed ursa $version" "$work/out" || fail "install.ps1: no version line: $(cat "$work/out")"
+    grep -qF "Docs: https://cldixon.github.io/ursa/sql/" "$work/out" || fail "install.ps1: no docs link: $(cat "$work/out")"
     cat "$work/out"
     pass "install.ps1 installs ursa $version"
 

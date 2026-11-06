@@ -10,12 +10,13 @@ use std::io::Write;
 
 use arrow::csv::WriterBuilder as CsvWriterBuilder;
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::{ArrayWriter, LineDelimitedWriter};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::FormatOptions;
 use arrow::util::pretty::pretty_format_batches_with_options;
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
@@ -113,4 +114,15 @@ pub async fn write_stream<W: Write>(
 /// Whether a result has anything to print. DDL and `SET` return no columns.
 pub fn has_columns(schema: &SchemaRef) -> bool {
     !schema.fields().is_empty()
+}
+
+/// Whether `err` is a write to a reader that has gone (`ursa … | head`).
+pub fn is_broken_pipe(err: &DataFusionError) -> bool {
+    match err {
+        DataFusionError::IoError(e) => e.kind() == std::io::ErrorKind::BrokenPipe,
+        DataFusionError::ArrowError(e, _) => {
+            matches!(e.as_ref(), ArrowError::IoError(_, e) if e.kind() == std::io::ErrorKind::BrokenPipe)
+        }
+        _ => false,
+    }
 }
