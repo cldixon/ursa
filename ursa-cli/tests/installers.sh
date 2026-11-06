@@ -42,7 +42,8 @@ pass() {
     printf 'ok: %s\n' "$*"
 }
 
-version=$("$bin" --version | sed 's/^ursa //')
+full=$("$bin" --version)
+version=$(printf '%s\n' "$full" | sed 's/^ursa //; s/ .*//')
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
     Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu ;;
@@ -128,7 +129,7 @@ for shell in $shells; do
     dir="$work/$shell/bin"
     install "$dir" "$shell" URSA_DOWNLOAD_BASE="$www/good" URSA_VERSION="$version" ||
         fail "$shell: install with URSA_VERSION=$version failed: $(cat "$work/out")"
-    [ "$("$dir/ursa" --version)" = "ursa $version" ] || fail "$shell: installed ursa reports $("$dir/ursa" --version)"
+    [ "$("$dir/ursa" --version)" = "$full" ] || fail "$shell: installed ursa reports $("$dir/ursa" --version)"
     [ "$("$dir/ursa" --format csv -c "SELECT 42 AS answer" | tail -n 1)" = 42 ] || fail "$shell: installed ursa cannot run a query"
     grep -q "Checksum OK" "$work/out" || fail "$shell: no checksum line: $(cat "$work/out")"
     grep -qF "export PATH=\"$dir:\$PATH\"" "$work/out" || fail "$shell: no PATH hint: $(cat "$work/out")"
@@ -144,7 +145,7 @@ before=$(ls -i "$dir/ursa")
 env -i PATH="$dir:$base_path" HOME="$work/home" URSA_INSTALL_DIR="$dir" \
     URSA_DOWNLOAD_BASE="$www/good" URSA_VERSION="v$version" sh -s < "$installer" > "$work/out" 2>&1 ||
     fail "reinstall failed: $(cat "$work/out")"
-[ "$("$dir/ursa" --version)" = "ursa $version" ] || fail "reinstalled ursa is broken"
+[ "$("$dir/ursa" --version)" = "$full" ] || fail "reinstalled ursa is broken"
 [ "$(ls -i "$dir/ursa")" != "$before" ] || fail "reinstall did not replace the file"
 ! grep -q "not on your PATH" "$work/out" || fail "PATH hint printed with the directory on PATH"
 [ "$(ls -A "$dir")" = ursa ] || fail "reinstall left files behind: $(ls -A "$dir")"
@@ -155,7 +156,7 @@ for listing in releases.json releases-pretty.json; do
     dir="$work/latest-$listing/bin"
     install "$dir" sh URSA_DOWNLOAD_BASE="$www/good" URSA_RELEASES_URL="$www/$listing" ||
         fail "install of the newest version ($listing) failed: $(cat "$work/out")"
-    [ "$("$dir/ursa" --version)" = "ursa $version" ] || fail "newest version ($listing): wrong binary"
+    [ "$("$dir/ursa" --version)" = "$full" ] || fail "newest version ($listing): wrong binary"
     grep -qF "Downloading ursa $version for $target" "$work/out" || fail "newest version ($listing) is not $version: $(cat "$work/out")"
 done
 pass "finds the newest ursa-cli release, skipping Python releases, drafts and prereleases"
@@ -212,7 +213,7 @@ if command -v curl > /dev/null; then
         URSA_DOWNLOAD_BASE="$www/good" URSA_VERSION="$version" \
         sh -c "curl -fsSL '$www/install.sh' | sh" > "$work/out" 2>&1 ||
         fail "curl | sh failed: $(cat "$work/out")"
-    [ "$("$dir/ursa" --version)" = "ursa $version" ] || fail "curl | sh: wrong binary"
+    [ "$("$dir/ursa" --version)" = "$full" ] || fail "curl | sh: wrong binary"
     pass "curl -fsSL .../install.sh | sh"
 else
     echo "skipped: curl | sh (curl not installed)"
@@ -258,7 +259,7 @@ EOF
     dir="$work/ps1/bin"
     ps1 "$dir" URSA_DOWNLOAD_BASE="$www/good" URSA_VERSION="$version" ||
         fail "install.ps1 failed: $(cat "$work/out")"
-    [ "$("$dir/ursa.exe" --version)" = "ursa $version" ] || fail "install.ps1: wrong binary"
+    [ "$("$dir/ursa.exe" --version)" = "$full" ] || fail "install.ps1: wrong binary"
     grep -q "Checksum OK" "$work/out" || fail "install.ps1: no checksum line: $(cat "$work/out")"
     grep -qF "Installed ursa $version" "$work/out" || fail "install.ps1: no version line: $(cat "$work/out")"
     cat "$work/out"

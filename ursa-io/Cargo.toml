@@ -1,7 +1,9 @@
 [package]
 name = "ursa-io"
 description = "Source reading for Ursa: Parquet/CSV scans through DataFusion, CSV options and inference, object_store/URL handling. No plan types."
-version.workspace = true
+# Released with ursa-engine, ursa-sql and ursa-cli, in lockstep at the CLI's
+# version (release-cli.yml checks); the Python package keeps the workspace version.
+version = "0.7.0-dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +15,7 @@ categories = ["database", "encoding"]
 [dependencies]
 # `ursa-core`'s `rayon` feature is native only (below): in the browser the
 # kernels take their serial path, whose results are bit-identical (#278).
-ursa-core = { path = "../ursa-core", version = "0.5.0", default-features = false }
+ursa-core = { path = "../ursa-core", version = "0.7.0-dev", default-features = false }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 rayon = { workspace = true }
@@ -33,7 +35,7 @@ csv = "1"
 # runtime the blocking scan entry points share (see `runtime.rs`). None of these
 # build for wasm32 (#278).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ursa-core = { path = "../ursa-core", version = "0.5.0", features = ["rayon"] }
+ursa-core = { path = "../ursa-core", version = "0.7.0-dev", features = ["rayon"] }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 

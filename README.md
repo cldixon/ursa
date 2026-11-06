@@ -85,13 +85,13 @@ CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (d
 SELECT * FROM pagerank(club, direction => 'both') ORDER BY pagerank DESC LIMIT 3;
 ```
 
-Algorithms give the same values in SQL and in Python. Ursa SQL is not released yet; it will ship as `ursa-cli` 0.6. Once it is out, install it with one line on Linux or macOS:
+Algorithms give the same values in SQL and in Python. Install `ursa` with one line on Linux or macOS:
 
 ```bash
 curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 ```
 
-On Windows, `irm https://cldixon.github.io/ursa/install.ps1 | iex` in PowerShell. Or `cargo install ursa-cli`, or a binary from the [releases page](https://github.com/cldixon/ursa/releases). Until the release, build it with `cargo install --git https://github.com/cldixon/ursa ursa-cli`. See the [SQL docs](https://cldixon.github.io/ursa/sql/).
+On Windows, `irm https://cldixon.github.io/ursa/install.ps1 | iex` in PowerShell. Or `cargo install ursa-cli`, or a binary from the [releases page](https://github.com/cldixon/ursa/releases). See the [SQL docs](https://cldixon.github.io/ursa/sql/).
 
 ## How it is built
 

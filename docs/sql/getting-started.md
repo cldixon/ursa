@@ -4,16 +4,6 @@ Ursa is a SQL engine for graph analytics. It reads Parquet, CSV, JSON and Arrow 
 
 ## Install
 
-!!! warning "Not released yet"
-
-    `ursa-cli` is not on crates.io yet, and there are no release downloads yet. Until the first release, build it from the repository:
-
-    ```bash
-    cargo install --git https://github.com/cldixon/ursa ursa-cli
-    ```
-
-    The instructions below are for after the release. The install script works once `ursa-cli` 0.6.0 is out.
-
 On Linux or macOS, run the install script:
 
 ```bash
@@ -91,9 +81,9 @@ ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
 +-----+-----+
 ```
 
-The format comes from the extension: `.parquet`, `.csv`, `.json`, `.jsonl` and `.ndjson` (JSON, one object per line), and `.arrow`. CSV and JSON may be compressed (`.csv.gz`, `.jsonl.zst`). A directory or a glob reads every file in it: `'edges/*.parquet'`.
+The format comes from the extension: `.parquet`, `.csv`, `.json`, `.jsonl` and `.ndjson` (JSON, one object per line; `.jsonl` and `.ndjson` are new in 0.7), and `.arrow`. CSV and JSON may be compressed (`.csv.gz`, `.jsonl.zst`). A directory or a glob reads every file in it: `'edges/*.parquet'`.
 
-`read_parquet`, `read_csv` and `read_json` read a file in the format they name, whatever its extension, with options, as in DuckDB:
+**New in 0.7:** `read_parquet`, `read_csv` and `read_json` read a file in the format they name, whatever its extension, with options, as in DuckDB:
 
 ```bash
 ursa -c "SELECT * FROM read_csv('karate_edges.csv', header => true, delim => ',') LIMIT 3"
@@ -267,7 +257,7 @@ LIMIT 3;
 +----+----------------+
 ```
 
-The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
+The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. (In 0.6.0, `count` and `n_unique` return floats, and strings take only those two.) A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
 
 ## Direction
 

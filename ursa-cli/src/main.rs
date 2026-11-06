@@ -36,7 +36,7 @@ use shell::{Flow, Shell};
 #[derive(Debug, Parser)]
 #[command(
     name = "ursa",
-    version,
+    version = env!("URSA_VERSION"),
     about = "SQL for graph analytics over Parquet, CSV, JSON and Arrow files, local or in object storage.",
     after_help = "Any file is a table: ursa -c \"SELECT * FROM 'edges.parquet' LIMIT 3\"\n\
                   With no SQL to run, ursa starts an interactive shell; enter .help there."
@@ -303,7 +303,7 @@ fn banner(args: &Args) -> String {
     };
     format!(
         "ursa {}, {session}. Enter .help for commands, .quit to exit.",
-        env!("CARGO_PKG_VERSION")
+        env!("URSA_VERSION")
     )
 }
 
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn the_banner_names_the_session() {
-        let version = env!("CARGO_PKG_VERSION");
+        let version = env!("URSA_VERSION");
         let args = Args::try_parse_from(["ursa"]).unwrap();
         assert_eq!(
             banner(&args),

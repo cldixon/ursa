@@ -1,5 +1,9 @@
 # Differences from DuckDB
 
+!!! info "New in 0.7"
+
+    `read_parquet`, `read_csv` and `read_json`, `.jsonl` and `.ndjson` files, and `SHOW TABLES` without `information_schema` arrive in `ursa-cli` 0.7. The rest of this page holds for 0.6.0 too.
+
 Ursa's SQL works like DuckDB's in the ways you use most: you name a file in `FROM`, and the shell takes the same flags and dot-commands. The engine underneath is [Apache DataFusion](https://datafusion.apache.org/), though, not DuckDB. This page lists what carries over and what does not.
 
 ## What works the same
