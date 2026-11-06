@@ -136,10 +136,10 @@ async fn aggregates_over_each_nodes_neighbours() {
     // sum and count are 0 with no neighbours; min and max are NULL.
     for (agg, expected) in [
         ("sum", ["60.0", "0.0", "0.0", "0.0"]),
-        ("count", ["3.0", "1.0", "0.0", "0.0"]),
+        ("count", ["3", "1", "0", "0"]),
         ("min", ["10.0", "0.0", "", ""]),
         ("max", ["30.0", "0.0", "", ""]),
-        ("n_unique", ["3.0", "1.0", "0.0", "0.0"]),
+        ("n_unique", ["3", "1", "0", "0"]),
     ] {
         let out = hub(
             &ctx,
@@ -189,13 +189,71 @@ async fn strings_count_and_n_unique() {
     )
     .await;
     // {us, us, eu} is two regions.
-    assert_eq!(out.lines().nth(3).unwrap(), "| 0  | 2.0           |");
+    assert_eq!(out.lines().nth(3).unwrap(), "| 0  | 2             |");
     let out = hub(
         &ctx,
         "values => (SELECT id, region FROM people), agg => 'count', direction => 'in'",
     )
     .await;
-    assert_eq!(out.lines().nth(3).unwrap(), "| 0  | 3.0           |");
+    assert_eq!(out.lines().nth(3).unwrap(), "| 0  | 3             |");
+}
+
+#[tokio::test]
+async fn min_and_max_of_strings_dates_and_times_keep_their_type() {
+    let ctx = session().await;
+    let column = |sql: String| {
+        let ctx = &ctx;
+        async move {
+            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            let field = batches[0].schema().field(1).data_type().to_string();
+            let table = pretty_format_batches(&batches).unwrap().to_string();
+            let values: Vec<String> = table
+                .lines()
+                .skip(3)
+                .filter(|l| l.starts_with("| "))
+                .map(|l| l.split('|').nth(2).unwrap().trim().to_string())
+                .collect();
+            (field, values)
+        }
+    };
+    for (value, agg, ty, expected) in [
+        ("region", "min", "Utf8", ["eu", "x", "", ""]),
+        ("region", "max", "Utf8", ["us", "x", "", ""]),
+        (
+            "DATE '2024-01-01' + CAST(id AS INT)",
+            "max",
+            "Date32",
+            ["2024-01-04", "2024-01-01", "", ""],
+        ),
+        (
+            "CAST(DATE '2024-01-01' + CAST(id AS INT) AS TIMESTAMP)",
+            "min",
+            "Timestamp(ns)",
+            ["2024-01-02T00:00:00", "2024-01-01T00:00:00", "", ""],
+        ),
+    ] {
+        let (field, values) = column(format!(
+            "SELECT * FROM neighbors_agg(hub, values => (SELECT id, {value} FROM people), \
+             agg => '{agg}', direction => 'in') ORDER BY id"
+        ))
+        .await;
+        assert_eq!(
+            (field.as_str(), values.as_slice()),
+            (ty, &expected.map(String::from)[..]),
+            "{agg} of {value}"
+        );
+    }
+    // Counting dates is counting values.
+    let (field, values) = column(
+        "SELECT * FROM neighbors_agg(hub, values => (SELECT id, DATE '2024-01-01' FROM people), \
+         agg => 'n_unique', direction => 'in') ORDER BY id"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        (field.as_str(), values.as_slice()),
+        ("UInt32", &["1", "1", "0", "0"].map(String::from)[..])
+    );
 }
 
 #[tokio::test]
@@ -344,13 +402,18 @@ async fn errors_say_what_to_write() {
         (
             "SELECT * FROM neighbors_agg(hub, values => (SELECT id, region FROM people))",
             "neighbors_agg(agg => 'mean') needs numbers, and the values are strings; only \
-             'count' and 'n_unique' take strings",
+             'count', 'n_unique', 'min' and 'max' take strings, dates and times",
         ),
         (
             "SELECT * FROM neighbors_agg(hub, values => (SELECT id, DATE '2020-01-01' FROM \
-             people), agg => 'max')",
-            "neighbors_agg(values =>): the values must be numbers, or strings for 'count' and \
-             'n_unique'; got a column of type Date32",
+             people), agg => 'sum')",
+            "neighbors_agg(agg => 'sum') needs numbers, and the values are of type Date32; only \
+             'count', 'n_unique', 'min' and 'max' take strings, dates and times",
+        ),
+        (
+            "SELECT * FROM neighbors_agg(hub, values => (SELECT id, [1, 2] FROM people))",
+            "neighbors_agg(values =>): the values must be numbers, or strings, dates or times \
+             for 'count', 'n_unique', 'min' and 'max'; got a column of type List(Int64)",
         ),
         (
             "SELECT * FROM neighbors_agg(hub, values => (SELECT id, capacity FROM nowhere))",

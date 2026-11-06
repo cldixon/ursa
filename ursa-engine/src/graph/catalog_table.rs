@@ -29,9 +29,16 @@
 //! `node id`), and its `default` is the
 //! literal SQL would write (`0.85`, `'out'`, `NULL`), or `required`. A
 //! traversal's node-id output columns have the graph's id type, `Int64 or
-//! Utf8`.
+//! Utf8`, and `neighbors_agg`'s column a type that depends on its `agg` and
+//! its values ([`NEIGHBORS_AGG_TYPE`]).
 
 use std::sync::Arc;
+
+/// The output type `ursa_functions()` gives `neighbors_agg`, whose column's
+/// type depends on `agg` and the values (`kernels::neighbors_agg_type`).
+pub const NEIGHBORS_AGG_TYPE: &str =
+    "Float64; UInt32 for count and n_unique; the values' type for min and max of strings, \
+     dates or times";
 
 use datafusion::arrow::array::{
     ArrayRef, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder,
@@ -181,9 +188,15 @@ pub fn functions_batch() -> Result<RecordBatch> {
             outs.field_builder::<StringBuilder>(0)
                 .expect("name")
                 .append_value(o.name);
+            // A neighbour aggregation's type depends on `agg` and the values.
+            let ty = if spec.reads_attribute() {
+                NEIGHBORS_AGG_TYPE.to_string()
+            } else {
+                o.ty.data_type().to_string()
+            };
             outs.field_builder::<StringBuilder>(1)
                 .expect("type")
-                .append_value(o.ty.data_type().to_string());
+                .append_value(ty);
             outs.field_builder::<BooleanBuilder>(2)
                 .expect("nullable")
                 .append_value(o.nullable);

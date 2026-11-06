@@ -1,6 +1,6 @@
 ---
 name: ursa-sql
-description: Write and run SQL for Ursa, a SQL engine for graph analytics over Parquet and CSV files (the `ursa` command-line tool, crate ursa-cli). Use when a task needs graph algorithms (PageRank, degree, components, triangles, Louvain communities, centrality, shortest paths, k-hop neighbourhoods, random walks) over edge lists in files, when the user mentions Ursa SQL, `ursa`, `.ursa` database files or `CREATE PROPERTY GRAPH`, or when writing SQL that calls Ursa's graph table functions.
+description: Write and run SQL for Ursa, a SQL engine for graph analytics over Parquet, CSV, JSON/NDJSON and Arrow files (the `ursa` command-line tool, crate ursa-cli). Use when a task needs graph algorithms (PageRank, degree, components, triangles, Louvain communities, centrality, shortest paths, k-hop neighbourhoods, random walks) over edge lists in files, when the user mentions Ursa SQL, `ursa`, `.ursa` database files or `CREATE PROPERTY GRAPH`, or when writing SQL that calls Ursa's graph table functions.
 ---
 
 # Writing Ursa SQL
@@ -56,7 +56,7 @@ CREATE PROPERTY GRAPH karate
 ```
 
 - `VERTEX TABLES` is optional. Without it, the nodes are the edges' endpoints: `CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));`
-- Paths: `.parquet`, `.csv`, `.csv.gz`, `.csv.zst`, a directory, or a glob (`'edges/*.parquet'`). URLs work: `s3://`, `gs://`, `az://`, `https://`. Credentials come from the environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`), AWS profiles (`AWS_PROFILE`, `~/.aws/`), gcloud's application default credentials, or the machine's role. There is no SQL statement for credentials. For a public S3 bucket, set `AWS_SKIP_SIGNATURE=true`.
+- Paths: `.parquet`, `.csv`, `.json`/`.jsonl`/`.ndjson` (newline-delimited JSON), `.arrow`, compressed CSV or JSON (`.csv.gz`, `.jsonl.zst`), a directory, or a glob (`'edges/*.parquet'`). `read_parquet(path)`, `read_csv(path, header => false, delim => '|')` and `read_json(path, format => 'array')` read a file whatever its extension; the first argument may be a list of paths. Unaliased expressions get DataFusion's names (`SELECT 42` is `Int64(42)`), so alias them with `AS`. URLs work: `s3://`, `gs://`, `az://`, `https://`. Credentials come from the environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`), AWS profiles (`AWS_PROFILE`, `~/.aws/`), gcloud's application default credentials, or the machine's role. There is no SQL statement for credentials. For a public S3 bucket, set `AWS_SKIP_SIGNATURE=true`.
 - The source and destination columns must have the same type, integer or string. Cast in the view if they don't.
 - A graph is a schema: `karate.edges` and `karate.nodes` are tables.
 - A subgraph is a graph over a view that filters the edges. Its nodes are only the endpoints of the kept edges.
@@ -159,7 +159,7 @@ ORDER BY id;
 
 ## Neighbour aggregation: neighbors_agg()
 
-`neighbors_agg` aggregates a value of each node over its neighbours, and returns one row per node: `id` and `neighbors_agg` (a `DOUBLE`). There are two ways to give the values:
+`neighbors_agg` aggregates a value of each node over its neighbours, and returns one row per node: `id` and `neighbors_agg` (a `DOUBLE`; an unsigned integer for `count` and `n_unique`; the values' own type for `min` and `max` of strings, dates and times). There are two ways to give the values:
 
 - `values =>` takes a query of two columns, node ids then values.
 - `attribute =>` takes an expression over the graph's node table.
@@ -201,7 +201,7 @@ ORDER BY club;
 +---------+---------+
 ```
 
-- `agg`: `'mean'` (the default), `'sum'`, `'min'`, `'max'`, `'count'` or `'n_unique'`. String values take only `'count'` and `'n_unique'`.
+- `agg`: `'mean'` (the default), `'sum'`, `'min'`, `'max'`, `'count'` or `'n_unique'`. Strings, dates and times take `'count'`, `'n_unique'`, `'min'` and `'max'`.
 - `direction`: `'out'` (the default), `'in'` or `'both'`. With `'both'`, a neighbour joined by edges both ways counts twice.
 - What is skipped: a NULL value, a row whose id is not in the graph, and a node with no row.
 - A node with no neighbour values gets NULL for mean, min and max, and 0 for sum, count and n_unique.

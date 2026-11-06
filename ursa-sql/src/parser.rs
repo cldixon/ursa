@@ -158,13 +158,34 @@ impl<'a> UrsaParser<'a> {
     /// (from its first token to its last, without the `;`). A database file
     /// stores this text when a statement's `Display` does not round-trip.
     pub fn parse_statements_with_text(&mut self) -> Result<Vec<(UrsaStatement, String)>> {
-        self.parse_all().map_err(|e| match e {
+        let statements = self.parse_all().map_err(|e| match e {
             // A syntax error in a statement that uses DuckDB's `USING SAMPLE`
             // says what to write instead.
             DataFusionError::SQL(..) if self.uses_sample_clause() => {
                 DataFusionError::NotImplemented(USING_SAMPLE.to_string())
             }
             e => e,
+        })?;
+        // sqlparser accepts TABLESAMPLE, but DataFusion ignores it and reads
+        // every row: a silently wrong answer. Refuse it instead.
+        if self.uses_tablesample() {
+            return Err(DataFusionError::NotImplemented(TABLESAMPLE.to_string()));
+        }
+        Ok(statements)
+    }
+
+    /// Whether the text holds the word `TABLESAMPLE`, outside quotes and
+    /// comments. Tokenizes only when the text contains it at all.
+    fn uses_tablesample(&self) -> bool {
+        if !self.sql.to_ascii_uppercase().contains("TABLESAMPLE") {
+            return false;
+        }
+        let Ok(tokens) = Tokenizer::new(self.dialect, &self.sql).tokenize() else {
+            return false;
+        };
+        tokens.iter().any(|t| {
+            matches!(t, Token::Word(w) if w.quote_style.is_none()
+                && w.value.eq_ignore_ascii_case("TABLESAMPLE"))
         })
     }
 
@@ -382,6 +403,10 @@ const DUCKDB_STATEMENTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The refusal for `TABLESAMPLE`, which DataFusion parses but ignores.
+const TABLESAMPLE: &str = "TABLESAMPLE is not supported (it would be ignored and every row read); \
+     use ORDER BY random() LIMIT n for a sample of n rows";
+
 /// The refusal for DuckDB's `USING SAMPLE` clause.
 const USING_SAMPLE: &str =
     "USING SAMPLE is not supported; use ORDER BY random() LIMIT n for a sample of n rows";
@@ -533,6 +558,20 @@ mod tests {
     fn missing_delimiter_is_a_syntax_error() {
         let err = parse_sql("SHOW GRAPHS SELECT 1").unwrap_err();
         assert!(err.to_string().contains("end of statement"), "{err}");
+    }
+
+    #[test]
+    fn tablesample_is_refused_not_ignored() {
+        for sql in [
+            "SELECT * FROM t TABLESAMPLE SYSTEM (10)",
+            "select * from t tablesample bernoulli (5 percent)",
+        ] {
+            let err = parse_sql(sql).unwrap_err().to_string();
+            assert!(err.contains("TABLESAMPLE is not supported"), "{sql}: {err}");
+        }
+        // The word in a string or a quoted name is not the clause.
+        parse_sql("SELECT 'tablesample' AS x").unwrap();
+        parse_sql("SELECT \"TABLESAMPLE\" FROM t").unwrap();
     }
 
     #[test]

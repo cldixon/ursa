@@ -75,6 +75,15 @@ fn the_getting_started_page_runs_as_written() {
             "+-----+-----+",
         ])
     );
+    // `read_csv` reads the same file, with options.
+    let (read, _) = ursa(
+        cwd,
+        &[
+            "-c",
+            "SELECT * FROM read_csv('karate_edges.csv', header => true, delim => ',') LIMIT 3",
+        ],
+    );
+    assert_eq!(read, out);
 
     // Open a database, and define a graph.
     let (out, _) = sql(
@@ -309,9 +318,19 @@ fn the_getting_started_page_runs_as_written() {
     );
     assert_eq!(out.lines().next(), Some("id,louvain"));
     assert_eq!(out.lines().count(), 1 + 34);
-    sql(
+    let (out, _) = sql(
         cwd,
         "COPY (SELECT * FROM pagerank(karate)) TO 'pagerank.parquet';",
+    );
+    assert_eq!(
+        out,
+        table(&[
+            "+-------+",
+            "| count |",
+            "+-------+",
+            "| 34    |",
+            "+-------+"
+        ])
     );
     let (out, _) = ursa(cwd, &["-c", "SELECT count(*) AS n FROM 'pagerank.parquet'"]);
     assert!(out.contains("| 34 |"), "{out}");

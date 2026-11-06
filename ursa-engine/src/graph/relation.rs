@@ -19,8 +19,8 @@
 //! <graph>.nodes`. Either becomes the node's last child (see
 //! [`GraphAlgorithmNode`]), planned as a derived table and run when the node
 //! runs, as a traversal's node ids are. Its column types are checked here: the
-//! ids integers or strings, the values numbers, or strings for `count` and
-//! `n_unique`.
+//! ids integers or strings, the values numbers, or strings, dates or times for
+//! `count`, `n_unique`, `min` and `max`.
 //!
 //! ## Node ids as child plans
 //!
@@ -313,10 +313,11 @@ fn values_node(
     }
     let mut weights = WeightSet::new(edges.schema().as_ref().clone());
     let (call, _) = resolve_call(spec, literals, context, &mut weights, "")?;
-    let takes_strings = matches!(
+    // Strings, dates and times are compared, not added.
+    let by_order = matches!(
         call,
         Call::NeighborAgg {
-            agg: AggKind::Count | AggKind::NUnique,
+            agg: AggKind::Count | AggKind::NUnique | AggKind::Min | AggKind::Max,
             ..
         }
     );
@@ -402,23 +403,28 @@ fn values_node(
             graph.name
         )));
     }
-    if kernels::is_string(value) {
-        if !takes_strings {
+    if kernels::is_ordered(value) {
+        if !by_order {
             let agg = call
                 .values()
                 .into_iter()
                 .find(|(p, _)| p.name == "agg")
                 .map(|(_, v)| functions::sql_value(&v))
                 .unwrap_or_default();
+            let what = if kernels::is_string(value) {
+                "strings".to_string()
+            } else {
+                format!("of type {value}")
+            };
             return Err(plan(format!(
-                "{f}(agg => {agg}) needs numbers, and the values are strings; only 'count' and \
-                 'n_unique' take strings"
+                "{f}(agg => {agg}) needs numbers, and the values are {what}; only 'count', \
+                 'n_unique', 'min' and 'max' take strings, dates and times"
             )));
         }
     } else if !(value == &DataType::Null || can_cast_types(value, &DataType::Float64)) {
         return Err(plan(format!(
-            "{f}({param} =>): the values must be numbers, or strings for 'count' and \
-             'n_unique'; got a column of type {value}"
+            "{f}({param} =>): the values must be numbers, or strings, dates or times for \
+             'count', 'n_unique', 'min' and 'max'; got a column of type {value}"
         )));
     }
     let outputs = spec

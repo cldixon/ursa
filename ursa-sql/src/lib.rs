@@ -8,7 +8,10 @@
 //! PROPERTY GRAPH` define graphs (see [`property_graph`] for the subset of
 //! SQL/PGQ supported); `SHOW GRAPHS` and `DESCRIBE GRAPH` describe them.
 //! `SHOW ursa.<setting>` shows one of Ursa's settings, and `SHOW ALL` lists
-//! them with DataFusion's (see `settings`).
+//! them with DataFusion's (see `settings`). `SHOW TABLES` lists the tables
+//! and views, without `information_schema`'s own views. `read_parquet(...)`,
+//! `read_csv(...)` and `read_json(...)` open their files before a statement
+//! is planned (see `ursa_engine::read_functions`).
 //!
 //! A session may have a `.ursa` database ([`database`]): [`open_session`]
 //! opens one, and `ATTACH 'club.ursa'` opens one in an in-memory session that
@@ -126,8 +129,21 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
                         return frame;
                     }
                 }
+                // `SHOW TABLES` without `information_schema`'s own views.
+                if is_plain_show_tables(inner) {
+                    return ctx
+                        .sql(
+                            "SELECT * FROM information_schema.tables \
+                             WHERE table_schema <> 'information_schema'",
+                        )
+                        .await;
+                }
             }
+            // `read_csv(...)` and its siblings open their files first: the
+            // planner that plans them cannot wait on a listing.
+            let reads = ursa_engine::read_functions::open_reads(&state, &statement).await?;
             let plan = state.statement_to_plan(*statement).await?;
+            drop(reads);
             ursa_engine::graph::check_ddl(&state, &plan).await?;
             ctx.execute_logical_plan(plan).await
         }
@@ -140,6 +156,27 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
             "ATTACH cannot run while replaying a database's catalog".into(),
         )),
     }
+}
+
+/// Whether `statement` is `SHOW TABLES`, with no option DataFusion would
+/// refuse or treat differently.
+fn is_plain_show_tables(statement: &SqlStatement) -> bool {
+    let SqlStatement::ShowTables {
+        terse: false,
+        history: false,
+        extended: false,
+        full: false,
+        external: false,
+        show_options,
+    } = statement
+    else {
+        return false;
+    };
+    show_options.show_in.is_none()
+        && show_options.starts_with.is_none()
+        && show_options.limit.is_none()
+        && show_options.limit_from.is_none()
+        && show_options.filter_position.is_none()
 }
 
 #[cfg(test)]
@@ -166,5 +203,29 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(formatted.contains("| 3 |"), "{formatted}");
+    }
+
+    #[tokio::test]
+    async fn show_tables_leaves_out_information_schema() {
+        let ctx = ursa_engine::new_session();
+        for sql in ["CREATE VIEW v AS SELECT 1 AS x", "SHOW TABLES"] {
+            let statement = parse_sql_for(&ctx, sql).unwrap().remove(0);
+            let batches = execute(&ctx, statement)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            if sql == "SHOW TABLES" {
+                let formatted = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    formatted.contains("| public       | v          | VIEW"),
+                    "{formatted}"
+                );
+                assert!(!formatted.contains("information_schema"), "{formatted}");
+            }
+        }
     }
 }

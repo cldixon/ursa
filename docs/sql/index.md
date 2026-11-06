@@ -4,7 +4,7 @@
 
     The newest release is `ursa-cli` 0.6.0; see [Getting Started](getting-started.md#install) to install it. Features marked **New in 0.7** are on `main` and arrive in the next release; to use them now, build from the repository with `cargo install --git https://github.com/cldixon/ursa ursa-cli`. The SQL surface may still change between minor versions, and the [changelog](../changelog.md) records every change.
 
-Ursa SQL is a SQL engine for graph analytics, used through a command-line tool called `ursa`. It works like DuckDB. You point it at Parquet or CSV files, on your disk or in object storage, and query them with SQL. Graph algorithms are part of that SQL. Nothing needs converting or loading first.
+Ursa SQL is a SQL engine for graph analytics, used through a command-line tool called `ursa`. It works like DuckDB. You point it at Parquet, CSV, JSON or Arrow files, on your disk or in object storage, and query them with SQL. Graph algorithms are part of that SQL. Nothing needs converting or loading first.
 
 ```sql
 CREATE VIEW ties AS SELECT * FROM 'karate_edges.csv';
@@ -44,7 +44,7 @@ Or `cargo install ursa-cli`, or a prebuilt binary from the [releases page](https
 
 ## What it is
 
-- **Files are tables.** `SELECT * FROM 'edges.parquet'` reads the file. Globs, directories and compressed CSV work too. So do `s3://`, `gs://`, `az://` and `https://` URLs.
+- **Files are tables.** `SELECT * FROM 'edges.parquet'` reads the file: Parquet, CSV, JSON/NDJSON (`.json`, `.jsonl`, `.ndjson`) and Arrow. Globs, directories and compressed CSV and JSON work too. So do `s3://`, `gs://`, `az://` and `https://` URLs, and DuckDB's `read_parquet`, `read_csv` and `read_json`.
 - **A graph is an edge table.** `CREATE PROPERTY GRAPH`, from the SQL standard (SQL/PGQ), names the edge table and its two endpoint columns. A node table with attributes is optional.
 - **Algorithms are table functions.** `pagerank(club)` returns one row per node. Join it to anything on `id`. Parameters are named: `damping => 0.9`.
 - **A database file keeps your work.** `ursa club.ursa` keeps your views, graphs and the graph indexes Ursa builds, so the next query does not rebuild them.
@@ -76,6 +76,7 @@ A few things differ:
 - [Getting started](getting-started.md): install `ursa`, define a graph and run algorithms on it.
 - [The database file](database.md): what a `.ursa` file keeps, and how stored indexes work.
 - [The shell](shell.md): dot-commands, init files and history.
-- [Statements](statements.md): `CREATE PROPERTY GRAPH`, `SHOW GRAPHS`, `DESCRIBE GRAPH`, `ATTACH` and the settings.
+- [Statements](statements.md): reading and writing files, `CREATE PROPERTY GRAPH`, `SHOW GRAPHS`, `DESCRIBE GRAPH`, `ATTACH` and the settings.
+- [Differences from DuckDB](duckdb.md): what carries over from DuckDB, and what does not.
 - [Function reference](reference/functions.md): every graph function, its parameters and its output.
 - [The agent skill](https://github.com/cldixon/ursa/tree/main/skills): teach a coding agent to write Ursa SQL.
