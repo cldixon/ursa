@@ -29,4 +29,4 @@ pub(crate) mod parallel;
 pub mod topology;
 
 pub use id_map::{EdgeInterner, IdError, IdMap};
-pub use topology::{Adjacency, Direction, EdgeMask, Topology};
+pub use topology::{Adjacency, Direction, EdgeMask, IncomingLoader, Topology};

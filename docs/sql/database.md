@@ -67,6 +67,10 @@ An index is stored under a key made from two things: the plan that produces the 
 - a weight is not part of the key, so trying several weightings reuses one index;
 - every graph function in a query shares one index, and so does `algorithms()`.
 
+Some algorithms, such as PageRank, in-degree and anything with `direction => 'both'`, also need the reverse of the index: each node's incoming edges. The first query that builds it adds it to the stored index when the database closes. A later process reads it from disk only when an algorithm asks for it, so a query that does not need it does not pay to load it.
+
+Evaluated weights are stored with the index too, one set per weight expression, when the database closes. A later weighted query with the same expression over the same files reads them instead of reading the edges again. A changed expression or source file never uses stored weights: it reads the edges and evaluates them afresh. Stored weights count toward the storage limit, and they are evicted with their index.
+
 Edges that are not read from files, such as an in-memory table, have no stable key. Their index is built once per session and not stored.
 
 To see whether a process built or loaded its indexes, set `URSA_INDEX_STATS=1`. `ursa` prints the counts when it exits:
