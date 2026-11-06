@@ -18,7 +18,7 @@ SELECT name, family, summary FROM ursa_functions() ORDER BY family, name;
 `ursa_functions()` has one row per graph function: `name`, `family` (`algorithm`, `statistic`, `traversal`, `combinator`), `summary`, `networkx` (the NetworkX call it matches), `parameters` (a list of `{name, type, default, choices, doc}`), `directions` and `outputs`. Read it as JSON to see the parameters:
 
 ```bash
-ursa -f json -c "SELECT * FROM ursa_functions() WHERE name = 'pagerank'"
+ursa --format json -c "SELECT * FROM ursa_functions() WHERE name = 'pagerank'"
 ```
 
 In a database that already has graphs, list them with `SHOW GRAPHS;` and inspect each with `DESCRIBE GRAPH name;` before writing queries. Never redefine a graph that exists.
@@ -27,11 +27,11 @@ In a database that already has graphs, list them with `SHOW GRAPHS;` and inspect
 
 ```bash
 ursa -c "SELECT * FROM 'edges.csv' LIMIT 3"            # in memory
-ursa club.ursa -f json -c "SELECT * FROM degree(g)"     # a database file, JSON out
-ursa club.ursa --file query.sql                         # SQL from a file
+ursa club.ursa --format json -c "SELECT * FROM degree(g)"  # a database file, JSON out
+ursa club.ursa -f query.sql                             # SQL from a file (--file)
 ```
 
-- Use `-f json` (an array of objects) or `-f ndjson` whenever you read results yourself. `-f csv` for files. The default `table` is for people.
+- Use `--format json` (an array of objects) or `--format ndjson` whenever you read results yourself. `--format csv` for files. The default `table` is for people.
 - Separate statements in one `-c` with `;`. They run in order.
 - On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix.
 - With no `-c`, `--file` or stdin, `ursa` starts an interactive shell and waits for input. Don't start it from an agent.

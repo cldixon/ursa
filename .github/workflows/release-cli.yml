@@ -108,13 +108,15 @@ jobs:
           bin="target/$TARGET/release/ursa"
           "$bin" --version
           test "$("$bin" --version)" = "ursa ${{ needs.version.outputs.version }}"
-          out=$("$bin" -f csv -c "
+          out=$("$bin" --format csv -c "
             CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
             CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
             SELECT count(*) AS n FROM pagerank(karate, direction => 'both');")
           echo "$out"
           test "$(echo "$out" | tr -d '\r' | tail -n 1)" = "34"
 
+      # docs/install.sh and docs/install.ps1 download these archives by name,
+      # and expect this layout and the .sha256 format: change them together.
       - name: Package
         shell: bash
         run: |
@@ -207,6 +209,6 @@ jobs:
             --title "ursa-cli $VERSION" \
             --notes "The \`ursa\` command-line tool, version $VERSION: Ursa's SQL engine for graph analytics.
 
-          Install with \`cargo install ursa-cli\`, or download the archive for your platform below. Each archive holds the \`ursa\` binary; check it against its \`.sha256\` file.
+          Install with \`curl -fsSL https://cldixon.github.io/ursa/install.sh | sh\` on Linux or macOS, \`irm https://cldixon.github.io/ursa/install.ps1 | iex\` in PowerShell on Windows, or \`cargo install ursa-cli\`. Or download the archive for your platform below. Each archive holds the \`ursa\` binary; check it against its \`.sha256\` file.
 
           Changes: see [CHANGELOG.md](https://github.com/cldixon/ursa/blob/$GITHUB_REF_NAME/CHANGELOG.md). Docs: https://cldixon.github.io/ursa/sql/"

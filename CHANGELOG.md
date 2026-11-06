@@ -41,12 +41,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     `--readonly`, and `SET`/`SHOW ursa.index_storage_limit`.
   - An interactive shell with DuckDB-style dot-commands, `-init` files,
     `~/.ursarc` and history; output as table, CSV, TSV, JSON, NDJSON or
-    Arrow (`-f`); `ursa --version`.
+    Arrow (`--format`); `-c`, `-f`/`--file` and stdin run SQL and exit,
+    as in DuckDB; `ursa --version`.
   - Docs: a new SQL section on the docs site, with a function reference
     generated from `ursa_functions()`. Every SQL example in it runs in CI.
   - An agent skill for writing Ursa SQL, in `skills/ursa-sql/`.
   - Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, Apple
-    silicon) and Windows (x64) on the GitHub Releases page.
+    silicon) and Windows (x64) on the GitHub Releases page, and a one-line
+    installer for them that checks each download's SHA-256 checksum:
+    `curl -fsSL https://cldixon.github.io/ursa/install.sh | sh`, or
+    `irm https://cldixon.github.io/ursa/install.ps1 | iex` on Windows.
 
 ### Changed
 

@@ -240,7 +240,7 @@ fn the_getting_started_page_runs_as_written() {
         cwd,
         &[
             "club.ursa",
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');",
@@ -251,7 +251,7 @@ fn the_getting_started_page_runs_as_written() {
         cwd,
         &[
             "club.ursa",
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT * FROM hop(karate,
@@ -290,7 +290,7 @@ fn the_getting_started_page_runs_as_written() {
         cwd,
         &[
             "club.ursa",
-            "-f",
+            "--format",
             "json",
             "-c",
             "SELECT * FROM pagerank(karate) ORDER BY pagerank DESC LIMIT 3",
@@ -301,7 +301,7 @@ fn the_getting_started_page_runs_as_written() {
         cwd,
         &[
             "club.ursa",
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT * FROM louvain(karate, seed => 1)",
@@ -327,7 +327,7 @@ fn the_getting_started_page_runs_as_written() {
         cwd,
         &[
             "club.ursa",
-            "-f",
+            "--format",
             "csv",
             "-c",
             "SELECT name, family FROM ursa_functions() ORDER BY name;",

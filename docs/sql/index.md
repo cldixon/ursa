@@ -2,7 +2,7 @@
 
 !!! warning "Not released yet"
 
-    The SQL engine and the `ursa` command-line tool will first be released as `ursa-cli` 0.6. Until then, `cargo install ursa-cli` and the release downloads described in [Getting Started](getting-started.md#install) do not work yet. To try it now, build it from this repository:
+    The SQL engine and the `ursa` command-line tool will first be released as `ursa-cli` 0.6. Until then, the install script, `cargo install ursa-cli` and the release downloads described in [Getting Started](getting-started.md#install) do not work yet. To try it now, build it from this repository:
 
     ```bash
     cargo install --git https://github.com/cldixon/ursa ursa-cli
@@ -32,6 +32,22 @@ LIMIT 3;
 +----+---------------------+
 ```
 
+## Install
+
+On Linux or macOS:
+
+```bash
+curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://cldixon.github.io/ursa/install.ps1 | iex
+```
+
+Or `cargo install ursa-cli`, or a prebuilt binary from the [releases page](https://github.com/cldixon/ursa/releases). [Getting started](getting-started.md#install) has the details. These work once `ursa-cli` 0.6.0 is released.
+
 ## What it is
 
 - **Files are tables.** `SELECT * FROM 'edges.parquet'` reads the file. Globs, directories and compressed CSV work too. So do `s3://`, `gs://`, `az://` and `https://` URLs.
@@ -47,7 +63,7 @@ Ursa has two front ends over one Rust core.
 
 | | Python library | SQL engine |
 | --- | --- | --- |
-| Package | [`ursa-graph`](../install.md) on PyPI | [`ursa-cli`](getting-started.md#install) on crates.io, and prebuilt binaries |
+| Package | [`ursa-graph`](../install.md) on PyPI | [`ursa-cli`](getting-started.md#install): an install script, prebuilt binaries, and crates.io |
 | You write | Python, with a Polars-shaped DataFrame API | SQL, in the `ursa` shell or with `ursa -c` |
 | Graph | `ur.read_edges(...)` | `CREATE PROPERTY GRAPH` |
 | Algorithm | `ur.pagerank(edges)` | `SELECT * FROM pagerank(g)` |

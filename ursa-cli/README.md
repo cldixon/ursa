@@ -2,11 +2,25 @@
 
 `ursa` is a SQL engine for graph analytics, used from the command line. It reads Parquet and CSV files where they are, on your disk or in object storage, and runs graph algorithms over them with SQL. There is no server and nothing to load first. An edge table is a graph.
 
+On Linux or macOS, install the prebuilt binary with the install script:
+
+```bash
+curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://cldixon.github.io/ursa/install.ps1 | iex
+```
+
+Or build it with Cargo:
+
 ```bash
 cargo install ursa-cli
 ```
 
-The binary is called `ursa`. Prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/cldixon/ursa/releases).
+The binary is called `ursa`. The prebuilt binaries for Linux, macOS and Windows are also on the [releases page](https://github.com/cldixon/ursa/releases), with a SHA-256 checksum for each.
 
 ```bash
 ursa club.ursa
