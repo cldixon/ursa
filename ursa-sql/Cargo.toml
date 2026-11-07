@@ -3,7 +3,7 @@ name = "ursa-sql"
 description = "Ursa's SQL dialect: DataFusion's parser plus Ursa's own statements, and running them on an engine session."
 # The SQL engine and CLI are versioned on their own: 0.6 is their first
 # release. The Python package (ursa-graph) follows the workspace version.
-version = "0.7.0"
+version = "0.8.0-dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ keywords = ["sql", "graph", "parser", "datafusion", "sql-pgq"]
 categories = ["database-implementations", "parser-implementations"]
 
 [dependencies]
-ursa-engine = { path = "../ursa-engine", version = "0.7.0" }
+ursa-engine = { path = "../ursa-engine", version = "0.8.0-dev" }
 datafusion = { workspace = true }
 # Opening a database may wait for another process's lock, off the async workers.
 tokio = { version = "1", features = ["rt"] }
