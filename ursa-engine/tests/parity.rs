@@ -382,10 +382,17 @@ async fn sql_matches_the_python_library() {
             assert_eq!(keyed(got, true), keyed(expected, true), "{label}");
             continue;
         }
-        let sql = if args.is_empty() {
-            format!("SELECT * FROM {function}({dataset})")
+        // SQL's hop names its columns (seed, id, distance), Python's (src,
+        // dst), with no distance (#328): compare the two Python has.
+        let columns = if function == "hop" {
+            "seed AS src, id AS dst"
         } else {
-            format!("SELECT * FROM {function}({dataset}, {args})")
+            "*"
+        };
+        let sql = if args.is_empty() {
+            format!("SELECT {columns} FROM {function}({dataset})")
+        } else {
+            format!("SELECT {columns} FROM {function}({dataset}, {args})")
         };
         let frame = ctx.sql(&sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         // describe's n_dropped_edges is SQL's own (a Python graph has no

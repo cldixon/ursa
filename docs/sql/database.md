@@ -53,6 +53,15 @@ CREATE VIEW scores AS SELECT * FROM 'scores.parquet';
 
 The same goes for `INSERT`, `UPDATE`, `DELETE`, `CREATE SCHEMA`, `CREATE FUNCTION` and `ALTER`. `TEMPORARY` views and tables run, but are not kept.
 
+Because a view stores the statement, a view over a CSV file parses the whole file again each time a query reads it. For a large vertex table, whose attributes many queries read, convert the file to Parquet once and define the view over the Parquet file. Parquet is much faster to read, and a query reads only the columns it uses:
+
+```sql
+COPY (FROM 'karate_nodes.csv') TO 'karate_nodes.parquet';
+CREATE VIEW members AS SELECT * FROM 'karate_nodes.parquet';
+```
+
+A compressed CSV converts the same way: `COPY (FROM 'users.csv.gz') TO 'users.parquet'`. A graph's edges are read into its [stored index](#stored-graph-indexes), so they are read again only when their files change.
+
 ## Paths
 
 A relative path resolves against the current directory when a statement runs, as in DuckDB. When Ursa stores a definition, it rewrites each relative path to be relative to the database file's directory. So the catalog finds the same files from any directory, and you can move a database and its data together. A path outside the database's directory is stored as an absolute path. URLs are stored as written.

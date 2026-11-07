@@ -6,7 +6,7 @@
 
 Every graph function Ursa's SQL engine offers. The page is generated from `SELECT * FROM ursa_functions()`, so it matches the engine you run.
 
-An algorithm or a statistic takes the graph as its first argument, then named parameters with `=>`. It returns one row per node: the node's `id` and its output columns. `neighbors_agg` does too, from a value per node it reads. A traversal returns edges or walks. `algorithms` runs several per-node functions in one call.
+An algorithm or a statistic takes the graph as its first argument, then named parameters with `=>`. It returns one row per node: the node's `id` and its output columns. `neighbors_agg` does too, from a value per node it reads. A traversal returns rows of its own: the nodes reached, a path's edges, or walks. `algorithms` runs several per-node functions in one call.
 
 A parameter's default is the SQL literal used when the parameter is left out. `required` means the call must give it. A `string` parameter with choices takes one of them, quoted: `direction => 'both'`. An `expression` parameter takes an expression over the edge table's columns: `weight => log10(1 + weight)`, or for `neighbors_agg`'s `attribute` over the node table's. A `query` parameter takes a subquery in parentheses.
 
@@ -18,7 +18,7 @@ A `node ids` or `node id` parameter takes integers or strings: a list, a query o
 
 ### degree
 
-Per-node degree.
+Per-node degree. Every edge counts, so parallel edges each count once. For the number of distinct neighbours, count them: count(DISTINCT dst) over the edge table grouped by src, or count(*) over hop(g, seeds => [id]), which reaches each neighbour once.
 
 ```text
 degree(graph, direction => 'out')
@@ -280,7 +280,7 @@ neighbors_agg(graph, values => NULL, direction => 'out', attribute => NULL, agg 
 
 ### hop
 
-The nodes within n steps of each seed: one (src, dst) row per seed and node reached, src the seed. A seed is not its own row; a repeated seed repeats its rows.
+The nodes within n steps of each seed: one (seed, id, distance) row per seed and node reached, distance the fewest steps from the seed to it. A seed is not its own row; a repeated seed repeats its rows.
 
 ```text
 hop(graph, seeds => …, n => 1, direction => 'out')
@@ -294,7 +294,7 @@ hop(graph, seeds => …, n => 1, direction => 'out')
 
 **Directions:** `'out'`, `'in'`, `'both'`
 
-**Returns:** `src` (Int64 or Utf8), `dst` (Int64 or Utf8)
+**Returns:** `seed` (Int64 or Utf8), `id` (Int64 or Utf8), `distance` (Int64)
 
 **NetworkX:** `nx.single_source_shortest_path_length(G, seed, cutoff=n), the seed left out (in: on G.reverse(); both: on U)`
 

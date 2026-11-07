@@ -287,8 +287,8 @@ async fn paths_agree_with_hop_and_shortest_path() {
     .await;
     let hop = rows(
         &ctx,
-        "SELECT DISTINCT dst FROM hop(karate, seeds => [0], n => 2, direction => 'both')
-         WHERE dst <> 0 ORDER BY dst",
+        "SELECT DISTINCT id FROM hop(karate, seeds => [0], n => 2, direction => 'both')
+         WHERE id <> 0 ORDER BY id",
     )
     .await;
     assert!(reached.len() > 10);
@@ -307,6 +307,24 @@ async fn paths_agree_with_hop_and_shortest_path() {
     )
     .await;
     assert_eq!(length, edges);
+    // hop's distance is the shortest path's length (#328).
+    let lengths = rows(
+        &ctx,
+        "SELECT b, n FROM GRAPH_TABLE (karate
+           MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]-{1,3}(m)
+           WHERE m.id <> 0
+           COLUMNS (m.id AS b, path_length(p) AS n))
+         ORDER BY b",
+    )
+    .await;
+    let distances = rows(
+        &ctx,
+        "SELECT id, distance FROM hop(karate, seeds => [0], n => 3, direction => 'both')
+         ORDER BY id",
+    )
+    .await;
+    assert!(lengths.len() > 20);
+    assert_eq!(lengths, distances);
     // The search reuses the graph's index, as the traversals do.
     let explain = ok(
         &ctx,

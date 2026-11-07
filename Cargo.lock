@@ -4327,6 +4327,7 @@ dependencies = [
  "datafusion",
  "flate2",
  "futures",
+ "libc",
  "rexpect",
  "rustyline",
  "serde_json",

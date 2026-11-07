@@ -16,6 +16,7 @@ use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token, Tokenizer};
 
 use crate::property_graph::{parse_tables, write_tables, EdgeTableDef, VertexTableDef};
+use crate::source_map::SourceMap;
 
 /// Same as sqlparser's and DataFusion's default.
 pub const DEFAULT_RECURSION_LIMIT: usize = 50;
@@ -128,20 +129,36 @@ pub struct UrsaParser<'a> {
     dialect: &'a dyn Dialect,
     /// The text being parsed, for [`Self::parse_statements_with_text`].
     sql: String,
+    /// How `sql` was rewritten from the user's text, so a syntax error names
+    /// a place in what the user wrote.
+    map: SourceMap,
 }
 
 impl<'a> UrsaParser<'a> {
     pub fn new(sql: &str, dialect: &'a dyn Dialect, recursion_limit: usize) -> Result<Self> {
         // SQL/PGQ's GRAPH_TABLE ( … ), which sqlparser cannot parse, becomes
         // the table function graph_table('…') first (see `graph_table`).
-        let sql = crate::graph_table::rewrite_graph_tables(sql, dialect);
+        let mut map = SourceMap::new(sql);
+        map.push(crate::graph_table::rewrite_graph_tables_mapped(
+            sql, dialect,
+        ));
         // DuckDB's `FROM t [WHERE …]` becomes `SELECT * FROM t [WHERE …]`.
-        let sql = crate::from_first::rewrite_from_first(&sql, dialect);
+        map.push(crate::from_first::rewrite_from_first_mapped(
+            map.text(),
+            dialect,
+        ));
+        let sql = map.text().to_string();
         let df = DFParserBuilder::new(sql.as_str())
             .with_dialect(dialect)
             .with_recursion_limit(recursion_limit)
-            .build()?;
-        Ok(Self { df, dialect, sql })
+            .build()
+            .map_err(|e| in_user_text(e, &map, dialect))?;
+        Ok(Self {
+            df,
+            dialect,
+            sql,
+            map,
+        })
     }
 
     /// Parse every statement, separated by `;`. Empty statements are skipped.
@@ -164,7 +181,7 @@ impl<'a> UrsaParser<'a> {
             DataFusionError::SQL(..) if self.uses_sample_clause() => {
                 DataFusionError::NotImplemented(USING_SAMPLE.to_string())
             }
-            e => e,
+            e => in_user_text(e, &self.map, self.dialect),
         })?;
         // sqlparser accepts TABLESAMPLE, but DataFusion ignores it and reads
         // every row: a silently wrong answer. Refuse it instead.
@@ -419,6 +436,96 @@ fn source_text(sql: &str, start: Location, end: Location) -> Option<String> {
     (from < to).then(|| sql[from..to].trim().to_string())
 }
 
+/// `e` with the locations in a syntax error moved from the rewritten text to
+/// the user's (see [`SourceMap`]), and a hint when a reserved word seems to
+/// be used as a name there ([`reserved_word_hint`]).
+fn in_user_text(e: DataFusionError, map: &SourceMap, dialect: &dyn Dialect) -> DataFusionError {
+    match e {
+        DataFusionError::SQL(e, backtrace) => {
+            let e = match *e {
+                ParserError::ParserError(m) => {
+                    let mut m = map.user_message(&m);
+                    if let Some(hint) = reserved_word_hint(&m, map.original(), dialect) {
+                        m.push_str(&hint);
+                    }
+                    ParserError::ParserError(m)
+                }
+                ParserError::TokenizerError(m) => ParserError::TokenizerError(map.user_message(&m)),
+                other => other,
+            };
+            DataFusionError::SQL(Box::new(e), backtrace)
+        }
+        other => other,
+    }
+}
+
+/// When a syntax error at "Line: L, Column: C" of `sql` looks like a reserved
+/// word used as a name, a hint to quote it: the word is next to the error's
+/// token, inside a list (after `(` or `,`, or before `,` or `)`), or after
+/// `SELECT`. `SELECT from, to FROM t` gives "`from` is a reserved word; to
+/// use it as a name, quote it: "from"".
+fn reserved_word_hint(message: &str, sql: &str, dialect: &dyn Dialect) -> Option<String> {
+    use datafusion::sql::sqlparser::keywords::{Keyword, RESERVED_FOR_COLUMN_ALIAS};
+
+    let at = message.rfind("Line: ")?;
+    let (line, column) = message[at + "Line: ".len()..].split_once(", Column: ")?;
+    let line: u64 = line.parse().ok()?;
+    let column: u64 = column
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let tokens = Tokenizer::new(dialect, sql).tokenize_with_location().ok()?;
+    let tokens: Vec<_> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+    let here = tokens
+        .iter()
+        .position(|t| t.span.start.line == line && t.span.start.column == column)
+        .unwrap_or(tokens.len());
+    let reserved = |i: usize| -> Option<&str> {
+        match &tokens.get(i)?.token {
+            Token::Word(w)
+                if w.quote_style.is_none()
+                    && w.keyword != Keyword::NoKeyword
+                    && RESERVED_FOR_COLUMN_ALIAS.contains(&w.keyword) =>
+            {
+                Some(w.value.as_str())
+            }
+            _ => None,
+        }
+    };
+    let is = |i: Option<usize>, kinds: &[Token]| {
+        i.and_then(|i| tokens.get(i))
+            .is_some_and(|t| kinds.contains(&t.token))
+    };
+    let is_select = |i: Option<usize>| {
+        i.and_then(|i| tokens.get(i))
+            .is_some_and(|t| matches!(&t.token, Token::Word(w) if w.keyword == Keyword::SELECT))
+    };
+    let list_end = [Token::Comma, Token::RParen, Token::EOF, Token::SemiColon];
+    let list_start = [Token::Comma, Token::LParen];
+    // The word before the error's token, ending a list item; or the error's
+    // token itself, starting one.
+    let word = here
+        .checked_sub(1)
+        .filter(|&before| {
+            (here >= tokens.len() || is(Some(here), &list_end))
+                && (is(before.checked_sub(1), &list_start) || is_select(before.checked_sub(1)))
+        })
+        .and_then(reserved)
+        .or_else(|| {
+            (is(here.checked_sub(1), &list_start) || is_select(here.checked_sub(1)))
+                .then(|| reserved(here))
+                .flatten()
+        })?;
+    Some(format!(
+        ". `{word}` is a reserved word; to use it as a name, quote it: \"{word}\""
+    ))
+}
+
 /// The byte offset of a tokenizer location (1-based line and column, columns
 /// counted in characters).
 pub(crate) fn byte_offset(sql: &str, at: Location) -> Option<usize> {
@@ -446,6 +553,51 @@ mod tests {
         let mut statements = parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1, "{sql}");
         statements.pop().unwrap()
+    }
+
+    fn syntax_error(sql: &str) -> String {
+        ursa_engine::user_message(&parse_sql(sql).unwrap_err())
+    }
+
+    /// #328: a key column named `from` is a column, not a FROM-first query.
+    #[test]
+    fn a_key_column_may_be_named_from() {
+        let UrsaStatement::CreatePropertyGraph(g) =
+            one("CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (from) DESTINATION KEY (to))")
+        else {
+            panic!("not a CREATE PROPERTY GRAPH")
+        };
+        assert_eq!(g.edges[0].source.key.value, "from");
+        assert_eq!(g.edges[0].destination.key.value, "to");
+    }
+
+    /// #328: syntax errors name a place in the user's text, not in the text
+    /// the GRAPH_TABLE and FROM-first rewrites made of it.
+    #[test]
+    fn syntax_errors_point_at_the_users_text() {
+        let sql =
+            "FROM GRAPH_TABLE (g MATCH (a WHERE a.name = 'x') COLUMNS (a.id AS s)) t WHERE s = = 1";
+        let column = sql.rfind("= =").unwrap() + 3;
+        assert_eq!(
+            syntax_error(sql),
+            format!("syntax error: Expected: an expression, found: = at Line: 1, Column: {column}")
+        );
+        assert_eq!(
+            syntax_error("FROM t\nWHERE s = = 1"),
+            "syntax error: Expected: an expression, found: = at Line: 2, Column: 11"
+        );
+    }
+
+    /// #328: a reserved word used as a name says to quote it.
+    #[test]
+    fn a_reserved_word_as_a_name_says_to_quote_it() {
+        assert_eq!(
+            syntax_error("SELECT from, to FROM t"),
+            "syntax error: Expected: identifier, found: , at Line: 1, Column: 12. `from` is a \
+             reserved word; to use it as a name, quote it: \"from\""
+        );
+        // Not for other syntax errors.
+        assert!(!syntax_error("SELECT a FROM t WHERE s = = 1").contains("reserved"));
     }
 
     #[test]

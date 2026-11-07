@@ -96,6 +96,21 @@ fn ctrl_c_cancels_a_running_query() {
     p.send_control('c').unwrap();
     p.exp_string("^C (cancelled)").unwrap();
     p.exp_string("ursa> ").unwrap();
+    // An algorithm too, which runs on a blocking thread (#328): the prompt
+    // comes back, and the shell still exits at once after it.
+    p.send_line(
+        "CREATE VIEW e AS SELECT value % 2000000 AS src, (value * 7919 + 13) % 2000000 AS dst \
+         FROM generate_series(1, 20000000); \
+         CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (src) DESTINATION KEY (dst)); \
+         SELECT count(*) FROM louvain(g);",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    p.send_control('c').unwrap();
+    p.exp_string("^C (cancelled)").unwrap();
+    p.exp_string("ursa> ").unwrap();
+    p.send_line("SELECT 41 + 1 AS answer;").unwrap();
+    p.exp_string("| 42     |").unwrap();
     p.send_line(".quit").unwrap();
     p.exp_eof().unwrap();
     assert!(!home.path().join(".ursa_history").exists());

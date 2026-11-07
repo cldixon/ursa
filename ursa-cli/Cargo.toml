@@ -36,6 +36,10 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal"
 # Line editing for the shell: the version datafusion-cli 54 uses.
 rustyline = "18.0"
 
+# getrusage, for `.timer`'s user and sys times.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # Reads `ursa --format json` in tests/docs.rs (the function reference generator).
