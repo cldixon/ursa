@@ -9,7 +9,18 @@
 //! are mutually reachable, computed by iterative Tarjan (an explicit DFS stack, so
 //! deep graphs don't overflow the native call stack).
 
+use super::linked::Linked;
 use crate::topology::{EdgeMask, Topology};
+
+/// The linked nodes a components kernel runs over, when enough nodes are
+/// isolated to be worth it (#326). An isolated node is a component of its own,
+/// labelled by itself, in either kernel: with the compact ids in node order,
+/// every union (weak) and every discovery-order comparison (strong) is the
+/// full run's, so a compact run's labels, mapped back to nodes, are too.
+fn linked_nodes(topo: &Topology, mask: Option<&EdgeMask>) -> Option<Linked> {
+    let linked = Linked::of(topo, mask);
+    linked.worth_it().then_some(linked)
+}
 
 struct DisjointSet {
     parent: Vec<u32>,
@@ -56,27 +67,39 @@ impl DisjointSet {
 /// index of each component's representative (not necessarily contiguous `0..k`);
 /// callers that want canonical small ids can densify the output.
 pub fn connected_components_weak(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
-    let n = topo.n_nodes();
-    let mut ds = DisjointSet::new(n);
+    weak_over(topo, mask, linked_nodes(topo, mask).as_ref())
+}
+
+/// [`connected_components_weak`], compact over `linked` when given.
+fn weak_over(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linked>) -> Vec<u32> {
+    let width = linked.map_or(topo.n_nodes(), Linked::len);
+    let node = |u: u32| linked.map_or(u, |l| l.nodes()[u as usize]);
+    let at = |v: u32| linked.map_or(v, |l| l.compact(v));
+    let mut ds = DisjointSet::new(width);
     let out = topo.out();
-    for u in 0..n as u32 {
+    for u in 0..width as u32 {
+        let uo = node(u);
         match mask {
             None => {
-                for &v in out.neighbors(u) {
-                    ds.union(u, v);
+                for &v in out.neighbors(uo) {
+                    ds.union(u, at(v));
                 }
             }
             // Subgraph: only kept edges connect their endpoints.
             Some(m) => {
-                for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                for (&v, &e) in out.neighbors(uo).iter().zip(out.edge_ids(uo)) {
                     if m.keep(e) {
-                        ds.union(u, v);
+                        ds.union(u, at(v));
                     }
                 }
             }
         }
     }
-    (0..n as u32).map(|u| ds.find(u)).collect()
+    let labels: Vec<u32> = (0..width as u32).map(|u| ds.find(u)).collect();
+    match linked {
+        None => labels,
+        Some(l) => l.expand_labels(&labels),
+    }
 }
 
 /// Strongly connected component label per node, dense-indexed, via **iterative
@@ -86,11 +109,18 @@ pub fn connected_components_weak(topo: &Topology, mask: Option<&EdgeMask>) -> Ve
 /// SCC's Tarjan root: an arbitrary but stable representative, matching the
 /// weak-component labeling convention. `O(n + m)`.
 pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
+    strong_over(topo, mask, linked_nodes(topo, mask).as_ref())
+}
+
+/// [`connected_components_strong`], compact over `linked` when given.
+fn strong_over(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linked>) -> Vec<u32> {
     // Discovery indices are `< n`, which fits `u32` (dense ids are `u32`), so the
     // max value is free to mark an unvisited node.
     const UNVISITED: u32 = u32::MAX;
 
-    let n = topo.n_nodes();
+    let n = linked.map_or(topo.n_nodes(), Linked::len);
+    let node = |u: u32| linked.map_or(u, |l| l.nodes()[u as usize]);
+    let at = |v: u32| linked.map_or(v, |l| l.compact(v));
     let out = topo.out();
 
     let mut index = vec![UNVISITED; n]; // discovery order per node
@@ -119,14 +149,14 @@ pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> 
                 scc_stack.push(v);
                 on_stack[v as usize] = true;
             }
-            let neighbors = out.neighbors(v);
+            let neighbors = out.neighbors(node(v));
             if (cursor as usize) < neighbors.len() {
-                let w = neighbors[cursor as usize];
                 call_stack.last_mut().unwrap().1 = cursor + 1;
                 // Subgraph: an edge masked out is not traversed (advance past it).
-                if mask.is_some_and(|m| !m.keep(out.edge_ids(v)[cursor as usize])) {
+                if mask.is_some_and(|m| !m.keep(out.edge_ids(node(v))[cursor as usize])) {
                     continue;
                 }
+                let w = at(neighbors[cursor as usize]);
                 if index[w as usize] == UNVISITED {
                     call_stack.push((w, 0)); // descend into w
                 } else if on_stack[w as usize] {
@@ -153,12 +183,39 @@ pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> 
             }
         }
     }
-    labels
+    match linked {
+        None => labels,
+        Some(l) => l.expand_labels(&labels),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compact runs (#326) give the full runs' labels.
+    #[test]
+    fn compact_runs_give_the_full_labels() {
+        use crate::algo::linked::testing::{sparse, CASES};
+        for &(seed, n, m) in CASES {
+            let (t, mask) = sparse(seed, n, m);
+            for mask in [None, Some(&mask)] {
+                let linked = Linked::of(&t, mask);
+                assert_eq!(
+                    weak_over(&t, mask, Some(&linked)),
+                    weak_over(&t, mask, None),
+                    "weak: graph {seed}, masked {}",
+                    mask.is_some()
+                );
+                assert_eq!(
+                    strong_over(&t, mask, Some(&linked)),
+                    strong_over(&t, mask, None),
+                    "strong: graph {seed}, masked {}",
+                    mask.is_some()
+                );
+            }
+        }
+    }
 
     #[test]
     fn two_components() {

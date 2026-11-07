@@ -300,7 +300,7 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
     FunctionSpec {
         name: "pagerank",
         family: Family::Algorithm,
-        summary: "PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes.",
+        summary: "PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.",
         networkx: Some("nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))"),
         params: &[
             param(
@@ -438,7 +438,7 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
     FunctionSpec {
         name: "louvain",
         family: Family::Algorithm,
-        summary: "Community labels by Louvain modularity optimization.",
+        summary: "Community labels by Louvain modularity optimization. A node with no edges is a community of its own: count communities of more than one member with GROUP BY louvain HAVING count(*) > 1.",
         networkx: Some("nx.community.louvain_communities(U)"),
         params: &[
             WEIGHT,
