@@ -40,6 +40,25 @@ pub mod matched {
     /// `Unexpected EOF while in a multi-line comment`). The shell reads the
     /// next line instead (`ursa-cli`'s `input.rs`).
     pub const TOKENIZER_EOF: &str = "EOF";
+
+    /// The start of the context DataFusion puts on an error inferring a CSV
+    /// file's schema, followed by the file's object store location, which
+    /// has lost its leading `/` (`Users/me/x.csv`): [`super::user_message`]
+    /// puts it back (#327, N14).
+    pub const CSV_FILE_CONTEXT: &str = "Error when processing CSV file ";
+}
+
+/// `location`, an object store location, as the local path the user wrote
+/// when it is one (`Users/me/x.csv` is `/Users/me/x.csv` if that exists).
+pub fn shown_path(location: &str) -> String {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    if !location.starts_with('/') && !location.contains("://") {
+        let absolute = format!("/{location}");
+        if std::path::Path::new(&absolute).exists() {
+            return absolute;
+        }
+    }
+    location.to_string()
 }
 
 /// The message to show a user for `err`: what went wrong, without the names of
@@ -69,7 +88,14 @@ pub fn user_message(err: &DataFusionError) -> String {
             user_message(inner)
         }
         DataFusionError::Context(context, inner) => {
-            format!("{context}: {}", user_message(inner))
+            match context.strip_prefix(matched::CSV_FILE_CONTEXT) {
+                Some(location) => format!(
+                    "cannot read {}: {}",
+                    shown_path(location),
+                    user_message(inner)
+                ),
+                None => format!("{context}: {}", user_message(inner)),
+            }
         }
         DataFusionError::Diagnostic(_, inner) => user_message(inner),
         DataFusionError::Collection(errs) => errs
@@ -214,6 +240,36 @@ mod tests {
                  matched::TOKENIZER_EOF: {sql}: {message}"
             );
         }
+    }
+
+    /// N14: a CSV file DataFusion cannot read is named by its path, with its
+    /// leading `/`, not by its object store location.
+    #[tokio::test]
+    async fn datafusion_still_names_a_bad_csv_file_by_its_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap().join("bad.csv");
+        std::fs::write(&path, "a,b\n1,2\n1,2,3\n").unwrap();
+        let ctx = SessionContext::new();
+        let err = ctx
+            .register_csv("t", path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap_err();
+        let DataFusionError::Context(context, _) = &err else {
+            panic!("DataFusion no longer gives a bad CSV file context; update matched::CSV_FILE_CONTEXT: {err:?}");
+        };
+        assert!(
+            context.starts_with(matched::CSV_FILE_CONTEXT),
+            "DataFusion's context for a bad CSV file changed; update \
+             matched::CSV_FILE_CONTEXT: {context}"
+        );
+        let message = user_message(&err);
+        #[cfg(unix)]
+        assert!(
+            message.starts_with(&format!("cannot read {}: ", path.display())),
+            "{message}"
+        );
+        #[cfg(not(unix))]
+        assert!(message.starts_with("cannot read "), "{message}");
     }
 
     #[test]

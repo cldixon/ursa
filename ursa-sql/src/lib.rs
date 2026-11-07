@@ -122,6 +122,14 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
                 }
                 _ => {}
             }
+            // `RESET ursa.<setting>`: DataFusion 55 resets only its own.
+            if let DFStatement::Reset(datafusion::sql::parser::ResetStatement::Variable(name)) =
+                statement.as_ref()
+            {
+                if let Some(frame) = settings::reset(ctx, name) {
+                    return frame;
+                }
+            }
             // `SHOW ursa.<setting>` and `SHOW ALL` with Ursa's settings.
             if let DFStatement::Statement(inner) = statement.as_ref() {
                 if let SqlStatement::ShowVariable { variable } = inner.as_ref() {

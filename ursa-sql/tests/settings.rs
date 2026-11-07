@@ -110,7 +110,7 @@ async fn unknown_ursa_settings_are_named() {
     );
     assert_eq!(
         error(&ctx, "SHOW ursa.colour").await,
-        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit"
+        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices"
     );
     // DataFusion's own SHOW is unchanged.
     assert_eq!(
@@ -152,7 +152,8 @@ async fn show_all_lists_ursa_settings() {
         .iter()
         .any(|l| l.starts_with("ursa.index_storage_limit,2GiB,The most bytes")));
 }
-
+/// In a session with a database, `SET ursa.index_storage_limit` is stored and
+/// shown again when the database is opened (#327); other settings are not.
 /// In a session with a database, SHOW reads the session and stores nothing.
 #[tokio::test]
 async fn show_in_a_database_session() {
@@ -175,6 +176,12 @@ async fn show_in_a_database_session() {
     let ctx = open_session(&db, &options).await.unwrap();
     assert_eq!(
         rows(&ctx, "SHOW ursa.index_storage_limit").await,
-        ["ursa.index_storage_limit,4GiB"]
+        ["ursa.index_storage_limit,8GiB"]
     );
+    // ursa.notices is the session's.
+    rows(&ctx, "SET ursa.notices = 'off'").await;
+    drop(ctx);
+    let ctx = open_session(&db, &options).await.unwrap();
+    assert_eq!(rows(&ctx, "SHOW ursa.notices").await, ["ursa.notices,on"]);
+    assert!(!std::fs::read_to_string(&db).unwrap().contains("notices"));
 }

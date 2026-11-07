@@ -31,7 +31,9 @@
 //! So a later process finds the same files from any directory, and a database
 //! and its data files can move together. URLs are never rewritten.
 
+use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -43,6 +45,8 @@ use datafusion::prelude::SessionConfig;
 pub mod catalog_file;
 pub mod index_file;
 pub mod index_store;
+
+use crate::options::{ByteSize, DEFAULT_INDEX_STORAGE_LIMIT};
 
 pub use catalog_file::{CatalogFile, FORMAT, VERSION};
 pub use index_file::IndexKey;
@@ -96,11 +100,14 @@ pub struct Database {
     /// The locked `club.ursa.d/lock`, held until the database is dropped.
     /// `None` when read-only.
     _lock: Option<File>,
-    /// The catalog's statements, as last read or written.
-    statements: Mutex<Vec<String>>,
+    /// The catalog (its statements and settings), as last read or written.
+    catalog: Mutex<CatalogFile>,
     /// The stored graph indexes, opened on first use.
     indexes: OnceLock<Arc<IndexStore>>,
 }
+
+/// The setting a database keeps in its catalog (#327).
+pub const INDEX_STORAGE_LIMIT: &str = "ursa.index_storage_limit";
 
 impl Database {
     /// Open the database at `path`, creating it (and its sidecar directory)
@@ -137,7 +144,7 @@ impl Database {
                 sidecar,
                 read_only: true,
                 _lock: None,
-                statements: Mutex::new(catalog.statements),
+                catalog: Mutex::new(catalog),
                 indexes: OnceLock::new(),
             });
         }
@@ -153,7 +160,7 @@ impl Database {
         };
         std::fs::create_dir_all(&sidecar)
             .map_err(|e| io(&format!("creating {}", sidecar.display()), e))?;
-        let lock = File::options()
+        let mut lock = File::options()
             .read(true)
             .write(true)
             .create(true)
@@ -161,13 +168,14 @@ impl Database {
             .open(sidecar.join("lock"))
             .map_err(|e| io("opening its lock file", e))?;
         acquire(&lock, &name, options.lock_timeout)?;
+        record_holder(&mut lock);
 
-        let statements = if path.exists() {
-            CatalogFile::read(&path, &name)?.statements
+        let catalog = if path.exists() {
+            CatalogFile::read(&path, &name)?
         } else {
             let empty = CatalogFile::default();
             empty.write(&path, &sidecar, &name)?;
-            empty.statements
+            empty
         };
         Ok(Self {
             name,
@@ -176,7 +184,7 @@ impl Database {
             sidecar,
             read_only: false,
             _lock: Some(lock),
-            statements: Mutex::new(statements),
+            catalog: Mutex::new(catalog),
             indexes: OnceLock::new(),
         })
     }
@@ -211,10 +219,14 @@ impl Database {
     /// The database's stored graph indexes. A read-only database reads them
     /// and never writes.
     pub fn index_store(&self) -> Arc<IndexStore> {
-        Arc::clone(
-            self.indexes
-                .get_or_init(|| Arc::new(IndexStore::new(self.index_dir(), !self.read_only))),
-        )
+        Arc::clone(self.indexes.get_or_init(|| {
+            Arc::new(IndexStore::new(
+                self.index_dir(),
+                !self.read_only,
+                self.name.clone(),
+                self.index_storage_limit(),
+            ))
+        }))
     }
 
     /// Wait for stored-index writes still running.
@@ -228,32 +240,81 @@ impl Database {
         self.read_only
     }
 
-    /// The catalog's statements, in replay order.
-    pub fn statements(&self) -> Vec<String> {
-        self.statements
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+    fn catalog(&self) -> std::sync::MutexGuard<'_, CatalogFile> {
+        self.catalog.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Replace the catalog with `statements`, rewriting the file atomically
-    /// (temporary file, `fsync`, rename). Refused when read-only.
+    /// The catalog's statements, in replay order.
+    pub fn statements(&self) -> Vec<String> {
+        self.catalog().statements.clone()
+    }
+
+    /// The settings the catalog keeps, by full name, as `SET` takes them.
+    pub fn settings(&self) -> BTreeMap<String, String> {
+        self.catalog().settings.clone()
+    }
+
+    /// The most bytes of stored indexes this database keeps: its stored
+    /// `ursa.index_storage_limit`, or the default. A session's own `SET` in
+    /// a read-only database does not change it.
+    pub fn index_storage_limit(&self) -> u64 {
+        self.catalog()
+            .settings
+            .get(INDEX_STORAGE_LIMIT)
+            .and_then(|v| ByteSize::parse(v).ok())
+            .map_or(DEFAULT_INDEX_STORAGE_LIMIT, |b| b.0)
+    }
+
+    /// Replace the catalog's statements with `statements`, rewriting the
+    /// file atomically (temporary file, `fsync`, rename). Refused when
+    /// read-only.
     pub fn save(&self, statements: Vec<String>) -> Result<()> {
+        let mut catalog = self.catalog();
+        if !self.read_only && catalog.statements == statements {
+            return Ok(());
+        }
+        let updated = CatalogFile {
+            statements,
+            settings: catalog.settings.clone(),
+        };
+        self.write_catalog(&mut catalog, updated)
+    }
+
+    /// Keep the setting `name` as `value` in the catalog (`None`: remove
+    /// it, back to the default), rewriting the file. Refused when read-only.
+    /// `value` must be valid for the setting.
+    pub fn set_setting(&self, name: &str, value: Option<&str>) -> Result<()> {
+        if name == INDEX_STORAGE_LIMIT {
+            if let Some(value) = value {
+                ByteSize::parse(value)?;
+            }
+        }
+        let mut catalog = self.catalog();
+        let mut updated = catalog.clone();
+        match value {
+            Some(value) => updated.settings.insert(name.to_string(), value.to_string()),
+            None => updated.settings.remove(name),
+        };
+        if !self.read_only && updated == *catalog {
+            return Ok(());
+        }
+        self.write_catalog(&mut catalog, updated)?;
+        drop(catalog);
+        if let Some(store) = self.indexes.get() {
+            store.set_limit(self.index_storage_limit());
+        }
+        Ok(())
+    }
+
+    fn write_catalog(&self, current: &mut CatalogFile, updated: CatalogFile) -> Result<()> {
         if self.read_only {
             return Err(DataFusionError::Plan(format!(
                 "{} is open read-only",
                 self.name
             )));
         }
-        let mut current = self.statements.lock().unwrap_or_else(|e| e.into_inner());
-        if *current == statements {
-            return Ok(());
-        }
-        let file = CatalogFile {
-            statements: statements.clone(),
-        };
-        file.write(&self.path, &self.sidecar, &self.name)?;
-        *current = statements;
+        updated.write(&self.path, &self.sidecar, &self.name)?;
+        *current = updated;
         Ok(())
     }
 
@@ -360,8 +421,13 @@ fn acquire(lock: &File, name: &str, timeout: Duration) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if start.elapsed() >= timeout {
+                    let holder = holder(lock)
+                        .map(|pid| format!(" (process {pid})"))
+                        .unwrap_or_default();
                     return Err(DataFusionError::Execution(format!(
-                        "{name} is in use by another process"
+                        "{name} is in use by another process{holder}, which has it open for \
+                         writing; open it read-only to query it meanwhile (ursa --readonly \
+                         {name}), or wait for that process to finish"
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -373,6 +439,25 @@ fn acquire(lock: &File, name: &str, timeout: Duration) -> Result<()> {
             }
         }
     }
+}
+
+/// Write this process's id into the lock file it holds, so another process
+/// waiting for the lock can name it. Best effort.
+fn record_holder(lock: &mut File) {
+    let _ = lock.set_len(0).and_then(|()| {
+        lock.rewind()?;
+        writeln!(lock, "{}", std::process::id())?;
+        lock.flush()
+    });
+}
+
+/// The id of the process holding `lock`, as it recorded it, if it can be read.
+fn holder(lock: &File) -> Option<u32> {
+    let mut text = String::new();
+    let mut reader = lock;
+    reader.rewind().ok()?;
+    reader.take(32).read_to_string(&mut text).ok()?;
+    text.trim().parse().ok()
 }
 
 /// Where a session keeps its database: empty for an in-memory session, set

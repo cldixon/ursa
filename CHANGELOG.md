@@ -97,8 +97,42 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     with what to write instead, not with a parser error.
   - `TABLESAMPLE` is refused. DataFusion parsed it but read every row, so a
     sample silently returned the whole table.
+- **SQL: notices about stored indexes and slow builds** (#327). The engine
+  says, one line each, what it does on its own that a user waits for or
+  loses; `ursa` prints them on stderr as `ursa: …`, so stdout holds only
+  results. At `ursa.notices = 'on'` (the default): an index build that runs
+  for more than a second (`building the index for g (95.7M edges)…`, then
+  `built … in 30.7 s; stored in club.ursa (1.4 GiB)`), and every index not
+  stored (larger than `ursa.index_storage_limit`, with the `SET` that keeps
+  it; or the database is read-only), evicted, or whose write failed. `'all'`
+  adds every build, load and store; `'off'` and `ursa --quiet` (`-q`) print
+  none.
+- **SQL: the lock error names the other process** and suggests
+  `ursa --readonly` to query meanwhile (#327).
 
 ### Changed
+
+- **SQL: `ursa.index_storage_limit` belongs to the database** (behaviour
+  change, #327). `SET` in a writable database is stored in the catalog
+  (a new `settings` object; older versions ignore it), applied when the
+  database is opened and shown by `SHOW`; `RESET` goes back to the default.
+  Stored indexes obey only the stored limit or the default: a read-only or
+  in-memory session's `SET` lasts for that session and never evicts, so a
+  temporary small limit can no longer delete a large stored index. Eviction
+  runs only to make room for an index being stored, least recently used
+  first, evicting no more than it must and never an index a running query
+  uses; if those leave no room, nothing is evicted and the new index is not
+  stored.
+- **SQL: a portable stored-index key** (#327). Paths inside the database's
+  directory are part of the key relative to it, so a database moved with its
+  data keeps its stored indexes; a file named in `FROM` is keyed by what it
+  reads rather than the name it was written as, so a view defined in this
+  process and the same view replayed later share an index; and only the file
+  options that change what is read are in it, not DataFusion's `Debug` text
+  of every listing option, so an unrelated setting or a DataFusion upgrade no
+  longer invalidates every index. The manifest is version 2: indexes stored
+  by earlier versions are removed once by the first writer (with a notice)
+  and built again when first used, never read under the old key.
 
 - **SQL: a vertex table defines the graph's node set** (behaviour change,
   #311). With `VERTEX TABLES`, every algorithm, statistic, traversal,
@@ -199,6 +233,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A CSV file DataFusion cannot read is named by its path, with its leading
+  `/` (`cannot read /Users/me/x.csv: …`), not by its object store location
+  (`Error when processing CSV file Users/me/x.csv`); stored index keys keep
+  local paths whole too (#327).
+- `RESET ursa.<setting>` works; DataFusion refused it for Ursa's settings.
 - `ursa --format csv … | head` (and `tsv`) ends quietly with status 0 once
   the reader is gone, as the other formats do. Before, it printed "Error: Csv
   error: Broken pipe" and exited 1 (#317).
