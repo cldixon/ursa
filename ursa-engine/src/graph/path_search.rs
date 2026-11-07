@@ -710,6 +710,45 @@ struct Walker<'a> {
     total: usize,
     /// Prefixes extended so far.
     expanded: usize,
+    /// The targets' slots, when a pruned search has targets: their paths are
+    /// known once pushed (see [`Reach`]).
+    slots: Option<&'a HashMap<u32, u32>>,
+    reach: Reach,
+}
+
+/// How far a pruned search with targets has reached them, counting the
+/// prefixes it pushed. A pruned search lists every prefix it pushes to a
+/// target (at `min` edges or more), in the order it pushed them, so once each
+/// target has its `k` (`SHORTEST k`), or its first (`ALL SHORTEST`), no
+/// prefix needs extending any more: for `ALL SHORTEST`, none at the
+/// longest of those lengths or beyond.
+#[derive(Default)]
+struct Reach {
+    /// Per slot, prefixes pushed.
+    pushed: Vec<u32>,
+    touched: Vec<u32>,
+    /// Targets without all their paths yet.
+    unfilled: usize,
+    /// The longest length at which a target was first reached.
+    longest: u32,
+}
+
+impl Reach {
+    fn reset(&mut self, n: usize) {
+        if self.pushed.len() != n {
+            self.pushed = vec![0; n];
+        }
+        for slot in self.touched.drain(..) {
+            self.pushed[slot as usize] = 0;
+        }
+        self.unfilled = n;
+        self.longest = 0;
+    }
+
+    /// Whether a prefix of `len` edges still needs extending.
+    fn extends(&self, len: u32, selector: Selector) -> bool {
+        self.unfilled > 0 || (selector == Selector::AllShortest && len < self.longest)
+    }
 }
 
 impl Walker<'_> {
@@ -750,6 +789,27 @@ impl Walker<'_> {
                 edge,
                 len,
             });
+            // A pruned search lists this prefix: a target may have its paths.
+            let listed = len >= min && !(self.search.mode == Mode::Acyclic && w == start);
+            if let (true, true, Some(&slot)) =
+                (self.pruned, listed, self.slots.and_then(|s| s.get(&w)))
+            {
+                let reach = &mut self.reach;
+                let pushed = &mut reach.pushed[slot as usize];
+                if *pushed == 0 {
+                    reach.touched.push(slot);
+                    reach.longest = reach.longest.max(len);
+                }
+                *pushed += 1;
+                let filled = match self.search.selector {
+                    Selector::All => false,
+                    Selector::Shortest(k) => *pushed == k,
+                    Selector::AllShortest => *pushed == 1,
+                };
+                if filled {
+                    reach.unfilled -= 1;
+                }
+            }
             if self.entries.len() + self.total > MAX_PATHS {
                 return Err(DataFusionError::Execution(format!(
                     "in GRAPH_TABLE: the path search reached {MAX_PATHS} paths; give the quantified edge a lower upper bound, or keep fewer paths with ANY SHORTEST"
@@ -802,6 +862,8 @@ pub fn run(
         next: Vec::new(),
         total: 0,
         expanded: 0,
+        slots: goals.as_ref().map(|g| &g.slots),
+        reach: Reach::default(),
     };
     // Per last node, for a search that lists every path: (paths kept, length of the first).
     let mut targets: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -833,6 +895,7 @@ pub fn run(
         for slot in touched.drain(..) {
             found[slot as usize] = (0, 0);
         }
+        walker.reach.reset(found.len());
         // Targets not yet done, and (ALL SHORTEST) the length past which
         // none has another path once every one is found.
         let mut remaining = found.len();
@@ -920,6 +983,9 @@ pub fn run(
             if max.is_some_and(|max| entry.len >= max) {
                 continue;
             }
+            if pruned && goals.is_some() && !walker.reach.extends(entry.len, search.selector) {
+                continue; // every target has its paths among those pushed
+            }
             walker.extend(at, start)?;
         }
     }
@@ -965,7 +1031,20 @@ mod tests {
 
     /// Each path as (vertices, edges).
     fn paths(edges: &[(i64, i64)], starts: &[i64], s: Search) -> Vec<(Vec<i64>, Vec<i64>)> {
+        targeted(edges, starts, None, s).0
+    }
+
+    /// Each path as (vertices, edges), searched toward `targets`, and how
+    /// many prefixes the search extended.
+    fn targeted(
+        edges: &[(i64, i64)],
+        starts: &[i64],
+        targets: Option<&[i64]>,
+        s: Search,
+    ) -> (Vec<(Vec<i64>, Vec<i64>)>, usize) {
         let (topology, ids) = index(edges);
+        let targets: Option<ArrayRef> =
+            targets.map(|t| Arc::new(Int64Array::from(t.to_vec())) as ArrayRef);
         let columns = PathColumns {
             vertices: true,
             edges: true,
@@ -973,13 +1052,13 @@ mod tests {
         };
         let schema = Arc::new(super::schema(&DataType::Int64, columns));
         let starts: ArrayRef = Arc::new(Int64Array::from(starts.to_vec()));
-        let (batches, _) = run(
+        let (batches, expanded) = run(
             &topology,
             &ids,
             &|e| u64::from(e),
             &s,
             &starts,
-            None,
+            targets.as_ref(),
             false,
             columns,
             schema,
@@ -1002,7 +1081,57 @@ mod tests {
                 out.push((vs, es));
             }
         }
-        out
+        (out, expanded)
+    }
+
+    /// A search toward targets keeps the paths a search without them finds
+    /// to those targets, in the same order, extending fewer prefixes.
+    #[test]
+    fn targets_keep_the_same_paths_and_stop_early() {
+        // A chain 0 → 1 → … → 9 with a fan out of every node, and shortcuts.
+        let mut edges: Vec<(i64, i64)> = (0..9).map(|i| (i, i + 1)).collect();
+        for i in 0..10 {
+            edges.extend((0..4).map(|j| (i, 100 + 10 * i + j)));
+        }
+        edges.extend([(0, 5), (2, 7), (5, 5), (7, 2), (3, 1)]);
+        let graphs: [&[(i64, i64)]; 2] = [KNOW, &edges];
+        let mut stopped_early = false;
+        for edges in graphs {
+            for direction in [Direction::Right, Direction::Left, Direction::Any] {
+                for selector in [
+                    Selector::All,
+                    Selector::Shortest(1),
+                    Selector::Shortest(2),
+                    Selector::AllShortest,
+                ] {
+                    for mode in [Mode::Walk, Mode::Trail, Mode::Simple, Mode::Acyclic] {
+                        for (min, max) in [(0, Some(3)), (1, None), (2, Some(4)), (1, Some(1))] {
+                            if selector == Selector::All && mode == Mode::Walk && max.is_none() {
+                                continue;
+                            }
+                            let s = search(direction, min, max, selector, mode);
+                            for (starts, targets) in [
+                                (&[0][..], &[3][..]),
+                                (&[0, 4], &[0, 3, 9]),
+                                (&[1, 2], &[2, 77]),
+                                (&[3], &[7, 5, 1]),
+                            ] {
+                                let (all, n_all) = targeted(edges, starts, None, s);
+                                let kept: Vec<_> = all
+                                    .into_iter()
+                                    .filter(|(v, _)| targets.contains(v.last().unwrap()))
+                                    .collect();
+                                let (found, n) = targeted(edges, starts, Some(targets), s);
+                                assert_eq!(found, kept, "{s} from {starts:?} to {targets:?}");
+                                assert!(n <= n_all, "{s}");
+                                stopped_early |= n < n_all;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(stopped_early);
     }
 
     // DuckPGQ's test graph: Daniel 0, Tavneet 1, Gabor 2, Peter 3, David 4.
