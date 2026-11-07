@@ -596,7 +596,7 @@ algorithms,combinator
         .await,
         "\
 name,summary,networkx,directions
-pagerank,PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes.,\
+pagerank,PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.,\
 \"nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))\",out both
 "
     );

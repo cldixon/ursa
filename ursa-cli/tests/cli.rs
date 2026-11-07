@@ -1034,7 +1034,7 @@ fn ursa_functions_lists_the_catalog() {
     assert_eq!(
         out,
         "[{\"name\":\"pagerank\",\"family\":\"algorithm\",\
-\"summary\":\"PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes.\",\
+\"summary\":\"PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.\",\
 \"networkx\":\"nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))\",\
 \"parameters\":[\
 {\"name\":\"damping\",\"type\":\"number\",\"default\":\"0.85\",\"choices\":[],\

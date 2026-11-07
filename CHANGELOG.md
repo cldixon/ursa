@@ -100,6 +100,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
+  table's keys with no edges are nodes, and on real data they can be most of
+  them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,
+  `label_propagation`, `connected_components` (weak and strong) and the
+  triangle pass behind `triangle_count` and `clustering_coefficient` now run
+  on the nodes with at least one edge, and fill in each isolated node's
+  result, which is closed-form: its own component or community, no
+  triangles, and for PageRank its share of the teleport and of the dangling
+  score (an isolated node is dangling too). Results are unchanged, bit for
+  bit, label values and order included: PageRank carries every isolated node
+  as one value and adds it into its sums where a run over every node does,
+  and the community kernels visit the other nodes in the order their seeded
+  permutation of every node gives. The Python library shares the kernels, so
+  a subgraph (a filtered edge frame) whose nodes lose every edge gains too.
+  On an R-MAT graph of 5M edges with its 180K nodes spread among 20M (99%
+  isolated), the kernels' time and peak memory, before → after: PageRank
+  4.84 s / 828 MB → 0.44 s / 194 MB, Louvain 18.1 s / 2,342 MB → 2.6 s /
+  283 MB, label propagation 4.8 s / 240 MB → 1.3 s / 169 MB, weak
+  components 180 MB → 88 MB, triangle count 258 MB → 105 MB; the memory left
+  is mostly the result, one value per node (0.06 s / 5 MB and 1.3 s /
+  276 MB for PageRank and Louvain without the isolated nodes). What remains
+  per isolated node is the result and, for the community kernels, the seeded
+  permutation of every node, whose order they keep. `cargo run --release -p
+  ursa-core --example isolated_vertices` measures the kernels, and
+  `benchmarks/sql_scale/isolated.py` the `ursa` binary end to end. The function
+  reference says what isolated nodes still change: PageRank's scores sum to
+  1 over every node, so more keys give lower scores, and each isolated node
+  is a community, so `count(DISTINCT louvain)` counts them; count
+  communities of more than one member with `GROUP BY louvain HAVING
+  count(*) > 1`.
 - **SQL: a vertex table defines the graph's node set** (behaviour change,
   #311). With `VERTEX TABLES`, every algorithm, statistic, traversal,
   `neighbors_agg` and `GRAPH_TABLE` path search runs on the vertex table's

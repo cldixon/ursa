@@ -220,40 +220,53 @@ impl Linked {
 /// for `s >= 0` and `x >= 0`, finite: exactly the left-to-right sum a loop
 /// computes, in O(log) steps rather than `r`.
 ///
-/// While the running sum stays in one binade `[2^e, 2^(e+1))`, every value in
-/// it is a multiple of the binade's ulp `u`, so `s + x` rounds to `s + q·u`
-/// with `q` the integer nearest `x / u` (exact: `u` is a power of two),
-/// whatever `s` is, unless `x / u` is exactly half an integer, when the
-/// round-to-even tie depends on `s`. So the additions that stay in the binade
-/// add `j·q·u` at once (exactly, as the result is representable), and only the
-/// one that crosses into the next binade, a tie, or a sum not yet normal, is
-/// done as a plain addition. Once an addition leaves the sum unchanged, all
-/// later ones do too.
+/// While the running sum stays in one binade `[2^e, 2^(e+1))`, it is `M·u`
+/// for an integer `M` and the binade's ulp `u`, and `x = t·u` exactly (`u` is
+/// a power of two). So `s + x` rounds to `(M + q)·u`, `q` the integer nearest
+/// `t`, whatever `M` is; or, when `t` is half an integer `q0 + ½` (common for
+/// a difference of two close values, which has few significant bits), to the
+/// even one of `M + q0` and `M + q0 + 1`. After a tie `M` is even, and from an
+/// even `M` every tie adds the same even step: `q0`, or `q0 + 1` when `q0` is
+/// odd. So the additions that stay in the binade add `j·q·u` at once (exactly,
+/// as the result is representable), and only the one that crosses into the
+/// next binade, a tie from an odd `M`, or a sum not yet normal, is done as a
+/// plain addition. Once an addition leaves the sum unchanged, all later ones
+/// do too.
 ///
 /// This is how PageRank sums the isolated nodes' rank, all equal, in the same
 /// order and to the same bits as summing them one by one (#326).
 pub(crate) fn add_repeated(mut s: f64, x: f64, mut r: u64) -> f64 {
     debug_assert!(s >= 0.0 && x >= 0.0 && s.is_finite() && x.is_finite());
     while r > 0 {
-        if s.is_normal() && x > 0.0 {
-            let e = (s.to_bits() >> 52) as i64; // biased exponent of s
-                                                // A binade whose ulp or top is not a normal power of two: add
-                                                // one at a time (never met by PageRank's sums).
-            if (53..2046).contains(&e) {
-                let ulp = f64::from_bits(((e - 52) as u64) << 52);
-                let top = f64::from_bits(((e + 1) as u64) << 52);
-                let t = x / ulp;
-                let q = t.round();
-                if t < 9.0e15 && (t - t.trunc()) != 0.5 {
-                    if q == 0.0 {
-                        return s; // x is under half an ulp: s + x == s
+        // The biased exponent of s. Outside 53..2046 the binade's ulp or top
+        // is not a normal power of two: add one at a time (never met by
+        // PageRank's sums).
+        let e = (s.to_bits() >> 52) as i64;
+        if s.is_normal() && x > 0.0 && (53..2046).contains(&e) {
+            let ulp = f64::from_bits(((e - 52) as u64) << 52);
+            let top = f64::from_bits(((e + 1) as u64) << 52);
+            let t = x / ulp;
+            if t < 4.0e15 {
+                let q0 = t.trunc();
+                let step = if t - q0 != 0.5 {
+                    Some(t.round() as u64)
+                } else if s.to_bits() & 1 == 0 {
+                    // M even: a tie adds the even one of q0 and q0 + 1.
+                    Some(q0 as u64 + (q0 as u64 & 1))
+                } else {
+                    None // M odd: one plain addition makes it even
+                };
+                if let Some(q) = step {
+                    if q == 0 {
+                        return s; // every addition leaves s as it is
                     }
-                    // Ulps left below the top, exact (Sterbenz), and how many
-                    // steps of q fit while the sum stays at most top - ulp.
-                    let room = (top - s) / ulp;
-                    let j = (((room - 1.0) / q).floor() as u64).min(r);
+                    // Ulps left below the top (exact, by Sterbenz), and how
+                    // many steps of q fit while the sum stays at most
+                    // top - ulp.
+                    let room = ((top - s) / ulp) as u64;
+                    let j = ((room - 1) / q).min(r);
                     if j > 0 {
-                        s += (j as f64 * q) * ulp;
+                        s += (j * q) as f64 * ulp;
                         r -= j;
                         continue;
                     }
@@ -343,14 +356,19 @@ mod tests {
     #[test]
     fn repeated_addition_matches_the_loop() {
         let mut state = 7u64;
-        for case in 0..4000 {
+        for case in 0..20_000 {
             let unit = |st: &mut u64| (rng(st) >> 11) as f64 / (1u64 << 53) as f64;
-            let x = match case % 4 {
+            let x = match case % 5 {
                 0 => unit(&mut state) * 1e-7,
                 1 => unit(&mut state),
                 // Few significant bits: ties and exact steps.
                 2 => (rng(&mut state) % 64) as f64 * 2f64.powi(-((rng(&mut state) % 60) as i32)),
-                _ => 1.0 / (1 + rng(&mut state) % 40_000_000) as f64,
+                3 => 1.0 / (1 + rng(&mut state) % 40_000_000) as f64,
+                // The difference of two close values, as in PageRank's delta.
+                _ => {
+                    let a = 1.0 / (1 + rng(&mut state) % 40_000_000) as f64;
+                    (a - a * (1.0 + unit(&mut state) * 1e-6)).abs()
+                }
             };
             let s = match case % 3 {
                 0 => 0.0,
