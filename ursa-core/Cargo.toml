@@ -3,7 +3,7 @@ name = "ursa-core"
 description = "Topology index and graph algorithm kernels for Ursa. Pure Rust; no DataFusion."
 # Released with ursa-engine, ursa-sql and ursa-cli, in lockstep at the CLI's
 # version (release-cli.yml checks); the Python package keeps the workspace version.
-version = "0.8.0-dev"
+version = "0.8.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
