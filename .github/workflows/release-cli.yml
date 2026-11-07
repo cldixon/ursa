@@ -1,44 +1,56 @@
 name: Release ursa-cli
 
-# Builds the `ursa` binary (the SQL engine's command-line tool, crate ursa-cli)
-# for five platforms, smoke-tests each build that can run on its runner, and,
-# for a release tag only, publishes the crates to crates.io and the archives to
-# a GitHub Release.
+# Releases the `ursa` command-line tool (crate ursa-cli) on the stable channel:
+# builds it for five platforms (cli-build.yml), tags the built commit, publishes
+# the five crates to crates.io, and makes a GitHub Release with the archives.
+# The nightly channel is nightly-cli.yml.
 #
 # Separate from release.yml, which releases the Python package (ursa-graph)
-# when a GitHub Release is published. The two never trigger each other: this
-# workflow runs on tags named ursa-cli-v*, and a release created here with the
-# workflow's GITHUB_TOKEN does not start other workflows. release.yml's publish
-# job also skips ursa-cli-v* releases, in case one is published by hand.
+# when a GitHub Release is published. The two never trigger each other: a
+# release created here with the workflow's GITHUB_TOKEN does not start other
+# workflows, and release.yml's publish job also skips ursa-cli-v* and nightly
+# releases, in case one is published by hand.
 #
-# Two ways to release, after the release PR (all five crates at the new
-# version) is merged into main:
+# A release starts by itself when a release PR is merged: the merge to main
+# that changes ursa-cli's version to a release version (0.8.0, not 0.8.0-dev),
+# when the tag ursa-cli-v<version> does not exist yet. Every other merge to
+# main stops in the first job, within seconds. So a release is:
 #
-#   - From GitHub, no local git needed: Actions -> Release ursa-cli -> Run
-#     workflow, on main, with `release` ticked and `version` set (e.g. 0.7.0).
-#     The run checks the version, builds and smoke-tests every target, and only
-#     then creates the tag ursa-cli-v<version> on the commit it built.
-#   - By pushing the tag yourself: git tag ursa-cli-v0.7.0 && git push origin
-#     ursa-cli-v0.7.0.
+#   1. A release PR sets all five crates to the version (0.8.0) and dates the
+#      changelog. Merge it once CI is green.
+#   2. This workflow builds and smoke-tests every target, tags the commit it
+#      built as ursa-cli-v0.8.0, publishes to crates.io, and makes the GitHub
+#      Release. No one needs to click anything.
+#   3. A follow-up PR moves main to the next development version (0.9.0-dev),
+#      which also restarts the nightly channel.
 #
-# Either way, publishing to crates.io waits for a person's approval of the
-# `crates-io` environment, and the GitHub Release is made after that. Run
-# without `release`, the workflow builds and smoke-tests all five targets as a
-# dry run and publishes nothing.
+# A release candidate (0.8.0-rc.1) releases the same way: it goes to crates.io,
+# where `cargo install` takes it only when asked for that exact version, and its
+# GitHub Release is a prerelease, which the installers skip.
+#
+# Two other ways to start a release, e.g. to retry one whose run failed:
+#
+#   - Actions -> Release ursa-cli -> Run workflow, on main, with `release`
+#     ticked and `version` set (e.g. 0.8.0). Unticked, the run is a dry run: it
+#     builds and smoke-tests all five targets and publishes nothing.
+#   - Pushing the tag yourself: git tag ursa-cli-v0.8.0 && git push origin
+#     ursa-cli-v0.8.0.
 #
 # The version must match ursa-cli's in ursa-cli/Cargo.toml, and ursa-core,
 # ursa-io, ursa-engine and ursa-sql must be at the same version, or the run
 # stops before building.
 #
 # One-time setup (maintainer):
-#   - GitHub, repository Settings -> Environments: `crates-io`, with yourself as
-#     a required reviewer, so every publish waits for approval.
+#   - GitHub, repository Settings -> Environments: `crates-io`. The publish job
+#     runs in it, because crates.io's Trusted Publishing names it. Since
+#     2026-11-07 it has no required reviewer, so a merged release PR publishes
+#     with no human step. To limit who can publish, set its deployment branches
+#     and tags to `main` and `ursa-cli-v*`. Adding a required reviewer back makes
+#     every publish wait for approval again; nothing here needs to change.
 #   - crates.io, Trusted Publishing: on each of the five crates' Settings page,
-#     add a GitHub publisher: repository cldixon/ursa, workflow release-cli.yml,
+#     a GitHub publisher: repository cldixon/ursa, workflow release-cli.yml,
 #     environment crates-io. The publish job then gets a short-lived token from
-#     crates.io for each run; no API token is stored anywhere. (0.6.0, the
-#     first release, used a token, since Trusted Publishing needs the crates to
-#     exist.)
+#     crates.io for each run; no API token is stored anywhere.
 #
 # Crates are published in dependency order, and a crate whose version is
 # already on crates.io is skipped, so a run can be re-run, and crates published
@@ -46,27 +58,28 @@ name: Release ursa-cli
 
 on:
   push:
+    branches: [main]
     tags: ["ursa-cli-v*"]
   workflow_dispatch:
     inputs:
       release:
-        description: "Release: tag, publish to crates.io (after approval) and make the GitHub Release. Unticked, a dry run."
+        description: "Release: tag, publish to crates.io and make the GitHub Release. Unticked, a dry run."
         type: boolean
         default: false
       version:
-        description: "The version to release, e.g. 0.7.0. Must match ursa-cli/Cargo.toml. Needed with release."
+        description: "The version to release, e.g. 0.8.0. Must match ursa-cli/Cargo.toml. Needed with release."
         type: string
         default: ""
 
+# One group per merge, not per branch: GitHub cancels a run that is waiting in
+# a group when a newer one joins it, and a release PR's merge must never be
+# cancelled by the merge after it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   version:
@@ -74,24 +87,61 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      # "true" for a tag push, or a dispatch with `release`.
+      # "true" to build: a release, or a dry run from the Actions tab.
+      build: ${{ steps.version.outputs.build }}
+      # "true" to release: tag, publish and make the GitHub Release.
       publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The merged commit and its first parent, to see whether the merge
+          # changed the version.
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@1.97.0
-      - name: ursa-cli's version, and the tag
+      - name: ursa-cli's version, and whether to release it
         id: version
         shell: bash
         env:
           RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
           WANTED: ${{ inputs.version }}
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
+          set -euo pipefail
+          crate_version() {
+            cargo metadata --no-deps --format-version 1 --locked \
+              | jq -r --arg c "$1" '.packages[] | select(.name == $c) | .version'
+          }
+          version=$(crate_version ursa-cli)
           echo "ursa-cli version: $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          tag_exists() {
+            git ls-remote --exit-code --tags origin "refs/tags/ursa-cli-v$version" > /dev/null
+          }
+          build=false
           publish=false
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "branch" ]]; then
+            # A merge to main: release only the merge that set a new release
+            # version. The version on the first parent is read from its
+            # Cargo.toml, as cargo metadata needs a checkout.
+            before=$(git show HEAD^:ursa-cli/Cargo.toml 2> /dev/null \
+              | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1 || true)
+            echo "before this merge: ${before:-unknown}"
+            if [[ "$version" == *-dev ]]; then
+              echo "$version is a development version: nothing to release (nightly-cli.yml builds it)"
+            elif [[ "$version" == "$before" ]]; then
+              echo "this merge did not change the version: nothing to release"
+            elif tag_exists; then
+              echo "the tag ursa-cli-v$version already exists: $version is released"
+            else
+              echo "this merge sets the release version $version: releasing"
+              build=true
+              publish=true
+            fi
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$GITHUB_REF_NAME" != "ursa-cli-v$version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match ursa-cli's version $version (expected ursa-cli-v$version)"
+              exit 1
+            fi
+            build=true
             publish=true
           elif [[ "$RELEASE" == "true" ]]; then
             # A release from the Actions tab: on main, at the version asked for,
@@ -104,29 +154,30 @@ jobs:
               echo "::error::asked to release '$WANTED', but ursa-cli/Cargo.toml on this commit is $version. Merge the release PR first, or ask for $version"
               exit 1
             fi
-            if [[ "$version" == *-* ]]; then
-              echo "::error::$version is a development version; the release PR sets the release version"
-              exit 1
-            fi
-            if git ls-remote --exit-code --tags origin "refs/tags/ursa-cli-v$version" > /dev/null; then
+            if tag_exists; then
               echo "::error::the tag ursa-cli-v$version already exists; $version is released"
               exit 1
             fi
+            build=true
             publish=true
+          else
+            # A dry run from the Actions tab.
+            build=true
           fi
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "publish: $publish"
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "ursa-cli-v$version" ]]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match ursa-cli's version $version (expected ursa-cli-v$version)"
+          if [[ "$publish" == "true" && "$version" == *-dev ]]; then
+            echo "::error::$version is a development version; the release PR sets the release version"
             exit 1
           fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "build: $build, publish: $publish"
+          [[ "$build" == "true" ]] || exit 0
           # ursa-cli needs ursa-core, ursa-io, ursa-engine and ursa-sql from
           # crates.io, and a version already there is skipped below. So all five
           # are released together at one version: a crate left at an old version
           # would ship its old code under the new ursa-cli.
           for crate in ursa-core ursa-io ursa-engine ursa-sql; do
-            v=$(cargo metadata --no-deps --format-version 1 --locked \
-              | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')
+            v=$(crate_version "$crate")
             if [[ "$v" != "$version" ]]; then
               echo "::error::$crate is at $v but ursa-cli is at $version; release them at one version"
               exit 1
@@ -134,91 +185,21 @@ jobs:
           done
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build
     needs: version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Built on Ubuntu 22.04, so the binary needs glibc 2.35 or later.
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, native: true }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, native: true }
-          # macos-latest is Apple silicon; the Intel build cross-compiles there.
-          - { target: aarch64-apple-darwin, os: macos-latest, native: true }
-          - { target: x86_64-apple-darwin, os: macos-latest, native: false }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, native: true }
-    env:
-      TARGET: ${{ matrix.target }}
-      ARCHIVE: ursa-cli-v${{ needs.version.outputs.version }}-${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v4
-
-      # Pinned to match rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build
-        shell: bash
-        run: cargo build --release --locked -p ursa-cli --target "$TARGET"
-
-      - name: Smoke test
-        if: matrix.native
-        shell: bash
-        run: |
-          bin="target/$TARGET/release/ursa"
-          "$bin" --version
-          test "$("$bin" --version)" = "ursa ${{ needs.version.outputs.version }}"
-          out=$("$bin" --format csv -c "
-            CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
-            CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
-            SELECT count(*) AS n FROM pagerank(karate, direction => 'both');")
-          echo "$out"
-          test "$(echo "$out" | tr -d '\r' | tail -n 1)" = "34"
-
-      # docs/install.sh and docs/install.ps1 download these archives by name,
-      # and expect this layout and the .sha256 format: change them together.
-      - name: Package
-        shell: bash
-        run: |
-          mkdir "$ARCHIVE"
-          if [[ "$TARGET" == *windows* ]]; then exe=ursa.exe; else exe=ursa; fi
-          cp "target/$TARGET/release/$exe" ursa-cli/README.md LICENSE-MIT LICENSE-APACHE "$ARCHIVE/"
-          if [[ "$TARGET" == *windows* ]]; then
-            7z a "$ARCHIVE.zip" "$ARCHIVE" > /dev/null
-            file="$ARCHIVE.zip"
-          else
-            tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
-            file="$ARCHIVE.tar.gz"
-          fi
-          if command -v sha256sum > /dev/null; then
-            sha256sum "$file" > "$file.sha256"
-          else
-            shasum -a 256 "$file" > "$file.sha256"
-          fi
-          cat "$file.sha256"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ursa-cli-${{ matrix.target }}
-          path: |
-            ${{ env.ARCHIVE }}.tar.gz
-            ${{ env.ARCHIVE }}.zip
-            ${{ env.ARCHIVE }}.*.sha256
-          if-no-files-found: error
+    if: needs.version.outputs.build == 'true'
+    uses: ./.github/workflows/cli-build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      label: v${{ needs.version.outputs.version }}
 
   tag:
     name: Tag the release
-    # A release from the Actions tab: tag the commit that was just built, once
-    # every target built and passed its smoke test. (A tag pushed by a person
-    # already exists.) A tag pushed with the workflow's token does not start
-    # another run of this workflow.
-    if: github.event_name == 'workflow_dispatch' && needs.version.outputs.publish == 'true'
+    # A release from a merge or from the Actions tab: tag the commit that was
+    # just built, once every target built and passed its smoke test. (A tag
+    # pushed by a person already exists.) A tag pushed with the workflow's token
+    # does not start another run of this workflow.
+    if: needs.version.outputs.publish == 'true' && github.ref_type == 'branch'
     needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
@@ -237,8 +218,7 @@ jobs:
 
   crates:
     name: Publish to crates.io
-    # A tag push, or a release from the Actions tab once it is tagged. A dry
-    # run stops after building.
+    # A release, once it is tagged. A dry run stops after building.
     if: >-
       always() && needs.version.outputs.publish == 'true'
       && needs.build.result == 'success'
@@ -301,12 +281,17 @@ jobs:
           TAG: ursa-cli-v${{ needs.version.outputs.version }}
         run: |
           ls -l dist
+          # A release candidate (0.8.0-rc.1) is a prerelease, which the
+          # installers skip.
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
           # --latest=false keeps the Python package's release as the
           # repository's latest.
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --latest=false \
+            "${prerelease[@]}" \
             --title "ursa-cli $VERSION" \
             --notes "The \`ursa\` command-line tool, version $VERSION: Ursa's SQL engine for graph analytics.
 

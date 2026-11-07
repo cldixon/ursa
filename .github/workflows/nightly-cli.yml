@@ -1,0 +1,140 @@
+name: Nightly ursa-cli
+
+# The nightly channel of the `ursa` command-line tool: on every merge to main,
+# builds main for five platforms (cli-build.yml) and replaces the archives of
+# one rolling GitHub prerelease, tagged `nightly`. Only the newest nightly is
+# kept. Nothing goes to crates.io: crates.io is for stable releases
+# (release-cli.yml).
+#
+# A nightly's version is main's next version with the build date,
+# 0.8.0-nightly.20261107 for a main at 0.8.0-dev, and `ursa --version` also
+# names its commit: `ursa 0.8.0-nightly.20261107 (a1b2c3d4e)`.
+#
+# Install it with the installers' nightly channel:
+#   curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_CHANNEL=nightly sh
+#   $env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | iex
+#
+# The archives have fixed names, ursa-cli-nightly-<target>.tar.gz (.zip on
+# Windows), so the installers download
+# https://github.com/cldixon/ursa/releases/download/nightly/<archive> without
+# asking GitHub's API which version is newest.
+#
+# Only a main at a development version (X.Y.Z-dev) builds a nightly. Between a
+# release PR's merge and the follow-up that moves main to the next -dev
+# version, main is at the release version, which release-cli.yml releases, and
+# the nightly stays as it was.
+#
+# Run workflow from the Actions tab (on main) rebuilds the nightly now.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer merge replaces a nightly that is still building: only the newest is
+# kept anyway.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Nightly version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: The nightly version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::a nightly is built from main only (this run is on $GITHUB_REF)"
+            exit 1
+          fi
+          crate=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
+          echo "ursa-cli version: $crate"
+          if [[ "$crate" != *-dev ]]; then
+            echo "main is at $crate, not a development version: release-cli.yml releases it, and the nightly waits for main's next -dev version"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="${crate%-dev}-nightly.$(date -u +%Y%m%d)"
+          echo "nightly version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    uses: ./.github/workflows/cli-build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      label: nightly
+      build-version: ${{ needs.version.outputs.version }}
+
+  publish:
+    name: Publish the nightly
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ursa-cli-*
+          merge-multiple: true
+          path: dist
+      - name: Replace the nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # A run for an older commit that finished after a newer one must not
+          # replace the newer nightly. (A newer run normally cancels this one.)
+          head=$(git ls-remote origin refs/heads/main | cut -f 1)
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo "main has moved on to $head; the run for it publishes the nightly"
+            exit 0
+          fi
+          short=${GITHUB_SHA:0:9}
+          notes="The newest build of \`main\`: \`ursa $VERSION ($short)\`, built from [$short](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) on $(date -u '+%Y-%m-%d at %H:%M UTC').
+
+          Nightly builds have the features on \`main\` before they are released, and may change or break. This release is replaced on every merge to \`main\`; only the newest nightly is kept. Stable releases are the \`ursa-cli-v*\` releases.
+
+          Install it with \`curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_CHANNEL=nightly sh\` on Linux or macOS, or \`\$env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | iex\` in PowerShell on Windows. Run the installer again without \`URSA_CHANNEL\` to go back to stable. Or download the archive for your platform below and check it against its \`.sha256\` file.
+
+          When you report a bug, include the output of \`ursa --version\`."
+
+          # Move the tag to this commit. A tag pushed with the workflow's token
+          # starts no workflows.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f -a nightly -m "ursa-cli $VERSION" "$GITHUB_SHA"
+          git push -f origin refs/tags/nightly
+
+          if gh release view nightly --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # The archives have fixed names, so --clobber replaces each one in
+            # place: the release is never without them.
+            gh release upload nightly dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit nightly --repo "$GITHUB_REPOSITORY" \
+              --prerelease --latest=false \
+              --title "ursa-cli nightly ($VERSION)" --notes "$notes"
+          else
+            gh release create nightly dist/* --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --prerelease --latest=false \
+              --title "ursa-cli nightly ($VERSION)" --notes "$notes"
+          fi

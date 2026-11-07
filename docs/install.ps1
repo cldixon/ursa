@@ -4,18 +4,32 @@
 #   irm https://cldixon.github.io/ursa/install.ps1 | iex
 #
 # Downloads the prebuilt x86_64 Windows binary from the repository's GitHub
-# Releases (the `ursa-cli-v*` releases, which .github/workflows/release-cli.yml
-# makes), checks it against its published SHA-256 checksum, puts it in
+# Releases, checks it against its published SHA-256 checksum, puts it in
 # %LOCALAPPDATA%\ursa\bin, and adds that directory to your user PATH. No
 # administrator rights needed.
+#
+# Two channels:
+#
+#   stable   (the default) the newest `ursa-cli-v*` release, which
+#            .github/workflows/release-cli.yml makes and crates.io also has.
+#   nightly  the newest build of main: the rolling `nightly` prerelease, which
+#            .github/workflows/nightly-cli.yml replaces on every merge. New
+#            features first, and they may change or break.
+#
+#   $env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | iex
+#
+# To go back to stable, run it again with URSA_CHANNEL unset
+# (`Remove-Item Env:URSA_CHANNEL`) or set to stable.
 #
 # Settings, as environment variables (set them first, e.g.
 # `$env:URSA_VERSION = "0.6.0"`):
 #
-#   URSA_VERSION        the version to install, e.g. 0.6.0. Default: the newest
-#                       ursa-cli release.
+#   URSA_CHANNEL        stable or nightly. Default: stable.
+#   URSA_VERSION        the stable version to install, e.g. 0.6.0. Default: the
+#                       newest ursa-cli release. Not with the nightly channel.
 #   URSA_INSTALL_DIR    where to put ursa.exe. Default: %LOCALAPPDATA%\ursa\bin.
-#   URSA_DOWNLOAD_BASE  the URL that holds ursa-cli-v<version>/<archive>.
+#   URSA_DOWNLOAD_BASE  the URL that holds ursa-cli-v<version>/<archive> and
+#                       nightly/<archive>.
 #                       Default: https://github.com/cldixon/ursa/releases/download
 #   URSA_RELEASES_URL   the GitHub API URL that lists the releases, read to find
 #                       the newest version.
@@ -47,7 +61,22 @@
     }
     $target = 'x86_64-pc-windows-msvc'
 
-    if ($env:URSA_VERSION) {
+    $channel = if ($env:URSA_CHANNEL) { $env:URSA_CHANNEL.ToLowerInvariant() } else { 'stable' }
+    if ($channel -ne 'stable' -and $channel -ne 'nightly') {
+        Fail "URSA_CHANNEL is '$($env:URSA_CHANNEL)'; it is stable or nightly"
+    }
+    $base = if ($env:URSA_DOWNLOAD_BASE) { $env:URSA_DOWNLOAD_BASE.TrimEnd('/') } else { "https://github.com/$Repo/releases/download" }
+
+    if ($channel -eq 'nightly') {
+        if ($env:URSA_VERSION) {
+            Fail "URSA_VERSION picks a stable release, and there is only one nightly, the newest. Leave out URSA_VERSION for the nightly, or URSA_CHANNEL for version $($env:URSA_VERSION)"
+        }
+        # One rolling release, with archives of fixed names: no lookup needed.
+        $name = "ursa-cli-nightly-$target"
+        $url = "$base/nightly/$name.zip"
+        $what = "the newest ursa nightly"
+        $missing = "Check that there is a nightly with a $target build: https://github.com/$Repo/releases/tag/nightly"
+    } elseif ($env:URSA_VERSION) {
         $version = $env:URSA_VERSION -replace '^ursa-cli-v', '' -replace '^v', ''
     } else {
         # The repository's releases also hold the Python package (tags v*), so
@@ -68,23 +97,25 @@
         }
         $version = $release.tag_name.Substring('ursa-cli-v'.Length)
     }
-
-    $base = if ($env:URSA_DOWNLOAD_BASE) { $env:URSA_DOWNLOAD_BASE.TrimEnd('/') } else { "https://github.com/$Repo/releases/download" }
-    $name = "ursa-cli-v$version-$target"
+    if ($channel -eq 'stable') {
+        $name = "ursa-cli-v$version-$target"
+        $url = "$base/ursa-cli-v$version/$name.zip"
+        $what = "ursa $version"
+        $missing = "Check that ursa $version exists and has a $target build: https://github.com/$Repo/releases"
+    }
     $archive = "$name.zip"
-    $url = "$base/ursa-cli-v$version/$archive"
     $installDir = if ($env:URSA_INSTALL_DIR) { $env:URSA_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'ursa\bin' }
 
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ursa-install-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
-        Write-Host "Downloading ursa $version for $target"
+        Write-Host "Downloading $what for $target"
         Write-Host "  from $url"
         $zip = Join-Path $tmp $archive
         try {
             Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
         } catch {
-            Fail "could not download $url. Check that ursa $version exists and has a $target build: https://github.com/$Repo/releases ($_)"
+            Fail "could not download $url. $missing ($_)"
         }
         try {
             Invoke-WebRequest -Uri "$url.sha256" -OutFile "$zip.sha256" -UseBasicParsing
@@ -120,6 +151,12 @@
 
     Write-Host ''
     Write-Host "Installed $(& $dest --version) to $dest"
+    if ($channel -eq 'nightly') {
+        Write-Host ''
+        Write-Host 'This is a nightly build of main: new features first, and they may change'
+        Write-Host 'or break. When you report a bug, include the output of: ursa --version'
+        Write-Host 'To go back to stable, run the installer again with URSA_CHANNEL unset.'
+    }
 
     # Add the directory to the user PATH, for new terminals, and to this one.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

@@ -2,7 +2,7 @@ name: CLI package
 
 # Proves the `ursa` binary still packages and runs, on pull requests that touch
 # the SQL engine's crates or their packaging: a release build for Linux
-# x86_64 (the same command release-cli.yml runs per platform), `ursa
+# x86_64 (the same command cli-build.yml runs per platform), `ursa
 # --version`, one query, and a crates.io dry run of the five crates ursa-cli
 # needs. Publishes nothing. Also tests the one-line installers (docs/install.sh
 # and docs/install.ps1) against that binary, packaged as a release and served
@@ -19,7 +19,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/cli-package.yml"
+      - ".github/workflows/cli-build.yml"
       - ".github/workflows/release-cli.yml"
+      - ".github/workflows/nightly-cli.yml"
       - "docs/install.sh"
       - "docs/install.ps1"
   workflow_dispatch:
@@ -81,13 +83,34 @@ jobs:
           echo "$out"
           test "$out" = "$(printf 'id,degree\n33,17')"
 
-      # Packages the binary as release-cli.yml does, serves it with python3 -m
+      # Packages the binary as cli-build.yml does, serves it with python3 -m
       # http.server, and runs install.sh (under sh, dash and bash) and
       # install.ps1 (pwsh) against it: a pinned and a newest-version install, a
       # bad checksum that must be refused, and a few error cases. Also runs
       # shellcheck. The runner has shellcheck and pwsh installed.
       - name: Installers
         run: sh ursa-cli/tests/installers.sh target/release/ursa
+
+      # A nightly build (nightly-cli.yml) prints its nightly version and commit
+      # in place of the crate's -dev version. Only ursa-cli is rebuilt.
+      - name: ursa --version, as a nightly
+        run: |
+          crate=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "ursa-cli") | .version')
+          if [[ "$crate" != *-dev ]]; then
+            echo "ursa-cli is at $crate, not a -dev version: no nightly is built from it"
+            exit 0
+          fi
+          nightly="${crate%-dev}-nightly.20990101"
+          URSA_BUILD_VERSION="$nightly" cargo build --release --locked -p ursa-cli
+          got=$(./target/release/ursa --version)
+          echo "$got"
+          [[ "$got" =~ ^"ursa $nightly ("[0-9a-f]{9,}")"$ ]]
+          # A version that is not a prerelease of the crate's version is refused.
+          if URSA_BUILD_VERSION=0.0.1-nightly.1 cargo build --release --locked -p ursa-cli 2> err.txt; then
+            echo "built with a nightly version for another release"; exit 1
+          fi
+          grep -q "must be a prerelease of the crate's version" err.txt
 
       # Packages each crate as crates.io would receive it, resolving the
       # unpublished ones against each other. --no-verify: the build above
