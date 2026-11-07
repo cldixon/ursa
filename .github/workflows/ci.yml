@@ -98,6 +98,11 @@ jobs:
       - name: test engine + sql + cli + wasm (natively)
         run: cargo test -p ursa-engine -p ursa-sql -p ursa-cli -p ursa-wasm --locked
 
+      # The graph view (#280): its scene, camera and styles, and its WGSL,
+      # validated by naga.
+      - name: test ursa-viz (natively)
+        run: cargo test -p ursa-viz --locked
+
       # Ensures ursa-py (PyO3 extension) also compiles.
       - name: check workspace
         run: cargo check --workspace --locked
@@ -119,6 +124,9 @@ jobs:
       # the moment one leaks onto the wasm32 build.
       - name: check the SQL engine on wasm32
         run: cargo clippy -p ursa-sql -p ursa-wasm --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: check the graph view on wasm32
+        run: cargo clippy -p ursa-viz --features web --target wasm32-unknown-unknown --locked -- -D warnings
 
   wasm:
     # The SQL engine in the browser (#277): build ursa-wasm for wasm32, then run
@@ -160,6 +168,19 @@ jobs:
 
       - name: Parity with the native engine
         run: bun ursa-wasm/tests/browser/parity.ts pkg target/debug/ursa
+
+      # The graph view (#280) on WebGL2: the layout runs in its worker, frames
+      # are drawn (read back and counted), and clusters come out separated.
+      - name: Build ursa-viz
+        run: |
+          cargo build -p ursa-viz --features web --target wasm32-unknown-unknown --profile wasm-test --locked
+          wasm-bindgen --target web --out-dir ursa-viz/pkg target/wasm32-unknown-unknown/wasm-test/ursa_viz.wasm
+
+      - name: The graph view in Chromium
+        run: bun ursa-viz/tests/browser/view.ts
+        env:
+          WEBGPU: "0"
+          ONLY: clusters
 
   web:
     # The Ursa Shell's Worker (web/, #279): generate the binding types from

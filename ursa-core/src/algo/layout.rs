@@ -337,6 +337,10 @@ impl Fa2State {
 
     /// Run `iterations` more iterations over `adj`, the adjacency the state
     /// was made for.
+    // The index loops walk forces, mass, prev and the positions together, in
+    // index order, as `layout_fa2` always has: the order is what keeps the
+    // sums, and so the layout, bit for bit the same.
+    #[allow(clippy::needless_range_loop)]
     pub fn step(&mut self, adj: &UndirectedCsr, iterations: u32) {
         let n = self.x.len();
         if n <= 1 {
