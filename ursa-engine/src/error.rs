@@ -13,6 +13,7 @@
 //! user DataFusion's raw message.
 
 use datafusion::arrow::error::ArrowError;
+use datafusion::common::SchemaError;
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::parser::ParserError;
 
@@ -40,11 +41,35 @@ pub mod matched {
     /// `Unexpected EOF while in a multi-line comment`). The shell reads the
     /// next line instead (`ursa-cli`'s `input.rs`).
     pub const TOKENIZER_EOF: &str = "EOF";
+
+    /// In arrow's cast error for a date or timestamp outside the range of a
+    /// nanosecond timestamp (`Cannot cast Date32 value -100000000 to
+    /// Timestamp(ns): converted value exceeds the representable i64 range`),
+    /// which `date_trunc` and other timestamp functions meet on an
+    /// out-of-range date. Matched together with [`TIMESTAMP_NS`].
+    pub const TIMESTAMP_OVERFLOW: &str = "exceeds the representable i64 range";
+
+    /// The nanosecond timestamp type, as arrow names it in a cast error.
+    pub const TIMESTAMP_NS: &str = "Timestamp(ns)";
 }
+
+/// What to do about a date outside a nanosecond timestamp's range (#328).
+const TIMESTAMP_RANGE_HINT: &str = "a timestamp in nanoseconds holds only dates from 1677-09-21 \
+     to 2262-04-11, and date_trunc and the other timestamp functions convert to one. Filter \
+     the dates first (WHERE d BETWEEN DATE '1678-01-01' AND DATE '2262-04-11'), or use \
+     extract(year FROM d) or date_part instead of date_trunc";
 
 /// The message to show a user for `err`: what went wrong, without the names of
 /// the internal error types it passed through.
 pub fn user_message(err: &DataFusionError) -> String {
+    let message = message_of(err);
+    if message.contains(matched::TIMESTAMP_OVERFLOW) && message.contains(matched::TIMESTAMP_NS) {
+        return format!("{message}; {TIMESTAMP_RANGE_HINT}");
+    }
+    message
+}
+
+fn message_of(err: &DataFusionError) -> String {
     match err {
         DataFusionError::ArrowError(e, _) => arrow_message(e),
         DataFusionError::ParquetError(e) => format!("Parquet: {e}"),
@@ -59,24 +84,57 @@ pub fn user_message(err: &DataFusionError) -> String {
         | DataFusionError::Substrait(m)
         | DataFusionError::Ffi(m) => m.clone(),
         DataFusionError::Internal(m) => format!("internal error: {m}"),
-        DataFusionError::SchemaError(e, _) => e.to_string(),
+        DataFusionError::SchemaError(e, _) => schema_message(e),
         DataFusionError::ExecutionJoin(e) => e.to_string(),
         DataFusionError::External(e) => external_message(e.as_ref()),
         // Which optimizer rule hit the error is DataFusion's business.
         DataFusionError::Context(context, inner)
             if context.starts_with(matched::OPTIMIZER_RULE_FAILED) =>
         {
-            user_message(inner)
+            message_of(inner)
         }
         DataFusionError::Context(context, inner) => {
-            format!("{context}: {}", user_message(inner))
+            format!("{context}: {}", message_of(inner))
         }
-        DataFusionError::Diagnostic(_, inner) => user_message(inner),
+        DataFusionError::Diagnostic(_, inner) => message_of(inner),
         DataFusionError::Collection(errs) => errs
             .first()
-            .map(user_message)
+            .map(message_of)
             .unwrap_or_else(|| "unknown error".to_string()),
-        DataFusionError::Shared(inner) => user_message(inner),
+        DataFusionError::Shared(inner) => message_of(inner),
+    }
+}
+
+/// A schema error, with a hint for a name with a `-` in it: unquoted,
+/// `date-created` is `date - created`, so DataFusion reports `date` missing.
+fn schema_message(e: &SchemaError) -> String {
+    let message = e.to_string();
+    let SchemaError::FieldNotFound {
+        field,
+        valid_fields,
+    } = e
+    else {
+        return message;
+    };
+    // A valid name that the missing one is a `-`-separated part of.
+    let part_of =
+        |name: &str| name.split('-').count() > 1 && name.split('-').any(|p| p == field.name);
+    match valid_fields.iter().find(|c| part_of(&c.name)) {
+        Some(column) => {
+            let (first, rest) = message.split_once('\n').unwrap_or((&message, ""));
+            let mut out = format!(
+                "{first}\nA name that contains '-' must be quoted, or it is read as a \
+                 subtraction: write \"{}\"",
+                column.name.replace('"', "\"\"")
+            );
+            out.push_str(&format!(", not {}.", column.name));
+            if !rest.is_empty() {
+                out.push('\n');
+                out.push_str(rest);
+            }
+            out
+        }
+        None => message,
     }
 }
 
@@ -100,7 +158,7 @@ fn arrow_message(e: &ArrowError) -> String {
 
 fn external_message(e: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
     if let Some(df) = e.downcast_ref::<DataFusionError>() {
-        user_message(df)
+        message_of(df)
     } else if let Some(arrow) = e.downcast_ref::<ArrowError>() {
         arrow_message(arrow)
     } else {
@@ -227,5 +285,55 @@ mod tests {
         assert_eq!(user_message(&err), "syntax error: Expected: an expression");
         let err = DataFusionError::External(Box::new(DataFusionError::Execution("boom".into())));
         assert_eq!(user_message(&err), "boom");
+    }
+
+    /// #328: an unquoted `date-created` is `date - created`; say to quote it.
+    #[tokio::test]
+    async fn a_hyphenated_name_says_to_quote_it() {
+        let ctx = SessionContext::new();
+        let sql = "SELECT date-created FROM (SELECT 1 AS \"date-created\", 2 AS x) t";
+        let err = ctx.sql(sql).await.unwrap_err();
+        assert_eq!(
+            user_message(&err),
+            "No field named date.\n\
+             A name that contains '-' must be quoted, or it is read as a subtraction: write \
+             \"date-created\", not date-created.\n\
+             Valid fields are t.\"date-created\", t.x."
+        );
+        // A missing name that is not part of one with a `-` gets no hint.
+        let sql = "SELECT nope FROM (SELECT 1 AS \"date-created\") t";
+        let err = ctx.sql(sql).await.unwrap_err();
+        assert!(
+            !user_message(&err).contains("quoted"),
+            "{}",
+            user_message(&err)
+        );
+    }
+
+    /// #328: a date out of a nanosecond timestamp's range, in date_trunc,
+    /// says what to do instead (and arrow still words the error as
+    /// [`matched::TIMESTAMP_OVERFLOW`] and [`matched::TIMESTAMP_NS`] say).
+    #[tokio::test]
+    async fn an_out_of_range_date_in_date_trunc_suggests_extract() {
+        let ctx = SessionContext::new();
+        let err = ctx
+            .sql("SELECT date_trunc('year', CAST(-100000000 AS DATE))")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        let raw = message_of(&err);
+        assert!(
+            raw.contains(matched::TIMESTAMP_OVERFLOW) && raw.contains(matched::TIMESTAMP_NS),
+            "arrow's message for an out-of-range timestamp cast changed; update \
+             matched::TIMESTAMP_OVERFLOW and TIMESTAMP_NS: {raw}"
+        );
+        let message = user_message(&err);
+        assert!(
+            message.ends_with(&format!("; {TIMESTAMP_RANGE_HINT}")),
+            "{message}"
+        );
+        assert!(message.contains("extract(year FROM d)"), "{message}");
     }
 }

@@ -932,8 +932,13 @@ fn traversals_match_getting_started() {
     );
     let out = ok(ursa(&["--format", "csv", "-c", &sql]));
     assert_eq!(out.lines().count(), 1 + 16, "{out}");
-    assert_eq!(out.lines().next(), Some("src,dst"));
-    assert!(out.lines().skip(1).all(|l| l.starts_with("0,")), "{out}");
+    assert_eq!(out.lines().next(), Some("seed,id,distance"));
+    assert!(
+        out.lines()
+            .skip(1)
+            .all(|l| l.starts_with("0,") && l.ends_with(",1")),
+        "{out}"
+    );
 
     let sql = format!(
         "{}
@@ -945,49 +950,49 @@ fn traversals_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+-----+-----+
-| src | dst |
-+-----+-----+
-| 9   | 33  |
-| 14  | 32  |
-| 14  | 33  |
-| 15  | 32  |
-| 15  | 33  |
-| 18  | 32  |
-| 18  | 33  |
-| 20  | 32  |
-| 20  | 33  |
-| 22  | 32  |
-| 22  | 33  |
-| 23  | 25  |
-| 23  | 27  |
-| 23  | 29  |
-| 23  | 32  |
-| 23  | 33  |
-| 23  | 31  |
-| 24  | 25  |
-| 24  | 27  |
-| 24  | 31  |
-| 24  | 33  |
-| 24  | 32  |
-| 25  | 31  |
-| 25  | 32  |
-| 25  | 33  |
-| 26  | 29  |
-| 26  | 33  |
-| 26  | 32  |
-| 27  | 33  |
-| 28  | 31  |
-| 28  | 33  |
-| 28  | 32  |
-| 29  | 32  |
-| 29  | 33  |
-| 30  | 32  |
-| 30  | 33  |
-| 31  | 32  |
-| 31  | 33  |
-| 32  | 33  |
-+-----+-----+
++------+----+----------+
+| seed | id | distance |
++------+----+----------+
+| 9    | 33 | 1        |
+| 14   | 32 | 1        |
+| 14   | 33 | 1        |
+| 15   | 32 | 1        |
+| 15   | 33 | 1        |
+| 18   | 32 | 1        |
+| 18   | 33 | 1        |
+| 20   | 32 | 1        |
+| 20   | 33 | 1        |
+| 22   | 32 | 1        |
+| 22   | 33 | 1        |
+| 23   | 25 | 1        |
+| 23   | 27 | 1        |
+| 23   | 29 | 1        |
+| 23   | 32 | 1        |
+| 23   | 33 | 1        |
+| 23   | 31 | 2        |
+| 24   | 25 | 1        |
+| 24   | 27 | 1        |
+| 24   | 31 | 1        |
+| 24   | 33 | 2        |
+| 24   | 32 | 2        |
+| 25   | 31 | 1        |
+| 25   | 32 | 2        |
+| 25   | 33 | 2        |
+| 26   | 29 | 1        |
+| 26   | 33 | 1        |
+| 26   | 32 | 2        |
+| 27   | 33 | 1        |
+| 28   | 31 | 1        |
+| 28   | 33 | 1        |
+| 28   | 32 | 2        |
+| 29   | 32 | 1        |
+| 29   | 33 | 1        |
+| 30   | 32 | 1        |
+| 30   | 33 | 1        |
+| 31   | 32 | 1        |
+| 31   | 33 | 1        |
+| 32   | 33 | 1        |
++------+----+----------+
 "
     );
 
@@ -1107,9 +1112,9 @@ fn scripts_take_dot_commands() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 6, "{out}");
     assert_eq!(&lines[..2], ["a", "1"]);
-    assert!(lines[2].starts_with("Run Time: "), "{out}");
+    assert!(lines[2].starts_with("Run Time (s): real "), "{out}");
     assert_eq!(&lines[3..5], ["b", "2"]);
-    assert!(lines[5].starts_with("Run Time: "), "{out}");
+    assert!(lines[5].starts_with("Run Time (s): real "), "{out}");
 
     // On stdin too.
     let out = ok(ursa_with_stdin(&[], ".mode json\nSELECT 1 AS a;\n"));
@@ -1185,7 +1190,7 @@ fn arrow_scripts_keep_the_stream_clean() {
     assert!(out.status.success());
     assert!(out.stdout.starts_with(&[0xff, 0xff, 0xff, 0xff]));
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.starts_with("Run Time: "), "{stderr}");
+    assert!(stderr.starts_with("Run Time (s): real "), "{stderr}");
     let e = err(ursa(&[
         "--format",
         "arrow",
@@ -1264,7 +1269,7 @@ fn every_statement_prints_a_result_or_nothing_by_rule() {
         (
             graph,
             "SELECT * FROM hop(g, seeds => [100])".into(),
-            Some("src,dst"),
+            Some("seed,id,distance"),
         ),
         (
             graph,
@@ -1371,4 +1376,165 @@ fn help_points_onward() {
     ] {
         assert!(help.contains(needle), "{needle} missing from:\n{help}");
     }
+}
+
+/// #328: a table shows at most 40 rows, the first and last 20, with a footer
+/// that counts them, as DuckDB's does; `--max-rows` and `.maxrows` change it
+/// (0: every row), and the other formats write every row.
+#[test]
+fn a_long_table_shows_its_first_and_last_rows() {
+    let sql = "SELECT * FROM generate_series(1, 1234) t(x)";
+    let out = ok(ursa(&["-c", sql]));
+    let lines: Vec<&str> = out.lines().collect();
+    // The header (3 lines), 20 rows, 3 rows of dots, 20 rows, the border and
+    // the footer.
+    assert_eq!(lines.len(), 3 + 20 + 3 + 20 + 1 + 1, "{out}");
+    assert_eq!(lines[3], "| 1    |");
+    assert_eq!(lines[22], "| 20   |");
+    assert_eq!(&lines[23..26], ["| ·    |"; 3]);
+    assert_eq!(lines[26], "| 1215 |");
+    assert_eq!(lines[45], "| 1234 |");
+    assert_eq!(lines[46], "+------+");
+    assert_eq!(lines[47], "1,234 rows (40 shown)");
+
+    // 40 rows or fewer: all of them, and no footer.
+    let out = ok(ursa(&["-c", "SELECT * FROM generate_series(1, 40) t(x)"]));
+    assert_eq!(out.lines().count(), 3 + 40 + 1, "{out}");
+    assert!(!out.contains("shown"), "{out}");
+
+    let out = ok(ursa(&["--max-rows", "3", "-c", sql]));
+    assert_eq!(
+        out,
+        "\
++------+
+| x    |
++------+
+| 1    |
+| 2    |
+| ·    |
+| ·    |
+| ·    |
+| 1234 |
++------+
+1,234 rows (3 shown)
+"
+    );
+    for args in [
+        &["--max-rows", "0", "-c", sql][..],
+        &["-c", ".maxrows 0", "-c", sql],
+    ] {
+        let out = ok(ursa(args));
+        assert_eq!(out.lines().count(), 3 + 1234 + 1, "{args:?}");
+    }
+    let out = ok(ursa(&["-c", ".maxrows 2", "-c", ".maxrows", "-c", sql]));
+    assert!(out.starts_with("Tables show at most 2 rows.\n"), "{out}");
+    assert!(out.ends_with("1,234 rows (2 shown)\n"), "{out}");
+    assert_eq!(
+        err(ursa(&["-c", ".maxrows many"])),
+        "Error: usage: .maxrows N, a number of rows (0 shows every row); got 'many'\n"
+    );
+    // Only the table is capped.
+    for format in ["csv", "tsv", "ndjson"] {
+        let out = ok(ursa(&["--format", format, "-c", sql]));
+        let header = usize::from(format != "ndjson");
+        assert_eq!(out.lines().count(), header + 1234, "{format}");
+    }
+    let out = ok(ursa(&["--format", "json", "-c", sql]));
+    assert_eq!(out.matches("{\"x\":").count(), 1234);
+
+    // An init file's .maxrows applies, and --max-rows wins over it.
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("init.sql");
+    std::fs::write(&init, ".maxrows 4\n").unwrap();
+    let init = init.display().to_string();
+    let out = ok(ursa(&["-init", &init, "-c", sql]));
+    assert!(out.ends_with("1,234 rows (4 shown)\n"), "{out}");
+    let out = ok(ursa(&["-init", &init, "--max-rows", "6", "-c", sql]));
+    assert!(out.ends_with("1,234 rows (6 shown)\n"), "{out}");
+}
+
+/// #328: SIGINT cancels a `-c` query: `Error: interrupted` on stderr, nothing
+/// more on stdout, status 130, and the database's lock released.
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_a_query() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("club.ursa").display().to_string();
+    for long in [
+        "SELECT sum(value) AS s FROM generate_series(1, 100000000000)",
+        // An algorithm, which runs on a blocking thread.
+        "CREATE OR REPLACE VIEW e AS SELECT value % 2000000 AS src, \
+         (value * 7919 + 13) % 2000000 AS dst FROM generate_series(1, 20000000); \
+         CREATE OR REPLACE PROPERTY GRAPH g \
+           EDGE TABLES (e SOURCE KEY (src) DESTINATION KEY (dst)); \
+         SELECT count(*) AS n FROM louvain(g)",
+    ] {
+        let child = Command::new(env!("CARGO_BIN_EXE_ursa"))
+            .args([db.as_str(), "-c", "SELECT 1 AS first", "-c", long])
+            .current_dir(workspace())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let killed = Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(130), "{stderr}");
+        assert_eq!(output.status.signal(), None);
+        assert_eq!(stderr, "Error: interrupted\n");
+        // The result that finished stays printed; nothing comes after it.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "+-------+\n| first |\n+-------+\n| 1     |\n+-------+\n"
+        );
+        // Another process can open the database at once.
+        let out = ok(ursa(&[&db, "-c", "SELECT 2 AS again"]));
+        assert!(out.contains("| 2     |"), "{out}");
+    }
+}
+
+/// #328: `.timer` reports real, user and sys time, as DuckDB does.
+#[test]
+fn the_timer_reports_real_user_and_sys() {
+    let out = ok(ursa(&["-c", ".timer on", "-c", "SELECT 1 AS a"]));
+    let last = out.lines().last().unwrap();
+    assert!(last.starts_with("Run Time (s): real "), "{out}");
+    if cfg!(unix) {
+        assert!(last.contains(" user ") && last.contains(" sys "), "{out}");
+    }
+}
+
+/// #328: a column named `from` (a reserved word) works as a key, also once
+/// stored in a database and replayed; a reserved word where SQL cannot take
+/// it says to quote it, at a place in the user's text.
+#[test]
+fn reserved_words_as_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("club.ursa").display().to_string();
+    ok(ursa(&[
+        &db,
+        "-c",
+        "CREATE VIEW follows AS SELECT * FROM (VALUES (1, 2), (2, 3)) t(\"from\", \"to\");
+         CREATE PROPERTY GRAPH g EDGE TABLES (follows SOURCE KEY (from) DESTINATION KEY (to));",
+    ]));
+    let out = ok(ursa(&[
+        &db,
+        "--format",
+        "csv",
+        "-c",
+        "SELECT * FROM degree(g) ORDER BY id",
+    ]));
+    assert_eq!(out, "id,degree\n1,1\n2,1\n3,0\n");
+    assert_eq!(
+        err(ursa(&["-c", "SELECT from, to FROM t"])),
+        "Error: syntax error: Expected: identifier, found: , at Line: 1, Column: 12. `from` is a \
+         reserved word; to use it as a name, quote it: \"from\"\n"
+    );
 }

@@ -15,7 +15,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use arrow::array::{Array, AsArray};
 use arrow::compute::cast;
@@ -26,7 +25,8 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
 
 use crate::input::{self, Status};
-use crate::print::{has_columns, is_broken_pipe, write_stream, OutputFormat};
+use crate::print::{has_columns, is_broken_pipe, write_stream, OutputFormat, DEFAULT_MAX_ROWS};
+use crate::timer::Timer;
 
 /// What the caller does after a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (".graphs", "", "List the graphs (SHOW GRAPHS)"),
     (".help", "", "Show this message"),
     (
+        ".maxrows",
+        "N",
+        "Show at most N rows of a table (default 40; 0 shows all)",
+    ),
+    (
         ".mode",
         "MODE",
         "Set the output mode: table, csv, tsv, json or ndjson",
@@ -85,7 +90,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (".quit", "", "Exit the shell (also Ctrl-D)"),
     (".read", "FILE", "Run the SQL and dot-commands in FILE"),
     (".tables", "", "List the tables and views"),
-    (".timer", "on|off", "Show how long each statement takes"),
+    (
+        ".timer",
+        "on|off",
+        "Show how long each statement takes (real, user and sys)",
+    ),
 ];
 
 /// A shell session: an engine session, the shell's settings, and the
@@ -93,6 +102,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub struct Shell<O: Write, E: Write> {
     ctx: SessionContext,
     mode: OutputFormat,
+    /// How many rows a table shows; 0 shows every row.
+    max_rows: usize,
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
@@ -115,6 +126,7 @@ impl<O: Write, E: Write> Shell<O, E> {
         Self {
             ctx,
             mode,
+            max_rows: DEFAULT_MAX_ROWS,
             timer: false,
             buffer: String::new(),
             depth: 0,
@@ -146,6 +158,10 @@ impl<O: Write, E: Write> Shell<O, E> {
 
     pub fn set_mode(&mut self, mode: OutputFormat) {
         self.mode = mode;
+    }
+
+    pub fn set_max_rows(&mut self, max_rows: usize) {
+        self.max_rows = max_rows;
     }
 
     /// Whether a statement is partly typed (the prompt shows a continuation).
@@ -286,7 +302,7 @@ impl<O: Write, E: Write> Shell<O, E> {
     async fn try_run_sql(&mut self, sql: &str) -> Result<()> {
         let statements = ursa_sql::parse_sql_with_text_for(&self.ctx, sql)?;
         for (statement, text) in statements {
-            let start = Instant::now();
+            let start = Timer::start();
             let frame = ursa_sql::execute_with_text(&self.ctx, statement, &text).await?;
             let stream = frame.execute_stream().await?;
             if has_columns(&stream.schema()) {
@@ -298,12 +314,11 @@ impl<O: Write, E: Write> Shell<O, E> {
                 }
                 let config = self.ctx.state().config().options().format.clone();
                 let options = (&config).try_into()?;
-                write_stream(self.mode, stream, &mut self.out, &options).await?;
+                write_stream(self.mode, stream, &mut self.out, &options, self.max_rows).await?;
                 self.results += 1;
             }
             if self.timer {
-                let seconds = start.elapsed().as_secs_f64();
-                self.say(&format!("Run Time: {seconds:.3}s"));
+                self.say(&start.report());
             }
         }
         Ok(())
@@ -319,6 +334,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             ".quit" | ".exit" => return Flow::Exit,
             ".help" => self.help(),
             ".mode" => self.mode_command(arg),
+            ".maxrows" => self.max_rows_command(arg),
             ".timer" => match arg.to_ascii_lowercase().as_str() {
                 "" => {
                     let state = if self.timer { "on" } else { "off" };
@@ -368,6 +384,23 @@ impl<O: Write, E: Write> Shell<O, E> {
              Docs: {DOCS_URL}\n"
         ));
         self.write_text(&text);
+    }
+
+    fn max_rows_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            let shown = match self.max_rows {
+                0 => "every row".to_string(),
+                n => format!("at most {n} rows"),
+            };
+            self.say(&format!("Tables show {shown}."));
+            return;
+        }
+        match arg.parse::<usize>() {
+            Ok(n) => self.max_rows = n,
+            Err(_) => self.error(&format!(
+                "usage: .maxrows N, a number of rows (0 shows every row); got '{arg}'"
+            )),
+        }
     }
 
     fn mode_command(&mut self, arg: &str) {
@@ -936,8 +969,12 @@ mod tests {
         let lines: Vec<_> = out.lines().collect();
         assert_eq!(lines.len(), 4, "{out}");
         assert_eq!(&lines[..2], ["x", "1"]);
-        assert!(lines[2].starts_with("Run Time: ") && lines[2].ends_with('s'));
-        assert!(lines[3].starts_with("Run Time: "));
+        assert!(
+            lines[2].starts_with("Run Time (s): real ")
+                && lines[2].contains(" user ")
+                && lines[2].contains(" sys ")
+        );
+        assert!(lines[3].starts_with("Run Time (s): real "));
         let (out, _) = feed(&mut shell, &[".timer off", "SELECT 1 AS x;"]).await;
         assert_eq!(out, "x\n1\n");
         let (_, err) = feed(&mut shell, &[".timer maybe"]).await;
@@ -1297,7 +1334,7 @@ mod tests {
         // An Arrow IPC stream starts with its continuation marker.
         assert!(out.starts_with(&[0xff, 0xff, 0xff, 0xff]), "{out:?}");
         assert!(
-            err.starts_with("The output mode is arrow.\nRun Time: "),
+            err.starts_with("The output mode is arrow.\nRun Time (s): real "),
             "{err}"
         );
         // A second result is refused.

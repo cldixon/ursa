@@ -97,8 +97,47 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     with what to write instead, not with a parser error.
   - `TABLESAMPLE` is refused. DataFusion parsed it but read every row, so a
     sample silently returned the whole table.
+- **`ursa`: CLI and semantics polish** (#328).
+  - A table shows at most 40 rows, as DuckDB's does: a longer result shows
+    its first 20 and last 20 rows, three rows of `·` between them, and a
+    footer, `39,650,447 rows (40 shown)`. `.maxrows N` (in the shell, a
+    script or an init file) and `--max-rows N` change it, with 0 for every
+    row; `--max-rows` wins over an init file's `.maxrows`. CSV, TSV, JSON,
+    NDJSON and Arrow still write every row. Before, `FROM degree(g)` on a
+    39.65M-node graph printed 39.65M lines.
+  - SIGINT (Ctrl-C) cancels a `-c`, `-f` or stdin run: `Error: interrupted`
+    on stderr, nothing more on stdout, exit status 130, and the database's
+    lock released. Before, a `louvain` sent SIGINT ran to completion,
+    printed its result and exited 0. In the shell, Ctrl-C still cancels the
+    running statement and returns to the prompt, now also for an algorithm,
+    and the shell exits at once afterwards.
+  - `.timer` reports `Run Time (s): real … user … sys …`, as DuckDB does:
+    CPU time in user code and in the kernel, over all threads, as well as
+    wall time.
+  - A syntax error names a place in the text you wrote. Before, its line and
+    column pointed into the text the `GRAPH_TABLE` and FROM-first rewrites
+    made of it. A reserved word used as a name says to quote it
+    (`` `from` is a reserved word; to use it as a name, quote it: "from" ``).
+  - `SOURCE KEY (from) DESTINATION KEY (to)` works: the FROM-first rewrite
+    no longer reads `(from)` as a query, which gave "Expected: ), found: *".
+  - An unknown column that is part of a name with a `-` in it (`date` from an
+    unquoted `date-created`) says to quote the name.
+  - A date out of a nanosecond timestamp's range in `date_trunc` (or another
+    timestamp function) says to filter the dates or use `extract(year FROM
+    …)`, after arrow's cast error.
+  - Docs: `degree` counts each parallel edge, and its reference shows how to
+    count distinct neighbours; integer division and decimals in "Differences
+    from DuckDB"; convert large vertex CSV files to Parquet once, in the
+    database and statements pages.
 
 ### Changed
+
+- **SQL: `hop` returns `(seed, id, distance)`** (breaking, #328). It
+  returned `(src, dst)`, but its rows are nodes reached from a seed, not
+  edges: `seed` is the seed, `id` a node reached and `distance` (Int64) the
+  fewest steps from the seed to it. Rename `src` to `seed` and `dst` to `id`
+  in queries over `hop`. The Python library's `ur.hop` is unchanged: it still
+  returns an `EdgeFrame` of `(src, dst)`.
 
 - **SQL: a vertex table defines the graph's node set** (behaviour change,
   #311). With `VERTEX TABLES`, every algorithm, statistic, traversal,
