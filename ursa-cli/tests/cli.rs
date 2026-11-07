@@ -1488,7 +1488,17 @@ fn sigint_cancels_a_query() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(130), "{stderr}");
         assert_eq!(output.status.signal(), None);
-        assert_eq!(stderr, "Error: interrupted\n");
+        // Index notices (`ursa: building the index for g…`, #327) may come
+        // first; the last line is the interruption, and nothing else.
+        assert!(stderr.ends_with("Error: interrupted\n"), "{stderr}");
+        assert!(
+            stderr
+                .lines()
+                .rev()
+                .skip(1)
+                .all(|line| line.starts_with("ursa: ")),
+            "{stderr}"
+        );
         // The result that finished stays printed; nothing comes after it.
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
