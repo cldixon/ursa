@@ -108,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     binaries = [b.split("=", 1) if "=" in b else (b, b) for b in args.ursa] or [
         ("ursa", str(REPO / "target" / "release" / "ursa"))
     ]
+    binaries = [(label, str(Path(path).resolve())) for label, path in binaries]
     args.work.mkdir(parents=True, exist_ok=True)
     edges = args.edges.resolve()
     vertices = write_vertices(edges, parse_size(args.vertices), args.work.resolve(), args.seed)
