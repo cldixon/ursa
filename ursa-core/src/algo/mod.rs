@@ -29,6 +29,10 @@ mod linked;
 mod louvain;
 mod neighbor_agg;
 mod pagerank;
+/// Public because it is independently useful — a deterministic spatial index over
+/// 2-D positions — and because `examples/layout_scaling.rs` times the build
+/// separately from the traversal, which is how we know which half to optimize.
+pub mod quadtree;
 mod random_walk;
 mod rng;
 pub use rng::sample_indices;
@@ -50,7 +54,10 @@ pub use hop::{
     k_hop, k_hop_distances_masked, k_hop_masked, k_hop_reached_masked, k_hop_reached_set,
 };
 pub use label_prop::label_propagation;
-pub use layout::{layout_circle, layout_fr, layout_random, LayoutParams, Positions};
+pub use layout::{
+    layout_circle, layout_fa2, layout_fr, layout_random, Fa2Params, Fa2State, LayoutParams,
+    Positions,
+};
 pub use louvain::{louvain, louvain_weighted};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
