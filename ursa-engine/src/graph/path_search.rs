@@ -20,6 +20,19 @@
 //!
 //! The last three are computed only when the query uses them.
 //!
+//! A fixed-length edge next to a bound node is searched too, as one edge
+//! (`{1,1}`) from the nodes already reached (see [`super::pattern`]): each of
+//! its rows is one edge, in edge-row order, so the search's rows are the
+//! join's rows.
+//!
+//! ## Targets
+//!
+//! A search may be given its targets: the keys the last node can have, when
+//! a condition on it alone says so (`b.id = 7`, `b.id IN (…)`). It keeps only
+//! the paths that end at one, and a search with a selector stops as soon as
+//! every target has all its paths: `ANY SHORTEST` from one node to another
+//! looks no further than the target.
+//!
 //! ## Which paths
 //!
 //! The search runs from each start node: every node of the left end's
@@ -52,7 +65,7 @@
 //! one back to its start is a cycle. Otherwise the search lists every path
 //! the mode allows, up to [`MAX_PATHS`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -64,7 +77,7 @@ use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::{concat, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{DFSchema, DFSchemaRef};
+use datafusion::common::{DFSchema, DFSchemaRef, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use ursa_core::{IdMap, Topology};
@@ -179,6 +192,14 @@ pub struct PathSearchNode {
     /// have them: the graph's nodes, as an algorithm's (#311).
     pub vertices: Option<Arc<LogicalPlan>>,
     pub starts: Arc<LogicalPlan>,
+    /// The keys the paths may end at, one column, if they are known (see the
+    /// module docs).
+    pub targets: Option<Arc<LogicalPlan>>,
+    /// Whether every node the starts can name is a node of the index (the
+    /// start node's table is the one the index's nodes are the keys of): a
+    /// start that is not one is no node, so it has no path, not even the
+    /// path of no edges.
+    pub known_only: bool,
     pub source: Expr,
     pub destination: Expr,
     pub id_type: DataType,
@@ -194,6 +215,8 @@ impl PathSearchNode {
         input: Arc<LogicalPlan>,
         vertices: Option<Arc<LogicalPlan>>,
         starts: Arc<LogicalPlan>,
+        targets: Option<Arc<LogicalPlan>>,
+        known_only: bool,
         source: Expr,
         destination: Expr,
     ) -> Result<Self> {
@@ -212,6 +235,8 @@ impl PathSearchNode {
             input,
             vertices,
             starts,
+            targets,
+            known_only,
             source,
             destination,
             id_type,
@@ -240,6 +265,8 @@ impl PartialEq for PathSearchNode {
             && self.input == other.input
             && self.vertices == other.vertices
             && self.starts == other.starts
+            && self.targets == other.targets
+            && self.known_only == other.known_only
             && self.source == other.source
             && self.destination == other.destination
     }
@@ -255,6 +282,8 @@ impl Hash for PathSearchNode {
         self.input.hash(state);
         self.vertices.hash(state);
         self.starts.hash(state);
+        self.targets.hash(state);
+        self.known_only.hash(state);
     }
 }
 
@@ -275,6 +304,7 @@ impl UserDefinedLogicalNodeCore for PathSearchNode {
         let mut inputs = vec![self.input.as_ref()];
         inputs.extend(self.vertices.as_deref());
         inputs.push(&self.starts);
+        inputs.extend(self.targets.as_deref());
         inputs
     }
 
@@ -289,13 +319,20 @@ impl UserDefinedLogicalNodeCore for PathSearchNode {
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "PathSearch: graph={}, search={}",
-            self.graph, self.search
+            "PathSearch: graph={}, search={}{}",
+            self.graph,
+            self.search,
+            if self.targets.is_some() {
+                ", targets"
+            } else {
+                ""
+            }
         )
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        let expected = 2 + usize::from(self.vertices.is_some());
+        let expected =
+            2 + usize::from(self.vertices.is_some()) + usize::from(self.targets.is_some());
         if inputs.len() != expected {
             return Err(DataFusionError::Internal(format!(
                 "PathSearch has {expected} inputs; got {}",
@@ -306,16 +343,18 @@ impl UserDefinedLogicalNodeCore for PathSearchNode {
         let input = inputs.next().expect("checked above");
         let vertices = self.vertices.as_ref().and_then(|_| inputs.next());
         let starts = inputs.next().expect("checked above");
+        let targets = self.targets.as_ref().and_then(|_| inputs.next());
         Ok(Self {
             input,
             vertices,
             starts,
+            targets,
             ..self.clone()
         })
     }
 
-    /// Every input is read whole: the endpoints, the vertex key, and the one
-    /// start column.
+    /// Every input is read whole: the endpoints, the vertex key, the one
+    /// start column and the one target column.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let (source, destination) = self.endpoint_indices().ok()?;
         let mut children = vec![vec![source, destination]];
@@ -323,6 +362,9 @@ impl UserDefinedLogicalNodeCore for PathSearchNode {
             children.push(vec![0]);
         }
         children.push(vec![0]);
+        if self.targets.is_some() {
+            children.push(vec![0]);
+        }
         Some(children)
     }
 
@@ -623,22 +665,184 @@ impl<'a> Rows<'a> {
     }
 }
 
+/// The targets of a search: the dense nodes its paths may end at, each with
+/// a slot, and the target keys that are no node of the index.
+struct Goals {
+    slots: HashMap<u32, u32>,
+    unknown: HashSet<ScalarValue>,
+}
+
+impl Goals {
+    fn new(ids: &IdMap, targets: &ArrayRef) -> Result<Self> {
+        let dense = ids
+            .dense_from_array(targets.as_ref())
+            .map_err(|e| DataFusionError::Execution(format!("in GRAPH_TABLE: {e}")))?;
+        let mut slots = HashMap::new();
+        let mut unknown = HashSet::new();
+        for (row, d) in dense.iter().enumerate() {
+            if targets.is_null(row) {
+                continue;
+            }
+            match d {
+                Some(d) => {
+                    let next = slots.len() as u32;
+                    slots.entry(*d).or_insert(next);
+                }
+                None => {
+                    unknown.insert(ScalarValue::try_from_array(targets.as_ref(), row)?);
+                }
+            }
+        }
+        Ok(Self { slots, unknown })
+    }
+}
+
+/// What one search is doing, apart from its rows.
+struct Walker<'a> {
+    topology: &'a Topology,
+    search: &'a Search,
+    restricted: bool,
+    pruned: bool,
+    states: States,
+    entries: Vec<Entry>,
+    next: Vec<(u32, u32)>,
+    /// Paths listed so far.
+    total: usize,
+    /// Prefixes extended so far.
+    expanded: usize,
+    /// The targets' slots, when a pruned search has targets: their paths are
+    /// known once pushed (see [`Reach`]).
+    slots: Option<&'a HashMap<u32, u32>>,
+    reach: Reach,
+}
+
+/// How far a pruned search with targets has reached them, counting the
+/// prefixes it pushed. A pruned search lists every prefix it pushes to a
+/// target (at `min` edges or more), in the order it pushed them, so once each
+/// target has its `k` (`SHORTEST k`), or its first (`ALL SHORTEST`), no
+/// prefix needs extending any more: for `ALL SHORTEST`, none at the
+/// longest of those lengths or beyond.
+#[derive(Default)]
+struct Reach {
+    /// Per slot, prefixes pushed.
+    pushed: Vec<u32>,
+    touched: Vec<u32>,
+    /// Targets without all their paths yet.
+    unfilled: usize,
+    /// The longest length at which a target was first reached.
+    longest: u32,
+}
+
+impl Reach {
+    fn reset(&mut self, n: usize) {
+        if self.pushed.len() != n {
+            self.pushed = vec![0; n];
+        }
+        for slot in self.touched.drain(..) {
+            self.pushed[slot as usize] = 0;
+        }
+        self.unfilled = n;
+        self.longest = 0;
+    }
+
+    /// Whether a prefix of `len` edges still needs extending.
+    fn extends(&self, len: u32, selector: Selector) -> bool {
+        self.unfilled > 0 || (selector == Selector::AllShortest && len < self.longest)
+    }
+}
+
+impl Walker<'_> {
+    /// Push the prefixes that extend entry `at` by one edge.
+    fn extend(&mut self, at: u32, start: u32) -> Result<()> {
+        let entry = self.entries[at as usize];
+        let min = self.search.quantifier.min;
+        self.expanded += 1;
+        steps(
+            self.topology,
+            self.search.direction,
+            entry.node,
+            &mut self.next,
+        );
+        for &(w, edge) in self.next.iter() {
+            if self.restricted && !allowed(&self.entries, at, w, edge, self.search.mode, start) {
+                continue;
+            }
+            let len = entry.len + 1;
+            if self.pruned {
+                let state = self.states.get(w, len.min(min));
+                let accept = match self.search.selector {
+                    Selector::All => true,
+                    Selector::Shortest(k) => state.0 < k,
+                    Selector::AllShortest => state.0 == 0 || state.1 == len,
+                };
+                if !accept {
+                    continue;
+                }
+                if state.0 == 0 {
+                    state.1 = len;
+                }
+                state.0 += 1;
+            }
+            self.entries.push(Entry {
+                node: w,
+                parent: at,
+                edge,
+                len,
+            });
+            // A pruned search lists this prefix: a target may have its paths.
+            let listed = len >= min && !(self.search.mode == Mode::Acyclic && w == start);
+            if let (true, true, Some(&slot)) =
+                (self.pruned, listed, self.slots.and_then(|s| s.get(&w)))
+            {
+                let reach = &mut self.reach;
+                let pushed = &mut reach.pushed[slot as usize];
+                if *pushed == 0 {
+                    reach.touched.push(slot);
+                    reach.longest = reach.longest.max(len);
+                }
+                *pushed += 1;
+                let filled = match self.search.selector {
+                    Selector::All => false,
+                    Selector::Shortest(k) => *pushed == k,
+                    Selector::AllShortest => *pushed == 1,
+                };
+                if filled {
+                    reach.unfilled -= 1;
+                }
+            }
+            if self.entries.len() + self.total > MAX_PATHS {
+                return Err(DataFusionError::Execution(format!(
+                    "in GRAPH_TABLE: the path search reached {MAX_PATHS} paths; give the quantified edge a lower upper bound, or keep fewer paths with ANY SHORTEST"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Run `search` from each of `starts` (keys of the graph's id type, each
-/// once) on the index `topology`/`ids`; the rows of [`schema`]. `edge_row`
-/// gives the edge table's row of an edge of the index (see
-/// [`super::GraphIndex::edge_row`]).
+/// once) on the index `topology`/`ids`; the rows of [`schema`], and how many
+/// path prefixes the search extended. `edge_row` gives the edge table's row
+/// of an edge of the index (see [`super::GraphIndex::edge_row`]). With
+/// `targets`, only the paths that end at one are kept, and a search with a
+/// selector stops once every target has its paths (see the module docs).
+/// With `known_only`, a start that is no node of the index has no path.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     topology: &Topology,
     ids: &IdMap,
     edge_row: &dyn Fn(u32) -> u64,
     search: &Search,
     starts: &ArrayRef,
+    targets: Option<&ArrayRef>,
+    known_only: bool,
     columns: PathColumns,
     schema: SchemaRef,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<(Vec<RecordBatch>, usize)> {
     let dense = ids
         .dense_from_array(starts.as_ref())
         .map_err(|e| DataFusionError::Execution(format!("in GRAPH_TABLE: {e}")))?;
+    let goals = targets.map(|t| Goals::new(ids, t)).transpose()?;
     let mut rows = Rows::new(ids, starts, columns, schema, edge_row)?;
     let Quantifier { min, max } = search.quantifier;
     let restricted = search.mode != Mode::Walk;
@@ -648,42 +852,77 @@ pub fn run(
             Selector::Shortest(1) | Selector::AllShortest
         ) && min <= 1
             && !(search.mode == Mode::Trail && search.direction == Direction::Any));
-    let mut states = States::new(topology.n_nodes(), min);
+    let mut walker = Walker {
+        topology,
+        search,
+        restricted,
+        pruned,
+        states: States::new(topology.n_nodes(), min),
+        entries: Vec::new(),
+        next: Vec::new(),
+        total: 0,
+        expanded: 0,
+        slots: goals.as_ref().map(|g| &g.slots),
+        reach: Reach::default(),
+    };
     // Per last node, for a search that lists every path: (paths kept, length of the first).
     let mut targets: HashMap<u32, (u32, u32)> = HashMap::new();
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut next = Vec::new();
+    // Per target slot, for this start: (paths kept, length of the first).
+    let mut found: Vec<(u32, u32)> = vec![(0, 0); goals.as_ref().map_or(0, |g| g.slots.len())];
+    let mut touched: Vec<u32> = Vec::new();
     let (mut nodes, mut edges) = (Vec::new(), Vec::new());
-    let mut total = 0usize;
     for (row, start) in dense.iter().enumerate() {
         if starts.is_null(row) {
             continue;
         }
-        let row = row as u32;
         let Some(start) = *start else {
             // A node with no edges: only the path of no edges.
-            if min == 0 {
-                rows.push(row, &[row], &[])?;
+            let ends_at_a_target = match &goals {
+                None => true,
+                Some(g) => g
+                    .unknown
+                    .contains(&ScalarValue::try_from_array(starts.as_ref(), row)?),
+            };
+            if min == 0 && !known_only && ends_at_a_target {
+                rows.push(row as u32, &[row as u32], &[])?;
             }
             continue;
         };
-        states.clear();
+        let row = row as u32;
+        if goals.as_ref().is_some_and(|g| g.slots.is_empty()) {
+            continue; // no target is a node: no path ends at one
+        }
+        for slot in touched.drain(..) {
+            found[slot as usize] = (0, 0);
+        }
+        walker.reach.reset(found.len());
+        // Targets not yet done, and (ALL SHORTEST) the length past which
+        // none has another path once every one is found.
+        let mut remaining = found.len();
+        let mut longest = 0u32;
+        let mut stop_after: Option<u32> = None;
+        walker.states.clear();
         targets.clear();
-        entries.clear();
-        entries.push(Entry {
+        walker.entries.clear();
+        walker.entries.push(Entry {
             node: start,
             parent: ROOT,
             edge: 0,
             len: 0,
         });
-        *states.get(start, 0) = (1, 0);
+        *walker.states.get(start, 0) = (1, 0);
         let mut head = 0;
-        while head < entries.len() {
+        'search: while head < walker.entries.len() {
             let at = head as u32;
-            let entry = entries[head];
+            let entry = walker.entries[head];
             head += 1;
+            if stop_after.is_some_and(|len| entry.len > len) {
+                break;
+            }
             let c = entry.len.min(min);
-            if c == min {
+            // The target slot of the entry's node, when the search has targets.
+            let slot = goals.as_ref().map(|g| g.slots.get(&entry.node).copied());
+            if c == min && slot != Some(None) {
                 let keep = if pruned {
                     true
                 } else {
@@ -705,7 +944,7 @@ pub fn run(
                     edges.clear();
                     let mut i = at;
                     while i != ROOT {
-                        let e = entries[i as usize];
+                        let e = walker.entries[i as usize];
                         nodes.push(rows.dense(e.node));
                         if e.parent != ROOT {
                             edges.push(e.edge);
@@ -715,49 +954,43 @@ pub fn run(
                     nodes.reverse();
                     edges.reverse();
                     rows.push(row, &nodes, &edges)?;
-                    total += 1;
+                    walker.total += 1;
+                    if let Some(Some(slot)) = slot {
+                        let f = &mut found[slot as usize];
+                        if f.0 == 0 {
+                            touched.push(slot);
+                            f.1 = entry.len;
+                        }
+                        f.0 += 1;
+                        let done = match search.selector {
+                            Selector::All => false,
+                            Selector::Shortest(k) => f.0 == k,
+                            Selector::AllShortest => f.0 == 1,
+                        };
+                        if done {
+                            remaining -= 1;
+                            longest = longest.max(f.1);
+                            if remaining == 0 {
+                                match search.selector {
+                                    Selector::AllShortest => stop_after = Some(longest),
+                                    _ => break 'search,
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if max.is_some_and(|max| entry.len >= max) {
                 continue;
             }
-            steps(topology, search.direction, entry.node, &mut next);
-            for &(w, edge) in &next {
-                if restricted && !allowed(&entries, at, w, edge, search.mode, start) {
-                    continue;
-                }
-                let len = entry.len + 1;
-                if pruned {
-                    let state = states.get(w, len.min(min));
-                    let accept = match search.selector {
-                        Selector::All => true,
-                        Selector::Shortest(k) => state.0 < k,
-                        Selector::AllShortest => state.0 == 0 || state.1 == len,
-                    };
-                    if !accept {
-                        continue;
-                    }
-                    if state.0 == 0 {
-                        state.1 = len;
-                    }
-                    state.0 += 1;
-                }
-                entries.push(Entry {
-                    node: w,
-                    parent: at,
-                    edge,
-                    len,
-                });
-                if entries.len() + total > MAX_PATHS {
-                    return Err(DataFusionError::Execution(format!(
-                        "in GRAPH_TABLE: the path search reached {MAX_PATHS} paths; give the quantified edge a lower upper bound, or keep fewer paths with ANY SHORTEST"
-                    )));
-                }
+            if pruned && goals.is_some() && !walker.reach.extends(entry.len, search.selector) {
+                continue; // every target has its paths among those pushed
             }
+            walker.extend(at, start)?;
         }
     }
     rows.flush()?;
-    Ok(rows.batches)
+    Ok((rows.batches, walker.expanded))
 }
 
 #[cfg(test)]
@@ -797,8 +1030,24 @@ mod tests {
     }
 
     /// Each path as (vertices, edges).
-    fn paths(edges: &[(i64, i64)], starts: &[i64], s: Search) -> Vec<(Vec<i64>, Vec<i64>)> {
+    /// A path: its vertices and its edges.
+    type Path = (Vec<i64>, Vec<i64>);
+
+    fn paths(edges: &[(i64, i64)], starts: &[i64], s: Search) -> Vec<Path> {
+        targeted(edges, starts, None, s).0
+    }
+
+    /// Each path as (vertices, edges), searched toward `targets`, and how
+    /// many prefixes the search extended.
+    fn targeted(
+        edges: &[(i64, i64)],
+        starts: &[i64],
+        targets: Option<&[i64]>,
+        s: Search,
+    ) -> (Vec<Path>, usize) {
         let (topology, ids) = index(edges);
+        let targets: Option<ArrayRef> =
+            targets.map(|t| Arc::new(Int64Array::from(t.to_vec())) as ArrayRef);
         let columns = PathColumns {
             vertices: true,
             edges: true,
@@ -806,12 +1055,14 @@ mod tests {
         };
         let schema = Arc::new(super::schema(&DataType::Int64, columns));
         let starts: ArrayRef = Arc::new(Int64Array::from(starts.to_vec()));
-        let batches = run(
+        let (batches, expanded) = run(
             &topology,
             &ids,
             &|e| u64::from(e),
             &s,
             &starts,
+            targets.as_ref(),
+            false,
             columns,
             schema,
         )
@@ -833,7 +1084,57 @@ mod tests {
                 out.push((vs, es));
             }
         }
-        out
+        (out, expanded)
+    }
+
+    /// A search toward targets keeps the paths a search without them finds
+    /// to those targets, in the same order, extending fewer prefixes.
+    #[test]
+    fn targets_keep_the_same_paths_and_stop_early() {
+        // A chain 0 → 1 → … → 9 with a fan out of every node, and shortcuts.
+        let mut edges: Vec<(i64, i64)> = (0..9).map(|i| (i, i + 1)).collect();
+        for i in 0..10 {
+            edges.extend((0..4).map(|j| (i, 100 + 10 * i + j)));
+        }
+        edges.extend([(0, 5), (2, 7), (5, 5), (7, 2), (3, 1)]);
+        let graphs: [&[(i64, i64)]; 2] = [KNOW, &edges];
+        let mut stopped_early = false;
+        for edges in graphs {
+            for direction in [Direction::Right, Direction::Left, Direction::Any] {
+                for selector in [
+                    Selector::All,
+                    Selector::Shortest(1),
+                    Selector::Shortest(2),
+                    Selector::AllShortest,
+                ] {
+                    for mode in [Mode::Walk, Mode::Trail, Mode::Simple, Mode::Acyclic] {
+                        for (min, max) in [(0, Some(3)), (1, None), (2, Some(4)), (1, Some(1))] {
+                            if selector == Selector::All && mode == Mode::Walk && max.is_none() {
+                                continue;
+                            }
+                            let s = search(direction, min, max, selector, mode);
+                            for (starts, targets) in [
+                                (&[0][..], &[3][..]),
+                                (&[0, 4], &[0, 3, 9]),
+                                (&[1, 2], &[2, 77]),
+                                (&[3], &[7, 5, 1]),
+                            ] {
+                                let (all, n_all) = targeted(edges, starts, None, s);
+                                let kept: Vec<_> = all
+                                    .into_iter()
+                                    .filter(|(v, _)| targets.contains(v.last().unwrap()))
+                                    .collect();
+                                let (found, n) = targeted(edges, starts, Some(targets), s);
+                                assert_eq!(found, kept, "{s} from {starts:?} to {targets:?}");
+                                assert!(n <= n_all, "{s}");
+                                stopped_early |= n < n_all;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(stopped_early);
     }
 
     // DuckPGQ's test graph: Daniel 0, Tavneet 1, Gabor 2, Peter 3, David 4.

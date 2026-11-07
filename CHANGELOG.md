@@ -129,6 +129,33 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     count distinct neighbours; integer division and decimals in "Differences
     from DuckDB"; convert large vertex CSV files to Parquet once, in the
     database and statements pages.
+- **`GRAPH_TABLE` through the graph index** (#325). The results are the
+  same; what changes is how a match runs.
+  - A node is *bound* when a condition on it alone names its keys:
+    `a.id = 7`, `a.id IN (1, 2)` or `a.id IN (SELECT …)`. From a bound node,
+    the fixed-length edges of its path are followed on the graph index, the
+    one `hop` uses, each from the nodes the one before reached, rather than
+    joined to the whole edge table: `MATCH (a WHERE a.id = 7)-[]->(b)-[]->(c)`
+    reads only the edges at the nodes it reaches. On a 20M-edge R-MAT graph
+    with a stored index, one edge from a bound node takes about as long as
+    `hop` (see the PR for the numbers).
+  - A node the query reads only the key of is not joined to its vertex
+    table: its key comes from the index. A vertex table is scanned only for
+    the properties the query reads.
+  - A path search whose last node is bound (`(b WHERE b.id = 9)`) stops once
+    it has that node's paths: `ANY SHORTEST` from one node to another takes
+    about as long as `shortest_path`.
+  - `EXPLAIN` shows each edge followed on the index as a `PathSearchExec`
+    of one edge (`-[]->{1,1}`), and `, targets` on a search that stops at
+    its last node; `EXPLAIN ANALYZE` counts the path prefixes each search
+    extended (`expanded`).
+  - Edges are still joined when no node is bound, when the query reads an
+    edge's columns, and when the edge table or its vertex tables are not
+    files or views over files (an in-memory table's index is not kept).
+  - A missing property is named in the pattern's terms: "node 'a' has no
+    property 's'; its properties are club, id", with a hint to name an edge
+    to read its columns, where DataFusion named an internal relation
+    (`__ursa_1.s`).
 
 ### Changed
 

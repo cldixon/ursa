@@ -230,6 +230,46 @@ The bounds count edges, and a shortest path of at least one edge from a node bac
 
 A quantified edge is not a chain of joins. It is a breadth-first search on the graph's index, the one `hop` and `shortest_path` use, starting from the nodes that the first node's conditions keep. Its nodes are the vertex table's keys, as the algorithms' are: a node on no edge has its path of no edges (`{0,…}`), and an edge to or from a value that is no key is not followed, as a fixed-length edge's join leaves it out. A condition on the first node makes the search small. A quantified edge can sit between fixed ones, as in `(s:school)<-[:studyat]-(a)-[:knows]->{1,3}(b)`.
 
+## What is fast
+
+A match is fast when it starts from a few nodes. Name them by their key, in the node or in the pattern's `WHERE`:
+
+- `(a WHERE a.id = 33)`, one node;
+- `(a WHERE a.id IN (0, 33))`, a list;
+- `WHERE a.id IN (SELECT id FROM members WHERE club = 'Officer')`, a subquery. For now, a table that a subquery inside the pattern reads must also be named in the statement outside the `GRAPH_TABLE`, as in `… FROM GRAPH_TABLE (…) g JOIN members m ON m.id = g.id`; otherwise it is reported as not found.
+
+Such a node is *bound*. From a bound node, every edge of its path is followed on the graph index, outward from it, one edge at a time from the nodes the edge before reached: `MATCH (a WHERE a.id = 33)-[]-(b)-[]-(c)` reads only the edges at member 33 and at its neighbours, never the whole edge table. With the index stored in a database, that takes about as long as `hop(karate, seeds => [33], n => 2)`. The bound node can be anywhere in the path; the edges on its left are followed backward.
+
+A node whose key is all the query reads (in `COLUMNS` and the conditions) is not joined to its vertex table: its keys come from the index. The vertex table is read only for the properties the query asks for, such as `c.club`.
+
+A path search whose last node is bound stops as soon as it has that node's paths. The shortest way from member 16 to member 26 looks no further than member 26, as `shortest_path(karate, source => 16, target => 26)` does:
+
+```sql
+SELECT steps
+FROM GRAPH_TABLE (karate
+  MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26)
+  COLUMNS (path_length(p) AS steps)
+);
+```
+
+```text
++-------+
+| steps |
++-------+
+| 5     |
++-------+
+```
+
+`EXPLAIN` shows the plan: each edge followed on the index is a `PathSearchExec` of one edge (`-[]->{1,1}`), a search that stops at its last node says `, targets`, and `EXPLAIN ANALYZE` counts how many paths each one extended (`expanded=`). Edges are joined instead, as in a plain SQL join of the edge and vertex tables, when:
+
+- no node of the path is bound (a condition such as `a.club = 'Officer'` keeps nodes, but does not name them);
+- the query reads an edge's columns (`e.since`): that edge, and the edges beyond it, are joined;
+- the edge table or a vertex table it references is not a file or a view over files: an in-memory table's index is built again for every query, so a join is cheaper.
+
+Either way, the rows are the same.
+
+**Keep large vertex tables in Parquet.** A query that reads a vertex table's properties scans it, and a gzipped CSV file is read whole on every scan; a Parquet file reads only the columns asked for, and can skip the rest. `COPY (SELECT * FROM 'nodes.csv.gz') TO 'nodes.parquet'` converts one.
+
 ## What is not supported yet
 
 These are refused with a message:
