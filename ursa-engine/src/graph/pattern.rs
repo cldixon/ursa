@@ -664,6 +664,9 @@ pub struct Source {
     pub joined: bool,
 }
 
+/// A variable's columns, as [`Source::columns`] lists them.
+type Columns = Option<Vec<(String, String)>>;
+
 /// A condition the lowering adds.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Join {
@@ -1042,8 +1045,7 @@ pub fn lower(
     let is_searched = |i: usize| searched.iter().any(|(s, ..)| *s == i);
 
     // Each node variable's columns, and its key's property names.
-    let mut node_columns: BTreeMap<&str, (TableReference, Option<Vec<(String, String)>>)> =
-        BTreeMap::new();
+    let mut node_columns: BTreeMap<&str, (TableReference, Columns)> = BTreeMap::new();
     for var in &order {
         let b = &bindings[var];
         if b.is_edge {

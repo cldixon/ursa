@@ -171,16 +171,18 @@ def main(argv: list[str] | None = None) -> int:
         CREATE VIEW vgz AS SELECT * FROM '{gz.resolve()}';
         CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (src) DESTINATION KEY (dst));
         CREATE PROPERTY GRAPH gv VERTEX TABLES (v KEY (id))
-          EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+          EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id)
+                         DESTINATION KEY (dst) REFERENCES v (id));
         CREATE PROPERTY GRAPH gz VERTEX TABLES (vgz KEY (id))
-          EDGE TABLES (e SOURCE KEY (src) REFERENCES vgz (id) DESTINATION KEY (dst) REFERENCES vgz (id));
+          EDGE TABLES (e SOURCE KEY (src) REFERENCES vgz (id)
+                         DESTINATION KEY (dst) REFERENCES vgz (id));
         SELECT count(*) FROM hop(g, seeds => [{seed}], n => 1);
         SELECT count(*) FROM hop(gv, seeds => [{seed}], n => 1);
         SELECT count(*) FROM hop(gz, seeds => [{seed}], n => 1);
     """
     run(args.ursa, db, define)
     print(f"{edges.name}: seed {seed}, target {target}", file=sys.stderr)
-    print(f"| step | median s | result |\n|---|---|---|")
+    print("| step | median s | result |\n|---|---|---|")
     for name, sql in steps(seed, target):
         times, result = [], ""
         for _ in range(args.repeat):

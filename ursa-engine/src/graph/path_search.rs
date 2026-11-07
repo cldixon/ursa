@@ -1030,7 +1030,10 @@ mod tests {
     }
 
     /// Each path as (vertices, edges).
-    fn paths(edges: &[(i64, i64)], starts: &[i64], s: Search) -> Vec<(Vec<i64>, Vec<i64>)> {
+    /// A path: its vertices and its edges.
+    type Path = (Vec<i64>, Vec<i64>);
+
+    fn paths(edges: &[(i64, i64)], starts: &[i64], s: Search) -> Vec<Path> {
         targeted(edges, starts, None, s).0
     }
 
@@ -1041,7 +1044,7 @@ mod tests {
         starts: &[i64],
         targets: Option<&[i64]>,
         s: Search,
-    ) -> (Vec<(Vec<i64>, Vec<i64>)>, usize) {
+    ) -> (Vec<Path>, usize) {
         let (topology, ids) = index(edges);
         let targets: Option<ArrayRef> =
             targets.map(|t| Arc::new(Int64Array::from(t.to_vec())) as ArrayRef);

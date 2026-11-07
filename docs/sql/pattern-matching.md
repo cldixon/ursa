@@ -245,10 +245,10 @@ A node whose key is all the query reads (in `COLUMNS` and the conditions) is not
 A path search whose last node is bound stops as soon as it has that node's paths. The shortest way from member 16 to member 26 looks no further than member 26, as `shortest_path(karate, source => 16, target => 26)` does:
 
 ```sql
-SELECT path_length(p) AS steps
+SELECT steps
 FROM GRAPH_TABLE (karate
   MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26)
-  COLUMNS (path_length(p))
+  COLUMNS (path_length(p) AS steps)
 );
 ```
 
