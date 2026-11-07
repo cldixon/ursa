@@ -1,7 +1,7 @@
 [package]
 name = "ursa-viz"
 description = "Ursa's graph view: a live ForceAtlas2 layout drawn with wgpu (WebGPU, WebGL2, or native), for the SQL shell and the DataFrame API alike."
-version = "0.8.0"
+version = "0.9.0-dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,7 +21,7 @@ web = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sy
 [dependencies]
 # Serial ursa-core: the browser has one thread, and the layout is the same
 # bits either way.
-ursa-core = { path = "../ursa-core", version = "0.8.0", default-features = false }
+ursa-core = { path = "../ursa-core", version = "0.9.0-dev", default-features = false }
 # Backends per target: WebGPU, falling back to WebGL2, in the browser. A native
 # window would add Vulkan, Metal and DX12 here.
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "wgsl"] }
