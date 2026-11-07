@@ -14,7 +14,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   command-line tool** (crate `ursa-cli`, released as 0.6.0 on 2026-11-06;
   the engine crates are `ursa-engine` and `ursa-sql`). This is its first
   release. It is versioned apart from the Python package. Changes on `main`
-  since then are released as `ursa-cli` 0.7.0 (2026-11-06).
+  since then are released as `ursa-cli` 0.7.0 (2026-11-06) and 0.8.0
+  (2026-11-07).
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
@@ -256,7 +257,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   type (#313). The Python library is unchanged.
 - **The five crates `ursa-cli` installs from crates.io** (`ursa-core`,
   `ursa-io`, `ursa-engine`, `ursa-sql`, `ursa-cli`) are released together at
-  one version, `0.7.0` for this release. `ursa-core` and `ursa-io` no longer follow the
+  one version, since 0.7.0. `ursa-core` and `ursa-io` no longer follow the
   Python package's version, and the release workflow refuses a tag where any
   of the five differ. A development build's `ursa --version` names its commit,
   for example `ursa 0.7.0-dev (a1b2c3d4e)`. Releases publish to crates.io by
