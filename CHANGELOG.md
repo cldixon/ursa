@@ -266,7 +266,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   Run workflow on `main`, with `release` and the version. The run builds and
   tests every target, then tags the commit it built; publishing still waits
   for the maintainer's approval. Pushing a tag works as before.
-- **Stable and nightly channels for `ursa-cli`** (#323). A stable release now
+- **Stable and nightly channels for `ursa-cli`** (#323, after 0.8.0). A stable release now
   starts by itself when a release PR is merged: the merge to `main` that sets
   a new release version builds every target, tags the commit, publishes to
   crates.io with no approval step, and makes the GitHub Release. Every merge
@@ -276,7 +276,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   (or `sh -s -- --nightly`), or `$env:URSA_CHANNEL = 'nightly'` before the
   PowerShell installer. The default stays stable. A nightly's
   `ursa --version` names its version, date and commit, for example
-  `ursa 0.8.0-nightly.20261107 (a1b2c3d4e)`.
+  `ursa 0.9.0-nightly.20261107 (a1b2c3d4e)`.
 - **Behaviour change:** `.functions` lists each graph function's name,
   family and the first sentence of its summary; before, it printed every
   column of `ursa_functions()`, too wide to read. A statement that returns

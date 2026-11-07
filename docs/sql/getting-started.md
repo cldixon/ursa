@@ -73,7 +73,7 @@ $env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | 
 The download is checked against its SHA-256 checksum, as a stable one is. A nightly names its version, build date and commit:
 
 ```text
-ursa 0.8.0-nightly.20261107 (a1b2c3d4e)
+ursa 0.9.0-nightly.20261107 (a1b2c3d4e)
 ```
 
 Only the newest nightly is kept, on the [`nightly` release](https://github.com/cldixon/ursa/releases/tag/nightly). To go back to stable, run the installer again without the nightly option (in PowerShell, `Remove-Item Env:URSA_CHANNEL` first). When you report a bug, include the output of `ursa --version`: it says which channel and commit you have. To build `main` yourself instead: `cargo install --git https://github.com/cldixon/ursa ursa-cli`.
