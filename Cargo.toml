@@ -66,10 +66,12 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 
-# A quicker browser build for CI's parity test: optimized enough to run fast in
-# Chromium, without the minutes of whole-program LTO.
+# A quicker browser build for CI's parity test: without the minutes of
+# whole-program LTO, but at the release build's opt-level, so the test runs
+# the code the shell ships. (rustc miscompiled a GRAPH_TABLE search at "s" and
+# "z" only; at opt-level 1 the test passed while the shell panicked.)
 [profile.wasm-test]
 inherits = "dev"
-opt-level = 1
+opt-level = "z"
 debug = false
 incremental = false

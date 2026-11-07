@@ -920,9 +920,21 @@ pub fn run(
                 break;
             }
             let c = entry.len.min(min);
-            // The target slot of the entry's node, when the search has targets.
-            let slot = goals.as_ref().map(|g| g.slots.get(&entry.node).copied());
-            if c == min && slot != Some(None) {
+            // The target slot of the entry's node, when the search has targets;
+            // with targets, a node that is none of them ends no path.
+            //
+            // Two plain values rather than one `Option<Option<u32>>`: rustc
+            // 1.97 at `opt-level` "s" and "z" (the browser engine's build)
+            // matched `Some(Some(_))` on a `None` here, and indexed `found`
+            // out of bounds. The browser parity test runs GRAPH_TABLE at "z".
+            let (slot, ends_here) = match &goals {
+                None => (None, true),
+                Some(g) => {
+                    let slot = g.slots.get(&entry.node).copied();
+                    (slot, slot.is_some())
+                }
+            };
+            if c == min && ends_here {
                 let keep = if pruned {
                     true
                 } else {
@@ -955,7 +967,7 @@ pub fn run(
                     edges.reverse();
                     rows.push(row, &nodes, &edges)?;
                     walker.total += 1;
-                    if let Some(Some(slot)) = slot {
+                    if let Some(slot) = slot {
                         let f = &mut found[slot as usize];
                         if f.0 == 0 {
                             touched.push(slot);
