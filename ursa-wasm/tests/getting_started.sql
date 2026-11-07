@@ -123,6 +123,19 @@ SELECT * FROM hop(karate,
 SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'both');
 SELECT * FROM random_walk(karate, start => [0, 1], steps => 4, walks_per_node => 2, seed => 7);
 
+-- @step Match patterns
+-- GRAPH_TABLE is SQL/PGQ's pattern matching: nodes in parentheses, edges in
+-- brackets, COLUMNS for what each match returns. A quantified edge searches
+-- paths: the shortest way from member 16 to member 26.
+SELECT * FROM GRAPH_TABLE (karate
+  MATCH (a WHERE a.id = 0)-[e]-(b WHERE b.club = 'Officer')
+  COLUMNS (b.id AS member)
+) ORDER BY member;
+SELECT * FROM GRAPH_TABLE (karate
+  MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26)
+  COLUMNS (path_length(p) AS steps, vertices(p) AS members)
+);
+
 -- @step Find out what is available
 -- SHOW GRAPHS and DESCRIBE GRAPH describe what is defined; ursa_functions()
 -- lists every graph function with its parameters.
