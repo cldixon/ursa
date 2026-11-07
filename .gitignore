@@ -30,3 +30,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# ursa-viz: the wasm-bindgen output the demo loads
+ursa-viz/pkg/
+ursa-viz/node_modules

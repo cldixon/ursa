@@ -416,6 +416,7 @@ fn layout_params(iterations: u32, k: f64, gravity: f64, seed: Option<u64>) -> La
         k: k as f32,
         gravity: gravity as f32,
         seed,
+        ..LayoutParams::default()
     }
 }
 
