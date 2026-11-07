@@ -332,6 +332,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
+  pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc
+  miscompiled the path search's target check at `opt-level` "s" and "z",
+  the browser engine's build, and indexed past the end of an empty list;
+  the check is written without the nested `Option` it miscompiled. CI's
+  browser test now builds at "z" too, and runs a `GRAPH_TABLE` step.
+
 - A CSV file DataFusion cannot read is named by its path, with its leading
   `/` (`cannot read /Users/me/x.csv: …`), not by its object store location
   (`Error when processing CSV file Users/me/x.csv`); stored index keys keep
