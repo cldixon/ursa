@@ -32,10 +32,11 @@ ursa club.ursa -f query.sql                             # SQL from a file (--fil
 ursa --skill                                            # this guide, for the version installed
 ```
 
-- Use `--format json` (an array of objects) or `--format ndjson` whenever you read results yourself. `--format csv` for files. The default `table` is for people.
+- Use `--format json` (an array of objects) or `--format ndjson` whenever you read results yourself. `--format csv` for files. The default `table` is for people: it shows at most 40 rows (the first and last 20, then a footer such as `1,234 rows (40 shown)`); `--max-rows 0` shows every row. The other formats write every row.
 - Separate statements in one `-c` with `;`. They run in order.
 - A `-f` file or stdin may hold the shell's dot-commands, one a line, as in DuckDB: `.mode json`, `.timer on`, `.read other.sql`, `.functions pagerank` (one function's parameters, one a line). A syntax error anywhere in a file runs none of it; otherwise the first error stops the run.
 - A statement that returns rows prints a header even with no rows. DDL (`CREATE`, `DROP`) and `SET` print nothing.
+- SIGINT (Ctrl-C) cancels a run: `ursa` prints `Error: interrupted` to stderr, writes nothing more to stdout, and exits with status 130.
 - On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix. DuckDB-only syntax (`SUMMARIZE`, `USING SAMPLE`, `PIVOT`, `PRAGMA`) is refused with what to write instead.
 - With no `-c`, `--file` or stdin, `ursa` starts an interactive shell and waits for input. Don't start it from an agent.
 
@@ -211,7 +212,7 @@ ORDER BY club;
 
 ## Traversals
 
-Traversals return edges or walk steps, not one row per node. A node-id argument takes a list literal (`[0, 1]`, `['Valjean']`), one id, or a subquery of one column:
+Traversals return rows of their own (nodes reached, path edges or walk steps), not one row per node of the graph. A node-id argument takes a list literal (`[0, 1]`, `['Valjean']`), one id, or a subquery of one column:
 
 ```sql
 SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'both');
@@ -233,7 +234,7 @@ FROM hop(karate,
          n => 2);
 ```
 
-- `hop(g, seeds =>, n =>, direction =>)`: one `(src, dst)` row per seed and node reached within `n` steps.
+- `hop(g, seeds =>, n =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `n` steps; `distance` is the fewest steps from the seed. The seed itself is not a row.
 - `shortest_path(g, source =>, target =>, weight =>, direction =>)`: one edge per row with `hop` and `cost`. Exactly one source and one target.
 - `random_walk(g, start =>, steps =>, walks_per_node =>, seed =>)`: one row per step.
 
@@ -278,7 +279,9 @@ ORDER BY b.club;
 - Define each view and graph once per database, not before every query. Check `SHOW GRAPHS` first; use `CREATE OR REPLACE` to redefine.
 - The file does not store rows. `CREATE TABLE ... AS`, `INSERT`, `UPDATE` and `DELETE` are refused. Write results with `COPY (SELECT ...) TO 'out.parquet'` and define a view over the file.
 - Relative paths are stored relative to the database's directory.
-- One writer at a time. Use `--readonly` to read a database another process has open.
+- One writer at a time. Use `--readonly` to read a database another process has open. A read-only process stores no indexes, so run a big graph's first query without it.
+- Stored indexes are capped by `ursa.index_storage_limit` (4GiB by default). `SET` in a writable database is stored in it and lasts. A big graph (tens of millions of edges) may need more: set it before the first query.
+- Notices go to stderr, never stdout, as lines starting `ursa: `: a slow index build, an index not stored or evicted. A `not stored` notice says the next process builds it again, and how to keep it. `--quiet` or `SET ursa.notices = 'off'` silences them; `'all'` reports every build and load.
 
 ## Common mistakes
 
@@ -388,7 +391,7 @@ CREATE VIEW strong_ties AS SELECT * FROM lesmis_edges WHERE weight >= 3;
 CREATE PROPERTY GRAPH lesmis_strong
   EDGE TABLES (strong_ties SOURCE KEY (src) DESTINATION KEY (dst));
 
-SELECT count(DISTINCT dst) AS reached
+SELECT count(DISTINCT id) AS reached
 FROM hop(lesmis_strong, seeds => ['Valjean'], n => 2, direction => 'both');
 ```
 

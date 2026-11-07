@@ -97,6 +97,38 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     with what to write instead, not with a parser error.
   - `TABLESAMPLE` is refused. DataFusion parsed it but read every row, so a
     sample silently returned the whole table.
+- **`ursa`: CLI and semantics polish** (#328).
+  - A table shows at most 40 rows, as DuckDB's does: a longer result shows
+    its first 20 and last 20 rows, three rows of `·` between them, and a
+    footer, `39,650,447 rows (40 shown)`. `.maxrows N` (in the shell, a
+    script or an init file) and `--max-rows N` change it, with 0 for every
+    row; `--max-rows` wins over an init file's `.maxrows`. CSV, TSV, JSON,
+    NDJSON and Arrow still write every row. Before, `FROM degree(g)` on a
+    39.65M-node graph printed 39.65M lines.
+  - SIGINT (Ctrl-C) cancels a `-c`, `-f` or stdin run: `Error: interrupted`
+    on stderr, nothing more on stdout, exit status 130, and the database's
+    lock released. Before, a `louvain` sent SIGINT ran to completion,
+    printed its result and exited 0. In the shell, Ctrl-C still cancels the
+    running statement and returns to the prompt, now also for an algorithm,
+    and the shell exits at once afterwards.
+  - `.timer` reports `Run Time (s): real … user … sys …`, as DuckDB does:
+    CPU time in user code and in the kernel, over all threads, as well as
+    wall time.
+  - A syntax error names a place in the text you wrote. Before, its line and
+    column pointed into the text the `GRAPH_TABLE` and FROM-first rewrites
+    made of it. A reserved word used as a name says to quote it
+    (`` `from` is a reserved word; to use it as a name, quote it: "from" ``).
+  - `SOURCE KEY (from) DESTINATION KEY (to)` works: the FROM-first rewrite
+    no longer reads `(from)` as a query, which gave "Expected: ), found: *".
+  - An unknown column that is part of a name with a `-` in it (`date` from an
+    unquoted `date-created`) says to quote the name.
+  - A date out of a nanosecond timestamp's range in `date_trunc` (or another
+    timestamp function) says to filter the dates or use `extract(year FROM
+    …)`, after arrow's cast error.
+  - Docs: `degree` counts each parallel edge, and its reference shows how to
+    count distinct neighbours; integer division and decimals in "Differences
+    from DuckDB"; convert large vertex CSV files to Parquet once, in the
+    database and statements pages.
 
 ### Changed
 
@@ -130,6 +162,49 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a community, so `count(DISTINCT louvain)` counts them; count
   communities of more than one member with `GROUP BY louvain HAVING
   count(*) > 1`.
+- **SQL: `hop` returns `(seed, id, distance)`** (breaking, #328). It
+  returned `(src, dst)`, but its rows are nodes reached from a seed, not
+  edges: `seed` is the seed, `id` a node reached and `distance` (Int64) the
+  fewest steps from the seed to it. Rename `src` to `seed` and `dst` to `id`
+  in queries over `hop`. The Python library's `ur.hop` is unchanged: it still
+  returns an `EdgeFrame` of `(src, dst)`.
+- **SQL: notices about stored indexes and slow builds** (#327). The engine
+  says, one line each, what it does on its own that a user waits for or
+  loses; `ursa` prints them on stderr as `ursa: …`, so stdout holds only
+  results. At `ursa.notices = 'on'` (the default): an index build that runs
+  for more than a second (`building the index for g (95.7M edges)…`, then
+  `built … in 30.7 s; stored in club.ursa (1.4 GiB)`), and every index not
+  stored (larger than `ursa.index_storage_limit`, with the `SET` that keeps
+  it; or the database is read-only), evicted, or whose write failed. `'all'`
+  adds every build, load and store; `'off'` and `ursa --quiet` (`-q`) print
+  none.
+- **SQL: the lock error names the other process** and suggests
+  `ursa --readonly` to query meanwhile (#327).
+
+### Changed
+
+- **SQL: `ursa.index_storage_limit` belongs to the database** (behaviour
+  change, #327). `SET` in a writable database is stored in the catalog
+  (a new `settings` object; older versions ignore it), applied when the
+  database is opened and shown by `SHOW`; `RESET` goes back to the default.
+  Stored indexes obey only the stored limit or the default: a read-only or
+  in-memory session's `SET` lasts for that session and never evicts, so a
+  temporary small limit can no longer delete a large stored index. Eviction
+  runs only to make room for an index being stored, least recently used
+  first, evicting no more than it must and never an index a running query
+  uses; if those leave no room, nothing is evicted and the new index is not
+  stored.
+- **SQL: a portable stored-index key** (#327). Paths inside the database's
+  directory are part of the key relative to it, so a database moved with its
+  data keeps its stored indexes; a file named in `FROM` is keyed by what it
+  reads rather than the name it was written as, so a view defined in this
+  process and the same view replayed later share an index; and only the file
+  options that change what is read are in it, not DataFusion's `Debug` text
+  of every listing option, so an unrelated setting or a DataFusion upgrade no
+  longer invalidates every index. The manifest is version 2: indexes stored
+  by earlier versions are removed once by the first writer (with a notice)
+  and built again when first used, never read under the old key.
+
 - **SQL: a vertex table defines the graph's node set** (behaviour change,
   #311). With `VERTEX TABLES`, every algorithm, statistic, traversal,
   `neighbors_agg` and `GRAPH_TABLE` path search runs on the vertex table's
@@ -229,6 +304,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- A CSV file DataFusion cannot read is named by its path, with its leading
+  `/` (`cannot read /Users/me/x.csv: …`), not by its object store location
+  (`Error when processing CSV file Users/me/x.csv`); stored index keys keep
+  local paths whole too (#327).
+- `RESET ursa.<setting>` works; DataFusion refused it for Ursa's settings.
 - `ursa --format csv … | head` (and `tsv`) ends quietly with status 0 once
   the reader is gone, as the other formats do. Before, it printed "Error: Csv
   error: Broken pipe" and exited 1 (#317).

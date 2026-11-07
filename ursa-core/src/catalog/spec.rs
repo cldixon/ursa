@@ -285,7 +285,10 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
     FunctionSpec {
         name: "degree",
         family: Family::Algorithm,
-        summary: "Per-node degree.",
+        summary: "Per-node degree. Every edge counts, so parallel edges each count once. For \
+                  the number of distinct neighbours, count them: count(DISTINCT dst) over the \
+                  edge table grouped by src, or count(*) over hop(g, seeds => [id]), which \
+                  reaches each neighbour once.",
         networkx: Some("G.out_degree() (in: G.in_degree(); both: U.degree() on a simple graph)"),
         params: &[DIRECTION_ALL],
         outputs: &[out("degree", ColumnType::UInt32)],

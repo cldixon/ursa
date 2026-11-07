@@ -104,49 +104,49 @@ async fn traversals_match_getting_started() {
     assert_eq!(
         out,
         "\
-+-----+-----+
-| src | dst |
-+-----+-----+
-| 9   | 33  |
-| 14  | 32  |
-| 14  | 33  |
-| 15  | 32  |
-| 15  | 33  |
-| 18  | 32  |
-| 18  | 33  |
-| 20  | 32  |
-| 20  | 33  |
-| 22  | 32  |
-| 22  | 33  |
-| 23  | 25  |
-| 23  | 27  |
-| 23  | 29  |
-| 23  | 32  |
-| 23  | 33  |
-| 23  | 31  |
-| 24  | 25  |
-| 24  | 27  |
-| 24  | 31  |
-| 24  | 33  |
-| 24  | 32  |
-| 25  | 31  |
-| 25  | 32  |
-| 25  | 33  |
-| 26  | 29  |
-| 26  | 33  |
-| 26  | 32  |
-| 27  | 33  |
-| 28  | 31  |
-| 28  | 33  |
-| 28  | 32  |
-| 29  | 32  |
-| 29  | 33  |
-| 30  | 32  |
-| 30  | 33  |
-| 31  | 32  |
-| 31  | 33  |
-| 32  | 33  |
-+-----+-----+"
++------+----+----------+
+| seed | id | distance |
++------+----+----------+
+| 9    | 33 | 1        |
+| 14   | 32 | 1        |
+| 14   | 33 | 1        |
+| 15   | 32 | 1        |
+| 15   | 33 | 1        |
+| 18   | 32 | 1        |
+| 18   | 33 | 1        |
+| 20   | 32 | 1        |
+| 20   | 33 | 1        |
+| 22   | 32 | 1        |
+| 22   | 33 | 1        |
+| 23   | 25 | 1        |
+| 23   | 27 | 1        |
+| 23   | 29 | 1        |
+| 23   | 32 | 1        |
+| 23   | 33 | 1        |
+| 23   | 31 | 2        |
+| 24   | 25 | 1        |
+| 24   | 27 | 1        |
+| 24   | 31 | 1        |
+| 24   | 33 | 2        |
+| 24   | 32 | 2        |
+| 25   | 31 | 1        |
+| 25   | 32 | 2        |
+| 25   | 33 | 2        |
+| 26   | 29 | 1        |
+| 26   | 33 | 1        |
+| 26   | 32 | 2        |
+| 27   | 33 | 1        |
+| 28   | 31 | 1        |
+| 28   | 33 | 1        |
+| 28   | 32 | 2        |
+| 29   | 32 | 1        |
+| 29   | 33 | 1        |
+| 30   | 32 | 1        |
+| 30   | 33 | 1        |
+| 31   | 32 | 1        |
+| 31   | 33 | 1        |
+| 32   | 33 | 1        |
++------+----+----------+"
     );
     let out = table(
         &ctx,
@@ -225,7 +225,12 @@ async fn node_ids_three_ways() {
     let out = table(&ctx, "SELECT * FROM hop(karate, seeds => [33, 32])")
         .await
         .unwrap();
-    assert!(out.starts_with("+-----+-----+\n| src | dst |\n+-----+-----+\n| 32  | 33  |"));
+    assert!(
+        out.starts_with(
+            "+------+----+----------+\n| seed | id | distance |\n+------+----+----------+\n| 32   | 33 | 1        |"
+        ),
+        "{out}"
+    );
     let out = table(
         &ctx,
         "SELECT * FROM hop(lesmis, seeds => ['Valjean', 'Marius'], direction => 'both')",
@@ -273,14 +278,13 @@ async fn schemas() {
     let out = table(&ctx, &describe("SELECT * FROM hop(karate, seeds => [0])"))
         .await
         .unwrap();
-    assert!(
-        out.contains("| src         | Int64     | NO          |"),
-        "{out}"
-    );
-    assert!(
-        out.contains("| dst         | Int64     | NO          |"),
-        "{out}"
-    );
+    for column in [
+        "| seed        | Int64     | NO          |",
+        "| id          | Int64     | NO          |",
+        "| distance    | Int64     | NO          |",
+    ] {
+        assert!(out.contains(column), "{out}");
+    }
     let out = table(
         &ctx,
         &describe("SELECT * FROM shortest_path(lesmis, source => 'a', target => 'b')"),
@@ -396,8 +400,8 @@ async fn seed_subqueries_run_with_the_query() {
     let batches = frame.collect().await.unwrap();
     let out = pretty_format_batches(&batches).unwrap().to_string();
     // Member 1's friends, not member 0's.
-    assert!(out.contains("| 1   | 2   |"), "{out}");
-    assert!(!out.contains("| 0   |"), "{out}");
+    assert!(out.contains("| 1    | 2  | 1        |"), "{out}");
+    assert!(!out.contains("| 0    |"), "{out}");
 }
 
 /// Traversals and algorithms over one graph share one index.
@@ -432,7 +436,7 @@ async fn traversals_compose() {
         &ctx,
         "SELECT n.club, count(*) AS reached
          FROM hop(karate, seeds => [0], n => 2, direction => 'both') AS h
-         JOIN karate.nodes AS n ON h.dst = n.id
+         JOIN karate.nodes AS n ON h.id = n.id
          GROUP BY n.club ORDER BY n.club",
     )
     .await
@@ -451,7 +455,7 @@ async fn traversals_compose() {
     assert_eq!(
         rows(
             &ctx,
-            "SELECT * FROM hop(karate, seeds => [0], direction => 'both') WHERE dst > 10"
+            "SELECT * FROM hop(karate, seeds => [0], direction => 'both') WHERE id > 10"
         )
         .await,
         7
@@ -467,7 +471,7 @@ async fn traversals_compose() {
     // Unaliased, the columns are qualified by the function's name.
     rows(
         &ctx,
-        "SELECT hop.dst FROM hop(karate, seeds => [0]) WHERE hop.src = 0",
+        "SELECT hop.id FROM hop(karate, seeds => [0]) WHERE hop.seed = 0",
     )
     .await;
 }

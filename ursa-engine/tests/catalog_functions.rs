@@ -661,8 +661,9 @@ random_walk,seed,integer or NULL,NULL
         .await,
         "\
 name,output,type
-hop,src,Int64 or Utf8
-hop,dst,Int64 or Utf8
+hop,seed,Int64 or Utf8
+hop,id,Int64 or Utf8
+hop,distance,Int64
 shortest_path,src,Int64 or Utf8
 shortest_path,dst,Int64 or Utf8
 shortest_path,hop,Int64

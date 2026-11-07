@@ -18,12 +18,20 @@ use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::parser::byte_offset;
+use crate::source_map::Rewritten;
 
 /// `sql` with `SELECT * ` before each FROM-first query's `FROM` that has no
 /// `SELECT`. Text that does not tokenize is returned as it is.
-pub fn rewrite_from_first(sql: &str, dialect: &dyn Dialect) -> String {
+#[cfg(test)]
+fn rewrite_from_first(sql: &str, dialect: &dyn Dialect) -> String {
+    rewrite_from_first_mapped(sql, dialect).text
+}
+
+/// [`rewrite_from_first`], with a record of what it inserted.
+pub(crate) fn rewrite_from_first_mapped(sql: &str, dialect: &dyn Dialect) -> Rewritten {
+    let mut out = Rewritten::new(sql.len());
     let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize_with_location() else {
-        return sql.to_string();
+        return out.finish(sql);
     };
     let tokens: Vec<&TokenWithSpan> = tokens
         .iter()
@@ -35,22 +43,31 @@ pub fn rewrite_from_first(sql: &str, dialect: &dyn Dialect) -> String {
     };
     let mut inserts = Vec::new();
     for i in 0..tokens.len() {
-        if !word(i, "FROM") || !starts_query(&tokens, i, &word) || has_select(&tokens, i, &word) {
+        if !word(i, "FROM")
+            || !starts_query(&tokens, i, &word)
+            || !names_a_table(&tokens, i)
+            || has_select(&tokens, i, &word)
+        {
             continue;
         }
         if let Some(at) = byte_offset(sql, tokens[i].span.start) {
             inserts.push(at);
         }
     }
-    let mut out = String::with_capacity(sql.len() + 9 * inserts.len());
-    let mut copied = 0;
     for at in inserts {
-        out.push_str(&sql[copied..at]);
-        out.push_str("SELECT * ");
-        copied = at;
+        out.replace(sql, at, at, "SELECT * ");
     }
-    out.push_str(&sql[copied..]);
-    out
+    out.finish(sql)
+}
+
+/// Whether something that could be a table follows the `FROM` at `i`: not
+/// `)`, `,`, `;` or the end. `KEY (from)` names a column called `from`, and
+/// is not a query.
+fn names_a_table(tokens: &[&TokenWithSpan], i: usize) -> bool {
+    !matches!(
+        tokens.get(i + 1).map(|t| &t.token),
+        None | Some(Token::RParen | Token::Comma | Token::SemiColon)
+    )
 }
 
 /// Whether the `FROM` at `i` starts a query.
@@ -177,6 +194,9 @@ mod tests {
             "SELECT cast(x AS int) FROM t",
             "WITH s AS (SELECT * FROM t) SELECT * FROM s",
             "SELECT 'unterminated FROM",
+            // A column named `from` (#328).
+            "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (from) DESTINATION KEY (to))",
+            "SELECT * FROM t WHERE x IN (from, to)",
         ] {
             assert_eq!(rewrite(sql), sql);
         }

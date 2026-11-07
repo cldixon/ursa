@@ -25,12 +25,14 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 
 mod input;
+mod notices;
 mod print;
 mod repl;
 mod shell;
 mod startup;
+mod timer;
 
-use print::{is_broken_pipe, OutputFormat};
+use print::{is_broken_pipe, OutputFormat, DEFAULT_MAX_ROWS};
 use shell::{Flow, Shell};
 
 /// The agent skill for writing Ursa SQL, which `--skill` prints: a copy of
@@ -86,6 +88,12 @@ struct Args {
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
 
+    /// Show at most N rows of a table: the first and last N/2, and a footer
+    /// that counts them. 0 shows every row. The other formats write every
+    /// row. Also .maxrows N.
+    #[arg(long = "max-rows", value_name = "N", default_value_t = DEFAULT_MAX_ROWS)]
+    max_rows: usize,
+
     /// Run the SQL and dot-commands in FILE at startup, before the shell's
     /// prompt or the -c, --file or stdin SQL. Replaces ~/.ursarc. Also
     /// spelled -init, as in DuckDB.
@@ -105,6 +113,11 @@ struct Args {
     /// in Markdown), and exit.
     #[arg(long = "skill")]
     skill: bool,
+
+    /// Print no notices on stderr (slow index builds, indexes not stored or
+    /// evicted); errors are still printed. As SET ursa.notices = 'off'.
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
 }
 
 /// Where SQL comes from, in the order given on the command line.
@@ -156,8 +169,19 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => return fail(&format!("cannot start: {e}")),
     };
-    let format_given = matches.value_source("format") == Some(ValueSource::CommandLine);
-    match runtime.block_on(run(sources, &args, interactive, format_given)) {
+    let given = Given {
+        format: matches.value_source("format") == Some(ValueSource::CommandLine),
+        max_rows: matches.value_source("max_rows") == Some(ValueSource::CommandLine),
+    };
+    if !interactive {
+        // The shell handles Ctrl-C itself: it cancels the statement.
+        cancel_on_interrupt();
+    }
+    let result = runtime.block_on(run(sources, &args, interactive, given));
+    // A query cancelled in the shell may still be running on a blocking
+    // thread; it has nothing more to say.
+    runtime.shutdown_background();
+    match result {
         Ok(true) => ExitCode::SUCCESS,
         // The shell has printed the error.
         Ok(false) => ExitCode::FAILURE,
@@ -165,6 +189,47 @@ fn main() -> ExitCode {
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => fail(&ursa_engine::user_message(&e)),
     }
+}
+
+/// Which settings were given on the command line, so they win over an init
+/// file's `.mode` and `.maxrows`.
+#[derive(Debug, Clone, Copy)]
+struct Given {
+    format: bool,
+    max_rows: bool,
+}
+
+/// The exit status after SIGINT (128 + 2), as shells report it.
+const INTERRUPTED_STATUS: i32 = 130;
+
+/// On SIGINT (Ctrl-C), cancel the `-c`, `-f` or stdin SQL: stop writing
+/// results, say `Error: interrupted` and exit with status 130. Exiting ends
+/// the query, wherever it is running, and the operating system releases the
+/// database's lock. Indexes still being stored are left unstored; their
+/// files are written whole or not at all.
+///
+/// The signal is waited for on a thread of its own, so a query that keeps
+/// every worker busy cannot delay it.
+fn cancel_on_interrupt() {
+    let waiting = std::thread::Builder::new()
+        .name("ursa-sigint".into())
+        .spawn(|| {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            if runtime.block_on(tokio::signal::ctrl_c()).is_ok() {
+                print::interrupt();
+                let mut err = io::stderr().lock();
+                let _ = writeln!(err, "Error: interrupted");
+                let _ = err.flush();
+                std::process::exit(INTERRUPTED_STATUS);
+            }
+        });
+    // Without the thread, SIGINT still ends the process (its default).
+    drop(waiting);
 }
 
 /// `-c` and `--file` sources in the order they were given.
@@ -203,7 +268,15 @@ fn format_hint(path: &std::path::Path) -> String {
 /// DuckDB spells its long options with one dash (`-init`); clap needs two.
 /// Rewrite `-init` and `-no-init`, except as the value of an option.
 fn single_dash_longs(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    const TAKE_VALUES: [&str; 6] = ["-c", "--command", "--file", "-f", "--format", "--init"];
+    const TAKE_VALUES: [&str; 7] = [
+        "-c",
+        "--command",
+        "--file",
+        "-f",
+        "--format",
+        "--init",
+        "--max-rows",
+    ];
     let mut out: Vec<OsString> = Vec::new();
     for arg in args {
         let is_value = out.len() > 1
@@ -233,7 +306,7 @@ async fn run(
     sources: Vec<Source>,
     args: &Args,
     interactive: bool,
-    format_given: bool,
+    given: Given,
 ) -> Result<bool, DataFusionError> {
     // Open (or create) the database even with no SQL to run, so `ursa
     // club.ursa` makes the file, as Getting Started says.
@@ -247,7 +320,10 @@ async fn run(
         }
         None => ursa_engine::new_session(),
     };
-    let result = run_session(ctx.clone(), sources, args, interactive, format_given).await;
+    if !args.quiet {
+        notices::to_stderr(&ctx);
+    }
+    let result = run_session(ctx.clone(), sources, args, interactive, given).await;
     // Finish storing the indexes this process built before it exits.
     ursa_engine::database::flush(&ctx.state());
     if std::env::var_os(INDEX_STATS_VAR).is_some() {
@@ -276,7 +352,7 @@ async fn run_session(
     sources: Vec<Source>,
     args: &Args,
     interactive: bool,
-    format_given: bool,
+    given: Given,
 ) -> Result<bool, DataFusionError> {
     let home = startup::home_dir();
     let init = startup::init_file(
@@ -293,9 +369,11 @@ async fn run_session(
     let out: Box<dyn Write> = if interactive {
         Box::new(io::stdout())
     } else {
-        Box::new(io::BufWriter::new(io::stdout()))
+        // Nothing more reaches stdout once SIGINT has cancelled the run.
+        Box::new(io::BufWriter::new(print::Interruptible(io::stdout())))
     };
     let mut shell = Shell::new(ctx, args.format, out, io::stderr());
+    shell.set_max_rows(args.max_rows);
     if interactive {
         println!("{}", banner(args));
     }
@@ -303,9 +381,13 @@ async fn run_session(
         if shell.run_file(&init).await == Flow::Exit {
             return Ok(true);
         }
-        // `-f` given on the command line wins over a `.mode` in the file.
-        if format_given {
+        // `--format` and `--max-rows` given on the command line win over a
+        // `.mode` or `.maxrows` in the file.
+        if given.format {
             shell.set_mode(args.format);
+        }
+        if given.max_rows {
+            shell.set_max_rows(args.max_rows);
         }
     }
     if interactive {

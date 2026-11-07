@@ -122,6 +122,24 @@ COPY (SELECT * FROM 'karate_edges.csv') TO 'ties.parquet';
 
 The format comes from the extension, or from `STORED AS PARQUET`. Options go in `OPTIONS (...)`, not DuckDB's `(FORMAT parquet, ...)`.
 
+**Division.** In DataFusion, `/` between two integers is integer division, rounded toward zero, as in PostgreSQL: `7 / 2` is `3`, and `count(*) / 3` is an integer. DuckDB's `/` returns a `DOUBLE` (3.5), and DuckDB's `//` (integer division) is not supported. With a `DECIMAL` (`NUMERIC`) on either side, the result is a `DECIMAL`. For a float, make one side a float, with `CAST(a AS DOUBLE)` or `* 1.0`; for an integer from a float or a decimal, `CAST(… AS BIGINT)` rounds toward zero:
+
+```sql
+SELECT 7 / 2 AS integers,
+       CAST(7 AS DOUBLE) / 2 AS doubles,
+       7 * 1.0 / 2 AS also_doubles,
+       CAST(7 AS DECIMAL(10, 2)) / 2 AS decimals,
+       CAST(7.9 AS BIGINT) AS truncated;
+```
+
+```text
++----------+---------+--------------+----------+-----------+
+| integers | doubles | also_doubles | decimals | truncated |
++----------+---------+--------------+----------+-----------+
+| 3        | 3.5     | 3.5          | 3.500000 | 7         |
++----------+---------+--------------+----------+-----------+
+```
+
 **Functions.** Scalar and aggregate functions are DataFusion's. Most common ones share DuckDB's names, but some do not: `to_char` formats a date where DuckDB has `strftime`, and `make_array` builds a list where DuckDB also has `list_value`. `SELECT * FROM ursa_functions()` lists the graph functions, and `SHOW FUNCTIONS` lists the rest.
 
 **Not supported:**

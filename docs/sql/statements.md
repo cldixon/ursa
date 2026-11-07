@@ -54,6 +54,17 @@ SELECT count(*) AS ties FROM 'ties.jsonl';
 
 `STORED AS CSV` (or `PARQUET`, `JSON`, `ARROW`) names the format when the extension does not.
 
+!!! tip "Convert large CSV files to Parquet once"
+
+    A view over a file reads the file each time a query uses it. For a CSV or JSON file, that means parsing all of it again, so a query that reads a large vertex table's attributes (a `JOIN` on its rows, `neighbors_agg`'s `attribute`, a `GRAPH_TABLE` property) pays for that every time. Parquet is much faster to read, and a query reads only the columns it needs. Convert the file once and define the view over the Parquet file:
+
+    ```sql
+    COPY (FROM 'karate_nodes.csv') TO 'karate_nodes.parquet';
+    CREATE VIEW member_attributes AS SELECT * FROM 'karate_nodes.parquet';
+    ```
+
+    This works for a compressed file too: `COPY (FROM 'users.csv.gz') TO 'users.parquet'`. A graph's edges are read once, into its [stored index](database.md#stored-graph-indexes); the attributes of its vertex table are read from the file by each query that uses them.
+
 ### read_parquet, read_csv and read_json
 
 `read_parquet`, `read_csv` and `read_json` read a file as `FROM 'path'` does, but in the format they name, whatever the extension, and with options. They take a path, a glob, a directory, a URL, or a list of them:

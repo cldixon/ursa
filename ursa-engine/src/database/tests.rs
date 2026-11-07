@@ -26,6 +26,44 @@ fn open_creates_the_file_the_sidecar_and_the_lock() {
 }
 
 #[test]
+fn the_index_storage_limit_is_kept_in_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("club.ursa");
+    {
+        let db = Database::open(&path, &quick()).unwrap();
+        assert_eq!(db.index_storage_limit(), DEFAULT_INDEX_STORAGE_LIMIT);
+        let store = db.index_store();
+        db.save(vec!["CREATE VIEW v AS SELECT 1".into()]).unwrap();
+        db.set_setting(INDEX_STORAGE_LIMIT, Some("32GiB")).unwrap();
+        assert_eq!(db.index_storage_limit(), 32 << 30);
+        // The store obeys it at once.
+        assert_eq!(store.limit(), 32 << 30);
+        assert!(db.set_setting(INDEX_STORAGE_LIMIT, Some("lots")).is_err());
+        // Saving statements keeps the setting.
+        db.save(vec![]).unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text,
+        "{\n  \"format\": \"ursa\",\n  \"version\": 1,\n  \"statements\": [],\n  \"settings\": \
+         {\n    \"ursa.index_storage_limit\": \"32GiB\"\n  }\n}\n"
+    );
+    assert_eq!(
+        CatalogFile::parse(&text, "club.ursa").unwrap().to_text(),
+        text
+    );
+    // A reader obeys it too, and cannot change it.
+    let reader = Database::open(&path, &OpenOptions::read_only()).unwrap();
+    assert_eq!(reader.index_storage_limit(), 32 << 30);
+    assert!(reader.set_setting(INDEX_STORAGE_LIMIT, None).is_err());
+    drop(reader);
+    let db = Database::open(&path, &quick()).unwrap();
+    db.set_setting(INDEX_STORAGE_LIMIT, None).unwrap();
+    assert_eq!(db.index_storage_limit(), DEFAULT_INDEX_STORAGE_LIMIT);
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("settings"));
+}
+
+#[test]
 fn save_rewrites_the_catalog_and_a_later_open_reads_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("club.ursa");
@@ -51,7 +89,13 @@ fn a_second_writer_is_refused_while_the_first_has_it_open() {
     let err = Database::open(&path, &quick()).unwrap_err();
     assert_eq!(
         crate::user_message(&err),
-        format!("{} is in use by another process", path.display())
+        format!(
+            "{name} is in use by another process (process {}), which has it open for \
+             writing; open it read-only to query it meanwhile (ursa --readonly {name}), or \
+             wait for that process to finish",
+            std::process::id(),
+            name = path.display()
+        )
     );
     // A reader takes no lock.
     let reader = Database::open(&path, &OpenOptions::read_only()).unwrap();

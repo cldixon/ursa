@@ -21,7 +21,7 @@
 //!     48     8  main_len         bytes of the main part, trailer included
 //!     56     8  n_dropped        edge rows left out (see below); zero before
 //!                                #311, and for a graph with no vertex table
-//!     64     …  key              JSON: {"fingerprint": …, "files": [{…}, …]}
+//!     64     …  key              JSON: {"version": 2, "fingerprint": …, "files": [{…}, …]}
 //!      …     …  section table    at the next multiple of 8; 24 bytes a section:
 //!                                kind u32, element width u32, offset u64, count u64
 //!      …     …  sections         each at a multiple of 64 from the file's start
@@ -149,6 +149,13 @@ const IDS_STR_BYTES: u32 = 9;
 const WEIGHTS_F64: u32 = 10;
 const KEPT_ROWS: u32 = 11;
 
+/// The version of the key's form. Version 2 (#327) is the portable key:
+/// paths inside the database's directory relative to it, and only the file
+/// options that change what is read (`crate::graph::index`). A key of
+/// another version is not read, so an index stored under an older key is a
+/// miss, never a wrong hit.
+pub const KEY_VERSION: u64 = 2;
+
 /// What an index is stored under: the edge plan's fingerprint and the
 /// identity of every file it reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +169,8 @@ impl IndexKey {
         Self { fingerprint, files }
     }
 
-    /// The key as JSON, as the file header and the manifest hold it.
+    /// The key as JSON, as the file header and the manifest hold it:
+    /// `{"version": 2, "fingerprint": …, "files": […]}`.
     pub fn to_json(&self) -> Value {
         let files: Vec<Value> = self
             .files
@@ -177,11 +185,14 @@ impl IndexKey {
                 })
             })
             .collect();
-        json!({ "fingerprint": self.fingerprint, "files": files })
+        json!({ "version": KEY_VERSION, "fingerprint": self.fingerprint, "files": files })
     }
 
     /// The key from its JSON, or `None` if it is not one.
     pub fn from_json(value: &Value) -> Option<Self> {
+        if value.get("version")?.as_u64()? != KEY_VERSION {
+            return None;
+        }
         let fingerprint = value.get("fingerprint")?.as_str()?.to_string();
         let files = value
             .get("files")?
@@ -1481,5 +1492,14 @@ mod tests {
         no_tag.files[0].e_tag = None;
         assert_eq!(IndexKey::from_json(&no_tag.to_json()), Some(no_tag.clone()));
         assert_ne!(no_tag.hash(), k.hash());
+    }
+
+    #[test]
+    fn a_key_of_another_version_is_not_read() {
+        let mut json = key().to_json();
+        json["version"] = 1.into();
+        assert_eq!(IndexKey::from_json(&json), None);
+        json.as_object_mut().unwrap().remove("version");
+        assert_eq!(IndexKey::from_json(&json), None);
     }
 }

@@ -46,7 +46,9 @@ pub use closeness::{
 pub use clustering::{clustering_coefficient, clustering_from_triangles};
 pub use components::{connected_components_strong, connected_components_weak};
 pub use degree::degree;
-pub use hop::{k_hop, k_hop_masked, k_hop_reached_masked, k_hop_reached_set};
+pub use hop::{
+    k_hop, k_hop_distances_masked, k_hop_masked, k_hop_reached_masked, k_hop_reached_set,
+};
 pub use label_prop::label_propagation;
 pub use layout::{layout_circle, layout_fr, layout_random, LayoutParams, Positions};
 pub use louvain::{louvain, louvain_weighted};

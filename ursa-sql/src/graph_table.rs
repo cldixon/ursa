@@ -16,6 +16,7 @@ use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use crate::parser::byte_offset;
+use crate::source_map::Rewritten;
 
 /// The table function a `GRAPH_TABLE ( … )` becomes.
 pub const GRAPH_TABLE_FUNCTION: &str = "graph_table";
@@ -23,16 +24,20 @@ pub const GRAPH_TABLE_FUNCTION: &str = "graph_table";
 /// `sql` with every `GRAPH_TABLE ( body )` rewritten to `graph_table('body')`.
 /// Text that does not tokenize is returned as it is, for the parser to report.
 pub fn rewrite_graph_tables(sql: &str, dialect: &dyn Dialect) -> String {
+    rewrite_graph_tables_mapped(sql, dialect).text
+}
+
+/// [`rewrite_graph_tables`], with a record of what it replaced.
+pub(crate) fn rewrite_graph_tables_mapped(sql: &str, dialect: &dyn Dialect) -> Rewritten {
+    let mut out = Rewritten::new(sql.len());
     let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize_with_location() else {
-        return sql.to_string();
+        return out.finish(sql);
     };
     // The tokens that are not whitespace or comments.
     let tokens: Vec<&TokenWithSpan> = tokens
         .iter()
         .filter(|t| !matches!(t.token, Token::Whitespace(_)))
         .collect();
-    let mut out = String::with_capacity(sql.len());
-    let mut copied = 0; // bytes of `sql` already in `out`
     let mut i = 0;
     while i < tokens.len() {
         let Some(open) = graph_table_at(&tokens, i) else {
@@ -50,17 +55,12 @@ pub fn rewrite_graph_tables(sql: &str, dialect: &dyn Dialect) -> String {
         ) else {
             break;
         };
-        out.push_str(&sql[copied..start]);
         let body = sql[body_start..body_end].trim();
-        out.push_str(GRAPH_TABLE_FUNCTION);
-        out.push_str("('");
-        out.push_str(&body.replace('\'', "''"));
-        out.push_str("')");
-        copied = end;
+        let call = format!("{GRAPH_TABLE_FUNCTION}('{}')", body.replace('\'', "''"));
+        out.replace(sql, start, end, &call);
         i = close + 1;
     }
-    out.push_str(&sql[copied..]);
-    out
+    out.finish(sql)
 }
 
 /// If a `GRAPH_TABLE (` or `GRAPH TABLE (` starts at token `i`, the index of

@@ -22,7 +22,10 @@
 //! the node runs ([`not_node_ids`] words the error for both).
 //!
 //! The kernels are `ursa_core::algo`'s, called exactly as `ursa-plan` calls
-//! them, so the rows are the Python library's, in the same order.
+//! them, so the rows are the Python library's, in the same order. One
+//! deliberate difference: SQL's `hop` names its columns `(seed, id,
+//! distance)`, where Python's `EdgeFrame` has `(src, dst)` and no distance
+//! (#328); the parity test compares `seed` and `id` with `src` and `dst`.
 
 use std::sync::Arc;
 
@@ -32,7 +35,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
-    k_hop_masked, random_walk_masked, shortest_path_masked, shortest_path_weighted_with_cost_masked,
+    k_hop_distances_masked, random_walk_masked, shortest_path_masked,
+    shortest_path_weighted_with_cost_masked,
 };
 use ursa_core::catalog::{
     direction_name, parse_direction, Expected, ParamType, Value, ALL_DIRECTIONS,
@@ -212,9 +216,9 @@ const DIRECTION: TraversalParam = param(
 pub static TRAVERSALS: &[TraversalSpec] = &[
     TraversalSpec {
         name: "hop",
-        summary: "The nodes within n steps of each seed: one (src, dst) row per seed and node \
-                  reached, src the seed. A seed is not its own row; a repeated seed repeats its \
-                  rows.",
+        summary: "The nodes within n steps of each seed: one (seed, id, distance) row per seed \
+                  and node reached, distance the fewest steps from the seed to it. A seed is not \
+                  its own row; a repeated seed repeats its rows.",
         networkx: Some(
             "nx.single_source_shortest_path_length(G, seed, cutoff=n), the seed left out \
              (in: on G.reverse(); both: on U)",
@@ -234,7 +238,11 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             ),
             DIRECTION,
         ],
-        outputs: &[out("src", OutputType::Id), out("dst", OutputType::Id)],
+        outputs: &[
+            out("seed", OutputType::Id),
+            out("id", OutputType::Id),
+            out("distance", OutputType::Int64),
+        ],
     },
     TraversalSpec {
         name: "shortest_path",
@@ -604,8 +612,14 @@ pub fn batch(
     let known = |i: usize| -> Vec<u32> { nodes[i].iter().flatten().copied().collect() };
     let columns: Vec<ArrayRef> = match *traversal {
         Traversal::Hop { n, direction } => {
-            let (seed, reached) = k_hop_masked(topology, None, &known(0), n, direction);
-            vec![ids.gather_user(&seed), ids.gather_user(&reached)]
+            let (seed, reached, distance) =
+                k_hop_distances_masked(topology, None, &known(0), n, direction);
+            let distance: Vec<i64> = distance.into_iter().map(i64::from).collect();
+            vec![
+                ids.gather_user(&seed),
+                ids.gather_user(&reached),
+                Arc::new(Int64Array::from(distance)),
+            ]
         }
         Traversal::ShortestPath { direction } => {
             let one = |i: usize| nodes[i].first().copied().flatten();
