@@ -2,7 +2,7 @@
 
 !!! info "Versions"
 
-    The newest release is `ursa-cli` 0.7.0; see [Getting Started](getting-started.md#install) to install or upgrade it. Features marked **New in 0.7** need 0.7 or later (`ursa --version` says which you have). The SQL surface may still change between minor versions, and the [changelog](../changelog.md) records every change.
+    The newest release is `ursa-cli` 0.8.0; see [Getting Started](getting-started.md#install) to install or upgrade it. Features marked **New in 0.7** or **New in 0.8** need that version or later (`ursa --version` says which you have). The SQL surface may still change between minor versions, and the [changelog](../changelog.md) records every change.
 
 Ursa SQL is a SQL engine for graph analytics, used through a command-line tool called `ursa`. It works like DuckDB. You point it at Parquet, CSV, JSON or Arrow files, on your disk or in object storage, and query them with SQL. Graph algorithms are part of that SQL. Nothing needs converting or loading first.
 
