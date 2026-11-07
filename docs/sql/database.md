@@ -74,7 +74,8 @@ An index is stored under a key made from two things: the plan that produces the 
 
 - if a source file changes, the key changes, and Ursa builds a new index. The old one is never used again;
 - a weight is not part of the key, so trying several weightings reuses one index;
-- every graph function in a query shares one index, and so does `algorithms()`.
+- every graph function in a query shares one index, and so does `algorithms()`;
+- the key is portable. A path inside the database's directory is part of the key relative to that directory, as the catalog stores it, so a database moved together with its data still finds its indexes. Only the file options that change what is read are part of it (the format, the CSV parsing options, partition columns), so a change to an unrelated setting, or a DataFusion upgrade, does not throw the indexes away.
 
 Some algorithms, such as PageRank, in-degree and anything with `direction => 'both'`, also need the reverse of the index: each node's incoming edges. The first query that builds it adds it to the stored index when the database closes. A later process reads it from disk only when an algorithm asks for it, so a query that does not need it does not pay to load it.
 
@@ -94,7 +95,7 @@ ursa: graph indexes built 0, loaded 1
 
 ### The storage limit
 
-Stored indexes are evicted least recently used first once their total size passes a limit. The default is 4 GiB. Change it for the session with `SET`:
+A database keeps at most `ursa.index_storage_limit` of stored indexes. The default is 4 GiB. Set it with `SET`:
 
 ```sql
 SET ursa.index_storage_limit = '8GiB';
@@ -109,17 +110,54 @@ SHOW ursa.index_storage_limit;
 +--------------------------+-------+
 ```
 
-The setting lasts for the session. It is not kept in the database. Eviction never removes the index just written, or one a running query uses. An index bigger than the whole limit is not stored.
+The limit belongs to the database. In a writable database, `SET` stores it in the catalog, every later process obeys it, and `SHOW` shows it. `RESET ursa.index_storage_limit` goes back to the default. In a read-only session, or one without a database, `SET` lasts for the session, and it never removes anything.
+
+The limit is applied only when an index is stored, never when you change it:
+
+- an index bigger than the whole limit is not stored. Ursa says so, and how large a limit would keep it;
+- otherwise Ursa evicts stored indexes, least recently used first, until the new one fits, and says which. It evicts only as many as it has to, and never one a running query uses. If the indexes in use leave no room, nothing is evicted and the new index is not stored.
+
+The reverse adjacency and stored weights, added when the database closes, make room in the same way.
+
+For a large graph, set the limit before the first query, so its index is kept: the index of a 100M-edge graph takes a few GiB.
+
+### Notices
+
+Some of this work takes a while, or loses work a later process does again. Ursa says so on stderr, one line each, so stdout holds only results:
+
+```text
+ursa: building the index for bsky (95.7M edges)…
+ursa: built the index for bsky (95.7M edges) in 30.7 s; stored in club.ursa (1.4 GiB)
+ursa: built the index for big (812.0M edges) in 4 min 5 s; not stored: it takes 12.1 GiB, more than ursa.index_storage_limit (4GiB); SET ursa.index_storage_limit = '32GiB' to keep it
+ursa: evicted the stored index for old (1.4 GiB, the least recently used) from club.ursa to stay within ursa.index_storage_limit (4GiB)
+ursa: built the index for bsky (95.7M edges) in 30.7 s; not stored: club.ursa is open read-only
+```
+
+Which notices are printed is `ursa.notices`:
+
+| Value | Prints |
+|---|---|
+| `on` (the default) | an index build that takes more than a second (when it starts, and when it is done); every index that is not stored or is evicted; a failed write |
+| `all` | also every build, load and store, however quick |
+| `off` | nothing |
+
+`ursa --quiet` (`-q`) prints no notices; errors are still printed. `ursa.notices` lasts for the session and is not stored in the database.
 
 ## Read-only and sharing
 
-One process at a time may have a database open for writing. A second process waits two seconds, then fails with `club.ursa is in use by another process`.
+One process at a time may have a database open for writing. A second process waits two seconds, then fails, naming the process that has it:
+
+```text
+Error: club.ursa is in use by another process (process 4195), which has it open for writing; open it read-only to query it meanwhile (ursa --readonly club.ursa), or wait for that process to finish
+```
 
 `--readonly` opens a database without taking that lock. It reads the catalog and the stored indexes, and refuses any statement that defines or drops something:
 
 ```bash
 ursa club.ursa --readonly -c "SELECT * FROM degree(karate) LIMIT 3"
 ```
+
+A read-only process uses the stored indexes, but stores none: an index it builds is built again by the next process. A build that takes more than a second says so (`not stored: club.ursa is open read-only`). Run the query once without `--readonly` to store it.
 
 ## On disk
 
@@ -141,8 +179,13 @@ The catalog is plain JSON, so you can read it and diff it:
   "statements": [
     "CREATE VIEW ties AS SELECT * FROM 'karate_edges.csv'",
     "CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))"
-  ]
+  ],
+  "settings": {
+    "ursa.index_storage_limit": "32GiB"
+  }
 }
 ```
 
-Copy or move `club.ursa` together with `club.ursa.d/`. Without the directory, the catalog still opens, and the indexes are built again. A damaged or out-of-date index file is treated as missing, never as an error.
+`settings` appears once you `SET ursa.index_storage_limit`. Versions of ursa before 0.8 ignore it, and drop it if they rewrite the catalog.
+
+Copy or move `club.ursa` together with `club.ursa.d/`, and, to keep the stored indexes, the data files inside its directory with them. Without `club.ursa.d/`, the catalog still opens, and the indexes are built again. A damaged or out-of-date index file is treated as missing, never as an error. Indexes stored by ursa 0.7 or earlier use the old key: the first writer to open the database with 0.8 removes them, says so, and builds each again when it is first used.

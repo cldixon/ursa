@@ -279,7 +279,9 @@ ORDER BY b.club;
 - Define each view and graph once per database, not before every query. Check `SHOW GRAPHS` first; use `CREATE OR REPLACE` to redefine.
 - The file does not store rows. `CREATE TABLE ... AS`, `INSERT`, `UPDATE` and `DELETE` are refused. Write results with `COPY (SELECT ...) TO 'out.parquet'` and define a view over the file.
 - Relative paths are stored relative to the database's directory.
-- One writer at a time. Use `--readonly` to read a database another process has open.
+- One writer at a time. Use `--readonly` to read a database another process has open. A read-only process stores no indexes, so run a big graph's first query without it.
+- Stored indexes are capped by `ursa.index_storage_limit` (4GiB by default). `SET` in a writable database is stored in it and lasts. A big graph (tens of millions of edges) may need more: set it before the first query.
+- Notices go to stderr, never stdout, as lines starting `ursa: `: a slow index build, an index not stored or evicted. A `not stored` notice says the next process builds it again, and how to keep it. `--quiet` or `SET ursa.notices = 'off'` silences them; `'all'` reports every build and load.
 
 ## Common mistakes
 

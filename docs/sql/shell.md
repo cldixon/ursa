@@ -60,6 +60,8 @@ Statements that return rows always print a result, with its header even when the
 
 Add `--readonly` to open a database without changing it. See [the database file](database.md#read-only-and-sharing).
 
+Notices, such as a slow graph index build or an index the database could not keep, go to stderr as lines starting `ursa: `, so stdout holds only results. `--quiet` (`-q`) turns them off. See [notices](database.md#notices).
+
 ## Dot-commands
 
 A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one.

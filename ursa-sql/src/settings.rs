@@ -21,7 +21,7 @@ use datafusion::config::ExtensionOptions;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::Ident;
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
 use ursa_engine::options::UrsaOptions;
 
 /// The prefix of Ursa's settings.
@@ -99,6 +99,41 @@ async fn answer(ctx: &SessionContext, request: Show) -> Result<DataFrame> {
         ),
     };
     ctx.sql(&query).await
+}
+
+/// Answer `RESET ursa.<setting>`, which DataFusion 55 refuses for an
+/// extension's settings, by setting its default; `None` leaves any other
+/// `RESET` to DataFusion.
+pub(crate) fn reset(ctx: &SessionContext, variable: &ObjectName) -> Option<Result<DataFrame>> {
+    let parts: Vec<String> = variable
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident().map(normalize))
+        .collect();
+    let [prefix, rest @ ..] = parts.as_slice() else {
+        return None;
+    };
+    if prefix != PREFIX || rest.is_empty() {
+        return None;
+    }
+    let name = rest.join(".");
+    let names = setting_names(ctx);
+    if !names.contains(&name) {
+        return Some(Err(unknown_setting(&name, &names)));
+    }
+    let default = UrsaOptions::default()
+        .entries()
+        .into_iter()
+        .find(|e| e.key == name)
+        .and_then(|e| e.value)
+        .unwrap_or_default();
+    let set = ctx
+        .state_ref()
+        .write()
+        .config_mut()
+        .options_mut()
+        .set(&format!("{PREFIX}.{name}"), &default);
+    Some(set.and_then(|()| crate::graph_ddl::empty(ctx)))
 }
 
 /// The names of Ursa's settings, without the prefix, in the session's order.

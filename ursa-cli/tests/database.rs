@@ -337,7 +337,15 @@ fn a_database_in_use_is_refused() {
     let path = dir.path().join("club.ursa");
     let held = ursa_engine::database::Database::open(&path, &Default::default()).unwrap();
     let e = err(ursa_in(dir.path(), &["club.ursa", "-c", "SELECT 1"]));
-    assert_eq!(e, "Error: club.ursa is in use by another process\n");
+    assert_eq!(
+        e,
+        format!(
+            "Error: club.ursa is in use by another process (process {}), which has it open \
+             for writing; open it read-only to query it meanwhile (ursa --readonly club.ursa), \
+             or wait for that process to finish\n",
+            std::process::id()
+        )
+    );
     // A reader is not blocked.
     ok(ursa_in(
         dir.path(),
@@ -601,4 +609,63 @@ fn a_second_process_over_parquet_loads_the_index() {
     assert_eq!(counts, (0, 1));
     assert_eq!(second, first);
     eprintln!("{n} edges, pagerank: first process {first_time:?}, second process {second_time:?}");
+}
+
+/// Notices go to stderr, one line each, and leave stdout as it was (#327).
+#[test]
+fn notices_go_to_stderr_and_leave_stdout_alone() {
+    let dir = karate_dir();
+    let cwd = dir.path();
+    assert_eq!(ok(ursa_in(cwd, &["club.ursa", "-c", DEFINE])), "");
+    let query = "SELECT count(*) AS n FROM degree(karate)";
+    let csv = "--format=csv";
+    let run = |args: &[&str]| {
+        let out = ursa_in(cwd, args);
+        let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+        (ok(out), stderr)
+    };
+
+    // A quick build that is stored says nothing at the default level.
+    let (stdout, stderr) = run(&["club.ursa", csv, "-c", query]);
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("n\n34\n", ""));
+
+    // Every load and build at 'all', on stderr only.
+    let all = format!("SET ursa.notices = 'all'; {query}");
+    let (stdout, stderr) = run(&["club.ursa", csv, "-c", &all]);
+    assert_eq!(stdout, "n\n34\n");
+    assert!(
+        stderr.starts_with("ursa: loaded the index for karate (78 edges) from club.ursa ("),
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+
+    // An index too large for the limit is not stored, and says how to keep it.
+    let tiny = format!("SET ursa.index_storage_limit = '1KiB'; {query}; {query}");
+    std::fs::remove_dir_all(cwd.join("club.ursa.d/indexes")).unwrap();
+    let (stdout, stderr) = run(&["club.ursa", csv, "-c", &tiny]);
+    assert_eq!(stdout, "n\n34\nn\n34\n");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "once per build, not per query: {stderr}");
+    assert!(
+        lines[0].starts_with("ursa: built the index for karate (78 edges) in ")
+            && lines[0].contains(
+                "; not stored: it takes 2.7 KiB, more than ursa.index_storage_limit (1KiB); SET \
+                 ursa.index_storage_limit = '1MiB' to keep it"
+            ),
+        "{stderr}"
+    );
+
+    // Read-only, at 'all': built, and not stored.
+    let (stdout, stderr) = run(&["club.ursa", "--readonly", csv, "-c", &all]);
+    assert_eq!(stdout, "n\n34\n");
+    assert!(
+        stderr.ends_with("; not stored: club.ursa is open read-only\n"),
+        "{stderr}"
+    );
+
+    // --quiet says nothing; errors are still said.
+    let (stdout, stderr) = run(&["club.ursa", "--quiet", csv, "-c", &all]);
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("n\n34\n", ""));
+    let e = err(ursa_in(cwd, &["club.ursa", "-q", "-c", "SELECT nope"]));
+    assert!(e.starts_with("Error: "), "{e}");
 }
