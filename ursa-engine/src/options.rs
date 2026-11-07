@@ -1,9 +1,12 @@
 //! Ursa's session settings, set with `SET ursa.<name> = …` and shown with
 //! `SHOW ursa.<name>`: a DataFusion config extension with the prefix `ursa`.
 //!
-//! Settings last for the session. They are not kept in the `.ursa` file: the
-//! catalog stores definitions, and a setting is a property of the process
-//! using the database, as DuckDB's `memory_limit` is.
+//! Settings last for the session, with one exception: in a writable `.ursa`
+//! database, `SET ursa.index_storage_limit` (and `RESET`) is stored in the
+//! catalog file and applied again when the database is opened, because it
+//! governs what the database keeps on disk (#327). The database's stored
+//! indexes obey the stored limit (or the default), never a session's own: a
+//! read-only or in-memory session's `SET` changes only what `SHOW` says.
 
 use std::fmt;
 
@@ -92,12 +95,68 @@ impl ConfigField for ByteSize {
     }
 }
 
+/// Which notices a session prints (`ursa.notices`): one line each, to the
+/// sink the host installed (`crate::notices`; the CLI's is stderr).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum NoticeLevel {
+    /// None.
+    Off,
+    /// Index builds that take more than a second, and every stored-index
+    /// decision that loses work: an index not stored, an index evicted, a
+    /// failed write.
+    #[default]
+    On,
+    /// Every index build, load and store, however quick.
+    All,
+}
+
+impl NoticeLevel {
+    /// `on`, `off` or `all` (`true` and `false` too), in any case.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" => Ok(Self::Off),
+            "on" | "true" => Ok(Self::On),
+            "all" => Ok(Self::All),
+            _ => Err(DataFusionError::Configuration(format!(
+                "'{text}' is not a notice level; use 'on', 'off' or 'all'"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for NoticeLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::All => "all",
+        })
+    }
+}
+
+impl ConfigField for NoticeLevel {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        *self = NoticeLevel::parse(value)?;
+        Ok(())
+    }
+}
+
 extensions_options! {
     /// Ursa's settings (`SET ursa.<name> = …`).
     pub struct UrsaOptions {
         /// The most bytes of graph indexes a `.ursa` database keeps on disk.
-        /// Past it, the least recently used are removed. Default 4GiB.
+        /// Past it, the least recently used are removed to make room for a
+        /// new one. Default 4GiB. SET in a writable database, it is stored
+        /// in the database.
         pub index_storage_limit: ByteSize, default = ByteSize(DEFAULT_INDEX_STORAGE_LIMIT)
+        /// Which notices to print on stderr: 'on' (slow index builds, and
+        /// indexes not stored or evicted), 'all' (every index build, load
+        /// and store) or 'off'. Default on.
+        pub notices: NoticeLevel, default = NoticeLevel::On
     }
 }
 
@@ -116,7 +175,19 @@ pub(crate) fn with_options(mut config: SessionConfig) -> SessionConfig {
     config
 }
 
-/// The session's `ursa.index_storage_limit`, in bytes.
+/// The session's `ursa.notices`.
+pub fn notice_level(config: &SessionConfig) -> NoticeLevel {
+    config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .map_or(NoticeLevel::default(), |o| o.notices)
+}
+
+/// The session's `ursa.index_storage_limit`, in bytes: what `SHOW` says. The
+/// database's stored indexes obey the database's limit
+/// (`Database::index_storage_limit`), which the SQL layer keeps in step with
+/// this in a writable database.
 pub fn index_storage_limit(config: &SessionConfig) -> u64 {
     config
         .options()

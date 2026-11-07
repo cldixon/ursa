@@ -362,7 +362,13 @@ async fn a_second_writer_fails_while_the_first_is_open() {
     let e = open_err(&path, &quick()).await;
     assert_eq!(
         e,
-        format!("{} is in use by another process", path.display())
+        format!(
+            "{name} is in use by another process (process {}), which has it open for \
+             writing; open it read-only to query it meanwhile (ursa --readonly {name}), or \
+             wait for that process to finish",
+            std::process::id(),
+            name = path.display()
+        )
     );
     drop(first);
     open(&path).await;
@@ -557,6 +563,7 @@ async fn an_m3a_catalog_replays_unchanged() {
     let statements = [MEMBERS, TIES, KARATE, external, bare];
     let file = ursa_engine::database::CatalogFile {
         statements: statements.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     };
     std::fs::write(&path, file.to_text()).unwrap();
     let ctx = open(&path).await;

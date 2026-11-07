@@ -90,7 +90,10 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use ursa_core::{EdgeInterner, IdError, Topology};
 
-use super::index::{file_identities, fingerprint, FileIdentity, GraphIndex, IndexCache, Weights};
+use super::index::{
+    file_identities, fingerprint, portable_in, BuildInfo, FileIdentity, GraphIndex, IndexCache,
+    Weights,
+};
 use super::kernels;
 use super::node::{
     weight_column, GraphAlgorithmNode, GraphTraversalNode, Output, WEIGHTED_DESTINATION,
@@ -1126,7 +1129,12 @@ async fn unweighted_index(
         Some(cache) => {
             let key = index_key(shape, &input, context).await?;
             cache
-                .get_or_build_stored(context.session_config(), key, build.boxed())
+                .get_or_build_for(
+                    context.session_config(),
+                    key,
+                    &build_info(shape, &input),
+                    build.boxed(),
+                )
                 .await
         }
         None => build.await.map(Arc::new),
@@ -1148,7 +1156,8 @@ async fn weighted_index(
     };
     let weights_key = match &weighted.fingerprint {
         Some(f) => Some(format!(
-            "{f}\n{:?}",
+            "{}\n{:?}",
+            portable_in(f, context.session_config()),
             file_identities(&weighted.plan, context).await?
         )),
         None => None,
@@ -1177,7 +1186,12 @@ async fn weighted_index(
                 }
             };
             let index = cache
-                .get_or_build_stored(context.session_config(), key, build.boxed())
+                .get_or_build_for(
+                    context.session_config(),
+                    key,
+                    &build_info(shape, &weighted.plan),
+                    build.boxed(),
+                )
                 .await?;
             let built_here = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
             // A stored index may have these weights stored with it.
@@ -1448,6 +1462,22 @@ fn row_hint(plan: &Arc<dyn ExecutionPlan>) -> usize {
         .ok()
         .and_then(|s| s.num_rows.get_value().copied())
         .unwrap_or(0)
+}
+
+/// What a build over `input` is for, as its notices say: the graph, and the
+/// edge rows `input`'s statistics promise, if they do.
+fn build_info(shape: &Edges, input: &Arc<dyn ExecutionPlan>) -> BuildInfo {
+    let rows = StatisticsContext::new()
+        .compute(input.as_ref(), &StatisticsArgs::new())
+        .ok()
+        .and_then(|s| {
+            let exact = s.num_rows.is_exact().unwrap_or(false);
+            s.num_rows.get_value().map(|n| (*n as u64, exact))
+        });
+    BuildInfo {
+        graph: Some(shape.graph.clone()),
+        edges: rows,
+    }
 }
 
 /// What the reader hands the interning thread.

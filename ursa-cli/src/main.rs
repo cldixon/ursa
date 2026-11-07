@@ -25,6 +25,7 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 
 mod input;
+mod notices;
 mod print;
 mod repl;
 mod shell;
@@ -105,6 +106,11 @@ struct Args {
     /// in Markdown), and exit.
     #[arg(long = "skill")]
     skill: bool,
+
+    /// Print no notices on stderr (slow index builds, indexes not stored or
+    /// evicted); errors are still printed. As SET ursa.notices = 'off'.
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
 }
 
 /// Where SQL comes from, in the order given on the command line.
@@ -247,6 +253,9 @@ async fn run(
         }
         None => ursa_engine::new_session(),
     };
+    if !args.quiet {
+        notices::to_stderr(&ctx);
+    }
     let result = run_session(ctx.clone(), sources, args, interactive, format_given).await;
     // Finish storing the indexes this process built before it exits.
     ursa_engine::database::flush(&ctx.state());
