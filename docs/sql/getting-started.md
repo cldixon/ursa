@@ -56,6 +56,28 @@ ursa --version
 ursa 0.7.0
 ```
 
+### Nightly builds
+
+The installers have two channels. **Stable**, the default, is the newest release, the same version as on crates.io. **Nightly** is the newest build of `main`, rebuilt on every merge. It has features before they are released, including ones these docs mark "New in" a version that isn't out yet. Those features may still change or break.
+
+```bash
+curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_CHANNEL=nightly sh
+```
+
+or `curl -fsSL https://cldixon.github.io/ursa/install.sh | sh -s -- --nightly`. On Windows, in PowerShell:
+
+```powershell
+$env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | iex
+```
+
+The download is checked against its SHA-256 checksum, as a stable one is. A nightly names its version, build date and commit:
+
+```text
+ursa 0.8.0-nightly.20261107 (a1b2c3d4e)
+```
+
+Only the newest nightly is kept, on the [`nightly` release](https://github.com/cldixon/ursa/releases/tag/nightly). To go back to stable, run the installer again without the nightly option (in PowerShell, `Remove-Item Env:URSA_CHANNEL` first). When you report a bug, include the output of `ursa --version`: it says which channel and commit you have. To build `main` yourself instead: `cargo install --git https://github.com/cldixon/ursa ursa-cli`.
+
 ## Query a file
 
 This guide uses Zachary's karate club: 34 members of a club, and 78 friendships between them. Download the two files:

@@ -1,0 +1,120 @@
+name: Build ursa-cli
+
+# Builds the `ursa` binary (crate ursa-cli) for five platforms, smoke-tests each
+# build that can run on its runner, and uploads one archive per platform with
+# its .sha256 file, as artifacts named ursa-cli-<target>. Publishes nothing.
+#
+# Called by release-cli.yml (stable releases) and nightly-cli.yml (the rolling
+# nightly prerelease), which publish what this builds.
+#
+# Archives are named ursa-cli-<label>-<target>.tar.gz (.zip on Windows) and
+# hold a directory of the same name with the binary, the README and the
+# licenses. docs/install.sh and docs/install.ps1 download them by that name and
+# expect this layout and the .sha256 format, as does ursa-cli/tests/installers.sh:
+# change them together.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "The version the binary must print, before any commit, e.g. 0.8.0 or 0.8.0-nightly.20261107."
+        type: string
+        required: true
+      label:
+        description: "The archive name's middle part: v<version> for a stable release, nightly for a nightly."
+        type: string
+        required: true
+      build-version:
+        description: "Set as URSA_BUILD_VERSION, to print in place of the crate's version (ursa-cli/build.rs). Empty for a stable build."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04, so the binary needs glibc 2.35 or later.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, native: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, native: true }
+          # macos-latest is Apple silicon; the Intel build cross-compiles there.
+          - { target: aarch64-apple-darwin, os: macos-latest, native: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, native: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, native: true }
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ inputs.version }}
+      ARCHIVE: ursa-cli-${{ inputs.label }}-${{ matrix.target }}
+      URSA_BUILD_VERSION: ${{ inputs.build-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p ursa-cli --target "$TARGET"
+
+      - name: Smoke test
+        if: matrix.native
+        shell: bash
+        run: |
+          bin="target/$TARGET/release/ursa"
+          got=$("$bin" --version | tr -d '\r')
+          echo "$got"
+          # A prerelease also names its commit: "ursa 0.8.0-nightly.20261107 (a1b2c3d4e)".
+          case "$VERSION" in
+            *-*) [[ "$got" =~ ^"ursa $VERSION ("[0-9a-f]{9,}")"$ ]] ;;
+            *) test "$got" = "ursa $VERSION" ;;
+          esac
+          out=$("$bin" --format csv -c "
+            CREATE VIEW ties AS SELECT * FROM 'python/ursa/datasets/data/karate_edges.csv';
+            CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+            SELECT count(*) AS n FROM pagerank(karate, direction => 'both');")
+          echo "$out"
+          test "$(echo "$out" | tr -d '\r' | tail -n 1)" = "34"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir "$ARCHIVE"
+          if [[ "$TARGET" == *windows* ]]; then exe=ursa.exe; else exe=ursa; fi
+          cp "target/$TARGET/release/$exe" ursa-cli/README.md LICENSE-MIT LICENSE-APACHE "$ARCHIVE/"
+          if [[ "$TARGET" == *windows* ]]; then
+            7z a "$ARCHIVE.zip" "$ARCHIVE" > /dev/null
+            file="$ARCHIVE.zip"
+          else
+            tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+            file="$ARCHIVE.tar.gz"
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$file" > "$file.sha256"
+          else
+            shasum -a 256 "$file" > "$file.sha256"
+          fi
+          cat "$file.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ursa-cli-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}.tar.gz
+            ${{ env.ARCHIVE }}.zip
+            ${{ env.ARCHIVE }}.*.sha256
+          if-no-files-found: error
