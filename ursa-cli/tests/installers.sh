@@ -4,12 +4,13 @@
 #
 #   sh ursa-cli/tests/installers.sh target/release/ursa
 #
-# Packages the given `ursa` binary the way .github/workflows/release-cli.yml
+# Packages the given `ursa` binary the way .github/workflows/cli-build.yml
 # does (ursa-cli-v<version>-<target>.tar.gz plus a .sha256 file), serves it
 # with `python3 -m http.server` in the layout of GitHub's release downloads,
 # and runs the installer against it with URSA_DOWNLOAD_BASE into temporary
-# directories. Needs python3, tar, and sha256sum or shasum. Runs shellcheck on
-# the scripts when it is installed.
+# directories, on the stable channel and the nightly one (the same binary, in
+# nightly/ under the nightly archive names). Needs python3, tar, and sha256sum
+# or shasum. Runs shellcheck on the scripts when it is installed.
 #
 # When `pwsh` is installed (it is on GitHub's Ubuntu runners), also runs
 # install.ps1 as `irm <url> | iex`. On Linux that installs the Linux binary,
@@ -64,13 +65,22 @@ sha256() {
     if command -v sha256sum > /dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi
 }
 
-# A release, packaged as release-cli.yml's Package step does.
+# A release, packaged as cli-build.yml's Package step does.
 name="ursa-cli-v$version-$target"
 release="$work/www/good/ursa-cli-v$version"
 mkdir -p "$release" "$work/pkg/$name"
 cp "$bin" "$here/../README.md" "$here/../../LICENSE-MIT" "$here/../../LICENSE-APACHE" "$work/pkg/$name/"
 (cd "$work/pkg" && tar czf "$release/$name.tar.gz" "$name")
 (cd "$release" && sha256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+# The rolling nightly release: the same binary, in archives of fixed names
+# under nightly/, as nightly-cli.yml publishes them.
+nname="ursa-cli-nightly-$target"
+nightly="$work/www/good/nightly"
+mkdir -p "$nightly" "$work/npkg/$nname"
+cp "$work/pkg/$name/"* "$work/npkg/$nname/"
+(cd "$work/npkg" && tar czf "$nightly/$nname.tar.gz" "$nname")
+(cd "$nightly" && sha256 "$nname.tar.gz" > "$nname.tar.gz.sha256")
 
 # The same archive with a checksum that does not match it.
 bad="$work/www/bad/ursa-cli-v$version"
@@ -221,6 +231,55 @@ else
     echo "skipped: curl | sh (curl not installed)"
 fi
 
+# The nightly channel, chosen with URSA_CHANNEL, with `sh -s -- --nightly`, and
+# undone with --stable. No releases listing is needed: it is never read.
+dir="$work/nightly/bin"
+install "$dir" sh URSA_DOWNLOAD_BASE="$www/good" URSA_RELEASES_URL="$www/no-releases.json" URSA_CHANNEL=nightly ||
+    fail "URSA_CHANNEL=nightly install failed: $(cat "$work/out")"
+[ "$("$dir/ursa" --version)" = "$full" ] || fail "nightly: wrong binary"
+grep -qF "Downloading the newest ursa nightly for $target" "$work/out" || fail "nightly: no download line: $(cat "$work/out")"
+grep -qF "/nightly/$nname.tar.gz" "$work/out" || fail "nightly: not from the nightly release: $(cat "$work/out")"
+grep -q "Checksum OK" "$work/out" || fail "nightly: no checksum line: $(cat "$work/out")"
+grep -q "This is a nightly build" "$work/out" || fail "nightly: no nightly notice: $(cat "$work/out")"
+cat "$work/out"
+pass "URSA_CHANNEL=nightly installs the nightly"
+
+dir="$work/nightly-arg/bin"
+env -i PATH="$base_path" HOME="$work/home" TMPDIR="$work/tmp" URSA_INSTALL_DIR="$dir" \
+    URSA_DOWNLOAD_BASE="$www/good" sh -s -- --nightly < "$installer" > "$work/out" 2>&1 ||
+    fail "sh -s -- --nightly failed: $(cat "$work/out")"
+grep -qF "/nightly/$nname.tar.gz" "$work/out" || fail "--nightly: not from the nightly release: $(cat "$work/out")"
+env -i PATH="$base_path" HOME="$work/home" TMPDIR="$work/tmp" URSA_INSTALL_DIR="$dir" URSA_CHANNEL=nightly \
+    URSA_DOWNLOAD_BASE="$www/good" URSA_VERSION="$version" sh -s -- --stable < "$installer" > "$work/out" 2>&1 ||
+    fail "sh -s -- --stable failed: $(cat "$work/out")"
+grep -qF "/ursa-cli-v$version/$name.tar.gz" "$work/out" || fail "--stable did not override URSA_CHANNEL: $(cat "$work/out")"
+! grep -q "This is a nightly build" "$work/out" || fail "--stable printed the nightly notice"
+pass "sh -s -- --nightly installs the nightly, and --stable goes back"
+
+# Nightly errors: a version with the nightly, an unknown channel or option, and
+# no nightly published.
+dir="$work/nightly-err/bin"
+if install "$dir" sh URSA_DOWNLOAD_BASE="$www/good" URSA_CHANNEL=nightly URSA_VERSION="$version"; then
+    fail "installed with both URSA_VERSION and the nightly channel"
+fi
+grep -q "URSA_VERSION picks a stable release" "$work/out" || fail "version-with-nightly error is unclear: $(cat "$work/out")"
+if install "$dir" sh URSA_DOWNLOAD_BASE="$www/good" URSA_CHANNEL=beta; then
+    fail "installed from an unknown channel"
+fi
+grep -q "it is stable or nightly" "$work/out" || fail "unknown channel error is unclear: $(cat "$work/out")"
+if env -i PATH="$base_path" HOME="$work/home" TMPDIR="$work/tmp" URSA_INSTALL_DIR="$dir" \
+    URSA_DOWNLOAD_BASE="$www/good" sh -s -- --beta < "$installer" > "$work/out" 2>&1; then
+    fail "installed with an unknown option"
+fi
+grep -q "unknown option '--beta'" "$work/out" || fail "unknown option error is unclear: $(cat "$work/out")"
+if install "$dir" sh URSA_DOWNLOAD_BASE="$www/bad" URSA_CHANNEL=nightly; then
+    fail "installed a nightly that does not exist"
+fi
+grep -q "Check that there is a nightly" "$work/out" || fail "missing nightly error is unclear: $(cat "$work/out")"
+[ ! -e "$dir/ursa" ] || fail "a binary was installed by a failed nightly install"
+[ -z "$(ls -A "$work/tmp")" ] || fail "temporary files left behind: $(ls -A "$work/tmp")"
+pass "nightly errors: a version, an unknown channel or option, no nightly"
+
 if command -v shellcheck > /dev/null; then
     shellcheck -s sh "$installer" "$0"
     pass "shellcheck"
@@ -229,7 +288,7 @@ else
 fi
 
 # install.ps1, with PowerShell 7 on this machine. The .zip is laid out as
-# release-cli.yml's 7z command lays it out, with the executable bit kept so
+# cli-build.yml's 7z command lays it out, with the executable bit kept so
 # the script's `ursa.exe --version` can run here.
 if command -v pwsh > /dev/null; then
     winname="ursa-cli-v$version-x86_64-pc-windows-msvc"
@@ -246,6 +305,18 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(doc, f"{name}/{doc.rsplit('/', 1)[-1]}")
 EOF
     (cd "$release" && sha256 "$winname.zip" > "$winname.zip.sha256")
+    # The nightly .zip: the same files under the nightly name.
+    nwinname="ursa-cli-nightly-x86_64-pc-windows-msvc"
+    python3 -I - "$release/$winname.zip" "$winname" "$nightly/$nwinname.zip" "$nwinname" << 'EOF'
+import sys, zipfile
+src, old, out, new = sys.argv[1:]
+with zipfile.ZipFile(src) as a, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as b:
+    for info in a.infolist():
+        data = a.read(info)
+        info.filename = new + info.filename[len(old):]
+        b.writestr(info, data)
+EOF
+    (cd "$nightly" && sha256 "$nwinname.zip" > "$nwinname.zip.sha256")
     cp "$release/$winname.zip" "$bad/"
     printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$winname.zip" > "$bad/$winname.zip.sha256"
 
@@ -281,6 +352,25 @@ EOF
     grep -q "checksum mismatch" "$work/out" || fail "install.ps1: bad checksum error is unclear: $(cat "$work/out")"
     [ ! -e "$dir/ursa.exe" ] || fail "install.ps1 installed a binary despite the bad checksum"
     pass "install.ps1 refuses an archive whose checksum does not match"
+
+    dir="$work/ps1-nightly/bin"
+    ps1 "$dir" URSA_DOWNLOAD_BASE="$www/good" URSA_RELEASES_URL="$www/no-releases.json" URSA_CHANNEL=nightly ||
+        fail "install.ps1 (nightly) failed: $(cat "$work/out")"
+    [ "$("$dir/ursa.exe" --version)" = "$full" ] || fail "install.ps1 (nightly): wrong binary"
+    grep -qF "/nightly/$nwinname.zip" "$work/out" || fail "install.ps1: nightly not from the nightly release: $(cat "$work/out")"
+    grep -q "This is a nightly build" "$work/out" || fail "install.ps1: no nightly notice: $(cat "$work/out")"
+    pass "install.ps1 installs the nightly with URSA_CHANNEL=nightly"
+
+    dir="$work/ps1-nightly-err/bin"
+    if ps1 "$dir" URSA_DOWNLOAD_BASE="$www/good" URSA_CHANNEL=nightly URSA_VERSION="$version"; then
+        fail "install.ps1 installed with both URSA_VERSION and the nightly channel"
+    fi
+    grep -q "URSA_VERSION picks a stable release" "$work/out" || fail "install.ps1: version-with-nightly error is unclear: $(cat "$work/out")"
+    if ps1 "$dir" URSA_DOWNLOAD_BASE="$www/good" URSA_CHANNEL=beta; then
+        fail "install.ps1 installed from an unknown channel"
+    fi
+    grep -q "it is stable or nightly" "$work/out" || fail "install.ps1: unknown channel error is unclear: $(cat "$work/out")"
+    pass "install.ps1 nightly errors: a version, an unknown channel"
 else
     echo "skipped: install.ps1 (pwsh not installed)"
 fi

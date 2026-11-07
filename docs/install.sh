@@ -4,17 +4,34 @@
 #   curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 #
 # Downloads the prebuilt binary for this machine from the repository's GitHub
-# Releases (the `ursa-cli-v*` releases, which .github/workflows/release-cli.yml
-# makes), checks it against its published SHA-256 checksum, and puts it in
+# Releases, checks it against its published SHA-256 checksum, and puts it in
 # ~/.local/bin. No sudo, and nothing outside the install directory changes.
+#
+# Two channels:
+#
+#   stable   (the default) the newest `ursa-cli-v*` release, which
+#            .github/workflows/release-cli.yml makes and crates.io also has.
+#   nightly  the newest build of main: the rolling `nightly` prerelease, which
+#            .github/workflows/nightly-cli.yml replaces on every merge. New
+#            features first, and they may change or break.
+#
+#   curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_CHANNEL=nightly sh
+#   curl -fsSL https://cldixon.github.io/ursa/install.sh | sh -s -- --nightly
+#
+# Running it again without the option goes back to stable.
+#
+# Options: --nightly, --stable (the channel; they override URSA_CHANNEL),
+# --help.
 #
 # Settings, as environment variables (put them after the pipe, e.g.
 # `curl -fsSL .../install.sh | URSA_VERSION=0.6.0 sh`):
 #
-#   URSA_VERSION        the version to install, e.g. 0.6.0. Default: the newest
-#                       ursa-cli release.
+#   URSA_CHANNEL        stable or nightly. Default: stable.
+#   URSA_VERSION        the stable version to install, e.g. 0.6.0. Default: the
+#                       newest ursa-cli release. Not with the nightly channel.
 #   URSA_INSTALL_DIR    where to put the binary. Default: $HOME/.local/bin.
-#   URSA_DOWNLOAD_BASE  the URL that holds ursa-cli-v<version>/<archive>.
+#   URSA_DOWNLOAD_BASE  the URL that holds ursa-cli-v<version>/<archive> and
+#                       nightly/<archive>.
 #                       Default: https://github.com/cldixon/ursa/releases/download
 #                       (for testing against a local copy).
 #   URSA_RELEASES_URL   the GitHub API URL that lists the releases, read to find
@@ -87,6 +104,23 @@ detect_target() {
     printf '%s\n' "$target"
 }
 
+usage() {
+    say "Install the ursa command-line tool."
+    say ""
+    say "  curl -fsSL https://cldixon.github.io/ursa/install.sh | sh"
+    say "  curl -fsSL https://cldixon.github.io/ursa/install.sh | sh -s -- --nightly"
+    say ""
+    say "Options:"
+    say "  --stable   the newest stable release (the default)"
+    say "  --nightly  the newest nightly build of main"
+    say "  --help     show this"
+    say ""
+    say "Settings, as environment variables: URSA_CHANNEL (stable or nightly),"
+    say "URSA_VERSION (a stable version, e.g. 0.6.0) and URSA_INSTALL_DIR (where"
+    say "to put ursa; the default is \$HOME/.local/bin). The comments at the top"
+    say "of the script describe the rest."
+}
+
 unsupported() {
     err "there is no prebuilt ursa binary for $1. Build it from source with Rust instead: cargo install ursa-cli"
 }
@@ -143,26 +177,53 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    target=$(detect_target)
+    channel=${URSA_CHANNEL:-stable}
+    for arg in "$@"; do
+        case "$arg" in
+            --nightly) channel=nightly ;;
+            --stable) channel=stable ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *) err "unknown option '$arg'. Options: --stable, --nightly, --help" ;;
+        esac
+    done
+    case "$channel" in
+        stable | nightly) ;;
+        *) err "URSA_CHANNEL is '$channel'; it is stable or nightly" ;;
+    esac
 
-    if [ -n "${URSA_VERSION:-}" ]; then
-        version=${URSA_VERSION#v}
-        version=${version#ursa-cli-v}
-    else
-        say "Finding the newest ursa release..."
-        version=$(latest_version)
-    fi
+    target=$(detect_target)
 
     base="${URSA_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download}"
     base=${base%/}
-    name="ursa-cli-v$version-$target"
-    archive="$name.tar.gz"
-    url="$base/ursa-cli-v$version/$archive"
+    if [ "$channel" = nightly ]; then
+        [ -z "${URSA_VERSION:-}" ] || err "URSA_VERSION picks a stable release, and there is only one nightly, the newest. Leave out URSA_VERSION for the nightly, or the nightly option for version ${URSA_VERSION}"
+        # One rolling release, with archives of fixed names: no lookup needed.
+        name="ursa-cli-nightly-$target"
+        archive="$name.tar.gz"
+        url="$base/nightly/$archive"
+        say "Downloading the newest ursa nightly for $target"
+        missing="Check that there is a nightly with a $target build: https://github.com/$REPO/releases/tag/nightly"
+    else
+        if [ -n "${URSA_VERSION:-}" ]; then
+            version=${URSA_VERSION#v}
+            version=${version#ursa-cli-v}
+        else
+            say "Finding the newest ursa release..."
+            version=$(latest_version)
+        fi
+        name="ursa-cli-v$version-$target"
+        archive="$name.tar.gz"
+        url="$base/ursa-cli-v$version/$archive"
+        say "Downloading ursa $version for $target"
+        missing="Check that ursa $version exists and has a $target build: https://github.com/$REPO/releases"
+    fi
     install_dir="${URSA_INSTALL_DIR:-${HOME:?HOME is not set; set URSA_INSTALL_DIR}/.local/bin}"
 
-    say "Downloading ursa $version for $target"
     say "  from $url"
-    download "$url" "$tmp/$archive" || err "could not download $url. Check that ursa $version exists and has a $target build: https://github.com/$REPO/releases"
+    download "$url" "$tmp/$archive" || err "could not download $url. $missing"
     download "$url.sha256" "$tmp/$archive.sha256" || err "could not download the checksum $url.sha256"
 
     expected=$(cut -d ' ' -f 1 < "$tmp/$archive.sha256" | tr 'A-F' 'a-f')
@@ -188,6 +249,12 @@ main() {
 
     say ""
     say "Installed $("$install_dir/ursa" --version) to $install_dir/ursa"
+    if [ "$channel" = nightly ]; then
+        say ""
+        say "This is a nightly build of main: new features first, and they may change"
+        say "or break. When you report a bug, include the output of: ursa --version"
+        say "To go back to stable, run the installer again without the nightly option."
+    fi
 
     case ":${PATH:-}:" in
         *":$install_dir:"*)
