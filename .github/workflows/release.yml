@@ -227,9 +227,12 @@ jobs:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     # Only publish for a real release; workflow_dispatch stops at building.
-    # Releases of the SQL CLI (tags ursa-cli-v*, release-cli.yml) are not
-    # Python releases.
-    if: github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'ursa-cli-v')
+    # Releases of the SQL CLI (tags ursa-cli-v*, release-cli.yml, and the
+    # rolling `nightly`, nightly-cli.yml) are not Python releases.
+    if: >-
+      github.event_name == 'release'
+      && !startsWith(github.event.release.tag_name, 'ursa-cli-v')
+      && github.event.release.tag_name != 'nightly'
     needs: [linux, macos, windows, sdist]
     environment: pypi
     permissions:
