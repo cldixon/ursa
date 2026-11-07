@@ -11,6 +11,7 @@
 resolver = "2"
 members = [
     "ursa-core", "ursa-io", "ursa-plan", "ursa-py", "ursa-engine", "ursa-sql", "ursa-cli", "ursa-wasm",
+    "ursa-viz",
 ]
 
 [workspace.package]

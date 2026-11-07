@@ -1,0 +1,43 @@
+[package]
+name = "ursa-viz"
+description = "Ursa's graph view: a live ForceAtlas2 layout drawn with wgpu (WebGPU, WebGL2, or native), for the SQL shell and the DataFrame API alike."
+version = "0.8.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A library first: the view takes a graph as a node count and dense src/dst
+# ids, so it knows nothing of SQL, DataFusion or Python. The `web` feature
+# adds the wasm-bindgen API the browser shell uses.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+web = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "dep:console_error_panic_hook"]
+
+[dependencies]
+# Serial ursa-core: the browser has one thread, and the layout is the same
+# bits either way.
+ursa-core = { path = "../ursa-core", version = "0.8.0", default-features = false }
+# Backends per target: WebGPU, falling back to WebGL2, in the browser. A native
+# window would add Vulkan, Metal and DX12 here.
+wgpu = { version = "29.0.4", default-features = false, features = ["std", "wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+# The one-shot that hands a mapped readback buffer back to async code.
+futures-channel = "0.3"
+wasm-bindgen = { version = "0.2.126", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["HtmlCanvasElement", "Window", "Performance", "console"] }
+console_error_panic_hook = { version = "0.1.7", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "29.0.4", default-features = false, features = ["std", "wgsl", "webgpu", "webgl"] }
+
+[dev-dependencies]
+# Validates the WGSL natively, so a shader error fails `cargo test`, not
+# only the browser.
+naga = { version = "29.0.4", features = ["wgsl-in"] }
