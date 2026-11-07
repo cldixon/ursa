@@ -7,14 +7,24 @@
 //!   "version": 1,
 //!   "statements": [
 //!     "CREATE VIEW ties AS SELECT * FROM 'karate_edges.csv'"
-//!   ]
+//!   ],
+//!   "settings": {
+//!     "ursa.index_storage_limit": "32GiB"
+//!   }
 //! }
 //! ```
+//!
+//! `settings` holds the settings the database keeps (#327): today only
+//! `ursa.index_storage_limit`, as `SET` left it. It is written only when there
+//! is one, so a database that never had one is the same file as before; a
+//! version of Ursa older than 0.8 ignores it (and drops it if it rewrites the
+//! file, which then obeys the default limit again).
 //!
 //! `version` changes only when the file's shape does. A file with a newer
 //! version is refused; anything that is not this shape is reported as not a
 //! valid database. An empty file (`touch club.ursa`) is an empty catalog.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -31,6 +41,9 @@ pub const VERSION: u64 = 1;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogFile {
     pub statements: Vec<String>,
+    /// Settings the database keeps, by their full name
+    /// (`ursa.index_storage_limit`), as `SET` would take them.
+    pub settings: BTreeMap<String, String>,
 }
 
 impl CatalogFile {
@@ -70,7 +83,19 @@ impl CatalogFile {
             .map(|s| s.as_str().map(str::to_string))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| invalid("an entry of \"statements\" is not a string".into()))?;
-        Ok(Self { statements })
+        let settings = match fields.get("settings") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(Value::Object(settings)) => settings
+                .iter()
+                .map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect::<Option<BTreeMap<_, _>>>()
+                .ok_or_else(|| invalid("a value of \"settings\" is not a string".into()))?,
+            Some(_) => return Err(invalid("its \"settings\" is not a JSON object".into())),
+        };
+        Ok(Self {
+            statements,
+            settings,
+        })
     }
 
     /// Read and parse the catalog file at `path`.
@@ -81,7 +106,8 @@ impl CatalogFile {
     }
 
     /// The file's text: `format`, `version`, then one statement per line,
-    /// with a trailing newline.
+    /// then the settings if there are any, one per line, with a trailing
+    /// newline.
     pub fn to_text(&self) -> String {
         let quote = |s: &str| Value::String(s.to_string()).to_string();
         let mut text = format!(
@@ -95,7 +121,16 @@ impl CatalogFile {
         if !self.statements.is_empty() {
             text.push_str("\n  ");
         }
-        text.push_str("]\n}\n");
+        text.push(']');
+        if !self.settings.is_empty() {
+            text.push_str(",\n  \"settings\": {");
+            for (i, (name, value)) in self.settings.iter().enumerate() {
+                text.push_str(if i == 0 { "\n    " } else { ",\n    " });
+                text.push_str(&format!("{}: {}", quote(name), quote(value)));
+            }
+            text.push_str("\n  }");
+        }
+        text.push_str("\n}\n");
         text
     }
 

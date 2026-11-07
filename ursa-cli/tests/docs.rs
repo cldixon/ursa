@@ -354,8 +354,8 @@ fn reference(rows: &[serde_json::Value]) -> String {
          An algorithm or a statistic takes the graph as its first argument, then named \
          parameters with `=>`. It returns one row per node: the node's `id` and its output \
          columns. `neighbors_agg` does too, from a value per node it reads. A traversal \
-         returns edges or walks. `algorithms` runs several per-node functions in one \
-         call.\n\n\
+         returns rows of its own: the nodes reached, a path's edges, or walks. \
+         `algorithms` runs several per-node functions in one call.\n\n\
          A parameter's default is the SQL literal used when the parameter is left out. \
          `required` means the call must give it. A `string` parameter with choices takes one \
          of them, quoted: `direction => 'both'`. An `expression` parameter takes an \

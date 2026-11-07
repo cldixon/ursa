@@ -43,7 +43,7 @@ LIMIT 5;`,
   },
   {
     title: "Two hops from the officers",
-    sql: `SELECT count(*) AS edges, count(DISTINCT dst) AS reached
+    sql: `SELECT count(*) AS pairs, count(DISTINCT id) AS reached
 FROM hop(karate,
          seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
          n => 2);`,

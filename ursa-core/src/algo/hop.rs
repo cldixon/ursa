@@ -62,37 +62,57 @@ pub fn k_hop_masked(
     k: u32,
     dir: Direction,
 ) -> (Vec<u32>, Vec<u32>) {
+    let (seeds, reached, _) = k_hop_distances_masked(topo, mask, seeds, k, dir);
+    (seeds, reached)
+}
+
+/// [`k_hop_masked`], with each reached node's distance from its seed: the
+/// number of steps (`1..=k`) at which the BFS first reached it. The three
+/// vectors have equal length and the same order as [`k_hop_masked`]'s.
+pub fn k_hop_distances_masked(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    seeds: &[u32],
+    k: u32,
+    dir: Direction,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let n = topo.n_nodes();
     if k == 0 || n == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     // Resolve the transpose before the parallel loop (see `neighbor_aggregate`).
     if dir != Direction::Out {
         topo.incoming();
     }
-    // One (src, dst) pair-list per seed, in seed order.
-    let per_seed: Vec<(Vec<u32>, Vec<u32>)> = seeds
+    // One (reached, distance) list per seed, in seed order.
+    let per_seed: Vec<(u32, Vec<u32>, Vec<u32>)> = seeds
         .par_iter()
         .map_init(
             || Scratch::new(n),
-            |scratch, &seed| bfs_seed(topo, mask, seed, k, dir, scratch),
+            |scratch, &seed| {
+                let (reached, distance) = bfs_seed(topo, mask, seed, k, dir, scratch);
+                (seed, reached, distance)
+            },
         )
         .collect();
 
-    let total: usize = per_seed.iter().map(|(s, _)| s.len()).sum();
+    let total: usize = per_seed.iter().map(|(_, r, _)| r.len()).sum();
     let mut src_out = Vec::with_capacity(total);
     let mut dst_out = Vec::with_capacity(total);
-    for (s, d) in per_seed {
-        src_out.extend(s);
-        dst_out.extend(d);
+    let mut distance_out = Vec::with_capacity(total);
+    for (seed, reached, distance) in per_seed {
+        src_out.extend(std::iter::repeat_n(seed, reached.len()));
+        dst_out.extend(reached);
+        distance_out.extend(distance);
     }
-    (src_out, dst_out)
+    (src_out, dst_out, distance_out)
 }
 
-/// BFS from a single seed to depth `k`, returning its `(seed, reached)` pairs.
-/// Uses and restores `scratch` (only the touched nodes are reset) so it is reusable
-/// across seeds handled by the same worker.
+/// BFS from a single seed to depth `k`, returning the nodes it reaches and the
+/// level (1-based) at which each was first reached. Uses and restores
+/// `scratch` (only the touched nodes are reset) so it is reusable across seeds
+/// handled by the same worker.
 fn bfs_seed(
     topo: &Topology,
     mask: Option<&EdgeMask>,
@@ -102,10 +122,10 @@ fn bfs_seed(
     scratch: &mut Scratch,
 ) -> (Vec<u32>, Vec<u32>) {
     let n = topo.n_nodes();
-    let mut src_out: Vec<u32> = Vec::new();
     let mut dst_out: Vec<u32> = Vec::new();
+    let mut distance_out: Vec<u32> = Vec::new();
     if (seed as usize) >= n {
-        return (src_out, dst_out); // unknown seed
+        return (dst_out, distance_out); // unknown seed
     }
 
     let Scratch {
@@ -120,7 +140,7 @@ fn bfs_seed(
     touched.clear();
     touched.push(seed);
 
-    for _level in 0..k {
+    for level in 1..=k {
         next.clear();
         for &u in frontier.iter() {
             topo.for_each_neighbor(u, dir, mask, |v| {
@@ -128,8 +148,8 @@ fn bfs_seed(
                     visited[v as usize] = true;
                     touched.push(v);
                     next.push(v);
-                    src_out.push(seed);
                     dst_out.push(v);
+                    distance_out.push(level);
                 }
             });
         }
@@ -143,7 +163,7 @@ fn bfs_seed(
     for &t in touched.iter() {
         visited[t as usize] = false;
     }
-    (src_out, dst_out)
+    (dst_out, distance_out)
 }
 
 /// The set of nodes reachable within `k` hops from **any** seed, including the
@@ -231,6 +251,21 @@ mod tests {
         let (s, d) = k_hop(&t, &[0], 2, Direction::Out);
         // from 0: level1 = {1}, level2 = {2, 4}
         assert_eq!(pairs(&s, &d), vec![(0, 1), (0, 2), (0, 4)]);
+    }
+
+    #[test]
+    fn distances_are_the_level_each_node_was_reached_at() {
+        let t = path();
+        let (s, d, hops) = k_hop_distances_masked(&t, None, &[0, 2], 10, Direction::Out);
+        let mut rows: Vec<(u32, u32, u32)> = (0..s.len()).map(|i| (s[i], d[i], hops[i])).collect();
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![(0, 1, 1), (0, 2, 2), (0, 3, 3), (0, 4, 2), (2, 3, 1)]
+        );
+        // The same pairs, in the same order, as k_hop.
+        let (s2, d2) = k_hop(&t, &[0, 2], 10, Direction::Out);
+        assert_eq!((s, d), (s2, d2));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! tests run real processes.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{Int64Array, RecordBatch};
@@ -414,9 +414,9 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
     assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
     close(ctx);
 
-    // The setting lasts for the session only.
+    // The setting is the database's: it lasts (#327).
     let ctx = open(&fixture.db()).await;
-    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("4GiB"));
+    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("1KiB"));
     let err = run(&ctx, "SET ursa.index_storage_limit = '8 gigs'")
         .await
         .unwrap_err();
@@ -424,6 +424,305 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
         ursa_engine::user_message(&err).contains("'8 gigs' is not a size"),
         "{err}"
     );
+    // A refused value changes nothing; RESET goes back to the default.
+    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("1KiB"));
+    ok(&ctx, "RESET ursa.index_storage_limit").await;
+    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("4GiB"));
+    close(ctx);
+    let ctx = open(&fixture.db()).await;
+    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("4GiB"));
+}
+
+/// A collecting notice sink on `ctx`, at `level`.
+async fn notices(ctx: &SessionContext, level: &str) -> Arc<Mutex<Vec<String>>> {
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let sink = {
+        let said = Arc::clone(&said);
+        Arc::new(move |line: &str| said.lock().unwrap().push(line.to_string()))
+    };
+    ursa_engine::notices::set_sink(&ctx.state(), Some(sink));
+    ok(ctx, &format!("SET ursa.notices = '{level}'")).await;
+    said
+}
+
+fn taken(said: &Mutex<Vec<String>>) -> Vec<String> {
+    std::mem::take(&mut *said.lock().unwrap())
+}
+
+/// N11: a read-only session's limit is its own, and never evicts; the
+/// database obeys only its stored limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_only_limit_never_evicts() {
+    let fixture = Fixture::new(20_000).await;
+    let dir = fixture.dir.path();
+    write_edges(&dir.join("edges_b.parquet"), 20_000, 3);
+    let ctx = open(&fixture.db()).await;
+    ok(
+        &ctx,
+        &in_dir(dir, "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));"),
+    )
+    .await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    close(ctx);
+    let before = read_manifest(&fixture.index_dir());
+    assert_eq!(before.len(), 1);
+
+    // A reader may SET a tiny limit: SHOW says so, and nothing is evicted
+    // (a reader writes nothing).
+    let reader = open_read_only(&fixture.db()).await;
+    ok(&reader, "SET ursa.index_storage_limit = '1KiB'").await;
+    assert_eq!(ok(&reader, SHOW_LIMIT).await, limit_row("1KiB"));
+    ok(&reader, "SELECT count(*) FROM degree(b)").await;
+    ok(&reader, "SELECT count(*) FROM degree(g)").await;
+    assert_eq!(counts(&reader), (1, 1));
+    close(reader);
+    assert_eq!(read_manifest(&fixture.index_dir()), before);
+    // ... and not stored.
+    let catalog = std::fs::read_to_string(fixture.db()).unwrap();
+    assert!(!catalog.contains("settings"), "{catalog}");
+
+    // A writer meanwhile obeys the database's limit (the default).
+    let writer = open(&fixture.db()).await;
+    assert_eq!(ok(&writer, SHOW_LIMIT).await, limit_row("4GiB"));
+    ok(&writer, "SELECT count(*) FROM degree(b)").await;
+    close(writer);
+    assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
+}
+
+/// A database's limit is SET once and kept in its catalog, and every later
+/// process obeys it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persistent_limit_survives_reopening() {
+    let fixture = Fixture::new(1_000).await;
+    let ctx = open(&fixture.db()).await;
+    ok(&ctx, "SET ursa.index_storage_limit = '32GiB'").await;
+    close(ctx);
+    let catalog = std::fs::read_to_string(fixture.db()).unwrap();
+    assert!(
+        catalog.contains("\"settings\": {\n    \"ursa.index_storage_limit\": \"32GiB\"\n  }"),
+        "{catalog}"
+    );
+    for ctx in [
+        open(&fixture.db()).await,
+        open_read_only(&fixture.db()).await,
+    ] {
+        assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("32GiB"));
+        let db = ursa_engine::database::database(&ctx.state()).unwrap();
+        assert_eq!(db.index_storage_limit(), 32 << 30);
+        close(ctx);
+    }
+}
+
+/// Each notice in its case (N11, N12, N17, N4).
+#[tokio::test(flavor = "multi_thread")]
+async fn notices_say_each_build_store_skip_and_eviction() {
+    let fixture = Fixture::new(20_000).await;
+    let dir = fixture.dir.path();
+    write_edges(&dir.join("edges_b.parquet"), 20_000, 3);
+
+    // Every build and store, at 'all'.
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "all").await;
+    ok(
+        &ctx,
+        &in_dir(dir, "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));"),
+    )
+    .await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    let lines = taken(&said);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], "building the index for g (20.0K edges)…");
+    assert!(
+        lines[1].starts_with("built the index for g (20.0K edges) in ")
+            && lines[1].contains(" s; stored in "),
+        "{lines:?}"
+    );
+    close(ctx);
+    let g = read_manifest(&fixture.index_dir())[0].size;
+
+    // At 'on', a quick build that is stored says nothing...
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    // ...and a limit with room for one index evicts g to store b.
+    ok(
+        &ctx,
+        &format!("SET ursa.index_storage_limit = '{}'", g * 3 / 2),
+    )
+    .await;
+    ok(&ctx, "SELECT count(*) FROM degree(b)").await;
+    let lines = taken(&said);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("evicted the stored index for g (")
+            && lines[0].ends_with(&format!(
+                "the least recently used) from {} to stay within ursa.index_storage_limit ({})",
+                fixture.db().display(),
+                ursa_engine::options::ByteSize(g * 3 / 2)
+            )),
+        "{lines:?}"
+    );
+    // Too large for the limit: said however quick.
+    ok(&ctx, "SET ursa.index_storage_limit = '1KiB'").await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    let lines = taken(&said);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("built the index for g (20.0K edges) in ")
+            && lines[0].contains("; not stored: it takes ")
+            && lines[0].contains(
+                ", more than ursa.index_storage_limit (1KiB); SET ursa.index_storage_limit = '"
+            )
+            && lines[0].ends_with("' to keep it"),
+        "{lines:?}"
+    );
+    close(ctx);
+
+    // Read-only: a build says it is not stored, at 'all' (and at 'on' when
+    // it is slow).
+    let reader = open_read_only(&fixture.db()).await;
+    let said = notices(&reader, "all").await;
+    ok(&reader, "SELECT count(*) FROM degree(g)").await;
+    let lines = taken(&said);
+    assert!(
+        lines.last().unwrap().ends_with(&format!(
+            "; not stored: {} is open read-only",
+            fixture.db().display()
+        )),
+        "{lines:?}"
+    );
+    // A load, at 'all'.
+    ok(&reader, "SELECT count(*) FROM degree(b)").await;
+    let lines = taken(&said);
+    assert!(
+        lines[0].starts_with("loaded the index for b (20.0K edges) from "),
+        "{lines:?}"
+    );
+    // 'off' says nothing.
+    ok(&reader, "SET ursa.notices = 'off'").await;
+    ok(&reader, "SELECT count(*) FROM pagerank(g)").await;
+    assert!(taken(&said).is_empty());
+}
+
+/// A database directory moved together with its data finds its stored
+/// indexes: the key holds paths relative to the database (#327, N13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_moved_database_directory_still_hits_its_stored_indexes() {
+    let root = tempfile::tempdir().unwrap();
+    let before = root.path().join("before");
+    std::fs::create_dir(&before).unwrap();
+    write_edges(&before.join("edges.parquet"), 20_000, 1);
+    let db = before.join("club.ursa");
+    let ctx = open(&db).await;
+    // A relative path, as a user writes it: stored relative to the database.
+    let cwd = std::env::current_dir().unwrap();
+    let relative = pathdiff(&before.join("edges.parquet"), &cwd);
+    ok(
+        &ctx,
+        &format!(
+            "CREATE VIEW ties AS SELECT * FROM '{}';
+             CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+            relative.display()
+        ),
+    )
+    .await;
+    let expected = ok(&ctx, QUERY).await;
+    assert_eq!(counts(&ctx), (1, 0));
+    close(ctx);
+    let entries = read_manifest(&before.join("club.ursa.d/indexes"));
+    assert_eq!(entries.len(), 1);
+    let key = entries[0].key.to_json().to_string();
+    assert!(!key.contains(&before.display().to_string()), "{key}");
+
+    // The replayed definition reads the file by its absolute path: a hit.
+    let ctx = open(&db).await;
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+    close(ctx);
+
+    let after = root.path().join("after");
+    std::fs::rename(&before, &after).unwrap();
+    let ctx = open(&after.join("club.ursa")).await;
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1), "the moved database loads its index");
+    close(ctx);
+}
+
+/// `path` relative to `base` (both absolute), as `../..` and names.
+fn pathdiff(path: &Path, base: &Path) -> PathBuf {
+    let path: Vec<_> = path.components().collect();
+    let base: Vec<_> = base.components().collect();
+    let common = path.iter().zip(&base).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..base.len() {
+        out.push("..");
+    }
+    for part in &path[common..] {
+        out.push(part.as_os_str());
+    }
+    out
+}
+
+/// The key has only the options that change what is read: settings that
+/// change DataFusion's other listing defaults leave it as it was (#327, N13).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_ignores_unrelated_listing_options() {
+    let fixture = Fixture::new(20_000).await;
+    let ctx = open(&fixture.db()).await;
+    let expected = ok(&ctx, QUERY).await;
+    close(ctx);
+
+    let ctx = open(&fixture.db()).await;
+    for set in [
+        "SET datafusion.execution.target_partitions = 3",
+        "SET datafusion.execution.collect_statistics = false",
+        "SET datafusion.execution.parquet.pushdown_filters = true",
+        "SET datafusion.execution.parquet.created_by = 'someone else'",
+        "SET datafusion.execution.parquet.max_row_group_size = 1000",
+    ] {
+        ok(&ctx, set).await;
+    }
+    // A new table over the same file, made under those settings.
+    ok(
+        &ctx,
+        &in_dir(
+            fixture.dir.path(),
+            "CREATE OR REPLACE VIEW ties AS SELECT * FROM 'edges.parquet'",
+        ),
+    )
+    .await;
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+}
+
+/// An index stored by an older version (manifest version 1) is a miss, and
+/// its file is removed once, with a notice.
+#[tokio::test(flavor = "multi_thread")]
+async fn indexes_stored_by_an_older_version_are_rebuilt() {
+    let fixture = Fixture::new(1_000).await;
+    std::fs::create_dir_all(fixture.index_dir()).unwrap();
+    std::fs::write(fixture.index_dir().join("00000000000000aa.idx"), b"old").unwrap();
+    std::fs::write(
+        fixture.index_dir().join("manifest.json"),
+        r#"{"format": "ursa-indexes", "version": 1, "indexes": [{"file": "00000000000000aa.idx",
+            "size": 3, "created": 1, "last_used": 1, "key": {"fingerprint": "f", "files": []}}]}"#,
+    )
+    .unwrap();
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    ok(&ctx, QUERY).await;
+    assert_eq!(counts(&ctx), (1, 0));
+    assert_eq!(
+        taken(&said),
+        [format!(
+            "removed 1 stored index (3 B) from {} written by another version of ursa; each is \
+             built again when it is first used",
+            fixture.db().display()
+        )]
+    );
+    close(ctx);
+    let entries = read_manifest(&fixture.index_dir());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(fixture.index_files(), [entries[0].file.clone()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

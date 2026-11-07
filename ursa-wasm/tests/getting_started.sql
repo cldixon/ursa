@@ -110,12 +110,12 @@ SELECT count(DISTINCT connected_components) AS groups
 FROM connected_components(lesmis_strong);
 
 -- @step Traversals
--- Traversals return edges. hop returns the edges within n steps of the seed
--- nodes; the seeds can be a list or a query.
-SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both') ORDER BY src, dst;
+-- Traversals return rows of their own. hop returns (seed, id, distance): each
+-- node within n steps of a seed; the seeds can be a list or a query.
+SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both') ORDER BY seed, id;
 SELECT * FROM hop(karate,
                   seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                  n => 2) ORDER BY src, dst;
+                  n => 2) ORDER BY seed, id;
 
 -- @step Shortest paths and random walks
 -- shortest_path returns the path's edges with their running cost. A seeded
