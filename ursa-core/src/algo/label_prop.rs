@@ -12,6 +12,7 @@
 //! parallel votes (multiplicity-is-rows) — a heavily-parallel neighbour pulls
 //! proportionally harder.
 
+use super::linked::Linked;
 use super::rng::{shuffled_order, DEFAULT_SEED};
 use crate::topology::{Adjacency, EdgeMask, Topology};
 
@@ -20,33 +21,66 @@ use crate::topology::{Adjacency, EdgeMask, Topology};
 /// label or `max_iter` sweeps have run. Labels are dense node indices (one
 /// representative per community), not necessarily a contiguous `0..k`. A subgraph
 /// `mask` restricts voting to kept edges.
+///
+/// An isolated node never votes and is never voted for, so it keeps its own
+/// label; a graph with many runs over its linked nodes only (#326), visited in
+/// the order the seeded permutation of every node gives them, with the same
+/// labels.
 pub fn label_propagation(
     topo: &Topology,
     mask: Option<&EdgeMask>,
     max_iter: u32,
     seed: Option<u64>,
 ) -> Vec<u32> {
-    let n = topo.n_nodes();
-    if n == 0 {
+    if topo.n_nodes() == 0 {
         return Vec::new();
     }
-    let mut label: Vec<u32> = (0..n as u32).collect();
+    topo.incoming();
+    let linked = Linked::of(topo, mask);
+    label_propagation_over(
+        topo,
+        mask,
+        max_iter,
+        seed,
+        linked.worth_it().then_some(&linked),
+    )
+}
+
+/// [`label_propagation`], compact over `linked` when given.
+fn label_propagation_over(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    max_iter: u32,
+    seed: Option<u64>,
+    linked: Option<&Linked>,
+) -> Vec<u32> {
+    let n = topo.n_nodes();
+    let width = linked.map_or(n, Linked::len);
+    // The node of compact node `u`, and the compact node of node `v`.
+    let node = |u: u32| linked.map_or(u, |l| l.nodes()[u as usize]);
+    let at = |v: u32| linked.map_or(v, |l| l.compact(v));
+    let mut label: Vec<u32> = (0..width as u32).collect();
     let out = topo.out();
     let inc = topo.incoming();
     let order = shuffled_order(n, seed.unwrap_or(DEFAULT_SEED));
+    let order = match linked {
+        None => order,
+        Some(l) => l.compact_order(&order).0,
+    };
     // Vote tally, dense over label ids (labels are node ids, so `< n`), plus the
     // labels touched for the current node. Counting into an array and resetting
     // only the touched slots replaces a hash map probe per neighbour; the winner
     // depends only on the counts, never on the order labels were seen.
-    let mut counts = vec![0u32; n];
+    let mut counts = vec![0u32; width];
     let mut touched: Vec<u32> = Vec::new();
 
     // Tally each kept-edge neighbour's label for node `u` in one adjacency.
     let tally =
         |adj: &Adjacency, u: u32, label: &[u32], counts: &mut [u32], touched: &mut Vec<u32>| {
+            let u = node(u);
             for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
                 if mask.is_none_or(|m| m.keep(e)) {
-                    let lab = label[v as usize];
+                    let lab = label[at(v) as usize];
                     let c = &mut counts[lab as usize];
                     if *c == 0 {
                         touched.push(lab);
@@ -86,7 +120,10 @@ pub fn label_propagation(
             break;
         }
     }
-    label
+    match linked {
+        None => label,
+        Some(l) => l.expand_labels(&label),
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +172,28 @@ mod tests {
             label_propagation(&t, None, 20, Some(3)),
             label_propagation(&t, None, 20, Some(3))
         );
+    }
+
+    /// The compact run (#326) gives the full run's labels.
+    #[test]
+    fn compact_runs_give_the_full_labels() {
+        use crate::algo::linked::testing::{sparse, CASES};
+        for &(seed, n, m) in CASES {
+            let (t, mask) = sparse(seed, n, m);
+            for mask in [None, Some(&mask)] {
+                let linked = Linked::of(&t, mask);
+                for s in [None, Some(5)] {
+                    for iters in [1, 3, 30] {
+                        assert_eq!(
+                            label_propagation_over(&t, mask, iters, s, Some(&linked)),
+                            label_propagation_over(&t, mask, iters, s, None),
+                            "graph {seed}, masked {}, seed {s:?}, {iters} iterations",
+                            mask.is_some()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

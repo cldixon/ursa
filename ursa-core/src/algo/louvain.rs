@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 
 use crate::parallel::*;
 
+use super::linked::Linked;
 use super::rng::{shuffled_order, DEFAULT_SEED};
 use crate::topology::{EdgeMask, Topology};
 
@@ -70,14 +71,45 @@ fn louvain_impl(
         return (0..n as u32).collect();
     }
 
+    let linked = Linked::of(topo, mask);
+    if linked.len() == 0 {
+        return (0..n as u32).collect();
+    }
+    let linked = (linked.n_isolated() > 0).then_some(linked);
+    louvain_over(topo, weights, mask, resolution, seed, linked, PACE)
+}
+
+/// Louvain over `topo`, compact over the linked nodes when `linked` is given
+/// (#326).
+///
+/// An isolated node has no neighbour, so it never moves and nothing moves to
+/// it: it is a singleton at every level, and its visits only count as work
+/// (see [`one_level`]). The compact run works on the linked (super-)nodes, in
+/// node order, and keeps, for each level, which positions of the full
+/// level's node order they hold (`level`): the full level numbers its
+/// communities by first appearance, isolated singletons included, so a
+/// linked community first met at compact node `s`, the `r`-th community met,
+/// is full node `r + (pos[s] - s)` of the next level. Its labels end up as the
+/// full run's: by first appearance over the nodes, isolated ones as their own.
+fn louvain_over(
+    topo: &Topology,
+    weights: Option<&[f64]>,
+    mask: Option<&EdgeMask>,
+    resolution: f64,
+    seed: Option<u64>,
+    linked: Option<Linked>,
+    pace: Pace,
+) -> Vec<u32> {
     let seed = seed.unwrap_or(DEFAULT_SEED);
-    let mut graph = Graph::from_topology(topo, weights, mask);
+    let mut graph = Graph::from_topology(topo, weights, mask, linked.as_ref());
+    let isolated = linked.as_ref().map_or(0, Linked::n_isolated);
     // Community of each *original* node, expressed in the current graph's node
     // space; updated (composed) at every level.
-    let mut node_comm: Vec<u32> = (0..n as u32).collect();
+    let mut node_comm: Vec<u32> = (0..graph.n() as u32).collect();
+    let mut level = linked.clone();
 
     loop {
-        let comm = one_level(&graph, resolution, seed);
+        let comm = one_level(&graph, resolution, seed, level.as_ref(), pace);
         let c = comm.iter().copied().max().map_or(0, |m| m as usize + 1);
         // Compose this level's assignment onto the original nodes.
         for label in node_comm.iter_mut() {
@@ -87,12 +119,58 @@ fn louvain_impl(
         if c == graph.n() {
             break;
         }
+        if let Some(l) = &level {
+            let mut pos: Vec<u32> = Vec::with_capacity(c);
+            for (s, (&r, &p)) in comm.iter().zip(l.nodes()).enumerate() {
+                if r as usize == pos.len() {
+                    pos.push(r + (p - s as u32));
+                }
+            }
+            level = Some(Linked::from_sorted(c + isolated, pos));
+        }
         graph = graph.aggregate(&comm, c);
-        if c == 1 {
+        if c + isolated == 1 {
             break;
         }
     }
-    node_comm
+    match &linked {
+        None => node_comm,
+        Some(l) => first_appearance(l, &node_comm),
+    }
+}
+
+/// Labels over every node, by first appearance in node order, from the
+/// compact nodes' communities: an isolated node is a community of its own.
+fn first_appearance(linked: &Linked, comm: &[u32]) -> Vec<u32> {
+    let mut map = vec![u32::MAX; comm.len()];
+    let mut next = 0u32;
+    let mut label = |slot: Option<&mut u32>| {
+        let fresh = next;
+        match slot {
+            Some(slot) if *slot != u32::MAX => *slot,
+            Some(slot) => {
+                *slot = fresh;
+                next += 1;
+                fresh
+            }
+            None => {
+                next += 1;
+                fresh
+            }
+        }
+    };
+    let nodes = linked.nodes();
+    let mut c = 0;
+    (0..linked.n() as u32)
+        .map(|v| {
+            if nodes.get(c) == Some(&v) {
+                c += 1;
+                label(Some(&mut map[comm[c - 1] as usize]))
+            } else {
+                label(None)
+            }
+        })
+        .collect()
 }
 
 /// Stop a level once a full sweep's worth of node visits (see [`one_level`])
@@ -112,6 +190,22 @@ const SWEEP_GAIN_THRESHOLD: f64 = 1e-7;
 /// bounding a level at O(64 · (n + m)).
 const MAX_SWEEPS: usize = 64;
 
+/// When a level stops: [`SWEEP_GAIN_THRESHOLD`] and [`MAX_SWEEPS`], checked
+/// every sweep's worth of work. Tests shorten the sweep to stop levels mid-way.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    threshold: f64,
+    max_sweeps: usize,
+    /// The work between checks, if not a sweep of the working graph.
+    sweep: Option<usize>,
+}
+
+const PACE: Pace = Pace {
+    threshold: SWEEP_GAIN_THRESHOLD,
+    max_sweeps: MAX_SWEEPS,
+    sweep: None,
+};
+
 /// One full local-moving phase over `graph`, returning a contiguous `0..k`
 /// community label per node.
 ///
@@ -127,11 +221,34 @@ const MAX_SWEEPS: usize = 64;
 /// a sweep's worth of visits gains less than [`SWEEP_GAIN_THRESHOLD`], or after
 /// [`MAX_SWEEPS`] sweeps' worth. Serial and seeded, so deterministic and
 /// independent of the thread count.
-fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
+///
+/// With `level`, `graph` is compact (see [`louvain_over`]): its nodes are the
+/// `level.nodes()` of a full level of `level.n()` nodes, the rest isolated
+/// singletons. The full level visits every node in a permutation of all
+/// `level.n()`; visiting an isolated node changes nothing but adds one to the
+/// work count, which decides when a level stops. So the compact level visits
+/// its own nodes in the order the permutation gives them and, before each,
+/// counts the isolated visits the full level makes there, all at once.
+fn one_level(
+    graph: &Graph,
+    resolution: f64,
+    seed: u64,
+    level: Option<&Linked>,
+    pace: Pace,
+) -> Vec<u32> {
     let n = graph.n();
+    let n_full = level.map_or(n, Linked::n);
     let mut comm: Vec<u32> = (0..n as u32).collect();
     let mut tot: Vec<f64> = graph.k.clone(); // Σ weighted-degree of each community
-    let mut queue: VecDeque<u32> = shuffled_order(n, seed).into();
+                                             // The visit order, and with `level`, the isolated visits before each of its
+                                             // nodes and after the last.
+    let (order, gaps, tail) = match level {
+        None => (shuffled_order(n, seed), Vec::new(), 0),
+        Some(l) => l.compact_order(&shuffled_order(n_full, seed)),
+    };
+    let first_visits = order.len();
+    let mut visits = 0usize;
+    let mut queue: VecDeque<u32> = order.into();
     let mut queued = vec![true; n];
     // Weight from the current node into each neighbouring community, dense over
     // community ids (`< n`), plus the communities touched for this node. Summed in
@@ -142,14 +259,36 @@ fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
 
     // Work is counted in adjacency slots visited (plus one per node visit), so a
     // sweep is `n + 2m` slots whatever the order in which nodes are visited.
-    let sweep = n + graph.targets.len();
-    let budget = sweep.saturating_mul(MAX_SWEEPS);
+    let sweep = pace.sweep.unwrap_or(n_full + graph.targets.len()).max(1);
+    let budget = sweep.saturating_mul(pace.max_sweeps);
     let (mut work, mut next_check) = (0usize, sweep);
     // Raw gain (in `best_gain - stay` units) accumulated since the last check;
     // `· 2 / m2` converts it to a modularity difference.
     let mut gain = 0.0f64;
 
-    while let Some(u) = queue.pop_front() {
+    'visits: while let Some(u) = queue.pop_front() {
+        // The isolated nodes the full level visits just before this one: each
+        // adds one to `work`, and the check below runs after each, so each
+        // check falls on the first of them to reach `next_check`.
+        if level.is_some() {
+            let run = match visits.cmp(&first_visits) {
+                std::cmp::Ordering::Less => gaps[visits] as usize,
+                std::cmp::Ordering::Equal => tail as usize,
+                std::cmp::Ordering::Greater => 0,
+            };
+            visits += 1;
+            let end = work + run;
+            while end >= next_check {
+                // The visit that brings `work` to `next_check` runs the check.
+                let at = next_check;
+                if gain * 2.0 / graph.m2 < pace.threshold || at >= budget {
+                    break 'visits;
+                }
+                gain = 0.0;
+                next_check = at + sweep;
+            }
+            work = end;
+        }
         queued[u as usize] = false;
         let ci = comm[u as usize];
         let ku = graph.k[u as usize];
@@ -206,7 +345,7 @@ fn one_level(graph: &Graph, resolution: f64, seed: u64) -> Vec<u32> {
         }
 
         if work >= next_check {
-            if gain * 2.0 / graph.m2 < SWEEP_GAIN_THRESHOLD || work >= budget {
+            if gain * 2.0 / graph.m2 < pace.threshold || work >= budget {
                 break;
             }
             gain = 0.0;
@@ -296,8 +435,20 @@ impl Graph {
     /// segment, so a segment receives its entries in exactly the order a serial
     /// row-order pass would produce, whatever the chunking (the same scheme as
     /// `Adjacency::transpose`).
-    fn from_topology(topo: &Topology, weights: Option<&[f64]>, mask: Option<&EdgeMask>) -> Graph {
-        let n = topo.n_nodes();
+    ///
+    /// With `linked`, the graph is over the linked nodes only, in node order
+    /// (compact ids keep the order of node ids, so every segment sorts and sums
+    /// as it would in the full graph).
+    fn from_topology(
+        topo: &Topology,
+        weights: Option<&[f64]>,
+        mask: Option<&EdgeMask>,
+        linked: Option<&Linked>,
+    ) -> Graph {
+        let n = linked.map_or(topo.n_nodes(), Linked::len);
+        // The node of compact node `u`, and the compact node of node `v`.
+        let node = |u: u32| linked.map_or(u, |l| l.nodes()[u as usize]);
+        let at = |v: u32| linked.map_or(v, |l| l.compact(v));
         let out = topo.out();
         let m = out.targets.len();
         // Under a subgraph mask, only kept edges enter the working graph. The
@@ -314,7 +465,15 @@ impl Graph {
         } else {
             threads.min((m / n.max(1)).max(4))
         };
-        let out_offsets: Vec<usize> = out.offsets.iter().map(|&o| o as usize).collect();
+        let out_offsets: Vec<usize> = match linked {
+            None => out.offsets.iter().map(|&o| o as usize).collect(),
+            Some(l) => std::iter::once(0)
+                .chain(l.nodes().iter().scan(0usize, |acc, &v| {
+                    *acc += out.degree(v) as usize;
+                    Some(*acc)
+                }))
+                .collect(),
+        };
         let chunks = node_blocks(&out_offsets, n_chunks);
         let ranges: Vec<(usize, usize)> = chunks.windows(2).map(|w| (w[0], w[1])).collect();
 
@@ -323,7 +482,9 @@ impl Graph {
         let hist = |&(lo, hi): &(usize, usize)| {
             let mut h = vec![0u32; n];
             for u in lo as u32..hi as u32 {
-                for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                let uo = node(u);
+                for (&v, &e) in out.neighbors(uo).iter().zip(out.edge_ids(uo)) {
+                    let v = at(v);
                     if keep(e) && u != v {
                         h[u as usize] += 1;
                         h[v as usize] += 1;
@@ -359,10 +520,12 @@ impl Graph {
         let scatter = |(&(lo, hi), mut cur): (&(usize, usize), Vec<u32>)| {
             let mut loops = vec![0.0f64; hi - lo];
             for u in lo as u32..hi as u32 {
-                for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                let uo = node(u);
+                for (&v, &e) in out.neighbors(uo).iter().zip(out.edge_ids(uo)) {
                     if !keep(e) {
                         continue;
                     }
+                    let v = at(v);
                     let w = weights.map_or(1.0, |ws| ws[e as usize]);
                     if u == v {
                         loops[u as usize - lo] += w;
@@ -570,6 +733,53 @@ fn renumber(comm: &[u32]) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    /// The compact run (#326) gives the full run's labels, values and order:
+    /// unweighted and weighted, masked and not, over several seeds.
+    #[test]
+    fn compact_runs_give_the_full_labels() {
+        use crate::algo::linked::testing::{sparse, weights, CASES};
+        for &(seed, n, m) in CASES {
+            let (t, mask) = sparse(seed, n, m);
+            let w = weights(seed, m);
+            for mask in [None, Some(&mask)] {
+                let linked = Linked::of(&t, mask);
+                if linked.len() == 0 || linked.n_isolated() == 0 {
+                    continue;
+                }
+                // Levels that end with the queue, and levels stopped mid-way
+                // by the gain threshold or the work budget, whose stopping
+                // point counts the isolated nodes' visits.
+                let short = |threshold, max_sweeps, sweep| Pace {
+                    threshold,
+                    max_sweeps,
+                    sweep: Some(sweep),
+                };
+                let paces = [
+                    PACE,
+                    short(1e-2, 64, n / 3 + 1),
+                    short(-1.0, 2, n / 2 + 3),
+                    short(-1.0, 3, 7),
+                ];
+                for s in [None, Some(1), Some(77)] {
+                    for (ws, res) in [(None, 1.0), (Some(w.as_slice()), 1.0), (None, 0.3)] {
+                        for pace in paces.into_iter().take(if n > 5000 { 1 } else { 4 }) {
+                            let full = louvain_over(&t, ws, mask, res, s, None, pace);
+                            let compact =
+                                louvain_over(&t, ws, mask, res, s, Some(linked.clone()), pace);
+                            assert_eq!(
+                                compact,
+                                full,
+                                "graph {seed}, masked {}, seed {s:?}, weighted {}, {pace:?}",
+                                mask.is_some(),
+                                ws.is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Two 4-cliques {0,1,2,3} and {4,5,6,7} joined by a single bridge 3-4.
     fn two_cliques() -> Topology {
         let mut src = Vec::new();
@@ -741,7 +951,7 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                let g = Graph::from_topology(&t, Some(&w), None);
+                let g = Graph::from_topology(&t, Some(&w), None, None);
                 let comm: Vec<u32> = (0..g.n() as u32).map(|u| u / 7).collect();
                 let agg = g.aggregate(&comm, g.n().div_ceil(7));
                 (g, agg)

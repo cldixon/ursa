@@ -17,6 +17,7 @@
 
 use crate::parallel::*;
 
+use super::linked::Linked;
 use crate::topology::{EdgeMask, Topology, UndirectedCsr};
 
 /// The undirected adjacency a triangle-family kernel runs over: the topology's
@@ -66,23 +67,42 @@ pub fn undirected_view<'a>(topo: &'a Topology, mask: Option<&EdgeMask>) -> Undir
 /// which is what made the plain node-iterator quadratic in hub degree. Each found
 /// triangle credits all three corners. The counts are integers, so the parallel
 /// atomic adds give the same result in any order and on any thread count.
+///
+/// A node of degree under 2 is in no triangle and is no common neighbour of
+/// two nodes, so it adds nothing to the count. When enough nodes have degree
+/// under 2 (isolated nodes, most often, #326), the pass runs over the others
+/// only, numbered in node order, and fills in 0 for the rest.
 pub fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
+    let n = adj.offsets.len().saturating_sub(1);
+    let linked = Linked::from_fn(n, |u| adj.degree(u) >= 2);
+    triangles_over(adj, linked.worth_it().then_some(&linked))
+}
+
+/// [`per_node_triangles`], over the nodes of `linked` only when given.
+fn triangles_over(adj: &UndirectedCsr, linked: Option<&Linked>) -> Vec<u32> {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let n = adj.offsets.len().saturating_sub(1);
+    let n = linked.map_or(adj.offsets.len().saturating_sub(1), Linked::len);
+    // The node of compact node `u`, the compact node of node `v`, and whether
+    // node `v` is one of the compact nodes.
+    let node = |u: u32| linked.map_or(u, |l| l.nodes()[u as usize]);
+    let at = |v: u32| linked.map_or(v, |l| l.compact(v));
+    let kept = |v: u32| linked.is_none_or(|l| l.contains(v));
     let ranks_above = |u: u32, v: u32| {
         let (du, dv) = (adj.degree(u), adj.degree(v));
         dv > du || (dv == du && v > u)
     };
 
     // The oriented adjacency: each node's higher-ranked neighbours, still sorted by
-    // id (a filtered sorted list stays sorted), as a flat CSR.
+    // id (a filtered sorted list stays sorted), as a flat CSR. Its entries are
+    // node ids; its rows are compact.
     let fwd_deg: Vec<u32> = (0..n as u32)
         .into_par_iter()
         .map(|u| {
+            let u = node(u);
             adj.neighbors(u)
                 .iter()
-                .filter(|&&v| ranks_above(u, v))
+                .filter(|&&v| kept(v) && ranks_above(u, v))
                 .count() as u32
         })
         .collect();
@@ -98,19 +118,27 @@ pub fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
     let fwd_addr = fwd.as_mut_ptr() as usize;
     (0..n as u32).into_par_iter().for_each(|u| {
         let base = fwd_off[u as usize];
-        let kept = adj.neighbors(u).iter().filter(|&&v| ranks_above(u, v));
-        for (k, &v) in kept.enumerate() {
+        let uo = node(u);
+        let ups = adj
+            .neighbors(uo)
+            .iter()
+            .filter(|&&v| kept(v) && ranks_above(uo, v));
+        for (k, &v) in ups.enumerate() {
             // SAFETY: `base + k < fwd_off[u + 1]` (the segment holds exactly the
             // `fwd_deg[u]` neighbours this filter yields), no other node writes this
             // segment, and `fwd` outlives the loop.
             unsafe { *(fwd_addr as *mut u32).add(base + k) = v };
         }
     });
-    let fwd_of = |u: u32| &fwd[fwd_off[u as usize]..fwd_off[u as usize + 1]];
+    // The higher-ranked neighbours of node `v`.
+    let fwd_of = |v: u32| {
+        let c = at(v) as usize;
+        &fwd[fwd_off[c]..fwd_off[c + 1]]
+    };
 
     let counts: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     (0..n as u32).into_par_iter().for_each(|u| {
-        let nu = fwd_of(u);
+        let nu = &fwd[fwd_off[u as usize]..fwd_off[u as usize + 1]];
         let mut found_u = 0u32;
         for &v in nu {
             // Common higher-ranked neighbours w of u and v close triangle {u, v, w}.
@@ -121,7 +149,7 @@ pub fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
                     std::cmp::Ordering::Less => i += 1,
                     std::cmp::Ordering::Greater => j += 1,
                     std::cmp::Ordering::Equal => {
-                        counts[a[i] as usize].fetch_add(1, Ordering::Relaxed);
+                        counts[at(a[i]) as usize].fetch_add(1, Ordering::Relaxed);
                         found_v += 1;
                         i += 1;
                         j += 1;
@@ -129,7 +157,7 @@ pub fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
                 }
             }
             if found_v > 0 {
-                counts[v as usize].fetch_add(found_v, Ordering::Relaxed);
+                counts[at(v) as usize].fetch_add(found_v, Ordering::Relaxed);
                 found_u += found_v;
             }
         }
@@ -137,7 +165,11 @@ pub fn per_node_triangles(adj: &UndirectedCsr) -> Vec<u32> {
             counts[u as usize].fetch_add(found_u, Ordering::Relaxed);
         }
     });
-    counts.into_iter().map(AtomicU32::into_inner).collect()
+    let counts: Vec<u32> = counts.into_iter().map(AtomicU32::into_inner).collect();
+    match linked {
+        None => counts,
+        Some(l) => l.expand(&counts, |_| 0),
+    }
 }
 
 /// Per-node triangle count, dense-indexed. A subgraph `mask` restricts triangles
@@ -188,6 +220,22 @@ mod tests {
                 }
             }
             assert_eq!(triangle_count(&t, None), expect, "n={n} m={m}");
+        }
+    }
+
+    /// The compact pass (#326) gives the full pass's counts.
+    #[test]
+    fn compact_counts_are_the_full_counts() {
+        use crate::algo::linked::testing::{sparse, CASES};
+        for &(seed, n, m) in CASES {
+            let (t, mask) = sparse(seed, n, m.max(3) * 3);
+            for view in [undirected_view(&t, None), undirected_view(&t, Some(&mask))] {
+                let adj = view.get();
+                let linked = Linked::from_fn(n, |u| adj.degree(u) >= 2);
+                let full = triangles_over(adj, None);
+                assert_eq!(triangles_over(adj, Some(&linked)), full, "graph {seed}");
+                assert!(n < 1000 || full.iter().any(|&c| c > 0));
+            }
         }
     }
 

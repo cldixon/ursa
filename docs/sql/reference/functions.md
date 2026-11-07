@@ -36,7 +36,7 @@ degree(graph, direction => 'out')
 
 ### pagerank
 
-PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes.
+PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.
 
 ```text
 pagerank(graph, damping => 0.85, max_iter => 30, tol => 1e-6, weight => NULL, direction => 'out')
@@ -155,7 +155,7 @@ label_propagation(graph, max_iter => 20, seed => NULL)
 
 ### louvain
 
-Community labels by Louvain modularity optimization.
+Community labels by Louvain modularity optimization. A node with no edges is a community of its own: count communities of more than one member with GROUP BY louvain HAVING count(*) > 1.
 
 ```text
 louvain(graph, weight => NULL, resolution => 1.0, seed => NULL)
