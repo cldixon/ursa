@@ -35,8 +35,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gen import parse_size, size_label  # noqa: E402
-from run import REPO, first_number, measure  # noqa: E402
+from gen import parse_size, size_label
+from run import REPO, first_number, measure
 
 QUERIES = {
     "degree": "SELECT count(*) AS n, sum(degree) AS s FROM degree(g)",
@@ -49,9 +49,7 @@ QUERIES = {
         "SELECT count(*) AS n, count(DISTINCT label_propagation) AS c "
         "FROM label_propagation(g, seed => 1)"
     ),
-    "louvain": (
-        "SELECT count(*) AS n, count(DISTINCT louvain) AS c FROM louvain(g, seed => 1)"
-    ),
+    "louvain": ("SELECT count(*) AS n, count(DISTINCT louvain) AS c FROM louvain(g, seed => 1)"),
     "triangle_count": "SELECT count(*) AS n, sum(triangle_count) AS t FROM triangle_count(g)",
 }
 
@@ -141,8 +139,11 @@ def main(argv: list[str] | None = None) -> int:
                         statistics.median(r[1] for r in runs),
                         runs[0][2],
                     )
-                print(f"  {label:<8} {graph:<26} {step:<18} {results[label, graph, step]}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"  {label:<8} {graph:<26} {step:<18} {results[label, graph, step]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     cols = [(label, graph) for label, _ in binaries for graph in graphs]
     print(f"\n{edges.name}, wall time / peak RSS\n")
