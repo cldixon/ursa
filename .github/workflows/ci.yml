@@ -93,10 +93,11 @@ jobs:
       - name: test core + io + plan + py
         run: cargo test -p ursa-core -p ursa-io -p ursa-plan -p ursa-py --locked
 
-      # The SQL engine (#232): the engine session, the parser, and the `ursa`
-      # binary's integration tests (which read python/ursa/datasets/data).
-      - name: test engine + sql + cli + wasm (natively)
-        run: cargo test -p ursa-engine -p ursa-sql -p ursa-cli -p ursa-wasm --locked
+      # The SQL engine (#232): the engine session, the parser, the shell, and
+      # the `ursa` binary's integration tests (which read
+      # python/ursa/datasets/data).
+      - name: test engine + sql + shell + cli + wasm (natively)
+        run: cargo test -p ursa-engine -p ursa-sql -p ursa-shell -p ursa-cli -p ursa-wasm --locked
 
       # The graph view (#280): its scene, camera and styles, and its WGSL,
       # validated by naga.
@@ -123,7 +124,7 @@ jobs:
       # stores and the multi-thread runtime are native-only dependencies; this fails
       # the moment one leaks onto the wasm32 build.
       - name: check the SQL engine on wasm32
-        run: cargo clippy -p ursa-sql -p ursa-wasm --target wasm32-unknown-unknown --locked -- -D warnings
+        run: cargo clippy -p ursa-sql -p ursa-shell -p ursa-wasm --target wasm32-unknown-unknown --locked -- -D warnings
 
       - name: check the graph view on wasm32
         run: cargo clippy -p ursa-viz --features web --target wasm32-unknown-unknown --locked -- -D warnings

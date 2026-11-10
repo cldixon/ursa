@@ -1,6 +1,8 @@
 // Browser parity test (#278): run ../getting_started.sql in the wasm engine in
 // headless Chromium and in the native `ursa` binary, and require byte-identical
-// output. Also reports load and query timings.
+// output. Also reports load and query timings. The shell itself (WebShell, the
+// one the browser shell's terminal drives) is fed the script a line at a time
+// and must print the same, once its colour is taken out.
 //
 //   bun ursa-wasm/tests/browser/parity.ts <wasm-bindgen --target web dir> <ursa binary>
 import { chromium } from "playwright";
@@ -78,8 +80,18 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
     const described = JSON.parse(await other.run(exportSql, 5));
     const last = described.length - 1;
     const csv = new TextDecoder().decode(other.export(last, "csv"));
-    const shape = { statements: described.length, columns: described[last].columns.map((c) => c.name), shown: described[last].rows.length + described[last].tail.length, total: described[last].totalRows };
-    return { out, csv, shape, load: t1 - t0, script: t2 - t1, pagerankFirst: t3 - t2, pagerankWarm: t4 - t3, version: mod.version() };
+    const shape = { statements: described.length, columns: described[last].columns.map((c) => c.name), shown: described[last].rows.length, total: described[last].totalRows };
+    // The shell, a line at a time, with no width limit (as a pipe has none).
+    const shell = new mod.WebShell();
+    shell.setWidth(0);
+    let shellOut = "";
+    let shellErr = "";
+    for (const line of sql.split("\n")) {
+      const r = JSON.parse(await shell.feed(line));
+      shellOut += r.out;
+      shellErr += r.err;
+    }
+    return { out, csv, shape, shellOut, shellErr, load: t1 - t0, script: t2 - t1, pagerankFirst: t3 - t2, pagerankWarm: t4 - t3, version: mod.version() };
   } catch (e) {
     return { error: String(e) };
   }
@@ -103,6 +115,15 @@ if (result.csv !== nativeCsv.stdout || !shapeOk) {
   process.exit(1);
 }
 console.log("PASS: run() describes the results, and export() CSV is byte-identical to native --format csv");
+const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+if (result.shellErr || plain(result.shellOut) !== native.stdout) {
+  const dir = mkdtempSync(join(tmpdir(), "ursa-parity-"));
+  writeFileSync(join(dir, "native.txt"), native.stdout);
+  writeFileSync(join(dir, "shell.txt"), plain(result.shellOut) + result.shellErr);
+  console.error(`FAIL: the shell's output differs; see diff ${dir}/native.txt ${dir}/shell.txt`);
+  process.exit(1);
+}
+console.log("PASS: the shell, fed a line at a time, prints what native prints (without its colour)");
 if (result.out === native.stdout) {
   console.log(`PASS: browser output is byte-identical to native (${native.stdout.length} bytes)`);
   process.exit(0);

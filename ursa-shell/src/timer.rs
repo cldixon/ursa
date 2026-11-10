@@ -3,7 +3,11 @@
 //! kernel (`user`, `sys`), summed over its threads, so a parallel query can
 //! use more CPU time than real time.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// std's Instant panics in the browser (wasm32-unknown-unknown); web-time's
+// is std's elsewhere and reads performance.now() there.
+use web_time::Instant;
 
 /// The times when a statement started.
 pub struct Timer {

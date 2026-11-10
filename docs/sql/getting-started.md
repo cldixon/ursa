@@ -94,13 +94,14 @@ ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
 ```
 
 ```text
-+-----+-----+
-| src | dst |
-+-----+-----+
-| 0   | 1   |
-| 0   | 2   |
-| 0   | 3   |
-+-----+-----+
+┌───────┬───────┐
+│  src  │  dst  │
+│ int64 │ int64 │
+├───────┼───────┤
+│     0 │     1 │
+│     0 │     2 │
+│     0 │     3 │
+└───────┴───────┘
 ```
 
 The format comes from the extension: `.parquet`, `.csv`, `.json`, `.jsonl` and `.ndjson` (JSON, one object per line; `.jsonl` and `.ndjson` are new in 0.7), and `.arrow`. CSV and JSON may be compressed (`.csv.gz`, `.jsonl.zst`). A directory or a glob reads every file in it: `'edges/*.parquet'`.
@@ -163,13 +164,14 @@ SELECT * FROM karate.nodes LIMIT 3;
 ```
 
 ```text
-+----+--------+
-| id | club   |
-+----+--------+
-| 0  | Mr. Hi |
-| 1  | Mr. Hi |
-| 2  | Mr. Hi |
-+----+--------+
+┌───────┬─────────┐
+│  id   │  club   │
+│ int64 │ varchar │
+├───────┼─────────┤
+│     0 │ Mr. Hi  │
+│     1 │ Mr. Hi  │
+│     2 │ Mr. Hi  │
+└───────┴─────────┘
 ```
 
 ## Run an algorithm
@@ -184,15 +186,16 @@ LIMIT 5;
 ```
 
 ```text
-+----+----------+
-| id | pagerank |
-+----+----------+
-| 33 | 0.1009   |
-| 0  | 0.097    |
-| 32 | 0.0717   |
-| 2  | 0.0571   |
-| 1  | 0.0529   |
-+----+----------+
+┌───────┬──────────┐
+│  id   │ pagerank │
+│ int64 │  double  │
+├───────┼──────────┤
+│    33 │   0.1009 │
+│     0 │    0.097 │
+│    32 │   0.0717 │
+│     2 │   0.0571 │
+│     1 │   0.0529 │
+└───────┴──────────┘
 ```
 
 Parameters are named, with `=>`:
@@ -218,15 +221,16 @@ LIMIT 5;
 ```
 
 ```text
-+----+---------+--------+-----------+-----------+
-| id | club    | degree | triangles | community |
-+----+---------+--------+-----------+-----------+
-| 33 | Officer | 17     | 15        | 2         |
-| 0  | Mr. Hi  | 16     | 18        | 0         |
-| 32 | Officer | 12     | 13        | 2         |
-| 2  | Mr. Hi  | 10     | 11        | 0         |
-| 1  | Mr. Hi  | 9      | 12        | 0         |
-+----+---------+--------+-----------+-----------+
+┌───────┬─────────┬────────┬───────────┬───────────┐
+│  id   │  club   │ degree │ triangles │ community │
+│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+├───────┼─────────┼────────┼───────────┼───────────┤
+│    33 │ Officer │     17 │        15 │         2 │
+│     0 │ Mr. Hi  │     16 │        18 │         0 │
+│    32 │ Officer │     12 │        13 │         2 │
+│     2 │ Mr. Hi  │     10 │        11 │         0 │
+│     1 │ Mr. Hi  │      9 │        12 │         0 │
+└───────┴─────────┴────────┴───────────┴───────────┘
 ```
 
 Each algorithm also works on its own, as in the previous section, and those results join on `id` too.
@@ -247,12 +251,13 @@ ORDER BY club;
 ```
 
 ```text
-+---------+---------+
-| club    | members |
-+---------+---------+
-| Mr. Hi  | 6       |
-| Officer | 7       |
-+---------+---------+
+┌─────────┬─────────┐
+│  club   │ members │
+│ varchar │  int64  │
+├─────────┼─────────┤
+│ Mr. Hi  │       6 │
+│ Officer │       7 │
+└─────────┴─────────┘
 ```
 
 There are two ways to give the value of each node:
@@ -270,13 +275,14 @@ LIMIT 3;
 ```
 
 ```text
-+----+----------------+
-| id | friends_degree |
-+----+----------------+
-| 11 | 16.0           |
-| 14 | 14.5           |
-| 15 | 14.5           |
-+----+----------------+
+┌───────┬────────────────┐
+│  id   │ friends_degree │
+│ int64 │     double     │
+├───────┼────────────────┤
+│    11 │           16.0 │
+│    14 │           14.5 │
+│    15 │           14.5 │
+└───────┴────────────────┘
 ```
 
 The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. (In 0.6.0, `count` and `n_unique` return floats, and strings take only those two.) A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
@@ -308,15 +314,16 @@ LIMIT 5;
 ```
 
 ```text
-+----------+----------------------+
-| id       | pagerank             |
-+----------+----------------------+
-| Valjean  | 0.09956068175644767  |
-| Marius   | 0.051667656904091475 |
-| Myriel   | 0.03923416880292588  |
-| Cosette  | 0.03691018363299517  |
-| Enjolras | 0.036614491459848165 |
-+----------+----------------------+
+┌──────────┬──────────────────────┐
+│    id    │       pagerank       │
+│ varchar  │        double        │
+├──────────┼──────────────────────┤
+│ Valjean  │  0.09956068175644767 │
+│ Marius   │ 0.051667656904091475 │
+│ Myriel   │  0.03923416880292588 │
+│ Cosette  │  0.03691018363299517 │
+│ Enjolras │ 0.036614491459848165 │
+└──────────┴──────────────────────┘
 ```
 
 The weight can be any expression over the edge columns:
@@ -328,15 +335,16 @@ LIMIT 5;
 ```
 
 ```text
-+------------+---------+
-| id         | louvain |
-+------------+---------+
-| Anzelma    | 3       |
-| Babet      | 3       |
-| Bahorel    | 5       |
-| Bamatabois | 1       |
-| BaronessT  | 4       |
-+------------+---------+
+┌────────────┬─────────┐
+│     id     │ louvain │
+│  varchar   │ uint32  │
+├────────────┼─────────┤
+│ Anzelma    │       3 │
+│ Babet      │       3 │
+│ Bahorel    │       5 │
+│ Bamatabois │       1 │
+│ BaronessT  │       4 │
+└────────────┴─────────┘
 ```
 
 Weights must be non-negative and not null. The graph index does not depend on the weight, so trying several weightings reuses one index.
@@ -356,11 +364,12 @@ FROM connected_components(lesmis_strong);
 ```
 
 ```text
-+--------+
-| groups |
-+--------+
-| 3      |
-+--------+
+┌────────┐
+│ groups │
+│ int64  │
+├────────┤
+│      3 │
+└────────┘
 ```
 
 Without a node table, the nodes of a subgraph are the endpoints of the edges it keeps. A character whose every tie is weaker than 3 is not in `lesmis_strong`.
@@ -381,11 +390,12 @@ SELECT n_nodes, n_edges FROM describe(karate_late);
 ```
 
 ```text
-+---------+---------+
-| n_nodes | n_edges |
-+---------+---------+
-| 34      | 41      |
-+---------+---------+
+┌─────────┬─────────┐
+│ n_nodes │ n_edges │
+│  int64  │  int64  │
+├─────────┼─────────┤
+│      34 │      41 │
+└─────────┴─────────┘
 ```
 
 `nodes => 'touched'` describes only the nodes at an end of a kept edge:
@@ -395,11 +405,12 @@ SELECT n_nodes, n_edges FROM describe(karate_late, nodes => 'touched');
 ```
 
 ```text
-+---------+---------+
-| n_nodes | n_edges |
-+---------+---------+
-| 24      | 41      |
-+---------+---------+
+┌─────────┬─────────┐
+│ n_nodes │ n_edges │
+│  int64  │  int64  │
+├─────────┼─────────┤
+│      24 │      41 │
+└─────────┴─────────┘
 ```
 
 ## Traversals
@@ -429,12 +440,13 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 ```
 
 ```text
-+-----+-----+-----+------+
-| src | dst | hop | cost |
-+-----+-----+-----+------+
-| 0   | 8   | 0   | 1.0  |
-| 8   | 33  | 1   | 2.0  |
-+-----+-----+-----+------+
+┌───────┬───────┬───────┬────────┐
+│  src  │  dst  │  hop  │  cost  │
+│ int64 │ int64 │ int64 │ double │
+├───────┼───────┼───────┼────────┤
+│     0 │     8 │     0 │    1.0 │
+│     8 │    33 │     1 │    2.0 │
+└───────┴───────┴───────┴────────┘
 ```
 
 ## Files in object storage
@@ -518,11 +530,12 @@ COPY (SELECT * FROM pagerank(karate)) TO 'pagerank.parquet';
 ```
 
 ```text
-+-------+
-| count |
-+-------+
-| 34    |
-+-------+
+┌────────┐
+│ count  │
+│ uint64 │
+├────────┤
+│     34 │
+└────────┘
 ```
 
 ## Find out what is available

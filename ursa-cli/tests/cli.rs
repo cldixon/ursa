@@ -75,13 +75,14 @@ fn query_a_file_matches_getting_started() {
     assert_eq!(
         out,
         "\
-+-----+-----+
-| src | dst |
-+-----+-----+
-| 0   | 1   |
-| 0   | 2   |
-| 0   | 3   |
-+-----+-----+
+┌───────┬───────┐
+│  src  │  dst  │
+│ int64 │ int64 │
+├───────┼───────┤
+│     0 │     1 │
+│     0 │     2 │
+│     0 │     3 │
+└───────┴───────┘
 "
     );
 }
@@ -115,7 +116,7 @@ fn output_formats() {
 fn empty_results_keep_their_header() {
     assert_eq!(
         ok(ursa(&["-c", "SELECT 1 AS x WHERE false"])),
-        "+---+\n| x |\n+---+\n+---+\n"
+        "┌───────┐\n│   x   │\n│ int64 │\n└───────┘\n  0 rows\n"
     );
     assert_eq!(
         ok(ursa(&[
@@ -454,13 +455,14 @@ fn define_a_graph_matches_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+----+--------+
-| id | club   |
-+----+--------+
-| 0  | Mr. Hi |
-| 1  | Mr. Hi |
-| 2  | Mr. Hi |
-+----+--------+
+┌───────┬─────────┐
+│  id   │  club   │
+│ int64 │ varchar │
+├───────┼─────────┤
+│     0 │ Mr. Hi  │
+│     1 │ Mr. Hi  │
+│     2 │ Mr. Hi  │
+└───────┴─────────┘
 "
     );
 }
@@ -561,7 +563,7 @@ fn scripts_do_not_read_ursarc() {
         .unwrap();
     assert_eq!(
         ok(out),
-        "+---+\n| x |\n+---+\n| 1 |\n+---+\n",
+        "┌───────┐\n│   x   │\n│ int64 │\n├───────┤\n│     1 │\n└───────┘\n",
         "~/.ursarc changed a script's output"
     );
     let e = err(ursa(&["-init", "x.sql", "-no-init", "-c", "SELECT 1"]));
@@ -598,15 +600,16 @@ fn run_an_algorithm_matches_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+----+----------+
-| id | pagerank |
-+----+----------+
-| 33 | 0.1009   |
-| 0  | 0.097    |
-| 32 | 0.0717   |
-| 2  | 0.0571   |
-| 1  | 0.0529   |
-+----+----------+
+┌───────┬──────────┐
+│  id   │ pagerank │
+│ int64 │  double  │
+├───────┼──────────┤
+│    33 │   0.1009 │
+│     0 │    0.097 │
+│    32 │   0.0717 │
+│     2 │   0.0571 │
+│     1 │   0.0529 │
+└───────┴──────────┘
 "
     );
 }
@@ -630,15 +633,16 @@ fn combine_algorithms_and_attributes() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+----+---------+--------+-----------+-----------+
-| id | club    | degree | triangles | community |
-+----+---------+--------+-----------+-----------+
-| 33 | Officer | 17     | 15        | 2         |
-| 0  | Mr. Hi  | 16     | 18        | 0         |
-| 32 | Officer | 12     | 13        | 2         |
-| 2  | Mr. Hi  | 10     | 11        | 0         |
-| 1  | Mr. Hi  | 9      | 12        | 0         |
-+----+---------+--------+-----------+-----------+
+┌───────┬─────────┬────────┬───────────┬───────────┐
+│  id   │  club   │ degree │ triangles │ community │
+│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+├───────┼─────────┼────────┼───────────┼───────────┤
+│    33 │ Officer │     17 │        15 │         2 │
+│     0 │ Mr. Hi  │     16 │        18 │         0 │
+│    32 │ Officer │     12 │        13 │         2 │
+│     2 │ Mr. Hi  │     10 │        11 │         0 │
+│     1 │ Mr. Hi  │      9 │        12 │         0 │
+└───────┴─────────┴────────┴───────────┴───────────┘
 "
     );
 }
@@ -688,20 +692,22 @@ fn find_out_what_is_available_matches_getting_started() {
     assert_eq!(
         out,
         "\
-+-------------------+------------+--------+-------------+--------------+------------+
-| name              | edge_table | source | destination | vertex_table | vertex_key |
-+-------------------+------------+--------+-------------+--------------+------------+
-| karate            | ties       | src    | dst         | members      | id         |
-| karate_edges_only | ties       | src    | dst         |              |            |
-+-------------------+------------+--------+-------------+--------------+------------+
-+------------+-------------+-----------+-------------+--------------+
-| table_name | column_name | data_type | role        | origin       |
-+------------+-------------+-----------+-------------+--------------+
-| nodes      | id          | Int64     | node id     | members.id   |
-| nodes      | club        | Utf8      |             | members.club |
-| edges      | src         | Int64     | source      | ties.src     |
-| edges      | dst         | Int64     | destination | ties.dst     |
-+------------+-------------+-----------+-------------+--------------+
+┌───────────────────┬────────────┬─────────┬─────────────┬──────────────┬────────────┐
+│       name        │ edge_table │ source  │ destination │ vertex_table │ vertex_key │
+│      varchar      │  varchar   │ varchar │   varchar   │   varchar    │  varchar   │
+├───────────────────┼────────────┼─────────┼─────────────┼──────────────┼────────────┤
+│ karate            │ ties       │ src     │ dst         │ members      │ id         │
+│ karate_edges_only │ ties       │ src     │ dst         │ NULL         │ NULL       │
+└───────────────────┴────────────┴─────────┴─────────────┴──────────────┴────────────┘
+┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
+│ table_name │ column_name │ data_type │    role     │    origin    │
+│  varchar   │   varchar   │  varchar  │   varchar   │   varchar    │
+├────────────┼─────────────┼───────────┼─────────────┼──────────────┤
+│ nodes      │ id          │ Int64     │ node id     │ members.id   │
+│ nodes      │ club        │ Utf8      │ NULL        │ members.club │
+│ edges      │ src         │ Int64     │ source      │ ties.src     │
+│ edges      │ dst         │ Int64     │ destination │ ties.dst     │
+└────────────┴─────────────┴───────────┴─────────────┴──────────────┘
 "
     );
 
@@ -746,23 +752,26 @@ fn a_graph_over_file_paths() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+------------+--------------------------------------------------+--------+-------------+--------------+------------+
-| name       | edge_table                                       | source | destination | vertex_table | vertex_key |
-+------------+--------------------------------------------------+--------+-------------+--------------+------------+
-| florentine | 'python/ursa/datasets/data/florentine_edges.csv' | src    | dst         |              |            |
-+------------+--------------------------------------------------+--------+-------------+--------------+------------+
-+----------+--------+
-| id       | degree |
-+----------+--------+
-| Medici   | 6      |
-| Guadagni | 4      |
-| Strozzi  | 4      |
-+----------+--------+
-+----------+
-| families |
-+----------+
-| 15       |
-+----------+
+┌────────────┬──────────────────────────────────────────────────┬─────────┬─────────────┬──────────────┬────────────┐
+│    name    │                    edge_table                    │ source  │ destination │ vertex_table │ vertex_key │
+│  varchar   │                     varchar                      │ varchar │   varchar   │   varchar    │  varchar   │
+├────────────┼──────────────────────────────────────────────────┼─────────┼─────────────┼──────────────┼────────────┤
+│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src     │ dst         │ NULL         │ NULL       │
+└────────────┴──────────────────────────────────────────────────┴─────────┴─────────────┴──────────────┴────────────┘
+┌──────────┬────────┐
+│    id    │ degree │
+│ varchar  │ uint32 │
+├──────────┼────────┤
+│ Medici   │      6 │
+│ Guadagni │      4 │
+│ Strozzi  │      4 │
+└──────────┴────────┘
+┌──────────┐
+│ families │
+│  int64   │
+├──────────┤
+│       15 │
+└──────────┘
 "
     );
 }
@@ -812,15 +821,16 @@ fn combine_algorithms_and_attributes_with_algorithms() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+----+---------+--------+-----------+-----------+
-| id | club    | degree | triangles | community |
-+----+---------+--------+-----------+-----------+
-| 33 | Officer | 17     | 15        | 2         |
-| 0  | Mr. Hi  | 16     | 18        | 0         |
-| 32 | Officer | 12     | 13        | 2         |
-| 2  | Mr. Hi  | 10     | 11        | 0         |
-| 1  | Mr. Hi  | 9      | 12        | 0         |
-+----+---------+--------+-----------+-----------+
+┌───────┬─────────┬────────┬───────────┬───────────┐
+│  id   │  club   │ degree │ triangles │ community │
+│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+├───────┼─────────┼────────┼───────────┼───────────┤
+│    33 │ Officer │     17 │        15 │         2 │
+│     0 │ Mr. Hi  │     16 │        18 │         0 │
+│    32 │ Officer │     12 │        13 │         2 │
+│     2 │ Mr. Hi  │     10 │        11 │         0 │
+│     1 │ Mr. Hi  │      9 │        12 │         0 │
+└───────┴─────────┴────────┴───────────┴───────────┘
 "
     );
 }
@@ -843,15 +853,16 @@ fn weights_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+----------+----------------------+
-| id       | pagerank             |
-+----------+----------------------+
-| Valjean  | 0.09956068175644767  |
-| Marius   | 0.051667656904091475 |
-| Myriel   | 0.03923416880292588  |
-| Cosette  | 0.03691018363299517  |
-| Enjolras | 0.036614491459848165 |
-+----------+----------------------+
+┌──────────┬──────────────────────┐
+│    id    │       pagerank       │
+│ varchar  │        double        │
+├──────────┼──────────────────────┤
+│ Valjean  │  0.09956068175644767 │
+│ Marius   │ 0.051667656904091475 │
+│ Myriel   │  0.03923416880292588 │
+│ Cosette  │  0.03691018363299517 │
+│ Enjolras │ 0.036614491459848165 │
+└──────────┴──────────────────────┘
 "
     );
     // The page's second query returns all 77 characters, in six communities;
@@ -875,15 +886,16 @@ fn weights_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+------------+---------+
-| id         | louvain |
-+------------+---------+
-| Anzelma    | 3       |
-| Babet      | 3       |
-| Bahorel    | 5       |
-| Bamatabois | 1       |
-| BaronessT  | 4       |
-+------------+---------+
+┌────────────┬─────────┐
+│     id     │ louvain │
+│  varchar   │ uint32  │
+├────────────┼─────────┤
+│ Anzelma    │       3 │
+│ Babet      │       3 │
+│ Bahorel    │       5 │
+│ Bamatabois │       1 │
+│ BaronessT  │       4 │
+└────────────┴─────────┘
 "
     );
     assert_eq!(
@@ -911,11 +923,12 @@ fn subgraphs_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+--------+
-| groups |
-+--------+
-| 3      |
-+--------+
+┌────────┐
+│ groups │
+│ int64  │
+├────────┤
+│      3 │
+└────────┘
 "
     );
 }
@@ -950,49 +963,50 @@ fn traversals_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+------+----+----------+
-| seed | id | distance |
-+------+----+----------+
-| 9    | 33 | 1        |
-| 14   | 32 | 1        |
-| 14   | 33 | 1        |
-| 15   | 32 | 1        |
-| 15   | 33 | 1        |
-| 18   | 32 | 1        |
-| 18   | 33 | 1        |
-| 20   | 32 | 1        |
-| 20   | 33 | 1        |
-| 22   | 32 | 1        |
-| 22   | 33 | 1        |
-| 23   | 25 | 1        |
-| 23   | 27 | 1        |
-| 23   | 29 | 1        |
-| 23   | 32 | 1        |
-| 23   | 33 | 1        |
-| 23   | 31 | 2        |
-| 24   | 25 | 1        |
-| 24   | 27 | 1        |
-| 24   | 31 | 1        |
-| 24   | 33 | 2        |
-| 24   | 32 | 2        |
-| 25   | 31 | 1        |
-| 25   | 32 | 2        |
-| 25   | 33 | 2        |
-| 26   | 29 | 1        |
-| 26   | 33 | 1        |
-| 26   | 32 | 2        |
-| 27   | 33 | 1        |
-| 28   | 31 | 1        |
-| 28   | 33 | 1        |
-| 28   | 32 | 2        |
-| 29   | 32 | 1        |
-| 29   | 33 | 1        |
-| 30   | 32 | 1        |
-| 30   | 33 | 1        |
-| 31   | 32 | 1        |
-| 31   | 33 | 1        |
-| 32   | 33 | 1        |
-+------+----+----------+
+┌───────┬───────┬──────────┐
+│ seed  │  id   │ distance │
+│ int64 │ int64 │  int64   │
+├───────┼───────┼──────────┤
+│     9 │    33 │        1 │
+│    14 │    32 │        1 │
+│    14 │    33 │        1 │
+│    15 │    32 │        1 │
+│    15 │    33 │        1 │
+│    18 │    32 │        1 │
+│    18 │    33 │        1 │
+│    20 │    32 │        1 │
+│    20 │    33 │        1 │
+│    22 │    32 │        1 │
+│    22 │    33 │        1 │
+│    23 │    25 │        1 │
+│    23 │    27 │        1 │
+│    23 │    29 │        1 │
+│    23 │    32 │        1 │
+│    23 │    33 │        1 │
+│    23 │    31 │        2 │
+│    24 │    25 │        1 │
+│    24 │    27 │        1 │
+│    24 │    31 │        1 │
+│    24 │    33 │        2 │
+│    24 │    32 │        2 │
+│    25 │    31 │        1 │
+│    25 │    32 │        2 │
+│    25 │    33 │        2 │
+│    26 │    29 │        1 │
+│    26 │    33 │        1 │
+│    26 │    32 │        2 │
+│    27 │    33 │        1 │
+│    28 │    31 │        1 │
+│    28 │    33 │        1 │
+│    28 │    32 │        2 │
+│    29 │    32 │        1 │
+│    29 │    33 │        1 │
+│    30 │    32 │        1 │
+│    30 │    33 │        1 │
+│    31 │    32 │        1 │
+│    31 │    33 │        1 │
+│    32 │    33 │        1 │
+└───────┴───────┴──────────┘
 "
     );
 
@@ -1004,12 +1018,13 @@ fn traversals_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-+-----+-----+-----+------+
-| src | dst | hop | cost |
-+-----+-----+-----+------+
-| 0   | 8   | 0   | 1.0  |
-| 8   | 33  | 1   | 2.0  |
-+-----+-----+-----+------+
+┌───────┬───────┬───────┬────────┐
+│  src  │  dst  │  hop  │  cost  │
+│ int64 │ int64 │ int64 │ double │
+├───────┼───────┼───────┼────────┤
+│     0 │     8 │     0 │    1.0 │
+│     8 │    33 │     1 │    2.0 │
+└───────┴───────┴───────┴────────┘
 "
     );
     assert_eq!(
@@ -1120,7 +1135,7 @@ fn scripts_take_dot_commands() {
     let out = ok(ursa_with_stdin(&[], ".mode json\nSELECT 1 AS a;\n"));
     assert_eq!(out, "[{\"a\":1}]\n");
     let out = ok(ursa_with_stdin(&[], ".help\n"));
-    assert!(out.contains(".functions [NAME]"), "{out}");
+    assert!(out.contains(".functions ?NAME?"), "{out}");
     // And in -c.
     let out = ok(ursa(&["-c", ".mode csv", "-c", "SELECT 3 AS c"]));
     assert_eq!(out, "c\n3\n");
@@ -1386,37 +1401,38 @@ fn a_long_table_shows_its_first_and_last_rows() {
     let sql = "SELECT * FROM generate_series(1, 1234) t(x)";
     let out = ok(ursa(&["-c", sql]));
     let lines: Vec<&str> = out.lines().collect();
-    // The header (3 lines), 20 rows, 3 rows of dots, 20 rows, the border and
-    // the footer.
-    assert_eq!(lines.len(), 3 + 20 + 3 + 20 + 1 + 1, "{out}");
-    assert_eq!(lines[3], "| 1    |");
-    assert_eq!(lines[22], "| 20   |");
-    assert_eq!(&lines[23..26], ["| ·    |"; 3]);
-    assert_eq!(lines[26], "| 1215 |");
-    assert_eq!(lines[45], "| 1234 |");
-    assert_eq!(lines[46], "+------+");
-    assert_eq!(lines[47], "1,234 rows (40 shown)");
+    // The header (4 lines: border, name, type, rule), 20 rows, 3 rows of
+    // dots, 20 rows, the border and the footer.
+    assert_eq!(lines.len(), 4 + 20 + 3 + 20 + 1 + 1, "{out}");
+    assert_eq!(lines[4], "│     1 │");
+    assert_eq!(lines[23], "│    20 │");
+    assert_eq!(&lines[24..27], ["│   ·   │"; 3]);
+    assert_eq!(lines[27], "│  1215 │");
+    assert_eq!(lines[46], "│  1234 │");
+    assert_eq!(lines[47], "└───────┘");
+    assert_eq!(lines[48], "  1,234 rows (40 shown)");
 
     // 40 rows or fewer: all of them, and no footer.
     let out = ok(ursa(&["-c", "SELECT * FROM generate_series(1, 40) t(x)"]));
-    assert_eq!(out.lines().count(), 3 + 40 + 1, "{out}");
+    assert_eq!(out.lines().count(), 4 + 40 + 1, "{out}");
     assert!(!out.contains("shown"), "{out}");
 
     let out = ok(ursa(&["--max-rows", "3", "-c", sql]));
     assert_eq!(
         out,
         "\
-+------+
-| x    |
-+------+
-| 1    |
-| 2    |
-| ·    |
-| ·    |
-| ·    |
-| 1234 |
-+------+
-1,234 rows (3 shown)
+┌───────┐
+│   x   │
+│ int64 │
+├───────┤
+│     1 │
+│     2 │
+│   ·   │
+│   ·   │
+│   ·   │
+│  1234 │
+└───────┘
+  1,234 rows (3 shown)
 "
     );
     for args in [
@@ -1424,7 +1440,7 @@ fn a_long_table_shows_its_first_and_last_rows() {
         &["-c", ".maxrows 0", "-c", sql],
     ] {
         let out = ok(ursa(args));
-        assert_eq!(out.lines().count(), 3 + 1234 + 1, "{args:?}");
+        assert_eq!(out.lines().count(), 4 + 1234 + 1, "{args:?}");
     }
     let out = ok(ursa(&["-c", ".maxrows 2", "-c", ".maxrows", "-c", sql]));
     assert!(out.starts_with("Tables show at most 2 rows.\n"), "{out}");
@@ -1502,11 +1518,11 @@ fn sigint_cancels_a_query() {
         // The result that finished stays printed; nothing comes after it.
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "+-------+\n| first |\n+-------+\n| 1     |\n+-------+\n"
+            "┌───────┐\n│ first │\n│ int64 │\n├───────┤\n│     1 │\n└───────┘\n"
         );
         // Another process can open the database at once.
         let out = ok(ursa(&[&db, "-c", "SELECT 2 AS again"]));
-        assert!(out.contains("| 2     |"), "{out}");
+        assert!(out.contains("│     2 │"), "{out}");
     }
 }
 

@@ -27,6 +27,12 @@
 //!   fail, and the text is compared with its error message instead.
 //! - A block with no ```` ```text ```` after it must run without error; its
 //!   output is not checked.
+//! - When the shell's output changes on purpose, rewrite the ```` ```text ````
+//!   blocks that differ with what the blocks now print, and read the diff:
+//!
+//!   ```text
+//!   URSA_BLESS=1 cargo test -p ursa-cli --test docs _run
+//!   ```
 //! - `<!-- skip -->` on the line before a ```` ```sql ```` block skips it. Use
 //!   it for SQL that cannot run here: object storage, placeholder paths.
 //! - Blocks indented inside an admonition or a content tab count too.
@@ -50,6 +56,9 @@ struct Example {
     line: usize,
     sql: String,
     expected: Option<String>,
+    /// Where the expected output's lines are in the page: the first, the
+    /// one after the last, and their indent.
+    expected_at: Option<(usize, usize, usize)>,
     skip: bool,
 }
 
@@ -59,6 +68,9 @@ struct Fence {
     lang: String,
     line: usize,
     body: String,
+    /// The body's lines in the page: the first, the one after the last, and
+    /// the fence's indent.
+    span: (usize, usize, usize),
     /// Whether `<!-- skip -->` is on the line before it.
     skip: bool,
     /// Whether only blank lines separate it from the previous fence.
@@ -97,6 +109,7 @@ fn fences(text: &str) -> Vec<Fence> {
             lang,
             line: i + 1,
             body,
+            span: (start, end.min(lines.len()), indent),
             skip,
             adjacent,
         });
@@ -115,14 +128,14 @@ fn examples(text: &str) -> Vec<Example> {
         if fence.lang != "sql" {
             continue;
         }
-        let expected = fences
+        let next = fences
             .get(i + 1)
-            .filter(|next| next.lang == "text" && next.adjacent)
-            .map(|next| next.body.clone());
+            .filter(|next| next.lang == "text" && next.adjacent);
         out.push(Example {
             line: fence.line,
             sql: fence.body.clone(),
-            expected,
+            expected: next.map(|next| next.body.clone()),
+            expected_at: next.map(|next| next.span),
             skip: fence.skip,
         });
     }
@@ -163,6 +176,9 @@ fn run_page(path: &Path) -> Vec<String> {
         .to_string();
     let dir = data_dir();
     let mut failures = Vec::new();
+    let bless = std::env::var_os("URSA_BLESS").is_some();
+    // With URSA_BLESS: the output blocks to rewrite, and their new lines.
+    let mut blessed: Vec<((usize, usize, usize), String)> = Vec::new();
     for example in examples(&text) {
         if example.skip {
             continue;
@@ -196,7 +212,9 @@ fn run_page(path: &Path) -> Vec<String> {
                 failures.push(format!("{at}: the block failed\n{}\n{stderr}", example.sql))
             }
             (Some(expected), true) => {
-                if normalize(&stdout) != normalize(expected) {
+                if normalize(&stdout) != normalize(expected) && bless {
+                    blessed.push((example.expected_at.unwrap(), normalize(&stdout)));
+                } else if normalize(&stdout) != normalize(expected) {
                     failures.push(format!(
                         "{at}: the output differs\n--- expected\n{}\n--- got\n{}",
                         normalize(expected),
@@ -206,6 +224,22 @@ fn run_page(path: &Path) -> Vec<String> {
             }
             (None, true) => {}
         }
+    }
+    if !blessed.is_empty() {
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        for ((start, end, indent), output) in blessed.into_iter().rev() {
+            let pad = " ".repeat(indent);
+            let new: Vec<String> = output
+                .lines()
+                .map(|l| format!("{pad}{l}").trim_end().to_string())
+                .collect();
+            lines.splice(start..end, new);
+        }
+        let mut page = lines.join("\n");
+        if text.ends_with('\n') {
+            page.push('\n');
+        }
+        std::fs::write(path, page).unwrap();
     }
     failures
 }

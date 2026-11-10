@@ -7,29 +7,29 @@
 //! can show a continuation while one is being typed. A complete statement,
 //! all its lines together, is one history entry.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
+use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Config, Context, Editor, Helper};
 
-use crate::shell::{Flow, Shell, COMMANDS};
-
-/// The prompt for a new statement.
-pub const PROMPT: &str = "ursa> ";
-/// The prompt while a statement continues on the next line.
-pub const CONTINUATION: &str = " ...> ";
+use ursa_shell::highlight;
+use ursa_shell::shell::{Flow, Shell, COMMANDS};
 
 /// Read lines from the terminal and feed them to `shell` until `.quit` or
-/// Ctrl-D. History is read from and saved to `history`, if given.
+/// Ctrl-D. History is read from and saved to `history`, if given. With
+/// `color`, the prompt and what is typed are coloured as the browser shell
+/// colours them ([`ursa_shell::highlight`]).
 pub async fn run<O: Write, E: Write>(
     shell: &mut Shell<O, E>,
     history: Option<PathBuf>,
+    color: bool,
 ) -> rustyline::Result<()> {
     let config = Config::builder()
         .max_history_size(10_000)?
@@ -37,7 +37,10 @@ pub async fn run<O: Write, E: Write>(
         .auto_add_history(false)
         .build();
     let mut rl: Editor<ShellHelper, FileHistory> = Editor::with_config(config)?;
-    rl.set_helper(Some(ShellHelper::default()));
+    rl.set_helper(Some(ShellHelper {
+        color,
+        ..ShellHelper::default()
+    }));
     if let Some(path) = &history {
         // A missing (or unreadable) history file is not an error.
         let _ = rl.load_history(path);
@@ -46,12 +49,13 @@ pub async fn run<O: Write, E: Write>(
     // The lines of the statement being typed, for its history entry.
     let mut entry = String::new();
     loop {
+        // `memory U `, or `club U ` with club.ursa open; then spaces as wide.
         let prompt = if shell.is_pending() {
-            CONTINUATION
+            shell.continuation()
         } else {
-            PROMPT
+            shell.prompt()
         };
-        match rl.readline(prompt) {
+        match rl.readline(&prompt) {
             Ok(line) => {
                 if !entry.is_empty() {
                     entry.push('\n');
@@ -105,9 +109,10 @@ fn save(rl: &mut Editor<ShellHelper, FileHistory>, path: &PathBuf) {
 }
 
 /// Completion of dot-commands, and of file names after `.read`, `.open` or
-/// an open quote (`FROM 'karate_<Tab>`).
+/// an open quote (`FROM 'karate_<Tab>`); colour, with `color`.
 #[derive(Default)]
 struct ShellHelper {
+    color: bool,
     files: FilenameCompleter,
     history_failed: std::cell::Cell<bool>,
 }
@@ -147,7 +152,32 @@ impl Hinter for ShellHelper {
     type Hint = String;
 }
 
-impl Highlighter for ShellHelper {}
+impl Highlighter for ShellHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if self.color {
+            Cow::Owned(highlight::ansi(line))
+        } else {
+            Cow::Borrowed(line)
+        }
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        if self.color {
+            Cow::Owned(format!("{}{prompt}{}", highlight::PROMPT, highlight::RESET))
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
+
+    // Colour each change as it is typed.
+    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
+        self.color
+    }
+}
 
 impl Validator for ShellHelper {}
 

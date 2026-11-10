@@ -13,11 +13,35 @@ console.log(await session.sql("SELECT * FROM 'karate_edges.csv' LIMIT 3"));
 ```
 
 - `session.sql(text)` runs one or more statements and resolves to every result
-  printed as the `ursa` shell prints it (ASCII tables). It rejects with the
+  printed as the `ursa` shell prints it (box tables). It rejects with the
   shell's error message.
 - `session.sqlArrow(text)` resolves to the last result as an Arrow IPC stream
   (`Uint8Array`).
 - `version()` is the engine's version.
+
+`WebShell` is the `ursa` shell itself (crate `ursa-shell`), for a terminal on
+the page such as xterm.js, as DuckDB's web shell is DuckDB's CLI:
+
+```js
+import init, { WebShell } from "./ursa_wasm.js";
+await init();
+WebShell.setBaseUrl(new URL("data/", location.href).href);
+const shell = new WebShell();
+shell.setWidth(term.cols); // tables fit the terminal
+const { out, err, flow } = JSON.parse(await shell.feed("SELECT 42 AS answer;"));
+term.write((out + err).replaceAll("\n", "\r\n")); // ANSI colour, as in a terminal
+```
+
+- `feed(line)` runs one typed line: a dot-command, or SQL that runs once the
+  statement ends with `;`. `flow` is `continue`, `exit` (`.quit`), or `host`
+  for a dot-command the page added with `addHostCommand(name, args, help)`
+  (`.help` lists those too); `command` is then the line.
+- `prompt()` (`memory U `), `continuation()` (spaces as wide), `isPending()`,
+  `cancelInput()`, `highlight(text)` (typed text in ANSI colour) and
+  `promptColor()` let the page draw the prompt and input as the CLI does.
+- `addFile(name, bytes)` puts a file at `memory://uploads/<name>`;
+  `exportLast(format)` writes the last result (`csv`, `json`, `arrow`,
+  `parquet`) with every row.
 
 Files are read over HTTP with range requests. A server must answer `HEAD` and
 single `Range: bytes=a-b` requests (206 with `Content-Range`).

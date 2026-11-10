@@ -72,14 +72,15 @@ DESCRIBE GRAPH karate;
 ```
 
 ```text
-+------------+-------------+-----------+-------------+--------------+
-| table_name | column_name | data_type | role        | origin       |
-+------------+-------------+-----------+-------------+--------------+
-| nodes      | id          | Int64     | node id     | members.id   |
-| nodes      | club        | Utf8      |             | members.club |
-| edges      | src         | Int64     | source      | ties.src     |
-| edges      | dst         | Int64     | destination | ties.dst     |
-+------------+-------------+-----------+-------------+--------------+
+┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
+│ table_name │ column_name │ data_type │    role     │    origin    │
+│  varchar   │   varchar   │  varchar  │   varchar   │   varchar    │
+├────────────┼─────────────┼───────────┼─────────────┼──────────────┤
+│ nodes      │ id          │ Int64     │ node id     │ members.id   │
+│ nodes      │ club        │ Utf8      │ NULL        │ members.club │
+│ edges      │ src         │ Int64     │ source      │ ties.src     │
+│ edges      │ dst         │ Int64     │ destination │ ties.dst     │
+└────────────┴─────────────┴───────────┴─────────────┴──────────────┘
 ```
 
 ## Calling a graph function
@@ -94,13 +95,14 @@ LIMIT 3;
 ```
 
 ```text
-+----+---------------------+
-| id | pagerank            |
-+----+---------------------+
-| 33 | 0.10346168993478702 |
-| 0  | 0.0992272932102213  |
-| 32 | 0.07331159631922397 |
-+----+---------------------+
+┌───────┬─────────────────────┐
+│  id   │      pagerank       │
+│ int64 │       double        │
+├───────┼─────────────────────┤
+│    33 │ 0.10346168993478702 │
+│     0 │  0.0992272932102213 │
+│    32 │ 0.07331159631922397 │
+└───────┴─────────────────────┘
 ```
 
 - An algorithm returns one row per node: `id` plus a column named after the function (`pagerank`, `degree`, `louvain`, ...). Rows have no order: always `ORDER BY`.
@@ -125,13 +127,14 @@ LIMIT 3;
 ```
 
 ```text
-+----+---------+--------+-----------+-----------+
-| id | club    | degree | triangles | community |
-+----+---------+--------+-----------+-----------+
-| 33 | Officer | 17     | 15        | 2         |
-| 0  | Mr. Hi  | 16     | 18        | 0         |
-| 32 | Officer | 12     | 13        | 2         |
-+----+---------+--------+-----------+-----------+
+┌───────┬─────────┬────────┬───────────┬───────────┐
+│  id   │  club   │ degree │ triangles │ community │
+│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+├───────┼─────────┼────────┼───────────┼───────────┤
+│    33 │ Officer │     17 │        15 │         2 │
+│     0 │ Mr. Hi  │     16 │        18 │         0 │
+│    32 │ Officer │     12 │        13 │         2 │
+└───────┴─────────┴────────┴───────────┴───────────┘
 ```
 
 ## Weights
@@ -150,13 +153,14 @@ ORDER BY id;
 ```
 
 ```text
-+---------+-----------+
-| id      | community |
-+---------+-----------+
-| Cosette | 4         |
-| Javert  | 1         |
-| Valjean | 1         |
-+---------+-----------+
+┌─────────┬───────────┐
+│   id    │ community │
+│ varchar │  uint32   │
+├─────────┼───────────┤
+│ Cosette │         4 │
+│ Javert  │         1 │
+│ Valjean │         1 │
+└─────────┴───────────┘
 ```
 
 ## Neighbour aggregation: neighbors_agg()
@@ -176,13 +180,14 @@ LIMIT 3;
 ```
 
 ```text
-+----+----------------+
-| id | friends_degree |
-+----+----------------+
-| 11 | 16.0           |
-| 14 | 14.5           |
-| 15 | 14.5           |
-+----+----------------+
+┌───────┬────────────────┐
+│  id   │ friends_degree │
+│ int64 │     double     │
+├───────┼────────────────┤
+│    11 │           16.0 │
+│    14 │           14.5 │
+│    15 │           14.5 │
+└───────┴────────────────┘
 ```
 
 ```sql
@@ -195,12 +200,13 @@ ORDER BY club;
 ```
 
 ```text
-+---------+---------+
-| club    | members |
-+---------+---------+
-| Mr. Hi  | 6       |
-| Officer | 7       |
-+---------+---------+
+┌─────────┬─────────┐
+│  club   │ members │
+│ varchar │  int64  │
+├─────────┼─────────┤
+│ Mr. Hi  │       6 │
+│ Officer │       7 │
+└─────────┴─────────┘
 ```
 
 - `agg`: `'mean'` (the default), `'sum'`, `'min'`, `'max'`, `'count'` or `'n_unique'`. Strings, dates and times take `'count'`, `'n_unique'`, `'min'` and `'max'`.
@@ -219,12 +225,13 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 ```
 
 ```text
-+-----+-----+-----+------+
-| src | dst | hop | cost |
-+-----+-----+-----+------+
-| 0   | 8   | 0   | 1.0  |
-| 8   | 33  | 1   | 2.0  |
-+-----+-----+-----+------+
+┌───────┬───────┬───────┬────────┐
+│  src  │  dst  │  hop  │  cost  │
+│ int64 │ int64 │ int64 │ double │
+├───────┼───────┼───────┼────────┤
+│     0 │     8 │     0 │    1.0 │
+│     8 │    33 │     1 │    2.0 │
+└───────┴───────┴───────┴────────┘
 ```
 
 ```sql
@@ -255,12 +262,13 @@ ORDER BY b.club;
 ```
 
 ```text
-+---------+------+
-| club    | ties |
-+---------+------+
-| Mr. Hi  | 15   |
-| Officer | 1    |
-+---------+------+
+┌─────────┬───────┐
+│  club   │ ties  │
+│ varchar │ int64 │
+├─────────┼───────┤
+│ Mr. Hi  │    15 │
+│ Officer │     1 │
+└─────────┴───────┘
 ```
 
 - Nodes are `(var:label WHERE …)`, edges `-[var:label WHERE …]->`, `<-[…]-`, or `-[…]-` (either way; each mutual tie is two matches). `->`, `<-`, `-` with no variable.
@@ -340,11 +348,12 @@ SELECT log(100) AS log, log10(100) AS log10, ln(100) AS ln;
 ```
 
 ```text
-+-----+-------+-------------------+
-| log | log10 | ln                |
-+-----+-------+-------------------+
-| 2.0 | 2.0   | 4.605170185988092 |
-+-----+-------+-------------------+
+┌────────┬────────┬───────────────────┐
+│  log   │ log10  │        ln         │
+│ double │ double │      double       │
+├────────┼────────┼───────────────────┤
+│    2.0 │    2.0 │ 4.605170185988092 │
+└────────┴────────┴───────────────────┘
 ```
 
 **A float, boolean or date as a node id.** `seeds`, `start`, `source` and `target` take integers or strings. On a graph with integer ids a string must be an integer (`'7'`), and nothing is rounded: `1.5`, `2.0` and `true` are refused. On a graph with string ids, an integer is taken as its string.
@@ -375,14 +384,15 @@ LIMIT 4;
 ```
 
 ```text
-+---------+----+-------------+
-| club    | id | betweenness |
-+---------+----+-------------+
-| Mr. Hi  | 0  | 231.071     |
-| Officer | 33 | 160.552     |
-| Officer | 32 | 76.69       |
-| Mr. Hi  | 2  | 75.851      |
-+---------+----+-------------+
+┌─────────┬───────┬─────────────┐
+│  club   │  id   │ betweenness │
+│ varchar │ int64 │   double    │
+├─────────┼───────┼─────────────┤
+│ Mr. Hi  │     0 │     231.071 │
+│ Officer │    33 │     160.552 │
+│ Officer │    32 │       76.69 │
+│ Mr. Hi  │     2 │      75.851 │
+└─────────┴───────┴─────────────┘
 ```
 
 The characters within two steps of Valjean, over strong ties only:
@@ -397,11 +407,12 @@ FROM hop(lesmis_strong, seeds => ['Valjean'], n => 2, direction => 'both');
 ```
 
 ```text
-+---------+
-| reached |
-+---------+
-| 39      |
-+---------+
+┌─────────┐
+│ reached │
+│  int64  │
+├─────────┤
+│      39 │
+└─────────┘
 ```
 
 A summary of the graph, read as undirected:
@@ -411,9 +422,10 @@ SELECT * FROM describe(karate, direction => 'both', full => true);
 ```
 
 ```text
-+---------+---------+---------------------+-------------------+--------------+-----------------+
-| n_nodes | n_edges | density             | avg_degree        | n_components | n_dropped_edges |
-+---------+---------+---------------------+-------------------+--------------+-----------------+
-| 34      | 78      | 0.13903743315508021 | 4.588235294117647 | 1            | 0               |
-+---------+---------+---------------------+-------------------+--------------+-----------------+
+┌─────────┬─────────┬─────────────────────┬───────────────────┬──────────────┬─────────────────┐
+│ n_nodes │ n_edges │       density       │    avg_degree     │ n_components │ n_dropped_edges │
+│  int64  │  int64  │       double        │      double       │    int64     │      int64      │
+├─────────┼─────────┼─────────────────────┼───────────────────┼──────────────┼─────────────────┤
+│      34 │      78 │ 0.13903743315508021 │ 4.588235294117647 │            1 │               0 │
+└─────────┴─────────┴─────────────────────┴───────────────────┴──────────────┴─────────────────┘
 ```

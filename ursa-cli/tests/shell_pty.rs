@@ -21,6 +21,13 @@ fn shell(home: &std::path::Path, args: &[&str]) -> PtySession {
     spawn_command(command, Some(TIMEOUT_MS)).expect("ursa starts in a pseudo-terminal")
 }
 
+/// `s` as rexpect sees it: it reads the terminal a byte at a time, each
+/// byte as one `char`, so UTF-8 text (a table's box drawing) must be matched
+/// byte by byte.
+fn bytes(s: &str) -> String {
+    s.bytes().map(char::from).collect()
+}
+
 #[test]
 fn a_session_in_the_shell() {
     let home = tempfile::tempdir().unwrap();
@@ -32,24 +39,24 @@ fn a_session_in_the_shell() {
         env!("URSA_VERSION")
     ))
     .unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
 
     // A statement over two lines, printed as CSV (from ~/.ursarc).
     p.send_line("SELECT 1 AS x,").unwrap();
-    p.exp_string(" ...> ").unwrap();
+    p.exp_string("       ").unwrap();
     p.send_line("  'a;b' AS y;").unwrap();
     p.exp_string("x,y\r\n1,a;b\r\n").unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
 
     // Ursa's own statements, kept in the database.
     p.send_line("CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2)) AS t(src, dst);")
         .unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
     p.send_line(
         "CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
     )
     .unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
     p.send_line(".graphs").unwrap();
     p.exp_string("g,ties,src,dst").unwrap();
 
@@ -58,16 +65,16 @@ fn a_session_in_the_shell() {
     p.exp_string("did you mean '.tables'?").unwrap();
     p.send_line("SELECT nope;").unwrap();
     p.exp_string("Error: ").unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
 
     // Ctrl-C drops a half-typed statement.
     p.send_line("SELECT 'dropped'").unwrap();
-    p.exp_string(" ...> ").unwrap();
+    p.exp_string("       ").unwrap();
     p.send_control('c').unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
     p.send_line("SELECT 2 AS z;").unwrap();
     p.exp_string("z\r\n2\r\n").unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("club U ").unwrap();
 
     // Ctrl-D exits.
     p.send_control('d').unwrap();
@@ -86,7 +93,7 @@ fn ctrl_c_cancels_a_running_query() {
     let home = tempfile::tempdir().unwrap();
     let mut p = shell(home.path(), &["--no-history"]);
     p.exp_string("in memory.").unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("memory U ").unwrap();
     // Long enough that it is still running when Ctrl-C arrives.
     p.send_line(
         "SELECT count(*) FROM generate_series(1, 100000000000) a CROSS JOIN generate_series(1, 10) b;",
@@ -95,7 +102,7 @@ fn ctrl_c_cancels_a_running_query() {
     std::thread::sleep(std::time::Duration::from_millis(500));
     p.send_control('c').unwrap();
     p.exp_string("^C (cancelled)").unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("memory U ").unwrap();
     // An algorithm too, which runs on a blocking thread (#328): the prompt
     // comes back, and the shell still exits at once after it.
     p.send_line(
@@ -108,9 +115,9 @@ fn ctrl_c_cancels_a_running_query() {
     std::thread::sleep(std::time::Duration::from_millis(2000));
     p.send_control('c').unwrap();
     p.exp_string("^C (cancelled)").unwrap();
-    p.exp_string("ursa> ").unwrap();
+    p.exp_string("memory U ").unwrap();
     p.send_line("SELECT 41 + 1 AS answer;").unwrap();
-    p.exp_string("| 42     |").unwrap();
+    p.exp_string(&bytes("│     42 │")).unwrap();
     p.send_line(".quit").unwrap();
     p.exp_eof().unwrap();
     assert!(!home.path().join(".ursa_history").exists());
