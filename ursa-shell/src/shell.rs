@@ -4,7 +4,8 @@
 //! that is added to the statement being typed and run once it ends with `;`
 //! (see [`crate::input`]). Results go to the shell's output and errors to its
 //! error stream, and an error never ends the session. The terminal side (line
-//! editing, history, Ctrl-C) is in [`crate::repl`]; `-init` files and
+//! editing, history, Ctrl-C) belongs to the host: `ursa-cli`'s `repl` in a
+//! terminal, the browser shell's line editor in a page. `-init` files and
 //! `~/.ursarc` run through [`Shell::run_file`], like `.read`.
 //!
 //! `-c`, `-f` and SQL on stdin run through [`Shell::run_text`] too, so a
@@ -19,7 +20,6 @@ use std::path::{Path, PathBuf};
 use arrow::array::{Array, AsArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use clap::ValueEnum;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
@@ -28,8 +28,8 @@ use crate::input::{self, Status};
 use crate::print::{
     has_columns, is_broken_pipe, write_stream, OutputFormat, TableStyle, DEFAULT_MAX_ROWS,
 };
+use crate::table::Style;
 use crate::timer::Timer;
-use ursa_shell::table::Style;
 
 /// What the caller does after a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         ".maxwidth",
         "N",
-        "Draw tables at most N characters wide (0: the terminal's width)",
+        "Draw tables at most N characters wide (0: the screen's width)",
     ),
     (
         ".mode",
@@ -112,12 +112,13 @@ pub struct Shell<O: Write, E: Write> {
     mode: OutputFormat,
     /// How many rows a table shows; 0 shows every row.
     max_rows: usize,
-    /// How wide a table may be; 0: the terminal's width, or no limit when
-    /// the output is not a terminal.
+    /// How wide a table may be; 0: the screen's width, or no limit when
+    /// the output is not a screen.
     max_width: usize,
-    /// The output is a terminal: tables fit its width, and are coloured
-    /// unless `NO_COLOR` is set.
-    terminal: bool,
+    /// The output is a screen (a terminal, or the browser shell's): its
+    /// width now, which tables fit.
+    screen: Option<Box<dyn Fn() -> usize>>,
+    /// Colour tables and the prompt with ANSI escapes.
     color: bool,
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
@@ -143,7 +144,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             mode,
             max_rows: DEFAULT_MAX_ROWS,
             max_width: 0,
-            terminal: false,
+            screen: None,
             color: false,
             timer: false,
             buffer: String::new(),
@@ -182,10 +183,11 @@ impl<O: Write, E: Write> Shell<O, E> {
         self.max_rows = max_rows;
     }
 
-    /// Say that the output is a terminal: tables fit its width and, with
-    /// `color`, dim their types and nulls.
-    pub fn set_terminal(&mut self, color: bool) {
-        self.terminal = true;
+    /// Say that the output is a screen whose width `width` reads (a
+    /// terminal's may change): tables fit it and, with `color`, dim their
+    /// types and nulls.
+    pub fn set_screen(&mut self, width: Box<dyn Fn() -> usize>, color: bool) {
+        self.screen = Some(width);
         self.color = color;
     }
 
@@ -214,9 +216,9 @@ impl<O: Write, E: Write> Shell<O, E> {
 
     /// How tables are drawn now.
     fn table_style(&self) -> TableStyle {
-        let max_width = match self.max_width {
-            0 if self.terminal => terminal_width(),
-            n => n,
+        let max_width = match (self.max_width, &self.screen) {
+            (0, Some(width)) => width(),
+            (n, _) => n,
         };
         TableStyle {
             max_rows: self.max_rows,
@@ -471,7 +473,7 @@ impl<O: Write, E: Write> Shell<O, E> {
     fn max_width_command(&mut self, arg: &str) {
         if arg.is_empty() {
             let shown = match self.max_width {
-                0 if self.terminal => "as wide as the terminal".to_string(),
+                0 if self.screen.is_some() => "as wide as the screen".to_string(),
                 0 => "as wide as they need".to_string(),
                 n => format!("at most {n} characters wide"),
             };
@@ -481,24 +483,24 @@ impl<O: Write, E: Write> Shell<O, E> {
         match arg.parse::<usize>() {
             Ok(n) => self.max_width = n,
             Err(_) => self.error(&format!(
-                "usage: .maxwidth N, a number of characters (0: the terminal's width); got '{arg}'"
+                "usage: .maxwidth N, a number of characters (0: the screen's width); got '{arg}'"
             )),
         }
     }
 
     fn mode_command(&mut self, arg: &str) {
         if arg.is_empty() {
-            let name = mode_name(self.mode);
+            let name = self.mode.name();
             self.say(&format!("The output mode is {name}."));
             return;
         }
-        match OutputFormat::from_str(arg, true) {
-            Ok(OutputFormat::Arrow) => self.error(
+        match OutputFormat::parse(arg) {
+            Some(OutputFormat::Arrow) => self.error(
                 "the shell cannot show the arrow format; to write an Arrow stream, run \
                  ursa --format arrow -c \"<sql>\" > out.arrows",
             ),
-            Ok(mode) => self.mode = mode,
-            Err(_) => self.error(&format!(
+            Some(mode) => self.mode = mode,
+            None => self.error(&format!(
                 "unknown mode '{arg}'; the modes are table, csv, tsv, json and ndjson"
             )),
         }
@@ -715,13 +717,6 @@ impl<O: Write, E: Write> Shell<O, E> {
     }
 }
 
-/// The name `.mode` shows for a format.
-fn mode_name(mode: OutputFormat) -> String {
-    mode.to_possible_value()
-        .map(|v| v.get_name().to_string())
-        .unwrap_or_default()
-}
-
 /// A file argument, without surrounding quotes.
 fn path_arg(arg: &str) -> Option<PathBuf> {
     let arg = arg.trim();
@@ -847,11 +842,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     row[b.len()]
-}
-
-/// The terminal's width in characters, or 0 (no limit) if it is unknown.
-fn terminal_width() -> usize {
-    terminal_size::terminal_size().map_or(0, |(w, _)| usize::from(w.0))
 }
 
 #[cfg(test)]

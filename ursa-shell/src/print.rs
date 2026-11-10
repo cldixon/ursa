@@ -1,6 +1,6 @@
 //! Writing results in the `-f` formats.
 //!
-//! The table format is DuckDB's box table, drawn by [`ursa_shell::table`] (the
+//! The table format is DuckDB's box table, drawn by [`crate::table`] (the
 //! browser shell draws the same): each column's type under its name, numbers
 //! to the right, and at most [`DEFAULT_MAX_ROWS`] rows (`.maxrows N`,
 //! `--max-rows N`; 0 shows every row) and as many columns as fit the
@@ -8,8 +8,8 @@
 //! row; table and JSON (an array) are written once the result is complete.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::table::{Rows, Style};
 use arrow::csv::WriterBuilder as CsvWriterBuilder;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -20,12 +20,12 @@ use arrow::util::display::FormatOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
-use ursa_shell::table::{Rows, Style};
 
-pub use ursa_shell::table::DEFAULT_MAX_ROWS;
+pub use crate::table::DEFAULT_MAX_ROWS;
 
 /// How results are written to stdout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum OutputFormat {
     /// ASCII table.
     Table,
@@ -39,6 +39,37 @@ pub enum OutputFormat {
     Ndjson,
     /// An Arrow IPC stream.
     Arrow,
+}
+
+impl OutputFormat {
+    /// Every format, in the order `--help` lists them.
+    pub const ALL: [OutputFormat; 6] = [
+        OutputFormat::Table,
+        OutputFormat::Csv,
+        OutputFormat::Tsv,
+        OutputFormat::Json,
+        OutputFormat::Ndjson,
+        OutputFormat::Arrow,
+    ];
+
+    /// The format's name, as `--format` and `.mode` take it.
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputFormat::Table => "table",
+            OutputFormat::Csv => "csv",
+            OutputFormat::Tsv => "tsv",
+            OutputFormat::Json => "json",
+            OutputFormat::Ndjson => "ndjson",
+            OutputFormat::Arrow => "arrow",
+        }
+    }
+
+    /// The format named `name`, in any case.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|f| f.name().eq_ignore_ascii_case(name))
+    }
 }
 
 /// How a table is drawn: how many rows it shows (0: every row), and how.
@@ -165,36 +196,6 @@ impl<W: Write> Write for BrokenPipeAware<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         let result = self.inner.flush();
         self.note(result)
-    }
-}
-
-/// Set once SIGINT has cancelled a script (see `cancel_on_interrupt` in
-/// `main.rs`).
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// Stop [`Interruptible`] writers from writing anything more.
-pub fn interrupt() {
-    INTERRUPTED.store(true, Ordering::SeqCst);
-}
-
-/// A writer that drops everything once [`interrupt`] is called, so a script
-/// cancelled with Ctrl-C prints nothing more: not the rest of a result, and
-/// not what is still buffered in front of this writer.
-pub struct Interruptible<W>(pub W);
-
-impl<W: Write> Write for Interruptible<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            return Ok(buf.len());
-        }
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        self.0.flush()
     }
 }
 

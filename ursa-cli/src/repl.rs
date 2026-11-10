@@ -18,7 +18,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Config, Context, Editor, Helper};
 
-use crate::shell::{Flow, Shell, COMMANDS};
+use ursa_shell::shell::{Flow, Shell, COMMANDS};
 
 /// Read lines from the terminal and feed them to `shell` until `.quit` or
 /// Ctrl-D. History is read from and saved to `history`, if given.

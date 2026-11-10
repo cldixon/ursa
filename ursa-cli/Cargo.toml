@@ -28,8 +28,7 @@ aws-profile = ["ursa-engine/aws-profile"]
 [dependencies]
 ursa-engine = { path = "../ursa-engine", version = "0.9.0-dev" }
 ursa-sql = { path = "../ursa-sql", version = "0.9.0-dev" }
-ursa-shell = { path = "../ursa-shell", version = "0.9.0-dev" }
-arrow = { workspace = true, features = ["prettyprint"] }
+ursa-shell = { path = "../ursa-shell", version = "0.9.0-dev", features = ["clap"] }
 datafusion = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
@@ -38,14 +37,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal"
 rustyline = "18.0"
 # The terminal's width, so tables fit it.
 terminal_size = "0.4"
-unicode-width = "0.2"
-
-# getrusage, for `.timer`'s user and sys times.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Builds the Parquet fixtures in tests/database.rs.
+arrow = { workspace = true }
 # Reads `ursa --format json` in tests/docs.rs (the function reference generator).
 serde_json = "1"
 # Writes the gzip CSV fixture (already in the tree via DataFusion's compression).
