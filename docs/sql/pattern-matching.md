@@ -36,7 +36,7 @@ ORDER BY officer, member;
 ```text
 ┌─────────┬────────┐
 │ officer │ member │
-│  int64  │ int64  │
+│  Int64  │ Int64  │
 ├─────────┼────────┤
 │       9 │      2 │
 │      27 │      2 │
@@ -92,7 +92,7 @@ LIMIT 5;
 ```text
 ┌──────────────────┐
 │ friend_of_friend │
-│      int64       │
+│      Int64       │
 ├──────────────────┤
 │                1 │
 │                2 │
@@ -117,7 +117,7 @@ LIMIT 3;
 ```text
 ┌───────┬──────────┐
 │  id   │ pagerank │
-│ int64 │  double  │
+│ Int64 │ Float64  │
 ├───────┼──────────┤
 │    32 │   0.0717 │
 │    31 │   0.0372 │
@@ -138,12 +138,12 @@ FROM GRAPH_TABLE (karate
 ```
 
 ```text
-┌───────┬───────────────────────┬────────────────────┐
-│ steps │        members        │        ties        │
-│ int64 │        int64[]        │      int64[]       │
-├───────┼───────────────────────┼────────────────────┤
-│     5 │ [16, 5, 0, 8, 33, 26] │ [39, 4, 7, 43, 67] │
-└───────┴───────────────────────┴────────────────────┘
+┌───────┬───────────────────────┬──────────────────────┐
+│ steps │        members        │         ties         │
+│ Int64 │ List(non-null Int64)  │ List(non-null Int64) │
+├───────┼───────────────────────┼──────────────────────┤
+│     5 │ [16, 5, 0, 8, 33, 26] │ [39, 4, 7, 43, 67]   │
+└───────┴───────────────────────┴──────────────────────┘
 ```
 
 A path has four functions: `path_length(p)` is its number of edges, `vertices(p)` its nodes' keys from first to last, `edges(p)` its edges' rows in the edge table (counted from 0), and `element_id(p)` the two alternating, as DuckPGQ lists them (it needs integer keys).
@@ -163,7 +163,7 @@ ORDER BY steps;
 ```text
 ┌───────┬─────────┐
 │ steps │ members │
-│ int64 │  int64  │
+│ Int64 │  Int64  │
 ├───────┼─────────┤
 │     0 │       1 │
 │     1 │      16 │
@@ -199,7 +199,7 @@ ORDER BY members;
 ```text
 ┌────────────────────────┐
 │        members         │
-│        int64[]         │
+│  List(non-null Int64)  │
 ├────────────────────────┤
 │ [16, 5, 0, 8, 33, 26]  │
 │ [16, 5, 0, 13, 33, 26] │
@@ -225,7 +225,7 @@ FROM GRAPH_TABLE (karate
 ```text
 ┌───────┐
 │ paths │
-│ int64 │
+│ Int64 │
 ├───────┤
 │   113 │
 └───────┘
@@ -262,7 +262,7 @@ FROM GRAPH_TABLE (karate
 ```text
 ┌───────┐
 │ steps │
-│ int64 │
+│ Int64 │
 ├───────┤
 │     5 │
 └───────┘

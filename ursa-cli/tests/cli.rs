@@ -77,7 +77,7 @@ fn query_a_file_matches_getting_started() {
         "\
 ┌───────┬───────┐
 │  src  │  dst  │
-│ int64 │ int64 │
+│ Int64 │ Int64 │
 ├───────┼───────┤
 │     0 │     1 │
 │     0 │     2 │
@@ -116,7 +116,7 @@ fn output_formats() {
 fn empty_results_keep_their_header() {
     assert_eq!(
         ok(ursa(&["-c", "SELECT 1 AS x WHERE false"])),
-        "┌───────┐\n│   x   │\n│ int64 │\n└───────┘\n  0 rows\n"
+        "┌───────┐\n│   x   │\n│ Int64 │\n└───────┘\n  0 rows\n"
     );
     assert_eq!(
         ok(ursa(&[
@@ -455,14 +455,14 @@ fn define_a_graph_matches_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-┌───────┬─────────┐
-│  id   │  club   │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ Mr. Hi  │
-│     1 │ Mr. Hi  │
-│     2 │ Mr. Hi  │
-└───────┴─────────┘
+┌───────┬────────┐
+│  id   │  club  │
+│ Int64 │  Utf8  │
+├───────┼────────┤
+│     0 │ Mr. Hi │
+│     1 │ Mr. Hi │
+│     2 │ Mr. Hi │
+└───────┴────────┘
 "
     );
 }
@@ -563,7 +563,7 @@ fn scripts_do_not_read_ursarc() {
         .unwrap();
     assert_eq!(
         ok(out),
-        "┌───────┐\n│   x   │\n│ int64 │\n├───────┤\n│     1 │\n└───────┘\n",
+        "┌───────┐\n│   x   │\n│ Int64 │\n├───────┤\n│     1 │\n└───────┘\n",
         "~/.ursarc changed a script's output"
     );
     let e = err(ursa(&["-init", "x.sql", "-no-init", "-c", "SELECT 1"]));
@@ -602,7 +602,7 @@ fn run_an_algorithm_matches_getting_started() {
         "\
 ┌───────┬──────────┐
 │  id   │ pagerank │
-│ int64 │  double  │
+│ Int64 │ Float64  │
 ├───────┼──────────┤
 │    33 │   0.1009 │
 │     0 │    0.097 │
@@ -635,7 +635,7 @@ fn combine_algorithms_and_attributes() {
         "\
 ┌───────┬─────────┬────────┬───────────┬───────────┐
 │  id   │  club   │ degree │ triangles │ community │
-│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+│ Int64 │  Utf8   │ UInt32 │  UInt32   │  UInt32   │
 ├───────┼─────────┼────────┼───────────┼───────────┤
 │    33 │ Officer │     17 │        15 │         2 │
 │     0 │ Mr. Hi  │     16 │        18 │         0 │
@@ -692,16 +692,16 @@ fn find_out_what_is_available_matches_getting_started() {
     assert_eq!(
         out,
         "\
-┌───────────────────┬────────────┬─────────┬─────────────┬──────────────┬────────────┐
-│       name        │ edge_table │ source  │ destination │ vertex_table │ vertex_key │
-│      varchar      │  varchar   │ varchar │   varchar   │   varchar    │  varchar   │
-├───────────────────┼────────────┼─────────┼─────────────┼──────────────┼────────────┤
-│ karate            │ ties       │ src     │ dst         │ members      │ id         │
-│ karate_edges_only │ ties       │ src     │ dst         │ NULL         │ NULL       │
-└───────────────────┴────────────┴─────────┴─────────────┴──────────────┴────────────┘
+┌───────────────────┬────────────┬────────┬─────────────┬──────────────┬────────────┐
+│       name        │ edge_table │ source │ destination │ vertex_table │ vertex_key │
+│       Utf8        │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
+├───────────────────┼────────────┼────────┼─────────────┼──────────────┼────────────┤
+│ karate            │ ties       │ src    │ dst         │ members      │ id         │
+│ karate_edges_only │ ties       │ src    │ dst         │ NULL         │ NULL       │
+└───────────────────┴────────────┴────────┴─────────────┴──────────────┴────────────┘
 ┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
 │ table_name │ column_name │ data_type │    role     │    origin    │
-│  varchar   │   varchar   │  varchar  │   varchar   │   varchar    │
+│    Utf8    │    Utf8     │   Utf8    │    Utf8     │     Utf8     │
 ├────────────┼─────────────┼───────────┼─────────────┼──────────────┤
 │ nodes      │ id          │ Int64     │ node id     │ members.id   │
 │ nodes      │ club        │ Utf8      │ NULL        │ members.club │
@@ -752,15 +752,15 @@ fn a_graph_over_file_paths() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-┌────────────┬──────────────────────────────────────────────────┬─────────┬─────────────┬──────────────┬────────────┐
-│    name    │                    edge_table                    │ source  │ destination │ vertex_table │ vertex_key │
-│  varchar   │                     varchar                      │ varchar │   varchar   │   varchar    │  varchar   │
-├────────────┼──────────────────────────────────────────────────┼─────────┼─────────────┼──────────────┼────────────┤
-│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src     │ dst         │ NULL         │ NULL       │
-└────────────┴──────────────────────────────────────────────────┴─────────┴─────────────┴──────────────┴────────────┘
+┌────────────┬──────────────────────────────────────────────────┬────────┬─────────────┬──────────────┬────────────┐
+│    name    │                    edge_table                    │ source │ destination │ vertex_table │ vertex_key │
+│    Utf8    │                       Utf8                       │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
+├────────────┼──────────────────────────────────────────────────┼────────┼─────────────┼──────────────┼────────────┤
+│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src    │ dst         │ NULL         │ NULL       │
+└────────────┴──────────────────────────────────────────────────┴────────┴─────────────┴──────────────┴────────────┘
 ┌──────────┬────────┐
 │    id    │ degree │
-│ varchar  │ uint32 │
+│   Utf8   │ UInt32 │
 ├──────────┼────────┤
 │ Medici   │      6 │
 │ Guadagni │      4 │
@@ -768,7 +768,7 @@ fn a_graph_over_file_paths() {
 └──────────┴────────┘
 ┌──────────┐
 │ families │
-│  int64   │
+│  Int64   │
 ├──────────┤
 │       15 │
 └──────────┘
@@ -823,7 +823,7 @@ fn combine_algorithms_and_attributes_with_algorithms() {
         "\
 ┌───────┬─────────┬────────┬───────────┬───────────┐
 │  id   │  club   │ degree │ triangles │ community │
-│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+│ Int64 │  Utf8   │ UInt32 │  UInt32   │  UInt32   │
 ├───────┼─────────┼────────┼───────────┼───────────┤
 │    33 │ Officer │     17 │        15 │         2 │
 │     0 │ Mr. Hi  │     16 │        18 │         0 │
@@ -855,7 +855,7 @@ fn weights_match_getting_started() {
         "\
 ┌──────────┬──────────────────────┐
 │    id    │       pagerank       │
-│ varchar  │        double        │
+│   Utf8   │       Float64        │
 ├──────────┼──────────────────────┤
 │ Valjean  │  0.09956068175644767 │
 │ Marius   │ 0.051667656904091475 │
@@ -888,7 +888,7 @@ fn weights_match_getting_started() {
         "\
 ┌────────────┬─────────┐
 │     id     │ louvain │
-│  varchar   │ uint32  │
+│    Utf8    │ UInt32  │
 ├────────────┼─────────┤
 │ Anzelma    │       3 │
 │ Babet      │       3 │
@@ -925,7 +925,7 @@ fn subgraphs_match_getting_started() {
         "\
 ┌────────┐
 │ groups │
-│ int64  │
+│ Int64  │
 ├────────┤
 │      3 │
 └────────┘
@@ -965,7 +965,7 @@ fn traversals_match_getting_started() {
         "\
 ┌───────┬───────┬──────────┐
 │ seed  │  id   │ distance │
-│ int64 │ int64 │  int64   │
+│ Int64 │ Int64 │  Int64   │
 ├───────┼───────┼──────────┤
 │     9 │    33 │        1 │
 │    14 │    32 │        1 │
@@ -1018,13 +1018,13 @@ fn traversals_match_getting_started() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-┌───────┬───────┬───────┬────────┐
-│  src  │  dst  │  hop  │  cost  │
-│ int64 │ int64 │ int64 │ double │
-├───────┼───────┼───────┼────────┤
-│     0 │     8 │     0 │    1.0 │
-│     8 │    33 │     1 │    2.0 │
-└───────┴───────┴───────┴────────┘
+┌───────┬───────┬───────┬─────────┐
+│  src  │  dst  │  hop  │  cost   │
+│ Int64 │ Int64 │ Int64 │ Float64 │
+├───────┼───────┼───────┼─────────┤
+│     0 │     8 │     0 │     1.0 │
+│     8 │    33 │     1 │     2.0 │
+└───────┴───────┴───────┴─────────┘
 "
     );
     assert_eq!(
@@ -1423,7 +1423,7 @@ fn a_long_table_shows_its_first_and_last_rows() {
         "\
 ┌───────┐
 │   x   │
-│ int64 │
+│ Int64 │
 ├───────┤
 │     1 │
 │     2 │
@@ -1518,7 +1518,7 @@ fn sigint_cancels_a_query() {
         // The result that finished stays printed; nothing comes after it.
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "┌───────┐\n│ first │\n│ int64 │\n├───────┤\n│     1 │\n└───────┘\n"
+            "┌───────┐\n│ first │\n│ Int64 │\n├───────┤\n│     1 │\n└───────┘\n"
         );
         // Another process can open the database at once.
         let out = ok(ursa(&[&db, "-c", "SELECT 2 AS again"]));

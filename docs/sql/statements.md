@@ -35,7 +35,7 @@ COPY (SELECT * FROM ties) TO 'ties.jsonl';
 ```text
 ┌────────┐
 │ count  │
-│ uint64 │
+│ UInt64 │
 ├────────┤
 │     78 │
 └────────┘
@@ -48,7 +48,7 @@ SELECT count(*) AS ties FROM 'ties.jsonl';
 ```text
 ┌───────┐
 │ ties  │
-│ int64 │
+│ Int64 │
 ├───────┤
 │    78 │
 └───────┘
@@ -81,25 +81,25 @@ SELECT count(*) AS both_files FROM read_json(['ties.jsonl', 'ties.json']);
 ```text
 ┌────────┐
 │ count  │
-│ uint64 │
+│ UInt64 │
 ├────────┤
 │     78 │
 └────────┘
 ┌───────┐
 │ ties  │
-│ int64 │
+│ Int64 │
 ├───────┤
 │    78 │
 └───────┘
 ┌────────┐
 │ count  │
-│ uint64 │
+│ UInt64 │
 ├────────┤
 │     78 │
 └────────┘
 ┌────────────┐
 │ both_files │
-│   int64    │
+│   Int64    │
 ├────────────┤
 │        156 │
 └────────────┘
@@ -166,7 +166,7 @@ SELECT count(*) AS edges FROM karate.edges;
 ```text
 ┌───────┐
 │ edges │
-│ int64 │
+│ Int64 │
 ├───────┤
 │    78 │
 └───────┘
@@ -221,7 +221,7 @@ LIMIT 3;
 ```text
 ┌───────┬──────────┐
 │  id   │ pagerank │
-│ int64 │  double  │
+│ Int64 │ Float64  │
 ├───────┼──────────┤
 │    33 │   0.1009 │
 │     0 │    0.097 │
@@ -260,14 +260,14 @@ SHOW GRAPHS;
 ```
 
 ```text
-┌─────────┬────────────┬─────────┬─────────────┬──────────────┬────────────┐
-│  name   │ edge_table │ source  │ destination │ vertex_table │ vertex_key │
-│ varchar │  varchar   │ varchar │   varchar   │   varchar    │  varchar   │
-├─────────┼────────────┼─────────┼─────────────┼──────────────┼────────────┤
-│ club    │ ties       │ src     │ dst         │ members      │ id         │
-│ club    │ wrote      │ author  │ post        │ members      │ id         │
-│ karate  │ ties       │ src     │ dst         │ members      │ id         │
-└─────────┴────────────┴─────────┴─────────────┴──────────────┴────────────┘
+┌────────┬────────────┬────────┬─────────────┬──────────────┬────────────┐
+│  name  │ edge_table │ source │ destination │ vertex_table │ vertex_key │
+│  Utf8  │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
+├────────┼────────────┼────────┼─────────────┼──────────────┼────────────┤
+│ club   │ ties       │ src    │ dst         │ members      │ id         │
+│ club   │ wrote      │ author │ post        │ members      │ id         │
+│ karate │ ties       │ src    │ dst         │ members      │ id         │
+└────────┴────────────┴────────┴─────────────┴──────────────┴────────────┘
 ```
 
 ## DESCRIBE GRAPH
@@ -281,7 +281,7 @@ DESCRIBE GRAPH karate;
 ```text
 ┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
 │ table_name │ column_name │ data_type │    role     │    origin    │
-│  varchar   │   varchar   │  varchar  │   varchar   │   varchar    │
+│    Utf8    │    Utf8     │   Utf8    │    Utf8     │     Utf8     │
 ├────────────┼─────────────┼───────────┼─────────────┼──────────────┤
 │ nodes      │ id          │ Int64     │ node id     │ members.id   │
 │ nodes      │ club        │ Utf8      │ NULL        │ members.club │
@@ -311,12 +311,12 @@ SHOW ursa.index_storage_limit;
 ```
 
 ```text
-┌──────────────────────────┬─────────┐
-│           name           │  value  │
-│         varchar          │ varchar │
-├──────────────────────────┼─────────┤
-│ ursa.index_storage_limit │ 8GiB    │
-└──────────────────────────┴─────────┘
+┌──────────────────────────┬───────┐
+│           name           │ value │
+│           Utf8           │ Utf8  │
+├──────────────────────────┼───────┤
+│ ursa.index_storage_limit │ 8GiB  │
+└──────────────────────────┴───────┘
 ```
 
 | Setting                    | Default | Meaning                                                                                                                                         |
@@ -336,7 +336,7 @@ SELECT * FROM degree(karate, direction => 'both') ORDER BY degree DESC LIMIT 1;
 ```text
 ┌───────┬────────┐
 │  id   │ degree │
-│ int64 │ uint32 │
+│ Int64 │ UInt32 │
 ├───────┼────────┤
 │    33 │     17 │
 └───────┴────────┘

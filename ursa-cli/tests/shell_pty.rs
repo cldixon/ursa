@@ -41,7 +41,7 @@ fn colour_in_a_colour_terminal() {
     p.exp_string("\x1b[1;38;5;208mmemory U \x1b[0m").unwrap();
     p.send_line("SELECT 42 AS answer;").unwrap();
     p.exp_string("\x1b[1mSELECT\x1b[0m").unwrap();
-    p.exp_string(&bytes("│ \x1b[90mint64 \x1b[0m │")).unwrap();
+    p.exp_string(&bytes("│ \x1b[90mInt64 \x1b[0m │")).unwrap();
     p.send_line(".quit").unwrap();
     p.exp_eof().unwrap();
 }

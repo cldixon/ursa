@@ -144,17 +144,17 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 
 ### Tables
 
-A table is drawn as DuckDB draws one: each column's name with its type under it, numbers to the right and everything else to the left, and `NULL` for a null.
+A table is drawn as DuckDB draws one: each column's name with its type under it, numbers to the right and everything else to the left, and `NULL` for a null. The types are Arrow's, named as `DESCRIBE` and `arrow_typeof()` name them (`Int64`, `Utf8`, `Float64`, `List(Int64)`).
 
 ```text
 memory U SELECT id, club FROM 'karate_nodes.csv' LIMIT 2;
-┌───────┬─────────┐
-│  id   │  club   │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ Mr. Hi  │
-│     1 │ Mr. Hi  │
-└───────┴─────────┘
+┌───────┬────────┐
+│  id   │  club  │
+│ Int64 │  Utf8  │
+├───────┼────────┤
+│     0 │ Mr. Hi │
+│     1 │ Mr. Hi │
+└───────┴────────┘
 ```
 
 In a terminal, types and nulls are dimmed; set `NO_COLOR` to turn colour off. Output that is not a terminal (a pipe, a file) has none.
@@ -167,7 +167,7 @@ A table shows at most 40 rows, as DuckDB's does. A longer result shows its first
 memory U SELECT * FROM generate_series(1, 100000);
 ┌────────┐
 │ value  │
-│ int64  │
+│ Int64  │
 ├────────┤
 │      1 │
 │      2 │

@@ -96,7 +96,7 @@ ursa -c "SELECT * FROM 'karate_edges.csv' LIMIT 3"
 ```text
 ┌───────┬───────┐
 │  src  │  dst  │
-│ int64 │ int64 │
+│ Int64 │ Int64 │
 ├───────┼───────┤
 │     0 │     1 │
 │     0 │     2 │
@@ -164,14 +164,14 @@ SELECT * FROM karate.nodes LIMIT 3;
 ```
 
 ```text
-┌───────┬─────────┐
-│  id   │  club   │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ Mr. Hi  │
-│     1 │ Mr. Hi  │
-│     2 │ Mr. Hi  │
-└───────┴─────────┘
+┌───────┬────────┐
+│  id   │  club  │
+│ Int64 │  Utf8  │
+├───────┼────────┤
+│     0 │ Mr. Hi │
+│     1 │ Mr. Hi │
+│     2 │ Mr. Hi │
+└───────┴────────┘
 ```
 
 ## Run an algorithm
@@ -188,7 +188,7 @@ LIMIT 5;
 ```text
 ┌───────┬──────────┐
 │  id   │ pagerank │
-│ int64 │  double  │
+│ Int64 │ Float64  │
 ├───────┼──────────┤
 │    33 │   0.1009 │
 │     0 │    0.097 │
@@ -223,7 +223,7 @@ LIMIT 5;
 ```text
 ┌───────┬─────────┬────────┬───────────┬───────────┐
 │  id   │  club   │ degree │ triangles │ community │
-│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+│ Int64 │  Utf8   │ UInt32 │  UInt32   │  UInt32   │
 ├───────┼─────────┼────────┼───────────┼───────────┤
 │    33 │ Officer │     17 │        15 │         2 │
 │     0 │ Mr. Hi  │     16 │        18 │         0 │
@@ -253,7 +253,7 @@ ORDER BY club;
 ```text
 ┌─────────┬─────────┐
 │  club   │ members │
-│ varchar │  int64  │
+│  Utf8   │  Int64  │
 ├─────────┼─────────┤
 │ Mr. Hi  │       6 │
 │ Officer │       7 │
@@ -277,7 +277,7 @@ LIMIT 3;
 ```text
 ┌───────┬────────────────┐
 │  id   │ friends_degree │
-│ int64 │     double     │
+│ Int64 │    Float64     │
 ├───────┼────────────────┤
 │    11 │           16.0 │
 │    14 │           14.5 │
@@ -316,7 +316,7 @@ LIMIT 5;
 ```text
 ┌──────────┬──────────────────────┐
 │    id    │       pagerank       │
-│ varchar  │        double        │
+│   Utf8   │       Float64        │
 ├──────────┼──────────────────────┤
 │ Valjean  │  0.09956068175644767 │
 │ Marius   │ 0.051667656904091475 │
@@ -337,7 +337,7 @@ LIMIT 5;
 ```text
 ┌────────────┬─────────┐
 │     id     │ louvain │
-│  varchar   │ uint32  │
+│    Utf8    │ UInt32  │
 ├────────────┼─────────┤
 │ Anzelma    │       3 │
 │ Babet      │       3 │
@@ -366,7 +366,7 @@ FROM connected_components(lesmis_strong);
 ```text
 ┌────────┐
 │ groups │
-│ int64  │
+│ Int64  │
 ├────────┤
 │      3 │
 └────────┘
@@ -392,7 +392,7 @@ SELECT n_nodes, n_edges FROM describe(karate_late);
 ```text
 ┌─────────┬─────────┐
 │ n_nodes │ n_edges │
-│  int64  │  int64  │
+│  Int64  │  Int64  │
 ├─────────┼─────────┤
 │      34 │      41 │
 └─────────┴─────────┘
@@ -407,7 +407,7 @@ SELECT n_nodes, n_edges FROM describe(karate_late, nodes => 'touched');
 ```text
 ┌─────────┬─────────┐
 │ n_nodes │ n_edges │
-│  int64  │  int64  │
+│  Int64  │  Int64  │
 ├─────────┼─────────┤
 │      24 │      41 │
 └─────────┴─────────┘
@@ -440,13 +440,13 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 ```
 
 ```text
-┌───────┬───────┬───────┬────────┐
-│  src  │  dst  │  hop  │  cost  │
-│ int64 │ int64 │ int64 │ double │
-├───────┼───────┼───────┼────────┤
-│     0 │     8 │     0 │    1.0 │
-│     8 │    33 │     1 │    2.0 │
-└───────┴───────┴───────┴────────┘
+┌───────┬───────┬───────┬─────────┐
+│  src  │  dst  │  hop  │  cost   │
+│ Int64 │ Int64 │ Int64 │ Float64 │
+├───────┼───────┼───────┼─────────┤
+│     0 │     8 │     0 │     1.0 │
+│     8 │    33 │     1 │     2.0 │
+└───────┴───────┴───────┴─────────┘
 ```
 
 ## Files in object storage
@@ -532,7 +532,7 @@ COPY (SELECT * FROM pagerank(karate)) TO 'pagerank.parquet';
 ```text
 ┌────────┐
 │ count  │
-│ uint64 │
+│ UInt64 │
 ├────────┤
 │     34 │
 └────────┘

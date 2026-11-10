@@ -74,7 +74,7 @@ DESCRIBE GRAPH karate;
 ```text
 ┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
 │ table_name │ column_name │ data_type │    role     │    origin    │
-│  varchar   │   varchar   │  varchar  │   varchar   │   varchar    │
+│    Utf8    │    Utf8     │   Utf8    │    Utf8     │     Utf8     │
 ├────────────┼─────────────┼───────────┼─────────────┼──────────────┤
 │ nodes      │ id          │ Int64     │ node id     │ members.id   │
 │ nodes      │ club        │ Utf8      │ NULL        │ members.club │
@@ -97,7 +97,7 @@ LIMIT 3;
 ```text
 ┌───────┬─────────────────────┐
 │  id   │      pagerank       │
-│ int64 │       double        │
+│ Int64 │       Float64       │
 ├───────┼─────────────────────┤
 │    33 │ 0.10346168993478702 │
 │     0 │  0.0992272932102213 │
@@ -129,7 +129,7 @@ LIMIT 3;
 ```text
 ┌───────┬─────────┬────────┬───────────┬───────────┐
 │  id   │  club   │ degree │ triangles │ community │
-│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+│ Int64 │  Utf8   │ UInt32 │  UInt32   │  UInt32   │
 ├───────┼─────────┼────────┼───────────┼───────────┤
 │    33 │ Officer │     17 │        15 │         2 │
 │     0 │ Mr. Hi  │     16 │        18 │         0 │
@@ -155,7 +155,7 @@ ORDER BY id;
 ```text
 ┌─────────┬───────────┐
 │   id    │ community │
-│ varchar │  uint32   │
+│  Utf8   │  UInt32   │
 ├─────────┼───────────┤
 │ Cosette │         4 │
 │ Javert  │         1 │
@@ -182,7 +182,7 @@ LIMIT 3;
 ```text
 ┌───────┬────────────────┐
 │  id   │ friends_degree │
-│ int64 │     double     │
+│ Int64 │    Float64     │
 ├───────┼────────────────┤
 │    11 │           16.0 │
 │    14 │           14.5 │
@@ -202,7 +202,7 @@ ORDER BY club;
 ```text
 ┌─────────┬─────────┐
 │  club   │ members │
-│ varchar │  int64  │
+│  Utf8   │  Int64  │
 ├─────────┼─────────┤
 │ Mr. Hi  │       6 │
 │ Officer │       7 │
@@ -225,13 +225,13 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 ```
 
 ```text
-┌───────┬───────┬───────┬────────┐
-│  src  │  dst  │  hop  │  cost  │
-│ int64 │ int64 │ int64 │ double │
-├───────┼───────┼───────┼────────┤
-│     0 │     8 │     0 │    1.0 │
-│     8 │    33 │     1 │    2.0 │
-└───────┴───────┴───────┴────────┘
+┌───────┬───────┬───────┬─────────┐
+│  src  │  dst  │  hop  │  cost   │
+│ Int64 │ Int64 │ Int64 │ Float64 │
+├───────┼───────┼───────┼─────────┤
+│     0 │     8 │     0 │     1.0 │
+│     8 │    33 │     1 │     2.0 │
+└───────┴───────┴───────┴─────────┘
 ```
 
 ```sql
@@ -264,7 +264,7 @@ ORDER BY b.club;
 ```text
 ┌─────────┬───────┐
 │  club   │ ties  │
-│ varchar │ int64 │
+│  Utf8   │ Int64 │
 ├─────────┼───────┤
 │ Mr. Hi  │    15 │
 │ Officer │     1 │
@@ -348,12 +348,12 @@ SELECT log(100) AS log, log10(100) AS log10, ln(100) AS ln;
 ```
 
 ```text
-┌────────┬────────┬───────────────────┐
-│  log   │ log10  │        ln         │
-│ double │ double │      double       │
-├────────┼────────┼───────────────────┤
-│    2.0 │    2.0 │ 4.605170185988092 │
-└────────┴────────┴───────────────────┘
+┌─────────┬─────────┬───────────────────┐
+│   log   │  log10  │        ln         │
+│ Float64 │ Float64 │      Float64      │
+├─────────┼─────────┼───────────────────┤
+│     2.0 │     2.0 │ 4.605170185988092 │
+└─────────┴─────────┴───────────────────┘
 ```
 
 **A float, boolean or date as a node id.** `seeds`, `start`, `source` and `target` take integers or strings. On a graph with integer ids a string must be an integer (`'7'`), and nothing is rounded: `1.5`, `2.0` and `true` are refused. On a graph with string ids, an integer is taken as its string.
@@ -386,7 +386,7 @@ LIMIT 4;
 ```text
 ┌─────────┬───────┬─────────────┐
 │  club   │  id   │ betweenness │
-│ varchar │ int64 │   double    │
+│  Utf8   │ Int64 │   Float64   │
 ├─────────┼───────┼─────────────┤
 │ Mr. Hi  │     0 │     231.071 │
 │ Officer │    33 │     160.552 │
@@ -409,7 +409,7 @@ FROM hop(lesmis_strong, seeds => ['Valjean'], n => 2, direction => 'both');
 ```text
 ┌─────────┐
 │ reached │
-│  int64  │
+│  Int64  │
 ├─────────┤
 │      39 │
 └─────────┘
@@ -424,7 +424,7 @@ SELECT * FROM describe(karate, direction => 'both', full => true);
 ```text
 ┌─────────┬─────────┬─────────────────────┬───────────────────┬──────────────┬─────────────────┐
 │ n_nodes │ n_edges │       density       │    avg_degree     │ n_components │ n_dropped_edges │
-│  int64  │  int64  │       double        │      double       │    int64     │      int64      │
+│  Int64  │  Int64  │       Float64       │      Float64      │    Int64     │      Int64      │
 ├─────────┼─────────┼─────────────────────┼───────────────────┼──────────────┼─────────────────┤
 │      34 │      78 │ 0.13903743315508021 │ 4.588235294117647 │            1 │               0 │
 └─────────┴─────────┴─────────────────────┴───────────────────┴──────────────┴─────────────────┘

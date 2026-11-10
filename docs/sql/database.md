@@ -103,12 +103,12 @@ SHOW ursa.index_storage_limit;
 ```
 
 ```text
-┌──────────────────────────┬─────────┐
-│           name           │  value  │
-│         varchar          │ varchar │
-├──────────────────────────┼─────────┤
-│ ursa.index_storage_limit │ 8GiB    │
-└──────────────────────────┴─────────┘
+┌──────────────────────────┬───────┐
+│           name           │ value │
+│           Utf8           │ Utf8  │
+├──────────────────────────┼───────┤
+│ ursa.index_storage_limit │ 8GiB  │
+└──────────────────────────┴───────┘
 ```
 
 The limit belongs to the database. In a writable database, `SET` stores it in the catalog, every later process obeys it, and `SHOW` shows it. `RESET ursa.index_storage_limit` goes back to the default. In a read-only session, or one without a database, `SET` lasts for the session, and it never removes anything.
