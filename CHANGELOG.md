@@ -14,8 +14,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   command-line tool** (crate `ursa-cli`, released as 0.6.0 on 2026-11-06;
   the engine crates are `ursa-engine` and `ursa-sql`). This is its first
   release. It is versioned apart from the Python package. Changes on `main`
-  since then are released as `ursa-cli` 0.7.0 (2026-11-06) and 0.8.0
-  (2026-11-07).
+  since then are released as `ursa-cli` 0.7.0 (2026-11-06), 0.8.0
+  (2026-11-07) and 0.9.0 (2026-11-10).
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
@@ -275,12 +275,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   return `UInt32`, as `degree` does, not `Float64`. `min` and `max` take
   strings, dates, times and timestamps too, and return a value of the same
   type (#313). The Python library is unchanged.
-- **The five crates `ursa-cli` installs from crates.io** (`ursa-core`,
-  `ursa-io`, `ursa-engine`, `ursa-sql`, `ursa-cli`) are released together at
-  one version, since 0.7.0. `ursa-core` and `ursa-io` no longer follow the
-  Python package's version, and the release workflow refuses a tag where any
-  of the five differ. A development build's `ursa --version` names its commit,
-  for example `ursa 0.7.0-dev (a1b2c3d4e)`. Releases publish to crates.io by
+- **The crates `ursa-cli` installs from crates.io** (`ursa-core`,
+  `ursa-io`, `ursa-engine`, `ursa-sql`, `ursa-cli`, and since 0.9.0
+  `ursa-shell`) are released together at one version, since 0.7.0.
+  `ursa-core` and `ursa-io` no longer follow the Python package's version,
+  and the release workflow refuses a tag where any of them differ. A
+  development build's `ursa --version` names its commit, for example
+  `ursa 0.7.0-dev (a1b2c3d4e)`. Releases publish to crates.io by
   Trusted Publishing, with no stored API token.
 - `ursa-cli` releases can start from GitHub: Actions -> Release ursa-cli ->
   Run workflow on `main`, with `release` and the version. The run builds and

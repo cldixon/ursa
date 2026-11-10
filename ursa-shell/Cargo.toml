@@ -1,7 +1,7 @@
 [package]
 name = "ursa-shell"
 description = "Ursa's shell apart from the terminal: dot-commands, results drawn as tables, and SQL highlighting, shared by the ursa CLI and the browser shell."
-version = "0.9.0-dev"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,8 +15,8 @@ categories = ["command-line-utilities", "database-implementations"]
 clap = ["dep:clap"]
 
 [dependencies]
-ursa-engine = { path = "../ursa-engine", version = "0.9.0-dev" }
-ursa-sql = { path = "../ursa-sql", version = "0.9.0-dev" }
+ursa-engine = { path = "../ursa-engine", version = "0.9.0" }
+ursa-sql = { path = "../ursa-sql", version = "0.9.0" }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 futures = "0.3"
