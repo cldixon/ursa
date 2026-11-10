@@ -371,11 +371,13 @@ async fn run_session(
     };
     let mut shell = Shell::new(ctx, args.format, out, io::stderr());
     shell.set_max_rows(args.max_rows);
+    shell.set_version(env!("URSA_VERSION"));
+    // Colour unless NO_COLOR is set (https://no-color.org) or the terminal
+    // says it has none.
+    let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+        && std::env::var("TERM").map_or(true, |t| t != "dumb");
+    shell.set_error_color(color && io::stderr().is_terminal());
     if io::stdout().is_terminal() {
-        // Colour unless NO_COLOR is set (https://no-color.org) or the
-        // terminal says it has none.
-        let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
-            && std::env::var("TERM").map_or(true, |t| t != "dumb");
         // The terminal's width when a table is drawn: it may have been resized.
         let width = || terminal_size::terminal_size().map_or(0, |(w, _)| usize::from(w.0));
         shell.set_screen(Box::new(width), color);
@@ -402,7 +404,7 @@ async fn run_session(
             std::env::var_os(startup::HISTORY_VAR),
             home.as_deref(),
         );
-        repl::run(&mut shell, history)
+        repl::run(&mut shell, history, color && io::stdout().is_terminal())
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         return Ok(true);

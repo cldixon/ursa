@@ -1135,7 +1135,7 @@ fn scripts_take_dot_commands() {
     let out = ok(ursa_with_stdin(&[], ".mode json\nSELECT 1 AS a;\n"));
     assert_eq!(out, "[{\"a\":1}]\n");
     let out = ok(ursa_with_stdin(&[], ".help\n"));
-    assert!(out.contains(".functions [NAME]"), "{out}");
+    assert!(out.contains(".functions ?NAME?"), "{out}");
     // And in -c.
     let out = ok(ursa(&["-c", ".mode csv", "-c", "SELECT 3 AS c"]));
     assert_eq!(out, "c\n3\n");
