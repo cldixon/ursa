@@ -210,7 +210,7 @@ await type("SELECT club,\n       count(*) AS n\nFROM members GROUP BY club ORDER
   await page.waitForTimeout(100);
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   check(
-    copied.startsWith("memory U SELECT club,\n                count(*) AS n\n") && copied.includes("│ Mr. Hi  │    17 │") && copied.trimEnd().endsWith("┘"),
+    copied.startsWith("memory U SELECT club,\n                count(*) AS n\n") && copied.includes("│ Mr. Hi   │    17 │") && copied.trimEnd().endsWith("┘"),
     "copy a statement and its table",
     JSON.stringify(copied.slice(0, 80)),
   );
