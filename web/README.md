@@ -1,11 +1,13 @@
 # Ursa Web Shell
 
 A web page where anyone can run Ursa SQL in their browser, over sample graphs
-stored in R2 (#279, part of #277). It is a terminal, laid out after DuckDB's
-web shell: a bar with New, Share, Import and a Datasets menu, and an `ursa>`
-prompt that takes SQL and the `ursa` CLI's dot-commands. The engine is `ursa-wasm`: Ursa's SQL engine
-compiled to WebAssembly. It runs in a Web Worker in the page and reads Parquet
-and CSV over HTTP with range requests. The Worker here serves files and does no
+stored in R2 (#279, part of #277). It is the `ursa` shell itself, in a
+terminal, as DuckDB's web shell is DuckDB's CLI: the shell (dot-commands, SQL a
+line at a time, DuckDB-style tables) is the `ursa-shell` crate, compiled into
+`ursa-wasm` as `WebShell` and run in a Web Worker; the page draws it with
+xterm.js. Around it is a bar laid out after DuckDB's web shell: New, Share,
+Import, a Datasets menu and a light/dark toggle. The engine reads Parquet and
+CSV over HTTP with range requests. The Worker here serves files and does no
 query work.
 
 The setup follows the Plain Text site's (`cldixon/plane-text`, `site/cloudflare/`):
@@ -16,28 +18,29 @@ static assets and an R2 bucket.
 
 - `public/`: the page (`index.html`, `app.js`, `style.css`), the Datasets
   menu (`datasets.js`) and the engine's Web Worker (`engine-worker.js`).
-  - **The terminal.** Enter runs a statement that ends with `;` (Shift+Enter
-    adds a line) or a dot-command; ↑/↓ recall history (kept in this browser);
-    Ctrl-C drops what was typed, Ctrl-L clears. Results are boxed tables with
-    each column's type; past `.maxrows` (40) a table shows its first and last
-    rows and a footer, as the CLI does.
-  - **Dot-commands:** the CLI's `.describe`, `.functions [NAME]`, `.graphs`,
-    `.help`, `.maxrows`, `.tables` and `.timer`, and the page's own `.clear`,
-    `.dataset [NAME]`, `.export FORMAT` (downloads the last result as CSV,
-    Parquet, JSON or Arrow), `.files [add]`, `.history [N]`, `.print`,
-    `.share` and `.version`. `.help graph` is a page of the graph SQL (its
-    forms are run by the e2e test) and `.help shortcuts` the keys.
-  - **Datasets.** Picking one runs its commands at the prompt, as if typed: its
-    views and `CREATE PROPERTY GRAPH`, then two or three queries that show the
-    graph functions, `GRAPH_TABLE` patterns and shortest paths.
-    `?dataset=karate` in the URL loads one on open.
+  - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
+    by the build), with a line editor in `app.js`: Enter sends the line to the
+    shell, which runs a statement once it ends with `;` and shows the
+    continuation prompt meanwhile; Shift+Enter adds a line to what is typed;
+    ↑/↓ recall history (kept in this browser); Ctrl+C copies a selection, or
+    drops what was typed; Ctrl+L clears. Keys pressed while a line runs wait
+    for it. What the shell prints (tables, errors, colour) is written to the
+    terminal as is, so a selection copies as the text on screen.
+  - **Dot-commands** are the CLI's (`.help`, `.tables`, `.describe`,
+    `.functions`, `.maxrows`, `.maxwidth`, `.timer`, `.mode`, …; `.help graph`
+    is a page on the graph SQL, whose forms the e2e test runs), and the page's
+    own, which the shell lists in `.help` and hands back to the page:
+    `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
+    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.history ?N?` and `.share`.
+  - **Datasets.** Picking one starts a fresh session and runs its commands at
+    the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
+    three queries that show the graph functions, `GRAPH_TABLE` patterns and
+    shortest paths. `?dataset=karate` in the URL loads one on open.
   - **Share** copies a link whose fragment holds the session's commands; opening
-    it replays them. **Import** adds files from this computer to the session
-    (`Session.addFile`, at `memory://uploads/<name>`) and defines a view over
+    it replays them. **Import** adds files from this computer
+    (`WebShell.addFile`, at `memory://uploads/<name>`) and defines a view over
     each. **New** starts a fresh session. The theme follows the system until the
-    toggle picks one, which is remembered.
-  - The worker keeps two engine sessions: `shell`, the terminal's, empty at
-    start, and `meta`, for the page's own lookups.
+    toggle picks one, which is remembered; the terminal's colours follow it.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
   engine; everything else is a static asset.

@@ -1,6 +1,7 @@
 // Assemble dist/, the static assets: public/, and the engine's JS glue and
 // engine.json from .engine/ (run `bun run engine` first), and the terminal's
-// font, IBM Plex Mono (SIL OFL 1.1), served from the Worker with the page.
+// font, IBM Plex Mono (SIL OFL 1.1), and xterm.js (MIT), the terminal, served
+// from the Worker with the page.
 import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { ENGINE_DIR, WEB } from "./common";
@@ -25,4 +26,12 @@ for (const subset of ["latin", "latin-ext"])
     cpSync(join(FONT, "files", file), join(dist, "fonts", file));
   }
 cpSync(join(FONT, "LICENSE"), join(dist, "fonts", "LICENSE.txt"));
+
+// The terminal: xterm.js and its fit addon, as ES modules.
+const XTERM = join(WEB, "node_modules", "@xterm");
+mkdirSync(join(dist, "vendor"), { recursive: true });
+cpSync(join(XTERM, "xterm", "lib", "xterm.mjs"), join(dist, "vendor", "xterm.mjs"));
+cpSync(join(XTERM, "xterm", "css", "xterm.css"), join(dist, "vendor", "xterm.css"));
+cpSync(join(XTERM, "addon-fit", "lib", "addon-fit.mjs"), join(dist, "vendor", "addon-fit.mjs"));
+cpSync(join(XTERM, "xterm", "LICENSE"), join(dist, "vendor", "LICENSE-xterm.txt"));
 console.log("built dist/");

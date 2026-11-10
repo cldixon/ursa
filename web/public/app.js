@@ -1,38 +1,28 @@
-// The Ursa Web Shell: a terminal over Ursa's engine, running in a Web Worker.
+// The Ursa Web Shell: the `ursa` shell itself, in a terminal on the page.
 //
-// Type SQL at the `ursa>` prompt: Enter runs a statement that ends with `;`
-// (Shift+Enter adds a line), and a dot-command at once. The Datasets menu
-// runs a dataset's commands at the prompt as if typed. Share copies a link
-// that replays the session's commands.
+// The shell (dot-commands, SQL, tables) is the CLI's, compiled to WebAssembly
+// and running in a Web Worker (engine-worker.js). This page is the terminal
+// around it, as a real terminal is around the CLI: xterm.js draws the screen,
+// and the line editor here sends the shell each typed line and writes back
+// what it printed. The page adds what only a page can do: the Datasets menu,
+// Share, Import, downloads, and the theme.
+import { Terminal } from "./vendor/xterm.mjs";
+import { FitAddon } from "./vendor/addon-fit.mjs";
 import { DATASETS } from "./datasets.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...children) => {
   const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(props)) {
-    if (key.startsWith("aria")) node.setAttribute(`aria-${key.slice(4).toLowerCase()}`, value);
-    else node[key] = value;
-  }
-  node.append(...children.filter((c) => c !== null && c !== undefined && c !== false));
+  Object.assign(node, props);
+  node.append(...children);
   return node;
 };
-
-const terminal = $("terminal");
-const log = $("log");
-const input = $("input");
-const highlight = $("highlight");
-const prompts = $("prompts");
-const inputLine = $("input-line");
-
-const PROMPT = "ursa> ";
-const CONTINUATION = " ...> ";
-const DOCS = "https://cldixon.github.io/ursa/sql/";
 
 // ---------------------------------------------------------------- engine
 
 const worker = new Worker(new URL("./engine-worker.js", import.meta.url), { type: "module" });
 let nextId = 0;
-const pending = new Map();
+const calls = new Map();
 let engineReady;
 const engineStarted = new Promise((resolve, reject) => (engineReady = { resolve, reject }));
 
@@ -42,32 +32,53 @@ worker.onmessage = ({ data }) => {
     else engineReady.reject(new Error(data.error));
     return;
   }
-  const call = pending.get(data.id);
-  pending.delete(data.id);
+  const call = calls.get(data.id);
+  calls.delete(data.id);
   if (data.ok) call.resolve(data);
   else call.reject(new Error(data.error));
 };
 
-function engine(op, args, transfer = []) {
+function engine(op, args = {}, transfer = []) {
   return new Promise((resolve, reject) => {
     const id = nextId++;
-    pending.set(id, { resolve, reject });
+    calls.set(id, { resolve, reject });
     worker.postMessage({ id, op, ...args }, transfer);
   });
 }
 
-// ---------------------------------------------------------------- settings
-
-// The engine keeps at most this many rows of a result for the page: in effect
-// every row of a listing.
-const ALL_ROWS = 1_000_000;
-const settings = { maxRows: 40, timer: false };
-// The commands this session ran, for Share; and where `.export` reads from.
-let ran = [];
-let lastResult = null; // {index} of the last result with columns
-let uploads = []; // names added with Import
-
 // ---------------------------------------------------------------- theme
+
+// The terminal's colours: the page's, with the ANSI colours the shell uses
+// (yellow strings, blue dot-commands, grey types and nulls, red errors, and
+// 256-colour 208 for the prompt) taken from the star-temperature ramp.
+const THEMES = {
+  light: {
+    background: "#ffffff", foreground: "#12120f", cursor: "#12120f", cursorAccent: "#ffffff",
+    selectionBackground: "#1f3e8c33", selectionInactiveBackground: "#1f3e8c22",
+    black: "#12120f", red: "#c0262d", green: "#3f7f3f", yellow: "#a8650f", blue: "#1f3e8c",
+    magenta: "#7a3e8c", cyan: "#2f6f7f", white: "#5a5852",
+    brightBlack: "#8a877f", brightRed: "#c4491b", brightGreen: "#3f7f3f", brightYellow: "#b07728",
+    brightBlue: "#4b6cb0", brightMagenta: "#7a3e8c", brightCyan: "#2f6f7f", brightWhite: "#12120f",
+    prompt: "#c4491b",
+  },
+  dark: {
+    background: "#0b0b0a", foreground: "#f4f1ea", cursor: "#f4f1ea", cursorAccent: "#0b0b0a",
+    selectionBackground: "#aabfff40", selectionInactiveBackground: "#aabfff26",
+    black: "#0b0b0a", red: "#ff6b6b", green: "#8fd18f", yellow: "#ffd2a1", blue: "#aabfff",
+    magenta: "#d6a8ff", cyan: "#9fd8e0", white: "#f4f1ea",
+    brightBlack: "#8a877f", brightRed: "#ff9f51", brightGreen: "#8fd18f", brightYellow: "#ffd2a1",
+    brightBlue: "#c8d6ff", brightMagenta: "#d6a8ff", brightCyan: "#9fd8e0", brightWhite: "#ffffff",
+    prompt: "#ff9f51",
+  },
+};
+
+function xtermTheme(name) {
+  const { prompt, ...theme } = THEMES[name];
+  // 256-colour 208 (the prompt's) is extendedAnsi[208 - 16].
+  const extendedAnsi = [];
+  extendedAnsi[208 - 16] = prompt;
+  return { ...theme, extendedAnsi };
+}
 
 function currentTheme() {
   const set = document.documentElement.dataset.theme;
@@ -80,561 +91,540 @@ $("theme").onclick = () => {
   try {
     localStorage.setItem("ursa-theme", next);
   } catch {}
+  term.options.theme = xtermTheme(next);
 };
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  term.options.theme = xtermTheme(currentTheme());
+});
 
-// ---------------------------------------------------------------- highlighting
+// ---------------------------------------------------------------- terminal
 
-const KEYWORDS = new Set(
-  (
-    "select from where group by order having limit offset join left right inner outer full cross on using as and or not in is null " +
-    "case when then else end distinct union all intersect except with recursive create replace view table drop if exists insert into values " +
-    "delete update set describe show explain analyze copy to property graph graphs vertex edge tables key source destination references label " +
-    "properties no are columns default graph_table match shortest any trail simple acyclic walk asc desc nulls first last true false cast " +
-    "between like ilike over partition rows range filter attach database"
-  ).split(" "),
-);
+// xterm measures the font when it opens: have it loaded first. Its DOM
+// renderer draws the text, so the browser's own text rendering (and
+// selection) apply; with line height 1, box characters join up.
+await document.fonts.load('13px "IBM Plex Mono"').catch(() => {});
+const term = new Terminal({
+  fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  fontSize: 13,
+  lineHeight: 1,
+  theme: xtermTheme(currentTheme()),
+  convertEol: true,
+  cursorBlink: true,
+  scrollback: 10_000,
+});
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.open($("terminal"));
+fit.fit();
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+/** Tables fit the terminal, a column kept free. */
+function sendWidth() {
+  engine("width", { columns: Math.max(20, term.cols - 1) });
 }
+new ResizeObserver(() => {
+  fit.fit();
+  sendWidth();
+}).observe($("terminal"));
 
-/** SQL (or a dot-command) as HTML with its keywords, strings, numbers and comments marked. */
-function highlightSql(text) {
-  if (/^\s*\./.test(text)) {
-    const m = text.match(/^(\s*\.\S*)(.*)$/s);
-    return `<span class="d">${escapeHtml(m[1])}</span><span class="a">${escapeHtml(m[2])}</span>`;
+term.attachCustomKeyEventHandler((e) => {
+  if (e.type !== "keydown") return true;
+  // Ctrl+C (Cmd+C) with text selected copies it, as in a terminal app.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && term.hasSelection()) {
+    navigator.clipboard?.writeText(term.getSelection());
+    return false;
   }
-  const token = /(--[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|('(?:[^']|'')*'?)|("(?:[^"]|"")*"?)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|([\s\S])/g;
-  let out = "";
-  for (const m of text.matchAll(token)) {
-    const [all, comment, string, quoted, number, word] = m;
-    if (comment) out += `<span class="c">${escapeHtml(comment)}</span>`;
-    else if (string) out += `<span class="s">${escapeHtml(string)}</span>`;
-    else if (quoted) out += escapeHtml(quoted);
-    else if (number) out += `<span class="n">${number}</span>`;
-    else if (word) out += KEYWORDS.has(word.toLowerCase()) ? `<span class="k">${escapeHtml(word)}</span>` : escapeHtml(word);
-    else out += escapeHtml(all);
+  // Shift+Enter starts a new line in what is typed.
+  if (e.key === "Enter" && e.shiftKey) {
+    if (!busy) insert("\n");
+    return false;
   }
-  return out;
-}
+  return true;
+});
 
-/** The prompt column for `lines` lines: `ursa> ` then ` ...> `. */
-function promptsFor(lines) {
-  return [PROMPT, ...Array(Math.max(0, lines - 1)).fill(CONTINUATION)].join("\n");
-}
+const write = (s) => new Promise((resolve) => term.write(s, resolve));
 
-// ---------------------------------------------------------------- the input
+// ---------------------------------------------------------------- the line editor
 
-function syncInput() {
-  // The trailing newline keeps the highlight as tall as the textarea.
-  highlight.innerHTML = highlightSql(input.value) + "\n";
-  prompts.textContent = promptsFor(input.value.split("\n").length);
-}
-input.addEventListener("input", syncInput);
-
-/** Whether `sql` ends a statement: a `;` outside strings and comments. */
-function isComplete(sql) {
-  const stripped = sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"/g, " ");
-  return /;\s*$/.test(stripped);
-}
+// What is typed: text that may hold newlines (Shift+Enter, a paste, a
+// statement from the history), and the cursor in it.
+let text = "";
+let cursor = 0;
+// The prompt for the next line, from the shell: `memory U ` or spaces as wide.
+let prompt = "memory U ";
+let promptColor = ["", ""];
+// How many rows the cursor is below where the drawn input starts.
+let cursorRow = 0;
+let busy = true;
+// `text` coloured by the shell's highlighter, once it has answered.
+let colored = { text: "", ansi: "" };
 
 const HISTORY_KEY = "ursa-shell-history";
-function readHistory() {
-  try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
-  } catch {
-    return [];
-  }
-}
-let history = readHistory();
+let history = [];
+try {
+  history = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]").filter((h) => typeof h === "string");
+} catch {}
 let historyAt = history.length;
 let draft = "";
-function remember(command) {
-  history = history.filter((h) => h !== command);
-  history.push(command);
-  history = history.slice(-200);
+
+function remember(entry) {
+  if (!entry.trim()) return;
+  history = history.filter((h) => h !== entry);
+  history.push(entry);
+  history = history.slice(-500);
   historyAt = history.length;
   try {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
   } catch {}
 }
 
-input.addEventListener("keydown", (e) => {
-  const value = input.value;
-  if (e.key === "Enter" && !e.shiftKey) {
-    const command = value.trim();
-    if (!command) {
-      e.preventDefault();
-      echo("");
+/** Lines of `text`, coloured once the shell's highlighter has answered. */
+function coloredLines() {
+  if (colored.text === text) return colored.ansi.split("\n");
+  const asked = text;
+  engine("highlight", { text: asked }).then(({ text: ansi }) => {
+    if (asked === text && !busy) {
+      colored = { text: asked, ansi };
+      draw();
+    }
+  });
+  return text.split("\n");
+}
+
+const length = (s) => [...s].length;
+
+/** Draw the prompt and what is typed, and put the cursor where it is. */
+function draw() {
+  const cols = term.cols;
+  const lines = text.split("\n");
+  const colors = coloredLines();
+  let out = "\r" + (cursorRow > 0 ? `\x1b[${cursorRow}A` : "") + "\x1b[J";
+  let row = 0; // the row this line starts on
+  let end = 0; // the row the last line ends on
+  let offset = 0;
+  let target = { row: 0, col: 0 };
+  lines.forEach((line, i) => {
+    if (i > 0) out += "\r\n";
+    out += (i === 0 ? `${promptColor[0]}${prompt}${promptColor[1]}` : " ".repeat(prompt.length)) + (colors[i] ?? line);
+    const width = prompt.length + length(line);
+    // A line that fills its last row exactly leaves the cursor waiting to
+    // wrap: wrap it now, so the rows below are where they are counted.
+    if (width > 0 && width % cols === 0) out += " \r";
+    if (cursor >= offset && cursor <= offset + line.length) {
+      const at = prompt.length + length(line.slice(0, cursor - offset));
+      target = { row: row + Math.floor(at / cols), col: at % cols };
+    }
+    end = row + Math.floor(width / cols);
+    row = end + 1;
+    offset += line.length + 1;
+  });
+  const up = end - target.row;
+  out += (up > 0 ? `\x1b[${up}A` : "") + "\r" + (target.col > 0 ? `\x1b[${target.col}C` : "");
+  cursorRow = target.row;
+  term.write(out);
+}
+
+/** Take what is drawn off the screen (before the page runs a command). */
+function erase() {
+  term.write("\r" + (cursorRow > 0 ? `\x1b[${cursorRow}A` : "") + "\x1b[J");
+  cursorRow = 0;
+}
+
+function insert(s) {
+  text = text.slice(0, cursor) + s + text.slice(cursor);
+  cursor += s.length;
+  draw();
+}
+
+function setText(s) {
+  text = s;
+  cursor = s.length;
+  draw();
+}
+
+/** Leave the input on screen as typed, and go to the next line for output. */
+async function finishLine() {
+  cursor = text.length;
+  draw();
+  cursorRow = 0;
+  await write("\r\n");
+}
+
+const lineStart = () => text.lastIndexOf("\n", cursor - 1) + 1;
+const lineEnd = () => (text.indexOf("\n", cursor) < 0 ? text.length : text.indexOf("\n", cursor));
+
+// Keys pressed while a line runs wait for it, as a terminal keeps them.
+let typeahead = [];
+
+term.onData((data) => {
+  if (busy) {
+    typeahead.push(data);
+    return;
+  }
+  key(data);
+});
+
+function key(data) {
+  // A paste arrives in one piece: its lines stay in the input, to run with Enter.
+  if (data.length > 1 && !data.startsWith("\x1b")) {
+    insert(data.replace(/\r\n?/g, "\n"));
+    return;
+  }
+  switch (data) {
+    case "\r":
+      submitTyped();
+      return;
+    case "\x7f": // Backspace
+    case "\b":
+      if (cursor > 0) {
+        text = text.slice(0, cursor - 1) + text.slice(cursor);
+        cursor--;
+        draw();
+      }
+      return;
+    case "\x1b[3~": // Delete
+      if (cursor < text.length) {
+        text = text.slice(0, cursor) + text.slice(cursor + 1);
+        draw();
+      }
+      return;
+    case "\x1b[D": // Left
+    case "\x02":
+      if (cursor > 0) cursor--;
+      draw();
+      return;
+    case "\x1b[C": // Right
+    case "\x06":
+      if (cursor < text.length) cursor++;
+      draw();
+      return;
+    case "\x1b[H": // Home
+    case "\x01": // Ctrl+A
+      cursor = lineStart();
+      draw();
+      return;
+    case "\x1b[F": // End
+    case "\x05": // Ctrl+E
+      cursor = lineEnd();
+      draw();
+      return;
+    case "\x0b": // Ctrl+K: delete to the end of the line
+      text = text.slice(0, cursor) + text.slice(lineEnd());
+      draw();
+      return;
+    case "\x15": {
+      // Ctrl+U: delete to the start of the line
+      const start = lineStart();
+      text = text.slice(0, start) + text.slice(cursor);
+      cursor = start;
+      draw();
       return;
     }
-    if (command.startsWith(".") || isComplete(value) || e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      input.value = "";
-      syncInput();
-      submit(command);
+    case "\x17": {
+      // Ctrl+W: delete the word before the cursor
+      const before = text.slice(0, cursor).replace(/\S+\s*$/, "");
+      text = before + text.slice(cursor);
+      cursor = before.length;
+      draw();
+      return;
     }
-    // Otherwise the newline goes in: the statement continues.
-  } else if (e.key === "ArrowUp" && !value.slice(0, input.selectionStart).includes("\n")) {
-    if (historyAt === 0) return;
-    if (historyAt === history.length) draft = value;
-    historyAt--;
-    setInput(history[historyAt]);
-    e.preventDefault();
-  } else if (e.key === "ArrowDown" && !value.slice(input.selectionEnd).includes("\n")) {
-    if (historyAt >= history.length) return;
-    historyAt++;
-    setInput(historyAt === history.length ? draft : history[historyAt]);
-    e.preventDefault();
-  } else if (e.key === "c" && e.ctrlKey && input.selectionStart === input.selectionEnd) {
-    // Ctrl-C drops what was typed, as in a terminal.
-    echo(value, "^C");
-    setInput("");
-    e.preventDefault();
-  } else if (e.key === "l" && e.ctrlKey) {
-    log.replaceChildren();
-    e.preventDefault();
-  } else if (e.key === "Tab") {
-    e.preventDefault();
-    input.setRangeText("  ", input.selectionStart, input.selectionEnd, "end");
-    syncInput();
+    case "\x1b[A": // Up: the line above, or the history
+      if (lineStart() === 0) {
+        if (historyAt === 0) return;
+        if (historyAt === history.length) draft = text;
+        historyAt--;
+        setText(history[historyAt]);
+      } else {
+        const column = cursor - lineStart();
+        const start = text.lastIndexOf("\n", lineStart() - 2) + 1;
+        cursor = Math.min(start + column, lineStart() - 1);
+        draw();
+      }
+      return;
+    case "\x1b[B": // Down: the line below, or the history
+      if (lineEnd() === text.length) {
+        if (historyAt >= history.length) return;
+        historyAt++;
+        setText(historyAt === history.length ? draft : history[historyAt]);
+      } else {
+        const column = cursor - lineStart();
+        const start = lineEnd() + 1;
+        const end = text.indexOf("\n", start) < 0 ? text.length : text.indexOf("\n", start);
+        cursor = Math.min(start + column, end);
+        draw();
+      }
+      return;
+    case "\x03": // Ctrl+C: drop what is typed
+      cancelTyped();
+      return;
+    case "\x0c": // Ctrl+L
+      clearScreen();
+      return;
+    case "\t":
+      insert("  ");
+      return;
+    default:
+      if (data >= " " && !data.startsWith("\x1b")) insert(data);
   }
-});
-
-function setInput(text) {
-  input.value = text;
-  input.setSelectionRange(text.length, text.length);
-  syncInput();
 }
 
-// A click on the terminal (not a selection) puts the cursor in the input.
-terminal.addEventListener("mouseup", () => {
-  if (!getSelection().toString() && !input.disabled) input.focus({ preventScroll: true });
-});
-
-// ---------------------------------------------------------------- output
-
-function scrollDown() {
-  terminal.scrollTop = terminal.scrollHeight;
+async function cancelTyped() {
+  busy = true;
+  await finishLine();
+  await write("^C\r\n");
+  const r = await engine("cancel");
+  prompt = r.prompt;
+  statement = [];
+  text = "";
+  cursor = 0;
+  historyAt = history.length;
+  busy = false;
+  draw();
 }
 
-/** A command at the prompt, as it was typed. */
-function echo(command, suffix = "") {
-  const lines = command.split("\n").length;
-  const code = el("pre");
-  code.innerHTML = highlightSql(command) + (suffix ? `<span class="muted">${escapeHtml(suffix)}</span>` : "");
-  log.append(el("div", { className: "echo" }, el("pre", { className: "prompts", textContent: promptsFor(lines) }), code));
-  scrollDown();
-}
-
-function say(text, className = "") {
-  log.append(el("pre", { className: `line ${className}`.trim(), textContent: text }));
-  scrollDown();
-}
-
-function error(message) {
-  say(message.startsWith("Error") ? message : `Error: ${message}`, "err");
-}
-
-const NUMERIC = /^(U?Int|Float|Decimal)/;
-const LONG = 60;
-
-/** An Arrow type as a short SQL-ish name, as DuckDB's shell labels columns. */
-function typeName(type) {
-  if (/^(Large)?Utf8(View)?$/.test(type)) return "varchar";
-  if (type === "Float64") return "double";
-  if (type === "Float32") return "float";
-  if (type === "Boolean") return "boolean";
-  if (type === "Date32" || type === "Date64") return "date";
-  if (type.startsWith("Timestamp")) return "timestamp";
-  if (/^(Large)?List/.test(type)) {
-    // Arrow prints `List(non-null Int64)` or `List(Field { …, data_type: Int64, … })`.
-    const inner = type.match(/List\((?:non-null |nullable )?(?:Field \{.*?data_type: )?([A-Za-z0-9]+)/);
-    return inner ? `${typeName(inner[1])}[]` : "list";
-  }
-  if (type.startsWith("Struct")) return "struct";
-  if (type.startsWith("Decimal")) return type.toLowerCase().replace(/^decimal\d*/, "decimal");
-  return type.toLowerCase();
-}
-
-function plural(n, word) {
-  return `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : "s"}`;
-}
-
-/** One result: a table, or nothing for a statement with no columns. */
-function renderResult(r) {
-  if (!r.columns.length) return;
-  const numeric = r.columns.map((c) => NUMERIC.test(c.type));
-  const cell = (v, i) =>
-    v === null
-      ? el("td", { className: "null", textContent: "NULL" })
-      : el("td", {
-          className: [numeric[i] ? "num" : "", v.length > LONG ? "long" : ""].join(" ").trim(),
-          textContent: v,
-          title: v.length > LONG ? v : "",
-        });
-  const body = el("tbody");
-  for (const row of r.rows) body.append(el("tr", {}, ...row.map(cell)));
-  const tail = r.tail ?? [];
-  if (tail.length) {
-    for (let i = 0; i < 3; i++) body.append(el("tr", { className: "gap" }, ...r.columns.map(() => el("td", { textContent: "·" }))));
-    for (const row of tail) body.append(el("tr", {}, ...row.map(cell)));
-  }
-  const head = el(
-    "tr",
-    {},
-    ...r.columns.map((c) => el("th", { scope: "col" }, c.name, el("span", { className: "type", textContent: typeName(c.type) }))),
-  );
-  const shown = r.rows.length + tail.length;
-  const footer =
-    r.totalRows > shown || r.totalRows === 0
-      ? el(
-          "div",
-          { className: "footer" },
-          el("span", { textContent: r.totalRows === 0 ? "0 rows" : `${plural(r.totalRows, "row")} (${shown} shown)` }),
-          el("span", { textContent: plural(r.columns.length, "column") }),
-        )
-      : null;
-  log.append(el("div", { className: "result" }, el("table", { className: "box" }, el("thead", {}, head), body), footer));
-}
-
-function formatMs(ms) {
-  return ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(2)} s`;
+function clearScreen() {
+  term.clear();
+  term.write("\x1b[H\x1b[2J");
+  cursorRow = 0;
+  draw();
 }
 
 // ---------------------------------------------------------------- running
 
-// Commands run one at a time, in order, whether typed or from a dataset. A
-// batch (a dataset's commands, a shared link's) is queued at once and stops at
-// its first error: the commands after it are skipped.
+// Everything that runs, one after another: typed lines, the page's commands.
 let queue = Promise.resolve();
-function submit(command, { record = true, batch = null } = {}) {
-  const run = queue.then(() => (batch?.failed ? undefined : execute(command, record)));
-  queue = run.catch(() => {
-    if (batch) batch.failed = true;
-  });
-  return run;
+// The statements and commands this session ran, for Share.
+let ran = [];
+// The lines of the statement being fed, until it runs.
+let statement = [];
+let uploads = [];
+
+function setBusy(on) {
+  busy = on;
+  term.options.cursorBlink = !on;
 }
 
-/** Queue `commands` as one batch; resolves when they have all run or one failed. */
-function submitAll(commands) {
-  const batch = { failed: false };
-  const runs = commands.map((command) => submit(command, { batch }));
-  return Promise.allSettled(runs);
-}
-
-async function execute(command, record) {
-  echo(command);
-  if (record) remember(command);
-  setBusy(true);
-  try {
-    await engineStarted;
-    if (command.startsWith(".")) await dotCommand(command, record);
-    else {
-      await runSql(command);
-      if (record) ran.push(command);
+/** Back at the prompt: draw it, then the keys pressed meanwhile. */
+function ready() {
+  setBusy(false);
+  draw();
+  const keys = typeahead;
+  typeahead = [];
+  // A key may start another run (Enter): the rest wait for it.
+  for (let i = 0; i < keys.length; i++) {
+    if (busy) {
+      typeahead.push(...keys.slice(i));
+      return;
     }
-  } catch (e) {
-    error(e.message);
-    throw e;
-  } finally {
-    setBusy(false);
-    scrollDown();
+    key(keys[i]);
   }
 }
 
-async function runSql(sql, { session = "shell", maxRows = settings.maxRows } = {}) {
-  const { results, ms } = await engine("run", { session, sql, maxRows });
-  results.forEach((r, i) => {
-    renderResult(r);
-    if (r.columns.length) lastResult = { index: i };
+/** Enter: what is typed goes to the shell, a line at a time. */
+function submitTyped() {
+  const entry = text;
+  setBusy(true);
+  queue = queue.then(async () => {
+    await finishLine();
+    remember(entry);
+    text = "";
+    cursor = 0;
+    for (const line of entry.split("\n")) await feed(line, { echo: false });
+    ready();
   });
-  if (settings.timer) say(`Run Time: ${formatMs(ms)}`, "muted");
-  return results;
 }
 
-function setBusy(busy) {
-  input.disabled = busy;
-  inputLine.classList.toggle("busy", busy);
-  if (!busy) input.focus({ preventScroll: true });
+/**
+ * Run `command` as if typed: each line is drawn after the prompt and fed to
+ * the shell. Resolves to whether it ran without an error.
+ */
+function run(command) {
+  setBusy(true);
+  const done = queue.then(async () => {
+    erase();
+    text = "";
+    cursor = 0;
+    let ok = true;
+    for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+    ready();
+    return ok;
+  });
+  queue = done.catch(() => {});
+  return done;
 }
 
-// ---------------------------------------------------------------- dot-commands
+/** Run `commands` in order, stopping at the first that fails. */
+async function runAll(commands) {
+  for (const command of commands) if (!(await run(command))) return false;
+  return true;
+}
 
-// The dot-commands, for .help: [command, arguments, what it does].
-const COMMANDS = [
-  [".clear", "", "Clear the terminal screen (also Ctrl+L)"],
-  [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session: its tables, graph and example queries"],
-  [".describe", "NAME", "Show the columns of a table or view, or the vertex and edge tables of a graph"],
-  [".export", "FORMAT", "Download the last result as csv, parquet, json or arrow"],
-  [".files", "", "List the files you can query by name: the datasets' and the ones you imported"],
-  [".files add", "", "Pick files from your computer to query (the same as Import)"],
-  [".functions", "?NAME?", "List the graph algorithms, or show one's parameters and output columns"],
-  [".graphs", "", "List the property graphs"],
-  [".help", "?PATTERN?", "Show help for the commands matching PATTERN"],
+// Commands that only look: Share leaves them out.
+const LOOKS = /^\s*\.(help|tables|graphs|describe|functions|version|print|history|files|share|quit|exit|dataset)\b/;
+
+/** Feed one line to the shell and write what it printed. True if no error. */
+async function feed(line, { echo }) {
+  if (echo) {
+    const { text: ansi } = await engine("highlight", { text: line });
+    await write(`${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
+  }
+  statement.push(line);
+  const r = await engine("feed", { line });
+  let ok = !r.err;
+  if (r.flow === "host") {
+    statement = [];
+    ok = (await hostCommand(r.command)) !== false;
+  } else {
+    await write(r.out + r.err);
+    if (r.flow === "exit") await write("This shell lives in the page: New starts a fresh session.\r\n");
+    if (!r.pending) {
+      const done = statement.join("\n");
+      statement = [];
+      if (done.trim() && ok && !LOOKS.test(done)) ran.push(done);
+    }
+  }
+  prompt = r.pending ? r.continuation : r.prompt;
+  return ok;
+}
+
+// ---------------------------------------------------------------- the page's own commands
+
+const HOST_COMMANDS = [
+  [".clear", "", "Clear the screen (also Ctrl+L)"],
+  [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
+  [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
+  [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
   [".history", "?N?", "Show the last N commands (default 20)"],
-  [".maxrows", "COUNT", "Show at most COUNT rows of a result (default 40, 0 = all)"],
-  [".print", "STRING...", "Print literal STRING"],
   [".share", "", "Copy a link that replays this session's commands"],
-  [".tables", "", "List the tables and views"],
-  [".timer", "on|off", "Show how long each statement takes"],
-  [".version", "", "Show the version"],
 ];
 
-const HELP_TOPICS = {
-  graph: `Graph SQL: SQL/PGQ (SQL:2023 Part 16), with DuckPGQ's extensions.
+const SHORTCUTS = `Enter            Run the line (a statement runs once it ends with ;)
+Shift+Enter      Start a new line in what is typed
+Up, Down         Step through the history (kept in this browser)
+Ctrl+C           Copy the selection; with none, drop what is typed
+Ctrl+L           Clear the screen
+Ctrl+A, Ctrl+E   Go to the start or end of the line
+Ctrl+U, Ctrl+K   Delete to the start or end of the line
+Ctrl+W           Delete the word before the cursor`;
 
-Define a graph over tables or views:
-  CREATE PROPERTY GRAPH g
-    VERTEX TABLES (people KEY (id))
-    EDGE TABLES (knows SOURCE KEY (src) REFERENCES people (id)
-                       DESTINATION KEY (dst) REFERENCES people (id));
-  CREATE PROPERTY GRAPH g EDGE TABLES (edges SOURCE KEY (src) DESTINATION KEY (dst));
+const errorLine = (message) => write(`\x1b[31mError: ${message}\x1b[0m\r\n`).then(() => false);
 
-Match patterns, with GRAPH_TABLE:
-  FROM GRAPH_TABLE (g
-    MATCH (a)-[e]->(b) WHERE a.id = 1
-    COLUMNS (a.id AS source, b.id AS target));
-
-  (a)-[e]->(b)  (a)<-[e]-(b)  (a)-[e]-(b)   an edge out, in, or either way
-  (a WHERE a.age > 30)                      a filter on one element
-  -[e]->{2}  -[e]->{1,3}                    an edge repeated 2 times, or 1 to 3 times
-  -[e]->*  -[e]->+                          any number of times, or at least once
-                                            (with a selector or a path mode)
-  ANY SHORTEST | ALL SHORTEST | SHORTEST k  selectors: which paths to keep
-  WALK | TRAIL | SIMPLE | ACYCLIC           path modes: may a path repeat edges or vertices
-  p = ... COLUMNS (path_length(p), vertices(p), edges(p))
-
-  FROM GRAPH_TABLE (g
-    MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b WHERE b.id = 9)
-    COLUMNS (path_length(p) AS steps, vertices(p) AS route));
-
-Run algorithms, as table functions over a graph:
-  SELECT * FROM pagerank(g, damping => 0.85);
-  SELECT * FROM algorithms(g, pagerank(), community => louvain(seed => 1));
-
-.functions lists the algorithms; .functions NAME shows one's parameters.
-.dataset karate loads a graph to try these on.
-The SQL reference: ${DOCS}`,
-  shortcuts: `Enter          Run the statement once it ends with ; (or a dot-command)
-Shift+Enter    Start a new line
-Ctrl+Enter     Run what is typed, ; or not
-Up, Down       Step through the history
-Ctrl+C         Drop what is typed
-Ctrl+L         Clear the screen
-Tab            Insert two spaces`,
-};
-
-function help(pattern) {
-  const topic = HELP_TOPICS[pattern.toLowerCase()];
-  if (topic) return say(topic);
-  const needle = pattern.toLowerCase().replace(/^\./, "");
-  const shown = COMMANDS.filter(([cmd, , doc]) => !needle || cmd.includes(needle) || doc.toLowerCase().includes(needle));
-  if (!shown.length) throw new Error(`no command matches '${pattern}'`);
-  log.append(
-    el(
-      "div",
-      { className: "help" },
-      ...shown.flatMap(([cmd, args, doc]) => [
-        el("span", {}, el("span", { className: "cmd", textContent: cmd }), args ? el("span", { className: "muted", textContent: ` ${args}` }) : ""),
-        el("span", { textContent: doc }),
-      ]),
-    ),
-  );
-  if (!needle) say("\nRun .help graph for the graph SQL: property graphs, MATCH and algorithms\nRun .help shortcuts for keyboard shortcuts");
-}
-
-function datasets(name) {
-  if (!name) {
-    log.append(
-      el(
-        "div",
-        { className: "help" },
-        ...DATASETS.flatMap((d) => [el("span", { className: "cmd", textContent: d.id }), el("span", { textContent: d.title })]),
-      ),
-    );
-    return;
-  }
-  const d = DATASETS.find((x) => x.id === name.toLowerCase());
-  if (!d) throw new Error(`no dataset named '${name}'; .dataset lists them`);
-  // Queued after this command, not awaited: it runs in the queue it joins.
-  loadDataset(d);
-}
-
-function showHistory(arg) {
-  const n = arg ? Number(arg) : 20;
-  if (!Number.isInteger(n) || n < 1) throw new Error("usage: .history ?N?");
-  const first = Math.max(0, history.length - n);
-  const width = String(history.length).length;
-  const lines = history.slice(first).map((command, i) => {
-    const number = String(first + i + 1).padStart(width);
-    return `<span class="muted">${number}</span>  ${highlightSql(command).replace(/\n/g, `\n${" ".repeat(width + 2)}`)}`;
-  });
-  log.append(el("pre", { className: "line", innerHTML: lines.join("\n") }));
-}
-
-const FUNCTIONS = `SELECT name, family,
-       CASE WHEN strpos(summary, '. ') > 0 THEN split_part(summary, '. ', 1) || '.' ELSE summary END AS summary
-FROM ursa_functions();`;
-
-async function dotCommand(command, record) {
-  const [name, ...rest] = command.replace(/;\s*$/, "").trim().split(/\s+/);
+/** Run a command the page added. False if it failed. */
+async function hostCommand(line) {
+  const [name, ...rest] = line.trim().replace(/;\s*$/, "").split(/\s+/);
   const arg = rest.join(" ");
-  switch (name.toLowerCase()) {
-    case ".help":
-      return help(arg);
-    case ".version":
-      say(`Ursa v${version}`);
-      return;
-    case ".print":
-      say(arg);
-      return;
-    case ".history":
-      return showHistory(arg);
-    case ".dataset":
-    case ".datasets":
-      return datasets(arg);
+  switch (name) {
     case ".clear":
-      log.replaceChildren();
-      return;
-    case ".tables":
-      return tables();
-    case ".graphs":
-      await runSql("SHOW GRAPHS;");
-      return;
-    case ".describe":
-      if (!arg) throw new Error("usage: .describe NAME (a graph, table or view)");
-      return describe(arg);
-    case ".functions":
-      if (arg) return describeFunction(arg);
-      await runSql(FUNCTIONS, { maxRows: ALL_ROWS });
-      return;
-    case ".maxrows": {
-      const n = Number(arg);
-      if (!Number.isInteger(n) || n < 0) throw new Error("usage: .maxrows N (0 shows every row)");
-      settings.maxRows = n === 0 ? ALL_ROWS : n;
-      say(n === 0 ? "Tables show every row." : `Tables show at most ${n} rows.`, "muted");
-      if (record) ran.push(command);
-      return;
-    }
-    case ".timer":
-      if (arg !== "on" && arg !== "off") throw new Error("usage: .timer on|off");
-      settings.timer = arg === "on";
-      if (record) ran.push(command);
-      return;
+      term.clear();
+      await write("\x1b[H\x1b[2J");
+      return true;
+    case ".share":
+      return share();
     case ".export":
       return exportLast(arg.toLowerCase());
     case ".files":
-      if (arg === "add") return pickFiles();
-      if (arg) throw new Error("usage: .files [add]");
+      if (arg === "add") {
+        $("file-input").click();
+        return true;
+      }
+      if (arg) return errorLine("usage: .files ?add?");
       return listFiles();
-    case ".share":
-      return share();
-    default:
-      throw new Error(`unknown command ${name}; .help lists them`);
-  }
-}
-
-async function graphNames() {
-  const { results } = await engine("run", { session: "shell", sql: "SHOW GRAPHS;", maxRows: 10_000 });
-  const r = results[0];
-  const i = r.columns.findIndex((c) => c.name === "name");
-  return new Set(r.rows.map((row) => row[i]));
-}
-
-/** `.tables`: the tables and views, leaving out the graphs' own schemas (which `.graphs` lists). */
-async function tables() {
-  const graphs = await graphNames();
-  const excluded = ["information_schema", ...graphs].map((g) => `'${g.replace(/'/g, "''")}'`).join(", ");
-  await runSql(
-    `SELECT CASE WHEN table_schema = 'public' THEN table_name ELSE table_schema || '.' || table_name END AS name,
-       CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS type
-FROM information_schema.tables
-WHERE table_schema NOT IN (${excluded})
-ORDER BY table_schema <> 'public', table_schema, table_name;`,
-    { maxRows: ALL_ROWS },
-  );
-}
-
-async function describe(name) {
-  const graphs = await graphNames();
-  const isGraph = [...graphs].some((g) => g.toLowerCase() === name.replace(/"/g, "").toLowerCase());
-  await runSql(isGraph ? `DESCRIBE GRAPH ${name};` : `DESCRIBE ${name};`, { maxRows: ALL_ROWS });
-}
-
-async function describeFunction(name) {
-  const literal = `'${name.replace(/'/g, "''")}'`;
-  await engine("run", {
-    session: "meta",
-    sql: `SELECT name, family, summary, parameters, outputs FROM ursa_functions() WHERE lower(name) = lower(${literal})`,
-    maxRows: 0, // read back through export, below
-  });
-  const { bytes } = await engine("export", { session: "meta", index: 0, format: "json" });
-  const [f] = JSON.parse(new TextDecoder().decode(bytes));
-  if (!f) throw new Error(`no graph function named '${name}'; .functions lists them`);
-  const lines = [`${f.name} (${f.family})`, f.summary, ""];
-  if (f.parameters?.length) {
-    lines.push("Parameters:");
-    for (const p of f.parameters) {
-      const choices = p.choices?.length ? ` (${p.choices.join(", ")})` : "";
-      lines.push(`  ${p.name} => ${p.default}   ${p.type}${choices}. ${p.doc}`);
+    case ".history": {
+      const n = arg ? Number(arg) : 20;
+      if (!Number.isInteger(n) || n < 1) return errorLine("usage: .history ?N?");
+      const first = Math.max(0, history.length - n);
+      const width = String(history.length).length;
+      for (let i = first; i < history.length; i++) {
+        const { text: ansi } = await engine("highlight", { text: history[i] });
+        await write(`\x1b[90m${String(i + 1).padStart(width)}\x1b[0m  ${ansi.replace(/\n/g, "\n" + " ".repeat(width + 2))}\r\n`);
+      }
+      return true;
+    }
+    case ".dataset": {
+      if (!arg) {
+        const rows = DATASETS.map((d) => `('${d.id}', '${d.title.replace(/'/g, "''")}')`).join(", ");
+        return quiet(`SELECT * FROM (VALUES ${rows}) AS datasets(name, title);`);
+      }
+      const d = DATASETS.find((x) => x.id === arg.toLowerCase());
+      if (!d) return errorLine(`no dataset named '${arg}'; .dataset lists them`);
+      // Once this line has finished: a fresh session, then the dataset.
+      setTimeout(() => loadDataset(d));
+      return true;
     }
   }
-  if (f.outputs?.length) lines.push("", `Returns: ${f.outputs.map((o) => `${o.name} ${typeName(o.type ?? "")}`.trim()).join(", ")}`);
-  say(lines.join("\n"));
+  return errorLine(`unknown command ${name}`);
+}
+
+/** Run `sql` in the shell for a listing the page makes; not recorded. */
+async function quiet(sql) {
+  const r = await engine("feed", { line: sql });
+  await write(r.out + r.err);
+  return !r.err;
+}
+
+let manifest = null;
+async function listFiles() {
+  manifest ??= await (await fetch("/data/manifest.json")).json();
+  const rows = manifest.datasets.flatMap((d) => d.files.map((f) => `('${f.name}', ${f.bytes}, '${d.title.replace(/'/g, "''")}')`));
+  rows.push(...uploads.map((u) => `('memory://uploads/${u.name.replace(/'/g, "''")}', ${u.bytes}, 'imported')`));
+  return quiet(`SELECT name AS file, bytes, dataset FROM (VALUES ${rows.join(", ")}) AS t(name, bytes, dataset) ORDER BY dataset = 'imported', name;`);
 }
 
 const EXTENSIONS = { csv: "csv", parquet: "parquet", json: "json", arrow: "arrows" };
 const MIME = { csv: "text/csv", parquet: "application/vnd.apache.parquet", json: "application/json", arrow: "application/vnd.apache.arrow.stream" };
 
 async function exportLast(format) {
-  if (!EXTENSIONS[format]) throw new Error("usage: .export csv|parquet|json|arrow");
-  if (!lastResult) throw new Error("no result to export yet; run a query first");
-  const { bytes } = await engine("export", { session: "shell", index: lastResult.index, format });
+  if (!EXTENSIONS[format]) return errorLine("usage: .export csv|parquet|json|arrow");
+  let bytes;
+  try {
+    ({ bytes } = await engine("export", { format }));
+  } catch (e) {
+    return errorLine(e.message);
+  }
   const name = `ursa-result.${EXTENSIONS[format]}`;
   const url = URL.createObjectURL(new Blob([bytes], { type: MIME[format] }));
   el("a", { href: url, download: name }).click();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
-  say(`Downloaded ${name} (${formatBytes(bytes.byteLength)}).`, "muted");
+  await write(`Downloaded ${name} (${formatBytes(bytes.byteLength)}).\r\n`);
+  return true;
 }
 
 function formatBytes(n) {
   return n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 }
 
-let manifest = null;
-async function listFiles() {
-  manifest ??= await (await fetch("/data/manifest.json")).json();
-  const rows = manifest.datasets.flatMap((d) =>
-    d.files.map((f) => `('${f.name}', ${f.bytes}, '${d.title.replace(/'/g, "''")}')`),
-  );
-  rows.push(...uploads.map((u) => `('memory://uploads/${u.name.replace(/'/g, "''")}', ${u.bytes}, 'imported')`));
-  await runSql(
-    `SELECT name AS file, bytes, dataset FROM (VALUES ${rows.join(", ")}) AS t(name, bytes, dataset) ORDER BY dataset = 'imported', name;`,
-    { maxRows: ALL_ROWS },
-  );
-  say("Read one by name: SELECT * FROM 'karate_edges.parquet'; Import adds your own.", "muted");
-}
-
 // ---------------------------------------------------------------- the bar
 
-// New: a fresh session and a clear screen.
-// A fresh session and a clear screen: New, and before each dataset.
-async function resetSession() {
-  await engine("reset", { session: "shell" });
+/** A fresh shell and a clear screen: New, and before each dataset. */
+async function restart() {
+  const r = await engine("start", { commands: HOST_COMMANDS, shortcuts: SHORTCUTS });
+  prompt = r.prompt;
+  promptColor = r.promptColor;
+  sendWidth();
   ran = [];
-  lastResult = null;
   uploads = [];
-  settings.maxRows = 40;
-  settings.timer = false;
+  statement = [];
+  text = "";
+  cursor = 0;
   history_replace("");
-  log.replaceChildren();
-  banner();
+  term.reset();
+  cursorRow = 0;
+  await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n`);
 }
-function queueReset() {
-  queue = queue.then(resetSession).catch((e) => error(e.message));
+
+$("new").onclick = () => {
+  setBusy(true);
+  queue = queue.then(async () => {
+    await restart();
+    ready();
+  });
+  term.focus();
+};
+
+function loadDataset(d) {
+  setBusy(true);
+  queue = queue.then(restart);
+  return runAll(d.commands);
 }
-$("new").onclick = queueReset;
 
 // Share: a link whose fragment holds the session's commands, replayed on open.
 function shareUrl() {
@@ -646,20 +636,25 @@ function shareUrl() {
 }
 async function share() {
   if (!ran.length) {
-    say("No commands to share.", "muted");
-    return;
+    await write("No commands to share.\r\n");
+    return true;
   }
   const url = shareUrl();
   history_replace(url);
+  const n = `${ran.length} command${ran.length === 1 ? "" : "s"}`;
   try {
     await navigator.clipboard.writeText(url);
-    say(`Copied a link that replays ${plural(ran.length, "command")}.`, "muted");
+    await write(`Copied a link that replays ${n}.\r\n`);
   } catch {
-    say(`A link that replays ${plural(ran.length, "command")} is in the address bar.`, "muted");
+    await write(`A link that replays ${n} is in the address bar.\r\n`);
   }
-  if (uploads.length) say("Imported files stay in this browser: whoever opens the link needs to import them again.", "muted");
+  if (uploads.length) await write("Imported files stay in this browser: whoever opens the link imports them again.\r\n");
+  return true;
 }
-$("share").onclick = () => submit(".share", { record: false });
+$("share").onclick = () => {
+  run(".share");
+  term.focus();
+};
 
 function history_replace(url) {
   window.history.replaceState(null, "", url || location.pathname);
@@ -677,31 +672,34 @@ function sharedCommands() {
   }
 }
 
-// Import: files from this computer, added to the session and given a view.
+// Import: a file from this computer becomes a view named after it.
 const fileInput = $("file-input");
-function pickFiles() {
-  fileInput.click();
-}
-$("import").onclick = () => submit(".files add", { record: false });
+$("import").onclick = () => fileInput.click();
 fileInput.onchange = async () => {
   const files = [...fileInput.files];
   fileInput.value = "";
   for (const file of files) {
-    const view = file.name.replace(/\.(gz|zst|bz2|xz)$/i, "").replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^(\d)/, "_$1") || "imported";
+    const view =
+      file.name
+        .replace(/\.(gz|zst|bz2|xz)$/i, "")
+        .replace(/\.[^.]+$/, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, "_")
+        .replace(/^(\d)/, "_$1") || "imported";
     try {
       const buffer = await file.arrayBuffer();
-      const { url } = await engine("addFile", { session: "shell", name: file.name, bytes: buffer }, [buffer]);
+      const { url } = await engine("addFile", { name: file.name, bytes: buffer }, [buffer]);
       uploads.push({ name: file.name, bytes: file.size });
-      say(`Imported ${file.name} (${formatBytes(file.size)}) as ${url}`, "muted");
-      await submit(`CREATE OR REPLACE VIEW ${view} AS SELECT * FROM '${url.replace(/'/g, "''")}';`);
-      await submit(`FROM ${view} LIMIT 10;`);
+      await run(`CREATE OR REPLACE VIEW ${view} AS SELECT * FROM '${url.replace(/'/g, "''")}';`);
+      await run(`FROM ${view} LIMIT 10;`);
     } catch (e) {
-      error(e.message);
+      await errorLine(e.message);
     }
   }
+  term.focus();
 };
 
-// Datasets: run a dataset's commands at the prompt, one after another.
+// The Datasets menu.
 const menu = $("dataset-menu");
 const menuButton = $("datasets");
 menu.replaceChildren(
@@ -713,6 +711,7 @@ menu.replaceChildren(
       onclick: () => {
         closeMenu();
         loadDataset(d);
+        term.focus();
       },
     }),
   ),
@@ -738,56 +737,46 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/** A dataset starts a fresh session, as New does, then runs its commands. */
-function loadDataset(d) {
-  queueReset();
-  return submitAll(d.commands);
-}
-
 // ---------------------------------------------------------------- start
 
-function banner() {
-  say("Ursa Web Shell running...");
-  if (version) say(`Ursa v${version}`);
-  say('Enter ".help" for usage hints.');
-}
-
-let version = null;
-say("Loading the engine (about 5 MB)...", "muted");
-syncInput();
-
+term.write("Loading the engine (about 5 MB)...\r\n");
 engineStarted.then(
-  (info) => {
-    version = info.version;
-    log.replaceChildren();
-    banner();
-    setBusy(false);
-    // A shared link replays its commands; ?dataset=karate loads one.
+  async () => {
     const shared = sharedCommands();
-    const wanted = new URLSearchParams(location.search).get("dataset");
+    const wanted = DATASETS.find((d) => d.id === new URLSearchParams(location.search).get("dataset"));
+    queue = queue.then(restart);
     if (shared.length) {
-      say(`Replaying ${plural(shared.length, "command")} from a shared link.`, "muted");
-      submitAll(shared);
+      queue = queue.then(() => write(`Replaying ${shared.length} command${shared.length === 1 ? "" : "s"} from a shared link.\r\n`));
+      await runAll(shared);
     } else if (wanted) {
-      const d = DATASETS.find((x) => x.id === wanted);
-      if (d) loadDataset(d);
+      await loadDataset(wanted);
     }
+    await queue;
+    ready();
+    term.focus();
   },
-  (e) => {
-    log.replaceChildren();
-    error(`The engine failed to start: ${e.message}`);
-  },
+  (e) => term.write(`\x1b[31mThe engine failed to start: ${e.message}\x1b[0m\r\n`),
 );
 
-// For tests: resolves once every command queued so far has finished.
+// For tests: the screen as text, and a promise that resolves once everything
+// queued so far has run.
 window.ursaShell = {
-  idle: async () => {
+  async idle() {
     let seen;
     do {
       seen = queue;
       await seen;
     } while (seen !== queue);
-    return true;
   },
+  screen() {
+    const buffer = term.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buffer.length; i++) lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
+    return lines.join("\n").replace(/\n+$/, "");
+  },
+  busy: () => busy,
+  cols: () => term.cols,
+  rows: () => term.rows,
+  selection: () => term.getSelection(),
   datasets: DATASETS,
 };

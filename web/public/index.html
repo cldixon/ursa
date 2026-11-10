@@ -14,8 +14,8 @@
   </script>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="preload" href="/fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/vendor/xterm.css">
   <link rel="stylesheet" href="/style.css">
-  <link rel="modulepreload" href="/engine/ursa_wasm.js">
   <script type="module" src="/app.js"></script>
 </head>
 <body>
@@ -55,16 +55,6 @@
     </div>
   </header>
 
-  <main id="terminal" class="terminal" aria-label="Ursa shell">
-    <div id="log" class="log" aria-live="polite"></div>
-    <div id="input-line" class="input-line">
-      <pre id="prompts" class="prompts" aria-hidden="true">ursa&gt; </pre>
-      <div class="editor">
-        <pre id="highlight" class="highlight" aria-hidden="true"></pre>
-        <textarea id="input" rows="1" spellcheck="false" autocapitalize="off" autocomplete="off"
-                  aria-label="SQL or a dot-command; Enter runs a statement ending in ;" disabled></textarea>
-      </div>
-    </div>
-  </main>
+  <main id="terminal" class="terminal" aria-label="Ursa shell"></main>
 </body>
 </html>

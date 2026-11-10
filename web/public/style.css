@@ -251,104 +251,21 @@ body {
 
 /* ---------------------------------------------------------------- terminal */
 
+/* xterm.js draws the terminal; this is the room it fills. Its colours are set
+   from app.js (THEMES), to match these tokens. */
 .terminal {
   flex: 1;
-  overflow-y: auto;
-  padding: 22px 18px 40vh;
-  font: 13px/1.25 "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  cursor: text;
+  min-height: 0;
+  padding: 16px 18px 8px;
+  background: var(--bg);
 }
-
-.log > * { margin: 0; }
-.log pre, .input-line pre { margin: 0; font: inherit; white-space: pre-wrap; word-break: break-word; }
-
-.line { white-space: pre-wrap; }
-.muted { color: var(--muted); }
-.err { color: var(--error); }
-.ok { color: var(--ok); }
-
-/* An echoed statement keeps its lines (so each lines up with its prompt) and
-   scrolls sideways on a narrow screen, as a terminal does. */
-.echo { display: flex; overflow-x: auto; }
-.echo pre:not(.prompts) { white-space: pre; word-break: normal; }
-pre.prompts { color: var(--prompt); font-weight: 500; flex: none; white-space: pre; user-select: none; }
-
-/* Syntax colours, in the echo and as you type. */
-.k { color: var(--keyword); font-weight: 600; }
-.s { color: var(--string); }
-.n { color: var(--number); }
-.c { color: var(--comment); font-style: italic; }
-.d { color: var(--dot); font-weight: 500; }
-.a { color: var(--muted); }
-
-/* The input: a transparent textarea over its highlighted copy. */
-.input-line { display: flex; }
-.editor { position: relative; flex: 1; min-width: 0; }
-.editor .highlight, .editor textarea {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  font: inherit;
-  line-height: inherit;
-  letter-spacing: inherit;
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: break-word;
-}
-.editor .highlight { pointer-events: none; min-height: 1.25em; }
-.editor textarea {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  resize: none;
-  overflow: hidden;
-  background: transparent;
-  color: transparent;
-  caret-color: var(--fg);
-  outline: none;
-}
-.editor textarea:disabled { cursor: progress; }
-.input-line.busy { opacity: 0.55; }
-
-/* ---------------------------------------------------------------- results */
-
-.result { margin: 6px 0 10px; display: inline-block; max-width: 100%; overflow-x: auto; vertical-align: top; }
-
-table.box {
-  border-collapse: collapse;
-  font: inherit;
-  border: 1px solid var(--table-border);
-}
-table.box th, table.box td {
-  padding: 1px 12px;
-  white-space: pre;
-  border-left: 1px solid var(--table-border);
-  vertical-align: top;
-}
-table.box th { padding-top: 6px; padding-bottom: 6px; font-weight: 400; text-align: center; border-bottom: 1px solid var(--table-border); }
-table.box th .type { display: block; color: var(--muted); font-style: italic; }
-table.box tbody tr:first-child td { padding-top: 6px; }
-table.box tbody tr:last-child td { padding-bottom: 6px; }
-table.box td.num { text-align: right; }
-table.box td.null { color: var(--muted); }
-table.box tr.gap td { color: var(--muted); text-align: center; line-height: 0.9; }
-table.box td.long { max-width: 60ch; overflow: hidden; text-overflow: ellipsis; }
-
-.footer {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  color: var(--muted);
-  padding: 4px 12px 0;
-}
-
-.help { display: grid; grid-template-columns: max-content 1fr; column-gap: 4ch; }
+.terminal .xterm { height: 100%; }
+.terminal .xterm-viewport { background: var(--bg) !important; }
 
 @media (max-width: 640px) {
   .bar { grid-template-columns: 1fr auto; height: auto; padding: 8px 12px; row-gap: 6px; }
   .brand { order: -1; grid-column: 1 / -1; justify-self: center; }
   .menu { flex-wrap: wrap; }
   .menu button { padding: 6px 8px; }
-  .terminal { padding: 16px 12px 40vh; }
+  .terminal { padding: 12px 8px 4px; }
 }
