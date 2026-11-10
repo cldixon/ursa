@@ -12,6 +12,10 @@
       if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
     } catch {}
   </script>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap">
   <link rel="stylesheet" href="/style.css">
   <link rel="modulepreload" href="/engine/ursa_wasm.js">
   <script type="module" src="/app.js"></script>
@@ -33,15 +37,14 @@
              accept=".csv,.tsv,.parquet,.json,.jsonl,.ndjson,.gz,.zst,.bz2,.xz">
     </nav>
     <a class="brand" href="https://github.com/cldixon/ursa" title="Ursa on GitHub">
-      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
-        <circle cx="16" cy="16" r="16" class="logo-disc"/>
-        <!-- The Big Dipper: Ursa Major's seven bright stars. -->
-        <polyline points="6,11 10,12.5 13.5,14.5 17,17 17.5,22 23.5,23 25,17.5 17,17" class="logo-line"/>
+      <svg class="logo" viewBox="0 0 22 22" aria-hidden="true">
+        <!-- The Big Dipper: Ursa Major's seven bright stars, sized by magnitude. -->
+        <path class="logo-line" d="M19.4 4.2 19.2 8.4 15.1 9.1 15.3 5.2 Z M15.3 5.2 11.2 6.0 7.6 4.9 3.2 6.7"/>
         <g class="logo-star">
-          <circle cx="6" cy="11" r="1.4"/><circle cx="10" cy="12.5" r="1.4"/>
-          <circle cx="13.5" cy="14.5" r="1.4"/><circle cx="17" cy="17" r="1.6"/>
-          <circle cx="17.5" cy="22" r="1.6"/><circle cx="23.5" cy="23" r="1.6"/>
-          <circle cx="25" cy="17.5" r="1.6"/>
+          <circle cx="19.4" cy="4.2" r="1.5"/><circle cx="15.3" cy="5.2" r="1.0"/>
+          <circle cx="15.1" cy="9.1" r="1.15"/><circle cx="19.2" cy="8.4" r="1.2"/>
+          <circle cx="11.2" cy="6.0" r="1.85"/><circle cx="7.6" cy="4.9" r="1.3"/>
+          <circle cx="3.2" cy="6.7" r="1.7"/>
         </g>
       </svg>
       <span><b>Ursa</b> Web Shell</span>
