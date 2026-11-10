@@ -364,7 +364,7 @@ function setBusy(busy) {
 // The dot-commands, for .help: [command, arguments, what it does].
 const COMMANDS = [
   [".clear", "", "Clear the terminal screen (also Ctrl+L)"],
-  [".dataset", "?NAME?", "List the sample datasets, or load one: its tables, its graph and example queries"],
+  [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session: its tables, graph and example queries"],
   [".describe", "NAME", "Show the columns of a table or view, or the vertex and edge tables of a graph"],
   [".export", "FORMAT", "Download the last result as csv, parquet, json or arrow"],
   [".files", "", "List the files you can query by name: the datasets' and the ones you imported"],
@@ -619,19 +619,22 @@ async function listFiles() {
 // ---------------------------------------------------------------- the bar
 
 // New: a fresh session and a clear screen.
-$("new").onclick = () => {
-  queue = queue.then(async () => {
-    await engine("reset", { session: "shell" });
-    ran = [];
-    lastResult = null;
-    uploads = [];
-    settings.maxRows = 40;
-    settings.timer = false;
-    history_replace("");
-    log.replaceChildren();
-    banner();
-  });
-};
+// A fresh session and a clear screen: New, and before each dataset.
+async function resetSession() {
+  await engine("reset", { session: "shell" });
+  ran = [];
+  lastResult = null;
+  uploads = [];
+  settings.maxRows = 40;
+  settings.timer = false;
+  history_replace("");
+  log.replaceChildren();
+  banner();
+}
+function queueReset() {
+  queue = queue.then(resetSession).catch((e) => error(e.message));
+}
+$("new").onclick = queueReset;
 
 // Share: a link whose fragment holds the session's commands, replayed on open.
 function shareUrl() {
@@ -735,7 +738,9 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+/** A dataset starts a fresh session, as New does, then runs its commands. */
 function loadDataset(d) {
+  queueReset();
   return submitAll(d.commands);
 }
 

@@ -63,20 +63,26 @@ await ready(page);
 const banner = await page.textContent("#log");
 check(/Ursa v\d/.test(banner ?? ""), "banner", `${(banner ?? "").match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
 
-// Every dataset, from the menu: its commands run with no error.
+// Every dataset, from the menu: each starts a fresh session (a clear screen and
+// none of the last one's tables), and its commands run with no error.
 const datasets: { id: string; title: string; commands: string[] }[] = await page.evaluate(() => (window as any).ursaShell.datasets);
 for (const d of datasets) {
-  const before = await tables();
   const t = Date.now();
   await page.click("#datasets");
   await page.click(`#dataset-menu button:has-text("${d.title}")`);
   await idle();
   const errs = await errors();
   const queries = d.commands.filter((c) => !/^CREATE/i.test(c)).length;
-  const made = (await tables()) - before;
+  const made = await tables();
   check(!errs.length && made === queries, `dataset ${d.id}`, errs[0] ?? `${made} tables in ${Date.now() - t} ms`);
   if (shots && d.id === "karate") await page.screenshot({ path: `${shots}/shell-karate.png` });
 }
+
+await type(".tables");
+let shown = await lastTable();
+check(JSON.stringify(shown.rows.map((r) => r[0])) === '["rmat_edges"]', "a dataset replaces the last one", JSON.stringify(shown.rows));
+await type(".dataset karate");
+check((await tables()) === 3 && !(await errors()).length, ".dataset karate");
 
 // SQL at the prompt: one line, several lines, and an error.
 await type("SELECT count(*) AS members FROM members;");
@@ -102,10 +108,10 @@ await type(".help");
 check(((await page.textContent("#log .help:last-of-type")) ?? "").includes(".describe"), ".help");
 await type(".tables");
 t = await lastTable();
-check(t.rows.some((r) => r[0] === "members") && t.rows.some((r) => r[0] === "rmat_edges"), ".tables", JSON.stringify(t.rows.map((r) => r[0])));
+check(t.rows.some((r) => r[0] === "members") && !t.rows.some((r) => r[0] === "rmat_edges"), ".tables", JSON.stringify(t.rows.map((r) => r[0])));
 await type(".graphs");
 t = await lastTable();
-check(["karate", "lesmis", "florentine", "rmat"].every((g) => t.rows.some((r) => r.includes(g))), ".graphs");
+check(t.rows.length === 1 && t.rows[0].includes("karate"), ".graphs", JSON.stringify(t.rows));
 await type(".describe karate");
 check(!(await errors()).slice(errs.length).length, ".describe karate");
 await type(".functions");
