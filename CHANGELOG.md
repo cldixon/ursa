@@ -140,6 +140,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   lines are indented to line up with it instead of starting ` ...>`, so a
   statement copied from the terminal is still SQL. The browser shell draws
   tables with the same code, the new crate `ursa-shell`.
+- **`ursa`: the shell is a library, and the browser runs it.** The shell
+  (dot-commands, SQL a line at a time, output formats) moves from `ursa-cli`
+  to `ursa-shell`, and `ursa-wasm`'s `WebShell` is that shell for a page's
+  terminal, as DuckDB's web shell is DuckDB's CLI: fed the Getting Started
+  script a line at a time it prints what `ursa` prints. `.help` lists the
+  commands as DuckDB does, `.help PATTERN` the matching ones, `.help graph`
+  is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
+  and `.print`. In a colour terminal what is typed is highlighted (keywords,
+  strings, comments, dot-commands), the prompt is orange, and errors are red.
 - **`GRAPH_TABLE` through the graph index** (#325). The results are the
   same; what changes is how a match runs.
   - A node is *bound* when a condition on it alone names its keys:

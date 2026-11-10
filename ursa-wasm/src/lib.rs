@@ -16,6 +16,9 @@
 //! file it needs. Results are the native engine's, byte for byte: [`Session::sql`]
 //! prints them with the same table printer as the `ursa` shell.
 //!
+//! [`WebShell`] is the `ursa` shell itself, for a page's terminal: fed a line
+//! at a time, it prints what the CLI prints, dot-commands and all.
+//!
 //! For a user interface, [`Session::run`] returns each statement's result as
 //! JSON (columns, the first rows formatted as the shell formats them, and the
 //! table), and keeps the results so [`Session::export`] can write one as CSV,
@@ -37,6 +40,9 @@ use js_sys::{Promise, Uint8Array};
 use serde_json::{json, Value};
 use url::Url;
 use ursa_shell::table::{Rows, Style, DEFAULT_MAX_ROWS};
+
+mod shell;
+pub use shell::WebShell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -84,12 +90,7 @@ impl Session {
     /// session on the page.
     #[wasm_bindgen(js_name = setBaseUrl)]
     pub fn set_base_url(&self, base: &str) -> Result<(), JsError> {
-        let base = Url::parse(base).map_err(|e| JsError::new(&format!("'{base}': {e}")))?;
-        #[cfg(target_arch = "wasm32")]
-        ursa_engine::paths::browser::set_base_url(Some(base));
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = base;
-        Ok(())
+        set_base_url(base)
     }
 
     /// Run `sql` (one or more statements) and resolve to every result as the
@@ -164,6 +165,16 @@ impl Session {
             encode(stored, format).map_err(|e| JsError::new(&ursa_engine::user_message(&e)))?;
         Ok(Uint8Array::from(bytes.as_slice()))
     }
+}
+
+/// Set the URL relative paths resolve against, for every session on the page.
+fn set_base_url(base: &str) -> Result<(), JsError> {
+    let base = Url::parse(base).map_err(|e| JsError::new(&format!("'{base}': {e}")))?;
+    #[cfg(target_arch = "wasm32")]
+    ursa_engine::paths::browser::set_base_url(Some(base));
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = base;
+    Ok(())
 }
 
 fn js_error(err: DataFusionError) -> JsValue {

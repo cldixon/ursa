@@ -16,13 +16,17 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
 use arrow::compute::cast;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
+use futures::TryStreamExt;
 
 use crate::highlight::{ERROR, RESET};
 use crate::input::{self, Status};
@@ -138,6 +142,9 @@ pub struct Shell<O: Write, E: Write> {
     shortcuts: String,
     /// What `.version` says.
     version: String,
+    /// Keep the last result's rows ([`Self::last_result`]).
+    keep_last: bool,
+    last: Option<(SchemaRef, Vec<RecordBatch>)>,
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
@@ -168,6 +175,8 @@ impl<O: Write, E: Write> Shell<O, E> {
             host_commands: Vec::new(),
             shortcuts: TERMINAL_SHORTCUTS.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            keep_last: false,
+            last: None,
             timer: false,
             buffer: String::new(),
             depth: 0,
@@ -218,6 +227,19 @@ impl<O: Write, E: Write> Shell<O, E> {
     pub fn add_host_command(&mut self, name: &str, args: &str, help: &str) {
         self.host_commands
             .push((name.to_string(), args.to_string(), help.to_string()));
+    }
+
+    /// Keep every row of the last result that had columns, for
+    /// [`Self::last_result`] (the browser's `.export`). It holds the whole
+    /// result in memory, so the CLI does not.
+    pub fn keep_last_result(&mut self) {
+        self.keep_last = true;
+    }
+
+    /// The last result that had columns, every row, if
+    /// [`Self::keep_last_result`] was called.
+    pub fn last_result(&self) -> Option<&(SchemaRef, Vec<RecordBatch>)> {
+        self.last.as_ref()
     }
 
     /// Colour errors red: the error stream is a screen that shows colour.
@@ -428,6 +450,18 @@ impl<O: Write, E: Write> Shell<O, E> {
                 let config = self.ctx.state().config().options().format.clone();
                 let options = (&config).try_into()?;
                 let table = self.table_style();
+                let stream = if self.keep_last {
+                    // Every row, for the host to write out later (`.export`).
+                    let schema = stream.schema();
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    self.last = Some((Arc::clone(&schema), batches.clone()));
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        futures::stream::iter(batches.into_iter().map(Ok)),
+                    ))
+                } else {
+                    stream
+                };
                 write_stream(self.mode, stream, &mut self.out, &options, table).await?;
                 self.results += 1;
             }
