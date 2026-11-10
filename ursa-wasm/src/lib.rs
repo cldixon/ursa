@@ -35,6 +35,9 @@ use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use js_sys::{Promise, Uint8Array};
+use object_store::memory::InMemory;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::{json, Value};
 use url::Url;
 use wasm_bindgen::prelude::*;
@@ -56,6 +59,8 @@ struct Stored {
 #[wasm_bindgen]
 pub struct Session {
     ctx: Arc<SessionContext>,
+    /// Files the page added ([`Session::add_file`]), at `memory://uploads/`.
+    uploads: Arc<InMemory>,
     /// The results of the last [`Session::run`], for [`Session::export`].
     last: Arc<Mutex<Vec<Stored>>>,
 }
@@ -73,10 +78,29 @@ impl Session {
     pub fn new() -> Session {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
+        let ctx = ursa_engine::new_session();
+        let uploads = Arc::new(InMemory::new());
+        ctx.register_object_store(&uploads_url(), Arc::clone(&uploads) as Arc<dyn ObjectStore>);
         Session {
-            ctx: Arc::new(ursa_engine::new_session()),
+            ctx: Arc::new(ctx),
+            uploads,
             last: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Add a file the page has (one the user picked, say) to this session, and
+    /// resolve to the URL SQL reads it by: `memory://uploads/<name>`. Its
+    /// format comes from its extension, as for any file: `.csv`, `.parquet`,
+    /// `.json`, compressed or not. Adding a name again replaces the file.
+    #[wasm_bindgen(js_name = addFile)]
+    pub fn add_file(&self, name: String, bytes: Vec<u8>) -> Promise {
+        let uploads = Arc::clone(&self.uploads);
+        future_to_promise(async move {
+            add_upload(&uploads, &name, bytes)
+                .await
+                .map(|url| JsValue::from_str(&url))
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        })
     }
 
     /// Set the URL relative paths resolve against, such as
@@ -136,8 +160,11 @@ impl Session {
     ///   "rows": [["33"], …], "totalRows": 34, "table": "+----+\n…" }
     /// ```
     ///
-    /// `rows` holds at most `max_rows` rows, each value formatted as the shell
-    /// formats it (`null` for a null); `table` is those rows as the shell's ASCII
+    /// At most `max_rows` rows are kept, each value formatted as the shell
+    /// formats it (`null` for a null): every row in `rows`, or, past
+    /// `max_rows`, the first `ceil(max_rows / 2)` in `rows` and the last
+    /// `floor(max_rows / 2)` in `tail`, as the shell shows a long table.
+    /// `table` is the rows in `rows` as the shell's ASCII
     /// table. A statement with no columns (DDL, `SET`) has `columns: []`. The
     /// results are kept for [`Session::export`] until the next `run`. A syntax
     /// error anywhere runs nothing.
@@ -250,8 +277,10 @@ async fn describe_all(
     Ok(Value::Array(out).to_string())
 }
 
-/// One result as JSON: its columns, its first `max_rows` rows formatted as the
-/// shell formats them, and those rows as the shell's table.
+/// One result as JSON: its columns; at most `max_rows` of its rows formatted as
+/// the shell formats them (all of them, or the first `ceil(max_rows / 2)` in
+/// `rows` and the last `floor(max_rows / 2)` in `tail`); and the first rows
+/// as the shell's table.
 fn describe(
     text: &str,
     stored: &Stored,
@@ -265,38 +294,15 @@ fn describe(
         .map(|f| json!({ "name": f.name(), "type": f.data_type().to_string() }))
         .collect();
     let total: usize = stored.batches.iter().map(RecordBatch::num_rows).sum();
-    let mut rows = Vec::with_capacity(total.min(max_rows));
-    let mut shown = Vec::new();
-    for batch in &stored.batches {
-        let take = (max_rows - rows.len()).min(batch.num_rows());
-        if take == 0 {
-            break;
-        }
-        let batch = batch.slice(0, take);
-        {
-            let formatters = batch
-                .columns()
-                .iter()
-                .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for row in 0..batch.num_rows() {
-                let cells: Vec<Value> = batch
-                    .columns()
-                    .iter()
-                    .zip(&formatters)
-                    .map(|(column, formatter)| {
-                        if column.is_null(row) {
-                            Value::Null
-                        } else {
-                            Value::String(formatter.value(row).to_string())
-                        }
-                    })
-                    .collect();
-                rows.push(Value::Array(cells));
-            }
-        }
-        shown.push(batch);
-    }
+    // Past max_rows, the first ceil(max_rows / 2) rows and the last
+    // floor(max_rows / 2), as the `ursa` shell shows a long table.
+    let (head, tail) = if total > max_rows {
+        (max_rows.div_ceil(2), max_rows / 2)
+    } else {
+        (total, 0)
+    };
+    let (rows, shown) = format_rows(stored, 0, head, options)?;
+    let (tail_rows, _) = format_rows(stored, total - tail, tail, options)?;
     let table = if columns.is_empty() {
         String::new()
     } else {
@@ -307,6 +313,7 @@ fn describe(
         "columns": columns,
         "rows": rows,
         "totalRows": total,
+        "tail": tail_rows,
         "table": table,
     }))
 }
@@ -355,6 +362,74 @@ fn encode(stored: &Stored, format: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Where added files live: `memory://uploads/`.
+fn uploads_url() -> Url {
+    Url::parse("memory://uploads").expect("a valid URL")
+}
+
+/// `count` rows of `stored` from row `start`, formatted as the shell formats
+/// them (null as JSON null), and the batches they came from.
+fn format_rows(
+    stored: &Stored,
+    start: usize,
+    count: usize,
+    options: &FormatOptions,
+) -> Result<(Vec<Value>, Vec<RecordBatch>)> {
+    let mut rows = Vec::with_capacity(count);
+    let mut slices = Vec::new();
+    let mut skip = start;
+    for batch in &stored.batches {
+        if rows.len() == count {
+            break;
+        }
+        if skip >= batch.num_rows() {
+            skip -= batch.num_rows();
+            continue;
+        }
+        let take = (count - rows.len()).min(batch.num_rows() - skip);
+        let batch = batch.slice(skip, take);
+        skip = 0;
+        {
+            let formatters = batch
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for row in 0..batch.num_rows() {
+                let cells: Vec<Value> = batch
+                    .columns()
+                    .iter()
+                    .zip(&formatters)
+                    .map(|(column, formatter)| {
+                        if column.is_null(row) {
+                            Value::Null
+                        } else {
+                            Value::String(formatter.value(row).to_string())
+                        }
+                    })
+                    .collect();
+                rows.push(Value::Array(cells));
+            }
+        }
+        slices.push(batch);
+    }
+    Ok((rows, slices))
+}
+
+/// Put `bytes` at `name` in `uploads`; the URL SQL reads it by.
+async fn add_upload(uploads: &InMemory, name: &str, bytes: Vec<u8>) -> Result<String> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return Err(DataFusionError::Plan(format!(
+            "'{name}' is not a file name to add; give a name with no path, such as edges.csv"
+        )));
+    }
+    uploads
+        .put(&ObjectPath::from(name), PutPayload::from(bytes))
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(format!("memory://uploads/{name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,12 +453,55 @@ mod tests {
         assert_eq!(ddl["columns"], json!([]));
         let rows = describe(&results[1].0, &results[1].1, 2, &options).unwrap();
         assert_eq!(rows["totalRows"], 3);
+        // Past max_rows: the first ceil(2 / 2) row and the last floor(2 / 2).
+        assert_eq!(rows["rows"], json!([["1", "a", "0.5"]]));
+        assert_eq!(rows["tail"], json!([["3", "c", "2.0"]]));
+        let all = describe(&results[1].0, &results[1].1, 3, &options).unwrap();
         assert_eq!(
-            rows["rows"],
-            json!([["1", "a", "0.5"], ["2", null, "1.25"]])
+            all["rows"],
+            json!([["1", "a", "0.5"], ["2", null, "1.25"], ["3", "c", "2.0"]])
         );
+        assert_eq!(all["tail"], json!([]));
         assert_eq!(rows["columns"][2], json!({"name": "x", "type": "Float64"}));
         assert!(rows["table"].as_str().unwrap().starts_with("+---+"));
+    }
+
+    #[tokio::test]
+    async fn an_added_file_is_read_by_its_url() {
+        let session = Session::new();
+        let url = add_upload(
+            &session.uploads,
+            "edges.csv",
+            b"src,dst\n1,2\n2,3\n".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(url, "memory://uploads/edges.csv");
+        let results = run_statements(
+            &session.ctx,
+            &format!(
+                "CREATE VIEW edges AS SELECT * FROM '{url}';
+                 CREATE PROPERTY GRAPH g EDGE TABLES (edges SOURCE KEY (src) DESTINATION KEY (dst));
+                 SELECT count(*) AS n FROM edges;
+                 SELECT id, degree FROM degree(g) ORDER BY id"
+            ),
+        )
+        .await
+        .unwrap();
+        let rows = |i: usize| {
+            let (_, stored) = &results[i];
+            arrow::util::pretty::pretty_format_batches(&stored.batches)
+                .unwrap()
+                .to_string()
+        };
+        assert!(rows(2).contains("| 2 |"), "{}", rows(2));
+        assert!(rows(3).contains("| 2  | 1      |"), "{}", rows(3));
+        for bad in ["", "a/b.csv", ".hidden"] {
+            assert!(
+                add_upload(&session.uploads, bad, vec![]).await.is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@
     "deploy": "bun run build && cf deploy",
     "upload:data": "bun scripts/upload-data.ts",
     "upload:engine": "bun scripts/upload-engine.ts",
-    "test:e2e": "bun tests/e2e.ts"
+    "test:e2e": "bun tests/e2e.ts",
+    "preview": "bun scripts/preview.ts"
   }
 }

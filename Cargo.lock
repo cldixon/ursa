@@ -4739,6 +4739,7 @@ dependencies = [
  "datafusion",
  "futures",
  "js-sys",
+ "object_store",
  "serde_json",
  "tokio",
  "url",

@@ -1,15 +1,11 @@
 -- The Getting Started page's SQL (docs/sql/getting-started.md), from "Query a
 -- file" through "Traversals" and "Find out what is available", as one session.
 --
--- Two things read this file:
---
--- - The browser parity test (browser/parity.ts) runs it in the wasm engine and
---   in the native `ursa` binary and requires byte-identical output. The native
---   outputs the page shows are checked against the page by
---   ursa-cli/tests/getting_started.rs.
--- - The Ursa Shell's Tour (web/scripts/tour.ts) is built from it: each
---   `-- @step <title>` starts a step, and the comment lines right after it are
---   the step's note. So every Tour step is tested.
+-- The browser parity test (browser/parity.ts) runs it in the wasm engine and
+-- in the native `ursa` binary and requires byte-identical output. The native
+-- outputs the page shows are checked against the page by
+-- ursa-cli/tests/getting_started.rs. Each `-- @step <title>` names a section
+-- of the page.
 --
 -- Not here: the `.ursa` database (the browser build has none), "Output" (COPY
 -- writes files), and "Files in object storage".

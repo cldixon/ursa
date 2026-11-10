@@ -78,7 +78,7 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
     const described = JSON.parse(await other.run(exportSql, 5));
     const last = described.length - 1;
     const csv = new TextDecoder().decode(other.export(last, "csv"));
-    const shape = { statements: described.length, columns: described[last].columns.map((c) => c.name), shown: described[last].rows.length, total: described[last].totalRows };
+    const shape = { statements: described.length, columns: described[last].columns.map((c) => c.name), shown: described[last].rows.length + described[last].tail.length, total: described[last].totalRows };
     return { out, csv, shape, load: t1 - t0, script: t2 - t1, pagerankFirst: t3 - t2, pagerankWarm: t4 - t3, version: mod.version() };
   } catch (e) {
     return { error: String(e) };
