@@ -374,6 +374,13 @@ async fn run_session(
     };
     let mut shell = Shell::new(ctx, args.format, out, io::stderr());
     shell.set_max_rows(args.max_rows);
+    if io::stdout().is_terminal() {
+        // Colour unless NO_COLOR is set (https://no-color.org) or the
+        // terminal says it has none.
+        let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+            && std::env::var("TERM").map_or(true, |t| t != "dumb");
+        shell.set_terminal(color);
+    }
     if interactive {
         println!("{}", banner(args));
     }

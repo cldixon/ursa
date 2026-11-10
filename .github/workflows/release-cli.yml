@@ -2,7 +2,7 @@ name: Release ursa-cli
 
 # Releases the `ursa` command-line tool (crate ursa-cli) on the stable channel:
 # builds it for five platforms (cli-build.yml), tags the built commit, publishes
-# the five crates to crates.io, and makes a GitHub Release with the archives.
+# the six crates to crates.io, and makes a GitHub Release with the archives.
 # The nightly channel is nightly-cli.yml.
 #
 # Separate from release.yml, which releases the Python package (ursa-graph)
@@ -16,7 +16,7 @@ name: Release ursa-cli
 # when the tag ursa-cli-v<version> does not exist yet. Every other merge to
 # main stops in the first job, within seconds. So a release is:
 #
-#   1. A release PR sets all five crates to the version (0.8.0) and dates the
+#   1. A release PR sets all six crates to the version (0.8.0) and dates the
 #      changelog. Merge it once CI is green.
 #   2. This workflow builds and smoke-tests every target, tags the commit it
 #      built as ursa-cli-v0.8.0, publishes to crates.io, and makes the GitHub
@@ -37,8 +37,8 @@ name: Release ursa-cli
 #     ursa-cli-v0.8.0.
 #
 # The version must match ursa-cli's in ursa-cli/Cargo.toml, and ursa-core,
-# ursa-io, ursa-engine and ursa-sql must be at the same version, or the run
-# stops before building.
+# ursa-io, ursa-engine, ursa-sql and ursa-shell must be at the same version, or
+# the run stops before building.
 #
 # One-time setup (maintainer):
 #   - GitHub, repository Settings -> Environments: `crates-io`. The publish job
@@ -47,7 +47,7 @@ name: Release ursa-cli
 #     with no human step. To limit who can publish, set its deployment branches
 #     and tags to `main` and `ursa-cli-v*`. Adding a required reviewer back makes
 #     every publish wait for approval again; nothing here needs to change.
-#   - crates.io, Trusted Publishing: on each of the five crates' Settings page,
+#   - crates.io, Trusted Publishing: on each of the six crates' Settings page,
 #     a GitHub publisher: repository cldixon/ursa, workflow release-cli.yml,
 #     environment crates-io. The publish job then gets a short-lived token from
 #     crates.io for each run; no API token is stored anywhere.
@@ -172,11 +172,11 @@ jobs:
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "build: $build, publish: $publish"
           [[ "$build" == "true" ]] || exit 0
-          # ursa-cli needs ursa-core, ursa-io, ursa-engine and ursa-sql from
-          # crates.io, and a version already there is skipped below. So all five
+          # ursa-cli needs ursa-core, ursa-io, ursa-engine, ursa-sql and ursa-shell
+          # from crates.io, and a version already there is skipped below. So all six
           # are released together at one version: a crate left at an old version
           # would ship its old code under the new ursa-cli.
-          for crate in ursa-core ursa-io ursa-engine ursa-sql; do
+          for crate in ursa-core ursa-io ursa-engine ursa-sql ursa-shell; do
             v=$(crate_version "$crate")
             if [[ "$v" != "$version" ]]; then
               echo "::error::$crate is at $v but ursa-cli is at $version; release them at one version"
@@ -243,8 +243,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
-          # All five are at one version (the version job checks).
-          for crate in ursa-core ursa-io ursa-engine ursa-sql ursa-cli; do
+          # All six are at one version (the version job checks).
+          for crate in ursa-core ursa-io ursa-engine ursa-sql ursa-shell ursa-cli; do
             version=$(cargo metadata --no-deps --format-version 1 --locked \
               | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')
             status=$(curl -s -o /dev/null -w '%{http_code}' \

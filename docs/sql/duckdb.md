@@ -15,11 +15,12 @@ SELECT count(*) AS ties FROM 'karate_edges.csv';
 ```
 
 ```text
-+------+
-| ties |
-+------+
-| 78   |
-+------+
+┌───────┐
+│ ties  │
+│ int64 │
+├───────┤
+│    78 │
+└───────┘
 ```
 
 **`read_parquet`, `read_csv` and `read_json`** read the same files, with a few of DuckDB's options. DuckDB's `name = value` form works, as does Ursa's `name => value`:
@@ -29,12 +30,13 @@ SELECT * FROM read_csv('karate_edges.csv', header = true, delim = ',') LIMIT 2;
 ```
 
 ```text
-+-----+-----+
-| src | dst |
-+-----+-----+
-| 0   | 1   |
-| 0   | 2   |
-+-----+-----+
+┌───────┬───────┐
+│  src  │  dst  │
+│ int64 │ int64 │
+├───────┼───────┤
+│     0 │     1 │
+│     0 │     2 │
+└───────┴───────┘
 ```
 
 [Reading and writing files](statements.md#reading-and-writing-files) lists the options. `read_csv_auto`, `read_json_auto` and `read_ndjson` are other names for the same functions.
@@ -48,21 +50,24 @@ SELECT src, count(*) AS friends FROM 'karate_edges.csv' GROUP BY ALL ORDER BY fr
 ```
 
 ```text
-+-----+-----+
-| src | dst |
-+-----+-----+
-| 0   | 1   |
-+-----+-----+
-+-----+
-| src |
-+-----+
-| 0   |
-+-----+
-+-----+---------+
-| src | friends |
-+-----+---------+
-| 0   | 16      |
-+-----+---------+
+┌───────┬───────┐
+│  src  │  dst  │
+│ int64 │ int64 │
+├───────┼───────┤
+│     0 │     1 │
+└───────┴───────┘
+┌───────┐
+│  src  │
+│ int64 │
+├───────┤
+│     0 │
+└───────┘
+┌───────┬─────────┐
+│  src  │ friends │
+│ int64 │  int64  │
+├───────┼─────────┤
+│     0 │      16 │
+└───────┴─────────┘
 ```
 
 **`DESCRIBE`** takes a table, a file or a query:
@@ -72,12 +77,13 @@ DESCRIBE 'karate_edges.csv';
 ```
 
 ```text
-+-------------+-----------+-------------+
-| column_name | data_type | is_nullable |
-+-------------+-----------+-------------+
-| src         | Int64     | YES         |
-| dst         | Int64     | YES         |
-+-------------+-----------+-------------+
+┌─────────────┬───────────┬─────────────┐
+│ column_name │ data_type │ is_nullable │
+│   varchar   │  varchar  │   varchar   │
+├─────────────┼───────────┼─────────────┤
+│ src         │ Int64     │ YES         │
+│ dst         │ Int64     │ YES         │
+└─────────────┴───────────┴─────────────┘
 ```
 
 **The shell.** `ursa club.ursa` opens or creates a database file, as `duckdb club.duckdb` does. `-c` runs SQL and exits, and `-f` runs a file. The dot-commands include `.tables`, `.mode`, `.read`, `.timer` and `.help`. See [the shell](shell.md).
@@ -93,11 +99,12 @@ SELECT 42 AS answer;
 ```
 
 ```text
-+--------+
-| answer |
-+--------+
-| 42     |
-+--------+
+┌────────┐
+│ answer │
+│ int64  │
+├────────┤
+│     42 │
+└────────┘
 ```
 
 **The catalog.** The default catalog is `datafusion` and the default schema is `public`. DuckDB uses `memory` (or the database's name) and `main`. `SHOW TABLES` returns four columns: `table_catalog`, `table_schema`, `table_name` and `table_type`. A graph's `nodes` and `edges` tables are listed under the graph's name.
@@ -113,11 +120,12 @@ COPY (SELECT * FROM 'karate_edges.csv') TO 'ties.parquet';
 ```
 
 ```text
-+-------+
-| count |
-+-------+
-| 78    |
-+-------+
+┌────────┐
+│ count  │
+│ uint64 │
+├────────┤
+│     78 │
+└────────┘
 ```
 
 The format comes from the extension, or from `STORED AS PARQUET`. Options go in `OPTIONS (...)`, not DuckDB's `(FORMAT parquet, ...)`.
@@ -133,11 +141,12 @@ SELECT 7 / 2 AS integers,
 ```
 
 ```text
-+----------+---------+--------------+----------+-----------+
-| integers | doubles | also_doubles | decimals | truncated |
-+----------+---------+--------------+----------+-----------+
-| 3        | 3.5     | 3.5          | 3.500000 | 7         |
-+----------+---------+--------------+----------+-----------+
+┌──────────┬─────────┬──────────────┬───────────────┬───────────┐
+│ integers │ doubles │ also_doubles │   decimals    │ truncated │
+│  int64   │ double  │    double    │ decimal(14,6) │   int64   │
+├──────────┼─────────┼──────────────┼───────────────┼───────────┤
+│        3 │     3.5 │          3.5 │      3.500000 │         7 │
+└──────────┴─────────┴──────────────┴───────────────┴───────────┘
 ```
 
 **Functions.** Scalar and aggregate functions are DataFusion's. Most common ones share DuckDB's names, but some do not: `to_char` formats a date where DuckDB has `strftime`, and `make_array` builds a list where DuckDB also has `list_value`. `SELECT * FROM ursa_functions()` lists the graph functions, and `SHOW FUNCTIONS` lists the rest.

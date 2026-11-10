@@ -130,6 +130,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     count distinct neighbours; integer division and decimals in "Differences
     from DuckDB"; convert large vertex CSV files to Parquet once, in the
     database and statements pages.
+- **`ursa`: tables and prompt as DuckDB's.** A table is a box drawn with
+  line characters, each column's type under its name, numbers aligned
+  right and `NULL` for a null. In a terminal it fits the terminal's width:
+  long values are cut short and middle columns left out, with a `…` column
+  and a footer, `17 columns (10 shown)`; `.maxwidth N` sets the width. Types
+  and nulls are dimmed unless `NO_COLOR` is set. The prompt names the
+  database, `memory U` or `club U` for `club.ursa`, and a statement's next
+  lines are indented to line up with it instead of starting ` ...>`, so a
+  statement copied from the terminal is still SQL. The browser shell draws
+  tables with the same code, the new crate `ursa-shell`.
 - **`GRAPH_TABLE` through the graph index** (#325). The results are the
   same; what changes is how a match runs.
   - A node is *bound* when a condition on it alone names its keys:

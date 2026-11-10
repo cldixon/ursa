@@ -9,10 +9,18 @@ ursa
 
 ```text
 ursa 0.8.0, database club.ursa. Enter .help for commands, .quit to exit.
-ursa>
+club U
 ```
 
-Type SQL at the prompt. A statement ends with `;` and may span lines; the prompt changes while a statement is unfinished. Results print as tables. An error prints a message and the session goes on.
+Type SQL at the prompt. A statement ends with `;` and may span lines. Results print as tables. An error prints a message and the session goes on.
+
+The prompt names the database, as DuckDB's does: `memory U` in a session without one, `club U` with `club.ursa` open. While a statement is unfinished its next lines are indented as far as the prompt, so a statement copied from the terminal is still SQL:
+
+```text
+memory U SELECT id, degree
+         FROM degree(karate)
+         LIMIT 3;
+```
 
 | Key      | Does                                       |
 | -------- | ------------------------------------------ |
@@ -67,7 +75,7 @@ Notices, such as a slow graph index build or an index the database could not kee
 A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one.
 
 ```text
-ursa> .help
+memory U .help
 Enter SQL statements ending with ';'. A statement may span lines.
 Ctrl-C cancels the current input or query; Ctrl-D exits.
 
@@ -77,6 +85,7 @@ Ctrl-C cancels the current input or query; Ctrl-D exits.
 .graphs               List the graphs (SHOW GRAPHS)
 .help                 Show this message
 .maxrows N            Show at most N rows of a table (default 40; 0 shows all)
+.maxwidth N           Draw tables at most N characters wide (0: the terminal's width)
 .mode MODE            Set the output mode: table, csv, tsv, json or ndjson
 .open FILE.ursa       Open a database file, before anything is defined (as ATTACH)
 .quit                 Exit the shell (also Ctrl-D)
@@ -102,7 +111,7 @@ Docs: https://cldixon.github.io/ursa/sql/
 `.functions NAME` shows one function: its summary, then its parameters one a line (name, type, default, what it does, and the values it takes), then its output columns:
 
 ```text
-ursa> .functions degree
+memory U .functions degree
 degree (algorithm)
 Per-node degree.
 NetworkX: G.out_degree() (in: G.in_degree(); both: U.degree() on a simple graph)
@@ -116,10 +125,10 @@ Output columns:
 
 A name that is not a function gets a suggestion, as a mistyped command does. `SELECT * FROM ursa_functions()` has the same information as columns, for programs.
 
-`.mode` with no argument shows the current mode, `.maxrows` how many rows a table shows, and `.timer` whether the timer is on. A mistyped command gets a suggestion:
+`.mode` with no argument shows the current mode, `.maxrows` how many rows a table shows, `.maxwidth` how wide a table may be, and `.timer` whether the timer is on. A mistyped command gets a suggestion:
 
 ```text
-ursa> .grpahs
+memory U .grpahs
 Error: unknown command '.grpahs'; did you mean '.graphs'? Enter .help for the list
 ```
 
@@ -137,30 +146,52 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 
 `--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows.
 
+### Tables
+
+A table is drawn as DuckDB draws one: each column's name with its type under it, numbers to the right and everything else to the left, and `NULL` for a null.
+
+```text
+memory U SELECT id, club FROM 'karate_nodes.csv' LIMIT 2;
+┌───────┬─────────┐
+│  id   │  club   │
+│ int64 │ varchar │
+├───────┼─────────┤
+│     0 │ Mr. Hi  │
+│     1 │ Mr. Hi  │
+└───────┴─────────┘
+```
+
+In a terminal, types and nulls are dimmed; set `NO_COLOR` to turn colour off. Output that is not a terminal (a pipe, a file) has none.
+
 ### Long results
 
 A table shows at most 40 rows, as DuckDB's does. A longer result shows its first 20 rows and its last 20, with rows of `·` between them, and a footer that counts the rows:
 
 ```text
-ursa> SELECT * FROM generate_series(1, 100000);
-+--------+
-| value  |
-+--------+
-| 1      |
-| 2      |
+memory U SELECT * FROM generate_series(1, 100000);
+┌────────┐
+│ value  │
+│ int64  │
+├────────┤
+│      1 │
+│      2 │
 …
-| 20     |
-| ·      |
-| ·      |
-| ·      |
-| 99981  |
+│     20 │
+│   ·    │
+│   ·    │
+│   ·    │
+│  99981 │
 …
-| 100000 |
-+--------+
-100,000 rows (40 shown)
+│ 100000 │
+└────────┘
+  100,000 rows (40 shown)
 ```
 
 `.maxrows N` (in the shell, a script or an init file) or `--max-rows N` (on the command line) changes how many: half from the start and half from the end. `.maxrows 0` and `--max-rows 0` show every row. The other modes, `csv`, `tsv`, `json`, `ndjson` and `arrow`, always write every row, so use one of them to save or read a whole result.
+
+### Wide results
+
+In a terminal a table is as wide as the terminal at most. A wider result first cuts long values short (`a long value…`), then leaves out columns from the middle, showing a `…` column in their place and saying so in the footer: `17 columns (10 shown)`. `.maxwidth N` sets the width instead; `.maxwidth 0` goes back to the terminal's. Output that is not a terminal is never cut.
 
 ## Init files
 

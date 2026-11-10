@@ -13,6 +13,7 @@ on:
     paths:
       - "ursa-cli/**"
       - "ursa-sql/**"
+      - "ursa-shell/**"
       - "ursa-engine/**"
       - "ursa-io/**"
       - "ursa-core/**"
@@ -69,7 +70,7 @@ jobs:
         run: |
           # ursa-cli needs these from crates.io; a release publishes them together.
           versions=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '
-            .packages[] | select(.name | IN("ursa-core","ursa-io","ursa-engine","ursa-sql","ursa-cli"))
+            .packages[] | select(.name | IN("ursa-core","ursa-io","ursa-engine","ursa-sql","ursa-shell","ursa-cli"))
             | "\(.name) \(.version)"')
           echo "$versions"
           test "$(echo "$versions" | cut -d' ' -f2 | sort -u | wc -l)" -eq 1
@@ -118,4 +119,4 @@ jobs:
       - name: crates.io dry run
         run: >
           cargo publish --dry-run --no-verify --locked
-          -p ursa-core -p ursa-io -p ursa-engine -p ursa-sql -p ursa-cli
+          -p ursa-core -p ursa-io -p ursa-engine -p ursa-sql -p ursa-shell -p ursa-cli
