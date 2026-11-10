@@ -62,7 +62,7 @@ SELECT * FROM karate.nodes ORDER BY id LIMIT 3";
 const EXPECTED: &str = "\
 ┌───────┬────────┐
 │  id   │ degree │
-│ int64 │ uint32 │
+│ Int64 │ UInt32 │
 ├───────┼────────┤
 │    33 │     17 │
 │     0 │     16 │
@@ -70,14 +70,14 @@ const EXPECTED: &str = "\
 │     2 │     10 │
 │     1 │      9 │
 └───────┴────────┘
-┌───────┬─────────┐
-│  id   │  club   │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ Mr. Hi  │
-│     1 │ Mr. Hi  │
-│     2 │ Mr. Hi  │
-└───────┴─────────┘
+┌───────┬────────┐
+│  id   │  club  │
+│ Int64 │  Utf8  │
+├───────┼────────┤
+│     0 │ Mr. Hi │
+│     1 │ Mr. Hi │
+│     2 │ Mr. Hi │
+└───────┴────────┘
 ";
 
 /// `DEFINE` with each `karate_…` file named by `prefix` (`../db/data/`).
@@ -412,14 +412,14 @@ fn open_a_database_matches_getting_started() {
             ]
         )),
         "\
-┌───────┬─────────┐
-│  id   │  club   │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ Mr. Hi  │
-│     1 │ Mr. Hi  │
-│     2 │ Mr. Hi  │
-└───────┴─────────┘
+┌───────┬────────┐
+│  id   │  club  │
+│ Int64 │  Utf8  │
+├───────┼────────┤
+│     0 │ Mr. Hi │
+│     1 │ Mr. Hi │
+│     2 │ Mr. Hi │
+└───────┴────────┘
 "
     );
     assert_eq!(
@@ -450,7 +450,7 @@ fn open_a_database_matches_getting_started() {
         "\
 ┌───────┬──────────┐
 │  id   │ pagerank │
-│ int64 │  double  │
+│ Int64 │ Float64  │
 ├───────┼──────────┤
 │    33 │   0.1009 │
 │     0 │    0.097 │
@@ -503,7 +503,7 @@ fn combine_in_a_database_loads_the_stored_index_in_a_second_process() {
     let expected = "\
 ┌───────┬─────────┬────────┬───────────┬───────────┐
 │  id   │  club   │ degree │ triangles │ community │
-│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+│ Int64 │  Utf8   │ UInt32 │  UInt32   │  UInt32   │
 ├───────┼─────────┼────────┼───────────┼───────────┤
 │    33 │ Officer │     17 │        15 │         2 │
 │     0 │ Mr. Hi  │     16 │        18 │         0 │

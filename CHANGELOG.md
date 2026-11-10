@@ -131,8 +131,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     from DuckDB"; convert large vertex CSV files to Parquet once, in the
     database and statements pages.
 - **`ursa`: tables and prompt as DuckDB's.** A table is a box drawn with
-  line characters, each column's type under its name, numbers aligned
-  right and `NULL` for a null. In a terminal it fits the terminal's width:
+  line characters, each column's type under its name (Arrow's name for it,
+  as `DESCRIBE` and `arrow_typeof()` give it), numbers aligned right and
+  `NULL` for a null. In a terminal it fits the terminal's width:
   long values are cut short and middle columns left out, with a `…` column
   and a footer, `17 columns (10 shown)`; `.maxwidth N` sets the width. Types
   and nulls are dimmed unless `NO_COLOR` is set. The prompt names the

@@ -68,7 +68,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌───────┬───────┐",
             "│  src  │  dst  │",
-            "│ int64 │ int64 │",
+            "│ Int64 │ Int64 │",
             "├───────┼───────┤",
             "│     0 │     1 │",
             "│     0 │     2 │",
@@ -107,14 +107,14 @@ fn the_getting_started_page_runs_as_written() {
     assert_eq!(
         out,
         table(&[
-            "┌───────┬─────────┐",
-            "│  id   │  club   │",
-            "│ int64 │ varchar │",
-            "├───────┼─────────┤",
-            "│     0 │ Mr. Hi  │",
-            "│     1 │ Mr. Hi  │",
-            "│     2 │ Mr. Hi  │",
-            "└───────┴─────────┘",
+            "┌───────┬────────┐",
+            "│  id   │  club  │",
+            "│ Int64 │  Utf8  │",
+            "├───────┼────────┤",
+            "│     0 │ Mr. Hi │",
+            "│     1 │ Mr. Hi │",
+            "│     2 │ Mr. Hi │",
+            "└───────┴────────┘",
         ])
     );
 
@@ -131,7 +131,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌───────┬──────────┐",
             "│  id   │ pagerank │",
-            "│ int64 │  double  │",
+            "│ Int64 │ Float64  │",
             "├───────┼──────────┤",
             "│    33 │   0.1009 │",
             "│     0 │    0.097 │",
@@ -168,7 +168,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌───────┬─────────┬────────┬───────────┬───────────┐",
             "│  id   │  club   │ degree │ triangles │ community │",
-            "│ int64 │ varchar │ uint32 │  uint32   │  uint32   │",
+            "│ Int64 │  Utf8   │ UInt32 │  UInt32   │  UInt32   │",
             "├───────┼─────────┼────────┼───────────┼───────────┤",
             "│    33 │ Officer │     17 │        15 │         2 │",
             "│     0 │ Mr. Hi  │     16 │        18 │         0 │",
@@ -198,7 +198,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌──────────┬──────────────────────┐",
             "│    id    │       pagerank       │",
-            "│ varchar  │        double        │",
+            "│   Utf8   │       Float64        │",
             "├──────────┼──────────────────────┤",
             "│ Valjean  │  0.09956068175644767 │",
             "│ Marius   │ 0.051667656904091475 │",
@@ -219,7 +219,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌────────────┬─────────┐",
             "│     id     │ louvain │",
-            "│  varchar   │ uint32  │",
+            "│    Utf8    │ UInt32  │",
             "├────────────┼─────────┤",
             "│ Anzelma    │       3 │",
             "│ Babet      │       3 │",
@@ -244,7 +244,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌────────┐",
             "│ groups │",
-            "│ int64  │",
+            "│ Int64  │",
             "├────────┤",
             "│      3 │",
             "└────────┘",
@@ -283,13 +283,13 @@ fn the_getting_started_page_runs_as_written() {
     assert_eq!(
         out,
         table(&[
-            "┌───────┬───────┬───────┬────────┐",
-            "│  src  │  dst  │  hop  │  cost  │",
-            "│ int64 │ int64 │ int64 │ double │",
-            "├───────┼───────┼───────┼────────┤",
-            "│     0 │     8 │     0 │    1.0 │",
-            "│     8 │    33 │     1 │    2.0 │",
-            "└───────┴───────┴───────┴────────┘",
+            "┌───────┬───────┬───────┬─────────┐",
+            "│  src  │  dst  │  hop  │  cost   │",
+            "│ Int64 │ Int64 │ Int64 │ Float64 │",
+            "├───────┼───────┼───────┼─────────┤",
+            "│     0 │     8 │     0 │     1.0 │",
+            "│     8 │    33 │     1 │     2.0 │",
+            "└───────┴───────┴───────┴─────────┘",
         ])
     );
     let (walk, _) = sql(
@@ -335,7 +335,7 @@ fn the_getting_started_page_runs_as_written() {
         table(&[
             "┌────────┐",
             "│ count  │",
-            "│ uint64 │",
+            "│ UInt64 │",
             "├────────┤",
             "│     34 │",
             "└────────┘",

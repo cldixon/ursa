@@ -1,11 +1,12 @@
 //! Results as DuckDB draws them: a box around the table, each column's name
 //! with its type under it, numbers to the right and everything else to the
-//! left, and `NULL` for a null.
+//! left, and `NULL` for a null. The types are Arrow's, named as DataFusion's
+//! `DESCRIBE` names them (see [`type_name`]).
 //!
 //! ```text
 //! ┌───────┬─────────┐
 //! │  id   │  club   │
-//! │ int64 │ varchar │
+//! │ Int64 │  Utf8   │
 //! ├───────┼─────────┤
 //! │     0 │ Mr. Hi  │
 //! │    33 │ Officer │
@@ -27,7 +28,7 @@
 use std::collections::VecDeque;
 
 use arrow::array::{Array, RecordBatch};
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -493,73 +494,12 @@ fn is_numeric(t: &DataType) -> bool {
     }
 }
 
-/// A type's name as the shell shows it: DuckDB's names where Arrow's type
-/// has a DuckDB counterpart (`Int64` is `int64`, `Utf8` is `varchar`), and
-/// `T[]` for a list of `T`.
+/// A type's name as the shell shows it: Arrow's own name for it, exactly as
+/// `DataType` prints it (`Int64`, `Utf8`, `List(Int64)`). DataFusion
+/// names types the same way in `DESCRIBE` and `arrow_typeof()`, so a table's
+/// type row says what those say.
 pub fn type_name(t: &DataType) -> String {
-    use DataType::*;
-    match t {
-        Null => "null".into(),
-        Boolean => "boolean".into(),
-        Int8 => "int8".into(),
-        Int16 => "int16".into(),
-        Int32 => "int32".into(),
-        Int64 => "int64".into(),
-        UInt8 => "uint8".into(),
-        UInt16 => "uint16".into(),
-        UInt32 => "uint32".into(),
-        UInt64 => "uint64".into(),
-        Float16 => "float16".into(),
-        Float32 => "float".into(),
-        Float64 => "double".into(),
-        Utf8 | LargeUtf8 | Utf8View => "varchar".into(),
-        Binary | LargeBinary | BinaryView | FixedSizeBinary(_) => "blob".into(),
-        Date32 | Date64 => "date".into(),
-        Time32(_) | Time64(_) => "time".into(),
-        Timestamp(unit, tz) => {
-            let base = match unit {
-                TimeUnit::Second => "timestamp_s",
-                TimeUnit::Millisecond => "timestamp_ms",
-                TimeUnit::Microsecond => "timestamp",
-                TimeUnit::Nanosecond => "timestamp_ns",
-            };
-            if tz.is_some() {
-                format!("{base} with time zone")
-            } else {
-                base.into()
-            }
-        }
-        Duration(_) => "duration".into(),
-        Interval(_) => "interval".into(),
-        Decimal32(p, s) | Decimal64(p, s) | Decimal128(p, s) | Decimal256(p, s) => {
-            format!("decimal({p},{s})")
-        }
-        List(f) | LargeList(f) | ListView(f) | LargeListView(f) => {
-            format!("{}[]", type_name(f.data_type()))
-        }
-        FixedSizeList(f, n) => format!("{}[{n}]", type_name(f.data_type())),
-        Struct(fields) => format!(
-            "struct({})",
-            fields
-                .iter()
-                .map(|f| format!("{} {}", f.name(), type_name(f.data_type())))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Map(f, _) => match f.data_type() {
-            Struct(kv) if kv.len() == 2 => {
-                format!(
-                    "map({}, {})",
-                    type_name(kv[0].data_type()),
-                    type_name(kv[1].data_type())
-                )
-            }
-            _ => "map".into(),
-        },
-        Dictionary(_, v) => type_name(v),
-        RunEndEncoded(_, v) => type_name(v.data_type()),
-        Union(..) => "union".into(),
-    }
+    t.to_string()
 }
 
 #[cfg(test)]
@@ -610,7 +550,7 @@ mod tests {
             "\
 ┌───────┬─────────┬──────────┐
 │  id   │  club   │ pagerank │
-│ int64 │ varchar │  double  │
+│ Int64 │  Utf8   │ Float64  │
 ├───────┼─────────┼──────────┤
 │    33 │ Officer │   0.1009 │
 │     0 │ Mr. Hi  │    0.097 │
@@ -638,7 +578,7 @@ mod tests {
             "\
 ┌───────┐
 │   n   │
-│ int64 │
+│ Int64 │
 ├───────┤
 │     0 │
 │     1 │
@@ -661,11 +601,11 @@ mod tests {
         assert_eq!(
             draw(rows, &schema, 0),
             "\
-┌───────┬─────────┬──────────┐
-│  id   │  club   │ pagerank │
-│ int64 │ varchar │  double  │
-└───────┴─────────┴──────────┘
-  0 rows             3 columns
+┌───────┬──────┬──────────┐
+│  id   │ club │ pagerank │
+│ Int64 │ Utf8 │ Float64  │
+└───────┴──────┴──────────┘
+  0 rows          3 columns
 "
         );
     }
@@ -703,23 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn types_have_duckdb_names() {
-        assert_eq!(type_name(&DataType::Utf8View), "varchar");
-        assert_eq!(type_name(&DataType::UInt32), "uint32");
-        assert_eq!(
-            type_name(&DataType::new_list(DataType::Int64, false)),
-            "int64[]"
-        );
-        assert_eq!(
-            type_name(&DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into())
-            )),
-            "timestamp with time zone"
-        );
+    fn types_have_arrows_names() {
+        assert_eq!(type_name(&DataType::Utf8View), "Utf8View");
+        assert_eq!(type_name(&DataType::UInt32), "UInt32");
         let list =
             ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(16), Some(5)])]);
-        assert_eq!(type_name(list.data_type()), "int64[]");
+        // As DataFusion's arrow_typeof() names it.
+        assert_eq!(type_name(list.data_type()), list.data_type().to_string());
     }
 
     #[test]
@@ -739,7 +669,7 @@ mod tests {
             max_width: 0,
             color: true,
         });
-        assert!(text.contains("\x1b[90m double \x1b[0m"), "{text}");
+        assert!(text.contains("\x1b[90mFloat64 \x1b[0m"), "{text}");
         assert!(text.contains("\x1b[90mNULL   \x1b[0m"), "{text}");
     }
 
@@ -785,19 +715,19 @@ mod tests {
     #[test]
     fn the_first_and_last_rows_whatever_the_batches() {
         let expected = "\
-┌───────┬─────────┐
-│   x   │    s    │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ v0      │
-│     1 │ NULL    │
-│     2 │ v2      │
-│   ·   │    ·    │
-│   ·   │    ·    │
-│   ·   │    ·    │
-│   998 │ v998    │
-│   999 │ NULL    │
-└───────┴─────────┘
+┌───────┬──────┐
+│   x   │  s   │
+│ Int64 │ Utf8 │
+├───────┼──────┤
+│     0 │ v0   │
+│     1 │ NULL │
+│     2 │ v2   │
+│   ·   │  ·   │
+│   ·   │  ·   │
+│   ·   │  ·   │
+│   998 │ v998 │
+│   999 │ NULL │
+└───────┴──────┘
   1,000 rows (5 shown)
 ";
         for size in [1, 2, 3, 7, 999, 1000] {
@@ -815,7 +745,7 @@ mod tests {
         assert!(numbered_table(6, 4, 5).contains("6 rows (5 shown)"));
         let one = numbered_table(3, 1, 1);
         assert!(
-            one.contains("│     0 │ v0      │\n│   ·   │    ·    │\n"),
+            one.contains("│     0 │ v0   │\n│   ·   │  ·   │\n"),
             "{one}"
         );
     }

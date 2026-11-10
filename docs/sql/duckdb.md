@@ -17,7 +17,7 @@ SELECT count(*) AS ties FROM 'karate_edges.csv';
 ```text
 ┌───────┐
 │ ties  │
-│ int64 │
+│ Int64 │
 ├───────┤
 │    78 │
 └───────┘
@@ -32,7 +32,7 @@ SELECT * FROM read_csv('karate_edges.csv', header = true, delim = ',') LIMIT 2;
 ```text
 ┌───────┬───────┐
 │  src  │  dst  │
-│ int64 │ int64 │
+│ Int64 │ Int64 │
 ├───────┼───────┤
 │     0 │     1 │
 │     0 │     2 │
@@ -52,19 +52,19 @@ SELECT src, count(*) AS friends FROM 'karate_edges.csv' GROUP BY ALL ORDER BY fr
 ```text
 ┌───────┬───────┐
 │  src  │  dst  │
-│ int64 │ int64 │
+│ Int64 │ Int64 │
 ├───────┼───────┤
 │     0 │     1 │
 └───────┴───────┘
 ┌───────┐
 │  src  │
-│ int64 │
+│ Int64 │
 ├───────┤
 │     0 │
 └───────┘
 ┌───────┬─────────┐
 │  src  │ friends │
-│ int64 │  int64  │
+│ Int64 │  Int64  │
 ├───────┼─────────┤
 │     0 │      16 │
 └───────┴─────────┘
@@ -79,7 +79,7 @@ DESCRIBE 'karate_edges.csv';
 ```text
 ┌─────────────┬───────────┬─────────────┐
 │ column_name │ data_type │ is_nullable │
-│   varchar   │  varchar  │   varchar   │
+│    Utf8     │   Utf8    │    Utf8     │
 ├─────────────┼───────────┼─────────────┤
 │ src         │ Int64     │ YES         │
 │ dst         │ Int64     │ YES         │
@@ -101,7 +101,7 @@ SELECT 42 AS answer;
 ```text
 ┌────────┐
 │ answer │
-│ int64  │
+│ Int64  │
 ├────────┤
 │     42 │
 └────────┘
@@ -122,7 +122,7 @@ COPY (SELECT * FROM 'karate_edges.csv') TO 'ties.parquet';
 ```text
 ┌────────┐
 │ count  │
-│ uint64 │
+│ UInt64 │
 ├────────┤
 │     78 │
 └────────┘
@@ -141,12 +141,12 @@ SELECT 7 / 2 AS integers,
 ```
 
 ```text
-┌──────────┬─────────┬──────────────┬───────────────┬───────────┐
-│ integers │ doubles │ also_doubles │   decimals    │ truncated │
-│  int64   │ double  │    double    │ decimal(14,6) │   int64   │
-├──────────┼─────────┼──────────────┼───────────────┼───────────┤
-│        3 │     3.5 │          3.5 │      3.500000 │         7 │
-└──────────┴─────────┴──────────────┴───────────────┴───────────┘
+┌──────────┬─────────┬──────────────┬───────────────────┬───────────┐
+│ integers │ doubles │ also_doubles │     decimals      │ truncated │
+│  Int64   │ Float64 │   Float64    │ Decimal128(14, 6) │   Int64   │
+├──────────┼─────────┼──────────────┼───────────────────┼───────────┤
+│        3 │     3.5 │          3.5 │          3.500000 │         7 │
+└──────────┴─────────┴──────────────┴───────────────────┴───────────┘
 ```
 
 **Functions.** Scalar and aggregate functions are DataFusion's. Most common ones share DuckDB's names, but some do not: `to_char` formats a date where DuckDB has `strftime`, and `make_array` builds a list where DuckDB also has `list_value`. `SELECT * FROM ursa_functions()` lists the graph functions, and `SHOW FUNCTIONS` lists the rest.
