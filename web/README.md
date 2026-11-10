@@ -1,9 +1,13 @@
-# Ursa Shell
+# Ursa Web Shell
 
 A web page where anyone can run Ursa SQL in their browser, over sample graphs
-stored in R2 (#279, part of #277). The engine is `ursa-wasm`: Ursa's SQL engine
-compiled to WebAssembly. It runs in a Web Worker in the page and reads Parquet
-and CSV over HTTP with range requests. The Worker here serves files and does no
+stored in R2 (#279, part of #277). It is the `ursa` shell itself, in a
+terminal, as DuckDB's web shell is DuckDB's CLI: the shell (dot-commands, SQL a
+line at a time, DuckDB-style tables) is the `ursa-shell` crate, compiled into
+`ursa-wasm` as `WebShell` and run in a Web Worker; the page draws it with
+xterm.js. Around it is a bar laid out after DuckDB's web shell: New, Share,
+Import, a Datasets menu and a light/dark toggle. The engine reads Parquet and
+CSV over HTTP with range requests. The Worker here serves files and does no
 query work.
 
 The setup follows the Plain Text site's (`cldixon/plane-text`, `site/cloudflare/`):
@@ -12,19 +16,38 @@ static assets and an R2 bucket.
 
 ## Layout
 
-- `public/`: the page (`index.html`, `app.js`, `examples.js`, `style.css`) and
-  the engine's Web Worker (`engine-worker.js`). The worker keeps three engine
-  sessions: the **workspace** (the editor's, with the sample graphs defined at
-  start), the **Tour**'s (empty at start, as the Getting Started page is) and a
-  **meta** one for the page's own lookups.
-- **The Tour** is built from `ursa-wasm/tests/getting_started.sql`, the fixture
-  the browser parity test runs: each `-- @step` there is a Tour step
-  (`scripts/tour.ts`, written to `dist/tour.json`). So every step is tested in
-  CI against the native engine. Running a step runs the steps before it first.
+- `public/`: the page (`index.html`, `app.js`, `style.css`), the Datasets
+  menu (`datasets.js`) and the engine's Web Worker (`engine-worker.js`).
+  - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
+    by the build), with a line editor in `app.js`: Enter sends the line to the
+    shell, which runs a statement once it ends with `;` and shows the
+    continuation prompt meanwhile; Shift+Enter adds a line to what is typed;
+    ↑/↓ recall history (kept in this browser); Ctrl+C copies a selection, or
+    drops what was typed; Ctrl+L clears. Keys pressed while a line runs wait
+    for it. What the shell prints (tables, errors, colour) is written to the
+    terminal as is, so a selection copies as the text on screen.
+  - **Dot-commands** are the CLI's (`.help`, `.tables`, `.describe`,
+    `.functions`, `.maxrows`, `.maxwidth`, `.timer`, `.mode`, …; `.help graph`
+    is a page on the graph SQL, whose forms the e2e test runs), and the page's
+    own, which the shell lists in `.help` and hands back to the page:
+    `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
+    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.history ?N?` and `.share`.
+  - **Datasets.** Picking one starts a fresh session and runs its commands at
+    the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
+    three queries that show the graph functions, `GRAPH_TABLE` patterns and
+    shortest paths. `?dataset=karate` in the URL loads one on open.
+  - **Share** copies a link whose fragment holds the session's commands; opening
+    it replays them. **Import** adds files from this computer
+    (`WebShell.addFile`, at `memory://uploads/<name>`) and defines a view over
+    each. **New** starts a fresh session. The theme follows the system until the
+    toggle picks one, which is remembered; the terminal's colours follow it.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
   engine; everything else is a static asset.
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
+  The build also copies the terminal's font, IBM Plex Mono (SIL OFL 1.1, from
+  `@fontsource/ibm-plex-mono`), into `dist/fonts/`, so the page loads nothing
+  from other hosts.
 - `cloudflare.config.ts`: the Worker (name `ursa-shell`, the `ursa-graph` bucket
   as `DATA`, on `workers.dev` for now). `wrangler.config.ts` is the setting for
   the asset bundler `cf build` uses internally; deploys use `cf` only.
@@ -61,14 +84,20 @@ bun run engine && bun run upload:engine -- --local && bun run upload:data -- --l
 bun run dev
 ```
 
+Or without Cloudflare: `bun run preview` serves `dist/`, `.data/` (with byte
+ranges) and the engine from `.engine/` as the Worker does, at
+http://localhost:8788.
+
 ## Test
 
 `tests/e2e.ts` drives the page in headless Chromium against a running site
-(`cf dev`, or a deploy): every Tour step, example, Data action and function,
-downloads in each format, both views, history and shared links.
+(`bun run preview`, `cf dev` or a deploy): every dataset in the menu, SQL typed
+at the prompt (one line, several, an error), every dot-command, a long table,
+downloads in each format, Import, a shared link replayed in a fresh page, New,
+the theme toggle and history.
 
 ```sh
-bun run dev                                   # in one terminal
+bun run preview                               # in one terminal
 bun run test:e2e                              # in another; or: bun tests/e2e.ts <url> [screenshot dir]
 ```
 

@@ -1,31 +1,28 @@
-import { EXAMPLES, GRAPHS } from "./examples.js";
+// The Ursa Web Shell: the `ursa` shell itself, in a terminal on the page.
+//
+// The shell (dot-commands, SQL, tables) is the CLI's, compiled to WebAssembly
+// and running in a Web Worker (engine-worker.js). This page is the terminal
+// around it, as a real terminal is around the CLI: xterm.js draws the screen,
+// and the line editor here sends the shell each typed line and writes back
+// what it printed. The page adds what only a page can do: the Datasets menu,
+// Share, Import, downloads, and the theme.
+import { Terminal } from "./vendor/xterm.mjs";
+import { FitAddon } from "./vendor/addon-fit.mjs";
+import { DATASETS } from "./datasets.js";
 
 const $ = (id) => document.getElementById(id);
-// Props are assigned as properties, except aria* ones, set as attributes
-// (ariaSelected becomes aria-selected), which every browser supports.
 const el = (tag, props = {}, ...children) => {
   const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(props)) {
-    if (key.startsWith("aria")) node.setAttribute(`aria-${key.slice(4).toLowerCase()}`, value);
-    else node[key] = value;
-  }
-  node.append(...children.filter((c) => c !== null && c !== undefined));
+  Object.assign(node, props);
+  node.append(...children);
   return node;
 };
-
-const editor = $("sql");
-const runButton = $("run");
-const engineChip = $("engine");
-const sessionChip = $("session");
-const status = $("status");
-const output = $("output");
-const MAX_ROWS = 1000;
 
 // ---------------------------------------------------------------- engine
 
 const worker = new Worker(new URL("./engine-worker.js", import.meta.url), { type: "module" });
 let nextId = 0;
-const pending = new Map();
+const calls = new Map();
 let engineReady;
 const engineStarted = new Promise((resolve, reject) => (engineReady = { resolve, reject }));
 
@@ -35,459 +32,751 @@ worker.onmessage = ({ data }) => {
     else engineReady.reject(new Error(data.error));
     return;
   }
-  const call = pending.get(data.id);
-  pending.delete(data.id);
+  const call = calls.get(data.id);
+  calls.delete(data.id);
   if (data.ok) call.resolve(data);
   else call.reject(new Error(data.error));
 };
 
-function engine(op, args) {
+function engine(op, args = {}, transfer = []) {
   return new Promise((resolve, reject) => {
     const id = nextId++;
-    pending.set(id, { resolve, reject });
-    worker.postMessage({ id, op, ...args });
+    calls.set(id, { resolve, reject });
+    worker.postMessage({ id, op, ...args }, transfer);
   });
 }
 
-// ---------------------------------------------------------------- state
+// ---------------------------------------------------------------- theme
 
-// The editor runs in the workspace, or in the Tour's session at one step.
-let mode = { kind: "workspace" };
-let tour = [];
-let tourRanThrough = -1; // the last Tour step run in the Tour's session
-let shown = { session: "workspace", results: [], index: 0 };
-let view = "table";
-let busy = false;
+// The terminal's colours: the page's, with the ANSI colours the shell uses
+// (yellow strings, blue dot-commands, grey types and nulls, red errors, and
+// 256-colour 208 for the prompt) taken from the star-temperature ramp.
+const THEMES = {
+  light: {
+    background: "#ffffff", foreground: "#12120f", cursor: "#12120f", cursorAccent: "#ffffff",
+    selectionBackground: "#1f3e8c33", selectionInactiveBackground: "#1f3e8c22",
+    black: "#12120f", red: "#c0262d", green: "#3f7f3f", yellow: "#a8650f", blue: "#1f3e8c",
+    magenta: "#7a3e8c", cyan: "#2f6f7f", white: "#5a5852",
+    brightBlack: "#8a877f", brightRed: "#c4491b", brightGreen: "#3f7f3f", brightYellow: "#b07728",
+    brightBlue: "#4b6cb0", brightMagenta: "#7a3e8c", brightCyan: "#2f6f7f", brightWhite: "#12120f",
+    prompt: "#c4491b",
+  },
+  dark: {
+    background: "#0b0b0a", foreground: "#f4f1ea", cursor: "#f4f1ea", cursorAccent: "#0b0b0a",
+    selectionBackground: "#aabfff40", selectionInactiveBackground: "#aabfff26",
+    black: "#0b0b0a", red: "#ff6b6b", green: "#8fd18f", yellow: "#ffd2a1", blue: "#aabfff",
+    magenta: "#d6a8ff", cyan: "#9fd8e0", white: "#f4f1ea",
+    brightBlack: "#8a877f", brightRed: "#ff9f51", brightGreen: "#8fd18f", brightYellow: "#ffd2a1",
+    brightBlue: "#c8d6ff", brightMagenta: "#d6a8ff", brightCyan: "#9fd8e0", brightWhite: "#ffffff",
+    prompt: "#ff9f51",
+  },
+};
 
-function setMode(next) {
-  mode = next;
-  if (mode.kind === "tour") {
-    sessionChip.textContent = `Tour · step ${mode.step + 1} of ${tour.length}`;
-    sessionChip.classList.add("tour");
-    sessionChip.title = "Runs in the Tour's own session; earlier steps run first";
-  } else {
-    sessionChip.textContent = "Workspace";
-    sessionChip.classList.remove("tour");
-    sessionChip.title = "The workspace session: the sample graphs are defined here";
+function xtermTheme(name) {
+  const { prompt, ...theme } = THEMES[name];
+  // 256-colour 208 (the prompt's) is extendedAnsi[208 - 16].
+  const extendedAnsi = [];
+  extendedAnsi[208 - 16] = prompt;
+  return { ...theme, extendedAnsi };
+}
+
+function currentTheme() {
+  const set = document.documentElement.dataset.theme;
+  if (set) return set;
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+$("theme").onclick = () => {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try {
+    localStorage.setItem("ursa-theme", next);
+  } catch {}
+  term.options.theme = xtermTheme(next);
+};
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  term.options.theme = xtermTheme(currentTheme());
+});
+
+// ---------------------------------------------------------------- terminal
+
+// xterm measures the font when it opens: have it loaded first. Its DOM
+// renderer draws the text, so the browser's own text rendering (and
+// selection) apply; with line height 1, box characters join up.
+await document.fonts.load('13px "IBM Plex Mono"').catch(() => {});
+const term = new Terminal({
+  fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  fontSize: 13,
+  lineHeight: 1,
+  theme: xtermTheme(currentTheme()),
+  convertEol: true,
+  cursorBlink: true,
+  scrollback: 10_000,
+});
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.open($("terminal"));
+fit.fit();
+
+/** Tables fit the terminal, a column kept free. */
+function sendWidth() {
+  engine("width", { columns: Math.max(20, term.cols - 1) });
+}
+new ResizeObserver(() => {
+  fit.fit();
+  sendWidth();
+}).observe($("terminal"));
+
+term.attachCustomKeyEventHandler((e) => {
+  if (e.type !== "keydown") return true;
+  // Ctrl+C (Cmd+C) with text selected copies it, as in a terminal app.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && term.hasSelection()) {
+    navigator.clipboard?.writeText(term.getSelection());
+    return false;
   }
-  renderTour();
+  // Shift+Enter starts a new line in what is typed.
+  if (e.key === "Enter" && e.shiftKey) {
+    if (!busy) insert("\n");
+    return false;
+  }
+  return true;
+});
+
+const write = (s) => new Promise((resolve) => term.write(s, resolve));
+
+// ---------------------------------------------------------------- the line editor
+
+// What is typed: text that may hold newlines (Shift+Enter, a paste, a
+// statement from the history), and the cursor in it.
+let text = "";
+let cursor = 0;
+// The prompt for the next line, from the shell: `memory U ` or spaces as wide.
+let prompt = "memory U ";
+let promptColor = ["", ""];
+// How many rows the cursor is below where the drawn input starts.
+let cursorRow = 0;
+let busy = true;
+// `text` coloured by the shell's highlighter, once it has answered.
+let colored = { text: "", ansi: "" };
+
+const HISTORY_KEY = "ursa-shell-history";
+let history = [];
+try {
+  history = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]").filter((h) => typeof h === "string");
+} catch {}
+let historyAt = history.length;
+let draft = "";
+
+function remember(entry) {
+  if (!entry.trim()) return;
+  history = history.filter((h) => h !== entry);
+  history.push(entry);
+  history = history.slice(-500);
+  historyAt = history.length;
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch {}
+}
+
+/** Lines of `text`, coloured once the shell's highlighter has answered. */
+function coloredLines() {
+  if (colored.text === text) return colored.ansi.split("\n");
+  const asked = text;
+  engine("highlight", { text: asked }).then(({ text: ansi }) => {
+    if (asked === text && !busy) {
+      colored = { text: asked, ansi };
+      draw();
+    }
+  });
+  return text.split("\n");
+}
+
+const length = (s) => [...s].length;
+
+/** Draw the prompt and what is typed, and put the cursor where it is. */
+function draw() {
+  const cols = term.cols;
+  const lines = text.split("\n");
+  const colors = coloredLines();
+  let out = "\r" + (cursorRow > 0 ? `\x1b[${cursorRow}A` : "") + "\x1b[J";
+  let row = 0; // the row this line starts on
+  let end = 0; // the row the last line ends on
+  let offset = 0;
+  let target = { row: 0, col: 0 };
+  lines.forEach((line, i) => {
+    if (i > 0) out += "\r\n";
+    out += (i === 0 ? `${promptColor[0]}${prompt}${promptColor[1]}` : " ".repeat(prompt.length)) + (colors[i] ?? line);
+    const width = prompt.length + length(line);
+    // A line that fills its last row exactly leaves the cursor waiting to
+    // wrap: wrap it now, so the rows below are where they are counted.
+    if (width > 0 && width % cols === 0) out += " \r";
+    if (cursor >= offset && cursor <= offset + line.length) {
+      const at = prompt.length + length(line.slice(0, cursor - offset));
+      target = { row: row + Math.floor(at / cols), col: at % cols };
+    }
+    end = row + Math.floor(width / cols);
+    row = end + 1;
+    offset += line.length + 1;
+  });
+  const up = end - target.row;
+  out += (up > 0 ? `\x1b[${up}A` : "") + "\r" + (target.col > 0 ? `\x1b[${target.col}C` : "");
+  cursorRow = target.row;
+  term.write(out);
+}
+
+/** Take what is drawn off the screen (before the page runs a command). */
+function erase() {
+  term.write("\r" + (cursorRow > 0 ? `\x1b[${cursorRow}A` : "") + "\x1b[J");
+  cursorRow = 0;
+}
+
+function insert(s) {
+  text = text.slice(0, cursor) + s + text.slice(cursor);
+  cursor += s.length;
+  draw();
+}
+
+function setText(s) {
+  text = s;
+  cursor = s.length;
+  draw();
+}
+
+/** Leave the input on screen as typed, and go to the next line for output. */
+async function finishLine() {
+  cursor = text.length;
+  draw();
+  cursorRow = 0;
+  await write("\r\n");
+}
+
+const lineStart = () => text.lastIndexOf("\n", cursor - 1) + 1;
+const lineEnd = () => (text.indexOf("\n", cursor) < 0 ? text.length : text.indexOf("\n", cursor));
+
+// Keys pressed while a line runs wait for it, as a terminal keeps them.
+let typeahead = [];
+
+term.onData((data) => {
+  if (busy) {
+    typeahead.push(data);
+    return;
+  }
+  key(data);
+});
+
+function key(data) {
+  // A paste arrives in one piece: its lines stay in the input, to run with Enter.
+  if (data.length > 1 && !data.startsWith("\x1b")) {
+    insert(data.replace(/\r\n?/g, "\n"));
+    return;
+  }
+  switch (data) {
+    case "\r":
+      submitTyped();
+      return;
+    case "\x7f": // Backspace
+    case "\b":
+      if (cursor > 0) {
+        text = text.slice(0, cursor - 1) + text.slice(cursor);
+        cursor--;
+        draw();
+      }
+      return;
+    case "\x1b[3~": // Delete
+      if (cursor < text.length) {
+        text = text.slice(0, cursor) + text.slice(cursor + 1);
+        draw();
+      }
+      return;
+    case "\x1b[D": // Left
+    case "\x02":
+      if (cursor > 0) cursor--;
+      draw();
+      return;
+    case "\x1b[C": // Right
+    case "\x06":
+      if (cursor < text.length) cursor++;
+      draw();
+      return;
+    case "\x1b[H": // Home
+    case "\x01": // Ctrl+A
+      cursor = lineStart();
+      draw();
+      return;
+    case "\x1b[F": // End
+    case "\x05": // Ctrl+E
+      cursor = lineEnd();
+      draw();
+      return;
+    case "\x0b": // Ctrl+K: delete to the end of the line
+      text = text.slice(0, cursor) + text.slice(lineEnd());
+      draw();
+      return;
+    case "\x15": {
+      // Ctrl+U: delete to the start of the line
+      const start = lineStart();
+      text = text.slice(0, start) + text.slice(cursor);
+      cursor = start;
+      draw();
+      return;
+    }
+    case "\x17": {
+      // Ctrl+W: delete the word before the cursor
+      const before = text.slice(0, cursor).replace(/\S+\s*$/, "");
+      text = before + text.slice(cursor);
+      cursor = before.length;
+      draw();
+      return;
+    }
+    case "\x1b[A": // Up: the line above, or the history
+      if (lineStart() === 0) {
+        if (historyAt === 0) return;
+        if (historyAt === history.length) draft = text;
+        historyAt--;
+        setText(history[historyAt]);
+      } else {
+        const column = cursor - lineStart();
+        const start = text.lastIndexOf("\n", lineStart() - 2) + 1;
+        cursor = Math.min(start + column, lineStart() - 1);
+        draw();
+      }
+      return;
+    case "\x1b[B": // Down: the line below, or the history
+      if (lineEnd() === text.length) {
+        if (historyAt >= history.length) return;
+        historyAt++;
+        setText(historyAt === history.length ? draft : history[historyAt]);
+      } else {
+        const column = cursor - lineStart();
+        const start = lineEnd() + 1;
+        const end = text.indexOf("\n", start) < 0 ? text.length : text.indexOf("\n", start);
+        cursor = Math.min(start + column, end);
+        draw();
+      }
+      return;
+    case "\x03": // Ctrl+C: drop what is typed
+      cancelTyped();
+      return;
+    case "\x0c": // Ctrl+L
+      clearScreen();
+      return;
+    case "\t":
+      insert("  ");
+      return;
+    default:
+      if (data >= " " && !data.startsWith("\x1b")) insert(data);
+  }
+}
+
+async function cancelTyped() {
+  busy = true;
+  await finishLine();
+  await write("^C\r\n");
+  const r = await engine("cancel");
+  prompt = r.prompt;
+  statement = [];
+  text = "";
+  cursor = 0;
+  historyAt = history.length;
+  busy = false;
+  draw();
+}
+
+function clearScreen() {
+  term.clear();
+  term.write("\x1b[H\x1b[2J");
+  cursorRow = 0;
+  draw();
 }
 
 // ---------------------------------------------------------------- running
 
-function selectedSql() {
-  const { selectionStart: a, selectionEnd: b, value } = editor;
-  return a !== b ? value.slice(a, b) : value;
+// Everything that runs, one after another: typed lines, the page's commands.
+let queue = Promise.resolve();
+// The statements and commands this session ran, for Share.
+let ran = [];
+// The lines of the statement being fed, until it runs.
+let statement = [];
+let uploads = [];
+
+function setBusy(on) {
+  busy = on;
+  term.options.cursorBlink = !on;
 }
 
-async function run(sql = selectedSql()) {
-  if (busy || !sql.trim()) return;
-  busy = true;
-  runButton.disabled = true;
-  status.classList.remove("error");
-  const session = mode.kind === "tour" ? "tour" : "workspace";
-  try {
-    if (mode.kind === "tour") await runTourPrerequisites(mode.step);
-    status.textContent = "Running…";
-    const { results, ms } = await engine("run", { session, sql, maxRows: MAX_ROWS });
-    if (mode.kind === "tour") tourRanThrough = Math.max(tourRanThrough, mode.step);
-    remember(sql);
-    if (mode.kind === "workspace") history.replaceState(null, "", `#${new URLSearchParams({ sql })}`);
-    show(session, results, ms);
-  } catch (e) {
-    showError(e.message);
-  } finally {
-    busy = false;
-    runButton.disabled = false;
-    renderTour();
-  }
-}
-
-/** Run the Tour's steps before `step` in its session, from a fresh session when needed. */
-async function runTourPrerequisites(step) {
-  if (step <= tourRanThrough) {
-    // Running an earlier step again: start over, so its CREATEs do not collide.
-    await engine("reset", { session: "tour" });
-    tourRanThrough = -1;
-  }
-  if (tourRanThrough < step - 1) {
-    const before = tour.slice(tourRanThrough + 1, step);
-    status.textContent = `Running steps ${tourRanThrough + 2}–${step} first…`;
-    try {
-      await engine("run", { session: "tour", sql: before.map((s) => s.sql).join("\n"), maxRows: 0 });
-    } catch (e) {
-      throw new Error(`An earlier Tour step failed: ${e.message}`);
+/** Back at the prompt: draw it, then the keys pressed meanwhile. */
+function ready() {
+  setBusy(false);
+  draw();
+  const keys = typeahead;
+  typeahead = [];
+  // A key may start another run (Enter): the rest wait for it.
+  for (let i = 0; i < keys.length; i++) {
+    if (busy) {
+      typeahead.push(...keys.slice(i));
+      return;
     }
-    tourRanThrough = step - 1;
+    key(keys[i]);
   }
 }
 
-// ---------------------------------------------------------------- results
-
-const NUMERIC = /^(U?Int|Float|Decimal)/;
-
-function statementLabel(text, i) {
-  const words = text.replace(/\s+/g, " ").trim();
-  return `${i + 1} · ${words.length > 28 ? words.slice(0, 27) + "…" : words}`;
+/** Enter: what is typed goes to the shell, a line at a time. */
+function submitTyped() {
+  const entry = text;
+  setBusy(true);
+  queue = queue.then(async () => {
+    await finishLine();
+    remember(entry);
+    text = "";
+    cursor = 0;
+    for (const line of entry.split("\n")) await feed(line, { echo: false });
+    ready();
+  });
 }
 
-function show(session, results, ms) {
-  // Show the last result with columns (the one a reader is after), or the last one.
-  let index = results.length - 1;
-  for (let i = results.length - 1; i >= 0; i--) {
-    if (results[i].columns.length) {
-      index = i;
-      break;
+/**
+ * Run `command` as if typed: each line is drawn after the prompt and fed to
+ * the shell. Resolves to whether it ran without an error.
+ */
+function run(command) {
+  setBusy(true);
+  const done = queue.then(async () => {
+    erase();
+    text = "";
+    cursor = 0;
+    let ok = true;
+    for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+    ready();
+    return ok;
+  });
+  queue = done.catch(() => {});
+  return done;
+}
+
+/** Run `commands` in order, stopping at the first that fails. */
+async function runAll(commands) {
+  for (const command of commands) if (!(await run(command))) return false;
+  return true;
+}
+
+// Commands that only look: Share leaves them out.
+const LOOKS = /^\s*\.(help|tables|graphs|describe|functions|version|print|history|files|share|quit|exit|dataset)\b/;
+
+/** Feed one line to the shell and write what it printed. True if no error. */
+async function feed(line, { echo }) {
+  if (echo) {
+    const { text: ansi } = await engine("highlight", { text: line });
+    await write(`${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
+  }
+  statement.push(line);
+  const r = await engine("feed", { line });
+  let ok = !r.err;
+  if (r.flow === "host") {
+    statement = [];
+    ok = (await hostCommand(r.command)) !== false;
+  } else {
+    await write(r.out + r.err);
+    if (r.flow === "exit") await write("This shell lives in the page: New starts a fresh session.\r\n");
+    if (!r.pending) {
+      const done = statement.join("\n");
+      statement = [];
+      if (done.trim() && ok && !LOOKS.test(done)) ran.push(done);
     }
   }
-  shown = { session, results, index, ms };
-  renderResults();
+  prompt = r.pending ? r.continuation : r.prompt;
+  return ok;
 }
 
-function showError(message) {
-  shown = { session: shown.session, results: [], index: 0 };
-  $("result-tabs").replaceChildren();
-  $("download").disabled = true;
-  status.textContent = "Error";
-  status.classList.add("error");
-  output.replaceChildren(el("pre", { className: "error", textContent: message }));
+// ---------------------------------------------------------------- the page's own commands
+
+const HOST_COMMANDS = [
+  [".clear", "", "Clear the screen (also Ctrl+L)"],
+  [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
+  [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
+  [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
+  [".history", "?N?", "Show the last N commands (default 20)"],
+  [".share", "", "Copy a link that replays this session's commands"],
+];
+
+const SHORTCUTS = `Enter            Run the line (a statement runs once it ends with ;)
+Shift+Enter      Start a new line in what is typed
+Up, Down         Step through the history (kept in this browser)
+Ctrl+C           Copy the selection; with none, drop what is typed
+Ctrl+L           Clear the screen
+Ctrl+A, Ctrl+E   Go to the start or end of the line
+Ctrl+U, Ctrl+K   Delete to the start or end of the line
+Ctrl+W           Delete the word before the cursor`;
+
+const errorLine = (message) => write(`\x1b[31mError: ${message}\x1b[0m\r\n`).then(() => false);
+
+/** Run a command the page added. False if it failed. */
+async function hostCommand(line) {
+  const [name, ...rest] = line.trim().replace(/;\s*$/, "").split(/\s+/);
+  const arg = rest.join(" ");
+  switch (name) {
+    case ".clear":
+      term.clear();
+      await write("\x1b[H\x1b[2J");
+      return true;
+    case ".share":
+      return share();
+    case ".export":
+      return exportLast(arg.toLowerCase());
+    case ".files":
+      if (arg === "add") {
+        $("file-input").click();
+        return true;
+      }
+      if (arg) return errorLine("usage: .files ?add?");
+      return listFiles();
+    case ".history": {
+      const n = arg ? Number(arg) : 20;
+      if (!Number.isInteger(n) || n < 1) return errorLine("usage: .history ?N?");
+      const first = Math.max(0, history.length - n);
+      const width = String(history.length).length;
+      for (let i = first; i < history.length; i++) {
+        const { text: ansi } = await engine("highlight", { text: history[i] });
+        await write(`\x1b[90m${String(i + 1).padStart(width)}\x1b[0m  ${ansi.replace(/\n/g, "\n" + " ".repeat(width + 2))}\r\n`);
+      }
+      return true;
+    }
+    case ".dataset": {
+      if (!arg) {
+        const rows = DATASETS.map((d) => `('${d.id}', '${d.title.replace(/'/g, "''")}')`).join(", ");
+        return quiet(`SELECT * FROM (VALUES ${rows}) AS datasets(name, title);`);
+      }
+      const d = DATASETS.find((x) => x.id === arg.toLowerCase());
+      if (!d) return errorLine(`no dataset named '${arg}'; .dataset lists them`);
+      // Once this line has finished: a fresh session, then the dataset.
+      setTimeout(() => loadDataset(d));
+      return true;
+    }
+  }
+  return errorLine(`unknown command ${name}`);
 }
 
-function renderResults() {
-  const { results, index, ms } = shown;
-  const tabs = $("result-tabs");
-  tabs.replaceChildren(
-    ...(results.length > 1
-      ? results.map((r, i) =>
-          el("button", {
-            role: "tab",
-            textContent: statementLabel(r.statement, i),
-            title: r.statement,
-            ariaSelected: String(i === index),
-            onclick: () => {
-              shown.index = i;
-              renderResults();
-            },
-          }),
-        )
-      : []),
-  );
-  const r = results[index];
-  if (!r) {
-    output.replaceChildren(el("p", { className: "empty", textContent: "Nothing to show." }));
-    return;
-  }
-  const time = ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(2)} s`;
-  const statements = results.length > 1 ? `${results.length} statements in ${time}` : time;
-  if (!r.columns.length) {
-    status.textContent = `Done · ${statements}`;
-    output.replaceChildren(el("p", { className: "empty", textContent: "The statement ran. It returns no rows." }));
-    $("download").disabled = true;
-    return;
-  }
-  const rows = `${r.totalRows.toLocaleString()} row${r.totalRows === 1 ? "" : "s"}`;
-  const capped = r.totalRows > r.rows.length ? ` · showing the first ${r.rows.length.toLocaleString()}; download for all` : "";
-  status.textContent = `${rows} · ${statements}${capped}`;
-  $("download").disabled = false;
-  if (view === "text") {
-    output.replaceChildren(el("pre", { textContent: r.table }));
-    return;
-  }
-  const numeric = r.columns.map((c) => NUMERIC.test(c.type));
-  const head = el(
-    "tr",
-    {},
-    ...r.columns.map((c) => el("th", { scope: "col" }, c.name, el("span", { className: "type", textContent: c.type }))),
-  );
-  const body = el("tbody");
-  for (const row of r.rows) {
-    body.append(
-      el(
-        "tr",
-        {},
-        ...row.map((v, i) =>
-          v === null
-            ? el("td", { className: "null", textContent: "NULL" })
-            : el("td", { className: numeric[i] ? "num" : "", textContent: v, title: v.length > 40 ? v : "" }),
-        ),
-      ),
-    );
-  }
-  output.replaceChildren(el("table", { className: "grid" }, el("thead", {}, head), body));
+/** Run `sql` in the shell for a listing the page makes; not recorded. */
+async function quiet(sql) {
+  const r = await engine("feed", { line: sql });
+  await write(r.out + r.err);
+  return !r.err;
 }
 
-function setView(next) {
-  view = next;
-  $("view-table").setAttribute("aria-pressed", String(view === "table"));
-  $("view-text").setAttribute("aria-pressed", String(view === "text"));
-  if (shown.results.length) renderResults();
+let manifest = null;
+async function listFiles() {
+  manifest ??= await (await fetch("/data/manifest.json")).json();
+  const rows = manifest.datasets.flatMap((d) => d.files.map((f) => `('${f.name}', ${f.bytes}, '${d.title.replace(/'/g, "''")}')`));
+  rows.push(...uploads.map((u) => `('memory://uploads/${u.name.replace(/'/g, "''")}', ${u.bytes}, 'imported')`));
+  return quiet(`SELECT name AS file, bytes, dataset FROM (VALUES ${rows.join(", ")}) AS t(name, bytes, dataset) ORDER BY dataset = 'imported', name;`);
 }
-$("view-table").onclick = () => setView("table");
-$("view-text").onclick = () => setView("text");
 
 const EXTENSIONS = { csv: "csv", parquet: "parquet", json: "json", arrow: "arrows" };
-const TYPES = { csv: "text/csv", parquet: "application/vnd.apache.parquet", json: "application/json", arrow: "application/vnd.apache.arrow.stream" };
-$("download").onchange = async (e) => {
-  const format = e.target.value;
-  e.target.value = "";
-  if (!format) return;
+const MIME = { csv: "text/csv", parquet: "application/vnd.apache.parquet", json: "application/json", arrow: "application/vnd.apache.arrow.stream" };
+
+async function exportLast(format) {
+  if (!EXTENSIONS[format]) return errorLine("usage: .export csv|parquet|json|arrow");
+  let bytes;
   try {
-    const { bytes } = await engine("export", { session: shown.session, index: shown.index, format });
-    const url = URL.createObjectURL(new Blob([bytes], { type: TYPES[format] }));
-    el("a", { href: url, download: `ursa-result.${EXTENSIONS[format]}` }).click();
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
-  } catch (err) {
-    showError(err.message);
+    ({ bytes } = await engine("export", { format }));
+  } catch (e) {
+    return errorLine(e.message);
   }
-};
-
-// ---------------------------------------------------------------- editor
-
-runButton.onclick = () => run();
-let tabMovesFocus = false;
-editor.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault();
-    run();
-  } else if (e.key === "Escape") {
-    // Escape, then Tab, leaves the editor (Tab otherwise indents).
-    tabMovesFocus = true;
-  } else if (e.key === "Tab" && !tabMovesFocus && !e.shiftKey) {
-    e.preventDefault();
-    editor.setRangeText("  ", editor.selectionStart, editor.selectionEnd, "end");
-  } else {
-    tabMovesFocus = false;
-  }
-});
-
-function load(sql, nextMode) {
-  setMode(nextMode);
-  editor.value = sql;
-  editor.scrollTop = 0;
+  const name = `ursa-result.${EXTENSIONS[format]}`;
+  const url = URL.createObjectURL(new Blob([bytes], { type: MIME[format] }));
+  el("a", { href: url, download: name }).click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  await write(`Downloaded ${name} (${formatBytes(bytes.byteLength)}).\r\n`);
+  return true;
 }
-
-$("share").onclick = async () => {
-  const url = `${location.origin}${location.pathname}#${new URLSearchParams({ sql: editor.value })}`;
-  try {
-    await navigator.clipboard.writeText(url);
-    $("share").textContent = "Copied";
-  } catch {
-    history.replaceState(null, "", url);
-    $("share").textContent = "Link in the address bar";
-  }
-  setTimeout(() => ($("share").textContent = "Copy link"), 1500);
-};
-
-// ---------------------------------------------------------------- panels
-
-for (const tab of document.querySelectorAll("[role=tab][data-panel]")) {
-  tab.onclick = () => {
-    for (const t of document.querySelectorAll("[role=tab][data-panel]")) {
-      t.setAttribute("aria-selected", String(t === tab));
-      $(`panel-${t.dataset.panel}`).hidden = t !== tab;
-    }
-    if (tab.dataset.panel === "functions") loadFunctions();
-    if (tab.dataset.panel === "history") renderHistory();
-  };
-}
-
-function item(title, sub, onclick, { code = false, className = "" } = {}) {
-  return el(
-    "button",
-    { className: `item ${className}`.trim(), onclick },
-    el("span", { className: "title", textContent: title }),
-    sub ? el(code ? "code" : "span", { className: "sub", textContent: sub }) : null,
-  );
-}
-
-// Tour
-function renderTour() {
-  $("tour").replaceChildren(
-    ...tour.map((step, i) => {
-      const classes = [i <= tourRanThrough ? "done" : "", mode.kind === "tour" && mode.step === i ? "current" : ""];
-      return el(
-        "li",
-        {},
-        item(step.title, step.note, () => {
-          load(step.sql, { kind: "tour", step: i });
-          run(step.sql);
-        }, { className: classes.join(" ") }),
-      );
-    }),
-  );
-}
-
-// Examples
-$("examples").replaceChildren(
-  ...EXAMPLES.map((e) =>
-    el("li", {}, item(e.title, e.sql.split("\n").find((l) => !l.startsWith("--")), () => {
-      load(e.sql, { kind: "workspace" });
-      run(e.sql);
-    }, { code: true })),
-  ),
-);
-
-// Data
-function query(sql) {
-  load(sql, { kind: "workspace" });
-  run(sql);
-}
-$("graphs").replaceChildren(
-  ...GRAPHS.map((g) =>
-    el(
-      "li",
-      {},
-      el(
-        "div",
-        { className: "item" },
-        el("span", { className: "title", textContent: g.name }),
-        el("span", { className: "sub", textContent: g.description }),
-        el(
-          "div",
-          { className: "actions" },
-          el("button", { textContent: "Edges", onclick: () => query(`SELECT * FROM ${g.name}.edges LIMIT 100;`) }),
-          el("button", { textContent: "Nodes", onclick: () => query(`SELECT * FROM ${g.name}.nodes LIMIT 100;`) }),
-          el("button", { textContent: "Describe", onclick: () => query(`SELECT * FROM describe(${g.name});`) }),
-          el("button", { textContent: "Definition", onclick: () => query(`DESCRIBE GRAPH ${g.name};`) }),
-        ),
-      ),
-    ),
-  ),
-);
-fetch("/data/manifest.json")
-  .then((r) => r.json())
-  .then((m) => {
-    $("files").replaceChildren(
-      ...m.datasets.flatMap((d) =>
-        d.files
-          .filter((f) => f.name.endsWith(".parquet"))
-          .map((f) =>
-            el("li", {}, item(f.name, `${d.title} · ${formatBytes(f.bytes)} · ${d.source}`, () => query(`SELECT * FROM '${f.name}' LIMIT 100;`))),
-          ),
-      ),
-    );
-    $("licence").textContent = m.licence;
-  })
-  .catch(() => ($("files").textContent = "The dataset list did not load."));
 
 function formatBytes(n) {
   return n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 }
 
-// Functions
-const TRY = {
-  algorithms: "SELECT * FROM algorithms(karate, pagerank(direction => 'both'), community => louvain(seed => 1)) LIMIT 10;",
-  neighbors_agg: "SELECT * FROM neighbors_agg(karate, attribute => club, agg => 'n_unique', direction => 'both') LIMIT 10;",
-  hop: "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both') LIMIT 20;",
-  shortest_path: "SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'both');",
-  random_walk: "SELECT * FROM random_walk(karate, start => [0], steps => 5, walks_per_node => 3, seed => 1);",
-};
-let functionsLoaded = false;
-async function loadFunctions() {
-  if (functionsLoaded) return;
-  functionsLoaded = true;
-  try {
-    await engineStarted;
-    await engine("run", { session: "meta", sql: "SELECT name, family, summary, parameters, outputs FROM ursa_functions()", maxRows: 0 });
-    const { bytes } = await engine("export", { session: "meta", index: 0, format: "json" });
-    const functions = JSON.parse(new TextDecoder().decode(bytes));
-    const list = functions.map((f) => {
-      const output = f.outputs?.[0]?.name ?? f.name;
-      const sql =
-        TRY[f.name] ??
-        (f.family === "algorithm"
-          ? `SELECT * FROM ${f.name}(karate) ORDER BY ${output} DESC LIMIT 10;`
-          : `SELECT * FROM ${f.name}(karate);`);
-      const node = el(
-        "details",
-        { className: "fn" },
-        el(
-          "summary",
-          {},
-          el("span", { className: "name", textContent: f.name }),
-          el("span", { className: "family", textContent: f.family }),
-        ),
-        el("p", { textContent: f.summary }),
-        el(
-          "dl",
-          {},
-          ...(f.parameters ?? []).flatMap((p) => [
-            el("dt", { textContent: `${p.name} => ${p.default}` }),
-            el("dd", { textContent: `${p.type}${p.choices?.length ? ` (${p.choices.join(", ")})` : ""}. ${p.doc}` }),
-          ]),
-        ),
-        el("div", { className: "actions" }, el("button", { textContent: "Try it", onclick: () => query(sql) })),
-      );
-      node.dataset.search = `${f.name} ${f.family} ${f.summary}`.toLowerCase();
-      return node;
-    });
-    $("functions").replaceChildren(...list);
-  } catch (e) {
-    functionsLoaded = false;
-    $("functions").replaceChildren(el("p", { className: "muted", textContent: `The functions did not load: ${e.message}` }));
-  }
+// ---------------------------------------------------------------- the bar
+
+/** A fresh shell and a clear screen: New, and before each dataset. */
+async function restart() {
+  const r = await engine("start", { commands: HOST_COMMANDS, shortcuts: SHORTCUTS });
+  prompt = r.prompt;
+  promptColor = r.promptColor;
+  sendWidth();
+  ran = [];
+  uploads = [];
+  statement = [];
+  text = "";
+  cursor = 0;
+  history_replace("");
+  term.reset();
+  cursorRow = 0;
+  await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n`);
 }
-$("function-filter").oninput = (e) => {
-  const q = e.target.value.toLowerCase();
-  for (const node of $("functions").querySelectorAll(".fn")) node.hidden = !node.dataset.search.includes(q);
+
+$("new").onclick = () => {
+  setBusy(true);
+  queue = queue.then(async () => {
+    await restart();
+    ready();
+  });
+  term.focus();
 };
 
-// History (this browser only; storage may be unavailable, e.g. in a private window)
-const HISTORY_KEY = "ursa-shell-history";
-function readHistory() {
+function loadDataset(d) {
+  setBusy(true);
+  queue = queue.then(restart);
+  return runAll(d.commands);
+}
+
+// Share: a link whose fragment holds the session's commands, replayed on open.
+function shareUrl() {
+  const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(ran))))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return `${location.origin}${location.pathname}#run=${encoded}`;
+}
+async function share() {
+  if (!ran.length) {
+    await write("No commands to share.\r\n");
+    return true;
+  }
+  const url = shareUrl();
+  history_replace(url);
+  const n = `${ran.length} command${ran.length === 1 ? "" : "s"}`;
   try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+    await navigator.clipboard.writeText(url);
+    await write(`Copied a link that replays ${n}.\r\n`);
+  } catch {
+    await write(`A link that replays ${n} is in the address bar.\r\n`);
+  }
+  if (uploads.length) await write("Imported files stay in this browser: whoever opens the link imports them again.\r\n");
+  return true;
+}
+$("share").onclick = () => {
+  run(".share");
+  term.focus();
+};
+
+function history_replace(url) {
+  window.history.replaceState(null, "", url || location.pathname);
+}
+
+function sharedCommands() {
+  const m = location.hash.match(/^#run=([A-Za-z0-9_-]+)$/);
+  if (!m) return [];
+  try {
+    const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+    const list = JSON.parse(decodeURIComponent(escape(atob(b64))));
+    return Array.isArray(list) ? list.filter((c) => typeof c === "string") : [];
   } catch {
     return [];
   }
 }
-function remember(sql) {
-  const entries = readHistory().filter((h) => h.sql !== sql);
-  entries.unshift({ sql, at: Date.now() });
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(entries.slice(0, 100)));
-  } catch {}
-  if (!$("panel-history").hidden) renderHistory();
-}
-function renderHistory() {
-  const entries = readHistory();
-  $("history").replaceChildren(
-    ...(entries.length
-      ? entries.map((h) =>
-          el("li", {}, item(new Date(h.at).toLocaleString(), h.sql.replace(/\s+/g, " ").slice(0, 120), () => load(h.sql, { kind: "workspace" }), { code: true })),
-        )
-      : [el("li", { className: "muted", textContent: "Nothing yet." })]),
-  );
-}
-$("clear-history").onclick = () => {
-  try {
-    localStorage.removeItem(HISTORY_KEY);
-  } catch {}
-  renderHistory();
+
+// Import: a file from this computer becomes a view named after it.
+const fileInput = $("file-input");
+$("import").onclick = () => fileInput.click();
+fileInput.onchange = async () => {
+  const files = [...fileInput.files];
+  fileInput.value = "";
+  for (const file of files) {
+    const view =
+      file.name
+        .replace(/\.(gz|zst|bz2|xz)$/i, "")
+        .replace(/\.[^.]+$/, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, "_")
+        .replace(/^(\d)/, "_$1") || "imported";
+    try {
+      const buffer = await file.arrayBuffer();
+      const { url } = await engine("addFile", { name: file.name, bytes: buffer }, [buffer]);
+      uploads.push({ name: file.name, bytes: file.size });
+      await run(`CREATE OR REPLACE VIEW ${view} AS SELECT * FROM '${url.replace(/'/g, "''")}';`);
+      await run(`FROM ${view} LIMIT 10;`);
+    } catch (e) {
+      await errorLine(e.message);
+    }
+  }
+  term.focus();
 };
+
+// The Datasets menu.
+const menu = $("dataset-menu");
+const menuButton = $("datasets");
+menu.replaceChildren(
+  ...DATASETS.map((d) =>
+    el("button", {
+      type: "button",
+      role: "menuitem",
+      textContent: d.title,
+      onclick: () => {
+        closeMenu();
+        loadDataset(d);
+        term.focus();
+      },
+    }),
+  ),
+);
+function closeMenu() {
+  menu.hidden = true;
+  menuButton.setAttribute("aria-expanded", "false");
+}
+menuButton.onclick = (e) => {
+  e.stopPropagation();
+  const open = menu.hidden;
+  menu.hidden = !open;
+  menuButton.setAttribute("aria-expanded", String(open));
+  if (open) menu.querySelector("button")?.focus();
+};
+document.addEventListener("click", (e) => {
+  if (!menu.hidden && !menu.contains(e.target)) closeMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !menu.hidden) {
+    closeMenu();
+    menuButton.focus();
+  }
+});
 
 // ---------------------------------------------------------------- start
 
-const linked = new URLSearchParams(location.hash.slice(1)).get("sql");
-editor.value = linked ?? EXAMPLES[0].sql;
-
-fetch("/tour.json")
-  .then((r) => r.json())
-  .then((steps) => {
-    tour = steps;
-    renderTour();
-  })
-  .catch(() => ($("tour").textContent = "The Tour did not load."));
-
+term.write("Loading the engine (about 5 MB)...\r\n");
 engineStarted.then(
-  ({ version, ms }) => {
-    engineChip.textContent = `Ursa ${version} · in your browser · ready in ${(ms / 1000).toFixed(1)} s`;
-    runButton.disabled = false;
-    status.textContent = "Ready. Run the query, or pick a Tour step or an example.";
-    if (linked) run(linked);
+  async () => {
+    const shared = sharedCommands();
+    const wanted = DATASETS.find((d) => d.id === new URLSearchParams(location.search).get("dataset"));
+    queue = queue.then(restart);
+    if (shared.length) {
+      queue = queue.then(() => write(`Replaying ${shared.length} command${shared.length === 1 ? "" : "s"} from a shared link.\r\n`));
+      await runAll(shared);
+    } else if (wanted) {
+      await loadDataset(wanted);
+    }
+    await queue;
+    ready();
+    term.focus();
   },
-  (e) => {
-    engineChip.textContent = "The engine failed to start";
-    showError(e.message);
-  },
+  (e) => term.write(`\x1b[31mThe engine failed to start: ${e.message}\x1b[0m\r\n`),
 );
+
+// For tests: the screen as text, and a promise that resolves once everything
+// queued so far has run.
+window.ursaShell = {
+  async idle() {
+    let seen;
+    do {
+      seen = queue;
+      await seen;
+    } while (seen !== queue);
+  },
+  screen() {
+    const buffer = term.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buffer.length; i++) lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
+    return lines.join("\n").replace(/\n+$/, "");
+  },
+  busy: () => busy,
+  cols: () => term.cols,
+  rows: () => term.rows,
+  selection: () => term.getSelection(),
+  datasets: DATASETS,
+};

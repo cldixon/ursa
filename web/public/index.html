@@ -3,92 +3,58 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ursa Shell</title>
+  <title>Ursa Web Shell</title>
   <meta name="description" content="Graph analytics in SQL, running entirely in your browser: Ursa's engine in WebAssembly over Parquet files.">
+  <script>
+    // The theme before the first paint: the one picked here before, else the system's.
+    try {
+      const saved = localStorage.getItem("ursa-theme");
+      if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+    } catch {}
+  </script>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/vendor/xterm.css">
   <link rel="stylesheet" href="/style.css">
-  <link rel="modulepreload" href="/engine/ursa_wasm.js">
   <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <header class="top">
-    <div class="brand">
-      <h1>Ursa Shell</h1>
-      <p>Graph analytics in SQL, running entirely in your browser.</p>
-    </div>
-    <span id="engine" class="chip" role="status">Loading the engine (about 5 MB)…</span>
-    <nav class="links">
-      <a href="https://github.com/cldixon/ursa">GitHub</a>
-      <a href="https://cldixon.github.io/ursa/sql/">SQL docs</a>
+  <header class="bar">
+    <nav class="menu" aria-label="Shell">
+      <button id="new" type="button" title="Start a new session">New</button>
+      <button id="share" type="button" title="Copy a link that replays this session">Share</button>
+      <button id="import" type="button" title="Add a CSV, Parquet or JSON file from your computer">Import</button>
+      <div class="dropdown">
+        <button id="datasets" type="button" aria-haspopup="menu" aria-expanded="false">
+          Datasets
+          <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div id="dataset-menu" class="dropdown-menu" role="menu" hidden></div>
+      </div>
+      <input id="file-input" type="file" multiple hidden
+             accept=".csv,.tsv,.parquet,.json,.jsonl,.ndjson,.gz,.zst,.bz2,.xz">
     </nav>
+    <a class="brand" href="https://github.com/cldixon/ursa" title="Ursa on GitHub">
+      <svg class="logo" viewBox="0 0 22 22" aria-hidden="true">
+        <!-- The Big Dipper: Ursa Major's seven bright stars, sized by magnitude. -->
+        <path class="logo-line" d="M19.4 4.2 19.2 8.4 15.1 9.1 15.3 5.2 Z M15.3 5.2 11.2 6.0 7.6 4.9 3.2 6.7"/>
+        <g class="logo-star">
+          <circle cx="19.4" cy="4.2" r="1.5"/><circle cx="15.3" cy="5.2" r="1.0"/>
+          <circle cx="15.1" cy="9.1" r="1.15"/><circle cx="19.2" cy="8.4" r="1.2"/>
+          <circle cx="11.2" cy="6.0" r="1.85"/><circle cx="7.6" cy="4.9" r="1.3"/>
+          <circle cx="3.2" cy="6.7" r="1.7"/>
+        </g>
+      </svg>
+      <span><b>Ursa</b> Web Shell</span>
+    </a>
+    <div class="right">
+      <button id="theme" type="button" class="theme" title="Switch between light and dark" aria-label="Switch between light and dark">
+        <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+      </button>
+    </div>
   </header>
 
-  <div class="layout">
-    <aside class="side">
-      <div class="tabs" role="tablist" aria-label="Panels">
-        <button role="tab" data-panel="tour" aria-selected="true">Tour</button>
-        <button role="tab" data-panel="examples" aria-selected="false">Examples</button>
-        <button role="tab" data-panel="data" aria-selected="false">Data</button>
-        <button role="tab" data-panel="functions" aria-selected="false">Functions</button>
-        <button role="tab" data-panel="history" aria-selected="false">History</button>
-      </div>
-      <section id="panel-tour" class="panel" role="tabpanel">
-        <p class="muted">The <a href="https://cldixon.github.io/ursa/sql/getting-started/">Getting Started</a> page, step by step, in its own session. Running a step runs the steps before it first.</p>
-        <ol id="tour" class="steps"></ol>
-      </section>
-      <section id="panel-examples" class="panel" role="tabpanel" hidden>
-        <p class="muted">Queries over the graphs defined in the workspace.</p>
-        <ul id="examples" class="list"></ul>
-      </section>
-      <section id="panel-data" class="panel" role="tabpanel" hidden>
-        <h2>Graphs</h2>
-        <p class="muted">Defined in the workspace at start, over the Parquet files below.</p>
-        <ul id="graphs" class="list"></ul>
-        <h2>Files</h2>
-        <p class="muted">Read any of them by name: <code>SELECT * FROM 'karate_edges.parquet'</code>.</p>
-        <ul id="files" class="list"></ul>
-        <p id="licence" class="muted small"></p>
-      </section>
-      <section id="panel-functions" class="panel" role="tabpanel" hidden>
-        <input id="function-filter" type="search" placeholder="Filter functions" aria-label="Filter functions">
-        <div id="functions"><p class="muted">Loading…</p></div>
-      </section>
-      <section id="panel-history" class="panel" role="tabpanel" hidden>
-        <p class="muted">Queries you ran, newest first. Kept in this browser only.</p>
-        <ol id="history" class="list"></ol>
-        <button id="clear-history" class="quiet">Clear history</button>
-      </section>
-    </aside>
-
-    <main class="work">
-      <div class="toolbar">
-        <span id="session" class="chip session" title="The session the editor runs in">Workspace</span>
-        <span class="hint">Ctrl / ⌘ + Enter runs (the selection, if any)</span>
-        <button id="share" class="quiet" title="Copy a link that runs this query">Copy link</button>
-        <button id="run" class="primary" disabled>Run</button>
-      </div>
-      <textarea id="sql" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
-
-      <section class="results" aria-label="Results">
-        <div class="results-bar">
-          <div id="result-tabs" class="result-tabs" role="tablist" aria-label="Statements"></div>
-          <div class="result-actions">
-            <div class="segmented" role="group" aria-label="View">
-              <button id="view-table" aria-pressed="true">Table</button>
-              <button id="view-text" aria-pressed="false">Text</button>
-            </div>
-            <select id="download" aria-label="Download this result" disabled>
-              <option value="" selected>Download…</option>
-              <option value="csv">CSV</option>
-              <option value="parquet">Parquet</option>
-              <option value="json">JSON</option>
-              <option value="arrow">Arrow IPC</option>
-            </select>
-          </div>
-        </div>
-        <p id="status" class="status" role="status"></p>
-        <div id="output" class="output" aria-live="polite"></div>
-      </section>
-    </main>
-  </div>
+  <main id="terminal" class="terminal" aria-label="Ursa shell"></main>
 </body>
 </html>

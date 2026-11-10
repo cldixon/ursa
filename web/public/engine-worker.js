@@ -1,57 +1,30 @@
 // The engine, in a Web Worker so a long query never freezes the page.
 //
-// It loads the build engine.json names and keeps named sessions, each with its
-// own views and graphs:
-//
-// - "workspace": the editor's session, with the sample graphs defined at start;
-// - "tour": the Tour's, which starts empty, as the Getting Started page does;
-// - "meta": for the page's own lookups (the function reference), so they never
-//   replace the results the user is looking at.
+// It runs the `ursa` shell itself (WebShell, from the ursa-shell crate): the
+// page's terminal sends it each typed line and writes back what it printed,
+// as a terminal shows the CLI's output.
 //
 // Messages are {id, op, ...}; replies are {id, ok: true, ...} or {id, ok: false, error}.
-//   run    {session, sql, maxRows} -> {results, ms}   (see Session.run in ursa-wasm)
-//   export {session, index, format} -> {bytes}         (the last run's result `index`)
-//   reset  {session}                -> {}              (a fresh session)
-import init, { Session, version } from "./engine/ursa_wasm.js";
+//   start     {commands, shortcuts}  -> {version, prompt, promptColor}  (a fresh shell)
+//   feed      {line}           -> {out, err, flow, command, prompt, pending}
+//   cancel    {}               -> {prompt}       (drop a half-typed statement)
+//   width     {columns}        -> {}             (tables fit the terminal)
+//   highlight {text}           -> {text}         (typed text in ANSI colour)
+//   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
+//   export    {format}         -> {bytes}        (the last result, every row)
+import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
-// The workspace's graphs, over Parquet in the bucket (see /data/manifest.json).
-const SETUP = `
-CREATE VIEW karate_members AS SELECT * FROM 'karate_nodes.parquet';
-CREATE VIEW karate_ties    AS SELECT * FROM 'karate_edges.parquet';
-CREATE PROPERTY GRAPH karate
-  VERTEX TABLES (karate_members KEY (id))
-  EDGE TABLES (
-    karate_ties SOURCE KEY (src) REFERENCES karate_members (id)
-                DESTINATION KEY (dst) REFERENCES karate_members (id)
-  );
-CREATE VIEW lesmis_edges AS SELECT * FROM 'lesmis_edges.parquet';
-CREATE PROPERTY GRAPH lesmis EDGE TABLES (lesmis_edges SOURCE KEY (src) DESTINATION KEY (dst));
-CREATE VIEW florentine_edges AS SELECT * FROM 'florentine_edges.parquet';
-CREATE PROPERTY GRAPH florentine EDGE TABLES (florentine_edges SOURCE KEY (src) DESTINATION KEY (dst));
-CREATE VIEW rmat_edges AS SELECT * FROM 'rmat_1m_edges.parquet';
-CREATE PROPERTY GRAPH rmat EDGE TABLES (rmat_edges SOURCE KEY (src) DESTINATION KEY (dst));
-`;
-
-const sessions = new Map();
-
-async function open(name) {
-  const session = new Session();
-  if (name === "workspace") await session.run(SETUP, 0);
-  sessions.set(name, session);
-  return session;
-}
-
-async function get(name) {
-  return sessions.get(name) ?? open(name);
-}
+let shell = null;
+let columns = 80;
+let hostCommands = [];
+let shortcuts = "";
 
 const ready = (async () => {
   const t0 = performance.now();
   const engine = await (await fetch(new URL("./engine/engine.json", import.meta.url))).json();
   await init({ module_or_path: new URL(engine.wasm, self.location.origin) });
-  // The base URL is shared by every session: relative paths are dataset files.
-  new Session().setBaseUrl(new URL("/data/", self.location.origin).href);
-  await open("workspace");
+  // Relative paths are the datasets' files.
+  WebShell.setBaseUrl(new URL("/data/", self.location.origin).href);
   return { version: version(), ms: performance.now() - t0 };
 })();
 
@@ -60,9 +33,17 @@ ready.then(
   (e) => postMessage({ ready: false, error: String(e?.message ?? e) }),
 );
 
-// One request at a time, in order: a session runs one statement list at once.
-let queue = Promise.resolve();
+/** A fresh shell, with the page's own commands and keys. */
+function fresh() {
+  shell?.free();
+  shell = new WebShell();
+  shell.setWidth(columns);
+  for (const [name, args, help] of hostCommands) shell.addHostCommand(name, args, help);
+  if (shortcuts) shell.setShortcuts(shortcuts);
+}
 
+// One request at a time, in order: the shell runs one line at once.
+let queue = Promise.resolve();
 onmessage = ({ data }) => {
   queue = queue.then(() => handle(data));
 };
@@ -70,20 +51,29 @@ onmessage = ({ data }) => {
 async function handle({ id, op, ...args }) {
   try {
     await ready;
-    if (op === "run") {
-      const session = await get(args.session);
-      const t = performance.now();
-      const results = JSON.parse(await session.run(args.sql, args.maxRows ?? 1000));
-      postMessage({ id, ok: true, results, ms: performance.now() - t });
-    } else if (op === "export") {
-      const session = await get(args.session);
-      const bytes = session.export(args.index, args.format);
-      postMessage({ id, ok: true, bytes }, [bytes.buffer]);
-    } else if (op === "reset") {
-      sessions.get(args.session)?.free();
-      sessions.delete(args.session);
-      await get(args.session);
+    if (op === "start") {
+      hostCommands = args.commands ?? hostCommands;
+      shortcuts = args.shortcuts ?? shortcuts;
+      fresh();
+      postMessage({ id, ok: true, version: version(), prompt: shell.prompt(), promptColor: WebShell.promptColor() });
+    } else if (op === "feed") {
+      const result = JSON.parse(await shell.feed(args.line));
+      postMessage({ id, ok: true, ...result, prompt: shell.prompt(), continuation: shell.continuation(), pending: shell.isPending() });
+    } else if (op === "cancel") {
+      shell.cancelInput();
+      postMessage({ id, ok: true, prompt: shell.prompt() });
+    } else if (op === "width") {
+      columns = args.columns;
+      shell?.setWidth(columns);
       postMessage({ id, ok: true });
+    } else if (op === "highlight") {
+      postMessage({ id, ok: true, text: WebShell.highlight(args.text) });
+    } else if (op === "addFile") {
+      const url = await shell.addFile(args.name, new Uint8Array(args.bytes));
+      postMessage({ id, ok: true, url });
+    } else if (op === "export") {
+      const bytes = shell.exportLast(args.format);
+      postMessage({ id, ok: true, bytes }, [bytes.buffer]);
     } else {
       throw new Error(`unknown op ${op}`);
     }
