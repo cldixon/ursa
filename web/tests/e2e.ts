@@ -120,6 +120,26 @@ await type(".timer off");
 await type(".files");
 t = await lastTable();
 check(t.rows.some((r) => r[0] === "karate_edges.parquet"), ".files");
+await type(".version");
+check(/^Ursa v\d/.test(await page.$$eval("#log pre.line", (l) => l.at(-1)?.textContent ?? "")), ".version");
+await type(".help graph");
+check(((await page.textContent("#log")) ?? "").includes("ANY SHORTEST | ALL SHORTEST"), ".help graph");
+await type(".help shortcuts");
+await type(".help timer");
+check((await page.$$eval("#log .help", (h) => h.at(-1)?.children.length ?? 0)) === 2, ".help PATTERN", "one command");
+await type(".history 2");
+check(((await page.$$eval("#log pre.line", (l) => l.at(-1)?.textContent ?? ""))).includes(".help timer"), ".history");
+await type(".dataset");
+check((await page.$$eval("#log .help", (h) => h.at(-1)?.children.length ?? 0)) === datasets.length * 2, ".dataset lists");
+// The forms .help graph shows, on the karate graph: they must parse and run.
+for (const sql of [
+  "FROM GRAPH_TABLE (karate MATCH (a)<-[e]-(b) WHERE a.id = 1 COLUMNS (b.id));",
+  "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 1)-[e]->{1,3}(b) COLUMNS (b.id));",
+  "FROM GRAPH_TABLE (karate MATCH p = TRAIL (a WHERE a.id = 1)-[e]->+(b WHERE b.id = 33) COLUMNS (path_length(p))) LIMIT 5;",
+  "FROM GRAPH_TABLE (karate MATCH p = SHORTEST 2 (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26) COLUMNS (path_length(p), vertices(p), edges(p)));",
+  "SELECT * FROM pagerank(karate, damping => 0.85) LIMIT 3;",
+  "SELECT * FROM algorithms(karate, pagerank(), community => louvain(seed => 1)) LIMIT 3;",
+]) await type(sql);
 check((await errors()).length === errs.length, "no errors from the dot-commands", (await errors()).slice(errs.length).join(" | "));
 
 // Downloads of the last result, in each format.

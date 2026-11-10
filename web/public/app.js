@@ -361,19 +361,117 @@ function setBusy(busy) {
 
 // ---------------------------------------------------------------- dot-commands
 
+// The dot-commands, for .help: [command, arguments, what it does].
 const COMMANDS = [
-  [".clear", "", "Clear the screen (also Ctrl-L)"],
-  [".describe", "NAME", "Describe a graph, table or view"],
-  [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
-  [".files", "[add]", "List the dataset files and imported files; add opens a file"],
-  [".functions", "[NAME]", "List the graph functions, or show one's parameters"],
-  [".graphs", "", "List the graphs (SHOW GRAPHS)"],
-  [".help", "", "Show this message"],
-  [".maxrows", "N", "Show at most N rows of a table (default 40; 0 shows all)"],
-  [".share", "", "Copy a link that replays this session"],
+  [".clear", "", "Clear the terminal screen (also Ctrl+L)"],
+  [".dataset", "?NAME?", "List the sample datasets, or load one: its tables, its graph and example queries"],
+  [".describe", "NAME", "Show the columns of a table or view, or the vertex and edge tables of a graph"],
+  [".export", "FORMAT", "Download the last result as csv, parquet, json or arrow"],
+  [".files", "", "List the files you can query by name: the datasets' and the ones you imported"],
+  [".files add", "", "Pick files from your computer to query (the same as Import)"],
+  [".functions", "?NAME?", "List the graph algorithms, or show one's parameters and output columns"],
+  [".graphs", "", "List the property graphs"],
+  [".help", "?PATTERN?", "Show help for the commands matching PATTERN"],
+  [".history", "?N?", "Show the last N commands (default 20)"],
+  [".maxrows", "COUNT", "Show at most COUNT rows of a result (default 40, 0 = all)"],
+  [".print", "STRING...", "Print literal STRING"],
+  [".share", "", "Copy a link that replays this session's commands"],
   [".tables", "", "List the tables and views"],
   [".timer", "on|off", "Show how long each statement takes"],
+  [".version", "", "Show the version"],
 ];
+
+const HELP_TOPICS = {
+  graph: `Graph SQL: SQL/PGQ (SQL:2023 Part 16), with DuckPGQ's extensions.
+
+Define a graph over tables or views:
+  CREATE PROPERTY GRAPH g
+    VERTEX TABLES (people KEY (id))
+    EDGE TABLES (knows SOURCE KEY (src) REFERENCES people (id)
+                       DESTINATION KEY (dst) REFERENCES people (id));
+  CREATE PROPERTY GRAPH g EDGE TABLES (edges SOURCE KEY (src) DESTINATION KEY (dst));
+
+Match patterns, with GRAPH_TABLE:
+  FROM GRAPH_TABLE (g
+    MATCH (a)-[e]->(b) WHERE a.id = 1
+    COLUMNS (a.id AS source, b.id AS target));
+
+  (a)-[e]->(b)  (a)<-[e]-(b)  (a)-[e]-(b)   an edge out, in, or either way
+  (a WHERE a.age > 30)                      a filter on one element
+  -[e]->{2}  -[e]->{1,3}                    an edge repeated 2 times, or 1 to 3 times
+  -[e]->*  -[e]->+                          any number of times, or at least once
+                                            (with a selector or a path mode)
+  ANY SHORTEST | ALL SHORTEST | SHORTEST k  selectors: which paths to keep
+  WALK | TRAIL | SIMPLE | ACYCLIC           path modes: may a path repeat edges or vertices
+  p = ... COLUMNS (path_length(p), vertices(p), edges(p))
+
+  FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b WHERE b.id = 9)
+    COLUMNS (path_length(p) AS steps, vertices(p) AS route));
+
+Run algorithms, as table functions over a graph:
+  SELECT * FROM pagerank(g, damping => 0.85);
+  SELECT * FROM algorithms(g, pagerank(), community => louvain(seed => 1));
+
+.functions lists the algorithms; .functions NAME shows one's parameters.
+.dataset karate loads a graph to try these on.
+The SQL reference: ${DOCS}`,
+  shortcuts: `Enter          Run the statement once it ends with ; (or a dot-command)
+Shift+Enter    Start a new line
+Ctrl+Enter     Run what is typed, ; or not
+Up, Down       Step through the history
+Ctrl+C         Drop what is typed
+Ctrl+L         Clear the screen
+Tab            Insert two spaces`,
+};
+
+function help(pattern) {
+  const topic = HELP_TOPICS[pattern.toLowerCase()];
+  if (topic) return say(topic);
+  const needle = pattern.toLowerCase().replace(/^\./, "");
+  const shown = COMMANDS.filter(([cmd, , doc]) => !needle || cmd.includes(needle) || doc.toLowerCase().includes(needle));
+  if (!shown.length) throw new Error(`no command matches '${pattern}'`);
+  log.append(
+    el(
+      "div",
+      { className: "help" },
+      ...shown.flatMap(([cmd, args, doc]) => [
+        el("span", {}, el("span", { className: "cmd", textContent: cmd }), args ? el("span", { className: "muted", textContent: ` ${args}` }) : ""),
+        el("span", { textContent: doc }),
+      ]),
+    ),
+  );
+  if (!needle) say("\nRun .help graph for the graph SQL: property graphs, MATCH and algorithms\nRun .help shortcuts for keyboard shortcuts");
+}
+
+function datasets(name) {
+  if (!name) {
+    log.append(
+      el(
+        "div",
+        { className: "help" },
+        ...DATASETS.flatMap((d) => [el("span", { className: "cmd", textContent: d.id }), el("span", { textContent: d.title })]),
+      ),
+    );
+    return;
+  }
+  const d = DATASETS.find((x) => x.id === name.toLowerCase());
+  if (!d) throw new Error(`no dataset named '${name}'; .dataset lists them`);
+  // Queued after this command, not awaited: it runs in the queue it joins.
+  loadDataset(d);
+}
+
+function showHistory(arg) {
+  const n = arg ? Number(arg) : 20;
+  if (!Number.isInteger(n) || n < 1) throw new Error("usage: .history ?N?");
+  const first = Math.max(0, history.length - n);
+  const width = String(history.length).length;
+  const lines = history.slice(first).map((command, i) => {
+    const number = String(first + i + 1).padStart(width);
+    return `<span class="muted">${number}</span>  ${highlightSql(command).replace(/\n/g, `\n${" ".repeat(width + 2)}`)}`;
+  });
+  log.append(el("pre", { className: "line", innerHTML: lines.join("\n") }));
+}
 
 const FUNCTIONS = `SELECT name, family,
        CASE WHEN strpos(summary, '. ') > 0 THEN split_part(summary, '. ', 1) || '.' ELSE summary END AS summary
@@ -384,19 +482,18 @@ async function dotCommand(command, record) {
   const arg = rest.join(" ");
   switch (name.toLowerCase()) {
     case ".help":
-      log.append(
-        el(
-          "div",
-          { className: "help" },
-          ...COMMANDS.flatMap(([cmd, args, doc]) => [
-            el("span", { className: "cmd", textContent: cmd }),
-            el("span", { className: "muted", textContent: args }),
-            el("span", { textContent: doc }),
-          ]),
-        ),
-      );
-      say(`End SQL with ; to run it (Shift+Enter adds a line). The Datasets menu loads a sample graph and queries it.\nThe SQL reference: ${DOCS}`, "muted");
+      return help(arg);
+    case ".version":
+      say(`Ursa v${version}`);
       return;
+    case ".print":
+      say(arg);
+      return;
+    case ".history":
+      return showHistory(arg);
+    case ".dataset":
+    case ".datasets":
+      return datasets(arg);
     case ".clear":
       log.replaceChildren();
       return;
@@ -645,9 +742,9 @@ function loadDataset(d) {
 // ---------------------------------------------------------------- start
 
 function banner() {
-  say("Ursa Web Shell running...", "muted");
-  if (version) say(`Ursa v${version} (in your browser, WebAssembly)`);
-  say('Enter ".help" for usage hints, or pick a graph from Datasets.', "muted");
+  say("Ursa Web Shell running...");
+  if (version) say(`Ursa v${version}`);
+  say('Enter ".help" for usage hints.');
 }
 
 let version = null;

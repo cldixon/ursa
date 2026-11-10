@@ -343,8 +343,7 @@ table.box td.long { max-width: 60ch; overflow: hidden; text-overflow: ellipsis; 
   padding: 4px 12px 0;
 }
 
-.help { display: grid; grid-template-columns: max-content max-content 1fr; column-gap: 16px; margin: 4px 0 10px; }
-.help .cmd { color: var(--dot); }
+.help { display: grid; grid-template-columns: max-content 1fr; column-gap: 4ch; }
 
 @media (max-width: 640px) {
   .bar { grid-template-columns: 1fr auto; height: auto; padding: 8px 12px; row-gap: 6px; }

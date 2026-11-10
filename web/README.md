@@ -23,8 +23,10 @@ static assets and an R2 bucket.
     rows and a footer, as the CLI does.
   - **Dot-commands:** the CLI's `.describe`, `.functions [NAME]`, `.graphs`,
     `.help`, `.maxrows`, `.tables` and `.timer`, and the page's own `.clear`,
-    `.export FORMAT` (downloads the last result as CSV, Parquet, JSON or
-    Arrow), `.files [add]` and `.share`.
+    `.dataset [NAME]`, `.export FORMAT` (downloads the last result as CSV,
+    Parquet, JSON or Arrow), `.files [add]`, `.history [N]`, `.print`,
+    `.share` and `.version`. `.help graph` is a page of the graph SQL (its
+    forms are run by the e2e test) and `.help shortcuts` the keys.
   - **Datasets.** Picking one runs its commands at the prompt, as if typed: its
     views and `CREATE PROPERTY GRAPH`, then two or three queries that show the
     graph functions, `GRAPH_TABLE` patterns and shortest paths.
