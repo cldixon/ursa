@@ -229,7 +229,10 @@ fn run_page(path: &Path) -> Vec<String> {
         let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
         for ((start, end, indent), output) in blessed.into_iter().rev() {
             let pad = " ".repeat(indent);
-            let new: Vec<String> = output.lines().map(|l| format!("{pad}{l}").trim_end().to_string()).collect();
+            let new: Vec<String> = output
+                .lines()
+                .map(|l| format!("{pad}{l}").trim_end().to_string())
+                .collect();
             lines.splice(start..end, new);
         }
         let mut page = lines.join("\n");

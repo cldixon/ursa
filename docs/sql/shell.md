@@ -9,7 +9,7 @@ ursa
 
 ```text
 ursa 0.8.0, database club.ursa. Enter .help for commands, .quit to exit.
-ursa>
+club U
 ```
 
 Type SQL at the prompt. A statement ends with `;` and may span lines. Results print as tables. An error prints a message and the session goes on.

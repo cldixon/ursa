@@ -60,22 +60,24 @@ const QUERY: &str =
 SELECT * FROM karate.nodes ORDER BY id LIMIT 3";
 
 const EXPECTED: &str = "\
-+----+--------+
-| id | degree |
-+----+--------+
-| 33 | 17     |
-| 0  | 16     |
-| 32 | 12     |
-| 2  | 10     |
-| 1  | 9      |
-+----+--------+
-+----+--------+
-| id | club   |
-+----+--------+
-| 0  | Mr. Hi |
-| 1  | Mr. Hi |
-| 2  | Mr. Hi |
-+----+--------+
+┌───────┬────────┐
+│  id   │ degree │
+│ int64 │ uint32 │
+├───────┼────────┤
+│    33 │     17 │
+│     0 │     16 │
+│    32 │     12 │
+│     2 │     10 │
+│     1 │      9 │
+└───────┴────────┘
+┌───────┬─────────┐
+│  id   │  club   │
+│ int64 │ varchar │
+├───────┼─────────┤
+│     0 │ Mr. Hi  │
+│     1 │ Mr. Hi  │
+│     2 │ Mr. Hi  │
+└───────┴─────────┘
 ";
 
 /// `DEFINE` with each `karate_…` file named by `prefix` (`../db/data/`).
@@ -410,13 +412,14 @@ fn open_a_database_matches_getting_started() {
             ]
         )),
         "\
-+----+--------+
-| id | club   |
-+----+--------+
-| 0  | Mr. Hi |
-| 1  | Mr. Hi |
-| 2  | Mr. Hi |
-+----+--------+
+┌───────┬─────────┐
+│  id   │  club   │
+│ int64 │ varchar │
+├───────┼─────────┤
+│     0 │ Mr. Hi  │
+│     1 │ Mr. Hi  │
+│     2 │ Mr. Hi  │
+└───────┴─────────┘
 "
     );
     assert_eq!(
@@ -445,15 +448,16 @@ fn open_a_database_matches_getting_started() {
             ]
         )),
         "\
-+----+----------+
-| id | pagerank |
-+----+----------+
-| 33 | 0.1009   |
-| 0  | 0.097    |
-| 32 | 0.0717   |
-| 2  | 0.0571   |
-| 1  | 0.0529   |
-+----+----------+
+┌───────┬──────────┐
+│  id   │ pagerank │
+│ int64 │  double  │
+├───────┼──────────┤
+│    33 │   0.1009 │
+│     0 │    0.097 │
+│    32 │   0.0717 │
+│     2 │   0.0571 │
+│     1 │   0.0529 │
+└───────┴──────────┘
 "
     );
     let catalog = std::fs::read_to_string(cwd.join("club.ursa")).unwrap();
@@ -497,15 +501,16 @@ fn combine_in_a_database_loads_the_stored_index_in_a_second_process() {
          ORDER BY degree DESC
          LIMIT 5;";
     let expected = "\
-+----+---------+--------+-----------+-----------+
-| id | club    | degree | triangles | community |
-+----+---------+--------+-----------+-----------+
-| 33 | Officer | 17     | 15        | 2         |
-| 0  | Mr. Hi  | 16     | 18        | 0         |
-| 32 | Officer | 12     | 13        | 2         |
-| 2  | Mr. Hi  | 10     | 11        | 0         |
-| 1  | Mr. Hi  | 9      | 12        | 0         |
-+----+---------+--------+-----------+-----------+
+┌───────┬─────────┬────────┬───────────┬───────────┐
+│  id   │  club   │ degree │ triangles │ community │
+│ int64 │ varchar │ uint32 │  uint32   │  uint32   │
+├───────┼─────────┼────────┼───────────┼───────────┤
+│    33 │ Officer │     17 │        15 │         2 │
+│     0 │ Mr. Hi  │     16 │        18 │         0 │
+│    32 │ Officer │     12 │        13 │         2 │
+│     2 │ Mr. Hi  │     10 │        11 │         0 │
+│     1 │ Mr. Hi  │      9 │        12 │         0 │
+└───────┴─────────┴────────┴───────────┴───────────┘
 ";
     assert_eq!(
         ursa_counting(cwd, &["club.ursa", "-c", combine]),
