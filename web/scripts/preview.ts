@@ -19,6 +19,7 @@ const TYPES: Record<string, string> = {
   ".csv": "text/csv",
   ".parquet": "application/vnd.apache.parquet",
   ".svg": "image/svg+xml",
+  ".woff2": "font/woff2",
 };
 
 /** `path` under `root`, or null if it escapes it or does not exist. */
