@@ -1,35 +1,28 @@
 //! Writing results in the `-f` formats.
 //!
-//! The table format is datafusion-cli's: Arrow's pretty printer (ASCII boxes,
-//! values left-aligned), with the column headers still printed when there are
-//! no rows. Adapted from datafusion-cli's `print_format.rs` (Apache-2.0).
-//! CSV, TSV, NDJSON and Arrow stream batch by batch; table and JSON (an array)
-//! are written once the result is complete.
-//!
-//! A table shows at most [`DEFAULT_MAX_ROWS`] rows (`.maxrows N`,
-//! `--max-rows N`; 0 shows every row), as DuckDB's does: a longer result shows
-//! its first half and its last half, three rows of `·` between them, and a
-//! footer that counts the rows (`39,650,447 rows (40 shown)`). The other
-//! formats write every row.
+//! The table format is DuckDB's box table, drawn by [`ursa_shell::table`] (the
+//! browser shell draws the same): each column's type under its name, numbers
+//! to the right, and at most [`DEFAULT_MAX_ROWS`] rows (`.maxrows N`,
+//! `--max-rows N`; 0 shows every row) and as many columns as fit the
+//! terminal. CSV, TSV, NDJSON and Arrow stream batch by batch, and write every
+//! row; table and JSON (an array) are written once the result is complete.
 
-use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
-use arrow::compute::concat_batches;
 use arrow::csv::WriterBuilder as CsvWriterBuilder;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::{ArrayWriter, LineDelimitedWriter};
 use arrow::record_batch::RecordBatch;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
-use arrow::util::pretty::pretty_format_batches_with_options;
+use arrow::util::display::FormatOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
+use ursa_shell::table::{Rows, Style};
+
+pub use ursa_shell::table::DEFAULT_MAX_ROWS;
 
 /// How results are written to stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -48,26 +41,34 @@ pub enum OutputFormat {
     Arrow,
 }
 
-/// How many rows a table shows by default, as in DuckDB.
-pub const DEFAULT_MAX_ROWS: usize = 40;
+/// How a table is drawn: how many rows it shows (0: every row), and how.
+#[derive(Debug, Clone, Copy)]
+pub struct TableStyle {
+    pub max_rows: usize,
+    pub style: Style,
+}
 
-/// Write every batch of `stream` to `out` as `format`. A table shows at most
-/// `max_rows` rows (0: every row); see the module's docs.
+/// Write every batch of `stream` to `out` as `format`, a table as `table`
+/// says; see the module's docs.
 pub async fn write_stream<W: Write>(
     format: OutputFormat,
     mut stream: SendableRecordBatchStream,
     out: &mut W,
     options: &FormatOptions<'_>,
-    max_rows: usize,
+    table: TableStyle,
 ) -> Result<()> {
     let schema = stream.schema();
     match format {
         OutputFormat::Table => {
-            let mut rows = TableRows::new(max_rows);
+            let mut rows = Rows::new(table.max_rows);
             while let Some(batch) = stream.next().await {
                 rows.push(batch?);
             }
-            writeln!(out, "{}", rows.render(schema, options)?)?;
+            write!(
+                out,
+                "{}",
+                rows.finish(&schema, options)?.render(table.style)
+            )?;
         }
         OutputFormat::Csv | OutputFormat::Tsv => {
             let delimiter = if format == OutputFormat::Csv {
@@ -128,129 +129,6 @@ pub async fn write_stream<W: Write>(
     }
     out.flush()?;
     Ok(())
-}
-
-/// The rows a table shows: every row, or, past `max_rows`, the first
-/// `ceil(max_rows / 2)` and the last `floor(max_rows / 2)`, and how many rows
-/// there were. The rows in between are counted and dropped as they arrive.
-struct TableRows {
-    max_rows: usize,
-    /// The first rows: up to `top()` of them, or every row with no cap.
-    head: Vec<RecordBatch>,
-    head_rows: usize,
-    /// Rows after `head`: the last `bottom()` at least, older ones dropped.
-    tail: VecDeque<RecordBatch>,
-    tail_rows: usize,
-    total: usize,
-}
-
-impl TableRows {
-    fn new(max_rows: usize) -> Self {
-        Self {
-            max_rows,
-            head: Vec::new(),
-            head_rows: 0,
-            tail: VecDeque::new(),
-            tail_rows: 0,
-            total: 0,
-        }
-    }
-
-    fn top(&self) -> usize {
-        self.max_rows.div_ceil(2)
-    }
-
-    fn bottom(&self) -> usize {
-        self.max_rows / 2
-    }
-
-    fn push(&mut self, batch: RecordBatch) {
-        let n = batch.num_rows();
-        if n == 0 {
-            return;
-        }
-        self.total += n;
-        let room = if self.max_rows == 0 {
-            n
-        } else {
-            self.top() - self.head_rows
-        };
-        if room > 0 {
-            let taken = room.min(n);
-            self.head.push(batch.slice(0, taken));
-            self.head_rows += taken;
-            if taken < n {
-                self.push_tail(batch.slice(taken, n - taken));
-            }
-        } else {
-            self.push_tail(batch);
-        }
-    }
-
-    fn push_tail(&mut self, batch: RecordBatch) {
-        self.tail_rows += batch.num_rows();
-        self.tail.push_back(batch);
-        // Keep only the batches the last `bottom()` rows are in.
-        while let Some(front) = self.tail.front() {
-            if self.tail_rows - front.num_rows() < self.bottom() {
-                break;
-            }
-            self.tail_rows -= front.num_rows();
-            self.tail.pop_front();
-        }
-    }
-
-    /// The table, with a footer when rows were left out.
-    fn render(self, schema: SchemaRef, options: &FormatOptions<'_>) -> Result<String> {
-        if self.max_rows == 0 || self.total <= self.max_rows {
-            let mut batches = self.head;
-            batches.extend(self.tail);
-            if batches.is_empty() {
-                batches.push(RecordBatch::new_empty(schema));
-            }
-            return Ok(pretty_format_batches_with_options(&batches, options)?.to_string());
-        }
-        let head = concat_batches(&schema, &self.head)?;
-        let tail = concat_batches(&schema, &self.tail)?;
-        let tail = tail.slice(tail.num_rows() - self.bottom(), self.bottom());
-        // Each value as the table would show it, so the left-out rows can be
-        // three rows of `·`.
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        for i in 0..schema.fields().len() {
-            let mut values: Vec<String> = Vec::with_capacity(self.max_rows + 3);
-            let formatter = ArrayFormatter::try_new(head.column(i).as_ref(), options)?;
-            values.extend((0..head.num_rows()).map(|row| formatter.value(row).to_string()));
-            values.extend(std::iter::repeat_n("·".to_string(), 3));
-            let formatter = ArrayFormatter::try_new(tail.column(i).as_ref(), options)?;
-            values.extend((0..tail.num_rows()).map(|row| formatter.value(row).to_string()));
-            columns.push(Arc::new(StringArray::from(values)));
-        }
-        let fields: Vec<Field> = schema
-            .fields()
-            .iter()
-            .map(|f| Field::new(f.name(), DataType::Utf8, true))
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        let table = pretty_format_batches_with_options(&[batch], options)?;
-        Ok(format!(
-            "{table}\n{} rows ({} shown)",
-            thousands(self.total),
-            thousands(head.num_rows() + tail.num_rows())
-        ))
-    }
-}
-
-/// `n` with a comma between each group of three digits.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// A writer that remembers whether a write failed with a broken pipe, for
@@ -333,103 +211,5 @@ pub fn is_broken_pipe(err: &DataFusionError) -> bool {
             matches!(e.as_ref(), ArrowError::IoError(_, e) if e.kind() == std::io::ErrorKind::BrokenPipe)
         }
         _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::array::Int64Array;
-
-    use super::*;
-
-    /// `n` rows of (x, s), with s null for odd x, in batches of `size`.
-    fn batches(n: i64, size: i64) -> (SchemaRef, Vec<RecordBatch>) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, true),
-        ]));
-        let mut out = Vec::new();
-        let mut start = 0;
-        while start < n {
-            let end = (start + size).min(n);
-            let x: Vec<i64> = (start..end).collect();
-            let s: Vec<Option<String>> = x
-                .iter()
-                .map(|x| (x % 2 == 0).then(|| format!("v{x}")))
-                .collect();
-            out.push(
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![
-                        Arc::new(Int64Array::from(x)),
-                        Arc::new(StringArray::from(s)),
-                    ],
-                )
-                .unwrap(),
-            );
-            start = end;
-        }
-        (schema, out)
-    }
-
-    fn render(n: i64, size: i64, max_rows: usize) -> String {
-        let (schema, batches) = batches(n, size);
-        let mut rows = TableRows::new(max_rows);
-        for batch in batches {
-            rows.push(batch);
-        }
-        let options = FormatOptions::default().with_null("NULL");
-        rows.render(schema, &options).unwrap()
-    }
-
-    #[test]
-    fn the_first_and_last_rows_whatever_the_batches() {
-        let expected = "\
-+-----+------+
-| x   | s    |
-+-----+------+
-| 0   | v0   |
-| 1   | NULL |
-| 2   | v2   |
-| ·   | ·    |
-| ·   | ·    |
-| ·   | ·    |
-| 998 | v998 |
-| 999 | NULL |
-+-----+------+
-1,000 rows (5 shown)";
-        for size in [1, 2, 3, 7, 999, 1000] {
-            assert_eq!(render(1000, size, 5), expected, "batches of {size}");
-        }
-    }
-
-    #[test]
-    fn up_to_the_cap_or_with_none_every_row() {
-        for (n, max_rows) in [(5, 5), (4, 5), (0, 5), (50, 0)] {
-            let out = render(n, 3, max_rows);
-            assert_eq!(out.lines().count(), 3 + n as usize + 1, "{out}");
-            assert!(!out.contains('·') && !out.contains("shown"), "{out}");
-        }
-        // One row over.
-        let out = render(6, 4, 5);
-        assert!(out.ends_with("6 rows (5 shown)"), "{out}");
-        let out = render(3, 1, 1);
-        assert!(
-            out.contains("| 0 | v0 |\n| · | ·  |\n| · | ·  |\n| · | ·  |\n+"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn thousands_separators() {
-        for (n, shown) in [
-            (0, "0"),
-            (999, "999"),
-            (1000, "1,000"),
-            (100_000, "100,000"),
-            (39_650_447, "39,650,447"),
-        ] {
-            assert_eq!(thousands(n), shown);
-        }
     }
 }

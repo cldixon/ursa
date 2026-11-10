@@ -29,7 +29,6 @@ use arrow::datatypes::SchemaRef;
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::ArrayWriter;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use arrow::util::pretty::pretty_format_batches_with_options;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::SessionContext;
@@ -37,6 +36,7 @@ use futures::StreamExt;
 use js_sys::{Promise, Uint8Array};
 use serde_json::{json, Value};
 use url::Url;
+use ursa_shell::table::{Rows, Style, DEFAULT_MAX_ROWS};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -93,7 +93,7 @@ impl Session {
     }
 
     /// Run `sql` (one or more statements) and resolve to every result as the
-    /// `ursa` shell prints it: ASCII tables, one after another. Statements that
+    /// `ursa` shell prints it: box tables, one after another. Statements that
     /// return no columns (DDL, `SET`) print nothing. A syntax error anywhere runs
     /// nothing. Rejects with the error message the shell would print.
     pub fn sql(&self, sql: String) -> Promise {
@@ -133,11 +133,11 @@ impl Session {
     ///
     /// ```json
     /// { "statement": "SELECT …", "columns": [{"name": "id", "type": "Int64"}],
-    ///   "rows": [["33"], …], "totalRows": 34, "table": "+----+\n…" }
+    ///   "rows": [["33"], …], "totalRows": 34, "table": "┌────┐\n…" }
     /// ```
     ///
     /// `rows` holds at most `max_rows` rows, each value formatted as the shell
-    /// formats it (`null` for a null); `table` is those rows as the shell's ASCII
+    /// formats it (`null` for a null); `table` is those rows as the shell's
     /// table. A statement with no columns (DDL, `SET`) has `columns: []`. The
     /// results are kept for [`Session::export`] until the next `run`. A syntax
     /// error anywhere runs nothing.
@@ -203,29 +203,38 @@ async fn run_all(ctx: &SessionContext, sql: &str) -> Result<Vec<Stored>> {
         .collect())
 }
 
-/// `batches` as the shell's ASCII table (an empty table when there are none).
-fn table(schema: &SchemaRef, batches: &[RecordBatch], options: &FormatOptions) -> Result<String> {
-    let empty;
-    let batches = if batches.is_empty() {
-        empty = [RecordBatch::new_empty(Arc::clone(schema))];
-        &empty[..]
-    } else {
-        batches
-    };
-    Ok(pretty_format_batches_with_options(batches, options)?.to_string())
+/// `batches` as the shell's table, showing at most `max_rows` rows (0: every
+/// row), with no width limit: what `ursa` prints when its output is not a
+/// terminal.
+fn table(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    options: &FormatOptions,
+    max_rows: usize,
+) -> Result<String> {
+    let mut rows = Rows::new(max_rows);
+    for batch in batches {
+        rows.push(batch.clone());
+    }
+    Ok(rows.finish(schema, options)?.render(Style::default()))
 }
 
 /// Every result as the shell's table format prints it (`ursa-cli`'s
-/// `print::write_stream`, `-f table`): Arrow's pretty printer with the
-/// session's `datafusion.format` options, and a newline after each table.
+/// `print::write_stream`, `-f table`, to a file or pipe): [`ursa_shell`]'s
+/// table with the session's `datafusion.format` options and the default
+/// number of rows.
 async fn run_tables(ctx: &SessionContext, sql: &str) -> Result<String> {
     let results = run_all(ctx, sql).await?;
     let config = ctx.state().config().options().format.clone();
     let options: FormatOptions<'_> = (&config).try_into()?;
     let mut out = String::new();
     for stored in results {
-        out.push_str(&table(&stored.schema, &stored.batches, &options)?);
-        out.push('\n');
+        out.push_str(&table(
+            &stored.schema,
+            &stored.batches,
+            &options,
+            DEFAULT_MAX_ROWS,
+        )?);
     }
     Ok(out)
 }
@@ -300,7 +309,7 @@ fn describe(
     let table = if columns.is_empty() {
         String::new()
     } else {
-        table(&stored.schema, &shown, options)?
+        table(&stored.schema, &shown, options, 0)?
     };
     Ok(json!({
         "statement": text,
@@ -383,7 +392,7 @@ mod tests {
             json!([["1", "a", "0.5"], ["2", null, "1.25"]])
         );
         assert_eq!(rows["columns"][2], json!({"name": "x", "type": "Float64"}));
-        assert!(rows["table"].as_str().unwrap().starts_with("+---+"));
+        assert!(rows["table"].as_str().unwrap().starts_with("┌───"));
     }
 
     #[tokio::test]

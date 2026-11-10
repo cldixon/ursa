@@ -1,0 +1,15 @@
+[package]
+name = "ursa-shell"
+description = "Ursa's shell, apart from the terminal: how results are drawn as tables, shared by the ursa CLI and the browser shell."
+version = "0.9.0-dev"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://cldixon.github.io/ursa/"
+keywords = ["sql", "graph", "shell", "cli"]
+categories = ["command-line-utilities", "database-implementations"]
+
+[dependencies]
+arrow = { workspace = true }
+unicode-width = "0.2"

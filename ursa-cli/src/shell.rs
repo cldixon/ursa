@@ -25,8 +25,11 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
 
 use crate::input::{self, Status};
-use crate::print::{has_columns, is_broken_pipe, write_stream, OutputFormat, DEFAULT_MAX_ROWS};
+use crate::print::{
+    has_columns, is_broken_pipe, write_stream, OutputFormat, TableStyle, DEFAULT_MAX_ROWS,
+};
 use crate::timer::Timer;
+use ursa_shell::table::Style;
 
 /// What the caller does after a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +81,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Show at most N rows of a table (default 40; 0 shows all)",
     ),
     (
+        ".maxwidth",
+        "N",
+        "Draw tables at most N characters wide (0: the terminal's width)",
+    ),
+    (
         ".mode",
         "MODE",
         "Set the output mode: table, csv, tsv, json or ndjson",
@@ -104,6 +112,13 @@ pub struct Shell<O: Write, E: Write> {
     mode: OutputFormat,
     /// How many rows a table shows; 0 shows every row.
     max_rows: usize,
+    /// How wide a table may be; 0: the terminal's width, or no limit when
+    /// the output is not a terminal.
+    max_width: usize,
+    /// The output is a terminal: tables fit its width, and are coloured
+    /// unless `NO_COLOR` is set.
+    terminal: bool,
+    color: bool,
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
@@ -127,6 +142,9 @@ impl<O: Write, E: Write> Shell<O, E> {
             ctx,
             mode,
             max_rows: DEFAULT_MAX_ROWS,
+            max_width: 0,
+            terminal: false,
+            color: false,
             timer: false,
             buffer: String::new(),
             depth: 0,
@@ -162,6 +180,51 @@ impl<O: Write, E: Write> Shell<O, E> {
 
     pub fn set_max_rows(&mut self, max_rows: usize) {
         self.max_rows = max_rows;
+    }
+
+    /// Say that the output is a terminal: tables fit its width and, with
+    /// `color`, dim their types and nulls.
+    pub fn set_terminal(&mut self, color: bool) {
+        self.terminal = true;
+        self.color = color;
+    }
+
+    /// The prompt for a new statement: the database's name (`club` for
+    /// `club.ursa`, `memory` with none) and `U`, as DuckDB's is `memory D`.
+    pub fn prompt(&self) -> String {
+        let name = ursa_engine::database::database(&self.ctx.state())
+            .map(|db| {
+                let name = Path::new(db.name());
+                name.file_stem()
+                    .unwrap_or(name.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| "memory".to_string());
+        format!("{name} U ")
+    }
+
+    /// The prompt while a statement continues: spaces as wide as
+    /// [`Self::prompt`], so the statement's lines line up and copy as SQL.
+    pub fn continuation(&self) -> String {
+        " ".repeat(unicode_width::UnicodeWidthStr::width(
+            self.prompt().as_str(),
+        ))
+    }
+
+    /// How tables are drawn now.
+    fn table_style(&self) -> TableStyle {
+        let max_width = match self.max_width {
+            0 if self.terminal => terminal_width(),
+            n => n,
+        };
+        TableStyle {
+            max_rows: self.max_rows,
+            style: Style {
+                max_width,
+                color: self.color,
+            },
+        }
     }
 
     /// Whether a statement is partly typed (the prompt shows a continuation).
@@ -314,7 +377,8 @@ impl<O: Write, E: Write> Shell<O, E> {
                 }
                 let config = self.ctx.state().config().options().format.clone();
                 let options = (&config).try_into()?;
-                write_stream(self.mode, stream, &mut self.out, &options, self.max_rows).await?;
+                let table = self.table_style();
+                write_stream(self.mode, stream, &mut self.out, &options, table).await?;
                 self.results += 1;
             }
             if self.timer {
@@ -335,6 +399,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             ".help" => self.help(),
             ".mode" => self.mode_command(arg),
             ".maxrows" => self.max_rows_command(arg),
+            ".maxwidth" => self.max_width_command(arg),
             ".timer" => match arg.to_ascii_lowercase().as_str() {
                 "" => {
                     let state = if self.timer { "on" } else { "off" };
@@ -399,6 +464,24 @@ impl<O: Write, E: Write> Shell<O, E> {
             Ok(n) => self.max_rows = n,
             Err(_) => self.error(&format!(
                 "usage: .maxrows N, a number of rows (0 shows every row); got '{arg}'"
+            )),
+        }
+    }
+
+    fn max_width_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            let shown = match self.max_width {
+                0 if self.terminal => "as wide as the terminal".to_string(),
+                0 => "as wide as they need".to_string(),
+                n => format!("at most {n} characters wide"),
+            };
+            self.say(&format!("Tables are drawn {shown}."));
+            return;
+        }
+        match arg.parse::<usize>() {
+            Ok(n) => self.max_width = n,
+            Err(_) => self.error(&format!(
+                "usage: .maxwidth N, a number of characters (0: the terminal's width); got '{arg}'"
             )),
         }
     }
@@ -766,6 +849,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// The terminal's width in characters, or 0 (no limit) if it is unknown.
+fn terminal_width() -> usize {
+    terminal_size::terminal_size().map_or(0, |(w, _)| usize::from(w.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,7 +899,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            "+---+---+\n| x | y |\n+---+---+\n| 1 | 2 |\n+---+---+\n"
+            "┌───────┬───────┐\n│   x   │   y   │\n│ int64 │ int64 │\n├───────┼───────┤\n│     1 │     2 │\n└───────┴───────┘\n"
         );
     }
 
@@ -933,7 +1021,7 @@ mod tests {
             ("ndjson", "{\"x\":1,\"y\":\"a\"}\n"),
             (
                 "TABLE",
-                "+---+---+\n| x | y |\n+---+---+\n| 1 | a |\n+---+---+\n",
+                "┌───────┬─────────┐\n│   x   │    y    │\n│ int64 │ varchar │\n├───────┼─────────┤\n│     1 │ a       │\n└───────┴─────────┘\n",
             ),
         ];
         for (mode, expected) in cases {

@@ -13,7 +13,7 @@ console.log(await session.sql("SELECT * FROM 'karate_edges.csv' LIMIT 3"));
 ```
 
 - `session.sql(text)` runs one or more statements and resolves to every result
-  printed as the `ursa` shell prints it (ASCII tables). It rejects with the
+  printed as the `ursa` shell prints it (box tables). It rejects with the
   shell's error message.
 - `session.sqlArrow(text)` resolves to the last result as an Arrow IPC stream
   (`Uint8Array`).

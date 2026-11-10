@@ -33,11 +33,12 @@ COPY (SELECT * FROM ties) TO 'ties.jsonl';
 ```
 
 ```text
-+-------+
-| count |
-+-------+
-| 78    |
-+-------+
+┌────────┐
+│ count  │
+│ uint64 │
+├────────┤
+│     78 │
+└────────┘
 ```
 
 ```sql
@@ -45,11 +46,12 @@ SELECT count(*) AS ties FROM 'ties.jsonl';
 ```
 
 ```text
-+------+
-| ties |
-+------+
-| 78   |
-+------+
+┌───────┐
+│ ties  │
+│ int64 │
+├───────┤
+│    78 │
+└───────┘
 ```
 
 `STORED AS CSV` (or `PARQUET`, `JSON`, `ARROW`) names the format when the extension does not.
@@ -77,26 +79,30 @@ SELECT count(*) AS both_files FROM read_json(['ties.jsonl', 'ties.json']);
 ```
 
 ```text
-+-------+
-| count |
-+-------+
-| 78    |
-+-------+
-+------+
-| ties |
-+------+
-| 78   |
-+------+
-+-------+
-| count |
-+-------+
-| 78    |
-+-------+
-+------------+
-| both_files |
-+------------+
-| 156        |
-+------------+
+┌────────┐
+│ count  │
+│ uint64 │
+├────────┤
+│     78 │
+└────────┘
+┌───────┐
+│ ties  │
+│ int64 │
+├───────┤
+│    78 │
+└───────┘
+┌────────┐
+│ count  │
+│ uint64 │
+├────────┤
+│     78 │
+└────────┘
+┌────────────┐
+│ both_files │
+│   int64    │
+├────────────┤
+│        156 │
+└────────────┘
 ```
 
 | Function       | Options                                                                                                   |
@@ -158,11 +164,12 @@ SELECT count(*) AS edges FROM karate.edges;
 ```
 
 ```text
-+-------+
-| edges |
-+-------+
-| 78    |
-+-------+
+┌───────┐
+│ edges │
+│ int64 │
+├───────┤
+│    78 │
+└───────┘
 ```
 
 A graph over a view that filters edges is a subgraph. With a vertex table, its nodes are the vertex table's keys, those on no kept edge included; without one, they are the endpoints of the edges it keeps:
@@ -212,13 +219,14 @@ LIMIT 3;
 ```
 
 ```text
-+----+----------+
-| id | pagerank |
-+----+----------+
-| 33 | 0.1009   |
-| 0  | 0.097    |
-| 32 | 0.0717   |
-+----+----------+
+┌───────┬──────────┐
+│  id   │ pagerank │
+│ int64 │  double  │
+├───────┼──────────┤
+│    33 │   0.1009 │
+│     0 │    0.097 │
+│    32 │   0.0717 │
+└───────┴──────────┘
 ```
 
 The edge table must connect one vertex table to itself: `wrote`, from members to posts, is not a graph an algorithm can run on.
@@ -252,13 +260,14 @@ SHOW GRAPHS;
 ```
 
 ```text
-+--------+------------+--------+-------------+--------------+------------+
-| name   | edge_table | source | destination | vertex_table | vertex_key |
-+--------+------------+--------+-------------+--------------+------------+
-| club   | ties       | src    | dst         | members      | id         |
-| club   | wrote      | author | post        | members      | id         |
-| karate | ties       | src    | dst         | members      | id         |
-+--------+------------+--------+-------------+--------------+------------+
+┌─────────┬────────────┬─────────┬─────────────┬──────────────┬────────────┐
+│  name   │ edge_table │ source  │ destination │ vertex_table │ vertex_key │
+│ varchar │  varchar   │ varchar │   varchar   │   varchar    │  varchar   │
+├─────────┼────────────┼─────────┼─────────────┼──────────────┼────────────┤
+│ club    │ ties       │ src     │ dst         │ members      │ id         │
+│ club    │ wrote      │ author  │ post        │ members      │ id         │
+│ karate  │ ties       │ src     │ dst         │ members      │ id         │
+└─────────┴────────────┴─────────┴─────────────┴──────────────┴────────────┘
 ```
 
 ## DESCRIBE GRAPH
@@ -270,14 +279,15 @@ DESCRIBE GRAPH karate;
 ```
 
 ```text
-+------------+-------------+-----------+-------------+--------------+
-| table_name | column_name | data_type | role        | origin       |
-+------------+-------------+-----------+-------------+--------------+
-| nodes      | id          | Int64     | node id     | members.id   |
-| nodes      | club        | Utf8      |             | members.club |
-| edges      | src         | Int64     | source      | ties.src     |
-| edges      | dst         | Int64     | destination | ties.dst     |
-+------------+-------------+-----------+-------------+--------------+
+┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
+│ table_name │ column_name │ data_type │    role     │    origin    │
+│  varchar   │   varchar   │  varchar  │   varchar   │   varchar    │
+├────────────┼─────────────┼───────────┼─────────────┼──────────────┤
+│ nodes      │ id          │ Int64     │ node id     │ members.id   │
+│ nodes      │ club        │ Utf8      │ NULL        │ members.club │
+│ edges      │ src         │ Int64     │ source      │ ties.src     │
+│ edges      │ dst         │ Int64     │ destination │ ties.dst     │
+└────────────┴─────────────┴───────────┴─────────────┴──────────────┘
 ```
 
 ## ATTACH
@@ -301,11 +311,12 @@ SHOW ursa.index_storage_limit;
 ```
 
 ```text
-+--------------------------+-------+
-| name                     | value |
-+--------------------------+-------+
-| ursa.index_storage_limit | 8GiB  |
-+--------------------------+-------+
+┌──────────────────────────┬─────────┐
+│           name           │  value  │
+│         varchar          │ varchar │
+├──────────────────────────┼─────────┤
+│ ursa.index_storage_limit │ 8GiB    │
+└──────────────────────────┴─────────┘
 ```
 
 | Setting                    | Default | Meaning                                                                                                                                         |
@@ -323,11 +334,12 @@ SELECT * FROM degree(karate, direction => 'both') ORDER BY degree DESC LIMIT 1;
 ```
 
 ```text
-+----+--------+
-| id | degree |
-+----+--------+
-| 33 | 17     |
-+----+--------+
+┌───────┬────────┐
+│  id   │ degree │
+│ int64 │ uint32 │
+├───────┼────────┤
+│    33 │     17 │
+└───────┴────────┘
 ```
 
 `SELECT * FROM ursa_functions()` lists them all, and the [function reference](reference/functions.md) describes each one.

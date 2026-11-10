@@ -20,11 +20,6 @@ use rustyline::{Config, Context, Editor, Helper};
 
 use crate::shell::{Flow, Shell, COMMANDS};
 
-/// The prompt for a new statement.
-pub const PROMPT: &str = "ursa> ";
-/// The prompt while a statement continues on the next line.
-pub const CONTINUATION: &str = " ...> ";
-
 /// Read lines from the terminal and feed them to `shell` until `.quit` or
 /// Ctrl-D. History is read from and saved to `history`, if given.
 pub async fn run<O: Write, E: Write>(
@@ -46,12 +41,13 @@ pub async fn run<O: Write, E: Write>(
     // The lines of the statement being typed, for its history entry.
     let mut entry = String::new();
     loop {
+        // `memory U `, or `club U ` with club.ursa open; then spaces as wide.
         let prompt = if shell.is_pending() {
-            CONTINUATION
+            shell.continuation()
         } else {
-            PROMPT
+            shell.prompt()
         };
-        match rl.readline(prompt) {
+        match rl.readline(&prompt) {
             Ok(line) => {
                 if !entry.is_empty() {
                     entry.push('\n');

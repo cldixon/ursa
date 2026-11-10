@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 ursa-engine = { path = "../ursa-engine", version = "0.9.0-dev" }
 ursa-sql = { path = "../ursa-sql", version = "0.9.0-dev" }
+ursa-shell = { path = "../ursa-shell", version = "0.9.0-dev" }
 arrow = { workspace = true, features = ["prettyprint", "ipc"] }
 datafusion = { workspace = true }
 futures = "0.3"
