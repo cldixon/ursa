@@ -90,7 +90,7 @@ check((await tables()) === 3 && !(await errors()), ".dataset karate");
 // SQL at the prompt: one line, several lines, and an error.
 await type("SELECT count(*) AS members FROM members;");
 let t = lastTable(await after("SELECT count(*) AS members"));
-check(t.rows[0]?.[0] === "34" && t.types[0] === "int64", "one line", JSON.stringify(t.rows));
+check(t.rows[0]?.[0] === "34" && t.types[0] === "Int64", "one line", JSON.stringify(t.rows));
 await type("SELECT club,\n       count(*) AS n\nFROM members\nGROUP BY club\nORDER BY club;");
 t = lastTable(await after("SELECT club,"));
 check(JSON.stringify(t.rows) === '[["Mr. Hi","17"],["Officer","17"]]', "several lines", JSON.stringify(t.rows));
