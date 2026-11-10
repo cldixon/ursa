@@ -72,32 +72,28 @@ Notices, such as a slow graph index build or an index the database could not kee
 
 ## Dot-commands
 
-A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one.
+A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one. `.help PATTERN` lists the commands whose name or description has PATTERN in it; `.help graph` is a page on the graph SQL (defining a graph, `MATCH` patterns and algorithms) and `.help shortcuts` lists the keys.
 
 ```text
 memory U .help
-Enter SQL statements ending with ';'. A statement may span lines.
-Ctrl-C cancels the current input or query; Ctrl-D exits.
+.describe NAME       Describe a graph, table or view
+.exit                Exit the shell (also Ctrl-D)
+.functions ?NAME?    List the graph functions, or show one's parameters
+.graphs              List the graphs (SHOW GRAPHS)
+.help ?PATTERN?      Show help for the commands matching PATTERN
+.maxrows N           Show at most N rows of a table (default 40; 0 shows all)
+.maxwidth N          Draw tables at most N characters wide (0: the screen's width)
+.mode MODE           Set the output mode: table, csv, tsv, json or ndjson
+.open FILE.ursa      Open a database file, before anything is defined (as ATTACH)
+.print STRING...     Print literal STRING
+.quit                Exit the shell (also Ctrl-D)
+.read FILE           Run the SQL and dot-commands in FILE
+.tables              List the tables and views
+.timer on|off        Show how long each statement takes (real, user and sys)
+.version             Show the version
 
-.describe NAME        Describe a graph, table or view
-.exit                 Exit the shell (also Ctrl-D)
-.functions [NAME]     List the graph functions, or show one's parameters
-.graphs               List the graphs (SHOW GRAPHS)
-.help                 Show this message
-.maxrows N            Show at most N rows of a table (default 40; 0 shows all)
-.maxwidth N           Draw tables at most N characters wide (0: the terminal's width)
-.mode MODE            Set the output mode: table, csv, tsv, json or ndjson
-.open FILE.ursa       Open a database file, before anything is defined (as ATTACH)
-.quit                 Exit the shell (also Ctrl-D)
-.read FILE            Run the SQL and dot-commands in FILE
-.tables               List the tables and views
-.timer on|off         Show how long each statement takes (real, user and sys)
-
-Any file is a table: SELECT * FROM 'edges.csv' LIMIT 3;
-An edge table is a graph:
-  CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
-SELECT * FROM ursa_functions(); lists the graph functions (as .functions does).
-Docs: https://cldixon.github.io/ursa/sql/
+Run .help graph for the graph SQL: property graphs, MATCH and algorithms
+Run .help shortcuts for keyboard shortcuts
 ```
 
 | Command           | Same as                                    |
@@ -148,17 +144,17 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 
 ### Tables
 
-A table is drawn as DuckDB draws one: each column's name with its type under it, numbers to the right and everything else to the left, and `NULL` for a null.
+A table is drawn as DuckDB draws one: each column's name with its type under it, numbers to the right and everything else to the left, and `NULL` for a null. The types are Arrow's, named as `DESCRIBE` and `arrow_typeof()` name them (`Int64`, `Utf8`, `Float64`, `List(Int64)`).
 
 ```text
 memory U SELECT id, club FROM 'karate_nodes.csv' LIMIT 2;
-┌───────┬─────────┐
-│  id   │  club   │
-│ int64 │ varchar │
-├───────┼─────────┤
-│     0 │ Mr. Hi  │
-│     1 │ Mr. Hi  │
-└───────┴─────────┘
+┌───────┬────────┐
+│  id   │  club  │
+│ Int64 │  Utf8  │
+├───────┼────────┤
+│     0 │ Mr. Hi │
+│     1 │ Mr. Hi │
+└───────┴────────┘
 ```
 
 In a terminal, types and nulls are dimmed; set `NO_COLOR` to turn colour off. Output that is not a terminal (a pipe, a file) has none.
@@ -171,7 +167,7 @@ A table shows at most 40 rows, as DuckDB's does. A longer result shows its first
 memory U SELECT * FROM generate_series(1, 100000);
 ┌────────┐
 │ value  │
-│ int64  │
+│ Int64  │
 ├────────┤
 │      1 │
 │      2 │

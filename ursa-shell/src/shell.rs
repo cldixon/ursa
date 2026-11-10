@@ -4,7 +4,8 @@
 //! that is added to the statement being typed and run once it ends with `;`
 //! (see [`crate::input`]). Results go to the shell's output and errors to its
 //! error stream, and an error never ends the session. The terminal side (line
-//! editing, history, Ctrl-C) is in [`crate::repl`]; `-init` files and
+//! editing, history, Ctrl-C) belongs to the host: `ursa-cli`'s `repl` in a
+//! terminal, the browser shell's line editor in a page. `-init` files and
 //! `~/.ursarc` run through [`Shell::run_file`], like `.read`.
 //!
 //! `-c`, `-f` and SQL on stdin run through [`Shell::run_text`] too, so a
@@ -15,29 +16,36 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
 use arrow::compute::cast;
-use arrow::datatypes::DataType;
-use clap::ValueEnum;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
+use futures::TryStreamExt;
 
+use crate::highlight::{ERROR, RESET};
 use crate::input::{self, Status};
 use crate::print::{
     has_columns, is_broken_pipe, write_stream, OutputFormat, TableStyle, DEFAULT_MAX_ROWS,
 };
+use crate::table::Style;
 use crate::timer::Timer;
-use ursa_shell::table::Style;
 
 /// What the caller does after a line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Flow {
     Continue,
     /// `.quit` or `.exit`; or, in a script, an error, or a reader that
     /// closed the output.
     Exit,
+    /// A dot-command the host added ([`Shell::add_host_command`]), for the
+    /// host to run: the whole line, trimmed.
+    Host(String),
 }
 
 /// `.functions`: each graph function's name, family and the first sentence
@@ -70,11 +78,15 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (".exit", "", "Exit the shell (also Ctrl-D)"),
     (
         ".functions",
-        "[NAME]",
+        "?NAME?",
         "List the graph functions, or show one's parameters",
     ),
     (".graphs", "", "List the graphs (SHOW GRAPHS)"),
-    (".help", "", "Show this message"),
+    (
+        ".help",
+        "?PATTERN?",
+        "Show help for the commands matching PATTERN",
+    ),
     (
         ".maxrows",
         "N",
@@ -83,7 +95,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         ".maxwidth",
         "N",
-        "Draw tables at most N characters wide (0: the terminal's width)",
+        "Draw tables at most N characters wide (0: the screen's width)",
     ),
     (
         ".mode",
@@ -95,6 +107,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "FILE.ursa",
         "Open a database file, before anything is defined (as ATTACH)",
     ),
+    (".print", "STRING...", "Print literal STRING"),
     (".quit", "", "Exit the shell (also Ctrl-D)"),
     (".read", "FILE", "Run the SQL and dot-commands in FILE"),
     (".tables", "", "List the tables and views"),
@@ -103,6 +116,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "on|off",
         "Show how long each statement takes (real, user and sys)",
     ),
+    (".version", "", "Show the version"),
 ];
 
 /// A shell session: an engine session, the shell's settings, and the
@@ -112,13 +126,25 @@ pub struct Shell<O: Write, E: Write> {
     mode: OutputFormat,
     /// How many rows a table shows; 0 shows every row.
     max_rows: usize,
-    /// How wide a table may be; 0: the terminal's width, or no limit when
-    /// the output is not a terminal.
+    /// How wide a table may be; 0: the screen's width, or no limit when
+    /// the output is not a screen.
     max_width: usize,
-    /// The output is a terminal: tables fit its width, and are coloured
-    /// unless `NO_COLOR` is set.
-    terminal: bool,
+    /// The output is a screen (a terminal, or the browser shell's): its
+    /// width now, which tables fit.
+    screen: Option<Box<dyn Fn() -> usize>>,
+    /// Colour tables and the prompt with ANSI escapes.
     color: bool,
+    /// Colour errors red (the error stream is a screen).
+    error_color: bool,
+    /// Dot-commands the host runs: name, arguments, help.
+    host_commands: Vec<(String, String, String)>,
+    /// `.help shortcuts`: the host's keys.
+    shortcuts: String,
+    /// What `.version` says.
+    version: String,
+    /// Keep the last result's rows ([`Self::last_result`]).
+    keep_last: bool,
+    last: Option<(SchemaRef, Vec<RecordBatch>)>,
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
@@ -143,8 +169,14 @@ impl<O: Write, E: Write> Shell<O, E> {
             mode,
             max_rows: DEFAULT_MAX_ROWS,
             max_width: 0,
-            terminal: false,
+            screen: None,
             color: false,
+            error_color: false,
+            host_commands: Vec::new(),
+            shortcuts: TERMINAL_SHORTCUTS.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            keep_last: false,
+            last: None,
             timer: false,
             buffer: String::new(),
             depth: 0,
@@ -182,11 +214,47 @@ impl<O: Write, E: Write> Shell<O, E> {
         self.max_rows = max_rows;
     }
 
-    /// Say that the output is a terminal: tables fit its width and, with
-    /// `color`, dim their types and nulls.
-    pub fn set_terminal(&mut self, color: bool) {
-        self.terminal = true;
+    /// Say that the output is a screen whose width `width` reads (a
+    /// terminal's may change): tables fit it and, with `color`, dim their
+    /// types and nulls.
+    pub fn set_screen(&mut self, width: Box<dyn Fn() -> usize>, color: bool) {
+        self.screen = Some(width);
         self.color = color;
+    }
+
+    /// Add a dot-command that the host runs (the browser's `.share`): `.help`
+    /// lists it, and [`Self::feed`] returns [`Flow::Host`] for it.
+    pub fn add_host_command(&mut self, name: &str, args: &str, help: &str) {
+        self.host_commands
+            .push((name.to_string(), args.to_string(), help.to_string()));
+    }
+
+    /// Keep every row of the last result that had columns, for
+    /// [`Self::last_result`] (the browser's `.export`). It holds the whole
+    /// result in memory, so the CLI does not.
+    pub fn keep_last_result(&mut self) {
+        self.keep_last = true;
+    }
+
+    /// The last result that had columns, every row, if
+    /// [`Self::keep_last_result`] was called.
+    pub fn last_result(&self) -> Option<&(SchemaRef, Vec<RecordBatch>)> {
+        self.last.as_ref()
+    }
+
+    /// Colour errors red: the error stream is a screen that shows colour.
+    pub fn set_error_color(&mut self, color: bool) {
+        self.error_color = color;
+    }
+
+    /// What `.version` says (`ursa --version`'s, which names a nightly build).
+    pub fn set_version(&mut self, version: &str) {
+        self.version = version.to_string();
+    }
+
+    /// What `.help shortcuts` says: the host's keys.
+    pub fn set_shortcuts(&mut self, text: &str) {
+        self.shortcuts = text.trim_end().to_string();
     }
 
     /// The prompt for a new statement: the database's name (`club` for
@@ -214,9 +282,9 @@ impl<O: Write, E: Write> Shell<O, E> {
 
     /// How tables are drawn now.
     fn table_style(&self) -> TableStyle {
-        let max_width = match self.max_width {
-            0 if self.terminal => terminal_width(),
-            n => n,
+        let max_width = match (self.max_width, &self.screen) {
+            (0, Some(width)) => width(),
+            (n, _) => n,
         };
         TableStyle {
             max_rows: self.max_rows,
@@ -322,7 +390,11 @@ impl<O: Write, E: Write> Shell<O, E> {
     }
 
     fn error(&mut self, message: &str) {
-        let _ = writeln!(self.err, "Error: {message}");
+        let _ = if self.error_color {
+            writeln!(self.err, "{ERROR}Error: {message}{RESET}")
+        } else {
+            writeln!(self.err, "Error: {message}")
+        };
         let _ = self.err.flush();
         if self.stop_on_error {
             self.failed = true;
@@ -378,6 +450,18 @@ impl<O: Write, E: Write> Shell<O, E> {
                 let config = self.ctx.state().config().options().format.clone();
                 let options = (&config).try_into()?;
                 let table = self.table_style();
+                let stream = if self.keep_last {
+                    // Every row, for the host to write out later (`.export`).
+                    let schema = stream.schema();
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    self.last = Some((Arc::clone(&schema), batches.clone()));
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        futures::stream::iter(batches.into_iter().map(Ok)),
+                    ))
+                } else {
+                    stream
+                };
                 write_stream(self.mode, stream, &mut self.out, &options, table).await?;
                 self.results += 1;
             }
@@ -396,7 +480,9 @@ impl<O: Write, E: Write> Shell<O, E> {
         };
         match name {
             ".quit" | ".exit" => return Flow::Exit,
-            ".help" => self.help(),
+            ".help" => self.help(arg),
+            ".version" => self.say(&format!("Ursa v{}", self.version)),
+            ".print" => self.say(arg),
             ".mode" => self.mode_command(arg),
             ".maxrows" => self.max_rows_command(arg),
             ".maxwidth" => self.max_width_command(arg),
@@ -418,8 +504,15 @@ impl<O: Write, E: Write> Shell<O, E> {
             },
             ".open" => self.open(arg).await,
             ".functions" => self.functions(arg).await,
+            _ if self.host_commands.iter().any(|(c, _, _)| c == name) => {
+                return Flow::Host(line.to_string());
+            }
             _ => {
-                let message = match did_you_mean(name) {
+                let names = COMMANDS
+                    .iter()
+                    .map(|(c, _, _)| *c)
+                    .chain(self.host_commands.iter().map(|(c, _, _)| c.as_str()));
+                let message = match closest(name, names) {
                     Some(command) => format!(
                         "unknown command '{name}'; did you mean '{command}'? Enter .help for \
                          the list"
@@ -432,22 +525,57 @@ impl<O: Write, E: Write> Shell<O, E> {
         Flow::Continue
     }
 
-    fn help(&mut self) {
-        let mut text = String::from(
-            "Enter SQL statements ending with ';'. A statement may span lines.\n\
-             Ctrl-C cancels the current input or query; Ctrl-D exits.\n\n",
-        );
-        for (name, args, help) in COMMANDS {
-            let usage = format!("{name} {args}");
-            text.push_str(&format!("{usage:<22}{help}\n"));
+    /// `.help`: every command, as DuckDB lists them. `.help graph` and
+    /// `.help shortcuts` are pages of their own; `.help PATTERN` lists the
+    /// commands whose name or help has PATTERN in it.
+    fn help(&mut self, arg: &str) {
+        match arg.to_ascii_lowercase().as_str() {
+            "graph" => return self.write_text(&format!("{}\n", graph_help())),
+            "shortcuts" => return self.write_text(&format!("{}\n", self.shortcuts)),
+            _ => {}
         }
-        text.push_str(&format!(
-            "\nAny file is a table: SELECT * FROM 'edges.csv' LIMIT 3;\n\
-             An edge table is a graph:\n  \
-             CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));\n\
-             SELECT * FROM ursa_functions(); lists the graph functions (as .functions does).\n\
-             Docs: {DOCS_URL}\n"
-        ));
+        let needle = arg.trim_start_matches('.').to_ascii_lowercase();
+        let mut commands: Vec<(&str, &str, &str)> = COMMANDS
+            .iter()
+            .copied()
+            .chain(
+                self.host_commands
+                    .iter()
+                    .map(|(c, a, h)| (c.as_str(), a.as_str(), h.as_str())),
+            )
+            .filter(|(c, _, h)| {
+                needle.is_empty() || c.contains(&needle) || h.to_ascii_lowercase().contains(&needle)
+            })
+            .collect();
+        if commands.is_empty() {
+            return self.error(&format!(
+                "no command matches '{arg}'; enter .help for the list"
+            ));
+        }
+        commands.sort_by_key(|(c, a, _)| (*c, *a));
+        let usage = |c: &str, a: &str| {
+            if a.is_empty() {
+                c.to_string()
+            } else {
+                format!("{c} {a}")
+            }
+        };
+        let width = commands
+            .iter()
+            .map(|(c, a, _)| usage(c, a).len())
+            .max()
+            .unwrap_or(0)
+            + 4;
+        let mut text = String::new();
+        for (c, a, h) in commands {
+            text.push_str(&format!("{:<width$}{h}\n", usage(c, a)));
+        }
+        if needle.is_empty() {
+            text.push_str(
+                "\nRun .help graph for the graph SQL: property graphs, MATCH and algorithms\n\
+                 Run .help shortcuts for keyboard shortcuts\n",
+            );
+        }
         self.write_text(&text);
     }
 
@@ -471,7 +599,7 @@ impl<O: Write, E: Write> Shell<O, E> {
     fn max_width_command(&mut self, arg: &str) {
         if arg.is_empty() {
             let shown = match self.max_width {
-                0 if self.terminal => "as wide as the terminal".to_string(),
+                0 if self.screen.is_some() => "as wide as the screen".to_string(),
                 0 => "as wide as they need".to_string(),
                 n => format!("at most {n} characters wide"),
             };
@@ -481,24 +609,24 @@ impl<O: Write, E: Write> Shell<O, E> {
         match arg.parse::<usize>() {
             Ok(n) => self.max_width = n,
             Err(_) => self.error(&format!(
-                "usage: .maxwidth N, a number of characters (0: the terminal's width); got '{arg}'"
+                "usage: .maxwidth N, a number of characters (0: the screen's width); got '{arg}'"
             )),
         }
     }
 
     fn mode_command(&mut self, arg: &str) {
         if arg.is_empty() {
-            let name = mode_name(self.mode);
+            let name = self.mode.name();
             self.say(&format!("The output mode is {name}."));
             return;
         }
-        match OutputFormat::from_str(arg, true) {
-            Ok(OutputFormat::Arrow) => self.error(
+        match OutputFormat::parse(arg) {
+            Some(OutputFormat::Arrow) => self.error(
                 "the shell cannot show the arrow format; to write an Arrow stream, run \
                  ursa --format arrow -c \"<sql>\" > out.arrows",
             ),
-            Ok(mode) => self.mode = mode,
-            Err(_) => self.error(&format!(
+            Some(mode) => self.mode = mode,
+            None => self.error(&format!(
                 "unknown mode '{arg}'; the modes are table, csv, tsv, json and ndjson"
             )),
         }
@@ -715,13 +843,6 @@ impl<O: Write, E: Write> Shell<O, E> {
     }
 }
 
-/// The name `.mode` shows for a format.
-fn mode_name(mode: OutputFormat) -> String {
-    mode.to_possible_value()
-        .map(|v| v.get_name().to_string())
-        .unwrap_or_default()
-}
-
 /// A file argument, without surrounding quotes.
 fn path_arg(arg: &str) -> Option<PathBuf> {
     let arg = arg.trim();
@@ -816,6 +937,57 @@ fn shift_lines(message: &str, offset: usize) -> String {
     out
 }
 
+/// `.help shortcuts` in a terminal (rustyline's keys).
+const TERMINAL_SHORTCUTS: &str = "\
+Enter          Run the statement once it ends with ; (or a dot-command)
+Up, Down       Step through the history
+Ctrl-R         Search the history
+Tab            Complete a dot-command, or a file name after .read, .open or a quote
+Ctrl-C         Drop what is typed, or cancel the running statement
+Ctrl-D         Exit";
+
+/// `.help graph`: the graph SQL on a page. The e2e test of the browser shell
+/// runs each form it shows.
+fn graph_help() -> String {
+    format!(
+        "\
+Graph SQL: SQL/PGQ (SQL:2023 Part 16), with DuckPGQ's extensions.
+
+Define a graph over tables or views:
+  CREATE PROPERTY GRAPH g
+    VERTEX TABLES (people KEY (id))
+    EDGE TABLES (knows SOURCE KEY (src) REFERENCES people (id)
+                       DESTINATION KEY (dst) REFERENCES people (id));
+  CREATE PROPERTY GRAPH g EDGE TABLES (edges SOURCE KEY (src) DESTINATION KEY (dst));
+
+Match patterns, with GRAPH_TABLE:
+  FROM GRAPH_TABLE (g
+    MATCH (a)-[e]->(b) WHERE a.id = 1
+    COLUMNS (a.id AS source, b.id AS target));
+
+  (a)-[e]->(b)  (a)<-[e]-(b)  (a)-[e]-(b)   an edge out, in, or either way
+  (a WHERE a.age > 30)                      a filter on one element
+  -[e]->{{2}}  -[e]->{{1,3}}                    an edge repeated 2 times, or 1 to 3 times
+  -[e]->*  -[e]->+                          any number of times, or at least once
+                                            (with a selector or a path mode)
+  ANY SHORTEST | ALL SHORTEST | SHORTEST k  selectors: which paths to keep
+  WALK | TRAIL | SIMPLE | ACYCLIC           path modes: may a path repeat edges or vertices
+  p = ... COLUMNS (path_length(p), vertices(p), edges(p))
+
+  FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b WHERE b.id = 9)
+    COLUMNS (path_length(p) AS steps, vertices(p) AS route));
+
+Run algorithms, as table functions over a graph:
+  SELECT * FROM pagerank(g, damping => 0.85);
+  SELECT * FROM algorithms(g, pagerank(), community => louvain(seed => 1));
+
+Any file is a table: SELECT * FROM 'edges.csv' LIMIT 3;
+.functions lists the algorithms; .functions NAME shows one's parameters.
+The SQL reference: {DOCS_URL}"
+    )
+}
+
 /// The dot-command closest to `name`, if one is close enough to be a typo.
 pub fn did_you_mean(name: &str) -> Option<&'static str> {
     closest(name, COMMANDS.iter().map(|(command, _, _)| *command))
@@ -847,11 +1019,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     row[b.len()]
-}
-
-/// The terminal's width in characters, or 0 (no limit) if it is unknown.
-fn terminal_width() -> usize {
-    terminal_size::terminal_size().map_or(0, |(w, _)| usize::from(w.0))
 }
 
 #[cfg(test)]
@@ -899,7 +1066,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            "┌───────┬───────┐\n│   x   │   y   │\n│ int64 │ int64 │\n├───────┼───────┤\n│     1 │     2 │\n└───────┴───────┘\n"
+            "┌───────┬───────┐\n│   x   │   y   │\n│ Int64 │ Int64 │\n├───────┼───────┤\n│     1 │     2 │\n└───────┴───────┘\n"
         );
     }
 
@@ -1021,7 +1188,7 @@ mod tests {
             ("ndjson", "{\"x\":1,\"y\":\"a\"}\n"),
             (
                 "TABLE",
-                "┌───────┬─────────┐\n│   x   │    y    │\n│ int64 │ varchar │\n├───────┼─────────┤\n│     1 │ a       │\n└───────┴─────────┘\n",
+                "┌───────┬──────┐\n│   x   │  y   │\n│ Int64 │ Utf8 │\n├───────┼──────┤\n│     1 │ a    │\n└───────┴──────┘\n",
             ),
         ];
         for (mode, expected) in cases {
@@ -1311,13 +1478,44 @@ mod tests {
     async fn help_points_to_graphs_functions_and_docs() {
         let mut shell = shell();
         let (out, _) = feed(&mut shell, &[".help"]).await;
+        assert!(out.contains("Run .help graph"), "{out}");
+        let (out, _) = feed(&mut shell, &[".help graph"]).await;
         for needle in [
             "CREATE PROPERTY GRAPH g EDGE TABLES",
-            "SELECT * FROM ursa_functions();",
+            "ANY SHORTEST | ALL SHORTEST | SHORTEST k",
+            ".functions lists the algorithms",
             DOCS_URL,
         ] {
             assert!(out.contains(needle), "{needle} missing from:\n{out}");
         }
+        let (out, _) = feed(&mut shell, &[".help shortcuts"]).await;
+        assert!(out.contains("Ctrl-D"), "{out}");
+        let (out, err) = feed(&mut shell, &[".help timer"]).await;
+        assert_eq!(out.lines().count(), 1, "{out}{err}");
+        let (_, err) = feed(&mut shell, &[".help zzzz"]).await;
+        assert!(err.contains("no command matches 'zzzz'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn host_commands_are_listed_and_handed_back() {
+        let mut shell = shell();
+        shell.add_host_command(".share", "", "Copy a link that replays this session");
+        let (out, _) = feed(&mut shell, &[".help"]).await;
+        assert!(out.contains(".share"), "{out}");
+        assert_eq!(
+            shell.feed(".share now").await,
+            Flow::Host(".share now".into())
+        );
+        let (_, err) = feed(&mut shell, &[".shar"]).await;
+        assert!(err.contains("did you mean '.share'?"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn version_and_print() {
+        let mut shell = shell();
+        shell.set_version("1.2.3");
+        let (out, _) = feed(&mut shell, &[".version", ".print hello  world"]).await;
+        assert_eq!(out, "Ursa v1.2.3\nhello  world\n");
     }
 
     #[test]

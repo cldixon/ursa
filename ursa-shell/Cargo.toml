@@ -1,6 +1,6 @@
 [package]
 name = "ursa-shell"
-description = "Ursa's shell, apart from the terminal: how results are drawn as tables, shared by the ursa CLI and the browser shell."
+description = "Ursa's shell apart from the terminal: dot-commands, results drawn as tables, and SQL highlighting, shared by the ursa CLI and the browser shell."
 version = "0.9.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,25 @@ homepage = "https://cldixon.github.io/ursa/"
 keywords = ["sql", "graph", "shell", "cli"]
 categories = ["command-line-utilities", "database-implementations"]
 
+[features]
+# `OutputFormat` as a clap value (`ursa --format`).
+clap = ["dep:clap"]
+
 [dependencies]
+ursa-engine = { path = "../ursa-engine", version = "0.9.0-dev" }
+ursa-sql = { path = "../ursa-sql", version = "0.9.0-dev" }
 arrow = { workspace = true }
+datafusion = { workspace = true }
+futures = "0.3"
 unicode-width = "0.2"
+# A clock that works in the browser too (std's Instant panics there).
+web-time = "1.1"
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+# getrusage, for `.timer`'s user and sys times.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"

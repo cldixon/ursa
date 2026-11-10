@@ -1,7 +1,7 @@
 //! The interactive shell, driven through a pseudo-terminal as a person
 //! drives it. The read–eval loop itself is unit-tested in `src/shell.rs`;
 //! this checks the terminal side: the banner, `~/.ursarc`, the prompts,
-//! multi-line input, Ctrl-C, history and Ctrl-D.
+//! multi-line input, Ctrl-C, history and Ctrl-D, and colour.
 #![cfg(unix)]
 
 use std::process::Command;
@@ -10,6 +10,9 @@ use rexpect::session::{spawn_command, PtySession};
 
 const TIMEOUT_MS: u64 = 30_000;
 
+/// The shell in a terminal without colour (`NO_COLOR`), so what is typed is
+/// echoed as typed. With colour the line editor redraws the whole line,
+/// prompt and all, at each key (see `colour_in_a_colour_terminal`).
 fn shell(home: &std::path::Path, args: &[&str]) -> PtySession {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ursa"));
     command
@@ -17,8 +20,30 @@ fn shell(home: &std::path::Path, args: &[&str]) -> PtySession {
         .current_dir(home)
         .env("HOME", home)
         .env_remove("URSA_HISTORY")
-        .env("TERM", "xterm");
+        .env("TERM", "xterm")
+        .env("NO_COLOR", "1");
     spawn_command(command, Some(TIMEOUT_MS)).expect("ursa starts in a pseudo-terminal")
+}
+
+/// In a colour terminal the prompt is orange, keywords are bold as they are
+/// typed, and a table's types are dimmed.
+#[test]
+fn colour_in_a_colour_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ursa"));
+    command
+        .args(["--no-history"])
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR");
+    let mut p = spawn_command(command, Some(TIMEOUT_MS)).expect("ursa starts in a pseudo-terminal");
+    p.exp_string("\x1b[1;38;5;208mmemory U \x1b[0m").unwrap();
+    p.send_line("SELECT 42 AS answer;").unwrap();
+    p.exp_string("\x1b[1mSELECT\x1b[0m").unwrap();
+    p.exp_string(&bytes("│ \x1b[90mInt64 \x1b[0m │")).unwrap();
+    p.send_line(".quit").unwrap();
+    p.exp_eof().unwrap();
 }
 
 /// `s` as rexpect sees it: it reads the terminal a byte at a time, each
