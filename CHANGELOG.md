@@ -219,6 +219,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a community, so `count(DISTINCT louvain)` counts them; count
   communities of more than one member with `GROUP BY louvain HAVING
   count(*) > 1`.
+- **Louvain builds its working graph in less memory** (#352). The graph was
+  scattered into padded `(u32, f64)` pairs, 16 bytes an entry, and copied
+  out while they were still held, so building it peaked at about the sum of
+  two copies of the adjacency (5.9 GB on the Bluesky follows graph, 95.7M
+  edges). Now the scatter buffers become the final arrays, compacted in
+  place; targets and weights are separate arrays (12 bytes an entry); and an
+  unweighted run scatters 4-byte targets and counts its parallel edges for
+  their weights. Results are unchanged, bit for bit. On an R-MAT graph of
+  100M edges (4.3M nodes), Louvain's peak heap went from 5,734 MB to
+  3,704 MB unweighted and to 4,928 MB weighted (peak RSS 6.50 → 4.08 GB and
+  7.28 → 5.57 GB); the building step itself fell from about 5.5 GB to about
+  2.4 GB, and the peak is now aggregating the first level. `cargo run
+  --release -p ursa-core --example louvain_memory` measures it.
 - **SQL: `hop` returns `(seed, id, distance)`** (breaking, #328). It
   returned `(src, dst)`, but its rows are nodes reached from a seed, not
   edges: `seed` is the seed, `id` a node reached and `distance` (Int64) the
