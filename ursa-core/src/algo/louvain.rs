@@ -890,6 +890,12 @@ mod tests {
     /// dependency): enough edges to take `from_topology`'s parallel path, with
     /// parallel edges, opposite edges and self-loops.
     fn random_weighted(n: u32, m: usize) -> (Topology, Vec<f64>) {
+        let (src, dst, w) = random_edges(n, m);
+        (Topology::build(n as usize, src, dst), w)
+    }
+
+    /// The edge list behind [`random_weighted`]: sources, targets, weights.
+    fn random_edges(n: u32, m: usize) -> (Vec<u32>, Vec<u32>, Vec<f64>) {
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = move || {
             state = state
@@ -910,7 +916,121 @@ mod tests {
             dst.push(b);
             w.push(((i % 89) as f64 + 1.0).sqrt() / 7.0);
         }
-        (Topology::build(n as usize, src, dst), w)
+        (src, dst, w)
+    }
+
+    /// Modularity (γ = 1) of `comm` over the symmetrised edge list, computed
+    /// from the edges themselves, not from Louvain's working graph.
+    fn modularity(src: &[u32], dst: &[u32], w: Option<&[f64]>, comm: &[u32]) -> f64 {
+        let k = comm.iter().max().map_or(0, |&c| c as usize + 1);
+        let (mut tot, mut intra, mut m2) = (vec![0.0f64; k], 0.0f64, 0.0f64);
+        for (i, (&s, &d)) in src.iter().zip(dst).enumerate() {
+            let wt = w.map_or(1.0, |w| w[i]);
+            let (cs, cd) = (comm[s as usize] as usize, comm[d as usize] as usize);
+            tot[cs] += wt;
+            tot[cd] += wt;
+            m2 += 2.0 * wt;
+            if cs == cd {
+                intra += 2.0 * wt;
+            }
+        }
+        intra / m2 - tot.iter().map(|t| (t / m2) * (t / m2)).sum::<f64>()
+    }
+
+    /// FNV-1a over a sequence of words.
+    fn fnv(words: impl IntoIterator<Item = u64>) -> u64 {
+        words.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, x| {
+            (h ^ x).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// Exact results, pinned (#352): the community count, modularity bits and
+    /// a hash of the labels for fixed seeds, unweighted and weighted, masked
+    /// and not, on a graph big enough for the parallel build; and a hash of
+    /// the level-0 working graph. A change to how the working graph is built
+    /// or stored must leave every one of these bit for bit as it is.
+    #[test]
+    fn results_are_pinned() {
+        let n = 5000u32;
+        let (src, dst, w) = random_edges(n, 120_000);
+        let t = Topology::build(n as usize, src.clone(), dst.clone());
+        let keep: Vec<bool> = (0..src.len()).map(|e| e % 5 != 2).collect();
+        let mask = EdgeMask::from_bools(&keep);
+        fn kept<T: Copy>(xs: &[T], keep: &[bool]) -> Vec<T> {
+            xs.iter().zip(keep).filter(|p| *p.1).map(|p| *p.0).collect()
+        }
+        let masked_edges = (kept(&src, &keep), kept(&dst, &keep), kept(&w, &keep));
+        let mut got = Vec::new();
+        for masked in [false, true] {
+            let (s, d, ww) = if masked {
+                (&masked_edges.0, &masked_edges.1, &masked_edges.2)
+            } else {
+                (&src, &dst, &w)
+            };
+            let mask = masked.then_some(&mask);
+            for weighted in [false, true] {
+                for seed in [1u64, 9] {
+                    let comm = if weighted {
+                        louvain_weighted(&t, &w, mask, 1.0, Some(seed))
+                    } else {
+                        louvain(&t, mask, 1.0, Some(seed))
+                    };
+                    let q = modularity(s, d, weighted.then_some(ww.as_slice()), &comm);
+                    let k = comm.iter().max().unwrap() + 1;
+                    let h = fnv(comm.iter().map(|&c| u64::from(c)));
+                    got.push((masked, weighted, seed, k, q.to_bits(), h));
+                }
+                let g = Graph::from_topology(&t, weighted.then_some(w.as_slice()), mask, None);
+                let h = fnv(g
+                    .offsets
+                    .iter()
+                    .map(|&o| o as u64)
+                    .chain(g.targets.iter().map(|&v| u64::from(v)))
+                    .chain(g.weights.iter().map(|x| x.to_bits()))
+                    .chain(g.self_loop.iter().map(|x| x.to_bits()))
+                    .chain(g.k.iter().map(|x| x.to_bits()))
+                    .chain([g.m2.to_bits()]));
+                got.push((masked, weighted, 0, 0, 0, h));
+            }
+        }
+        // (masked, weighted, seed, communities, modularity bits, labels hash);
+        // seed 0 rows are the level-0 graph's hash.
+        let want: &[(bool, bool, u64, u32, u64, u64)] = &[
+            (
+                false,
+                false,
+                1,
+                20,
+                4604229447551481594,
+                2248463203008460393,
+            ),
+            (false, false, 9, 21, 4604228329304253869, 613740474174045293),
+            (false, false, 0, 0, 0, 5059561701017657901),
+            (false, true, 1, 20, 4604229012191403382, 6018945348175921665),
+            (
+                false,
+                true,
+                9,
+                21,
+                4604228104913520882,
+                17737549763898365559,
+            ),
+            (false, true, 0, 0, 0, 6124457408852198281),
+            (
+                true,
+                false,
+                1,
+                21,
+                4604241415289548926,
+                16938039130672030744,
+            ),
+            (true, false, 9, 21, 4604237435839331312, 9774245703022877507),
+            (true, false, 0, 0, 0, 318761951090822375),
+            (true, true, 1, 21, 4604240838659378926, 753696038131262450),
+            (true, true, 9, 21, 4604232695396470159, 7947206719753406432),
+            (true, true, 0, 0, 0, 8722660127737123802),
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]
