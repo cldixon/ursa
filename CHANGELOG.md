@@ -508,6 +508,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `CREATE PROPERTY GRAPH` and `pagerank` example, run in CI with the SQL
   docs. The Python library is the second path (#354).
 
+- The browser shell's accessibility, look and onboarding. Tab and Shift+Tab
+  move the focus out of the terminal (they inserted spaces, so the keyboard
+  could not leave it), and the Datasets menu is a menu button: arrow keys,
+  Home, End, Enter, Space and Escape. A click on the theme toggle, Import,
+  Share, New or a dataset hands the keys back to the terminal; from the
+  keyboard the focus stays put. The grey text (types, footers, nulls) is
+  5.5:1 on white (it was 3.6:1). The logo is drawn at a legible size, the
+  favicon has no white tile and follows a dark browser, and the scrollbars
+  take the theme. On a phone the bar is one row (icons for New, Share and
+  Import under 420px), the terminal's input is 16px so iOS does not zoom
+  in, and a dataset's SQL is broken at spaces to fit the screen rather than
+  wrapped mid-word. Each dataset explains its steps in `--` comments at the
+  prompt, and the R-MAT dataset turns `.timer on`.
+
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc
   miscompiled the path search's target check at `opt-level` "s" and "z",

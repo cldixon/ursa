@@ -22,21 +22,21 @@
 <body>
   <header class="bar">
     <nav class="menu" aria-label="Shell">
-      <button id="new" type="button" title="Start a new session">New</button>
-      <button id="share" type="button" title="Copy a link that replays this session">Share</button>
-      <button id="import" type="button" title="Add a CSV, Parquet or JSON file from your computer">Import</button>
+      <button id="new" type="button" title="Start a new session"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">New</span></button>
+      <button id="share" type="button" title="Copy a link that replays this session"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3A4 4 0 0 0 13 5.3l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">Share</span></button>
+      <button id="import" type="button" title="Add a CSV, Parquet or JSON file from your computer"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7.5 10.5 12 15l4.5-4.5M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">Import</span></button>
       <div class="dropdown">
-        <button id="datasets" type="button" aria-haspopup="menu" aria-expanded="false">
+        <button id="datasets" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="dataset-menu">
           Datasets
           <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
-        <div id="dataset-menu" class="dropdown-menu" role="menu" hidden></div>
+        <div id="dataset-menu" class="dropdown-menu" role="menu" aria-labelledby="datasets" hidden></div>
       </div>
       <input id="file-input" type="file" multiple hidden
              accept=".csv,.tsv,.parquet,.json,.jsonl,.ndjson,.gz,.zst,.bz2,.xz">
     </nav>
     <a class="brand" href="https://github.com/cldixon/ursa" title="Ursa on GitHub">
-      <svg class="logo" viewBox="0 0 22 22" aria-hidden="true">
+      <svg class="logo" viewBox="1 2.2 20.4 8.6" aria-hidden="true">
         <!-- The Big Dipper: Ursa Major's seven bright stars, sized by magnitude. -->
         <path class="logo-line" d="M19.4 4.2 19.2 8.4 15.1 9.1 15.3 5.2 Z M15.3 5.2 11.2 6.0 7.6 4.9 3.2 6.7"/>
         <g class="logo-star">
@@ -46,7 +46,7 @@
           <circle cx="3.2" cy="6.7" r="1.7"/>
         </g>
       </svg>
-      <span><b>Ursa</b> Web Shell</span>
+      <span class="label"><b>Ursa</b> Web Shell</span>
     </a>
     <div class="right">
       <button id="theme" type="button" class="theme" title="Switch between light and dark" aria-label="Switch between light and dark">

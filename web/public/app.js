@@ -84,8 +84,9 @@ const THEMES = {
     selectionBackground: "#1f3e8c33", selectionInactiveBackground: "#1f3e8c22",
     black: "#12120f", red: "#c0262d", green: "#3f7f3f", yellow: "#a8650f", blue: "#1f3e8c",
     magenta: "#7a3e8c", cyan: "#2f6f7f", white: "#5a5852",
-    brightBlack: "#8a877f", brightRed: "#c4491b", brightGreen: "#3f7f3f", brightYellow: "#b07728",
+    brightBlack: "#6b6963", brightRed: "#c4491b", brightGreen: "#3f7f3f", brightYellow: "#b07728",
     brightBlue: "#4b6cb0", brightMagenta: "#7a3e8c", brightCyan: "#2f6f7f", brightWhite: "#12120f",
+    scrollbarSliderBackground: "#12120f26", scrollbarSliderHoverBackground: "#12120f4d", scrollbarSliderActiveBackground: "#12120f66",
     prompt: "#c4491b",
   },
   dark: {
@@ -95,6 +96,7 @@ const THEMES = {
     magenta: "#d6a8ff", cyan: "#9fd8e0", white: "#f4f1ea",
     brightBlack: "#8a877f", brightRed: "#ff9f51", brightGreen: "#8fd18f", brightYellow: "#ffd2a1",
     brightBlue: "#c8d6ff", brightMagenta: "#d6a8ff", brightCyan: "#9fd8e0", brightWhite: "#ffffff",
+    scrollbarSliderBackground: "#f4f1ea26", scrollbarSliderHoverBackground: "#f4f1ea4d", scrollbarSliderActiveBackground: "#f4f1ea66",
     prompt: "#ff9f51",
   },
 };
@@ -112,13 +114,17 @@ function currentTheme() {
   if (set) return set;
   return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
-$("theme").onclick = () => {
+// A click on the bar's buttons hands the keys back to the terminal; pressed
+// from the keyboard (a click with no pointer), they keep the focus.
+const byPointer = (e) => e.detail > 0;
+$("theme").onclick = (e) => {
   const next = currentTheme() === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   try {
     localStorage.setItem("ursa-theme", next);
   } catch {}
   term.options.theme = xtermTheme(next);
+  if (byPointer(e)) term.focus();
 };
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   term.options.theme = xtermTheme(currentTheme());
@@ -158,6 +164,9 @@ new ResizeObserver(() => {
 }).observe($("terminal"));
 
 term.attachCustomKeyEventHandler((e) => {
+  // Tab and Shift+Tab move the focus on, as anywhere on a page (there is no
+  // completion for them to do), so the keyboard can leave the terminal.
+  if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return false;
   if (e.type !== "keydown") return true;
   // Ctrl+C (Cmd+C) with text selected copies it, as in a terminal app.
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && term.hasSelection()) {
@@ -513,7 +522,7 @@ function submitTyped() {
  * they are skipped if a fresh session starts before they run. What is being
  * typed is put back afterwards. Resolves to whether all of them ran.
  */
-function runAll(commands, { session = generation } = {}) {
+function runAll(commands, { session = generation, fit = false } = {}) {
   let ok = true;
   const jobs = commands.map((command) =>
     enqueue(async () => {
@@ -524,7 +533,8 @@ function runAll(commands, { session = generation } = {}) {
       cursor = 0;
       // A statement left half typed would take this command as its next line.
       if (statement.length) await cancelPending();
-      for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+      const lines = fit ? fitLines(command, term.cols - prompt.length - 1) : command.split("\n");
+      for (const line of lines) ok = (await feed(line, { echo: true })) && ok;
       return ok;
     }),
   );
@@ -532,6 +542,52 @@ function runAll(commands, { session = generation } = {}) {
 }
 
 const run = (command) => runAll([command]);
+
+/**
+ * The lines of `sql`, those wider than `width` broken at spaces, so that a
+ * narrow terminal doesn't wrap them mid-word. A space in a quoted string or
+ * after `--` is no place to break; a broken comment carries on as a comment.
+ * A break goes on the next line, indented two more than its own; a line
+ * indented too far to break loses its indent first.
+ */
+function fitLines(sql, width) {
+  const out = [];
+  for (const line of sql.split("\n")) {
+    const indent = line.match(/^\s*/)[0];
+    const comment = line.trimStart().startsWith("--");
+    let pad = indent + (comment ? "-- " : "  ");
+    let rest = line;
+    let from = indent.length; // breaks come after this, so each line holds something
+    while (rest.length > width) {
+      let at = -1;
+      let quote = "";
+      for (let i = 0; i <= width && i < rest.length; i++) {
+        const c = rest[i];
+        if (quote) {
+          if (c === quote) quote = "";
+        } else if (!comment && (c === "'" || c === '"')) {
+          quote = c;
+        } else if (!comment && c === "-" && rest[i + 1] === "-") {
+          break;
+        } else if (c === " " && i > from && rest[i - 1] !== " ") {
+          at = i;
+        }
+      }
+      if (at < 0) {
+        if (rest.length - rest.trimStart().length <= 2) break;
+        rest = "  " + rest.trimStart();
+        pad = comment ? "  -- " : "    ";
+        from = 2;
+        continue;
+      }
+      out.push(rest.slice(0, at));
+      rest = pad + rest.slice(at).trimStart();
+      from = pad.length;
+    }
+    out.push(rest);
+  }
+  return out;
+}
 
 /** Drop the statement the shell holds, unrun. */
 async function cancelPending() {
@@ -546,7 +602,8 @@ const LOOKS = /^\s*\.(help|tables|graphs|describe|functions|version|print|histor
 /** Feed one line to the shell and write what it printed. True if no error. */
 async function feed(line, { echo }) {
   if (echo) {
-    const { text: ansi } = await engine("highlight", { text: line });
+    // The shell's highlighter leaves comments plain: the page greys them.
+    const { text: ansi } = /^\s*--/.test(line) ? { text: `\x1b[90m${line}\x1b[0m` } : await engine("highlight", { text: line });
     await write(`${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
   }
   statement.push(line);
@@ -700,14 +757,14 @@ function fresh() {
   return session;
 }
 
-$("new").onclick = () => {
+$("new").onclick = (e) => {
   fresh();
-  term.focus();
+  if (byPointer(e)) term.focus();
 };
 
 function loadDataset(d) {
   const session = fresh();
-  return runAll(d.commands, { session });
+  return runAll(d.commands, { session, fit: true });
 }
 
 // Share: a link whose fragment holds the session's commands, replayed on open.
@@ -735,9 +792,9 @@ async function share() {
   if (uploads.length) await write("Imported files stay in this browser: whoever opens the link imports them again.\r\n");
   return true;
 }
-$("share").onclick = () => {
+$("share").onclick = (e) => {
   run(".share");
-  term.focus();
+  if (byPointer(e)) term.focus();
 };
 
 function history_replace(url) {
@@ -758,7 +815,10 @@ function sharedCommands() {
 
 // Import: a file from this computer becomes a view named after it.
 const fileInput = $("file-input");
-$("import").onclick = () => fileInput.click();
+$("import").onclick = (e) => {
+  fileInput.click();
+  if (byPointer(e)) term.focus();
+};
 fileInput.onchange = () => {
   const files = [...fileInput.files];
   fileInput.value = "";
@@ -781,7 +841,8 @@ fileInput.onchange = () => {
   term.focus();
 };
 
-// The Datasets menu.
+// The Datasets menu, a menu button: arrow keys, Home and End move between
+// its items, Enter or Space picks one, Escape (or Tab) closes it.
 const menu = $("dataset-menu");
 const menuButton = $("datasets");
 menu.replaceChildren(
@@ -789,26 +850,49 @@ menu.replaceChildren(
     el("button", {
       type: "button",
       role: "menuitem",
+      tabIndex: -1,
       textContent: d.title,
-      onclick: () => {
+      onclick: (e) => {
         closeMenu();
         loadDataset(d);
-        term.focus();
+        (byPointer(e) ? term : menuButton).focus();
       },
     }),
   ),
 );
+const menuItems = () => [...menu.querySelectorAll('[role="menuitem"]')];
+function openMenu(at = 0) {
+  menu.hidden = false;
+  menuButton.setAttribute("aria-expanded", "true");
+  menuItems().at(at)?.focus();
+}
 function closeMenu() {
   menu.hidden = true;
   menuButton.setAttribute("aria-expanded", "false");
 }
 menuButton.onclick = (e) => {
   e.stopPropagation();
-  const open = menu.hidden;
-  menu.hidden = !open;
-  menuButton.setAttribute("aria-expanded", String(open));
-  if (open) menu.querySelector("button")?.focus();
+  if (menu.hidden) openMenu();
+  else closeMenu();
 };
+menuButton.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  openMenu(e.key === "ArrowDown" ? 0 : -1);
+});
+menu.addEventListener("keydown", (e) => {
+  const items = menuItems();
+  const at = items.indexOf(document.activeElement);
+  const to = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: items.length - 1 }[e.key];
+  if (to !== undefined) {
+    e.preventDefault();
+    items[(to + items.length) % items.length].focus();
+  } else if (e.key === "Tab") {
+    // Focus moves on from the menu button; the menu closes behind it.
+    menuButton.focus();
+    closeMenu();
+  }
+});
 document.addEventListener("click", (e) => {
   if (!menu.hidden && !menu.contains(e.target)) closeMenu();
 });
