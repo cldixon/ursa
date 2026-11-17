@@ -72,7 +72,7 @@ Notices, such as a slow graph index build or an index the database could not kee
 
 ## Dot-commands
 
-A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one. `.help PATTERN` lists the commands whose name or description has PATTERN in it; `.help graph` is a page on the graph SQL (defining a graph, `MATCH` patterns and algorithms) and `.help shortcuts` lists the keys.
+A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one. A `;` at the end of a command is ignored (`.tables;`), except by `.print`, which prints its text as it is. `.help PATTERN` lists the commands whose name or description has PATTERN in it; `.help graph` is a page on the graph SQL (defining a graph, `MATCH` patterns and algorithms) and `.help shortcuts` lists the keys.
 
 ```text
 memory U .help
@@ -121,7 +121,9 @@ Output columns:
 
 A name that is not a function gets a suggestion, as a mistyped command does. `SELECT * FROM ursa_functions()` has the same information as columns, for programs.
 
-`.mode` with no argument shows the current mode, `.maxrows` how many rows a table shows, `.maxwidth` how wide a table may be, and `.timer` whether the timer is on. A mistyped command gets a suggestion:
+`.describe NAME` takes the name as `.tables` and `.graphs` list it, in any case unless it is quoted: `.describe Mixed` describes a table created as `"Mixed"`. A qualified name (`s.t`) works too.
+
+`.mode` with no argument shows the current mode, `.maxrows` how many rows a table shows, `.maxwidth` how wide a table may be, and `.timer` whether the timer is on. A mistyped command, or the start of one (`.q`, `.tab`), gets a suggestion; it is not run:
 
 ```text
 memory U .grpahs
@@ -140,7 +142,7 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 [{"id":0,"degree":16},{"id":1,"degree":8}]
 ```
 
-`--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows.
+`--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows: a second result, or none at all (a script of only `CREATE` statements), is an error. `.mode` cannot switch to it.
 
 ### Tables
 
@@ -187,7 +189,7 @@ memory U SELECT * FROM generate_series(1, 100000);
 
 ### Wide results
 
-In a terminal a table is as wide as the terminal at most. A wider result first cuts long values short (`a long value…`), then leaves out columns from the middle, showing a `…` column in their place and saying so in the footer: `17 columns (10 shown)`. `.maxwidth N` sets the width instead; `.maxwidth 0` goes back to the terminal's. Output that is not a terminal is never cut.
+In a terminal a table is as wide as the terminal at most. A wider result first cuts its longest values short (`a long value…`), only as far as it needs to and no shorter than the column's name. If that is not enough, it leaves out columns from the middle, showing a `…` column in their place and saying so in the footer: `17 columns (10 shown)`. `.maxwidth N` (in the shell, a script or an init file) or `--max-width N` (on the command line) sets the width instead; `.maxwidth 0` goes back to the terminal's. Output that is not a terminal (a pipe, a file) is cut only when `.maxwidth N` or `--max-width N` sets a width.
 
 ## Init files
 
@@ -201,7 +203,7 @@ SET datafusion.execution.batch_size = 4096;
 
 `-init FILE` runs `FILE` instead of `~/.ursarc`. `-no-init` runs neither. They are spelled with one dash, as in DuckDB; `--init` and `--no-init` work too.
 
-`~/.ursarc` is read only by the interactive shell. `-c`, `--file` and SQL on stdin skip it, so a script gives the same output whoever runs it. `-init FILE` runs for those too, before their SQL. A `--format` or `--max-rows` given on the command line wins over a `.mode` or `.maxrows` in the init file.
+`~/.ursarc` is read only by the interactive shell. `-c`, `--file` and SQL on stdin skip it, so a script gives the same output whoever runs it. `-init FILE` runs for those too, before their SQL. A `--format`, `--max-rows` or `--max-width` given on the command line wins over a `.mode`, `.maxrows` or `.maxwidth` in the init file.
 
 `.read FILE` runs a file the same way, from the prompt.
 

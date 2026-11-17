@@ -150,6 +150,41 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
   and `.print`. In a colour terminal what is typed is highlighted (keywords,
   strings, comments, dot-commands), the prompt is orange, and errors are red.
+- **`ursa`: shell fixes.**
+  - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
+    other nulls do; it was a blank cell. So does a dictionary's null value.
+  - A table too wide for the screen is narrowed only as much as it needs:
+    its widest values are cut first, and no shorter than the column's name,
+    before any column is left out. Before, every long value was cut to 20
+    characters even when two would do. When columns are left out, a column
+    too wide to fit no longer stops the others: the columns after it on the
+    other side are still shown.
+  - The footer stays as wide as the table: the column count goes on a line
+    of its own when the two counts do not fit on one, and is left out when
+    nothing was left out. The space between the counts is at least two.
+  - `--max-width N` sets the table width from the command line, as
+    `.maxwidth N` does, and wins over an init file's `.maxwidth`.
+  - Values are drawn as they are: bidirectional overrides, zero-width
+    spaces and joiners, line and paragraph separators and byte order marks
+    are written as escapes (`\u{202e}`), as control characters were, and so
+    are a column name's.
+  - A dot-command may end with `;` (`.tables;`, `.mode csv;`), as
+    `.describe` could. The start of a command (`.q`, `.tab`) gets a
+    suggestion, `did you mean '.quit'?`, and is not run.
+  - `.describe NAME` finds a table or view in any case, as it found graphs
+    (`.describe Mixed` for a table created as `"Mixed"`), and reads NAME as
+    a name: `.describe v; SELECT 99` is an error instead of two statements.
+  - What is typed is coloured as part of the statement typed so far, in the
+    terminal and the browser: a string or comment left open on one line
+    goes on in the next, and a next line starting `.5` is SQL, not a
+    command. `E'…'` strings, `$$…$$` and `$tag$…$tag$` strings and nested
+    `/* /* */ */` comments are coloured as they are read.
+  - Ctrl-C during a `.read` no longer counts it as still running; after 16,
+    every `.read` failed as nested too deep. A cancelled query prints
+    `^C (cancelled)`, not `^C^C (cancelled)`.
+  - `--format arrow` with no query that returns a result is an error, not an
+    empty output that exits 0, and `.mode arrow` says to give
+    `--format arrow` on the command line, in the shell and in a script.
 - **`GRAPH_TABLE` through the graph index** (#325). The results are the
   same; what changes is how a match runs.
   - A node is *bound* when a condition on it alone names its keys:
