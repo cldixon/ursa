@@ -23,8 +23,12 @@ static assets and an R2 bucket.
     shell, which runs a statement once it ends with `;` and shows the
     continuation prompt meanwhile; Shift+Enter adds a line to what is typed;
     ↑/↓ recall history (kept in this browser); Ctrl+C copies a selection, or
-    drops what was typed; Ctrl+L clears. Keys pressed while a line runs wait
-    for it. What the shell prints (tables, errors, colour) is written to the
+    drops what was typed; Ctrl+L clears; `.help shortcuts` lists every key
+    (the `SHORTCUTS` text in `app.js`, which the e2e test checks against the
+    keys). The cursor moves and deletes by the character as seen (an emoji
+    sequence, a flag, a letter and its accent), and CJK and emoji take two
+    cells, by the width table `app.js` gives xterm. Keys pressed while a
+    line runs wait for it. What the shell prints (tables, errors, colour) is written to the
     terminal as is, so a selection copies as the text on screen.
   - **Dot-commands** are the CLI's (`.help`, `.tables`, `.describe`,
     `.functions`, `.maxrows`, `.maxwidth`, `.timer`, `.mode`, …; `.help graph`
