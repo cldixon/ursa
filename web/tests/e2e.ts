@@ -10,8 +10,10 @@
 // file, replays a shared link in a fresh page, and checks New, the theme toggle
 // and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. It
 // also checks the keyboard (Tab out of the terminal, the Datasets menu's keys,
-// the focus after a click), a phone's bar and SQL, and the grey text's contrast. An error on screen fails the run, except the ones a test asks
-// for.
+// the focus after a click), a phone's bar and SQL, and the grey text's
+// contrast. The line editor's checks cover wide characters (CJK and emoji),
+// lines that wrap or fill the width exactly, resizing, colour, and its keys. An
+// error on screen fails the run, except the ones a test asks for.
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -339,6 +341,11 @@ await page.keyboard.press("Shift+Enter");
 await page.keyboard.type("8 AS eight;");
 await page.waitForTimeout(200);
 check(!(await screen()).includes("│     7 │"), "Shift+Enter doesn't run the line");
+check(
+  (await screen()).split("\n").slice(-2).join("\n") === "memory U SELECT 7 AS seven,\n         8 AS eight;",
+  "Shift+Enter adds one line, and sends nothing to the shell",
+  JSON.stringify((await screen()).split("\n").slice(-3)),
+);
 await page.keyboard.press("Enter");
 await idle();
 check(lastTable(await after("SELECT 7 AS seven,")).rows[0]?.join(",") === "7,8", "Shift+Enter then Enter runs both lines", JSON.stringify(lastTable(await after("SELECT 7 AS seven,")).rows));
@@ -387,6 +394,203 @@ await page.click(`#dataset-menu button:has-text("${datasets[1].title}")`);
 await page.click("#new");
 await idle();
 check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New during a dataset stops it", `${await tables()} tables`);
+
+// The line editor: wide characters, wrapping, resizing, colour and its keys.
+{
+  const shell = (fn: string, ...args: any[]) => page.evaluate(([fn, args]) => (window as any).ursaShell[fn as string](...(args as any[])), [fn, args] as const);
+  const cursorAt = async () => (await shell("cursor")) as { x: number; y: number };
+  const lastLines = async (n: number) => (await screen()).split("\n").slice(-n);
+  const settle = async () => {
+    await page.waitForTimeout(150);
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+  };
+  /** Drop what is typed. */
+  const drop = async () => {
+    await page.keyboard.press("Control+C");
+    await idle();
+  };
+  await page.click("#new");
+  await idle();
+
+  // Wide characters: CJK takes two cells, an emoji sequence two; the cursor
+  // goes where the characters are, and moves over (and deletes) them whole.
+  await page.keyboard.type("SELECT '日本語' AS t");
+  for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowLeft");
+  await settle();
+  let c = await cursorAt();
+  let line = (await screen()).split("\n")[c.y] ?? "";
+  // memory U SELECT '日本語' AS t: the cursor is on the closing quote, after three wide characters.
+  check(c.x === "memory U SELECT '".length + 6, "the cursor after CJK text", `column ${c.x}, line ${JSON.stringify(line)}`);
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type("x");
+  await settle();
+  c = await cursorAt();
+  check((await lastLines(1))[0] === "memory U SELECT '日本x' AS t" && c.x === "memory U SELECT '".length + 5, "Backspace deletes a CJK character", `${JSON.stringify((await lastLines(1))[0])} column ${c.x}`);
+  await drop();
+  const cp = (...cps: number[]) => String.fromCodePoint(...cps);
+  // A face, a ZWJ family, a flag, a skin tone, a heart with VS16, and e with a combining accent.
+  const emoji = [cp(0x1f600), cp(0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467), cp(0x1f1fa, 0x1f1f8), cp(0x1f44d, 0x1f3fd), cp(0x2764, 0xfe0f), cp(0x65, 0x301)];
+  await page.keyboard.insertText(`SELECT '${emoji.join("")}'`);
+  await page.keyboard.press("ArrowLeft");
+  await settle();
+  const typed = `memory U SELECT '${emoji.join("")}`;
+  c = await cursorAt();
+  check(c.x === "memory U SELECT '".length + 11, "the cursor after emoji", `column ${c.x}`);
+  const cells = ((await shell("cells", c.y)) as { ch: string }[]).map((x) => x.ch);
+  check(JSON.stringify(cells.slice(17, 23)) === JSON.stringify(emoji), "an emoji sequence is one character on screen", JSON.stringify(cells.slice(17, 23)));
+  let shown = "";
+  for (const want of [...emoji].reverse()) {
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("Delete");
+    await settle();
+    shown = (await lastLines(1))[0];
+    if (!shown.startsWith(typed.slice(0, typed.lastIndexOf(want))) || shown.includes(cp(0xfffd))) break;
+  }
+  check(shown === "memory U SELECT ''", "Left and Delete take an emoji sequence whole", JSON.stringify(shown));
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("🇺🇸🇫🇷");
+  await page.keyboard.press("Backspace");
+  await settle();
+  check((await lastLines(1))[0] === "memory U SELECT ''🇺🇸", "Backspace deletes a flag whole", JSON.stringify((await lastLines(1))[0]));
+  await drop();
+
+  // A long CJK line wraps (a wide character that doesn't fit the row starts
+  // the next one) and is drawn once however it is edited.
+  const cols: number = await shell("cols");
+  const long = "漢字".repeat(cols);
+  await page.keyboard.insertText(`SELECT '${long}`);
+  await page.keyboard.type("' AS kanji;");
+  for (let i = 0; i < 11; i++) await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type("x");
+  await page.keyboard.press("End");
+  await page.keyboard.press("Backspace");
+  await settle();
+  {
+    // The ; is gone: the line ends "AS kanji".
+    const text = await screen();
+    const rows = text.split("\n");
+    const first = rows.findLastIndex((l) => l.startsWith("memory U SELECT '漢字"));
+    const joined = rows.slice(first).join("");
+    check(count(text, "memory U SELECT '漢字") === 1 && joined === `memory U SELECT '${long}x' AS kanji`, "a wrapped CJK line is drawn once", `${count(text, "memory U SELECT '漢字")} prompts, ${rows.length - first} rows`);
+    c = await cursorAt();
+    check(c.y === rows.length - 1 && c.x === [...rows.at(-1)!].reduce((n, ch) => n + (ch.charCodeAt(0) > 0x2e80 ? 2 : 1), 0), "the cursor at the end of a wrapped CJK line", JSON.stringify(c));
+  }
+  await page.keyboard.type(";");
+  await page.keyboard.press("Enter");
+  await idle();
+  check(lastTable(await after("SELECT '漢字")).head[0] === "kanji", "a wrapped CJK line runs", JSON.stringify(lastTable(await after("SELECT '漢字")).head));
+
+  // A line that fills the terminal's width exactly, with lines after it: no
+  // empty row after it.
+  const exact = "SELECT " + "1".repeat(cols - "memory U SELECT ".length - " AS w,".length) + " AS w,";
+  await page.keyboard.type(exact);
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("2 AS v;");
+  await page.keyboard.press("ArrowUp");
+  await settle();
+  {
+    const rows = await lastLines(2);
+    check(rows[0] === `memory U ${exact}` && rows[1] === "         2 AS v;", "a line as wide as the terminal leaves no empty row", JSON.stringify(rows));
+  }
+  await page.keyboard.press("End");
+  await settle();
+  c = await cursorAt();
+  check(c.y === (await screen()).split("\n").length - 1 && c.x === 0, "the cursor after a line as wide as the terminal", JSON.stringify(c));
+  await page.keyboard.press("Enter");
+  await idle();
+  {
+    const rows = (await after(exact.slice(0, 20))).split("\n");
+    check(rows[0] === "         2 AS v;" && rows[1].startsWith("┌"), "a line as wide as the terminal, run", JSON.stringify(rows.slice(0, 2)));
+  }
+
+  // Resizing redraws what is typed for the new width, at once.
+  const statement = "SELECT 'resize' AS r, " + Array.from({ length: 12 }, (_, i) => `${i} AS c${i}`).join(", ");
+  await page.keyboard.type(statement);
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("FROM members");
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("End");
+  await settle();
+  for (const width of [640, 1100]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForFunction((n) => (window as any).ursaShell.cols() !== n, await shell("cols"));
+    await settle();
+    await settle();
+    const n: number = await shell("cols");
+    const first = `memory U ${statement}`;
+    const want: string[] = [];
+    for (let i = 0; i < first.length; i += n) want.push(first.slice(i, i + n));
+    want.push("         FROM members");
+    const text = await screen();
+    const rows = text.split("\n");
+    c = await cursorAt();
+    check(
+      count(text, "memory U SELECT 'resize'") === 1 && JSON.stringify(rows.slice(-want.length)) === JSON.stringify(want),
+      `resizing to ${n} columns redraws what is typed`,
+      `${count(text, "memory U SELECT 'resize'")} prompts; ${JSON.stringify(rows.slice(-want.length - 1))}`,
+    );
+    const end = (statement.length + 9) % n;
+    check(c.y === rows.length - 2 && c.x === end, `the cursor where it was, at ${n} columns`, `${JSON.stringify(c)}, want x ${end}`);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await settle();
+  await drop();
+
+  // What is typed and run before the highlighter answers is coloured all the same.
+  await shell("input", [..."SELECT 'quick' AS fast;", "\r"]);
+  await idle();
+  {
+    const rows = (await screen()).split("\n");
+    const y = rows.findLastIndex((l) => l.startsWith("memory U SELECT 'quick'"));
+    const cells = (await shell("cells", y)) as { ch: string; fg: number; bold: boolean }[];
+    const word = (from: number, n: number) => cells.slice(from, from + n);
+    const keyword = word(9, 6), string = word(16, 7);
+    check(keyword.every((x) => x.bold || x.fg >= 0) && string.every((x) => x.fg >= 0) && string[0].fg !== keyword[0].fg, "a line run at once is coloured", JSON.stringify([keyword[0], string[0]]));
+  }
+
+  // .help shortcuts lists the keys the line editor knows, and they do what it says.
+  await type(".help shortcuts");
+  {
+    const listed = (await after(".help shortcuts"))
+      .split("\n")
+      .filter((l) => /^\S/.test(l) && !l.startsWith("memory U"))
+      .flatMap((l) => {
+        const [keys, what] = l.split(/\s{2,}/);
+        return [...keys.split(", "), ...(what.match(/\(also ([^)]*)\)/)?.[1].split(", ") ?? [])];
+      });
+    const known = ["Enter", "Shift+Enter", "Up", "Down", "Left", "Right", "Ctrl+B", "Ctrl+F", "Home", "End", "Ctrl+A", "Ctrl+E", "Backspace", "Ctrl+H", "Delete", "Ctrl+U", "Ctrl+K", "Ctrl+W", "Tab", "Shift+Tab", "Ctrl+C", "Cmd+C", "Ctrl+L"];
+    check(JSON.stringify([...listed].sort()) === JSON.stringify([...known].sort()), ".help shortcuts lists the editor's keys", JSON.stringify(listed));
+    // Each editing key on "one two three", the cursor after "two": what is left, and where the cursor is.
+    const edits: [string[], string, number][] = [
+      [["ArrowLeft"], "one two three", 6],
+      [["Control+B"], "one two three", 6],
+      [["ArrowRight"], "one two three", 8],
+      [["Control+F"], "one two three", 8],
+      [["Home"], "one two three", 0],
+      [["Control+A"], "one two three", 0],
+      [["End"], "one two three", 13],
+      [["Control+E"], "one two three", 13],
+      [["Backspace"], "one tw three", 6],
+      [["Control+H"], "one tw three", 6],
+      [["Delete"], "one twothree", 7],
+      [["Control+U"], " three", 0],
+      [["Control+K"], "one two", 7],
+      [["Control+W"], "one  three", 4],
+    ];
+    const wrong: string[] = [];
+    for (const [keys, want, at] of edits) {
+      await page.keyboard.type("one two three");
+      for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowLeft");
+      for (const k of keys) await page.keyboard.press(k);
+      await settle();
+      const got = (await lastLines(1))[0];
+      c = await cursorAt();
+      if (got !== `memory U ${want}` || c.x !== 9 + at) wrong.push(`${keys}: ${JSON.stringify(got)} at ${c.x - 9}`);
+      await drop();
+    }
+    check(!wrong.length, "the editing keys do what .help shortcuts says", wrong.join("; "));
+  }
+}
 
 // The engine crashing (out of memory) leaves a working shell, in a fresh session.
 await type("SELECT length(repeat('x', 2000000000)) AS n;");
