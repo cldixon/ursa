@@ -3,6 +3,10 @@
 // show what Ursa does with it. The files are Parquet in the bucket, read by
 // name (see /data/manifest.json).
 //
+// The `--` lines say what each step is about. They are part of the commands,
+// so they are shown at the prompt (and the shell takes a line that is only a
+// comment as a no-op): keep the explanations there, not in comments here.
+//
 // Keep every query here in step with what the engine returns: the e2e test
 // runs each dataset and fails on any error.
 
@@ -11,26 +15,30 @@ export const DATASETS = [
     id: "karate",
     title: "Karate club (graph + attributes)",
     commands: [
-      `CREATE VIEW members AS SELECT * FROM 'karate_nodes.parquet';`,
+      `-- Zachary's karate club: 34 members and the friendships between them,
+-- recorded just before the club split between Mr. Hi and the Officer.
+CREATE VIEW members AS SELECT * FROM 'karate_nodes.parquet';`,
       `CREATE VIEW ties AS SELECT * FROM 'karate_edges.parquet';`,
-      `CREATE PROPERTY GRAPH karate
+      `-- A property graph over the two tables: members are its vertices, ties its edges.
+CREATE PROPERTY GRAPH karate
   VERTEX TABLES (members KEY (id))
   EDGE TABLES (ties SOURCE KEY (src) REFERENCES members (id)
                     DESTINATION KEY (dst) REFERENCES members (id));`,
-      // Algorithms are table functions: join them to the members' attributes.
-      `SELECT id, club, round(pagerank, 4) AS pagerank, community
+      `-- Graph algorithms are table functions: join them to the members' attributes.
+-- PageRank scores each member's influence; Louvain finds communities.
+SELECT id, club, round(pagerank, 4) AS pagerank, community
 FROM members
 JOIN algorithms(karate, pagerank(direction => 'both'), community => louvain(seed => 1)) USING (id)
 ORDER BY pagerank DESC
 LIMIT 10;`,
-      // SQL/PGQ pattern matching: the friendships across the club's split.
-      `FROM GRAPH_TABLE (karate
+      `-- SQL/PGQ pattern matching: the friendships across the club's split.
+FROM GRAPH_TABLE (karate
   MATCH (a)-[e]-(b)
   WHERE a.club = 'Officer' AND b.club = 'Mr. Hi'
   COLUMNS (a.id AS officer, b.id AS member))
 ORDER BY officer, member;`,
-      // A shortest path, as a pattern with a quantified edge.
-      `FROM GRAPH_TABLE (karate
+      `-- A shortest path, as a pattern with a quantified edge: -[e]-* is any number of hops.
+FROM GRAPH_TABLE (karate
   MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26)
   COLUMNS (path_length(p) AS steps, vertices(p) AS members));`,
     ],
@@ -39,20 +47,25 @@ ORDER BY officer, member;`,
     id: "lesmis",
     title: "Les Misérables (weighted)",
     commands: [
-      `CREATE VIEW scenes AS SELECT * FROM 'lesmis_edges.parquet';`,
-      `CREATE PROPERTY GRAPH lesmis EDGE TABLES (scenes SOURCE KEY (src) DESTINATION KEY (dst));`,
-      `SELECT id AS character, round(pagerank, 4) AS pagerank
+      `-- Les Misérables: characters linked by the scenes they share, weighted by how many.
+CREATE VIEW scenes AS SELECT * FROM 'lesmis_edges.parquet';`,
+      `-- An edge table alone makes a graph: its vertices are the ids in src and dst.
+CREATE PROPERTY GRAPH lesmis EDGE TABLES (scenes SOURCE KEY (src) DESTINATION KEY (dst));`,
+      `-- Weighted PageRank: the characters at the centre of the story.
+SELECT id AS character, round(pagerank, 4) AS pagerank
 FROM pagerank(lesmis, weight => weight, direction => 'both')
 ORDER BY pagerank DESC
 LIMIT 10;`,
-      `SELECT community, count(*) AS characters,
+      `-- Louvain communities, each with its size and its most central character.
+SELECT community, count(*) AS characters,
        first_value(id ORDER BY pagerank DESC) AS most_central
 FROM algorithms(lesmis,
                 pagerank(weight => weight, direction => 'both'),
                 community => louvain(weight => weight, seed => 1))
 GROUP BY community
 ORDER BY characters DESC;`,
-      `FROM GRAPH_TABLE (lesmis
+      `-- A pattern with a condition on its edge: who shares five or more scenes with Valjean.
+FROM GRAPH_TABLE (lesmis
   MATCH (a WHERE a.id = 'Valjean')-[e WHERE e.weight >= 5]-(b)
   COLUMNS (b.id AS character, e.weight AS scenes))
 ORDER BY scenes DESC;`,
@@ -62,13 +75,17 @@ ORDER BY scenes DESC;`,
     id: "florentine",
     title: "Florentine families",
     commands: [
-      `CREATE VIEW marriages AS SELECT * FROM 'florentine_edges.parquet';`,
+      `-- Marriages between the leading families of Renaissance Florence.
+CREATE VIEW marriages AS SELECT * FROM 'florentine_edges.parquet';`,
       `CREATE PROPERTY GRAPH florentine EDGE TABLES (marriages SOURCE KEY (src) DESTINATION KEY (dst));`,
-      `SELECT id AS family, round(betweenness, 3) AS betweenness
+      `-- Betweenness: how often a family lies on the shortest paths between the others.
+-- The Medici, who came to rule Florence, top it.
+SELECT id AS family, round(betweenness, 3) AS betweenness
 FROM betweenness(florentine, direction => 'both')
 ORDER BY betweenness DESC
 LIMIT 5;`,
-      `FROM GRAPH_TABLE (florentine
+      `-- Every shortest chain of marriages from the Strozzi to the Medici.
+FROM GRAPH_TABLE (florentine
   MATCH p = ALL SHORTEST (a WHERE a.id = 'Strozzi')-[e]-*(b WHERE b.id = 'Medici')
   COLUMNS (vertices(p) AS route));`,
     ],
@@ -77,11 +94,17 @@ LIMIT 5;`,
     id: "rmat",
     title: "R-MAT graph, 1M edges (Parquet)",
     commands: [
+      `-- A synthetic R-MAT graph of a million edges, read from Parquet in your browser.
+-- .timer on shows how long each statement takes.
+.timer on`,
       `CREATE VIEW rmat_edges AS SELECT * FROM 'rmat_1m_edges.parquet';`,
       `CREATE PROPERTY GRAPH rmat EDGE TABLES (rmat_edges SOURCE KEY (src) DESTINATION KEY (dst));`,
-      `FROM describe(rmat);`,
-      `SELECT id, round(pagerank, 6) AS pagerank FROM pagerank(rmat) ORDER BY pagerank DESC LIMIT 10;`,
-      `SELECT steps, count(*) AS nodes
+      `-- The graph's size: its nodes, edges, density and average degree.
+FROM describe(rmat);`,
+      `-- PageRank over all million edges.
+SELECT id, round(pagerank, 6) AS pagerank FROM pagerank(rmat) ORDER BY pagerank DESC LIMIT 10;`,
+      `-- A breadth-first search from vertex 0: how many vertices lie how many steps away.
+SELECT steps, count(*) AS nodes
 FROM GRAPH_TABLE (rmat
   MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->*(b)
   COLUMNS (path_length(p) AS steps))

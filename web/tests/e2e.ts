@@ -8,9 +8,12 @@
 // menu, types SQL at the prompt (one line and several), runs dot-commands (the
 // shell's and the page's), downloads the last result in each format, imports a
 // file, replays a shared link in a fresh page, and checks New, the theme toggle
-// and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. An error on screen fails the run, except the ones a test asks
-// for. The line editor's checks cover wide characters (CJK and emoji), lines
-// that wrap or fill the width exactly, resizing, colour, and its keys.
+// and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. It
+// also checks the keyboard (Tab out of the terminal, the Datasets menu's keys,
+// the focus after a click), a phone's bar and SQL, and the grey text's
+// contrast. The line editor's checks cover wide characters (CJK and emoji),
+// lines that wrap or fill the width exactly, resizing, colour, and its keys. An
+// error on screen fails the run, except the ones a test asks for.
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -38,6 +41,30 @@ const count = (text: string, needle: string) => text.split(needle).length - 1;
 /** Tables on screen: each starts with a ┌ at the start of a line. */
 const tables = async (p: Page = page) => (await screen(p)).split("\n").filter((l) => l.startsWith("┌")).length;
 const errors = async (p: Page = page) => count(await screen(p), "Error: ");
+/** The queries in a dataset's commands: not its CREATEs, dot-commands or comments. */
+const queries = (commands: string[]) =>
+  commands.map((c) => c.split("\n").filter((l) => !/^\s*--/.test(l)).join("\n")).filter((c) => !/^(CREATE|\.)/i.test(c)).length;
+/** What has the focus: an id, or the terminal. */
+const focused = (p: Page = page): Promise<string> =>
+  p.evaluate(() => (document.activeElement?.classList.contains("xterm-helper-textarea") ? "terminal" : document.activeElement?.id || document.activeElement?.tagName || ""));
+/** WCAG contrast of two computed CSS colours, rgb(...). */
+function contrast(a: string, b: string) {
+  const lum = (c: string) => {
+    const [r, g, bl] = c.match(/\d+(\.\d+)?/g)!.slice(0, 3).map((v) => {
+      const x = Number(v) / 255;
+      return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+/** The colour of the types under a table's header (the shell's grey), and the terminal's background. */
+const greyText = (p: Page = page) =>
+  p.evaluate(() => {
+    const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
+    return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
+  });
 
 /** Type `text` at the prompt, a line at a time, each with Enter; wait for it. */
 async function type(text: string, p: Page = page) {
@@ -70,17 +97,85 @@ const banner = await screen();
 check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
 await page.click("#terminal");
 
+// The keyboard can leave the terminal: Tab and Shift+Tab move the focus on
+// (there is no completion for them to do), and Tab comes back to it.
+{
+  const before = await screen();
+  await page.keyboard.press("Shift+Tab");
+  check((await focused()) === "theme", "Shift+Tab leaves the terminal", await focused());
+  await page.keyboard.press("Tab");
+  check((await focused()) === "terminal", "Tab goes back into the terminal", await focused());
+  await page.keyboard.press("Tab");
+  const left = await focused();
+  check(left !== "terminal" && (await screen()) === before, "Tab leaves the terminal, typing nothing", left);
+  // The theme toggle: a click hands the keys back to the terminal; from the
+  // keyboard, the focus stays on it.
+  await page.click("#theme");
+  check((await focused()) === "terminal", "focus is back in the terminal after a theme click", await focused());
+  await page.focus("#theme");
+  await page.keyboard.press("Enter");
+  check((await focused()) === "theme", "focus stays on the theme toggle pressed from the keyboard", await focused());
+  await page.click("#terminal");
+}
+
+// The Datasets menu from the keyboard: a menu button.
+{
+  const menuState = () =>
+    page.evaluate(() => ({
+      open: !document.getElementById("dataset-menu")!.hidden,
+      expanded: document.getElementById("datasets")!.getAttribute("aria-expanded"),
+      item: [...document.querySelectorAll("#dataset-menu [role=menuitem]")].indexOf(document.activeElement!),
+    }));
+  const n = await page.locator("#dataset-menu [role=menuitem]").count();
+  const steps: [string, number][] = [["ArrowDown", 1], ["ArrowUp", 0], ["ArrowUp", n - 1], ["ArrowDown", 0], ["End", n - 1], ["Home", 0]];
+  await page.focus("#datasets");
+  await page.keyboard.press("ArrowDown");
+  let s = await menuState();
+  let ok = s.open && s.expanded === "true" && s.item === 0;
+  const seen = [s.item];
+  for (const [key, want] of steps) {
+    await page.keyboard.press(key);
+    s = await menuState();
+    seen.push(s.item);
+    ok &&= s.item === want;
+  }
+  check(ok, "the Datasets menu's arrow keys, Home and End", JSON.stringify(seen));
+  await page.keyboard.press("Escape");
+  s = await menuState();
+  check(!s.open && s.expanded === "false" && (await focused()) === "datasets", "Escape closes the menu, back on its button", JSON.stringify(s));
+  const attrs = await page.evaluate(() => {
+    const b = document.getElementById("datasets")!, m = document.getElementById("dataset-menu")!;
+    return [b.getAttribute("aria-haspopup"), b.getAttribute("aria-controls"), m.getAttribute("role"), m.getAttribute("aria-labelledby"), m.querySelector("button")!.tabIndex].join(",");
+  });
+  check(attrs === "menu,dataset-menu,menu,datasets,-1", "the menu's aria attributes", attrs);
+  await page.click("#terminal");
+}
+
 // Every dataset, from the menu: each starts a fresh session, and its queries
 // print a table each, with no error.
 const datasets: { id: string; title: string; commands: string[] }[] = await page.evaluate(() => (window as any).ursaShell.datasets);
-for (const d of datasets) {
+for (const [i, d] of datasets.entries()) {
   const t = Date.now();
-  await page.click("#datasets");
-  await page.click(`#dataset-menu button:has-text("${d.title}")`);
+  if (i === 0) {
+    // The first from the keyboard: Enter opens the menu on its first item, and
+    // Enter picks it.
+    await page.focus("#datasets");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+  } else {
+    await page.click("#datasets");
+    await page.click(`#dataset-menu button:has-text("${d.title}")`);
+  }
   await idle();
   const text = await screen();
-  const queries = d.commands.filter((c) => !/^CREATE/i.test(c)).length;
-  check(!text.includes("Error: ") && (await tables()) === queries && text.startsWith("Ursa Web Shell running"), `dataset ${d.id}`, `${await tables()} tables in ${Date.now() - t} ms`);
+  check(!text.includes("Error: ") && (await tables()) === queries(d.commands) && text.startsWith("Ursa Web Shell running"), `dataset ${d.id}`, `${await tables()} tables in ${Date.now() - t} ms`);
+  if (i === 0) {
+    check((await focused()) === "datasets", "a dataset picked from the keyboard leaves the focus on the menu button", await focused());
+    // Its explanations are shown, as SQL comments.
+    check(/^memory U -- \S/m.test(text), "a dataset's explanations show as comments", text.match(/^memory U --.*$/m)?.[0]);
+    await page.click("#terminal");
+  }
+  if (d.id === "rmat") check(text.includes("Run Time (s): real "), "the R-MAT dataset turns the timer on");
   if (shots && d.id === "karate") await page.screenshot({ path: `${shots}/shell-karate.png` });
 }
 await type(".tables");
@@ -291,7 +386,7 @@ for (const title of [datasets[0].title, datasets[2].title]) {
 await idle();
 {
   const text = await screen();
-  check(!text.includes("Error: ") && (await tables()) === datasets[2].commands.filter((c) => !/^CREATE/i.test(c)).length, "a dataset picked during another replaces it cleanly", `${await tables()} tables`);
+  check(!text.includes("Error: ") && (await tables()) === queries(datasets[2].commands), "a dataset picked during another replaces it cleanly", `${await tables()} tables`);
 }
 // New during a dataset: the dataset stops; the session is empty.
 await page.click("#datasets");
@@ -463,7 +558,7 @@ check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New duri
         const [keys, what] = l.split(/\s{2,}/);
         return [...keys.split(", "), ...(what.match(/\(also ([^)]*)\)/)?.[1].split(", ") ?? [])];
       });
-    const known = ["Enter", "Shift+Enter", "Up", "Down", "Left", "Right", "Ctrl+B", "Ctrl+F", "Home", "End", "Ctrl+A", "Ctrl+E", "Backspace", "Ctrl+H", "Delete", "Ctrl+U", "Ctrl+K", "Ctrl+W", "Tab", "Ctrl+C", "Cmd+C", "Ctrl+L"];
+    const known = ["Enter", "Shift+Enter", "Up", "Down", "Left", "Right", "Ctrl+B", "Ctrl+F", "Home", "End", "Ctrl+A", "Ctrl+E", "Backspace", "Ctrl+H", "Delete", "Ctrl+U", "Ctrl+K", "Ctrl+W", "Tab", "Shift+Tab", "Ctrl+C", "Cmd+C", "Ctrl+L"];
     check(JSON.stringify([...listed].sort()) === JSON.stringify([...known].sort()), ".help shortcuts lists the editor's keys", JSON.stringify(listed));
     // Each editing key on "one two three", the cursor after "two": what is left, and where the cursor is.
     const edits: [string[], string, number][] = [
@@ -481,7 +576,6 @@ check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New duri
       [["Control+U"], " three", 0],
       [["Control+K"], "one two", 7],
       [["Control+W"], "one  three", 4],
-      [["Tab"], "one two   three", 9],
     ];
     const wrong: string[] = [];
     for (const [keys, want, at] of edits) {
@@ -524,6 +618,53 @@ const columns: number = await phone.evaluate(() => (window as any).ursaShell.col
 const widest = Math.max(...(await screen(phone)).split("\n").filter((l) => /^[┌│└├]/.test(l)).map((l) => [...l].length));
 check(widest <= columns, "tables fit a phone's width", `widest ${widest}, ${columns} columns`);
 if (shots) await phone.screenshot({ path: `${shots}/shell-phone.png` });
+// The dataset's SQL is broken at spaces to fit: no line fills the width, as a
+// line the terminal wraps (mid-word) does.
+{
+  const full = (await screen(phone)).split("\n").filter((l) => [...l].length >= columns);
+  check(full.length === 0, "a dataset's SQL fits a phone without wrapping mid-word", full[0]);
+}
+// iOS zooms in on a text field with a font under 16px.
+{
+  const size: string = await phone.evaluate(() => getComputedStyle(document.querySelector(".xterm-helper-textarea")!).fontSize);
+  check(parseFloat(size) >= 16, "the terminal's textarea is 16px or more", size);
+}
+await phone.close();
+
+// The narrowest phone: the bar is one row, and the SQL still fits.
+const small = await browser.newPage({ viewport: { width: 320, height: 640 } });
+await small.goto(`${base}/?dataset=lesmis`);
+await ready(small);
+await idle(small);
+{
+  const bar = (await small.locator("header.bar").boundingBox())!;
+  const fits: boolean = await small.evaluate(() =>
+    [...document.querySelectorAll("header button, header a")].every((e) => {
+      const r = e.getBoundingClientRect();
+      return r.height <= 44 && r.right <= innerWidth && r.left >= 0;
+    }),
+  );
+  check(bar.height <= 56 && fits, "the bar is one row at 320px", `${bar.height}px`);
+  const cols: number = await small.evaluate(() => (window as any).ursaShell.cols());
+  const full = (await screen(small)).split("\n").filter((l) => [...l].length >= cols);
+  check(full.length === 0 && !(await errors(small)) && (await tables(small)) === queries(datasets[1].commands), "lesmis at 320px: no mid-word wraps, no errors", full[0] ?? `${await tables(small)} tables`);
+}
+await small.close();
+
+// The dim text (types, footers, nulls) is readable: 4.5:1 or more on the
+// terminal's background, in both themes.
+for (const scheme of ["light", "dark"] as const) {
+  const ctx = await browser.newContext({ viewport: { width: 1000, height: 700 }, colorScheme: scheme });
+  const p = await ctx.newPage();
+  await p.goto(base);
+  await ready(p);
+  await p.click("#terminal");
+  await type("SELECT 1 AS one;", p);
+  const colors = await greyText(p);
+  const ratio = colors ? contrast(colors[0], colors[1]) : 0;
+  check(ratio >= 4.5, `dim text contrast, ${scheme}`, `${ratio.toFixed(2)}:1 (${colors?.join(" on ")})`);
+  await ctx.close();
+}
 
 await browser.close();
 console.log(failures.length ? `\n${failures.length} failures:\n- ${failures.join("\n- ")}` : "\nall passed");
