@@ -180,6 +180,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **`ursa`: JSON and NDJSON write `null` for a null** (behaviour change,
+  #350). Every row object has every column, in column order, as DuckDB
+  writes them: `SELECT NULL AS a, '' AS b` is `[{"a":null,"b":""}]`, which
+  was `[{"b":""}]`, so a missing key no longer stands for a null. The
+  browser shell's JSON export does the same.
+- **`ursa`: CSV and TSV write an empty string as `""`** (behaviour change,
+  #350), as DuckDB does, so it can be told from a null, which is still an
+  empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
+  browser shell's CSV export does the same.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,
@@ -363,6 +372,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Fixed
+
+- `ursa --format csv` and `tsv` write lists, structs and maps, as DuckDB
+  does, as their text form, quoted where CSV needs it (`"[1, 2]"`, with
+  `NULL` for a null inside one). They failed with "Nested type List(Int64)
+  is not supported in CSV", so `vertices(p)`, `edges(p)`, `array_agg` and
+  `random_walk` paths could not be written (#350).
+- A table shows an untyped null (`SELECT NULL AS n`, of type `Null`) as
+  `NULL`, as it shows a typed one; the cell was blank (#350).
+- The skill and the shell page say which format to read results in (`json`
+  or `ndjson`), that a table shows at most 40 rows while CSV and JSON write
+  every row, and that piped output is never cut to a width (#350).
 
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc

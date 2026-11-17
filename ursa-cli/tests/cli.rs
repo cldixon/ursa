@@ -711,7 +711,7 @@ fn find_out_what_is_available_matches_getting_started() {
 "
     );
 
-    // As JSON, one object per row; NULLs are left out.
+    // As JSON, one object per row, with every column; a null is `null`.
     let out = ok(ursa(&[
         "--format",
         "json",
@@ -724,7 +724,7 @@ fn find_out_what_is_available_matches_getting_started() {
         out,
         "\
 [{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\"},\
-{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\"}]
+{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":null,\"vertex_key\":null}]
 [{\"table_name\":\"nodes\",\"column_name\":\"id\",\"data_type\":\"Int64\",\"role\":\"node id\",\"origin\":\"ties.src, ties.dst\"},\
 {\"table_name\":\"edges\",\"column_name\":\"src\",\"data_type\":\"Int64\",\"role\":\"source\",\"origin\":\"ties.src\"},\
 {\"table_name\":\"edges\",\"column_name\":\"dst\",\"data_type\":\"Int64\",\"role\":\"destination\",\"origin\":\"ties.dst\"}]
@@ -1083,13 +1083,13 @@ fn ursa_functions_lists_the_catalog() {
 name,family,parameters,directions
 degree,algorithm,1,out in both
 pagerank,algorithm,5,out both
-connected_components,algorithm,1,
-triangle_count,algorithm,0,
-clustering_coefficient,algorithm,0,
+connected_components,algorithm,1,\"\"
+triangle_count,algorithm,0,\"\"
+clustering_coefficient,algorithm,0,\"\"
 betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
-label_propagation,algorithm,2,
-louvain,algorithm,3,
+label_propagation,algorithm,2,\"\"
+louvain,algorithm,3,\"\"
 neighbors_agg,aggregation,4,out in both
 density,statistic,1,out in both
 avg_path_length,statistic,2,out in both
@@ -1097,8 +1097,8 @@ diameter,statistic,2,out in both
 describe,statistic,3,out in both
 hop,traversal,3,out in both
 shortest_path,traversal,4,out in both
-random_walk,traversal,4,
-algorithms,combinator,0,
+random_walk,traversal,4,\"\"
+algorithms,combinator,0,\"\"
 "
     );
     assert_eq!(
@@ -1563,4 +1563,27 @@ fn reserved_words_as_names() {
         "Error: syntax error: Expected: identifier, found: , at Line: 1, Column: 12. `from` is a \
          reserved word; to use it as a name, quote it: \"from\"\n"
     );
+}
+
+/// #350: the formats an agent reads keep lists, nulls and empty strings.
+#[test]
+fn output_formats_keep_lists_nulls_and_empty_strings() {
+    let sql = "SELECT NULL AS a, '' AS b, [1, 2] AS l";
+    assert_eq!(
+        ok(ursa(&["--format", "csv", "-c", sql])),
+        "a,b,l\n,\"\",\"[1, 2]\"\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "tsv", "-c", sql])),
+        "a\tb\tl\n\t\"\"\t[1, 2]\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "json", "-c", sql])),
+        "[{\"a\":null,\"b\":\"\",\"l\":[1,2]}]\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "ndjson", "-c", sql])),
+        "{\"a\":null,\"b\":\"\",\"l\":[1,2]}\n"
+    );
+    assert!(ok(ursa(&["-c", "SELECT NULL AS n"])).contains("│ NULL │"));
 }
