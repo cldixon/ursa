@@ -48,6 +48,9 @@ static assets and an R2 bucket.
   The build also copies the terminal's font, IBM Plex Mono (SIL OFL 1.1, from
   `@fontsource/ibm-plex-mono`), into `dist/fonts/`, so the page loads nothing
   from other hosts.
+  Plex Mono's web fonts have no box-drawing characters, so table borders come
+  from `public/fonts/ursa-box.woff2`, a font of just those, made by
+  `scripts/box-font.py` with lines that run past each row so borders join.
 - `cloudflare.config.ts`: the Worker (name `ursa-shell`, the `ursa-graph` bucket
   as `DATA`, on `workers.dev` for now). `wrangler.config.ts` is the setting for
   the asset bundler `cf build` uses internally; deploys use `cf` only.
