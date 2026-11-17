@@ -203,8 +203,18 @@ impl WebShell {
         Ok(Uint8Array::from(bytes.as_slice()))
     }
 
-    /// `text` coloured as the shell colours what is typed (ANSI).
-    pub fn highlight(text: &str) -> String {
+    /// `text` coloured as the shell colours what is typed (ANSI), as what
+    /// is typed next: part of the statement typed so far, if one is pending,
+    /// so a string or comment it left open goes on, and a line starting
+    /// with `.` is SQL in it.
+    pub fn highlight(&self, text: &str) -> Result<String, JsError> {
+        Ok(self.borrow()?.highlight_line(text))
+    }
+
+    /// `text` coloured as a statement of its own, whatever is pending (for
+    /// the history).
+    #[wasm_bindgen(js_name = highlightText)]
+    pub fn highlight_text(text: &str) -> String {
         highlight::ansi(text)
     }
 
@@ -313,6 +323,27 @@ mod tests {
             "{error}"
         );
         assert_eq!(run(&shell, ".quit").await["flow"], "exit");
+    }
+
+    #[tokio::test]
+    async fn what_is_typed_is_coloured_after_what_is_pending() {
+        let shell = WebShell::new();
+        let string = format!("{}'a{}", highlight::STRING, highlight::RESET);
+        assert_eq!(shell.highlight("'a").unwrap(), string);
+        run(&shell, "SELECT 'it''s").await;
+        // The string goes on: the quote ends it.
+        let next = shell.highlight("b' AS s;").unwrap();
+        assert!(
+            next.starts_with(&format!("{}b'{}", highlight::STRING, highlight::RESET)),
+            "{next:?}"
+        );
+        // On its own, the same text opens a string.
+        assert!(WebShell::highlight_text("b' AS s;").starts_with("b\x1b[33m'"));
+        shell.cancel_input().unwrap();
+        assert!(shell
+            .highlight(".tables")
+            .unwrap()
+            .starts_with(highlight::COMMAND));
     }
 
     #[tokio::test]

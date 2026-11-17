@@ -14,9 +14,10 @@
 //! ```
 //!
 //! A result longer than `max_rows` shows its first and last rows with three
-//! rows of `·` between them; a result wider than the screen shows its first
-//! and last columns with a `…` column between them, after cutting long values
-//! short. Either way a footer counts what there was:
+//! rows of `·` between them; a result wider than the screen cuts its longest
+//! values short, as little as it can, and if that is not enough shows its
+//! first and last columns with a `…` column between them. Either way a
+//! footer counts what there was:
 //!
 //! ```text
 //!   39,650,447 rows (40 shown)                     17 columns (10 shown)
@@ -25,6 +26,7 @@
 //! [`Rows`] collects a result batch by batch and keeps only the rows it will
 //! show; [`Table::render`] draws them for a given width.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use arrow::array::{Array, RecordBatch};
@@ -36,8 +38,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// How many rows a table shows by default, as in DuckDB.
 pub const DEFAULT_MAX_ROWS: usize = 40;
 
-/// How wide a column may be when the table is too wide for the screen
-/// (DuckDB's `max_col_width` default).
+/// How wide a column is when choosing which columns a table too wide for the
+/// screen shows (DuckDB's `max_col_width` default), and the most a column's
+/// floor may be (see [`MIN_COLUMN`]).
 const NARROW_COLUMN: usize = 20;
 
 /// The rows a table shows: every row, or, past `max_rows`, the first
@@ -207,7 +210,7 @@ impl Table {
             .fields()
             .iter()
             .map(|f| Column {
-                name: f.name().clone(),
+                name: escape(f.name()).into_owned(),
                 kind: type_name(f.data_type()),
                 numeric: is_numeric(f.data_type()),
             })
@@ -231,11 +234,13 @@ impl Table {
         if n == 0 {
             return String::new();
         }
-        let cells: Vec<Vec<Option<String>>> = self
+        // Values are escaped only when they need it.
+        let cells: Vec<Vec<Option<Cow<str>>>> = self
             .rows
             .iter()
             .map(|row| row.iter().map(|v| v.as_deref().map(escape)).collect())
             .collect();
+        // Each column's width with nothing cut: its widest value, name or type.
         let mut widths: Vec<usize> = (0..n)
             .map(|i| {
                 let values = cells
@@ -251,46 +256,13 @@ impl Table {
                     .unwrap_or(1)
             })
             .collect();
-        let width = |widths: &[usize], shown: &[usize], elided: bool| {
-            shown.iter().map(|&i| widths[i] + 3).sum::<usize>() + 1 + if elided { 4 } else { 0 }
+        let (shown, left_count, elided) = if style.max_width > 0
+            && table_width(&widths, &(0..n).collect::<Vec<_>>(), false) > style.max_width
+        {
+            fit_width(&self.columns, &mut widths, style.max_width)
+        } else {
+            ((0..n).collect(), n, false)
         };
-
-        // Too wide: cut long columns short, then leave out middle columns.
-        let mut shown: Vec<usize> = (0..n).collect();
-        let mut elided = false;
-        if style.max_width > 0 && width(&widths, &shown, false) > style.max_width {
-            for w in &mut widths {
-                *w = (*w).min(NARROW_COLUMN);
-            }
-            if width(&widths, &shown, false) > style.max_width {
-                // Keep columns from both ends, alternately, while they fit.
-                let order = (0..n).map(|k| if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 });
-                let mut kept: Vec<usize> = Vec::new();
-                for i in order {
-                    let mut candidate = kept.clone();
-                    candidate.push(i);
-                    if !kept.is_empty() && width(&widths, &candidate, true) > style.max_width {
-                        break;
-                    }
-                    kept = candidate;
-                }
-                kept.sort_unstable();
-                elided = kept.len() < n;
-                shown = kept;
-                // One column still too wide: narrow it to fit.
-                let over = width(&widths, &shown, elided).saturating_sub(style.max_width);
-                if over > 0 {
-                    let i = shown[0];
-                    widths[i] = widths[i].saturating_sub(over).max(1);
-                }
-            }
-        }
-        // Where the `…` column goes: after the columns kept from the left.
-        let left_count = shown
-            .iter()
-            .enumerate()
-            .take_while(|&(k, &i)| k == i)
-            .count();
 
         let dim = |s: String| {
             if style.color {
@@ -395,21 +367,27 @@ impl Table {
                     thousands(shown_rows)
                 )
             };
-            let table_width = width(&widths, &shown, elided);
-            // The columns, when some were left out or there is room to say.
+            let table_width = table_width(&widths, &shown, elided);
+            // The columns, at the table's right edge when they fit there with
+            // two spaces to spare; on a line of their own when some were left
+            // out and they do not; otherwise not at all.
             let columns = if elided {
                 format!("{} ({} shown)", plural(n, "column"), shown.len())
-            } else if 2 + rows.width() + 1 + plural(n, "column").width() <= table_width {
-                plural(n, "column")
             } else {
-                String::new()
+                plural(n, "column")
             };
-            let room = table_width
-                .saturating_sub(2 + rows.width() + columns.width())
-                .max(1);
-            let footer = format!("  {rows}{}{columns}", " ".repeat(room));
-            out.push_str(&dim(footer.trim_end().to_string()));
-            out.push('\n');
+            let footer = if 2 + rows.width() + 2 + columns.width() <= table_width {
+                let room = table_width - 2 - rows.width() - columns.width();
+                format!("  {rows}{}{columns}", " ".repeat(room))
+            } else if elided {
+                format!("  {rows}\n  {columns}")
+            } else {
+                format!("  {rows}")
+            };
+            for line in footer.lines() {
+                out.push_str(&dim(line.to_string()));
+                out.push('\n');
+            }
         }
         out
     }
@@ -433,10 +411,14 @@ pub fn thousands(n: usize) -> String {
     out
 }
 
-/// A value on one line: control characters written as escapes.
-fn escape(value: &str) -> String {
-    if !value.chars().any(char::is_control) {
-        return value.to_string();
+/// A value on one line, its characters shown as they are: control
+/// characters, and the invisible ones that change how text around them is
+/// drawn (bidirectional overrides, zero-width spaces and joiners, line and
+/// paragraph separators, byte order marks), written as escapes. A value that
+/// needs none is borrowed.
+fn escape(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(needs_escape) {
+        return Cow::Borrowed(value);
     }
     let mut out = String::with_capacity(value.len() + 2);
     for c in value.chars() {
@@ -444,11 +426,31 @@ fn escape(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if needs_escape(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
+}
+
+/// Whether `c` is written as an escape: a control character, or a format
+/// character or separator that is invisible but moves or hides the text
+/// around it. The zero-width joiner and non-joiner (U+200D, U+200C) are not:
+/// they are part of ordinary text, in emoji sequences and in several scripts.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+        )
 }
 
 /// `text` cut to `width` columns, ending in `…` if it was cut.
@@ -490,6 +492,154 @@ fn center(text: &str, width: usize) -> String {
     )
 }
 
+/// How wide a table is with columns `shown` at `widths`, and a `…` column
+/// if `elided`.
+fn table_width(widths: &[usize], shown: &[usize], elided: bool) -> usize {
+    shown.iter().map(|&i| widths[i] + 3).sum::<usize>() + 1 + if elided { 4 } else { 0 }
+}
+
+/// The narrowest a column is cut when every column can still be shown: its
+/// name and type (between [`MIN_COLUMN`] and [`NARROW_COLUMN`] wide), or less
+/// if nothing in it is that wide.
+const MIN_COLUMN: usize = 10;
+
+/// Fit a table too wide for `max_width`: narrow the widest columns, only as
+/// much as needed and no narrower than their names (see [`MIN_COLUMN`]); if
+/// that is not enough, leave out middle columns, keeping as many from both
+/// ends as fit (see [`from_both_ends`]), then narrow those as needed.
+/// Returns the columns shown, how many of them are from the left (the `…`
+/// column comes after them), and whether any were left out. `widths` holds
+/// each column's width with nothing cut, and is set to the widths to draw.
+fn fit_width(
+    columns: &[Column],
+    widths: &mut [usize],
+    max_width: usize,
+) -> (Vec<usize>, usize, bool) {
+    let n = columns.len();
+    let all: Vec<usize> = (0..n).collect();
+    let floor = |i: usize| {
+        let header = columns[i].name.width().max(columns[i].kind.width());
+        widths[i].min(header.clamp(MIN_COLUMN, NARROW_COLUMN))
+    };
+    let floors: Vec<usize> = all.iter().map(|&i| floor(i)).collect();
+    if table_width(&floors, &all, false) <= max_width {
+        let room = max_width - table_width(&vec![0; n], &all, false);
+        narrow(widths, &all, &floors, room);
+        return (all, n, false);
+    }
+
+    // As many columns as fit: from both ends, at NARROW_COLUMN wide or at
+    // their floors, whichever shows more (at NARROW_COLUMN if the same).
+    let narrowed: Vec<usize> = widths.iter().map(|&w| w.min(NARROW_COLUMN)).collect();
+    let (wide, wide_left) = from_both_ends(&narrowed, max_width);
+    let (narrow_ones, narrow_left) = from_both_ends(&floors, max_width);
+    let (shown, left_count) = if narrow_ones.len() > wide.len() {
+        (narrow_ones, narrow_left)
+    } else {
+        (wide, wide_left)
+    };
+    let elided = shown.len() < n;
+    // Then as wide as there is room for: no narrower than their floors
+    // unless a column alone is too wide.
+    let room = max_width.saturating_sub(table_width(&vec![0; n], &shown, elided));
+    narrow(widths, &shown, &floors, room);
+    narrow(widths, &shown, &vec![1; n], room);
+    (shown, left_count, elided)
+}
+
+/// The columns that fit in `max_width` at `widths`, with a `…` column for
+/// the rest: taken from both ends, alternately, the first column always. A
+/// column that does not fit closes its end (the columns past it would make a
+/// second gap) and the other end goes on. Returns them in order, and how
+/// many are from the left.
+fn from_both_ends(widths: &[usize], max_width: usize) -> (Vec<usize>, usize) {
+    let n = widths.len();
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let (mut next_left, mut next_right) = (0, n);
+    let (mut left_open, mut right_open) = (true, true);
+    let mut used = table_width(widths, &[], true);
+    let mut from_left = true;
+    while next_left < next_right && (left_open || right_open) {
+        if !(if from_left { left_open } else { right_open }) {
+            from_left = !from_left;
+            continue;
+        }
+        let i = if from_left { next_left } else { next_right - 1 };
+        let first = left.is_empty() && right.is_empty();
+        if first || used + widths[i] + 3 <= max_width {
+            used += widths[i] + 3;
+            if from_left {
+                left.push(i);
+                next_left += 1;
+            } else {
+                right.push(i);
+                next_right -= 1;
+            }
+        } else if from_left {
+            left_open = false;
+        } else {
+            right_open = false;
+        }
+        from_left = !from_left;
+    }
+    let left_count = left.len();
+    left.extend(right.into_iter().rev());
+    (left, left_count)
+}
+
+/// Narrow the widest of the columns `shown`, none below its floor, until
+/// their widths add up to `room` at most (or all are at their floors). Each
+/// is cut to the same level, as little as that allows; the leftmost of those
+/// cut take what is left over.
+fn narrow(widths: &mut [usize], shown: &[usize], floors: &[usize], room: usize) {
+    let total: usize = shown.iter().map(|&i| widths[i]).sum();
+    if total <= room {
+        return;
+    }
+    let over = total - room;
+    let at = |i: usize, level: usize| widths[i].min(level).max(floors[i].min(widths[i]));
+    let cut = |level: usize| {
+        shown
+            .iter()
+            .map(|&i| widths[i] - at(i, level))
+            .sum::<usize>()
+    };
+    if cut(0) <= over {
+        let floored: Vec<usize> = shown.iter().map(|&i| at(i, 0)).collect();
+        for (&i, w) in shown.iter().zip(floored) {
+            widths[i] = w;
+        }
+        return;
+    }
+    // The highest level that cuts enough.
+    let (mut low, mut high) = (0, shown.iter().map(|&i| widths[i]).max().unwrap_or(0));
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if cut(mid) >= over {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let level = low;
+    let mut spare = cut(level) - over;
+    let narrowed: Vec<(usize, usize)> = shown
+        .iter()
+        .map(|&i| {
+            let w = at(i, level);
+            if spare > 0 && w == level && widths[i] > level {
+                spare -= 1;
+                (i, level + 1)
+            } else {
+                (i, w)
+            }
+        })
+        .collect();
+    for (i, w) in narrowed {
+        widths[i] = w;
+    }
+}
+
 fn is_numeric(t: &DataType) -> bool {
     match t {
         DataType::Dictionary(_, v) => is_numeric(v),
@@ -510,8 +660,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int64Array, ListArray, StringArray};
-    use arrow::datatypes::{Field, Int64Type, Schema};
+    use arrow::array::{
+        DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray, NullArray, StringArray,
+    };
+    use arrow::datatypes::{Field, Int32Type, Int64Type, Schema};
 
     fn karate() -> (SchemaRef, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
@@ -635,12 +787,19 @@ mod tests {
         let text = draw(rows, &schema, 80);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines.iter().all(|l| l.width() <= 80), "{text}");
-        assert!(lines[1].starts_with("│       column_0       │"), "{text}");
-        assert!(lines[1].contains(" … "), "{text}");
-        assert!(lines[1].ends_with("│       column_7       │"), "{text}");
-        assert!(lines[4].contains("a value much longer…"), "{text}");
+        // As many columns as fit, from both ends, each cut to the same width.
         assert!(
-            lines.last().unwrap().ends_with("8 columns (3 shown)"),
+            lines[1].starts_with("│   column_0   │   column_1   │"),
+            "{text}"
+        );
+        assert!(lines[1].contains(" … "), "{text}");
+        assert!(
+            lines[1].ends_with("│   column_6   │   column_7   │"),
+            "{text}"
+        );
+        assert!(lines[4].starts_with("│ a value muc… │"), "{text}");
+        assert!(
+            lines.last().unwrap().ends_with("8 columns (5 shown)"),
             "{text}"
         );
     }
@@ -750,6 +909,219 @@ mod tests {
         assert!(
             one.contains("│     0 │ v0   │\n│   ·   │  ·   │\n"),
             "{one}"
+        );
+    }
+
+    /// A table of one row, from `(name, type, value)` (`None`: null).
+    fn one_row(columns: &[(&str, DataType, Option<&str>)]) -> Table {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(name, t, _)| Field::new(*name, t.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        let row = columns
+            .iter()
+            .map(|(_, _, v)| v.map(String::from))
+            .collect();
+        Table::new(&schema, vec![row], None, 1)
+    }
+
+    fn at_width(table: &Table, max_width: usize) -> String {
+        table.render(Style {
+            max_width,
+            color: false,
+        })
+    }
+
+    #[test]
+    fn a_null_in_a_null_column_shows_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Null, true),
+            Field::new("i", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(NullArray::new(1)),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mut rows = Rows::new(40);
+        rows.push(batch);
+        assert_eq!(
+            draw(rows, &schema, 0),
+            "\
+┌──────┬───────┐
+│  n   │   i   │
+│ Null │ Int64 │
+├──────┼───────┤
+│ NULL │     1 │
+└──────┴───────┘
+"
+        );
+    }
+
+    #[test]
+    fn a_null_dictionary_value_shows_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let values = StringArray::from(vec![Some("a"), None]);
+        let keys = Int32Array::from(vec![0, 1]);
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        let mut rows = Rows::new(40);
+        rows.push(batch);
+        let text = draw(rows, &schema, 0);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[4].starts_with("│ a ") && lines[5].starts_with("│ NULL "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_column_too_wide_to_show_is_skipped_and_the_other_end_goes_on() {
+        // `SELECT 1 a, 'abcdefghijklmnopqrstuvwxyz' b, 3 c, 4 d, 5 e, 6 f` in 40.
+        let mut columns = vec![("a", DataType::Int64, Some("1"))];
+        columns.push(("b", DataType::Utf8, Some("abcdefghijklmnopqrstuvwxyz")));
+        for (name, value) in [("c", "3"), ("d", "4"), ("e", "5"), ("f", "6")] {
+            columns.push((name, DataType::Int64, Some(value)));
+        }
+        let table = one_row(&columns);
+        assert_eq!(
+            at_width(&table, 40),
+            "\
+┌───────┬───┬───────┬───────┬───────┐
+│   a   │ … │   d   │   e   │   f   │
+│ Int64 │ … │ Int64 │ Int64 │ Int64 │
+├───────┼───┼───────┼───────┼───────┤
+│     1 │ … │     4 │     5 │     6 │
+└───────┴───┴───────┴───────┴───────┘
+  1 row           6 columns (4 shown)
+"
+        );
+        // At the right end too: the left end goes on.
+        let b = columns.remove(1);
+        columns.insert(4, b);
+        let names: Vec<_> = columns.iter().map(|c| c.0).collect();
+        assert_eq!(names, ["a", "c", "d", "e", "b", "f"]);
+        let text = at_width(&one_row(&columns), 40);
+        assert!(
+            text.lines().nth(1) == Some("│   a   │   c   │   d   │ … │   f   │"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_table_a_little_too_wide_is_narrowed_only_as_needed() {
+        // `SELECT repeat('x', 60) AS s, 1 AS n` in 70: s loses two characters.
+        let long = "x".repeat(60);
+        let table = one_row(&[
+            ("s", DataType::Utf8, Some(long.as_str())),
+            ("n", DataType::Int64, Some("1")),
+        ]);
+        let text = at_width(&table, 70);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.iter().all(|l| l.width() == 70), "{text}");
+        assert_eq!(lines[4], format!("│ {}… │     1 │", "x".repeat(57)));
+
+        // Both columns shown, narrowed, rather than one left out.
+        let table = one_row(&[
+            ("a", DataType::Int64, Some("1")),
+            ("b", DataType::Utf8, Some("a long value that is long")),
+        ]);
+        assert_eq!(
+            at_width(&table, 25),
+            "\
+┌───────┬───────────────┐
+│   a   │       b       │
+│ Int64 │     Utf8      │
+├───────┼───────────────┤
+│     1 │ a long value… │
+└───────┴───────────────┘
+"
+        );
+    }
+
+    #[test]
+    fn columns_are_narrowed_no_further_than_their_names_before_some_are_left_out() {
+        let long = "y".repeat(30);
+        let columns: Vec<(&str, DataType, Option<&str>)> = ["first", "second_name", "third"]
+            .into_iter()
+            .map(|name| (name, DataType::Utf8, Some(long.as_str())))
+            .collect();
+        let table = one_row(&columns);
+        // 10, 11 and 10 wide fit in 41: all three, cut to their names.
+        let text = at_width(&table, 41);
+        assert!(
+            text.lines().nth(1) == Some("│   first    │ second_name │   third    │"),
+            "{text}"
+        );
+        // Not in 40: the middle one is left out, the others as wide as fits.
+        let text = at_width(&table, 40);
+        assert!(text.lines().all(|l| l.width() <= 40), "{text}");
+        assert!(text.lines().nth(1).unwrap().contains(" … "), "{text}");
+        assert!(text.ends_with("3 columns (2 shown)\n"), "{text}");
+    }
+
+    #[test]
+    fn the_footer_fits_under_the_table() {
+        let long = "z".repeat(30);
+        let columns: Vec<(&str, DataType, Option<&str>)> = ["p", "q", "r"]
+            .into_iter()
+            .map(|name| (name, DataType::Utf8, Some(long.as_str())))
+            .collect();
+        let table = one_row(&columns);
+        // Too narrow for the rows and the columns on one line: two lines.
+        let text = at_width(&table, 25);
+        assert!(
+            text.ends_with("┘\n  1 row\n  3 columns (1 shown)\n"),
+            "{text}"
+        );
+        assert!(text.lines().all(|l| l.width() <= 25), "{text}");
+        // Wide enough: one line, the columns at the table's right edge.
+        let text = at_width(&table, 38);
+        let last = text.lines().last().unwrap();
+        assert_eq!(last.width(), text.lines().next().unwrap().width(), "{text}");
+        assert!(last.starts_with("  1 row  ") && last.ends_with("3 columns (2 shown)"));
+
+        // A count of columns that is not needed is left out rather than
+        // crowded in.
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let empty = Table::new(&schema, vec![], None, 0);
+        assert_eq!(
+            at_width(&empty, 0),
+            "┌───────┐\n│   n   │\n│ Int64 │\n└───────┘\n  0 rows\n"
+        );
+    }
+
+    #[test]
+    fn invisible_characters_are_escaped() {
+        assert_eq!(
+            escape("a\u{202e}b\u{200b}c\u{feff}"),
+            "a\\u{202e}b\\u{200b}c\\u{feff}"
+        );
+        // Joiners are ordinary text: an emoji family stays one family.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(escape(family), family);
+        assert_eq!(escape("a\u{200c}b"), "a\u{200c}b");
+        assert_eq!(
+            escape("\u{2028}\u{2029}\u{2066}\u{2069}\u{200f}"),
+            "\\u{2028}\\u{2029}\\u{2066}\\u{2069}\\u{200f}"
+        );
+        // Text that needs no escapes is not copied.
+        assert!(matches!(escape("plain, ünïcode 熊"), Cow::Borrowed(_)));
+        // Names too.
+        let table = one_row(&[("x\u{202e}y", DataType::Utf8, Some("\u{2067}v"))]);
+        let text = at_width(&table, 0);
+        assert!(
+            text.contains("x\\u{202e}y") && text.contains("\\u{2067}v"),
+            "{text}"
         );
     }
 

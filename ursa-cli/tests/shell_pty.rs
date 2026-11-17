@@ -42,6 +42,11 @@ fn colour_in_a_colour_terminal() {
     p.send_line("SELECT 42 AS answer;").unwrap();
     p.exp_string("\x1b[1mSELECT\x1b[0m").unwrap();
     p.exp_string(&bytes("│ \x1b[90mInt64 \x1b[0m │")).unwrap();
+    // A string left open goes on in the next line's colour.
+    p.send_line("SELECT 'a").unwrap();
+    p.exp_string("\x1b[33m'a\x1b[0m").unwrap();
+    p.send_line("b' AS s;").unwrap();
+    p.exp_string("\x1b[33mb'\x1b[0m \x1b[1mAS\x1b[0m").unwrap();
     p.send_line(".quit").unwrap();
     p.exp_eof().unwrap();
 }

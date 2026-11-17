@@ -60,6 +60,10 @@ pub async fn run<O: Write, E: Write>(
         } else {
             shell.prompt()
         };
+        // The line is coloured as the next of the statement typed so far.
+        if let Some(helper) = rl.helper_mut() {
+            helper.state = shell.highlight_state().clone();
+        }
         match rl.readline(&prompt) {
             Ok(line) => {
                 if !entry.is_empty() {
@@ -202,6 +206,8 @@ fn save(rl: &mut Editor<ShellHelper, FileHistory>, path: &PathBuf) {
 #[derive(Default)]
 struct ShellHelper {
     color: bool,
+    /// Where the line starts: in a new statement or the one being typed.
+    state: highlight::State,
     files: FilenameCompleter,
     history_failed: std::cell::Cell<bool>,
 }
@@ -244,7 +250,7 @@ impl Hinter for ShellHelper {
 impl Highlighter for ShellHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         if self.color {
-            Cow::Owned(highlight::ansi(line))
+            Cow::Owned(highlight::ansi_from(line, &self.state))
         } else {
             Cow::Borrowed(line)
         }

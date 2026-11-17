@@ -616,7 +616,7 @@ async function hostCommand(line) {
       const first = Math.max(0, history.length - n);
       const width = String(history.length).length;
       for (let i = first; i < history.length; i++) {
-        const { text: ansi } = await engine("highlight", { text: history[i] });
+        const { text: ansi } = await engine("highlight", { text: history[i], alone: true });
         await write(`\x1b[90m${String(i + 1).padStart(width)}\x1b[0m  ${ansi.replace(/\n/g, "\n" + " ".repeat(width + 2))}\r\n`);
       }
       return true;
