@@ -21,6 +21,12 @@ ignore = [
     # uses, so the fix waits for a DataFusion release on a newer object_store.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml ^0.39 via object_store 0.13 (Azure); fix is in 0.41, not reachable with DataFusion 55" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml ^0.39 via object_store 0.13 (Azure); fix is in 0.41, not reachable with DataFusion 55" },
+    # Unmaintained, not vulnerable, with no maintained release to move to. Each is
+    # pulled only through the arrow 59 / DataFusion 55 / object_store 0.13 chain, so
+    # they leave with an upgrade of that chain, not a change in Ursa (#366).
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; via object_store 0.13, no maintained release; waits for the arrow/DataFusion/object_store chain" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; via arrow 59 and DataFusion 55, no maintained release; waits for the arrow/DataFusion chain" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; via arrow-array 59 and datafusion-functions 55, no maintained release; waits for the arrow/DataFusion chain" },
 ]
 
 [licenses]

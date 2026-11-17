@@ -23,8 +23,13 @@ static assets and an R2 bucket.
     shell, which runs a statement once it ends with `;` and shows the
     continuation prompt meanwhile; Shift+Enter adds a line to what is typed;
     ↑/↓ recall history (kept in this browser); Ctrl+C copies a selection, or
-    drops what was typed; Ctrl+L clears. Keys pressed while a line runs wait
-    for it. What the shell prints (tables, errors, colour) is written to the
+    drops what was typed; Ctrl+L clears; Tab and Shift+Tab move the focus out
+    of the terminal, to the bar (there is no completion); `.help shortcuts`
+    lists every key (the `SHORTCUTS` text in `app.js`, which the e2e test
+    checks against the keys). The cursor moves and deletes by the character
+    as seen (an emoji sequence, a flag, a letter and its accent), and CJK and
+    emoji take two cells, by the width table `app.js` gives xterm. Keys pressed while a
+    line runs wait for it. What the shell prints (tables, errors, colour) is written to the
     terminal as is, so a selection copies as the text on screen.
   - **Dot-commands** are the CLI's (`.help`, `.tables`, `.describe`,
     `.functions`, `.maxrows`, `.maxwidth`, `.timer`, `.mode`, …; `.help graph`
@@ -35,16 +40,24 @@ static assets and an R2 bucket.
   - **Datasets.** Picking one starts a fresh session and runs its commands at
     the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
     three queries that show the graph functions, `GRAPH_TABLE` patterns and
-    shortest paths. `?dataset=karate` in the URL loads one on open.
+    shortest paths, each after `--` comments that say what it shows (keep the
+    explanations in the commands, not in JS comments). Long lines are broken
+    at spaces to fit the terminal. `?dataset=karate` in the URL loads one on
+    open. The menu works from the keyboard as a menu button (arrows, Home,
+    End, Enter, Escape).
   - **Share** copies a link whose fragment holds the session's commands;
     opening it lists them, with control characters shown as escapes, and asks
     `Run N shared commands? [y/N]`: only `y` replays them, and a link's
     `.export` is skipped, so a link never downloads files. **Import** adds
     files from this computer (`WebShell.addFile`, at `memory://uploads/<name>`,
     where characters other than ASCII letters, digits, `.`, `_` and `-` become
-    `_`) and defines a view over each, named after the file and quoted
-    (`"données"`, `"order"`). **New** starts a fresh session. The theme follows the system until the
+    `_` and a name so changed gets a hash of the original) and defines a view
+    over each, named after the file and quoted (`"données"`, `"order"`).
+    **New** starts a fresh session. The theme follows the system until the
     toggle picks one, which is remembered; the terminal's colours follow it.
+    A click on a bar button hands the focus back to the terminal; pressed from
+    the keyboard, the button keeps it. Under 640px the bar is one row: the
+    logo without its name, and under 420px icons for New, Share and Import.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
   engine; everything else is a static asset. A path that does not decode is
@@ -109,9 +122,11 @@ http://localhost:8788.
 at the prompt (one line, several, an error), every dot-command, a long table,
 downloads in each format, Import (with awkward file names), a shared link
 replayed in a fresh page (answered y and N, and a crafted one with escape
-sequences and `.export`), New, the theme toggle and history; and the security
-headers, 404s for malformed and traversing paths, and no Content Security
-Policy violation in the console.
+sequences and `.export`), New, the theme toggle and history; the keyboard and
+phone checks: Tab out of the terminal, the menu's keys, the focus after a
+click, no mid-word wraps and a one-row bar at 320px, a 16px input, and the grey
+text's contrast; and the security headers, 404s for malformed and traversing
+paths, and no Content Security Policy violation in the console.
 
 ```sh
 bun run preview                               # in one terminal

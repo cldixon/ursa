@@ -8,11 +8,16 @@
 // menu, types SQL at the prompt (one line and several), runs dot-commands (the
 // shell's and the page's), downloads the last result in each format, imports a
 // file, replays a shared link in a fresh page, and checks New, the theme toggle
-// and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. An error on screen fails the run, except the ones a test asks
-// for. It also checks what keeps the page safe: a shared link asks before it
-// runs, shows control characters as escapes and downloads nothing; awkward
-// file names import; and every response carries the security headers, which
-// the page runs under with no Content Security Policy violation.
+// and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. It
+// also checks the keyboard (Tab out of the terminal, the Datasets menu's keys,
+// the focus after a click), a phone's bar and SQL, and the grey text's
+// contrast. The line editor's checks cover wide characters (CJK and emoji),
+// lines that wrap or fill the width exactly, resizing, colour, and its keys.
+// And it checks what keeps the page safe: a shared link asks before it runs,
+// shows control characters as escapes and downloads nothing; awkward file
+// names import; and every response carries the security headers, which the
+// page runs under with no Content Security Policy violation. An error on
+// screen fails the run, except the ones a test asks for.
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -51,6 +56,30 @@ const count = (text: string, needle: string) => text.split(needle).length - 1;
 /** Tables on screen: each starts with a ┌ at the start of a line. */
 const tables = async (p: Page = page) => (await screen(p)).split("\n").filter((l) => l.startsWith("┌")).length;
 const errors = async (p: Page = page) => count(await screen(p), "Error: ");
+/** The queries in a dataset's commands: not its CREATEs, dot-commands or comments. */
+const queries = (commands: string[]) =>
+  commands.map((c) => c.split("\n").filter((l) => !/^\s*--/.test(l)).join("\n")).filter((c) => !/^(CREATE|\.)/i.test(c)).length;
+/** What has the focus: an id, or the terminal. */
+const focused = (p: Page = page): Promise<string> =>
+  p.evaluate(() => (document.activeElement?.classList.contains("xterm-helper-textarea") ? "terminal" : document.activeElement?.id || document.activeElement?.tagName || ""));
+/** WCAG contrast of two computed CSS colours, rgb(...). */
+function contrast(a: string, b: string) {
+  const lum = (c: string) => {
+    const [r, g, bl] = c.match(/\d+(\.\d+)?/g)!.slice(0, 3).map((v) => {
+      const x = Number(v) / 255;
+      return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+/** The colour of the types under a table's header (the shell's grey), and the terminal's background. */
+const greyText = (p: Page = page) =>
+  p.evaluate(() => {
+    const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
+    return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
+  });
 
 /** Type `text` at the prompt, a line at a time, each with Enter; wait for it. */
 async function type(text: string, p: Page = page) {
@@ -83,17 +112,85 @@ const banner = await screen();
 check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
 await page.click("#terminal");
 
+// The keyboard can leave the terminal: Tab and Shift+Tab move the focus on
+// (there is no completion for them to do), and Tab comes back to it.
+{
+  const before = await screen();
+  await page.keyboard.press("Shift+Tab");
+  check((await focused()) === "theme", "Shift+Tab leaves the terminal", await focused());
+  await page.keyboard.press("Tab");
+  check((await focused()) === "terminal", "Tab goes back into the terminal", await focused());
+  await page.keyboard.press("Tab");
+  const left = await focused();
+  check(left !== "terminal" && (await screen()) === before, "Tab leaves the terminal, typing nothing", left);
+  // The theme toggle: a click hands the keys back to the terminal; from the
+  // keyboard, the focus stays on it.
+  await page.click("#theme");
+  check((await focused()) === "terminal", "focus is back in the terminal after a theme click", await focused());
+  await page.focus("#theme");
+  await page.keyboard.press("Enter");
+  check((await focused()) === "theme", "focus stays on the theme toggle pressed from the keyboard", await focused());
+  await page.click("#terminal");
+}
+
+// The Datasets menu from the keyboard: a menu button.
+{
+  const menuState = () =>
+    page.evaluate(() => ({
+      open: !document.getElementById("dataset-menu")!.hidden,
+      expanded: document.getElementById("datasets")!.getAttribute("aria-expanded"),
+      item: [...document.querySelectorAll("#dataset-menu [role=menuitem]")].indexOf(document.activeElement!),
+    }));
+  const n = await page.locator("#dataset-menu [role=menuitem]").count();
+  const steps: [string, number][] = [["ArrowDown", 1], ["ArrowUp", 0], ["ArrowUp", n - 1], ["ArrowDown", 0], ["End", n - 1], ["Home", 0]];
+  await page.focus("#datasets");
+  await page.keyboard.press("ArrowDown");
+  let s = await menuState();
+  let ok = s.open && s.expanded === "true" && s.item === 0;
+  const seen = [s.item];
+  for (const [key, want] of steps) {
+    await page.keyboard.press(key);
+    s = await menuState();
+    seen.push(s.item);
+    ok &&= s.item === want;
+  }
+  check(ok, "the Datasets menu's arrow keys, Home and End", JSON.stringify(seen));
+  await page.keyboard.press("Escape");
+  s = await menuState();
+  check(!s.open && s.expanded === "false" && (await focused()) === "datasets", "Escape closes the menu, back on its button", JSON.stringify(s));
+  const attrs = await page.evaluate(() => {
+    const b = document.getElementById("datasets")!, m = document.getElementById("dataset-menu")!;
+    return [b.getAttribute("aria-haspopup"), b.getAttribute("aria-controls"), m.getAttribute("role"), m.getAttribute("aria-labelledby"), m.querySelector("button")!.tabIndex].join(",");
+  });
+  check(attrs === "menu,dataset-menu,menu,datasets,-1", "the menu's aria attributes", attrs);
+  await page.click("#terminal");
+}
+
 // Every dataset, from the menu: each starts a fresh session, and its queries
 // print a table each, with no error.
 const datasets: { id: string; title: string; commands: string[] }[] = await page.evaluate(() => (window as any).ursaShell.datasets);
-for (const d of datasets) {
+for (const [i, d] of datasets.entries()) {
   const t = Date.now();
-  await page.click("#datasets");
-  await page.click(`#dataset-menu button:has-text("${d.title}")`);
+  if (i === 0) {
+    // The first from the keyboard: Enter opens the menu on its first item, and
+    // Enter picks it.
+    await page.focus("#datasets");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+  } else {
+    await page.click("#datasets");
+    await page.click(`#dataset-menu button:has-text("${d.title}")`);
+  }
   await idle();
   const text = await screen();
-  const queries = d.commands.filter((c) => !/^CREATE/i.test(c)).length;
-  check(!text.includes("Error: ") && (await tables()) === queries && text.startsWith("Ursa Web Shell running"), `dataset ${d.id}`, `${await tables()} tables in ${Date.now() - t} ms`);
+  check(!text.includes("Error: ") && (await tables()) === queries(d.commands) && text.startsWith("Ursa Web Shell running"), `dataset ${d.id}`, `${await tables()} tables in ${Date.now() - t} ms`);
+  if (i === 0) {
+    check((await focused()) === "datasets", "a dataset picked from the keyboard leaves the focus on the menu button", await focused());
+    // Its explanations are shown, as SQL comments.
+    check(/^memory U -- \S/m.test(text), "a dataset's explanations show as comments", text.match(/^memory U --.*$/m)?.[0]);
+    await page.click("#terminal");
+  }
+  if (d.id === "rmat") check(text.includes("Run Time (s): real "), "the R-MAT dataset turns the timer on");
   if (shots && d.id === "karate") await page.screenshot({ path: `${shots}/shell-karate.png` });
 }
 await type(".tables");
@@ -328,6 +425,11 @@ await page.keyboard.press("Shift+Enter");
 await page.keyboard.type("8 AS eight;");
 await page.waitForTimeout(200);
 check(!(await screen()).includes("│     7 │"), "Shift+Enter doesn't run the line");
+check(
+  (await screen()).split("\n").slice(-2).join("\n") === "memory U SELECT 7 AS seven,\n         8 AS eight;",
+  "Shift+Enter adds one line, and sends nothing to the shell",
+  JSON.stringify((await screen()).split("\n").slice(-3)),
+);
 await page.keyboard.press("Enter");
 await idle();
 check(lastTable(await after("SELECT 7 AS seven,")).rows[0]?.join(",") === "7,8", "Shift+Enter then Enter runs both lines", JSON.stringify(lastTable(await after("SELECT 7 AS seven,")).rows));
@@ -368,7 +470,7 @@ for (const title of [datasets[0].title, datasets[2].title]) {
 await idle();
 {
   const text = await screen();
-  check(!text.includes("Error: ") && (await tables()) === datasets[2].commands.filter((c) => !/^CREATE/i.test(c)).length, "a dataset picked during another replaces it cleanly", `${await tables()} tables`);
+  check(!text.includes("Error: ") && (await tables()) === queries(datasets[2].commands), "a dataset picked during another replaces it cleanly", `${await tables()} tables`);
 }
 // New during a dataset: the dataset stops; the session is empty.
 await page.click("#datasets");
@@ -376,6 +478,203 @@ await page.click(`#dataset-menu button:has-text("${datasets[1].title}")`);
 await page.click("#new");
 await idle();
 check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New during a dataset stops it", `${await tables()} tables`);
+
+// The line editor: wide characters, wrapping, resizing, colour and its keys.
+{
+  const shell = (fn: string, ...args: any[]) => page.evaluate(([fn, args]) => (window as any).ursaShell[fn as string](...(args as any[])), [fn, args] as const);
+  const cursorAt = async () => (await shell("cursor")) as { x: number; y: number };
+  const lastLines = async (n: number) => (await screen()).split("\n").slice(-n);
+  const settle = async () => {
+    await page.waitForTimeout(150);
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+  };
+  /** Drop what is typed. */
+  const drop = async () => {
+    await page.keyboard.press("Control+C");
+    await idle();
+  };
+  await page.click("#new");
+  await idle();
+
+  // Wide characters: CJK takes two cells, an emoji sequence two; the cursor
+  // goes where the characters are, and moves over (and deletes) them whole.
+  await page.keyboard.type("SELECT '日本語' AS t");
+  for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowLeft");
+  await settle();
+  let c = await cursorAt();
+  let line = (await screen()).split("\n")[c.y] ?? "";
+  // memory U SELECT '日本語' AS t: the cursor is on the closing quote, after three wide characters.
+  check(c.x === "memory U SELECT '".length + 6, "the cursor after CJK text", `column ${c.x}, line ${JSON.stringify(line)}`);
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type("x");
+  await settle();
+  c = await cursorAt();
+  check((await lastLines(1))[0] === "memory U SELECT '日本x' AS t" && c.x === "memory U SELECT '".length + 5, "Backspace deletes a CJK character", `${JSON.stringify((await lastLines(1))[0])} column ${c.x}`);
+  await drop();
+  const cp = (...cps: number[]) => String.fromCodePoint(...cps);
+  // A face, a ZWJ family, a flag, a skin tone, a heart with VS16, and e with a combining accent.
+  const emoji = [cp(0x1f600), cp(0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467), cp(0x1f1fa, 0x1f1f8), cp(0x1f44d, 0x1f3fd), cp(0x2764, 0xfe0f), cp(0x65, 0x301)];
+  await page.keyboard.insertText(`SELECT '${emoji.join("")}'`);
+  await page.keyboard.press("ArrowLeft");
+  await settle();
+  const typed = `memory U SELECT '${emoji.join("")}`;
+  c = await cursorAt();
+  check(c.x === "memory U SELECT '".length + 11, "the cursor after emoji", `column ${c.x}`);
+  const cells = ((await shell("cells", c.y)) as { ch: string }[]).map((x) => x.ch);
+  check(JSON.stringify(cells.slice(17, 23)) === JSON.stringify(emoji), "an emoji sequence is one character on screen", JSON.stringify(cells.slice(17, 23)));
+  let shown = "";
+  for (const want of [...emoji].reverse()) {
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("Delete");
+    await settle();
+    shown = (await lastLines(1))[0];
+    if (!shown.startsWith(typed.slice(0, typed.lastIndexOf(want))) || shown.includes(cp(0xfffd))) break;
+  }
+  check(shown === "memory U SELECT ''", "Left and Delete take an emoji sequence whole", JSON.stringify(shown));
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("🇺🇸🇫🇷");
+  await page.keyboard.press("Backspace");
+  await settle();
+  check((await lastLines(1))[0] === "memory U SELECT ''🇺🇸", "Backspace deletes a flag whole", JSON.stringify((await lastLines(1))[0]));
+  await drop();
+
+  // A long CJK line wraps (a wide character that doesn't fit the row starts
+  // the next one) and is drawn once however it is edited.
+  const cols: number = await shell("cols");
+  const long = "漢字".repeat(cols);
+  await page.keyboard.insertText(`SELECT '${long}`);
+  await page.keyboard.type("' AS kanji;");
+  for (let i = 0; i < 11; i++) await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type("x");
+  await page.keyboard.press("End");
+  await page.keyboard.press("Backspace");
+  await settle();
+  {
+    // The ; is gone: the line ends "AS kanji".
+    const text = await screen();
+    const rows = text.split("\n");
+    const first = rows.findLastIndex((l) => l.startsWith("memory U SELECT '漢字"));
+    const joined = rows.slice(first).join("");
+    check(count(text, "memory U SELECT '漢字") === 1 && joined === `memory U SELECT '${long}x' AS kanji`, "a wrapped CJK line is drawn once", `${count(text, "memory U SELECT '漢字")} prompts, ${rows.length - first} rows`);
+    c = await cursorAt();
+    check(c.y === rows.length - 1 && c.x === [...rows.at(-1)!].reduce((n, ch) => n + (ch.charCodeAt(0) > 0x2e80 ? 2 : 1), 0), "the cursor at the end of a wrapped CJK line", JSON.stringify(c));
+  }
+  await page.keyboard.type(";");
+  await page.keyboard.press("Enter");
+  await idle();
+  check(lastTable(await after("SELECT '漢字")).head[0] === "kanji", "a wrapped CJK line runs", JSON.stringify(lastTable(await after("SELECT '漢字")).head));
+
+  // A line that fills the terminal's width exactly, with lines after it: no
+  // empty row after it.
+  const exact = "SELECT " + "1".repeat(cols - "memory U SELECT ".length - " AS w,".length) + " AS w,";
+  await page.keyboard.type(exact);
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("2 AS v;");
+  await page.keyboard.press("ArrowUp");
+  await settle();
+  {
+    const rows = await lastLines(2);
+    check(rows[0] === `memory U ${exact}` && rows[1] === "         2 AS v;", "a line as wide as the terminal leaves no empty row", JSON.stringify(rows));
+  }
+  await page.keyboard.press("End");
+  await settle();
+  c = await cursorAt();
+  check(c.y === (await screen()).split("\n").length - 1 && c.x === 0, "the cursor after a line as wide as the terminal", JSON.stringify(c));
+  await page.keyboard.press("Enter");
+  await idle();
+  {
+    const rows = (await after(exact.slice(0, 20))).split("\n");
+    check(rows[0] === "         2 AS v;" && rows[1].startsWith("┌"), "a line as wide as the terminal, run", JSON.stringify(rows.slice(0, 2)));
+  }
+
+  // Resizing redraws what is typed for the new width, at once.
+  const statement = "SELECT 'resize' AS r, " + Array.from({ length: 12 }, (_, i) => `${i} AS c${i}`).join(", ");
+  await page.keyboard.type(statement);
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("FROM members");
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("End");
+  await settle();
+  for (const width of [640, 1100]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForFunction((n) => (window as any).ursaShell.cols() !== n, await shell("cols"));
+    await settle();
+    await settle();
+    const n: number = await shell("cols");
+    const first = `memory U ${statement}`;
+    const want: string[] = [];
+    for (let i = 0; i < first.length; i += n) want.push(first.slice(i, i + n));
+    want.push("         FROM members");
+    const text = await screen();
+    const rows = text.split("\n");
+    c = await cursorAt();
+    check(
+      count(text, "memory U SELECT 'resize'") === 1 && JSON.stringify(rows.slice(-want.length)) === JSON.stringify(want),
+      `resizing to ${n} columns redraws what is typed`,
+      `${count(text, "memory U SELECT 'resize'")} prompts; ${JSON.stringify(rows.slice(-want.length - 1))}`,
+    );
+    const end = (statement.length + 9) % n;
+    check(c.y === rows.length - 2 && c.x === end, `the cursor where it was, at ${n} columns`, `${JSON.stringify(c)}, want x ${end}`);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await settle();
+  await drop();
+
+  // What is typed and run before the highlighter answers is coloured all the same.
+  await shell("input", [..."SELECT 'quick' AS fast;", "\r"]);
+  await idle();
+  {
+    const rows = (await screen()).split("\n");
+    const y = rows.findLastIndex((l) => l.startsWith("memory U SELECT 'quick'"));
+    const cells = (await shell("cells", y)) as { ch: string; fg: number; bold: boolean }[];
+    const word = (from: number, n: number) => cells.slice(from, from + n);
+    const keyword = word(9, 6), string = word(16, 7);
+    check(keyword.every((x) => x.bold || x.fg >= 0) && string.every((x) => x.fg >= 0) && string[0].fg !== keyword[0].fg, "a line run at once is coloured", JSON.stringify([keyword[0], string[0]]));
+  }
+
+  // .help shortcuts lists the keys the line editor knows, and they do what it says.
+  await type(".help shortcuts");
+  {
+    const listed = (await after(".help shortcuts"))
+      .split("\n")
+      .filter((l) => /^\S/.test(l) && !l.startsWith("memory U"))
+      .flatMap((l) => {
+        const [keys, what] = l.split(/\s{2,}/);
+        return [...keys.split(", "), ...(what.match(/\(also ([^)]*)\)/)?.[1].split(", ") ?? [])];
+      });
+    const known = ["Enter", "Shift+Enter", "Up", "Down", "Left", "Right", "Ctrl+B", "Ctrl+F", "Home", "End", "Ctrl+A", "Ctrl+E", "Backspace", "Ctrl+H", "Delete", "Ctrl+U", "Ctrl+K", "Ctrl+W", "Tab", "Shift+Tab", "Ctrl+C", "Cmd+C", "Ctrl+L"];
+    check(JSON.stringify([...listed].sort()) === JSON.stringify([...known].sort()), ".help shortcuts lists the editor's keys", JSON.stringify(listed));
+    // Each editing key on "one two three", the cursor after "two": what is left, and where the cursor is.
+    const edits: [string[], string, number][] = [
+      [["ArrowLeft"], "one two three", 6],
+      [["Control+B"], "one two three", 6],
+      [["ArrowRight"], "one two three", 8],
+      [["Control+F"], "one two three", 8],
+      [["Home"], "one two three", 0],
+      [["Control+A"], "one two three", 0],
+      [["End"], "one two three", 13],
+      [["Control+E"], "one two three", 13],
+      [["Backspace"], "one tw three", 6],
+      [["Control+H"], "one tw three", 6],
+      [["Delete"], "one twothree", 7],
+      [["Control+U"], " three", 0],
+      [["Control+K"], "one two", 7],
+      [["Control+W"], "one  three", 4],
+    ];
+    const wrong: string[] = [];
+    for (const [keys, want, at] of edits) {
+      await page.keyboard.type("one two three");
+      for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowLeft");
+      for (const k of keys) await page.keyboard.press(k);
+      await settle();
+      const got = (await lastLines(1))[0];
+      c = await cursorAt();
+      if (got !== `memory U ${want}` || c.x !== 9 + at) wrong.push(`${keys}: ${JSON.stringify(got)} at ${c.x - 9}`);
+      await drop();
+    }
+    check(!wrong.length, "the editing keys do what .help shortcuts says", wrong.join("; "));
+  }
+}
 
 // The engine crashing (out of memory) leaves a working shell, in a fresh session.
 await type("SELECT length(repeat('x', 2000000000)) AS n;");
@@ -403,6 +702,53 @@ const columns: number = await phone.evaluate(() => (window as any).ursaShell.col
 const widest = Math.max(...(await screen(phone)).split("\n").filter((l) => /^[┌│└├]/.test(l)).map((l) => [...l].length));
 check(widest <= columns, "tables fit a phone's width", `widest ${widest}, ${columns} columns`);
 if (shots) await phone.screenshot({ path: `${shots}/shell-phone.png` });
+// The dataset's SQL is broken at spaces to fit: no line fills the width, as a
+// line the terminal wraps (mid-word) does.
+{
+  const full = (await screen(phone)).split("\n").filter((l) => [...l].length >= columns);
+  check(full.length === 0, "a dataset's SQL fits a phone without wrapping mid-word", full[0]);
+}
+// iOS zooms in on a text field with a font under 16px.
+{
+  const size: string = await phone.evaluate(() => getComputedStyle(document.querySelector(".xterm-helper-textarea")!).fontSize);
+  check(parseFloat(size) >= 16, "the terminal's textarea is 16px or more", size);
+}
+await phone.close();
+
+// The narrowest phone: the bar is one row, and the SQL still fits.
+const small = await browser.newPage({ viewport: { width: 320, height: 640 } });
+await small.goto(`${base}/?dataset=lesmis`);
+await ready(small);
+await idle(small);
+{
+  const bar = (await small.locator("header.bar").boundingBox())!;
+  const fits: boolean = await small.evaluate(() =>
+    [...document.querySelectorAll("header button, header a")].every((e) => {
+      const r = e.getBoundingClientRect();
+      return r.height <= 44 && r.right <= innerWidth && r.left >= 0;
+    }),
+  );
+  check(bar.height <= 56 && fits, "the bar is one row at 320px", `${bar.height}px`);
+  const cols: number = await small.evaluate(() => (window as any).ursaShell.cols());
+  const full = (await screen(small)).split("\n").filter((l) => [...l].length >= cols);
+  check(full.length === 0 && !(await errors(small)) && (await tables(small)) === queries(datasets[1].commands), "lesmis at 320px: no mid-word wraps, no errors", full[0] ?? `${await tables(small)} tables`);
+}
+await small.close();
+
+// The dim text (types, footers, nulls) is readable: 4.5:1 or more on the
+// terminal's background, in both themes.
+for (const scheme of ["light", "dark"] as const) {
+  const ctx = await browser.newContext({ viewport: { width: 1000, height: 700 }, colorScheme: scheme });
+  const p = await ctx.newPage();
+  await p.goto(base);
+  await ready(p);
+  await p.click("#terminal");
+  await type("SELECT 1 AS one;", p);
+  const colors = await greyText(p);
+  const ratio = colors ? contrast(colors[0], colors[1]) : 0;
+  check(ratio >= 4.5, `dim text contrast, ${scheme}`, `${ratio.toFixed(2)}:1 (${colors?.join(" on ")})`);
+  await ctx.close();
+}
 
 // The security headers, on every kind of response.
 for (const path of ["/", "/app.js", "/engine/engine.json", "/data/manifest.json", "/data/no_such_file.csv", "/no/such/page"]) {

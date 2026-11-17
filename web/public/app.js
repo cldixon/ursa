@@ -84,8 +84,9 @@ const THEMES = {
     selectionBackground: "#1f3e8c33", selectionInactiveBackground: "#1f3e8c22",
     black: "#12120f", red: "#c0262d", green: "#3f7f3f", yellow: "#a8650f", blue: "#1f3e8c",
     magenta: "#7a3e8c", cyan: "#2f6f7f", white: "#5a5852",
-    brightBlack: "#8a877f", brightRed: "#c4491b", brightGreen: "#3f7f3f", brightYellow: "#b07728",
+    brightBlack: "#6b6963", brightRed: "#c4491b", brightGreen: "#3f7f3f", brightYellow: "#b07728",
     brightBlue: "#4b6cb0", brightMagenta: "#7a3e8c", brightCyan: "#2f6f7f", brightWhite: "#12120f",
+    scrollbarSliderBackground: "#12120f26", scrollbarSliderHoverBackground: "#12120f4d", scrollbarSliderActiveBackground: "#12120f66",
     prompt: "#c4491b",
   },
   dark: {
@@ -95,6 +96,7 @@ const THEMES = {
     magenta: "#d6a8ff", cyan: "#9fd8e0", white: "#f4f1ea",
     brightBlack: "#8a877f", brightRed: "#ff9f51", brightGreen: "#8fd18f", brightYellow: "#ffd2a1",
     brightBlue: "#c8d6ff", brightMagenta: "#d6a8ff", brightCyan: "#9fd8e0", brightWhite: "#ffffff",
+    scrollbarSliderBackground: "#f4f1ea26", scrollbarSliderHoverBackground: "#f4f1ea4d", scrollbarSliderActiveBackground: "#f4f1ea66",
     prompt: "#ff9f51",
   },
 };
@@ -112,13 +114,17 @@ function currentTheme() {
   if (set) return set;
   return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
-$("theme").onclick = () => {
+// A click on the bar's buttons hands the keys back to the terminal; pressed
+// from the keyboard (a click with no pointer), they keep the focus.
+const byPointer = (e) => e.detail > 0;
+$("theme").onclick = (e) => {
   const next = currentTheme() === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   try {
     localStorage.setItem("ursa-theme", next);
   } catch {}
   term.options.theme = xtermTheme(next);
+  if (byPointer(e)) term.focus();
 };
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   term.options.theme = xtermTheme(currentTheme());
@@ -142,9 +148,110 @@ const term = new Terminal({
   convertEol: true,
   cursorBlink: true,
   scrollback: 10_000,
+  allowProposedApi: true, // term.unicode.register
 });
 const fit = new FitAddon();
 term.loadAddon(fit);
+
+// ---------------------------------------------------------------- cell widths
+//
+// How many cells a character takes, for xterm (which draws it) and for the
+// line editor (which puts the cursor): the same function, so they agree.
+// xterm's own table is Unicode 6, where emoji take one cell. Here CJK and
+// emoji take two, combining marks none, and an emoji sequence (ZWJ, skin
+// tone, flag, variation selector) is joined into one cluster of two cells.
+const WIDE = [
+  [0x1100, 0x115f], [0x231a, 0x231b], [0x2329, 0x232a], [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff], [0xa000, 0xa4cf], [0xa960, 0xa97f], [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe10, 0xfe19],
+  [0xfe30, 0xfe6f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x16fe0, 0x18d8f], [0x1aff0, 0x1b2ff], [0x1f200, 0x1f2ff],
+  [0x20000, 0x2fffd], [0x30000, 0x3fffd],
+];
+const ZERO_WIDTH = /^[\p{Mn}\p{Me}\p{Cf}]$/u;
+const EMOJI = /^\p{Emoji_Presentation}$/u;
+const PICTOGRAPHIC = /^\p{Extended_Pictographic}$/u;
+// A character's class: its width (the low 2 bits) and what it joins.
+const JOINS = 4, PICT = 8, RI = 16, ZWJ = 32, MODIFIER = 64, VS16 = 128;
+const classes = new Map();
+function charClass(cp) {
+  let c = classes.get(cp);
+  if (c !== undefined) return c;
+  const ch = String.fromCodePoint(cp);
+  if (cp >= 0x1f3fb && cp <= 0x1f3ff) c = 2 | MODIFIER;
+  else if (cp >= 0x1f1e6 && cp <= 0x1f1ff) c = 2 | RI;
+  else if (ZERO_WIDTH.test(ch) || (cp >= 0x1160 && cp <= 0x11ff) || (cp >= 0xd7b0 && cp <= 0xd7ff)) c = JOINS | (cp === 0x200d ? ZWJ : 0) | (cp === 0xfe0f ? VS16 : 0);
+  else c = (EMOJI.test(ch) || WIDE.some(([a, b]) => cp >= a && cp <= b) ? 2 : 1) | (PICTOGRAPHIC.test(ch) ? PICT : 0);
+  classes.set(cp, c);
+  return c;
+}
+// What follows a character: an emoji (a ZWJ, skin tone or VS16 joins it), a
+// ZWJ after an emoji (the next emoji joins it), or one regional indicator
+// (the next one makes a flag).
+const AFTER_EMOJI = 1, AFTER_ZWJ = 2, AFTER_RI = 3;
+const props = (state, width, join) => (state << 3) | (width << 1) | (join ? 1 : 0);
+const propsWidth = (p) => (p >> 1) & 3;
+/** xterm's charProperties: `cp`'s width, and whether it joins the cell before. */
+function charProperties(cp, preceding) {
+  if (cp < 0x300) return props(0, cp < 32 || (cp >= 0x7f && cp < 0xa0) ? 0 : 1, false);
+  const c = charClass(cp);
+  const state = preceding >>> 3;
+  const before = propsWidth(preceding);
+  if (before > 0) {
+    if (c & RI && state === AFTER_RI) return props(0, 2, true);
+    if (c & PICT && state === AFTER_ZWJ) return props(AFTER_EMOJI, Math.max(before, c & 3), true);
+    if (c & MODIFIER && state === AFTER_EMOJI) return props(AFTER_EMOJI, 2, true);
+    if (c & JOINS) {
+      const next = state === AFTER_EMOJI ? (c & ZWJ ? AFTER_ZWJ : AFTER_EMOJI) : 0;
+      return props(next, c & VS16 ? 2 : before, true);
+    }
+  }
+  // A mark with nothing to join takes a cell of its own, as xterm draws it.
+  return props(c & RI ? AFTER_RI : c & (PICT | MODIFIER) ? AFTER_EMOJI : 0, c & 3 || 1, false);
+}
+const wcwidth = (cp) => (cp < 0x300 ? propsWidth(charProperties(cp, 0)) : charClass(cp) & 3);
+term.unicode.register({ version: "ursa", wcwidth, charProperties });
+term.unicode.activeVersion = "ursa";
+
+/**
+ * Where `s` leaves the cursor, written from column `x` of row `y` as xterm
+ * writes it: a character that doesn't fit wraps to the next row (a wide one
+ * leaves the last cell empty), and `x` may be `cols`, waiting to wrap.
+ */
+function place(s, { x, y, p }, cols) {
+  for (const ch of s) {
+    const f = charProperties(ch.codePointAt(0), p);
+    const width = propsWidth(f);
+    const joined = f & 1 ? propsWidth(p) : 0;
+    p = f;
+    if (x + width - joined > cols) {
+      x = joined;
+      y++;
+    }
+    x += x && f & 1 ? width - joined : width;
+  }
+  return { x, y, p };
+}
+const cellWidth = (s) => place(s, { x: 0, y: 0, p: 0 }, Infinity).x;
+
+// Characters as a person sees them (an emoji with its skin tone, a flag, a
+// letter and its accent): the cursor moves over them, and deletes them, whole.
+const segmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+const graphemes = (s) => (segmenter ? Array.from(segmenter.segment(s), (g) => g.segment) : Array.from(s));
+/** The start of the character before index `i` of `s`. */
+function before(s, i) {
+  if (i <= 0) return 0;
+  if (segmenter) return segmenter.segment(s).containing(i - 1).index;
+  return i - (i >= 2 && /[\udc00-\udfff]/.test(s[i - 1]) && /[\ud800-\udbff]/.test(s[i - 2]) ? 2 : 1);
+}
+/** The end of the character at index `i` of `s`. */
+function after(s, i) {
+  if (i >= s.length) return s.length;
+  if (segmenter) {
+    const g = segmenter.segment(s).containing(i);
+    return g.index + g.segment.length;
+  }
+  return i + (s.codePointAt(i) > 0xffff ? 2 : 1);
+}
+
 term.open($("terminal"));
 fit.fit();
 
@@ -153,11 +260,24 @@ function sendWidth() {
   engine("width", { columns: Math.max(20, term.cols - 1) });
 }
 new ResizeObserver(() => {
+  const size = `${term.cols}x${term.rows}`;
   fit.fit();
   sendWidth();
+  // The terminal rewraps what is on screen: draw what is typed afresh.
+  if (!busy && `${term.cols}x${term.rows}` !== size) redrawInput();
 }).observe($("terminal"));
 
 term.attachCustomKeyEventHandler((e) => {
+  // Tab and Shift+Tab move the focus on, as anywhere on a page (there is no
+  // completion for them to do), so the keyboard can leave the terminal.
+  if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return false;
+  // Shift+Enter starts a new line in what is typed. xterm would send Enter for
+  // it (on keydown, and again on keypress), so it never reaches xterm.
+  if (e.key === "Enter" && e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    if (e.type === "keydown") onKey("\n");
+    return false;
+  }
   if (e.type !== "keydown") return true;
   // Ctrl+C (Cmd+C) with text selected copies it, as in a terminal app.
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && term.hasSelection()) {
@@ -166,18 +286,6 @@ term.attachCustomKeyEventHandler((e) => {
   }
   return true;
 });
-// Shift+Enter starts a new line in what is typed. xterm would also turn its
-// keypress into Enter, so the key never reaches xterm.
-term.textarea?.addEventListener(
-  "keydown",
-  (e) => {
-    if (e.key !== "Enter" || !e.shiftKey || e.isComposing) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    onKey("\n");
-  },
-  true,
-);
 
 const write = (s) => new Promise((resolve) => term.write(s, resolve));
 
@@ -218,47 +326,121 @@ function remember(entry) {
 /** Lines of `text`, coloured once the shell's highlighter has answered. */
 function coloredLines() {
   if (colored.text === text) return colored.ansi.split("\n");
-  const asked = text;
-  engine("highlight", { text: asked }).then(({ text: ansi }) => {
-    if (asked === text && !busy) {
-      colored = { text: asked, ansi };
-      draw();
-    }
-  });
+  highlight().then((done) => done && !busy && draw());
   return text.split("\n");
 }
 
-const length = (s) => [...s].length;
+// Each request to the highlighter is numbered: a reply to an older one, for
+// text since changed, is dropped.
+let highlightSeq = 0;
+let highlighting = null;
+/** Ask the highlighter for `text`, once; resolves true if `colored` is now current. */
+function highlight() {
+  if (colored.text === text) return Promise.resolve(true);
+  if (highlighting?.text === text) return highlighting.done;
+  const asked = text;
+  const seq = ++highlightSeq;
+  const done = engine("highlight", { text: asked }).then(
+    ({ text: ansi }) => {
+      if (seq !== highlightSeq || asked !== text) return false;
+      colored = { text: asked, ansi };
+      return true;
+    },
+    () => false,
+  );
+  highlighting = { text: asked, done };
+  return done;
+}
 
-/** Draw the prompt and what is typed, and put the cursor where it is. */
-function draw() {
+/** What was typed ran: the shell's state changed, and with it the colours. */
+function forgetColors() {
+  colored = { text: "", ansi: "" };
+  highlighting = null;
+  highlightSeq++;
+}
+
+/**
+ * Where each line of what is typed goes on screen, after its prompt: the row
+ * its last character is on (from the row the line starts on), whether it
+ * fills that row exactly (the terminal waits to wrap), and the cursor's row
+ * and column if `at` (an index in the line) is where it is.
+ */
+function layout(lead, line, at, cols) {
+  let pos = place(lead, { x: 0, y: 0, p: 0 }, cols);
+  let target = null;
+  let i = 0;
+  for (const g of graphemes(line)) {
+    if (i === at) {
+      // Where the character's first cell goes: on the next row if it doesn't fit.
+      const next = place(String.fromCodePoint(g.codePointAt(0)), pos, cols);
+      target = next.y > pos.y ? { row: next.y, col: 0 } : { row: pos.y, col: pos.x };
+    }
+    pos = place(g, pos, cols);
+    i += g.length;
+  }
+  if (at === line.length) target = pos.x >= cols ? { row: pos.y + 1, col: 0 } : { row: pos.y, col: pos.x };
+  return { last: pos.y, full: pos.x >= cols, target };
+}
+
+/**
+ * Draw the prompt and what is typed, and put the cursor where it is. `final`
+ * draws it for the scrollback: the cursor is left after the last character.
+ */
+function draw(final = false) {
   const cols = term.cols;
   const lines = text.split("\n");
   const colors = coloredLines();
+  const pad = " ".repeat(cellWidth(prompt));
   let out = "\r" + (cursorRow > 0 ? `\x1b[${cursorRow}A` : "") + "\x1b[J";
   let row = 0; // the row this line starts on
-  let end = 0; // the row the last line ends on
+  let end = 0; // the row the cursor is on once all is written
   let offset = 0;
   let target = { row: 0, col: 0 };
   lines.forEach((line, i) => {
     if (i > 0) out += "\r\n";
-    out += (i === 0 ? `${promptColor[0]}${prompt}${promptColor[1]}` : " ".repeat(prompt.length)) + (colors[i] ?? line);
-    const width = prompt.length + length(line);
-    // A line that fills its last row exactly leaves the cursor waiting to
-    // wrap: wrap it now, so the rows below are where they are counted.
-    if (width > 0 && width % cols === 0) out += " \r";
-    if (cursor >= offset && cursor <= offset + line.length) {
-      const at = prompt.length + length(line.slice(0, cursor - offset));
-      target = { row: row + Math.floor(at / cols), col: at % cols };
+    out += (i === 0 ? `${promptColor[0]}${prompt}${promptColor[1]}` : pad) + (colors[i] ?? line);
+    const at = cursor >= offset && cursor <= offset + line.length ? cursor - offset : -1;
+    const placed = layout(i === 0 ? prompt : pad, line, at, cols);
+    if (placed.target) target = { row: row + placed.target.row, col: placed.target.col };
+    end = row + placed.last;
+    // The last line, if it fills its last row exactly, leaves the cursor
+    // waiting to wrap: wrap it now, so the cursor can go to the row below.
+    // A line before it needs nothing: its newline goes to the next row.
+    if (placed.full && i === lines.length - 1 && !final) {
+      out += " \r";
+      end++;
     }
-    end = row + Math.floor(width / cols);
     row = end + 1;
     offset += line.length + 1;
   });
+  if (final) {
+    cursorRow = 0;
+    term.write(out);
+    return;
+  }
   const up = end - target.row;
   out += (up > 0 ? `\x1b[${up}A` : "") + "\r" + (target.col > 0 ? `\x1b[${target.col}C` : "");
   cursorRow = target.row;
-  term.write(out);
+  const rows = cursorRow;
+  term.write(out, () => {
+    // Where the input starts, kept by the terminal as it rewraps: see redrawInput.
+    inputStart?.dispose();
+    inputStart = term.registerMarker(-rows);
+  });
+}
+
+// The row the drawn input starts on, which the terminal moves as it rewraps.
+let inputStart = null;
+
+/** Draw what is typed again, after the terminal changed size and rewrapped. */
+function redrawInput() {
+  term.write("", () => {
+    if (busy || !inputStart || inputStart.isDisposed || inputStart.line < 0) return;
+    const top = Math.max(0, inputStart.line - term.buffer.active.baseY);
+    term.write(`\x1b[${top + 1};1H`);
+    cursorRow = 0;
+    draw();
+  });
 }
 
 /** Take what is drawn off the screen (before the page runs a command). */
@@ -279,16 +461,28 @@ function setText(s) {
   draw();
 }
 
-/** Leave the input on screen as typed, and go to the next line for output. */
+/** Leave the input on screen as typed, coloured, and go to the next line for output. */
 async function finishLine() {
+  await highlight();
   cursor = text.length;
-  draw();
-  cursorRow = 0;
+  draw(true);
   await write("\r\n");
 }
 
 const lineStart = () => text.lastIndexOf("\n", cursor - 1) + 1;
 const lineEnd = () => (text.indexOf("\n", cursor) < 0 ? text.length : text.indexOf("\n", cursor));
+/** The cursor's column in its line, in cells. */
+const column = () => cellWidth(text.slice(lineStart(), cursor));
+/** The index in the line starting at `start` that is nearest `col` cells in, not past it. */
+function atColumn(start, col) {
+  const end = text.indexOf("\n", start) < 0 ? text.length : text.indexOf("\n", start);
+  let i = start;
+  for (const g of graphemes(text.slice(start, end))) {
+    if (cellWidth(text.slice(start, i + g.length)) > col) break;
+    i += g.length;
+  }
+  return i;
+}
 
 // Keys pressed while a line runs wait for it, as a terminal keeps them.
 let typeahead = [];
@@ -343,25 +537,26 @@ function key(data) {
     case "\x7f": // Backspace
     case "\b":
       if (cursor > 0) {
-        text = text.slice(0, cursor - 1) + text.slice(cursor);
-        cursor--;
+        const start = before(text, cursor);
+        text = text.slice(0, start) + text.slice(cursor);
+        cursor = start;
         draw();
       }
       return;
     case "\x1b[3~": // Delete
       if (cursor < text.length) {
-        text = text.slice(0, cursor) + text.slice(cursor + 1);
+        text = text.slice(0, cursor) + text.slice(after(text, cursor));
         draw();
       }
       return;
     case "\x1b[D": // Left
     case "\x02":
-      if (cursor > 0) cursor--;
+      cursor = before(text, cursor);
       draw();
       return;
     case "\x1b[C": // Right
     case "\x06":
-      if (cursor < text.length) cursor++;
+      cursor = after(text, cursor);
       draw();
       return;
     case "\x1b[H": // Home
@@ -401,9 +596,7 @@ function key(data) {
         historyAt--;
         setText(history[historyAt]);
       } else {
-        const column = cursor - lineStart();
-        const start = text.lastIndexOf("\n", lineStart() - 2) + 1;
-        cursor = Math.min(start + column, lineStart() - 1);
+        cursor = atColumn(text.lastIndexOf("\n", lineStart() - 2) + 1, column());
         draw();
       }
       return;
@@ -413,10 +606,7 @@ function key(data) {
         historyAt++;
         setText(historyAt === history.length ? draft : history[historyAt]);
       } else {
-        const column = cursor - lineStart();
-        const start = lineEnd() + 1;
-        const end = text.indexOf("\n", start) < 0 ? text.length : text.indexOf("\n", start);
-        cursor = Math.min(start + column, end);
+        cursor = atColumn(lineEnd() + 1, column());
         draw();
       }
       return;
@@ -442,6 +632,7 @@ function cancelTyped() {
     await cancelPending();
     text = "";
     cursor = 0;
+    forgetColors();
     historyAt = history.length;
   });
 }
@@ -529,6 +720,7 @@ function submitTyped() {
     remember(entry);
     text = "";
     cursor = 0;
+    forgetColors();
     for (const line of entry.split("\n")) await feed(line, { echo: false });
   });
 }
@@ -540,7 +732,7 @@ function submitTyped() {
  * they are skipped if a fresh session starts before they run. What is being
  * typed is put back afterwards. Resolves to whether all of them ran.
  */
-function runAll(commands, { session = generation, replay = false } = {}) {
+function runAll(commands, { session = generation, replay = false, fit = false } = {}) {
   let ok = true;
   const jobs = commands.map((command) =>
     enqueue(async () => {
@@ -548,9 +740,10 @@ function runAll(commands, { session = generation, replay = false } = {}) {
       setAside();
       // A statement left half typed would take this command as its next line.
       if (statement.length) await cancelPending();
+      const lines = fit ? fitLines(command, term.cols - prompt.length - 1) : command.split("\n");
       replaying = replay;
       try {
-        for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+        for (const line of lines) ok = (await feed(line, { echo: true })) && ok;
       } finally {
         replaying = false;
       }
@@ -573,6 +766,52 @@ function setAside() {
   cursor = 0;
 }
 
+/**
+ * The lines of `sql`, those wider than `width` broken at spaces, so that a
+ * narrow terminal doesn't wrap them mid-word. A space in a quoted string or
+ * after `--` is no place to break; a broken comment carries on as a comment.
+ * A break goes on the next line, indented two more than its own; a line
+ * indented too far to break loses its indent first.
+ */
+function fitLines(sql, width) {
+  const out = [];
+  for (const line of sql.split("\n")) {
+    const indent = line.match(/^\s*/)[0];
+    const comment = line.trimStart().startsWith("--");
+    let pad = indent + (comment ? "-- " : "  ");
+    let rest = line;
+    let from = indent.length; // breaks come after this, so each line holds something
+    while (rest.length > width) {
+      let at = -1;
+      let quote = "";
+      for (let i = 0; i <= width && i < rest.length; i++) {
+        const c = rest[i];
+        if (quote) {
+          if (c === quote) quote = "";
+        } else if (!comment && (c === "'" || c === '"')) {
+          quote = c;
+        } else if (!comment && c === "-" && rest[i + 1] === "-") {
+          break;
+        } else if (c === " " && i > from && rest[i - 1] !== " ") {
+          at = i;
+        }
+      }
+      if (at < 0) {
+        if (rest.length - rest.trimStart().length <= 2) break;
+        rest = "  " + rest.trimStart();
+        pad = comment ? "  -- " : "    ";
+        from = 2;
+        continue;
+      }
+      out.push(rest.slice(0, at));
+      rest = pad + rest.slice(at).trimStart();
+      from = pad.length;
+    }
+    out.push(rest);
+  }
+  return out;
+}
+
 /** Drop the statement the shell holds, unrun. */
 async function cancelPending() {
   const r = await engine("cancel");
@@ -587,8 +826,10 @@ const LOOKS = /^\s*\.(help|tables|graphs|describe|functions|version|print|histor
 async function feed(line, { echo }) {
   if (echo) {
     // Shown as typed, but with control characters escaped: a command from a
-    // shared link cannot rewrite the screen as it is echoed.
-    const { text: ansi } = await engine("highlight", { text: visible(line) });
+    // shared link cannot rewrite the screen as it is echoed. The shell's
+    // highlighter leaves comments plain: the page greys them.
+    const shown = visible(line);
+    const { text: ansi } = /^\s*--/.test(line) ? { text: `\x1b[90m${shown}\x1b[0m` } : await engine("highlight", { text: shown });
     await write(`${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
   }
   statement.push(line);
@@ -623,12 +864,17 @@ const HOST_COMMANDS = [
 
 const SHORTCUTS = `Enter            Run the line (a statement runs once it ends with ;)
 Shift+Enter      Start a new line in what is typed
-Up, Down         Step through the history (kept in this browser)
-Ctrl+C           Copy the selection; with none, drop what is typed
-Ctrl+L           Clear the screen
-Ctrl+A, Ctrl+E   Go to the start or end of the line
+Up, Down         Go to the line above or below; past the first or last, step
+                 through the history (kept in this browser)
+Left, Right      Move a character (also Ctrl+B, Ctrl+F)
+Home, End        Go to the start or end of the line (also Ctrl+A, Ctrl+E)
+Backspace        Delete the character before the cursor (also Ctrl+H)
+Delete           Delete the character at the cursor
 Ctrl+U, Ctrl+K   Delete to the start or end of the line
-Ctrl+W           Delete the word before the cursor`;
+Ctrl+W           Delete the word before the cursor
+Tab, Shift+Tab   Move the focus out of the terminal, to the page's buttons
+Ctrl+C           Copy the selection (also Cmd+C); with none, drop what is typed
+Ctrl+L           Clear the screen`;
 
 const errorLine = (message) => write(`\x1b[31mError: ${message}\x1b[0m\r\n`).then(() => false);
 
@@ -748,14 +994,14 @@ function fresh() {
   return session;
 }
 
-$("new").onclick = () => {
+$("new").onclick = (e) => {
   fresh();
-  term.focus();
+  if (byPointer(e)) term.focus();
 };
 
 function loadDataset(d) {
   const session = fresh();
-  return runAll(d.commands, { session });
+  return runAll(d.commands, { session, fit: true });
 }
 
 // Share: a link whose fragment holds the session's commands, replayed on open.
@@ -783,9 +1029,9 @@ async function share() {
   if (uploads.length) await write("Imported files stay in this browser: whoever opens the link imports them again.\r\n");
   return true;
 }
-$("share").onclick = () => {
+$("share").onclick = (e) => {
   run(".share");
-  term.focus();
+  if (byPointer(e)) term.focus();
 };
 
 function history_replace(url) {
@@ -832,7 +1078,10 @@ function confirmShared(shared, session) {
 
 // Import: a file from this computer becomes a view named after it.
 const fileInput = $("file-input");
-$("import").onclick = () => fileInput.click();
+$("import").onclick = (e) => {
+  fileInput.click();
+  if (byPointer(e)) term.focus();
+};
 fileInput.onchange = () => {
   const files = [...fileInput.files];
   fileInput.value = "";
@@ -860,7 +1109,8 @@ fileInput.onchange = () => {
   term.focus();
 };
 
-// The Datasets menu.
+// The Datasets menu, a menu button: arrow keys, Home and End move between
+// its items, Enter or Space picks one, Escape (or Tab) closes it.
 const menu = $("dataset-menu");
 const menuButton = $("datasets");
 menu.replaceChildren(
@@ -868,26 +1118,49 @@ menu.replaceChildren(
     el("button", {
       type: "button",
       role: "menuitem",
+      tabIndex: -1,
       textContent: d.title,
-      onclick: () => {
+      onclick: (e) => {
         closeMenu();
         loadDataset(d);
-        term.focus();
+        (byPointer(e) ? term : menuButton).focus();
       },
     }),
   ),
 );
+const menuItems = () => [...menu.querySelectorAll('[role="menuitem"]')];
+function openMenu(at = 0) {
+  menu.hidden = false;
+  menuButton.setAttribute("aria-expanded", "true");
+  menuItems().at(at)?.focus();
+}
 function closeMenu() {
   menu.hidden = true;
   menuButton.setAttribute("aria-expanded", "false");
 }
 menuButton.onclick = (e) => {
   e.stopPropagation();
-  const open = menu.hidden;
-  menu.hidden = !open;
-  menuButton.setAttribute("aria-expanded", String(open));
-  if (open) menu.querySelector("button")?.focus();
+  if (menu.hidden) openMenu();
+  else closeMenu();
 };
+menuButton.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  openMenu(e.key === "ArrowDown" ? 0 : -1);
+});
+menu.addEventListener("keydown", (e) => {
+  const items = menuItems();
+  const at = items.indexOf(document.activeElement);
+  const to = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: items.length - 1 }[e.key];
+  if (to !== undefined) {
+    e.preventDefault();
+    items[(to + items.length) % items.length].focus();
+  } else if (e.key === "Tab") {
+    // Focus moves on from the menu button; the menu closes behind it.
+    menuButton.focus();
+    closeMenu();
+  }
+});
 document.addEventListener("click", (e) => {
   if (!menu.hidden && !menu.contains(e.target)) closeMenu();
 });
@@ -934,6 +1207,21 @@ window.ursaShell = {
     return lines.join("\n").replace(/\n+$/, "");
   },
   busy: () => busy,
+  // The cursor, as a line of the screen (as `screen` numbers them) and a column.
+  cursor: () => ({ y: term.buffer.active.baseY + term.buffer.active.cursorY, x: term.buffer.active.cursorX }),
+  // A line's cells: the character, its colour (-1 the default) and if bold.
+  cells(y) {
+    const line = term.buffer.active.getLine(y);
+    const cells = [];
+    for (let x = 0; line && x < line.length; x++) {
+      const cell = line.getCell(x);
+      if (cell.getWidth() === 0) continue;
+      cells.push({ ch: cell.getChars(), fg: cell.isFgDefault() ? -1 : cell.getFgColor(), bold: !!cell.isBold() });
+    }
+    return cells;
+  },
+  // Keys, as if typed, all at once: before any reply from the engine.
+  input: (keys) => keys.forEach((k) => term.input(k)),
   cols: () => term.cols,
   rows: () => term.rows,
   selection: () => term.getSelection(),

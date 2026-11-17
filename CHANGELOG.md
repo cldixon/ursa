@@ -508,12 +508,45 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `CREATE PROPERTY GRAPH` and `pagerank` example, run in CI with the SQL
   docs. The Python library is the second path (#354).
 
+- The browser shell's accessibility, look and onboarding. Tab and Shift+Tab
+  move the focus out of the terminal (they inserted spaces, so the keyboard
+  could not leave it), and the Datasets menu is a menu button: arrow keys,
+  Home, End, Enter, Space and Escape. A click on the theme toggle, Import,
+  Share, New or a dataset hands the keys back to the terminal; from the
+  keyboard the focus stays put. The grey text (types, footers, nulls) is
+  5.5:1 on white (it was 3.6:1). The logo is drawn at a legible size, the
+  favicon has no white tile and follows a dark browser, and the scrollbars
+  take the theme. On a phone the bar is one row (icons for New, Share and
+  Import under 420px), the terminal's input is 16px so iOS does not zoom
+  in, and a dataset's SQL is broken at spaces to fit the screen rather than
+  wrapped mid-word. Each dataset explains its steps in `--` comments at the
+  prompt, and the R-MAT dataset turns `.timer on`.
+
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc
   miscompiled the path search's target check at `opt-level` "s" and "z",
   the browser engine's build, and indexed past the end of an empty list;
   the check is written without the nested `Option` it miscompiled. CI's
   browser test now builds at "z" too, and runs a `GRAPH_TABLE` step.
+
+- The browser shell's line editor:
+  - CJK and emoji take two cells and combining marks none, so the cursor is
+    where the characters are, and a long CJK line that wraps is drawn once
+    (it left a copy of its prompt for each edit). An emoji sequence (a ZWJ
+    family, a skin tone, a flag) is one character on screen, and Left,
+    Right, Backspace and Delete move over and delete what is seen as one
+    character whole; they split emoji into broken halves.
+  - A line of several that fills the terminal's width exactly no longer
+    leaves an empty row after it.
+  - Resizing the window redraws what is being typed for the new width at
+    once; it was left as the terminal rewrapped it until the next key.
+  - A line typed and run before the highlighter answered is coloured in the
+    scrollback; it stayed plain. Late replies for text since changed are
+    dropped.
+  - Shift+Enter adds a line without also sending the line to the shell.
+  - `.help shortcuts` lists every key the editor knows, and only those:
+    Left and Right, Home and End, Backspace and Delete, Tab and the Ctrl
+    keys were missing, and Up and Down move between the lines typed first.
 
 - A CSV file DataFusion cannot read is named by its path, with its leading
   `/` (`cannot read /Users/me/x.csv: …`), not by its object store location
