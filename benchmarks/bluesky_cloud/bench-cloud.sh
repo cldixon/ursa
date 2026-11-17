@@ -146,7 +146,7 @@ cmd_results() {
     [ -n "$run_id" ] || die "no runs in s3://$bucket/results/"
     dest="$here/results/$run_id"
     mkdir -p "$dest"
-    aws s3 cp --recursive "s3://$bucket/results/$run_id/" "$dest/"
+    aws s3 cp --recursive --only-show-errors "s3://$bucket/results/$run_id/" "$dest/"
     [ -f "$dest/summary.md" ] && cat "$dest/summary.md"
     say "results in $dest"
 }

@@ -442,14 +442,64 @@ def host_info() -> dict:
                 info["mem_bytes"] = int(f.readline().split()[1]) * 1024
     except (OSError, ValueError, subprocess.CalledProcessError):
         pass
-    # Fargate's task limits (cgroup v2), which /proc/meminfo does not show.
+    # The container's memory limit, which /proc/meminfo (the host's) does not
+    # show: cgroup v2, then v1 (Fargate's Linux platform 1.4 uses v1).
     for k, p in (
         ("cgroup_mem_max", "/sys/fs/cgroup/memory.max"),
+        ("cgroup_mem_max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
         ("cgroup_cpu_max", "/sys/fs/cgroup/cpu.max"),
     ):
-        with contextlib.suppress(OSError):
-            info[k] = Path(p).read_text().strip()
+        if k not in info:
+            with contextlib.suppress(OSError):
+                info[k] = Path(p).read_text().strip()
+    # On ECS, the task's own size and placement, from the task metadata endpoint.
+    meta_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+    if meta_uri:
+        import urllib.request
+
+        with contextlib.suppress(OSError, ValueError):
+            with urllib.request.urlopen(f"{meta_uri}/task", timeout=2) as resp:
+                task = json.load(resp)
+            info["ecs"] = {
+                "limits": task.get("Limits"),
+                "availability_zone": task.get("AvailabilityZone"),
+                "launch_type": task.get("LaunchType"),
+                "task_arn": task.get("TaskARN"),
+            }
+            limits = task.get("Limits") or {}
+            if limits.get("Memory"):
+                info["mem_bytes"] = int(limits["Memory"]) * 1024 * 1024
+    # On EC2, the instance type (IMDSv2), so results say what they ran on.
+    elif sys.platform == "linux":
+        info.update(_ec2_identity())
     return info
+
+
+def _ec2_identity() -> dict:
+    import urllib.request
+
+    base = "http://169.254.169.254/latest"
+    with contextlib.suppress(OSError, ValueError):
+        req = urllib.request.Request(
+            f"{base}/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            token = resp.read().decode()
+        req = urllib.request.Request(
+            f"{base}/dynamic/instance-identity/document",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            doc = json.load(resp)
+        return {
+            "ec2": {
+                "instance_type": doc.get("instanceType"),
+                "availability_zone": doc.get("availabilityZone"),
+            }
+        }
+    return {}
 
 
 # --- report -----------------------------------------------------------------
@@ -459,13 +509,18 @@ def gb(b: int) -> str:
     return f"{b / 1e9:.2f}" if b else ""
 
 
+def _host_name(host: dict) -> str:
+    ec2 = (host.get("ec2") or {}).get("instance_type")
+    return host.get("label") or (f"EC2 {ec2}" if ec2 else host["platform"])
+
+
 def summary_md(meta: dict, results: list[Result]) -> str:
     lines = [
         f"## Bluesky benchmark: {meta['ursa_version']}",
         "",
         f"- Graph: follows {'before ' + meta['before'] if meta['before'] else '(whole graph)'}, "
         f"vertex table as {meta['vertex']}",
-        f"- Host: {meta['host'].get('label') or meta['host']['platform']}, "
+        f"- Host: {_host_name(meta['host'])}, "
         f"{meta['host']['cpus']} CPUs, {gb(meta['host'].get('mem_bytes', 0))} GB",
         f"- Download: {meta['download_s']:.1f} s; total: {meta['total_s']:.1f} s",
         "",
