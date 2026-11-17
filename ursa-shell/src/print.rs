@@ -10,13 +10,14 @@
 use std::io::Write;
 
 use crate::table::{Rows, Style};
-use arrow::csv::WriterBuilder as CsvWriterBuilder;
+use arrow::array::Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::ipc::writer::StreamWriter;
-use arrow::json::{ArrayWriter, LineDelimitedWriter};
+use arrow::json::writer::{JsonArray, LineDelimited};
+use arrow::json::{Writer as JsonWriter, WriterBuilder as JsonWriterBuilder};
 use arrow::record_batch::RecordBatch;
-use arrow::util::display::FormatOptions;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
@@ -107,35 +108,13 @@ pub async fn write_stream<W: Write>(
             } else {
                 b'\t'
             };
-            // arrow-csv turns an I/O error into text (`CsvError("Broken
-            // pipe")`), so the sink records a broken pipe itself, and it is
-            // returned as one: `ursa --format csv … | head` then ends quietly.
-            let mut sink = BrokenPipeAware::new(&mut *out);
-            let mut writer = CsvWriterBuilder::new()
-                .with_header(true)
-                .with_delimiter(delimiter)
-                .build(&mut sink);
-            let mut wrote = false;
-            let mut written = Ok(());
+            let mut writer = DelimitedWriter::new(&mut *out, delimiter, &schema)?;
             while let Some(batch) = stream.next().await {
-                written = writer.write(&batch?);
-                if written.is_err() {
-                    break;
-                }
-                wrote = true;
+                writer.write(&batch?)?;
             }
-            if written.is_ok() && !wrote {
-                // An empty batch still writes the header row.
-                written = writer.write(&RecordBatch::new_empty(schema));
-            }
-            drop(writer);
-            if sink.broken {
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
-            }
-            written?;
         }
         OutputFormat::Json => {
-            let mut writer = ArrayWriter::new(&mut *out);
+            let mut writer = json_array_writer(&mut *out);
             while let Some(batch) = stream.next().await {
                 writer.write(&batch?)?;
             }
@@ -144,7 +123,9 @@ pub async fn write_stream<W: Write>(
             writeln!(out)?;
         }
         OutputFormat::Ndjson => {
-            let mut writer = LineDelimitedWriter::new(&mut *out);
+            let mut writer = JsonWriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, LineDelimited>(&mut *out);
             while let Some(batch) = stream.next().await {
                 writer.write(&batch?)?;
             }
@@ -162,40 +143,105 @@ pub async fn write_stream<W: Write>(
     Ok(())
 }
 
-/// A writer that remembers whether a write failed with a broken pipe, for
-/// writers (arrow-csv) that do not pass the `io::Error` through.
-struct BrokenPipeAware<W> {
-    inner: W,
-    broken: bool,
+/// A JSON writer that writes `null` for a null, as DuckDB does, so every row
+/// object has every column, in column order.
+pub fn json_array_writer<W: Write>(out: W) -> JsonWriter<W, JsonArray> {
+    JsonWriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, JsonArray>(out)
 }
 
-impl<W: Write> BrokenPipeAware<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            broken: false,
+/// A CSV or TSV writer (`delimiter` `,` or tab), with a header row, written
+/// as DuckDB writes them:
+///
+/// - a null is an empty field and an empty string is `""`, so the two can be
+///   told apart;
+/// - a list, struct or map is its text form (`[1, 2]`, `{a: 1}`), with
+///   `NULL` for a null inside it, quoted where CSV needs it;
+/// - a field is quoted when it holds the delimiter, a quote or a line break,
+///   and a quote in it is doubled.
+pub struct DelimitedWriter<W> {
+    out: W,
+    delimiter: u8,
+    line: Vec<u8>,
+}
+
+impl<W: Write> DelimitedWriter<W> {
+    /// A writer to `out`, which writes the header row of `schema` now.
+    pub fn new(out: W, delimiter: u8, schema: &SchemaRef) -> std::result::Result<Self, ArrowError> {
+        let mut writer = Self {
+            out,
+            delimiter,
+            line: Vec::with_capacity(1024),
+        };
+        for (i, field) in schema.fields().iter().enumerate() {
+            writer.field(i, Some(field.name()));
         }
+        writer.end_line();
+        writer.out.write_all(&writer.line)?;
+        writer.line.clear();
+        Ok(writer)
     }
 
-    fn note<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
-        if let Err(e) = &result {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                self.broken = true;
+    /// Write every row of `batch`.
+    pub fn write(&mut self, batch: &RecordBatch) -> std::result::Result<(), ArrowError> {
+        let options = FormatOptions::default().with_null("NULL");
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // `logical_nulls`, not `is_null`: a column of type Null has no null
+        // buffer, yet every value in it is null.
+        let nulls: Vec<_> = batch.columns().iter().map(|c| c.logical_nulls()).collect();
+        let mut text = String::new();
+        for row in 0..batch.num_rows() {
+            for (i, formatter) in formatters.iter().enumerate() {
+                if nulls[i].as_ref().is_some_and(|n| n.is_null(row)) {
+                    self.field(i, None);
+                } else {
+                    text.clear();
+                    formatter.value(row).write(&mut text)?;
+                    self.field(i, Some(&text));
+                }
+            }
+            self.end_line();
+            if self.line.len() >= 64 * 1024 {
+                self.out.write_all(&self.line)?;
+                self.line.clear();
             }
         }
-        result
-    }
-}
-
-impl<W: Write> Write for BrokenPipeAware<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let result = self.inner.write(buf);
-        self.note(result)
+        self.out.write_all(&self.line)?;
+        self.line.clear();
+        Ok(())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        let result = self.inner.flush();
-        self.note(result)
+    /// Add the `i`th field of a line to the buffer: `None` for a null.
+    fn field(&mut self, i: usize, value: Option<&str>) {
+        if i > 0 {
+            self.line.push(self.delimiter);
+        }
+        let Some(value) = value else { return };
+        let quote = value.is_empty()
+            || value
+                .bytes()
+                .any(|b| b == self.delimiter || b == b'"' || b == b'\n' || b == b'\r');
+        if quote {
+            self.line.push(b'"');
+            for b in value.bytes() {
+                if b == b'"' {
+                    self.line.push(b'"');
+                }
+                self.line.push(b);
+            }
+            self.line.push(b'"');
+        } else {
+            self.line.extend_from_slice(value.as_bytes());
+        }
+    }
+
+    fn end_line(&mut self) {
+        self.line.push(b'\n');
     }
 }
 

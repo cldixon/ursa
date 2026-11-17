@@ -26,11 +26,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::RecordBatch;
-use arrow::csv::WriterBuilder as CsvWriterBuilder;
+use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::writer::StreamWriter;
-use arrow::json::ArrayWriter;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowWriter;
@@ -39,6 +37,7 @@ use futures::StreamExt;
 use js_sys::{Promise, Uint8Array};
 use serde_json::{json, Value};
 use url::Url;
+use ursa_shell::print::{json_array_writer, DelimitedWriter};
 use ursa_shell::table::{Rows, Style, DEFAULT_MAX_ROWS};
 
 mod shell;
@@ -299,13 +298,14 @@ fn describe(
                 .iter()
                 .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            // `logical_nulls`: a column of type Null has no null buffer.
+            let nulls: Vec<_> = batch.columns().iter().map(|c| c.logical_nulls()).collect();
             for row in 0..batch.num_rows() {
-                let cells: Vec<Value> = batch
-                    .columns()
+                let cells: Vec<Value> = nulls
                     .iter()
                     .zip(&formatters)
-                    .map(|(column, formatter)| {
-                        if column.is_null(row) {
+                    .map(|(nulls, formatter)| {
+                        if nulls.as_ref().is_some_and(|n| n.is_null(row)) {
                             Value::Null
                         } else {
                             Value::String(formatter.value(row).to_string())
@@ -337,16 +337,13 @@ fn encode(stored: &Stored, format: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     match format {
         "csv" => {
-            let mut writer = CsvWriterBuilder::new().with_header(true).build(&mut bytes);
-            if stored.batches.is_empty() {
-                writer.write(&RecordBatch::new_empty(Arc::clone(schema)))?;
-            }
+            let mut writer = DelimitedWriter::new(&mut bytes, b',', schema)?;
             for batch in &stored.batches {
                 writer.write(batch)?;
             }
         }
         "json" => {
-            let mut writer = ArrayWriter::new(&mut bytes);
+            let mut writer = json_array_writer(&mut bytes);
             for batch in &stored.batches {
                 writer.write(batch)?;
             }
@@ -420,5 +417,19 @@ mod tests {
         let arrow = encode(&stored, "arrow").unwrap();
         assert!(!arrow.is_empty());
         assert!(encode(&stored, "xlsx").is_err());
+    }
+
+    #[tokio::test]
+    async fn exports_lists_nulls_and_empty_strings_as_the_cli_does() {
+        let (ctx, mut results) = session_with("SELECT NULL AS a, '' AS b, [1, 2] AS l").await;
+        let stored = results.remove(0).1;
+        let csv = String::from_utf8(encode(&stored, "csv").unwrap()).unwrap();
+        assert_eq!(csv, "a,b,l\n,\"\",\"[1, 2]\"\n");
+        let json = String::from_utf8(encode(&stored, "json").unwrap()).unwrap();
+        assert_eq!(json, r#"[{"a":null,"b":"","l":[1,2]}]"#);
+        let config = ctx.state().config().options().format.clone();
+        let options: FormatOptions<'_> = (&config).try_into().unwrap();
+        let shown = describe("", &stored, 10, &options).unwrap();
+        assert_eq!(shown["rows"][0][0], Value::Null);
     }
 }

@@ -180,6 +180,15 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **`ursa`: JSON and NDJSON write `null` for a null** (behaviour change,
+  #350). Every row object has every column, in column order, as DuckDB
+  writes them: `SELECT NULL AS a, '' AS b` is `[{"a":null,"b":""}]`, which
+  was `[{"b":""}]`, so a missing key no longer stands for a null. The
+  browser shell's JSON export does the same.
+- **`ursa`: CSV and TSV write an empty string as `""`** (behaviour change,
+  #350), as DuckDB does, so it can be told from a null, which is still an
+  empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
+  browser shell's CSV export does the same.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,
@@ -210,6 +219,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a community, so `count(DISTINCT louvain)` counts them; count
   communities of more than one member with `GROUP BY louvain HAVING
   count(*) > 1`.
+- **Louvain builds its working graph in less memory** (#352). The graph was
+  scattered into padded `(u32, f64)` pairs, 16 bytes an entry, and copied
+  out while they were still held, so building it peaked at about the sum of
+  two copies of the adjacency (5.9 GB on the Bluesky follows graph, 95.7M
+  edges). Now the scatter buffers become the final arrays, compacted in
+  place; targets and weights are separate arrays (12 bytes an entry); and an
+  unweighted run scatters 4-byte targets and counts its parallel edges for
+  their weights. Results are unchanged, bit for bit. On an R-MAT graph of
+  100M edges (4.3M nodes), Louvain's peak heap went from 5,734 MB to
+  3,704 MB unweighted and to 4,928 MB weighted (peak RSS 6.50 → 4.08 GB and
+  7.28 → 5.57 GB); the building step itself fell from about 5.5 GB to about
+  2.4 GB, and the peak is now aggregating the first level. `cargo run
+  --release -p ursa-core --example louvain_memory` measures it.
 - **SQL: `hop` returns `(seed, id, distance)`** (breaking, #328). It
   returned `(src, dst)`, but its rows are nodes reached from a seed, not
   edges: `seed` is the seed, `id` a node reached and `distance` (Int64) the
@@ -394,6 +416,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Fixed
+
+- `ursa --format csv` and `tsv` write lists, structs and maps, as DuckDB
+  does, as their text form, quoted where CSV needs it (`"[1, 2]"`, with
+  `NULL` for a null inside one). They failed with "Nested type List(Int64)
+  is not supported in CSV", so `vertices(p)`, `edges(p)`, `array_agg` and
+  `random_walk` paths could not be written (#350).
+- A table shows an untyped null (`SELECT NULL AS n`, of type `Null`) as
+  `NULL`, as it shows a typed one; the cell was blank (#350).
+- The skill and the shell page say which format to read results in (`json`
+  or `ndjson`), that a table shows at most 40 rows while CSV and JSON write
+  every row, and that piped output is never cut to a width (#350).
 
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc

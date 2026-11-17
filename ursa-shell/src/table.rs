@@ -130,14 +130,17 @@ impl Rows {
                     .iter()
                     .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
                     .collect::<Result<Vec<_>, _>>()?;
+                // `logical_nulls`, not `is_null`: a column of type Null (an
+                // untyped `SELECT NULL`) has no null buffer, yet is all null.
+                let nulls: Vec<_> = batch.columns().iter().map(|c| c.logical_nulls()).collect();
                 for row in skip..batch.num_rows() {
                     rows.push(
-                        batch
-                            .columns()
+                        nulls
                             .iter()
                             .zip(&formatters)
-                            .map(|(column, f)| {
-                                (!column.is_null(row)).then(|| f.value(row).to_string())
+                            .map(|(nulls, f)| {
+                                let null = nulls.as_ref().is_some_and(|n| n.is_null(row));
+                                (!null).then(|| f.value(row).to_string())
                             })
                             .collect(),
                     );
