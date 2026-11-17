@@ -761,10 +761,12 @@ for (const path of ["/", "/app.js", "/engine/engine.json", "/data/manifest.json"
   );
 }
 // A path that does not decode is not found, not a server error; and no path
-// leaves the files served.
+// leaves the files served. The Worker answers 404; on Cloudflare the edge may
+// refuse some such paths itself with 400 (`%A.` in /engine/%E0%A4%A.wasm) before
+// they reach it, which is as good.
 for (const path of ["/data/%E0%A4%A", "/%E0%A4%A", "/engine/%E0%A4%A.wasm", "/data/%"]) {
   const r = await fetch(`${base}${path}`);
-  check(r.status === 404, `${path} is 404`, `${r.status}`);
+  check(r.status === 404 || r.status === 400, `${path} is refused (404, or 400 from the edge)`, `${r.status}`);
 }
 for (const path of [
   "/data/..%2f..%2fpackage.json",
