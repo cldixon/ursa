@@ -42,6 +42,11 @@ fn colour_in_a_colour_terminal() {
     p.send_line("SELECT 42 AS answer;").unwrap();
     p.exp_string("\x1b[1mSELECT\x1b[0m").unwrap();
     p.exp_string(&bytes("│ \x1b[90mInt64 \x1b[0m │")).unwrap();
+    // A string left open goes on in the next line's colour.
+    p.send_line("SELECT 'a").unwrap();
+    p.exp_string("\x1b[33m'a\x1b[0m").unwrap();
+    p.send_line("b' AS s;").unwrap();
+    p.exp_string("\x1b[33mb'\x1b[0m \x1b[1mAS\x1b[0m").unwrap();
     p.send_line(".quit").unwrap();
     p.exp_eof().unwrap();
 }
@@ -126,7 +131,10 @@ fn ctrl_c_cancels_a_running_query() {
     .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
     p.send_control('c').unwrap();
-    p.exp_string("^C (cancelled)").unwrap();
+    // A terminal echoes the ^C (this one, without ECHOCTL, does not); the
+    // shell does not add another.
+    let before = p.exp_string(" (cancelled)").unwrap();
+    assert!(!before.contains("^C"), "{before:?}");
     p.exp_string("memory U ").unwrap();
     // An algorithm too, which runs on a blocking thread (#328): the prompt
     // comes back, and the shell still exits at once after it.
@@ -139,7 +147,7 @@ fn ctrl_c_cancels_a_running_query() {
     .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2000));
     p.send_control('c').unwrap();
-    p.exp_string("^C (cancelled)").unwrap();
+    p.exp_string(" (cancelled)").unwrap();
     p.exp_string("memory U ").unwrap();
     p.send_line("SELECT 41 + 1 AS answer;").unwrap();
     p.exp_string(&bytes("│     42 │")).unwrap();

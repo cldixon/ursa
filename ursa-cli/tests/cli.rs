@@ -1564,3 +1564,122 @@ fn reserved_words_as_names() {
          reserved word; to use it as a name, quote it: \"from\"\n"
     );
 }
+
+/// A null in a column of type `Null` shows `NULL`, as other nulls do.
+#[test]
+fn a_null_column_shows_null() {
+    let out = ok(ursa(&["-c", "SELECT NULL AS n, 1 AS i;"]));
+    assert_eq!(
+        out,
+        "\
+┌──────┬───────┐
+│  n   │   i   │
+│ Null │ Int64 │
+├──────┼───────┤
+│ NULL │     1 │
+└──────┴───────┘
+"
+    );
+}
+
+/// `--max-width N` sets the table width, as `.maxwidth N` does, even when
+/// the output is not a terminal; it wins over an init file's `.maxwidth`.
+#[test]
+fn max_width_cuts_a_table_to_fit() {
+    let sql = "SELECT 1 a, 'abcdefghijklmnopqrstuvwxyz' b, 3 c, 4 d, 5 e, 6 f;";
+    // Not a terminal, and no width given: nothing is cut.
+    let out = ok(ursa(&["-c", sql]));
+    assert!(out.contains("abcdefghijklmnopqrstuvwxyz"), "{out}");
+    let expected = "\
+┌───────┬───┬───────┬───────┬───────┐
+│   a   │ … │   d   │   e   │   f   │
+│ Int64 │ … │ Int64 │ Int64 │ Int64 │
+├───────┼───┼───────┼───────┼───────┤
+│     1 │ … │     4 │     5 │     6 │
+└───────┴───┴───────┴───────┴───────┘
+  1 row           6 columns (4 shown)
+";
+    assert_eq!(ok(ursa(&["--max-width", "40", "-c", sql])), expected);
+    assert_eq!(ok(ursa(&["-c", ".maxwidth 40;", "-c", sql])), expected);
+    // Only as much as needed: two characters, not down to 20.
+    let out = ok(ursa(&[
+        "--max-width",
+        "70",
+        "-c",
+        "SELECT repeat('x', 60) AS s, 1 AS n",
+    ]));
+    assert!(
+        out.contains(&format!("│ {}… │     1 │\n", "x".repeat(57))),
+        "{out}"
+    );
+    assert!(out.lines().all(|l| l.chars().count() <= 70), "{out}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("init.sql");
+    std::fs::write(&init, ".maxwidth 30\n").unwrap();
+    let init = init.display().to_string();
+    let out = ok(ursa(&["-init", &init, "-c", sql]));
+    assert!(out.lines().all(|l| l.chars().count() <= 30), "{out}");
+    assert_eq!(
+        ok(ursa(&["-init", &init, "--max-width", "40", "-c", sql])),
+        expected
+    );
+}
+
+/// With --format arrow, a script whose statements return no result is an
+/// error, not an empty output; and `.mode arrow` says how to get one.
+#[test]
+fn arrow_needs_a_result() {
+    let out = ursa(&["--format", "arrow", "-c", "CREATE VIEW v AS SELECT 1 AS a"]);
+    assert!(out.stdout.is_empty());
+    let e = err(out);
+    assert_eq!(
+        e,
+        "Error: --format arrow writes the result of one query, but no statement returned one; \
+         end the script with a query that returns rows\n"
+    );
+    let e = err(ursa(&["-c", ".mode arrow", "-c", "SELECT 1 AS a"]));
+    assert!(
+        e.starts_with("Error: .mode cannot switch to the arrow format")
+            && e.contains("Give --format arrow on the command line"),
+        "{e}"
+    );
+    // Already writing one, `.mode arrow` is fine.
+    let out = ursa(&[
+        "--format",
+        "arrow",
+        "-c",
+        ".mode arrow;",
+        "-c",
+        "SELECT 1 AS a",
+    ]);
+    assert!(out.status.success());
+    assert!(out.stdout.starts_with(&[0xff, 0xff, 0xff, 0xff]));
+}
+
+/// A dot-command may end with `;`, and `.describe` takes a name, not SQL.
+#[test]
+fn dot_commands_take_a_semicolon_and_describe_takes_a_name() {
+    let out = ok(ursa(&[
+        "-c",
+        ".mode csv;",
+        "-c",
+        "CREATE TABLE \"Mixed\" AS SELECT 1 AS x;",
+        "-c",
+        ".tables;",
+        "-c",
+        ".describe Mixed;",
+    ]));
+    assert!(
+        out.starts_with("name,type\nMixed,table\ncolumn_name,"),
+        "{out}"
+    );
+    let out = ursa(&[
+        "-c",
+        "CREATE VIEW v AS SELECT 1 AS x",
+        "-c",
+        ".describe v; SELECT 99",
+    ]);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("99"));
+    assert!(err(out).contains("'v; SELECT 99' is not a name"));
+}
