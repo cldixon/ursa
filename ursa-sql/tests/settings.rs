@@ -50,11 +50,15 @@ async fn error(ctx: &SessionContext, sql: &str) -> String {
     user_message(&run(ctx, sql).await.expect_err(sql))
 }
 
+/// What SHOW says of `ursa.index_storage_limit` without a database.
+const AUTO: &str = "auto (the default: in a database, 25% of the free space on its disk; at \
+                    least 4GiB, at most 64GiB)";
+
 #[tokio::test]
 async fn show_an_ursa_setting() {
     let ctx = ursa_engine::new_session();
     let (schema, lines) = run(&ctx, "SHOW ursa.index_storage_limit").await.unwrap();
-    assert_eq!(lines, ["ursa.index_storage_limit,4GiB"]);
+    assert_eq!(lines, [format!("ursa.index_storage_limit,{AUTO}")]);
     // The shape of DataFusion's own SHOW <name>.
     let (datafusion, _) = run(&ctx, "SHOW datafusion.execution.batch_size")
         .await
@@ -70,11 +74,11 @@ async fn show_an_ursa_setting() {
             "SET ursa.index_storage_limit = '512MiB'; SHOW ursa.index_storage_limit"
         )
         .await,
-        ["ursa.index_storage_limit,512MiB"]
+        ["ursa.index_storage_limit,512MiB (SET for this session)"]
     );
     assert_eq!(
         rows(&ctx, "show URSA.Index_Storage_Limit").await,
-        ["ursa.index_storage_limit,512MiB"]
+        ["ursa.index_storage_limit,512MiB (SET for this session)"]
     );
     assert_eq!(
         rows(
@@ -82,8 +86,27 @@ async fn show_an_ursa_setting() {
             "SET ursa.index_storage_limit = 1048576; SHOW ursa.index_storage_limit"
         )
         .await,
-        ["ursa.index_storage_limit,1MiB"]
+        ["ursa.index_storage_limit,1MiB (SET for this session)"]
     );
+    // RESET, or 'auto', is the default again.
+    assert_eq!(
+        rows(
+            &ctx,
+            "RESET ursa.index_storage_limit; SHOW ursa.index_storage_limit"
+        )
+        .await,
+        [format!("ursa.index_storage_limit,{AUTO}")]
+    );
+    rows(&ctx, "SET ursa.index_storage_limit = '1MiB'").await;
+    assert_eq!(
+        rows(
+            &ctx,
+            "SET ursa.index_storage_limit = 'auto'; SHOW ursa.index_storage_limit"
+        )
+        .await,
+        [format!("ursa.index_storage_limit,{AUTO}")]
+    );
+    rows(&ctx, "SET ursa.index_storage_limit = 1048576").await;
 
     // VERBOSE adds the description, as DataFusion's does.
     let (schema, lines) = run(&ctx, "SHOW ursa.index_storage_limit VERBOSE")
@@ -95,7 +118,9 @@ async fn show_an_ursa_setting() {
     assert_eq!(schema, datafusion);
     assert_eq!(lines.len(), 1);
     assert!(
-        lines[0].starts_with("ursa.index_storage_limit,1MiB,The most bytes of graph indexes"),
+        lines[0].starts_with(
+            "ursa.index_storage_limit,1MiB (SET for this session),The most bytes of graph indexes"
+        ),
         "{lines:?}"
     );
 }
@@ -129,7 +154,7 @@ async fn show_all_lists_ursa_settings() {
     let (schema, all) = run(&ctx, "SHOW ALL").await.unwrap();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, ["name", "value"]);
-    assert!(all.contains(&"ursa.index_storage_limit,4GiB".to_string()));
+    assert!(all.contains(&format!("ursa.index_storage_limit,{AUTO}")));
     assert!(
         all.iter().all(|l| !l.starts_with("index_storage_limit,")),
         "the setting is listed under its SET name only"
@@ -145,16 +170,19 @@ async fn show_all_lists_ursa_settings() {
     rows(&ctx, "SET ursa.index_storage_limit = '2GiB'").await;
     assert!(rows(&ctx, "SHOW ALL")
         .await
-        .contains(&"ursa.index_storage_limit,2GiB".to_string()));
+        .contains(&"ursa.index_storage_limit,2GiB (SET for this session)".to_string()));
     let (schema, verbose) = run(&ctx, "SHOW ALL VERBOSE").await.unwrap();
     assert_eq!(schema.fields().len(), 3);
     assert!(verbose
         .iter()
-        .any(|l| l.starts_with("ursa.index_storage_limit,2GiB,The most bytes")));
+        .any(|l| l
+            .starts_with("ursa.index_storage_limit,2GiB (SET for this session),The most bytes")));
 }
-/// In a session with a database, `SET ursa.index_storage_limit` is stored and
-/// shown again when the database is opened (#327); other settings are not.
-/// In a session with a database, SHOW reads the session and stores nothing.
+
+/// In a session with a database, SET lasts for the session and is never
+/// stored, writable or not, as in DuckDB and Postgres (#353). SHOW says the
+/// limit in effect: the database's default, a share of the free space on its
+/// disk, unless SET.
 #[tokio::test]
 async fn show_in_a_database_session() {
     let dir = tempfile::tempdir().unwrap();
@@ -164,24 +192,49 @@ async fn show_in_a_database_session() {
         ..OpenOptions::default()
     };
     let ctx = open_session(&db, &options).await.unwrap();
+    let default = ursa_engine::database::database(&ctx.state())
+        .unwrap()
+        .default_index_storage_limit();
+    let shown = format!(
+        "ursa.index_storage_limit,{} (the default: ",
+        ursa_engine::options::ByteSize(default.bytes)
+    );
+    let limit = rows(&ctx, "SHOW ursa.index_storage_limit").await;
+    assert!(limit[0].starts_with(&shown), "{limit:?}");
+    if default.free.is_some() {
+        assert!(
+            limit[0].ends_with(&format!(
+                " free on the disk of {}; at least 4GiB, at most 64GiB)",
+                db.display()
+            )),
+            "{limit:?}"
+        );
+    }
+    assert!(rows(&ctx, "SHOW ALL").await.contains(&limit[0]));
     assert_eq!(
         rows(
             &ctx,
             "SET ursa.index_storage_limit = '8GiB'; SHOW ursa.index_storage_limit"
         )
         .await,
-        ["ursa.index_storage_limit,8GiB"]
+        ["ursa.index_storage_limit,8GiB (SET for this session)"]
     );
-    drop(ctx);
-    let ctx = open_session(&db, &options).await.unwrap();
-    assert_eq!(
-        rows(&ctx, "SHOW ursa.index_storage_limit").await,
-        ["ursa.index_storage_limit,8GiB"]
-    );
-    // ursa.notices is the session's.
     rows(&ctx, "SET ursa.notices = 'off'").await;
     drop(ctx);
-    let ctx = open_session(&db, &options).await.unwrap();
-    assert_eq!(rows(&ctx, "SHOW ursa.notices").await, ["ursa.notices,on"]);
-    assert!(!std::fs::read_to_string(&db).unwrap().contains("notices"));
+    // Nothing was stored: a later session has the defaults.
+    assert!(!std::fs::read_to_string(&db).unwrap().contains("settings"));
+    for read_only in [false, true] {
+        let options = OpenOptions {
+            read_only,
+            ..options.clone()
+        };
+        let ctx = open_session(&db, &options).await.unwrap();
+        let limit = rows(&ctx, "SHOW ursa.index_storage_limit").await;
+        assert!(limit[0].starts_with(&shown), "{limit:?}");
+        assert_eq!(rows(&ctx, "SHOW ursa.notices").await, ["ursa.notices,on"]);
+        // A read-only session may SET too, for itself.
+        rows(&ctx, "SET ursa.index_storage_limit = '1GiB'").await;
+        rows(&ctx, "RESET ursa.index_storage_limit").await;
+    }
+    assert!(!std::fs::read_to_string(&db).unwrap().contains("settings"));
 }

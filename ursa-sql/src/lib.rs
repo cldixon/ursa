@@ -37,7 +37,7 @@ pub mod property_graph;
 mod settings;
 mod source_map;
 
-pub use database::open_session;
+pub use database::{open_database, open_session};
 pub use parser::{
     parse_sql, Attach, CreatePropertyGraph, DescribeGraph, DropPropertyGraph, UrsaParser,
     UrsaStatement, DEFAULT_RECURSION_LIMIT,
