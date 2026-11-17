@@ -314,20 +314,19 @@ async fn run(
     interactive: bool,
     given: Given,
 ) -> Result<bool, DataFusionError> {
-    // Open (or create) the database even with no SQL to run, so `ursa
-    // club.ursa` makes the file, as Getting Started says.
-    let ctx = match &args.database {
-        Some(path) => {
-            let options = ursa_sql::OpenOptions {
-                read_only: args.readonly,
-                ..Default::default()
-            };
-            ursa_sql::open_session(path, &options).await?
-        }
-        None => ursa_engine::new_session(),
-    };
+    let ctx = ursa_engine::new_session();
+    // Before the database opens, so what opening it says is heard.
     if !args.quiet {
         notices::to_stderr(&ctx);
+    }
+    // Open (or create) the database even with no SQL to run, so `ursa
+    // club.ursa` makes the file, as Getting Started says.
+    if let Some(path) = &args.database {
+        let options = ursa_sql::OpenOptions {
+            read_only: args.readonly,
+            ..Default::default()
+        };
+        ursa_sql::open_database(&ctx, path, &options).await?;
     }
     let result = run_session(ctx.clone(), sources, args, interactive, given).await;
     // Finish storing the indexes this process built before it exits.

@@ -46,8 +46,6 @@ pub mod catalog_file;
 pub mod index_file;
 pub mod index_store;
 
-use crate::options::{ByteSize, DEFAULT_INDEX_STORAGE_LIMIT};
-
 pub use catalog_file::{CatalogFile, FORMAT, VERSION};
 pub use index_file::IndexKey;
 pub use index_store::IndexStore;
@@ -100,14 +98,32 @@ pub struct Database {
     /// The locked `club.ursa.d/lock`, held until the database is dropped.
     /// `None` when read-only.
     _lock: Option<File>,
-    /// The catalog (its statements and settings), as last read or written.
+    /// The catalog (its statements, and any settings 0.8 or 0.9 saved), as
+    /// last read or written.
     catalog: Mutex<CatalogFile>,
     /// The stored graph indexes, opened on first use.
     indexes: OnceLock<Arc<IndexStore>>,
+    /// The default `ursa.index_storage_limit`, worked out on first use.
+    default_limit: OnceLock<DefaultLimit>,
 }
 
-/// The setting a database keeps in its catalog (#327).
+/// The setting that limits the bytes of stored indexes. Ursa 0.8 and 0.9
+/// saved it in a writable database's catalog (#327); since #353 it lasts for
+/// the session, and a saved value is no longer applied.
 pub const INDEX_STORAGE_LIMIT: &str = "ursa.index_storage_limit";
+
+/// A database's default `ursa.index_storage_limit`, and what it came from
+/// ([`crate::options::default_index_storage_limit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultLimit {
+    /// The limit.
+    pub bytes: u64,
+    /// The free space on the database's disk when it was worked out, if it
+    /// could be read.
+    pub free: Option<u64>,
+    /// The bytes of indexes the database stored then.
+    pub stored: u64,
+}
 
 impl Database {
     /// Open the database at `path`, creating it (and its sidecar directory)
@@ -146,6 +162,7 @@ impl Database {
                 _lock: None,
                 catalog: Mutex::new(catalog),
                 indexes: OnceLock::new(),
+                default_limit: OnceLock::new(),
             });
         }
 
@@ -186,6 +203,7 @@ impl Database {
             _lock: Some(lock),
             catalog: Mutex::new(catalog),
             indexes: OnceLock::new(),
+            default_limit: OnceLock::new(),
         })
     }
 
@@ -224,7 +242,7 @@ impl Database {
                 self.index_dir(),
                 !self.read_only,
                 self.name.clone(),
-                self.index_storage_limit(),
+                self.default_index_storage_limit().bytes,
             ))
         }))
     }
@@ -249,20 +267,62 @@ impl Database {
         self.catalog().statements.clone()
     }
 
-    /// The settings the catalog keeps, by full name, as `SET` takes them.
-    pub fn settings(&self) -> BTreeMap<String, String> {
+    /// The settings Ursa 0.8 or 0.9 saved in the catalog, by full name, as
+    /// `SET` takes them. They are not applied (#353).
+    pub fn saved_settings(&self) -> BTreeMap<String, String> {
         self.catalog().settings.clone()
     }
 
-    /// The most bytes of stored indexes this database keeps: its stored
-    /// `ursa.index_storage_limit`, or the default. A session's own `SET` in
-    /// a read-only database does not change it.
-    pub fn index_storage_limit(&self) -> u64 {
-        self.catalog()
-            .settings
-            .get(INDEX_STORAGE_LIMIT)
-            .and_then(|v| ByteSize::parse(v).ok())
-            .map_or(DEFAULT_INDEX_STORAGE_LIMIT, |b| b.0)
+    /// Remove the settings 0.8 or 0.9 saved from the catalog, rewriting the
+    /// file if it has any. Refused when read-only.
+    pub fn remove_saved_settings(&self) -> Result<()> {
+        let mut catalog = self.catalog();
+        if catalog.settings.is_empty() {
+            return Ok(());
+        }
+        let updated = CatalogFile {
+            statements: catalog.statements.clone(),
+            settings: BTreeMap::new(),
+        };
+        self.write_catalog(&mut catalog, updated)
+    }
+
+    /// The default `ursa.index_storage_limit` of this database: 25% of the
+    /// free space on its disk plus the indexes it stores, within bounds
+    /// ([`crate::options::default_index_storage_limit`]). Worked out once,
+    /// when first needed, so it does not move while a session runs.
+    pub fn default_index_storage_limit(&self) -> DefaultLimit {
+        *self.default_limit.get_or_init(|| {
+            let on = if self.sidecar.is_dir() {
+                &self.sidecar
+            } else {
+                &self.dir
+            };
+            let free = free_space(on);
+            let stored = index_store::manifest_bytes(&self.index_dir());
+            DefaultLimit {
+                bytes: crate::options::default_index_storage_limit(
+                    free.map(|f| f.saturating_add(stored)),
+                ),
+                free,
+                stored,
+            }
+        })
+    }
+
+    /// The `ursa.index_storage_limit` in effect for the session `config`
+    /// belongs to: what it `SET`, or the database's default.
+    pub fn index_storage_limit(&self, config: &SessionConfig) -> u64 {
+        crate::options::index_storage_limit_set(config)
+            .unwrap_or_else(|| self.default_index_storage_limit().bytes)
+    }
+
+    /// Keep the stored indexes within the limit in effect for the session
+    /// `config` belongs to from now on: the next index stored makes room
+    /// within it. Nothing is removed now.
+    pub fn use_index_storage_limit(&self, config: &SessionConfig) {
+        let limit = self.index_storage_limit(config);
+        self.index_store().set_limit(limit);
     }
 
     /// Replace the catalog's statements with `statements`, rewriting the
@@ -278,32 +338,6 @@ impl Database {
             settings: catalog.settings.clone(),
         };
         self.write_catalog(&mut catalog, updated)
-    }
-
-    /// Keep the setting `name` as `value` in the catalog (`None`: remove
-    /// it, back to the default), rewriting the file. Refused when read-only.
-    /// `value` must be valid for the setting.
-    pub fn set_setting(&self, name: &str, value: Option<&str>) -> Result<()> {
-        if name == INDEX_STORAGE_LIMIT {
-            if let Some(value) = value {
-                ByteSize::parse(value)?;
-            }
-        }
-        let mut catalog = self.catalog();
-        let mut updated = catalog.clone();
-        match value {
-            Some(value) => updated.settings.insert(name.to_string(), value.to_string()),
-            None => updated.settings.remove(name),
-        };
-        if !self.read_only && updated == *catalog {
-            return Ok(());
-        }
-        self.write_catalog(&mut catalog, updated)?;
-        drop(catalog);
-        if let Some(store) = self.indexes.get() {
-            store.set_limit(self.index_storage_limit());
-        }
-        Ok(())
     }
 
     fn write_catalog(&self, current: &mut CatalogFile, updated: CatalogFile) -> Result<()> {
@@ -410,6 +444,22 @@ fn keep_trailing_separator(original: &str, rewritten: &mut String) {
         && !rewritten.ends_with(['/', separator])
     {
         rewritten.push(separator);
+    }
+}
+
+/// The bytes free to an unprivileged process on the file system holding
+/// `path`, if they can be read (on Unix; elsewhere `None`, and the default
+/// limit is its least, 4 GiB).
+fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let stat = rustix::fs::statvfs(path).ok()?;
+        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 

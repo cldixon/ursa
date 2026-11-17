@@ -30,7 +30,6 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use arrow::array::{Array, RecordBatch};
-use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -134,20 +133,17 @@ impl Rows {
                     .iter()
                     .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
                     .collect::<Result<Vec<_>, _>>()?;
-                // Logical nulls: a `Null` column, a dictionary's null values
-                // and a run-end array's have no null buffer of their own.
-                let nulls: Vec<Option<NullBuffer>> =
-                    batch.columns().iter().map(|c| c.logical_nulls()).collect();
+                // `logical_nulls`, not `is_null`: a column of type Null (an
+                // untyped `SELECT NULL`) has no null buffer, yet is all null.
+                let nulls: Vec<_> = batch.columns().iter().map(|c| c.logical_nulls()).collect();
                 for row in skip..batch.num_rows() {
                     rows.push(
-                        formatters
+                        nulls
                             .iter()
-                            .zip(&nulls)
-                            .map(|(f, nulls)| {
-                                nulls
-                                    .as_ref()
-                                    .is_none_or(|n| n.is_valid(row))
-                                    .then(|| f.value(row).to_string())
+                            .zip(&formatters)
+                            .map(|(nulls, f)| {
+                                let null = nulls.as_ref().is_some_and(|n| n.is_null(row));
+                                (!null).then(|| f.value(row).to_string())
                             })
                             .collect(),
                     );

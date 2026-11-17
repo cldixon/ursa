@@ -51,6 +51,12 @@ aws-profile = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-smithy-htt
 ursa-core = { path = "../ursa-core", version = "0.10.0-dev", features = ["rayon"] }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 
+# The free space on a database's disk, which the default
+# `ursa.index_storage_limit` is a share of (#353; already in the tree via
+# tempfile).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio ={ version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "3"

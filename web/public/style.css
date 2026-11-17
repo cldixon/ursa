@@ -78,6 +78,17 @@
 
 /* The terminal's font, IBM Plex Mono (SIL OFL 1.1), served with the page:
    see scripts/build.ts. */
+/* Box drawing (U+2500-257F), which the Plex Mono web fonts lack: our own
+   strokes on Plex Mono's metrics that run past each row, so a table's lines
+   join whatever the line height (scripts/box-font.py makes the font). */
+@font-face {
+  font-family: "Ursa Box";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("/fonts/ursa-box.woff2") format("woff2");
+  unicode-range: U+2500-257F;
+}
 @font-face {
   font-family: "IBM Plex Mono";
   font-style: normal;

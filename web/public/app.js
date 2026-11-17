@@ -20,30 +20,57 @@ const el = (tag, props = {}, ...children) => {
 
 // ---------------------------------------------------------------- engine
 
-const worker = new Worker(new URL("./engine-worker.js", import.meta.url), { type: "module" });
+// The worker that runs the engine. If the engine crashes (a WebAssembly trap,
+// such as running out of memory), the page replaces the worker and starts a
+// fresh session: see `crashed`.
+let worker;
+let engineStarted;
 let nextId = 0;
 const calls = new Map();
-let engineReady;
-const engineStarted = new Promise((resolve, reject) => (engineReady = { resolve, reject }));
 
-worker.onmessage = ({ data }) => {
-  if ("ready" in data) {
-    if (data.ready) engineReady.resolve(data);
-    else engineReady.reject(new Error(data.error));
-    return;
-  }
-  const call = calls.get(data.id);
-  calls.delete(data.id);
-  if (data.ok) call.resolve(data);
-  else call.reject(new Error(data.error));
-};
+function startWorker() {
+  worker?.terminate();
+  for (const call of calls.values()) call.reject(Object.assign(new Error("the engine stopped"), { crash: true }));
+  calls.clear();
+  let started;
+  engineStarted = new Promise((resolve, reject) => (started = { resolve, reject }));
+  engineStarted.catch(() => {});
+  worker = new Worker(new URL("./engine-worker.js", import.meta.url), { type: "module" });
+  worker.onmessage = ({ data }) => {
+    if ("ready" in data) {
+      if (data.ready) started.resolve(data);
+      else started.reject(new Error(data.error));
+      return;
+    }
+    const call = calls.get(data.id);
+    calls.delete(data.id);
+    if (!call) return;
+    if (data.ok) call.resolve(data);
+    else call.reject(Object.assign(new Error(data.error), { crash: call.crashes }));
+  };
+  // An error the worker didn't catch: it may be in any state.
+  worker.onerror = (e) => {
+    e.preventDefault();
+    for (const call of calls.values()) call.reject(Object.assign(new Error(e.message || "the engine stopped"), { crash: true }));
+    calls.clear();
+  };
+}
+startWorker();
+
+// The calls whose failure means the engine itself broke: the shell reports
+// SQL and command errors in what it prints, so `feed` only rejects when the
+// engine trapped. `export` and `addFile` reject for ordinary mistakes.
+const CRASHES = new Set(["start", "feed", "cancel", "width", "highlight"]);
 
 function engine(op, args = {}, transfer = []) {
-  return new Promise((resolve, reject) => {
-    const id = nextId++;
-    calls.set(id, { resolve, reject });
-    worker.postMessage({ id, op, ...args }, transfer);
-  });
+  return engineStarted.then(
+    () =>
+      new Promise((resolve, reject) => {
+        const id = nextId++;
+        calls.set(id, { resolve, reject, crashes: CRASHES.has(op) });
+        worker.postMessage({ id, op, ...args }, transfer);
+      }),
+  );
 }
 
 // ---------------------------------------------------------------- theme
@@ -100,11 +127,15 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
 // ---------------------------------------------------------------- terminal
 
 // xterm measures the font when it opens: have it loaded first. Its DOM
-// renderer draws the text, so the browser's own text rendering (and
-// selection) apply; with line height 1, box characters join up.
-await document.fonts.load('13px "IBM Plex Mono"').catch(() => {});
+// renderer draws the text with the browser's own text rendering (and
+// selection). Box drawing comes from "Ursa Box" (style.css), whose lines run
+// past each row, so a table's borders join.
+await Promise.all([
+  document.fonts.load('13px "IBM Plex Mono"'),
+  document.fonts.load('13px "Ursa Box"', "\u2502"),
+]).catch(() => {});
 const term = new Terminal({
-  fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  fontFamily: '"Ursa Box", "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
   fontSize: 13,
   lineHeight: 1,
   theme: xtermTheme(currentTheme()),
@@ -133,13 +164,20 @@ term.attachCustomKeyEventHandler((e) => {
     navigator.clipboard?.writeText(term.getSelection());
     return false;
   }
-  // Shift+Enter starts a new line in what is typed.
-  if (e.key === "Enter" && e.shiftKey) {
-    if (!busy) insert("\n");
-    return false;
-  }
   return true;
 });
+// Shift+Enter starts a new line in what is typed. xterm would also turn its
+// keypress into Enter, so the key never reaches xterm.
+term.textarea?.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key !== "Enter" || !e.shiftKey || e.isComposing) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    onKey("\n");
+  },
+  true,
+);
 
 const write = (s) => new Promise((resolve) => term.write(s, resolve));
 
@@ -255,13 +293,12 @@ const lineEnd = () => (text.indexOf("\n", cursor) < 0 ? text.length : text.index
 // Keys pressed while a line runs wait for it, as a terminal keeps them.
 let typeahead = [];
 
-term.onData((data) => {
-  if (busy) {
-    typeahead.push(data);
-    return;
-  }
-  key(data);
-});
+term.onData((data) => onKey(data));
+
+function onKey(data) {
+  if (busy) typeahead.push(data);
+  else key(data);
+}
 
 function key(data) {
   // A paste arrives in one piece: its lines stay in the input, to run with Enter.
@@ -272,6 +309,9 @@ function key(data) {
   switch (data) {
     case "\r":
       submitTyped();
+      return;
+    case "\n": // Shift+Enter
+      insert("\n");
       return;
     case "\x7f": // Backspace
     case "\b":
@@ -367,18 +407,16 @@ function key(data) {
   }
 }
 
-async function cancelTyped() {
-  busy = true;
-  await finishLine();
-  await write("^C\r\n");
-  const r = await engine("cancel");
-  prompt = r.prompt;
-  statement = [];
-  text = "";
-  cursor = 0;
-  historyAt = history.length;
-  busy = false;
-  draw();
+/** Ctrl+C: drop what is typed, and the statement the shell holds. */
+function cancelTyped() {
+  enqueue(async () => {
+    await finishLine();
+    await write("^C\r\n");
+    await cancelPending();
+    text = "";
+    cursor = 0;
+    historyAt = history.length;
+  });
 }
 
 function clearScreen() {
@@ -390,26 +428,63 @@ function clearScreen() {
 
 // ---------------------------------------------------------------- running
 
-// Everything that runs, one after another: typed lines, the page's commands.
+// Everything that runs does so as a job, one after another: typed lines, the
+// page's commands, a dataset, New. While jobs are waiting the terminal is busy
+// and keys wait for them (`typeahead`). A job that throws never stops the
+// ones after it: its error is printed, and a crashed engine is replaced.
 let queue = Promise.resolve();
+let waiting = 0;
 // The statements and commands this session ran, for Share.
 let ran = [];
 // The lines of the statement being fed, until it runs.
 let statement = [];
 let uploads = [];
+// Bumped by every fresh session (New, a dataset, a crash): jobs queued for an
+// older session are skipped.
+let generation = 0;
+// What was typed when the page started running its own commands, to put back.
+let stash = null;
 
 function setBusy(on) {
   busy = on;
   term.options.cursorBlink = !on;
 }
 
+/** Queue `job`; resolves to its result, or to `undefined` if it failed. */
+function enqueue(job) {
+  waiting++;
+  setBusy(true);
+  const done = queue.then(job).catch(async (e) => {
+    await failed(e);
+    return undefined;
+  });
+  queue = done.finally(() => {
+    if (--waiting === 0) ready();
+  });
+  return done;
+}
+
+/** A job threw: say so, and if the engine broke, start a new one. */
+async function failed(e) {
+  if (!e?.crash) {
+    await write(`\x1b[31mError: ${String(e?.message ?? e)}\x1b[0m\r\n`);
+    return;
+  }
+  await write(`\x1b[31mError: the engine stopped (${e.message}). Starting a fresh session: what was defined is gone.\x1b[0m\r\n`);
+  startWorker();
+  generation++;
+  await restart({ clear: false });
+}
+
 /** Back at the prompt: draw it, then the keys pressed meanwhile. */
 function ready() {
   setBusy(false);
+  if (stash && !text) ({ text, cursor } = stash);
+  stash = null;
   draw();
   const keys = typeahead;
   typeahead = [];
-  // A key may start another run (Enter): the rest wait for it.
+  // A key may start another job (Enter): the rest wait for it.
   for (let i = 0; i < keys.length; i++) {
     if (busy) {
       typeahead.push(...keys.slice(i));
@@ -422,40 +497,47 @@ function ready() {
 /** Enter: what is typed goes to the shell, a line at a time. */
 function submitTyped() {
   const entry = text;
-  setBusy(true);
-  queue = queue.then(async () => {
+  enqueue(async () => {
     await finishLine();
     remember(entry);
     text = "";
     cursor = 0;
     for (const line of entry.split("\n")) await feed(line, { echo: false });
-    ready();
   });
 }
 
 /**
- * Run `command` as if typed: each line is drawn after the prompt and fed to
- * the shell. Resolves to whether it ran without an error.
+ * Run the page's `commands` as if typed, each drawn after the prompt and fed
+ * to the shell a line at a time, in order, stopping at the first that fails.
+ * They are queued at once, so nothing queued later runs between them, and
+ * they are skipped if a fresh session starts before they run. What is being
+ * typed is put back afterwards. Resolves to whether all of them ran.
  */
-function run(command) {
-  setBusy(true);
-  const done = queue.then(async () => {
-    erase();
-    text = "";
-    cursor = 0;
-    let ok = true;
-    for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
-    ready();
-    return ok;
-  });
-  queue = done.catch(() => {});
-  return done;
+function runAll(commands, { session = generation } = {}) {
+  let ok = true;
+  const jobs = commands.map((command) =>
+    enqueue(async () => {
+      if (!ok || session !== generation) return (ok = false);
+      if (text && !stash) stash = { text, cursor };
+      erase();
+      text = "";
+      cursor = 0;
+      // A statement left half typed would take this command as its next line.
+      if (statement.length) await cancelPending();
+      for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+      return ok;
+    }),
+  );
+  return Promise.all(jobs).then((results) => results.every((r) => r === true));
 }
 
-/** Run `commands` in order, stopping at the first that fails. */
-async function runAll(commands) {
-  for (const command of commands) if (!(await run(command))) return false;
-  return true;
+const run = (command) => runAll([command]);
+
+/** Drop the statement the shell holds, unrun. */
+async function cancelPending() {
+  const r = await engine("cancel");
+  prompt = r.prompt;
+  statement = [];
 }
 
 // Commands that only look: Share leaves them out.
@@ -546,8 +628,8 @@ async function hostCommand(line) {
       }
       const d = DATASETS.find((x) => x.id === arg.toLowerCase());
       if (!d) return errorLine(`no dataset named '${arg}'; .dataset lists them`);
-      // Once this line has finished: a fresh session, then the dataset.
-      setTimeout(() => loadDataset(d));
+      // Queued now, it runs once this line's job has finished.
+      loadDataset(d);
       return true;
     }
   }
@@ -594,8 +676,8 @@ function formatBytes(n) {
 
 // ---------------------------------------------------------------- the bar
 
-/** A fresh shell and a clear screen: New, and before each dataset. */
-async function restart() {
+/** A fresh shell (New, a dataset, after a crash), and a clear screen. */
+async function restart({ clear = true } = {}) {
   const r = await engine("start", { commands: HOST_COMMANDS, shortcuts: SHORTCUTS });
   prompt = r.prompt;
   promptColor = r.promptColor;
@@ -603,27 +685,29 @@ async function restart() {
   ran = [];
   uploads = [];
   statement = [];
-  text = "";
-  cursor = 0;
   history_replace("");
-  term.reset();
+  if (clear) term.reset();
   cursorRow = 0;
   await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n`);
 }
 
-$("new").onclick = () => {
-  setBusy(true);
-  queue = queue.then(async () => {
-    await restart();
-    ready();
+/** Start a fresh session; what was queued for the old one is skipped. */
+function fresh() {
+  const session = ++generation;
+  enqueue(async () => {
+    if (session === generation) await restart();
   });
+  return session;
+}
+
+$("new").onclick = () => {
+  fresh();
   term.focus();
 };
 
 function loadDataset(d) {
-  setBusy(true);
-  queue = queue.then(restart);
-  return runAll(d.commands);
+  const session = fresh();
+  return runAll(d.commands, { session });
 }
 
 // Share: a link whose fragment holds the session's commands, replayed on open.
@@ -675,7 +759,7 @@ function sharedCommands() {
 // Import: a file from this computer becomes a view named after it.
 const fileInput = $("file-input");
 $("import").onclick = () => fileInput.click();
-fileInput.onchange = async () => {
+fileInput.onchange = () => {
   const files = [...fileInput.files];
   fileInput.value = "";
   for (const file of files) {
@@ -686,15 +770,13 @@ fileInput.onchange = async () => {
         .toLowerCase()
         .replace(/[^a-z0-9_]+/g, "_")
         .replace(/^(\d)/, "_$1") || "imported";
-    try {
+    enqueue(async () => {
       const buffer = await file.arrayBuffer();
       const { url } = await engine("addFile", { name: file.name, bytes: buffer }, [buffer]);
       uploads.push({ name: file.name, bytes: file.size });
-      await run(`CREATE OR REPLACE VIEW ${view} AS SELECT * FROM '${url.replace(/'/g, "''")}';`);
-      await run(`FROM ${view} LIMIT 10;`);
-    } catch (e) {
-      await errorLine(e.message);
-    }
+      // Quoted: a file may be named after a keyword (order.csv).
+      runAll([`CREATE OR REPLACE VIEW "${view}" AS SELECT * FROM '${url.replace(/'/g, "''")}';`, `FROM "${view}" LIMIT 10;`]);
+    });
   }
   term.focus();
 };
@@ -740,19 +822,20 @@ document.addEventListener("keydown", (e) => {
 // ---------------------------------------------------------------- start
 
 term.write("Loading the engine (about 5 MB)...\r\n");
+setBusy(true);
 engineStarted.then(
-  async () => {
+  () => {
     const shared = sharedCommands();
     const wanted = DATASETS.find((d) => d.id === new URLSearchParams(location.search).get("dataset"));
-    queue = queue.then(restart);
-    if (shared.length) {
-      queue = queue.then(() => write(`Replaying ${shared.length} command${shared.length === 1 ? "" : "s"} from a shared link.\r\n`));
-      await runAll(shared);
-    } else if (wanted) {
-      await loadDataset(wanted);
+    if (wanted && !shared.length) {
+      loadDataset(wanted);
+    } else {
+      const session = fresh();
+      if (shared.length) {
+        enqueue(() => write(`Replaying ${shared.length} command${shared.length === 1 ? "" : "s"} from a shared link.\r\n`));
+        runAll(shared, { session });
+      }
     }
-    await queue;
-    ready();
     term.focus();
   },
   (e) => term.write(`\x1b[31mThe engine failed to start: ${e.message}\x1b[0m\r\n`),
@@ -766,7 +849,7 @@ window.ursaShell = {
     do {
       seen = queue;
       await seen;
-    } while (seen !== queue);
+    } while (seen !== queue || waiting > 0);
   },
   screen() {
     const buffer = term.buffer.active;
