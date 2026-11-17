@@ -72,7 +72,7 @@ Notices, such as a slow graph index build or an index the database could not kee
 
 ## Dot-commands
 
-A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one. A `;` at the end of a command is ignored (`.tables;`), except by `.print`, which prints its text as it is. `.help PATTERN` lists the commands whose name or description has PATTERN in it; `.help graph` is a page on the graph SQL (defining a graph, `MATCH` patterns and algorithms) and `.help shortcuts` lists the keys.
+A line that starts with `.` is a shell command, not SQL. The commands follow DuckDB's shell where it has the same one. A `;` at the end of a command is ignored (`.tables;`), except by `.print`, which prints its text as it is, but with control characters other than tabs written as escapes (ESC as `\u{1b}`, a carriage return as `\r`), as tables write them, so printed text cannot move the cursor or change the terminal's colours. `.help PATTERN` lists the commands whose name or description has PATTERN in it; `.help graph` is a page on the graph SQL (defining a graph, `MATCH` patterns and algorithms) and `.help shortcuts` lists the keys.
 
 ```text
 memory U .help

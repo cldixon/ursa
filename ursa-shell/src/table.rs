@@ -433,6 +433,30 @@ fn escape(value: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// `text` as a terminal shows it safely: its lines and tabs kept, and every
+/// other character [`escape`] writes as an escape (ESC and the rest of C0 and
+/// C1, carriage returns, invisible format characters) written as one, so text
+/// cannot move the cursor, clear the screen or hide itself. `.print` writes
+/// its text so.
+pub(crate) fn visible(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|c| c != '\n' && c != '\t' && needs_escape(c))
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' => out.push_str("\\r"),
+            c if needs_escape(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Whether `c` is written as an escape: a control character, or a format
 /// character or separator that is invisible but moves or hides the text
 /// around it. The zero-width joiner and non-joiner (U+200D, U+200C) are not:
@@ -1097,6 +1121,16 @@ mod tests {
         assert_eq!(
             at_width(&empty, 0),
             "┌───────┐\n│   n   │\n│ Int64 │\n└───────┘\n  0 rows\n"
+        );
+    }
+
+    #[test]
+    fn visible_text_keeps_lines_and_tabs_and_escapes_the_rest() {
+        assert_eq!(visible("plain"), "plain");
+        assert_eq!(visible("a\tb\nc"), "a\tb\nc");
+        assert_eq!(
+            visible("\x1b[2J\x1b]0;title\x07\r\u{9b}31m\u{7f}\u{202e}x"),
+            "\\u{1b}[2J\\u{1b}]0;title\\u{7}\\r\\u{9b}31m\\u{7f}\\u{202e}x"
         );
     }
 

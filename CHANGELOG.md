@@ -559,6 +559,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Security
 
+- **The browser shell is safer to open from a link.** A shared link
+  (`#run=`) lists its commands and asks `Run N shared commands? [y/N]`; only
+  `y` runs them, and a link's `.export` is skipped, so it cannot download
+  files. Control characters (ESC above all) in a replayed command are shown
+  as escapes (`\u{1b}`), and `.print` writes them so in the CLI too, keeping
+  lines and tabs, so text cannot move the cursor or restyle the terminal.
+  Import takes any file name (`données.csv`, `a#b.csv`, `order.csv`), and
+  its errors print below the prompt instead of over it. The Worker answers
+  a path with a malformed `%` escape with 404, not 500, and every response
+  carries a Content Security Policy (`frame-ancestors 'none'`, the page's
+  own scripts, fonts and fetches only), `X-Content-Type-Options: nosniff`
+  and `Referrer-Policy: no-referrer`; the local preview server sends the
+  same, and the e2e test checks them and that the page runs with no
+  violation.
 - The upgrade clears RUSTSEC-2026-0435 (`thrift` 0.17, a parquet 58
   dependency that parquet 59 no longer has) and RUSTSEC-2026-0176/0177
   (`pyo3` 0.28), and drops `paste` (RUSTSEC-2024-0436) from the tree. Bumped
