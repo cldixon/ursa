@@ -14,9 +14,10 @@
 //! ```
 //!
 //! A result longer than `max_rows` shows its first and last rows with three
-//! rows of `·` between them; a result wider than the screen shows its first
-//! and last columns with a `…` column between them, after cutting long values
-//! short. Either way a footer counts what there was:
+//! rows of `·` between them; a result wider than the screen cuts its longest
+//! values short, as little as it can, and if that is not enough shows its
+//! first and last columns with a `…` column between them. Either way a
+//! footer counts what there was:
 //!
 //! ```text
 //!   39,650,447 rows (40 shown)                     17 columns (10 shown)
@@ -38,8 +39,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// How many rows a table shows by default, as in DuckDB.
 pub const DEFAULT_MAX_ROWS: usize = 40;
 
-/// How wide a column may be when the table is too wide for the screen
-/// (DuckDB's `max_col_width` default).
+/// How wide a column is when choosing which columns a table too wide for the
+/// screen shows (DuckDB's `max_col_width` default), and the most a column's
+/// floor may be (see [`MIN_COLUMN`]).
 const NARROW_COLUMN: usize = 20;
 
 /// The rows a table shows: every row, or, past `max_rows`, the first
