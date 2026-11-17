@@ -36,14 +36,25 @@ static assets and an R2 bucket.
     the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
     three queries that show the graph functions, `GRAPH_TABLE` patterns and
     shortest paths. `?dataset=karate` in the URL loads one on open.
-  - **Share** copies a link whose fragment holds the session's commands; opening
-    it replays them. **Import** adds files from this computer
-    (`WebShell.addFile`, at `memory://uploads/<name>`) and defines a view over
-    each. **New** starts a fresh session. The theme follows the system until the
+  - **Share** copies a link whose fragment holds the session's commands;
+    opening it lists them, with control characters shown as escapes, and asks
+    `Run N shared commands? [y/N]`: only `y` replays them, and a link's
+    `.export` is skipped, so a link never downloads files. **Import** adds
+    files from this computer (`WebShell.addFile`, at `memory://uploads/<name>`,
+    where characters other than ASCII letters, digits, `.`, `_` and `-` become
+    `_`) and defines a view over each, named after the file and quoted
+    (`"données"`, `"order"`). **New** starts a fresh session. The theme follows the system until the
     toggle picks one, which is remembered; the terminal's colours follow it.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
-  engine; everything else is a static asset.
+  engine; everything else is a static asset. A path that does not decode is
+  404. `src/headers.ts` holds the security headers every response carries, from
+  the Worker and `bun run preview` alike: a Content Security Policy (the page's
+  own scripts, worker, fetches, fonts and images; WebAssembly compiles under
+  `'wasm-unsafe-eval'`; `style-src` allows `'unsafe-inline'` for the `<style>`
+  elements xterm.js adds; no framing), `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`. The page has no inline script: the theme is
+  set before the first paint by `public/theme.js`.
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
   The build also copies the terminal's font, IBM Plex Mono (SIL OFL 1.1, from
   `@fontsource/ibm-plex-mono`), into `dist/fonts/`, so the page loads nothing
@@ -96,8 +107,11 @@ http://localhost:8788.
 `tests/e2e.ts` drives the page in headless Chromium against a running site
 (`bun run preview`, `cf dev` or a deploy): every dataset in the menu, SQL typed
 at the prompt (one line, several, an error), every dot-command, a long table,
-downloads in each format, Import, a shared link replayed in a fresh page, New,
-the theme toggle and history.
+downloads in each format, Import (with awkward file names), a shared link
+replayed in a fresh page (answered y and N, and a crafted one with escape
+sequences and `.export`), New, the theme toggle and history; and the security
+headers, 404s for malformed and traversing paths, and no Content Security
+Policy violation in the console.
 
 ```sh
 bun run preview                               # in one terminal

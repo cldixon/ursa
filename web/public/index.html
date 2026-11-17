@@ -5,13 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ursa Web Shell</title>
   <meta name="description" content="Graph analytics in SQL, running entirely in your browser: Ursa's engine in WebAssembly over Parquet files.">
-  <script>
-    // The theme before the first paint: the one picked here before, else the system's.
-    try {
-      const saved = localStorage.getItem("ursa-theme");
-      if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
-    } catch {}
-  </script>
+  <script src="/theme.js"></script>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="preload" href="/fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="/fonts/ursa-box.woff2" as="font" type="font/woff2" crossorigin>

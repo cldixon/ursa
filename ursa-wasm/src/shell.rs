@@ -280,11 +280,28 @@ pub(crate) async fn add_upload(uploads: &InMemory, name: &str, bytes: Vec<u8>) -
             "'{name}' is not a file name to add; give a name with no path, such as edges.csv"
         )));
     }
+    let key = upload_key(name);
     uploads
-        .put(&ObjectPath::from(name), PutPayload::from(bytes))
+        .put(&ObjectPath::from(key.as_str()), PutPayload::from(bytes))
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    Ok(format!("memory://uploads/{name}"))
+    Ok(format!("memory://uploads/{key}"))
+}
+
+/// The name a file is kept under: its name with every character but ASCII
+/// letters, digits, `.`, `_` and `-` made `_`, so its URL reads back as it is
+/// written. A URL decodes `%`, ends its path at `#` and `?`, and globs at `*`,
+/// `?` and `[`; and non-ASCII names are percent-encoded on the way in.
+fn upload_key(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -383,6 +400,24 @@ mod tests {
         assert_eq!(url, "memory://uploads/edges.csv");
         let out = run(&shell, &format!("SELECT count(*) AS n FROM '{url}';")).await;
         assert!(out["out"].as_str().unwrap().contains("│     2 │"), "{out}");
+        // Names a URL would read otherwise are kept under safe ones.
+        for (name, kept) in [
+            ("données.csv", "donn_es.csv"),
+            ("a#b.csv", "a_b.csv"),
+            ("50%.csv", "50_.csv"),
+            ("what?.csv", "what_.csv"),
+            ("[x] y*.csv", "_x__y_.csv"),
+            ("it's.csv", "it_s.csv"),
+        ] {
+            let bytes = b"src,dst\n1,2\n2,3\n".to_vec();
+            let url = add_upload(&shell.uploads, name, bytes).await.unwrap();
+            assert_eq!(url, format!("memory://uploads/{kept}"));
+            let out = run(&shell, &format!("SELECT count(*) AS n FROM '{url}';")).await;
+            assert!(
+                out["out"].as_str().unwrap().contains("│     2 │"),
+                "{name}: {out}"
+            );
+        }
         for bad in ["", "a/b.csv", "..", ".hidden"] {
             assert!(
                 add_upload(&shell.uploads, bad, vec![]).await.is_err(),

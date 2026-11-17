@@ -296,9 +296,36 @@ let typeahead = [];
 term.onData((data) => onKey(data));
 
 function onKey(data) {
-  if (busy) typeahead.push(data);
+  if (answer) answer(data);
+  else if (busy) typeahead.push(data);
   else key(data);
 }
+
+// A question the page asks (a shared link's "Run N shared commands? [y/N]"):
+// while one waits, the next key answers it.
+let answer = null;
+
+/** Write `question` and resolve to the next key pressed ("" if a fresh session starts first). */
+function ask(question) {
+  return write(question).then(
+    () =>
+      new Promise((resolve) => {
+        term.options.cursorBlink = true;
+        answer = (data) => {
+          answer = null;
+          term.options.cursorBlink = false;
+          resolve(data);
+        };
+      }),
+  );
+}
+
+// Control characters, which a terminal would act on (ESC starts a sequence
+// that can move the cursor, clear the screen or hide text), and invisible
+// format characters, as the shell's `.print` writes them: \u{1b}, \r. Lines
+// and tabs stay.
+const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u180e\u200b\u200e\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g;
+const visible = (s) => s.replace(CONTROL, (c) => (c === "\r" ? "\\r" : `\\u{${c.codePointAt(0).toString(16)}}`));
 
 function key(data) {
   // A paste arrives in one piece: its lines stay in the input, to run with Enter.
@@ -513,18 +540,20 @@ function submitTyped() {
  * they are skipped if a fresh session starts before they run. What is being
  * typed is put back afterwards. Resolves to whether all of them ran.
  */
-function runAll(commands, { session = generation } = {}) {
+function runAll(commands, { session = generation, replay = false } = {}) {
   let ok = true;
   const jobs = commands.map((command) =>
     enqueue(async () => {
       if (!ok || session !== generation) return (ok = false);
-      if (text && !stash) stash = { text, cursor };
-      erase();
-      text = "";
-      cursor = 0;
+      setAside();
       // A statement left half typed would take this command as its next line.
       if (statement.length) await cancelPending();
-      for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+      replaying = replay;
+      try {
+        for (const line of command.split("\n")) ok = (await feed(line, { echo: true })) && ok;
+      } finally {
+        replaying = false;
+      }
       return ok;
     }),
   );
@@ -532,6 +561,17 @@ function runAll(commands, { session = generation } = {}) {
 }
 
 const run = (command) => runAll([command]);
+
+// Whether the commands running are a shared link's, which may not download.
+let replaying = false;
+
+/** Take what is typed off the screen, to put back once the page's jobs are done. */
+function setAside() {
+  if (text && !stash) stash = { text, cursor };
+  erase();
+  text = "";
+  cursor = 0;
+}
 
 /** Drop the statement the shell holds, unrun. */
 async function cancelPending() {
@@ -546,7 +586,9 @@ const LOOKS = /^\s*\.(help|tables|graphs|describe|functions|version|print|histor
 /** Feed one line to the shell and write what it printed. True if no error. */
 async function feed(line, { echo }) {
   if (echo) {
-    const { text: ansi } = await engine("highlight", { text: line });
+    // Shown as typed, but with control characters escaped: a command from a
+    // shared link cannot rewrite the screen as it is echoed.
+    const { text: ansi } = await engine("highlight", { text: visible(line) });
     await write(`${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
   }
   statement.push(line);
@@ -602,6 +644,10 @@ async function hostCommand(line) {
     case ".share":
       return share();
     case ".export":
+      if (replaying) {
+        await write("Skipped .export: a shared link does not download files. Run it yourself to download.\r\n");
+        return true;
+      }
       return exportLast(arg.toLowerCase());
     case ".files":
       if (arg === "add") {
@@ -647,7 +693,7 @@ let manifest = null;
 async function listFiles() {
   manifest ??= await (await fetch("/data/manifest.json")).json();
   const rows = manifest.datasets.flatMap((d) => d.files.map((f) => `('${f.name}', ${f.bytes}, '${d.title.replace(/'/g, "''")}')`));
-  rows.push(...uploads.map((u) => `('memory://uploads/${u.name.replace(/'/g, "''")}', ${u.bytes}, 'imported')`));
+  rows.push(...uploads.map((u) => `('${u.url.replace(/'/g, "''")}', ${u.bytes}, 'imported')`));
   return quiet(`SELECT name AS file, bytes, dataset FROM (VALUES ${rows.join(", ")}) AS t(name, bytes, dataset) ORDER BY dataset = 'imported', name;`);
 }
 
@@ -694,6 +740,8 @@ async function restart({ clear = true } = {}) {
 /** Start a fresh session; what was queued for the old one is skipped. */
 function fresh() {
   const session = ++generation;
+  // A question waiting (a shared link's) is answered no.
+  answer?.("");
   enqueue(async () => {
     if (session === generation) await restart();
   });
@@ -756,6 +804,32 @@ function sharedCommands() {
   }
 }
 
+/**
+ * A shared link's commands: show them (control characters escaped, so none
+ * can hide what it runs) and run them only if the answer is y. A link cannot
+ * download files: `.export` is skipped as they run.
+ */
+function confirmShared(shared, session) {
+  const n = `${shared.length} shared command${shared.length === 1 ? "" : "s"}`;
+  enqueue(async () => {
+    await write(`This link runs ${n}:\r\n`);
+    for (const command of shared) {
+      const { text: ansi } = await engine("highlight", { text: visible(command), alone: true });
+      await write(`  ${ansi.replace(/\n/g, "\r\n  ")}\r\n`);
+    }
+    const reply = await ask(`Run ${n}? [y/N] `);
+    const yes = reply === "y" || reply === "Y";
+    await write(`${yes ? "y" : "N"}\r\n`);
+    if (session !== generation) return;
+    if (!yes) {
+      await write("Not run.\r\n");
+      return;
+    }
+    await write(`Replaying ${n} from a shared link.\r\n`);
+    runAll(shared, { session, replay: true });
+  });
+}
+
 // Import: a file from this computer becomes a view named after it.
 const fileInput = $("file-input");
 $("import").onclick = () => fileInput.click();
@@ -763,19 +837,24 @@ fileInput.onchange = () => {
   const files = [...fileInput.files];
   fileInput.value = "";
   for (const file of files) {
+    // Letters (any script) and digits; the rest become _.
     const view =
       file.name
         .replace(/\.(gz|zst|bz2|xz)$/i, "")
         .replace(/\.[^.]+$/, "")
         .toLowerCase()
-        .replace(/[^a-z0-9_]+/g, "_")
-        .replace(/^(\d)/, "_$1") || "imported";
+        .replace(/[^\p{L}\p{N}_]+/gu, "_")
+        .replace(/^(\p{N})/u, "_$1") || "imported";
+    // Quoted: a file may be named after a keyword (order.csv).
+    const quoted = `"${view.replace(/"/g, '""')}"`;
     enqueue(async () => {
+      // Off the prompt line: an error prints on lines of its own, and the
+      // prompt and what was typed are drawn again after it.
+      setAside();
       const buffer = await file.arrayBuffer();
       const { url } = await engine("addFile", { name: file.name, bytes: buffer }, [buffer]);
-      uploads.push({ name: file.name, bytes: file.size });
-      // Quoted: a file may be named after a keyword (order.csv).
-      runAll([`CREATE OR REPLACE VIEW "${view}" AS SELECT * FROM '${url.replace(/'/g, "''")}';`, `FROM "${view}" LIMIT 10;`]);
+      uploads.push({ name: file.name, url, bytes: file.size });
+      runAll([`CREATE OR REPLACE VIEW ${quoted} AS SELECT * FROM '${url.replace(/'/g, "''")}';`, `FROM ${quoted} LIMIT 10;`]);
     });
   }
   term.focus();
@@ -831,10 +910,7 @@ engineStarted.then(
       loadDataset(wanted);
     } else {
       const session = fresh();
-      if (shared.length) {
-        enqueue(() => write(`Replaying ${shared.length} command${shared.length === 1 ? "" : "s"} from a shared link.\r\n`));
-        runAll(shared, { session });
-      }
+      if (shared.length) confirmShared(shared, session);
     }
     term.focus();
   },

@@ -16,9 +16,15 @@
  * - everything else is a static asset (dist/: the page, the engine's JS glue
  *   and engine.json, which names the current .wasm).
  *
+ * Every response carries the security headers in headers.ts (a Content
+ * Security Policy, nosniff, no referrer). A path that does not decode (a
+ * malformed `%` escape) is not found.
+ *
  * `Env` (the `ASSETS` and R2 `DATA` bindings) is generated from
  * cloudflare.config.ts by `cf workers types` into .cloudflare/types/.
  */
+
+import { withSecurityHeaders } from "./headers";
 
 const DATA_PREFIX = "/data/";
 const ENGINE_PREFIX = "/engine/";
@@ -134,14 +140,28 @@ async function serveEngine(request: Request, env: Env, file: string): Promise<Re
 	return new Response(object.body, { headers, encodeBody: "manual" });
 }
 
+/** `pathname` decoded, or null if it has a malformed escape (`%E0%A4%A`). */
+function decodePath(pathname: string): string | null {
+	try {
+		return decodeURIComponent(pathname);
+	} catch {
+		return null;
+	}
+}
+
+async function route(request: Request, env: Env): Promise<Response> {
+	const url = new URL(request.url);
+	const path = decodePath(url.pathname);
+	if (path === null) return new Response("Not found\n", { status: 404 });
+	if (path.startsWith(DATA_PREFIX)) return serveData(request, env, path.slice(DATA_PREFIX.length));
+	if (path.startsWith(ENGINE_PREFIX) && path.endsWith(".wasm")) {
+		return serveEngine(request, env, path.slice(ENGINE_PREFIX.length));
+	}
+	return env.ASSETS.fetch(request);
+}
+
 export default {
 	async fetch(request, env): Promise<Response> {
-		const url = new URL(request.url);
-		const path = decodeURIComponent(url.pathname);
-		if (path.startsWith(DATA_PREFIX)) return serveData(request, env, path.slice(DATA_PREFIX.length));
-		if (path.startsWith(ENGINE_PREFIX) && path.endsWith(".wasm")) {
-			return serveEngine(request, env, path.slice(ENGINE_PREFIX.length));
-		}
-		return env.ASSETS.fetch(request);
+		return withSecurityHeaders(await route(request, env));
 	},
 } satisfies ExportedHandler<Env>;

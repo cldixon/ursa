@@ -9,7 +9,10 @@
 // shell's and the page's), downloads the last result in each format, imports a
 // file, replays a shared link in a fresh page, and checks New, the theme toggle
 // and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. An error on screen fails the run, except the ones a test asks
-// for.
+// for. It also checks what keeps the page safe: a shared link asks before it
+// runs, shows control characters as escapes and downloads nothing; awkward
+// file names import; and every response carries the security headers, which
+// the page runs under with no Content Security Policy violation.
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -22,6 +25,17 @@ const check = (ok: boolean, label: string, detail = "") => {
 
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
+// Content Security Policy violations, from every page: the console's, and
+// the documents' securitypolicyviolation events.
+const violations: string[] = [];
+await context.addInitScript(() => {
+  document.addEventListener("securitypolicyviolation", (e) =>
+    console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+  );
+});
+context.on("console", (m) => {
+  if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
+});
 const page = await context.newPage();
 page.on("pageerror", (e) => failures.push(`page error: ${e.message}`));
 
@@ -182,6 +196,28 @@ await page.waitForFunction(() => (window as any).ursaShell.screen().includes(`FR
 await idle();
 t = lastTable(await after(`FROM "my_ties" LIMIT 10;`));
 check(t.rows.length === 3 && t.head.join(",") === "src,dst", "import", JSON.stringify(t.rows));
+// Names a URL or SQL would read otherwise: non-ASCII, #, and a keyword.
+for (const [name, view] of [["données.csv", "données"], ["a#b.csv", "a_b"], ["order.csv", "order"]]) {
+  const before = await errors();
+  await page.setInputFiles("#file-input", { name, mimeType: "text/csv", buffer: Buffer.from("src,dst\n1,2\n2,3\n3,1\n") });
+  await page.waitForFunction((v) => (window as any).ursaShell.screen().includes(`FROM "${v}" LIMIT 10;`), view, { timeout: 30_000 });
+  await idle();
+  t = lastTable(await after(`FROM "${view}" LIMIT 10;`));
+  check(t.rows.length === 3 && (await errors()) === before, `import ${name}`, JSON.stringify(t.rows));
+}
+// An import that fails prints its error on a line of its own, and the prompt
+// and what was being typed come back below it.
+await page.keyboard.type("SELECT 'draft'");
+await page.setInputFiles("#file-input", { name: ".hidden.csv", mimeType: "text/csv", buffer: Buffer.from("a\n1\n") });
+await page.waitForFunction(() => /\nError: [^\n]*\.hidden\.csv/.test((window as any).ursaShell.screen()), null, { timeout: 30_000 });
+await idle();
+{
+  const lines = (await screen()).split("\n");
+  const at = lines.findLastIndex((l) => l.includes(".hidden.csv"));
+  check(lines[at].startsWith("Error: ") && lines[at - 1] !== "memory U SELECT 'draft'" && lines.at(-1) === "memory U SELECT 'draft'", "an import error prints on its own line, then the prompt", JSON.stringify(lines.slice(at - 1)));
+}
+await page.keyboard.press("Control+C");
+await idle();
 
 // History: the up arrow brings back the last command.
 await page.keyboard.press("ArrowUp");
@@ -221,15 +257,62 @@ await page.click("#share");
 await idle();
 const url = page.url().includes("#run=") ? page.url() : await page.evaluate(() => navigator.clipboard.readText());
 check(url.includes("#run="), "share link", `${url.length} characters`);
-const replay = await context.newPage();
-replay.on("pageerror", (e) => failures.push(`replay page error: ${e.message}`));
-await replay.goto(url);
-await ready(replay);
+/** Open a shared link in a new page and wait for its question. */
+async function openShared(link: string) {
+  const p = await context.newPage();
+  p.on("pageerror", (e) => failures.push(`replay page error: ${e.message}`));
+  await p.goto(link);
+  await p.waitForFunction(() => (window as any).ursaShell?.screen().includes("? [y/N] "), null, { timeout: 120_000 });
+  return p;
+}
+const linkTo = (commands: string[]) =>
+  `${base}/#run=${Buffer.from(JSON.stringify(commands)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+
+// A shared link shows its commands and asks; only y runs them.
+let replay = await openShared(url);
+{
+  const asked = await screen(replay);
+  const n = asked.match(/Run (\d+) shared commands\? \[y\/N\]/)?.[1];
+  check(!!n && asked.includes(`This link runs ${n} shared commands:`) && (await tables(replay)) === 0, "a shared link asks before it runs", `${n} commands`);
+}
+let replayDownloads = 0;
+replay.on("download", () => replayDownloads++);
+await replay.keyboard.press("y");
 await idle(replay);
 const replayed = await screen(replay);
 // The imported file is not in the link: its view is the one error expected.
 const replayErrors = replayed.split("\n").filter((l) => l.startsWith("Error: "));
-check(replayed.includes("Replaying") && replayErrors.every((e) => /my_ties/.test(e)) && (await tables(replay)) > 5, "shared link replays", replayErrors[0] ?? `${await tables(replay)} tables`);
+check(replayed.includes("Replaying") && replayErrors.every((e) => /my_ties/.test(e)) && (await tables(replay)) > 5, "shared link replays after y", replayErrors[0] ?? `${await tables(replay)} tables`);
+check(replayDownloads === 0 && !replayed.includes("Downloaded "), "a shared link downloads nothing", `${replayDownloads} downloads`);
+await replay.close();
+
+replay = await openShared(url);
+await replay.keyboard.press("n");
+await idle(replay);
+{
+  const text = await screen(replay);
+  check(/\[y\/N\] N\nNot run\.\nmemory U/.test(text) && (await tables(replay)) === 0 && !text.includes("Replaying"), "a shared link answered N runs nothing");
+  await type("SELECT 3 AS three;", replay);
+  check(lastTable(await after("SELECT 3 AS three;", replay)).rows[0]?.[0] === "3", "the shell works after N");
+}
+await replay.close();
+
+// A crafted link: escape sequences are shown as escapes, in the question, the
+// echo and .print, and its .export downloads nothing.
+replay = await openShared(linkTo([".print \x1b[2J\x1b[8mhidden\x07\u009b0m", "SELECT 1 AS \"\x1b[31mone\";", ".export csv", "SELECT 2 AS two;"]));
+{
+  const asked = await screen(replay);
+  check(asked.includes("  .print \\u{1b}[2J\\u{1b}[8mhidden\\u{7}\\u{9b}0m") && !asked.includes("\x1b"), "a shared link's commands are shown with escapes", asked.split("\n").find((l) => l.includes(".print")));
+  let downloads = 0;
+  replay.on("download", () => downloads++);
+  await replay.keyboard.press("y");
+  await idle(replay);
+  const text = await screen(replay);
+  const printed = (await after(".print", replay)).split("\n")[0];
+  check(printed === "\\u{1b}[2J\\u{1b}[8mhidden\\u{7}\\u{9b}0m", ".print writes control characters as escapes", JSON.stringify(printed));
+  check(text.includes(`memory U SELECT 1 AS "\\u{1b}[31mone";`) && text.includes("This link runs 4 shared commands:"), "replayed commands are echoed with escapes");
+  check(downloads === 0 && text.includes("Skipped .export") && lastTable(await after("SELECT 2 AS two;", replay)).rows[0]?.[0] === "2", "a crafted link's .export is skipped and the rest runs", `${downloads} downloads`);
+}
 await replay.close();
 
 // New: a fresh session and a clear screen.
@@ -320,6 +403,38 @@ const columns: number = await phone.evaluate(() => (window as any).ursaShell.col
 const widest = Math.max(...(await screen(phone)).split("\n").filter((l) => /^[┌│└├]/.test(l)).map((l) => [...l].length));
 check(widest <= columns, "tables fit a phone's width", `widest ${widest}, ${columns} columns`);
 if (shots) await phone.screenshot({ path: `${shots}/shell-phone.png` });
+
+// The security headers, on every kind of response.
+for (const path of ["/", "/app.js", "/engine/engine.json", "/data/manifest.json", "/data/no_such_file.csv", "/no/such/page"]) {
+  const r = await fetch(`${base}${path}`);
+  const csp = r.headers.get("content-security-policy") ?? "";
+  check(
+    /frame-ancestors 'none'/.test(csp) && /script-src 'self' 'wasm-unsafe-eval'/.test(csp) && r.headers.get("x-content-type-options") === "nosniff" && /^(no-referrer|strict-origin-when-cross-origin)$/.test(r.headers.get("referrer-policy") ?? ""),
+    `security headers on ${path}`,
+    `${r.status}`,
+  );
+}
+// A path that does not decode is not found, not a server error; and no path
+// leaves the files served.
+for (const path of ["/data/%E0%A4%A", "/%E0%A4%A", "/engine/%E0%A4%A.wasm", "/data/%"]) {
+  const r = await fetch(`${base}${path}`);
+  check(r.status === 404, `${path} is 404`, `${r.status}`);
+}
+for (const path of [
+  "/data/..%2f..%2fpackage.json",
+  "/data/%2e%2e%2f%2e%2e%2fpackage.json",
+  "/data/..%5c..%5cpackage.json",
+  "/data/.%2e/.%2e/package.json",
+  "/..%2f..%2fpackage.json",
+  "/%2e%2e%2f%2e%2e%2fpackage.json",
+  "/engine/..%2f..%2f..%2fpackage.json.wasm",
+  "/data/..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+]) {
+  const r = await fetch(`${base}${path}`);
+  const body = await r.text();
+  check(r.status >= 400 && !body.includes('"devDependencies"') && !body.includes("root:"), `${path} stays blocked`, `${r.status}`);
+}
+check(violations.length === 0, "no Content Security Policy violations", violations.slice(0, 3).join(" | "));
 
 await browser.close();
 console.log(failures.length ? `\n${failures.length} failures:\n- ${failures.join("\n- ")}` : "\nall passed");

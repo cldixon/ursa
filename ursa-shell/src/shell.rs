@@ -543,7 +543,9 @@ impl<O: Write, E: Write> Shell<O, E> {
             ".quit" | ".exit" => return Flow::Exit,
             ".help" => self.help(arg),
             ".version" => self.say(&format!("Ursa v{}", self.version)),
-            ".print" => self.say(arg),
+            // Control characters (ESC above all) are written as escapes:
+            // printed text cannot move the cursor or restyle the terminal.
+            ".print" => self.say(&crate::table::visible(arg)),
             ".mode" => self.mode_command(arg),
             ".maxrows" => self.max_rows_command(arg),
             ".maxwidth" => self.max_width_command(arg),
@@ -1756,6 +1758,18 @@ mod tests {
         shell.set_version("1.2.3");
         let (out, _) = feed(&mut shell, &[".version", ".print hello  world"]).await;
         assert_eq!(out, "Ursa v1.2.3\nhello  world\n");
+    }
+
+    #[tokio::test]
+    async fn print_writes_control_characters_as_escapes() {
+        let mut shell = shell();
+        let (out, _) = feed(
+            &mut shell,
+            &[".print \x1b[2J\x1b[31mred\x07 \u{9b}0m\tend\rx"],
+        )
+        .await;
+        assert_eq!(out, "\\u{1b}[2J\\u{1b}[31mred\\u{7} \\u{9b}0m\tend\\rx\n");
+        assert!(!out.contains('\x1b') && !out.contains('\u{9b}'), "{out:?}");
     }
 
     #[test]
