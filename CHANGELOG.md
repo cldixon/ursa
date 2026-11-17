@@ -455,6 +455,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - The skill and the shell page say which format to read results in (`json`
   or `ndjson`), that a table shows at most 40 rows while CSV and JSON write
   every row, and that piped output is never cut to a width (#350).
+- Ctrl-C in the `ursa` shell prints `Interrupted` (stderr) and draws the
+  prompt again at once. The signal was waited for on the query's own
+  runtime, so a statement that kept every worker busy (an index build, a
+  large join) could hold it back; it said `^C (cancelled)` when it was seen
+  (#354).
+- An error names the file it cannot read once: `cannot read 'x.csv': Csv
+  error: …`, not `cannot read 'x.csv': cannot read /…/x.csv: Csv error: …`.
+  For a glob or a list it names the file that failed. A Parquet error says
+  `Parquet error: …`, not `Parquet: Parquet error: …` (#354).
+- The docs and the skill take the top k before joining attributes
+  (`WITH top AS (SELECT * FROM pagerank(g) ORDER BY pagerank DESC LIMIT 5)
+  SELECT … FROM top JOIN g.nodes USING (id)`), and say why: an
+  `ORDER BY … LIMIT` is not moved below a join, so joining first sorts every
+  node's attributes too, about twice the memory on a large graph (#354).
+- The docs' landing page leads with Ursa SQL: the install one-liner and a
+  `CREATE PROPERTY GRAPH` and `pagerank` example, run in CI with the SQL
+  docs. The Python library is the second path (#354).
 
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc

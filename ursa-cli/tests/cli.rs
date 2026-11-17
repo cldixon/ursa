@@ -1597,3 +1597,33 @@ fn output_formats_keep_lists_nulls_and_empty_strings() {
     );
     assert!(ok(ursa(&["-c", "SELECT NULL AS n"])).contains("│ NULL │"));
 }
+
+/// N40: a file that cannot be read is named once, whether it is given by
+/// itself, in a glob or in a list, and a Parquet error says Parquet once.
+#[test]
+fn a_file_that_cannot_be_read_is_named_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(dir.join("bad.csv"), "a,b\n1,2\n1,2,3\n").unwrap();
+    std::fs::write(dir.join("bad.parquet"), "not parquet\n").unwrap();
+    let bad = dir.join("bad.csv").display().to_string();
+    let glob = dir.join("b*.csv").display().to_string();
+    for from in [
+        format!("'{bad}'"),
+        format!("'{glob}'"),
+        format!("read_csv(['{bad}', '{bad}'])"),
+    ] {
+        let message = err(ursa(&["-c", &format!("SELECT * FROM {from};")]));
+        assert_eq!(message.matches("cannot read").count(), 1, "{message}");
+        assert!(
+            message.starts_with(&format!("Error: cannot read '{bad}': Csv error: ")),
+            "{message}"
+        );
+    }
+    let parquet = dir.join("bad.parquet").display().to_string();
+    let message = err(ursa(&["-c", &format!("SELECT * FROM '{parquet}';")]));
+    assert!(
+        message.starts_with(&format!("Error: cannot read '{parquet}': Parquet error: ")),
+        "{message}"
+    );
+}

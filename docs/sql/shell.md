@@ -40,7 +40,7 @@ echo "SHOW GRAPHS;" | ursa club.ursa               # SQL on stdin
 
 `-c` and `-f` (`--file`) may be repeated; they run in the order given. If any statement fails, `ursa` prints the error, stops, and exits with status 1. A syntax error anywhere in a `-c`, a file or stdin runs none of it.
 
-Ctrl-C (SIGINT) cancels the run: `ursa` stops the query that is running, prints `Error: interrupted` to stderr, writes nothing more to stdout, and exits with status 130. Results that finished before it stay printed. The database is left as the last finished statement left it, and another process can open it at once. In the shell, Ctrl-C cancels the running statement and returns to the prompt.
+Ctrl-C (SIGINT) cancels the run: `ursa` stops the query that is running, prints `Error: interrupted` to stderr, writes nothing more to stdout, and exits with status 130. Results that finished before it stay printed. The database is left as the last finished statement left it, and another process can open it at once. In the shell, Ctrl-C cancels the running statement, prints `Interrupted` to stderr and draws the prompt again at once.
 
 A script may hold dot-commands too, one a line, as at the prompt and as in DuckDB:
 
