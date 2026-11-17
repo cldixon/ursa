@@ -979,6 +979,7 @@ mod tests {
     /// A deterministic pseudo-random graph with inexact weights (an LCG, so no RNG
     /// dependency): enough edges to take `from_topology`'s parallel path, with
     /// parallel edges, opposite edges and self-loops.
+    #[cfg(feature = "rayon")]
     fn random_weighted(n: u32, m: usize) -> (Topology, Vec<f64>) {
         let (src, dst, w) = random_edges(n, m);
         (Topology::build(n as usize, src, dst), w)
