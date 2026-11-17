@@ -4653,6 +4653,7 @@ dependencies = [
  "glob",
  "object_store",
  "parking_lot",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

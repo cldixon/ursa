@@ -36,16 +36,21 @@
 //! that does not (truncated, corrupt, another version) is a miss, and a
 //! writer drops its entry. A hit updates `last_used`.
 //!
-//! **The limit** is the database's: its stored `ursa.index_storage_limit`,
-//! or the default ([`IndexStore::set_limit`]), never a session's own `SET`,
-//! so a read-only or in-memory session cannot shrink what a database keeps.
+//! **The limit** is the session's `ursa.index_storage_limit` in effect: what
+//! it `SET`, or the database's default, a share of the free space on its disk
+//! (`Database::index_storage_limit`, kept in step by
+//! [`IndexStore::set_limit`] whenever a session uses the store). A limit
+//! decides only whether something *new* is stored: lowering it never removes
+//! an index already stored (#353).
 //!
 //! **Storing** ([`IndexStore::save`]) decides at once, in the query that
 //! built the index, and says what it decided ([`Saved`]):
 //!
 //! 1. A read-only store stores nothing.
 //! 2. An index larger than the limit on its own is not stored.
-//! 3. Otherwise it replaces any entry with the same fingerprint (an index of
+//! 3. If the stored indexes already take more than the limit (it was lowered
+//!    since), the index is not stored and nothing is evicted.
+//! 4. Otherwise it replaces any entry with the same fingerprint (an index of
 //!    the same edges over an older version of a file), and evicts entries,
 //!    least recently used first, only as many as it takes to fit within the
 //!    limit beside the indexes being written. Never evicted: an index a
@@ -159,12 +164,18 @@ impl Entry {
 /// What [`IndexStore::save`] decided for an index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Saved {
-    /// Being written, in `size` bytes.
-    Stored { size: u64 },
+    /// Being written, in `size` bytes. `grows_to` is about what the file
+    /// takes once an algorithm adds the in-adjacency, if it is not in it
+    /// yet; `None` when it is.
+    Stored { size: u64, grows_to: Option<u64> },
     /// The database is open read-only.
     ReadOnly,
     /// `size` bytes is more than the limit on its own.
     TooLarge { size: u64, limit: u64 },
+    /// The stored indexes already take `stored` bytes, more than the limit
+    /// (lowered since they were stored): they are kept, and no new index is
+    /// stored.
+    OverLimit { stored: u64, limit: u64 },
     /// The indexes running queries hold leave less than `size` bytes of the
     /// limit.
     NoRoom { size: u64, limit: u64 },
@@ -178,7 +189,10 @@ impl Saved {
     pub fn loses_work(&self) -> bool {
         matches!(
             self,
-            Saved::TooLarge { .. } | Saved::NoRoom { .. } | Saved::Unstorable(_)
+            Saved::TooLarge { .. }
+                | Saved::OverLimit { .. }
+                | Saved::NoRoom { .. }
+                | Saved::Unstorable(_)
         )
     }
 
@@ -186,9 +200,22 @@ impl Saved {
     /// named `database`.
     pub fn describe(&self, database: &str) -> String {
         match self {
-            Saved::Stored { size } => {
-                format!("stored in {database} ({})", notices::size(*size))
-            }
+            Saved::Stored {
+                size,
+                grows_to: None,
+            } => format!(
+                "stored in {database} ({}, with its reverse adjacency)",
+                notices::size(*size)
+            ),
+            Saved::Stored {
+                size,
+                grows_to: Some(grown),
+            } => format!(
+                "stored in {database} ({}; about {} once an algorithm adds the reverse \
+                 adjacency)",
+                notices::size(*size),
+                notices::size(*grown)
+            ),
             Saved::ReadOnly => format!("not stored: {database} is open read-only"),
             Saved::TooLarge { size, limit } => format!(
                 "not stored: it takes {}, more than ursa.index_storage_limit ({}); SET \
@@ -196,6 +223,13 @@ impl Saved {
                 notices::size(*size),
                 ByteSize(*limit),
                 ByteSize(suggested_limit(*size))
+            ),
+            Saved::OverLimit { stored, limit } => format!(
+                "not stored: the indexes {database} stores take {}, more than \
+                 ursa.index_storage_limit ({}); they are kept, and new indexes are not stored \
+                 until it is raised",
+                notices::size(*stored),
+                ByteSize(*limit)
             ),
             Saved::NoRoom { size, limit } => format!(
                 "not stored: the stored indexes running queries use leave less than its {} of \
@@ -225,7 +259,8 @@ pub struct IndexStore {
     writable: bool,
     /// The database as notices name it.
     database: String,
-    /// The most bytes the store keeps: the database's limit.
+    /// The most bytes the store keeps: the limit in effect for the session
+    /// that last used it.
     limit: AtomicU64,
     state: Mutex<State>,
     pending: Mutex<Vec<JoinHandle<()>>>,
@@ -294,9 +329,23 @@ impl IndexStore {
     }
 
     /// Keep at most `limit` bytes from now on: the next index stored makes
-    /// room within it. Nothing is evicted now.
+    /// room within it. Nothing is evicted now, nor later to bring indexes
+    /// already stored within a lower limit.
     pub fn set_limit(&self, limit: u64) {
         self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The bytes of the indexes stored, and being written, as this process
+    /// knows them.
+    pub fn stored_bytes(&self) -> u64 {
+        if !self.writable {
+            return manifest_bytes(&self.dir);
+        }
+        let state = self.state();
+        if !state.loaded {
+            return manifest_bytes(&self.dir);
+        }
+        state.reserved + state.entries.iter().map(|e| e.size).sum::<u64>()
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -491,6 +540,12 @@ impl IndexStore {
             return Saved::TooLarge { size, limit };
         }
         let with_incoming = size > main;
+        let grows_to = (!with_incoming).then(|| {
+            size.saturating_add(incoming_estimate(
+                index.topology.n_nodes() as u64,
+                index.topology.n_edges() as u64,
+            ))
+        });
         let file = format!("{:016x}.idx", key.hash());
 
         let mut state = self.state();
@@ -503,8 +558,10 @@ impl IndexStore {
             .filter(|e| e.key.fingerprint == key.fingerprint || e.file == file)
             .map(|e| e.file.clone())
             .collect();
-        let Some(evicted) = room_for(&state, size, &replaced, &[], limit) else {
-            return Saved::NoRoom { size, limit };
+        let evicted = match room_for(&state, size, &replaced, &[], limit) {
+            Ok(evicted) => evicted,
+            Err(NoRoom::OverLimit { stored }) => return Saved::OverLimit { stored, limit },
+            Err(NoRoom::InUse) => return Saved::NoRoom { size, limit },
         };
         let gone = self.remove(&mut state, &replaced, &evicted, notifier, limit);
         state.reserved += size;
@@ -535,7 +592,7 @@ impl IndexStore {
                 let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
                 pending.retain(|h| !h.is_finished());
                 pending.push(handle);
-                Saved::Stored { size }
+                Saved::Stored { size, grows_to }
             }
             Err(e) => {
                 self.state().reserved -= size;
@@ -653,16 +710,25 @@ impl IndexStore {
                     CHUNK_WEIGHTS => "evaluated weights",
                     _ => "in-adjacency",
                 };
-                let Some(evicted) = room_for(&state, need, &[], std::slice::from_ref(&file), limit)
-                else {
-                    notifier.say(NoticeLevel::On, || {
-                        format!(
+                let room = room_for(&state, need, &[], std::slice::from_ref(&file), limit);
+                let Ok(evicted) = room else {
+                    notifier.say(NoticeLevel::On, || match room {
+                        Err(NoRoom::OverLimit { stored }) => format!(
+                            "did not store the {what} of the index for {graph} ({}) in {}: the \
+                             stored indexes already take {}, more than \
+                             ursa.index_storage_limit ({})",
+                            notices::size(need),
+                            self.database,
+                            notices::size(stored),
+                            ByteSize(limit)
+                        ),
+                        _ => format!(
                             "did not store the {what} of the index for {graph} ({}) in {}: it \
                              would take the stored indexes past ursa.index_storage_limit ({})",
                             notices::size(need),
                             self.database,
                             ByteSize(limit)
-                        )
+                        ),
                     });
                     if let Some(live) = state.live.get_mut(&file) {
                         live.declined.insert((kind, name));
@@ -782,18 +848,29 @@ impl Drop for IndexStore {
     }
 }
 
+/// Why [`room_for`] found no room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoRoom {
+    /// The stored indexes already take `stored` bytes, more than the limit
+    /// (it was lowered): nothing is evicted, and nothing new is stored.
+    OverLimit { stored: u64 },
+    /// Evicting every index no running query holds would not make room.
+    InUse,
+}
+
 /// The entries to evict, least recently used first, to fit `need` more bytes
 /// within `limit`, beside the indexes being written and every entry but
 /// those of `dropping` (which are going anyway). Entries of `keep` and any
-/// index a running query holds are never chosen. `None` if no choice makes
-/// room; nothing is evicted then.
+/// index a running query holds are never chosen. Eviction only makes room for
+/// something new, never more than it needs: if the stored indexes are
+/// already over `limit`, or no choice makes room, nothing is evicted.
 fn room_for(
     state: &State,
     need: u64,
     dropping: &[String],
     keep: &[String],
     limit: u64,
-) -> Option<Vec<String>> {
+) -> Result<Vec<String>, NoRoom> {
     let staying = |e: &&Entry| !dropping.contains(&e.file);
     let mut total: u64 = state.reserved
         + state
@@ -802,6 +879,9 @@ fn room_for(
             .filter(staying)
             .map(|e| e.size)
             .sum::<u64>();
+    if total > limit {
+        return Err(NoRoom::OverLimit { stored: total });
+    }
     let mut candidates: Vec<&Entry> = state
         .entries
         .iter()
@@ -812,11 +892,11 @@ fn room_for(
     let mut evicted = Vec::new();
     let mut candidates = candidates.into_iter();
     while total.saturating_add(need) > limit {
-        let entry = candidates.next()?;
+        let entry = candidates.next().ok_or(NoRoom::InUse)?;
         total -= entry.size;
         evicted.push(entry.file.clone());
     }
-    Some(evicted)
+    Ok(evicted)
 }
 
 /// Whether a running query holds the index stored in `file`: the session's
@@ -853,6 +933,22 @@ struct Manifest {
 /// build reads. Entries it cannot read are skipped.
 pub fn read_manifest(dir: &Path) -> Vec<Entry> {
     read_manifest_checked(dir).entries
+}
+
+/// The bytes of the indexes the manifest in `dir` lists.
+pub fn manifest_bytes(dir: &Path) -> u64 {
+    read_manifest(dir).iter().map(|e| e.size).sum()
+}
+
+/// About how many bytes the in-adjacency of an index of `n_nodes` nodes and
+/// `n_edges` edges adds to its file: its offsets, targets and edge ids, and
+/// a little for the chunk's header and table.
+pub fn incoming_estimate(n_nodes: u64, n_edges: u64) -> u64 {
+    n_nodes
+        .saturating_add(1)
+        .saturating_mul(8)
+        .saturating_add(n_edges.saturating_mul(8))
+        .saturating_add(4096)
 }
 
 fn read_manifest_checked(dir: &Path) -> Manifest {
@@ -915,6 +1011,69 @@ fn sync_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_only_makes_room_and_never_below_a_lowered_limit() {
+        let entry = |file: &str, size, last_used| Entry {
+            key: IndexKey::new(file.into(), Vec::new()),
+            file: file.into(),
+            graph: file.into(),
+            size,
+            created: 0,
+            last_used,
+        };
+        let state = State {
+            loaded: true,
+            entries: vec![entry("a", 300, 1), entry("b", 300, 2), entry("c", 300, 3)],
+            ..State::default()
+        };
+        // Room already: nothing is evicted.
+        assert_eq!(room_for(&state, 100, &[], &[], 1000), Ok(vec![]));
+        // Only as many as it takes, least recently used first.
+        assert_eq!(room_for(&state, 200, &[], &[], 1000), Ok(vec!["a".into()]));
+        assert_eq!(
+            room_for(&state, 700, &[], &[], 1000),
+            Ok(vec!["a".into(), "b".into()])
+        );
+        // A limit lowered below what is stored evicts nothing, even to store
+        // something small.
+        assert_eq!(
+            room_for(&state, 1, &[], &[], 500),
+            Err(NoRoom::OverLimit { stored: 900 })
+        );
+        // ... unless what is going anyway brings it within.
+        assert_eq!(room_for(&state, 100, &["c".into()], &[], 700), Ok(vec![]));
+        // Kept entries are never chosen.
+        assert_eq!(
+            room_for(&state, 900, &[], &["a".into(), "b".into()], 1000),
+            Err(NoRoom::InUse)
+        );
+    }
+
+    #[test]
+    fn a_stored_notice_says_how_the_index_grows() {
+        let gib = 1u64 << 30;
+        assert_eq!(
+            Saved::Stored {
+                size: 768 << 20,
+                grows_to: Some(3 * gib / 2)
+            }
+            .describe("club.ursa"),
+            "stored in club.ursa (768.0 MiB; about 1.5 GiB once an algorithm adds the reverse \
+             adjacency)"
+        );
+        assert_eq!(
+            Saved::Stored {
+                size: 3 * gib / 2,
+                grows_to: None
+            }
+            .describe("club.ursa"),
+            "stored in club.ursa (1.5 GiB, with its reverse adjacency)"
+        );
+        // 95.7M edges over 10M nodes: about 806 MiB more.
+        let more = incoming_estimate(10_000_000, 95_700_000);
+        assert!((800 << 20..810 << 20).contains(&more), "{more}");
+    }
 
     #[test]
     fn the_suggested_limit_leaves_room_for_the_in_adjacency() {

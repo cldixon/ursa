@@ -231,8 +231,39 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: `SET` lasts for the session** (behaviour change, #353; reverses
+  #327's persistence). `SET` and `RESET` change only the current session, in
+  any database, writable or read-only, as in DuckDB, Postgres and
+  DataFusion: nothing is written to the catalog. Since 0.8, `SET
+  ursa.index_storage_limit = '50MiB'` in a writable database was saved for
+  good, and a limit tried "for now" evicted gigabytes of indexes at the next
+  build. To keep a setting, put the `SET` in `~/.ursarc` (the shell) or an
+  `-init` file (scripts too). A limit 0.8 or 0.9 saved is no longer applied:
+  opening the database says so once (`ursa: club.ursa has a saved
+  ursa.index_storage_limit = 50MiB, which is no longer applied; …`), and a
+  writable open removes it from the catalog.
+  - **Lowering the limit never removes a stored index.** A limit decides
+    only whether a new index is stored; eviction makes room for a new index
+    under the session's limit, least recently used first, never more than it
+    needs. If the stored indexes already take more than a lower limit, no new
+    index is stored and nothing is evicted, and the `SET` says so (`ursa:
+    3.8 GiB of indexes are stored in club.ursa, more than the 50MiB limit;
+    they are kept, and new indexes won't be stored`).
+  - **The default limit follows the disk** (N32): 25% of the free space on
+    the database's disk, counting the indexes it stores, in whole GiB, at
+    least 4 GiB (the old default) and at most 64 GiB. At 4 GiB, three graphs
+    over the same 95.7M edges evicted each other, each eviction costing a
+    30 s rebuild later. The setting's value is `auto` until `SET`, and
+    `SHOW ursa.index_storage_limit` says the limit in effect and where it
+    comes from (`8GiB (SET for this session)`, or `25GiB (the default: 25%
+    of 100.2 GiB: …)`).
+  - The `stored` notice says how the index grows once an algorithm adds its
+    reverse adjacency (about 1.75×): `stored in club.ursa (768.0 MiB; about
+    1.5 GiB once an algorithm adds the reverse adjacency)`, or `(…, with its
+    reverse adjacency)` when it is already in it.
 - **SQL: `ursa.index_storage_limit` belongs to the database** (behaviour
-  change, #327). `SET` in a writable database is stored in the catalog
+  change, #327; its persistence is reversed by #353 above, and `SET` now
+  lasts for the session). `SET` in a writable database is stored in the catalog
   (a new `settings` object; older versions ignore it), applied when the
   database is opened and shown by `SHOW`; `RESET` goes back to the default.
   Stored indexes obey only the stored limit or the default: a read-only or
