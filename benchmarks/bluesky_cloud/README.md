@@ -53,7 +53,18 @@ python3 smoke_data.py /tmp/smoke/data
 python3 run.py --data /tmp/smoke/data --work /tmp/smoke/work --before 2024-03-01
 ```
 
-On an M-series Mac (12 cores, 32 GB) with `ursa 0.9.0`, the 2024-01-01 run passes all 22 checks in about 3 minutes.
+With `ursa 0.9.0`, the 2024-01-01 run passes all 23 checked steps on each of these (measured 2026-11-17):
+
+| Where | Total | Index build (`g` / `ge`) | PageRank `g` | Louvain `g` | Peak RSS (largest step) |
+|---|---|---|---|---|---|
+| M-series Mac, 12 cores, 32 GB | ~3 min | 27.4 / 25.6 s | 4.1 s | 15.3 s | 6.2 GB (RSS overstates on macOS) |
+| EC2 r7g.4xlarge, Docker, 250 GB gp3 | ~4 min | 40.8 / 39.1 s | 6.6 s | 26.8 s | 6.7 GB |
+| Fargate 16 vCPU / 120 GB, arm64, 150 GiB | 4.7 min (33 s of it the S3 download) | 35.8 / 34.9 s (55 / 46 s wall) | 15.9 s | 21.5 s | 6.7 GB |
+
+**How to read these numbers:**
+- The index build is single-threaded today (0.9.0 report, N30). A Graviton3 core is slower than an M-series core, so the build is slower in the cloud even with more cores.
+- Fargate's disk is slower than gp3, so steps that read a lot from disk (the build, PageRank adding the reverse index) take longer there than on EC2.
+- Compare runs on the same kind of machine.
 
 **Measurement notes:**
 - Peak memory is each `ursa` process's own `ru_maxrss`. On Linux that is close to the real peak. On macOS RSS overstates it; the round reports use `phys_footprint` there.

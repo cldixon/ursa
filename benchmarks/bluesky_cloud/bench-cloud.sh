@@ -53,6 +53,10 @@ out() { # out NAME: one stack output
 }
 
 cmd_deploy() {
+    # ECS needs its service-linked role to create a cluster with capacity
+    # providers. An account that has never used ECS lacks it, and the stack
+    # then fails at the cluster; create it first (an error means it exists).
+    aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com >/dev/null 2>&1 || true
     aws cloudformation deploy --stack-name "$STACK" --template-file "$here/stack.yml" \
         --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
         --parameter-overrides "ImageTag=ursa-$URSA_VERSION" "$@"
@@ -175,7 +179,7 @@ cmd_ec2_up() {
         --tag-specifications "ResourceType=instance,Tags=[{Key=ursa-bench,Value=$STACK},{Key=Name,Value=$STACK-live}]" \
         --user-data "$(sed -e "s|@REPO@|$(out RepositoryUri)|g" -e "s|@BUCKET@|$(out Bucket)|g" \
             -e "s|@VERSION@|$URSA_VERSION|g" -e "s|@REGION@|$AWS_REGION|g" "$here/ec2-user-data.sh")" \
-        "${spot[@]}" --query 'Instances[0].[InstanceId,InstanceType]' --output text
+        ${spot[@]+"${spot[@]}"} --query 'Instances[0].[InstanceId,InstanceType]' --output text
     say "starting; give it ~2 minutes, then: bench-cloud.sh ec2-connect"
     say "it costs money every hour it runs: bench-cloud.sh ec2-down when done"
 }
