@@ -1,0 +1,108 @@
+name: Bluesky benchmark
+
+# The ursa binary on the Bluesky follows graph (2.42B edges), as a Fargate task
+# in the maintainer's AWS account. Manual only: each run costs money (about
+# $1 per hour of a 16 vCPU / 120 GB Graviton task). The runner only builds the
+# image and waits; the work runs in the task. See benchmarks/bluesky_cloud/README.md.
+#
+# One-time setup (README.md, "GitHub Actions"):
+#   - deploy benchmarks/bluesky_cloud/stack.yml and upload the data;
+#   - a GitHub environment named `bluesky-bench` (add required reviewers to gate spend),
+#     with variables BENCH_ACCOUNT (the AWS account id) and BENCH_ROLE_ARN (the
+#     stack's GitHubRoleArn output); optionally BENCH_AWS_REGION and BENCH_STACK.
+on:
+  workflow_dispatch:
+    inputs:
+      ursa_version:
+        description: "The ursa-cli release to test, e.g. 0.9.0"
+        required: true
+        default: "0.9.0"
+      before:
+        description: "Keep follows before this date (2024-01-01 is the 95.7M-edge graph with checks); empty for the whole graph"
+        required: false
+        default: "2024-01-01"
+      steps:
+        description: "Comma-separated steps or groups to run (empty: all). Groups: build, algorithm, traversal, pattern, check"
+        required: false
+        default: ""
+      skip:
+        description: "Comma-separated steps or groups to leave out, e.g. louvain_g,louvain_ge"
+        required: false
+        default: ""
+
+concurrency:
+  group: bluesky-bench
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bench:
+    name: Fargate run (ursa ${{ inputs.ursa_version }})
+    runs-on: ubuntu-24.04-arm
+    environment: bluesky-bench
+    timeout-minutes: 350
+    env:
+      AWS_REGION: ${{ vars.BENCH_AWS_REGION || 'us-east-1' }}
+      BENCH_STACK: ${{ vars.BENCH_STACK || 'ursa-bluesky-bench' }}
+      BENCH_ACCOUNT: ${{ vars.BENCH_ACCOUNT }}
+      BENCH_STARTED_BY: gh-${{ github.run_id }}
+      BENCH_RUN_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}-ursa-${{ inputs.ursa_version }}
+      URSA_VERSION: ${{ inputs.ursa_version }}
+      BEFORE: ${{ inputs.before }}
+      STEPS: ${{ inputs.steps }}
+      SKIP: ${{ inputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the inputs
+        run: |
+          [[ "$URSA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ursa_version must look like 0.9.0"; exit 1; }
+          [[ -z "$BEFORE" || "$BEFORE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "before must be YYYY-MM-DD or empty"; exit 1; }
+          [[ "$STEPS$SKIP" =~ ^[a-z0-9_,]*$ ]] || { echo "steps and skip are names and commas"; exit 1; }
+          [[ -n "$BENCH_ACCOUNT" ]] || { echo "set the BENCH_ACCOUNT variable on the bluesky-bench environment"; exit 1; }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.BENCH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Build and push the image
+        run: benchmarks/bluesky_cloud/bench-cloud.sh push "$URSA_VERSION"
+
+      - name: Run the benchmark on Fargate
+        run: |
+          args=()
+          [[ -n "$BEFORE" ]] && args+=(--before "$BEFORE")
+          [[ -n "$STEPS" ]] && args+=(--steps "$STEPS")
+          [[ -n "$SKIP" ]] && args+=(--skip "$SKIP")
+          benchmarks/bluesky_cloud/bench-cloud.sh run "${args[@]}"
+
+      - name: Job summary
+        if: always()
+        run: |
+          f="benchmarks/bluesky_cloud/results/$BENCH_RUN_ID/summary.md"
+          if [[ -f "$f" ]]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; else echo "No results (see the run step's log)." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bluesky-bench-${{ env.BENCH_RUN_ID }}
+          path: benchmarks/bluesky_cloud/results/
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # A cancelled workflow must not leave a 16 vCPU task running.
+      - name: Stop the task if the run was cancelled
+        if: cancelled()
+        run: |
+          cluster=$(aws cloudformation describe-stacks --stack-name "$BENCH_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='Cluster'].OutputValue" --output text)
+          for t in $(aws ecs list-tasks --cluster "$cluster" --started-by "$BENCH_STARTED_BY" --query 'taskArns[]' --output text); do
+            aws ecs stop-task --cluster "$cluster" --task "$t" --reason "workflow cancelled" >/dev/null
+            echo "stopped $t"
+          done
