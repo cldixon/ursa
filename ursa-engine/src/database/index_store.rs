@@ -420,6 +420,12 @@ impl IndexStore {
         }
     }
 
+    /// Whether the manifest lists an index stored under `key`. Nothing is
+    /// read but the manifest: [`Self::load`] still checks the file.
+    pub fn contains(&self, key: &IndexKey) -> bool {
+        self.entries().iter().any(|e| e.key == *key)
+    }
+
     /// The stored index for `key`, if there is one whose full key matches
     /// and whose file reads back whole, and the size of its file. Blocking:
     /// it reads the file.
