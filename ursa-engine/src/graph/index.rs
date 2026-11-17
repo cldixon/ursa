@@ -625,7 +625,7 @@ impl IndexCache {
     /// As [`Self::get_or_build`], and on a miss, the index stored under the
     /// same full key in the database of the session `config` belongs to, if
     /// it has one. An index built in a writable database is stored there, in
-    /// the background, within the database's `ursa.index_storage_limit`.
+    /// the background, within the session's `ursa.index_storage_limit`.
     pub async fn get_or_build_stored(
         &self,
         config: &SessionConfig,
@@ -645,8 +645,11 @@ impl IndexCache {
         info: &BuildInfo,
         build: BoxFuture<'_, Result<GraphIndex>>,
     ) -> Result<Arc<GraphIndex>> {
-        let stored =
-            database_of_config(config).map(|db| (db.index_store(), db.dir().to_path_buf()));
+        let stored = database_of_config(config).map(|db| {
+            // The session's limit: what it SET, or the database's default.
+            db.use_index_storage_limit(config);
+            (db.index_store(), db.dir().to_path_buf())
+        });
         let notifier = Notifier::of(config);
         self.get_or_build_in(stored, &notifier, info, key, build)
             .await

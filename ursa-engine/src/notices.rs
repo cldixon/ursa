@@ -10,13 +10,17 @@
 //!
 //! - `on` (the default): a build that has run for a second announces itself
 //!   (`building the index for g (95.7M edges)…`) and says when it is done and
-//!   what became of it (`built the index for g in 30.7 s; stored it in
-//!   club.ursa (1.4 GiB)`); and every stored-index decision that loses work is
-//!   said, however quick: an index not stored (too large for
-//!   `ursa.index_storage_limit`, or no room beside the indexes in use), an
-//!   index evicted to make room, a write that failed, and stored indexes
-//!   dropped because another version of Ursa wrote them. A quick build that
-//!   is stored, or is in memory only, says nothing.
+//!   what became of it (`built the index for g in 30.7 s; stored in club.ursa
+//!   (768.0 MiB; about 1.5 GiB once an algorithm adds the reverse
+//!   adjacency)`); and every stored-index decision that loses work is said,
+//!   however quick: an index not stored (too large for
+//!   `ursa.index_storage_limit`, the stored indexes already over it, or no
+//!   room beside the indexes in use), an index evicted to make room, a write
+//!   that failed, and stored indexes dropped because another version of Ursa
+//!   wrote them. A quick build that is stored, or is in memory only, says
+//!   nothing. So are a `SET` of the limit below what is already stored
+//!   (#353), and a limit Ursa 0.8 or 0.9 saved in the database, which is no
+//!   longer applied.
 //! - `all`: also every build, load and store, however quick.
 //! - `off`: nothing.
 //!

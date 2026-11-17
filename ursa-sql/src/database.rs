@@ -14,12 +14,16 @@
 //!   version 1 of the file does not store rows. So is any other DDL
 //!   (`CREATE SCHEMA`, `CREATE FUNCTION`, `ALTER …`), which the file could not
 //!   replay.
-//! - `SET ursa.index_storage_limit = …` and `RESET ursa.index_storage_limit`
-//!   are kept in the catalog's settings (#327), and applied to the session
-//!   again when the database is opened: the limit belongs to the database,
-//!   which obeys only its stored limit (or the default). In a read-only
-//!   session they run for the session only. Other settings are the
-//!   session's.
+//! - `SET` and `RESET` last for the session, as in DuckDB and Postgres, in
+//!   any database, writable or not: nothing is written to the catalog (#353).
+//!   To keep a setting, put the `SET` in `~/.ursarc` or an `-init` file.
+//!   `SET ursa.index_storage_limit` takes effect for the stored indexes at
+//!   once, and never removes one: if they already take more than the new
+//!   limit, it says so (a notice), and no new index is stored.
+//! - Ursa 0.8 and 0.9 kept `SET ursa.index_storage_limit` in a writable
+//!   database's catalog (#327). Such a saved setting is no longer applied:
+//!   opening the database says so (a notice), and a writable open removes it
+//!   from the catalog, so it is said once.
 //! - `TEMPORARY` views and external tables run and are not stored.
 //! - In a read-only session, every statement that defines or drops anything
 //!   is refused.
@@ -54,7 +58,8 @@ use datafusion::sql::planner::object_name_to_table_reference;
 use datafusion::sql::sqlparser::ast::{ObjectName, ObjectType, Set, Statement as SQLStatement};
 use ursa_engine::database::{self as db, Database, OpenOptions};
 use ursa_engine::graph;
-use ursa_engine::options::UrsaOptions;
+use ursa_engine::notices::{self, NoticeLevel, Notifier};
+use ursa_engine::options::ByteSize;
 
 use crate::parser::{Attach, UrsaStatement};
 use crate::{graph_ddl, parse_sql_for, paths, run};
@@ -91,6 +96,17 @@ pub async fn open_session(path: impl AsRef<Path>, options: &OpenOptions) -> Resu
     Ok(ctx)
 }
 
+/// Open the database at `path` for `ctx`, a session without one, and replay
+/// its catalog. Notices (a setting Ursa 0.8 or 0.9 saved) go to `ctx`'s sink,
+/// so a host that installs one first hears them.
+pub async fn open_database(
+    ctx: &SessionContext,
+    path: impl AsRef<Path>,
+    options: &OpenOptions,
+) -> Result<()> {
+    open_into(ctx, path.as_ref(), options).await
+}
+
 /// Open the database at `path` for `ctx` and replay its catalog.
 async fn open_into(ctx: &SessionContext, path: &Path, options: &OpenOptions) -> Result<()> {
     let path = path.to_path_buf();
@@ -102,70 +118,80 @@ async fn open_into(ctx: &SessionContext, path: &Path, options: &OpenOptions) -> 
     let database = Arc::new(database);
     db::slot(&ctx.state()).set(Arc::clone(&database))?;
     replay(ctx, &database).await?;
-    apply_settings(ctx, &database)
-}
-
-/// Apply the settings the catalog keeps (`ursa.index_storage_limit`) to the
-/// session, so `SHOW` says what the database obeys.
-fn apply_settings(ctx: &SessionContext, database: &Database) -> Result<()> {
-    let state = ctx.state_ref();
-    let mut state = state.write();
-    for (name, value) in database.settings() {
-        state
-            .config_mut()
-            .options_mut()
-            .set(&name, &value)
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "cannot open {}: its setting {name} = '{value}' is not valid: {}",
-                    database.name(),
-                    ursa_engine::user_message(&e)
-                ))
-            })?;
-    }
+    retire_saved_settings(ctx, &database);
     Ok(())
 }
 
-/// Whether `statement` sets or resets a setting the database keeps: `SET
-/// ursa.index_storage_limit = …` (`Some(true)`) or `RESET …` (`Some(false)`).
-fn kept_setting(statement: &UrsaStatement) -> Option<bool> {
+/// Say that the settings Ursa 0.8 or 0.9 saved in the catalog are no longer
+/// applied (#353), and remove them from a writable database, so it is said
+/// once. Best effort: a catalog that cannot be rewritten says it again next
+/// time.
+fn retire_saved_settings(ctx: &SessionContext, database: &Database) {
+    let saved = database.saved_settings();
+    if saved.is_empty() {
+        return;
+    }
+    let notifier = Notifier::of(ctx.state().config());
+    for (name, value) in &saved {
+        notifier.say(NoticeLevel::On, || {
+            format!(
+                "{} has a saved {name} = {value}, which is no longer applied; SET now lasts \
+                 for the session. To keep it, add SET {name} = '{value}' to ~/.ursarc (or an \
+                 -init file)",
+                database.name()
+            )
+        });
+    }
+    if !database.is_read_only() {
+        let _ = database.remove_saved_settings();
+    }
+}
+
+/// Whether `statement` is `SET ursa.index_storage_limit = …` or `RESET
+/// ursa.index_storage_limit`.
+fn sets_index_storage_limit(statement: &UrsaStatement) -> bool {
     let UrsaStatement::DataFusion(statement) = statement else {
-        return None;
+        return false;
     };
-    let (name, set) = match statement.as_ref() {
+    let name = match statement.as_ref() {
         DFStatement::Statement(s) => match s.as_ref() {
-            SQLStatement::Set(Set::SingleAssignment { variable, .. }) => (variable, true),
-            _ => return None,
+            SQLStatement::Set(Set::SingleAssignment { variable, .. }) => variable,
+            _ => return false,
         },
-        DFStatement::Reset(ResetStatement::Variable(variable)) => (variable, false),
-        _ => return None,
+        DFStatement::Reset(ResetStatement::Variable(variable)) => variable,
+        _ => return false,
     };
     name.to_string()
         .eq_ignore_ascii_case(db::INDEX_STORAGE_LIMIT)
-        .then_some(set)
 }
 
-/// Run `SET` or `RESET` of a setting the database keeps (see
-/// [`kept_setting`]); in a writable database, store the value it leaves.
-/// In a read-only one it lasts for the session.
-async fn run_kept_setting(
+/// Run `SET` or `RESET` of `ursa.index_storage_limit`, for the session, and
+/// have the database's stored indexes obey it at once. A lower limit removes
+/// nothing: if the indexes stored take more than it, say so (they are kept,
+/// and no new index is stored).
+async fn run_index_storage_limit(
     ctx: &SessionContext,
     database: &Database,
     statement: UrsaStatement,
-    set: bool,
 ) -> Result<DataFrame> {
     let frame = run(ctx, statement).await?;
+    let state = ctx.state();
+    let config = state.config();
+    database.use_index_storage_limit(config);
     if !database.is_read_only() {
-        let value = set.then(|| {
-            let state = ctx.state();
-            state
-                .config_options()
-                .extensions
-                .get::<UrsaOptions>()
-                .map(|o| o.index_storage_limit.to_string())
-                .unwrap_or_default()
-        });
-        database.set_setting(db::INDEX_STORAGE_LIMIT, value.as_deref())?;
+        let limit = database.index_storage_limit(config);
+        let stored = database.index_store().stored_bytes();
+        if stored > limit {
+            Notifier::of(config).say(NoticeLevel::On, || {
+                format!(
+                    "{} of indexes are stored in {}, more than the {} limit; they are kept, and \
+                     new indexes won't be stored",
+                    notices::size(stored),
+                    database.name(),
+                    ByteSize(limit)
+                )
+            });
+        }
     }
     Ok(frame)
 }
@@ -286,10 +312,10 @@ pub(crate) async fn execute(
         )));
     }
     match effect {
-        Effect::None => match kept_setting(&statement) {
-            Some(set) => run_kept_setting(ctx, database, statement, set).await,
-            None => run(ctx, statement).await,
-        },
+        Effect::None if sets_index_storage_limit(&statement) => {
+            run_index_storage_limit(ctx, database, statement).await
+        }
+        Effect::None => run(ctx, statement).await,
         Effect::Session => run(ctx, statement).await,
         Effect::Refused(message) => Err(DataFusionError::Plan(message)),
         Effect::Define {

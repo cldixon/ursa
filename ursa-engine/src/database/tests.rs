@@ -25,42 +25,76 @@ fn open_creates_the_file_the_sidecar_and_the_lock() {
     );
 }
 
+/// A setting 0.8 or 0.9 saved is read, never applied, and removed only by a
+/// writer (#353).
 #[test]
-fn the_index_storage_limit_is_kept_in_the_catalog() {
+fn a_saved_setting_is_read_not_applied_and_removed_by_a_writer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("club.ursa");
-    {
-        let db = Database::open(&path, &quick()).unwrap();
-        assert_eq!(db.index_storage_limit(), DEFAULT_INDEX_STORAGE_LIMIT);
-        let store = db.index_store();
-        db.save(vec!["CREATE VIEW v AS SELECT 1".into()]).unwrap();
-        db.set_setting(INDEX_STORAGE_LIMIT, Some("32GiB")).unwrap();
-        assert_eq!(db.index_storage_limit(), 32 << 30);
-        // The store obeys it at once.
-        assert_eq!(store.limit(), 32 << 30);
-        assert!(db.set_setting(INDEX_STORAGE_LIMIT, Some("lots")).is_err());
-        // Saving statements keeps the setting.
-        db.save(vec![]).unwrap();
-    }
-    let text = std::fs::read_to_string(&path).unwrap();
+    let saved = "{\n  \"format\": \"ursa\",\n  \"version\": 1,\n  \"statements\": [\n    \
+                 \"CREATE VIEW v AS SELECT 1\"\n  ],\n  \"settings\": {\n    \
+                 \"ursa.index_storage_limit\": \"50MiB\"\n  }\n}\n";
+    std::fs::write(&path, saved).unwrap();
     assert_eq!(
-        text,
-        "{\n  \"format\": \"ursa\",\n  \"version\": 1,\n  \"statements\": [],\n  \"settings\": \
-         {\n    \"ursa.index_storage_limit\": \"32GiB\"\n  }\n}\n"
+        CatalogFile::parse(saved, "club.ursa").unwrap().to_text(),
+        saved
     );
-    assert_eq!(
-        CatalogFile::parse(&text, "club.ursa").unwrap().to_text(),
-        text
-    );
-    // A reader obeys it too, and cannot change it.
+    let session = SessionConfig::new();
     let reader = Database::open(&path, &OpenOptions::read_only()).unwrap();
-    assert_eq!(reader.index_storage_limit(), 32 << 30);
-    assert!(reader.set_setting(INDEX_STORAGE_LIMIT, None).is_err());
+    assert_eq!(
+        reader.saved_settings().get(INDEX_STORAGE_LIMIT).unwrap(),
+        "50MiB"
+    );
+    // Not applied: the limit is the default.
+    let default = reader.default_index_storage_limit();
+    assert_eq!(reader.index_storage_limit(&session), default.bytes);
+    assert!(default.bytes >= crate::options::MIN_DEFAULT_INDEX_STORAGE_LIMIT);
+    assert!(reader.remove_saved_settings().is_err());
     drop(reader);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+
     let db = Database::open(&path, &quick()).unwrap();
-    db.set_setting(INDEX_STORAGE_LIMIT, None).unwrap();
-    assert_eq!(db.index_storage_limit(), DEFAULT_INDEX_STORAGE_LIMIT);
+    db.remove_saved_settings().unwrap();
+    assert!(db.saved_settings().is_empty());
+    assert_eq!(db.statements(), ["CREATE VIEW v AS SELECT 1"]);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("settings"), "{text}");
+    // Nothing writes one again.
+    db.save(vec![]).unwrap();
     assert!(!std::fs::read_to_string(&path).unwrap().contains("settings"));
+}
+
+/// The limit in effect is the session's SET, or the database's default, a
+/// share of the free space on its disk; the store obeys the session that
+/// uses it.
+#[test]
+fn the_limit_is_the_sessions_or_the_databases_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("club.ursa"), &quick()).unwrap();
+    let default = db.default_index_storage_limit();
+    assert_eq!(default.stored, 0);
+    if cfg!(unix) {
+        assert!(default.free.is_some());
+    }
+    assert_eq!(
+        default.bytes,
+        crate::options::default_index_storage_limit(default.free)
+    );
+    // Worked out once.
+    assert_eq!(db.default_index_storage_limit(), default);
+    let auto = crate::options::with_options(SessionConfig::new());
+    assert_eq!(db.index_storage_limit(&auto), default.bytes);
+    assert_eq!(db.index_store().limit(), default.bytes);
+
+    let mut set = auto.clone();
+    set.options_mut()
+        .set("ursa.index_storage_limit", "50MiB")
+        .unwrap();
+    assert_eq!(db.index_storage_limit(&set), 50 << 20);
+    db.use_index_storage_limit(&set);
+    assert_eq!(db.index_store().limit(), 50 << 20);
+    db.use_index_storage_limit(&auto);
+    assert_eq!(db.index_store().limit(), default.bytes);
 }
 
 #[test]

@@ -15,6 +15,10 @@
 //! - `SHOW ALL [VERBOSE]`: DataFusion's rows with Ursa's named as `SET` names
 //!   them, ordered by name.
 //!
+//! `ursa.index_storage_limit` is shown as the limit in effect and where it
+//! comes from (`8GiB (SET for this session)`, or the database's default and
+//! the free space it is a share of), not as `auto` (#353).
+//!
 //! Every other `SHOW` is DataFusion's.
 
 use datafusion::config::ExtensionOptions;
@@ -22,7 +26,8 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
-use ursa_engine::options::UrsaOptions;
+use ursa_engine::notices;
+use ursa_engine::options::{self, ByteSize, UrsaOptions};
 
 /// The prefix of Ursa's settings.
 const PREFIX: &str = "ursa";
@@ -80,6 +85,12 @@ async fn answer(ctx: &SessionContext, request: Show) -> Result<DataFrame> {
         "CASE WHEN name IN ({}) THEN '{PREFIX}.' || name ELSE name END",
         quoted(&names)
     );
+    // `ursa.index_storage_limit` is shown as the limit in effect and where it
+    // comes from, not as `auto`.
+    let value = format!(
+        "CASE WHEN name IN ('{LIMIT}', '{PREFIX}.{LIMIT}') THEN {} ELSE value END",
+        quoted(&[index_storage_limit_shown(ctx)])
+    );
     let query = match request {
         Show::One { name, verbose } => {
             if !names.contains(&name) {
@@ -87,18 +98,63 @@ async fn answer(ctx: &SessionContext, request: Show) -> Result<DataFrame> {
             }
             let full = format!("{PREFIX}.{name}");
             format!(
-                "SELECT '{full}' AS name, value{} FROM information_schema.df_settings \
+                "SELECT '{full}' AS name, {value} AS value{} FROM information_schema.df_settings \
                  WHERE name IN ('{name}', '{full}')",
                 if verbose { ", description" } else { "" }
             )
         }
         Show::All { verbose } => format!(
-            "SELECT {as_set} AS name, value{} FROM information_schema.df_settings \
+            "SELECT {as_set} AS name, {value} AS value{} FROM information_schema.df_settings \
              ORDER BY name",
             if verbose { ", description" } else { "" }
         ),
     };
     ctx.sql(&query).await
+}
+
+/// `ursa.index_storage_limit` without the prefix.
+const LIMIT: &str = "index_storage_limit";
+
+/// What `SHOW` says of `ursa.index_storage_limit`: the limit in effect and
+/// where it comes from (#353). `50MiB (SET for this session)`, or the
+/// database's default and what it is a share of, or, without a database,
+/// `auto` and how a database works it out.
+fn index_storage_limit_shown(ctx: &SessionContext) -> String {
+    let state = ctx.state();
+    if let Some(bytes) = options::index_storage_limit_set(state.config()) {
+        return format!("{} (SET for this session)", ByteSize(bytes));
+    }
+    let bounds = format!(
+        "at least {}, at most {}",
+        ByteSize(options::MIN_DEFAULT_INDEX_STORAGE_LIMIT),
+        ByteSize(options::MAX_DEFAULT_INDEX_STORAGE_LIMIT)
+    );
+    let share = options::DEFAULT_INDEX_STORAGE_SHARE;
+    let Some(database) = ursa_engine::database::database(&state) else {
+        return format!(
+            "auto (the default: in a database, {share}% of the free space on its disk; {bounds})"
+        );
+    };
+    let default = database.default_index_storage_limit();
+    let of = match (default.free, default.stored) {
+        (None, _) => format!(
+            "the free space on the disk of {} cannot be read, so the least default",
+            database.name()
+        ),
+        (Some(free), 0) => format!(
+            "{share}% of the {} free on the disk of {}; {bounds}",
+            notices::size(free),
+            database.name()
+        ),
+        (Some(free), stored) => format!(
+            "{share}% of {}: the {} free on the disk of {} and the {} its indexes take; {bounds}",
+            notices::size(free.saturating_add(stored)),
+            notices::size(free),
+            database.name(),
+            notices::size(stored)
+        ),
+    };
+    format!("{} (the default: {of})", ByteSize(default.bytes))
 }
 
 /// Answer `RESET ursa.<setting>`, which DataFusion 55 refuses for an

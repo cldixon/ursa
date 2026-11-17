@@ -162,11 +162,21 @@ fn show_ursa_settings() {
             "SHOW ursa.index_storage_limit; SET ursa.index_storage_limit = '1GiB'; \
              SHOW ursa.index_storage_limit",
         ])),
-        "name,value\nursa.index_storage_limit,4GiB\nname,value\nursa.index_storage_limit,1GiB\n"
+        format!(
+            "name,value\nursa.index_storage_limit,\"{AUTO_LIMIT}\"\nname,value\n\
+             ursa.index_storage_limit,1GiB (SET for this session)\n"
+        )
     );
     let all = ok(ursa(&["--format", "csv", "-c", "SHOW ALL"]));
-    assert!(all.contains("\nursa.index_storage_limit,4GiB\n"), "{all}");
+    assert!(
+        all.contains(&format!("\nursa.index_storage_limit,\"{AUTO_LIMIT}\"\n")),
+        "{all}"
+    );
 }
+
+/// What SHOW says of `ursa.index_storage_limit` without a database.
+const AUTO_LIMIT: &str = "auto (the default: in a database, 25% of the free space on its \
+                          disk; at least 4GiB, at most 64GiB)";
 
 #[test]
 fn commands_and_files_run_in_order() {

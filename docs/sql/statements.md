@@ -311,19 +311,21 @@ SHOW ursa.index_storage_limit;
 ```
 
 ```text
-┌──────────────────────────┬───────┐
-│           name           │ value │
-│           Utf8           │ Utf8  │
-├──────────────────────────┼───────┤
-│ ursa.index_storage_limit │ 8GiB  │
-└──────────────────────────┴───────┘
+┌──────────────────────────┬─────────────────────────────┐
+│           name           │            value            │
+│           Utf8           │            Utf8             │
+├──────────────────────────┼─────────────────────────────┤
+│ ursa.index_storage_limit │ 8GiB (SET for this session) │
+└──────────────────────────┴─────────────────────────────┘
 ```
 
 | Setting                    | Default | Meaning                                                                                                                                         |
 | -------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ursa.index_storage_limit` | `4GiB`  | The most space stored graph indexes may take in a database. Bytes, or a number with `KiB`, `MiB`, `GiB` or `TiB`. See [the database file](database.md#the-storage-limit). |
+| `ursa.index_storage_limit` | `auto`  | The most space stored graph indexes may take in a database. Bytes, or a number with `KiB`, `MiB`, `GiB` or `TiB`. `auto`: 25% of the free space on the database's disk, at least 4 GiB and at most 64 GiB. `SHOW` says the limit in effect and where it comes from. See [the database file](database.md#the-storage-limit). |
 
-`SHOW ursa.index_storage_limit VERBOSE` adds a description. `SHOW ALL` lists every setting, DataFusion's and Ursa's. DataFusion's settings, such as `datafusion.execution.target_partitions`, work as in DataFusion. A setting lasts for the session; the database file does not keep it.
+`SHOW ursa.index_storage_limit VERBOSE` adds a description. `SHOW ALL` lists every setting, DataFusion's and Ursa's. DataFusion's settings, such as `datafusion.execution.target_partitions`, work as in DataFusion.
+
+A setting lasts for the session, as in DuckDB and Postgres, in any database: `SET` and `RESET` write nothing to the database file. To keep a setting, put the `SET` in `~/.ursarc`, which the interactive shell runs at startup, or in a file you pass with `-init`, which scripts run too.
 
 ## Graph functions
 
