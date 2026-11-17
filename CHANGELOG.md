@@ -165,9 +165,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `--max-width N` sets the table width from the command line, as
     `.maxwidth N` does, and wins over an init file's `.maxwidth`.
   - Values are drawn as they are: bidirectional overrides, zero-width
-    spaces and joiners, line and paragraph separators and byte order marks
-    are written as escapes (`\u{202e}`), as control characters were, and so
-    are a column name's.
+    spaces, line and paragraph separators and byte order marks are written
+    as escapes (`\u{202e}`), as control characters were, and so are a
+    column name's. Zero-width joiners are not: emoji sequences and the
+    scripts that use them stay as they are.
   - A dot-command may end with `;` (`.tables;`, `.mode csv;`), as
     `.describe` could. The start of a command (`.q`, `.tab`) gets a
     suggestion, `did you mean '.quit'?`, and is not run.

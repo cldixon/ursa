@@ -439,14 +439,16 @@ fn escape(value: &str) -> Cow<'_, str> {
 
 /// Whether `c` is written as an escape: a control character, or a format
 /// character or separator that is invisible but moves or hides the text
-/// around it.
+/// around it. The zero-width joiner and non-joiner (U+200D, U+200C) are not:
+/// they are part of ordinary text, in emoji sequences and in several scripts.
 fn needs_escape(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{061c}'
                 | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
+                | '\u{200b}'
+                | '\u{200e}'..='\u{200f}'
                 | '\u{2028}'..='\u{202e}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{206f}'
@@ -1108,6 +1110,10 @@ mod tests {
             escape("a\u{202e}b\u{200b}c\u{feff}"),
             "a\\u{202e}b\\u{200b}c\\u{feff}"
         );
+        // Joiners are ordinary text: an emoji family stays one family.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(escape(family), family);
+        assert_eq!(escape("a\u{200c}b"), "a\u{200c}b");
         assert_eq!(
             escape("\u{2028}\u{2029}\u{2066}\u{2069}\u{200f}"),
             "\\u{2028}\\u{2029}\\u{2066}\\u{2069}\\u{200f}"
