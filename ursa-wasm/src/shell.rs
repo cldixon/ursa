@@ -291,9 +291,12 @@ pub(crate) async fn add_upload(uploads: &InMemory, name: &str, bytes: Vec<u8>) -
 /// The name a file is kept under: its name with every character but ASCII
 /// letters, digits, `.`, `_` and `-` made `_`, so its URL reads back as it is
 /// written. A URL decodes `%`, ends its path at `#` and `?`, and globs at `*`,
-/// `?` and `[`; and non-ASCII names are percent-encoded on the way in.
+/// `?` and `[`; and non-ASCII names are percent-encoded on the way in. A name
+/// that changes also gets a hash of the original before its extension, so two
+/// files (`a#b.csv`, `a?b.csv`) are never kept as one.
 fn upload_key(name: &str) -> String {
-    name.chars()
+    let safe: String = name
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -301,7 +304,19 @@ fn upload_key(name: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if safe == name {
+        return safe;
+    }
+    // FNV-1a: stable across builds, unlike the standard library's hasher.
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let tag = format!("-{:08x}", hash as u32);
+    match safe.rfind('.').filter(|&i| i > 0) {
+        Some(dot) => format!("{}{tag}{}", &safe[..dot], &safe[dot..]),
+        None => safe + &tag,
+    }
 }
 
 #[cfg(test)]
@@ -401,23 +416,35 @@ mod tests {
         let out = run(&shell, &format!("SELECT count(*) AS n FROM '{url}';")).await;
         assert!(out["out"].as_str().unwrap().contains("│     2 │"), "{out}");
         // Names a URL would read otherwise are kept under safe ones.
+        let mut urls = Vec::new();
         for (name, kept) in [
-            ("données.csv", "donn_es.csv"),
-            ("a#b.csv", "a_b.csv"),
-            ("50%.csv", "50_.csv"),
-            ("what?.csv", "what_.csv"),
-            ("[x] y*.csv", "_x__y_.csv"),
-            ("it's.csv", "it_s.csv"),
+            ("données.csv", "donn_es-"),
+            ("a#b.csv", "a_b-"),
+            ("a?b.csv", "a_b-"),
+            ("50%.csv", "50_-"),
+            ("what?.csv", "what_-"),
+            ("[x] y*.csv", "_x__y_-"),
+            ("it's.csv", "it_s-"),
         ] {
             let bytes = b"src,dst\n1,2\n2,3\n".to_vec();
             let url = add_upload(&shell.uploads, name, bytes).await.unwrap();
-            assert_eq!(url, format!("memory://uploads/{kept}"));
+            assert!(
+                url.starts_with(&format!("memory://uploads/{kept}")),
+                "{url}"
+            );
+            assert!(url.ends_with(".csv"), "{url}");
             let out = run(&shell, &format!("SELECT count(*) AS n FROM '{url}';")).await;
             assert!(
                 out["out"].as_str().unwrap().contains("│     2 │"),
                 "{name}: {out}"
             );
+            urls.push(url);
         }
+        // Names that differ only in what was replaced are kept apart.
+        urls.sort();
+        urls.dedup();
+        assert_eq!(urls.len(), 7, "{urls:?}");
+        assert_eq!(upload_key("edges.csv"), "edges.csv");
         for bad in ["", "a/b.csv", "..", ".hidden"] {
             assert!(
                 add_upload(&shell.uploads, bad, vec![]).await.is_err(),
