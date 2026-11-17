@@ -142,6 +142,32 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 
 `--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows.
 
+### Reading results in a program
+
+Read results in a program, or as an agent, as `json` or `ndjson`. Every row object has every column, in column order, with `null` for a null, as DuckDB writes them. A list, such as `vertices(p)` or `array_agg(x)`, is a JSON array, and a struct a JSON object:
+
+```bash
+ursa --format ndjson -c "SELECT * FROM (VALUES (1, NULL, [1, 2]), (2, 'x', [3])) t(n, s, l)"
+```
+
+```text
+{"n":1,"s":null,"l":[1,2]}
+{"n":2,"s":"x","l":[3]}
+```
+
+`csv` and `tsv` are for files and spreadsheets. They write as DuckDB does: a list, struct or map is its text form, quoted where CSV needs it; a null is an empty field and an empty string is `""`, so the two can be told apart:
+
+```bash
+ursa --format csv -c "SELECT NULL AS a, '' AS b, [1, 2] AS l"
+```
+
+```text
+a,b,l
+,"","[1, 2]"
+```
+
+`csv`, `tsv`, `json`, `ndjson` and `arrow` write every row and never cut a value. A `table` shows at most 40 rows (see [Long results](#long-results)).
+
 ### Tables
 
 A table is drawn as DuckDB draws one: each column's name with its type under it, numbers to the right and everything else to the left, and `NULL` for a null. The types are Arrow's, named as `DESCRIBE` and `arrow_typeof()` name them (`Int64`, `Utf8`, `Float64`, `List(Int64)`).
@@ -187,7 +213,7 @@ memory U SELECT * FROM generate_series(1, 100000);
 
 ### Wide results
 
-In a terminal a table is as wide as the terminal at most. A wider result first cuts long values short (`a long value…`), then leaves out columns from the middle, showing a `…` column in their place and saying so in the footer: `17 columns (10 shown)`. `.maxwidth N` sets the width instead; `.maxwidth 0` goes back to the terminal's. Output that is not a terminal is never cut.
+In a terminal a table is as wide as the terminal at most. A wider result first cuts long values short (`a long value…`), then leaves out columns from the middle, showing a `…` column in their place and saying so in the footer: `17 columns (10 shown)`. `.maxwidth N` sets the width instead; `.maxwidth 0` goes back to the terminal's. Output that is not a terminal (a pipe, a file) is never cut to a width: only a terminal or `.maxwidth` cuts a table.
 
 ## Init files
 
@@ -213,6 +239,8 @@ SET datafusion.execution.batch_size = 4096;
 mkdir -p ~/.claude/skills/ursa-sql
 ursa --skill > ~/.claude/skills/ursa-sql/SKILL.md
 ```
+
+An agent should read results as `--format json` or `--format ndjson` (see [Reading results in a program](#reading-results-in-a-program)): a table shows at most 40 rows, while CSV and JSON write every row.
 
 ## History
 

@@ -1207,6 +1207,75 @@ mod tests {
         assert_eq!(shell.mode(), OutputFormat::Table);
     }
 
+    /// Run `sql` in `mode` and return what it printed, failing on an error.
+    async fn in_mode(mode: &str, sql: &str) -> String {
+        let mut shell = shell();
+        let (out, err) = feed(&mut shell, &[&format!(".mode {mode}"), sql]).await;
+        assert_eq!(err, "", "{mode}: {sql}");
+        out
+    }
+
+    /// N34: lists, structs and maps are written as quoted text in CSV and TSV.
+    #[tokio::test]
+    async fn csv_and_tsv_write_nested_values_as_text() {
+        let sql = "SELECT [1, 2] AS l, named_struct('a', 1, 'b', 'x') AS s, \
+                   map(['k'], [1]) AS m, [1, NULL] AS n, CAST(NULL AS INT[]) AS z;";
+        assert_eq!(
+            in_mode("csv", sql).await,
+            "l,s,m,n,z\n\"[1, 2]\",\"{a: 1, b: x}\",{k: 1},\"[1, NULL]\",\n"
+        );
+        assert_eq!(
+            in_mode("tsv", sql).await,
+            "l\ts\tm\tn\tz\n[1, 2]\t{a: 1, b: x}\t{k: 1}\t[1, NULL]\t\n"
+        );
+        // Quotes and line breaks in a value are quoted, as CSV requires.
+        assert_eq!(
+            in_mode("csv", "SELECT 'say \"hi\"' AS q, 'a\nb' AS r, 'x\ty' AS t;").await,
+            "q,r,t\n\"say \"\"hi\"\"\",\"a\nb\",x\ty\n"
+        );
+        // An empty result still writes the header row.
+        assert_eq!(in_mode("csv", "SELECT 1 AS a WHERE false;").await, "a\n");
+    }
+
+    /// N36: in CSV and TSV a null is an empty field and `''` is `""`.
+    #[tokio::test]
+    async fn csv_tells_null_from_the_empty_string() {
+        let sql = "SELECT NULL AS a, '' AS b, CAST(NULL AS VARCHAR) AS c, 1 AS d;";
+        assert_eq!(in_mode("csv", sql).await, "a,b,c,d\n,\"\",,1\n");
+        assert_eq!(in_mode("tsv", sql).await, "a\tb\tc\td\n\t\"\"\t\t1\n");
+    }
+
+    /// N35: JSON and NDJSON write `null`, so every row has every key.
+    #[tokio::test]
+    async fn json_writes_explicit_nulls() {
+        assert_eq!(
+            in_mode("json", "SELECT NULL AS a, '' AS b;").await,
+            "[{\"a\":null,\"b\":\"\"}]\n"
+        );
+        assert_eq!(
+            in_mode(
+                "ndjson",
+                "SELECT * FROM (SELECT NULL AS a, 1 AS b UNION ALL SELECT 2, 3) ORDER BY b;"
+            )
+            .await,
+            "{\"a\":null,\"b\":1}\n{\"a\":2,\"b\":3}\n"
+        );
+        assert_eq!(
+            in_mode("json", "SELECT [1, 2] AS l, CAST(NULL AS VARCHAR) AS s;").await,
+            "[{\"l\":[1,2],\"s\":null}]\n"
+        );
+    }
+
+    /// N37: an untyped NULL is shown as `NULL` in a table, as a typed one is.
+    #[tokio::test]
+    async fn table_shows_an_untyped_null_as_null() {
+        let out = in_mode("table", "SELECT NULL AS n, CAST(NULL AS VARCHAR) AS v;").await;
+        assert_eq!(
+            out,
+            "┌──────┬──────────┐\n│  n   │    v     │\n│ Null │ Utf8View │\n├──────┼──────────┤\n│ NULL │ NULL     │\n└──────┴──────────┘\n"
+        );
+    }
+
     #[tokio::test]
     async fn timer_reports_each_statement() {
         let mut shell = shell();
