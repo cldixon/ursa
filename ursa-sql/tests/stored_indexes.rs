@@ -732,6 +732,80 @@ async fn notices_say_each_build_store_skip_and_eviction() {
     assert!(taken(&said).is_empty());
 }
 
+/// N29: over a filter the statistics cannot settle, the build notice gives
+/// the rows it reads, not a guess at the edges (#351).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filtered_build_says_the_rows_it_reads() {
+    let fixture = Fixture::new(20_000).await;
+    let ctx = open(&fixture.db()).await;
+    ok(
+        &ctx,
+        "CREATE VIEW few AS SELECT * FROM ties WHERE src % 1000 = 0;
+         CREATE PROPERTY GRAPH f EDGE TABLES (few SOURCE KEY (src) DESTINATION KEY (dst));",
+    )
+    .await;
+    let said = notices(&ctx, "all").await;
+    ok(&ctx, "SELECT count(*) FROM degree(f)").await;
+    let lines = taken(&said);
+    assert_eq!(
+        lines[0], "reading about 20.0K rows to build the index for f…",
+        "{lines:?}"
+    );
+    // The final notice gives the real count.
+    let edges = ok(&ctx, "SELECT count(*) FROM ties WHERE src % 1000 = 0").await;
+    let edges: u64 = edges[0].parse().unwrap();
+    assert!(edges < 1_000, "{edges}");
+    assert!(
+        lines[1].starts_with(&format!("built the index for f ({edges} edges) in ")),
+        "{lines:?}"
+    );
+    // Unfiltered, the statistics are exact.
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    assert_eq!(taken(&said)[0], "building the index for g (20.0K edges)…");
+}
+
+/// N38: `EXPLAIN` marks a path search whose index the session holds, in
+/// memory or stored, since its edge and vertex scans then do not run (#351).
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_marks_a_path_search_over_a_held_index() {
+    let fixture = Fixture::new(1_000).await;
+    const PATHS: &str = "FROM GRAPH_TABLE (g
+        MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b) COLUMNS (b.id))";
+    let explain = |ctx: &SessionContext| {
+        let ctx = ctx.clone();
+        async move {
+            let lines = ok(&ctx, &format!("EXPLAIN {PATHS}")).await;
+            lines
+                .iter()
+                .flat_map(|l| l.lines())
+                .find(|l| l.contains("PathSearchExec"))
+                .unwrap_or_else(|| panic!("no PathSearchExec in {lines:?}"))
+                .to_string()
+        }
+    };
+    let ctx = open(&fixture.db()).await;
+    // Not built yet: the sources are read.
+    let line = explain(&ctx).await;
+    assert!(!line.contains("index="), "{line}");
+    ok(&ctx, PATHS).await;
+    let line = explain(&ctx).await;
+    assert!(
+        line.ends_with(", index=cached (sources not read)"),
+        "{line}"
+    );
+    close(ctx);
+    // A later session holds it stored, and loads it without reading them.
+    let ctx = open(&fixture.db()).await;
+    let line = explain(&ctx).await;
+    assert!(
+        line.ends_with(", index=stored (sources not read)"),
+        "{line}"
+    );
+    ok(&ctx, PATHS).await;
+    assert_eq!(counts(&ctx), (0, 1));
+    close(ctx);
+}
+
 /// A database directory moved together with its data finds its stored
 /// indexes: the key holds paths relative to the database (#327, N13).
 #[tokio::test(flavor = "multi_thread")]

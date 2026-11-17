@@ -181,8 +181,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     command. `E'…'` strings, `$$…$$` and `$tag$…$tag$` strings and nested
     `/* /* */ */` comments are coloured as they are read.
   - Ctrl-C during a `.read` no longer counts it as still running; after 16,
-    every `.read` failed as nested too deep. A cancelled query prints
-    `^C (cancelled)`, not `^C^C (cancelled)`.
+    every `.read` failed as nested too deep.
   - `--format arrow` with no query that returns a result is an error, not an
     empty output that exits 0, and `.mode arrow` says to give
     `--format arrow` on the command line, in the shell and in a script.
@@ -225,6 +224,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   #350), as DuckDB does, so it can be told from a null, which is still an
   empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
   browser shell's CSV export does the same.
+- **SQL: an index build decodes its source's partitions in parallel**
+  (#351, N30). The build read its edge plan one partition at a time to keep
+  the order that numbers the nodes, so a filtered view over a large Parquet
+  file spent its build in zstd decompression on one core while the other
+  scan workers waited. Each partition now runs as its own task, and its
+  batches are interned in partition order, so the node numbering, the CSR and
+  the stored index are byte for byte the ones a serial read gives (a test
+  checks it over a multi-partition, multi-row-group source). Partitions ahead
+  of the one being interned hold at most 1 GiB of decoded batches between
+  them. The vertex keys, and the weights read beside an index, are read the
+  same way. On a synthetic 120M-row zstd Parquet (1M-row row groups) behind a
+  filter no statistics prune (`t < 5000`, 5% kept, 6M edges), on 4 cores:
+  3.66 s → 1.55 s, against 1.2 s for the parallel SQL scan of the same view.
+  `cargo run --release -p ursa-engine --example filtered_build` measures it.
+- **SQL: the build notice no longer guesses at a filtered view's edges**
+  (#351, N29). Over a filter the statistics cannot settle, DataFusion's
+  estimate is its default 20% selectivity, so a view keeping 1K of 1M rows
+  was announced as `about 200.0K edges`, and Bluesky's 95.7M-edge view as
+  2.4B. Such a build now says what it reads: `reading about 1.0M rows to
+  build the index for g2…`; an edge count is given only when the statistics
+  have one, exact or unfiltered. The `built` notice gives the real count, as
+  before. `ursa_engine::graph::BuildInfo` holds a `BuildSize` in place of
+  its `edges` pair.
+- **SQL: `EXPLAIN` marks a path search over a held index** (#351, N38).
+  `PathSearchExec: graph=g, search=…, index=stored (sources not read)` (or
+  `index=cached`, for one already in the session) says that the edge and
+  vertex scans drawn under it will not run, where the plan read as if the
+  index were not used.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,
@@ -463,6 +490,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - The skill and the shell page say which format to read results in (`json`
   or `ndjson`), that a table shows at most 40 rows while CSV and JSON write
   every row, and that piped output is never cut to a width (#350).
+- Ctrl-C in the `ursa` shell prints `Interrupted` (stderr) and draws the
+  prompt again at once. The signal was waited for on the query's own
+  runtime, so a statement that kept every worker busy (an index build, a
+  large join) could hold it back; it said `^C (cancelled)` when it was seen
+  (#354).
+- An error names the file it cannot read once: `cannot read 'x.csv': Csv
+  error: …`, not `cannot read 'x.csv': cannot read /…/x.csv: Csv error: …`.
+  For a glob or a list it names the file that failed. A Parquet error says
+  `Parquet error: …`, not `Parquet: Parquet error: …` (#354).
+- The docs and the skill take the top k before joining attributes
+  (`WITH top AS (SELECT * FROM pagerank(g) ORDER BY pagerank DESC LIMIT 5)
+  SELECT … FROM top JOIN g.nodes USING (id)`), and say why: an
+  `ORDER BY … LIMIT` is not moved below a join, so joining first sorts every
+  node's attributes too, about twice the memory on a large graph (#354).
+- The docs' landing page leads with Ursa SQL: the install one-liner and a
+  `CREATE PROPERTY GRAPH` and `pagerank` example, run in CI with the SQL
+  docs. The Python library is the second path (#354).
 
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc

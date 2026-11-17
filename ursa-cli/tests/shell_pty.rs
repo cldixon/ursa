@@ -130,12 +130,14 @@ fn ctrl_c_cancels_a_running_query() {
     )
     .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
+    // N39: `Interrupted`, then the prompt, at once, though the query keeps
+    // every worker busy.
+    let sent = std::time::Instant::now();
     p.send_control('c').unwrap();
-    // A terminal echoes the ^C (this one, without ECHOCTL, does not); the
-    // shell does not add another.
-    let before = p.exp_string(" (cancelled)").unwrap();
-    assert!(!before.contains("^C"), "{before:?}");
+    p.exp_string("Interrupted\r\n").unwrap();
     p.exp_string("memory U ").unwrap();
+    let waited = sent.elapsed();
+    assert!(waited.as_secs() < 5, "the prompt took {waited:?}");
     // An algorithm too, which runs on a blocking thread (#328): the prompt
     // comes back, and the shell still exits at once after it.
     p.send_line(
@@ -147,7 +149,7 @@ fn ctrl_c_cancels_a_running_query() {
     .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2000));
     p.send_control('c').unwrap();
-    p.exp_string(" (cancelled)").unwrap();
+    p.exp_string("Interrupted\r\n").unwrap();
     p.exp_string("memory U ").unwrap();
     p.send_line("SELECT 41 + 1 AS answer;").unwrap();
     p.exp_string(&bytes("│     42 │")).unwrap();

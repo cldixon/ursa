@@ -3,8 +3,9 @@
 //! [`GraphPlanner`] maps a [`GraphAlgorithmNode`] to a [`GraphAlgorithmExec`]
 //! whose children are the planned edge plans. When it executes, it looks up
 //! the index in the session's [`IndexCache`]; on a miss it reads a child,
-//! partition by partition, and builds the index as the rows arrive. Then it runs the calls and
-//! emits one batch.
+//! its partitions decoded in parallel and handed on in partition order, and
+//! builds the index as the rows arrive. Then it runs the calls and emits one
+//! batch.
 //!
 //! Row order matters to the index: dense node ids are given in first-seen
 //! order, and they decide component labels and the order floating-point sums
@@ -64,6 +65,8 @@ use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::ScalarValue;
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::TaskContext;
@@ -76,6 +79,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::replace_children_if_necessary;
@@ -88,12 +92,13 @@ use datafusion::physical_plan::{
     PlanProperties, SendableRecordBatchStream, StatisticsArgs, StatisticsContext,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, TryStreamExt};
 use ursa_core::{EdgeInterner, IdError, Topology};
 
+use super::in_order::{InOrder, READ_AHEAD_BYTES};
 use super::index::{
-    file_identities, fingerprint, portable_in, BuildInfo, FileIdentity, GraphIndex, IndexCache,
-    Weights,
+    file_identities, fingerprint, portable_in, BuildInfo, BuildSize, FileIdentity, GraphIndex,
+    IndexCache, IndexHeld, Weights,
 };
 use super::kernels;
 use super::node::{
@@ -115,14 +120,16 @@ impl ExtensionPlanner for GraphPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &dyn Session,
+        session_state: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(node) = node.as_any().downcast_ref::<GraphTraversalNode>() {
             return plan_traversal(node, logical_inputs, physical_inputs).map(Some);
         }
         if let Some(node) = node.as_any().downcast_ref::<PathSearchNode>() {
-            return plan_path_search(node, logical_inputs, physical_inputs).map(Some);
+            let mut exec = plan_path_search(node, logical_inputs, physical_inputs)?;
+            exec.held = held_index(&exec.shape.edges, &exec.input, session_state).await;
+            return Ok(Some(Arc::new(exec)));
         }
         let Some(node) = node.as_any().downcast_ref::<GraphAlgorithmNode>() else {
             return Ok(None);
@@ -270,11 +277,24 @@ fn plan_traversal(
     )))
 }
 
+/// Where the session keeps the index of the edges `input` reads, if it
+/// does: then running the node reads none of its edge or vertex inputs.
+async fn held_index(
+    shape: &Edges,
+    input: &Arc<dyn ExecutionPlan>,
+    session: &dyn Session,
+) -> Option<IndexHeld> {
+    let context = session.task_ctx();
+    let cache = context.session_config().get_extension::<IndexCache>()?;
+    let key = index_key(shape, input, &context).await.ok()??;
+    cache.holds(context.session_config(), &key)
+}
+
 fn plan_path_search(
     node: &PathSearchNode,
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
-) -> Result<Arc<dyn ExecutionPlan>> {
+) -> Result<PathSearchExec> {
     let expected = 2 + usize::from(node.vertices.is_some()) + usize::from(node.targets.is_some());
     if physical_inputs.len() != expected || logical_inputs.len() != expected {
         return Err(DataFusionError::Internal(format!(
@@ -284,7 +304,7 @@ fn plan_path_search(
     }
     let vertices = vertex_input(node.vertices.is_some(), logical_inputs, physical_inputs, 1)?;
     let starts = 1 + usize::from(vertices.is_some());
-    Ok(Arc::new(PathSearchExec::new(
+    Ok(PathSearchExec::new(
         PathShape {
             edges: Edges {
                 graph: node.graph.clone(),
@@ -303,7 +323,7 @@ fn plan_path_search(
         node.targets
             .as_ref()
             .map(|_| Arc::clone(&physical_inputs[starts + 1])),
-    )))
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -319,12 +339,17 @@ struct PathShape {
 /// the start nodes its next child produces (and the targets its last, if it
 /// has them), and searches paths from them (see [`super::path_search`]).
 /// `EXPLAIN ANALYZE` shows how many path prefixes it extended (`expanded`).
+/// When the session held the index as the node was planned, `EXPLAIN` says
+/// so (`index=stored (sources not read)`): its edge and vertex inputs are
+/// drawn, but do not run (#351).
 #[derive(Debug)]
 pub struct PathSearchExec {
     shape: PathShape,
     input: Arc<dyn ExecutionPlan>,
     starts: Arc<dyn ExecutionPlan>,
     targets: Option<Arc<dyn ExecutionPlan>>,
+    /// Where the session kept the index when the node was planned.
+    held: Option<IndexHeld>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -347,6 +372,7 @@ impl PathSearchExec {
             input,
             starts,
             targets,
+            held: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -365,7 +391,11 @@ impl DisplayAs for PathSearchExec {
             } else {
                 ""
             }
-        )
+        )?;
+        if let Some(held) = self.held {
+            write!(f, ", index={held} (sources not read)")?;
+        }
+        Ok(())
     }
 }
 
@@ -421,7 +451,9 @@ impl ExecutionPlan for PathSearchExec {
         });
         let starts = children.next().expect("checked above");
         let targets = self.targets.as_ref().and_then(|_| children.next());
-        Ok(Arc::new(Self::new(shape, input, starts, targets)))
+        let mut exec = Self::new(shape, input, starts, targets);
+        exec.held = self.held;
+        Ok(Arc::new(exec))
     }
 
     fn execute(
@@ -1321,31 +1353,28 @@ async fn read_aligned(
 ) -> Result<bool> {
     let id_type = &shape.id_type;
     let mut rows = RowCheck::new(index);
-    let plan = &weighted.plan;
-    for partition in 0..plan.output_partitioning().partition_count() {
-        let mut stream = plan.execute(partition, Arc::clone(context))?;
-        while let Some(batch) = stream.next().await {
-            let mut batch = batch?;
-            let mut src = cast(batch.column(weighted.source), id_type)?;
-            let mut dst = cast(batch.column(weighted.destination), id_type)?;
-            // With a vertex table, the index holds only the edges between
-            // keys: skip the others, as the build did.
-            if shape.vertices.is_some() {
-                let keep = between_nodes(index, &src, &dst)?;
-                if keep.true_count() < keep.len() {
-                    batch = filter_record_batch(&batch, &keep)?;
-                    src = filter(&src, &keep)?;
-                    dst = filter(&dst, &keep)?;
-                }
+    let mut batches = InOrder::new(&weighted.plan, context);
+    while let Some(batch) = batches.next().await {
+        let mut batch = batch?;
+        let mut src = cast(batch.column(weighted.source), id_type)?;
+        let mut dst = cast(batch.column(weighted.destination), id_type)?;
+        // With a vertex table, the index holds only the edges between
+        // keys: skip the others, as the build did.
+        if shape.vertices.is_some() {
+            let keep = between_nodes(index, &src, &dst)?;
+            if keep.true_count() < keep.len() {
+                batch = filter_record_batch(&batch, &keep)?;
+                src = filter(&src, &keep)?;
+                dst = filter(&dst, &keep)?;
             }
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            if !rows.check(&src, &dst)? {
-                return Ok(false);
-            }
-            weights.push(&batch);
         }
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if !rows.check(&src, &dst)? {
+            return Ok(false);
+        }
+        weights.push(&batch);
     }
     Ok(rows.complete())
 }
@@ -1415,7 +1444,8 @@ impl WeightReader {
     }
 }
 
-/// Every batch of `input`, partition by partition in order, as the columns
+/// Every batch of `input`, partition by partition in order (decoded in
+/// parallel, see [`InOrder`]), as the columns
 /// `columns` of each non-empty batch.
 async fn drain(
     input: &Arc<dyn ExecutionPlan>,
@@ -1423,21 +1453,18 @@ async fn drain(
     context: &Arc<TaskContext>,
 ) -> Result<Vec<Vec<ArrayRef>>> {
     let mut out = Vec::new();
-    let partitions = input.output_partitioning().partition_count();
-    for partition in 0..partitions {
-        let mut stream = input.execute(partition, Arc::clone(context))?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            out.push(
-                columns
-                    .iter()
-                    .map(|&c| Arc::clone(batch.column(c)))
-                    .collect(),
-            );
+    let mut batches = InOrder::new(input, context);
+    while let Some(batch) = batches.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
         }
+        out.push(
+            columns
+                .iter()
+                .map(|&c| Arc::clone(batch.column(c)))
+                .collect(),
+        );
     }
     Ok(out)
 }
@@ -1511,20 +1538,68 @@ fn row_hint(plan: &Arc<dyn ExecutionPlan>) -> usize {
         .unwrap_or(0)
 }
 
-/// What a build over `input` is for, as its notices say: the graph, and the
-/// edge rows `input`'s statistics promise, if they do.
+/// What a build over `input` is for, as its notices say: the graph, and how
+/// much it reads, as far as `input`'s statistics know (#351). An exact count
+/// is the edge rows. A filter the statistics cannot settle (one no file or
+/// row-group statistics prune) leaves only a guess at the edges, DataFusion's
+/// default selectivity, which can be off a hundredfold either way: then the
+/// notice gives the rows the scans read instead, which the statistics do
+/// know. Otherwise the estimate is of edge rows.
 fn build_info(shape: &Edges, input: &Arc<dyn ExecutionPlan>) -> BuildInfo {
-    let rows = StatisticsContext::new()
-        .compute(input.as_ref(), &StatisticsArgs::new())
+    let rows = plan_rows(input);
+    let size = match rows {
+        Some((n, true)) => Some(BuildSize::Edges(n, true)),
+        _ if filters(input) => scanned_rows(input).map(BuildSize::Reads),
+        Some((n, false)) => Some(BuildSize::Edges(n, false)),
+        None => None,
+    };
+    BuildInfo {
+        graph: Some(shape.graph.clone()),
+        size,
+    }
+}
+
+/// The rows `plan`'s statistics say it gives, and whether that is exact.
+fn plan_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<(u64, bool)> {
+    StatisticsContext::new()
+        .compute(plan.as_ref(), &StatisticsArgs::new())
         .ok()
         .and_then(|s| {
             let exact = s.num_rows.is_exact().unwrap_or(false);
             s.num_rows.get_value().map(|n| (*n as u64, exact))
-        });
-    BuildInfo {
-        graph: Some(shape.graph.clone()),
-        edges: rows,
-    }
+        })
+}
+
+/// Whether `plan` filters rows: a filter node, or a predicate pushed into a
+/// file scan.
+fn filters(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        let scan_predicate = node
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+            .is_some_and(|config| config.file_source().filter().is_some());
+        if scan_predicate || node.downcast_ref::<FilterExec>().is_some() {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// The rows the scans under `plan` read, if every scan's statistics say:
+/// the rows of its leaves.
+fn scanned_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+    let mut total = Some(0u64);
+    let _ = plan.apply(|node| {
+        if node.children().is_empty() {
+            let leaf = plan_rows(node).map(|(n, _)| n);
+            total = total.zip(leaf).map(|(a, b)| a + b);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    total.filter(|n| *n > 0)
 }
 
 /// What the reader hands the interning thread.
@@ -1564,8 +1639,10 @@ fn take_chunk(
 
 /// Build the index of the edge rows `input` produces, interning each chunk
 /// as it is read rather than collecting every endpoint array first, so the
-/// Arrow input never accumulates: the build holds the dense endpoints and a
-/// chunk or two in flight, as `ursa-io`'s scan does. Reading (here) and
+/// Arrow input does not accumulate: the build holds the dense endpoints, a
+/// chunk or two in flight, and what the partitions decoded ahead of their
+/// turn hold, within [`READ_AHEAD_BYTES`]. The partitions decode in parallel
+/// and are interned in partition order ([`InOrder`]), and reading (here) and
 /// interning (on a blocking thread) overlap. The rows are interned in the
 /// order [`drain`] would collect them, so the index is the one
 /// `ursa_io::build_topology_batches` gives over the collected rows. A
@@ -1575,9 +1652,24 @@ fn take_chunk(
 async fn build_streamed(
     shape: &Edges,
     input: &Arc<dyn ExecutionPlan>,
+    endpoints: (usize, usize),
+    context: &Arc<TaskContext>,
+    weights: &mut WeightReader,
+) -> Result<GraphIndex> {
+    let read_ahead = Some(READ_AHEAD_BYTES);
+    build_streamed_with(shape, input, endpoints, context, weights, read_ahead).await
+}
+
+/// [`build_streamed`], reading the partitions in parallel within
+/// `read_ahead` bytes (see [`InOrder`]), or one after another with `None`:
+/// the index is the same either way.
+async fn build_streamed_with(
+    shape: &Edges,
+    input: &Arc<dyn ExecutionPlan>,
     (source, destination): (usize, usize),
     context: &Arc<TaskContext>,
     weights: &mut WeightReader,
+    read_ahead: Option<usize>,
 ) -> Result<GraphIndex> {
     let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
     let hint = row_hint(input);
@@ -1617,18 +1709,15 @@ async fn build_streamed(
         // when the reader stops, on an error as at the end.
         let tx = tx;
         if let Some(vertices) = &shape.vertices {
-            let keys = &vertices.plan;
-            for partition in 0..keys.output_partitioning().partition_count() {
-                let mut stream = keys.execute(partition, Arc::clone(context))?;
-                while let Some(batch) = stream.next().await {
-                    let batch = batch?;
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    let keys = cast(batch.column(0), &shape.id_type)?;
-                    if tx.send(Chunk::Nodes(keys)).await.is_err() {
-                        return Ok(());
-                    }
+            let mut batches = InOrder::with_budget(&vertices.plan, context, read_ahead);
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let keys = cast(batch.column(0), &shape.id_type)?;
+                if tx.send(Chunk::Nodes(keys)).await.is_err() {
+                    return Ok(());
                 }
             }
             if tx.send(Chunk::NodesDone).await.is_err() {
@@ -1636,22 +1725,20 @@ async fn build_streamed(
             }
         }
         let mut gather = Gather::default();
-        for partition in 0..input.output_partitioning().partition_count() {
-            let mut stream = input.execute(partition, Arc::clone(context))?;
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let src = cast(batch.column(source), &shape.id_type)?;
-                let dst = cast(batch.column(destination), &shape.id_type)?;
-                weights.push(&batch);
-                drop(batch);
-                if let Some((src, dst)) = gather.push(src, dst)? {
-                    if tx.send(Chunk::Edges(src, dst)).await.is_err() {
-                        // The interner stopped on an error: it is reported below.
-                        return Ok(());
-                    }
+        let mut batches = InOrder::with_budget(input, context, read_ahead);
+        while let Some(batch) = batches.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let src = cast(batch.column(source), &shape.id_type)?;
+            let dst = cast(batch.column(destination), &shape.id_type)?;
+            weights.push(&batch);
+            drop(batch);
+            if let Some((src, dst)) = gather.push(src, dst)? {
+                if tx.send(Chunk::Edges(src, dst)).await.is_err() {
+                    // The interner stopped on an error: it is reported below.
+                    return Ok(());
                 }
             }
         }
@@ -1835,6 +1922,102 @@ mod tests {
         let built = index(s.as_ref(), d.as_ref());
         assert!(aligned(&built, &[(Arc::clone(&s), Arc::clone(&d))]).unwrap());
         assert!(!aligned(&built, &[(d, s)]).unwrap());
+    }
+
+    /// The bytes a database stores `index` as.
+    fn stored_bytes(index: &GraphIndex) -> Vec<u8> {
+        let key = crate::database::IndexKey::new("edges".into(), Vec::new());
+        let encoded =
+            crate::database::index_file::Encoded::new(&key, &index.topology, &index.ids).unwrap();
+        let mut bytes = Vec::new();
+        encoded.write_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// A session over a Parquet file of many row groups, split into several
+    /// partitions, and the plan of its edges behind a filter no statistics
+    /// prune.
+    async fn filtered_edges() -> (tempfile::TempDir, Arc<dyn ExecutionPlan>, Arc<TaskContext>) {
+        use datafusion::prelude::SessionConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SessionConfig::new().with_target_partitions(8);
+        config.options_mut().optimizer.repartition_file_min_size = 1;
+        let ctx = crate::new_session_with_config(config);
+        let file = dir.path().join("edges.parquet");
+        let sql = [
+            "SET datafusion.execution.parquet.max_row_group_size = 4096".to_string(),
+            // Ids scattered over the rows, so first-seen order numbers them
+            // differently from sorted order.
+            format!(
+                "COPY (SELECT (value * 7919) % 50021 AS s, (value * 104729 + 13) % 50021 AS d \
+                 FROM generate_series(0, 299999)) TO '{}'",
+                file.display()
+            ),
+        ];
+        for sql in sql {
+            ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        }
+        let plan = ctx
+            .sql(&format!(
+                "SELECT s, d FROM '{}' WHERE s % 7 <> 3",
+                file.display()
+            ))
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        (dir, plan, ctx.task_ctx())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_index_built_from_partitions_read_in_parallel_is_the_serial_one() {
+        let (_dir, plan, context) = filtered_edges().await;
+        let partitions = plan.output_partitioning().partition_count();
+        assert!(partitions > 1, "{partitions} partition(s)");
+        let shape = Edges {
+            graph: "g".into(),
+            endpoints: (0, 1),
+            id_type: DataType::Int64,
+            fingerprint: None,
+            vertices: None,
+        };
+        let build = |read_ahead| {
+            let (shape, plan, context) = (shape.clone(), Arc::clone(&plan), Arc::clone(&context));
+            async move {
+                let mut no_weights = WeightReader::new(&[], 0);
+                build_streamed_with(&shape, &plan, (0, 1), &context, &mut no_weights, read_ahead)
+                    .await
+                    .unwrap()
+            }
+        };
+        let serial = build(None).await;
+        assert!(serial.topology.n_edges() > 200_000);
+        // The serial build is the one over the rows collected in order.
+        let rows = drain(&plan, &[0, 1], &context).await.unwrap();
+        let rows: Vec<(&dyn Array, &dyn Array)> = rows
+            .iter()
+            .map(|c| (c[0].as_ref(), c[1].as_ref()))
+            .collect();
+        let (topology, ids) = ursa_io::build_topology_batches(&rows).unwrap();
+        let collected = GraphIndex::new(topology, ids);
+        let expected = stored_bytes(&serial);
+        assert_eq!(stored_bytes(&collected), expected);
+        // In parallel, with room to read ahead and with none: the same node
+        // numbering, the same CSR, the same stored bytes.
+        for read_ahead in [Some(READ_AHEAD_BYTES), Some(1)] {
+            let parallel = build(read_ahead).await;
+            assert_eq!(
+                parallel.ids.user_id_array().as_ref(),
+                serial.ids.user_id_array().as_ref(),
+                "node numbering, read ahead {read_ahead:?}"
+            );
+            assert_eq!(
+                stored_bytes(&parallel),
+                expected,
+                "read ahead {read_ahead:?}"
+            );
+        }
     }
 
     #[test]
