@@ -95,7 +95,9 @@ ursa: graph indexes built 0, loaded 1
 
 ### The storage limit
 
-A database keeps at most `ursa.index_storage_limit` of stored indexes. The default is 4 GiB. Set it with `SET`:
+A database keeps at most `ursa.index_storage_limit` of stored indexes. By default the limit is 25% of the free space on the database's disk, counting the indexes it already stores, in whole GiB, at least 4 GiB and at most 64 GiB. It is worked out once per process, when it is first needed. So a large disk keeps the indexes of several large graphs, and indexes, which are only a cache, never take most of a disk. In a database, `SHOW ursa.index_storage_limit` says the limit in effect and where it comes from, for example `25GiB (the default: 25% of 100.2 GiB: the 97.9 GiB free on the disk of club.ursa and the 2.3 GiB its indexes take; at least 4GiB, at most 64GiB)`.
+
+Set it with `SET`:
 
 ```sql
 SET ursa.index_storage_limit = '8GiB';
@@ -103,24 +105,36 @@ SHOW ursa.index_storage_limit;
 ```
 
 ```text
-┌──────────────────────────┬───────┐
-│           name           │ value │
-│           Utf8           │ Utf8  │
-├──────────────────────────┼───────┤
-│ ursa.index_storage_limit │ 8GiB  │
-└──────────────────────────┴───────┘
+┌──────────────────────────┬─────────────────────────────┐
+│           name           │            value            │
+│           Utf8           │            Utf8             │
+├──────────────────────────┼─────────────────────────────┤
+│ ursa.index_storage_limit │ 8GiB (SET for this session) │
+└──────────────────────────┴─────────────────────────────┘
 ```
 
-The limit belongs to the database. In a writable database, `SET` stores it in the catalog, every later process obeys it, and `SHOW` shows it. `RESET ursa.index_storage_limit` goes back to the default. In a read-only session, or one without a database, `SET` lasts for the session, and it never removes anything.
+`SET` lasts for the session, as in DuckDB and Postgres, in any database, writable or read-only: nothing is written to the database. `RESET ursa.index_storage_limit` (or `SET … = 'auto'`) goes back to the default. To keep a limit for every session, put the `SET` in `~/.ursarc`, which the interactive shell runs at startup, or in a file you pass with `-init`, which scripts (`-c`, `--file`) run too:
 
-The limit is applied only when an index is stored, never when you change it:
+```bash
+echo "SET ursa.index_storage_limit = '32GiB';" >> ~/.ursarc
+ursa club.ursa -init settings.sql -c "SELECT count(*) FROM pagerank(bsky)"
+```
+
+The limit decides only whether a *new* index is stored. Changing it never removes an index already stored:
 
 - an index bigger than the whole limit is not stored. Ursa says so, and how large a limit would keep it;
+- if the stored indexes already take more than the limit (you lowered it), they are kept, and no new index is stored until you raise it. The `SET` says so: `ursa: 3.8 GiB of indexes are stored in club.ursa, more than the 50MiB limit; they are kept, and new indexes won't be stored`;
 - otherwise Ursa evicts stored indexes, least recently used first, until the new one fits, and says which. It evicts only as many as it has to, and never one a running query uses. If the indexes in use leave no room, nothing is evicted and the new index is not stored.
 
 The reverse adjacency and stored weights, added when the database closes, make room in the same way.
 
-For a large graph, set the limit before the first query, so its index is kept: the index of a 100M-edge graph takes a few GiB.
+An index grows by about three quarters once an algorithm adds its reverse adjacency: the index of a 95.7M-edge graph takes 1.3 GiB, then 2.3 GiB. The notice that an index is stored says how large it will grow. To keep the indexes of several graphs that large on a small disk, set a higher limit before the first query.
+
+Ursa 0.8 and 0.9 stored a `SET ursa.index_storage_limit` in a writable database. That saved value is no longer applied. Opening such a database says so, once, and a writable open removes it from the catalog:
+
+```text
+ursa: club.ursa has a saved ursa.index_storage_limit = 50MiB, which is no longer applied; SET now lasts for the session. To keep it, add SET ursa.index_storage_limit = '50MiB' to ~/.ursarc (or an -init file)
+```
 
 ### Notices
 
@@ -128,9 +142,9 @@ Some of this work takes a while, or loses work a later process does again. Ursa 
 
 ```text
 ursa: building the index for bsky (95.7M edges)…
-ursa: built the index for bsky (95.7M edges) in 30.7 s; stored in club.ursa (1.4 GiB)
-ursa: built the index for big (812.0M edges) in 4 min 5 s; not stored: it takes 12.1 GiB, more than ursa.index_storage_limit (4GiB); SET ursa.index_storage_limit = '32GiB' to keep it
-ursa: evicted the stored index for old (1.4 GiB, the least recently used) from club.ursa to stay within ursa.index_storage_limit (4GiB)
+ursa: built the index for bsky (95.7M edges) in 30.7 s; stored in club.ursa (1.3 GiB; about 2.3 GiB once an algorithm adds the reverse adjacency)
+ursa: built the index for big (812.0M edges) in 4 min 5 s; not stored: it takes 12.1 GiB, more than ursa.index_storage_limit (8GiB); SET ursa.index_storage_limit = '32GiB' to keep it
+ursa: evicted the stored index for old (1.4 GiB, the least recently used) from club.ursa to stay within ursa.index_storage_limit (8GiB)
 ursa: built the index for bsky (95.7M edges) in 30.7 s; not stored: club.ursa is open read-only
 ```
 
@@ -138,7 +152,7 @@ Which notices are printed is `ursa.notices`:
 
 | Value | Prints |
 |---|---|
-| `on` (the default) | an index build that takes more than a second (when it starts, and when it is done); every index that is not stored or is evicted; a failed write |
+| `on` (the default) | an index build that takes more than a second (when it starts, and when it is done); every index that is not stored or is evicted; a failed write; a `SET` of the limit below what is stored; a limit saved by 0.8 or 0.9 |
 | `all` | also every build, load and store, however quick |
 | `off` | nothing |
 
@@ -180,13 +194,10 @@ The catalog is plain JSON, so you can read it and diff it:
   "statements": [
     "CREATE VIEW ties AS SELECT * FROM 'karate_edges.csv'",
     "CREATE PROPERTY GRAPH karate EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))"
-  ],
-  "settings": {
-    "ursa.index_storage_limit": "32GiB"
-  }
+  ]
 }
 ```
 
-`settings` appears once you `SET ursa.index_storage_limit`. Versions of ursa before 0.8 ignore it, and drop it if they rewrite the catalog.
+A catalog written by ursa 0.8 or 0.9 may also have `"settings"`, with a saved `ursa.index_storage_limit`. It is no longer applied, and a writable open removes it (see [the storage limit](#the-storage-limit)).
 
 Copy or move `club.ursa` together with `club.ursa.d/`, and, to keep the stored indexes, the data files inside its directory with them. Without `club.ursa.d/`, the catalog still opens, and the indexes are built again. A damaged or out-of-date index file is treated as missing, never as an error. Indexes stored by ursa 0.7 or earlier use the old key: the first writer to open the database with 0.8 removes them, says so, and builds each again when it is first used.

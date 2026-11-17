@@ -61,6 +61,7 @@ pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, Graph
 mod catalog_table;
 mod exec;
 pub mod functions;
+mod in_order;
 mod index;
 mod kernels;
 mod node;
@@ -75,7 +76,8 @@ pub use exec::{
     GraphAlgorithmExec, GraphPlanner, GraphTraversalExec, KeepEdgeOrder, UrsaQueryPlanner,
 };
 pub use index::{
-    index_builds, index_loads, BuildInfo, FileIdentity, GraphIndex, IndexCache, Weights,
+    index_builds, index_loads, BuildInfo, BuildSize, FileIdentity, GraphIndex, IndexCache,
+    IndexHeld, Weights,
 };
 pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
 pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};

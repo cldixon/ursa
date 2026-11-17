@@ -8,7 +8,7 @@
 // menu, types SQL at the prompt (one line and several), runs dot-commands (the
 // shell's and the page's), downloads the last result in each format, imports a
 // file, replays a shared link in a fresh page, and checks New, the theme toggle
-// and history. An error on screen fails the run, except the ones a test asks
+// and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. An error on screen fails the run, except the ones a test asks
 // for.
 import { chromium, type Page } from "playwright";
 
@@ -178,9 +178,9 @@ await page.setInputFiles("#file-input", {
   mimeType: "text/csv",
   buffer: Buffer.from("src,dst\n1,2\n2,3\n3,1\n"),
 });
-await page.waitForFunction(() => (window as any).ursaShell.screen().includes("FROM my_ties LIMIT 10;"), null, { timeout: 30_000 });
+await page.waitForFunction(() => (window as any).ursaShell.screen().includes(`FROM "my_ties" LIMIT 10;`), null, { timeout: 30_000 });
 await idle();
-t = lastTable(await after("FROM my_ties LIMIT 10;"));
+t = lastTable(await after(`FROM "my_ties" LIMIT 10;`));
 check(t.rows.length === 3 && t.head.join(",") === "src,dst", "import", JSON.stringify(t.rows));
 
 // History: the up arrow brings back the last command.
@@ -238,6 +238,68 @@ await idle();
 check((await screen()).startsWith("Ursa Web Shell running"), "New clears the screen");
 await type("SELECT count(*) FROM members;");
 check((await after("SELECT count(*) FROM members")).includes("Error: "), "New starts an empty session");
+
+// Shift+Enter adds a line to what is typed; it doesn't run it.
+await page.keyboard.type("SELECT 7 AS seven,");
+await page.keyboard.press("Shift+Enter");
+await page.keyboard.type("8 AS eight;");
+await page.waitForTimeout(200);
+check(!(await screen()).includes("│     7 │"), "Shift+Enter doesn't run the line");
+await page.keyboard.press("Enter");
+await idle();
+check(lastTable(await after("SELECT 7 AS seven,")).rows[0]?.join(",") === "7,8", "Shift+Enter then Enter runs both lines", JSON.stringify(lastTable(await after("SELECT 7 AS seven,")).rows));
+
+// Ctrl+C drops a half-typed statement; what is typed right after it runs, in order.
+await type("SELECT 1 AS");
+await page.keyboard.press("Control+C");
+await page.keyboard.type("SELECT 5 AS five;");
+await page.keyboard.press("Enter");
+await page.keyboard.type("SELECT 6 AS six;");
+await page.keyboard.press("Enter");
+await idle();
+{
+  const text = await screen();
+  const five = text.lastIndexOf("│     5 │"), six = text.lastIndexOf("│     6 │");
+  check(five > 0 && six > five, "keys typed after Ctrl+C run, in order", `five at ${five}, six at ${six}`);
+}
+
+// Share with a statement half typed: the statement is dropped, Share works,
+// and what was being typed comes back.
+await type("SELECT 2 AS");
+await page.keyboard.type("SELECT 'draft'");
+await page.click("#share");
+await idle();
+{
+  const text = await screen();
+  check(/Copied a link|address bar|No commands/.test(text.split("\n").slice(-4).join("\n")), "Share with a half-typed statement", text.split("\n").slice(-3).join(" | "));
+  check((text.split("\n").at(-1) ?? "").startsWith("memory U SELECT 'draft'"), "what was being typed comes back after Share", text.split("\n").at(-1));
+}
+await page.keyboard.press("Control+C");
+await idle();
+
+// Two datasets picked back to back: the second wins, with no errors.
+for (const title of [datasets[0].title, datasets[2].title]) {
+  await page.click("#datasets");
+  await page.click(`#dataset-menu button:has-text("${title}")`);
+}
+await idle();
+{
+  const text = await screen();
+  check(!text.includes("Error: ") && (await tables()) === datasets[2].commands.filter((c) => !/^CREATE/i.test(c)).length, "a dataset picked during another replaces it cleanly", `${await tables()} tables`);
+}
+// New during a dataset: the dataset stops; the session is empty.
+await page.click("#datasets");
+await page.click(`#dataset-menu button:has-text("${datasets[1].title}")`);
+await page.click("#new");
+await idle();
+check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New during a dataset stops it", `${await tables()} tables`);
+
+// The engine crashing (out of memory) leaves a working shell, in a fresh session.
+await type("SELECT length(repeat('x', 2000000000)) AS n;");
+await idle();
+check((await screen()).includes("the engine stopped"), "an engine crash is reported");
+await type("SELECT 41 + 1 AS answer;");
+check(lastTable(await after("SELECT 41 + 1 AS answer;")).rows[0]?.[0] === "42", "the shell works after an engine crash");
 
 // The theme toggle, remembered.
 const theme0 = await page.evaluate(() => document.documentElement.dataset.theme ?? "");

@@ -14,11 +14,11 @@
 //! }
 //! ```
 //!
-//! `settings` holds the settings the database keeps (#327): today only
-//! `ursa.index_storage_limit`, as `SET` left it. It is written only when there
-//! is one, so a database that never had one is the same file as before; a
-//! version of Ursa older than 0.8 ignores it (and drops it if it rewrites the
-//! file, which then obeys the default limit again).
+//! `settings` is where Ursa 0.8 and 0.9 kept `SET ursa.index_storage_limit`
+//! in a writable database (#327). Since #353 `SET` lasts for the session, so
+//! no version writes it any more: it is still read, so that opening the
+//! database can say the saved value is no longer applied, and a writable open
+//! removes it. A version of Ursa older than 0.8 ignores it.
 //!
 //! `version` changes only when the file's shape does. A file with a newer
 //! version is refused; anything that is not this shape is reported as not a
@@ -41,8 +41,8 @@ pub const VERSION: u64 = 1;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogFile {
     pub statements: Vec<String>,
-    /// Settings the database keeps, by their full name
-    /// (`ursa.index_storage_limit`), as `SET` would take them.
+    /// Settings Ursa 0.8 or 0.9 saved, by their full name
+    /// (`ursa.index_storage_limit`), as `SET` would take them. Not applied.
     pub settings: BTreeMap<String, String>,
 }
 
