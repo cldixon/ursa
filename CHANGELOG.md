@@ -189,6 +189,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   #350), as DuckDB does, so it can be told from a null, which is still an
   empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
   browser shell's CSV export does the same.
+- **SQL: an index build decodes its source's partitions in parallel**
+  (#351, N30). The build read its edge plan one partition at a time to keep
+  the order that numbers the nodes, so a filtered view over a large Parquet
+  file spent its build in zstd decompression on one core while the other
+  scan workers waited. Each partition now runs as its own task, and its
+  batches are interned in partition order, so the node numbering, the CSR and
+  the stored index are byte for byte the ones a serial read gives (a test
+  checks it over a multi-partition, multi-row-group source). Partitions ahead
+  of the one being interned hold at most 1 GiB of decoded batches between
+  them. The vertex keys, and the weights read beside an index, are read the
+  same way. On a synthetic 120M-row zstd Parquet (1M-row row groups) behind a
+  filter no statistics prune (`t < 5000`, 5% kept, 6M edges), on 4 cores:
+  3.66 s → 1.55 s, against 1.2 s for the parallel SQL scan of the same view.
+  `cargo run --release -p ursa-engine --example filtered_build` measures it.
+- **SQL: the build notice no longer guesses at a filtered view's edges**
+  (#351, N29). Over a filter the statistics cannot settle, DataFusion's
+  estimate is its default 20% selectivity, so a view keeping 1K of 1M rows
+  was announced as `about 200.0K edges`, and Bluesky's 95.7M-edge view as
+  2.4B. Such a build now says what it reads: `reading about 1.0M rows to
+  build the index for g2…`; an edge count is given only when the statistics
+  have one, exact or unfiltered. The `built` notice gives the real count, as
+  before. `ursa_engine::graph::BuildInfo` holds a `BuildSize` in place of
+  its `edges` pair.
+- **SQL: `EXPLAIN` marks a path search over a held index** (#351, N38).
+  `PathSearchExec: graph=g, search=…, index=stored (sources not read)` (or
+  `index=cached`, for one already in the session) says that the edge and
+  vertex scans drawn under it will not run, where the plan read as if the
+  index were not used.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,

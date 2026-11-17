@@ -584,6 +584,31 @@ impl IndexCache {
         Some(index)
     }
 
+    /// Where the index for `key` is kept, if it is: in this cache, or stored
+    /// in the database of the session `config` belongs to. Nothing is built
+    /// or loaded (for `EXPLAIN`, #351).
+    pub fn holds(
+        &self,
+        config: &SessionConfig,
+        key: &(String, Vec<FileIdentity>),
+    ) -> Option<IndexHeld> {
+        let cached = {
+            let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .get(&key.0)
+                .filter(|s| s.files == key.1)
+                .is_some_and(|s| s.cell.get().is_some())
+        };
+        if cached {
+            return Some(IndexHeld::Cached);
+        }
+        let db = database_of_config(config)?;
+        let stored = IndexKey::new(portable(&key.0, db.dir()), key.1.clone());
+        db.index_store()
+            .contains(&stored)
+            .then_some(IndexHeld::Stored)
+    }
+
     /// The index for `key` (a fingerprint and file identities), built by
     /// `build` if it is not cached. With no fingerprint, always built. The
     /// database's stored indexes are not consulted: see
@@ -720,19 +745,70 @@ impl IndexCache {
     }
 }
 
+/// Where a session keeps an index ([`IndexCache::holds`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexHeld {
+    /// Built or loaded in this session.
+    Cached,
+    /// Stored in the session's database.
+    Stored,
+}
+
+impl fmt::Display for IndexHeld {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            IndexHeld::Cached => "cached",
+            IndexHeld::Stored => "stored",
+        })
+    }
+}
+
 /// What a build is for, as notices describe it.
 #[derive(Debug, Clone, Default)]
 pub struct BuildInfo {
     /// The graph, as the query names it.
     pub graph: Option<String>,
-    /// About how many edge rows the build reads, and whether that is exact,
-    /// if the plan's statistics say.
-    pub edges: Option<(u64, bool)>,
+    /// How much the build reads, if the plan's statistics say.
+    pub size: Option<BuildSize>,
+}
+
+/// How much a build reads, as its first notice says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildSize {
+    /// About this many edge rows, or exactly this many if the flag is set.
+    Edges(u64, bool),
+    /// About this many rows, read from scans whose filter the statistics
+    /// cannot settle: how many edges they give is not known.
+    Reads(u64),
 }
 
 impl BuildInfo {
     fn graph(&self) -> &str {
         self.graph.as_deref().unwrap_or("a graph")
+    }
+
+    /// The notice that announces the build: `building the index for g
+    /// (95.7M edges)…`, or `reading about 2.4B rows to build the index for
+    /// g…` when only the rows read are known.
+    fn announcement(&self) -> String {
+        let graph = self.graph();
+        match self.size {
+            Some(BuildSize::Edges(n, true)) if n > 0 => {
+                format!(
+                    "building the index for {graph} ({} edges)…",
+                    notices::count(n)
+                )
+            }
+            Some(BuildSize::Edges(n, false)) if n > 0 => format!(
+                "building the index for {graph} (about {} edges)…",
+                notices::count(n)
+            ),
+            Some(BuildSize::Reads(n)) if n > 0 => format!(
+                "reading about {} rows to build the index for {graph}…",
+                notices::count(n)
+            ),
+            _ => format!("building the index for {graph}…"),
+        }
     }
 }
 
@@ -772,19 +848,11 @@ async fn build_noticed(
     kept: Kept,
 ) -> Result<Arc<GraphIndex>> {
     let started = clock(notifier, NoticeLevel::On);
-    let estimate = match info.edges {
-        Some((n, true)) if n > 0 => format!(" ({} edges)", notices::count(n)),
-        Some((n, false)) if n > 0 => format!(" (about {} edges)", notices::count(n)),
-        _ => String::new(),
-    };
     let delay = match notifier.level() {
         NoticeLevel::All => Duration::ZERO,
         _ => notices::BUILD_NOTICE_AFTER,
     };
-    let announcement = notifier.announce_after(
-        delay,
-        format!("building the index for {}{estimate}…", info.graph()),
-    );
+    let announcement = notifier.announce_after(delay, info.announcement());
     let built = build.await;
     let announced = announcement.finish();
     let index = Arc::new(built?);
