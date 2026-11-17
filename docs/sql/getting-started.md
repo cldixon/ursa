@@ -210,14 +210,17 @@ SELECT * FROM pagerank(karate, damping => 0.9, direction => 'both');
 `algorithms` runs several algorithms over one graph and returns one row per node with a column for each. Name a column with `name =>`; otherwise it is named after the algorithm. Join it to the node table on `id`. This query finds the five best-connected members, with their club, how many triangles they are part of, and their community:
 
 ```sql
+WITH top AS (
+    SELECT * FROM algorithms(karate,
+                             degree(direction => 'both'),
+                             triangles => triangle_count(),
+                             community => louvain(seed => 1))
+    ORDER BY degree DESC
+    LIMIT 5
+)
 SELECT id, club, degree, triangles, community
-FROM karate.nodes
-JOIN algorithms(karate,
-                degree(direction => 'both'),
-                triangles => triangle_count(),
-                community => louvain(seed => 1)) USING (id)
-ORDER BY degree DESC
-LIMIT 5;
+FROM top JOIN karate.nodes USING (id)
+ORDER BY degree DESC;
 ```
 
 ```text
@@ -234,6 +237,12 @@ LIMIT 5;
 ```
 
 Each algorithm also works on its own, as in the previous section, and those results join on `id` too.
+
+!!! tip "Take the top k, then join the attributes"
+
+    The query takes the five rows it wants from `algorithms(...)` first, and joins the club to those five. Written the other way round, `FROM karate.nodes JOIN algorithms(...) USING (id) ORDER BY degree DESC LIMIT 5` gives the same rows, but the `ORDER BY ... LIMIT` is not moved below the join, so every node's attributes are carried through the sort. On a graph of millions of nodes that is about twice the memory, and slower.
+
+    This is safe when the join keeps every row, as a join to the graph's own node table does: one row for each node. A join that drops rows, such as a `WHERE` on an attribute or a [`GRAPH_TABLE`](pattern-matching.md), must come before the `LIMIT`.
 
 All three algorithms run over one index of the graph. Ursa builds it the first time a query needs it and stores it in `club.ursa`. The next query, in this session or a later one, uses the stored index. If `karate_edges.csv` changes, Ursa notices and builds a new one.
 

@@ -110,20 +110,24 @@ LIMIT 3;
 - `direction` is `'out'` (the default), `'in'` or `'both'`. For an undirected edge list stored once per edge, use `'both'`. `triangle_count`, `clustering_coefficient`, `louvain` and `label_propagation` take no direction: they read the graph as undirected.
 - Stochastic functions take `seed => n`. Set it to get the same result twice.
 - Join results to node attributes on `id`: `FROM karate.nodes JOIN degree(karate) USING (id)`.
+- For a top-k with attributes, take the top k first, then join: `WITH top AS (SELECT * FROM pagerank(g) ORDER BY pagerank DESC LIMIT 5) SELECT ... FROM top JOIN g.nodes USING (id) ORDER BY pagerank DESC`. The `ORDER BY ... LIMIT` is not moved below a join, so joining first carries every node's attributes through the sort: on a large graph, about twice the memory. This holds when the join keeps every row, as a join to the graph's node table does; a join that filters (a `WHERE` on an attribute, a `GRAPH_TABLE`) must come before the `LIMIT`.
 
 ## Several algorithms: algorithms()
 
 To get several per-node results, use one `algorithms()` call, not a chain of joins. Each argument is a call without the graph. Name a column with `name =>`:
 
 ```sql
+WITH top AS (
+    SELECT * FROM algorithms(karate,
+                             degree(direction => 'both'),
+                             triangles => triangle_count(),
+                             community => louvain(seed => 1))
+    ORDER BY degree DESC
+    LIMIT 3
+)
 SELECT id, club, degree, triangles, community
-FROM karate.nodes
-JOIN algorithms(karate,
-                degree(direction => 'both'),
-                triangles => triangle_count(),
-                community => louvain(seed => 1)) USING (id)
-ORDER BY degree DESC
-LIMIT 3;
+FROM top JOIN karate.nodes USING (id)
+ORDER BY degree DESC;
 ```
 
 ```text
@@ -376,11 +380,14 @@ Error: hop(seeds =>) must be node ids of graph 'karate', which are integers; got
 The most central members, by betweenness:
 
 ```sql
+WITH top AS (
+    SELECT * FROM betweenness(karate, direction => 'both')
+    ORDER BY betweenness DESC
+    LIMIT 4
+)
 SELECT club, id, round(betweenness, 3) AS betweenness
-FROM karate.nodes
-JOIN betweenness(karate, direction => 'both') USING (id)
-ORDER BY betweenness DESC
-LIMIT 4;
+FROM top JOIN karate.nodes USING (id)
+ORDER BY betweenness DESC;
 ```
 
 ```text

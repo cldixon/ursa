@@ -2,8 +2,8 @@
 //!
 //! Three checks:
 //!
-//! - **`sql_docs_run`**: the SQL on every page under `docs/sql/` runs and
-//!   prints what the page shows.
+//! - **`sql_docs_run`**: the SQL on every page under `docs/sql/`, and on the
+//!   landing page (`docs/index.md`), runs and prints what the page shows.
 //! - **`skill_examples_run`**: the same for `skills/ursa-sql/SKILL.md`.
 //! - **`function_reference_is_current`**: `docs/sql/reference/functions.md` is
 //!   what `SELECT * FROM ursa_functions()` generates. To regenerate it, run
@@ -282,6 +282,8 @@ fn check(pages: &[PathBuf]) {
 fn sql_docs_run() {
     let mut pages = Vec::new();
     markdown_files(&workspace().join("docs/sql"), &mut pages);
+    // The landing page leads with SQL too (N42).
+    pages.push(workspace().join("docs/index.md"));
     check(&pages);
 }
 
