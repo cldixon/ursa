@@ -6,7 +6,7 @@
     "dev": "bun scripts/changelog.ts && astro dev",
     "build": "bun scripts/changelog.ts && astro build",
     "preview": "astro preview",
-    "deploy": "bun run build && cf deploy",
+    "deploy": "bun run build && cf-wrangler build && cf deploy --prebuilt",
     "changelog": "bun scripts/changelog.ts"
   },
   "dependencies": {

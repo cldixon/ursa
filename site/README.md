@@ -71,16 +71,21 @@ The Docs workflow (`.github/workflows/docs.yml`, job `site`) runs
 
 ## Deploy
 
-Not deployed yet. To deploy, with `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` set for the account (or after `bunx cf auth login`):
+Deployed at https://ursa-site.cl-dixon.workers.dev. To deploy, with
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` set for the account (or
+after `bunx cf auth login`):
 
 ```sh
 bun install
-bun run deploy     # astro build into dist/, then cf deploy
+bun run deploy     # astro build, cf-wrangler build, cf deploy --prebuilt
 ```
 
-`cf deploy` uploads `dist/` as the static assets of the Worker `ursa-site` and
-deploys it, at `https://ursa-site.<account subdomain>.workers.dev`. There is
+`cf build` (which a plain `cf deploy` runs) sees Astro and expects the Astro
+Cloudflare adapter's output, which a static site does not have. So the deploy
+script packages `dist/` with `cf-wrangler build` (the bundler `cf` delegates
+to for static projects; it reads `wrangler.config.ts`) and deploys that with
+`cf deploy --prebuilt`, which uploads `dist/` as the static assets of the
+Worker `ursa-site` and deploys it, at `https://ursa-site.<account subdomain>.workers.dev`. There is
 no Worker code: `htmlHandling: "force-trailing-slash"` matches Astro's
 `trailingSlash: "always"`, and Starlight's `404.html` answers any other path.
 
