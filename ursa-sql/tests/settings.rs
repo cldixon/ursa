@@ -135,6 +135,55 @@ async fn show_an_ursa_setting() {
     );
 }
 
+/// `ursa.build_read_ahead` is `auto` until `SET`, takes a size, and a build
+/// gives the same graph under any value (#385).
+#[tokio::test]
+async fn the_build_read_ahead_is_a_setting() {
+    let ctx = ursa_engine::new_session();
+    assert_eq!(
+        rows(&ctx, "SHOW ursa.build_read_ahead").await,
+        ["ursa.build_read_ahead,auto"]
+    );
+    rows(
+        &ctx,
+        "CREATE VIEW e AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (4, 1)) t(s, d); \
+         CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
+    )
+    .await;
+    let degrees = "SELECT id, degree FROM degree(g, direction => 'both') ORDER BY id";
+    let expected = rows(&ctx, degrees).await;
+    assert_eq!(expected, ["1,3", "2,2", "3,2", "4,1"]);
+    for value in ["'64MiB'", "0", "1", "'auto'"] {
+        let set = format!("SET ursa.build_read_ahead = {value}");
+        rows(&ctx, &set).await;
+        // A new session builds the index anew under the setting.
+        let fresh = ursa_engine::new_session();
+        rows(
+            &fresh,
+            &format!(
+                "{set}; CREATE VIEW e AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (4, 1)) \
+                 t(s, d); CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY \
+                 (d))"
+            ),
+        )
+        .await;
+        assert_eq!(rows(&fresh, degrees).await, expected, "{value}");
+    }
+    assert_eq!(
+        rows(
+            &ctx,
+            "SET ursa.build_read_ahead = '512MiB'; SHOW ursa.build_read_ahead"
+        )
+        .await,
+        ["ursa.build_read_ahead,512MiB"]
+    );
+    assert_eq!(
+        error(&ctx, "SET ursa.build_read_ahead = 'lots'").await,
+        "'lots' is not a size; write bytes (1048576) or \
+         a number with KiB, MiB, GiB or TiB (8GiB)"
+    );
+}
+
 #[tokio::test]
 async fn unknown_ursa_settings_are_named() {
     let ctx = ursa_engine::new_session();
@@ -145,7 +194,7 @@ async fn unknown_ursa_settings_are_named() {
     );
     assert_eq!(
         error(&ctx, "SHOW ursa.colour").await,
-        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices, ursa.max_paths"
+        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices, ursa.max_paths, ursa.build_read_ahead"
     );
     // DataFusion's own SHOW is unchanged.
     assert_eq!(

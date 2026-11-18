@@ -95,7 +95,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use futures::{FutureExt, TryStreamExt};
 use ursa_core::{EdgeInterner, IdError, Topology};
 
-use super::in_order::{InOrder, READ_AHEAD_BYTES};
+use super::in_order::{read_ahead, InOrder};
 use super::index::{
     file_identities, fingerprint, portable_in, BuildInfo, BuildSize, FileIdentity, GraphIndex,
     IndexCache, IndexHeld, Weights,
@@ -1752,7 +1752,7 @@ fn scanned_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
     total.filter(|n| *n > 0)
 }
 
-/// What the reader hands the interning thread.
+/// What the reader hands an interning thread.
 enum Chunk {
     /// Vertex keys, before any edge.
     Nodes(ArrayRef),
@@ -1763,8 +1763,10 @@ enum Chunk {
     End,
 }
 
-/// Hand one chunk to `interner` (see [`build_streamed`]); the index once
-/// every row has been read.
+/// Hand one chunk to `interner`, which takes the keys and then the edges in
+/// turn (the browser's build, see [`build_streamed`]); the index once every
+/// row has been read.
+#[cfg(target_arch = "wasm32")]
 fn take_chunk(
     interner: &mut EdgeInterner,
     chunk: Chunk,
@@ -1787,18 +1789,225 @@ fn take_chunk(
     Ok(None)
 }
 
+/// Send the vertex keys `batches` gives, cast to `id_type`, to `tx`, then
+/// [`Chunk::NodesDone`]. Stops without error if the receiver is gone (it
+/// stopped on an error of its own).
+async fn send_keys(
+    mut batches: InOrder,
+    id_type: &DataType,
+    tx: &tokio::sync::mpsc::Sender<Chunk>,
+) -> Result<()> {
+    while let Some(batch) = batches.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let keys = cast(batch.column(0), id_type)?;
+        if tx.send(Chunk::Nodes(keys)).await.is_err() {
+            return Ok(());
+        }
+    }
+    let _ = tx.send(Chunk::NodesDone).await;
+    Ok(())
+}
+
+/// Send the endpoints of the edge rows `batches` gives to `tx`, gathered
+/// into chunks of [`INTERN_ROWS`] rows, then [`Chunk::End`]; and read each
+/// batch's weights into `weights`. Stops without error if the receiver is
+/// gone (it stopped on an error of its own).
+async fn send_edges(
+    mut batches: InOrder,
+    shape: &Edges,
+    (source, destination): (usize, usize),
+    weights: &mut WeightReader,
+    tx: &tokio::sync::mpsc::Sender<Chunk>,
+) -> Result<()> {
+    let mut gather = Gather::default();
+    while let Some(batch) = batches.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let src = cast(batch.column(source), &shape.id_type)?;
+        let dst = cast(batch.column(destination), &shape.id_type)?;
+        weights.push(&batch);
+        drop(batch);
+        if let Some((src, dst)) = gather.push(src, dst)? {
+            if tx.send(Chunk::Edges(src, dst)).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    if let Some((src, dst)) = gather.take()? {
+        if tx.send(Chunk::Edges(src, dst)).await.is_err() {
+            return Ok(());
+        }
+    }
+    let _ = tx.send(Chunk::End).await;
+    Ok(())
+}
+
+/// Intern the vertex keys `rx` brings, on a thread of their own, and once the
+/// last is in, hand the interner, its node set fixed, to the edges' thread
+/// (`done`; see [`build_streamed`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn intern_keys(
+    mut rx: tokio::sync::mpsc::Receiver<Chunk>,
+    done: tokio::sync::oneshot::Sender<EdgeInterner>,
+    hint: usize,
+    graph: &str,
+) -> Result<()> {
+    let mut interner = EdgeInterner::with_capacity(hint);
+    while let Some(chunk) = rx.blocking_recv() {
+        match chunk {
+            Chunk::Nodes(keys) => interner
+                .push_nodes(keys.as_ref())
+                .map_err(|e| build_error(graph, e))?,
+            Chunk::NodesDone => {
+                interner.close_nodes();
+                // The edges' thread is gone only if it stopped on an error.
+                let _ = done.send(interner);
+                return Ok(());
+            }
+            Chunk::Edges(..) | Chunk::End => {
+                return Err(DataFusionError::Internal(format!(
+                    "building graph '{graph}': an edge chunk reached the vertex keys"
+                )))
+            }
+        }
+    }
+    // The key read stopped before the end: its error is the one reported.
+    Ok(())
+}
+
+/// The edges' side of a build with a vertex table (see [`build_streamed`]):
+/// edges interned provisionally until the node set is fixed, then into it.
+#[cfg(not(target_arch = "wasm32"))]
+struct EdgeSide {
+    /// The interner the edges go into once the node set is fixed; from the
+    /// start without a vertex table.
+    interner: Option<EdgeInterner>,
+    /// The edges interned before then ([`EdgeInterner::provisional`]).
+    provisional: Option<EdgeInterner>,
+    /// Where the keys' interner comes from, until it has.
+    nodes: Option<tokio::sync::oneshot::Receiver<EdgeInterner>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl EdgeSide {
+    fn new(nodes: Option<tokio::sync::oneshot::Receiver<EdgeInterner>>, hint: usize) -> Self {
+        match nodes {
+            None => Self {
+                interner: Some(EdgeInterner::with_capacity(hint)),
+                provisional: None,
+                nodes: None,
+            },
+            Some(nodes) => Self {
+                interner: None,
+                provisional: Some(EdgeInterner::provisional(hint)),
+                nodes: Some(nodes),
+            },
+        }
+    }
+
+    /// Take the node set in if it is fixed (waiting for it, with `wait`),
+    /// renumbering the edges interned so far into it. `false` if it never
+    /// will be: the keys' read or interning stopped on an error.
+    fn take_nodes(&mut self, wait: bool) -> std::result::Result<bool, IdError> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(mut rx) = self.nodes.take() else {
+            return Ok(true);
+        };
+        let mut nodes = match wait {
+            true => match rx.blocking_recv() {
+                Ok(nodes) => nodes,
+                Err(_) => return Ok(false),
+            },
+            false => match rx.try_recv() {
+                Ok(nodes) => nodes,
+                Err(TryRecvError::Empty) => {
+                    self.nodes = Some(rx);
+                    return Ok(true);
+                }
+                Err(TryRecvError::Closed) => return Ok(false),
+            },
+        };
+        if let Some(provisional) = self.provisional.take() {
+            nodes.adopt(provisional)?;
+        }
+        self.interner = Some(nodes);
+        Ok(true)
+    }
+
+    fn push(&mut self, src: &dyn Array, dst: &dyn Array) -> std::result::Result<(), IdError> {
+        match (&mut self.interner, &mut self.provisional) {
+            (Some(interner), _) => interner.push(src, dst),
+            (None, Some(provisional)) => provisional.push(src, dst),
+            (None, None) => unreachable!("edges interned before the node set, or into it"),
+        }
+    }
+}
+
+/// Intern the edges `rx` brings, on a thread of their own (see
+/// [`build_streamed`]); the index once every row has been read, `None` if a
+/// read stopped first (its error is the one reported).
+#[cfg(not(target_arch = "wasm32"))]
+fn intern_edges(
+    mut rx: tokio::sync::mpsc::Receiver<Chunk>,
+    nodes: Option<tokio::sync::oneshot::Receiver<EdgeInterner>>,
+    hint: usize,
+    graph: &str,
+    id_type: &DataType,
+) -> Result<Option<GraphIndex>> {
+    let error = |e| build_error(graph, e);
+    let mut side = EdgeSide::new(nodes, hint);
+    while let Some(chunk) = rx.blocking_recv() {
+        if !side.take_nodes(false).map_err(error)? {
+            return Ok(None);
+        }
+        match chunk {
+            Chunk::Edges(src, dst) => side.push(src.as_ref(), dst.as_ref()).map_err(error)?,
+            Chunk::End => {
+                if !side.take_nodes(true).map_err(error)? {
+                    return Ok(None);
+                }
+                let interner = side.interner.take().expect("the node set is taken in");
+                return Ok(Some(finish_index(interner, id_type)));
+            }
+            Chunk::Nodes(_) | Chunk::NodesDone => {
+                return Err(DataFusionError::Internal(format!(
+                    "building graph '{graph}': a vertex key chunk reached the edges"
+                )))
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Build the index of the edge rows `input` produces, interning each chunk
 /// as it is read rather than collecting every endpoint array first, so the
 /// Arrow input does not accumulate: the build holds the dense endpoints, a
 /// chunk or two in flight, and what the partitions decoded ahead of their
-/// turn hold, within [`READ_AHEAD_BYTES`]. The partitions decode in parallel
-/// and are interned in partition order ([`InOrder`]), and reading (here) and
-/// interning (on a blocking thread) overlap. The rows are interned in the
-/// order [`drain`] would collect them, so the index is the one
-/// `ursa_io::build_topology_batches` gives over the collected rows. A
-/// weighted node's weights are read from the same rows (`weights`), and with
-/// a vertex table kept only for the edges kept (see the module docs), whose
-/// keys are read first.
+/// turn hold, within the session's read-ahead ([`read_ahead`]). The
+/// partitions decode in parallel and are interned in partition order
+/// ([`InOrder`]), and reading (here) and interning (on a blocking thread)
+/// overlap. The rows are interned in the order [`drain`] would collect them,
+/// so the index is the one `ursa_io::build_topology_batches` gives over the
+/// collected rows. A weighted node's weights are read from the same rows
+/// (`weights`), and with a vertex table kept only for the edges kept (see
+/// the module docs).
+///
+/// A vertex table's keys number the nodes, in the order they are read, and
+/// an edge between two keys is kept. The keys used to be read and interned
+/// first, then the edges; now (#385) both are read and interned at once, on
+/// two threads: the keys into their interner, the edges into a provisional
+/// one ([`EdgeInterner::provisional`]) until the last key is in. Then the
+/// edges interned so far are renumbered into the keys' numbering
+/// ([`EdgeInterner::adopt`]), and the rest go straight into it. The index is
+/// exactly the one interning the keys first gives, wherever that switch
+/// falls. The two reads share the read-ahead: a quarter for the keys, the
+/// rest for the edges. In the browser (wasm32), with one thread, the keys
+/// are still read first.
 async fn build_streamed(
     shape: &Edges,
     input: &Arc<dyn ExecutionPlan>,
@@ -1806,7 +2015,8 @@ async fn build_streamed(
     context: &Arc<TaskContext>,
     weights: &mut WeightReader,
 ) -> Result<GraphIndex> {
-    let read_ahead = Some(READ_AHEAD_BYTES);
+    let partitions = input.output_partitioning().partition_count();
+    let read_ahead = read_ahead(context.session_config(), partitions);
     build_streamed_with(shape, input, endpoints, context, weights, read_ahead).await
 }
 
@@ -1816,100 +2026,91 @@ async fn build_streamed(
 async fn build_streamed_with(
     shape: &Edges,
     input: &Arc<dyn ExecutionPlan>,
-    (source, destination): (usize, usize),
+    endpoints: (usize, usize),
     context: &Arc<TaskContext>,
     weights: &mut WeightReader,
     read_ahead: Option<usize>,
 ) -> Result<GraphIndex> {
-    let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
     let hint = row_hint(input);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
-
-    // Native: the interner runs on a blocking thread, so reading and interning
-    // overlap on two threads. It is spawned here, before the reader starts
-    // (`run_blocking` would start it only when awaited, after the reader).
-    #[cfg(not(target_arch = "wasm32"))]
-    let interning = tokio::task::spawn_blocking(move || -> Result<Option<GraphIndex>> {
-        let mut interner = EdgeInterner::with_capacity(hint);
-        while let Some(chunk) = rx.blocking_recv() {
-            if let Some(index) = take_chunk(&mut interner, chunk, &graph, &id_type)? {
-                return Ok(Some(index));
-            }
-        }
-        // The reader stopped before the end (its error is the one reported).
-        Ok(None)
-    });
-    // The browser (wasm32) has one thread: the interner is a future polled
-    // alongside the reader, taking each chunk as it is sent. The channel's
-    // bound still keeps at most two chunks in flight, and the chunks arrive in
-    // the same order, so the index is the same (#278).
-    #[cfg(target_arch = "wasm32")]
-    let interning = async move {
-        let mut interner = EdgeInterner::with_capacity(hint);
-        while let Some(chunk) = rx.recv().await {
-            if let Some(index) = take_chunk(&mut interner, chunk, &graph, &id_type)? {
-                return Ok(Some(index));
-            }
-        }
-        Ok::<_, DataFusionError>(None)
+    let (key_budget, edge_budget) = match (&shape.vertices, read_ahead) {
+        (Some(_), Some(bytes)) => (Some(bytes / 4), Some(bytes - bytes / 4)),
+        _ => (read_ahead, read_ahead),
     };
+    let edges = InOrder::with_budget(input, context, edge_budget);
 
-    let read = async {
-        // The reader owns the sender, so the interner sees the channel close
-        // when the reader stops, on an error as at the end.
-        let tx = tx;
-        if let Some(vertices) = &shape.vertices {
-            let mut batches = InOrder::with_budget(&vertices.plan, context, read_ahead);
-            while let Some(batch) = batches.next().await {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let keys = cast(batch.column(0), &shape.id_type)?;
-                if tx.send(Chunk::Nodes(keys)).await.is_err() {
-                    return Ok(());
-                }
-            }
-            if tx.send(Chunk::NodesDone).await.is_err() {
-                return Ok(());
-            }
-        }
-        let mut gather = Gather::default();
-        let mut batches = InOrder::with_budget(input, context, read_ahead);
-        while let Some(batch) = batches.next().await {
-            let batch = batch?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let src = cast(batch.column(source), &shape.id_type)?;
-            let dst = cast(batch.column(destination), &shape.id_type)?;
-            weights.push(&batch);
-            drop(batch);
-            if let Some((src, dst)) = gather.push(src, dst)? {
-                if tx.send(Chunk::Edges(src, dst)).await.is_err() {
-                    // The interner stopped on an error: it is reported below.
-                    return Ok(());
-                }
-            }
-        }
-        if let Some((src, dst)) = gather.take()? {
-            if tx.send(Chunk::Edges(src, dst)).await.is_err() {
-                return Ok(());
-            }
-        }
-        let _ = tx.send(Chunk::End).await;
-        Ok::<_, DataFusionError>(())
-    };
+    // Native: the keys are read on a task of their own and interned on a
+    // thread of their own, while the edges are read here and interned on a
+    // third (see the docs above). The threads are spawned before the reads
+    // start (`run_blocking` would start one only when awaited).
     #[cfg(not(target_arch = "wasm32"))]
     let (read, built) = {
-        let read = read.await;
-        let built = interning.await.map_err(|e| {
+        use datafusion::common::runtime::SpawnedTask;
+        let failed = |e: tokio::task::JoinError| {
             DataFusionError::Execution(format!("building graph '{}' failed: {e}", shape.graph))
-        })?;
-        (read, built)
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Chunk>(2);
+        let mut keys = None;
+        let mut nodes = None;
+        if let Some(vertices) = &shape.vertices {
+            let (keys_tx, keys_rx) = tokio::sync::mpsc::channel::<Chunk>(2);
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            nodes = Some(done_rx);
+            let graph = shape.graph.clone();
+            let interning =
+                tokio::task::spawn_blocking(move || intern_keys(keys_rx, done_tx, hint, &graph));
+            let batches = InOrder::with_budget(&vertices.plan, context, key_budget);
+            let id_type = shape.id_type.clone();
+            let reading =
+                SpawnedTask::spawn(async move { send_keys(batches, &id_type, &keys_tx).await });
+            keys = Some((reading, interning));
+        }
+        let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
+        let interning =
+            tokio::task::spawn_blocking(move || intern_edges(rx, nodes, hint, &graph, &id_type));
+        // The reader owns the sender, so the interner sees the channel close
+        // when the reader stops, on an error as at the end.
+        let edges_read = send_edges(edges, shape, endpoints, weights, &tx).await;
+        drop(tx);
+        // A key's error comes first, as when the keys were read first.
+        let keys_done = match keys {
+            Some((reading, interning)) => {
+                let read = reading.join().await.map_err(failed)?;
+                let interned = interning.await.map_err(failed)?;
+                read.and(interned)
+            }
+            None => Ok(()),
+        };
+        let built = interning.await.map_err(failed)?;
+        (keys_done.and(edges_read), built)
     };
+
+    // The browser (wasm32) has one thread: the interner is a future polled
+    // alongside the reader, taking each chunk as it is sent, the keys first.
+    // The channel's bound still keeps at most two chunks in flight, and the
+    // chunks arrive in the same order, so the index is the same (#278).
     #[cfg(target_arch = "wasm32")]
-    let (read, built) = futures::join!(read, interning);
+    let (read, built) = {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
+        let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
+        let interning = async move {
+            let mut interner = EdgeInterner::with_capacity(hint);
+            while let Some(chunk) = rx.recv().await {
+                if let Some(index) = take_chunk(&mut interner, chunk, &graph, &id_type)? {
+                    return Ok(Some(index));
+                }
+            }
+            Ok::<_, DataFusionError>(None)
+        };
+        let read = async {
+            let tx = tx;
+            if let Some(vertices) = &shape.vertices {
+                let batches = InOrder::with_budget(&vertices.plan, context, key_budget);
+                send_keys(batches, &shape.id_type, &tx).await?;
+            }
+            send_edges(edges, shape, endpoints, weights, &tx).await
+        };
+        futures::join!(read, interning)
+    };
     read?;
     let index = built?.ok_or_else(|| {
         DataFusionError::Internal(format!(
@@ -2040,6 +2241,7 @@ fn build_error(graph: &str, e: IdError) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::in_order::MAX_READ_AHEAD;
     use datafusion::arrow::array::{Int64Array, StringArray};
 
     fn index(src: &dyn Array, dst: &dyn Array) -> GraphIndex {
@@ -2155,7 +2357,7 @@ mod tests {
         assert_eq!(stored_bytes(&collected), expected);
         // In parallel, with room to read ahead and with none: the same node
         // numbering, the same CSR, the same stored bytes.
-        for read_ahead in [Some(READ_AHEAD_BYTES), Some(1)] {
+        for read_ahead in [Some(MAX_READ_AHEAD), Some(1)] {
             let parallel = build(read_ahead).await;
             assert_eq!(
                 parallel.ids.user_id_array().as_ref(),
@@ -2167,6 +2369,121 @@ mod tests {
                 expected,
                 "read ahead {read_ahead:?}"
             );
+        }
+    }
+
+    /// The plan of a vertex table of `keys` keys written as `file` (by its
+    /// extension: CSV, gzipped CSV or Parquet of many row groups), read in
+    /// several partitions where the format splits.
+    async fn vertex_keys(dir: &std::path::Path, file: &str) -> Arc<dyn ExecutionPlan> {
+        use datafusion::prelude::SessionConfig;
+        let mut config = SessionConfig::new().with_target_partitions(8);
+        config.options_mut().optimizer.repartition_file_min_size = 1;
+        let ctx = crate::new_session_with_config(config);
+        let path = dir.join(file);
+        // Keys scattered over a range wider than the edges' ids, so some keys
+        // are on no edge and some edges have an endpoint that is no key.
+        let keys = "SELECT (value * 31337) % 60013 AS id FROM generate_series(0, 45000)";
+        let copy = match file {
+            f if f.ends_with(".csv.gz") => format!(
+                "COPY ({keys}) TO '{}' STORED AS CSV OPTIONS ('format.compression' 'gzip')",
+                path.display()
+            ),
+            f if f.ends_with(".csv") => {
+                format!("COPY ({keys}) TO '{}' STORED AS CSV", path.display())
+            }
+            _ => format!("COPY ({keys}) TO '{}'", path.display()),
+        };
+        for sql in [
+            "SET datafusion.execution.parquet.max_row_group_size = 2048".to_string(),
+            copy,
+        ] {
+            ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        }
+        ctx.sql(&format!("SELECT id FROM '{}'", path.display()))
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn keys_and_edges_interned_at_once_build_the_index_keys_first_did() {
+        let (dir, plan, context) = filtered_edges().await;
+        for file in ["keys.csv", "keys.csv.gz", "keys.parquet"] {
+            let vertices = vertex_keys(dir.path(), file).await;
+            let shape = Edges {
+                graph: "g".into(),
+                endpoints: (0, 1),
+                id_type: DataType::Int64,
+                fingerprint: None,
+                vertices: Some(VertexInput {
+                    plan: vertices,
+                    fingerprint: None,
+                }),
+            };
+            let build = |read_ahead| {
+                let (shape, plan, context) =
+                    (shape.clone(), Arc::clone(&plan), Arc::clone(&context));
+                async move {
+                    let mut no_weights = WeightReader::new(&[], 0);
+                    build_streamed_with(
+                        &shape,
+                        &plan,
+                        (0, 1),
+                        &context,
+                        &mut no_weights,
+                        read_ahead,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            // The index as the build made it before #385: every key interned,
+            // then every edge, in the order a serial read gives them.
+            let mut interner = EdgeInterner::with_capacity(0);
+            for keys in drain(&shape.vertices.as_ref().unwrap().plan, &[0], &context)
+                .await
+                .unwrap()
+            {
+                let keys = cast(&keys[0], &DataType::Int64).unwrap();
+                interner.push_nodes(keys.as_ref()).unwrap();
+            }
+            interner.close_nodes();
+            for edges in drain(&plan, &[0, 1], &context).await.unwrap() {
+                interner.push(edges[0].as_ref(), edges[1].as_ref()).unwrap();
+            }
+            let before = finish_index(interner, &DataType::Int64);
+            assert!(before.ids.len() > 45_000, "{file}: {}", before.ids.len());
+            assert!(before.n_dropped() > 0, "{file}");
+            assert!(before.topology.n_edges() > 100_000, "{file}");
+            let expected = stored_bytes(&before);
+            // The keys and the edges read and interned at once: serially, in
+            // parallel with room to read ahead, with little, and with none.
+            // Wherever the edges switch from provisional interning to the
+            // keys' numbering, the same node numbering, the same edges kept
+            // and the same stored bytes.
+            for _ in 0..3 {
+                for read_ahead in [None, Some(MAX_READ_AHEAD), Some(1 << 20), Some(1), Some(0)] {
+                    let built = build(read_ahead).await;
+                    assert_eq!(
+                        built.ids.user_id_array().as_ref(),
+                        before.ids.user_id_array().as_ref(),
+                        "{file}: node numbering, read ahead {read_ahead:?}"
+                    );
+                    assert_eq!(
+                        (built.n_dropped(), built.kept_rows()),
+                        (before.n_dropped(), before.kept_rows()),
+                        "{file}: edges kept, read ahead {read_ahead:?}"
+                    );
+                    assert_eq!(
+                        stored_bytes(&built),
+                        expected,
+                        "{file}: read ahead {read_ahead:?}"
+                    );
+                }
+            }
         }
     }
 

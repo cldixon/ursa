@@ -16,9 +16,24 @@
 //! is the one a serial read builds, node numbering and all.
 //!
 //! A partition ahead of the one being read keeps its batches until their
-//! turn comes, within [`READ_AHEAD_BYTES`] for all of them; past that it
+//! turn comes, within a read-ahead budget for all of them; past that it
 //! waits. The partition being read can always hand on a batch or two, so
 //! the read never waits on batches that are themselves waiting for it.
+//!
+//! The budget is memory the build holds on top of the index it builds, so it
+//! is bounded on purpose (#385, N45). Unless `ursa.build_read_ahead` is `SET`,
+//! it is [`READ_AHEAD_PER_PARTITION`] (256 MiB) per partition of the plan, at
+//! most [`MAX_READ_AHEAD`] (1 GiB, what every build held before) and at most
+//! an eighth of the memory available to the process (see
+//! [`default_read_ahead`]): 1 GiB from 4 partitions up (one per core, as a
+//! rule), unless memory is short. Each partition but the one being read
+//! needs room to decode ahead, or it waits and the one being read decodes
+//! alone; less than 1 GiB slowed a 96M-edge build on 4 cores by about 10%
+//! (512 MiB) to 13% (256 MiB), and more did not speed it up, since then
+//! interning, not decoding, is what the build waits on. So a plan of fewer
+//! partitions gets less, and a machine short of memory gets less, at that
+//! cost in time. `SET ursa.build_read_ahead = 0` reads the partitions one
+//! after another, holding nothing ahead.
 //!
 //! In the browser (wasm32) there is no runtime to spawn on, and a plan with
 //! one partition gains nothing from a task: both are read serially, on the
@@ -32,11 +47,82 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
 };
+use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
 
-/// The bytes of decoded batches the partitions read ahead of the one being
-/// read may hold between them: about 64M `Int64` endpoint pairs.
-pub(crate) const READ_AHEAD_BYTES: usize = 1 << 30;
+/// The most bytes of decoded batches the partitions read ahead of the one
+/// being read may hold between them by default: about 64M `Int64` endpoint
+/// pairs.
+pub(crate) const MAX_READ_AHEAD: usize = 1 << 30;
+
+/// The default read-ahead per partition of the plan read.
+pub(crate) const READ_AHEAD_PER_PARTITION: usize = 256 << 20;
+
+/// The default read-ahead is at most this share (one in N) of the memory
+/// available to the process.
+const READ_AHEAD_MEMORY_SHARE: u64 = 8;
+
+/// The default read-ahead of a plan of `partitions` partitions, when
+/// `available` bytes of memory are available to the process (`None` if that
+/// cannot be read): [`READ_AHEAD_PER_PARTITION`] per partition, at most
+/// [`MAX_READ_AHEAD`] and at most an eighth of `available` (see the module
+/// docs).
+pub(crate) fn default_read_ahead(partitions: usize, available: Option<u64>) -> usize {
+    let scaled = READ_AHEAD_PER_PARTITION
+        .saturating_mul(partitions.max(1))
+        .min(MAX_READ_AHEAD);
+    match available {
+        Some(bytes) => {
+            scaled.min(usize::try_from(bytes / READ_AHEAD_MEMORY_SHARE).unwrap_or(usize::MAX))
+        }
+        None => scaled,
+    }
+}
+
+/// The read-ahead a read of `partitions` partitions may hold in `config`'s
+/// session: `ursa.build_read_ahead` if it is `SET` (`None`, read serially,
+/// when it is 0), otherwise [`default_read_ahead`].
+pub(crate) fn read_ahead(config: &SessionConfig, partitions: usize) -> Option<usize> {
+    match crate::options::build_read_ahead_set(config) {
+        Some(0) => None,
+        Some(bytes) => Some(usize::try_from(bytes).unwrap_or(usize::MAX)),
+        None => Some(default_read_ahead(partitions, available_memory())),
+    }
+}
+
+/// The bytes of memory available to this process, as far as the system
+/// says: Linux's `MemAvailable`, less if the process's cgroup (v2) allows
+/// less. `None` elsewhere, or if neither can be read.
+pub(crate) fn available_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| {
+                let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
+                let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                Some(kib.saturating_mul(1024))
+            });
+        let read = |name: &str| -> Option<u64> {
+            std::fs::read_to_string(format!("/sys/fs/cgroup/{name}"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        // `memory.max` is `max` when the cgroup sets no limit.
+        let cgroup =
+            read("memory.max").map(|max| max.saturating_sub(read("memory.current").unwrap_or(0)));
+        match (meminfo, cgroup) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
 
 /// The batches the partition being read may hand on past the read-ahead
 /// budget.
@@ -56,9 +142,12 @@ enum Inner {
 }
 
 impl InOrder {
-    /// The batches of `plan`, decoding its partitions in parallel.
+    /// The batches of `plan`, decoding its partitions in parallel within the
+    /// session's read-ahead ([`read_ahead`]).
     pub(crate) fn new(plan: &Arc<dyn ExecutionPlan>, context: &Arc<TaskContext>) -> Self {
-        Self::with_budget(plan, context, Some(READ_AHEAD_BYTES))
+        let partitions = plan.output_partitioning().partition_count();
+        let budget = read_ahead(context.session_config(), partitions);
+        Self::with_budget(plan, context, budget)
     }
 
     /// The batches of `plan`, read one partition after another.
@@ -347,6 +436,36 @@ mod tests {
             out.extend(column.values().iter().copied());
         }
         out
+    }
+
+    #[test]
+    fn the_default_read_ahead_scales_with_partitions_within_the_memory() {
+        const MIB: usize = 1 << 20;
+        assert_eq!(default_read_ahead(1, None), 256 * MIB);
+        assert_eq!(default_read_ahead(3, None), 768 * MIB);
+        assert_eq!(default_read_ahead(4, None), MAX_READ_AHEAD);
+        assert_eq!(default_read_ahead(64, None), MAX_READ_AHEAD);
+        // An eighth of the memory available, at most.
+        assert_eq!(default_read_ahead(16, Some(16 << 30)), MAX_READ_AHEAD);
+        assert_eq!(default_read_ahead(16, Some(2 << 30)), 256 * MIB);
+        assert_eq!(default_read_ahead(2, Some(8 << 30)), 512 * MIB);
+        assert_eq!(default_read_ahead(4, Some(0)), 0);
+    }
+
+    #[test]
+    fn the_read_ahead_setting_overrides_the_default() {
+        let set = |value: &str| {
+            let mut config = crate::options::with_options(SessionConfig::new());
+            config
+                .options_mut()
+                .set("ursa.build_read_ahead", value)
+                .unwrap();
+            read_ahead(&config, 4)
+        };
+        assert_eq!(set("0"), None);
+        assert_eq!(set("16MiB"), Some(16 << 20));
+        let auto = set("auto").unwrap();
+        assert!(auto > 0 && auto <= MAX_READ_AHEAD, "{auto}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
