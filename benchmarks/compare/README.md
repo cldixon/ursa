@@ -57,6 +57,11 @@ igraph and rustworkx have no per-node triangle count, and rustworkx has no Louva
 
 **Parameters that mean different things.** NetworkX and rustworkx stop PageRank when the L1 change is below `n * tol`, while Ursa stops below `tol`. So they get `tol / n`; with `tol = 1e-6` as written, they stopped after a few iterations on 50k nodes. Library imports happen before the clock starts: NetworkX loads SciPy lazily inside `nx.pagerank`.
 
+## Results and CI
+
+- **Results:** each run's `summary.md` is committed to [`results/`](results/), named `<date>-<machine>-<size>.md`; the raw `results.json` stays with the run. The first is `results/2026-11-18-laptop-bsky-5m.md`.
+- **CI:** `.github/workflows/bench-smoke.yml` runs every engine on a synthetic graph when these files change, and checks they all agree with `ursa-sql`.
+
 ## Run it
 
 **Laptop:**

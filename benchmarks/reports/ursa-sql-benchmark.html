@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ursa SQL Benchmark</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+</head>
+<body>
+<style>
+  /* Layout: one 1060px reading column, as the July flywheel report; cards hold charts, each with its data table. */
+  :root {
+    --surface:#FBFAF7; --panel:#FFFFFF; --ink:#1B1D1A; --ink-2:#55584F; --ink-3:#8A8D82;
+    --line:#E7E4DB; --line-2:#F0EEE7; --accent:#009E73; --on-accent:#FFFFFF;
+    --s-mac:#0072B2; --s-ec2:#D55E00; --s-fg:#CC79A7; --v-old:#A3A69B; --v-new:#009E73;
+    --bar:#009E73; --ref:#55584F; --tip-bg:#1B1D1A; --tip-fg:#FBFAF7;
+    --shadow:0 1px 2px rgba(20,22,26,.04), 0 8px 24px rgba(20,22,26,.06);
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --surface:#14161A; --panel:#1B1E23; --ink:#ECEDE8; --ink-2:#A7ABA2; --ink-3:#7D8278;
+      --line:#2A2E34; --line-2:#23262B; --accent:#17A57E; --on-accent:#0E1512;
+      --s-mac:#5892D0; --s-ec2:#D06A30; --s-fg:#B278C6; --v-old:#6B7068; --v-new:#17A57E;
+      --bar:#17A57E; --ref:#A7ABA2; --tip-bg:#ECEDE8; --tip-fg:#14161A;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --surface:#14161A; --panel:#1B1E23; --ink:#ECEDE8; --ink-2:#A7ABA2; --ink-3:#7D8278;
+    --line:#2A2E34; --line-2:#23262B; --accent:#17A57E; --on-accent:#0E1512;
+    --s-mac:#5892D0; --s-ec2:#D06A30; --s-fg:#B278C6; --v-old:#6B7068; --v-new:#17A57E;
+    --bar:#17A57E; --ref:#A7ABA2; --tip-bg:#ECEDE8; --tip-fg:#14161A;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    color-scheme: dark;
+  }
+
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--surface); color:var(--ink); line-height:1.5; font-family:var(--sans); -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1060px; margin:0 auto; padding-block:clamp(20px,4vw,56px) 72px;
+    padding-left:max(16px, env(safe-area-inset-left, 0px)); padding-right:max(16px, env(safe-area-inset-right, 0px)); }
+  .eyebrow { font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); font-weight:600; margin:0 0 14px; }
+  h1 { font-size:clamp(28px,4.4vw,42px); line-height:1.08; letter-spacing:-.02em; margin:0 0 14px; font-weight:680; text-wrap:balance; }
+  h1 .em { color:var(--accent); }
+  .lede { font-size:clamp(16px,1.9vw,19px); color:var(--ink-2); max-width:66ch; margin:0 0 22px; text-wrap:pretty; }
+  .meta { display:flex; flex-wrap:wrap; gap:8px 10px; margin:0 0 30px; }
+  .chip { font-family:var(--mono); font-size:12px; color:var(--ink-2); background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:4px 11px; white-space:nowrap; }
+
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin:0 0 44px; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; min-width:0; }
+  .tile .k { font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-3); margin:0 0 6px; }
+  .tile .v { font-size:28px; font-weight:680; letter-spacing:-.02em; line-height:1.1; font-variant-numeric:tabular-nums; }
+  .tile .v small { font-size:15px; font-weight:560; color:var(--ink-2); letter-spacing:0; }
+  .tile .d { font-size:13px; color:var(--ink-2); margin:6px 0 0; }
+
+  section { margin:0 0 48px; }
+  section > h2 { font-size:20px; margin:0 0 4px; letter-spacing:-.01em; font-weight:650; text-wrap:balance; }
+  section > .sub { font-size:14px; color:var(--ink-2); margin:0 0 16px; max-width:76ch; text-wrap:pretty; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr)); gap:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px 18px 12px; box-shadow:var(--shadow); min-width:0; }
+  .card h3 { font-size:15px; margin:0 0 2px; font-weight:620; display:flex; align-items:baseline; gap:9px; flex-wrap:wrap; }
+  .card h3 code { font-family:var(--mono); font-size:12.5px; color:var(--ink-2); font-weight:500; }
+  .card .sub { font-size:12.5px; color:var(--ink-3); margin:0 0 6px; }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 16px; margin:4px 0 6px; }
+  .legend .item { display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--ink-2); }
+
+  svg.chart { width:100%; height:auto; display:block; overflow:visible; }
+  svg.chart text { font-family:var(--mono); }
+  .tick { fill:var(--ink-3); font-size:11px; }
+  .rowlab { fill:var(--ink); font-size:12px; font-family:var(--sans) !important; }
+  .rowlab2 { fill:var(--ink-3); font-size:10.5px; }
+  .vallab { fill:var(--ink-2); font-size:11px; }
+  .gain { fill:var(--ink); font-size:11.5px; font-weight:650; }
+  .gain.flat { fill:var(--ink-3); font-weight:500; }
+  .grid { stroke:var(--line-2); stroke-width:1; }
+  .axis { stroke:var(--line); stroke-width:1; }
+  .hit { fill:transparent; cursor:default; }
+  .hit:hover { fill:var(--line-2); fill-opacity:.55; }
+  .refline { stroke:var(--ref); stroke-width:1.2; stroke-dasharray:4 3; }
+  .reflab { fill:var(--ink-2); font-size:11px; }
+  .annot { fill:var(--ink-2); font-size:11px; }
+
+  details.data { margin:6px 0 0; }
+  details.data summary { font-size:12.5px; color:var(--ink-2); cursor:pointer; padding:4px 0; width:max-content; }
+  details.data summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  .table-scroll { overflow-x:auto; border:1px solid var(--line); border-radius:10px; margin:6px 0 4px; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th { text-align:right; font-weight:600; color:var(--ink-2); font-size:11px; text-transform:uppercase; letter-spacing:.05em; padding:9px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  td { padding:8px 12px; text-align:right; border-bottom:1px solid var(--line-2); font-variant-numeric:tabular-nums; font-family:var(--mono); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; font-family:var(--sans); }
+  tr:last-child td { border-bottom:0; }
+
+  .gaps td { white-space:normal; font-family:var(--sans); text-align:left; vertical-align:top; }
+  .gaps td.mono { font-family:var(--mono); white-space:nowrap; }
+  .gaps th { text-align:left; }
+  .kind { font-family:var(--mono); font-size:11px; color:var(--ink-2); border:1px solid var(--line); border-radius:999px; padding:1px 8px; white-space:nowrap; }
+
+  .notes { font-size:13.5px; color:var(--ink-2); max-width:78ch; }
+  .notes b { color:var(--ink); font-weight:620; }
+  .notes ul { padding-left:18px; margin:8px 0 0; }
+  .notes li { margin:6px 0; }
+  .notes code, .sub code { font-family:var(--mono); font-size:.92em; }
+
+  .tip { position:fixed; pointer-events:none; z-index:20; opacity:0; transform:translate(-50%,calc(-100% - 12px));
+    background:var(--tip-bg); color:var(--tip-fg); border-radius:9px; padding:9px 11px; font-size:12px; box-shadow:0 6px 24px rgba(0,0,0,.28); min-width:170px; transition:opacity .1s; }
+  .tip .th { font-family:var(--mono); font-size:11px; opacity:.75; margin-bottom:6px; }
+  .tip .row { display:flex; align-items:center; gap:10px; justify-content:space-between; margin:3px 0; }
+  .tip .row .lab { display:inline-flex; align-items:center; gap:6px; }
+  .tip .row .val { font-family:var(--mono); font-variant-numeric:tabular-nums; font-weight:600; }
+  @media (prefers-reduced-motion: reduce) { .tip { transition:none; } }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Ursa · SQL engine · benchmark baseline</p>
+  <h1>The <span class="em">ursa</span> binary on 95.7 million Bluesky follows, from a laptop to Fargate.</h1>
+  <p class="lede">The SQL engine measured on a real social graph: release over release, laptop against cloud, and how far it scales. Every result is checked against values cross-checked with plain SQL, and every step runs in its own <code>ursa</code> process, as a user's next query would.</p>
+  <div class="meta">
+    <span class="chip">ursa-cli 0.9.0</span>
+    <span class="chip">graph bsky23 · 95,744,886 edges</span>
+    <span class="chip">39,650,447 users</span>
+    <span class="chip">23 checks · all pass</span>
+    <span class="chip">measured 2026-11-16/17</span>
+    <span class="chip">full graph · 2,416,311,437 edges · ursa 0.10.0 · 2026-11-18</span>
+    <span class="chip">branch claude/bluesky-cloud-bench</span>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><p class="k">Correctness</p><div class="v">23 / 23</div><p class="d">checked steps pass on the Mac, EC2 r7g.4xlarge and Fargate</p></div>
+    <div class="tile"><p class="k">GRAPH_TABLE, 0.7 → 0.9</p><div class="v">6–25<small>× faster</small></div><p class="d">bound patterns now follow the stored graph index</p></div>
+    <div class="tile"><p class="k">Louvain peak memory</p><div class="v">13.5 → 7.1<small> GB</small></div><p class="d">37M isolated users no longer enter the kernel</p></div>
+    <div class="tile"><p class="k">Full graph, 2.42B edges</p><div class="v">44.6<small> GB to build</small></div><p class="d">every algorithm fits a 128 GiB machine (EC2, ursa 0.10.0)</p></div>
+  </div>
+
+  <section id="release">
+    <h2>Release over release: 0.7.0 → 0.9.0</h2>
+    <p class="sub">Same laptop, same graph, each query in its own process with the index stored. A log scale, so equal distances are equal ratios. 0.9.0 times include about 0.9 s of process start and index load.</p>
+    <div class="grid2">
+      <div class="card">
+        <h3>Wall time <code>seconds, log scale</code></h3>
+        <div class="legend" id="lg-rel"></div>
+        <div id="ch-rel"></div>
+        <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-rel"></div></details>
+      </div>
+      <div class="card">
+        <h3>Peak memory <code>GB, macOS footprint</code></h3>
+        <div class="legend" id="lg-mem"></div>
+        <div id="ch-mem"></div>
+        <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-mem"></div></details>
+      </div>
+    </div>
+  </section>
+
+  <section id="platforms">
+    <h2>Laptop, EC2 and Fargate, same release</h2>
+    <p class="sub">One run of <code>bluesky_cloud/run.py --before 2024-01-01</code> on each. <code>g</code> has the users as a vertex table; <code>ge</code> is edges only. The laptop leads on almost everything: the index build is serial and an M-series core is faster than a Graviton3 core. Triangles, the best-parallelised kernel, is the one step the 16-core machines win.</p>
+    <div class="card">
+      <h3>Wall time per step <code>seconds, log scale</code></h3>
+      <div class="legend" id="lg-plat"></div>
+      <div id="ch-plat"></div>
+      <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-plat"></div></details>
+    </div>
+  </section>
+
+  <section id="scale">
+    <h2>Scaling to the full graph</h2>
+    <p class="sub">Bytes per edge stay flat from 95.7M to 983M edges, so round 3 estimated the full 2.42B-edge graph linearly. The full graph has now run on EC2 (ursa 0.10.0): every measured peak is at or under its estimate.</p>
+    <div class="grid2">
+      <div class="card">
+        <h3>Bytes per edge <code>95.7M vs 983M edges</code></h3>
+        <div class="legend" id="lg-bpe"></div>
+        <div id="ch-bpe"></div>
+        <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-bpe"></div></details>
+      </div>
+      <div class="card">
+        <h3>Full graph: measured peak memory <code>GB, EC2 r7g.4xlarge</code></h3>
+        <p class="sub">Bars are measured with ursa 0.10.0; hover for round 3's estimate. Dashed lines: 32 GB, 64 GB, and Fargate's 120 GB task. The stored index takes 18.6 GiB, 36.9 GiB with the reverse adjacency.</p>
+        <div id="ch-full"></div>
+        <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-full"></div></details>
+      </div>
+    </div>
+  </section>
+
+  <section id="fullgraph">
+    <h2>The full graph, step by step</h2>
+    <p class="sub">All 2,416,311,437 follows with all 39,650,447 users as nodes, on one EC2 r7g.4xlarge (16 vCPU, 128 GiB), ursa 0.10.0, each step in its own process. 70 minutes of instance time, about $1.10. Memory isn't the limit any more; time is. Triangles uses all 16 cores but grows with the hubs; Louvain and the components stay near one core; and every query pays a 15 s index load.</p>
+    <div class="card">
+      <h3>Wall time per step <code>seconds</code></h3>
+      <div id="ch-fullsteps"></div>
+      <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-fullsteps"></div></details>
+    </div>
+  </section>
+
+  <section id="profiles">
+    <h2>Where the time and memory go</h2>
+    <p class="sub">Two profiles of the 0.9.0 release binary on the laptop, taken with macOS <code>sample</code> and <code>footprint</code>.</p>
+    <div class="grid2">
+      <div class="card">
+        <h3>Index build: CPU by phase <code>% of active samples</code></h3>
+        <p class="sub">0.8 cores busy of 12. Decoding the Parquet file dominates, one partition at a time; a parallel SQL scan of the same rows takes 5.3 s against the build's 28 s.</p>
+        <div id="ch-build"></div>
+        <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-build"></div></details>
+      </div>
+      <div class="card">
+        <h3>Louvain, edges only: memory over time <code>GB</code></h3>
+        <p class="sub">A 2 s spike while the working graph is built: padded 16-byte pairs (3.06 GB) alive alongside the final arrays. Then local moving, on one thread.</p>
+        <div id="ch-lv"></div>
+        <details class="data"><summary>Data</summary><div class="table-scroll" id="tb-lv"></div></details>
+      </div>
+    </div>
+  </section>
+
+  <section id="gaps">
+    <h2>The gaps list</h2>
+    <p class="sub">What the measurements say to fix, in order of expected payoff. Numbers refer to findings in the 0.9.0 and 0.10.0 reports; the first two are fixed in 0.10.</p>
+    <div class="table-scroll">
+      <table class="gaps">
+        <thead><tr><th>Gap</th><th>Kind</th><th>Evidence</th><th>Expected gain</th></tr></thead>
+        <tbody>
+          <tr><td>N30 · the index build reads its source on one thread</td><td><span class="kind">fixed in 0.10</span></td><td>was 0.8 cores of 12 and 28 s; now 6.3 cores and 6.0 s (edges only), 40.8 s for the full graph</td><td>done: 3–6.5× on every first query</td></tr>
+          <tr><td>N31 · Louvain builds its working graph with padded pairs</td><td><span class="kind">fixed in 0.10</span></td><td>peak 6.17 → 3.23 GB (edges only); full graph 73.9 GB</td><td>done: full-graph Louvain fits 120 GB</td></tr>
+          <tr><td>N44 · one view over a missing file makes the database unopenable</td><td><span class="kind">reliability</span></td><td>even DROP VIEW and --readonly fail; the only fix is editing the catalog JSON</td><td>moved or deleted files no longer lock users out</td></tr>
+          <tr><td>N51 · every query loads the whole index on one core</td><td><span class="kind">speed</span></td><td>full graph: 15.3 s at 1.0 cores, so a 1-edge MATCH takes 16 s</td><td>memory-map the index: point queries in well under a second</td></tr>
+          <tr><td>N52 · components and Louvain stay near one core</td><td><span class="kind">speed</span></td><td>full graph: components 63–82 s at 1.2–1.3 cores; Louvain 27 min at 1.5</td><td>parallel components (identical results); deterministic parallel Louvain</td></tr>
+          <tr><td>N50 · a 10M-path cap refuses a valid ANY SHORTEST query</td><td><span class="kind">correctness</span></td><td>3 steps from one account reach over 10M nodes; the error suggests ANY SHORTEST, which the query already uses</td><td>count destinations, not paths; make the cap a setting</td></tr>
+          <tr><td>Fargate's slower disk</td><td><span class="kind">operations</span></td><td>PageRank 15.9 s on Fargate against 6.6 s on EC2</td><td>use EC2 with gp3 for published numbers</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="notes">
+    <h2 style="font-size:17px;margin:0 0 4px">How to read this</h2>
+    <ul>
+      <li><b>One run per platform.</b> These are a baseline, not a leaderboard. Fargate's hardware generation isn't selectable, so its times vary between runs; repeat before quoting a ratio.</li>
+      <li><b>Memory differs by platform.</b> The laptop numbers are macOS peak footprint. EC2 and Fargate peaks are Linux <code>ru_maxrss</code>; the platform table lists EC2's, and Fargate's match within 0.01 GB.</li>
+      <li><b>Two releases on this page.</b> The release, platform and profile sections are ursa 0.9.0; the full-graph sections are 0.10.0, which made builds 3–6.5× faster and Louvain's peak about half. The round-4 report has the 0.10.0 laptop numbers.</li>
+      <li><b>The full graph ran once</b>, on one EC2 r7g.4xlarge. Its memory figures are Linux <code>ru_maxrss</code>; its times include the 15 s index load each new process pays.</li>
+      <li><b>0.6.0 is left out.</b> It counted only the endpoints of edges as nodes, so its numbers measure a different graph.</li>
+      <li><b>The companion report</b> is the July flywheel, Ursa's Python API against NetworkX, rustworkx and igraph. A SQL version, with DuckDB + DuckPGQ, is the next step in <code>benchmarks/SQL_PERFORMANCE.md</code>.</li>
+    </ul>
+  </section>
+</div>
+
+<div class="tip" id="tip" role="status" aria-live="polite"></div>
+
+<script>
+const REL = [
+  {n:"Index build", d:"first query", a:30.7, b:30.3},
+  {n:"PageRank", d:"", a:6.9, b:3.55},
+  {n:"Weak components", d:"", a:2.3, b:2.57},
+  {n:"Triangles", d:"", a:11.9, b:12.5},
+  {n:"Louvain", d:"", a:42.7, b:18.6},
+  {n:"1-edge MATCH", d:"bound node, edges only", a:14.0, b:0.57},
+  {n:"Mutual follows", d:"2-edge cycle", a:12.8, b:1.09},
+  {n:"ANY SHORTEST", d:"fixed target", a:12.6, b:1.01},
+  {n:"{1,3} histogram", d:"ANY SHORTEST", a:9.6, b:1.69},
+];
+const MEM = [
+  {n:"Index build", d:"", a:3.1, b:3.03},
+  {n:"PageRank", d:"", a:4.83, b:3.47},
+  {n:"Weak components", d:"", a:2.21, b:2.11},
+  {n:"Triangles", d:"", a:4.70, b:4.44},
+  {n:"Louvain", d:"", a:13.5, b:7.06},
+];
+const PLAT = [
+  {n:"Index build", d:"g, inside the process", v:[27.4, 40.8, 35.8], m:3.21},
+  {n:"Index build", d:"ge", v:[25.6, 39.1, 34.9], m:1.98},
+  {n:"PageRank", d:"g", v:[4.11, 6.58, 15.92], m:3.56},
+  {n:"PageRank", d:"ge", v:[3.05, 4.47, 7.97], m:1.97},
+  {n:"Weak components", d:"g", v:[2.24, 4.31, 3.46], m:2.06},
+  {n:"Strong components", d:"g", v:[3.79, 6.36, 6.06], m:2.06},
+  {n:"Triangles", d:"g", v:[11.94, 10.53, 10.29], m:4.28},
+  {n:"Louvain", d:"g", v:[15.33, 26.80, 21.48], m:6.73},
+  {n:"Louvain", d:"ge", v:[12.01, 20.39, 15.47], m:6.17},
+  {n:"1-edge MATCH", d:"g", v:[0.87, 1.50, 1.25], m:2.06},
+  {n:"Mutual follows", d:"g", v:[0.98, 1.75, 1.45], m:2.07},
+  {n:"ANY SHORTEST", d:"g", v:[0.88, 1.55, 1.25], m:2.06},
+  {n:"{1,3} histogram", d:"g", v:[1.57, 3.20, 2.40], m:2.07},
+];
+const PLAT_SER = [
+  {k:"mac", label:"Mac M-series, 12 cores", color:"--s-mac", shape:"circle"},
+  {k:"ec2", label:"EC2 r7g.4xlarge", color:"--s-ec2", shape:"square"},
+  {k:"fg",  label:"Fargate 16 vCPU / 120 GB", color:"--s-fg", shape:"diamond"},
+];
+const BPE = [
+  {n:"Build peak", d:"", a:21.2, b:17.7},
+  {n:"PageRank", d:"", a:20.0, b:19.1},
+  {n:"Stored index", d:"with reverse", a:16.8, b:16.5},
+  {n:"Load + components", d:"", a:10.5, b:10.0},
+  {n:"Stored index", d:"out-adjacency", a:8.4, b:8.3},
+];
+// Full graph, measured with ursa 0.10.0 on EC2 r7g.4xlarge (v), against round 3's estimate (est).
+const FULL = [
+  {n:"Louvain", d:"", v:73.89, est:"~80 after N31 (~155 in 0.9)"},
+  {n:"Triangles", d:"", v:65.09, est:"~75"},
+  {n:"Build the index", d:"", v:44.59, est:"~44"},
+  {n:"PageRank", d:"", v:42.39, est:"~47–49"},
+  {n:"Components, MATCH", d:"traversals, index load", v:22.47, est:"~25–27"},
+];
+// Full graph, every step (seconds, cores busy, peak GB, result).
+const FULLSTEPS = [
+  {n:"Triangles", d:"", v:1828.2, c:15.5, m:65.09, res:"559,781,041,475 triangles"},
+  {n:"Louvain", d:"seed => 1", v:1618.2, c:1.5, m:73.89, res:"39,650,447 rows"},
+  {n:"PageRank", d:"adds the reverse", v:115.0, c:8.0, m:42.39, res:"top score 0.0846"},
+  {n:"Index build", d:"+ component count", v:90.0, c:2.6, m:44.59, res:"build 40.8 s; 3,209,457 weak components"},
+  {n:"Strong components", d:"", v:82.2, c:1.2, m:22.47, res:""},
+  {n:"Weak components", d:"", v:63.2, c:1.3, m:22.47, res:""},
+  {n:"Mutual follows", d:"GRAPH_TABLE", v:16.1, c:1.0, m:22.47, res:"2,764 (2,715 distinct)"},
+  {n:"1-edge MATCH", d:"GRAPH_TABLE", v:15.7, c:1.0, m:22.47, res:"3,919 rows"},
+  {n:"ANY SHORTEST", d:"GRAPH_TABLE", v:15.9, c:1.0, m:22.47, res:"[7078889, 36081159, 25003023]"},
+  {n:"hop, 2 steps", d:"", v:15.6, c:1.0, m:22.47, res:"890,250 nodes"},
+  {n:"Index load only", d:"count(*) FROM degree", v:15.3, c:1.0, m:22.47, res:"39,650,447 rows"},
+];
+const REFS = [{v:32, l:"32 GB"}, {v:64, l:"64 GB", side:"r"}, {v:120, l:"Fargate 120 GB"}];
+const BUILD = [
+  {n:"Parquet zstd decompression", v:60.5},
+  {n:"Parquet decode (RLE, bit-unpack)", v:13.0},
+  {n:"Id interning", v:9.1},
+  {n:"I/O (pread, open)", v:7.4},
+  {n:"memcpy, alloc", v:5.4},
+  {n:"Date filter", v:2.2},
+  {n:"Other", v:1.7},
+  {n:"CSR construction", v:0.6},
+];
+const LV = [[0,0.036],[0.5,0.944],[1,3.927],[1.5,4.387],[2,5.877],[2.5,5.883],[3,5.883],[3.5,2.843],[4,2.843],[5,2.843],[6,2.843],[7,2.843],[8,2.843],[9,2.843],[10,2.843],[11,2.843],[12,2.843],[13,2.843],[13.5,2.843]];
+
+const NS = "http://www.w3.org/2000/svg";
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function el(t, a, txt){ const n=document.createElementNS(NS,t); for(const k in a) n.setAttribute(k,a[k]); if(txt!=null) n.textContent=txt; return n; }
+function fmtS(v){ return v<1 ? v.toFixed(2)+" s" : v<10 ? v.toFixed(2)+" s" : v.toFixed(1)+" s"; }
+function fmtGB(v){ return v.toFixed(v<10?2:1)+" GB"; }
+function marker(shape, cx, cy, fill, r){
+  r=r||5;
+  const ring = {stroke:css("--panel"), "stroke-width":2};
+  if(shape==="square") return el("rect",{x:cx-r+0.5,y:cy-r+0.5,width:2*r-1,height:2*r-1,rx:1.5,fill,...ring});
+  if(shape==="diamond"){ const d=r+1; return el("polygon",{points:`${cx},${cy-d} ${cx+d},${cy} ${cx},${cy+d} ${cx-d},${cy}`,fill,...ring}); }
+  if(shape==="hollow") return el("circle",{cx,cy,r:r-0.5,fill:css("--panel"),stroke:fill,"stroke-width":2.2});
+  return el("circle",{cx,cy,r,fill,...ring});
+}
+function legend(id, items){
+  const host=document.getElementById(id); host.innerHTML="";
+  for(const it of items){
+    const s=document.createElement("span"); s.className="item";
+    const g=el("svg",{width:14,height:14,viewBox:"0 0 14 14"}); g.style.overflow="visible";
+    g.appendChild(marker(it.shape,7,7,css(it.color),5)); s.appendChild(g);
+    s.appendChild(document.createTextNode(it.label)); host.appendChild(s);
+  }
+}
+function table(id, head, rows){
+  const t=document.createElement("table");
+  t.innerHTML="<thead><tr>"+head.map(h=>`<th>${h}</th>`).join("")+"</tr></thead><tbody>"+
+    rows.map(r=>"<tr>"+r.map(c=>`<td>${c}</td>`).join("")+"</tr>").join("")+"</tbody>";
+  const h=document.getElementById(id); h.innerHTML=""; h.appendChild(t);
+}
+
+/* tooltip */
+const tip=document.getElementById("tip");
+function showTip(ev, title, rows){
+  tip.innerHTML=`<div class="th">${title}</div>`+rows.map(r=>`<div class="row"><span class="lab">${r.sw?`<svg width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4.5" fill="${r.sw}"/></svg>`:""}${r.l}</span><span class="val">${r.v}</span></div>`).join("");
+  tip.style.opacity=1; moveTip(ev);
+}
+function moveTip(ev){
+  const x=Math.min(Math.max(ev.clientX, 100), window.innerWidth-100);
+  tip.style.left=x+"px"; tip.style.top=ev.clientY+"px";
+}
+function hideTip(){ tip.style.opacity=0; }
+function bindHover(node, title, rowsFn){
+  node.addEventListener("pointerenter", e=>showTip(e,title,rowsFn()));
+  node.addEventListener("pointermove", moveTip);
+  node.addEventListener("pointerleave", hideTip);
+}
+
+/* scales */
+function logScale(lo, hi, x0, x1){ const a=Math.log10(lo), b=Math.log10(hi); return v => x0 + (Math.log10(v)-a)/(b-a)*(x1-x0); }
+function linScale(lo, hi, x0, x1){ return v => x0 + (v-lo)/(hi-lo)*(x1-x0); }
+
+/* row chart frame: label column on the left, plot, a value column on the right */
+function frame(host, nRows, opt){
+  // Draw at the card's real width, so 11-12px text stays 11-12px on screen.
+  const W=Math.max(320, Math.round(host.clientWidth||760));
+  const LW=Math.min(opt.LW||170, Math.round(W*0.36)), RW=opt.RW||64, rowH=opt.rowH||30, top=8, bottom=30;
+  const H=top+nRows*rowH+bottom;
+  const svg=el("svg",{class:"chart",viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":opt.aria});
+  host.innerHTML=""; host.appendChild(svg);
+  return {svg, W, H, x0:LW, x1:W-RW, top, rowH, bottom, y:i=>top+i*rowH+rowH/2};
+}
+function rowLabels(f, rows){
+  rows.forEach((r,i)=>{
+    const y=f.y(i);
+    if(r.d){ f.svg.appendChild(el("text",{class:"rowlab",x:0,y:y-2},r.n)); f.svg.appendChild(el("text",{class:"rowlab2",x:0,y:y+11},r.d)); }
+    else f.svg.appendChild(el("text",{class:"rowlab",x:0,y:y+4},r.n));
+  });
+}
+function xAxis(f, ticks, sx, fmt){
+  const yb=f.top+f.rowH*f.n;
+  for(const t of ticks){
+    const x=sx(t);
+    f.svg.appendChild(el("line",{class:"grid",x1:x,x2:x,y1:f.top,y2:yb}));
+    f.svg.appendChild(el("text",{class:"tick",x,y:yb+16,"text-anchor":"middle"},fmt(t)));
+  }
+  f.svg.appendChild(el("line",{class:"axis",x1:f.x0,x2:f.x1,y1:yb,y2:yb}));
+}
+
+/* dumbbell: before (hollow, muted) to after (filled, accent) */
+function dumbbell(hostId, rows, o){
+  const f=frame(document.getElementById(hostId), rows.length, {aria:o.aria, LW:o.LW||150, RW:68}); f.n=rows.length;
+  const sx=o.log ? logScale(o.lo,o.hi,f.x0+8,f.x1-6) : linScale(o.lo,o.hi,f.x0+8,f.x1-6);
+  xAxis(f, o.ticks, sx, o.tickFmt);
+  rowLabels(f, rows);
+  const cOld=css("--v-old"), cNew=css("--v-new");
+  rows.forEach((r,i)=>{
+    const y=f.y(i), xa=sx(r.a), xb=sx(r.b);
+    const hit=el("rect",{class:"hit",x:0,y:y-f.rowH/2,width:f.W,height:f.rowH}); f.svg.appendChild(hit);
+    f.svg.appendChild(el("line",{x1:xa,x2:xb,y1:y,y2:y,stroke:css("--line"),"stroke-width":3,"stroke-linecap":"round"}));
+    f.svg.appendChild(marker("hollow",xa,y,cOld,5));
+    f.svg.appendChild(marker("circle",xb,y,cNew,5.5));
+    const ratio=r.a/r.b, flat=Math.abs(Math.log(ratio))<Math.log(1.12);
+    const lab = flat ? "≈ same" : (ratio>1 ? (o.lowerWord||"×")+ (ratio>=10?ratio.toFixed(0):ratio.toFixed(1)) : "×"+(1/ratio).toFixed(1)+" more");
+    f.svg.appendChild(el("text",{class:"gain"+(flat?" flat":""),x:f.W,y:y+4,"text-anchor":"end"}, o.gainFmt ? o.gainFmt(r) : lab));
+    bindHover(hit, r.n+(r.d?` · ${r.d}`:""), ()=>[
+      {l:o.aLabel, v:o.valFmt(r.a), sw:cOld},{l:o.bLabel, v:o.valFmt(r.b), sw:cNew},
+      {l:"change", v: o.gainFmt ? o.gainFmt(r) : (flat?"≈ same":(ratio>1?(ratio).toFixed(1)+"× lower":(1/ratio).toFixed(1)+"× higher"))}]);
+  });
+}
+
+/* dot plot: several series per row */
+function dotplot(hostId, rows, ser, o){
+  const f=frame(document.getElementById(hostId), rows.length, {aria:o.aria, LW:160, RW:8, rowH:30}); f.n=rows.length;
+  const sx=logScale(o.lo,o.hi,f.x0+8,f.x1-6);
+  xAxis(f, o.ticks, sx, o.tickFmt);
+  rowLabels(f, rows);
+  rows.forEach((r,i)=>{
+    const y=f.y(i);
+    const hit=el("rect",{class:"hit",x:0,y:y-f.rowH/2,width:f.W,height:f.rowH}); f.svg.appendChild(hit);
+    const xs=r.v.map(sx);
+    f.svg.appendChild(el("line",{x1:Math.min(...xs),x2:Math.max(...xs),y1:y,y2:y,stroke:css("--line"),"stroke-width":2}));
+    ser.forEach((s,j)=>f.svg.appendChild(marker(s.shape,xs[j],y,css(s.color),5)));
+    bindHover(hit, r.n+(r.d?` · ${r.d}`:""), ()=>ser.map((s,j)=>({l:s.label, v:fmtS(r.v[j]), sw:css(s.color)})).concat([{l:"peak RSS, EC2", v:fmtGB(r.m)}]));
+  });
+}
+
+/* horizontal bars, one hue, optional reference lines */
+function hbars(hostId, rows, o){
+  const f=frame(document.getElementById(hostId), rows.length, {aria:o.aria, LW:o.LW||200, RW:o.RW||58, rowH:o.rowH||26}); f.n=rows.length;
+  const sx=linScale(0,o.hi,f.x0,f.x1);
+  xAxis(f, o.ticks, sx, o.tickFmt);
+  rowLabels(f, rows);
+  const fill=css("--bar"), bh=12;
+  rows.forEach((r,i)=>{
+    const y=f.y(i);
+    const hit=el("rect",{class:"hit",x:0,y:y-f.rowH/2,width:f.W,height:f.rowH}); f.svg.appendChild(hit);
+    const w=Math.max(2, sx(r.v)-f.x0);
+    f.svg.appendChild(el("path",{d:roundRight(f.x0,y-bh/2,w,bh,3),fill}));
+    f.svg.appendChild(el("text",{class:"vallab",x:f.x0+w+6,y:y+4}, o.valFmt(r)));
+    bindHover(hit, r.n+(r.d?` · ${r.d}`:""), ()=>o.tipRows(r));
+  });
+  for(const ref of (o.refs||[])){
+    const x=sx(ref.v), yb=f.top+f.rowH*f.n;
+    f.svg.appendChild(el("line",{class:"refline",x1:x,x2:x,y1:f.top-4,y2:yb}));
+    f.svg.appendChild(el("text",{class:"reflab",x:x+(ref.side==="r"?4:-4),y:yb+28,"text-anchor":ref.side==="r"?"start":"end"},ref.l));
+  }
+  if(o.refs) f.svg.setAttribute("viewBox",`0 0 ${f.W} ${f.H+14}`);
+}
+function roundRight(x,y,w,h,r){ r=Math.min(r,w/2,h/2); return `M${x},${y}H${x+w-r}Q${x+w},${y} ${x+w},${y+r}V${y+h-r}Q${x+w},${y+h} ${x+w-r},${y+h}H${x}Z`; }
+
+/* line + area over time */
+function timeline(hostId, pts, o){
+  const host=document.getElementById(hostId);
+  const W=Math.max(320, Math.round(host.clientWidth||760)), H=Math.round(Math.min(300, Math.max(220, W*0.55))), L=46, R=16, T=14, B=36;
+  const svg=el("svg",{class:"chart",viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":o.aria});
+  host.innerHTML=""; host.appendChild(svg);
+  const sx=linScale(0,o.xhi,L,W-R), sy=linScale(0,o.yhi,H-B,T);
+  for(const t of o.yt){ svg.appendChild(el("line",{class:"grid",x1:L,x2:W-R,y1:sy(t),y2:sy(t)})); svg.appendChild(el("text",{class:"tick",x:L-8,y:sy(t)+4,"text-anchor":"end"},t+" GB")); }
+  for(const t of o.xt){ svg.appendChild(el("text",{class:"tick",x:sx(t),y:H-B+18,"text-anchor":"middle"},t+" s")); }
+  svg.appendChild(el("line",{class:"axis",x1:L,x2:W-R,y1:H-B,y2:H-B}));
+  const c=css("--bar");
+  const d=pts.map((p,i)=>(i?"L":"M")+sx(p[0]).toFixed(1)+","+sy(p[1]).toFixed(1)).join("");
+  svg.appendChild(el("path",{d:d+`L${sx(pts[pts.length-1][0])},${sy(0)}L${sx(0)},${sy(0)}Z`,fill:c,"fill-opacity":.13}));
+  svg.appendChild(el("path",{d,fill:"none",stroke:c,"stroke-width":2,"stroke-linejoin":"round"}));
+  for(const a of o.annots){
+    svg.appendChild(el("text",{class:"annot",x:sx(a.x),y:sy(a.y)-10,"text-anchor":a.anchor||"start"},a.t));
+  }
+  const peak=pts.reduce((m,p)=>p[1]>m[1]?p:m);
+  svg.appendChild(marker("circle",sx(peak[0]),sy(peak[1]),c,5));
+  const cross=el("line",{x1:0,x2:0,y1:T,y2:H-B,stroke:css("--ink-3"),"stroke-dasharray":"3 3",opacity:0}); svg.appendChild(cross);
+  const hit=el("rect",{x:L,y:T,width:W-L-R,height:H-T-B,fill:"transparent"}); svg.appendChild(hit);
+  hit.addEventListener("pointermove", e=>{
+    const r=svg.getBoundingClientRect(), x=(e.clientX-r.left)/r.width*W;
+    const t=(x-L)/(W-L-R)*o.xhi; let best=pts[0]; for(const p of pts) if(Math.abs(p[0]-t)<Math.abs(best[0]-t)) best=p;
+    cross.setAttribute("x1",sx(best[0])); cross.setAttribute("x2",sx(best[0])); cross.setAttribute("opacity",1);
+    showTip(e, `t = ${best[0]} s`, [{l:"phys_footprint", v:fmtGB(best[1]), sw:c}]);
+  });
+  hit.addEventListener("pointerleave", ()=>{ cross.setAttribute("opacity",0); hideTip(); });
+}
+
+function render(){
+  const relLeg=[{label:"0.7.0", color:"--v-old", shape:"hollow"},{label:"0.9.0", color:"--v-new", shape:"circle"}];
+  legend("lg-rel", relLeg); legend("lg-mem", relLeg);
+  dumbbell("ch-rel", REL, {aria:"Wall time, 0.7.0 against 0.9.0, per query", log:true, lo:0.4, hi:50, ticks:[0.5,1,2,5,10,20,50], tickFmt:t=>t+" s", aLabel:"0.7.0", bLabel:"0.9.0", valFmt:fmtS});
+  dumbbell("ch-mem", MEM, {aria:"Peak memory, 0.7.0 against 0.9.0", log:false, lo:0, hi:14, ticks:[0,2,4,6,8,10,12,14], tickFmt:t=>t, aLabel:"0.7.0", bLabel:"0.9.0", valFmt:fmtGB,
+    gainFmt:r=>{ const p=(r.b-r.a)/r.a*100; return Math.abs(p)<5 ? "≈ same" : (p<0?"−":"+")+Math.abs(p).toFixed(0)+"%"; }});
+  table("tb-rel", ["Query","0.7.0","0.9.0","Speed-up"], REL.map(r=>[r.n+(r.d?` (${r.d})`:""), fmtS(r.a), fmtS(r.b), (r.a/r.b).toFixed(2)+"×"]));
+  table("tb-mem", ["Query","0.7.0","0.9.0","Change"], MEM.map(r=>[r.n, fmtGB(r.a), fmtGB(r.b), ((r.b-r.a)/r.a*100).toFixed(0)+"%"]));
+
+  legend("lg-plat", PLAT_SER);
+  dotplot("ch-plat", PLAT, PLAT_SER, {aria:"Wall time per step on three platforms", lo:0.6, hi:60, ticks:[1,2,5,10,20,50], tickFmt:t=>t+" s"});
+  table("tb-plat", ["Step","Mac","EC2 r7g.4xlarge","Fargate","Peak RSS, EC2"], PLAT.map(r=>[r.n+(r.d?` (${r.d})`:""), ...r.v.map(fmtS), fmtGB(r.m)]));
+
+  legend("lg-bpe", [{label:"95.7M edges", color:"--v-old", shape:"hollow"},{label:"983M edges", color:"--v-new", shape:"circle"}]);
+  dumbbell("ch-bpe", BPE, {aria:"Bytes per edge at 95.7M and 983M edges", log:false, lo:0, hi:24, ticks:[0,4,8,12,16,20,24], tickFmt:t=>t+" B", aLabel:"95.7M edges", bLabel:"983M edges", valFmt:v=>v.toFixed(1)+" B",
+    gainFmt:r=>{ const p=(r.b-r.a)/r.a*100; return (p<0?"−":"+")+Math.abs(p).toFixed(0)+"%"; }});
+  table("tb-bpe", ["Measure","95.7M edges","983M edges"], BPE.map(r=>[r.n+(r.d?` (${r.d})`:""), r.a.toFixed(1)+" B/edge", r.b.toFixed(1)+" B/edge"]));
+
+  hbars("ch-full", FULL, {aria:"Measured peak memory for the full graph, with machine limits", hi:130, ticks:[0,20,40,60,80,100,120], tickFmt:t=>t, LW:170, RW:62, rowH:30, refs:REFS,
+    valFmt:r=>r.v.toFixed(1)+" GB",
+    tipRows:r=>[{l:"measured", v:fmtGB(r.v)},{l:"round-3 estimate", v:r.est+" GB"},{l:"64 GB", v:r.v<=60?"fits":"no"},{l:"Fargate 120 GB", v:r.v<=115?"fits":"no"}]});
+  table("tb-full", ["Workload","Measured peak","Round-3 estimate","32 GB","64 GB","Fargate 120 GB"], FULL.map(r=>[r.n+(r.d?` (${r.d})`:""), fmtGB(r.v), r.est+" GB", "no", r.v<=60?"yes":"no", r.v<=115?"yes":"no"]));
+
+  hbars("ch-fullsteps", FULLSTEPS, {aria:"Wall time per step on the full graph", hi:2000, ticks:[0,300,600,900,1200,1500,1800], tickFmt:t=>t+" s", LW:170, RW:120, rowH:28,
+    valFmt:r=>(r.v>=120 ? (r.v/60).toFixed(1)+" min" : r.v.toFixed(0)+" s")+" · "+r.c.toFixed(1)+" cores",
+    tipRows:r=>[{l:"wall time", v:fmtS(r.v)},{l:"cores busy", v:r.c.toFixed(1)+" of 16"},{l:"peak RSS", v:fmtGB(r.m)}].concat(r.res?[{l:"result", v:r.res}]:[])});
+  table("tb-fullsteps", ["Step","Wall","Cores busy","Peak RSS","Result"], FULLSTEPS.map(r=>[r.n+(r.d?` (${r.d})`:""), fmtS(r.v), r.c.toFixed(1), fmtGB(r.m), r.res]));
+
+  hbars("ch-build", BUILD, {aria:"Index build CPU by phase", hi:70, ticks:[0,10,20,30,40,50,60,70], tickFmt:t=>t+"%", LW:220, RW:48, rowH:26,
+    valFmt:r=>r.v.toFixed(1)+"%", tipRows:r=>[{l:"share of active CPU", v:r.v.toFixed(1)+"%"}]});
+  table("tb-build", ["Phase","Share of active samples"], BUILD.map(r=>[r.n, r.v.toFixed(1)+"%"]));
+
+  timeline("ch-lv", LV, {aria:"Louvain memory over time", xhi:14, yhi:7, yt:[0,1,2,3,4,5,6,7], xt:[0,2,4,6,8,10,12,14],
+    annots:[{x:0.75,y:0.944,t:"index loaded (0.9 GB)",anchor:"start"},{x:3.2,y:5.883,t:"peak 5.88 GB: working-graph build",anchor:"start"},{x:7.8,y:2.843,t:"2.84 GB: local moving, one thread",anchor:"middle"}]});
+  table("tb-lv", ["Time","Footprint"], LV.map(p=>[p[0]+" s", fmtGB(p[1])]));
+}
+render();
+let rt; window.addEventListener("resize", ()=>{ clearTimeout(rt); rt=setTimeout(render, 150); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+new MutationObserver(render).observe(document.documentElement, {attributes:true, attributeFilter:["data-theme"]});
+</script>
+
+</body>
+</html>

@@ -18,7 +18,7 @@
 #                    deploys or spends anything.
 #   AWS_REGION       default us-east-1
 #   BENCH_STACK      default ursa-bluesky-bench
-#   URSA_VERSION     default 0.9.0 (push, and the run's image tag)
+#   URSA_VERSION     default 0.10.0 (push, and the run's image tag)
 #   BENCH_RUN_ID     run: the results folder name (default: a UTC timestamp + version)
 #   BENCH_STARTED_BY run: the task's startedBy tag (default bench-cloud)
 set -euo pipefail
@@ -34,7 +34,7 @@ fi
 export AWS_REGION=${AWS_REGION:-us-east-1}
 export AWS_PAGER=""
 STACK=${BENCH_STACK:-ursa-bluesky-bench}
-URSA_VERSION=${URSA_VERSION:-0.9.0}
+URSA_VERSION=${URSA_VERSION:-0.10.0}
 
 die() { echo "bench-cloud: $*" >&2; exit 1; }
 say() { echo "bench-cloud: $*" >&2; }

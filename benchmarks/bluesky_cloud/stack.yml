@@ -45,7 +45,7 @@ Parameters:
       the users, and ~41 GB of stored index.
   ImageTag:
     Type: String
-    Default: ursa-0.9.0
+    Default: ursa-0.10.0
     Description: The image tag the task definition starts with (the workflow registers new revisions).
   AzIdA:
     Type: String

@@ -5,13 +5,13 @@
 # SHA-256, so the image tests exactly what users install. Build it for the
 # machine it runs on: linux/arm64 for Graviton (the default in README.md).
 #
-#   docker build --build-arg URSA_VERSION=0.9.0 -t ursa-bluesky-bench .
+#   docker build --build-arg URSA_VERSION=0.10.0 -t ursa-bluesky-bench .
 #   docker run --rm ursa-bluesky-bench --help
 #
 # Debian 12's glibc is 2.36; the prebuilt Linux binaries need 2.35 or later.
 FROM debian:bookworm-slim
 
-ARG URSA_VERSION=0.9.0
+ARG URSA_VERSION=0.10.0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-boto3 \

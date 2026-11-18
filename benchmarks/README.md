@@ -1,4 +1,25 @@
-# Ursa benchmarks — the flywheel
+# Ursa benchmarks
+
+Everything here measures Ursa: speed, memory, scale and correctness, against itself over time and against other graph libraries. Pick the harness by the question:
+
+| Question | Harness | Where it runs | Docs |
+|---|---|---|---|
+| How does the SQL engine do on a real, large graph, and is it still correct? | **Bluesky benchmark** (`bluesky_cloud/`): the released `ursa` binary on the 2.42B-edge Bluesky follows graph, 29 steps, 23 correctness checks | laptop (a 95.7M-edge cut), EC2, Fargate, GitHub Actions | [`bluesky_cloud/README.md`](bluesky_cloud/README.md) |
+| How does Ursa compare with igraph, rustworkx and NetworkX at scale, and SQL with the DataFrame API? | **Cross-library comparison** (`compare/`, #378): five engines × six algorithms on Bluesky cuts of 5.1M to 2.4B edges, results checked against `ursa-sql` | laptop, EC2 | [`compare/README.md`](compare/README.md) |
+| Same question, on small synthetic graphs, with leaderboards and gap lists? | **The flywheel** (`ursa_bench/`): the Python API against NetworkX, rustworkx, igraph, up to ~1M edges | laptop, CI smoke | below |
+| Did a change to the Rust kernels make them faster or slower? | **Criterion** (`ursa-core/benches/`) | laptop, weekly CI (`bench.yml`) | [below](#kernel-micro-benchmarks-criterion) |
+| Did a change to the plan layer (Python API) cost anything? | **Plan matrix** (`plan_matrix/`): two builds of Ursa, A/B | laptop | [below](#plan-layer-matrix-plan_matrix) |
+| How does the `ursa` binary scale on synthetic graphs (1M–20M edges, string ids, weights, isolated vertices, GRAPH_TABLE)? | **SQL scale** (`sql_scale/`) | laptop | [below](#sql-scale-test-sql_scale) |
+
+The plan that ties these together (metrics, tiers, cadence, and the current baseline) is [`SQL_PERFORMANCE.md`](SQL_PERFORMANCE.md).
+
+**Results.**
+- **Rendered reports are committed; raw rows are not.** That includes [`reports/ursa-sql-benchmark.html`](reports/ursa-sql-benchmark.html) (open it in a browser), `bluesky_cloud/reports/*.md`, and `compare/results/*.md`.
+- Raw `results.json` files stay in each run's output folder and in the AWS bucket.
+
+**AWS.** The Bluesky and comparison runs share one CloudFormation stack (`bluesky_cloud/stack.yml`): a private bucket with the data, ECR, ECS/Fargate, and an EC2 role. It costs nothing while idle. Every command checks it is signed in to the account you name (`BENCH_ACCOUNT`), and every long run should have a time budget. See [`bluesky_cloud/README.md`](bluesky_cloud/README.md#aws).
+
+## The flywheel (`ursa_bench/`)
 
 A cross-library graph-benchmark harness built as an **iterative flywheel**: every
 run mechanically emits a to-do list — **perf gaps** ("X is 8× slower than
