@@ -387,10 +387,12 @@ def _scalar_columns(n: int) -> None:
 
 @pytest.mark.parametrize("build", [_filters, _graph_columns, _scalar_columns])
 def test_a_step_validates_in_time_independent_of_the_chain_before_it(build):
-    # 4x the steps in well under 4x^2 the time: a step's validation reads its
-    # input's, not the whole chain (or every column) again.
+    # 4x the steps in well under 4x^2 = 16x the time: a step's validation reads
+    # its input's, not the whole chain (or every column) again. Linear work is
+    # about 4x; 8x leaves room for a shared CI runner's noise (6x failed at
+    # 6.4x on macOS) while still catching quadratic work.
     small, large = _best_times(build, (200, 800))
-    assert large < 6 * small, (small, large)
+    assert large < 8 * small, (small, large)
 
 
 def test_a_frame_joined_with_itself_validates_in_linear_time():
