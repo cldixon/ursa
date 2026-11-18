@@ -1410,6 +1410,40 @@ mod tests {
         assert_eq!(in_mode("csv", "SELECT 1 AS a WHERE false;").await, "a\n");
     }
 
+    /// N43: a string inside a nested value is quoted where it needs it, so
+    /// different values have different text, in CSV, TSV and the table.
+    #[tokio::test]
+    async fn strings_inside_nested_values_are_quoted() {
+        let sql = "SELECT ['a, b', 'c'] AS l1, ['a', 'b', 'c'] AS l2, \
+                   ['x]', NULL, 'NULL'] AS l3, {'k': 'v, w'} AS s;";
+        assert_eq!(
+            in_mode("csv", sql).await,
+            "l1,l2,l3,s\n\"['a, b', c]\",\"[a, b, c]\",\"['x]', NULL, 'NULL']\",\"{k: 'v, w'}\"\n"
+        );
+        assert_eq!(
+            in_mode("tsv", sql).await,
+            "l1\tl2\tl3\ts\n['a, b', c]\t[a, b, c]\t['x]', NULL, 'NULL']\t{k: 'v, w'}\n"
+        );
+        // A quote in a string is escaped with a backslash; CSV then quotes
+        // the field and doubles a double quote, as it does for any field.
+        assert_eq!(
+            in_mode("csv", "SELECT ['it''s', 'say \"hi\"'] AS q;").await,
+            "q\n\"['it\\'s', 'say \"\"hi\"\"']\"\n"
+        );
+        // A map's string keys and values.
+        assert_eq!(
+            in_mode("csv", "SELECT map(['a, b', 'c'], ['x', 'y: z']) AS m;").await,
+            "m\n\"{'a, b': x, c: 'y: z'}\"\n"
+        );
+        // The table writes the same text.
+        let table = in_mode("table", sql).await;
+        assert!(table.contains("['a, b', c]"), "{table}");
+        assert!(table.contains("['x]', NULL, 'NULL']"), "{table}");
+        assert!(table.contains("{k: 'v, w'}"), "{table}");
+        // A string at the top is not quoted.
+        assert_eq!(in_mode("csv", "SELECT 'a, b' AS t;").await, "t\n\"a, b\"\n");
+    }
+
     /// N36: in CSV and TSV a null is an empty field and `''` is `""`.
     #[tokio::test]
     async fn csv_tells_null_from_the_empty_string() {

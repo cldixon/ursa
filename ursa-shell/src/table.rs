@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow::util::display::FormatOptions;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// How many rows a table shows by default, as in DuckDB.
@@ -131,7 +131,7 @@ impl Rows {
                 let formatters = batch
                     .columns()
                     .iter()
-                    .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
+                    .map(|c| crate::text::formatter(c.as_ref(), options))
                     .collect::<Result<Vec<_>, _>>()?;
                 // `logical_nulls`, not `is_null`: a column of type Null (an
                 // untyped `SELECT NULL`) has no null buffer, yet is all null.

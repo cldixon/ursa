@@ -63,7 +63,22 @@
 //! selector is `ANY SHORTEST` or `ALL SHORTEST` and the path is not an
 //! undirected `TRAIL`: a shortest walk between two nodes repeats no node, and
 //! one back to its start is a cycle. Otherwise the search lists every path
-//! the mode allows, up to [`MAX_PATHS`].
+//! the mode allows.
+//!
+//! ## The limit
+//!
+//! A search stops with an error once it holds more paths than
+//! `ursa.max_paths` (default [`MAX_PATHS`]; 0 for no limit). What counts
+//! depends on what the search can hold (#384, N50):
+//!
+//! - A pruned search with `ANY SHORTEST` or `SHORTEST k` holds at most `k`
+//!   prefixes per (node, edges so far up to `min`), so its memory is bounded
+//!   by the graph's nodes. It counts the paths it keeps (for `ANY SHORTEST`,
+//!   one per pair of first and last node: the destinations), never fewer
+//!   than `k` per node of the graph, so one start is never refused what
+//!   `hop` would list.
+//! - Every other search counts the prefixes it holds and the paths it keeps:
+//!   a walk's prefixes can grow exponentially with its length.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -106,7 +121,8 @@ pub const FUNCTIONS: &[(&str, &str)] = &[
     ("element_id", ELEMENTS),
 ];
 
-/// The most paths one search lists before it stops with an error.
+/// The default `ursa.max_paths`: the most paths one search holds before it
+/// stops with an error (see the module docs).
 pub const MAX_PATHS: usize = 10_000_000;
 
 /// Rows per output batch.
@@ -708,6 +724,12 @@ struct Walker<'a> {
     next: Vec<(u32, u32)>,
     /// Paths listed so far.
     total: usize,
+    /// The most prefixes and paths the search may hold (`ursa.max_paths`),
+    /// unless it is `bounded`.
+    cap: Option<usize>,
+    /// Whether the search's memory is bounded by the graph's nodes (see the
+    /// module docs): it counts only the paths it keeps.
+    bounded: bool,
     /// Prefixes extended so far.
     expanded: usize,
     /// The targets' slots, when a pruned search has targets: their paths are
@@ -810,14 +832,42 @@ impl Walker<'_> {
                     reach.unfilled -= 1;
                 }
             }
-            if self.entries.len() + self.total > MAX_PATHS {
-                return Err(DataFusionError::Execution(format!(
-                    "in GRAPH_TABLE: the path search reached {MAX_PATHS} paths; give the quantified edge a lower upper bound, or keep fewer paths with ANY SHORTEST"
-                )));
+            if let (false, Some(cap)) = (self.bounded, self.cap) {
+                if self.entries.len() + self.total > cap {
+                    return Err(too_many_paths(cap, self.search, false));
+                }
             }
         }
         Ok(())
     }
+}
+
+/// The error of a search that reached `limit` paths, with the remedy that
+/// fits it: a search with a selector already keeps the fewest paths, so it
+/// is pointed to `hop` (a `bounded` one says it keeps one path per pair of
+/// nodes, or `k`); one without a selector to `ANY SHORTEST`. Either may
+/// raise `ursa.max_paths`.
+fn too_many_paths(limit: usize, search: &Search, bounded: bool) -> DataFusionError {
+    const RAISE: &str = "or SET ursa.max_paths to a higher limit (0 for none)";
+    const HOP: &str = "count the nodes at each distance with hop(…) \
+                       (SELECT distance, count(*) FROM hop(g, seeds => […], n => …) GROUP BY 1)";
+    let remedy = match search.selector {
+        Selector::All => format!(
+            "give the quantified edge a lower upper bound, keep fewer paths with ANY SHORTEST, \
+             {RAISE}"
+        ),
+        Selector::Shortest(1) if bounded => {
+            format!("ANY SHORTEST keeps one path per pair of nodes already; {HOP}, {RAISE}")
+        }
+        Selector::Shortest(k) if bounded => {
+            format!("SHORTEST {k} keeps {k} paths per pair of nodes already; {HOP}, {RAISE}")
+        }
+        _ => format!("give the quantified edge a lower upper bound, {HOP}, {RAISE}"),
+    };
+    DataFusionError::Execution(format!(
+        "in GRAPH_TABLE: the path search reached {limit} paths, the limit ursa.max_paths sets; \
+         {remedy}"
+    ))
 }
 
 /// Run `search` from each of `starts` (keys of the graph's id type, each
@@ -827,6 +877,8 @@ impl Walker<'_> {
 /// `targets`, only the paths that end at one are kept, and a search with a
 /// selector stops once every target has its paths (see the module docs).
 /// With `known_only`, a start that is no node of the index has no path.
+/// `max_paths` is `ursa.max_paths` (`None` for no limit; see the module
+/// docs).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     topology: &Topology,
@@ -838,6 +890,7 @@ pub fn run(
     known_only: bool,
     columns: PathColumns,
     schema: SchemaRef,
+    max_paths: Option<usize>,
 ) -> Result<(Vec<RecordBatch>, usize)> {
     let dense = ids
         .dense_from_array(starts.as_ref())
@@ -852,6 +905,15 @@ pub fn run(
             Selector::Shortest(1) | Selector::AllShortest
         ) && min <= 1
             && !(search.mode == Mode::Trail && search.direction == Direction::Any));
+    // At most `k` prefixes per state: memory bounded by the nodes, and at
+    // most `k` paths per node from one start.
+    let bounded = pruned && matches!(search.selector, Selector::Shortest(_));
+    let kept_limit = match (bounded, max_paths, search.selector) {
+        (true, Some(cap), Selector::Shortest(k)) => {
+            Some(cap.max(topology.n_nodes().saturating_mul(k as usize)))
+        }
+        _ => None,
+    };
     let mut walker = Walker {
         topology,
         search,
@@ -861,6 +923,8 @@ pub fn run(
         entries: Vec::new(),
         next: Vec::new(),
         total: 0,
+        cap: max_paths,
+        bounded,
         expanded: 0,
         slots: goals.as_ref().map(|g| &g.slots),
         reach: Reach::default(),
@@ -967,6 +1031,9 @@ pub fn run(
                     edges.reverse();
                     rows.push(row, &nodes, &edges)?;
                     walker.total += 1;
+                    if let Some(limit) = kept_limit.filter(|&l| walker.total > l) {
+                        return Err(too_many_paths(limit, search, true));
+                    }
                     if let Some(slot) = slot {
                         let f = &mut found[slot as usize];
                         if f.0 == 0 {
@@ -1077,6 +1144,7 @@ mod tests {
             false,
             columns,
             schema,
+            Some(MAX_PATHS),
         )
         .unwrap();
         let mut out = Vec::new();
