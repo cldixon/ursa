@@ -313,6 +313,35 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: a stored graph index is memory-mapped, not read whole** (#382).
+  Loading one read the whole file on one core, so at full scale (2.42B
+  edges, an 18.6 GiB index) every query in a new process paid 15 s, even a
+  `hop` that touches a few thousand edges. Now the index file is mapped
+  (Linux, macOS): a traversal or path search reads only the adjacency lists
+  it visits, and an algorithm over the whole graph reads the file at the file
+  cache's speed, on all cores. On a 250M-edge graph (a 1.9 GiB index), a
+  1-step `hop` in a new process takes 0.16 s (was 6.6 s) and 0.2 GB of
+  memory (was 2.4 GB); `degree` 0.33 s (was 6.7 s); PageRank 2.8 s (was
+  18 s). Results and node numbering are unchanged. On Windows, which cannot
+  replace a mapped file, the index is read whole as before, but on all
+  cores.
+  - **Index file format version 3.** The layout is version 2's (raw
+    little-endian arrays at 64-byte-aligned offsets); each section now has
+    its own CRC-32 in the section table, and the trailer's CRC covers the
+    header, key and table. Loading checks those and the per-node sections
+    (offsets, node ids) at once; the edge arrays' CRCs are checked, in
+    parallel, before a whole-graph algorithm runs, and a mismatch drops the
+    stored index and builds it again, with a notice. A traversal relies on the
+    checked offsets and the kernels' bounds checks instead.
+  - **Indexes stored by 0.10 keep loading** (read whole and checked, as
+    before), and the first writer to load one rewrites it as version 3, with
+    a notice (`rewriting the stored index for g in club.ursa (…) in the
+    current format: …`). Version 1 files are still built again.
+  - A stored index is still never changed in place (a new one is renamed
+    over it, an eviction removes it, a chunk is only appended), so a process
+    keeps reading the index it mapped while another process replaces it.
+    Mapped pages count in a process's RSS once read, as shared, reclaimable
+    file cache.
 - **Weak and strong connected components run in parallel, with the same
   labels** (#383). Both kernels ran on about one core (63 s and 82 s on the
   full Bluesky graph, on 16 cores). Weak components now find, per thread and

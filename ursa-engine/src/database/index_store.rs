@@ -34,7 +34,13 @@
 //! **Lookup** ([`IndexStore::load`]) uses an entry only if its full key
 //! matches, file identities included, and the file reads back whole; a file
 //! that does not (truncated, corrupt, another version) is a miss, and a
-//! writer drops its entry. A hit updates `last_used`.
+//! writer drops its entry. A hit updates `last_used`. A file is
+//! memory-mapped where it can be, and the CRCs of its edge arrays are
+//! checked only before a whole-graph algorithm reads them (`super::mapped`):
+//! one found damaged then is dropped the same way (a read-only store only
+//! stops using it), and the index built again. A file 0.10 wrote (format
+//! version 2) is read whole, and a writer rewrites it in the current format,
+//! with a notice.
 //!
 //! **The limit** is the session's `ursa.index_storage_limit` in effect: what
 //! it `SET`, or the database's default, a share of the free space on its disk
@@ -280,6 +286,11 @@ struct State {
     /// a running query holds is not evicted (see `in_use`), and chunks built
     /// since are appended to its file (see [`IndexStore::flush`]).
     live: HashMap<String, Live>,
+    /// Index files found damaged after they loaded (a checksum checked late,
+    /// see `super::mapped`), by file and main part: not loaded again by this
+    /// process, which builds the index instead, even when the store is
+    /// read-only and cannot remove them.
+    damaged: HashSet<(String, MainPart)>,
 }
 
 /// An index this process loaded or stored, and what its file holds.
@@ -429,7 +440,11 @@ impl IndexStore {
     /// The stored index for `key`, if there is one whose full key matches
     /// and whose file reads back whole, and the size of its file. Blocking:
     /// it reads the file.
-    pub fn load(&self, key: &IndexKey, notifier: &Notifier) -> Option<(Arc<GraphIndex>, u64)> {
+    pub fn load(
+        self: &Arc<Self>,
+        key: &IndexKey,
+        notifier: &Notifier,
+    ) -> Option<(Arc<GraphIndex>, u64)> {
         let entry = if self.writable {
             self.use_notifier(notifier);
             let mut state = self.state();
@@ -444,7 +459,9 @@ impl IndexStore {
         let read = index_file::read_file(&self.dir.join(&file), key);
         let mut state = self.state();
         match read {
+            Ok(stored) if state.damaged.contains(&(file.clone(), stored.main)) => None,
             Ok(stored) => {
+                let has_incoming = stored.chunks.iter().any(|c| c.kind == CHUNK_INCOMING);
                 let chunks = stored
                     .chunks
                     .iter()
@@ -461,6 +478,16 @@ impl IndexStore {
                     .collect();
                 let (path, main) = (self.dir.join(&file), stored.main);
                 let n_edges = stored.topology.n_edges();
+                if let Some(checks) = &stored.unverified {
+                    // A checksum found not to match drops the file, so the
+                    // index is built again.
+                    let (store, file) = (Arc::downgrade(self), file.clone());
+                    checks.on_damage(Box::new(move || {
+                        if let Some(store) = store.upgrade() {
+                            store.discard(&file, main);
+                        }
+                    }));
+                }
                 let read = Box::new(move |key: &str| {
                     let chunk = weights.iter().find(|c| c.name == key.as_bytes())?;
                     index_file::read_weights(&path, main, chunk, n_edges).ok()
@@ -468,7 +495,8 @@ impl IndexStore {
                 let index = Arc::new(
                     GraphIndex::new(Arc::new(stored.topology), Arc::new(stored.ids))
                         .with_dropped(stored.dropped.n_dropped, stored.dropped.kept)
-                        .with_stored_weights(keys, read),
+                        .with_stored_weights(keys, read)
+                        .with_unverified(stored.unverified),
                 );
                 state.live.insert(
                     file.clone(),
@@ -487,6 +515,10 @@ impl IndexStore {
                         let _ = write_manifest(&self.dir, &state.entries);
                     }
                 }
+                drop(state);
+                if stored.version == index_file::VERSION_2 && self.writable {
+                    self.upgrade(key, &index, &entry.graph, has_incoming, notifier);
+                }
                 Some((index, entry.size))
             }
             Err(_) => {
@@ -500,6 +532,64 @@ impl IndexStore {
                 }
                 None
             }
+        }
+    }
+
+    /// Store again, in the current format, `index`, just read from a file
+    /// written by 0.10 (format version 2), so later processes map it instead
+    /// of reading it whole. Its in-adjacency, if the file has one, is read
+    /// first, to be stored with it; weights stored with it are evaluated
+    /// again when next needed.
+    fn upgrade(
+        self: &Arc<Self>,
+        key: &IndexKey,
+        index: &Arc<GraphIndex>,
+        graph: &str,
+        has_incoming: bool,
+        notifier: &Notifier,
+    ) {
+        if has_incoming {
+            index.topology.incoming();
+        }
+        let saved = self.save(key.clone(), Arc::clone(index), graph, notifier);
+        notifier.say(NoticeLevel::On, || match saved {
+            Saved::Stored { size, .. } => format!(
+                "rewriting the stored index for {graph} in {} ({}) in the current format: an \
+                 older version of ursa stored it, and it is read whole until it is rewritten",
+                self.database,
+                notices::size(size)
+            ),
+            _ => format!(
+                "an older version of ursa stored the index for {graph} in {}; it is read whole \
+                 until it can be rewritten in the current format, and was {}",
+                self.database,
+                saved.describe(&self.database)
+            ),
+        });
+    }
+
+    /// Drop the entry and file of `file`, whose main part is `main`, found
+    /// damaged after it was loaded (a checksum checked late, see
+    /// `super::mapped`): the index is built again when next needed. A
+    /// read-only store, or a file replaced since, is left as it is; this
+    /// process does not load that main part again either way.
+    fn discard(&self, file: &str, main: MainPart) {
+        let mut state = self.state();
+        state.damaged.insert((file.to_string(), main));
+        if !self.writable {
+            return;
+        }
+        self.ensure_loaded(&mut state);
+        if state.live.get(file).is_some_and(|live| live.main != main) {
+            return;
+        }
+        let before = state.entries.len();
+        state.entries.retain(|e| e.file != file);
+        state.live.remove(file);
+        if state.entries.len() != before {
+            let _ = write_manifest(&self.dir, &state.entries);
+            drop(state);
+            let _ = std::fs::remove_file(self.dir.join(file));
         }
     }
 

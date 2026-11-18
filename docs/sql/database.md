@@ -79,6 +79,10 @@ An index is stored under a key made from two things: the plan that produces the 
 
 Some algorithms, such as PageRank, in-degree and anything with `direction => 'both'`, also need the reverse of the index: each node's incoming edges. The first query that builds it adds it to the stored index when the database closes. A later process reads it from disk only when an algorithm asks for it, so a query that does not need it does not pay to load it.
 
+Loading a stored index does not read all of it. On Linux and macOS the file is memory-mapped: a query that follows the edges of a few nodes, such as `hop`, `shortest_path` or a `MATCH` from a bound node, reads only those parts of the file, so it answers in a fraction of a second in a new process however large the graph. An algorithm over the whole graph, such as PageRank, reads all of it, from the operating system's file cache when the file is there, and checks the file's checksums before it runs. A file found damaged then is dropped and the index built again, with a notice. On Windows the file is read whole when it is loaded, on all cores. Mapped pages count toward a process's memory as the operating system's file cache: they are shared between processes reading the same index, and released under memory pressure.
+
+Indexes stored by ursa 0.10 use an older file format. They still load, read whole, and the first writer to load one rewrites it in the current format, with a notice.
+
 Evaluated weights are stored with the index too, one set per weight expression, when the database closes. A later weighted query with the same expression over the same files reads them instead of reading the edges again. A changed expression or source file never uses stored weights: it reads the edges and evaluates them afresh. Stored weights count toward the storage limit, and they are evicted with their index.
 
 Edges that are not read from files, such as an in-memory table, have no stable key. Their index is built once per session and not stored.
