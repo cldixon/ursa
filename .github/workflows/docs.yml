@@ -7,7 +7,7 @@ name: Docs
 # https://ursa.cldixon.dev), so a broken page or link fails the check. It does
 # not deploy: site/README.md has the deploy steps.
 #
-# Four jobs, with `site` above. `build` runs on every pull request that touches the docs and on every
+# Five jobs, with `site` and `sql-examples` (the SQL in the docs pages) above. `build` runs on every pull request that touches the docs and on every
 # push to main, in strict mode, so a broken link or a page missing from the nav
 # fails the check instead of shipping. `examples` runs the code in the docs pages
 # and the README. `deploy` runs only on main, after a successful build, and
@@ -99,6 +99,26 @@ jobs:
       # astro build checks every link between docs pages
       # (starlight-links-validator) and fails on a broken one.
       - run: bun run build
+
+  # ci.yml skips changes that touch only docs or Markdown, so this job runs the
+  # SQL on every page under docs/sql/ and site/src/content/docs/, and checks
+  # both copies of the function reference against ursa_functions()
+  # (ursa-cli/tests/docs.rs). A change to code and docs runs it in ci.yml too.
+  sql-examples:
+    name: SQL examples (docs/sql, site)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml, as in ci.yml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the SQL in the docs
+        run: cargo test --locked -p ursa-cli --test docs
 
   examples:
     name: Examples (docs pages, README)

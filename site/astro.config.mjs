@@ -32,6 +32,10 @@ export default defineConfig({
 				defaultProps: { frame: "code" },
 				styleOverrides: {
 					borderRadius: "0.5rem",
+					// The page's own warm greys (docs.css: --sl-color-gray-6 dark,
+					// --sl-color-gray-7 light), not GitHub's cooler backgrounds.
+					codeBackground: ({ theme }) => (theme.type === "dark" ? "#1c1c19" : "#f8f7f4"),
+					borderColor: ({ theme }) => (theme.type === "dark" ? "#34332f" : "#dcd9d2"),
 					codeFontFamily: "var(--ursa-font-mono)",
 					codeFontSize: "0.86rem",
 					codeLineHeight: "1.55",
@@ -43,6 +47,8 @@ export default defineConfig({
 				Header: "./src/components/DocsHeader.astro",
 				SiteTitle: "./src/components/SiteTitle.astro",
 				MobileMenuFooter: "./src/components/MobileMenuFooter.astro",
+				// One-click light/dark toggle in place of the Auto/Light/Dark select.
+				ThemeSelect: "./src/components/ThemeToggle.astro",
 			},
 			sidebar: [
 				{
@@ -110,7 +116,7 @@ export default defineConfig({
 							collapsed: true,
 							items: [
 								{ label: "Function reference", slug: "docs/reference/functions" },
-								{ label: "Changelog", link: "https://github.com/cldixon/ursa/blob/main/CHANGELOG.md" },
+								{ label: "Changelog", slug: "docs/changelog" },
 								{ label: "Python library", link: "https://cldixon.github.io/ursa/" },
 							],
 						},

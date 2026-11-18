@@ -26,6 +26,8 @@ site/dist/
 site/.astro/
 site/.wrangler/
 site/.cloudflare/
+# Generated from CHANGELOG.md by site/scripts/changelog.ts at build time.
+site/src/content/docs/docs/changelog.md
 
 # Credentials.
 .env

@@ -3,10 +3,11 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "astro dev",
-    "build": "astro build",
+    "dev": "bun scripts/changelog.ts && astro dev",
+    "build": "bun scripts/changelog.ts && astro build",
     "preview": "astro preview",
-    "deploy": "bun run build && cf deploy"
+    "deploy": "bun run build && cf deploy",
+    "changelog": "bun scripts/changelog.ts"
   },
   "dependencies": {
     "@astrojs/starlight": "0.43.1",
