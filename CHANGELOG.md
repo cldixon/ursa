@@ -295,6 +295,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   7.28 → 5.57 GB); the building step itself fell from about 5.5 GB to about
   2.4 GB, and the peak is now aggregating the first level. `cargo run
   --release -p ursa-core --example louvain_memory` measures it.
+- **Louvain aggregates its first level in less memory** (#359). Collapsing
+  each community into a super-node ran while the level-0 graph was held, and
+  grew its output in per-block vectors that were then concatenated. It now
+  counts each community's neighbouring communities first and writes the
+  aggregated graph straight into arrays of its exact size. And when every
+  weight is a whole number (any unweighted run, or integer weights), each
+  node's edges are first collapsed in place to one entry per neighbouring
+  community and the level-0 arrays shrunk, before the aggregated graph is
+  allocated: every sum there is exact, so the regrouping changes no bit.
+  Results are unchanged, bit for bit. On an R-MAT graph of 100M edges
+  (4.3M nodes), Louvain's peak heap went from 3,704 MB to 2,594 MB
+  unweighted and from 4,928 MB to 3,757 MB weighted, and peak RSS from 4.13
+  to 3.42 GB and from 5.50 to 5.36 GB, at the same speed. (Much of the old
+  vectors' slack was never written, so it was never resident: RSS falls
+  less than the heap.) Unweighted, the peak is now local moving on the
+  level-0 graph; weighted with inexact weights, it is still the first
+  aggregation, now holding just the level-0 and level-1 graphs.
 - **SQL: `hop` returns `(seed, id, distance)`** (breaking, #328). It
   returned `(src, dst)`, but its rows are nodes reached from a seed, not
   edges: `seed` is the seed, `id` a node reached and `distance` (Int64) the
