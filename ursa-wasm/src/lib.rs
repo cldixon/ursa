@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::writer::StreamWriter;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow::util::display::FormatOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::SessionContext;
@@ -297,7 +297,7 @@ fn describe(
             let formatters = batch
                 .columns()
                 .iter()
-                .map(|c| ArrayFormatter::try_new(c.as_ref(), options))
+                .map(|c| ursa_shell::text::formatter(c.as_ref(), options))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             // `logical_nulls`: a column of type Null has no null buffer.
             let nulls: Vec<_> = batch.columns().iter().map(|c| c.logical_nulls()).collect();
@@ -432,5 +432,23 @@ mod tests {
         let options: FormatOptions<'_> = (&config).try_into().unwrap();
         let shown = describe("", &stored, 10, &options).unwrap();
         assert_eq!(shown["rows"][0][0], Value::Null);
+    }
+
+    /// N43: the export and the rows shown quote strings inside nested values
+    /// as the CLI does.
+    #[tokio::test]
+    async fn quotes_strings_inside_nested_values_as_the_cli_does() {
+        let (ctx, mut results) =
+            session_with("SELECT ['a, b', 'c'] AS l, ['x]', NULL, 'NULL'] AS m").await;
+        let stored = results.remove(0).1;
+        let csv = String::from_utf8(encode(&stored, "csv").unwrap()).unwrap();
+        assert_eq!(csv, "l,m\n\"['a, b', c]\",\"['x]', NULL, 'NULL']\"\n");
+        let config = ctx.state().config().options().format.clone();
+        let options: FormatOptions<'_> = (&config).try_into().unwrap();
+        let shown = describe("", &stored, 10, &options).unwrap();
+        assert_eq!(
+            shown["rows"][0],
+            json!(["['a, b', c]", "['x]', NULL, 'NULL']"])
+        );
     }
 }

@@ -133,9 +133,7 @@ const SHOW_LIMIT: &str = "SHOW ursa.index_storage_limit";
 
 /// The row `SHOW ursa.index_storage_limit` gives for `limit`, SET.
 fn limit_row(limit: &str) -> [String; 1] {
-    [format!(
-        "ursa.index_storage_limit,{limit} (SET for this session)"
-    )]
+    [format!("ursa.index_storage_limit,{limit}")]
 }
 
 /// Whether `rows` (of `SHOW ursa.index_storage_limit`) show the database's
@@ -143,10 +141,7 @@ fn limit_row(limit: &str) -> [String; 1] {
 fn shows_the_default(ctx: &SessionContext, rows: &[String]) -> bool {
     let db = ursa_engine::database::database(&ctx.state()).unwrap();
     let default = ursa_engine::options::ByteSize(db.default_index_storage_limit().bytes);
-    rows.len() == 1
-        && rows[0].starts_with(&format!(
-            "ursa.index_storage_limit,{default} (the default: "
-        ))
+    rows.len() == 1 && rows[0].starts_with(&format!("ursa.index_storage_limit,{default}"))
 }
 
 const QUERY: &str =
@@ -765,42 +760,67 @@ async fn a_filtered_build_says_the_rows_it_reads() {
 }
 
 /// N38: `EXPLAIN` marks a path search whose index the session holds, in
-/// memory or stored, since its edge and vertex scans then do not run (#351).
+/// memory or stored, since its edge and vertex scans then do not run (#351);
+/// and it no longer draws them under the node, but counts them on its line
+/// (#384, N48).
 #[tokio::test(flavor = "multi_thread")]
 async fn explain_marks_a_path_search_over_a_held_index() {
     let fixture = Fixture::new(1_000).await;
     const PATHS: &str = "FROM GRAPH_TABLE (g
         MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b) COLUMNS (b.id))";
+    // The PathSearchExec line, and the lines of its subtree.
     let explain = |ctx: &SessionContext| {
         let ctx = ctx.clone();
         async move {
             let lines = ok(&ctx, &format!("EXPLAIN {PATHS}")).await;
-            lines
+            let lines: Vec<String> = lines
                 .iter()
                 .flat_map(|l| l.lines())
-                .find(|l| l.contains("PathSearchExec"))
-                .unwrap_or_else(|| panic!("no PathSearchExec in {lines:?}"))
-                .to_string()
+                .map(str::to_string)
+                .collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("PathSearchExec"))
+                .unwrap_or_else(|| panic!("no PathSearchExec in {lines:?}"));
+            let depth = |l: &str| l.len() - l.trim_start().len();
+            let below: Vec<String> = lines[at + 1..]
+                .iter()
+                .take_while(|l| depth(l) > depth(&lines[at]))
+                .cloned()
+                .collect();
+            (lines[at].clone(), below)
         }
     };
+    // The scans of the edge file under the node.
+    let edge_scans = |below: &[String]| {
+        below
+            .iter()
+            .filter(|l| l.contains("DataSourceExec") && l.contains("edges.parquet"))
+            .count()
+    };
     let ctx = open(&fixture.db()).await;
-    // Not built yet: the sources are read.
-    let line = explain(&ctx).await;
+    // Not built yet: the sources are read, and drawn.
+    let (line, below) = explain(&ctx).await;
     assert!(!line.contains("index="), "{line}");
+    let scans = edge_scans(&below);
+    assert!(scans > 0, "{below:#?}");
     ok(&ctx, PATHS).await;
-    let line = explain(&ctx).await;
+    let (line, below) = explain(&ctx).await;
     assert!(
-        line.ends_with(", index=cached (sources not read)"),
+        line.ends_with(", index=cached, sources: 1 file, not read"),
         "{line}"
     );
+    // One scan fewer: the edges' (the start nodes' scan is still read).
+    assert_eq!(edge_scans(&below), scans - 1, "{below:#?}");
     close(ctx);
     // A later session holds it stored, and loads it without reading them.
     let ctx = open(&fixture.db()).await;
-    let line = explain(&ctx).await;
+    let (line, below) = explain(&ctx).await;
     assert!(
-        line.ends_with(", index=stored (sources not read)"),
+        line.ends_with(", index=stored, sources: 1 file, not read"),
         "{line}"
     );
+    assert_eq!(edge_scans(&below), scans - 1, "{below:#?}");
     ok(&ctx, PATHS).await;
     assert_eq!(counts(&ctx), (0, 1));
     close(ctx);
@@ -1072,4 +1092,60 @@ async fn traversals_use_a_stored_index() {
     let second = open(&fixture.db()).await;
     assert_eq!((ok(&second, hop).await, ok(&second, path).await), expected);
     assert_eq!(counts(&second), (0, 1));
+}
+
+/// N47 (#381): the reverse adjacency, appended to a stored index when the
+/// database closes, is said at 'all', and at 'on' when it brings the stored
+/// indexes close to the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn storing_the_reverse_adjacency_is_said() {
+    let size = ursa_engine::notices::size;
+    let stored = |fixture: &Fixture, before: u64, after: u64| {
+        format!(
+            "stored the reverse adjacency of g in {} (+{}, {} in all)",
+            fixture.db().display(),
+            size(after - before),
+            size(after)
+        )
+    };
+    let fixture = Fixture::new(20_000).await;
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "all").await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    ursa_engine::database::flush(&ctx.state());
+    let before = read_manifest(&fixture.index_dir())[0].size;
+    taken(&said);
+    ok(&ctx, "SELECT count(*) FROM pagerank(g)").await;
+    ursa_engine::database::flush(&ctx.state());
+    let after = read_manifest(&fixture.index_dir())[0].size;
+    assert!(after > before);
+    assert_eq!(taken(&said), [stored(&fixture, before, after)]);
+    close(ctx);
+
+    // At 'on', only when it brings them close to the limit.
+    for (limit, heard) in [(after * 100, false), (after + after / 20, true)] {
+        let fixture = Fixture::new(20_000).await;
+        let ctx = open(&fixture.db()).await;
+        let said = notices(&ctx, "on").await;
+        ok(&ctx, &format!("SET ursa.index_storage_limit = {limit}")).await;
+        ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+        ursa_engine::database::flush(&ctx.state());
+        ok(&ctx, "SELECT count(*) FROM pagerank(g)").await;
+        ursa_engine::database::flush(&ctx.state());
+        let lines = taken(&said);
+        if heard {
+            assert_eq!(
+                lines,
+                [format!(
+                    "{}; the stored indexes now take {} of ursa.index_storage_limit ({})",
+                    stored(&fixture, before, after),
+                    size(after),
+                    ursa_engine::options::ByteSize(limit)
+                )]
+            );
+        } else {
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+        close(ctx);
+    }
 }

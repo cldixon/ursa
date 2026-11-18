@@ -921,6 +921,169 @@ for (const scheme of ["light", "dark"] as const) {
   check(!(await graphOpen(g)), "a dataset closes the graph view");
   await gctx.close();
 }
+// SIZE BY and COLOR BY (#389): Karate's two factions in two colours, in each
+// theme, read back from the view's pixels (the view draws in the theme's own
+// colours: no CSS inversion), a theme switch with the pane open, the legend,
+// NODES (…), and each error said plainly. And the status line (#390), from
+// Enter to Done.
+/** Statuses the pane's header showed, in order, since the last call. */
+const statuses = (p: Page): Promise<string[]> =>
+  p.evaluate(() => {
+    const w = window as any;
+    const seen: string[] = w.__statuses ?? [];
+    w.__statuses = [];
+    if (!w.__statusObserver) {
+      const el = document.getElementById("graph-status")!;
+      w.__statusObserver = new MutationObserver(() => w.__statuses.push(el.textContent));
+      w.__statusObserver.observe(el, { childList: true, characterData: true, subtree: true });
+    }
+    return seen;
+  });
+/** The palette colours drawn: how many of each (8 hues, then other) cover more than `min` pixels. */
+const huesDrawn = async (p: Page, min = 40) => {
+  const inked: any = await p.evaluate(() => (window as any).ursaShell.graphInked());
+  return { inked, hues: (inked?.palette ?? []).filter((n: number) => n > min).length };
+};
+/** The legend as text: what sizes the nodes, what colours them, then each colour's name and count. */
+const legendText = (p: Page) =>
+  p.evaluate(() => {
+    const legend = document.getElementById("graph-legend")!;
+    if (legend.hidden) return "";
+    return [...legend.querySelectorAll(".size, .color-head, li")].map((e) => e.textContent!.replace(/\s+/g, " ").trim()).join(" ");
+  });
+for (const scheme of ["light", "dark"] as const) {
+  const sctx = await watchedContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: scheme });
+  const s = await sctx.newPage();
+  await s.goto(`${base}/?dataset=karate`);
+  await ready(s);
+  await idle(s);
+  await s.click("#terminal");
+  await statuses(s);
+  if (scheme === "light") {
+    for (const [args, says] of [
+      ["karate SIZE BY nope", "SIZE BY nope: graph 'karate' has no vertex column or algorithm named 'nope'. Its vertex columns are"],
+      ["karate COLOR BY wcc", "the algorithms are degree, pagerank"],
+      ["karate SIZE BY club", "SIZE BY club needs numbers, and club is text; colour nodes by it instead: COLOR BY club"],
+      ["karate COLOR BY pagerank", "distinct values over 34 nodes are too many categories to tell apart by colour. A measure is better shown by size: SIZE BY pagerank"],
+      ["karate COLOR BY id", "COLOR BY id: 34 distinct values over 34 nodes are too many categories to tell apart by colour. Colour by a column with fewer values, or size nodes by this one: SIZE BY id"],
+      ["karate COLOR BY name", "COLOR BY name: graph 'karate' has no vertex column or algorithm named 'name'. Its vertex columns are club, id;"],
+      ["SELECT src, dst FROM ties SIZE BY pagerank", "SIZE BY pagerank runs pagerank() on a property graph, and this draws rows"],
+      ["SELECT src, dst FROM ties COLOR BY club", "no column named 'club'. Rows drawn as edges are sized or coloured by degree, or by a column of NODES"],
+      ["karate SIZE BY", "SIZE BY needs a numeric column or an algorithm"],
+      ["karate SIZE BY pagerank SIZE BY degree", "SIZE BY is given twice"],
+      ["karate NODES (SELECT id, 1 AS one FROM members)", "NODES (…) gives values for SIZE BY or COLOR BY to use"],
+      ["karate NODES (SELECT id FROM members) SIZE BY id", "NODES (…) needs two columns or more"],
+    ]) {
+      await type(`.graph ${args}`, s);
+      const out = await after(`.graph ${args}`, s);
+      // Compared without spaces: the terminal wraps long lines.
+      const squeezed = (t: string) => t.replace(/\s+/g, "");
+      check(out.startsWith("Error: ") && squeezed(out).includes(squeezed(says)) && !(await graphOpen(s)), `.graph ${args}: a clear error`, out.split("\n").slice(0, 3).join(" "));
+    }
+  }
+
+  // Sized by PageRank, coloured by Louvain: run through algorithms(karate, …).
+  await statuses(s);
+  await type(".graph karate SIZE BY pagerank COLOR BY louvain", s);
+  check((await after(".graph karate SIZE BY", s)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), `${scheme}: .graph karate SIZE BY pagerank COLOR BY louvain draws`, (await after(".graph karate SIZE BY", s)).split("\n")[0]);
+  await graphSettled(s);
+  const seen = await statuses(s);
+  const loading = seen.findIndex((t) => t.startsWith("Loading graph view…"));
+  const laying = seen.findIndex((t) => / · Laying out · level \d+ of \d+$/.test(t));
+  const done = seen.findIndex((t) => t === "34 nodes · 78 edges · Done");
+  check(laying >= 0 && done > laying && (loading < 0 || loading < laying), `${scheme}: the status shows the layout's progress, then Done`, JSON.stringify(seen));
+  const legend = await legendText(s);
+  check(/^size: pagerank 0\.\d+–0\.\d+ colour: louvain (\S+ \(\d+\) ?){2,8}$/.test(legend), `${scheme}: the legend names what sizes and colours the nodes`, legend);
+  const counts = [...legend.matchAll(/\((\d+)\)/g)].reduce((a, m) => a + Number(m[1]), 0);
+  check(counts === 34, `${scheme}: the legend counts every node`, `${counts}`);
+  const filter = await s.evaluate(() => getComputedStyle(document.querySelector("#graph-stage canvas")!).filter);
+  let drawn = await huesDrawn(s);
+  const bg = scheme === "light" ? [255, 255, 255] : [11, 11, 10];
+  check(drawn.hues >= 2 && filter === "none" && drawn.inked.corner.every((v: number, i: number) => Math.abs(v - bg[i]) <= 2), `${scheme}: two colours or more, in the theme's own palette, on its own ground (no inversion)`, `${JSON.stringify(drawn.inked.palette)}, corner ${drawn.inked.corner}, filter ${filter}`);
+  if (shots) {
+    await s.waitForTimeout(300);
+    await s.screenshot({ path: `${shots}/graph-styled-${scheme}.png` });
+    await s.locator("#graph-pane").screenshot({ path: `${shots}/graph-legend-${scheme}.png`, clip: undefined });
+  }
+
+  // The theme switched with the pane open: the view is drawn in the other's colours.
+  await s.click("#theme");
+  const other = scheme === "light" ? [11, 11, 10] : [255, 255, 255];
+  drawn = await huesDrawn(s);
+  check(drawn.hues >= 2 && drawn.inked.corner.every((v: number, i: number) => Math.abs(v - other[i]) <= 2), `${scheme}: switching the theme recolours the open view`, `${JSON.stringify(drawn.inked.palette)}, corner ${drawn.inked.corner}`);
+  if (shots) await s.screenshot({ path: `${shots}/graph-styled-${scheme}-switched.png` });
+  await s.click("#theme");
+
+  if (scheme === "light") {
+    // A vertex column, and degree; a click names the node's values.
+    await type(".graph karate SIZE BY degree COLOR BY club", s);
+    await graphSettled(s);
+    const clubs = await legendText(s);
+    check(/^size: degree 1–17 colour: club (Mr\. Hi|Officer) \(\d+\) (Mr\. Hi|Officer) \(\d+\)$/.test(clubs), "COLOR BY a vertex column, SIZE BY degree", clubs);
+    const box = (await s.locator("#graph-stage canvas").boundingBox())!;
+    const hit: { x: number; y: number } | null = await s.evaluate(([w, h]) => {
+      for (let y = 2; y < h; y += 2)
+        for (let x = 2; x < w; x += 2) if ((window as any).ursaShell.graphNodeAt(x * 2, y * 2) !== null) return { x, y };
+      return null;
+    }, [box.width, box.height]);
+    if (hit) await s.mouse.click(box.x + hit.x, box.y + hit.y);
+    const status = await s.locator("#graph-status").textContent();
+    check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\) · degree \d+ · club (Mr\. Hi|Officer)$/.test(status ?? ""), "a click names the node's size and colour values", status ?? "no node found");
+    await s.click("#terminal");
+
+    // NODES (…): values for a query's rows, joined on id.
+    // Karate's members are 0 to 33: the four past 29 have no values.
+    const nodes = ".graph SELECT src, dst FROM ties NODES (SELECT id, CASE WHEN club = 'Officer' THEN 'officer' END AS side, id * 2 AS twice FROM members WHERE id < 30) SIZE BY twice COLOR BY side";
+    await type(nodes, s);
+    const drew = (await after(".graph SELECT src, dst FROM ties NODES", s)).split("\n").find((l) => l.startsWith("Drawing")) ?? "";
+    check(drew === "Drawing 78 edges, 34 nodes (replacing the last drawing; Esc closes)", ".graph QUERY NODES (…) draws", drew);
+    await graphSettled(s);
+    const sides = await legendText(s);
+    check(/^size: twice 0–58 colour: side officer \(\d+\) no value \(\d+\)$/.test(sides), "NODES (…) columns size and colour a query's nodes", sides);
+    drawn = await huesDrawn(s, 10);
+    check(drawn.inked.palette[0] > 10 && drawn.inked.palette[8] > 10, "NODES (…): a category's colour, and other's grey for no value", JSON.stringify(drawn.inked.palette));
+    await s.keyboard.press("Escape");
+    check(!(await graphOpen(s)) && (await legendText(s)) === "", "Esc closes the pane and its legend");
+    check((await errors(s)) === 12, "no errors from styled drawings but the ones asked for", `${await errors(s)}`);
+  }
+  await sctx.close();
+}
+// A big graph says so at once (#390): rmat's million edges show a status
+// within a second of Enter, and the layout's levels before it is done.
+{
+  const rctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const r = await rctx.newPage();
+  await r.goto(`${base}/?dataset=rmat`);
+  await ready(r);
+  await idle(r);
+  await r.click("#terminal");
+  // Each status as it is set, and when: the page is too busy drawing a
+  // million edges (in software, headless) to be polled on time.
+  await r.evaluate(() => {
+    const w = window as any;
+    const el = document.getElementById("graph-status")!;
+    w.__timed = [];
+    new MutationObserver(() => w.__timed.push([performance.now(), el.textContent])).observe(el, { childList: true, characterData: true, subtree: true });
+  });
+  await r.keyboard.type(".graph rmat");
+  const enter: number = await r.evaluate(() => performance.now());
+  await r.keyboard.press("Enter");
+  await graphSettled(r);
+  const timed: [number, string][] = await r.evaluate(() => (window as any).__timed);
+  const first = timed[0];
+  const laying = timed.filter(([, t]) => / · Laying out · level \d+ of \d+$/.test(t)).map(([, t]) => t.match(/level (\d+) of (\d+)/)!.slice(1).map(Number));
+  const doneAt = timed.findIndex(([, t]) => t.endsWith(" · Done"));
+  const times = await r.evaluate(() => (window as any).ursaShell.graphTimings());
+  check(
+    first && first[0] - enter < 1_000 && first[1] === "Loading graph view…" && laying.length > 1 && laying[0][1] > 1 && doneAt > 0,
+    "a big graph: its status within a second, then its layout's levels, then Done",
+    `"${first?.[1]}" at ${Math.round((first?.[0] ?? 0) - enter)} ms; levels ${JSON.stringify(laying.slice(0, 3))}…; ms after Enter ${JSON.stringify(times)}`,
+  );
+  await r.keyboard.press("Escape");
+  check(!(await graphOpen(r)) && (await errors(r)) === 0, "a big graph's view closes");
+  await rctx.close();
+}
+
 // A phone: the pane goes under the terminal, which refits to its new height.
 {
   const pctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
