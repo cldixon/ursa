@@ -300,6 +300,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `index=cached`, for one already in the session) says that the edge and
   vertex scans drawn under it will not run, where the plan read as if the
   index were not used.
+- **SQL: `EXPLAIN` no longer draws the scans a held index skips** (#384,
+  N48). Under a path search whose index the session holds, the edge and
+  vertex scans are now counted on its line rather than drawn as its
+  children: `PathSearchExec: graph=g, search=…, index=stored, sources: 2
+  files, not read`. A path search over an index not held, and `EXPLAIN
+  ANALYZE`, are as before.
+- **SQL: `ANY SHORTEST` counts the paths it keeps, and the path limit is a
+  setting, `ursa.max_paths`** (#384, N50). A path search stopped at a fixed
+  10M paths, counting every partial path it held, and told an `ANY
+  SHORTEST` query to use `ANY SHORTEST`: from one well-followed Bluesky
+  account, the `{1,3}` histogram failed, where `hop` answers at once. Under
+  `ANY SHORTEST` (and `SHORTEST k`), whose search holds at most one (`k`)
+  partial path per node, the limit now counts the paths kept, never fewer
+  than one (`k`) per node of the graph, so one start node is never refused.
+  The limit is `SET ursa.max_paths = …` (default 10000000; 0 for none), and
+  the error names it, with the remedy that fits the query: a lower upper
+  bound or `ANY SHORTEST` without a selector, `hop(…)` with one.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,

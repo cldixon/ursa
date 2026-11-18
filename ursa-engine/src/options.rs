@@ -241,6 +241,12 @@ extensions_options! {
         /// indexes not stored or evicted), 'all' (every index build, load
         /// and store) or 'off'. Default on.
         pub notices: NoticeLevel, default = NoticeLevel::On
+        /// The most paths one GRAPH_TABLE path search holds before it stops
+        /// with an error; 0 for no limit. Under ANY SHORTEST (and SHORTEST
+        /// k) it counts the paths kept, never fewer than one (k) per node of
+        /// the graph; otherwise the paths and prefixes held. Default
+        /// 10000000.
+        pub max_paths: usize, default = crate::graph::path_search::MAX_PATHS
     }
 }
 
@@ -266,6 +272,16 @@ pub fn notice_level(config: &SessionConfig) -> NoticeLevel {
         .extensions
         .get::<UrsaOptions>()
         .map_or(NoticeLevel::default(), |o| o.notices)
+}
+
+/// The session's `ursa.max_paths`: `None` when it is 0, no limit.
+pub fn max_paths(config: &SessionConfig) -> Option<usize> {
+    let n = config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .map_or(crate::graph::path_search::MAX_PATHS, |o| o.max_paths);
+    (n > 0).then_some(n)
 }
 
 /// The session's `ursa.index_storage_limit`, if it was `SET`; `None` when it

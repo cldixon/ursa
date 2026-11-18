@@ -236,6 +236,13 @@ FROM GRAPH_TABLE (karate
 
 The bounds count edges, and a shortest path of at least one edge from a node back to itself is a cycle, as the SQL standard defines it. DuckPGQ leaves those out; `WHERE a.id <> b.id` does the same here.
 
+### How many paths
+
+A path search holds its paths in memory, and stops with an error once it holds more than `ursa.max_paths` (10,000,000 unless `SET`; `0` for no limit). The error names the setting and what to do:
+
+- Without a selector, a walk's paths grow fast with its length: give the quantified edge a lower upper bound, or keep fewer paths with `ANY SHORTEST`.
+- `ANY SHORTEST` keeps one path per first and last node, so its search holds at most one partial path per node. It counts the paths it keeps, and never refuses one start node's: from one node it may reach every node of the graph. From many start nodes it can still reach the limit; to count the nodes at each distance, [`hop`](/docs/graphs/traversals/#hop) answers without listing paths, or `SET ursa.max_paths` higher.
+
 ### How it runs
 
 A quantified edge is not a chain of joins. It is a breadth-first search on the graph's index, the one `hop` and `shortest_path` use, starting from the nodes that the first node's conditions keep. Its nodes are the vertex table's keys, as the algorithms' are: a node on no edge has its path of no edges (`{0,…}`), and an edge to or from a value that is no key is not followed, as a fixed-length edge's join leaves it out. A condition on the first node makes the search small. A quantified edge can sit between fixed ones, as in `(s:school)<-[:studyat]-(a)-[:knows]->{1,3}(b)`.
