@@ -153,6 +153,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - **Ursa Web Shell: a start hint.** Under the banner, one line points to the
   sample graphs: `Pick a sample graph from the Datasets menu, or type
   .dataset karate` (broken between words on a narrow screen).
+- **Ursa Web Shell: the Graph view.** `.graph` draws the last result as a
+  graph in a pane beside the terminal (under it on a phone), and so does
+  the new Graph button: each row is an edge from its `src` column to its
+  `dst` column, or else from its first column to its second, with ids of
+  any type. `.graph QUERY` draws a query's result and `.graph NAME` a
+  property graph (every edge table, and every vertex, edges or not) or a
+  table. The shell says what it draws, `Drawing 78 edges, 34 nodes (Esc
+  closes)`, and keeps the keys: queries can be typed while the graph shows,
+  and the terminal refits to its half. The drawing is `ursa-viz`'s (WebGPU,
+  or else WebGL2), its ForceAtlas2 layout converging live in a worker,
+  nodes sized by degree: drag or the arrow keys pan, the wheel or `+` and
+  `-` zoom, a double-click or `0` fits, and a click names a node. It is
+  ink on white by day and starlight by night. Esc or the close button
+  closes it; New and the Datasets menu do too. It is loaded on the first
+  `.graph` only (about 1 MB gzipped), and draws at most 2,000,000 edges.
+  `WebShell.graph(text)` gives the page the graph: node ids mapped to
+  dense indexes in the order they are first seen, with clear errors when
+  there is nothing to draw.
 - **`ursa`: shell fixes.**
   - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
     other nulls do; it was a blank cell. So does a dictionary's null value.

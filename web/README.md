@@ -6,7 +6,7 @@ terminal, as DuckDB's web shell is DuckDB's CLI: the shell (dot-commands, SQL a
 line at a time, DuckDB-style tables) is the `ursa-shell` crate, compiled into
 `ursa-wasm` as `WebShell` and run in a Web Worker; the page draws it with
 xterm.js. Around it is a bar laid out after DuckDB's web shell: New, Share,
-Import, a Datasets menu and a light/dark toggle. The engine reads Parquet and
+Import, Graph, a Datasets menu and a light/dark toggle. The engine reads Parquet and
 CSV over HTTP with range requests. The Worker here serves files and does no
 query work.
 
@@ -36,7 +36,8 @@ static assets and an R2 bucket.
     is a page on the graph SQL, whose forms the e2e test runs), and the page's
     own, which the shell lists in `.help` and hands back to the page:
     `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
-    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.history ?N?` and `.share`.
+    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME?`,
+    `.history ?N?` and `.share`.
   - **Datasets.** Picking one starts a fresh session and runs its commands at
     the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
     three queries that show the graph functions, `GRAPH_TABLE` patterns and
@@ -57,7 +58,28 @@ static assets and an R2 bucket.
     toggle picks one, which is remembered; the terminal's colours follow it.
     A click on a bar button hands the focus back to the terminal; pressed from
     the keyboard, the button keeps it. Under 640px the bar is one row: the
-    logo without its name, and under 420px icons for New, Share and Import.
+    logo without its name, and under 420px icons for New, Share, Import and
+    Graph.
+  - **The Graph view** (`public/graph.js`, `public/graph-worker.js`):
+    `.graph` (or the Graph button) draws the last result as a graph in a
+    pane beside the terminal, or under it under 640px; `.graph QUERY` draws a
+    query's and `.graph NAME` a property graph's (or a table's). The engine
+    makes the graph (`WebShell.graph`, the `graph` op of the worker): each
+    row an edge from its `src` to its `dst` column (in any case), else from
+    its first column to its second, the ids of any type numbered `0..n` in
+    the order they are first seen, at most 2,000,000 edges. `ursa-viz` draws
+    it (WebGPU, else WebGL2) with its ForceAtlas2 layout running in
+    `graph-worker.js`, nodes sized by degree. The view is ink on white; the
+    dark theme inverts the canvas in CSS and screens it onto the sky.
+    `graph.js` is imported on the first `.graph`, and it loads `ursa-viz`
+    (about 1 MB gzipped), so a session that draws nothing downloads neither.
+    The terminal keeps the focus and refits to its half (xterm's fit addon,
+    then the engine's width); Esc (in the terminal or the pane) or the
+    close button closes the pane, and New or a dataset does too. In the
+    pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
+    double-click or `0` fits, and a click on a node names it in the pane's
+    header. A lost WebGL context or GPU device, or a layout that stops,
+    closes the pane with an error in the terminal.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
   engine; everything else is a static asset. A path that does not decode is
@@ -69,6 +91,10 @@ static assets and an R2 bucket.
   `Referrer-Policy: no-referrer`. The page has no inline script: the theme is
   set before the first paint by `public/theme.js`.
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
+  `build.ts` also builds the graph view (`scripts/viz.ts`: `ursa-viz` with
+  its `web` feature and the `wasm-release` profile, then wasm-bindgen) into
+  `dist/viz/<hash>/`, a static asset of about 4 MB (1 MB gzipped) named by
+  a hash of its glue and `.wasm`; `dist/viz/viz.json` names the build.
   The build also copies the terminal's font, IBM Plex Mono (SIL OFL 1.1, from
   `@fontsource/ibm-plex-mono`), into `dist/fonts/`, so the page loads nothing
   from other hosts.
@@ -122,7 +148,11 @@ http://localhost:8788.
 at the prompt (one line, several, an error), every dot-command, a long table,
 downloads in each format, Import (with awkward file names), a shared link
 replayed in a fresh page (answered y and N, and a crafted one with escape
-sequences and `.export`), New, the theme toggle and history; the keyboard and
+sequences and `.export`), New, the theme toggle and history; the Graph view
+(`.graph` on a result, a query and a property graph, its errors, pixels drawn
+in both themes, a node picked, typing while it shows, Esc and the close
+button, the terminal refitting beside it and under it on a phone, the Graph
+button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
 phone checks: Tab out of the terminal, the menu's keys, the focus after a
 click, no mid-word wraps and a one-row bar at 320px, a 16px input, and the grey
 text's contrast; and the security headers, 404s for malformed and traversing
