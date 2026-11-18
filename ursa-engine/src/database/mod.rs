@@ -46,10 +46,12 @@ pub mod catalog_file;
 pub mod index_file;
 pub mod index_store;
 pub mod mapped;
+pub mod unavailable;
 
 pub use catalog_file::{CatalogFile, FORMAT, VERSION};
 pub use index_file::IndexKey;
 pub use index_store::IndexStore;
+pub use unavailable::{as_unavailable, check_available, UnavailableTable};
 
 /// How long a writer waits for another process to close the database.
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2);

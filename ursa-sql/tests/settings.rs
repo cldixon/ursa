@@ -50,9 +50,9 @@ async fn error(ctx: &SessionContext, sql: &str) -> String {
     user_message(&run(ctx, sql).await.expect_err(sql))
 }
 
-/// What SHOW says of `ursa.index_storage_limit` without a database.
-const AUTO: &str = "auto (the default: in a database, 25% of the free space on its disk; at \
-                    least 4GiB, at most 64GiB)";
+/// What SHOW says of `ursa.index_storage_limit` without a database: just the
+/// value, as for every other setting (#381).
+const AUTO: &str = "auto";
 
 #[tokio::test]
 async fn show_an_ursa_setting() {
@@ -74,11 +74,11 @@ async fn show_an_ursa_setting() {
             "SET ursa.index_storage_limit = '512MiB'; SHOW ursa.index_storage_limit"
         )
         .await,
-        ["ursa.index_storage_limit,512MiB (SET for this session)"]
+        ["ursa.index_storage_limit,512MiB"]
     );
     assert_eq!(
         rows(&ctx, "show URSA.Index_Storage_Limit").await,
-        ["ursa.index_storage_limit,512MiB (SET for this session)"]
+        ["ursa.index_storage_limit,512MiB"]
     );
     assert_eq!(
         rows(
@@ -86,7 +86,7 @@ async fn show_an_ursa_setting() {
             "SET ursa.index_storage_limit = 1048576; SHOW ursa.index_storage_limit"
         )
         .await,
-        ["ursa.index_storage_limit,1MiB (SET for this session)"]
+        ["ursa.index_storage_limit,1MiB"]
     );
     // RESET, or 'auto', is the default again.
     assert_eq!(
@@ -119,7 +119,17 @@ async fn show_an_ursa_setting() {
     assert_eq!(lines.len(), 1);
     assert!(
         lines[0].starts_with(
-            "ursa.index_storage_limit,1MiB (SET for this session),The most bytes of graph indexes"
+            "ursa.index_storage_limit,1MiB,SET for this session. The most bytes of graph indexes"
+        ),
+        "{lines:?}"
+    );
+    rows(&ctx, "RESET ursa.index_storage_limit").await;
+    let lines = rows(&ctx, "SHOW ursa.index_storage_limit VERBOSE").await;
+    assert!(
+        lines[0].starts_with(
+            "ursa.index_storage_limit,auto,the default: in a database, 25% of the free space on \
+             its disk, rounded down to a multiple of 4GiB, at least 4GiB, at most 64GiB. The \
+             most bytes"
         ),
         "{lines:?}"
     );
@@ -135,7 +145,7 @@ async fn unknown_ursa_settings_are_named() {
     );
     assert_eq!(
         error(&ctx, "SHOW ursa.colour").await,
-        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices"
+        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices, ursa.max_paths"
     );
     // DataFusion's own SHOW is unchanged.
     assert_eq!(
@@ -170,13 +180,12 @@ async fn show_all_lists_ursa_settings() {
     rows(&ctx, "SET ursa.index_storage_limit = '2GiB'").await;
     assert!(rows(&ctx, "SHOW ALL")
         .await
-        .contains(&"ursa.index_storage_limit,2GiB (SET for this session)".to_string()));
+        .contains(&"ursa.index_storage_limit,2GiB".to_string()));
     let (schema, verbose) = run(&ctx, "SHOW ALL VERBOSE").await.unwrap();
     assert_eq!(schema.fields().len(), 3);
-    assert!(verbose
-        .iter()
-        .any(|l| l
-            .starts_with("ursa.index_storage_limit,2GiB (SET for this session),The most bytes")));
+    assert!(verbose.iter().any(
+        |l| l.starts_with("ursa.index_storage_limit,2GiB,SET for this session. The most bytes")
+    ));
 }
 
 /// In a session with a database, SET lasts for the session and is never
@@ -195,19 +204,28 @@ async fn show_in_a_database_session() {
     let default = ursa_engine::database::database(&ctx.state())
         .unwrap()
         .default_index_storage_limit();
+    // The value is just the value (#381), a multiple of 4GiB.
+    assert_eq!(default.bytes % (4 << 30), 0);
     let shown = format!(
-        "ursa.index_storage_limit,{} (the default: ",
+        "ursa.index_storage_limit,{}",
         ursa_engine::options::ByteSize(default.bytes)
     );
     let limit = rows(&ctx, "SHOW ursa.index_storage_limit").await;
-    assert!(limit[0].starts_with(&shown), "{limit:?}");
+    assert_eq!(limit, std::slice::from_ref(&shown));
+    // Where it comes from is in the description.
+    let verbose = rows(&ctx, "SHOW ursa.index_storage_limit VERBOSE").await;
+    assert!(
+        verbose[0].starts_with(&format!("{shown},the default: ")),
+        "{verbose:?}"
+    );
     if default.free.is_some() {
         assert!(
-            limit[0].ends_with(&format!(
-                " free on the disk of {}; at least 4GiB, at most 64GiB)",
+            verbose[0].contains(&format!(
+                " free on the disk of {} when it was opened, rounded down to a multiple of \
+                 4GiB, at least 4GiB, at most 64GiB. The most bytes",
                 db.display()
             )),
-            "{limit:?}"
+            "{verbose:?}"
         );
     }
     assert!(rows(&ctx, "SHOW ALL").await.contains(&limit[0]));
@@ -217,7 +235,7 @@ async fn show_in_a_database_session() {
             "SET ursa.index_storage_limit = '8GiB'; SHOW ursa.index_storage_limit"
         )
         .await,
-        ["ursa.index_storage_limit,8GiB (SET for this session)"]
+        ["ursa.index_storage_limit,8GiB"]
     );
     rows(&ctx, "SET ursa.notices = 'off'").await;
     drop(ctx);

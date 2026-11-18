@@ -36,6 +36,20 @@ later, in a notebook widget or a native window through the same `View`.
   them: no interleaving on upload. Everything is a vertex or index buffer,
   never a storage buffer, because WebGL2 has none.
 
+## Colours
+
+`setTheme({background, edge, node, palette})` takes CSS hex colours, each
+optional: the background, the edges' ink (their opacity is `edgeAlpha` times
+its alpha), the nodes' colour when not coloured by category, and the
+categories' colours (`colorBy(categories)` gives category `c` the colour
+`palette[c % palette.length]`). The view keeps the categories, so a new theme
+recolours them. `setThemeNamed("light" | "dark")` takes the built-in ones
+(`Theme::light()`, `Theme::dark()`): ink on white, and light on near-black,
+with an eight-hue palette (`PALETTE`, `DARK_PALETTE`: blue, orange, aqua,
+yellow, magenta, green, violet, red) stepped for each, adjacent hues apart
+under each kind of colour-vision deficiency. The shell's Graph view passes
+its page's `--graph-*` tokens.
+
 ## How it lays out
 
 Coarse to fine (`ursa-core`'s `Fa2Multilevel`), as sfdp and OpenOrd do it:
@@ -77,7 +91,9 @@ the same bits as `layout_fa2`.
 In the browser it runs in a **Web Worker** (`Layout`), which posts the
 positions after each batch of about 100 ms (transferred, not copied), so a
 slow iteration never holds up a frame: the page draws at the display's rate
-whatever the layout costs.
+whatever the layout costs. `Layout`'s `level` and `levels` say how far it
+is: coarse to fine counts `level` down from `levels - 1` to 0, the graph
+itself.
 
 ## Measured
 
@@ -164,6 +180,4 @@ bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONL
   rejected ("A valid external Instance reference no longer exists"), though
   plain WebGPU reads back there. To check on real hardware, and with wgpu 30,
   which needs wasm-bindgen 0.2.127 or later (the workspace is on 0.2.126).
-- **The shell's Graph view:** results with `src`/`dst` columns, sized and
-  coloured by their other columns.
 - **The DataFrame API:** a notebook widget over the same view.

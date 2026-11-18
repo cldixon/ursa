@@ -374,3 +374,121 @@ async fn refusals() {
         assert_contains(&err(&ctx, sql).await, expected);
     }
 }
+
+/// A complete graph on 50 nodes: 2,450 edges, every pair both ways.
+async fn complete() -> SessionContext {
+    let ctx = ursa_engine::new_session();
+    ok(
+        &ctx,
+        "CREATE VIEW e AS SELECT a.x AS s, b.x AS d
+           FROM generate_series(0, 49) a(x), generate_series(0, 49) b(x) WHERE a.x <> b.x;
+         CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
+    )
+    .await;
+    ctx
+}
+
+/// `ursa.max_paths` limits a path search, names itself in the error, and
+/// each error names the remedy that fits the query (#384, N50).
+#[tokio::test]
+async fn max_paths_limits_a_search_with_the_right_remedy() {
+    let ctx = complete().await;
+    assert_eq!(
+        rows(&ctx, "SHOW ursa.max_paths").await,
+        ["ursa.max_paths|10000000"]
+    );
+    const WALKS: &str =
+        "SELECT count(*) FROM GRAPH_TABLE (g MATCH (a)-[e]->{1,2}(b) COLUMNS (b.id AS b))";
+    // 2,450 paths of one edge, and 49 more of two from each.
+    assert_eq!(rows(&ctx, WALKS).await, ["122500"]);
+    ok(&ctx, "SET ursa.max_paths = 1000").await;
+    let message = err(&ctx, WALKS).await;
+    assert_contains(
+        &message,
+        "the path search reached 1000 paths, the limit ursa.max_paths sets",
+    );
+    assert_contains(&message, "keep fewer paths with ANY SHORTEST");
+    assert_contains(
+        &message,
+        "SET ursa.max_paths to a higher limit (0 for none)",
+    );
+
+    // ANY SHORTEST from every node keeps 2,500 paths (one back to the start
+    // too, in two edges), over the limit: the
+    // remedy is hop, not the selector the query already uses.
+    const SHORTEST: &str = "SELECT count(*) FROM GRAPH_TABLE (g
+        MATCH p = ANY SHORTEST (a)-[e]->{1,2}(b) COLUMNS (b.id AS b))";
+    let message = err(&ctx, SHORTEST).await;
+    assert_contains(
+        &message,
+        "ANY SHORTEST keeps one path per pair of nodes already",
+    );
+    assert_contains(&message, "hop(");
+    assert!(!message.contains("keep fewer paths"), "{message}");
+    // ALL SHORTEST holds every prefix: hop, or a lower bound.
+    let message = err(
+        &ctx,
+        "SELECT count(*) FROM GRAPH_TABLE (g
+           MATCH p = ALL SHORTEST (a)-[e]->{1,2}(b) COLUMNS (b.id AS b))",
+    )
+    .await;
+    assert_contains(&message, "lower upper bound");
+    assert_contains(&message, "hop(");
+    assert!(!message.contains("keep fewer paths"), "{message}");
+
+    // ANY SHORTEST from one node keeps one path per node at most, and the
+    // limit never refuses those: a limit of 10 lets its 50 through.
+    ok(&ctx, "SET ursa.max_paths = 10").await;
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT count(*) FROM GRAPH_TABLE (g
+               MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->{1,2}(b) COLUMNS (b.id AS b))"
+        )
+        .await,
+        ["50"]
+    );
+
+    // 0 is no limit.
+    ok(&ctx, "SET ursa.max_paths = 0").await;
+    assert_eq!(rows(&ctx, WALKS).await, ["122500"]);
+    assert_eq!(rows(&ctx, SHORTEST).await, ["2500"]);
+    ok(&ctx, "RESET ursa.max_paths").await;
+    assert_eq!(
+        rows(&ctx, "SHOW ursa.max_paths").await,
+        ["ursa.max_paths|10000000"]
+    );
+}
+
+/// N50's repro: ANY SHORTEST from one node reaches 12,004,000 nodes within
+/// two edges, more than the default limit of paths, and keeps one path to
+/// each, as hop counts them (#384).
+#[tokio::test(flavor = "multi_thread")]
+async fn any_shortest_counts_destinations_not_paths() {
+    let ctx = ursa_engine::new_session();
+    ok(
+        &ctx,
+        "CREATE VIEW e AS SELECT 0 AS s, x AS d FROM generate_series(1, 4000) t(x)
+           UNION ALL SELECT x AS s, 1000000 + x * 4000 + y AS d
+           FROM generate_series(1, 4000) a(x), generate_series(1, 3000) b(y);
+         CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (s) DESTINATION KEY (d))",
+    )
+    .await;
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT count(*) FROM GRAPH_TABLE (g
+               MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->{1,2}(b) COLUMNS (b.id AS b))"
+        )
+        .await,
+        ["12004000"]
+    );
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT distance, count(*) FROM hop(g, seeds => [0], n => 2) GROUP BY 1 ORDER BY 1"
+        )
+        .await,
+        ["1|4000", "2|12000000"]
+    );
+}

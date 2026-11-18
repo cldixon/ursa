@@ -153,6 +153,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - **Ursa Web Shell: a start hint.** Under the banner, one line points to the
   sample graphs: `Pick a sample graph from the Datasets menu, or type
   .dataset karate` (broken between words on a narrow screen).
+- **Ursa Web Shell: the browser e2e suite runs in CI** (#392). The "Ursa
+  Shell (browser e2e)" job builds the engine and the page, stages the sample
+  datasets locally, serves them as the Worker does and runs `web/tests/e2e.ts`
+  in headless Chromium, on pull requests that touch the shell or the crates
+  in it; screenshots and logs are uploaded when it fails.
 - **Ursa Web Shell: the Graph view.** `.graph` draws the last result as a
   graph in a pane beside the terminal (under it on a phone), and so does
   the new Graph button: each row is an edge from its `src` column to its
@@ -171,6 +176,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WebShell.graph(text)` gives the page the graph: node ids mapped to
   dense indexes in the order they are first seen, with clear errors when
   there is nothing to draw.
+- **Ursa Web Shell: sizes, colours and a legend for the Graph view**
+  (#389). `.graph [SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
+  `.graph karate SIZE BY pagerank COLOR BY louvain` sizes nodes by PageRank
+  and colours them by Louvain community. x and y name a column of `NODES
+  (SELECT id, … FROM …)`, a vertex column of the property graph, `degree`,
+  or a per-node algorithm, run on the graph with defaults through
+  `algorithms(G, …)` and joined on id. A query or the last result takes
+  `NODES` and `degree` only. Errors say what fits: an unknown name lists the
+  graph's columns and the algorithms, `SIZE BY` text suggests `COLOR BY`,
+  and too many categories suggests `SIZE BY`. `COLOR BY` colours the eight
+  largest categories and draws the rest as "other"; the pane's legend names
+  what sizes the nodes and each colour's category and count. The engine does
+  it all (`WebShell.graph` returns `size`, `color` and the legend; with no
+  clause, the graph as before).
+- **Ursa Web Shell: the Graph view in each theme's own colours.** The view
+  draws on the theme's background with its own edge ink and a categorical
+  palette stepped for white and for the dark sky, so the CSS inversion is
+  gone; switching the theme recolours an open view. `ursa-viz` has
+  `setTheme({background, edge, node, palette})` and a `Theme` in Rust, and
+  its `Layout` a `levels` getter.
+- **Ursa Web Shell: the Graph view says how far it is, and draws sooner**
+  (#390). The pane shows "Loading graph view…" within a moment of Enter,
+  then "Laying out · level k of n", then the counts and "Done". `ursa-viz`
+  and the layout worker start loading while the engine runs the query, the
+  layout gets the graph before the view is built, and nothing is drawn
+  before its first positions: `.graph rmat` (1M edges) first draws 0.95 s
+  after Enter in headless Chromium, from 4.6 s, and finishes its layout at
+  6.0 s, from 12.1 s.
 - **`ursa`: shell fixes.**
   - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
     other nulls do; it was a blank cell. So does a dictionary's null value.
@@ -292,6 +325,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     keeps reading the index it mapped while another process replaces it.
     Mapped pages count in a process's RSS once read, as shared, reclaimable
     file cache.
+- **SQL: a database always opens** (#381, N44). A catalog statement that
+  fails when the database opens, such as a view over a data file that was
+  moved, renamed or deleted, or a database copied without its files, no
+  longer makes the database unopenable (`cannot open m.ursa: statement 1 of
+  its catalog failed`), with every statement, `DROP` included, failing the
+  same way. The object it defines is unavailable instead, and one notice
+  says why: `ursa: view v is unavailable: no file found at '…/t.csv'; DROP
+  VIEW v or restore the file`. Everything else works, in a writable or a
+  read-only open; `SHOW TABLES` and `.tables` still list it, and using it
+  fails with that message, as a broken view does in DuckDB. A view or graph
+  that uses an unavailable object is unavailable too, with its own notice.
+  `DROP` (with or without `IF EXISTS`) and `CREATE OR REPLACE` repair it.
+  Its statement stays in the catalog as it was, so restoring the file and
+  opening the database again brings it back.
+- **SQL: `SHOW ursa.index_storage_limit` shows just the value** (behaviour
+  change, #381, N46), `21GiB` or `8GiB`, like every other setting, not
+  `21GiB (the default: …)`. Where it comes from starts its description,
+  which `SHOW ursa.index_storage_limit VERBOSE` and `SHOW ALL VERBOSE` show.
+  The default limit is rounded down to a multiple of 4 GiB (it was a whole
+  GiB), so it no longer moves between runs as the free space changes a
+  little.
+- **SQL: storing an index's reverse adjacency is said** (#381, N47). When
+  the database closes and appends the reverse adjacency (or evaluated
+  weights) to a stored index, `ursa.notices = 'all'` says `stored the
+  reverse adjacency of g in club.ursa (+1.0 GiB, 2.3 GiB in all)`, and
+  `'on'` says it too when it brings the stored indexes to 90% of
+  `ursa.index_storage_limit` or more. A chunk that cannot be written is
+  said at `'on'`.
 - **`ursa`: JSON and NDJSON write `null` for a null** (behaviour change,
   #350). Every row object has every column, in column order, as DuckDB
   writes them: `SELECT NULL AS a, '' AS b` is `[{"a":null,"b":""}]`, which
@@ -301,6 +362,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   #350), as DuckDB does, so it can be told from a null, which is still an
   empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
   browser shell's CSV export does the same.
+- **`ursa`: a string inside a list, struct or map is quoted in its text**
+  (behaviour change, #386), as in DuckDB, so different values print
+  differently in CSV, TSV and the table: `['a, b', 'c']` is `['a, b', c]`
+  and `['a', 'b', 'c']` is `[a, b, c]`, which both were `[a, b, c]`, and
+  `['x]', NULL, 'NULL']` is `['x]', NULL, 'NULL']`, which was
+  `[x], NULL, NULL]`. A string is quoted when it is empty, is `NULL` in any
+  case, starts or ends with whitespace, or holds any of
+  `' " \ , : = [ ] { } ( )`; a `'` or `\` in it is escaped with `\`. Struct
+  field names and map keys follow the same rule, and a null inside a nested
+  value is `NULL` in the table too. The browser shell's table and CSV export
+  do the same. JSON stays the lossless format for nested results.
 - **SQL: an index build decodes its source's partitions in parallel**
   (#351, N30). The build read its edge plan one partition at a time to keep
   the order that numbers the nodes, so a filtered view over a large Parquet
@@ -329,6 +401,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `index=cached`, for one already in the session) says that the edge and
   vertex scans drawn under it will not run, where the plan read as if the
   index were not used.
+- **SQL: `EXPLAIN` no longer draws the scans a held index skips** (#384,
+  N48). Under a path search whose index the session holds, the edge and
+  vertex scans are now counted on its line rather than drawn as its
+  children: `PathSearchExec: graph=g, search=…, index=stored, sources: 2
+  files, not read`. A path search over an index not held, and `EXPLAIN
+  ANALYZE`, are as before.
+- **SQL: `ANY SHORTEST` counts the paths it keeps, and the path limit is a
+  setting, `ursa.max_paths`** (#384, N50). A path search stopped at a fixed
+  10M paths, counting every partial path it held, and told an `ANY
+  SHORTEST` query to use `ANY SHORTEST`: from one well-followed Bluesky
+  account, the `{1,3}` histogram failed, where `hop` answers at once. Under
+  `ANY SHORTEST` (and `SHORTEST k`), whose search holds at most one (`k`)
+  partial path per node, the limit now counts the paths kept, never fewer
+  than one (`k`) per node of the graph, so one start node is never refused.
+  The limit is `SET ursa.max_paths = …` (default 10000000; 0 for none), and
+  the error names it, with the remedy that fits the query: a lower upper
+  bound or `ANY SHORTEST` without a selector, `hop(…)` with one.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,

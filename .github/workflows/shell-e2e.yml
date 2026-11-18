@@ -1,0 +1,184 @@
+name: Ursa Shell e2e
+
+# The Ursa Web Shell end to end (#392): build the engine and the page, stage the
+# sample datasets locally, serve them with the Worker's security headers
+# (web/scripts/preview.ts) and run web/tests/e2e.ts in headless Chromium. No
+# Cloudflare credentials: nothing here touches the account.
+#
+# Runs when the page, the crates compiled into it, or the datasets' inputs
+# change: web/, ursa-wasm and ursa-shell (the engine), ursa-viz (the graph
+# view), the engine crates under them, the workspace's Cargo files and
+# toolchain (profiles, versions), the bundled CSVs and the R-MAT generator.
+on:
+  pull_request:
+    paths:
+      - "web/**"
+      - "ursa-wasm/**"
+      - "ursa-shell/**"
+      - "ursa-viz/**"
+      - "ursa-core/**"
+      - "ursa-io/**"
+      - "ursa-engine/**"
+      - "ursa-sql/**"
+      - "ursa-plan/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "python/ursa/datasets/data/**"
+      - "benchmarks/sql_scale/gen.py"
+      - ".github/workflows/shell-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "ursa-wasm/**"
+      - "ursa-shell/**"
+      - "ursa-viz/**"
+      - "ursa-core/**"
+      - "ursa-io/**"
+      - "ursa-engine/**"
+      - "ursa-sql/**"
+      - "ursa-plan/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "python/ursa/datasets/data/**"
+      - "benchmarks/sql_scale/gen.py"
+      - ".github/workflows/shell-e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The playwright package; `playwright install` fetches the Chromium build
+  # this version drives, so the two always match.
+  PLAYWRIGHT_VERSION: "1.63.0"
+  PORT: "8788"
+
+jobs:
+  e2e:
+    name: Ursa Shell (browser e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        # bash -eo pipefail, so the tee'd e2e run fails the step.
+        shell: bash
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Dependencies only: rust-cache drops the workspace's own crates (cargo
+      # would rebuild them anyway, checkout gives them new mtimes).
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read the wasm-bindgen version from Cargo.lock
+        id: wb
+        working-directory: .
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # wasm-bindgen-cli must match the wasm-bindgen crate exactly.
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install the page's dependencies
+        run: bun install --frozen-lockfile
+
+      # Not a dependency of the page, so not in package.json: added here, as
+      # the Browser (wasm32 parity) job does, at a pinned version.
+      - name: Install Playwright and Chromium
+        run: |
+          bun add --no-save "playwright@$PLAYWRIGHT_VERSION"
+          bunx playwright install --with-deps chromium
+
+      # The engine (ursa-wasm, wasm-release: fat LTO, the slow part) depends on
+      # the engine crates and the Cargo files only, so a PR that changes only
+      # the page reuses the last build of the same sources.
+      - name: Restore the engine build
+        id: engine
+        uses: actions/cache/restore@v4
+        with:
+          path: web/.engine
+          key: shell-engine-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock', 'ursa-core/**', 'ursa-io/**', 'ursa-engine/**', 'ursa-sql/**', 'ursa-shell/**', 'ursa-wasm/**', 'web/scripts/engine.ts', 'web/scripts/common.ts') }}
+
+      - name: Build the engine
+        if: steps.engine.outputs.cache-hit != 'true'
+        run: bun run engine
+
+      - name: Save the engine build
+        if: steps.engine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: web/.engine
+          key: ${{ steps.engine.outputs.cache-primary-key }}
+
+      # dist/, with the graph view (ursa-viz, built by scripts/viz.ts).
+      - name: Build the page
+        run: bun run build
+
+      # The datasets: the bundled CSVs, their Parquet (written by the native
+      # ursa binary) and a seeded 1M-edge R-MAT (benchmarks/sql_scale/gen.py,
+      # with uv). `--dry` stages them in .data/ and uploads nothing. Keyed by
+      # their inputs; a miss builds ursa-cli --release, several minutes.
+      - name: Restore the datasets
+        id: data
+        uses: actions/cache/restore@v4
+        with:
+          path: web/.data
+          key: shell-data-${{ runner.os }}-${{ hashFiles('python/ursa/datasets/data/**', 'benchmarks/sql_scale/gen.py', 'web/scripts/upload-data.ts') }}
+
+      - name: Install uv
+        if: steps.data.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v6
+
+      - name: Stage the datasets
+        if: steps.data.outputs.cache-hit != 'true'
+        run: bun run upload:data -- --dry
+
+      - name: Save the datasets
+        if: steps.data.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: web/.data
+          key: ${{ steps.data.outputs.cache-primary-key }}
+
+      - name: Serve the shell
+        run: |
+          mkdir -p e2e-out
+          nohup bun scripts/preview.ts "$PORT" > e2e-out/preview.log 2>&1 &
+          for _ in $(seq 60); do
+            curl -sf -o /dev/null "http://localhost:$PORT/" && exit 0
+            sleep 1
+          done
+          echo "the preview server did not start"; cat e2e-out/preview.log; exit 1
+
+      - name: Run the e2e suite
+        run: bun run test:e2e "http://localhost:$PORT" e2e-out 2>&1 | tee e2e-out/e2e.log
+
+      - name: Upload screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-e2e
+          path: web/e2e-out/
+          if-no-files-found: ignore
+          retention-days: 14

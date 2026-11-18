@@ -29,6 +29,7 @@ use super::schema::{graph_table, lookup_table, GraphSchema, EDGES, ID, NODES};
 use super::{
     registry, EdgeTable, FileTable, GraphRegistry, Label, Properties, PropertyGraph, VertexTable,
 };
+use crate::database::check_available;
 use crate::file_table::open_file_table;
 use crate::paths::looks_like_location;
 
@@ -103,6 +104,20 @@ pub async fn create_graph(
     }
     let state = ctx.state();
     let graphs = registry(&state);
+    if let Some(why) = graphs.unavailable(&spec.name) {
+        // The database's graph that could not be defined when it was opened
+        // exists: it is kept, or replaced.
+        if if_not_exists {
+            return Ok(());
+        }
+        if !or_replace {
+            return plan_err(format!(
+                "graph '{}' already exists ({why}); replace it with CREATE OR REPLACE \
+                 PROPERTY GRAPH",
+                spec.name
+            ));
+        }
+    }
     if graphs.get(&spec.name).is_some() {
         if if_not_exists {
             return Ok(());
@@ -153,6 +168,7 @@ pub async fn create_graph(
     let name = def.name.clone();
     let has_tables = def.default_pair().is_some();
     graphs.put_with_files(def, files);
+    graphs.clear_unavailable(&name);
     let catalog = default_catalog_inner(&state)?;
     let schema = match catalog.schema(&name) {
         Some(schema) => schema,
@@ -360,17 +376,24 @@ async fn session_table(
         return lookup_table(state, table).await;
     };
     let resolved = resolve(state, table);
-    match catalogs
+    let provider = match catalogs
         .catalog(&resolved.catalog)
         .and_then(|c| c.schema(&resolved.schema))
     {
-        Some(schema) => schema.table(&resolved.table).await,
-        None => Ok(None),
+        Some(schema) => schema.table(&resolved.table).await?,
+        None => None,
+    };
+    if let Some(provider) = &provider {
+        check_available(provider.as_ref())?;
     }
+    Ok(provider)
 }
 
 /// The error for a graph that does not exist, with a suggestion.
 pub fn unknown_graph(name: &str, graphs: &GraphRegistry) -> DataFusionError {
+    if let Some(why) = graphs.unavailable(name) {
+        return DataFusionError::Plan(why);
+    }
     let names = graphs.names();
     let hint = match closest_name(name, names.iter().map(String::as_str)) {
         Some(s) => format!("; did you mean '{s}'?"),
@@ -569,7 +592,7 @@ pub fn drop_graph(ctx: &SessionContext, name: &str, if_exists: bool) -> Result<(
     let state = ctx.state();
     let graphs = registry(&state);
     if graphs.remove(name).is_none() {
-        if if_exists {
+        if graphs.clear_unavailable(name) || if_exists {
             return Ok(());
         }
         return Err(unknown_graph(name, &graphs));
@@ -723,7 +746,10 @@ async fn find_table(
     table: &TableReference,
 ) -> Result<Arc<dyn TableProvider>> {
     match lookup_table(state, table).await? {
-        Some(provider) => Ok(provider),
+        Some(provider) => {
+            check_available(provider.as_ref())?;
+            Ok(provider)
+        }
         None => {
             let names = table_names(state).await;
             plan_err(format!(

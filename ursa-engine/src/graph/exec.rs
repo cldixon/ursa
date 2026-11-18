@@ -341,8 +341,11 @@ struct PathShape {
 /// has them), and searches paths from them (see [`super::path_search`]).
 /// `EXPLAIN ANALYZE` shows how many path prefixes it extended (`expanded`).
 /// When the session held the index as the node was planned, `EXPLAIN` says
-/// so (`index=stored (sources not read)`): its edge and vertex inputs are
-/// drawn, but do not run (#351).
+/// so (`index=stored, sources: 2 files, not read`, #351): once the plan is
+/// optimized, its edge and vertex inputs, which do not run, are no longer
+/// its children, so `EXPLAIN` does not draw them (#384, N48). They are kept,
+/// optimized, to build the index from should the session no longer hold it
+/// when the node runs.
 #[derive(Debug)]
 pub struct PathSearchExec {
     shape: PathShape,
@@ -351,6 +354,9 @@ pub struct PathSearchExec {
     targets: Option<Arc<dyn ExecutionPlan>>,
     /// Where the session kept the index when the node was planned.
     held: Option<IndexHeld>,
+    /// Whether the edge and vertex inputs are left out of the children: set
+    /// by [`CollapseHeldInputs`] when the index is `held`.
+    collapsed: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -374,8 +380,56 @@ impl PathSearchExec {
             starts,
             targets,
             held: None,
+            collapsed: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// This node with its edge and vertex inputs left out of its children.
+    fn collapse(&self) -> Self {
+        let mut exec = Self::new(
+            self.shape.clone(),
+            Arc::clone(&self.input),
+            Arc::clone(&self.starts),
+            self.targets.clone(),
+        );
+        exec.held = self.held;
+        exec.collapsed = true;
+        exec
+    }
+
+    /// What the index is built from, for `EXPLAIN`: `2 files`, `1 file and
+    /// 1 other source`.
+    fn sources(&self) -> String {
+        let mut files = Vec::new();
+        let mut others = 0usize;
+        let plans =
+            std::iter::once(&self.input).chain(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
+        for plan in plans {
+            let _ =
+                plan.apply(|node| {
+                    match node
+                        .downcast_ref::<DataSourceExec>()
+                        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                    {
+                        Some(config) => files.extend(config.file_groups.iter().flat_map(|g| {
+                            g.files().iter().map(|f| f.object_meta.location.clone())
+                        })),
+                        None if node.children().is_empty() => others += 1,
+                        None => {}
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                });
+        }
+        files.sort();
+        files.dedup();
+        let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        match (files.len(), others) {
+            (0, 0) => "none".to_string(),
+            (f, 0) => plural(f, "file"),
+            (0, o) => plural(o, "source"),
+            (f, o) => format!("{} and {}", plural(f, "file"), plural(o, "other source")),
         }
     }
 }
@@ -394,7 +448,7 @@ impl DisplayAs for PathSearchExec {
             }
         )?;
         if let Some(held) = self.held {
-            write!(f, ", index={held} (sources not read)")?;
+            write!(f, ", index={held}, sources: {}, not read", self.sources())?;
         }
         Ok(())
     }
@@ -410,8 +464,11 @@ impl ExecutionPlan for PathSearchExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        let mut children = vec![&self.input];
-        children.extend(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
+        let mut children = Vec::new();
+        if !self.collapsed {
+            children.push(&self.input);
+            children.extend(self.shape.edges.vertices.as_ref().map(|v| &v.plan));
+        }
         children.push(&self.starts);
         children.extend(self.targets.as_ref());
         children
@@ -444,16 +501,22 @@ impl ExecutionPlan for PathSearchExec {
             )));
         }
         let mut children = children.into_iter();
-        let input = children.next().expect("checked above");
         let mut shape = self.shape.clone();
-        shape.edges.vertices = shape.edges.vertices.map(|v| VertexInput {
-            plan: children.next().expect("checked above"),
-            ..v
-        });
+        let input = if self.collapsed {
+            Arc::clone(&self.input)
+        } else {
+            let input = children.next().expect("checked above");
+            shape.edges.vertices = shape.edges.vertices.map(|v| VertexInput {
+                plan: children.next().expect("checked above"),
+                ..v
+            });
+            input
+        };
         let starts = children.next().expect("checked above");
         let targets = self.targets.as_ref().and_then(|_| children.next());
         let mut exec = Self::new(shape, input, starts, targets);
         exec.held = self.held;
+        exec.collapsed = self.collapsed;
         Ok(Arc::new(exec))
     }
 
@@ -473,6 +536,7 @@ impl ExecutionPlan for PathSearchExec {
         let targets = self.targets.clone();
         let schema = Arc::clone(&shape.schema);
         let expanded = MetricBuilder::new(&self.metrics).counter("expanded", partition);
+        let max_paths = crate::options::max_paths(context.session_config());
         let run = async move {
             let index = unweighted_index(&shape.edges, input, &context).await?;
             let starts = search_keys(&starts, "start nodes", &shape, &context).await?;
@@ -492,6 +556,7 @@ impl ExecutionPlan for PathSearchExec {
                     shape.known_only,
                     shape.columns,
                     out_schema,
+                    max_paths,
                 )
             })
             .await
@@ -1040,6 +1105,39 @@ fn sql_text(values: &ArrayRef, row: usize) -> Option<String> {
     })
 }
 
+/// Leaves the edge and vertex inputs of a path search over a held index out
+/// of its children, so `EXPLAIN` does not draw inputs that do not run
+/// (#384, N48). It runs last, once every other rule has optimized them: they
+/// still build the index should the session no longer hold it when the node
+/// runs.
+#[derive(Debug)]
+pub struct CollapseHeldInputs;
+
+impl PhysicalOptimizerRule for CollapseHeldInputs {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|node| match node.downcast_ref::<PathSearchExec>() {
+            Some(exec) if exec.held.is_some() && !exec.collapsed => Ok(Transformed::yes(Arc::new(
+                exec.collapse(),
+            )
+                as Arc<dyn ExecutionPlan>)),
+            _ => Ok(Transformed::no(node)),
+        })
+        .map(|t| t.data)
+    }
+
+    fn name(&self) -> &str {
+        "collapse_held_inputs"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 /// Keeps a graph node's edge rows in the order the plan produces them, and
 /// gives them a fixed order where the plan has none.
 ///
@@ -1091,6 +1189,9 @@ impl PhysicalOptimizerRule for KeepEdgeOrder {
                     keys.extend(exec.nodes.iter().map(|_| vec![0]));
                     keys
                 } else if let Some(exec) = node.downcast_ref::<PathSearchExec>() {
+                    if exec.collapsed {
+                        return Ok(Transformed::no(node)); // its inputs are done
+                    }
                     let mut keys = vec![endpoint_keys(exec.shape.edges.endpoints)];
                     keys.extend(exec.shape.edges.vertices.as_ref().map(|_| vec![0]));
                     keys.push(vec![0]);

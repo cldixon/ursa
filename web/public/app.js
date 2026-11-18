@@ -124,10 +124,12 @@ $("theme").onclick = (e) => {
     localStorage.setItem("ursa-theme", next);
   } catch {}
   term.options.theme = xtermTheme(next);
+  graphLoaded?.retheme();
   if (byPointer(e)) term.focus();
 };
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   term.options.theme = xtermTheme(currentTheme());
+  graphLoaded?.retheme();
 });
 
 // ---------------------------------------------------------------- terminal
@@ -863,7 +865,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME?", "Draw the last result as a graph (its src and dst columns, or the first two), or a query's, or a property graph's; Esc closes it"],
+  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph (its src and dst columns, or the first two), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); Esc closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
 ];
@@ -956,25 +958,53 @@ const loadGraphModule = () =>
     },
   ));
 
+// When each step of the last `.graph` ended (performance.now()), for tests
+// and tests/graph-timing.ts: enter, engine, viz, posted, view, the worker's
+// workerStart, workerLoaded and hierarchy, firstPositions, firstDraw, done.
+let graphTimes = null;
+
 /**
- * `.graph ?QUERY|NAME?`: draw the last result, a query's result, or a
- * property graph (WebShell.graph says which rows are edges), replacing what
- * the pane drew. The terminal keeps the focus: queries can still be typed.
+ * `.graph ?SOURCE? ?NODES (query)? ?SIZE BY x? ?COLOR BY y?`: draw the last
+ * result, a query's result, or a property graph (WebShell.graph says which
+ * rows are edges, and what sizes and colours the nodes), replacing what the
+ * pane drew. The terminal keeps the focus: queries can still be typed.
+ *
+ * The pane opens with "Loading graph view…" as soon as the engine takes more
+ * than a moment (at once, for a big graph; not at all, for a typo), and the
+ * graph view's code starts loading then, while the engine still works.
  */
 async function drawGraph(text) {
+  const times = (graphTimes = { enter: performance.now() });
+  const wasOpen = graphOpen();
+  const status = $("graph-status");
+  const before = status.textContent;
+  let opened = false;
+  const open = () => {
+    if (opened) return;
+    opened = true;
+    graphPane.hidden = false;
+    status.textContent = "Loading graph view…";
+    loadGraphModule().then((m) => m.preload(), () => {});
+  };
+  const soon = setTimeout(open, 150);
   let graph;
   try {
     graph = await engine("graph", { text });
+    times.engine = performance.now();
   } catch (e) {
+    clearTimeout(soon);
+    // The pane as it was: closed, or with its drawing.
+    if (opened && !wasOpen) closeGraph();
+    else if (opened) status.textContent = before;
     if (e.crash) throw e;
     return errorLine(e.message);
   }
-  const wasOpen = graphOpen();
-  graphPane.hidden = false;
+  clearTimeout(soon);
+  open();
   let drawn;
   try {
     const module = await loadGraphModule();
-    drawn = await module.show($("graph-stage"), graph, { status: $("graph-status"), onError: graphFailed });
+    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, times });
   } catch (e) {
     // Closed (Esc) before it was drawn: nothing went wrong.
     if (!graphOpen()) return true;
@@ -995,6 +1025,8 @@ function closeGraph() {
   graphModule?.then((m) => m.close(), () => {});
   $("graph-stage").replaceChildren();
   $("graph-status").textContent = "";
+  $("graph-legend").replaceChildren();
+  $("graph-legend").hidden = true;
   if (hadFocus) term.focus();
 }
 
@@ -1340,6 +1372,8 @@ window.ursaShell = {
   // draws, a frame's inked pixels, and the node at a canvas pixel.
   graphOpen,
   graph: () => graphLoaded?.info() ?? null,
+  // When each step of the last .graph ended, in ms after Enter.
+  graphTimings: () => graphTimes && Object.fromEntries(Object.entries(graphTimes).map(([k, v]) => [k, Math.round(v - graphTimes.enter)])),
   graphInked: async () => graphLoaded?.inked() ?? null,
   graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
 };
