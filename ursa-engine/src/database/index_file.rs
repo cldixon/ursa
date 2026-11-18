@@ -4,14 +4,14 @@
 //! full key it was built for (the edge plan's fingerprint and the identity of
 //! every source file), followed by optional **chunks**: parts of the index
 //! that are built later, or that only some queries need, such as the
-//! in-adjacency. Version 2, all integers little-endian.
+//! in-adjacency. Version 3, all integers little-endian.
 //!
 //! The **main part** comes first:
 //!
 //! ```text
 //! offset  size  field
 //!      0     8  magic            "URSAIDX\0"
-//!      8     4  version          2
+//!      8     4  version          3
 //!     12     4  flags            bit 0: string ids
 //!     16     8  n_nodes
 //!     24     8  n_edges
@@ -22,13 +22,22 @@
 //!     56     8  n_dropped        edge rows left out (see below); zero before
 //!                                #311, and for a graph with no vertex table
 //!     64     …  key              JSON: {"version": 2, "fingerprint": …, "files": [{…}, …]}
-//!      …     …  section table    at the next multiple of 8; 24 bytes a section:
-//!                                kind u32, element width u32, offset u64, count u64
+//!      …     …  section table    at the next multiple of 8; 32 bytes a section:
+//!                                kind u32, element width u32, offset u64, count u64,
+//!                                CRC-32 of the section's bytes u32, zero u32
 //!      …     …  sections         each at a multiple of 64 from the file's start
 //!      …    16  trailer          at the next multiple of 8: main_len u64,
-//!                                CRC-32 of every byte before the trailer u32,
+//!                                CRC-32 of the header, key and section table
+//!                                (every byte before the first section) u32,
 //!                                "XDIU"
 //! ```
+//!
+//! Every byte between the table and the trailer that is not in a section
+//! (alignment padding) is zero. The trailer's CRC covers the section CRCs, so
+//! it still identifies every byte of the main part (see [`MainPart`]), while
+//! each section can be checked on its own: a reader that maps the file checks
+//! the small sections when it loads and the edge arrays only when something
+//! reads them whole (see `super::mapped`).
 //!
 //! Its sections, in this order: the out-adjacency's offsets (`u64`,
 //! `n_nodes + 1`), targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`);
@@ -78,6 +87,10 @@
 //! chunk, so a reader in another process (`--readonly`) never sees them
 //! change.
 //!
+//! **Version 2** (0.10) is the same layout with 24-byte table entries (no
+//! section CRCs) and one CRC over every byte before the trailer. It is still
+//! read, whole and checked (see [`read_file`]).
+//!
 //! **Why raw arrays, not Arrow IPC.** The arrays have different lengths and
 //! no schema: an IPC stream would need one record batch per array, or padding
 //! them into one table, and its metadata says nothing a section table does
@@ -85,39 +98,53 @@
 //! memory-mapped reader wants (each section is a ready `&[u32]`/`&[u64]` on a
 //! little-endian machine), need no dependency, and the string ids are already
 //! in Arrow's layout, so they become a `StringArray` without a copy once
-//! mapped. The main part is read once, front to back, decoding each section
-//! into its array as it goes ([`read_file`]).
+//! mapped. Where the platform allows, [`read_file`] maps the file and the
+//! arrays are borrowed from the map, never copied (`super::mapped`);
+//! elsewhere the main part is read into memory in parallel and the arrays are
+//! borrowed from that.
 //!
 //! **Corruption.** The main part is read only if its length matches the
-//! trailer, the CRC matches, the version is 2, the key matches the key asked
-//! for, every section lies within it, and the arrays form a valid topology and
-//! id map (`ursa_core::Topology::from_parts`, `IdMap::from_user_ids`).
-//! Anything else is an error, which the store treats as a miss. A chunk that
-//! does not check out is ignored, and what it held is rebuilt when needed.
+//! trailer, the trailer's CRC matches, the version is 2 or 3, the key matches
+//! the key asked for, every section lies within it, the padding is zero, the
+//! CRC of every section but the edge arrays matches (all of them, for a file
+//! that is not mapped), and the arrays form a valid topology and id map
+//! (`ursa_core::Topology::from_checksummed_parts`, which checks the offsets;
+//! `IdMap::from_user_ids`; a version 2 file, whose sections have no CRC of
+//! their own, is checked in full by `Topology::from_parts`). Anything else is
+//! an error, which the store treats as a miss. The edge arrays' CRCs of a
+//! mapped file are checked before a whole-graph algorithm runs
+//! (`super::mapped::Unverified`). A chunk that does not check out is ignored,
+//! and what it held is rebuilt when needed.
 //!
 //! **Version 1** files (the in-adjacency, if any, inside the main part) are
 //! not read: they are a miss like any other unreadable file, so the index is
-//! built again once and stored as version 2 in their place.
+//! built again once and stored as version 3 in their place.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
+use datafusion::arrow::datatypes::ArrowNativeType;
 use serde_json::{json, Value};
 use ursa_core::{Adjacency, IdMap, Topology};
 
+use super::mapped::{Region, Unverified};
 use crate::graph::FileIdentity;
 
 /// The first bytes of every index file.
 pub const MAGIC: [u8; 8] = *b"URSAIDX\0";
 /// The last bytes of every index file.
 const END_MAGIC: [u8; 4] = *b"XDIU";
-/// The index file version this build reads and writes.
-pub const VERSION: u32 = 2;
+/// The index file version this build writes. It reads this one and
+/// [`VERSION_2`].
+pub const VERSION: u32 = 3;
+/// The version 0.10 wrote: no section CRCs, one CRC over the main part.
+pub const VERSION_2: u32 = 2;
 /// The first bytes of every chunk.
 const CHUNK_MAGIC: [u8; 4] = *b"CHNK";
 /// The last bytes but four of every chunk's trailer.
@@ -132,7 +159,10 @@ pub const CHUNK_WEIGHTS: u32 = 2;
 
 const HEADER_LEN: u64 = 64;
 const TRAILER_LEN: u64 = 16;
-const SECTION_ENTRY_LEN: u64 = 24;
+/// A main part's section table entry (version 3).
+const SECTION_ENTRY_LEN: u64 = 32;
+/// A chunk's section table entry, and a version 2 main part's: no CRC.
+const CHUNK_ENTRY_LEN: u64 = 24;
 const SECTION_ALIGN: u64 = 64;
 
 const FLAG_STRING_IDS: u32 = 1;
@@ -281,6 +311,8 @@ fn align(n: u64, to: u64) -> u64 {
 /// An index laid out for writing: its header fields, key, sections and where
 /// each goes.
 pub struct Encoded<'a> {
+    /// [`VERSION`], or [`VERSION_2`] for a test of reading what 0.10 wrote.
+    version: u32,
     flags: u32,
     n_nodes: u64,
     n_edges: u64,
@@ -337,8 +369,29 @@ impl<'a> Encoded<'a> {
         };
 
         let key = key.to_json().to_string().into_bytes();
+        let (n_nodes, n_edges) = (topology.n_nodes() as u64, topology.n_edges() as u64);
+        Ok(Self::laid_out(
+            VERSION, flags, n_nodes, n_edges, n_dropped, key, sections,
+        ))
+    }
+
+    /// Place the sections after the header, key and table of a file of
+    /// `version`.
+    fn laid_out(
+        version: u32,
+        flags: u32,
+        n_nodes: u64,
+        n_edges: u64,
+        n_dropped: u64,
+        key: Vec<u8>,
+        sections: Vec<(u32, Data<'a>)>,
+    ) -> Self {
+        let entry_len = match version {
+            VERSION_2 => CHUNK_ENTRY_LEN,
+            _ => SECTION_ENTRY_LEN,
+        };
         let table_offset = align(HEADER_LEN + key.len() as u64, 8);
-        let mut at = table_offset + SECTION_ENTRY_LEN * sections.len() as u64;
+        let mut at = table_offset + entry_len * sections.len() as u64;
         let sections = sections
             .into_iter()
             .map(|(kind, data)| {
@@ -348,16 +401,34 @@ impl<'a> Encoded<'a> {
                 (kind, data, offset)
             })
             .collect();
-        Ok(Self {
+        Self {
+            version,
             flags,
-            n_nodes: topology.n_nodes() as u64,
-            n_edges: topology.n_edges() as u64,
+            n_nodes,
+            n_edges,
             n_dropped,
             key,
             sections,
             table_offset,
             trailer_offset: align(at, 8),
-        })
+        }
+    }
+
+    /// This index laid out as version 2, as 0.10 wrote it: for tests of
+    /// reading such a file.
+    #[doc(hidden)]
+    pub fn as_version_2(self) -> Self {
+        let Self {
+            flags,
+            n_nodes,
+            n_edges,
+            n_dropped,
+            key,
+            sections,
+            ..
+        } = self;
+        let sections = sections.into_iter().map(|(k, d, _)| (k, d)).collect();
+        Self::laid_out(VERSION_2, flags, n_nodes, n_edges, n_dropped, key, sections)
     }
 
     /// The size of the main part, in bytes.
@@ -367,14 +438,23 @@ impl<'a> Encoded<'a> {
 
     /// Write the main part to `out`. Returns its identity.
     pub fn write_to(&self, out: impl Write) -> io::Result<MainPart> {
+        let v2 = self.version == VERSION_2;
+        // Each section's CRC goes in the table, before the section: one pass
+        // over the arrays first (in parallel), then one to write them.
+        let crcs: Vec<Option<u32>> = self
+            .sections
+            .iter()
+            .map(|(_, data, _)| (!v2).then(|| data_crc(data)))
+            .collect();
         let mut sink = Sink {
             out,
             crc: crc32fast::Hasher::new(),
             at: 0,
+            hash: true,
         };
         let mut header = Vec::with_capacity(HEADER_LEN as usize);
         header.extend_from_slice(&MAGIC);
-        header.extend_from_slice(&VERSION.to_le_bytes());
+        header.extend_from_slice(&self.version.to_le_bytes());
         header.extend_from_slice(&self.flags.to_le_bytes());
         header.extend_from_slice(&self.n_nodes.to_le_bytes());
         header.extend_from_slice(&self.n_edges.to_le_bytes());
@@ -387,15 +467,22 @@ impl<'a> Encoded<'a> {
         sink.put(&header)?;
         sink.put(&self.key)?;
         sink.pad_to(self.table_offset)?;
-        for (kind, data, offset) in &self.sections {
-            sink.put(&section_entry(*kind, data, *offset))?;
+        for ((kind, data, offset), crc) in self.sections.iter().zip(&crcs) {
+            sink.put(&section_entry(*kind, data, *offset, *crc))?;
         }
+        // Version 3's trailer CRC covers the header, key and table; the
+        // sections have their own.
+        let meta_crc = sink.crc.clone().finalize();
+        sink.hash = v2;
         for (_, data, offset) in &self.sections {
             sink.pad_to(*offset)?;
             sink.put_data(data)?;
         }
         sink.pad_to(self.trailer_offset)?;
-        let crc = sink.crc.clone().finalize();
+        let crc = match v2 {
+            true => sink.crc.clone().finalize(),
+            false => meta_crc,
+        };
         let mut trailer = Vec::with_capacity(TRAILER_LEN as usize);
         trailer.extend_from_slice(&self.file_size().to_le_bytes());
         trailer.extend_from_slice(&crc.to_le_bytes());
@@ -411,7 +498,7 @@ impl<'a> Encoded<'a> {
 
 /// The identity of a file's main part: its length and CRC. A chunk is read
 /// from, or appended to, a file only while its main part is still this one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MainPart {
     pub len: u64,
     pub crc: u32,
@@ -480,7 +567,7 @@ impl<'a> EncodedChunk<'a> {
     }
 
     fn trailer_offset(&self) -> u64 {
-        self.table_offset + SECTION_ENTRY_LEN * self.sections.len() as u64
+        self.table_offset + CHUNK_ENTRY_LEN * self.sections.len() as u64
     }
 
     /// The offset just past the chunk: the file's length once it is written.
@@ -499,6 +586,7 @@ impl<'a> EncodedChunk<'a> {
             out,
             crc: crc32fast::Hasher::new(),
             at: self.start,
+            hash: true,
         };
         let mut header = Vec::with_capacity(CHUNK_HEADER_LEN as usize);
         header.extend_from_slice(&CHUNK_MAGIC);
@@ -514,7 +602,7 @@ impl<'a> EncodedChunk<'a> {
         sink.put(&self.name)?;
         sink.pad_to(self.table_offset)?;
         for (kind, data, offset) in &self.sections {
-            sink.put(&section_entry(*kind, data, *offset))?;
+            sink.put(&section_entry(*kind, data, *offset, None))?;
         }
         let mut trailer = Vec::with_capacity(CHUNK_TRAILER_LEN as usize);
         trailer.extend_from_slice(&self.kind.to_le_bytes());
@@ -533,26 +621,69 @@ impl<'a> EncodedChunk<'a> {
     }
 }
 
-/// A section table entry.
-fn section_entry(kind: u32, data: &Data<'_>, offset: u64) -> Vec<u8> {
+/// A section table entry: with the section's CRC in a version 3 main part,
+/// without in a chunk.
+fn section_entry(kind: u32, data: &Data<'_>, offset: u64, crc: Option<u32>) -> Vec<u8> {
     let mut entry = Vec::with_capacity(SECTION_ENTRY_LEN as usize);
     entry.extend_from_slice(&kind.to_le_bytes());
     entry.extend_from_slice(&(data.width() as u32).to_le_bytes());
     entry.extend_from_slice(&offset.to_le_bytes());
     entry.extend_from_slice(&data.count().to_le_bytes());
+    if let Some(crc) = crc {
+        entry.extend_from_slice(&crc.to_le_bytes());
+        entry.extend_from_slice(&[0; 4]);
+    }
     entry
 }
 
-/// A writer that keeps a running CRC and position.
+/// The CRC-32 of the bytes `data` is written as.
+fn data_crc(data: &Data<'_>) -> u32 {
+    /// The bytes of `values`, which are plain numbers.
+    fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
+        // SAFETY: `T` is a primitive number here (u64, u32, i64, f64): every
+        // byte of it is initialized, and the view spans the slice exactly.
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), size_of_val(values)) }
+    }
+    // On a little-endian machine an array is written as it is in memory, so
+    // its CRC is computed in place, in parallel.
+    if cfg!(target_endian = "little") {
+        let bytes = match data {
+            Data::U64(v) => Some(bytes_of(v)),
+            Data::F64(v) => Some(bytes_of(v)),
+            Data::U32(v) => Some(bytes_of(v)),
+            Data::Ints(a) => Some(bytes_of(a.values())),
+            Data::StrBytes(a) => Some(str_bytes(a)),
+            Data::Bytes(b) => Some(b.as_slice()),
+            Data::StrOffsets(_) => None,
+        };
+        if let Some(bytes) = bytes {
+            return super::mapped::crc(bytes);
+        }
+    }
+    let mut sink = Sink {
+        out: io::sink(),
+        crc: crc32fast::Hasher::new(),
+        at: 0,
+        hash: true,
+    };
+    sink.put_data(data)
+        .expect("writing to io::sink does not fail");
+    sink.crc.finalize()
+}
+
+/// A writer that keeps a running CRC (while `hash` is set) and position.
 struct Sink<W> {
     out: W,
     crc: crc32fast::Hasher,
     at: u64,
+    hash: bool,
 }
 
 impl<W: Write> Sink<W> {
     fn put(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.crc.update(bytes);
+        if self.hash {
+            self.crc.update(bytes);
+        }
         self.at += bytes.len() as u64;
         self.out.write_all(bytes)
     }
@@ -623,6 +754,12 @@ pub struct Stored {
     pub main: MainPart,
     /// The chunks that check out, in file order.
     pub chunks: Vec<ChunkInfo>,
+    /// The file's version: [`VERSION`], or [`VERSION_2`] for a file 0.10
+    /// wrote.
+    pub version: u32,
+    /// The checksums of a mapped file that are checked only when something
+    /// reads the arrays whole; `None` when every one was checked as it loaded.
+    pub unverified: Option<Arc<Unverified>>,
 }
 
 /// Whether `chunks` has one of `kind` named `name`.
@@ -641,21 +778,51 @@ pub fn incoming_reads() -> u64 {
 
 /// Read the index file at `path`, which must be stored under `key`.
 ///
-/// The main part is read once, front to back, straight into the arrays the
-/// index is made of, so a load holds the index and a small buffer, not the
-/// file's bytes as well. The key is checked before the sections are read, so
-/// a file for another key costs only its header; the checksum covers every
-/// byte of the main part and is checked before any array is used. The chunks
-/// are only listed; the in-adjacency's is read when the topology is first
-/// asked for it.
+/// The header, key and section table are read first, so a file for another
+/// key costs only those. Then, for a version 3 file on a platform that maps
+/// files (`super::mapped`), the file is mapped, up to the end of its last
+/// chunk that checks out: the arrays are borrowed from the map, the small
+/// sections (offsets, ids) are checked now, and the edge arrays' checksums
+/// are deferred to [`Stored::unverified`]. Otherwise the main part is read
+/// whole, in parallel, and every checksum is checked before any array is
+/// used. The chunks are only listed; the in-adjacency's is read when the
+/// topology is first asked for it.
 pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
-    let (topology, ids, main, dropped) =
-        decode_from(BufReader::with_capacity(BLOCK, &file), len, key)?;
-    let (chunks, _) = list_chunks(&mut file, main.len, len);
-    let topology = match chunks.iter().find(|c| c.kind == CHUNK_INCOMING) {
-        Some(chunk) => {
+    let head = read_head(&mut file, len, key)?;
+    let (chunks, end) = list_chunks(&mut file, head.main_len, len);
+    let mapped = head.version == VERSION && super::mapped::MAPS;
+    let data = match mapped {
+        true => super::mapped::map(&file, end)?,
+        false => super::mapped::read_whole(&file, head.main_len)?,
+    };
+    let (topology, ids, main, dropped, deferred) = parse(&head, &data, mapped)?;
+    let unverified = mapped.then(|| Arc::new(Unverified::new(data.clone(), deferred)));
+    let topology = match (
+        chunks.iter().find(|c| c.kind == CHUNK_INCOMING),
+        &unverified,
+    ) {
+        (Some(chunk), Some(checks)) => {
+            // Borrowed from the map, its data CRC deferred as the edge
+            // arrays' are.
+            let (chunk, checks) = (chunk.clone(), Arc::clone(checks));
+            let (n_nodes, n_edges) = (topology.n_nodes(), topology.n_edges());
+            topology.with_checksummed_incoming_loader(Box::new(move || {
+                let incoming = mapped_incoming(&data, &chunk, n_nodes, n_edges).ok()?;
+                checks
+                    .defer(Region {
+                        what: "in-adjacency",
+                        range: usize::try_from(chunk.start).ok()?
+                            ..usize::try_from(chunk.data_end).ok()?,
+                        crc: chunk.data_crc,
+                    })
+                    .ok()?;
+                INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+                Some(incoming)
+            }))
+        }
+        (Some(chunk), None) => {
             let (path, chunk) = (path.to_path_buf(), chunk.clone());
             let (n_nodes, n_edges) = (topology.n_nodes(), topology.n_edges());
             topology.with_incoming_loader(Box::new(move || {
@@ -664,7 +831,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
                 Some(incoming)
             }))
         }
-        None => topology,
+        (None, _) => topology,
     };
     Ok(Stored {
         topology,
@@ -672,13 +839,34 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
         dropped,
         main,
         chunks,
+        version: head.version,
+        unverified,
     })
 }
 
 /// Read the main part of the index in `bytes`, which must be stored under
-/// `key`. Chunks are not read.
+/// `key`, checking every checksum. Chunks are not read.
 pub fn decode(bytes: &[u8], key: &IndexKey) -> Result<(Topology, IdMap), DecodeError> {
-    decode_from(bytes, bytes.len() as u64, key).map(|(topology, ids, _, _)| (topology, ids))
+    decode_main(bytes, key).map(|(topology, ids, _, _)| (topology, ids))
+}
+
+/// [`decode`], with the main part's identity and the rows left out.
+fn decode_main(
+    bytes: &[u8],
+    key: &IndexKey,
+) -> Result<(Topology, IdMap, MainPart, Dropped), DecodeError> {
+    let head = read_head(&mut io::Cursor::new(bytes), bytes.len() as u64, key)?;
+    // Copied to memory aligned for 64-bit values, as a read file is.
+    let main = &bytes[..head.main_len as usize];
+    let mut words = vec![0u64; main.len().div_ceil(8)];
+    for (word, chunk) in words.iter_mut().zip(main.chunks(8)) {
+        let mut le = [0u8; 8];
+        le[..chunk.len()].copy_from_slice(chunk);
+        *word = u64::from_ne_bytes(le);
+    }
+    let data = Buffer::from_vec(words).slice_with_length(0, main.len());
+    parse(&head, &data, false)
+        .map(|(topology, ids, main, dropped, _)| (topology, ids, main, dropped))
 }
 
 /// One chunk of a file, as listed: where it is and what it holds.
@@ -743,7 +931,7 @@ fn chunk_at<R: Read + Seek>(file: &mut R, start: u64, len: u64) -> Option<ChunkI
         || u64_at(&trailer, 8) != start
         || name_offset < start + CHUNK_HEADER_LEN
         || n_sections
-            .checked_mul(SECTION_ENTRY_LEN)?
+            .checked_mul(CHUNK_ENTRY_LEN)?
             .checked_add(table_offset)?
             != trailer_offset
     {
@@ -759,7 +947,7 @@ fn chunk_at<R: Read + Seek>(file: &mut R, start: u64, len: u64) -> Option<ChunkI
     let name = meta[..name_len as usize].to_vec();
     let table = &meta[(table_offset - name_offset) as usize..];
     let mut sections = Vec::new();
-    for entry in table.chunks_exact(SECTION_ENTRY_LEN as usize) {
+    for entry in table.chunks_exact(CHUNK_ENTRY_LEN as usize) {
         let (kind, width) = (u32_at(entry, 0), u32_at(entry, 4) as u64);
         let (offset, count) = (u64_at(entry, 8), u64_at(entry, 16));
         width
@@ -857,9 +1045,9 @@ fn read_incoming(
                 && edge_ids.len() == n_edges =>
         {
             Ok(Adjacency {
-                offsets,
-                targets,
-                edge_ids,
+                offsets: offsets.into(),
+                targets: targets.into(),
+                edge_ids: edge_ids.into(),
             })
         }
         _ => Err("the in-adjacency is malformed".into()),
@@ -1011,159 +1199,271 @@ pub enum Section {
     Bytes(Vec<u8>),
 }
 
-/// Read the index from `reader`, a file of `len` bytes stored under `key`.
-fn decode_from(
-    reader: impl Read,
-    len: u64,
-    key: &IndexKey,
-) -> Result<(Topology, IdMap, MainPart, Dropped), DecodeError> {
+/// A section table entry, as read.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    kind: u32,
+    width: u64,
+    offset: u64,
+    count: u64,
+    /// The section's CRC (version 3; zero in version 2).
+    crc: u32,
+}
+
+impl Entry {
+    fn range(&self) -> Range<usize> {
+        // Within the main part, which `read_head` checked fits in memory.
+        self.offset as usize..(self.offset + self.width * self.count) as usize
+    }
+}
+
+/// The main part's header, key and table, read and checked.
+struct Head {
+    version: u32,
+    flags: u32,
+    n_nodes: usize,
+    n_edges: usize,
+    n_dropped: u64,
+    main_len: u64,
+    /// The end of the section table: where the sections may start.
+    table_end: u64,
+    /// By offset; they do not overlap.
+    sections: Vec<Entry>,
+    /// The trailer's CRC.
+    crc: u32,
+}
+
+/// Read and check the header, key, section table and trailer of the index
+/// file in `file`, `len` bytes, which must be stored under `key`. Version 3's
+/// trailer CRC (over the header, key and table) is checked here; version 2's
+/// covers the sections, so [`parse`] checks it.
+fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<Head, DecodeError> {
+    let read = |file: &mut R, at: u64, n: u64| -> Result<Vec<u8>, DecodeError> {
+        file.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+        let mut buf = vec![0; usize::try_from(n).map_err(|e| e.to_string())?];
+        file.read_exact(&mut buf).map_err(|e| match e.kind() {
+            io::ErrorKind::UnexpectedEof => "the file is truncated".to_string(),
+            _ => e.to_string(),
+        })?;
+        Ok(buf)
+    };
     if len < HEADER_LEN + TRAILER_LEN {
         return Err(format!("{len} bytes is too short for an index file"));
     }
-    let mut src = Source {
-        inner: reader,
-        crc: crc32fast::Hasher::new(),
-        at: 0,
-    };
-    let header = src.bytes(HEADER_LEN as usize)?;
+    let header = read(file, 0, HEADER_LEN)?;
     if header[..8] != MAGIC {
         return Err("not an Ursa index file".into());
     }
-    let version = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
-    if version != VERSION {
+    let version = u32_at(&header, 8);
+    if version != VERSION && version != VERSION_2 {
         return Err(format!(
-            "index format version {version}; this build reads {VERSION}"
+            "index format version {version}; this build reads {VERSION_2} and {VERSION}"
         ));
     }
-    let flags = u32::from_le_bytes(header[12..16].try_into().expect("4 bytes"));
+    let flags = u32_at(&header, 12);
     let n_nodes = usize::try_from(u64_at(&header, 16)).map_err(|e| e.to_string())?;
     let n_edges = usize::try_from(u64_at(&header, 24)).map_err(|e| e.to_string())?;
     let key_len = u64_at(&header, 32);
-    let n_sections = u32::from_le_bytes(header[40..44].try_into().expect("4 bytes")) as u64;
+    let n_sections = u32_at(&header, 40) as u64;
     let main_len = u64_at(&header, 48);
     let n_dropped = u64_at(&header, 56);
-    if main_len > len || main_len < HEADER_LEN + TRAILER_LEN {
+    if main_len > len || main_len < HEADER_LEN + TRAILER_LEN || usize::try_from(main_len).is_err() {
         return Err("the file is truncated".into());
     }
-
     let body = main_len - TRAILER_LEN;
     let key_end = HEADER_LEN
         .checked_add(key_len)
         .filter(|&end| end <= body)
         .ok_or("the key runs past the end of the file")?;
-    let stored = src.bytes((key_end - HEADER_LEN) as usize)?;
-    let stored: Value =
-        serde_json::from_slice(&stored).map_err(|e| format!("the key is not JSON: {e}"))?;
+    let table = align(key_end, 8);
+    let entry_len = match version {
+        VERSION_2 => CHUNK_ENTRY_LEN,
+        _ => SECTION_ENTRY_LEN,
+    };
+    let table_end = n_sections
+        .checked_mul(entry_len)
+        .and_then(|n| n.checked_add(table))
+        .filter(|&end| end <= body)
+        .ok_or("the section table runs past the end of the file")?;
+    let rest = read(file, HEADER_LEN, table_end - HEADER_LEN)?;
+    let trailer = read(file, body, TRAILER_LEN)?;
+    if trailer[12..] != END_MAGIC || u64_at(&trailer, 0) != main_len {
+        return Err("the file is truncated".into());
+    }
+    let crc = u32_at(&trailer, 8);
+    if version == VERSION {
+        let mut meta = crc32fast::Hasher::new();
+        meta.update(&header);
+        meta.update(&rest);
+        if meta.finalize() != crc {
+            return Err("the checksum does not match".into());
+        }
+        if rest[(key_end - HEADER_LEN) as usize..(table - HEADER_LEN) as usize]
+            .iter()
+            .any(|&b| b != 0)
+        {
+            return Err("the padding is not zero".into());
+        }
+    }
+    let stored: Value = serde_json::from_slice(&rest[..key_len as usize])
+        .map_err(|e| format!("the key is not JSON: {e}"))?;
     if IndexKey::from_json(&stored).as_ref() != Some(key) {
         return Err("the file holds an index for another key".into());
     }
 
-    let table = align(key_end, 8);
-    let table_end = n_sections
-        .checked_mul(SECTION_ENTRY_LEN)
-        .and_then(|n| n.checked_add(table))
-        .filter(|&end| end <= body)
-        .ok_or("the section table runs past the end of the file")?;
-    src.skip_to(table)?;
-    let entries = src.bytes((table_end - table) as usize)?;
-    // (kind, width, offset, count), in file order. Sections are read in one
-    // pass, so they may not overlap.
-    let mut layout: Vec<(u32, u64, u64, u64)> = Vec::new();
-    for entry in entries.chunks_exact(SECTION_ENTRY_LEN as usize) {
-        let kind = u32::from_le_bytes(entry[0..4].try_into().expect("4 bytes"));
-        let width = u32::from_le_bytes(entry[4..8].try_into().expect("4 bytes")) as u64;
-        let offset = u64_at(entry, 8);
-        let count = u64_at(entry, 16);
+    let entries = &rest[(table - HEADER_LEN) as usize..];
+    let mut sections = Vec::with_capacity(n_sections as usize);
+    for entry in entries.chunks_exact(entry_len as usize) {
+        let (kind, width) = (u32_at(entry, 0), u32_at(entry, 4) as u64);
+        let (offset, count) = (u64_at(entry, 8), u64_at(entry, 16));
+        let crc = match version {
+            VERSION_2 => 0,
+            _ => u32_at(entry, 24),
+        };
         width
             .checked_mul(count)
             .and_then(|n| n.checked_add(offset))
             .filter(|&end| offset >= table_end && end <= body)
             .ok_or("a section runs past the end of the file")?;
-        layout.push((kind, width, offset, count));
+        sections.push(Entry {
+            kind,
+            width,
+            offset,
+            count,
+            crc,
+        });
     }
-    layout.sort_by_key(|&(_, _, offset, _)| offset);
-    if layout.windows(2).any(|w| w[0].2 + w[0].1 * w[0].3 > w[1].2) {
+    sections.sort_by_key(|e| e.offset);
+    if sections
+        .windows(2)
+        .any(|w| w[0].offset + w[0].width * w[0].count > w[1].offset)
+    {
         return Err("the sections overlap".into());
     }
+    Ok(Head {
+        version,
+        flags,
+        n_nodes,
+        n_edges,
+        n_dropped,
+        main_len,
+        table_end,
+        sections,
+        crc,
+    })
+}
 
-    let mut sections: Vec<(u32, u64, u64, Section)> = Vec::new();
-    for (kind, width, offset, count) in layout {
-        src.skip_to(offset)?;
-        // A section this build does not read, or a known one of the wrong
-        // width (malformed, below), comes back empty.
-        let data = src.section(kind, width, offset, count)?;
-        sections.push((kind, width, count, data));
+/// The sections whose CRCs a mapped file defers (see `super::mapped`): the
+/// `O(edges)` arrays, which only a whole-graph algorithm reads whole.
+fn deferred_kind(kind: u32) -> Option<&'static str> {
+    match kind {
+        OUT_TARGETS => Some("targets"),
+        OUT_EDGE_IDS => Some("edge ids"),
+        _ => None,
     }
-    src.skip_to(body)?;
-    let crc = src.crc.clone().finalize();
-    let mut trailer = [0u8; TRAILER_LEN as usize];
-    src.fill(&mut trailer)?;
-    if trailer[12..] != END_MAGIC || u64_at(&trailer, 0) != main_len {
+}
+
+/// The `count` values of type `T` at byte `offset` of `data`, borrowed.
+fn scalars<T: ArrowNativeType>(data: &Buffer, entry: &Entry) -> ScalarBuffer<T> {
+    let size = std::mem::size_of::<T>();
+    debug_assert_eq!(entry.width as usize, size);
+    // `data` starts 8-aligned (a map, or a vector of `u64`s) and every
+    // section at a multiple of 64, so the values are aligned.
+    ScalarBuffer::new(
+        data.clone(),
+        entry.offset as usize / size,
+        entry.count as usize,
+    )
+}
+
+/// What [`parse`] makes of a main part.
+type Parsed = (Topology, IdMap, MainPart, Dropped, Vec<Region>);
+
+/// The index in `data`, the main part `head` describes (and maybe more),
+/// borrowing its arrays. A `mapped` file's edge arrays are not read: their
+/// CRCs come back to be checked later. Every other checksum is checked here.
+fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError> {
+    let main_len = head.main_len as usize;
+    if data.len() < main_len {
         return Err("the file is truncated".into());
     }
-    if u32::from_le_bytes(trailer[8..12].try_into().expect("4 bytes")) != crc {
-        return Err("the checksum does not match".into());
+    let bytes = &data.as_slice()[..main_len];
+    let body = main_len - TRAILER_LEN as usize;
+    let mut deferred = Vec::new();
+    if head.version == VERSION_2 {
+        if super::mapped::crc(&bytes[..body]) != head.crc {
+            return Err("the checksum does not match".into());
+        }
+    } else {
+        // Padding is zero, and each section's CRC matches (or is deferred).
+        let mut at = head.table_end as usize;
+        for entry in &head.sections {
+            let range = entry.range();
+            if bytes[at..range.start].iter().any(|&b| b != 0) {
+                return Err("the padding is not zero".into());
+            }
+            at = range.end;
+            match deferred_kind(entry.kind).filter(|_| mapped) {
+                Some(what) => deferred.push(Region {
+                    what,
+                    range,
+                    crc: entry.crc,
+                }),
+                None => {
+                    if super::mapped::crc(&bytes[range]) != entry.crc {
+                        return Err(format!(
+                            "the checksum of section {} does not match",
+                            entry.kind
+                        ));
+                    }
+                }
+            }
+        }
+        if bytes[at..body].iter().any(|&b| b != 0) {
+            return Err("the padding is not zero".into());
+        }
     }
 
-    let main = MainPart { len: main_len, crc };
-    let mut take = |kind: u32, width: u64, count: Option<usize>| -> Result<Section, DecodeError> {
-        let mut found = sections.iter().filter(|(k, _, _, _)| *k == kind);
-        let (_, w, c, _) = found
+    let (n_nodes, n_edges) = (head.n_nodes, head.n_edges);
+    let take = |kind: u32, width: u64, count: Option<usize>| -> Result<Entry, DecodeError> {
+        let mut found = head.sections.iter().filter(|e| e.kind == kind);
+        let entry = found
             .next()
             .ok_or_else(|| format!("section {kind} is missing"))?;
-        if found.next().is_some() || *w != width {
+        if found.next().is_some() || entry.width != width {
             return Err(format!("section {kind} is malformed"));
         }
-        if count.is_some_and(|count| *c != count as u64) {
+        if count.is_some_and(|count| entry.count != count as u64) {
             return Err(format!("section {kind} has the wrong length"));
         }
-        let i = sections
-            .iter()
-            .position(|(k, _, _, _)| *k == kind)
-            .expect("found above");
-        Ok(sections.swap_remove(i).3)
+        Ok(*entry)
     };
-    let malformed = |kind: u32| format!("section {kind} is malformed");
-    let mut adjacency = |kinds: [u32; 3]| -> Result<Adjacency, DecodeError> {
-        match (
-            take(kinds[0], 8, Some(n_nodes + 1))?,
-            take(kinds[1], 4, Some(n_edges))?,
-            take(kinds[2], 4, Some(n_edges))?,
-        ) {
-            (Section::U64(offsets), Section::U32(targets), Section::U32(edge_ids)) => {
-                Ok(Adjacency {
-                    offsets,
-                    targets,
-                    edge_ids,
-                })
-            }
-            _ => Err(malformed(kinds[0])),
-        }
+    let out = Adjacency {
+        offsets: scalars(data, &take(OUT_OFFSETS, 8, Some(n_nodes + 1))?),
+        targets: scalars(data, &take(OUT_TARGETS, 4, Some(n_edges))?),
+        edge_ids: scalars(data, &take(OUT_EDGE_IDS, 4, Some(n_edges))?),
     };
-    let out = adjacency([OUT_OFFSETS, OUT_TARGETS, OUT_EDGE_IDS])?;
-    let topology = Topology::from_parts(n_nodes, out, None)?;
+    let topology = match head.version {
+        // No section CRCs to vouch for the arrays: check them in full.
+        VERSION_2 => Topology::from_parts(n_nodes, out, None)?,
+        _ => Topology::from_checksummed_parts(n_nodes, out)?,
+    };
 
-    let ids: Arc<dyn Array> = if flags & FLAG_STRING_IDS == 0 {
-        let Section::I64(values) = take(IDS_INT64, 8, Some(n_nodes))? else {
-            return Err(malformed(IDS_INT64));
-        };
-        Arc::new(Int64Array::from(values))
+    let ids: Arc<dyn Array> = if head.flags & FLAG_STRING_IDS == 0 {
+        let values = scalars::<i64>(data, &take(IDS_INT64, 8, Some(n_nodes))?);
+        Arc::new(Int64Array::new(values, None))
     } else {
-        let (Section::I32(offsets), Section::Bytes(data)) = (
-            take(IDS_STR_OFFSETS, 4, Some(n_nodes + 1))?,
-            take(IDS_STR_BYTES, 1, None)?,
-        ) else {
-            return Err(malformed(IDS_STR_OFFSETS));
-        };
+        let offsets = scalars::<i32>(data, &take(IDS_STR_OFFSETS, 4, Some(n_nodes + 1))?);
+        let strings = take(IDS_STR_BYTES, 1, None)?;
         if offsets[0] != 0
             || offsets.windows(2).any(|w| w[0] > w[1])
-            || offsets[n_nodes] as usize != data.len()
+            || offsets[n_nodes] as u64 != strings.count
         {
             return Err("the string ids' offsets are malformed".into());
         }
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        let values = data.slice_with_length(strings.offset as usize, strings.count as usize);
         Arc::new(
-            StringArray::try_new(offsets, Buffer::from_vec(data), None)
+            StringArray::try_new(OffsetBuffer::new(offsets), values, None)
                 .map_err(|e| format!("the string ids are malformed: {e}"))?,
         )
     };
@@ -1171,17 +1471,16 @@ fn decode_from(
     if ids.len() != n_nodes {
         return Err("the id map does not match the topology".into());
     }
-    let dropped = match n_dropped {
+    let dropped = match head.n_dropped {
         0 => Dropped::default(),
         n_dropped => {
             let rows = usize::try_from(n_dropped)
                 .ok()
                 .and_then(|d| d.checked_add(n_edges))
                 .ok_or("the kept rows are malformed")?;
-            let Section::Bytes(bits) = take(KEPT_ROWS, 1, Some(rows.div_ceil(8)))? else {
-                return Err(malformed(KEPT_ROWS));
-            };
-            let kept = BooleanBuffer::new(Buffer::from_vec(bits), 0, rows);
+            let bits = take(KEPT_ROWS, 1, Some(rows.div_ceil(8)))?;
+            let bits = data.slice_with_length(bits.offset as usize, bits.count as usize);
+            let kept = BooleanBuffer::new(bits, 0, rows);
             if kept.count_set_bits() != n_edges {
                 return Err("the kept rows do not match the edges".into());
             }
@@ -1191,7 +1490,43 @@ fn decode_from(
             }
         }
     };
-    Ok((topology, ids, main, dropped))
+    let main = MainPart {
+        len: head.main_len,
+        crc: head.crc,
+    };
+    Ok((topology, ids, main, dropped, deferred))
+}
+
+/// The in-adjacency in `chunk` of the mapped file `data`, borrowed, for a
+/// topology of `n_nodes` nodes and `n_edges` edges. Its data CRC is not
+/// checked here.
+fn mapped_incoming(
+    data: &Buffer,
+    chunk: &ChunkInfo,
+    n_nodes: usize,
+    n_edges: usize,
+) -> Result<Adjacency, DecodeError> {
+    if (data.len() as u64) < chunk.end {
+        return Err("the file is shorter than the chunk".into());
+    }
+    let entry = |kind: u32, width: u64, count: usize| -> Result<Entry, DecodeError> {
+        let mut found = chunk.sections.iter().filter(|s| s.0 == kind);
+        match (found.next(), found.next()) {
+            (Some(&(kind, w, offset, c)), None) if w == width && c == count as u64 => Ok(Entry {
+                kind,
+                width,
+                offset,
+                count: c,
+                crc: 0,
+            }),
+            _ => Err("the in-adjacency is malformed".into()),
+        }
+    };
+    Ok(Adjacency {
+        offsets: scalars(data, &entry(IN_OFFSETS, 8, n_nodes + 1)?),
+        targets: scalars(data, &entry(IN_TARGETS, 4, n_edges)?),
+        edge_ids: scalars(data, &entry(IN_EDGE_IDS, 4, n_edges)?),
+    })
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -1273,11 +1608,19 @@ mod tests {
             ids.user_id_array().as_ref()
         );
 
-        // Sections are 64-byte aligned.
+        // Sections are 64-byte aligned, each with its CRC in the table.
         let n_sections = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
         let table = align(HEADER_LEN + u64_at(&bytes, 32), 8) as usize;
         for i in 0..n_sections {
-            assert_eq!(u64_at(&bytes, table + 24 * i + 8) % 64, 0);
+            let entry = table + 32 * i;
+            let (width, offset) = (
+                u32_at(&bytes, entry + 4) as usize,
+                u64_at(&bytes, entry + 8),
+            );
+            let count = u64_at(&bytes, entry + 16) as usize;
+            assert_eq!(offset % 64, 0);
+            let section = &bytes[offset as usize..offset as usize + width * count];
+            assert_eq!(u32_at(&bytes, entry + 24), crc32fast::hash(section));
         }
     }
 
@@ -1290,13 +1633,13 @@ mod tests {
         let encoded = Encoded::with_dropped(&key(), &topology, &ids, 2, Some(&kept)).unwrap();
         let mut bytes = Vec::new();
         encoded.write_to(&mut bytes).unwrap();
-        let (back, _, _, dropped) = decode_from(&bytes[..], bytes.len() as u64, &key()).unwrap();
+        let (back, _, _, dropped) = decode_main(&bytes, &key()).unwrap();
         same(&topology, &back);
         assert_eq!(dropped.n_dropped, 2);
         assert_eq!(dropped.kept, Some(kept));
         // A file with nothing left out has no such section, as before #311.
         let plain = encode(&key(), &topology, &ids);
-        let (_, _, _, none) = decode_from(&plain[..], plain.len() as u64, &key()).unwrap();
+        let (_, _, _, none) = decode_main(&plain, &key()).unwrap();
         assert_eq!((none.n_dropped, none.kept), (0, None));
     }
 
@@ -1472,6 +1815,213 @@ mod tests {
         assert!(read_weights(&path, main, chunk(b"w1"), 4).is_err());
     }
 
+    /// The section table entry of `kind` in the version 3 main part `bytes`:
+    /// its offset and length in bytes.
+    fn section_of(bytes: &[u8], kind: u32) -> (usize, usize) {
+        let n_sections = u32_at(bytes, 40) as usize;
+        let table = align(HEADER_LEN + u64_at(bytes, 32), 8) as usize;
+        (0..n_sections)
+            .map(|i| table + 32 * i)
+            .find(|&entry| u32_at(bytes, entry) == kind)
+            .map(|entry| {
+                let width = u32_at(bytes, entry + 4) as usize;
+                let count = u64_at(bytes, entry + 16) as usize;
+                (u64_at(bytes, entry + 8) as usize, width * count)
+            })
+            .unwrap()
+    }
+
+    fn a_graph() -> (Arc<Topology>, Arc<IdMap>) {
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        built(
+            ints(&[10, 20, 10, 30, 20, 40, 40, 50]),
+            ints(&[20, 30, 30, 10, 40, 10, 50, 10]),
+        )
+    }
+
+    #[test]
+    fn a_version_2_file_from_0_10_is_read_whole_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let (topology, ids) = a_graph();
+        let encoded = Encoded::new(&key(), &topology, &ids)
+            .unwrap()
+            .as_version_2();
+        let mut v2 = Vec::new();
+        let main = encoded.write_to(&mut v2).unwrap();
+        assert_eq!(u32_at(&v2, 8), VERSION_2);
+        assert_eq!(main.crc, crc32fast::hash(&v2[..v2.len() - 16]));
+        std::fs::write(&path, &v2).unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        assert_eq!(stored.version, VERSION_2);
+        // Read whole, every byte checked: nothing is left to check.
+        assert!(stored.unverified.is_none());
+        assert_eq!(stored.main, main);
+        same(&topology, &stored.topology);
+        assert_eq!(
+            stored.ids.user_id_array().as_ref(),
+            ids.user_id_array().as_ref()
+        );
+        // With an in-adjacency appended, as 0.10 appended it.
+        let incoming = topology.incoming().clone();
+        append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap()
+        .unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        assert_eq!(stored.topology.incoming().targets, incoming.targets);
+
+        // A damaged or truncated version 2 file is an error, never a crash.
+        for at in [9, 70, v2.len() / 2, v2.len() - 20] {
+            let mut flipped = v2.clone();
+            flipped[at] ^= 0x40;
+            std::fs::write(&path, &flipped).unwrap();
+            assert!(read_file(&path, &key()).is_err(), "flipped at {at}");
+        }
+        for cut in [0, 10, 64, v2.len() / 2, v2.len() - 1] {
+            std::fs::write(&path, &v2[..cut]).unwrap();
+            assert!(read_file(&path, &key()).is_err(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_damaged_version_3_file_is_an_error_never_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let (topology, ids) = a_graph();
+        let main = write_main(&path, &topology, &ids);
+        let incoming = topology.incoming().clone();
+        append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap();
+        let good = std::fs::read(&path).unwrap();
+        let main_len = main.len as usize;
+        // Cut anywhere in the main part: an error (a mapped reader never
+        // maps past the end of the file).
+        for cut in (0..main_len).step_by(7).chain([main_len - 1]) {
+            std::fs::write(&path, &good[..cut]).unwrap();
+            assert!(read_file(&path, &key()).is_err(), "cut at {cut}");
+        }
+        // Cut in the chunk: the main part reads, the chunk is not listed.
+        std::fs::write(&path, &good[..good.len() - 1]).unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        assert!(stored.chunks.is_empty());
+        assert_eq!(stored.topology.incoming().targets, incoming.targets);
+        // A flipped byte anywhere in the main part but the edge arrays (the
+        // header, key, table, offsets, ids, padding, trailer) is an error at
+        // once.
+        let (targets, t_len) = section_of(&good, OUT_TARGETS);
+        let (edge_ids, e_len) = section_of(&good, OUT_EDGE_IDS);
+        let edge_arrays = |at: usize| {
+            (targets..targets + t_len).contains(&at) || (edge_ids..edge_ids + e_len).contains(&at)
+        };
+        for at in (0..main_len).filter(|&at| !edge_arrays(at)) {
+            let mut flipped = good.clone();
+            flipped[at] ^= 0x10;
+            std::fs::write(&path, &flipped).unwrap();
+            assert!(read_file(&path, &key()).is_err(), "flipped at {at}");
+        }
+    }
+
+    #[test]
+    fn the_edge_arrays_checksums_are_checked_before_a_whole_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let (topology, ids) = a_graph();
+        let main = write_main(&path, &topology, &ids);
+        let good = std::fs::read(&path).unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        same(&topology, &stored.topology);
+        if let Some(checks) = &stored.unverified {
+            checks.verify().unwrap();
+        }
+
+        for kind in [OUT_TARGETS, OUT_EDGE_IDS] {
+            let (at, _) = section_of(&good, kind);
+            let mut flipped = good.clone();
+            // Still in range, so a point traversal could not tell.
+            flipped[at] ^= 0x01;
+            std::fs::write(&path, &flipped).unwrap();
+            // Read whole (as on Windows, and by `decode`): an error at once.
+            assert!(decode(&flipped, &key()).is_err());
+            match read_file(&path, &key()) {
+                // Mapped: the damage is found before a whole-graph read.
+                Ok(stored) => {
+                    let checks = stored.unverified.expect("a mapped file defers");
+                    assert!(!checks.is_damaged());
+                    let why = checks.verify().unwrap_err();
+                    assert!(why.contains("does not match"), "{why}");
+                    assert!(checks.is_damaged());
+                }
+                // Read whole where files are not mapped: an error at once.
+                Err(e) if !super::super::mapped::MAPS => {
+                    assert!(e.contains("does not match"), "{e}")
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        // A damaged in-adjacency, read after the check: the transpose is
+        // built instead, the same.
+        std::fs::write(&path, &good).unwrap();
+        let incoming = topology.incoming().clone();
+        append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let chunk = read_file(&path, &key()).unwrap().chunks[0].clone();
+        let (_, _, edge_ids, _) = chunk.sections[2];
+        bytes[edge_ids as usize] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        if let Some(checks) = &stored.unverified {
+            checks.verify().unwrap();
+        }
+        assert_eq!(stored.topology.incoming().targets, incoming.targets);
+        assert_eq!(stored.topology.incoming().edge_ids, incoming.edge_ids);
+    }
+
+    #[test]
+    fn a_mapped_index_survives_its_file_being_replaced_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let (topology, ids) = a_graph();
+        let main = write_main(&path, &topology, &ids);
+        let incoming = topology.incoming().clone();
+        append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+            EncodedChunk::incoming(&incoming, at)
+        })
+        .unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+
+        // Another index replaces the file the way the store does: written to
+        // a temporary file, then renamed over it.
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        let (other, other_ids) = built(ints(&[7, 8, 9]), ints(&[8, 9, 7]));
+        let temp = dir.path().join("x.idx.tmp");
+        write_main(&temp, &other, &other_ids);
+        std::fs::rename(&temp, &path).unwrap();
+        assert_eq!(read_file(&path, &key()).unwrap().topology.n_nodes(), 3);
+
+        // The index loaded before reads as it was, the arrays whole, and its
+        // checksums still match (a map keeps the replaced file's pages).
+        same(&topology, &stored.topology);
+        assert_eq!(stored.topology.incoming().targets, incoming.targets);
+        if let Some(checks) = &stored.unverified {
+            checks.verify().unwrap();
+        }
+        // And after the file is removed (an eviction).
+        std::fs::remove_file(&path).unwrap();
+        same(&topology, &stored.topology);
+        assert_eq!(
+            stored.ids.user_id_array().as_ref(),
+            ids.user_id_array().as_ref()
+        );
+    }
+
     #[test]
     fn a_version_1_file_is_not_read() {
         let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
@@ -1480,7 +2030,7 @@ mod tests {
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(
             decode(&bytes, &key()).unwrap_err(),
-            "index format version 1; this build reads 2"
+            "index format version 1; this build reads 2 and 3"
         );
     }
 

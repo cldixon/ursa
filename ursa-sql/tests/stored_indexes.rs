@@ -1073,3 +1073,177 @@ async fn traversals_use_a_stored_index() {
     assert_eq!((ok(&second, hop).await, ok(&second, path).await), expected);
     assert_eq!(counts(&second), (0, 1));
 }
+
+/// The stored index file of the only manifest entry, and its key.
+fn the_index(fixture: &Fixture) -> (PathBuf, ursa_engine::database::IndexKey) {
+    let entries = read_manifest(&fixture.index_dir());
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    (
+        fixture.index_dir().join(&entries[0].file),
+        entries[0].key.clone(),
+    )
+}
+
+/// The format version of the index file at `path`.
+fn version_of(path: &Path) -> u32 {
+    let bytes = std::fs::read(path).unwrap();
+    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+}
+
+/// #382: an index stored by 0.10 (format version 2) loads, gives the same
+/// results, and a writer rewrites it in the current format, which the next
+/// process maps.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_stored_by_0_10_loads_and_is_rewritten_in_the_current_format() {
+    use ursa_engine::database::index_file::{read_file, Encoded, VERSION, VERSION_2};
+    let fixture = Fixture::new(20_000).await;
+    let first = open(&fixture.db()).await;
+    let expected = ok(&first, QUERY).await;
+    close(first);
+    let (path, key) = the_index(&fixture);
+    assert_eq!(version_of(&path), VERSION);
+    // The same index, as 0.10 wrote it.
+    let stored = read_file(&path, &key).unwrap();
+    let mut v2 = Vec::new();
+    Encoded::new(&key, &stored.topology, &stored.ids)
+        .unwrap()
+        .as_version_2()
+        .write_to(&mut v2)
+        .unwrap();
+    drop(stored);
+    std::fs::write(&path, &v2).unwrap();
+    assert_eq!(version_of(&path), VERSION_2);
+
+    // A reader loads it, whole, and leaves it as it is.
+    let reader = open_read_only(&fixture.db()).await;
+    assert_eq!(ok(&reader, QUERY).await, expected);
+    assert_eq!(counts(&reader), (0, 1));
+    close(reader);
+    assert_eq!(version_of(&path), VERSION_2);
+
+    // A writer loads it and rewrites it, saying so.
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+    let said = taken(&said);
+    assert!(
+        said.iter()
+            .any(|n| n.contains("rewriting the stored index for g") && n.contains("older version")),
+        "{said:?}"
+    );
+    close(ctx);
+    let (path, _) = the_index(&fixture);
+    assert_eq!(version_of(&path), VERSION);
+
+    // The next process maps it: the same results, nothing said.
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+    assert_eq!(taken(&said), Vec::<String>::new());
+}
+
+/// The byte offset of section `kind` in the version 3 index file `bytes`.
+fn section_offset(bytes: &[u8], kind: u32) -> usize {
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let table = (64 + u64_at(32) as usize).div_ceil(8) * 8;
+    (0..u32_at(40) as usize)
+        .map(|i| table + 32 * i)
+        .find(|&entry| u32_at(entry) == kind)
+        .map(|entry| u64_at(entry + 8) as usize)
+        .unwrap()
+}
+
+/// #382: a stored index's edge arrays are checked before an algorithm reads
+/// them whole, not when a traversal reads a few of them. One found damaged
+/// is dropped and built again, with a notice, and the algorithm's result is
+/// the right one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_stored_index_is_built_again_before_an_algorithm_reads_it() {
+    let fixture = Fixture::new(20_000).await;
+    let hop = "SELECT count(*) FROM hop(g, seeds => [0, 1, 2], n => 1)";
+    let first = open(&fixture.db()).await;
+    let expected = ok(&first, QUERY).await;
+    close(first);
+    let (path, _) = the_index(&fixture);
+    let mut bytes = std::fs::read(&path).unwrap();
+    // The low bit of an edge id, deep in the edge arrays.
+    let at = section_offset(&bytes, 3) + 4 * 1000;
+    bytes[at] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+
+    // A reader cannot drop it, and builds the index instead of using it.
+    let reader = open_read_only(&fixture.db()).await;
+    assert_eq!(ok(&reader, QUERY).await, expected);
+    assert_eq!(counts(&reader), (1, 0));
+    assert_eq!(ok(&reader, QUERY).await, expected);
+    close(reader);
+    assert!(path.exists());
+
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    ok(&ctx, hop).await;
+    assert_eq!(counts(&ctx), (0, 1));
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    // Loaded, found damaged before PageRank read it, built again.
+    assert_eq!(counts(&ctx), (1, 0));
+    let said = taken(&said);
+    assert!(
+        said.iter()
+            .any(|n| n.contains("the stored index for g is damaged")
+                && n.contains("does not match")
+                && n.contains("building it again")),
+        "{said:?}"
+    );
+    close(ctx);
+
+    // The damaged file was replaced by a good one.
+    let ctx = open(&fixture.db()).await;
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+}
+
+/// #382: a process keeps reading the index it loaded while another process
+/// replaces its file: evicts it (the file is removed), then stores it again
+/// (a new file renamed into its place). On Unix the first process has the
+/// file mapped, and reads the old file's pages, whole, after both.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_in_use_survives_another_process_replacing_its_file() {
+    let fixture = Fixture::new(20_000).await;
+    let dir = fixture.dir.path();
+    write_edges(&dir.join("edges_b.parquet"), 20_000, 3);
+    let ctx = open(&fixture.db()).await;
+    ok(
+        &ctx,
+        &in_dir(dir, "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));"),
+    )
+    .await;
+    let expected = ok(&ctx, QUERY).await;
+    close(ctx);
+    let (path, _) = the_index(&fixture);
+    let size = read_manifest(&fixture.index_dir())[0].size;
+
+    // A reader loads g, for a traversal.
+    let reader = open_read_only(&fixture.db()).await;
+    ok(&reader, "SELECT count(*) FROM hop(g, seeds => [0], n => 1)").await;
+    assert_eq!(counts(&reader), (0, 1));
+
+    // A writer with room for one index stores b, evicting g, then g again,
+    // evicting b: g's file is removed, then written anew in its place.
+    let writer = open(&fixture.db()).await;
+    let set = format!("SET ursa.index_storage_limit = '{}'", size * 3 / 2);
+    ok(&writer, &set).await;
+    ok(&writer, "SELECT count(*) FROM pagerank(b)").await;
+    ursa_engine::database::flush(&writer.state());
+    assert!(!path.exists());
+    assert_eq!(ok(&writer, QUERY).await, expected);
+    close(writer);
+    assert!(path.exists());
+
+    // The reader runs PageRank over the index it loaded before: every array
+    // read whole, its checksums checked, the same result.
+    assert_eq!(ok(&reader, QUERY).await, expected);
+    assert_eq!(counts(&reader), (0, 1));
+}

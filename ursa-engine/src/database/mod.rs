@@ -45,6 +45,7 @@ use datafusion::prelude::SessionConfig;
 pub mod catalog_file;
 pub mod index_file;
 pub mod index_store;
+pub mod mapped;
 
 pub use catalog_file::{CatalogFile, FORMAT, VERSION};
 pub use index_file::IndexKey;

@@ -107,6 +107,7 @@ use super::node::{
 };
 use super::path_search::{self, PathColumns, PathSearchNode, Search};
 use super::traversal::{self, Traversal, TraversalParam, TraversalParamType};
+use crate::notices::{NoticeLevel, Notifier};
 
 /// Plans Ursa's graph nodes.
 #[derive(Debug)]
@@ -715,13 +716,7 @@ impl ExecutionPlan for GraphAlgorithmExec {
         let values_plan = self.values.clone();
         let schema = Arc::clone(&shape.schema);
         let run = async move {
-            let (index, weights) = match weighted {
-                None => (unweighted_index(&shape.edges, input, &context).await?, None),
-                Some(w) => {
-                    let (index, weights) = weighted_index(&shape.edges, input, w, &context).await?;
-                    (index, Some(weights))
-                }
-            };
+            let (index, weights) = verified_index(&shape.edges, input, weighted, &context).await?;
             let values = match values_plan {
                 Some(plan) => {
                     let batches = drain(&plan, &[0, 1], &context).await?;
@@ -749,6 +744,60 @@ impl ExecutionPlan for GraphAlgorithmExec {
             schema,
             futures::stream::once(run),
         )))
+    }
+}
+
+/// The index (and the weight columns, for a weighted node) for an algorithm
+/// that reads the whole graph, with the checksums of a memory-mapped stored
+/// index checked first (`crate::database::mapped`): the arrays are about to
+/// be read whole anyway, and a result is never computed from damaged ones.
+/// A damaged stored index is dropped and built again from its sources, with
+/// a notice.
+async fn verified_index(
+    edges: &Edges,
+    input: Arc<dyn ExecutionPlan>,
+    weighted: Option<WeightedInput>,
+    context: &Arc<TaskContext>,
+) -> Result<(Arc<GraphIndex>, Option<Weights>)> {
+    let mut damaged = None;
+    loop {
+        let (index, weights) = match weighted.clone() {
+            None => (
+                unweighted_index(edges, Arc::clone(&input), context).await?,
+                None,
+            ),
+            Some(w) => {
+                let (index, weights) =
+                    weighted_index(edges, Arc::clone(&input), w, context).await?;
+                (index, Some(weights))
+            }
+        };
+        let checked = Arc::clone(&index);
+        let verified = crate::run_blocking(move || checked.verify_stored())
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("checking an index failed: {e}")))?;
+        match (verified, damaged) {
+            (Ok(()), _) => return Ok((index, weights)),
+            (Err(why), None) => {
+                if let Some(cache) = context.session_config().get_extension::<IndexCache>() {
+                    cache.record_damaged_load();
+                }
+                Notifier::of(context.session_config()).say(NoticeLevel::On, || {
+                    format!(
+                        "the stored index for {} is damaged ({why}); building it again",
+                        edges.graph
+                    )
+                });
+                damaged = Some(why);
+            }
+            // Built from its sources: not stored, so never damaged.
+            (Err(why), Some(_)) => {
+                return Err(DataFusionError::Execution(format!(
+                    "the index for {} is damaged ({why})",
+                    edges.graph
+                )))
+            }
+        }
     }
 }
 
