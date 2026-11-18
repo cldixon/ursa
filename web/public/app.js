@@ -783,6 +783,12 @@ function setAside() {
 function fitLines(sql, width) {
   const out = [];
   for (const line of sql.split("\n")) {
+    // A dot-command is one line: broken, its rest would run as a command of
+    // its own (.graph karate SIZE BY pagerank / COLOR BY club).
+    if (line.trimStart().startsWith(".")) {
+      out.push(line);
+      continue;
+    }
     const indent = line.match(/^\s*/)[0];
     const comment = line.trimStart().startsWith("--");
     let pad = indent + (comment ? "-- " : "  ");
@@ -846,6 +852,8 @@ async function feed(line, { echo }) {
     statement = [];
     ok = (await hostCommand(r.command)) !== false;
   } else {
+    // A plain .help starts with the tour and .graph, before the list.
+    if (!r.err && /^\s*\.help\s*;?\s*$/.test(line)) await write(HELP_FIRST.flatMap((l) => wrapWords(l, term.cols - 1)).join("\r\n") + "\r\n\r\n");
     await write(r.out + r.err);
     if (r.flow === "exit") await write("This shell lives in the page: New starts a fresh session.\r\n");
     if (!r.pending) {
@@ -868,6 +876,13 @@ const HOST_COMMANDS = [
   [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph (its src and dst columns, or the first two), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); Esc closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
+  [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
+];
+
+// What `.help` says first: where to start, and how to draw a graph.
+const HELP_FIRST = [
+  "New here? .tour runs a five-step tour, and .dataset loads a sample graph.",
+  "Draw a graph: .graph karate draws a property graph, and .graph alone the last result.",
 ];
 
 const SHORTCUTS = `Enter            Run the line (a statement runs once it ends with ;)
@@ -924,6 +939,10 @@ async function hostCommand(line) {
       }
       return true;
     }
+    case ".tour":
+      if (arg) return errorLine("usage: .tour");
+      loadDataset(DATASETS.find((d) => d.id === "tour"));
+      return true;
     case ".dataset": {
       if (!arg) {
         const rows = DATASETS.map((d) => `('${d.id}', '${d.title.replace(/'/g, "''")}')`).join(", ");

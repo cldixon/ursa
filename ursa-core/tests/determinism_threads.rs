@@ -19,10 +19,10 @@
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
-    betweenness, betweenness_weighted, closeness_weighted, label_propagation, layout_fa2,
-    layout_fa2_multilevel, layout_fr, louvain, louvain_weighted, pagerank, pagerank_weighted,
-    symmetric_view_weighted, Fa2Multilevel, Fa2Params, LayoutParams, MultilevelParams,
-    PageRankParams,
+    betweenness, betweenness_weighted, closeness_weighted, connected_components_strong,
+    connected_components_weak, label_propagation, layout_fa2, layout_fa2_multilevel, layout_fr,
+    louvain, louvain_weighted, pagerank, pagerank_weighted, symmetric_view_weighted, Fa2Multilevel,
+    Fa2Params, LayoutParams, MultilevelParams, PageRankParams,
 };
 use ursa_core::Topology;
 
@@ -348,5 +348,33 @@ fn layout_fa2_multilevel_is_thread_count_independent() {
             got_stepped, baseline,
             "stepped diverged on {threads} threads"
         );
+    }
+}
+
+#[test]
+fn connected_components_are_thread_count_independent() {
+    // Above the kernels' parallel threshold (65,536 edges): at one thread they
+    // run serially, which defines the labels, and in parallel at the others
+    // (#383). Sparse enough for many weak and strong components.
+    for (n, m) in [(100_000, 70_000), (40_000, 120_000)] {
+        let t = seeded_graph(n, m);
+        let run = || {
+            (
+                connected_components_weak(&t, None),
+                connected_components_strong(&t, None),
+            )
+        };
+        let reference = on_pool(1, run);
+        for &threads in &THREADS {
+            let (weak, strong) = on_pool(threads, run);
+            assert_eq!(
+                weak, reference.0,
+                "weak components diverged at {threads} threads"
+            );
+            assert_eq!(
+                strong, reference.1,
+                "strong components diverged at {threads} threads"
+            );
+        }
     }
 }

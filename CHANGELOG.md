@@ -150,6 +150,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
   and `.print`. In a colour terminal what is typed is highlighted (keywords,
   strings, comments, dot-commands), the prompt is orange, and errors are red.
+- **Ursa Web Shell: a guided tour, and "Try it live" links from the docs**
+  (#391, and the discoverability half of #390). The Datasets menu's first
+  item, `Tour: the karate club` (also `.tour`, or `?dataset=tour` in the
+  URL), tells one story in five steps, each with a comment for a newcomer:
+  the club's data and its property graph, PageRank (the two leaders come out
+  on top), Louvain (its two factions match the club's real split for 33 of
+  34 members), a drawing of the club, and every shortest path between the
+  two leaders with `GRAPH_TABLE … ALL SHORTEST`. Its tables fit a phone. The
+  karate dataset stays as it was, next to it. Each dataset now ends with a
+  comment that says how to draw it (`.graph lesmis`; for rmat, that the
+  layout takes a few seconds), and `.help` starts with `.tour` and `.graph`.
+  The README, the SQL docs' landing page and the website (its landing page,
+  the docs' overview, Introduction and Quickstart) link to the shell with
+  their example preloaded, as a Share link that shows its statements and
+  runs them on `y`, or with `?dataset=`. `web/scripts/share-link.ts` makes
+  such links, encoded as the shell's Share does. The e2e test runs the tour
+  on a phone and replays every docs link.
 - **Ursa Web Shell: a start hint.** Under the banner, one line points to the
   sample graphs: `Pick a sample graph from the Datasets menu, or type
   .dataset karate` (broken between words on a narrow screen).
@@ -325,6 +342,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     keeps reading the index it mapped while another process replaces it.
     Mapped pages count in a process's RSS once read, as shared, reclaimable
     file cache.
+- **Weak and strong connected components run in parallel, with the same
+  labels** (#383). Both kernels ran on about one core (63 s and 82 s on the
+  full Bluesky graph, on 16 cores). Weak components now find, per thread and
+  range of edges, the edges that join two union-find sets, and replay only
+  those through the serial union-find, so every root is the one the serial
+  kernel picks. Strong components are found in parallel by trimming and
+  colouring rounds, over out-edges only (no transpose), and a serial DFS in
+  Tarjan's order, testing one bit per edge, then names each by Tarjan's root.
+  Labels are bit for bit the serial kernels', which tests pin per node and
+  compare at several pool sizes. On a 256M-edge R-MAT graph on a shared
+  4-core machine: weak 10.4 s to 6.3 s, strong 21.1 s to 13.8 s (the strong
+  kernel's serial DFS takes 0.25 s of it), with 120 MiB more heap at most
+  for weak and 70 MiB less for strong, on a 2 GiB graph. The serial kernels
+  still run on one thread, below 65,536 edges, and without the `rayon`
+  feature. `Linked::of`, run before every compact kernel, also no longer
+  makes an atomic update per edge.
 - **SQL: a database always opens** (#381, N44). A catalog statement that
   fails when the database opens, such as a view over a data file that was
   moved, renamed or deleted, or a database copied without its files, no
