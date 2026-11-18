@@ -153,6 +153,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - **Ursa Web Shell: a start hint.** Under the banner, one line points to the
   sample graphs: `Pick a sample graph from the Datasets menu, or type
   .dataset karate` (broken between words on a narrow screen).
+- **Ursa Web Shell: the browser e2e suite runs in CI** (#392). The "Ursa
+  Shell (browser e2e)" job builds the engine and the page, stages the sample
+  datasets locally, serves them as the Worker does and runs `web/tests/e2e.ts`
+  in headless Chromium, on pull requests that touch the shell or the crates
+  in it; screenshots and logs are uploaded when it fails.
 - **Ursa Web Shell: the Graph view.** `.graph` draws the last result as a
   graph in a pane beside the terminal (under it on a phone), and so does
   the new Graph button: each row is an edge from its `src` column to its
