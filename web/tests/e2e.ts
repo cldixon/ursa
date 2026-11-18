@@ -17,7 +17,9 @@
 // shows control characters as escapes and downloads nothing; awkward file
 // names import; and every response carries the security headers, which the
 // page runs under with no Content Security Policy violation. An error on
-// screen fails the run, except the ones a test asks for.
+// screen fails the run, except the ones a test asks for. It also runs the
+// tour on a phone, and opens every "Try it live" link in the README, the SQL
+// docs and the website (a Share link is answered y).
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -237,6 +239,11 @@ const help = await after(".help");
 check(help.includes(".describe NAME") && help.includes(".share") && help.includes("Run .help graph"), ".help lists the shell's and the page's commands");
 await type(".help graph");
 check((await after(".help graph")).includes("ANY SHORTEST | ALL SHORTEST | SHORTEST k"), ".help graph");
+{
+  // .help starts with where to begin: the tour, and how to draw a graph.
+  const first = help.split("\n.clear")[0];
+  check(first.includes(".tour") && first.includes(".graph karate"), ".help names .tour and .graph before the list", JSON.stringify(first.slice(0, 120)));
+}
 await type(".help shortcuts");
 check((await after(".help shortcuts")).includes("Shift+Enter"), ".help shortcuts (the page's keys)");
 await type(".help timer");
@@ -939,6 +946,79 @@ for (const scheme of ["light", "dark"] as const) {
   check(pane.y >= termBox.y + termBox.height - 1 && pane.width > 380 && rows1 < rows0 && bar.height <= 56, "a phone: the graph view is stacked under the terminal", `terminal ${rows0} → ${rows1} rows, pane at ${pane.y}px`);
   if (shots) await p.screenshot({ path: `${shots}/graph-stacked-phone.png` });
   await pctx.close();
+}
+
+// The tour (`.tour`, ?dataset=tour, the first item of the Datasets menu): on a
+// phone, it runs end to end with no error, its tables fit the screen, its
+// Louvain step matches the club's real split but for one member, and it draws
+// the club.
+{
+  const tctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  const p = await tctx.newPage();
+  await p.goto(`${base}/?dataset=tour`);
+  await ready(p);
+  await idle(p);
+  const text = await screen(p);
+  const cols: number = await p.evaluate(() => (window as any).ursaShell.cols());
+  const tour = datasets.find((d) => d.id === "tour")!;
+  const wide = text.split("\n").filter((l) => /^[┌│└├]/.test(l) && [...l].length > cols);
+  check(!text.includes("Error: ") && (await tables(p)) === queries(tour.commands) && text.includes("That's the tour"), "the tour runs end to end", `${await tables(p)} tables`);
+  check(wide.length === 0, "the tour's tables fit a phone", `${cols} columns; ${wide[0] ?? ""}`);
+  const lines = text.split("\n");
+  const factions = lastTable(lines.slice(0, lines.findIndex((l) => l.includes("Step 4"))).join("\n"));
+  check(JSON.stringify(factions.rows) === '[["0","Mr. Hi","16"],["1","Mr. Hi","1"],["1","Officer","17"]]', "the tour's factions match the club's split", JSON.stringify(factions.rows));
+  check(JSON.stringify(lastTable(text).rows.map((r) => r[1])) === '["[0, 8, 33]","[0, 13, 33]","[0, 19, 33]","[0, 31, 33]"]', "the tour's shortest paths", JSON.stringify(lastTable(text).rows));
+  await graphSettled(p);
+  const info = await graphInfo(p);
+  check((await graphOpen(p)) && info.nodes === 34 && info.edges === 78, "the tour draws the club", JSON.stringify(info));
+  if (shots) await p.screenshot({ path: `${shots}/tour-phone.png` });
+  // .tour runs it again, in a fresh session.
+  await p.click("#terminal");
+  await type(".tour", p);
+  const again = await screen(p);
+  check(again.startsWith("Ursa Web Shell running") && !again.includes("Error: ") && (await tables(p)) === queries(tour.commands), ".tour", `${await tables(p)} tables`);
+  await tctx.close();
+}
+
+// The docs' "Try it live" links (README, the SQL docs, the website): each
+// opens here, and a Share link replays its example after y, with no error.
+{
+  const { linkCommands } = await import("../scripts/share-link.ts");
+  const root = `${import.meta.dir}/../..`;
+  const links = new Set<string>();
+  for (const file of ["README.md", "docs/sql/index.md", "site/src/content/docs/docs/sql/introduction.md", "site/src/content/docs/docs/index.mdx", "site/src/content/docs/docs/quickstart.md", "site/src/pages/index.astro", "site/src/consts.ts"]) {
+    const text = await Bun.file(`${root}/${file}`).text();
+    for (const m of text.matchAll(/https:\/\/ursa-shell\.cl-dixon\.workers\.dev\/(#run=[A-Za-z0-9_-]+|\?dataset=\w+)/g)) links.add(m[1]);
+  }
+  for (const m of (await Bun.file(`${root}/site/src/consts.ts`).text()).matchAll(/\$\{SHELL_URL\}\/(\?dataset=\w+)/g)) links.add(m[1]);
+  check([...links].some((l) => l.startsWith("#run=")) && links.has("?dataset=tour"), "the docs link to the shell", [...links].map((l) => l.slice(0, 20)).join(", "));
+  const lctx = await watchedContext({ viewport: { width: 1280, height: 900 } });
+  for (const link of links) {
+    let p: Page;
+    if (link.startsWith("#run=")) {
+      const commands = linkCommands(link);
+      p = await lctx.newPage();
+      await p.goto(`${base}/${link}`);
+      await p.waitForFunction(() => (window as any).ursaShell?.screen().includes("? [y/N] "), null, { timeout: 120_000 });
+      check((await screen(p)).includes(`This link runs ${commands.length} shared commands:`), `a docs link asks first (${commands.length} commands)`);
+      await p.keyboard.press("y");
+    } else {
+      p = await lctx.newPage();
+      await p.goto(`${base}/${link}`);
+      await ready(p);
+    }
+    await idle(p);
+    const text = await screen(p);
+    const id = link.slice(0, 32);
+    if (link.startsWith("#run=")) {
+      const t = lastTable(text);
+      check(!text.includes("Error: ") && text.includes("Replaying") && t.head[0] === "id" && t.rows[0]?.[0] === "33", `the docs link ${id}… replays its example`, JSON.stringify(t.rows.slice(0, 2)));
+    } else {
+      check(!text.includes("Error: ") && (await tables(p)) > 0, `the docs link ${link} loads`, `${await tables(p)} tables`);
+    }
+    await p.close();
+  }
+  await lctx.close();
 }
 
 // The security headers, on every kind of response.

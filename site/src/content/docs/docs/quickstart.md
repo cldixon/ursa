@@ -5,7 +5,7 @@ description: Query a file, define a graph and run graph algorithms on it with Ur
 
 Ursa is a SQL engine for graph analytics. It reads Parquet, CSV, JSON and Arrow files where they are, on your disk or in object storage, and runs graph algorithms over them with SQL. There is no server and nothing to load first. An edge table is a graph.
 
-This page needs `ursa` installed (see [Installation](/docs/installation/)), or open [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) and pick the karate dataset from its menu.
+This page needs `ursa` installed (see [Installation](/docs/installation/)), or open [Ursa Shell with the karate dataset loaded](https://ursa-shell.cl-dixon.workers.dev/?dataset=karate).
 
 ## Query a file
 
