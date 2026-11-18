@@ -1,21 +1,26 @@
 // Assemble dist/, the static assets: public/, and the engine's JS glue and
-// engine.json from .engine/ (run `bun run engine` first), and the terminal's
+// engine.json from .engine/ (run `bun run engine` first), the graph view
+// (ursa-viz, built here by scripts/viz.ts into dist/viz/), and the terminal's
 // font, IBM Plex Mono (SIL OFL 1.1), and xterm.js (MIT), the terminal, served
 // from the Worker with the page.
 import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { ENGINE_DIR, WEB } from "./common";
+import { ENGINE_DIR, VIZ_DIR, WEB } from "./common";
+import { buildViz } from "./viz";
 
 const dist = join(WEB, "dist");
 if (!existsSync(join(ENGINE_DIR, "engine.json"))) {
   console.error("no engine build: run `bun run engine` first");
   process.exit(1);
 }
+// The graph view: a few MB the page loads only on the first `.graph`.
+buildViz();
 rmSync(dist, { recursive: true, force: true });
 cpSync(join(WEB, "public"), dist, { recursive: true });
 mkdirSync(join(dist, "engine"), { recursive: true });
 cpSync(join(ENGINE_DIR, "pkg", "ursa_wasm.js"), join(dist, "engine", "ursa_wasm.js"));
 cpSync(join(ENGINE_DIR, "engine.json"), join(dist, "engine", "engine.json"));
+cpSync(VIZ_DIR, join(dist, "viz"), { recursive: true });
 
 // The weights and styles style.css uses, in the Latin and Latin Extended subsets.
 const FONT = join(WEB, "node_modules", "@fontsource", "ibm-plex-mono");

@@ -13,6 +13,9 @@
 //                                               what is pending unless alone)
 //   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
 //   export    {format}         -> {bytes}        (the last result, every row)
+//   graph     {text}           -> {n, src, dst, ids, skipped}  (a graph to draw:
+//                                               the last result, a query's or a
+//                                               property graph's; see WebShell.graph)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
 let shell = null;
@@ -77,6 +80,11 @@ async function handle({ id, op, ...args }) {
     } else if (op === "export") {
       const bytes = shell.exportLast(args.format);
       postMessage({ id, ok: true, bytes }, [bytes.buffer]);
+    } else if (op === "graph") {
+      const g = await shell.graph(args.text ?? "");
+      const reply = { id, ok: true, n: g.n, src: g.src, dst: g.dst, ids: g.ids, skipped: g.skipped };
+      g.free();
+      postMessage(reply, [reply.src.buffer, reply.dst.buffer]);
     } else {
       throw new Error(`unknown op ${op}`);
     }

@@ -5,7 +5,7 @@
 // around it, as a real terminal is around the CLI: xterm.js draws the screen,
 // and the line editor here sends the shell each typed line and writes back
 // what it printed. The page adds what only a page can do: the Datasets menu,
-// Share, Import, downloads, and the theme.
+// Share, Import, downloads, the Graph view (graph.js) and the theme.
 import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { DATASETS } from "./datasets.js";
@@ -271,6 +271,11 @@ term.attachCustomKeyEventHandler((e) => {
   // Tab and Shift+Tab move the focus on, as anywhere on a page (there is no
   // completion for them to do), so the keyboard can leave the terminal.
   if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return false;
+  // Esc closes the Graph view, the terminal keeping the focus.
+  if (e.key === "Escape" && graphOpen()) {
+    if (e.type === "keydown") closeGraph();
+    return false;
+  }
   // Shift+Enter starts a new line in what is typed. xterm would send Enter for
   // it (on keydown, and again on keypress), so it never reaches xterm.
   if (e.key === "Enter" && e.shiftKey && !e.isComposing) {
@@ -858,6 +863,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
+  [".graph", "?QUERY|NAME?", "Draw the last result as a graph (its src and dst columns, or the first two), or a query's, or a property graph's; Esc closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
 ];
@@ -883,6 +889,9 @@ async function hostCommand(line) {
   const [name, ...rest] = line.trim().replace(/;\s*$/, "").split(/\s+/);
   const arg = rest.join(" ");
   switch (name) {
+    case ".graph":
+      // The query as typed: its spaces may be in a string.
+      return drawGraph(line.trim().slice(name.length).trim());
     case ".clear":
       term.clear();
       await write("\x1b[H\x1b[2J");
@@ -927,6 +936,91 @@ async function hostCommand(line) {
   }
   return errorLine(`unknown command ${name}`);
 }
+
+// ---------------------------------------------------------------- the Graph view
+
+// The pane beside the terminal (under it on a phone), and graph.js, which
+// draws in it: imported on the first `.graph`, so a session that draws no
+// graph downloads none of it (it loads ursa-viz, a few MB, in turn).
+const graphPane = $("graph-pane");
+let graphModule = null;
+// graph.js once loaded, for the test hooks.
+let graphLoaded = null;
+const graphOpen = () => !graphPane.hidden;
+const loadGraphModule = () =>
+  (graphModule ??= import("./graph.js").then(
+    (m) => (graphLoaded = m),
+    (e) => {
+      graphModule = null;
+      throw e;
+    },
+  ));
+
+/**
+ * `.graph ?QUERY|NAME?`: draw the last result, a query's result, or a
+ * property graph (WebShell.graph says which rows are edges), replacing what
+ * the pane drew. The terminal keeps the focus: queries can still be typed.
+ */
+async function drawGraph(text) {
+  let graph;
+  try {
+    graph = await engine("graph", { text });
+  } catch (e) {
+    if (e.crash) throw e;
+    return errorLine(e.message);
+  }
+  const wasOpen = graphOpen();
+  graphPane.hidden = false;
+  let drawn;
+  try {
+    const module = await loadGraphModule();
+    drawn = await module.show($("graph-stage"), graph, { status: $("graph-status"), onError: graphFailed });
+  } catch (e) {
+    // Closed (Esc) before it was drawn: nothing went wrong.
+    if (!graphOpen()) return true;
+    closeGraph();
+    return errorLine(`the graph view could not start: ${String(e?.message ?? e)}`);
+  }
+  const count = (n, one) => `${n.toLocaleString("en-US")} ${one}${n === 1 ? "" : "s"}`;
+  const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
+  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  return true;
+}
+
+/** Close the pane: the terminal takes the whole width again, and the focus. */
+function closeGraph() {
+  if (graphPane.hidden) return;
+  const hadFocus = graphPane.contains(document.activeElement);
+  graphPane.hidden = true;
+  graphModule?.then((m) => m.close(), () => {});
+  $("graph-stage").replaceChildren();
+  $("graph-status").textContent = "";
+  if (hadFocus) term.focus();
+}
+
+/** The view failed while drawing (a lost GPU, a layout that stopped): say so. */
+function graphFailed(message) {
+  closeGraph();
+  enqueue(async () => {
+    setAside();
+    await errorLine(message);
+  });
+}
+
+$("graph-close").onclick = () => {
+  closeGraph();
+  term.focus();
+};
+graphPane.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  e.preventDefault();
+  closeGraph();
+  term.focus();
+});
+$("graph").onclick = (e) => {
+  run(".graph");
+  if (byPointer(e)) term.focus();
+};
 
 /** Run `sql` in the shell for a listing the page makes; not recorded. */
 async function quiet(sql) {
@@ -1002,6 +1096,8 @@ function fresh() {
   const session = ++generation;
   // A question waiting (a shared link's) is answered no.
   answer?.("");
+  // What the pane drew belongs to the old session.
+  closeGraph();
   enqueue(async () => {
     if (session === generation) await restart();
   });
@@ -1240,4 +1336,10 @@ window.ursaShell = {
   rows: () => term.rows,
   selection: () => term.getSelection(),
   datasets: DATASETS,
+  // The Graph view: whether it is open, and (once graph.js is loaded) what it
+  // draws, a frame's inked pixels, and the node at a canvas pixel.
+  graphOpen,
+  graph: () => graphLoaded?.info() ?? null,
+  graphInked: async () => graphLoaded?.inked() ?? null,
+  graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
 };
