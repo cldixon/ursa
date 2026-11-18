@@ -160,12 +160,10 @@ export async function show(stage, graph, { status, onError }) {
     e.preventDefault();
     fail(`the layout stopped: ${e.message || "its worker failed"}`);
   };
-  // Small graphs settle in a few hundred iterations; large ones get fewer,
-  // as each costs more (half a second at a million edges).
-  const maxIterations = state.edges > 200_000 ? 300 : state.edges > 20_000 ? 600 : 1000;
+  // Coarse to fine: the layout sizes its own schedule to the graph.
   const src = graph.src.slice();
   const dst = graph.dst.slice();
-  worker.postMessage({ type: "start", module: url, n: graph.n, src, dst, maxIterations }, [src.buffer, dst.buffer]);
+  worker.postMessage({ type: "start", module: url, n: graph.n, src, dst }, [src.buffer, dst.buffer]);
 
   // A lost GPU: WebGL2 says so on the canvas; WebGPU's loss shows as a frame
   // that fails to draw (above).

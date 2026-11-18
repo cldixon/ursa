@@ -233,6 +233,21 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     property 's'; its properties are club, id", with a hint to name an edge
     to read its columns, where DataFusion named an internal relation
     (`__ursa_1.s`).
+- **Coarse-to-fine ForceAtlas2, and the graph view lays out with it.**
+  `ursa_core::algo::layout_fa2_multilevel` and its incremental form
+  `Fa2Multilevel` coarsen the graph (heavy-edge matching, with a hub's
+  leftover leaves joining it, and isolated nodes set aside on a ring), lay
+  out its 50-node top level, then refine each finer level in a few
+  iterations. The output is the same bits on any thread count, and however
+  the work is split into steps. On one core a 10,000-node grid comes out as
+  a flat sheet in 2 s, where flat ForceAtlas2 leaves it folded after 1,500
+  iterations; a 16K-node R-MAT graph is as good in 3.5 s as flat after 17 s;
+  clustered graphs separate as well as flat. The `ursa-viz` worker uses it by
+  default (`&multilevel=0` in the demo for flat), drawing every node from the
+  first frame: a 1M-edge R-MAT graph takes shape in about 8 s in the browser,
+  where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
+  weight per edge) and `from_positions` (start positions and masses);
+  `layout_fa2` and `layout_fr` give the same bits as before.
 
 ### Changed
 

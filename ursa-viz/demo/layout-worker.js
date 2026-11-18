@@ -7,28 +7,44 @@ let running = false;
 self.onmessage = async ({ data }) => {
   if (data.type === "start") {
     await init();
-    layout = new Layout(data.n, data.src, data.dst);
+    const t0 = performance.now();
+    layout = new Layout(data.n, data.src, data.dst, data.multilevel ?? true);
+    const buildMs = performance.now() - t0;
     running = true;
-    loop(data.budgetMs ?? 30, data.maxIterations ?? 1000);
+    // Coarse to fine has a place for every node before any iteration: draw it.
+    post({ buildMs });
+    loop(data.budgetMs ?? 100, layout.total ?? data.maxIterations ?? 1000, t0);
   } else if (data.type === "stop") {
     running = false;
   }
 };
 
-/** Step in batches of about `budgetMs`, posting the positions after each. */
-async function loop(budgetMs, maxIterations) {
-  let perIteration = null; // ms, measured over the whole run
+function post(extra) {
+  const xy = new Float32Array(layout.positions());
+  self.postMessage({ type: "positions", xy, iterations: layout.iterations, level: layout.level, ...extra }, [xy.buffer]);
+}
+
+/**
+ * Step in batches of about `budgetMs`, posting the positions after each
+ * (100 ms: coarse to fine, posting means prolonging every level down to the
+ * input graph, a few milliseconds a time at 1M edges).
+ * Coarse to fine, a step's unit is work worth one iteration of the whole
+ * graph; its cost per unit moves as the levels change, so the batch size
+ * follows the last batch's rate rather than the run's average.
+ */
+async function loop(budgetMs, maxIterations, t0) {
+  let msPerUnit = null;
   let totalMs = 0;
-  while (running && layout.iterations < maxIterations) {
-    const batch = perIteration === null ? 1 : Math.max(1, Math.floor(budgetMs / Math.max(perIteration, 0.01)));
-    const n = Math.min(batch, maxIterations - layout.iterations);
+  while (running && !layout.done && layout.iterations < maxIterations) {
+    let batch = msPerUnit === null ? 1 : Math.max(1, Math.floor(budgetMs / Math.max(msPerUnit, 0.01)));
+    batch = Math.min(batch, maxIterations - layout.iterations);
     const t = performance.now();
-    layout.step(n);
-    totalMs += performance.now() - t;
-    perIteration = totalMs / layout.iterations;
-    const xy = new Float32Array(layout.positions());
-    self.postMessage({ type: "positions", xy, iterations: layout.iterations, msPerIteration: perIteration }, [xy.buffer]);
+    layout.step(batch);
+    const ms = performance.now() - t;
+    totalMs += ms;
+    msPerUnit = ms / batch;
+    post({ msPerIteration: totalMs / Math.max(layout.iterations, 1) });
     await new Promise((r) => setTimeout(r, 0)); // let "stop" arrive
   }
-  self.postMessage({ type: "done", iterations: layout.iterations });
+  self.postMessage({ type: "done", iterations: layout.iterations, layoutMs: performance.now() - t0 });
 }

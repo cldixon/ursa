@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use ursa_core::algo::{Fa2Params, Fa2State};
+use ursa_core::algo::{Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams};
 use ursa_core::topology::Topology;
 
 /// A graph to show: `n_nodes` nodes, and one edge per `(src[i], dst[i])`, as
@@ -97,33 +97,96 @@ impl Graph {
 }
 
 /// ForceAtlas2, run a few iterations at a time so the view can draw it as it
-/// converges. The positions are `Fa2State`'s, so a layout stepped here is the
-/// same as `layout_fa2` with as many iterations.
+/// converges: flat ([`LiveLayout::new`]), whose positions are `Fa2State`'s, so
+/// a layout stepped here is the same as `layout_fa2` with as many iterations;
+/// or coarse to fine ([`LiveLayout::multilevel`]), `Fa2Multilevel`'s, the same
+/// as `layout_fa2_multilevel` once done.
 #[derive(Debug)]
 pub struct LiveLayout {
     topology: Arc<Topology>,
-    state: Fa2State,
+    engine: Engine,
+}
+
+#[derive(Debug)]
+enum Engine {
+    Flat(Fa2State),
+    // Boxed: one per view, and twice the size of the flat state.
+    Multilevel(Box<Fa2Multilevel>),
 }
 
 impl LiveLayout {
     pub fn new(graph: &Graph, params: Fa2Params) -> Self {
         let topology = Arc::clone(graph.topology());
         let state = Fa2State::new(topology.undirected(), params);
-        Self { topology, state }
+        Self {
+            topology,
+            engine: Engine::Flat(state),
+        }
     }
 
-    /// Run `iterations` more iterations.
+    /// Coarse to fine: the graph's hierarchy is built here, and every node
+    /// has a position from the start (its coarsest ancestor's, spread out).
+    pub fn multilevel(graph: &Graph, params: MultilevelParams) -> Self {
+        let topology = Arc::clone(graph.topology());
+        let state = Fa2Multilevel::new(topology.undirected(), params);
+        Self {
+            topology,
+            engine: Engine::Multilevel(Box::new(state)),
+        }
+    }
+
+    /// Run `iterations` more iterations. Coarse to fine, that is work worth
+    /// as many iterations of the whole graph, spent on as many iterations of
+    /// the current level as it buys.
     pub fn step(&mut self, iterations: u32) {
-        self.state.step(self.topology.undirected(), iterations);
+        let adj = self.topology.undirected();
+        match &mut self.engine {
+            Engine::Flat(s) => s.step(adj, iterations),
+            Engine::Multilevel(s) => s.step(adj, f64::from(iterations)),
+        }
     }
 
+    /// Iterations run so far: for coarse to fine, the work done, in
+    /// iterations of the whole graph.
     pub fn iterations(&self) -> u32 {
-        self.state.iterations()
+        match &self.engine {
+            Engine::Flat(s) => s.iterations(),
+            Engine::Multilevel(s) => s.work_done().round() as u32,
+        }
+    }
+
+    /// The work of the whole schedule, in iterations of the whole graph, for
+    /// coarse to fine; `None` for flat, which runs for as long as it is
+    /// stepped.
+    pub fn total(&self) -> Option<u32> {
+        match &self.engine {
+            Engine::Flat(_) => None,
+            Engine::Multilevel(s) => Some(s.total_work().round() as u32),
+        }
+    }
+
+    /// Whether coarse to fine has run its schedule (never, for flat).
+    pub fn is_done(&self) -> bool {
+        match &self.engine {
+            Engine::Flat(_) => false,
+            Engine::Multilevel(s) => s.is_done(),
+        }
+    }
+
+    /// The level being laid out: 0 is the graph itself (always, for flat).
+    pub fn level(&self) -> usize {
+        match &self.engine {
+            Engine::Flat(_) => 0,
+            Engine::Multilevel(s) => s.level(),
+        }
     }
 
     /// The positions now: `x` and `y`, one per node.
     pub fn positions(&self) -> (&[f32], &[f32]) {
-        self.state.positions()
+        match &self.engine {
+            Engine::Flat(s) => s.positions(),
+            Engine::Multilevel(s) => s.positions(),
+        }
     }
 }
 
@@ -305,6 +368,44 @@ mod tests {
         let (x, y) = live.positions();
         let (ex, ey) = state.positions();
         assert_eq!((x, y), (ex, ey));
+    }
+
+    #[test]
+    fn a_multilevel_live_layout_is_layout_fa2_multilevel() {
+        // A grid big enough to coarsen, stepped in uneven budgets: the end is
+        // the one-shot layout, uncentered.
+        let (w, h) = (30u32, 30u32);
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if x + 1 < w {
+                    src.push(i);
+                    dst.push(i + 1);
+                }
+                if y + 1 < h {
+                    src.push(i);
+                    dst.push(i + w);
+                }
+            }
+        }
+        let g = Graph::new((w * h) as usize, src, dst).unwrap();
+        let params = MultilevelParams::default();
+        let mut live = LiveLayout::multilevel(&g, params);
+        assert!(live.level() > 0, "a 900-node grid is coarsened");
+        assert_eq!(
+            live.positions().0.len(),
+            900,
+            "every node has a place at once"
+        );
+        let total = live.total().unwrap();
+        while !live.is_done() {
+            live.step(7);
+        }
+        assert!(live.iterations().abs_diff(total) <= 1);
+        let mut state = Fa2Multilevel::new(g.topology().undirected(), params);
+        state.step(g.topology().undirected(), f64::INFINITY);
+        assert_eq!(live.positions(), state.positions());
     }
 
     #[test]
