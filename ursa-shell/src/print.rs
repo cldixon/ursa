@@ -17,7 +17,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::json::writer::{JsonArray, LineDelimited};
 use arrow::json::{Writer as JsonWriter, WriterBuilder as JsonWriterBuilder};
 use arrow::record_batch::RecordBatch;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow::util::display::FormatOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
@@ -157,7 +157,9 @@ pub fn json_array_writer<W: Write>(out: W) -> JsonWriter<W, JsonArray> {
 /// - a null is an empty field and an empty string is `""`, so the two can be
 ///   told apart;
 /// - a list, struct or map is its text form (`[1, 2]`, `{a: 1}`), with
-///   `NULL` for a null inside it, quoted where CSV needs it;
+///   `NULL` for a null inside it and a string inside it in single quotes
+///   where it needs them (`['a, b', c]`, see [`crate::text`]), quoted where
+///   CSV needs it;
 /// - a field is quoted when it holds the delimiter, a quote or a line break,
 ///   and a quote in it is doubled.
 pub struct DelimitedWriter<W> {
@@ -189,7 +191,7 @@ impl<W: Write> DelimitedWriter<W> {
         let formatters = batch
             .columns()
             .iter()
-            .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
+            .map(|c| crate::text::formatter(c.as_ref(), &options))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         // `logical_nulls`, not `is_null`: a column of type Null has no null
         // buffer, yet every value in it is null.

@@ -272,6 +272,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   #350), as DuckDB does, so it can be told from a null, which is still an
   empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
   browser shell's CSV export does the same.
+- **`ursa`: a string inside a list, struct or map is quoted in its text**
+  (behaviour change, #386), as in DuckDB, so different values print
+  differently in CSV, TSV and the table: `['a, b', 'c']` is `['a, b', c]`
+  and `['a', 'b', 'c']` is `[a, b, c]`, which both were `[a, b, c]`, and
+  `['x]', NULL, 'NULL']` is `['x]', NULL, 'NULL']`, which was
+  `[x], NULL, NULL]`. A string is quoted when it is empty, is `NULL` in any
+  case, starts or ends with whitespace, or holds any of
+  `' " \ , : = [ ] { } ( )`; a `'` or `\` in it is escaped with `\`. Struct
+  field names and map keys follow the same rule, and a null inside a nested
+  value is `NULL` in the table too. The browser shell's table and CSV export
+  do the same. JSON stays the lossless format for nested results.
 - **SQL: an index build decodes its source's partitions in parallel**
   (#351, N30). The build read its edge plan one partition at a time to keep
   the order that numbers the nodes, so a filtered view over a large Parquet
