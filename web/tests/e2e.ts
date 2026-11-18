@@ -45,7 +45,12 @@ const page = await context.newPage();
 page.on("pageerror", (e) => failures.push(`page error: ${e.message}`));
 
 async function ready(p: Page) {
-  await p.waitForFunction(() => (window as any).ursaShell && !(window as any).ursaShell.busy(), null, { timeout: 120_000 });
+  // Not busy, and started: the banner and a prompt are on screen. A fresh page
+  // is not busy for a moment before its session starts (and clears the screen).
+  await p.waitForFunction(() => {
+    const shell = (window as any).ursaShell;
+    return shell && !shell.busy() && shell.screen().includes("memory U");
+  }, null, { timeout: 120_000 });
 }
 async function idle(p: Page = page) {
   await p.evaluate(() => (window as any).ursaShell.idle());
@@ -75,11 +80,18 @@ function contrast(a: string, b: string) {
   return (hi + 0.05) / (lo + 0.05);
 }
 /** The colour of the types under a table's header (the shell's grey), and the terminal's background. */
+// xterm draws its rows on the next animation frame: wait for the span.
 const greyText = (p: Page = page) =>
-  p.evaluate(() => {
-    const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
-    return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
-  });
+  p
+    .waitForFunction(
+      () => {
+        const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
+        return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
+      },
+      null,
+      { timeout: 5_000 },
+    )
+    .then((h) => h.jsonValue() as Promise<string[]>, () => null);
 
 /** Type `text` at the prompt, a line at a time, each with Enter; wait for it. */
 async function type(text: string, p: Page = page) {
@@ -109,7 +121,7 @@ const t0 = Date.now();
 await page.goto(base);
 await ready(page);
 const banner = await screen();
-check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
+check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nPick a sample graph from the Datasets menu, or type \.dataset karate\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
 await page.click("#terminal");
 
 // The keyboard can leave the terminal: Tab and Shift+Tab move the focus on
@@ -701,6 +713,10 @@ await idle(phone);
 const columns: number = await phone.evaluate(() => (window as any).ursaShell.cols());
 const widest = Math.max(...(await screen(phone)).split("\n").filter((l) => /^[┌│└├]/.test(l)).map((l) => [...l].length));
 check(widest <= columns, "tables fit a phone's width", `widest ${widest}, ${columns} columns`);
+{
+  const hint = (await screen(phone)).split("\n").slice(3, 6);
+  check(hint.join(" ").startsWith("Pick a sample graph from the Datasets menu, or type .dataset karate") && hint.every((l) => [...l].length < columns), "the banner's hint breaks between words on a phone", JSON.stringify(hint));
+}
 if (shots) await phone.screenshot({ path: `${shots}/shell-phone.png` });
 // The dataset's SQL is broken at spaces to fit: no line fills the width, as a
 // line the terminal wraps (mid-word) does.

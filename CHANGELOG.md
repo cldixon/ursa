@@ -150,6 +150,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
   and `.print`. In a colour terminal what is typed is highlighted (keywords,
   strings, comments, dot-commands), the prompt is orange, and errors are red.
+- **Ursa Web Shell: a start hint.** Under the banner, one line points to the
+  sample graphs: `Pick a sample graph from the Datasets menu, or type
+  .dataset karate` (broken between words on a narrow screen).
 - **`ursa`: shell fixes.**
   - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
     other nulls do; it was a blank cell. So does a dictionary's null value.
