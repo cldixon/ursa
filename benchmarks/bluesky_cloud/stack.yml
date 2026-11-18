@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Ursa Bluesky benchmark: a private S3 bucket for the data and results, an ECR
+  repository for the image, a small VPC with no NAT gateway, an ECS cluster
+  with a Fargate (Graviton) task definition, the EC2 instance role for the
+  live phase, and an IAM role GitHub Actions assumes through OIDC.
+  Nothing here runs or costs per hour until a task or instance is started.
+  See benchmarks/bluesky_cloud/README.md.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: cldixon/ursa
+    Description: The repository whose workflow may run the benchmark (owner/name).
+  GitHubEnvironment:
+    Type: String
+    Default: bluesky-bench
+    Description: >-
+      The GitHub environment the workflow job runs in. Only jobs in this
+      environment can assume the role, so its protection rules (required
+      reviewers) gate every run.
+  CreateGitHubOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >-
+      Create the account's token.actions.githubusercontent.com OIDC provider.
+      An account has at most one; set false if it already exists.
+  TaskCpu:
+    Type: String
+    Default: "16384"
+    AllowedValues: ["4096", "8192", "16384"]
+    Description: Fargate task CPU units (16384 = 16 vCPU, the largest).
+  TaskMemory:
+    Type: String
+    Default: "122880"
+    Description: Fargate task memory in MiB (16 vCPU allows 32768 to 122880, in 8192 steps).
+  EphemeralStorageGiB:
+    Type: Number
+    Default: 150
+    MinValue: 21
+    MaxValue: 200
+    Description: >-
+      Task disk. The full graph needs ~13 GB of data, a ~0.1 GB Parquet copy of
+      the users, and ~41 GB of stored index.
+  ImageTag:
+    Type: String
+    Default: ursa-0.10.0
+    Description: The image tag the task definition starts with (the workflow registers new revisions).
+  AzIdA:
+    Type: String
+    Default: use1-az1
+    Description: >-
+      An Availability Zone ID for the first subnet. In us-east-1, Fargate has no
+      ARM64 capacity in use1-az3, so it is not a default.
+  AzIdB:
+    Type: String
+    Default: use1-az2
+    Description: An Availability Zone ID for the second subnet.
+
+Conditions:
+  MakeOidcProvider: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+
+Resources:
+  # --- storage ---------------------------------------------------------------
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 2
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub "${Bucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "keep the newest 20 images",
+            "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 20},
+            "action": {"type": "expire"}}]}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ursa/${AWS::StackName}"
+      RetentionInDays: 90
+
+  # --- network: public subnets, no NAT gateway, S3 through a free endpoint ----
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzIdA
+      CidrBlock: 10.42.0.0/20
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-a"}]
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzIdB
+      CidrBlock: 10.42.16.0/20
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-b"}]
+
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  # S3 traffic stays inside AWS and costs nothing (a gateway endpoint is free).
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RouteTable]
+
+  # No inbound rules at all: tasks and the instance only call out (ECR, S3,
+  # logs, the install script). The instance is reached with SSM Session
+  # Manager, which needs no open port.
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ursa benchmark tasks and instances; outbound only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # --- ECS / Fargate ------------------------------------------------------------
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}"
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # What run.py may do: read the data, write results. Nothing else.
+  BenchPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "${Bucket.Arn}/data/*"
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "${Bucket.Arn}/results/*"
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt Bucket.Arn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:*"
+      ManagedPolicyArns: [!Ref BenchPolicy]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      EphemeralStorage:
+        SizeInGiB: !Ref EphemeralStorageGiB
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: ARM64
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: bench
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}:${ImageTag}"
+          Essential: true
+          Environment:
+            - {Name: BENCH_HOST_LABEL, Value: !Sub "fargate ${TaskCpu} cpu-units ${TaskMemory} MiB arm64"}
+          # The run's arguments come from `aws ecs run-task --overrides`.
+          Command: ["--help"]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: fargate
+
+  # --- EC2, for the live phase ---------------------------------------------------
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref BenchPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # --- GitHub Actions ------------------------------------------------------------
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  GitHubRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 21600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:environment:${GitHubEnvironment}"
+      Policies:
+        - PolicyName: run-bench
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadStack
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
+              - Sid: PushImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: TaskDefinitions
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                Resource: "*"
+              - Sid: RunTasks
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Sid: WatchTasks
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${AWS::StackName}/*"
+              - Sid: PassTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskRole.Arn
+                  - !GetAtt ExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: ReadResults
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${Bucket.Arn}/results/*"
+              - Sid: ListResults
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: ["results/*"]
+              - Sid: FindTasks
+                Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Sid: ReadLogs
+                Effect: Allow
+                Action: logs:GetLogEvents
+                Resource: !Sub "${LogGroup.Arn}:log-stream:*"
+
+Outputs:
+  Bucket:
+    Value: !Ref Bucket
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  Cluster:
+    Value: !Ref Cluster
+  TaskFamily:
+    Value: !Sub "${AWS::StackName}"
+  Subnets:
+    Value: !Join [",", [!Ref SubnetA, !Ref SubnetB]]
+  SecurityGroup:
+    Value: !Ref SecurityGroup
+  LogGroup:
+    Value: !Ref LogGroup
+  InstanceProfile:
+    Value: !Ref InstanceProfile
+  GitHubRoleArn:
+    Value: !GetAtt GitHubRole.Arn
