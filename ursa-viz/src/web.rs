@@ -290,8 +290,16 @@ pub struct Layout {
 
 #[wasm_bindgen]
 impl Layout {
+    /// The layout of the graph of `n_nodes` nodes and the edges
+    /// `(src[i], dst[i])`: coarse to fine unless `multilevel` is `false`, in
+    /// which case flat ForceAtlas2.
     #[wasm_bindgen(constructor)]
-    pub fn new(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Layout, JsValue> {
+    pub fn new(
+        n_nodes: u32,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        multilevel: Option<bool>,
+    ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
         if src.len() != dst.len() {
             return Err(js_err(format!(
@@ -301,19 +309,44 @@ impl Layout {
             )));
         }
         let graph = Graph::new(n_nodes as usize, src, dst).map_err(js_err)?;
-        Ok(Layout {
-            layout: LiveLayout::new(&graph, ursa_core::algo::Fa2Params::default()),
-        })
+        let layout = if multilevel.unwrap_or(true) {
+            LiveLayout::multilevel(&graph, ursa_core::algo::MultilevelParams::default())
+        } else {
+            LiveLayout::new(&graph, ursa_core::algo::Fa2Params::default())
+        };
+        Ok(Layout { layout })
     }
 
-    /// Run `iterations` more iterations.
+    /// Run `iterations` more iterations: coarse to fine, work worth that many
+    /// iterations of the whole graph.
     pub fn step(&mut self, iterations: u32) {
         self.layout.step(iterations);
     }
 
+    /// Iterations so far: coarse to fine, work done, in iterations of the
+    /// whole graph.
     #[wasm_bindgen(getter)]
     pub fn iterations(&self) -> u32 {
         self.layout.iterations()
+    }
+
+    /// The whole schedule's work, in iterations of the whole graph, coarse to
+    /// fine; `undefined` for flat, which runs as long as it is stepped.
+    #[wasm_bindgen(getter)]
+    pub fn total(&self) -> Option<u32> {
+        self.layout.total()
+    }
+
+    /// Whether coarse to fine has finished its schedule (never, for flat).
+    #[wasm_bindgen(getter)]
+    pub fn done(&self) -> bool {
+        self.layout.is_done()
+    }
+
+    /// The level laid out now: 0 is the graph itself.
+    #[wasm_bindgen(getter)]
+    pub fn level(&self) -> u32 {
+        self.layout.level() as u32
     }
 
     /// The positions now: `x` then `y`, one per node each.

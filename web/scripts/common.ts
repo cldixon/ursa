@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 export const WEB = resolve(import.meta.dir, "..");
 export const REPO = resolve(WEB, "..");
 export const ENGINE_DIR = resolve(WEB, ".engine");
+export const VIZ_DIR = resolve(WEB, ".viz");
 export const DATA_DIR = resolve(WEB, ".data");
 export const BUCKET = "ursa-graph";
 

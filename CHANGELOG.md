@@ -153,6 +153,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - **Ursa Web Shell: a start hint.** Under the banner, one line points to the
   sample graphs: `Pick a sample graph from the Datasets menu, or type
   .dataset karate` (broken between words on a narrow screen).
+- **Ursa Web Shell: the Graph view.** `.graph` draws the last result as a
+  graph in a pane beside the terminal (under it on a phone), and so does
+  the new Graph button: each row is an edge from its `src` column to its
+  `dst` column, or else from its first column to its second, with ids of
+  any type. `.graph QUERY` draws a query's result and `.graph NAME` a
+  property graph (every edge table, and every vertex, edges or not) or a
+  table. The shell says what it draws, `Drawing 78 edges, 34 nodes (Esc
+  closes)`, and keeps the keys: queries can be typed while the graph shows,
+  and the terminal refits to its half. The drawing is `ursa-viz`'s (WebGPU,
+  or else WebGL2), its ForceAtlas2 layout converging live in a worker,
+  nodes sized by degree: drag or the arrow keys pan, the wheel or `+` and
+  `-` zoom, a double-click or `0` fits, and a click names a node. It is
+  ink on white by day and starlight by night. Esc or the close button
+  closes it; New and the Datasets menu do too. It is loaded on the first
+  `.graph` only (about 1 MB gzipped), and draws at most 2,000,000 edges.
+  `WebShell.graph(text)` gives the page the graph: node ids mapped to
+  dense indexes in the order they are first seen, with clear errors when
+  there is nothing to draw.
 - **`ursa`: shell fixes.**
   - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
     other nulls do; it was a blank cell. So does a dictionary's null value.
@@ -227,6 +245,21 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     reference as well. CI builds the site.
   - Zensical builds into `zensical-site/` instead of `site/`, which is now
     the new website's source.
+- **Coarse-to-fine ForceAtlas2, and the graph view lays out with it.**
+  `ursa_core::algo::layout_fa2_multilevel` and its incremental form
+  `Fa2Multilevel` coarsen the graph (heavy-edge matching, with a hub's
+  leftover leaves joining it, and isolated nodes set aside on a ring), lay
+  out its 50-node top level, then refine each finer level in a few
+  iterations. The output is the same bits on any thread count, and however
+  the work is split into steps. On one core a 10,000-node grid comes out as
+  a flat sheet in 2 s, where flat ForceAtlas2 leaves it folded after 1,500
+  iterations; a 16K-node R-MAT graph is as good in 3.5 s as flat after 17 s;
+  clustered graphs separate as well as flat. The `ursa-viz` worker uses it by
+  default (`&multilevel=0` in the demo for flat), drawing every node from the
+  first frame: a 1M-edge R-MAT graph takes shape in about 8 s in the browser,
+  where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
+  weight per edge) and `from_positions` (start positions and masses);
+  `layout_fa2` and `layout_fr` give the same bits as before.
 
 ### Changed
 

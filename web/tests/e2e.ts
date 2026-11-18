@@ -766,6 +766,181 @@ for (const scheme of ["light", "dark"] as const) {
   await ctx.close();
 }
 
+// The Graph view (.graph): a result, a query or a property graph drawn in a
+// pane beside the terminal (under it on a phone), loaded only when first
+// asked for. Headless Chromium draws it with WebGL2 (SwiftShader).
+/** A context watched for Content Security Policy violations, as the main one is. */
+async function watchedContext(options: Parameters<typeof browser.newContext>[0]) {
+  const ctx = await browser.newContext(options);
+  await ctx.addInitScript(() => {
+    document.addEventListener("securitypolicyviolation", (e) =>
+      console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+    );
+  });
+  ctx.on("console", (m) => {
+    if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
+  });
+  ctx.on("page", (p) => p.on("pageerror", (e) => failures.push(`page error: ${e.message}`)));
+  return ctx;
+}
+const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
+const graphOpen = (p: Page): Promise<boolean> => p.evaluate(() => (window as any).ursaShell.graphOpen());
+/** Wait until the view has drawn a frame and its layout has run to the end. */
+async function graphSettled(p: Page) {
+  await p.waitForFunction(
+    () => {
+      const g = (window as any).ursaShell.graph();
+      return g && g.frames > 0 && g.layoutDone;
+    },
+    null,
+    { timeout: 60_000, polling: 200 },
+  );
+}
+/** The terminal's columns, once a resize has settled. */
+async function settledCols(p: Page) {
+  let last = -1;
+  for (let i = 0; i < 20; i++) {
+    await p.waitForTimeout(100);
+    const now: number = await p.evaluate(() => (window as any).ursaShell.cols());
+    if (now === last) return now;
+    last = now;
+  }
+  return last;
+}
+for (const scheme of ["light", "dark"] as const) {
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: scheme });
+  const g = await gctx.newPage();
+  const vizRequests: string[] = [];
+  g.on("request", (r) => {
+    if (/\/viz\/|\/graph(-worker)?\.js/.test(r.url())) vizRequests.push(new URL(r.url()).pathname);
+  });
+  await g.goto(base);
+  await ready(g);
+  await g.click("#terminal");
+  const fullCols = await settledCols(g);
+  if (scheme === "light") {
+    // Errors, each said plainly: nothing to draw yet, too few columns, no rows,
+    // an unknown name, a query that fails.
+    await type(".graph", g);
+    check((await after(".graph", g)).startsWith("Error: no result to draw yet"), ".graph with no result says so", (await after(".graph", g)).split("\n")[0]);
+    for (const [sql, says] of [
+      ["SELECT 1 AS x", "the result has 1 column"],
+      ["SELECT 1 AS src, 2 AS dst WHERE false", "the result has no rows"],
+      ["nothing_here", "no graph or table named 'nothing_here'"],
+      ["SELECT * FROM no_such_table", "no_such_table"],
+    ]) {
+      await type(`.graph ${sql}`, g);
+      const out = await after(`.graph ${sql}`, g);
+      check(out.startsWith("Error: ") && out.includes(says) && !(await graphOpen(g)), `.graph ${sql}: an error`, out.split("\n")[0]);
+    }
+  }
+  await type(".dataset karate", g);
+  check(!(await errors(g)) && vizRequests.length === 0 && !(await graphOpen(g)), `${scheme}: the graph view is not downloaded before .graph`, vizRequests.join(", "));
+
+  // .graph draws the last result: karate's 78 ties between its 34 members.
+  await type("SELECT * FROM ties;", g);
+  await type(".graph", g);
+  const drawing = (await after(".graph", g)).split("\n")[0];
+  check(drawing === "Drawing 78 edges, 34 nodes (Esc closes)", `${scheme}: .graph draws the last result`, drawing);
+  check(vizRequests.some((u) => u.startsWith("/viz/") && u.endsWith(".wasm")) && vizRequests.includes("/graph.js"), `${scheme}: .graph loads the graph view`, vizRequests.join(", "));
+  await graphSettled(g);
+  let info = await graphInfo(g);
+  check(info.nodes === 34 && info.edges === 78 && info.iterations > 0 && info.layoutDone, `${scheme}: the view holds the graph, its layout run to the end`, JSON.stringify(info));
+  const inked = await g.evaluate(() => (window as any).ursaShell.graphInked());
+  check(inked && inked.inked > 500, `${scheme}: the view draws the graph (non-blank pixels)`, `${inked?.inked} of ${inked?.width}x${inked?.height} px, ${info.backend}`);
+  const pane = (await g.locator("#graph-pane").boundingBox())!;
+  const termBox = (await g.locator("#terminal").boundingBox())!;
+  const split = await settledCols(g);
+  check(pane.x >= termBox.x + termBox.width - 1 && Math.abs(pane.width - termBox.width) < 4 && split < fullCols * 0.6, `${scheme}: the pane sits beside the terminal, which refits`, `terminal ${termBox.width}px, ${split} of ${fullCols} columns; pane ${pane.width}px`);
+  const label = await g.evaluate(() => [document.getElementById("graph-pane")!.getAttribute("aria-label"), document.getElementById("graph-close")!.getAttribute("aria-label"), document.querySelector("#graph-stage canvas")?.getAttribute("aria-label")]);
+  check(label.every(Boolean), `${scheme}: the pane, its close button and canvas are labelled`, JSON.stringify(label));
+  check((await focused(g)) === "terminal", `${scheme}: the terminal keeps the focus while the graph shows`, await focused(g));
+  if (shots) await g.screenshot({ path: `${shots}/graph-split-${scheme}.png` });
+  if (scheme === "dark") {
+    await gctx.close();
+    continue;
+  }
+
+  // Typing works while the pane is open.
+  await type("SELECT 6 * 7 AS answer;", g);
+  check(lastTable(await after("SELECT 6 * 7", g)).rows[0]?.[0] === "42" && (await graphOpen(g)), "queries run while the graph shows");
+
+  // A click on a node names it in the pane's header.
+  const box = (await g.locator("#graph-stage canvas").boundingBox())!;
+  const hit: { x: number; y: number } | null = await g.evaluate(([w, h]) => {
+    for (let y = 2; y < h; y += 2)
+      for (let x = 2; x < w; x += 2) if ((window as any).ursaShell.graphNodeAt(x * 2, y * 2) !== null) return { x, y };
+    return null;
+  }, [box.width, box.height]);
+  if (hit) await g.mouse.click(box.x + hit.x, box.y + hit.y);
+  const status = await g.locator("#graph-status").textContent();
+  check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\)/.test(status ?? ""), "a click on a node names it", status ?? "no node found");
+  // Double-click fits, and the wheel zooms, without errors.
+  await g.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
+  await g.mouse.wheel(0, -200);
+
+  // Esc, in the terminal, closes it: the terminal takes the whole width again.
+  await g.click("#terminal");
+  await g.keyboard.press("Escape");
+  check(!(await graphOpen(g)) && (await settledCols(g)) === fullCols && (await focused(g)) === "terminal", "Esc closes the graph view and the terminal refits", `${await settledCols(g)} of ${fullCols} columns`);
+
+  // .graph NAME: a property graph.
+  await type(".graph karate", g);
+  check((await after(".graph karate", g)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), ".graph karate draws the property graph", (await after(".graph karate", g)).split("\n")[0]);
+  // .graph QUERY replaces the drawing.
+  await type(".graph SELECT src, dst FROM ties WHERE src = 1;", g);
+  const replaced = (await after(".graph SELECT src, dst FROM ties WHERE src = 1", g)).split("\n")[0];
+  await graphSettled(g);
+  info = await graphInfo(g);
+  check(/^Drawing 8 edges, 9 nodes \(replacing the last drawing; Esc closes\)$/.test(replaced) && info.edges === 8 && info.nodes === 9, ".graph QUERY replaces the drawing", replaced);
+  // Esc with the focus in the pane closes it, and the focus goes back to the terminal.
+  await g.focus("#graph-stage canvas");
+  await g.keyboard.press("Escape");
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "Esc in the pane closes it, focus back in the terminal", await focused(g));
+
+  // The Graph button draws the last result; a click hands the keys back to the terminal.
+  await type("SELECT * FROM ties;", g);
+  await g.click("#graph");
+  await idle(g);
+  check((await after(".graph", g)).startsWith("Drawing 78 edges, 34 nodes") && (await graphOpen(g)) && (await focused(g)) === "terminal", "the Graph button draws the last result", (await after(".graph", g)).split("\n")[0]);
+  const buttonLabel = await g.evaluate(() => document.getElementById("graph")!.textContent!.trim());
+  check(buttonLabel === "Graph", "the Graph button is named", buttonLabel);
+  // The close button closes it.
+  await g.click("#graph-close");
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "the close button closes the pane", await focused(g));
+  check((await errors(g)) === 0, "no errors from the graph view (since the dataset cleared the screen)", `${await errors(g)}`);
+  // New, or a dataset, closes the pane.
+  await type(".graph karate", g);
+  await g.click("#new");
+  await idle(g);
+  check(!(await graphOpen(g)), "New closes the graph view");
+  await type(".dataset karate", g);
+  await type(".graph karate", g);
+  check(await graphOpen(g), ".graph karate after a fresh session");
+  await type(".dataset florentine", g);
+  check(!(await graphOpen(g)), "a dataset closes the graph view");
+  await gctx.close();
+}
+// A phone: the pane goes under the terminal, which refits to its new height.
+{
+  const pctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  const p = await pctx.newPage();
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  const rows0: number = await p.evaluate(() => (window as any).ursaShell.rows());
+  await p.click("#terminal");
+  await type(".graph karate", p);
+  await graphSettled(p);
+  const pane = (await p.locator("#graph-pane").boundingBox())!;
+  const termBox = (await p.locator("#terminal").boundingBox())!;
+  const rows1: number = await p.evaluate(() => (window as any).ursaShell.rows());
+  const bar = (await p.locator("header.bar").boundingBox())!;
+  check(pane.y >= termBox.y + termBox.height - 1 && pane.width > 380 && rows1 < rows0 && bar.height <= 56, "a phone: the graph view is stacked under the terminal", `terminal ${rows0} → ${rows1} rows, pane at ${pane.y}px`);
+  if (shots) await p.screenshot({ path: `${shots}/graph-stacked-phone.png` });
+  await pctx.close();
+}
+
 // The security headers, on every kind of response.
 for (const path of ["/", "/app.js", "/engine/engine.json", "/data/manifest.json", "/data/no_such_file.csv", "/no/such/page"]) {
   const r = await fetch(`${base}${path}`);

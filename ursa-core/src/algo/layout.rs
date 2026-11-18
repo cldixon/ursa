@@ -138,7 +138,7 @@ impl Default for Fa2Params {
 /// two coincident, which matters because two nodes at exactly the same point feel
 /// infinite repulsion and shoot apart. The jitter keeps different seeds giving
 /// genuinely different layouts.
-fn seed_positions(n: usize, k: f32, seed: u64) -> Positions {
+pub(crate) fn seed_positions(n: usize, k: f32, seed: u64) -> Positions {
     let mut x = vec![0.0f32; n];
     let mut y = vec![0.0f32; n];
     // Golden angle: successive points land maximally out of phase, which is what
@@ -318,6 +318,27 @@ impl Fa2State {
         }
     }
 
+    /// A state that starts from the positions `x`, `y` with the per-node
+    /// repulsion masses `mass`, rather than from seeded positions and
+    /// `deg + 1`: a coarsened graph's node stands for many, and repels as the
+    /// sum of their masses ([`super::multilevel`]). The adaptive speed starts
+    /// afresh, as in [`Self::new`].
+    pub fn from_positions(params: Fa2Params, x: Vec<f32>, y: Vec<f32>, mass: Vec<f32>) -> Self {
+        let n = x.len();
+        assert_eq!(n, y.len(), "one y per x");
+        assert_eq!(n, mass.len(), "one mass per node");
+        Self {
+            params,
+            k: params.k.max(1e-4),
+            x,
+            y,
+            mass,
+            prev: vec![(0.0, 0.0); n],
+            speed: 1.0,
+            iterations: 0,
+        }
+    }
+
     /// The positions now, uncentered.
     pub fn positions(&self) -> (&[f32], &[f32]) {
         (&self.x, &self.y)
@@ -337,11 +358,22 @@ impl Fa2State {
 
     /// Run `iterations` more iterations over `adj`, the adjacency the state
     /// was made for.
+    pub fn step(&mut self, adj: &UndirectedCsr, iterations: u32) {
+        self.step_weighted(adj, None, iterations);
+    }
+
+    /// [`Self::step`] with a weight per edge: `weights[e]` scales the
+    /// attraction along `adj.targets[e]`, as ForceAtlas2's edge weights do.
+    /// A coarsened graph's edge stands for every edge it merged, and pulls as
+    /// hard as all of them. `None` is [`Self::step`], bit for bit.
     // The index loops walk forces, mass, prev and the positions together, in
     // index order, as `layout_fa2` always has: the order is what keeps the
     // sums, and so the layout, bit for bit the same.
     #[allow(clippy::needless_range_loop)]
-    pub fn step(&mut self, adj: &UndirectedCsr, iterations: u32) {
+    pub fn step_weighted(&mut self, adj: &UndirectedCsr, weights: Option<&[f32]>, iterations: u32) {
+        if let Some(w) = weights {
+            assert_eq!(w.len(), adj.targets.len(), "one weight per adjacency entry");
+        }
         let n = self.x.len();
         if n <= 1 {
             self.iterations += iterations;
@@ -377,20 +409,40 @@ impl Fa2State {
                     // crate. Linear in distance by default: the force vector is just
                     // the displacement, which is why there is no division here.
                     let (xi, yi) = (self.x[i], self.y[i]);
-                    for &j in adj.neighbors(i as u32) {
-                        let j = j as usize;
-                        let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
-                        if params.lin_log {
-                            let d = (dx * dx + dy * dy).sqrt().max(1e-4);
-                            // ln(1+d) magnitude along the unit vector. The one
-                            // transcendental in this file, and the reason LinLog is
-                            // excluded from the cross-platform determinism claim.
-                            let f = (1.0 + d).ln() / d;
+                    if let Some(w) = weights {
+                        // Weighted: the same law, times the edge's weight. A
+                        // branch of its own, so the unweighted loop below is
+                        // the one `layout_fa2` has always run.
+                        let base = adj.offsets[i] as usize;
+                        for (e, &j) in adj.neighbors(i as u32).iter().enumerate() {
+                            let j = j as usize;
+                            let we = w[base + e];
+                            let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
+                            let f = if params.lin_log {
+                                let d = (dx * dx + dy * dy).sqrt().max(1e-4);
+                                we * (1.0 + d).ln() / d
+                            } else {
+                                we
+                            };
                             fx -= dx * f;
                             fy -= dy * f;
-                        } else {
-                            fx -= dx;
-                            fy -= dy;
+                        }
+                    } else {
+                        for &j in adj.neighbors(i as u32) {
+                            let j = j as usize;
+                            let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
+                            if params.lin_log {
+                                let d = (dx * dx + dy * dy).sqrt().max(1e-4);
+                                // ln(1+d) magnitude along the unit vector. The one
+                                // transcendental in this file, and the reason LinLog is
+                                // excluded from the cross-platform determinism claim.
+                                let f = (1.0 + d).ln() / d;
+                                fx -= dx * f;
+                                fy -= dy * f;
+                            } else {
+                                fx -= dx;
+                                fy -= dy;
+                            }
                         }
                     }
 
@@ -497,7 +549,7 @@ pub fn layout_circle(topo: &Topology, params: LayoutParams) -> Positions {
 
 /// Recentre on the origin, so a layout's position in space is not an accident of
 /// where it happened to drift.
-fn center(x: &mut [f32], y: &mut [f32]) {
+pub(crate) fn center(x: &mut [f32], y: &mut [f32]) {
     let n = x.len() as f32;
     if n == 0.0 {
         return;
