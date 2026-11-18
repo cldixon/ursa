@@ -165,6 +165,20 @@ bun run test:e2e                              # in another; or: bun tests/e2e.ts
 
 It needs Playwright and Chromium (`bun add --no-save playwright && bunx playwright install chromium`).
 
+CI runs it: the "Ursa Shell (browser e2e)" job (`.github/workflows/shell-e2e.yml`)
+runs on pull requests and pushes to `main` that touch `web/`, the crates built
+into the page (`ursa-wasm`, `ursa-shell`, `ursa-viz` and the engine crates
+under them), the Cargo files, or the datasets' inputs; it can also be started
+by hand (Run workflow). It does what is above, with no Cloudflare credentials:
+`bun run engine`, `bun run build`, `bun run upload:data -- --dry` (which only
+stages `.data/`), then `bun scripts/preview.ts` and the suite against it, with
+Playwright pinned in the workflow (`PLAYWRIGHT_VERSION`) and its own Chromium.
+Cargo's dependencies are cached; so are `.engine/`, keyed by the engine's
+sources, and `.data/`, keyed by the bundled CSVs, `gen.py` and
+`upload-data.ts` (a miss builds the native `ursa` in release, several
+minutes). A failed run uploads the screenshots and the server's and suite's
+logs as the `shell-e2e` artifact.
+
 ## Datasets
 
 - The library's bundled sample graphs (`python/ursa/datasets/data/`), each as
