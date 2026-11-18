@@ -215,6 +215,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     property 's'; its properties are club, id", with a hint to name an edge
     to read its columns, where DataFusion named an internal relation
     (`__ursa_1.s`).
+- **A new website for Ursa SQL, in `site/`**, to be served at
+  `https://ursa.cldixon.dev`: a landing page at `/` and the docs at `/docs/`,
+  built with Astro and Starlight and laid out after duckdb.org's docs, ready
+  to deploy as Workers static assets (worker `ursa-site`; not deployed yet).
+  The docs are the eight `docs/sql/` pages, regrouped under Get started and
+  Topics. `docs/sql/` stays, served by the Zensical site, until the cutover.
+  - `ursa-cli`'s docs test runs the SQL on the new pages too
+    (`site_docs_run`, with `{/* skip */}` for MDX), and
+    `function_reference_is_current` checks the site's copy of the function
+    reference as well. CI builds the site.
+  - Zensical builds into `zensical-site/` instead of `site/`, which is now
+    the new website's source.
 
 ### Changed
 

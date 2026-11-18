@@ -17,8 +17,15 @@ __pycache__/
 .mypy_cache/
 
 # Documentation site: build output and zensical's cache, never committed.
-/site/
+/zensical-site/
 /.cache/
+
+# The website (site/): its dependencies and Astro's build and cache.
+site/node_modules/
+site/dist/
+site/.astro/
+site/.wrangler/
+site/.cloudflare/
 
 # Credentials.
 .env

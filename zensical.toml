@@ -8,6 +8,9 @@ copyright = "Copyright &copy; 2026 Ursa contributors. MIT OR Apache-2.0."
 repo_url = "https://github.com/cldixon/ursa"
 repo_name = "cldixon/ursa"
 edit_uri = "edit/main/docs/"
+# Not the default, site/: that is the new website's source (site/README.md),
+# and `zensical build --clean` would empty it.
+site_dir = "zensical-site"
 extra_css = ["stylesheets/extra.css"]
 
 nav = [

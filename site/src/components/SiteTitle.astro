@@ -1,0 +1,47 @@
+---
+// The docs header's title, as DuckDB's: the logo and the name link home, and
+// "Docs" links to the docs overview.
+import Logo from "./Logo.astro";
+---
+
+<div class="site-title sl-flex">
+	<a href="/" class="home sl-flex" aria-label="Ursa home">
+		<Logo />
+		<span class="name" translate="no">Ursa</span>
+	</a>
+	<a href="/docs/" class="docs">Docs</a>
+</div>
+
+<style>
+	.site-title {
+		align-items: center;
+		gap: 0.5rem;
+		white-space: nowrap;
+		min-width: 0;
+	}
+	a {
+		text-decoration: none;
+		color: var(--sl-color-white);
+	}
+	.home {
+		align-items: center;
+		gap: 0.55rem;
+	}
+	.home :global(.ursa-logo) {
+		width: 2.75rem;
+		height: auto;
+	}
+	.name {
+		font-size: var(--sl-text-h4);
+		font-weight: 700;
+		letter-spacing: -0.01em;
+	}
+	.docs {
+		font-size: var(--sl-text-h4);
+		font-weight: 400;
+		color: var(--sl-color-gray-3);
+	}
+	.docs:hover {
+		color: var(--sl-color-white);
+	}
+</style>

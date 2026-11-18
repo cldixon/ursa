@@ -1,0 +1,61 @@
+---
+// Starlight's header, with an "Ursa Shell" link to the web shell beside the
+// GitHub icon and the theme toggle.
+import Default from "@astrojs/starlight/components/Header.astro";
+import { SHELL_URL } from "../consts";
+---
+
+<div class="docs-header">
+	<Default />
+	<a class="try" href={SHELL_URL}>
+		<svg viewBox="0 0 24 24" aria-hidden="true"
+			><path
+				d="M5 7l5 5-5 5M12 17h7"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.8"
+				stroke-linecap="round"
+				stroke-linejoin="round"></path></svg
+		>
+		<span>Ursa Shell</span>
+	</a>
+</div>
+
+<style>
+	.docs-header {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+		height: 100%;
+	}
+	.docs-header > :global(.header) {
+		flex: 1;
+		min-width: 0;
+	}
+	.try {
+		display: none;
+		align-items: center;
+		gap: 0.35rem;
+		padding: 0.35rem 0.8rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 999px;
+		font-size: var(--sl-text-sm);
+		font-weight: 500;
+		color: var(--sl-color-white);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.try:hover {
+		border-color: var(--sl-color-accent);
+		color: var(--sl-color-accent);
+	}
+	.try svg {
+		width: 1rem;
+		height: 1rem;
+	}
+	@media (min-width: 50rem) {
+		.try {
+			display: flex;
+		}
+	}
+</style>
