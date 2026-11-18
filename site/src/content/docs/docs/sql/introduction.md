@@ -30,7 +30,7 @@ LIMIT 3;
 └───────┴─────────────────────┘
 ```
 
-To install `ursa`, see [Installation](/docs/installation/); to try it with nothing to install, open [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev), which runs the same engine in your browser.
+**[Try it live](https://ursa-shell.cl-dixon.workers.dev/#run=WyJDUkVBVEUgVklFVyB0aWVzIEFTIFNFTEVDVCAqIEZST00gJ2thcmF0ZV9lZGdlcy5jc3YnOyIsIkNSRUFURSBQUk9QRVJUWSBHUkFQSCBjbHViXG4gIEVER0UgVEFCTEVTICh0aWVzIFNPVVJDRSBLRVkgKHNyYykgREVTVElOQVRJT04gS0VZIChkc3QpKTsiLCJTRUxFQ1QgKiBGUk9NIHBhZ2VyYW5rKGNsdWIsIGRpcmVjdGlvbiA9PiAnYm90aCcpXG5PUkRFUiBCWSBwYWdlcmFuayBERVNDXG5MSU1JVCAzOyJd)** in [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev), which runs the same engine in your browser: the link shows the three statements and runs them when you answer `y`. Or take the [tour](https://ursa-shell.cl-dixon.workers.dev/?dataset=tour), five steps on the karate club from PageRank to a drawing of the graph. To install `ursa`, see [Installation](/docs/installation/).
 
 ## What it is
 

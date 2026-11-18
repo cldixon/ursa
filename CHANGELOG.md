@@ -150,6 +150,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
   and `.print`. In a colour terminal what is typed is highlighted (keywords,
   strings, comments, dot-commands), the prompt is orange, and errors are red.
+- **Ursa Web Shell: a guided tour, and "Try it live" links from the docs**
+  (#391, and the discoverability half of #390). The Datasets menu's first
+  item, `Tour: the karate club` (also `.tour`, or `?dataset=tour` in the
+  URL), tells one story in five steps, each with a comment for a newcomer:
+  the club's data and its property graph, PageRank (the two leaders come out
+  on top), Louvain (its two factions match the club's real split for 33 of
+  34 members), a drawing of the club, and every shortest path between the
+  two leaders with `GRAPH_TABLE … ALL SHORTEST`. Its tables fit a phone. The
+  karate dataset stays as it was, next to it. Each dataset now ends with a
+  comment that says how to draw it (`.graph lesmis`; for rmat, that the
+  layout takes a few seconds), and `.help` starts with `.tour` and `.graph`.
+  The README, the SQL docs' landing page and the website (its landing page,
+  the docs' overview, Introduction and Quickstart) link to the shell with
+  their example preloaded, as a Share link that shows its statements and
+  runs them on `y`, or with `?dataset=`. `web/scripts/share-link.ts` makes
+  such links, encoded as the shell's Share does. The e2e test runs the tour
+  on a phone and replays every docs link.
 - **Ursa Web Shell: a start hint.** Under the banner, one line points to the
   sample graphs: `Pick a sample graph from the Datasets menu, or type
   .dataset karate` (broken between words on a narrow screen).
