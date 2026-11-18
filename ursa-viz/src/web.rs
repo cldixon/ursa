@@ -15,7 +15,7 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use crate::scene::{Graph, LiveLayout, NodeStyle};
+use crate::scene::{parse_color, Graph, LiveLayout, NodeStyle, Theme};
 use crate::view::View;
 
 fn js_err(e: impl std::fmt::Display) -> JsValue {
@@ -225,13 +225,78 @@ impl GraphView {
         Ok(())
     }
 
-    /// Node colours from a categorical column, one category per node.
+    /// Node colours from a categorical column, one category per node:
+    /// category `c` is the theme's `palette[c % palette.length]`. Kept, so
+    /// [`GraphView::set_theme`] recolours the nodes.
     #[wasm_bindgen(js_name = colorBy)]
     pub fn color_by(&mut self, categories: Vec<u32>) -> Result<(), JsValue> {
         self.check_len(categories.len())?;
-        let mut style = self.view.style().clone();
-        style.color = NodeStyle::colors_from(&categories);
-        self.view.set_style(&self.queue, style);
+        self.view.color_by(&self.queue, Some(categories));
+        Ok(())
+    }
+
+    /// The colours to draw with, as CSS hex colours (`#rrggbb`, `#rgb`,
+    /// with alpha or not): `{background, edge, node, palette}`, each
+    /// optional, a missing one kept. `edge` is the edges' ink (their
+    /// opacity is [`GraphView::set_edge_alpha`] times its alpha), `node` the
+    /// nodes' colour when they are not coloured by category, and `palette`
+    /// the categories' colours (an array). Takes effect on the next
+    /// [`GraphView::render`]; the default is ink on white.
+    #[wasm_bindgen(js_name = setTheme)]
+    pub fn set_theme(&mut self, theme: JsValue) -> Result<(), JsValue> {
+        let mut next = self.view.theme().clone();
+        let field = |name: &str| js_sys::Reflect::get(&theme, &JsValue::from_str(name));
+        let color = |name: &str, value: JsValue| -> Result<u32, JsValue> {
+            let text = value
+                .as_string()
+                .ok_or_else(|| js_err(format!("setTheme: {name} must be a CSS hex colour")))?;
+            parse_color(&text).ok_or_else(|| {
+                js_err(format!(
+                    "setTheme: {name} must be a CSS hex colour, as #0b0b0a; got '{text}'"
+                ))
+            })
+        };
+        for (name, slot) in [
+            ("background", &mut next.background),
+            ("edge", &mut next.edge),
+            ("node", &mut next.node),
+        ] {
+            let value = field(name)?;
+            if !value.is_undefined() && !value.is_null() {
+                *slot = color(name, value)?;
+            }
+        }
+        let palette = field("palette")?;
+        if !palette.is_undefined() && !palette.is_null() {
+            if !js_sys::Array::is_array(&palette) {
+                return Err(js_err(
+                    "setTheme: palette must be an array of CSS hex colours",
+                ));
+            }
+            next.palette = js_sys::Array::from(&palette)
+                .iter()
+                .map(|c| color("palette", c))
+                .collect::<Result<_, _>>()?;
+        }
+        self.view.set_theme(&self.queue, next);
+        Ok(())
+    }
+
+    /// The built-in themes' colours: `"light"` (ink on white, the default)
+    /// or `"dark"` (light on near-black), as [`GraphView::set_theme`] takes
+    /// them.
+    #[wasm_bindgen(js_name = setThemeNamed)]
+    pub fn set_theme_named(&mut self, name: &str) -> Result<(), JsValue> {
+        let theme = match name {
+            "light" => Theme::light(),
+            "dark" => Theme::dark(),
+            other => {
+                return Err(js_err(format!(
+                    "no theme named '{other}'; use light or dark"
+                )))
+            }
+        };
+        self.view.set_theme(&self.queue, theme);
         Ok(())
     }
 
@@ -347,6 +412,14 @@ impl Layout {
     #[wasm_bindgen(getter)]
     pub fn level(&self) -> u32 {
         self.layout.level() as u32
+    }
+
+    /// How many levels there are: the coarse levels, then the graph itself
+    /// (level 0). Coarse to fine counts [`Layout::level`] down from
+    /// `levels - 1`; flat has one.
+    #[wasm_bindgen(getter)]
+    pub fn levels(&self) -> u32 {
+        self.layout.levels() as u32
     }
 
     /// The positions now: `x` then `y`, one per node each.

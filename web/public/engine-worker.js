@@ -16,6 +16,9 @@
 //   graph     {text}           -> {n, src, dst, ids, skipped}  (a graph to draw:
 //                                               the last result, a query's or a
 //                                               property graph's; see WebShell.graph)
+//                                  and with SIZE BY: {size, sizeBy}; with COLOR BY:
+//                                  {color, colorBy, colorLabels, colorCounts,
+//                                   colorOther, colorMissing}
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
 let shell = null;
@@ -83,8 +86,19 @@ async function handle({ id, op, ...args }) {
     } else if (op === "graph") {
       const g = await shell.graph(args.text ?? "");
       const reply = { id, ok: true, n: g.n, src: g.src, dst: g.dst, ids: g.ids, skipped: g.skipped };
+      const transfer = [reply.src.buffer, reply.dst.buffer];
+      const size = g.size;
+      if (size) {
+        Object.assign(reply, { size, sizeBy: g.sizeBy });
+        transfer.push(size.buffer);
+      }
+      const color = g.color;
+      if (color) {
+        Object.assign(reply, { color, colorBy: g.colorBy, colorLabels: g.colorLabels, colorCounts: g.colorCounts, colorOther: g.colorOther, colorMissing: g.colorMissing });
+        transfer.push(color.buffer);
+      }
       g.free();
-      postMessage(reply, [reply.src.buffer, reply.dst.buffer]);
+      postMessage(reply, transfer);
     } else {
       throw new Error(`unknown op ${op}`);
     }

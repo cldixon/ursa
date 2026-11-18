@@ -36,7 +36,7 @@ static assets and an R2 bucket.
     is a page on the graph SQL, whose forms the e2e test runs), and the page's
     own, which the shell lists in `.help` and hands back to the page:
     `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
-    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME?`,
+    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?`,
     `.history ?N?` and `.share`.
   - **Datasets.** Picking one starts a fresh session and runs its commands at
     the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
@@ -69,8 +69,43 @@ static assets and an R2 bucket.
     its first column to its second, the ids of any type numbered `0..n` in
     the order they are first seen, at most 2,000,000 edges. `ursa-viz` draws
     it (WebGPU, else WebGL2) with its ForceAtlas2 layout running in
-    `graph-worker.js`, nodes sized by degree. The view is ink on white; the
-    dark theme inverts the canvas in CSS and screens it onto the sky.
+    `graph-worker.js`, nodes sized by degree unless asked otherwise.
+  - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES
+    (query)] [SIZE BY x] [COLOR BY y]`, the clauses in any order after the
+    source. `.graph karate SIZE BY pagerank COLOR BY louvain` sizes Karate's
+    members by PageRank and colours them by Louvain community. A name is, in
+    turn: a column of `NODES (SELECT id, … FROM …)` (its `id` column, or else
+    its first, joined to the drawing's node ids); a column of the property
+    graph's vertex tables (`COLOR BY club`); `degree` (of the drawing); or a
+    per-node algorithm run on the property graph with the view's defaults
+    through `algorithms(G, …)` (`direction => 'both'` where it has one,
+    `seed => 1` where it is random): `pagerank`, `louvain`, `betweenness`,
+    `closeness`, `label_propagation`, `connected_components`,
+    `triangle_count`, `clustering_coefficient`. A source that is rows (a
+    query, a table, the last result) takes `NODES` and `degree` only.
+    `SIZE BY` needs numbers; `COLOR BY` colours the eight largest
+    categories, the rest "other", and refuses a fractional column with more
+    than eight values or any with more than eight that are over half the
+    nodes (it suggests `SIZE BY`). The engine parses and resolves it all
+    (`ursa-wasm/src/graph.rs`) and returns each node's size and colour index
+    with the legend's labels and counts. The legend, under the pane's
+    header, names what sizes the nodes (with its range) and each colour's
+    category and count, in text.
+  - **Theme:** `ursa-viz` draws in the page's `--graph-*` tokens
+    (`style.css`: background, edge ink, plain nodes, eight categorical hues
+    and "other", stepped for each theme), set with `view.setTheme(…)`; the
+    theme toggle (or the system's) recolours an open view. No CSS filter.
+  - **Progress** (#390): the pane opens with "Loading graph view…" as soon
+    as the engine takes more than 150 ms (not at all, for a quick error),
+    and starts loading `ursa-viz`, here and in the layout worker, then,
+    while the engine still runs the query. The graph goes to the worker
+    before the page builds its view, and nothing is drawn before the
+    layout's first positions. The header then reads `… · Laying out · level
+    k of n`, then `N nodes · M edges · Done`. `window.ursaShell.graphTimings()`
+    gives when each step ended, and `bun tests/graph-timing.ts [url] [runs]`
+    times `.graph rmat` (1M edges): in headless Chromium, the first drawing
+    went from 4.6 s after Enter to 0.95 s, and the layout's end from 12.1 s
+    to 6.0 s.
     `graph.js` is imported on the first `.graph`, and it loads `ursa-viz`
     (about 1 MB gzipped), so a session that draws nothing downloads neither.
     The terminal keeps the focus and refits to its half (xterm's fit addon,
@@ -150,7 +185,10 @@ downloads in each format, Import (with awkward file names), a shared link
 replayed in a fresh page (answered y and N, and a crafted one with escape
 sequences and `.export`), New, the theme toggle and history; the Graph view
 (`.graph` on a result, a query and a property graph, its errors, pixels drawn
-in both themes, a node picked, typing while it shows, Esc and the close
+in both themes; `SIZE BY` and `COLOR BY` from an algorithm, a vertex column and
+`NODES (…)`, each of their errors, at least two palette colours read back in
+each theme with no inversion, a theme switch with the pane open, the legend's
+text, and the status from Enter to Done, within a second for rmat; a node picked, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, the Graph
 button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
 phone checks: Tab out of the terminal, the menu's keys, the focus after a

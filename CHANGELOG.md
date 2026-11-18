@@ -188,6 +188,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WebShell.graph(text)` gives the page the graph: node ids mapped to
   dense indexes in the order they are first seen, with clear errors when
   there is nothing to draw.
+- **Ursa Web Shell: sizes, colours and a legend for the Graph view**
+  (#389). `.graph [SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
+  `.graph karate SIZE BY pagerank COLOR BY louvain` sizes nodes by PageRank
+  and colours them by Louvain community. x and y name a column of `NODES
+  (SELECT id, … FROM …)`, a vertex column of the property graph, `degree`,
+  or a per-node algorithm, run on the graph with defaults through
+  `algorithms(G, …)` and joined on id. A query or the last result takes
+  `NODES` and `degree` only. Errors say what fits: an unknown name lists the
+  graph's columns and the algorithms, `SIZE BY` text suggests `COLOR BY`,
+  and too many categories suggests `SIZE BY`. `COLOR BY` colours the eight
+  largest categories and draws the rest as "other"; the pane's legend names
+  what sizes the nodes and each colour's category and count. The engine does
+  it all (`WebShell.graph` returns `size`, `color` and the legend; with no
+  clause, the graph as before).
+- **Ursa Web Shell: the Graph view in each theme's own colours.** The view
+  draws on the theme's background with its own edge ink and a categorical
+  palette stepped for white and for the dark sky, so the CSS inversion is
+  gone; switching the theme recolours an open view. `ursa-viz` has
+  `setTheme({background, edge, node, palette})` and a `Theme` in Rust, and
+  its `Layout` a `levels` getter.
+- **Ursa Web Shell: the Graph view says how far it is, and draws sooner**
+  (#390). The pane shows "Loading graph view…" within a moment of Enter,
+  then "Laying out · level k of n", then the counts and "Done". `ursa-viz`
+  and the layout worker start loading while the engine runs the query, the
+  layout gets the graph before the view is built, and nothing is drawn
+  before its first positions: `.graph rmat` (1M edges) first draws 0.95 s
+  after Enter in headless Chromium, from 4.6 s, and finishes its layout at
+  6.0 s, from 12.1 s.
 - **`ursa`: shell fixes.**
   - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
     other nulls do; it was a blank cell. So does a dictionary's null value.

@@ -11,7 +11,7 @@ use wasm_bindgen::JsCast;
 use ursa_core::algo::Fa2Params;
 
 use crate::render::{node_radius_scale, Renderer};
-use crate::scene::{bounds, Camera, Graph, LiveLayout, NodeStyle};
+use crate::scene::{bounds, Camera, Graph, LiveLayout, NodeStyle, Theme};
 
 pub struct View {
     graph: Graph,
@@ -23,6 +23,11 @@ pub struct View {
     x: Vec<f32>,
     y: Vec<f32>,
     style: NodeStyle,
+    /// The colours drawn with.
+    theme: Theme,
+    /// Each node's category, once coloured by one ([`View::color_by`]): kept
+    /// so a new theme recolours them.
+    categories: Option<Vec<u32>>,
     camera: Camera,
     renderer: Renderer,
     /// Fit the camera to the layout as it moves, until the user pans or zooms.
@@ -56,6 +61,8 @@ impl View {
             x,
             y,
             style,
+            theme: Theme::light(),
+            categories: None,
             camera: Camera::new(width as f32, height as f32),
             renderer,
             follow: true,
@@ -128,6 +135,37 @@ impl View {
 
     pub fn style(&self) -> &NodeStyle {
         &self.style
+    }
+
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Colour nodes by category, one per node, with the theme's palette;
+    /// `None` draws every node in the theme's node colour.
+    pub fn color_by(&mut self, queue: &wgpu::Queue, categories: Option<Vec<u32>>) {
+        if let Some(c) = &categories {
+            assert_eq!(c.len(), self.graph.n_nodes());
+        }
+        self.categories = categories;
+        self.recolor(queue);
+    }
+
+    /// Draw with `theme`: its background and edge ink, and node colours
+    /// from its palette (or its node colour).
+    pub fn set_theme(&mut self, queue: &wgpu::Queue, theme: Theme) {
+        self.renderer.set_theme(&theme);
+        self.theme = theme;
+        self.recolor(queue);
+    }
+
+    fn recolor(&mut self, queue: &wgpu::Queue) {
+        let mut style = self.style.clone();
+        style.color = match &self.categories {
+            Some(c) => self.theme.colors(c),
+            None => vec![self.theme.node; self.graph.n_nodes()],
+        };
+        self.set_style(queue, style);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

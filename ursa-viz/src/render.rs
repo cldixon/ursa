@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::scene::{Camera, NodeStyle};
+use crate::scene::{rgba, Camera, NodeStyle, Theme};
 
 /// The camera, as the shaders read it.
 #[repr(C)]
@@ -32,6 +32,8 @@ struct Uniforms {
     edge_alpha: f32,
     /// Multiplies every node's radius (see [`node_radius_scale`]).
     radius_scale: f32,
+    /// The edges' ink, straight (not premultiplied) RGBA.
+    edge_color: [f32; 4],
 }
 
 const SHADER: &str = r#"
@@ -41,6 +43,7 @@ struct Uniforms {
     pixel: vec2<f32>,
     edge_alpha: f32,
     radius_scale: f32,
+    edge_color: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -55,9 +58,9 @@ fn edge_vs(@location(0) x: f32, @location(1) y: f32) -> @builtin(position) vec4<
 
 @fragment
 fn edge_fs() -> @location(0) vec4<f32> {
-    // Premultiplied: a light grey that darkens where edges pile up.
-    let a = u.edge_alpha;
-    return vec4<f32>(0.35 * a, 0.35 * a, 0.40 * a, a);
+    // Premultiplied: faint ink that deepens where edges pile up.
+    let a = u.edge_alpha * u.edge_color.a;
+    return vec4<f32>(u.edge_color.rgb * a, a);
 }
 
 struct NodeOut {
@@ -119,6 +122,8 @@ pub struct Renderer {
     n_indices: u32,
     /// The background, white unless set.
     pub background: wgpu::Color,
+    /// The edges' ink, `0xRRGGBBAA` (grey unless set; see [`crate::scene::Theme`]).
+    pub edge_color: u32,
     /// Edge opacity, from 0 to 1; lower for dense graphs.
     pub edge_alpha: f32,
 }
@@ -316,6 +321,7 @@ impl Renderer {
             n_nodes: n_nodes as u32,
             n_indices: line_indices.len() as u32,
             background: wgpu::Color::WHITE,
+            edge_color: Theme::light().edge,
             edge_alpha: default_edge_alpha(n_nodes, line_indices.len() / 2),
         }
     }
@@ -327,6 +333,19 @@ impl Renderer {
         }
         queue.write_buffer(&self.x, 0, bytemuck::cast_slice(x));
         queue.write_buffer(&self.y, 0, bytemuck::cast_slice(y));
+    }
+
+    /// Draw with `theme`'s background and edge ink (node colours are the
+    /// style's: see [`crate::view::View::set_theme`]).
+    pub fn set_theme(&mut self, theme: &Theme) {
+        let [r, g, b, a] = rgba(theme.background);
+        self.background = wgpu::Color {
+            r: r.into(),
+            g: g.into(),
+            b: b.into(),
+            a: a.into(),
+        };
+        self.edge_color = theme.edge;
     }
 
     /// Upload new radii and colours.
@@ -356,6 +375,7 @@ impl Renderer {
             pixel: [2.0 / w, 2.0 / h],
             edge_alpha: self.edge_alpha,
             radius_scale,
+            edge_color: rgba(self.edge_color),
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -417,6 +437,13 @@ mod tests {
         )
         .validate(&module)
         .expect("WGSL validates");
+    }
+
+    #[test]
+    fn the_uniforms_are_laid_out_as_wgsl_lays_them_out() {
+        // vec4 aligns to 16 bytes: edge_color follows radius_scale at 32.
+        assert_eq!(std::mem::size_of::<Uniforms>(), 48);
+        assert_eq!(std::mem::offset_of!(Uniforms, edge_color), 32);
     }
 
     #[test]
