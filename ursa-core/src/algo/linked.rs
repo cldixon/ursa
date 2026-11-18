@@ -63,8 +63,13 @@ impl Linked {
             return Linked::from_fn(n, |u| out.degree(u) > 0 || inc.degree(u) > 0);
         }
         let words: Vec<AtomicU64> = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        // A plain load first: most targets are set already (a hub is the
+        // target of many edges), and the atomic update costs far more (#383).
         let set = |v: u32| {
-            words[(v >> 6) as usize].fetch_or(1u64 << (v & 63), Ordering::Relaxed);
+            let (word, bit) = (&words[(v >> 6) as usize], 1u64 << (v & 63));
+            if word.load(Ordering::Relaxed) & bit == 0 {
+                word.fetch_or(bit, Ordering::Relaxed);
+            }
         };
         (0..n as u32).into_par_iter().for_each(|u| {
             let mut any = false;
