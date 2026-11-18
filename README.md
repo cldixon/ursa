@@ -91,6 +91,8 @@ Algorithms give the same values in SQL and in Python. Install `ursa` with one li
 curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 ```
 
+Or try it in your browser, with nothing to install, in [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev).
+
 On Windows, `irm https://cldixon.github.io/ursa/install.ps1 | iex` in PowerShell. Or `cargo install ursa-cli`, or a binary from the [releases page](https://github.com/cldixon/ursa/releases). See the [SQL docs](https://cldixon.github.io/ursa/sql/).
 
 ## How it is built
