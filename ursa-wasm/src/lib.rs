@@ -40,8 +40,9 @@ use url::Url;
 use ursa_shell::print::{json_array_writer, DelimitedWriter};
 use ursa_shell::table::{Rows, Style, DEFAULT_MAX_ROWS};
 
+mod graph;
 mod shell;
-pub use shell::WebShell;
+pub use shell::{GraphData, WebShell};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 

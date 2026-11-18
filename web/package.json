@@ -13,6 +13,7 @@
   "scripts": {
     "engine": "bun scripts/engine.ts",
     "build": "bun scripts/build.ts",
+    "viz": "bun scripts/viz.ts",
     "check": "cf workers types && tsc -p .",
     "dev": "bun run build && cf dev",
     "deploy": "bun run build && cf deploy",
