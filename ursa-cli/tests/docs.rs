@@ -4,9 +4,13 @@
 //!
 //! - **`sql_docs_run`**: the SQL on every page under `docs/sql/`, and on the
 //!   landing page (`docs/index.md`), runs and prints what the page shows.
+//! - **`site_docs_run`**: the same for the new website's docs, the Markdown
+//!   and MDX pages under `site/src/content/docs/`.
 //! - **`skill_examples_run`**: the same for `skills/ursa-sql/SKILL.md`.
-//! - **`function_reference_is_current`**: `docs/sql/reference/functions.md` is
-//!   what `SELECT * FROM ursa_functions()` generates. To regenerate it, run
+//! - **`function_reference_is_current`**: `docs/sql/reference/functions.md`,
+//!   and the website's copy, `site/src/content/docs/docs/reference/functions.md`
+//!   (the same page with Starlight's frontmatter for a title), are what
+//!   `SELECT * FROM ursa_functions()` generates. To regenerate both, run
 //!
 //!   ```text
 //!   URSA_BLESS=1 cargo test -p ursa-cli --test docs function_reference
@@ -34,8 +38,13 @@
 //!   URSA_BLESS=1 cargo test -p ursa-cli --test docs _run
 //!   ```
 //! - `<!-- skip -->` on the line before a ```` ```sql ```` block skips it. Use
-//!   it for SQL that cannot run here: object storage, placeholder paths.
-//! - Blocks indented inside an admonition or a content tab count too.
+//!   it for SQL that cannot run here: object storage, placeholder paths. In an
+//!   MDX page, where HTML comments are not allowed, write `{/* skip */}`.
+//! - Blocks indented inside an admonition or a content tab count too, and so
+//!   do blocks inside a Starlight aside (`:::note` … `:::`).
+//! - A fence's info string may carry more than the language, as Starlight's
+//!   code blocks allow (```` ```sql title="q.sql" ````): the first word is
+//!   the language.
 //! - Shell dot-commands and `ursa …` command lines go in ```` ```text ```` or
 //!   ```` ```bash ```` blocks, which do not run. The command lines of the
 //!   Getting Started page are checked by `tests/getting_started.rs`.
@@ -77,6 +86,12 @@ struct Fence {
     adjacent: bool,
 }
 
+/// The marker that skips the block after it: an HTML comment in Markdown, a
+/// JSX comment in MDX.
+fn is_skip(line: &str) -> bool {
+    matches!(line.trim(), "<!-- skip -->" | "{/* skip */}")
+}
+
 fn fences(text: &str) -> Vec<Fence> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
@@ -92,7 +107,7 @@ fn fences(text: &str) -> Vec<Fence> {
         };
         let indent = line.len() - trimmed.len();
         let lang = info.split_whitespace().next().unwrap_or("").to_string();
-        let skip = i > 0 && lines[i - 1].trim() == "<!-- skip -->";
+        let skip = i > 0 && is_skip(lines[i - 1]);
         let adjacent =
             after_previous.is_some_and(|start| lines[start..i].iter().all(|l| l.trim().is_empty()));
         let start = i + 1;
@@ -253,7 +268,7 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for path in entries {
         if path.is_dir() {
             markdown_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "md") {
+        } else if path.extension().is_some_and(|e| e == "md" || e == "mdx") {
             out.push(path);
         }
     }
@@ -287,6 +302,16 @@ fn sql_docs_run() {
     check(&pages);
 }
 
+/// The new website's docs (site/): copies of the `docs/sql/` pages,
+/// regrouped, under the same convention. Until the cutover removes
+/// `docs/sql/`, both are checked.
+#[test]
+fn site_docs_run() {
+    let mut pages = Vec::new();
+    markdown_files(&workspace().join("site/src/content/docs"), &mut pages);
+    check(&pages);
+}
+
 #[test]
 fn skill_examples_run() {
     check(&[workspace().join("skills/ursa-sql/SKILL.md")]);
@@ -306,11 +331,38 @@ fn the_convention_is_parsed() {
     assert_eq!(examples[2].sql, "SELECT 3;");
 }
 
+#[test]
+fn the_site_convention_is_parsed() {
+    let page =
+        ":::tip[Title]\n```sql title=\"q.sql\"\nSELECT 1;\n```\n\n```text\nout\n```\n:::\n\n\
+                {/* skip */}\n```sql\nSELECT 2;\n```\n";
+    let examples = examples(page);
+    assert_eq!(examples.len(), 2);
+    assert_eq!(examples[0].sql, "SELECT 1;");
+    assert_eq!(examples[0].expected.as_deref(), Some("out"));
+    assert!(examples[1].skip);
+}
+
 // The function reference.
 
 /// Where the generated reference lives.
 fn reference_path() -> PathBuf {
     workspace().join("docs/sql/reference/functions.md")
+}
+
+/// The website's copy of the reference.
+fn site_reference_path() -> PathBuf {
+    workspace().join("site/src/content/docs/docs/reference/functions.md")
+}
+
+/// The reference as a Starlight page: its title moves from the `#` heading to
+/// the frontmatter, which Starlight needs, and the rest is the same.
+fn site_reference(generated: &str) -> String {
+    let body = generated.replacen("# Function reference\n\n", "", 1);
+    format!(
+        "---\ntitle: Function reference\ndescription: Every graph function in Ursa SQL, \
+         its parameters and its output, generated from ursa_functions().\n---\n\n{body}"
+    )
 }
 
 const REGENERATE: &str = "URSA_BLESS=1 cargo test -p ursa-cli --test docs function_reference";
@@ -329,18 +381,24 @@ fn function_reference_is_current() {
     );
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     let generated = reference(&rows);
-    let path = reference_path();
+    let site = site_reference(&generated);
+    let pages = [(reference_path(), generated), (site_reference_path(), site)];
     if std::env::var_os("URSA_BLESS").is_some() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &generated).unwrap();
+        for (path, text) in &pages {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
         return;
     }
-    let committed = std::fs::read_to_string(&path).unwrap_or_default();
-    assert!(
-        committed == generated,
-        "docs/sql/reference/functions.md is out of date with ursa_functions(). \
-         Regenerate it with\n\n    {REGENERATE}\n\nand commit the result."
-    );
+    for (path, text) in &pages {
+        let committed = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            committed == *text,
+            "{} is out of date with ursa_functions(). \
+             Regenerate it with\n\n    {REGENERATE}\n\nand commit the result.",
+            path.strip_prefix(workspace()).unwrap_or(path).display()
+        );
+    }
 }
 
 fn text<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {

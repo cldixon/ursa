@@ -1,0 +1,130 @@
+/* The docs' look: clean, neutral and roomy, after duckdb.org/docs, in the web
+   shell's colours (web/public/style.css): warm near-black ink on white, and
+   its orange star as the accent. Starlight's dark theme is :root, its light
+   theme :root[data-theme='light']. */
+
+:root {
+	--sl-color-accent-low: #3a1d0e;
+	--sl-color-accent: #ff9f51;
+	--sl-color-accent-high: #ffd2a1;
+	--sl-color-white: #f4f1ea;
+	--sl-color-gray-1: #e6e3dc;
+	--sl-color-gray-2: #c4c1b9;
+	--sl-color-gray-3: #9a978f;
+	--sl-color-gray-4: #6b6963;
+	--sl-color-gray-5: #34332f;
+	--sl-color-gray-6: #1c1c19;
+	--sl-color-black: #0f0f0d;
+
+	--sl-content-width: 48rem;
+	--sl-sidebar-width: 18.5rem;
+	--sl-nav-height: 4rem;
+	--sl-text-h1: 2.25rem;
+	--sl-text-h2: 1.6rem;
+	--sl-text-h3: 1.25rem;
+	--sl-line-height: 1.7;
+}
+
+:root[data-theme="light"] {
+	--sl-color-accent-low: #fbe6da;
+	--sl-color-accent: #c4491b;
+	--sl-color-accent-high: #8f3210;
+	--sl-color-white: #12120f;
+	--sl-color-gray-1: #24231f;
+	--sl-color-gray-2: #3d3c37;
+	--sl-color-gray-3: #5f5d57;
+	--sl-color-gray-4: #8c8981;
+	--sl-color-gray-5: #dcd9d2;
+	--sl-color-gray-6: #f1efea;
+	--sl-color-gray-7: #f8f7f4;
+	--sl-color-black: #ffffff;
+}
+
+/* One background for header, sidebar and page, divided by hairlines. */
+:root {
+	--sl-color-bg-nav: var(--sl-color-black);
+	--sl-color-bg-sidebar: var(--sl-color-black);
+	--sl-color-hairline-shade: var(--sl-color-gray-5);
+}
+
+/* The sidebar: "Get started" and "Topics" are small headings over their
+   links, as DuckDB's are; the topic groups under them fold. */
+.sidebar-content ul.top-level > li > details > summary .large {
+	font-size: 0.75rem;
+	font-weight: 600;
+	letter-spacing: 0.07em;
+	text-transform: uppercase;
+	color: var(--sl-color-gray-3);
+}
+.sidebar-content ul ul details > summary .large {
+	font-size: var(--sl-text-sm);
+	font-weight: 600;
+	color: var(--sl-color-gray-1);
+}
+.sidebar-content a {
+	border-radius: 0.375rem;
+}
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:hover,
+.sidebar-content a[aria-current="page"]:focus {
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-accent-high);
+	font-weight: 600;
+}
+
+/* Header icons in ink, not the accent. */
+.social-icons a {
+	color: var(--sl-color-gray-3);
+}
+.social-icons a:hover {
+	color: var(--sl-color-white);
+}
+
+/* Headings: roomy, quiet. */
+.sl-markdown-content :is(h2, h3) {
+	letter-spacing: -0.01em;
+}
+.sl-markdown-content h2 {
+	margin-top: 2.75rem;
+	padding-top: 0.25rem;
+}
+h1#_top {
+	letter-spacing: -0.02em;
+}
+
+/* Tables: hairlines only. */
+.sl-markdown-content table {
+	font-size: var(--sl-text-sm);
+}
+
+/* Inline code: a soft tile. */
+.sl-markdown-content :not(pre) > code {
+	background: var(--sl-color-gray-6);
+	border: 1px solid var(--sl-color-gray-5);
+	border-radius: 0.3rem;
+	padding: 0.1em 0.35em;
+	font-size: 0.875em;
+}
+
+/* Asides: quiet tints, not saturated blocks. Notes are blue as the web
+   shell's dot-commands are; tips take the accent. */
+.starlight-aside {
+	border-radius: 0.5rem;
+	border-inline-start-width: 3px;
+}
+:root:not([data-theme="light"]) {
+	--sl-color-blue-low: #161d2e;
+	--sl-color-blue: #7d97d8;
+	--sl-color-blue-high: #c9d6ff;
+	--sl-color-purple-low: #2a1a10;
+	--sl-color-purple: #ff9f51;
+	--sl-color-purple-high: #ffd2a1;
+}
+:root[data-theme="light"] {
+	--sl-color-blue-low: #eef2fb;
+	--sl-color-blue: #3456a8;
+	--sl-color-blue-high: #1f3e8c;
+	--sl-color-purple-low: #fbefe8;
+	--sl-color-purple: #c4491b;
+	--sl-color-purple-high: #8f3210;
+}

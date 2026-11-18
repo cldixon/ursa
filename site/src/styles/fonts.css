@@ -1,0 +1,23 @@
+/* The site's fonts, shared by the landing page and the docs, all served from
+   the site itself: Inter for text, IBM Plex Mono for code (as the web shell
+   uses), and Ursa Box for the box-drawing characters of result tables, which
+   Plex Mono's web fonts lack (web/scripts/box-font.py makes it). */
+@import "@fontsource-variable/inter/index.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+@font-face {
+	font-family: "Ursa Box";
+	font-style: normal;
+	font-weight: 400 700;
+	font-display: block;
+	src: url("/fonts/ursa-box.woff2") format("woff2");
+	unicode-range: U+2500-257F;
+}
+
+:root {
+	--ursa-font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+	--ursa-font-mono: "Ursa Box", "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	--sl-font: var(--ursa-font-sans);
+	--sl-font-mono: var(--ursa-font-mono);
+}

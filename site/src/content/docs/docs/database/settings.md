@@ -1,0 +1,28 @@
+---
+title: "Settings"
+description: "Ursa's settings, set with SET and read with SHOW."
+---
+
+Ursa's settings start with `ursa.`. Set one with `SET` and read it with `SHOW`:
+
+```sql
+SET ursa.index_storage_limit = '8GiB';
+SHOW ursa.index_storage_limit;
+```
+
+```text
+┌──────────────────────────┬─────────────────────────────┐
+│           name           │            value            │
+│           Utf8           │            Utf8             │
+├──────────────────────────┼─────────────────────────────┤
+│ ursa.index_storage_limit │ 8GiB (SET for this session) │
+└──────────────────────────┴─────────────────────────────┘
+```
+
+| Setting                    | Default | Meaning                                                                                                                                         |
+| -------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ursa.index_storage_limit` | `auto`  | The most space stored graph indexes may take in a database. Bytes, or a number with `KiB`, `MiB`, `GiB` or `TiB`. `auto`: 25% of the free space on the database's disk, at least 4 GiB and at most 64 GiB. `SHOW` says the limit in effect and where it comes from. See [the database file](/docs/database/database-file/#the-storage-limit). |
+
+`SHOW ursa.index_storage_limit VERBOSE` adds a description. `SHOW ALL` lists every setting, DataFusion's and Ursa's. DataFusion's settings, such as `datafusion.execution.target_partitions`, work as in DataFusion.
+
+A setting lasts for the session, as in DuckDB and Postgres, in any database: `SET` and `RESET` write nothing to the database file. To keep a setting, put the `SET` in `~/.ursarc`, which the interactive shell runs at startup, or in a file you pass with `-init`, which scripts run too.
