@@ -333,7 +333,8 @@ fn the_convention_is_parsed() {
 
 #[test]
 fn the_site_convention_is_parsed() {
-    let page = ":::tip[Title]\n```sql title=\"q.sql\"\nSELECT 1;\n```\n\n```text\nout\n```\n:::\n\n\
+    let page =
+        ":::tip[Title]\n```sql title=\"q.sql\"\nSELECT 1;\n```\n\n```text\nout\n```\n:::\n\n\
                 {/* skip */}\n```sql\nSELECT 2;\n```\n";
     let examples = examples(page);
     assert_eq!(examples.len(), 2);
