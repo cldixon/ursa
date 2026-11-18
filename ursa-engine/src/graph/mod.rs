@@ -80,7 +80,9 @@ pub use index::{
     IndexHeld, Weights,
 };
 pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
-pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
+pub(crate) use session::{
+    collapse_held_rule, edge_order_rule, query_planner, register_functions, with_algorithms,
+};
 
 /// One graph, as `CREATE PROPERTY GRAPH` defined it: its vertex and edge
 /// tables (SQL/PGQ's element tables), with their keys resolved (#295).

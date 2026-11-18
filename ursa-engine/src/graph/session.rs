@@ -9,7 +9,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use super::catalog_table::UrsaFunctions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 
-use super::exec::{KeepEdgeOrder, UrsaQueryPlanner};
+use super::exec::{CollapseHeldInputs, KeepEdgeOrder, UrsaQueryPlanner};
 use super::relation::GraphFunctions;
 
 /// `config` with an index cache, and with file-scan work stealing off so a
@@ -26,6 +26,12 @@ pub(crate) fn with_algorithms(config: SessionConfig) -> SessionConfig {
 /// The physical optimizer rule that keeps graph nodes' edge rows in order.
 pub(crate) fn edge_order_rule() -> Arc<dyn PhysicalOptimizerRule + Send + Sync> {
     Arc::new(KeepEdgeOrder)
+}
+
+/// The physical optimizer rule, run last, that stops drawing the inputs a
+/// path search over a held index does not read.
+pub(crate) fn collapse_held_rule() -> Arc<dyn PhysicalOptimizerRule + Send + Sync> {
+    Arc::new(CollapseHeldInputs)
 }
 
 /// The query planner that plans graph nodes.

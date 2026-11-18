@@ -68,9 +68,12 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
         .with_catalog_list(catalogs)
         .with_query_planner(graph::query_planner())
         .with_physical_optimizer_rule(graph::edge_order_rule());
-    // In the browser, last: every plan runs on the task that polls it.
+    // In the browser, after the graph rules: every plan runs on the task
+    // that polls it.
     #[cfg(target_arch = "wasm32")]
     let ctx = ctx.with_physical_optimizer_rule(Arc::new(serial::SingleTask));
+    // Last of all: hide the inputs a path search over a held index skips.
+    let ctx = ctx.with_physical_optimizer_rule(graph::collapse_held_rule());
     let mut state = ctx.build();
     for ext in ["jsonl", "ndjson"] {
         state
