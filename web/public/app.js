@@ -980,7 +980,21 @@ async function restart({ clear = true } = {}) {
   history_replace("");
   if (clear) term.reset();
   cursorRow = 0;
-  await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n`);
+  // Where to start: the sample graphs. Broken between words when the
+  // terminal is too narrow (a phone) to hold it on one line.
+  const hint = wrapWords("Pick a sample graph from the Datasets menu, or type .dataset karate", term.cols - 1);
+  await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n${hint.join("\r\n")}\r\n`);
+}
+
+/** `text`'s words in lines no wider than `width` (a longer word gets a line of its own). */
+function wrapWords(text, width) {
+  const lines = [];
+  for (const word of text.split(" ")) {
+    const last = lines.length - 1;
+    if (last >= 0 && lines[last].length + 1 + word.length <= width) lines[last] += ` ${word}`;
+    else lines.push(word);
+  }
+  return lines;
 }
 
 /** Start a fresh session; what was queued for the old one is skipped. */
