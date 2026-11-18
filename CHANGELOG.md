@@ -15,7 +15,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the engine crates are `ursa-engine` and `ursa-sql`). This is its first
   release. It is versioned apart from the Python package. Changes on `main`
   since then are released as `ursa-cli` 0.7.0 (2026-11-06), 0.8.0
-  (2026-11-07), 0.9.0 (2026-11-10) and 0.10.0 (2026-11-17).
+  (2026-11-07), 0.9.0 (2026-11-10), 0.10.0 (2026-11-17) and 0.11.0
+  (2026-11-18).
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
