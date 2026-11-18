@@ -674,3 +674,78 @@ fn notices_go_to_stderr_and_leave_stdout_alone() {
     let e = err(ursa_in(cwd, &["club.ursa", "-q", "-c", "SELECT nope"]));
     assert!(e.starts_with("Error: "), "{e}");
 }
+
+/// SET lasts for the process, as in DuckDB and Postgres (#353): nothing is
+/// stored in the database; an -init file keeps a setting. A limit Ursa 0.8 or
+/// 0.9 saved is said once, on stderr, and removed.
+#[test]
+fn set_lasts_for_the_process_and_a_saved_limit_is_said_once() {
+    let dir = karate_dir();
+    let cwd = dir.path();
+    assert_eq!(ok(ursa_in(cwd, &["club.ursa", "-c", DEFINE])), "");
+    let catalog = std::fs::read_to_string(cwd.join("club.ursa")).unwrap();
+    let show = "SHOW ursa.index_storage_limit";
+    let shown = |args: &[&str]| {
+        let out = ursa_in(cwd, args);
+        let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+        (ok(out), stderr)
+    };
+
+    let set = format!("SET ursa.index_storage_limit = '50MiB'; {show}");
+    let (stdout, stderr) = shown(&["club.ursa", "--format=csv", "-c", &set]);
+    assert_eq!(
+        stdout,
+        "name,value\nursa.index_storage_limit,50MiB (SET for this session)\n"
+    );
+    assert_eq!(stderr, "");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("club.ursa")).unwrap(),
+        catalog
+    );
+    // The next process has the default, and says where it comes from.
+    let (stdout, _) = shown(&["club.ursa", "--format=csv", "-c", show]);
+    assert!(
+        stdout.starts_with("name,value\nursa.index_storage_limit,\"")
+            && stdout.contains("iB (the default: 25% of ")
+            && stdout.contains(" free on the disk of club.ursa"),
+        "{stdout}"
+    );
+    // An -init file keeps it.
+    std::fs::write(
+        cwd.join("init.sql"),
+        "SET ursa.index_storage_limit = '50MiB';\n",
+    )
+    .unwrap();
+    let (stdout, _) = shown(&["club.ursa", "-init", "init.sql", "--format=csv", "-c", show]);
+    assert_eq!(
+        stdout,
+        "name,value\nursa.index_storage_limit,50MiB (SET for this session)\n"
+    );
+
+    // A limit 0.8 or 0.9 saved: not applied, said once, and removed.
+    let saved = catalog.replacen(
+        "\n}\n",
+        ",\n  \"settings\": {\n    \"ursa.index_storage_limit\": \"50MiB\"\n  }\n}\n",
+        1,
+    );
+    std::fs::write(cwd.join("club.ursa"), &saved).unwrap();
+    let notice = "ursa: club.ursa has a saved ursa.index_storage_limit = 50MiB, which is no \
+                  longer applied; SET now lasts for the session. To keep it, add SET \
+                  ursa.index_storage_limit = '50MiB' to ~/.ursarc (or an -init file)\n";
+    let (stdout, stderr) = shown(&["club.ursa", "--readonly", "--format=csv", "-c", show]);
+    assert!(stdout.contains("(the default: "), "{stdout}");
+    assert_eq!(stderr, notice);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("club.ursa")).unwrap(),
+        saved
+    );
+    let (stdout, stderr) = shown(&["club.ursa", "--format=csv", "-c", show]);
+    assert!(stdout.contains("(the default: "), "{stdout}");
+    assert_eq!(stderr, notice);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("club.ursa")).unwrap(),
+        catalog
+    );
+    let (_, stderr) = shown(&["club.ursa", "--format=csv", "-c", show]);
+    assert_eq!(stderr, "");
+}

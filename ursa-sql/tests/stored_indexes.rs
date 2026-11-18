@@ -131,9 +131,22 @@ CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst)
 
 const SHOW_LIMIT: &str = "SHOW ursa.index_storage_limit";
 
-/// The row `SHOW ursa.index_storage_limit` gives for `limit`.
+/// The row `SHOW ursa.index_storage_limit` gives for `limit`, SET.
 fn limit_row(limit: &str) -> [String; 1] {
-    [format!("ursa.index_storage_limit,{limit}")]
+    [format!(
+        "ursa.index_storage_limit,{limit} (SET for this session)"
+    )]
+}
+
+/// Whether `rows` (of `SHOW ursa.index_storage_limit`) show the database's
+/// default limit.
+fn shows_the_default(ctx: &SessionContext, rows: &[String]) -> bool {
+    let db = ursa_engine::database::database(&ctx.state()).unwrap();
+    let default = ursa_engine::options::ByteSize(db.default_index_storage_limit().bytes);
+    rows.len() == 1
+        && rows[0].starts_with(&format!(
+            "ursa.index_storage_limit,{default} (the default: "
+        ))
 }
 
 const QUERY: &str =
@@ -414,9 +427,12 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
     assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
     close(ctx);
 
-    // The setting is the database's: it lasts (#327).
+    // The setting lasts for the session only (#353), and the two indexes the
+    // tiny limit was over are still there.
     let ctx = open(&fixture.db()).await;
-    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("1KiB"));
+    assert!(shows_the_default(&ctx, &ok(&ctx, SHOW_LIMIT).await));
+    assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
+    ok(&ctx, "SET ursa.index_storage_limit = '1KiB'").await;
     let err = run(&ctx, "SET ursa.index_storage_limit = '8 gigs'")
         .await
         .unwrap_err();
@@ -427,10 +443,77 @@ async fn indexes_are_evicted_least_recently_used_first_past_the_limit() {
     // A refused value changes nothing; RESET goes back to the default.
     assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("1KiB"));
     ok(&ctx, "RESET ursa.index_storage_limit").await;
-    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("4GiB"));
+    assert!(shows_the_default(&ctx, &ok(&ctx, SHOW_LIMIT).await));
+    close(ctx);
+    assert!(!std::fs::read_to_string(fixture.db())
+        .unwrap()
+        .contains("settings"));
+}
+
+/// N33: lowering the limit never removes a stored index. A limit decides only
+/// whether a new index is stored: with the stored indexes already over it,
+/// none is, and nothing is evicted. The SET says so, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lower_limit_keeps_what_is_stored_and_stores_nothing_new() {
+    let fixture = Fixture::new(20_000).await;
+    let dir = fixture.dir.path();
+    // b is small enough for the lower limit on its own.
+    write_edges(&dir.join("edges_b.parquet"), 2_000, 3);
+    let ctx = open(&fixture.db()).await;
+    ok(
+        &ctx,
+        &in_dir(dir, "CREATE PROPERTY GRAPH b EDGE TABLES ('edges_b.parquet' SOURCE KEY (src) DESTINATION KEY (dst));"),
+    )
+    .await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    close(ctx);
+    let before = read_manifest(&fixture.index_dir());
+    assert_eq!(before.len(), 1);
+    let g = before[0].size;
+
+    // A limit below what is stored, but with room for b on its own.
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    let limit = g / 2;
+    ok(&ctx, &format!("SET ursa.index_storage_limit = {limit}")).await;
+    assert_eq!(
+        taken(&said),
+        [format!(
+            "{} of indexes are stored in {}, more than the {} limit; they are kept, and new \
+             indexes won't be stored",
+            ursa_engine::notices::size(g),
+            fixture.db().display(),
+            ursa_engine::options::ByteSize(limit)
+        )]
+    );
+    // g is still used, and b is built but not stored: g is not evicted.
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    ok(&ctx, "SELECT count(*) FROM degree(b)").await;
+    assert_eq!(counts(&ctx), (1, 1));
+    ursa_engine::database::flush(&ctx.state());
+    let lines = taken(&said);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains(&format!(
+            "; not stored: the indexes {} stores take {}, more than ursa.index_storage_limit \
+             ({}); they are kept, and new indexes are not stored until it is raised",
+            fixture.db().display(),
+            ursa_engine::notices::size(g),
+            ursa_engine::options::ByteSize(limit)
+        )),
+        "{lines:?}"
+    );
+    let after = read_manifest(&fixture.index_dir());
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].file, before[0].file);
+    // A limit with room says nothing, and the next index is stored.
+    ok(&ctx, "RESET ursa.index_storage_limit").await;
+    assert!(taken(&said).is_empty());
     close(ctx);
     let ctx = open(&fixture.db()).await;
-    assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("4GiB"));
+    ok(&ctx, "SELECT count(*) FROM degree(b)").await;
+    close(ctx);
+    assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
 }
 
 /// A collecting notice sink on `ctx`, at `level`.
@@ -449,8 +532,8 @@ fn taken(said: &Mutex<Vec<String>>) -> Vec<String> {
     std::mem::take(&mut *said.lock().unwrap())
 }
 
-/// N11: a read-only session's limit is its own, and never evicts; the
-/// database obeys only its stored limit.
+/// N11: a read-only session's limit is its own, and never evicts; a later
+/// writer obeys its own limit, the default.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_only_limit_never_evicts() {
     let fixture = Fixture::new(20_000).await;
@@ -481,36 +564,67 @@ async fn a_session_only_limit_never_evicts() {
     let catalog = std::fs::read_to_string(fixture.db()).unwrap();
     assert!(!catalog.contains("settings"), "{catalog}");
 
-    // A writer meanwhile obeys the database's limit (the default).
+    // A writer meanwhile obeys its own limit (the default).
     let writer = open(&fixture.db()).await;
-    assert_eq!(ok(&writer, SHOW_LIMIT).await, limit_row("4GiB"));
+    assert!(shows_the_default(&writer, &ok(&writer, SHOW_LIMIT).await));
     ok(&writer, "SELECT count(*) FROM degree(b)").await;
     close(writer);
     assert_eq!(read_manifest(&fixture.index_dir()).len(), 2);
 }
 
-/// A database's limit is SET once and kept in its catalog, and every later
-/// process obeys it.
+/// A limit Ursa 0.8 or 0.9 saved in the catalog (#327) is no longer applied
+/// (#353): opening says so, once, and a writable open removes it. A reader
+/// says so too, and changes nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_persistent_limit_survives_reopening() {
+async fn a_limit_saved_by_an_earlier_version_is_said_once_and_removed() {
     let fixture = Fixture::new(1_000).await;
-    let ctx = open(&fixture.db()).await;
-    ok(&ctx, "SET ursa.index_storage_limit = '32GiB'").await;
-    close(ctx);
     let catalog = std::fs::read_to_string(fixture.db()).unwrap();
-    assert!(
-        catalog.contains("\"settings\": {\n    \"ursa.index_storage_limit\": \"32GiB\"\n  }"),
-        "{catalog}"
+    let saved = catalog.replacen(
+        "\n}\n",
+        ",\n  \"settings\": {\n    \"ursa.index_storage_limit\": \"50MiB\"\n  }\n}\n",
+        1,
     );
-    for ctx in [
-        open(&fixture.db()).await,
-        open_read_only(&fixture.db()).await,
-    ] {
-        assert_eq!(ok(&ctx, SHOW_LIMIT).await, limit_row("32GiB"));
-        let db = ursa_engine::database::database(&ctx.state()).unwrap();
-        assert_eq!(db.index_storage_limit(), 32 << 30);
-        close(ctx);
-    }
+    std::fs::write(fixture.db(), &saved).unwrap();
+    let notice = format!(
+        "{} has a saved ursa.index_storage_limit = 50MiB, which is no longer applied; SET now \
+         lasts for the session. To keep it, add SET ursa.index_storage_limit = '50MiB' to \
+         ~/.ursarc (or an -init file)",
+        fixture.db().display()
+    );
+    // Open as a host does: its notice sink first, then the database.
+    let open_heard = |read_only: bool| {
+        let db = fixture.db();
+        async move {
+            let ctx = ursa_engine::new_session();
+            let said = notices(&ctx, "on").await;
+            let options = if read_only {
+                OpenOptions::read_only()
+            } else {
+                quick()
+            };
+            ursa_sql::open_database(&ctx, &db, &options).await.unwrap();
+            (ctx, said)
+        }
+    };
+
+    let (reader, said) = open_heard(true).await;
+    assert_eq!(taken(&said), std::slice::from_ref(&notice));
+    assert!(shows_the_default(&reader, &ok(&reader, SHOW_LIMIT).await));
+    close(reader);
+    assert_eq!(std::fs::read_to_string(fixture.db()).unwrap(), saved);
+
+    let (writer, said) = open_heard(false).await;
+    assert_eq!(taken(&said), [notice]);
+    assert!(shows_the_default(&writer, &ok(&writer, SHOW_LIMIT).await));
+    let db = ursa_engine::database::database(&writer.state()).unwrap();
+    assert_ne!(db.index_storage_limit(writer.state().config()), 50 << 20);
+    drop(db);
+    close(writer);
+    assert_eq!(std::fs::read_to_string(fixture.db()).unwrap(), catalog);
+
+    let (writer, said) = open_heard(false).await;
+    assert!(taken(&said).is_empty());
+    assert_eq!(ok(&writer, "SELECT count(*) FROM ties").await, ["1000"]);
 }
 
 /// Each notice in its case (N11, N12, N17, N4).
@@ -534,7 +648,9 @@ async fn notices_say_each_build_store_skip_and_eviction() {
     assert_eq!(lines[0], "building the index for g (20.0K edges)…");
     assert!(
         lines[1].starts_with("built the index for g (20.0K edges) in ")
-            && lines[1].contains(" s; stored in "),
+            && lines[1].contains(" s; stored in ")
+            // Out-degree does not build the reverse adjacency (N32).
+            && lines[1].ends_with(" once an algorithm adds the reverse adjacency)"),
         "{lines:?}"
     );
     close(ctx);
@@ -561,8 +677,19 @@ async fn notices_say_each_build_store_skip_and_eviction() {
             )),
         "{lines:?}"
     );
-    // Too large for the limit: said however quick.
+    // A limit below what is stored says so, and keeps it (#353)...
     ok(&ctx, "SET ursa.index_storage_limit = '1KiB'").await;
+    let lines = taken(&said);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with(&format!(
+            " of indexes are stored in {}, more than the 1KiB limit; they are kept, and new \
+             indexes won't be stored",
+            fixture.db().display()
+        )),
+        "{lines:?}"
+    );
+    // ...and an index too large for the limit is said however quick.
     ok(&ctx, "SELECT count(*) FROM degree(g)").await;
     let lines = taken(&said);
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -575,6 +702,8 @@ async fn notices_say_each_build_store_skip_and_eviction() {
             && lines[0].ends_with("' to keep it"),
         "{lines:?}"
     );
+    ursa_engine::database::flush(&ctx.state());
+    assert_eq!(read_manifest(&fixture.index_dir()).len(), 1);
     close(ctx);
 
     // Read-only: a build says it is not stored, at 'all' (and at 'on' when
@@ -601,6 +730,80 @@ async fn notices_say_each_build_store_skip_and_eviction() {
     ok(&reader, "SET ursa.notices = 'off'").await;
     ok(&reader, "SELECT count(*) FROM pagerank(g)").await;
     assert!(taken(&said).is_empty());
+}
+
+/// N29: over a filter the statistics cannot settle, the build notice gives
+/// the rows it reads, not a guess at the edges (#351).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filtered_build_says_the_rows_it_reads() {
+    let fixture = Fixture::new(20_000).await;
+    let ctx = open(&fixture.db()).await;
+    ok(
+        &ctx,
+        "CREATE VIEW few AS SELECT * FROM ties WHERE src % 1000 = 0;
+         CREATE PROPERTY GRAPH f EDGE TABLES (few SOURCE KEY (src) DESTINATION KEY (dst));",
+    )
+    .await;
+    let said = notices(&ctx, "all").await;
+    ok(&ctx, "SELECT count(*) FROM degree(f)").await;
+    let lines = taken(&said);
+    assert_eq!(
+        lines[0], "reading about 20.0K rows to build the index for f…",
+        "{lines:?}"
+    );
+    // The final notice gives the real count.
+    let edges = ok(&ctx, "SELECT count(*) FROM ties WHERE src % 1000 = 0").await;
+    let edges: u64 = edges[0].parse().unwrap();
+    assert!(edges < 1_000, "{edges}");
+    assert!(
+        lines[1].starts_with(&format!("built the index for f ({edges} edges) in ")),
+        "{lines:?}"
+    );
+    // Unfiltered, the statistics are exact.
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    assert_eq!(taken(&said)[0], "building the index for g (20.0K edges)…");
+}
+
+/// N38: `EXPLAIN` marks a path search whose index the session holds, in
+/// memory or stored, since its edge and vertex scans then do not run (#351).
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_marks_a_path_search_over_a_held_index() {
+    let fixture = Fixture::new(1_000).await;
+    const PATHS: &str = "FROM GRAPH_TABLE (g
+        MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b) COLUMNS (b.id))";
+    let explain = |ctx: &SessionContext| {
+        let ctx = ctx.clone();
+        async move {
+            let lines = ok(&ctx, &format!("EXPLAIN {PATHS}")).await;
+            lines
+                .iter()
+                .flat_map(|l| l.lines())
+                .find(|l| l.contains("PathSearchExec"))
+                .unwrap_or_else(|| panic!("no PathSearchExec in {lines:?}"))
+                .to_string()
+        }
+    };
+    let ctx = open(&fixture.db()).await;
+    // Not built yet: the sources are read.
+    let line = explain(&ctx).await;
+    assert!(!line.contains("index="), "{line}");
+    ok(&ctx, PATHS).await;
+    let line = explain(&ctx).await;
+    assert!(
+        line.ends_with(", index=cached (sources not read)"),
+        "{line}"
+    );
+    close(ctx);
+    // A later session holds it stored, and loads it without reading them.
+    let ctx = open(&fixture.db()).await;
+    let line = explain(&ctx).await;
+    assert!(
+        line.ends_with(", index=stored (sources not read)"),
+        "{line}"
+    );
+    ok(&ctx, PATHS).await;
+    assert_eq!(counts(&ctx), (0, 1));
+    close(ctx);
 }
 
 /// A database directory moved together with its data finds its stored

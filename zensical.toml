@@ -1,13 +1,16 @@
 [project]
 site_name = "Ursa"
 site_url = "https://cldixon.github.io/ursa/"
-site_description = "Polars-shaped dataframes for graph data. A Rust engine with a Python API."
+site_description = "Graph analytics in SQL, like DuckDB, and a Polars-shaped Python library. One Rust engine."
 site_author = "Ursa contributors"
 copyright = "Copyright &copy; 2026 Ursa contributors. MIT OR Apache-2.0."
 
 repo_url = "https://github.com/cldixon/ursa"
 repo_name = "cldixon/ursa"
 edit_uri = "edit/main/docs/"
+# Not the default, site/: that is the new website's source (site/README.md),
+# and `zensical build --clean` would empty it.
+site_dir = "zensical-site"
 extra_css = ["stylesheets/extra.css"]
 
 nav = [

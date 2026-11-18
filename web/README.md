@@ -6,7 +6,7 @@ terminal, as DuckDB's web shell is DuckDB's CLI: the shell (dot-commands, SQL a
 line at a time, DuckDB-style tables) is the `ursa-shell` crate, compiled into
 `ursa-wasm` as `WebShell` and run in a Web Worker; the page draws it with
 xterm.js. Around it is a bar laid out after DuckDB's web shell: New, Share,
-Import, a Datasets menu and a light/dark toggle. The engine reads Parquet and
+Import, Graph, a Datasets menu and a light/dark toggle. The engine reads Parquet and
 CSV over HTTP with range requests. The Worker here serves files and does no
 query work.
 
@@ -23,31 +23,84 @@ static assets and an R2 bucket.
     shell, which runs a statement once it ends with `;` and shows the
     continuation prompt meanwhile; Shift+Enter adds a line to what is typed;
     ↑/↓ recall history (kept in this browser); Ctrl+C copies a selection, or
-    drops what was typed; Ctrl+L clears. Keys pressed while a line runs wait
-    for it. What the shell prints (tables, errors, colour) is written to the
+    drops what was typed; Ctrl+L clears; Tab and Shift+Tab move the focus out
+    of the terminal, to the bar (there is no completion); `.help shortcuts`
+    lists every key (the `SHORTCUTS` text in `app.js`, which the e2e test
+    checks against the keys). The cursor moves and deletes by the character
+    as seen (an emoji sequence, a flag, a letter and its accent), and CJK and
+    emoji take two cells, by the width table `app.js` gives xterm. Keys pressed while a
+    line runs wait for it. What the shell prints (tables, errors, colour) is written to the
     terminal as is, so a selection copies as the text on screen.
   - **Dot-commands** are the CLI's (`.help`, `.tables`, `.describe`,
     `.functions`, `.maxrows`, `.maxwidth`, `.timer`, `.mode`, …; `.help graph`
     is a page on the graph SQL, whose forms the e2e test runs), and the page's
     own, which the shell lists in `.help` and hands back to the page:
     `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
-    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.history ?N?` and `.share`.
+    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME?`,
+    `.history ?N?` and `.share`.
   - **Datasets.** Picking one starts a fresh session and runs its commands at
     the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
     three queries that show the graph functions, `GRAPH_TABLE` patterns and
-    shortest paths. `?dataset=karate` in the URL loads one on open.
-  - **Share** copies a link whose fragment holds the session's commands; opening
-    it replays them. **Import** adds files from this computer
-    (`WebShell.addFile`, at `memory://uploads/<name>`) and defines a view over
-    each. **New** starts a fresh session. The theme follows the system until the
+    shortest paths, each after `--` comments that say what it shows (keep the
+    explanations in the commands, not in JS comments). Long lines are broken
+    at spaces to fit the terminal. `?dataset=karate` in the URL loads one on
+    open. The menu works from the keyboard as a menu button (arrows, Home,
+    End, Enter, Escape).
+  - **Share** copies a link whose fragment holds the session's commands;
+    opening it lists them, with control characters shown as escapes, and asks
+    `Run N shared commands? [y/N]`: only `y` replays them, and a link's
+    `.export` is skipped, so a link never downloads files. **Import** adds
+    files from this computer (`WebShell.addFile`, at `memory://uploads/<name>`,
+    where characters other than ASCII letters, digits, `.`, `_` and `-` become
+    `_` and a name so changed gets a hash of the original) and defines a view
+    over each, named after the file and quoted (`"données"`, `"order"`).
+    **New** starts a fresh session. The theme follows the system until the
     toggle picks one, which is remembered; the terminal's colours follow it.
+    A click on a bar button hands the focus back to the terminal; pressed from
+    the keyboard, the button keeps it. Under 640px the bar is one row: the
+    logo without its name, and under 420px icons for New, Share, Import and
+    Graph.
+  - **The Graph view** (`public/graph.js`, `public/graph-worker.js`):
+    `.graph` (or the Graph button) draws the last result as a graph in a
+    pane beside the terminal, or under it under 640px; `.graph QUERY` draws a
+    query's and `.graph NAME` a property graph's (or a table's). The engine
+    makes the graph (`WebShell.graph`, the `graph` op of the worker): each
+    row an edge from its `src` to its `dst` column (in any case), else from
+    its first column to its second, the ids of any type numbered `0..n` in
+    the order they are first seen, at most 2,000,000 edges. `ursa-viz` draws
+    it (WebGPU, else WebGL2) with its ForceAtlas2 layout running in
+    `graph-worker.js`, nodes sized by degree. The view is ink on white; the
+    dark theme inverts the canvas in CSS and screens it onto the sky.
+    `graph.js` is imported on the first `.graph`, and it loads `ursa-viz`
+    (about 1 MB gzipped), so a session that draws nothing downloads neither.
+    The terminal keeps the focus and refits to its half (xterm's fit addon,
+    then the engine's width); Esc (in the terminal or the pane) or the
+    close button closes the pane, and New or a dataset does too. In the
+    pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
+    double-click or `0` fits, and a click on a node names it in the pane's
+    header. A lost WebGL context or GPU device, or a layout that stops,
+    closes the pane with an error in the terminal.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
-  engine; everything else is a static asset.
+  engine; everything else is a static asset. A path that does not decode is
+  404. `src/headers.ts` holds the security headers every response carries, from
+  the Worker and `bun run preview` alike: a Content Security Policy (the page's
+  own scripts, worker, fetches, fonts and images; WebAssembly compiles under
+  `'wasm-unsafe-eval'`; `style-src` allows `'unsafe-inline'` for the `<style>`
+  elements xterm.js adds; no framing), `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`. The page has no inline script: the theme is
+  set before the first paint by `public/theme.js`.
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
+  `build.ts` also builds the graph view (`scripts/viz.ts`: `ursa-viz` with
+  its `web` feature and the `wasm-release` profile, then wasm-bindgen) into
+  `dist/viz/<hash>/`, a static asset of about 4 MB (1 MB gzipped) named by
+  a hash of its glue and `.wasm`; `dist/viz/viz.json` names the build.
   The build also copies the terminal's font, IBM Plex Mono (SIL OFL 1.1, from
   `@fontsource/ibm-plex-mono`), into `dist/fonts/`, so the page loads nothing
   from other hosts.
+  Plex Mono's web fonts have no box-drawing characters, so table borders come
+  from `public/fonts/ursa-box.woff2`, a font of just those, made by
+  `scripts/box-font.py` with lines that run past each row so borders join.
 - `cloudflare.config.ts`: the Worker (name `ursa-shell`, the `ursa-graph` bucket
   as `DATA`, on `workers.dev` for now). `wrangler.config.ts` is the setting for
   the asset bundler `cf build` uses internally; deploys use `cf` only.
@@ -93,8 +146,17 @@ http://localhost:8788.
 `tests/e2e.ts` drives the page in headless Chromium against a running site
 (`bun run preview`, `cf dev` or a deploy): every dataset in the menu, SQL typed
 at the prompt (one line, several, an error), every dot-command, a long table,
-downloads in each format, Import, a shared link replayed in a fresh page, New,
-the theme toggle and history.
+downloads in each format, Import (with awkward file names), a shared link
+replayed in a fresh page (answered y and N, and a crafted one with escape
+sequences and `.export`), New, the theme toggle and history; the Graph view
+(`.graph` on a result, a query and a property graph, its errors, pixels drawn
+in both themes, a node picked, typing while it shows, Esc and the close
+button, the terminal refitting beside it and under it on a phone, the Graph
+button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
+phone checks: Tab out of the terminal, the menu's keys, the focus after a
+click, no mid-word wraps and a one-row bar at 320px, a 16px input, and the grey
+text's contrast; and the security headers, 404s for malformed and traversing
+paths, and no Content Security Policy violation in the console.
 
 ```sh
 bun run preview                               # in one terminal

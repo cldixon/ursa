@@ -283,7 +283,14 @@ fn compression_name(c: CompressionTypeVariant) -> String {
     }
 }
 
-/// Say why `location` could not be opened.
+/// Say why `location` could not be opened, naming the path once: an error
+/// that already names the file it could not read (a bad CSV file, perhaps
+/// one of a glob's) says enough as it is (N40).
 fn explain(location: &str, err: &DataFusionError) -> DataFusionError {
-    DataFusionError::Plan(format!("cannot read '{location}': {}", user_message(err)))
+    let message = user_message(err);
+    if message.starts_with("cannot read '") {
+        DataFusionError::Plan(message)
+    } else {
+        DataFusionError::Plan(format!("cannot read '{location}': {message}"))
+    }
 }

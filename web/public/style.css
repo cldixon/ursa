@@ -23,6 +23,11 @@
   --error: #c0262d;
   --ok: #1f3e8c;
   --selection: #1f3e8c24;
+  --scrollbar: #c9c6be;
+  --scrollbar-hover: #a19e95;
+  /* The graph view draws ink on white; the dark theme inverts it (below). */
+  --graph-filter: none;
+  --graph-blend: normal;
   color-scheme: light;
 }
 
@@ -48,6 +53,10 @@
     --error: #ff6b6b;
     --ok: #aabfff;
     --selection: #aabfff33;
+    --scrollbar: #3a3935;
+    --scrollbar-hover: #5a5852;
+    --graph-filter: invert(1);
+    --graph-blend: screen;
     color-scheme: dark;
   }
 }
@@ -73,11 +82,26 @@
   --error: #ff6b6b;
   --ok: #aabfff;
   --selection: #aabfff33;
+  --scrollbar: #3a3935;
+  --scrollbar-hover: #5a5852;
+  --graph-filter: invert(1);
+  --graph-blend: screen;
   color-scheme: dark;
 }
 
 /* The terminal's font, IBM Plex Mono (SIL OFL 1.1), served with the page:
    see scripts/build.ts. */
+/* Box drawing (U+2500-257F), which the Plex Mono web fonts lack: our own
+   strokes on Plex Mono's metrics that run past each row, so a table's lines
+   join whatever the line height (scripts/box-font.py makes the font). */
+@font-face {
+  font-family: "Ursa Box";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("/fonts/ursa-box.woff2") format("woff2");
+  unicode-range: U+2500-257F;
+}
 @font-face {
   font-family: "IBM Plex Mono";
   font-style: normal;
@@ -157,6 +181,14 @@ body {
 
 ::selection { background: var(--selection); }
 
+/* Scrollbars in the theme's colours: thin, on no track. The terminal draws
+   its own (xterm.js), coloured from app.js (THEMES) and shaped below. */
+html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar); border: 2px solid transparent; border-radius: 5px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-hover); }
+::-webkit-scrollbar-corner { background: transparent; }
+
 /* ---------------------------------------------------------------- bar */
 
 .bar {
@@ -164,8 +196,9 @@ body {
   top: 0;
   z-index: 10;
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  grid-template-columns: minmax(max-content, 1fr) auto minmax(max-content, 1fr);
   align-items: center;
+  column-gap: 16px;
   height: 52px;
   padding: 0 16px;
   background: var(--bar-bg);
@@ -183,6 +216,7 @@ body {
   border-radius: 6px;
   padding: 6px 10px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .menu button:hover, .menu button[aria-expanded="true"] { color: var(--prompt); }
 .menu button:focus-visible, .theme:focus-visible, .dropdown-menu button:focus-visible {
@@ -191,6 +225,8 @@ body {
 }
 
 .chevron { width: 12px; height: 12px; vertical-align: -1px; margin-left: 2px; }
+/* New, Share and Import show these instead of their labels on a phone. */
+.menu .icon { display: none; width: 18px; height: 18px; }
 
 .dropdown { position: relative; }
 .dropdown-menu {
@@ -227,8 +263,8 @@ body {
   font-size: 15px;
 }
 .brand b { font-weight: 650; }
-.logo { width: 30px; height: 30px; }
-.logo-line { fill: none; stroke: var(--logo-ink); stroke-width: 0.7; stroke-linejoin: round; opacity: 0.4; }
+.logo { width: 45px; height: 19px; flex: none; }
+.logo-line { fill: none; stroke: var(--logo-ink); stroke-width: 0.7; stroke-linejoin: round; opacity: 0.5; }
 .logo-star { fill: var(--logo-ink); }
 
 .right { display: flex; justify-content: flex-end; }
@@ -251,6 +287,15 @@ body {
 
 /* ---------------------------------------------------------------- terminal */
 
+/* The terminal, and the graph view beside it when open (.graph). */
+.workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+/* Half each, whatever their padding. */
+.workspace > .terminal { flex: 1 1 50%; min-width: 0; }
+
 /* xterm.js draws the terminal; this is the room it fills. Its colours are set
    from app.js (THEMES), to match these tokens. */
 .terminal {
@@ -261,11 +306,100 @@ body {
 }
 .terminal .xterm { height: 100%; }
 .terminal .xterm-viewport { background: var(--bg) !important; }
+/* The hidden textarea xterm.js types into: at under 16px, iOS zooms the page
+   in when it takes the focus. Nothing shows it, so its size changes nothing. */
+.terminal .xterm .xterm-helper-textarea { font-size: 16px; }
+/* The terminal's scrollbar: a rounded thumb inset from the edge. */
+.terminal .xterm .xterm-scrollable-element > .scrollbar > .slider {
+  border: 3px solid transparent;
+  border-radius: 7px;
+  background-clip: padding-box !important;
+  box-sizing: border-box;
+}
 
+/* ---------------------------------------------------------------- graph view */
+
+/* Beside the terminal, half the width; under it on a phone. The view draws
+   dark nodes and grey edges on white (ursa-viz); by night the canvas is
+   inverted and screened onto the sky, so they are starlight on --bg. */
+.graph-pane {
+  flex: 1 1 50%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+.graph-pane[hidden] { display: none; }
+.graph-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 6px 0 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--muted);
+}
+.graph-status {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+.graph-close {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 6px;
+  color: var(--fg);
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.graph-close svg { width: 18px; height: 18px; display: block; }
+.graph-close:hover { color: var(--prompt); }
+.graph-close:focus-visible, .graph-stage canvas:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.graph-stage { flex: 1; min-height: 0; position: relative; }
+.graph-stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+  filter: var(--graph-filter);
+  mix-blend-mode: var(--graph-blend);
+}
+.graph-stage canvas:active { cursor: grabbing; }
+
+/* A phone: one row, the logo first (its name left to screen readers). Under
+   420px, New, Share and Import are icons, their labels still naming them. */
 @media (max-width: 640px) {
-  .bar { grid-template-columns: 1fr auto; height: auto; padding: 8px 12px; row-gap: 6px; }
-  .brand { order: -1; grid-column: 1 / -1; justify-self: center; }
-  .menu { flex-wrap: wrap; }
+  .bar { display: flex; gap: 6px; padding: 0 10px; }
+  .brand { order: -1; flex: none; padding: 4px; }
+  .menu { flex: 1; min-width: 0; gap: 0; }
   .menu button { padding: 6px 8px; }
+  /* The menu drops from the bar, across it, so it stays on screen. */
+  .dropdown { position: static; }
+  .dropdown-menu { top: calc(100% + 4px); left: 8px; right: 8px; min-width: 0; }
   .terminal { padding: 12px 8px 4px; }
+  /* The graph view under the terminal. */
+  .workspace { flex-direction: column; }
+  .workspace > .terminal { min-height: 0; }
+  .graph-pane { border-left: 0; border-top: 1px solid var(--border); }
+  .brand .label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+@media (max-width: 420px) {
+  .menu .icon { display: block; }
+  .menu button:has(.icon) { padding: 8px; }
+  .menu .label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 }

@@ -9,9 +9,13 @@
 //   feed      {line}           -> {out, err, flow, command, prompt, pending}
 //   cancel    {}               -> {prompt}       (drop a half-typed statement)
 //   width     {columns}        -> {}             (tables fit the terminal)
-//   highlight {text}           -> {text}         (typed text in ANSI colour)
+//   highlight {text, alone?}   -> {text}         (typed text in ANSI colour, after
+//                                               what is pending unless alone)
 //   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
 //   export    {format}         -> {bytes}        (the last result, every row)
+//   graph     {text}           -> {n, src, dst, ids, skipped}  (a graph to draw:
+//                                               the last result, a query's or a
+//                                               property graph's; see WebShell.graph)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
 let shell = null;
@@ -67,13 +71,20 @@ async function handle({ id, op, ...args }) {
       shell?.setWidth(columns);
       postMessage({ id, ok: true });
     } else if (op === "highlight") {
-      postMessage({ id, ok: true, text: WebShell.highlight(args.text) });
+      // As the next line of what is typed, unless asked for the text alone.
+      const text = shell && !args.alone ? shell.highlight(args.text) : WebShell.highlightText(args.text);
+      postMessage({ id, ok: true, text });
     } else if (op === "addFile") {
       const url = await shell.addFile(args.name, new Uint8Array(args.bytes));
       postMessage({ id, ok: true, url });
     } else if (op === "export") {
       const bytes = shell.exportLast(args.format);
       postMessage({ id, ok: true, bytes }, [bytes.buffer]);
+    } else if (op === "graph") {
+      const g = await shell.graph(args.text ?? "");
+      const reply = { id, ok: true, n: g.n, src: g.src, dst: g.dst, ids: g.ids, skipped: g.skipped };
+      g.free();
+      postMessage(reply, [reply.src.buffer, reply.dst.buffer]);
     } else {
       throw new Error(`unknown op ${op}`);
     }

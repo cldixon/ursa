@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result};
+use datafusion::prelude::SessionContext;
 use js_sys::{Promise, Uint8Array};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -33,6 +34,7 @@ use ursa_shell::shell::{Flow, Shell};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use crate::graph::{self, EdgeList};
 use crate::{encode, js_error, Stored};
 
 /// Where added files live: `memory://uploads/`.
@@ -71,6 +73,46 @@ pub struct WebShell {
     width: Rc<Cell<usize>>,
     /// Files the page added ([`WebShell::add_file`]), at `memory://uploads/`.
     uploads: Arc<InMemory>,
+    /// The shell's session (the same state), for [`WebShell::graph`].
+    ctx: SessionContext,
+}
+
+/// A graph for the page's Graph view, from [`WebShell::graph`]: `n` nodes,
+/// the edges `(src[i], dst[i])` as dense node indexes, and each node's id.
+#[wasm_bindgen]
+pub struct GraphData(EdgeList);
+
+#[wasm_bindgen]
+impl GraphData {
+    /// The number of nodes.
+    #[wasm_bindgen(getter)]
+    pub fn n(&self) -> u32 {
+        self.0.n
+    }
+
+    /// Each edge's source node, `0..n` (a `Uint32Array`).
+    #[wasm_bindgen(getter)]
+    pub fn src(&self) -> Vec<u32> {
+        self.0.src.clone()
+    }
+
+    /// Each edge's destination node (a `Uint32Array`).
+    #[wasm_bindgen(getter)]
+    pub fn dst(&self) -> Vec<u32> {
+        self.0.dst.clone()
+    }
+
+    /// Each node's id, as the shell prints it, by node index.
+    #[wasm_bindgen(getter)]
+    pub fn ids(&self) -> Vec<String> {
+        self.0.ids.clone()
+    }
+
+    /// Rows left out because an endpoint is NULL.
+    #[wasm_bindgen(getter)]
+    pub fn skipped(&self) -> u32 {
+        self.0.skipped as u32
+    }
 }
 
 impl Default for WebShell {
@@ -92,7 +134,7 @@ impl WebShell {
         ctx.register_object_store(&uploads_url(), Arc::clone(&uploads) as Arc<dyn ObjectStore>);
         let (out, err) = (Buffer::default(), Buffer::default());
         let width = Rc::new(Cell::new(80));
-        let mut shell = Shell::new(ctx, OutputFormat::Table, out.clone(), err.clone());
+        let mut shell = Shell::new(ctx.clone(), OutputFormat::Table, out.clone(), err.clone());
         let screen = Rc::clone(&width);
         shell.set_screen(Box::new(move || screen.get()), true);
         shell.set_error_color(true);
@@ -104,6 +146,7 @@ impl WebShell {
             err,
             width,
             uploads,
+            ctx,
         }
     }
 
@@ -203,8 +246,40 @@ impl WebShell {
         Ok(Uint8Array::from(bytes.as_slice()))
     }
 
-    /// `text` coloured as the shell colours what is typed (ANSI).
-    pub fn highlight(text: &str) -> String {
+    /// A graph to draw (the page's `.graph`), resolving to a [`GraphData`].
+    /// `text` is empty for the last result, a property graph's name for its
+    /// edges (and its vertices' keys), a table's name for its rows, or a
+    /// query. Each row is an edge from its `src` column to its `dst` column
+    /// (in any case), or else from its first column to its second; the ids,
+    /// of any type, become node indexes in the order they are first seen.
+    /// Rejects, with a message to show, when there is nothing to draw or
+    /// more than 2,000,000 edges.
+    pub fn graph(&self, text: String) -> Promise {
+        let ctx = self.ctx.clone();
+        let last = match self.borrow() {
+            Ok(shell) => shell.last_result().cloned(),
+            Err(e) => return Promise::reject(&e.into()),
+        };
+        future_to_promise(async move {
+            graph_of(&ctx, last, &text)
+                .await
+                .map(|g| GraphData(g).into())
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
+    /// `text` coloured as the shell colours what is typed (ANSI), as what
+    /// is typed next: part of the statement typed so far, if one is pending,
+    /// so a string or comment it left open goes on, and a line starting
+    /// with `.` is SQL in it.
+    pub fn highlight(&self, text: &str) -> Result<String, JsError> {
+        Ok(self.borrow()?.highlight_line(text))
+    }
+
+    /// `text` coloured as a statement of its own, whatever is pending (for
+    /// the history).
+    #[wasm_bindgen(js_name = highlightText)]
+    pub fn highlight_text(text: &str) -> String {
         highlight::ansi(text)
     }
 
@@ -263,6 +338,26 @@ async fn feed(
     .to_string())
 }
 
+/// What [`WebShell::graph`] draws, given the shell's last result.
+async fn graph_of(
+    ctx: &SessionContext,
+    last: Option<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>)>,
+    text: &str,
+) -> Result<EdgeList> {
+    let text = text.trim().trim_end_matches(';').trim();
+    if !text.is_empty() {
+        return graph::from_text(ctx, text).await;
+    }
+    let Some((schema, batches)) = last else {
+        return Err(DataFusionError::Plan(
+            "no result to draw yet: run a query whose rows are edges (columns src and dst, or \
+             else the first two), then .graph; or .graph NAME for a property graph"
+                .into(),
+        ));
+    };
+    graph::from_result(&schema, &batches)
+}
+
 /// Put `bytes` at `name` in `uploads`; the URL SQL reads it by.
 pub(crate) async fn add_upload(uploads: &InMemory, name: &str, bytes: Vec<u8>) -> Result<String> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
@@ -270,11 +365,43 @@ pub(crate) async fn add_upload(uploads: &InMemory, name: &str, bytes: Vec<u8>) -
             "'{name}' is not a file name to add; give a name with no path, such as edges.csv"
         )));
     }
+    let key = upload_key(name);
     uploads
-        .put(&ObjectPath::from(name), PutPayload::from(bytes))
+        .put(&ObjectPath::from(key.as_str()), PutPayload::from(bytes))
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    Ok(format!("memory://uploads/{name}"))
+    Ok(format!("memory://uploads/{key}"))
+}
+
+/// The name a file is kept under: its name with every character but ASCII
+/// letters, digits, `.`, `_` and `-` made `_`, so its URL reads back as it is
+/// written. A URL decodes `%`, ends its path at `#` and `?`, and globs at `*`,
+/// `?` and `[`; and non-ASCII names are percent-encoded on the way in. A name
+/// that changes also gets a hash of the original before its extension, so two
+/// files (`a#b.csv`, `a?b.csv`) are never kept as one.
+fn upload_key(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe == name {
+        return safe;
+    }
+    // FNV-1a: stable across builds, unlike the standard library's hasher.
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let tag = format!("-{:08x}", hash as u32);
+    match safe.rfind('.').filter(|&i| i > 0) {
+        Some(dot) => format!("{}{tag}{}", &safe[..dot], &safe[dot..]),
+        None => safe + &tag,
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +443,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_is_typed_is_coloured_after_what_is_pending() {
+        let shell = WebShell::new();
+        let string = format!("{}'a{}", highlight::STRING, highlight::RESET);
+        assert_eq!(shell.highlight("'a").unwrap(), string);
+        run(&shell, "SELECT 'it''s").await;
+        // The string goes on: the quote ends it.
+        let next = shell.highlight("b' AS s;").unwrap();
+        assert!(
+            next.starts_with(&format!("{}b'{}", highlight::STRING, highlight::RESET)),
+            "{next:?}"
+        );
+        // On its own, the same text opens a string.
+        assert!(WebShell::highlight_text("b' AS s;").starts_with("b\x1b[33m'"));
+        shell.cancel_input().unwrap();
+        assert!(shell
+            .highlight(".tables")
+            .unwrap()
+            .starts_with(highlight::COMMAND));
+    }
+
+    #[tokio::test]
     async fn tables_fit_the_terminal() {
         let shell = WebShell::new();
         shell.set_width(30);
@@ -352,12 +500,91 @@ mod tests {
         assert_eq!(url, "memory://uploads/edges.csv");
         let out = run(&shell, &format!("SELECT count(*) AS n FROM '{url}';")).await;
         assert!(out["out"].as_str().unwrap().contains("│     2 │"), "{out}");
+        // Names a URL would read otherwise are kept under safe ones.
+        let mut urls = Vec::new();
+        for (name, kept) in [
+            ("données.csv", "donn_es-"),
+            ("a#b.csv", "a_b-"),
+            ("a?b.csv", "a_b-"),
+            ("50%.csv", "50_-"),
+            ("what?.csv", "what_-"),
+            ("[x] y*.csv", "_x__y_-"),
+            ("it's.csv", "it_s-"),
+        ] {
+            let bytes = b"src,dst\n1,2\n2,3\n".to_vec();
+            let url = add_upload(&shell.uploads, name, bytes).await.unwrap();
+            assert!(
+                url.starts_with(&format!("memory://uploads/{kept}")),
+                "{url}"
+            );
+            assert!(url.ends_with(".csv"), "{url}");
+            let out = run(&shell, &format!("SELECT count(*) AS n FROM '{url}';")).await;
+            assert!(
+                out["out"].as_str().unwrap().contains("│     2 │"),
+                "{name}: {out}"
+            );
+            urls.push(url);
+        }
+        // Names that differ only in what was replaced are kept apart.
+        urls.sort();
+        urls.dedup();
+        assert_eq!(urls.len(), 7, "{urls:?}");
+        assert_eq!(upload_key("edges.csv"), "edges.csv");
         for bad in ["", "a/b.csv", "..", ".hidden"] {
             assert!(
                 add_upload(&shell.uploads, bad, vec![]).await.is_err(),
                 "{bad}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn graph_draws_the_last_result_a_query_or_a_property_graph() {
+        let shell = WebShell::new();
+        let last = || shell.borrow().unwrap().last_result().cloned();
+        let err = graph_of(&shell.ctx, last(), "").await.unwrap_err();
+        assert!(err.to_string().contains("no result to draw yet"), "{err}");
+
+        run(&shell, "CREATE VIEW people AS SELECT * FROM (VALUES ('ann'), ('bob'), ('cy'), ('dee')) AS t(name);").await;
+        run(&shell, "CREATE VIEW knows AS SELECT * FROM (VALUES ('bob', 'ann', 1), ('cy', 'bob', 2)) AS t(a, b, w);").await;
+        run(&shell, "SELECT w, a AS Src, b AS DST FROM knows;").await;
+        // The last result: src and dst by name, not position.
+        let g = graph_of(&shell.ctx, last(), "").await.unwrap();
+        assert_eq!(g.ids, vec!["bob", "ann", "cy"]);
+        assert_eq!((g.src, g.dst), (vec![0, 2], vec![1, 0]));
+
+        // A query, with or without its semicolon; the first two columns.
+        let g = graph_of(&shell.ctx, last(), " SELECT b, a FROM knows; ")
+            .await
+            .unwrap();
+        assert_eq!(g.ids, vec!["ann", "bob", "cy"]);
+        let g = graph_of(&shell.ctx, last(), "FROM knows").await.unwrap();
+        assert_eq!(g.n, 3);
+        // A table by name.
+        assert_eq!(graph_of(&shell.ctx, last(), "knows").await.unwrap().n, 3);
+
+        // A property graph: its vertices first, so dee, with no edges, is drawn.
+        run(&shell, "CREATE PROPERTY GRAPH social VERTEX TABLES (people KEY (name)) EDGE TABLES (knows SOURCE KEY (a) REFERENCES people (name) DESTINATION KEY (b) REFERENCES people (name));").await;
+        let g = graph_of(&shell.ctx, last(), "Social").await.unwrap();
+        assert_eq!(g.ids, vec!["ann", "bob", "cy", "dee"]);
+        assert_eq!((g.src, g.dst), (vec![1, 2], vec![0, 1]));
+
+        // What cannot be drawn says why.
+        for (text, says) in [
+            ("nothing_here", "no graph or table named 'nothing_here'"),
+            ("SELECT 1 AS x", "1 column"),
+            ("SELECT * FROM knows WHERE false", "no rows"),
+            ("SELECT nope", "nope"),
+        ] {
+            let err = graph_of(&shell.ctx, last(), text).await.unwrap_err();
+            assert!(
+                ursa_engine::user_message(&err).contains(says),
+                "{text}: {err}"
+            );
+        }
+        run(&shell, "SELECT 42 AS answer;").await;
+        let err = graph_of(&shell.ctx, last(), "").await.unwrap_err();
+        assert!(err.to_string().contains("1 column"), "{err}");
     }
 
     #[tokio::test]

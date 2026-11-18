@@ -14,8 +14,10 @@
 //!
 //! The dot-commands follow DuckDB's shell where it has the same command.
 
+use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
@@ -25,10 +27,13 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
 use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDialect};
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::Token;
 use futures::TryStreamExt;
 
-use crate::highlight::{ERROR, RESET};
+use crate::highlight::{self, ERROR, RESET};
 use crate::input::{self, Status};
 use crate::print::{
     has_columns, is_broken_pipe, write_stream, OutputFormat, TableStyle, DEFAULT_MAX_ROWS,
@@ -148,8 +153,12 @@ pub struct Shell<O: Write, E: Write> {
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
-    /// How many `.read`s (or init files) are running.
-    depth: usize,
+    /// Where the next line starts, after `buffer`, for colouring it.
+    buffer_state: highlight::State,
+    /// How many `.read`s (or init files) are running. A [`Nested`] counts
+    /// one, so a `.read` cancelled with Ctrl-C (its future dropped) counts
+    /// itself out.
+    depth: Rc<Cell<usize>>,
     /// A script: the first error ends the session.
     stop_on_error: bool,
     /// A script's error has ended the session.
@@ -179,7 +188,8 @@ impl<O: Write, E: Write> Shell<O, E> {
             last: None,
             timer: false,
             buffer: String::new(),
-            depth: 0,
+            buffer_state: highlight::State::Start,
+            depth: Rc::new(Cell::new(0)),
             stop_on_error: false,
             failed: false,
             closed: false,
@@ -201,6 +211,18 @@ impl<O: Write, E: Write> Shell<O, E> {
         self.failed
     }
 
+    /// End a script: with `--format arrow`, a script that wrote no result is
+    /// an error, since an Arrow stream needs one (its schema) and an empty
+    /// output is not a stream another program can read.
+    pub fn end_script(&mut self) {
+        if self.mode == OutputFormat::Arrow && self.results == 0 && !self.failed && !self.closed {
+            self.error(
+                "--format arrow writes the result of one query, but no statement returned \
+                 one; end the script with a query that returns rows",
+            );
+        }
+    }
+
     #[cfg(test)]
     pub fn mode(&self) -> OutputFormat {
         self.mode
@@ -212,6 +234,12 @@ impl<O: Write, E: Write> Shell<O, E> {
 
     pub fn set_max_rows(&mut self, max_rows: usize) {
         self.max_rows = max_rows;
+    }
+
+    /// Draw tables at most `max_width` characters wide; 0: the screen's
+    /// width, or no limit when the output is not a screen (`.maxwidth N`).
+    pub fn set_max_width(&mut self, max_width: usize) {
+        self.max_width = max_width;
     }
 
     /// Say that the output is a screen whose width `width` reads (a
@@ -303,15 +331,41 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// Drop the statement being typed (Ctrl-C).
     pub fn cancel_input(&mut self) {
         self.buffer.clear();
+        self.buffer_state = highlight::State::Start;
+    }
+
+    /// Where a line typed now starts, for colouring it: in a new statement,
+    /// or in the one being typed, perhaps in a string or comment it left
+    /// open.
+    pub fn highlight_state(&self) -> &highlight::State {
+        &self.buffer_state
+    }
+
+    /// `line` in ANSI colour, as the next line of what is being typed (see
+    /// [`highlight::ansi_from`]).
+    pub fn highlight_line(&self, line: &str) -> String {
+        highlight::ansi_from(line, &self.buffer_state)
     }
 
     /// Take one line of input. A line starting with `.` is a dot-command
     /// unless it continues a statement.
+    ///
+    /// Dropping the future (Ctrl-C) cancels the line: the SQL is taken from
+    /// the buffer before it runs, so a cancelled query leaves nothing
+    /// behind, and a cancelled `.read` no longer counts as running.
     pub async fn feed(&mut self, line: &str) -> Flow {
-        // The SQL is taken from the buffer before it runs, so a query
-        // cancelled with Ctrl-C leaves nothing behind.
         let dialect = self.dialect();
+        let before = self.buffer.len();
         let step = next_step(&mut self.buffer, line, dialect.as_ref());
+        self.buffer_state = if self.buffer.is_empty() {
+            highlight::State::Start
+        } else {
+            // The buffer grew by this line: read on from where it was.
+            match highlight::state_after(&self.buffer[before..], &self.buffer_state) {
+                highlight::State::Start => highlight::State::Statement,
+                state => state,
+            }
+        };
         match step {
             Some(step) => self.run_step(step).await,
             None => Flow::Continue,
@@ -361,7 +415,7 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// Run a file of SQL and dot-commands, as `.read` does (see
     /// [`Self::run_text`]).
     pub async fn run_file(&mut self, path: &Path) -> Flow {
-        if self.depth >= MAX_READ_DEPTH {
+        if self.depth.get() >= MAX_READ_DEPTH {
             self.error(&format!(
                 "cannot read '{}': .read is nested more than {MAX_READ_DEPTH} deep",
                 path.display()
@@ -377,10 +431,8 @@ impl<O: Write, E: Write> Shell<O, E> {
         };
         // The file's statements are its own: whatever was being typed waits
         // (run_text does not touch the buffer).
-        self.depth += 1;
-        let flow = Box::pin(self.run_text(&text)).await;
-        self.depth -= 1;
-        flow
+        let _nested = Nested::enter(&self.depth);
+        Box::pin(self.run_text(&text)).await
     }
 
     /// The session's SQL dialect, for telling where statements end.
@@ -472,17 +524,28 @@ impl<O: Write, E: Write> Shell<O, E> {
         Ok(())
     }
 
-    /// Run a dot-command (`line` is trimmed and starts with `.`).
+    /// Run a dot-command (`line` is trimmed and starts with `.`). A `;` at
+    /// its end, as SQL has, is not part of it (`.tables;`), except for
+    /// `.print`, which prints its text as it is.
     async fn command(&mut self, line: &str) -> Flow {
-        let (name, arg) = match line.split_once(char::is_whitespace) {
-            Some((name, arg)) => (name, arg.trim()),
-            None => (line, ""),
+        let split = |line: &'_ str| match line.split_once(char::is_whitespace) {
+            Some((name, arg)) => (name.to_string(), arg.trim().to_string()),
+            None => (line.to_string(), String::new()),
         };
+        let typed = line;
+        let line = line.strip_suffix(';').map_or(line, str::trim_end);
+        let (name, mut arg) = split(line);
+        if name == ".print" {
+            arg = split(typed).1;
+        }
+        let (name, arg) = (name.as_str(), arg.as_str());
         match name {
             ".quit" | ".exit" => return Flow::Exit,
             ".help" => self.help(arg),
             ".version" => self.say(&format!("Ursa v{}", self.version)),
-            ".print" => self.say(arg),
+            // Control characters (ESC above all) are written as escapes:
+            // printed text cannot move the cursor or restyle the terminal.
+            ".print" => self.say(&crate::table::visible(arg)),
             ".mode" => self.mode_command(arg),
             ".maxrows" => self.max_rows_command(arg),
             ".maxwidth" => self.max_width_command(arg),
@@ -512,7 +575,7 @@ impl<O: Write, E: Write> Shell<O, E> {
                     .iter()
                     .map(|(c, _, _)| *c)
                     .chain(self.host_commands.iter().map(|(c, _, _)| c.as_str()));
-                let message = match closest(name, names) {
+                let message = match suggest_command(name, names) {
                     Some(command) => format!(
                         "unknown command '{name}'; did you mean '{command}'? Enter .help for \
                          the list"
@@ -621,8 +684,11 @@ impl<O: Write, E: Write> Shell<O, E> {
             return;
         }
         match OutputFormat::parse(arg) {
+            // Already writing an Arrow stream (`--format arrow`).
+            Some(OutputFormat::Arrow) if self.mode == OutputFormat::Arrow => {}
             Some(OutputFormat::Arrow) => self.error(
-                "the shell cannot show the arrow format; to write an Arrow stream, run \
+                ".mode cannot switch to the arrow format: an Arrow stream is one result, \
+                 written to a file or a program. Give --format arrow on the command line: \
                  ursa --format arrow -c \"<sql>\" > out.arrows",
             ),
             Some(mode) => self.mode = mode,
@@ -657,29 +723,87 @@ impl<O: Write, E: Write> Shell<O, E> {
     }
 
     /// `.describe NAME`: `DESCRIBE GRAPH` for a graph, `DESCRIBE` otherwise.
+    /// NAME is a name, perhaps qualified (`schema.table`) or quoted; written
+    /// without quotes, it names a graph, table or view in any case, as
+    /// `.tables` and `.graphs` list them (`.describe Mixed` for a table
+    /// created as `"Mixed"`).
     async fn describe(&mut self, name: &str) {
-        let name = name.trim_end_matches(';').trim();
+        const USAGE: &str = "usage: .describe NAME (a graph, table or view)";
         if name.is_empty() {
-            return self.error("usage: .describe NAME (a graph, table or view)");
+            return self.error(USAGE);
         }
+        let Some(object) = self.object_name(name) else {
+            return self.error(&format!("{USAGE}; '{name}' is not a name"));
+        };
+        let parts: Vec<&Ident> = object.0.iter().filter_map(|p| p.as_ident()).collect();
         let graphs = match Box::pin(self.graph_names()).await {
             Ok(graphs) => graphs,
             Err(e) => return self.error(&ursa_engine::user_message(&e)),
         };
-        let unquoted = name.trim_matches('"');
-        let is_graph = graphs.iter().any(|g| {
-            if name.starts_with('"') {
-                g == unquoted
-            } else {
-                g.eq_ignore_ascii_case(name)
-            }
-        });
-        let sql = if is_graph {
-            format!("DESCRIBE GRAPH {name};")
-        } else {
-            format!("DESCRIBE {name};")
+        let graph = match parts[..] {
+            [part] => graphs.iter().find(|g| names(part, g)),
+            _ => None,
+        };
+        let sql = match graph {
+            Some(graph) => format!("DESCRIBE GRAPH {};", quote_ident(graph)),
+            None => match Box::pin(self.find_table(&parts)).await {
+                Ok(Some(table)) => format!(
+                    "DESCRIBE {};",
+                    table
+                        .iter()
+                        .map(|p| quote_ident(p))
+                        .collect::<Vec<_>>()
+                        .join(".")
+                ),
+                // Not a table this session lists: DESCRIBE says why.
+                Ok(None) => format!("DESCRIBE {object};"),
+                Err(e) => return self.error(&ursa_engine::user_message(&e)),
+            },
         };
         self.run_sql(&sql, 0).await;
+    }
+
+    /// `text` as one object name (`t`, `"My Table"`, `s.t`), or `None` if
+    /// it is not exactly one.
+    fn object_name(&self, text: &str) -> Option<ObjectName> {
+        let dialect = self.dialect();
+        let mut parser = Parser::new(dialect.as_ref()).try_with_sql(text).ok()?;
+        let name = parser.parse_object_name(false).ok()?;
+        let whole = parser.peek_token().token == Token::EOF;
+        let plain = name.0.iter().all(|p| p.as_ident().is_some());
+        (whole && plain && !name.0.is_empty() && name.0.len() <= 3).then_some(name)
+    }
+
+    /// The catalog, schema and name of the table or view `parts` names, as
+    /// `information_schema` has them: a quoted part matches exactly, and an
+    /// unquoted one in any case, preferring the lower case it stands for.
+    async fn find_table(&self, parts: &[&Ident]) -> Result<Option<[String; 3]>> {
+        let options = self.ctx.state().config().options().catalog.clone();
+        let tables = self
+            .rows("SELECT table_catalog, table_schema, table_name FROM information_schema.tables")
+            .await?;
+        // The parts given, after the default catalog and schema.
+        let defaults = [&options.default_catalog, &options.default_schema];
+        let matching: Vec<[String; 3]> = tables
+            .into_iter()
+            .filter_map(|row| <[String; 3]>::try_from(row).ok())
+            .filter(|row| {
+                let given = row.len() - parts.len();
+                row[..given].iter().zip(defaults).all(|(a, b)| a == b)
+                    && row[given..].iter().zip(parts).all(|(a, p)| names(p, a))
+            })
+            .collect();
+        let exact = |row: &&[String; 3]| {
+            row[3 - parts.len()..]
+                .iter()
+                .zip(parts)
+                .all(|(a, p)| p.quote_style.is_some() || *a == p.value.to_lowercase())
+        };
+        Ok(match matching.iter().find(exact) {
+            Some(row) => Some(row.clone()),
+            None if matching.len() == 1 => matching.into_iter().next(),
+            None => None,
+        })
     }
 
     /// `.open FILE.ursa`: `ATTACH`, with its rules (only in a session that
@@ -705,7 +829,6 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// (from `ursa_functions()`). `.functions NAME`: one function's
     /// parameters and outputs.
     async fn functions(&mut self, name: &str) {
-        let name = name.trim_end_matches(';').trim();
         if name.is_empty() {
             return self.run_sql(FUNCTIONS, 0).await;
         }
@@ -858,6 +981,36 @@ fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// `s` as a quoted SQL name.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Whether `part` names `name`: exactly if it was quoted, in any case if not.
+fn names(part: &Ident, name: &str) -> bool {
+    if part.quote_style.is_some() {
+        part.value == name
+    } else {
+        part.value.eq_ignore_ascii_case(name)
+    }
+}
+
+/// Counts one `.read` running while it lives ([`Shell::run_file`]).
+struct Nested(Rc<Cell<usize>>);
+
+impl Nested {
+    fn enter(depth: &Rc<Cell<usize>>) -> Self {
+        depth.set(depth.get() + 1);
+        Self(Rc::clone(depth))
+    }
+}
+
+impl Drop for Nested {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 /// The next step, once `line` is added to the SQL typed so far (`buffer`):
 /// a line that starts with `.` is a dot-command unless it continues a
 /// statement, and SQL is a step once it ends with `;`.
@@ -988,9 +1141,25 @@ The SQL reference: {DOCS_URL}"
     )
 }
 
-/// The dot-command closest to `name`, if one is close enough to be a typo.
+/// The dot-command `name` was meant to be, if one is close enough to be a
+/// typo or `name` begins only one (as `.q` begins `.quit`).
 pub fn did_you_mean(name: &str) -> Option<&'static str> {
-    closest(name, COMMANDS.iter().map(|(command, _, _)| *command))
+    suggest_command(name, COMMANDS.iter().map(|(command, _, _)| *command))
+}
+
+/// The command `name` begins, if it begins only one (`.q`, `.tab`: sqlite
+/// and DuckDB users type these); otherwise the closest, if it is close
+/// enough to be a typo.
+fn suggest_command<'a>(name: &str, commands: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let commands: Vec<&str> = commands.into_iter().collect();
+    let lower = name.to_ascii_lowercase();
+    if lower.len() > 1 {
+        let mut begun = commands.iter().filter(|c| c.starts_with(&lower));
+        if let (Some(only), None) = (begun.next(), begun.next()) {
+            return Some(only);
+        }
+    }
+    closest(name, commands)
 }
 
 /// The candidate closest to `name`, ignoring case, if one is close enough to
@@ -1201,10 +1370,83 @@ mod tests {
             assert_eq!(out, expected, "{mode}");
         }
         let (_, err) = feed(&mut shell, &[".mode arrow"]).await;
-        assert!(err.contains("cannot show the arrow format"), "{err}");
+        assert!(
+            err.starts_with("Error: .mode cannot switch to the arrow format")
+                && err.contains("Give --format arrow on the command line"),
+            "{err}"
+        );
         let (_, err) = feed(&mut shell, &[".mode box"]).await;
         assert!(err.contains("unknown mode 'box'"), "{err}");
         assert_eq!(shell.mode(), OutputFormat::Table);
+    }
+
+    /// Run `sql` in `mode` and return what it printed, failing on an error.
+    async fn in_mode(mode: &str, sql: &str) -> String {
+        let mut shell = shell();
+        let (out, err) = feed(&mut shell, &[&format!(".mode {mode}"), sql]).await;
+        assert_eq!(err, "", "{mode}: {sql}");
+        out
+    }
+
+    /// N34: lists, structs and maps are written as quoted text in CSV and TSV.
+    #[tokio::test]
+    async fn csv_and_tsv_write_nested_values_as_text() {
+        let sql = "SELECT [1, 2] AS l, named_struct('a', 1, 'b', 'x') AS s, \
+                   map(['k'], [1]) AS m, [1, NULL] AS n, CAST(NULL AS INT[]) AS z;";
+        assert_eq!(
+            in_mode("csv", sql).await,
+            "l,s,m,n,z\n\"[1, 2]\",\"{a: 1, b: x}\",{k: 1},\"[1, NULL]\",\n"
+        );
+        assert_eq!(
+            in_mode("tsv", sql).await,
+            "l\ts\tm\tn\tz\n[1, 2]\t{a: 1, b: x}\t{k: 1}\t[1, NULL]\t\n"
+        );
+        // Quotes and line breaks in a value are quoted, as CSV requires.
+        assert_eq!(
+            in_mode("csv", "SELECT 'say \"hi\"' AS q, 'a\nb' AS r, 'x\ty' AS t;").await,
+            "q,r,t\n\"say \"\"hi\"\"\",\"a\nb\",x\ty\n"
+        );
+        // An empty result still writes the header row.
+        assert_eq!(in_mode("csv", "SELECT 1 AS a WHERE false;").await, "a\n");
+    }
+
+    /// N36: in CSV and TSV a null is an empty field and `''` is `""`.
+    #[tokio::test]
+    async fn csv_tells_null_from_the_empty_string() {
+        let sql = "SELECT NULL AS a, '' AS b, CAST(NULL AS VARCHAR) AS c, 1 AS d;";
+        assert_eq!(in_mode("csv", sql).await, "a,b,c,d\n,\"\",,1\n");
+        assert_eq!(in_mode("tsv", sql).await, "a\tb\tc\td\n\t\"\"\t\t1\n");
+    }
+
+    /// N35: JSON and NDJSON write `null`, so every row has every key.
+    #[tokio::test]
+    async fn json_writes_explicit_nulls() {
+        assert_eq!(
+            in_mode("json", "SELECT NULL AS a, '' AS b;").await,
+            "[{\"a\":null,\"b\":\"\"}]\n"
+        );
+        assert_eq!(
+            in_mode(
+                "ndjson",
+                "SELECT * FROM (SELECT NULL AS a, 1 AS b UNION ALL SELECT 2, 3) ORDER BY b;"
+            )
+            .await,
+            "{\"a\":null,\"b\":1}\n{\"a\":2,\"b\":3}\n"
+        );
+        assert_eq!(
+            in_mode("json", "SELECT [1, 2] AS l, CAST(NULL AS VARCHAR) AS s;").await,
+            "[{\"l\":[1,2],\"s\":null}]\n"
+        );
+    }
+
+    /// N37: an untyped NULL is shown as `NULL` in a table, as a typed one is.
+    #[tokio::test]
+    async fn table_shows_an_untyped_null_as_null() {
+        let out = in_mode("table", "SELECT NULL AS n, CAST(NULL AS VARCHAR) AS v;").await;
+        assert_eq!(
+            out,
+            "┌──────┬──────────┐\n│  n   │    v     │\n│ Null │ Utf8View │\n├──────┼──────────┤\n│ NULL │ NULL     │\n└──────┴──────────┘\n"
+        );
     }
 
     #[tokio::test]
@@ -1349,7 +1591,7 @@ mod tests {
         std::fs::write(&looping, format!(".read {}\n", looping.display())).unwrap();
         let (_, err) = feed(&mut shell, &[&format!(".read {}", looping.display())]).await;
         assert!(err.contains("nested more than 16 deep"), "{err}");
-        assert_eq!(shell.depth, 0);
+        assert_eq!(shell.depth.get(), 0);
     }
 
     #[tokio::test]
@@ -1518,6 +1760,18 @@ mod tests {
         assert_eq!(out, "Ursa v1.2.3\nhello  world\n");
     }
 
+    #[tokio::test]
+    async fn print_writes_control_characters_as_escapes() {
+        let mut shell = shell();
+        let (out, _) = feed(
+            &mut shell,
+            &[".print \x1b[2J\x1b[31mred\x07 \u{9b}0m\tend\rx"],
+        )
+        .await;
+        assert_eq!(out, "\\u{1b}[2J\\u{1b}[31mred\\u{7} \\u{9b}0m\tend\\rx\n");
+        assert!(!out.contains('\x1b') && !out.contains('\u{9b}'), "{out:?}");
+    }
+
     #[test]
     fn scripts_split_into_steps_with_their_lines() {
         let dialect = GenericDialect {};
@@ -1649,6 +1903,182 @@ mod tests {
             err,
             "Error: unknown command '.frobnicate'; enter .help for the list\n"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_read_counts_itself_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = dir.path().join("slow.sql");
+        std::fs::write(
+            &slow,
+            "SELECT count(*) FROM generate_series(1, 100000000000);\n",
+        )
+        .unwrap();
+        let read = format!(".read {}", slow.display());
+        let mut shell = shell();
+        // More than MAX_READ_DEPTH times: each cancelled (dropped) .read
+        // counted itself in and must count itself out.
+        for _ in 0..MAX_READ_DEPTH + 2 {
+            let cancelled =
+                tokio::time::timeout(std::time::Duration::from_millis(50), shell.feed(&read)).await;
+            assert!(cancelled.is_err(), "the query finished");
+            assert_eq!(shell.depth.get(), 0);
+        }
+        let quick = dir.path().join("quick.sql");
+        std::fs::write(&quick, ".mode csv\nSELECT 1 AS a;\n").unwrap();
+        let (out, err) = feed(&mut shell, &[&format!(".read {}", quick.display())]).await;
+        assert_eq!((out.as_str(), err.as_str()), ("a\n1\n", ""));
+    }
+
+    #[tokio::test]
+    async fn a_dot_command_may_end_with_a_semicolon() {
+        let mut shell = shell();
+        let (out, err) = feed(
+            &mut shell,
+            &[
+                ".mode csv;",
+                ".maxrows 5;",
+                ".timer on ;",
+                ".timer off;",
+                ".tables;",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        assert_eq!(out, "name,type\n");
+        assert_eq!(shell.mode(), OutputFormat::Csv);
+        assert_eq!(shell.max_rows, 5);
+        assert!(!shell.timer);
+        let (out, _) = feed(&mut shell, &[".maxwidth 30;", ".maxwidth;"]).await;
+        assert_eq!(out, "Tables are drawn at most 30 characters wide.\n");
+        assert_eq!(shell.feed(".quit;").await, Flow::Exit);
+        // Only one, and not .print's: it prints what it is given.
+        let (out, err) = feed(&mut shell, &[".print a;", ".maxrows 5;;"]).await;
+        assert_eq!(out, "a;\n");
+        assert!(err.contains("usage: .maxrows N"), "{err}");
+        // A host's command comes back without it.
+        shell.add_host_command(".share", "", "Share");
+        assert_eq!(shell.feed(".share;").await, Flow::Host(".share".into()));
+    }
+
+    #[tokio::test]
+    async fn the_start_of_a_command_is_suggested_not_run() {
+        let mut shell = shell();
+        assert_eq!(shell.feed(".q").await, Flow::Continue);
+        let (_, err) = take(&mut shell);
+        assert!(
+            err.contains("unknown command '.q'; did you mean '.quit'?"),
+            "{err}"
+        );
+        let (out, err) = feed(&mut shell, &[".tab"]).await;
+        assert_eq!(out, "");
+        assert!(err.contains("did you mean '.tables'?"), "{err}");
+        assert_eq!(did_you_mean(".desc"), Some(".describe"));
+        assert_eq!(did_you_mean(".EX"), Some(".exit"));
+        // `.t` begins .tables and .timer: no guess from that.
+        assert_eq!(did_you_mean(".t"), None);
+    }
+
+    #[tokio::test]
+    async fn describe_finds_a_name_in_any_case_and_runs_nothing_else() {
+        let mut shell = shell();
+        shell.set_mode(OutputFormat::Csv);
+        let (_, err) = feed(
+            &mut shell,
+            &[
+                "CREATE TABLE \"Mixed\" AS SELECT 1 AS x;",
+                "CREATE VIEW v AS SELECT 2 AS y;",
+                "CREATE SCHEMA s;",
+                "CREATE VIEW s.\"Odd Name\" AS SELECT 3 AS z;",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        let (out, _) = feed(&mut shell, &[".tables"]).await;
+        assert!(out.contains("\nMixed,table\n"), "{out}");
+        for name in [
+            "Mixed",
+            "mixed",
+            "MIXED",
+            "\"Mixed\"",
+            "public.Mixed",
+            "Mixed;",
+        ] {
+            let (out, err) = feed(&mut shell, &[&format!(".describe {name}")]).await;
+            assert_eq!(err, "", "{name}");
+            assert!(
+                out.starts_with("column_name,data_type,") && out.contains("\nx,"),
+                "{name}: {out}"
+            );
+        }
+        let (out, err) = feed(&mut shell, &[".describe s.\"Odd Name\""]).await;
+        assert_eq!(err, "");
+        assert!(out.contains("\nz,"), "{out}");
+        // Quoted, the case must match.
+        let (_, err) = feed(&mut shell, &[".describe \"mixed\""]).await;
+        assert!(err.starts_with("Error: "), "{err}");
+        // The name is a name, not SQL.
+        let (out, err) = feed(&mut shell, &[".describe v; SELECT 99"]).await;
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "Error: usage: .describe NAME (a graph, table or view); 'v; SELECT 99' is not a \
+             name\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_script_with_arrow_must_write_a_result() {
+        let mut shell = Shell::new(
+            ursa_engine::new_session(),
+            OutputFormat::Arrow,
+            Vec::new(),
+            Vec::new(),
+        );
+        shell.stop_on_error();
+        assert_eq!(
+            shell
+                .run_text(".mode arrow\nCREATE VIEW v AS SELECT 1 AS a;")
+                .await,
+            Flow::Continue
+        );
+        shell.end_script();
+        assert!(shell.failed());
+        let (out, err) = take(&mut shell);
+        assert_eq!(out, "");
+        assert!(
+            err.starts_with("Error: --format arrow writes the result of one query, but no statement returned one"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_next_line_is_coloured_as_part_of_the_statement() {
+        use crate::highlight::{State, COMMAND, KEYWORD, STRING};
+        let mut shell = shell();
+        assert_eq!(shell.highlight_state(), &State::Start);
+        assert!(shell.highlight_line(".tables").starts_with(COMMAND));
+        shell.feed("SELECT 'a").await;
+        assert_eq!(shell.highlight_state(), &State::String { escapes: false });
+        assert!(
+            shell
+                .highlight_line("b' AS s")
+                .starts_with(&format!("{STRING}b'{RESET} {KEYWORD}AS")),
+            "{:?}",
+            shell.highlight_line("b' AS s")
+        );
+        shell.feed("b' AS s,").await;
+        assert_eq!(shell.highlight_state(), &State::Statement);
+        // `.5` goes on the statement: SQL, not a command.
+        assert!(!shell.highlight_line(".5 AS half").contains(COMMAND));
+        shell.feed("/* a /* nested").await;
+        assert_eq!(shell.highlight_state(), &State::Comment(2));
+        shell.cancel_input();
+        assert_eq!(shell.highlight_state(), &State::Start);
+        shell.feed("SELECT 1").await;
+        shell.feed(";").await;
+        assert_eq!(shell.highlight_state(), &State::Start);
+        take(&mut shell);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // The graph view, bare: a generated graph, its layout running in a worker,
 // drawn every frame. Drag to pan, wheel to zoom, double-click to fit, click a
-// node to see its index. ?graph=rmat&scale=17&edges=1000000 | grid | clusters
+// node to see its index. ?graph=rmat&scale=17&edges=1000000 | grid | clusters;
+// &multilevel=0 for flat ForceAtlas2 (coarse to fine is the default).
 import init, { createView } from "../pkg/ursa_viz.js";
 import { fromParams } from "./graphs.js";
 
@@ -38,13 +39,18 @@ worker.onmessage = ({ data }) => {
   if (data.type === "positions") {
     pending = data.xy;
     stats.iterations = data.iterations;
-    stats.msPerIteration = data.msPerIteration;
+    stats.level = data.level;
+    if (data.msPerIteration !== undefined) stats.msPerIteration = data.msPerIteration;
+    if (data.buildMs !== undefined) stats.buildMs = data.buildMs;
   } else if (data.type === "done") {
     stats.layoutDone = true;
+    stats.layoutMs = data.layoutMs;
   }
 };
+const multilevel = params.get("multilevel") !== "0";
 const maxIterations = Number(params.get("iterations") ?? 300);
-worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations }, []);
+stats.multilevel = multilevel;
+worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations, multilevel }, []);
 
 // Frames: draw every animation frame, recording how long each draw takes.
 const frameMs = [];
@@ -65,7 +71,11 @@ function frame() {
     stats.drawMsMedian = sorted[Math.floor(sorted.length / 2)];
     statsEl.textContent =
       `${stats.backend} · ${stats.nodes.toLocaleString()} nodes · ${stats.edges.toLocaleString()} edges\n` +
-      `layout ${stats.iterations}/${maxIterations} it · ${stats.msPerIteration?.toFixed(1) ?? "–"} ms/it (worker)\n` +
+      (multilevel
+        ? `layout coarse to fine, level ${stats.level ?? "–"} · ${stats.iterations} it of work` +
+          (stats.layoutDone ? ` · done in ${(stats.layoutMs / 1000).toFixed(1)} s` : "") + "\n"
+        : `layout ${stats.iterations}/${maxIterations} it · ${stats.msPerIteration?.toFixed(1) ?? "–"} ms/it (worker)` +
+          (stats.layoutDone ? ` · done in ${(stats.layoutMs / 1000).toFixed(1)} s` : "") + "\n") +
       `draw ${stats.drawMsMedian.toFixed(2)} ms · ${stats.fps.toFixed(0)} fps` + (stats.picked !== undefined ? `\nnode ${stats.picked}` : "");
   }
   requestAnimationFrame(frame);

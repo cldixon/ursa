@@ -91,6 +91,12 @@ struct Args {
     #[arg(long = "max-rows", value_name = "N", default_value_t = DEFAULT_MAX_ROWS)]
     max_rows: usize,
 
+    /// Draw tables at most N characters wide, cutting long values short and
+    /// leaving out middle columns. 0: the terminal's width, or no limit when
+    /// the output is not a terminal. Also .maxwidth N.
+    #[arg(long = "max-width", value_name = "N", default_value_t = 0)]
+    max_width: usize,
+
     /// Run the SQL and dot-commands in FILE at startup, before the shell's
     /// prompt or the -c, --file or stdin SQL. Replaces ~/.ursarc. Also
     /// spelled -init, as in DuckDB.
@@ -169,6 +175,7 @@ fn main() -> ExitCode {
     let given = Given {
         format: matches.value_source("format") == Some(ValueSource::CommandLine),
         max_rows: matches.value_source("max_rows") == Some(ValueSource::CommandLine),
+        max_width: matches.value_source("max_width") == Some(ValueSource::CommandLine),
     };
     if !interactive {
         // The shell handles Ctrl-C itself: it cancels the statement.
@@ -189,11 +196,12 @@ fn main() -> ExitCode {
 }
 
 /// Which settings were given on the command line, so they win over an init
-/// file's `.mode` and `.maxrows`.
+/// file's `.mode`, `.maxrows` and `.maxwidth`.
 #[derive(Debug, Clone, Copy)]
 struct Given {
     format: bool,
     max_rows: bool,
+    max_width: bool,
 }
 
 /// The exit status after SIGINT (128 + 2), as shells report it.
@@ -265,7 +273,7 @@ fn format_hint(path: &std::path::Path) -> String {
 /// DuckDB spells its long options with one dash (`-init`); clap needs two.
 /// Rewrite `-init` and `-no-init`, except as the value of an option.
 fn single_dash_longs(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    const TAKE_VALUES: [&str; 7] = [
+    const TAKE_VALUES: [&str; 8] = [
         "-c",
         "--command",
         "--file",
@@ -273,6 +281,7 @@ fn single_dash_longs(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> 
         "--format",
         "--init",
         "--max-rows",
+        "--max-width",
     ];
     let mut out: Vec<OsString> = Vec::new();
     for arg in args {
@@ -305,20 +314,19 @@ async fn run(
     interactive: bool,
     given: Given,
 ) -> Result<bool, DataFusionError> {
-    // Open (or create) the database even with no SQL to run, so `ursa
-    // club.ursa` makes the file, as Getting Started says.
-    let ctx = match &args.database {
-        Some(path) => {
-            let options = ursa_sql::OpenOptions {
-                read_only: args.readonly,
-                ..Default::default()
-            };
-            ursa_sql::open_session(path, &options).await?
-        }
-        None => ursa_engine::new_session(),
-    };
+    let ctx = ursa_engine::new_session();
+    // Before the database opens, so what opening it says is heard.
     if !args.quiet {
         notices::to_stderr(&ctx);
+    }
+    // Open (or create) the database even with no SQL to run, so `ursa
+    // club.ursa` makes the file, as Getting Started says.
+    if let Some(path) = &args.database {
+        let options = ursa_sql::OpenOptions {
+            read_only: args.readonly,
+            ..Default::default()
+        };
+        ursa_sql::open_database(&ctx, path, &options).await?;
     }
     let result = run_session(ctx.clone(), sources, args, interactive, given).await;
     // Finish storing the indexes this process built before it exits.
@@ -371,6 +379,7 @@ async fn run_session(
     };
     let mut shell = Shell::new(ctx, args.format, out, io::stderr());
     shell.set_max_rows(args.max_rows);
+    shell.set_max_width(args.max_width);
     shell.set_version(env!("URSA_VERSION"));
     // Colour unless NO_COLOR is set (https://no-color.org) or the terminal
     // says it has none.
@@ -389,13 +398,16 @@ async fn run_session(
         if shell.run_file(&init).await == Flow::Exit {
             return Ok(true);
         }
-        // `--format` and `--max-rows` given on the command line win over a
-        // `.mode` or `.maxrows` in the file.
+        // `--format`, `--max-rows` and `--max-width` given on the command
+        // line win over a `.mode`, `.maxrows` or `.maxwidth` in the file.
         if given.format {
             shell.set_mode(args.format);
         }
         if given.max_rows {
             shell.set_max_rows(args.max_rows);
+        }
+        if given.max_width {
+            shell.set_max_width(args.max_width);
         }
     }
     if interactive {
@@ -427,6 +439,7 @@ async fn run_session(
             break;
         }
     }
+    shell.end_script();
     Ok(!shell.failed())
 }
 

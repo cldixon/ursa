@@ -20,8 +20,9 @@
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
     betweenness, betweenness_weighted, closeness_weighted, label_propagation, layout_fa2,
-    layout_fr, louvain, louvain_weighted, pagerank, pagerank_weighted, symmetric_view_weighted,
-    Fa2Params, LayoutParams, PageRankParams,
+    layout_fa2_multilevel, layout_fr, louvain, louvain_weighted, pagerank, pagerank_weighted,
+    symmetric_view_weighted, Fa2Multilevel, Fa2Params, LayoutParams, MultilevelParams,
+    PageRankParams,
 };
 use ursa_core::Topology;
 
@@ -304,5 +305,48 @@ fn layout_fa2_lin_log_is_thread_count_independent() {
         let got = on_pool(threads, || layout_fa2(&topo, None, params));
         assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
         assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
+    }
+}
+
+/// Coarse-to-fine ForceAtlas2, across thread counts: the hierarchy (built
+/// serially in index order, its coarse rows gathered per coarse node), every
+/// level's ForceAtlas2, and the prolongation between them. Stepped in uneven
+/// budgets too, as the graph view steps it, which must end on the same bits.
+#[test]
+fn layout_fa2_multilevel_is_thread_count_independent() {
+    // Sparse enough to leave isolated nodes, which leave the hierarchy, and
+    // big enough for several levels.
+    let topo = seeded_graph(3000, 4000);
+    let params = MultilevelParams {
+        coarsest_nodes: 40,
+        coarsest_iterations: 60,
+        max_iterations: 20,
+        fa2: Fa2Params {
+            seed: Some(11),
+            ..MultilevelParams::default().fa2
+        },
+        ..MultilevelParams::default()
+    };
+    let run = || {
+        let one = layout_fa2_multilevel(&topo, None, params);
+        let adj = topo.undirected();
+        let mut ml = Fa2Multilevel::new(adj, params);
+        assert!(ml.coarse_levels() >= 3, "levels {:?}", ml.level_sizes());
+        let mut budgets = [0.5, 3.0, 0.05, 9.0].iter().cycle();
+        while !ml.is_done() {
+            ml.step(adj, *budgets.next().unwrap());
+        }
+        (one, ml.into_positions())
+    };
+    let (baseline, stepped) = on_pool(1, run);
+    assert_eq!(baseline, stepped, "stepped differs from one call");
+    for threads in [2, 3, 4, 8] {
+        let (got, got_stepped) = on_pool(threads, run);
+        assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
+        assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
+        assert_eq!(
+            got_stepped, baseline,
+            "stepped diverged on {threads} threads"
+        );
     }
 }

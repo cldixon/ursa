@@ -1,0 +1,66 @@
+---
+// One card of the docs overview: an icon, a title and a line, linking to a page.
+import { Icon } from "@astrojs/starlight/components";
+import type { StarlightIcon } from "@astrojs/starlight/types";
+
+interface Props {
+	title: string;
+	href: string;
+	icon: StarlightIcon;
+}
+const { title, href, icon } = Astro.props;
+---
+
+<a class="topic-card" href={href}>
+	<span class="icon"><Icon name={icon} size="1.25rem" /></span>
+	<span class="body">
+		<span class="title">{title}</span>
+		<span class="text"><slot /></span>
+	</span>
+</a>
+
+<style>
+	.topic-card {
+		display: flex;
+		gap: 0.9rem;
+		align-items: flex-start;
+		padding: 1.1rem 1.15rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 0.6rem;
+		text-decoration: none;
+		color: var(--sl-color-gray-2);
+		background: var(--sl-color-black);
+		transition:
+			border-color 0.15s,
+			box-shadow 0.15s;
+	}
+	.topic-card:hover {
+		border-color: var(--sl-color-gray-4);
+		box-shadow: 0 2px 10px rgb(0 0 0 / 0.06);
+	}
+	.icon {
+		flex: none;
+		display: grid;
+		place-items: center;
+		width: 2.25rem;
+		height: 2.25rem;
+		border-radius: 0.5rem;
+		background: var(--sl-color-accent-low);
+		color: var(--sl-color-accent-high);
+	}
+	.body {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		min-width: 0;
+	}
+	.title {
+		font-weight: 600;
+		color: var(--sl-color-white);
+		line-height: 1.4;
+	}
+	.text {
+		font-size: var(--sl-text-sm);
+		line-height: 1.5;
+	}
+</style>

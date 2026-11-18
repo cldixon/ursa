@@ -13,7 +13,7 @@ curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 It downloads the newest `ursa` for your machine from the [releases page](https://github.com/cldixon/ursa/releases), checks it against its SHA-256 checksum, and puts it in `~/.local/bin`. It needs no `sudo`. If `~/.local/bin` is not on your `PATH`, it prints the line to add. To choose the version or the directory, set `URSA_VERSION` or `URSA_INSTALL_DIR` after the pipe:
 
 ```bash
-curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.9.0 URSA_INSTALL_DIR=/opt/bin sh
+curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.10.0 URSA_INSTALL_DIR=/opt/bin sh
 ```
 
 On Windows, in PowerShell. This installs to `%LOCALAPPDATA%\ursa\bin` and adds it to your user `PATH`:
@@ -30,20 +30,20 @@ cargo install ursa-cli
 
 Or download a prebuilt binary yourself from the [releases page](https://github.com/cldixon/ursa/releases). Each release has one archive per platform:
 
-| Platform              | Archive                                              |
-| --------------------- | ---------------------------------------------------- |
-| Linux x86_64          | `ursa-cli-v0.9.0-x86_64-unknown-linux-gnu.tar.gz`    |
-| Linux aarch64         | `ursa-cli-v0.9.0-aarch64-unknown-linux-gnu.tar.gz`   |
-| macOS (Intel)         | `ursa-cli-v0.9.0-x86_64-apple-darwin.tar.gz`         |
-| macOS (Apple silicon) | `ursa-cli-v0.9.0-aarch64-apple-darwin.tar.gz`        |
-| Windows x64           | `ursa-cli-v0.9.0-x86_64-pc-windows-msvc.zip`         |
+| Platform              | Archive                                             |
+| --------------------- | --------------------------------------------------- |
+| Linux x86_64          | `ursa-cli-v0.10.0-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux aarch64         | `ursa-cli-v0.10.0-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS (Intel)         | `ursa-cli-v0.10.0-x86_64-apple-darwin.tar.gz`       |
+| macOS (Apple silicon) | `ursa-cli-v0.10.0-aarch64-apple-darwin.tar.gz`      |
+| Windows x64           | `ursa-cli-v0.10.0-x86_64-pc-windows-msvc.zip`       |
 
 Each archive has a `.sha256` file next to it. For example, on an Apple silicon Mac:
 
 ```bash
-curl -LO https://github.com/cldixon/ursa/releases/download/ursa-cli-v0.9.0/ursa-cli-v0.9.0-aarch64-apple-darwin.tar.gz
-tar xzf ursa-cli-v0.9.0-aarch64-apple-darwin.tar.gz
-sudo mv ursa-cli-v0.9.0-aarch64-apple-darwin/ursa /usr/local/bin/
+curl -LO https://github.com/cldixon/ursa/releases/download/ursa-cli-v0.10.0/ursa-cli-v0.10.0-aarch64-apple-darwin.tar.gz
+tar xzf ursa-cli-v0.10.0-aarch64-apple-darwin.tar.gz
+sudo mv ursa-cli-v0.10.0-aarch64-apple-darwin/ursa /usr/local/bin/
 ```
 
 The binary is called `ursa`. Check it runs:
@@ -53,7 +53,7 @@ ursa --version
 ```
 
 ```text
-ursa 0.9.0
+ursa 0.10.0
 ```
 
 ### Nightly builds
@@ -73,7 +73,7 @@ $env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | 
 The download is checked against its SHA-256 checksum, as a stable one is. A nightly names its version, build date and commit:
 
 ```text
-ursa 0.9.0-nightly.20261107 (a1b2c3d4e)
+ursa 0.11.0-nightly.20261117 (a1b2c3d4e)
 ```
 
 Only the newest nightly is kept, on the [`nightly` release](https://github.com/cldixon/ursa/releases/tag/nightly). To go back to stable, run the installer again without the nightly option (in PowerShell, `Remove-Item Env:URSA_CHANNEL` first). When you report a bug, include the output of `ursa --version`: it says which channel and commit you have. To build `main` yourself instead: `cargo install --git https://github.com/cldixon/ursa ursa-cli`.
@@ -210,14 +210,17 @@ SELECT * FROM pagerank(karate, damping => 0.9, direction => 'both');
 `algorithms` runs several algorithms over one graph and returns one row per node with a column for each. Name a column with `name =>`; otherwise it is named after the algorithm. Join it to the node table on `id`. This query finds the five best-connected members, with their club, how many triangles they are part of, and their community:
 
 ```sql
+WITH top AS (
+    SELECT * FROM algorithms(karate,
+                             degree(direction => 'both'),
+                             triangles => triangle_count(),
+                             community => louvain(seed => 1))
+    ORDER BY degree DESC
+    LIMIT 5
+)
 SELECT id, club, degree, triangles, community
-FROM karate.nodes
-JOIN algorithms(karate,
-                degree(direction => 'both'),
-                triangles => triangle_count(),
-                community => louvain(seed => 1)) USING (id)
-ORDER BY degree DESC
-LIMIT 5;
+FROM top JOIN karate.nodes USING (id)
+ORDER BY degree DESC;
 ```
 
 ```text
@@ -234,6 +237,12 @@ LIMIT 5;
 ```
 
 Each algorithm also works on its own, as in the previous section, and those results join on `id` too.
+
+!!! tip "Take the top k, then join the attributes"
+
+    The query takes the five rows it wants from `algorithms(...)` first, and joins the club to those five. Written the other way round, `FROM karate.nodes JOIN algorithms(...) USING (id) ORDER BY degree DESC LIMIT 5` gives the same rows, but the `ORDER BY ... LIMIT` is not moved below the join, so every node's attributes are carried through the sort. On a graph of millions of nodes that is about twice the memory, and slower.
+
+    This is safe when the join keeps every row, as a join to the graph's own node table does: one row for each node. A join that drops rows, such as a `WHERE` on an attribute or a [`GRAPH_TABLE`](pattern-matching.md), must come before the `LIMIT`.
 
 All three algorithms run over one index of the graph. Ursa builds it the first time a query needs it and stores it in `club.ursa`. The next query, in this session or a later one, uses the stored index. If `karate_edges.csv` changes, Ursa notices and builds a new one.
 

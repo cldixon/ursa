@@ -8,8 +8,16 @@
 // menu, types SQL at the prompt (one line and several), runs dot-commands (the
 // shell's and the page's), downloads the last result in each format, imports a
 // file, replays a shared link in a fresh page, and checks New, the theme toggle
-// and history. An error on screen fails the run, except the ones a test asks
-// for.
+// and history, Shift+Enter, Ctrl+C, overlapping datasets and an engine crash. It
+// also checks the keyboard (Tab out of the terminal, the Datasets menu's keys,
+// the focus after a click), a phone's bar and SQL, and the grey text's
+// contrast. The line editor's checks cover wide characters (CJK and emoji),
+// lines that wrap or fill the width exactly, resizing, colour, and its keys.
+// And it checks what keeps the page safe: a shared link asks before it runs,
+// shows control characters as escapes and downloads nothing; awkward file
+// names import; and every response carries the security headers, which the
+// page runs under with no Content Security Policy violation. An error on
+// screen fails the run, except the ones a test asks for.
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -22,11 +30,27 @@ const check = (ok: boolean, label: string, detail = "") => {
 
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
+// Content Security Policy violations, from every page: the console's, and
+// the documents' securitypolicyviolation events.
+const violations: string[] = [];
+await context.addInitScript(() => {
+  document.addEventListener("securitypolicyviolation", (e) =>
+    console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+  );
+});
+context.on("console", (m) => {
+  if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
+});
 const page = await context.newPage();
 page.on("pageerror", (e) => failures.push(`page error: ${e.message}`));
 
 async function ready(p: Page) {
-  await p.waitForFunction(() => (window as any).ursaShell && !(window as any).ursaShell.busy(), null, { timeout: 120_000 });
+  // Not busy, and started: the banner and a prompt are on screen. A fresh page
+  // is not busy for a moment before its session starts (and clears the screen).
+  await p.waitForFunction(() => {
+    const shell = (window as any).ursaShell;
+    return shell && !shell.busy() && shell.screen().includes("memory U");
+  }, null, { timeout: 120_000 });
 }
 async function idle(p: Page = page) {
   await p.evaluate(() => (window as any).ursaShell.idle());
@@ -37,6 +61,37 @@ const count = (text: string, needle: string) => text.split(needle).length - 1;
 /** Tables on screen: each starts with a ┌ at the start of a line. */
 const tables = async (p: Page = page) => (await screen(p)).split("\n").filter((l) => l.startsWith("┌")).length;
 const errors = async (p: Page = page) => count(await screen(p), "Error: ");
+/** The queries in a dataset's commands: not its CREATEs, dot-commands or comments. */
+const queries = (commands: string[]) =>
+  commands.map((c) => c.split("\n").filter((l) => !/^\s*--/.test(l)).join("\n")).filter((c) => !/^(CREATE|\.)/i.test(c)).length;
+/** What has the focus: an id, or the terminal. */
+const focused = (p: Page = page): Promise<string> =>
+  p.evaluate(() => (document.activeElement?.classList.contains("xterm-helper-textarea") ? "terminal" : document.activeElement?.id || document.activeElement?.tagName || ""));
+/** WCAG contrast of two computed CSS colours, rgb(...). */
+function contrast(a: string, b: string) {
+  const lum = (c: string) => {
+    const [r, g, bl] = c.match(/\d+(\.\d+)?/g)!.slice(0, 3).map((v) => {
+      const x = Number(v) / 255;
+      return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+/** The colour of the types under a table's header (the shell's grey), and the terminal's background. */
+// xterm draws its rows on the next animation frame: wait for the span.
+const greyText = (p: Page = page) =>
+  p
+    .waitForFunction(
+      () => {
+        const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
+        return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
+      },
+      null,
+      { timeout: 5_000 },
+    )
+    .then((h) => h.jsonValue() as Promise<string[]>, () => null);
 
 /** Type `text` at the prompt, a line at a time, each with Enter; wait for it. */
 async function type(text: string, p: Page = page) {
@@ -66,20 +121,88 @@ const t0 = Date.now();
 await page.goto(base);
 await ready(page);
 const banner = await screen();
-check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
+check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nPick a sample graph from the Datasets menu, or type \.dataset karate\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
 await page.click("#terminal");
+
+// The keyboard can leave the terminal: Tab and Shift+Tab move the focus on
+// (there is no completion for them to do), and Tab comes back to it.
+{
+  const before = await screen();
+  await page.keyboard.press("Shift+Tab");
+  check((await focused()) === "theme", "Shift+Tab leaves the terminal", await focused());
+  await page.keyboard.press("Tab");
+  check((await focused()) === "terminal", "Tab goes back into the terminal", await focused());
+  await page.keyboard.press("Tab");
+  const left = await focused();
+  check(left !== "terminal" && (await screen()) === before, "Tab leaves the terminal, typing nothing", left);
+  // The theme toggle: a click hands the keys back to the terminal; from the
+  // keyboard, the focus stays on it.
+  await page.click("#theme");
+  check((await focused()) === "terminal", "focus is back in the terminal after a theme click", await focused());
+  await page.focus("#theme");
+  await page.keyboard.press("Enter");
+  check((await focused()) === "theme", "focus stays on the theme toggle pressed from the keyboard", await focused());
+  await page.click("#terminal");
+}
+
+// The Datasets menu from the keyboard: a menu button.
+{
+  const menuState = () =>
+    page.evaluate(() => ({
+      open: !document.getElementById("dataset-menu")!.hidden,
+      expanded: document.getElementById("datasets")!.getAttribute("aria-expanded"),
+      item: [...document.querySelectorAll("#dataset-menu [role=menuitem]")].indexOf(document.activeElement!),
+    }));
+  const n = await page.locator("#dataset-menu [role=menuitem]").count();
+  const steps: [string, number][] = [["ArrowDown", 1], ["ArrowUp", 0], ["ArrowUp", n - 1], ["ArrowDown", 0], ["End", n - 1], ["Home", 0]];
+  await page.focus("#datasets");
+  await page.keyboard.press("ArrowDown");
+  let s = await menuState();
+  let ok = s.open && s.expanded === "true" && s.item === 0;
+  const seen = [s.item];
+  for (const [key, want] of steps) {
+    await page.keyboard.press(key);
+    s = await menuState();
+    seen.push(s.item);
+    ok &&= s.item === want;
+  }
+  check(ok, "the Datasets menu's arrow keys, Home and End", JSON.stringify(seen));
+  await page.keyboard.press("Escape");
+  s = await menuState();
+  check(!s.open && s.expanded === "false" && (await focused()) === "datasets", "Escape closes the menu, back on its button", JSON.stringify(s));
+  const attrs = await page.evaluate(() => {
+    const b = document.getElementById("datasets")!, m = document.getElementById("dataset-menu")!;
+    return [b.getAttribute("aria-haspopup"), b.getAttribute("aria-controls"), m.getAttribute("role"), m.getAttribute("aria-labelledby"), m.querySelector("button")!.tabIndex].join(",");
+  });
+  check(attrs === "menu,dataset-menu,menu,datasets,-1", "the menu's aria attributes", attrs);
+  await page.click("#terminal");
+}
 
 // Every dataset, from the menu: each starts a fresh session, and its queries
 // print a table each, with no error.
 const datasets: { id: string; title: string; commands: string[] }[] = await page.evaluate(() => (window as any).ursaShell.datasets);
-for (const d of datasets) {
+for (const [i, d] of datasets.entries()) {
   const t = Date.now();
-  await page.click("#datasets");
-  await page.click(`#dataset-menu button:has-text("${d.title}")`);
+  if (i === 0) {
+    // The first from the keyboard: Enter opens the menu on its first item, and
+    // Enter picks it.
+    await page.focus("#datasets");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+  } else {
+    await page.click("#datasets");
+    await page.click(`#dataset-menu button:has-text("${d.title}")`);
+  }
   await idle();
   const text = await screen();
-  const queries = d.commands.filter((c) => !/^CREATE/i.test(c)).length;
-  check(!text.includes("Error: ") && (await tables()) === queries && text.startsWith("Ursa Web Shell running"), `dataset ${d.id}`, `${await tables()} tables in ${Date.now() - t} ms`);
+  check(!text.includes("Error: ") && (await tables()) === queries(d.commands) && text.startsWith("Ursa Web Shell running"), `dataset ${d.id}`, `${await tables()} tables in ${Date.now() - t} ms`);
+  if (i === 0) {
+    check((await focused()) === "datasets", "a dataset picked from the keyboard leaves the focus on the menu button", await focused());
+    // Its explanations are shown, as SQL comments.
+    check(/^memory U -- \S/m.test(text), "a dataset's explanations show as comments", text.match(/^memory U --.*$/m)?.[0]);
+    await page.click("#terminal");
+  }
+  if (d.id === "rmat") check(text.includes("Run Time (s): real "), "the R-MAT dataset turns the timer on");
   if (shots && d.id === "karate") await page.screenshot({ path: `${shots}/shell-karate.png` });
 }
 await type(".tables");
@@ -178,10 +301,32 @@ await page.setInputFiles("#file-input", {
   mimeType: "text/csv",
   buffer: Buffer.from("src,dst\n1,2\n2,3\n3,1\n"),
 });
-await page.waitForFunction(() => (window as any).ursaShell.screen().includes("FROM my_ties LIMIT 10;"), null, { timeout: 30_000 });
+await page.waitForFunction(() => (window as any).ursaShell.screen().includes(`FROM "my_ties" LIMIT 10;`), null, { timeout: 30_000 });
 await idle();
-t = lastTable(await after("FROM my_ties LIMIT 10;"));
+t = lastTable(await after(`FROM "my_ties" LIMIT 10;`));
 check(t.rows.length === 3 && t.head.join(",") === "src,dst", "import", JSON.stringify(t.rows));
+// Names a URL or SQL would read otherwise: non-ASCII, #, and a keyword.
+for (const [name, view] of [["données.csv", "données"], ["a#b.csv", "a_b"], ["order.csv", "order"]]) {
+  const before = await errors();
+  await page.setInputFiles("#file-input", { name, mimeType: "text/csv", buffer: Buffer.from("src,dst\n1,2\n2,3\n3,1\n") });
+  await page.waitForFunction((v) => (window as any).ursaShell.screen().includes(`FROM "${v}" LIMIT 10;`), view, { timeout: 30_000 });
+  await idle();
+  t = lastTable(await after(`FROM "${view}" LIMIT 10;`));
+  check(t.rows.length === 3 && (await errors()) === before, `import ${name}`, JSON.stringify(t.rows));
+}
+// An import that fails prints its error on a line of its own, and the prompt
+// and what was being typed come back below it.
+await page.keyboard.type("SELECT 'draft'");
+await page.setInputFiles("#file-input", { name: ".hidden.csv", mimeType: "text/csv", buffer: Buffer.from("a\n1\n") });
+await page.waitForFunction(() => /\nError: [^\n]*\.hidden\.csv/.test((window as any).ursaShell.screen()), null, { timeout: 30_000 });
+await idle();
+{
+  const lines = (await screen()).split("\n");
+  const at = lines.findLastIndex((l) => l.includes(".hidden.csv"));
+  check(lines[at].startsWith("Error: ") && lines[at - 1] !== "memory U SELECT 'draft'" && lines.at(-1) === "memory U SELECT 'draft'", "an import error prints on its own line, then the prompt", JSON.stringify(lines.slice(at - 1)));
+}
+await page.keyboard.press("Control+C");
+await idle();
 
 // History: the up arrow brings back the last command.
 await page.keyboard.press("ArrowUp");
@@ -221,15 +366,62 @@ await page.click("#share");
 await idle();
 const url = page.url().includes("#run=") ? page.url() : await page.evaluate(() => navigator.clipboard.readText());
 check(url.includes("#run="), "share link", `${url.length} characters`);
-const replay = await context.newPage();
-replay.on("pageerror", (e) => failures.push(`replay page error: ${e.message}`));
-await replay.goto(url);
-await ready(replay);
+/** Open a shared link in a new page and wait for its question. */
+async function openShared(link: string) {
+  const p = await context.newPage();
+  p.on("pageerror", (e) => failures.push(`replay page error: ${e.message}`));
+  await p.goto(link);
+  await p.waitForFunction(() => (window as any).ursaShell?.screen().includes("? [y/N] "), null, { timeout: 120_000 });
+  return p;
+}
+const linkTo = (commands: string[]) =>
+  `${base}/#run=${Buffer.from(JSON.stringify(commands)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+
+// A shared link shows its commands and asks; only y runs them.
+let replay = await openShared(url);
+{
+  const asked = await screen(replay);
+  const n = asked.match(/Run (\d+) shared commands\? \[y\/N\]/)?.[1];
+  check(!!n && asked.includes(`This link runs ${n} shared commands:`) && (await tables(replay)) === 0, "a shared link asks before it runs", `${n} commands`);
+}
+let replayDownloads = 0;
+replay.on("download", () => replayDownloads++);
+await replay.keyboard.press("y");
 await idle(replay);
 const replayed = await screen(replay);
 // The imported file is not in the link: its view is the one error expected.
 const replayErrors = replayed.split("\n").filter((l) => l.startsWith("Error: "));
-check(replayed.includes("Replaying") && replayErrors.every((e) => /my_ties/.test(e)) && (await tables(replay)) > 5, "shared link replays", replayErrors[0] ?? `${await tables(replay)} tables`);
+check(replayed.includes("Replaying") && replayErrors.every((e) => /my_ties/.test(e)) && (await tables(replay)) > 5, "shared link replays after y", replayErrors[0] ?? `${await tables(replay)} tables`);
+check(replayDownloads === 0 && !replayed.includes("Downloaded "), "a shared link downloads nothing", `${replayDownloads} downloads`);
+await replay.close();
+
+replay = await openShared(url);
+await replay.keyboard.press("n");
+await idle(replay);
+{
+  const text = await screen(replay);
+  check(/\[y\/N\] N\nNot run\.\nmemory U/.test(text) && (await tables(replay)) === 0 && !text.includes("Replaying"), "a shared link answered N runs nothing");
+  await type("SELECT 3 AS three;", replay);
+  check(lastTable(await after("SELECT 3 AS three;", replay)).rows[0]?.[0] === "3", "the shell works after N");
+}
+await replay.close();
+
+// A crafted link: escape sequences are shown as escapes, in the question, the
+// echo and .print, and its .export downloads nothing.
+replay = await openShared(linkTo([".print \x1b[2J\x1b[8mhidden\x07\u009b0m", "SELECT 1 AS \"\x1b[31mone\";", ".export csv", "SELECT 2 AS two;"]));
+{
+  const asked = await screen(replay);
+  check(asked.includes("  .print \\u{1b}[2J\\u{1b}[8mhidden\\u{7}\\u{9b}0m") && !asked.includes("\x1b"), "a shared link's commands are shown with escapes", asked.split("\n").find((l) => l.includes(".print")));
+  let downloads = 0;
+  replay.on("download", () => downloads++);
+  await replay.keyboard.press("y");
+  await idle(replay);
+  const text = await screen(replay);
+  const printed = (await after(".print", replay)).split("\n")[0];
+  check(printed === "\\u{1b}[2J\\u{1b}[8mhidden\\u{7}\\u{9b}0m", ".print writes control characters as escapes", JSON.stringify(printed));
+  check(text.includes(`memory U SELECT 1 AS "\\u{1b}[31mone";`) && text.includes("This link runs 4 shared commands:"), "replayed commands are echoed with escapes");
+  check(downloads === 0 && text.includes("Skipped .export") && lastTable(await after("SELECT 2 AS two;", replay)).rows[0]?.[0] === "2", "a crafted link's .export is skipped and the rest runs", `${downloads} downloads`);
+}
 await replay.close();
 
 // New: a fresh session and a clear screen.
@@ -238,6 +430,270 @@ await idle();
 check((await screen()).startsWith("Ursa Web Shell running"), "New clears the screen");
 await type("SELECT count(*) FROM members;");
 check((await after("SELECT count(*) FROM members")).includes("Error: "), "New starts an empty session");
+
+// Shift+Enter adds a line to what is typed; it doesn't run it.
+await page.keyboard.type("SELECT 7 AS seven,");
+await page.keyboard.press("Shift+Enter");
+await page.keyboard.type("8 AS eight;");
+await page.waitForTimeout(200);
+check(!(await screen()).includes("│     7 │"), "Shift+Enter doesn't run the line");
+check(
+  (await screen()).split("\n").slice(-2).join("\n") === "memory U SELECT 7 AS seven,\n         8 AS eight;",
+  "Shift+Enter adds one line, and sends nothing to the shell",
+  JSON.stringify((await screen()).split("\n").slice(-3)),
+);
+await page.keyboard.press("Enter");
+await idle();
+check(lastTable(await after("SELECT 7 AS seven,")).rows[0]?.join(",") === "7,8", "Shift+Enter then Enter runs both lines", JSON.stringify(lastTable(await after("SELECT 7 AS seven,")).rows));
+
+// Ctrl+C drops a half-typed statement; what is typed right after it runs, in order.
+await type("SELECT 1 AS");
+await page.keyboard.press("Control+C");
+await page.keyboard.type("SELECT 5 AS five;");
+await page.keyboard.press("Enter");
+await page.keyboard.type("SELECT 6 AS six;");
+await page.keyboard.press("Enter");
+await idle();
+{
+  const text = await screen();
+  const five = text.lastIndexOf("│     5 │"), six = text.lastIndexOf("│     6 │");
+  check(five > 0 && six > five, "keys typed after Ctrl+C run, in order", `five at ${five}, six at ${six}`);
+}
+
+// Share with a statement half typed: the statement is dropped, Share works,
+// and what was being typed comes back.
+await type("SELECT 2 AS");
+await page.keyboard.type("SELECT 'draft'");
+await page.click("#share");
+await idle();
+{
+  const text = await screen();
+  check(/Copied a link|address bar|No commands/.test(text.split("\n").slice(-4).join("\n")), "Share with a half-typed statement", text.split("\n").slice(-3).join(" | "));
+  check((text.split("\n").at(-1) ?? "").startsWith("memory U SELECT 'draft'"), "what was being typed comes back after Share", text.split("\n").at(-1));
+}
+await page.keyboard.press("Control+C");
+await idle();
+
+// Two datasets picked back to back: the second wins, with no errors.
+for (const title of [datasets[0].title, datasets[2].title]) {
+  await page.click("#datasets");
+  await page.click(`#dataset-menu button:has-text("${title}")`);
+}
+await idle();
+{
+  const text = await screen();
+  check(!text.includes("Error: ") && (await tables()) === queries(datasets[2].commands), "a dataset picked during another replaces it cleanly", `${await tables()} tables`);
+}
+// New during a dataset: the dataset stops; the session is empty.
+await page.click("#datasets");
+await page.click(`#dataset-menu button:has-text("${datasets[1].title}")`);
+await page.click("#new");
+await idle();
+check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New during a dataset stops it", `${await tables()} tables`);
+
+// The line editor: wide characters, wrapping, resizing, colour and its keys.
+{
+  const shell = (fn: string, ...args: any[]) => page.evaluate(([fn, args]) => (window as any).ursaShell[fn as string](...(args as any[])), [fn, args] as const);
+  const cursorAt = async () => (await shell("cursor")) as { x: number; y: number };
+  const lastLines = async (n: number) => (await screen()).split("\n").slice(-n);
+  const settle = async () => {
+    await page.waitForTimeout(150);
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+  };
+  /** Drop what is typed. */
+  const drop = async () => {
+    await page.keyboard.press("Control+C");
+    await idle();
+  };
+  await page.click("#new");
+  await idle();
+
+  // Wide characters: CJK takes two cells, an emoji sequence two; the cursor
+  // goes where the characters are, and moves over (and deletes) them whole.
+  await page.keyboard.type("SELECT '日本語' AS t");
+  for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowLeft");
+  await settle();
+  let c = await cursorAt();
+  let line = (await screen()).split("\n")[c.y] ?? "";
+  // memory U SELECT '日本語' AS t: the cursor is on the closing quote, after three wide characters.
+  check(c.x === "memory U SELECT '".length + 6, "the cursor after CJK text", `column ${c.x}, line ${JSON.stringify(line)}`);
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type("x");
+  await settle();
+  c = await cursorAt();
+  check((await lastLines(1))[0] === "memory U SELECT '日本x' AS t" && c.x === "memory U SELECT '".length + 5, "Backspace deletes a CJK character", `${JSON.stringify((await lastLines(1))[0])} column ${c.x}`);
+  await drop();
+  const cp = (...cps: number[]) => String.fromCodePoint(...cps);
+  // A face, a ZWJ family, a flag, a skin tone, a heart with VS16, and e with a combining accent.
+  const emoji = [cp(0x1f600), cp(0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467), cp(0x1f1fa, 0x1f1f8), cp(0x1f44d, 0x1f3fd), cp(0x2764, 0xfe0f), cp(0x65, 0x301)];
+  await page.keyboard.insertText(`SELECT '${emoji.join("")}'`);
+  await page.keyboard.press("ArrowLeft");
+  await settle();
+  const typed = `memory U SELECT '${emoji.join("")}`;
+  c = await cursorAt();
+  check(c.x === "memory U SELECT '".length + 11, "the cursor after emoji", `column ${c.x}`);
+  const cells = ((await shell("cells", c.y)) as { ch: string }[]).map((x) => x.ch);
+  check(JSON.stringify(cells.slice(17, 23)) === JSON.stringify(emoji), "an emoji sequence is one character on screen", JSON.stringify(cells.slice(17, 23)));
+  let shown = "";
+  for (const want of [...emoji].reverse()) {
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("Delete");
+    await settle();
+    shown = (await lastLines(1))[0];
+    if (!shown.startsWith(typed.slice(0, typed.lastIndexOf(want))) || shown.includes(cp(0xfffd))) break;
+  }
+  check(shown === "memory U SELECT ''", "Left and Delete take an emoji sequence whole", JSON.stringify(shown));
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("🇺🇸🇫🇷");
+  await page.keyboard.press("Backspace");
+  await settle();
+  check((await lastLines(1))[0] === "memory U SELECT ''🇺🇸", "Backspace deletes a flag whole", JSON.stringify((await lastLines(1))[0]));
+  await drop();
+
+  // A long CJK line wraps (a wide character that doesn't fit the row starts
+  // the next one) and is drawn once however it is edited.
+  const cols: number = await shell("cols");
+  const long = "漢字".repeat(cols);
+  await page.keyboard.insertText(`SELECT '${long}`);
+  await page.keyboard.type("' AS kanji;");
+  for (let i = 0; i < 11; i++) await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type("x");
+  await page.keyboard.press("End");
+  await page.keyboard.press("Backspace");
+  await settle();
+  {
+    // The ; is gone: the line ends "AS kanji".
+    const text = await screen();
+    const rows = text.split("\n");
+    const first = rows.findLastIndex((l) => l.startsWith("memory U SELECT '漢字"));
+    const joined = rows.slice(first).join("");
+    check(count(text, "memory U SELECT '漢字") === 1 && joined === `memory U SELECT '${long}x' AS kanji`, "a wrapped CJK line is drawn once", `${count(text, "memory U SELECT '漢字")} prompts, ${rows.length - first} rows`);
+    c = await cursorAt();
+    check(c.y === rows.length - 1 && c.x === [...rows.at(-1)!].reduce((n, ch) => n + (ch.charCodeAt(0) > 0x2e80 ? 2 : 1), 0), "the cursor at the end of a wrapped CJK line", JSON.stringify(c));
+  }
+  await page.keyboard.type(";");
+  await page.keyboard.press("Enter");
+  await idle();
+  check(lastTable(await after("SELECT '漢字")).head[0] === "kanji", "a wrapped CJK line runs", JSON.stringify(lastTable(await after("SELECT '漢字")).head));
+
+  // A line that fills the terminal's width exactly, with lines after it: no
+  // empty row after it.
+  const exact = "SELECT " + "1".repeat(cols - "memory U SELECT ".length - " AS w,".length) + " AS w,";
+  await page.keyboard.type(exact);
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("2 AS v;");
+  await page.keyboard.press("ArrowUp");
+  await settle();
+  {
+    const rows = await lastLines(2);
+    check(rows[0] === `memory U ${exact}` && rows[1] === "         2 AS v;", "a line as wide as the terminal leaves no empty row", JSON.stringify(rows));
+  }
+  await page.keyboard.press("End");
+  await settle();
+  c = await cursorAt();
+  check(c.y === (await screen()).split("\n").length - 1 && c.x === 0, "the cursor after a line as wide as the terminal", JSON.stringify(c));
+  await page.keyboard.press("Enter");
+  await idle();
+  {
+    const rows = (await after(exact.slice(0, 20))).split("\n");
+    check(rows[0] === "         2 AS v;" && rows[1].startsWith("┌"), "a line as wide as the terminal, run", JSON.stringify(rows.slice(0, 2)));
+  }
+
+  // Resizing redraws what is typed for the new width, at once.
+  const statement = "SELECT 'resize' AS r, " + Array.from({ length: 12 }, (_, i) => `${i} AS c${i}`).join(", ");
+  await page.keyboard.type(statement);
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("FROM members");
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("End");
+  await settle();
+  for (const width of [640, 1100]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForFunction((n) => (window as any).ursaShell.cols() !== n, await shell("cols"));
+    await settle();
+    await settle();
+    const n: number = await shell("cols");
+    const first = `memory U ${statement}`;
+    const want: string[] = [];
+    for (let i = 0; i < first.length; i += n) want.push(first.slice(i, i + n));
+    want.push("         FROM members");
+    const text = await screen();
+    const rows = text.split("\n");
+    c = await cursorAt();
+    check(
+      count(text, "memory U SELECT 'resize'") === 1 && JSON.stringify(rows.slice(-want.length)) === JSON.stringify(want),
+      `resizing to ${n} columns redraws what is typed`,
+      `${count(text, "memory U SELECT 'resize'")} prompts; ${JSON.stringify(rows.slice(-want.length - 1))}`,
+    );
+    const end = (statement.length + 9) % n;
+    check(c.y === rows.length - 2 && c.x === end, `the cursor where it was, at ${n} columns`, `${JSON.stringify(c)}, want x ${end}`);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await settle();
+  await drop();
+
+  // What is typed and run before the highlighter answers is coloured all the same.
+  await shell("input", [..."SELECT 'quick' AS fast;", "\r"]);
+  await idle();
+  {
+    const rows = (await screen()).split("\n");
+    const y = rows.findLastIndex((l) => l.startsWith("memory U SELECT 'quick'"));
+    const cells = (await shell("cells", y)) as { ch: string; fg: number; bold: boolean }[];
+    const word = (from: number, n: number) => cells.slice(from, from + n);
+    const keyword = word(9, 6), string = word(16, 7);
+    check(keyword.every((x) => x.bold || x.fg >= 0) && string.every((x) => x.fg >= 0) && string[0].fg !== keyword[0].fg, "a line run at once is coloured", JSON.stringify([keyword[0], string[0]]));
+  }
+
+  // .help shortcuts lists the keys the line editor knows, and they do what it says.
+  await type(".help shortcuts");
+  {
+    const listed = (await after(".help shortcuts"))
+      .split("\n")
+      .filter((l) => /^\S/.test(l) && !l.startsWith("memory U"))
+      .flatMap((l) => {
+        const [keys, what] = l.split(/\s{2,}/);
+        return [...keys.split(", "), ...(what.match(/\(also ([^)]*)\)/)?.[1].split(", ") ?? [])];
+      });
+    const known = ["Enter", "Shift+Enter", "Up", "Down", "Left", "Right", "Ctrl+B", "Ctrl+F", "Home", "End", "Ctrl+A", "Ctrl+E", "Backspace", "Ctrl+H", "Delete", "Ctrl+U", "Ctrl+K", "Ctrl+W", "Tab", "Shift+Tab", "Ctrl+C", "Cmd+C", "Ctrl+L"];
+    check(JSON.stringify([...listed].sort()) === JSON.stringify([...known].sort()), ".help shortcuts lists the editor's keys", JSON.stringify(listed));
+    // Each editing key on "one two three", the cursor after "two": what is left, and where the cursor is.
+    const edits: [string[], string, number][] = [
+      [["ArrowLeft"], "one two three", 6],
+      [["Control+B"], "one two three", 6],
+      [["ArrowRight"], "one two three", 8],
+      [["Control+F"], "one two three", 8],
+      [["Home"], "one two three", 0],
+      [["Control+A"], "one two three", 0],
+      [["End"], "one two three", 13],
+      [["Control+E"], "one two three", 13],
+      [["Backspace"], "one tw three", 6],
+      [["Control+H"], "one tw three", 6],
+      [["Delete"], "one twothree", 7],
+      [["Control+U"], " three", 0],
+      [["Control+K"], "one two", 7],
+      [["Control+W"], "one  three", 4],
+    ];
+    const wrong: string[] = [];
+    for (const [keys, want, at] of edits) {
+      await page.keyboard.type("one two three");
+      for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowLeft");
+      for (const k of keys) await page.keyboard.press(k);
+      await settle();
+      const got = (await lastLines(1))[0];
+      c = await cursorAt();
+      if (got !== `memory U ${want}` || c.x !== 9 + at) wrong.push(`${keys}: ${JSON.stringify(got)} at ${c.x - 9}`);
+      await drop();
+    }
+    check(!wrong.length, "the editing keys do what .help shortcuts says", wrong.join("; "));
+  }
+}
+
+// The engine crashing (out of memory) leaves a working shell, in a fresh session.
+await type("SELECT length(repeat('x', 2000000000)) AS n;");
+await idle();
+check((await screen()).includes("the engine stopped"), "an engine crash is reported");
+await type("SELECT 41 + 1 AS answer;");
+check(lastTable(await after("SELECT 41 + 1 AS answer;")).rows[0]?.[0] === "42", "the shell works after an engine crash");
 
 // The theme toggle, remembered.
 const theme0 = await page.evaluate(() => document.documentElement.dataset.theme ?? "");
@@ -257,7 +713,267 @@ await idle(phone);
 const columns: number = await phone.evaluate(() => (window as any).ursaShell.cols());
 const widest = Math.max(...(await screen(phone)).split("\n").filter((l) => /^[┌│└├]/.test(l)).map((l) => [...l].length));
 check(widest <= columns, "tables fit a phone's width", `widest ${widest}, ${columns} columns`);
+{
+  const hint = (await screen(phone)).split("\n").slice(3, 6);
+  check(hint.join(" ").startsWith("Pick a sample graph from the Datasets menu, or type .dataset karate") && hint.every((l) => [...l].length < columns), "the banner's hint breaks between words on a phone", JSON.stringify(hint));
+}
 if (shots) await phone.screenshot({ path: `${shots}/shell-phone.png` });
+// The dataset's SQL is broken at spaces to fit: no line fills the width, as a
+// line the terminal wraps (mid-word) does.
+{
+  const full = (await screen(phone)).split("\n").filter((l) => [...l].length >= columns);
+  check(full.length === 0, "a dataset's SQL fits a phone without wrapping mid-word", full[0]);
+}
+// iOS zooms in on a text field with a font under 16px.
+{
+  const size: string = await phone.evaluate(() => getComputedStyle(document.querySelector(".xterm-helper-textarea")!).fontSize);
+  check(parseFloat(size) >= 16, "the terminal's textarea is 16px or more", size);
+}
+await phone.close();
+
+// The narrowest phone: the bar is one row, and the SQL still fits.
+const small = await browser.newPage({ viewport: { width: 320, height: 640 } });
+await small.goto(`${base}/?dataset=lesmis`);
+await ready(small);
+await idle(small);
+{
+  const bar = (await small.locator("header.bar").boundingBox())!;
+  const fits: boolean = await small.evaluate(() =>
+    [...document.querySelectorAll("header button, header a")].every((e) => {
+      const r = e.getBoundingClientRect();
+      return r.height <= 44 && r.right <= innerWidth && r.left >= 0;
+    }),
+  );
+  check(bar.height <= 56 && fits, "the bar is one row at 320px", `${bar.height}px`);
+  const cols: number = await small.evaluate(() => (window as any).ursaShell.cols());
+  const full = (await screen(small)).split("\n").filter((l) => [...l].length >= cols);
+  check(full.length === 0 && !(await errors(small)) && (await tables(small)) === queries(datasets[1].commands), "lesmis at 320px: no mid-word wraps, no errors", full[0] ?? `${await tables(small)} tables`);
+}
+await small.close();
+
+// The dim text (types, footers, nulls) is readable: 4.5:1 or more on the
+// terminal's background, in both themes.
+for (const scheme of ["light", "dark"] as const) {
+  const ctx = await browser.newContext({ viewport: { width: 1000, height: 700 }, colorScheme: scheme });
+  const p = await ctx.newPage();
+  await p.goto(base);
+  await ready(p);
+  await p.click("#terminal");
+  await type("SELECT 1 AS one;", p);
+  const colors = await greyText(p);
+  const ratio = colors ? contrast(colors[0], colors[1]) : 0;
+  check(ratio >= 4.5, `dim text contrast, ${scheme}`, `${ratio.toFixed(2)}:1 (${colors?.join(" on ")})`);
+  await ctx.close();
+}
+
+// The Graph view (.graph): a result, a query or a property graph drawn in a
+// pane beside the terminal (under it on a phone), loaded only when first
+// asked for. Headless Chromium draws it with WebGL2 (SwiftShader).
+/** A context watched for Content Security Policy violations, as the main one is. */
+async function watchedContext(options: Parameters<typeof browser.newContext>[0]) {
+  const ctx = await browser.newContext(options);
+  await ctx.addInitScript(() => {
+    document.addEventListener("securitypolicyviolation", (e) =>
+      console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+    );
+  });
+  ctx.on("console", (m) => {
+    if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
+  });
+  ctx.on("page", (p) => p.on("pageerror", (e) => failures.push(`page error: ${e.message}`)));
+  return ctx;
+}
+const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
+const graphOpen = (p: Page): Promise<boolean> => p.evaluate(() => (window as any).ursaShell.graphOpen());
+/** Wait until the view has drawn a frame and its layout has run to the end. */
+async function graphSettled(p: Page) {
+  await p.waitForFunction(
+    () => {
+      const g = (window as any).ursaShell.graph();
+      return g && g.frames > 0 && g.layoutDone;
+    },
+    null,
+    { timeout: 60_000, polling: 200 },
+  );
+}
+/** The terminal's columns, once a resize has settled. */
+async function settledCols(p: Page) {
+  let last = -1;
+  for (let i = 0; i < 20; i++) {
+    await p.waitForTimeout(100);
+    const now: number = await p.evaluate(() => (window as any).ursaShell.cols());
+    if (now === last) return now;
+    last = now;
+  }
+  return last;
+}
+for (const scheme of ["light", "dark"] as const) {
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: scheme });
+  const g = await gctx.newPage();
+  const vizRequests: string[] = [];
+  g.on("request", (r) => {
+    if (/\/viz\/|\/graph(-worker)?\.js/.test(r.url())) vizRequests.push(new URL(r.url()).pathname);
+  });
+  await g.goto(base);
+  await ready(g);
+  await g.click("#terminal");
+  const fullCols = await settledCols(g);
+  if (scheme === "light") {
+    // Errors, each said plainly: nothing to draw yet, too few columns, no rows,
+    // an unknown name, a query that fails.
+    await type(".graph", g);
+    check((await after(".graph", g)).startsWith("Error: no result to draw yet"), ".graph with no result says so", (await after(".graph", g)).split("\n")[0]);
+    for (const [sql, says] of [
+      ["SELECT 1 AS x", "the result has 1 column"],
+      ["SELECT 1 AS src, 2 AS dst WHERE false", "the result has no rows"],
+      ["nothing_here", "no graph or table named 'nothing_here'"],
+      ["SELECT * FROM no_such_table", "no_such_table"],
+    ]) {
+      await type(`.graph ${sql}`, g);
+      const out = await after(`.graph ${sql}`, g);
+      check(out.startsWith("Error: ") && out.includes(says) && !(await graphOpen(g)), `.graph ${sql}: an error`, out.split("\n")[0]);
+    }
+  }
+  await type(".dataset karate", g);
+  check(!(await errors(g)) && vizRequests.length === 0 && !(await graphOpen(g)), `${scheme}: the graph view is not downloaded before .graph`, vizRequests.join(", "));
+
+  // .graph draws the last result: karate's 78 ties between its 34 members.
+  await type("SELECT * FROM ties;", g);
+  await type(".graph", g);
+  const drawing = (await after(".graph", g)).split("\n")[0];
+  check(drawing === "Drawing 78 edges, 34 nodes (Esc closes)", `${scheme}: .graph draws the last result`, drawing);
+  check(vizRequests.some((u) => u.startsWith("/viz/") && u.endsWith(".wasm")) && vizRequests.includes("/graph.js"), `${scheme}: .graph loads the graph view`, vizRequests.join(", "));
+  await graphSettled(g);
+  let info = await graphInfo(g);
+  check(info.nodes === 34 && info.edges === 78 && info.iterations > 0 && info.layoutDone, `${scheme}: the view holds the graph, its layout run to the end`, JSON.stringify(info));
+  const inked = await g.evaluate(() => (window as any).ursaShell.graphInked());
+  check(inked && inked.inked > 500, `${scheme}: the view draws the graph (non-blank pixels)`, `${inked?.inked} of ${inked?.width}x${inked?.height} px, ${info.backend}`);
+  const pane = (await g.locator("#graph-pane").boundingBox())!;
+  const termBox = (await g.locator("#terminal").boundingBox())!;
+  const split = await settledCols(g);
+  check(pane.x >= termBox.x + termBox.width - 1 && Math.abs(pane.width - termBox.width) < 4 && split < fullCols * 0.6, `${scheme}: the pane sits beside the terminal, which refits`, `terminal ${termBox.width}px, ${split} of ${fullCols} columns; pane ${pane.width}px`);
+  const label = await g.evaluate(() => [document.getElementById("graph-pane")!.getAttribute("aria-label"), document.getElementById("graph-close")!.getAttribute("aria-label"), document.querySelector("#graph-stage canvas")?.getAttribute("aria-label")]);
+  check(label.every(Boolean), `${scheme}: the pane, its close button and canvas are labelled`, JSON.stringify(label));
+  check((await focused(g)) === "terminal", `${scheme}: the terminal keeps the focus while the graph shows`, await focused(g));
+  if (shots) await g.screenshot({ path: `${shots}/graph-split-${scheme}.png` });
+  if (scheme === "dark") {
+    await gctx.close();
+    continue;
+  }
+
+  // Typing works while the pane is open.
+  await type("SELECT 6 * 7 AS answer;", g);
+  check(lastTable(await after("SELECT 6 * 7", g)).rows[0]?.[0] === "42" && (await graphOpen(g)), "queries run while the graph shows");
+
+  // A click on a node names it in the pane's header.
+  const box = (await g.locator("#graph-stage canvas").boundingBox())!;
+  const hit: { x: number; y: number } | null = await g.evaluate(([w, h]) => {
+    for (let y = 2; y < h; y += 2)
+      for (let x = 2; x < w; x += 2) if ((window as any).ursaShell.graphNodeAt(x * 2, y * 2) !== null) return { x, y };
+    return null;
+  }, [box.width, box.height]);
+  if (hit) await g.mouse.click(box.x + hit.x, box.y + hit.y);
+  const status = await g.locator("#graph-status").textContent();
+  check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\)/.test(status ?? ""), "a click on a node names it", status ?? "no node found");
+  // Double-click fits, and the wheel zooms, without errors.
+  await g.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
+  await g.mouse.wheel(0, -200);
+
+  // Esc, in the terminal, closes it: the terminal takes the whole width again.
+  await g.click("#terminal");
+  await g.keyboard.press("Escape");
+  check(!(await graphOpen(g)) && (await settledCols(g)) === fullCols && (await focused(g)) === "terminal", "Esc closes the graph view and the terminal refits", `${await settledCols(g)} of ${fullCols} columns`);
+
+  // .graph NAME: a property graph.
+  await type(".graph karate", g);
+  check((await after(".graph karate", g)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), ".graph karate draws the property graph", (await after(".graph karate", g)).split("\n")[0]);
+  // .graph QUERY replaces the drawing.
+  await type(".graph SELECT src, dst FROM ties WHERE src = 1;", g);
+  const replaced = (await after(".graph SELECT src, dst FROM ties WHERE src = 1", g)).split("\n")[0];
+  await graphSettled(g);
+  info = await graphInfo(g);
+  check(/^Drawing 8 edges, 9 nodes \(replacing the last drawing; Esc closes\)$/.test(replaced) && info.edges === 8 && info.nodes === 9, ".graph QUERY replaces the drawing", replaced);
+  // Esc with the focus in the pane closes it, and the focus goes back to the terminal.
+  await g.focus("#graph-stage canvas");
+  await g.keyboard.press("Escape");
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "Esc in the pane closes it, focus back in the terminal", await focused(g));
+
+  // The Graph button draws the last result; a click hands the keys back to the terminal.
+  await type("SELECT * FROM ties;", g);
+  await g.click("#graph");
+  await idle(g);
+  check((await after(".graph", g)).startsWith("Drawing 78 edges, 34 nodes") && (await graphOpen(g)) && (await focused(g)) === "terminal", "the Graph button draws the last result", (await after(".graph", g)).split("\n")[0]);
+  const buttonLabel = await g.evaluate(() => document.getElementById("graph")!.textContent!.trim());
+  check(buttonLabel === "Graph", "the Graph button is named", buttonLabel);
+  // The close button closes it.
+  await g.click("#graph-close");
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "the close button closes the pane", await focused(g));
+  check((await errors(g)) === 0, "no errors from the graph view (since the dataset cleared the screen)", `${await errors(g)}`);
+  // New, or a dataset, closes the pane.
+  await type(".graph karate", g);
+  await g.click("#new");
+  await idle(g);
+  check(!(await graphOpen(g)), "New closes the graph view");
+  await type(".dataset karate", g);
+  await type(".graph karate", g);
+  check(await graphOpen(g), ".graph karate after a fresh session");
+  await type(".dataset florentine", g);
+  check(!(await graphOpen(g)), "a dataset closes the graph view");
+  await gctx.close();
+}
+// A phone: the pane goes under the terminal, which refits to its new height.
+{
+  const pctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  const p = await pctx.newPage();
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  const rows0: number = await p.evaluate(() => (window as any).ursaShell.rows());
+  await p.click("#terminal");
+  await type(".graph karate", p);
+  await graphSettled(p);
+  const pane = (await p.locator("#graph-pane").boundingBox())!;
+  const termBox = (await p.locator("#terminal").boundingBox())!;
+  const rows1: number = await p.evaluate(() => (window as any).ursaShell.rows());
+  const bar = (await p.locator("header.bar").boundingBox())!;
+  check(pane.y >= termBox.y + termBox.height - 1 && pane.width > 380 && rows1 < rows0 && bar.height <= 56, "a phone: the graph view is stacked under the terminal", `terminal ${rows0} → ${rows1} rows, pane at ${pane.y}px`);
+  if (shots) await p.screenshot({ path: `${shots}/graph-stacked-phone.png` });
+  await pctx.close();
+}
+
+// The security headers, on every kind of response.
+for (const path of ["/", "/app.js", "/engine/engine.json", "/data/manifest.json", "/data/no_such_file.csv", "/no/such/page"]) {
+  const r = await fetch(`${base}${path}`);
+  const csp = r.headers.get("content-security-policy") ?? "";
+  check(
+    /frame-ancestors 'none'/.test(csp) && /script-src 'self' 'wasm-unsafe-eval'/.test(csp) && r.headers.get("x-content-type-options") === "nosniff" && /^(no-referrer|strict-origin-when-cross-origin)$/.test(r.headers.get("referrer-policy") ?? ""),
+    `security headers on ${path}`,
+    `${r.status}`,
+  );
+}
+// A path that does not decode is not found, not a server error; and no path
+// leaves the files served. The Worker answers 404; on Cloudflare the edge may
+// refuse some such paths itself with 400 (`%A.` in /engine/%E0%A4%A.wasm) before
+// they reach it, which is as good.
+for (const path of ["/data/%E0%A4%A", "/%E0%A4%A", "/engine/%E0%A4%A.wasm", "/data/%"]) {
+  const r = await fetch(`${base}${path}`);
+  check(r.status === 404 || r.status === 400, `${path} is refused (404, or 400 from the edge)`, `${r.status}`);
+}
+for (const path of [
+  "/data/..%2f..%2fpackage.json",
+  "/data/%2e%2e%2f%2e%2e%2fpackage.json",
+  "/data/..%5c..%5cpackage.json",
+  "/data/.%2e/.%2e/package.json",
+  "/..%2f..%2fpackage.json",
+  "/%2e%2e%2f%2e%2e%2fpackage.json",
+  "/engine/..%2f..%2f..%2fpackage.json.wasm",
+  "/data/..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+]) {
+  const r = await fetch(`${base}${path}`);
+  const body = await r.text();
+  check(r.status >= 400 && !body.includes('"devDependencies"') && !body.includes("root:"), `${path} stays blocked`, `${r.status}`);
+}
+check(violations.length === 0, "no Content Security Policy violations", violations.slice(0, 3).join(" | "));
 
 await browser.close();
 console.log(failures.length ? `\n${failures.length} failures:\n- ${failures.join("\n- ")}` : "\nall passed");

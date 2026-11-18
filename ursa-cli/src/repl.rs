@@ -8,8 +8,12 @@
 //! all its lines together, is one history entry.
 
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::Notify;
 
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
@@ -46,6 +50,7 @@ pub async fn run<O: Write, E: Write>(
         let _ = rl.load_history(path);
     }
 
+    let interrupts = Interrupts::start();
     // The lines of the statement being typed, for its history entry.
     let mut entry = String::new();
     loop {
@@ -55,18 +60,24 @@ pub async fn run<O: Write, E: Write>(
         } else {
             shell.prompt()
         };
+        // The line is coloured as the next of the statement typed so far.
+        if let Some(helper) = rl.helper_mut() {
+            helper.state = shell.highlight_state().clone();
+        }
         match rl.readline(&prompt) {
             Ok(line) => {
                 if !entry.is_empty() {
                     entry.push('\n');
                 }
                 entry.push_str(&line);
+                let interrupted = interrupts.armed();
                 let flow = tokio::select! {
                     flow = shell.feed(&line) => Some(flow),
-                    _ = tokio::signal::ctrl_c() => None,
+                    _ = interrupted => None,
                 };
+                interrupts.disarm();
+                // `Interrupted` is said by the signal thread, at once.
                 let flow = flow.unwrap_or_else(|| {
-                    eprintln!("^C (cancelled)");
                     shell.cancel_input();
                     Flow::Continue
                 });
@@ -96,6 +107,88 @@ pub async fn run<O: Write, E: Write>(
     Ok(())
 }
 
+/// Ctrl-C while a statement runs (N39). The terminal is not in raw mode
+/// then, so Ctrl-C is SIGINT; it is waited for on a thread of its own, as
+/// `cancel_on_interrupt` in `main.rs` waits for it in a script, so a query
+/// that keeps every runtime worker busy cannot delay it. That thread says
+/// `Interrupted` at once and wakes the read loop, which drops the statement
+/// and draws the prompt again.
+///
+/// At the prompt the line editor reads Ctrl-C as a key; a SIGINT that comes
+/// while no statement runs is ignored.
+struct Interrupts {
+    /// Whether a statement is running.
+    running: Arc<AtomicBool>,
+    /// Woken on SIGINT while one is.
+    notify: Arc<Notify>,
+}
+
+impl Interrupts {
+    fn start() -> Self {
+        let running = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let (r, n) = (Arc::clone(&running), Arc::clone(&notify));
+        let (ready, listening) = std::sync::mpsc::channel();
+        let waiting = std::thread::Builder::new()
+            .name("ursa-sigint".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async {
+                    #[cfg(unix)]
+                    let sigint =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+                    #[cfg(windows)]
+                    let sigint = tokio::signal::windows::ctrl_c();
+                    let _ = ready.send(());
+                    let Ok(mut sigint) = sigint else {
+                        return;
+                    };
+                    while sigint.recv().await.is_some() {
+                        if r.load(Ordering::SeqCst) {
+                            let mut err = std::io::stderr().lock();
+                            // Over the `^C` the terminal echoed.
+                            let start = if err.is_terminal() { "\r" } else { "" };
+                            let _ = writeln!(err, "{start}{INTERRUPTED}");
+                            let _ = err.flush();
+                            n.notify_waiters();
+                        }
+                    }
+                });
+            });
+        // Listening before the first line is read: the line editor sets its
+        // own SIGINT handler while it reads, and puts back the one it found,
+        // so one installed meanwhile would be lost. Without the thread,
+        // SIGINT ends the shell (its default).
+        if waiting.is_ok() {
+            let _ = listening.recv();
+        }
+        Interrupts { running, notify }
+    }
+
+    /// Mark a statement as running, and return a future that completes on
+    /// Ctrl-C while it is.
+    fn armed(&self) -> impl std::future::Future<Output = ()> + '_ {
+        let mut notified = Box::pin(self.notify.notified());
+        // Waiting from here on, before the signal thread can see `running`.
+        notified.as_mut().enable();
+        self.running.store(true, Ordering::SeqCst);
+        notified
+    }
+
+    /// The statement is done (or dropped).
+    fn disarm(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// What Ctrl-C says when it cancels a statement in the shell.
+const INTERRUPTED: &str = "Interrupted";
+
 /// Write the history, saying once if it cannot be.
 fn save(rl: &mut Editor<ShellHelper, FileHistory>, path: &PathBuf) {
     if let Err(e) = rl.append_history(path) {
@@ -113,6 +206,8 @@ fn save(rl: &mut Editor<ShellHelper, FileHistory>, path: &PathBuf) {
 #[derive(Default)]
 struct ShellHelper {
     color: bool,
+    /// Where the line starts: in a new statement or the one being typed.
+    state: highlight::State,
     files: FilenameCompleter,
     history_failed: std::cell::Cell<bool>,
 }
@@ -155,7 +250,7 @@ impl Hinter for ShellHelper {
 impl Highlighter for ShellHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         if self.color {
-            Cow::Owned(highlight::ansi(line))
+            Cow::Owned(highlight::ansi_from(line, &self.state))
         } else {
             Cow::Borrowed(line)
         }

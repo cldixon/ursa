@@ -15,7 +15,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the engine crates are `ursa-engine` and `ursa-sql`). This is its first
   release. It is versioned apart from the Python package. Changes on `main`
   since then are released as `ursa-cli` 0.7.0 (2026-11-06), 0.8.0
-  (2026-11-07) and 0.9.0 (2026-11-10).
+  (2026-11-07), 0.9.0 (2026-11-10) and 0.10.0 (2026-11-17).
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
@@ -150,6 +150,62 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
   and `.print`. In a colour terminal what is typed is highlighted (keywords,
   strings, comments, dot-commands), the prompt is orange, and errors are red.
+- **Ursa Web Shell: a start hint.** Under the banner, one line points to the
+  sample graphs: `Pick a sample graph from the Datasets menu, or type
+  .dataset karate` (broken between words on a narrow screen).
+- **Ursa Web Shell: the Graph view.** `.graph` draws the last result as a
+  graph in a pane beside the terminal (under it on a phone), and so does
+  the new Graph button: each row is an edge from its `src` column to its
+  `dst` column, or else from its first column to its second, with ids of
+  any type. `.graph QUERY` draws a query's result and `.graph NAME` a
+  property graph (every edge table, and every vertex, edges or not) or a
+  table. The shell says what it draws, `Drawing 78 edges, 34 nodes (Esc
+  closes)`, and keeps the keys: queries can be typed while the graph shows,
+  and the terminal refits to its half. The drawing is `ursa-viz`'s (WebGPU,
+  or else WebGL2), its ForceAtlas2 layout converging live in a worker,
+  nodes sized by degree: drag or the arrow keys pan, the wheel or `+` and
+  `-` zoom, a double-click or `0` fits, and a click names a node. It is
+  ink on white by day and starlight by night. Esc or the close button
+  closes it; New and the Datasets menu do too. It is loaded on the first
+  `.graph` only (about 1 MB gzipped), and draws at most 2,000,000 edges.
+  `WebShell.graph(text)` gives the page the graph: node ids mapped to
+  dense indexes in the order they are first seen, with clear errors when
+  there is nothing to draw.
+- **`ursa`: shell fixes.**
+  - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
+    other nulls do; it was a blank cell. So does a dictionary's null value.
+  - A table too wide for the screen is narrowed only as much as it needs:
+    its widest values are cut first, and no shorter than the column's name,
+    before any column is left out. Before, every long value was cut to 20
+    characters even when two would do. When columns are left out, a column
+    too wide to fit no longer stops the others: the columns after it on the
+    other side are still shown.
+  - The footer stays as wide as the table: the column count goes on a line
+    of its own when the two counts do not fit on one, and is left out when
+    nothing was left out. The space between the counts is at least two.
+  - `--max-width N` sets the table width from the command line, as
+    `.maxwidth N` does, and wins over an init file's `.maxwidth`.
+  - Values are drawn as they are: bidirectional overrides, zero-width
+    spaces, line and paragraph separators and byte order marks are written
+    as escapes (`\u{202e}`), as control characters were, and so are a
+    column name's. Zero-width joiners are not: emoji sequences and the
+    scripts that use them stay as they are.
+  - A dot-command may end with `;` (`.tables;`, `.mode csv;`), as
+    `.describe` could. The start of a command (`.q`, `.tab`) gets a
+    suggestion, `did you mean '.quit'?`, and is not run.
+  - `.describe NAME` finds a table or view in any case, as it found graphs
+    (`.describe Mixed` for a table created as `"Mixed"`), and reads NAME as
+    a name: `.describe v; SELECT 99` is an error instead of two statements.
+  - What is typed is coloured as part of the statement typed so far, in the
+    terminal and the browser: a string or comment left open on one line
+    goes on in the next, and a next line starting `.5` is SQL, not a
+    command. `E'…'` strings, `$$…$$` and `$tag$…$tag$` strings and nested
+    `/* /* */ */` comments are coloured as they are read.
+  - Ctrl-C during a `.read` no longer counts it as still running; after 16,
+    every `.read` failed as nested too deep.
+  - `--format arrow` with no query that returns a result is an error, not an
+    empty output that exits 0, and `.mode arrow` says to give
+    `--format arrow` on the command line, in the shell and in a script.
 - **`GRAPH_TABLE` through the graph index** (#325). The results are the
   same; what changes is how a match runs.
   - A node is *bound* when a condition on it alone names its keys:
@@ -177,9 +233,73 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     property 's'; its properties are club, id", with a hint to name an edge
     to read its columns, where DataFusion named an internal relation
     (`__ursa_1.s`).
+- **A new website for Ursa SQL, in `site/`**, to be served at
+  `https://ursa.cldixon.dev`: a landing page at `/` and the docs at `/docs/`,
+  built with Astro and Starlight and laid out after duckdb.org's docs, ready
+  to deploy as Workers static assets (worker `ursa-site`; not deployed yet).
+  The docs are the eight `docs/sql/` pages, regrouped under Get started and
+  Topics. `docs/sql/` stays, served by the Zensical site, until the cutover.
+  - `ursa-cli`'s docs test runs the SQL on the new pages too
+    (`site_docs_run`, with `{/* skip */}` for MDX), and
+    `function_reference_is_current` checks the site's copy of the function
+    reference as well. CI builds the site.
+  - Zensical builds into `zensical-site/` instead of `site/`, which is now
+    the new website's source.
+- **Coarse-to-fine ForceAtlas2, and the graph view lays out with it.**
+  `ursa_core::algo::layout_fa2_multilevel` and its incremental form
+  `Fa2Multilevel` coarsen the graph (heavy-edge matching, with a hub's
+  leftover leaves joining it, and isolated nodes set aside on a ring), lay
+  out its 50-node top level, then refine each finer level in a few
+  iterations. The output is the same bits on any thread count, and however
+  the work is split into steps. On one core a 10,000-node grid comes out as
+  a flat sheet in 2 s, where flat ForceAtlas2 leaves it folded after 1,500
+  iterations; a 16K-node R-MAT graph is as good in 3.5 s as flat after 17 s;
+  clustered graphs separate as well as flat. The `ursa-viz` worker uses it by
+  default (`&multilevel=0` in the demo for flat), drawing every node from the
+  first frame: a 1M-edge R-MAT graph takes shape in about 8 s in the browser,
+  where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
+  weight per edge) and `from_positions` (start positions and masses);
+  `layout_fa2` and `layout_fr` give the same bits as before.
 
 ### Changed
 
+- **`ursa`: JSON and NDJSON write `null` for a null** (behaviour change,
+  #350). Every row object has every column, in column order, as DuckDB
+  writes them: `SELECT NULL AS a, '' AS b` is `[{"a":null,"b":""}]`, which
+  was `[{"b":""}]`, so a missing key no longer stands for a null. The
+  browser shell's JSON export does the same.
+- **`ursa`: CSV and TSV write an empty string as `""`** (behaviour change,
+  #350), as DuckDB does, so it can be told from a null, which is still an
+  empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
+  browser shell's CSV export does the same.
+- **SQL: an index build decodes its source's partitions in parallel**
+  (#351, N30). The build read its edge plan one partition at a time to keep
+  the order that numbers the nodes, so a filtered view over a large Parquet
+  file spent its build in zstd decompression on one core while the other
+  scan workers waited. Each partition now runs as its own task, and its
+  batches are interned in partition order, so the node numbering, the CSR and
+  the stored index are byte for byte the ones a serial read gives (a test
+  checks it over a multi-partition, multi-row-group source). Partitions ahead
+  of the one being interned hold at most 1 GiB of decoded batches between
+  them. The vertex keys, and the weights read beside an index, are read the
+  same way. On a synthetic 120M-row zstd Parquet (1M-row row groups) behind a
+  filter no statistics prune (`t < 5000`, 5% kept, 6M edges), on 4 cores:
+  3.66 s → 1.55 s, against 1.2 s for the parallel SQL scan of the same view.
+  `cargo run --release -p ursa-engine --example filtered_build` measures it.
+- **SQL: the build notice no longer guesses at a filtered view's edges**
+  (#351, N29). Over a filter the statistics cannot settle, DataFusion's
+  estimate is its default 20% selectivity, so a view keeping 1K of 1M rows
+  was announced as `about 200.0K edges`, and Bluesky's 95.7M-edge view as
+  2.4B. Such a build now says what it reads: `reading about 1.0M rows to
+  build the index for g2…`; an edge count is given only when the statistics
+  have one, exact or unfiltered. The `built` notice gives the real count, as
+  before. `ursa_engine::graph::BuildInfo` holds a `BuildSize` in place of
+  its `edges` pair.
+- **SQL: `EXPLAIN` marks a path search over a held index** (#351, N38).
+  `PathSearchExec: graph=g, search=…, index=stored (sources not read)` (or
+  `index=cached`, for one already in the session) says that the edge and
+  vertex scans drawn under it will not run, where the plan read as if the
+  index were not used.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,
@@ -210,6 +330,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a community, so `count(DISTINCT louvain)` counts them; count
   communities of more than one member with `GROUP BY louvain HAVING
   count(*) > 1`.
+- **Louvain builds its working graph in less memory** (#352). The graph was
+  scattered into padded `(u32, f64)` pairs, 16 bytes an entry, and copied
+  out while they were still held, so building it peaked at about the sum of
+  two copies of the adjacency (5.9 GB on the Bluesky follows graph, 95.7M
+  edges). Now the scatter buffers become the final arrays, compacted in
+  place; targets and weights are separate arrays (12 bytes an entry); and an
+  unweighted run scatters 4-byte targets and counts its parallel edges for
+  their weights. Results are unchanged, bit for bit. On an R-MAT graph of
+  100M edges (4.3M nodes), Louvain's peak heap went from 5,734 MB to
+  3,704 MB unweighted and to 4,928 MB weighted (peak RSS 6.50 → 4.08 GB and
+  7.28 → 5.57 GB); the building step itself fell from about 5.5 GB to about
+  2.4 GB, and the peak is now aggregating the first level. `cargo run
+  --release -p ursa-core --example louvain_memory` measures it.
 - **SQL: `hop` returns `(seed, id, distance)`** (breaking, #328). It
   returned `(src, dst)`, but its rows are nodes reached from a seed, not
   edges: `seed` is the seed, `id` a node reached and `distance` (Int64) the
@@ -231,8 +364,39 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: `SET` lasts for the session** (behaviour change, #353; reverses
+  #327's persistence). `SET` and `RESET` change only the current session, in
+  any database, writable or read-only, as in DuckDB, Postgres and
+  DataFusion: nothing is written to the catalog. Since 0.8, `SET
+  ursa.index_storage_limit = '50MiB'` in a writable database was saved for
+  good, and a limit tried "for now" evicted gigabytes of indexes at the next
+  build. To keep a setting, put the `SET` in `~/.ursarc` (the shell) or an
+  `-init` file (scripts too). A limit 0.8 or 0.9 saved is no longer applied:
+  opening the database says so once (`ursa: club.ursa has a saved
+  ursa.index_storage_limit = 50MiB, which is no longer applied; …`), and a
+  writable open removes it from the catalog.
+  - **Lowering the limit never removes a stored index.** A limit decides
+    only whether a new index is stored; eviction makes room for a new index
+    under the session's limit, least recently used first, never more than it
+    needs. If the stored indexes already take more than a lower limit, no new
+    index is stored and nothing is evicted, and the `SET` says so (`ursa:
+    3.8 GiB of indexes are stored in club.ursa, more than the 50MiB limit;
+    they are kept, and new indexes won't be stored`).
+  - **The default limit follows the disk** (N32): 25% of the free space on
+    the database's disk, counting the indexes it stores, in whole GiB, at
+    least 4 GiB (the old default) and at most 64 GiB. At 4 GiB, three graphs
+    over the same 95.7M edges evicted each other, each eviction costing a
+    30 s rebuild later. The setting's value is `auto` until `SET`, and
+    `SHOW ursa.index_storage_limit` says the limit in effect and where it
+    comes from (`8GiB (SET for this session)`, or `25GiB (the default: 25%
+    of 100.2 GiB: …)`).
+  - The `stored` notice says how the index grows once an algorithm adds its
+    reverse adjacency (about 1.75×): `stored in club.ursa (768.0 MiB; about
+    1.5 GiB once an algorithm adds the reverse adjacency)`, or `(…, with its
+    reverse adjacency)` when it is already in it.
 - **SQL: `ursa.index_storage_limit` belongs to the database** (behaviour
-  change, #327). `SET` in a writable database is stored in the catalog
+  change, #327; its persistence is reversed by #353 above, and `SET` now
+  lasts for the session). `SET` in a writable database is stored in the catalog
   (a new `settings` object; older versions ignore it), applied when the
   database is opened and shown by `SHOW`; `RESET` goes back to the default.
   Stored indexes obey only the stored limit or the default: a read-only or
@@ -364,12 +528,73 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- `ursa --format csv` and `tsv` write lists, structs and maps, as DuckDB
+  does, as their text form, quoted where CSV needs it (`"[1, 2]"`, with
+  `NULL` for a null inside one). They failed with "Nested type List(Int64)
+  is not supported in CSV", so `vertices(p)`, `edges(p)`, `array_agg` and
+  `random_walk` paths could not be written (#350).
+- A table shows an untyped null (`SELECT NULL AS n`, of type `Null`) as
+  `NULL`, as it shows a typed one; the cell was blank (#350).
+- The skill and the shell page say which format to read results in (`json`
+  or `ndjson`), that a table shows at most 40 rows while CSV and JSON write
+  every row, and that piped output is never cut to a width (#350).
+- Ctrl-C in the `ursa` shell prints `Interrupted` (stderr) and draws the
+  prompt again at once. The signal was waited for on the query's own
+  runtime, so a statement that kept every worker busy (an index build, a
+  large join) could hold it back; it said `^C (cancelled)` when it was seen
+  (#354).
+- An error names the file it cannot read once: `cannot read 'x.csv': Csv
+  error: …`, not `cannot read 'x.csv': cannot read /…/x.csv: Csv error: …`.
+  For a glob or a list it names the file that failed. A Parquet error says
+  `Parquet error: …`, not `Parquet: Parquet error: …` (#354).
+- The docs and the skill take the top k before joining attributes
+  (`WITH top AS (SELECT * FROM pagerank(g) ORDER BY pagerank DESC LIMIT 5)
+  SELECT … FROM top JOIN g.nodes USING (id)`), and say why: an
+  `ORDER BY … LIMIT` is not moved below a join, so joining first sorts every
+  node's attributes too, about twice the memory on a large graph (#354).
+- The docs' landing page leads with Ursa SQL: the install one-liner and a
+  `CREATE PROPERTY GRAPH` and `pagerank` example, run in CI with the SQL
+  docs. The Python library is the second path (#354).
+
+- The browser shell's accessibility, look and onboarding. Tab and Shift+Tab
+  move the focus out of the terminal (they inserted spaces, so the keyboard
+  could not leave it), and the Datasets menu is a menu button: arrow keys,
+  Home, End, Enter, Space and Escape. A click on the theme toggle, Import,
+  Share, New or a dataset hands the keys back to the terminal; from the
+  keyboard the focus stays put. The grey text (types, footers, nulls) is
+  5.5:1 on white (it was 3.6:1). The logo is drawn at a legible size, the
+  favicon has no white tile and follows a dark browser, and the scrollbars
+  take the theme. On a phone the bar is one row (icons for New, Share and
+  Import under 420px), the terminal's input is 16px so iOS does not zoom
+  in, and a dataset's SQL is broken at spaces to fit the screen rather than
+  wrapped mid-word. Each dataset explains its steps in `--` comments at the
+  prompt, and the R-MAT dataset turns `.timer on`.
+
 - The browser shell no longer crashes on a fixed-length `GRAPH_TABLE`
   pattern from a bound node (`MATCH (a WHERE a.id = 0)-[e]-(b)`). rustc
   miscompiled the path search's target check at `opt-level` "s" and "z",
   the browser engine's build, and indexed past the end of an empty list;
   the check is written without the nested `Option` it miscompiled. CI's
   browser test now builds at "z" too, and runs a `GRAPH_TABLE` step.
+
+- The browser shell's line editor:
+  - CJK and emoji take two cells and combining marks none, so the cursor is
+    where the characters are, and a long CJK line that wraps is drawn once
+    (it left a copy of its prompt for each edit). An emoji sequence (a ZWJ
+    family, a skin tone, a flag) is one character on screen, and Left,
+    Right, Backspace and Delete move over and delete what is seen as one
+    character whole; they split emoji into broken halves.
+  - A line of several that fills the terminal's width exactly no longer
+    leaves an empty row after it.
+  - Resizing the window redraws what is being typed for the new width at
+    once; it was left as the terminal rewrapped it until the next key.
+  - A line typed and run before the highlighter answered is coloured in the
+    scrollback; it stayed plain. Late replies for text since changed are
+    dropped.
+  - Shift+Enter adds a line without also sending the line to the shell.
+  - `.help shortcuts` lists every key the editor knows, and only those:
+    Left and Right, Home and End, Backspace and Delete, Tab and the Ctrl
+    keys were missing, and Up and Down move between the lines typed first.
 
 - A CSV file DataFusion cannot read is named by its path, with its leading
   `/` (`cannot read /Users/me/x.csv: …`), not by its object store location
@@ -382,6 +607,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Security
 
+- **The browser shell is safer to open from a link.** A shared link
+  (`#run=`) lists its commands and asks `Run N shared commands? [y/N]`; only
+  `y` runs them, and a link's `.export` is skipped, so it cannot download
+  files. Control characters (ESC above all) in a replayed command are shown
+  as escapes (`\u{1b}`), and `.print` writes them so in the CLI too, keeping
+  lines and tabs, so text cannot move the cursor or restyle the terminal.
+  Import takes any file name (`données.csv`, `a#b.csv`, `order.csv`), and
+  its errors print below the prompt instead of over it. The Worker answers
+  a path with a malformed `%` escape with 404, not 500, and every response
+  carries a Content Security Policy (`frame-ancestors 'none'`, the page's
+  own scripts, fonts and fetches only), `X-Content-Type-Options: nosniff`
+  and `Referrer-Policy: no-referrer`; the local preview server sends the
+  same, and the e2e test checks them and that the page runs with no
+  violation.
 - The upgrade clears RUSTSEC-2026-0435 (`thrift` 0.17, a parquet 58
   dependency that parquet 59 no longer has) and RUSTSEC-2026-0176/0177
   (`pyo3` 0.28), and drops `paste` (RUSTSEC-2024-0436) from the tree. Bumped

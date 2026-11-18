@@ -162,11 +162,21 @@ fn show_ursa_settings() {
             "SHOW ursa.index_storage_limit; SET ursa.index_storage_limit = '1GiB'; \
              SHOW ursa.index_storage_limit",
         ])),
-        "name,value\nursa.index_storage_limit,4GiB\nname,value\nursa.index_storage_limit,1GiB\n"
+        format!(
+            "name,value\nursa.index_storage_limit,\"{AUTO_LIMIT}\"\nname,value\n\
+             ursa.index_storage_limit,1GiB (SET for this session)\n"
+        )
     );
     let all = ok(ursa(&["--format", "csv", "-c", "SHOW ALL"]));
-    assert!(all.contains("\nursa.index_storage_limit,4GiB\n"), "{all}");
+    assert!(
+        all.contains(&format!("\nursa.index_storage_limit,\"{AUTO_LIMIT}\"\n")),
+        "{all}"
+    );
 }
+
+/// What SHOW says of `ursa.index_storage_limit` without a database.
+const AUTO_LIMIT: &str = "auto (the default: in a database, 25% of the free space on its \
+                          disk; at least 4GiB, at most 64GiB)";
 
 #[test]
 fn commands_and_files_run_in_order() {
@@ -711,7 +721,7 @@ fn find_out_what_is_available_matches_getting_started() {
 "
     );
 
-    // As JSON, one object per row; NULLs are left out.
+    // As JSON, one object per row, with every column; a null is `null`.
     let out = ok(ursa(&[
         "--format",
         "json",
@@ -724,7 +734,7 @@ fn find_out_what_is_available_matches_getting_started() {
         out,
         "\
 [{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\"},\
-{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\"}]
+{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":null,\"vertex_key\":null}]
 [{\"table_name\":\"nodes\",\"column_name\":\"id\",\"data_type\":\"Int64\",\"role\":\"node id\",\"origin\":\"ties.src, ties.dst\"},\
 {\"table_name\":\"edges\",\"column_name\":\"src\",\"data_type\":\"Int64\",\"role\":\"source\",\"origin\":\"ties.src\"},\
 {\"table_name\":\"edges\",\"column_name\":\"dst\",\"data_type\":\"Int64\",\"role\":\"destination\",\"origin\":\"ties.dst\"}]
@@ -1083,13 +1093,13 @@ fn ursa_functions_lists_the_catalog() {
 name,family,parameters,directions
 degree,algorithm,1,out in both
 pagerank,algorithm,5,out both
-connected_components,algorithm,1,
-triangle_count,algorithm,0,
-clustering_coefficient,algorithm,0,
+connected_components,algorithm,1,\"\"
+triangle_count,algorithm,0,\"\"
+clustering_coefficient,algorithm,0,\"\"
 betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
-label_propagation,algorithm,2,
-louvain,algorithm,3,
+label_propagation,algorithm,2,\"\"
+louvain,algorithm,3,\"\"
 neighbors_agg,aggregation,4,out in both
 density,statistic,1,out in both
 avg_path_length,statistic,2,out in both
@@ -1097,8 +1107,8 @@ diameter,statistic,2,out in both
 describe,statistic,3,out in both
 hop,traversal,3,out in both
 shortest_path,traversal,4,out in both
-random_walk,traversal,4,
-algorithms,combinator,0,
+random_walk,traversal,4,\"\"
+algorithms,combinator,0,\"\"
 "
     );
     assert_eq!(
@@ -1562,5 +1572,177 @@ fn reserved_words_as_names() {
         err(ursa(&["-c", "SELECT from, to FROM t"])),
         "Error: syntax error: Expected: identifier, found: , at Line: 1, Column: 12. `from` is a \
          reserved word; to use it as a name, quote it: \"from\"\n"
+    );
+}
+
+/// A null in a column of type `Null` shows `NULL`, as other nulls do.
+#[test]
+fn a_null_column_shows_null() {
+    let out = ok(ursa(&["-c", "SELECT NULL AS n, 1 AS i;"]));
+    assert_eq!(
+        out,
+        "\
+┌──────┬───────┐
+│  n   │   i   │
+│ Null │ Int64 │
+├──────┼───────┤
+│ NULL │     1 │
+└──────┴───────┘
+"
+    );
+}
+
+/// `--max-width N` sets the table width, as `.maxwidth N` does, even when
+/// the output is not a terminal; it wins over an init file's `.maxwidth`.
+#[test]
+fn max_width_cuts_a_table_to_fit() {
+    let sql = "SELECT 1 a, 'abcdefghijklmnopqrstuvwxyz' b, 3 c, 4 d, 5 e, 6 f;";
+    // Not a terminal, and no width given: nothing is cut.
+    let out = ok(ursa(&["-c", sql]));
+    assert!(out.contains("abcdefghijklmnopqrstuvwxyz"), "{out}");
+    let expected = "\
+┌───────┬───┬───────┬───────┬───────┐
+│   a   │ … │   d   │   e   │   f   │
+│ Int64 │ … │ Int64 │ Int64 │ Int64 │
+├───────┼───┼───────┼───────┼───────┤
+│     1 │ … │     4 │     5 │     6 │
+└───────┴───┴───────┴───────┴───────┘
+  1 row           6 columns (4 shown)
+";
+    assert_eq!(ok(ursa(&["--max-width", "40", "-c", sql])), expected);
+    assert_eq!(ok(ursa(&["-c", ".maxwidth 40;", "-c", sql])), expected);
+    // Only as much as needed: two characters, not down to 20.
+    let out = ok(ursa(&[
+        "--max-width",
+        "70",
+        "-c",
+        "SELECT repeat('x', 60) AS s, 1 AS n",
+    ]));
+    assert!(
+        out.contains(&format!("│ {}… │     1 │\n", "x".repeat(57))),
+        "{out}"
+    );
+    assert!(out.lines().all(|l| l.chars().count() <= 70), "{out}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("init.sql");
+    std::fs::write(&init, ".maxwidth 30\n").unwrap();
+    let init = init.display().to_string();
+    let out = ok(ursa(&["-init", &init, "-c", sql]));
+    assert!(out.lines().all(|l| l.chars().count() <= 30), "{out}");
+    assert_eq!(
+        ok(ursa(&["-init", &init, "--max-width", "40", "-c", sql])),
+        expected
+    );
+}
+
+/// With --format arrow, a script whose statements return no result is an
+/// error, not an empty output; and `.mode arrow` says how to get one.
+#[test]
+fn arrow_needs_a_result() {
+    let out = ursa(&["--format", "arrow", "-c", "CREATE VIEW v AS SELECT 1 AS a"]);
+    assert!(out.stdout.is_empty());
+    let e = err(out);
+    assert_eq!(
+        e,
+        "Error: --format arrow writes the result of one query, but no statement returned one; \
+         end the script with a query that returns rows\n"
+    );
+    let e = err(ursa(&["-c", ".mode arrow", "-c", "SELECT 1 AS a"]));
+    assert!(
+        e.starts_with("Error: .mode cannot switch to the arrow format")
+            && e.contains("Give --format arrow on the command line"),
+        "{e}"
+    );
+    // Already writing one, `.mode arrow` is fine.
+    let out = ursa(&[
+        "--format",
+        "arrow",
+        "-c",
+        ".mode arrow;",
+        "-c",
+        "SELECT 1 AS a",
+    ]);
+    assert!(out.status.success());
+    assert!(out.stdout.starts_with(&[0xff, 0xff, 0xff, 0xff]));
+}
+
+/// A dot-command may end with `;`, and `.describe` takes a name, not SQL.
+#[test]
+fn dot_commands_take_a_semicolon_and_describe_takes_a_name() {
+    let out = ok(ursa(&[
+        "-c",
+        ".mode csv;",
+        "-c",
+        "CREATE TABLE \"Mixed\" AS SELECT 1 AS x;",
+        "-c",
+        ".tables;",
+        "-c",
+        ".describe Mixed;",
+    ]));
+    assert!(
+        out.starts_with("name,type\nMixed,table\ncolumn_name,"),
+        "{out}"
+    );
+    let out = ursa(&[
+        "-c",
+        "CREATE VIEW v AS SELECT 1 AS x",
+        "-c",
+        ".describe v; SELECT 99",
+    ]);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("99"));
+    assert!(err(out).contains("'v; SELECT 99' is not a name"));
+}
+
+/// #350: the formats an agent reads keep lists, nulls and empty strings.
+#[test]
+fn output_formats_keep_lists_nulls_and_empty_strings() {
+    let sql = "SELECT NULL AS a, '' AS b, [1, 2] AS l";
+    assert_eq!(
+        ok(ursa(&["--format", "csv", "-c", sql])),
+        "a,b,l\n,\"\",\"[1, 2]\"\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "tsv", "-c", sql])),
+        "a\tb\tl\n\t\"\"\t[1, 2]\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "json", "-c", sql])),
+        "[{\"a\":null,\"b\":\"\",\"l\":[1,2]}]\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "ndjson", "-c", sql])),
+        "{\"a\":null,\"b\":\"\",\"l\":[1,2]}\n"
+    );
+    assert!(ok(ursa(&["-c", "SELECT NULL AS n"])).contains("│ NULL │"));
+}
+
+/// N40: a file that cannot be read is named once, whether it is given by
+/// itself, in a glob or in a list, and a Parquet error says Parquet once.
+#[test]
+fn a_file_that_cannot_be_read_is_named_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(dir.join("bad.csv"), "a,b\n1,2\n1,2,3\n").unwrap();
+    std::fs::write(dir.join("bad.parquet"), "not parquet\n").unwrap();
+    let bad = dir.join("bad.csv").display().to_string();
+    let glob = dir.join("b*.csv").display().to_string();
+    for from in [
+        format!("'{bad}'"),
+        format!("'{glob}'"),
+        format!("read_csv(['{bad}', '{bad}'])"),
+    ] {
+        let message = err(ursa(&["-c", &format!("SELECT * FROM {from};")]));
+        assert_eq!(message.matches("cannot read").count(), 1, "{message}");
+        assert!(
+            message.starts_with(&format!("Error: cannot read '{bad}': Csv error: ")),
+            "{message}"
+        );
+    }
+    let parquet = dir.join("bad.parquet").display().to_string();
+    let message = err(ursa(&["-c", &format!("SELECT * FROM '{parquet}';")]));
+    assert!(
+        message.starts_with(&format!("Error: cannot read '{parquet}': Parquet error: ")),
+        "{message}"
     );
 }

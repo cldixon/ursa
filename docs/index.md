@@ -1,16 +1,62 @@
 # Ursa
 
-**Polars-shaped dataframes for graph data.**
+**Graph analytics in SQL.**
 
-Ursa is a graph analytics library for Python. You write a query the way you write a Polars query. A Rust engine runs it: Apache Arrow for the data, DataFusion for the plan, and parallel, deterministic kernels for the algorithms.
+Ursa is a SQL engine for graphs. Point the `ursa` command-line tool at an edge list in Parquet, CSV or JSON, on your disk or in object storage, name it as a graph, and run PageRank, Louvain, shortest paths and the rest as table functions. It works like DuckDB: one binary, no server, and a database file that keeps your work. A Rust engine runs it: Apache Arrow for the data, DataFusion for the plan, and parallel, deterministic kernels for the algorithms.
 
-There is no `Graph` object. An edge table *is* the graph. Every operation returns a table.
+The same engine is also a Python library, with a Polars-shaped API: see [From Python](#from-python) below.
 
-!!! tip "New: Ursa SQL"
+## Try it in your browser
 
-    The same algorithms now run from SQL, in the `ursa` command-line tool. See [Ursa SQL](sql/index.md).
+[Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) is the `ursa` shell in a web page, with nothing to install. It runs the same engine, compiled to WebAssembly, in your browser. Pick a dataset from its menu, or import a file of your own: it stays on your machine.
 
 ## Install
+
+On Linux or macOS:
+
+```bash
+curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
+```
+
+On Windows, in PowerShell: `irm https://cldixon.github.io/ursa/install.ps1 | iex`. Or `cargo install ursa-cli`. [Getting started](sql/getting-started.md#install) has the details.
+
+## First query
+
+Download Zachary's karate club, 78 friendships between 34 members, and start the shell:
+
+```bash
+curl -LO https://raw.githubusercontent.com/cldixon/ursa/main/python/ursa/datasets/data/karate_edges.csv
+ursa
+```
+
+A file is a table. Name it as a graph, then run an algorithm over it:
+
+```sql
+CREATE PROPERTY GRAPH club
+  EDGE TABLES ('karate_edges.csv' SOURCE KEY (src) DESTINATION KEY (dst));
+
+SELECT id, round(pagerank, 4) AS pagerank
+FROM pagerank(club, direction => 'both')
+ORDER BY pagerank DESC
+LIMIT 5;
+```
+
+```text
+┌───────┬──────────┐
+│  id   │ pagerank │
+│ Int64 │ Float64  │
+├───────┼──────────┤
+│    33 │   0.1009 │
+│     0 │    0.097 │
+│    32 │   0.0717 │
+│     2 │   0.0571 │
+│     1 │   0.0529 │
+└───────┴──────────┘
+```
+
+[Getting started](sql/getting-started.md) goes on from here: node attributes, several algorithms at once, weights, subgraphs, traversals and `GRAPH_TABLE` patterns. [Ursa SQL](sql/index.md) is the overview.
+
+## From Python
 
 ```bash
 pip install ursa-graph
@@ -18,9 +64,7 @@ pip install ursa-graph
 
 The package is `ursa-graph`. The import name is `ursa`. Wheels include the compiled core, so you need no Rust toolchain. Python 3.10 or later. See [Install](install.md) for the optional extras.
 
-## First example
-
-Paste this into a Python session. It needs no files and no network.
+There is no `Graph` object. An edge table *is* the graph. Every operation returns a table. Paste this into a Python session. It needs no files and no network.
 
 ```python
 import ursa as ur
@@ -75,11 +119,19 @@ Nothing after that line changes.
 
 <div class="grid cards" markdown>
 
+-   :material-console:{ .lg .middle } **SQL, like DuckDB**
+
+    ---
+
+    Files are tables, a graph is an edge table, and algorithms are table functions you join on `id`. An interactive shell, `ursa -c` for scripts, and output as tables, CSV, JSON or Arrow.
+
+    [:octicons-arrow-right-24: Ursa SQL](sql/index.md)
+
 -   :material-table-arrow-right:{ .lg .middle } **A dataframe API**
 
     ---
 
-    `with_columns`, `filter`, `sort`, `group_by`, `join`. If you know Polars, you know the shape. Lazy until `collect()`.
+    In Python: `with_columns`, `filter`, `sort`, `group_by`, `join`. If you know Polars, you know the shape. Lazy until `collect()`.
 
     [:octicons-arrow-right-24: Concepts](concepts/index.md)
 
@@ -111,9 +163,10 @@ Nothing after that line changes.
 
 ## Next steps
 
-- [Quickstart](quickstart.md): a ten-minute session that uses most of the API.
-- [Guides](guides/index.md): one task per page, with code that runs.
-- [Reference](reference/index.md): every public name.
-- [Ursa SQL](sql/index.md): the same algorithms from SQL, with the `ursa` command-line tool.
+- [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev): try Ursa SQL in your browser.
+- [Getting started with Ursa SQL](sql/getting-started.md): install `ursa`, define a graph and run algorithms on it.
+- [Quickstart](quickstart.md): a ten-minute Python session that uses most of the API.
+- [Guides](guides/index.md): the Python library, one task per page, with code that runs.
+- [Reference](reference/index.md): every public name in Python; the [function reference](sql/reference/functions.md) for SQL.
 
-Ursa is version 0.4 and in active development. The [Limits](limits.md) page lists what does not run yet.
+The `ursa` CLI is version 0.9 and the Python library 0.5; both are in active development. The [Limits](limits.md) page lists what does not run yet.

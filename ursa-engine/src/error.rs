@@ -91,7 +91,11 @@ pub fn user_message(err: &DataFusionError) -> String {
 fn message_of(err: &DataFusionError) -> String {
     match err {
         DataFusionError::ArrowError(e, _) => arrow_message(e),
-        DataFusionError::ParquetError(e) => format!("Parquet: {e}"),
+        // `Parquet error: …` says Parquet already; `EOF: …` and the rest do not.
+        DataFusionError::ParquetError(e) => match e.to_string() {
+            m if m.starts_with("Parquet error: ") => m,
+            m => format!("Parquet: {m}"),
+        },
         DataFusionError::ObjectStore(e) => e.to_string(),
         DataFusionError::IoError(e) => e.to_string(),
         DataFusionError::SQL(e, _) => parser_message(e),
@@ -115,7 +119,7 @@ fn message_of(err: &DataFusionError) -> String {
         DataFusionError::Context(context, inner) => {
             match context.strip_prefix(matched::CSV_FILE_CONTEXT) {
                 Some(location) => format!(
-                    "cannot read {}: {}",
+                    "cannot read '{}': {}",
                     shown_path(location),
                     message_of(inner)
                 ),
@@ -323,7 +327,7 @@ mod tests {
         let message = user_message(&err);
         #[cfg(unix)]
         assert!(
-            message.starts_with(&format!("cannot read {}: ", path.display())),
+            message.starts_with(&format!("cannot read '{}': ", path.display())),
             "{message}"
         );
         #[cfg(not(unix))]

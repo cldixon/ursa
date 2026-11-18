@@ -1,0 +1,83 @@
+---
+// One button that switches between light and dark, as DuckDB's docs and the
+// landing page have, in place of Starlight's Auto/Light/Dark select. It keeps
+// the choice under Starlight's own key, `starlight-theme`, so the landing page
+// and the docs agree, and Starlight's ThemeProvider applies it before the page
+// paints. With nothing stored, the page follows the system's scheme.
+---
+
+<ursa-theme-toggle>
+	<button type="button" aria-label="Switch between light and dark" title="Switch between light and dark">
+		<svg class="moon" viewBox="0 0 24 24" aria-hidden="true"
+			><path
+				d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.6"
+				stroke-linejoin="round"></path></svg
+		>
+		<svg class="sun" viewBox="0 0 24 24" aria-hidden="true"
+			><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+				><circle cx="12" cy="12" r="4"></circle><path
+					d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"
+				></path></g
+			></svg
+		>
+	</button>
+</ursa-theme-toggle>
+
+<style>
+	button {
+		display: grid;
+		place-items: center;
+		width: 2.25rem;
+		height: 2.25rem;
+		padding: 0;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 999px;
+		background: transparent;
+		color: var(--sl-color-gray-2);
+		cursor: pointer;
+	}
+	button:hover {
+		border-color: var(--sl-color-accent);
+		color: var(--sl-color-accent);
+	}
+	svg {
+		width: 1.1rem;
+		height: 1.1rem;
+	}
+	/* The icon shows the theme a click switches to. */
+	:global([data-theme="light"]) .sun,
+	:global([data-theme="dark"]) .moon {
+		display: none;
+	}
+</style>
+
+<script>
+	const storageKey = "starlight-theme";
+
+	// Follow the system's scheme while nothing is stored, as Starlight's select did on "Auto".
+	matchMedia("(prefers-color-scheme: light)").addEventListener("change", (e) => {
+		let stored = "";
+		try {
+			stored = localStorage.getItem(storageKey) || "";
+		} catch {}
+		if (!stored) document.documentElement.dataset.theme = e.matches ? "light" : "dark";
+	});
+
+	class UrsaThemeToggle extends HTMLElement {
+		constructor() {
+			super();
+			this.querySelector("button")?.addEventListener("click", () => {
+				const root = document.documentElement;
+				const next = root.dataset.theme === "dark" ? "light" : "dark";
+				root.dataset.theme = next;
+				try {
+					localStorage.setItem(storageKey, next);
+				} catch {}
+			});
+		}
+	}
+	if (!customElements.get("ursa-theme-toggle")) customElements.define("ursa-theme-toggle", UrsaThemeToggle);
+</script>

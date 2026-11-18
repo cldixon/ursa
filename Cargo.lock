@@ -2136,7 +2136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3574,7 +3574,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3876,15 +3876,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4291,7 +4291,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4608,7 +4608,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "ursa-cli"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "arrow",
  "clap",
@@ -4628,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-core"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "arrow",
  "criterion",
@@ -4641,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-engine"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4653,6 +4653,7 @@ dependencies = [
  "glob",
  "object_store",
  "parking_lot",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4663,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-io"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4716,7 +4717,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-shell"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "arrow",
  "clap",
@@ -4733,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-sql"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "datafusion",
  "tempfile",
@@ -4743,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-viz"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "bytemuck",
  "console_error_panic_hook",
@@ -4759,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-wasm"
-version = "0.9.0"
+version = "0.11.0-dev"
 dependencies = [
  "arrow",
  "chrono",
@@ -5109,7 +5110,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

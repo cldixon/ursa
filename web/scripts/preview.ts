@@ -1,12 +1,14 @@
 // Serve the shell locally without Cloudflare, as the Worker would: dist/ for
 // the page, .data/ at /data/ (with HEAD and byte ranges, which the engine
-// reads Parquet with) and the engine from .engine/ at /engine/<hash>.wasm.
+// reads Parquet with) and the engine from .engine/ at /engine/<hash>.wasm,
+// with the Worker's security headers (src/headers.ts) on every response.
 // Build first: `bun run engine`, `bun run upload:data -- --dry` (stages
 // .data/) and `bun run build`.
 //
 //   bun run preview [port]
 import { file } from "bun";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, sep } from "node:path";
+import { withSecurityHeaders } from "../src/headers";
 import { DATA_DIR, ENGINE_DIR, WEB } from "./common";
 
 const dist = join(WEB, "dist");
@@ -26,7 +28,7 @@ const TYPES: Record<string, string> = {
 /** `path` under `root`, or null if it escapes it or does not exist. */
 async function within(root: string, path: string) {
   const full = normalize(join(root, path));
-  if (!full.startsWith(normalize(root))) return null;
+  if (!full.startsWith(normalize(root) + sep)) return null;
   const f = file(full);
   return (await f.exists()) ? { f, full } : null;
 }
@@ -52,20 +54,31 @@ const port = Number(Bun.argv[2] ?? 8788);
 const server = Bun.serve({
   port,
   async fetch(req) {
-    const path = decodeURIComponent(new URL(req.url).pathname);
-    if (path.startsWith("/data/")) {
-      const hit = await within(DATA_DIR, path.slice("/data/".length));
-      return hit ? serveRange(req, hit.f, TYPES[extname(hit.full)] ?? "application/octet-stream") : new Response("not found", { status: 404 });
-    }
-    const wasm = path.match(/^\/engine\/([0-9a-f]+)\.wasm$/);
-    if (wasm) {
-      const hit = await within(ENGINE_DIR, `${wasm[1]}.wasm.br`);
-      if (!hit) return new Response("not found", { status: 404 });
-      return new Response(hit.f, { headers: { "content-type": "application/wasm", "content-encoding": "br" } });
-    }
-    const hit = await within(dist, path === "/" ? "index.html" : path);
-    if (!hit) return new Response("not found", { status: 404 });
-    return new Response(hit.f, { headers: { "content-type": TYPES[extname(hit.full)] ?? "application/octet-stream" } });
+    return withSecurityHeaders(await route(req));
   },
 });
 console.log(`the shell at http://localhost:${server.port}/`);
+
+async function route(req: Request): Promise<Response> {
+  let path: string;
+  try {
+    path = decodeURIComponent(new URL(req.url).pathname);
+  } catch {
+    return new Response("not found", { status: 404 });
+  }
+  if (path.startsWith("/data/")) {
+    // A file name, as the Worker takes one: no directories, no dot files.
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(path.slice("/data/".length))) return new Response("not found", { status: 404 });
+    const hit = await within(DATA_DIR, path.slice("/data/".length));
+    return hit ? serveRange(req, hit.f, TYPES[extname(hit.full)] ?? "application/octet-stream") : new Response("not found", { status: 404 });
+  }
+  const wasm = path.match(/^\/engine\/([0-9a-f]+)\.wasm$/);
+  if (wasm) {
+    const hit = await within(ENGINE_DIR, `${wasm[1]}.wasm.br`);
+    if (!hit) return new Response("not found", { status: 404 });
+    return new Response(hit.f, { headers: { "content-type": "application/wasm", "content-encoding": "br" } });
+  }
+  const hit = await within(dist, path === "/" ? "index.html" : path);
+  if (!hit) return new Response("not found", { status: 404 });
+  return new Response(hit.f, { headers: { "content-type": TYPES[extname(hit.full)] ?? "application/octet-stream" } });
+}

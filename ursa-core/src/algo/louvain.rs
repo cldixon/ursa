@@ -430,6 +430,12 @@ impl Graph {
     /// segments make the neighbour order, and with it every weighted sum,
     /// deterministic.
     ///
+    /// Memory (#352): the scatter buffers become the final CSR arrays, compacted
+    /// in place, so the adjacency is never held twice. Targets and weights are
+    /// separate arrays (12 bytes an entry, not a padded 16), and an unweighted
+    /// run scatters targets alone (4 bytes) and derives each weight from the
+    /// count of parallel edges.
+    ///
     /// The histogram and scatter run over contiguous chunks of source nodes in
     /// parallel. Each chunk's per-node counts become its base cursor into every
     /// segment, so a segment receives its entries in exactly the order a serial
@@ -513,10 +519,16 @@ impl Graph {
         // Pass 2: scatter each edge into both endpoints' segments, and sum
         // self-loops (a node's own, so chunk-local). Positions are disjoint across
         // chunks (the cursors partition each segment), so writes never overlap;
-        // the pointer crosses threads as a plain address, as in `transpose`.
+        // the pointers cross threads as plain addresses, as in `transpose`.
+        //
+        // Targets and weights go to separate arrays (#352): a `(u32, f64)` pair
+        // pads to 16 bytes, two arrays take 12. An unweighted run stores no
+        // weights at all: every weight is 1.0, so a coalesced weight is the
+        // number of entries a segment has for that neighbour, counted in pass 3.
         let total = offsets[n];
-        let mut pairs: Vec<(u32, f64)> = vec![(0, 0.0); total];
-        let addr = pairs.as_mut_ptr() as usize;
+        let mut targets = vec![0u32; total];
+        let mut wts: Vec<f64> = vec![0.0; if weights.is_some() { total } else { 0 }];
+        let (t_addr, w_addr) = (targets.as_mut_ptr() as usize, wts.as_mut_ptr() as usize);
         let scatter = |(&(lo, hi), mut cur): (&(usize, usize), Vec<u32>)| {
             let mut loops = vec![0.0f64; hi - lo];
             for u in lo as u32..hi as u32 {
@@ -535,8 +547,14 @@ impl Graph {
                         let pos = offsets[a as usize] + cur[a as usize] as usize;
                         cur[a as usize] += 1;
                         // SAFETY: `pos < total` and is claimed by exactly one
-                        // (chunk, slot); `pairs` outlives the loop.
-                        unsafe { *(addr as *mut (u32, f64)).add(pos) = (b, w) };
+                        // (chunk, slot); `targets` and `wts` (of length
+                        // `total` when weighted) outlive the loop.
+                        unsafe {
+                            *(t_addr as *mut u32).add(pos) = b;
+                            if weights.is_some() {
+                                *(w_addr as *mut f64).add(pos) = w;
+                            }
+                        }
                     }
                 }
             }
@@ -549,56 +567,128 @@ impl Graph {
             .collect::<Vec<_>>()
             .concat();
 
-        // Pass 3: sort each segment by neighbour id and coalesce parallel edges
-        // into its prefix, in place.
+        // Pass 3: sort each segment by neighbour id and coalesce parallel edges,
+        // writing the coalesced entries to the front of their block, in place.
         let blocks = node_blocks(&offsets, 4 * threads);
         let block_ranges: Vec<(usize, usize)> = blocks.windows(2).map(|w| (w[0], w[1])).collect();
-        let lens: Vec<usize> = split_blocks(&mut pairs, &offsets, &blocks)
-            .into_par_iter()
-            .zip(block_ranges.par_iter())
-            .map(|(buf, &(lo, hi))| {
-                let base = offsets[lo];
-                let mut lens = Vec::with_capacity(hi - lo);
-                for u in lo..hi {
-                    let seg = &mut buf[offsets[u] - base..offsets[u + 1] - base];
-                    seg.sort_unstable_by_key(|&(v, _)| v);
-                    let mut len = 0;
-                    for i in 0..seg.len() {
-                        if len > 0 && seg[len - 1].0 == seg[i].0 {
-                            seg[len - 1].1 += seg[i].1;
-                        } else {
-                            seg[len] = seg[i];
-                            len += 1;
+        let lens: Vec<usize>;
+        let new_offsets: Vec<usize>;
+        let lens_to_offsets = |lens: &[usize]| {
+            let mut o = vec![0usize; n + 1];
+            for u in 0..n {
+                o[u + 1] = o[u] + lens[u];
+            }
+            o
+        };
+        if weights.is_some() {
+            // Each segment is sorted as `(u32, f64)` pairs in a per-worker
+            // scratch buffer (a segment's worth, not the edge list's), with the
+            // same unstable sort as ever: the order it leaves parallel edges in
+            // is the order their weights are summed, so this keeps every sum
+            // bit for bit.
+            lens = split_blocks(&mut targets, &offsets, &blocks)
+                .into_par_iter()
+                .zip(split_blocks(&mut wts, &offsets, &blocks))
+                .zip(block_ranges.par_iter())
+                .map_init(
+                    Vec::new,
+                    |scratch: &mut Vec<(u32, f64)>, ((ts, ws), &(lo, hi))| {
+                        let base = offsets[lo];
+                        let mut lens = Vec::with_capacity(hi - lo);
+                        let mut k = 0;
+                        for u in lo..hi {
+                            let seg = offsets[u] - base..offsets[u + 1] - base;
+                            scratch.clear();
+                            scratch.extend(
+                                ts[seg.clone()].iter().copied().zip(ws[seg].iter().copied()),
+                            );
+                            scratch.sort_unstable_by_key(|&(v, _)| v);
+                            let mut len = 0;
+                            for i in 0..scratch.len() {
+                                if len > 0 && scratch[len - 1].0 == scratch[i].0 {
+                                    scratch[len - 1].1 += scratch[i].1;
+                                } else {
+                                    scratch[len] = scratch[i];
+                                    len += 1;
+                                }
+                            }
+                            // `k` never passes the segment's start, which is read.
+                            for &(v, w) in &scratch[..len] {
+                                ts[k] = v;
+                                ws[k] = w;
+                                k += 1;
+                            }
+                            lens.push(len);
+                        }
+                        lens
+                    },
+                )
+                .collect::<Vec<_>>()
+                .concat();
+            new_offsets = lens_to_offsets(&lens);
+        } else {
+            // Sort, and count the distinct neighbours, which sizes the weights.
+            lens = split_blocks(&mut targets, &offsets, &blocks)
+                .into_par_iter()
+                .zip(block_ranges.par_iter())
+                .map(|(ts, &(lo, hi))| {
+                    let base = offsets[lo];
+                    (lo..hi)
+                        .map(|u| {
+                            let seg = &mut ts[offsets[u] - base..offsets[u + 1] - base];
+                            seg.sort_unstable();
+                            seg.chunk_by(|a, b| a == b).count()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            new_offsets = lens_to_offsets(&lens);
+            // Each run of equal neighbours becomes one entry whose weight is
+            // the run's length: the sum of that many 1.0s, exactly.
+            wts = vec![0.0f64; new_offsets[n]];
+            split_blocks(&mut targets, &offsets, &blocks)
+                .into_par_iter()
+                .zip(split_blocks(&mut wts, &new_offsets, &blocks))
+                .zip(block_ranges.par_iter())
+                .for_each(|((ts, ws), &(lo, hi))| {
+                    let base = offsets[lo];
+                    let mut k = 0;
+                    for u in lo..hi {
+                        let (mut i, end) = (offsets[u] - base, offsets[u + 1] - base);
+                        while i < end {
+                            let v = ts[i];
+                            let run = ts[i..end].iter().take_while(|&&x| x == v).count();
+                            // `k <= i`: the entry is read before it is written.
+                            ts[k] = v;
+                            ws[k] = run as f64;
+                            k += 1;
+                            i += run;
                         }
                     }
-                    lens.push(len);
-                }
-                lens
-            })
-            .collect::<Vec<_>>()
-            .concat();
-
-        // Pass 4: compact the coalesced prefixes into the SoA CSR.
-        let mut new_offsets = vec![0usize; n + 1];
-        for u in 0..n {
-            new_offsets[u + 1] = new_offsets[u] + lens[u];
+                });
         }
-        let mut targets = vec![0u32; new_offsets[n]];
-        let mut wts = vec![0.0f64; new_offsets[n]];
-        split_blocks(&mut targets, &new_offsets, &blocks)
-            .into_par_iter()
-            .zip(split_blocks(&mut wts, &new_offsets, &blocks))
-            .zip(block_ranges.par_iter())
-            .for_each(|((ts, ws), &(lo, hi))| {
-                let mut k = 0;
-                for u in lo..hi {
-                    for &(v, wt) in &pairs[offsets[u]..offsets[u] + lens[u]] {
-                        ts[k] = v;
-                        ws[k] = wt;
-                        k += 1;
-                    }
-                }
-            });
+        drop(lens);
+
+        // Pass 4: move each block's coalesced entries down to their place in
+        // the final CSR, in block order (a block's destination never passes
+        // its own start, so nothing unread is overwritten), and give back the
+        // tail. The final arrays are the scatter buffers themselves, so the
+        // build never holds a second copy of the adjacency.
+        let new_total = new_offsets[n];
+        for w in blocks.windows(2) {
+            let (from, to) = (offsets[w[0]], new_offsets[w[0]]);
+            let len = new_offsets[w[1]] - to;
+            targets.copy_within(from..from + len, to);
+            if weights.is_some() {
+                wts.copy_within(from..from + len, to);
+            }
+        }
+        targets.truncate(new_total);
+        targets.shrink_to_fit();
+        wts.truncate(new_total);
+        wts.shrink_to_fit();
+        drop(offsets);
         Graph::finalize(new_offsets, targets, wts, self_loop)
     }
 
@@ -889,7 +979,14 @@ mod tests {
     /// A deterministic pseudo-random graph with inexact weights (an LCG, so no RNG
     /// dependency): enough edges to take `from_topology`'s parallel path, with
     /// parallel edges, opposite edges and self-loops.
+    #[cfg(feature = "rayon")]
     fn random_weighted(n: u32, m: usize) -> (Topology, Vec<f64>) {
+        let (src, dst, w) = random_edges(n, m);
+        (Topology::build(n as usize, src, dst), w)
+    }
+
+    /// The edge list behind [`random_weighted`]: sources, targets, weights.
+    fn random_edges(n: u32, m: usize) -> (Vec<u32>, Vec<u32>, Vec<f64>) {
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = move || {
             state = state
@@ -910,7 +1007,121 @@ mod tests {
             dst.push(b);
             w.push(((i % 89) as f64 + 1.0).sqrt() / 7.0);
         }
-        (Topology::build(n as usize, src, dst), w)
+        (src, dst, w)
+    }
+
+    /// Modularity (γ = 1) of `comm` over the symmetrised edge list, computed
+    /// from the edges themselves, not from Louvain's working graph.
+    fn modularity(src: &[u32], dst: &[u32], w: Option<&[f64]>, comm: &[u32]) -> f64 {
+        let k = comm.iter().max().map_or(0, |&c| c as usize + 1);
+        let (mut tot, mut intra, mut m2) = (vec![0.0f64; k], 0.0f64, 0.0f64);
+        for (i, (&s, &d)) in src.iter().zip(dst).enumerate() {
+            let wt = w.map_or(1.0, |w| w[i]);
+            let (cs, cd) = (comm[s as usize] as usize, comm[d as usize] as usize);
+            tot[cs] += wt;
+            tot[cd] += wt;
+            m2 += 2.0 * wt;
+            if cs == cd {
+                intra += 2.0 * wt;
+            }
+        }
+        intra / m2 - tot.iter().map(|t| (t / m2) * (t / m2)).sum::<f64>()
+    }
+
+    /// FNV-1a over a sequence of words.
+    fn fnv(words: impl IntoIterator<Item = u64>) -> u64 {
+        words.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, x| {
+            (h ^ x).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// Exact results, pinned (#352): the community count, modularity bits and
+    /// a hash of the labels for fixed seeds, unweighted and weighted, masked
+    /// and not, on a graph big enough for the parallel build; and a hash of
+    /// the level-0 working graph. A change to how the working graph is built
+    /// or stored must leave every one of these bit for bit as it is.
+    #[test]
+    fn results_are_pinned() {
+        let n = 5000u32;
+        let (src, dst, w) = random_edges(n, 120_000);
+        let t = Topology::build(n as usize, src.clone(), dst.clone());
+        let keep: Vec<bool> = (0..src.len()).map(|e| e % 5 != 2).collect();
+        let mask = EdgeMask::from_bools(&keep);
+        fn kept<T: Copy>(xs: &[T], keep: &[bool]) -> Vec<T> {
+            xs.iter().zip(keep).filter(|p| *p.1).map(|p| *p.0).collect()
+        }
+        let masked_edges = (kept(&src, &keep), kept(&dst, &keep), kept(&w, &keep));
+        let mut got = Vec::new();
+        for masked in [false, true] {
+            let (s, d, ww) = if masked {
+                (&masked_edges.0, &masked_edges.1, &masked_edges.2)
+            } else {
+                (&src, &dst, &w)
+            };
+            let mask = masked.then_some(&mask);
+            for weighted in [false, true] {
+                for seed in [1u64, 9] {
+                    let comm = if weighted {
+                        louvain_weighted(&t, &w, mask, 1.0, Some(seed))
+                    } else {
+                        louvain(&t, mask, 1.0, Some(seed))
+                    };
+                    let q = modularity(s, d, weighted.then_some(ww.as_slice()), &comm);
+                    let k = comm.iter().max().unwrap() + 1;
+                    let h = fnv(comm.iter().map(|&c| u64::from(c)));
+                    got.push((masked, weighted, seed, k, q.to_bits(), h));
+                }
+                let g = Graph::from_topology(&t, weighted.then_some(w.as_slice()), mask, None);
+                let h = fnv(g
+                    .offsets
+                    .iter()
+                    .map(|&o| o as u64)
+                    .chain(g.targets.iter().map(|&v| u64::from(v)))
+                    .chain(g.weights.iter().map(|x| x.to_bits()))
+                    .chain(g.self_loop.iter().map(|x| x.to_bits()))
+                    .chain(g.k.iter().map(|x| x.to_bits()))
+                    .chain([g.m2.to_bits()]));
+                got.push((masked, weighted, 0, 0, 0, h));
+            }
+        }
+        // (masked, weighted, seed, communities, modularity bits, labels hash);
+        // seed 0 rows are the level-0 graph's hash.
+        let want: &[(bool, bool, u64, u32, u64, u64)] = &[
+            (
+                false,
+                false,
+                1,
+                20,
+                4604229447551481594,
+                2248463203008460393,
+            ),
+            (false, false, 9, 21, 4604228329304253869, 613740474174045293),
+            (false, false, 0, 0, 0, 5059561701017657901),
+            (false, true, 1, 20, 4604229012191403382, 6018945348175921665),
+            (
+                false,
+                true,
+                9,
+                21,
+                4604228104913520882,
+                17737549763898365559,
+            ),
+            (false, true, 0, 0, 0, 6124457408852198281),
+            (
+                true,
+                false,
+                1,
+                21,
+                4604241415289548926,
+                16938039130672030744,
+            ),
+            (true, false, 9, 21, 4604237435839331312, 9774245703022877507),
+            (true, false, 0, 0, 0, 318761951090822375),
+            (true, true, 1, 21, 4604240838659378926, 753696038131262450),
+            (true, true, 9, 21, 4604232695396470159, 7947206719753406432),
+            (true, true, 0, 0, 0, 8722660127737123802),
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]
