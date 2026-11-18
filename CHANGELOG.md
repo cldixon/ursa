@@ -313,6 +313,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Weak and strong connected components run in parallel, with the same
+  labels** (#383). Both kernels ran on about one core (63 s and 82 s on the
+  full Bluesky graph, on 16 cores). Weak components now find, per thread and
+  range of edges, the edges that join two union-find sets, and replay only
+  those through the serial union-find, so every root is the one the serial
+  kernel picks. Strong components are found in parallel by trimming and
+  colouring rounds, over out-edges only (no transpose), and a serial DFS in
+  Tarjan's order, testing one bit per edge, then names each by Tarjan's root.
+  Labels are bit for bit the serial kernels', which tests pin per node and
+  compare at several pool sizes. On a 256M-edge R-MAT graph on a shared
+  4-core machine: weak 10.4 s to 6.3 s, strong 21.1 s to 13.8 s (the strong
+  kernel's serial DFS takes 0.25 s of it), with 120 MiB more heap at most
+  for weak and 70 MiB less for strong, on a 2 GiB graph. The serial kernels
+  still run on one thread, below 65,536 edges, and without the `rayon`
+  feature. `Linked::of`, run before every compact kernel, also no longer
+  makes an atomic update per edge.
 - **SQL: a database always opens** (#381, N44). A catalog statement that
   fails when the database opens, such as a view over a data file that was
   moved, renamed or deleted, or a database copied without its files, no
