@@ -783,6 +783,12 @@ function setAside() {
 function fitLines(sql, width) {
   const out = [];
   for (const line of sql.split("\n")) {
+    // A dot-command is one line: broken, its rest would run as a command of
+    // its own (.graph karate SIZE BY pagerank / COLOR BY club).
+    if (line.trimStart().startsWith(".")) {
+      out.push(line);
+      continue;
+    }
     const indent = line.match(/^\s*/)[0];
     const comment = line.trimStart().startsWith("--");
     let pad = indent + (comment ? "-- " : "  ");

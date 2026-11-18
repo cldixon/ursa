@@ -48,9 +48,9 @@ SELECT louvain AS faction, club, count(*) AS members
 FROM members JOIN louvain(karate, resolution => 0.5, seed => 1) USING (id)
 GROUP BY faction, club
 ORDER BY faction, club;`,
-    // TODO(#389): once .graph styling is on main, colour it by faction: .graph karate SIZE BY pagerank COLOR BY louvain
-    `-- Step 4, draw it. Drag to pan, scroll to zoom, click a member to see who it is; Esc closes the view.
-.graph karate`,
+    `-- Step 4, draw it: members sized by PageRank and coloured by the side they took.
+-- Drag to pan, scroll to zoom, click a member to see who it is; Esc closes the view.
+.graph karate SIZE BY pagerank COLOR BY club`,
     `-- Step 5, paths: GRAPH_TABLE matches patterns of nodes and edges, in SQL/PGQ from the SQL standard.
 -- ALL SHORTEST finds every shortest chain of friendships from Mr. Hi to the Officer.
 FROM GRAPH_TABLE (karate

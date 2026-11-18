@@ -1134,6 +1134,8 @@ for (const scheme of ["light", "dark"] as const) {
   await graphSettled(p);
   const info = await graphInfo(p);
   check((await graphOpen(p)) && info.nodes === 34 && info.edges === 78, "the tour draws the club", JSON.stringify(info));
+  const tourLegend = await legendText(p);
+  check(/colou?r: club/.test(tourLegend) && tourLegend.includes("Mr. Hi (17)") && tourLegend.includes("Officer (17)") && /size: pagerank/.test(tourLegend), "the tour colours the club by side and sizes it by PageRank", tourLegend);
   if (shots) await p.screenshot({ path: `${shots}/tour-phone.png` });
   // .tour runs it again, in a fresh session.
   await p.click("#terminal");
