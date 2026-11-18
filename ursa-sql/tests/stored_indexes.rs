@@ -760,42 +760,67 @@ async fn a_filtered_build_says_the_rows_it_reads() {
 }
 
 /// N38: `EXPLAIN` marks a path search whose index the session holds, in
-/// memory or stored, since its edge and vertex scans then do not run (#351).
+/// memory or stored, since its edge and vertex scans then do not run (#351);
+/// and it no longer draws them under the node, but counts them on its line
+/// (#384, N48).
 #[tokio::test(flavor = "multi_thread")]
 async fn explain_marks_a_path_search_over_a_held_index() {
     let fixture = Fixture::new(1_000).await;
     const PATHS: &str = "FROM GRAPH_TABLE (g
         MATCH p = ANY SHORTEST (a WHERE a.id = 1)-[e]->*(b) COLUMNS (b.id))";
+    // The PathSearchExec line, and the lines of its subtree.
     let explain = |ctx: &SessionContext| {
         let ctx = ctx.clone();
         async move {
             let lines = ok(&ctx, &format!("EXPLAIN {PATHS}")).await;
-            lines
+            let lines: Vec<String> = lines
                 .iter()
                 .flat_map(|l| l.lines())
-                .find(|l| l.contains("PathSearchExec"))
-                .unwrap_or_else(|| panic!("no PathSearchExec in {lines:?}"))
-                .to_string()
+                .map(str::to_string)
+                .collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("PathSearchExec"))
+                .unwrap_or_else(|| panic!("no PathSearchExec in {lines:?}"));
+            let depth = |l: &str| l.len() - l.trim_start().len();
+            let below: Vec<String> = lines[at + 1..]
+                .iter()
+                .take_while(|l| depth(l) > depth(&lines[at]))
+                .cloned()
+                .collect();
+            (lines[at].clone(), below)
         }
     };
+    // The scans of the edge file under the node.
+    let edge_scans = |below: &[String]| {
+        below
+            .iter()
+            .filter(|l| l.contains("DataSourceExec") && l.contains("edges.parquet"))
+            .count()
+    };
     let ctx = open(&fixture.db()).await;
-    // Not built yet: the sources are read.
-    let line = explain(&ctx).await;
+    // Not built yet: the sources are read, and drawn.
+    let (line, below) = explain(&ctx).await;
     assert!(!line.contains("index="), "{line}");
+    let scans = edge_scans(&below);
+    assert!(scans > 0, "{below:#?}");
     ok(&ctx, PATHS).await;
-    let line = explain(&ctx).await;
+    let (line, below) = explain(&ctx).await;
     assert!(
-        line.ends_with(", index=cached (sources not read)"),
+        line.ends_with(", index=cached, sources: 1 file, not read"),
         "{line}"
     );
+    // One scan fewer: the edges' (the start nodes' scan is still read).
+    assert_eq!(edge_scans(&below), scans - 1, "{below:#?}");
     close(ctx);
     // A later session holds it stored, and loads it without reading them.
     let ctx = open(&fixture.db()).await;
-    let line = explain(&ctx).await;
+    let (line, below) = explain(&ctx).await;
     assert!(
-        line.ends_with(", index=stored (sources not read)"),
+        line.ends_with(", index=stored, sources: 1 file, not read"),
         "{line}"
     );
+    assert_eq!(edge_scans(&below), scans - 1, "{below:#?}");
     ok(&ctx, PATHS).await;
     assert_eq!(counts(&ctx), (0, 1));
     close(ctx);

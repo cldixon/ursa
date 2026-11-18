@@ -145,7 +145,7 @@ async fn unknown_ursa_settings_are_named() {
     );
     assert_eq!(
         error(&ctx, "SHOW ursa.colour").await,
-        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices"
+        "'ursa.colour' is not an Ursa setting. Ursa's settings are: ursa.index_storage_limit, ursa.notices, ursa.max_paths"
     );
     // DataFusion's own SHOW is unchanged.
     assert_eq!(
