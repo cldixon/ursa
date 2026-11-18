@@ -693,20 +693,25 @@ fn set_lasts_for_the_process_and_a_saved_limit_is_said_once() {
 
     let set = format!("SET ursa.index_storage_limit = '50MiB'; {show}");
     let (stdout, stderr) = shown(&["club.ursa", "--format=csv", "-c", &set]);
-    assert_eq!(
-        stdout,
-        "name,value\nursa.index_storage_limit,50MiB (SET for this session)\n"
-    );
+    assert_eq!(stdout, "name,value\nursa.index_storage_limit,50MiB\n");
     assert_eq!(stderr, "");
     assert_eq!(
         std::fs::read_to_string(cwd.join("club.ursa")).unwrap(),
         catalog
     );
-    // The next process has the default, and says where it comes from.
+    // The next process has the default: just the value, and VERBOSE says
+    // where it comes from.
     let (stdout, _) = shown(&["club.ursa", "--format=csv", "-c", show]);
     assert!(
-        stdout.starts_with("name,value\nursa.index_storage_limit,\"")
-            && stdout.contains("iB (the default: 25% of ")
+        stdout.starts_with("name,value\nursa.index_storage_limit,")
+            && stdout.ends_with("GiB\n")
+            && !stdout.contains("default"),
+        "{stdout}"
+    );
+    let verbose = format!("{show} VERBOSE");
+    let (stdout, _) = shown(&["club.ursa", "--format=csv", "-c", &verbose]);
+    assert!(
+        stdout.contains("GiB,\"the default: 25% of ")
             && stdout.contains(" free on the disk of club.ursa"),
         "{stdout}"
     );
@@ -717,10 +722,7 @@ fn set_lasts_for_the_process_and_a_saved_limit_is_said_once() {
     )
     .unwrap();
     let (stdout, _) = shown(&["club.ursa", "-init", "init.sql", "--format=csv", "-c", show]);
-    assert_eq!(
-        stdout,
-        "name,value\nursa.index_storage_limit,50MiB (SET for this session)\n"
-    );
+    assert_eq!(stdout, "name,value\nursa.index_storage_limit,50MiB\n");
 
     // A limit 0.8 or 0.9 saved: not applied, said once, and removed.
     let saved = catalog.replacen(
@@ -733,14 +735,14 @@ fn set_lasts_for_the_process_and_a_saved_limit_is_said_once() {
                   longer applied; SET now lasts for the session. To keep it, add SET \
                   ursa.index_storage_limit = '50MiB' to ~/.ursarc (or an -init file)\n";
     let (stdout, stderr) = shown(&["club.ursa", "--readonly", "--format=csv", "-c", show]);
-    assert!(stdout.contains("(the default: "), "{stdout}");
+    assert!(!stdout.contains("50MiB"), "{stdout}");
     assert_eq!(stderr, notice);
     assert_eq!(
         std::fs::read_to_string(cwd.join("club.ursa")).unwrap(),
         saved
     );
     let (stdout, stderr) = shown(&["club.ursa", "--format=csv", "-c", show]);
-    assert!(stdout.contains("(the default: "), "{stdout}");
+    assert!(!stdout.contains("50MiB"), "{stdout}");
     assert_eq!(stderr, notice);
     assert_eq!(
         std::fs::read_to_string(cwd.join("club.ursa")).unwrap(),
@@ -748,4 +750,60 @@ fn set_lasts_for_the_process_and_a_saved_limit_is_said_once() {
     );
     let (_, stderr) = shown(&["club.ursa", "--format=csv", "-c", show]);
     assert_eq!(stderr, "");
+}
+
+/// N44 (#381): a view over a file that is gone no longer makes the database
+/// unopenable. It is unavailable, said once on stderr; the rest works, in a
+/// writable or read-only process, and DROP repairs it.
+#[test]
+fn a_database_with_a_view_over_a_missing_file_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    std::fs::write(cwd.join("t.csv"), "a,b\n1,2\n").unwrap();
+    ok(ursa_in(
+        cwd,
+        &[
+            "m.ursa",
+            "-c",
+            "CREATE VIEW v AS FROM 't.csv'; CREATE VIEW w AS SELECT 1 AS x",
+        ],
+    ));
+    let saved = std::fs::read_to_string(cwd.join("m.ursa")).unwrap();
+    std::fs::remove_file(cwd.join("t.csv")).unwrap();
+    let notice = "ursa: view v is unavailable: no file found at '<dir>/t.csv'; DROP VIEW v or \
+                  restore the file\n";
+    // The database's directory, however the process names it.
+    let canonical = std::fs::canonicalize(cwd).unwrap().display().to_string();
+    let normalized = |s: String| {
+        s.replace(&canonical, "<dir>")
+            .replace(&cwd.display().to_string(), "<dir>")
+    };
+    for readonly in [true, false] {
+        let mut args = vec!["m.ursa", "--format=csv", "-c", "FROM w; SHOW TABLES"];
+        if readonly {
+            args.insert(1, "--readonly");
+        }
+        let out = ursa_in(cwd, &args);
+        let stderr = normalized(String::from_utf8(out.stderr.clone()).unwrap());
+        assert_eq!(stderr, notice);
+        let stdout = ok(out);
+        assert!(stdout.starts_with("x\n1\n"), "{stdout}");
+        assert!(stdout.contains(",v,VIEW"), "{stdout}");
+
+        let mut args = vec!["m.ursa", "-q", "-c", "FROM v"];
+        if readonly {
+            args.insert(1, "--readonly");
+        }
+        let e = normalized(err(ursa_in(cwd, &args)));
+        assert!(
+            e.contains(notice.trim_start_matches("ursa: ").trim_end()),
+            "{e}"
+        );
+    }
+    // Opening wrote nothing.
+    assert_eq!(std::fs::read_to_string(cwd.join("m.ursa")).unwrap(), saved);
+    ok(ursa_in(cwd, &["m.ursa", "-q", "-c", "DROP VIEW v"]));
+    let out = ursa_in(cwd, &["m.ursa", "--format=csv", "-c", "FROM w"]);
+    assert_eq!(String::from_utf8(out.stderr.clone()).unwrap(), "");
+    assert_eq!(ok(out), "x\n1\n");
 }

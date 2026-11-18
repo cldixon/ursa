@@ -133,9 +133,7 @@ const SHOW_LIMIT: &str = "SHOW ursa.index_storage_limit";
 
 /// The row `SHOW ursa.index_storage_limit` gives for `limit`, SET.
 fn limit_row(limit: &str) -> [String; 1] {
-    [format!(
-        "ursa.index_storage_limit,{limit} (SET for this session)"
-    )]
+    [format!("ursa.index_storage_limit,{limit}")]
 }
 
 /// Whether `rows` (of `SHOW ursa.index_storage_limit`) show the database's
@@ -143,10 +141,7 @@ fn limit_row(limit: &str) -> [String; 1] {
 fn shows_the_default(ctx: &SessionContext, rows: &[String]) -> bool {
     let db = ursa_engine::database::database(&ctx.state()).unwrap();
     let default = ursa_engine::options::ByteSize(db.default_index_storage_limit().bytes);
-    rows.len() == 1
-        && rows[0].starts_with(&format!(
-            "ursa.index_storage_limit,{default} (the default: "
-        ))
+    rows.len() == 1 && rows[0].starts_with(&format!("ursa.index_storage_limit,{default}"))
 }
 
 const QUERY: &str =
@@ -1097,4 +1092,60 @@ async fn traversals_use_a_stored_index() {
     let second = open(&fixture.db()).await;
     assert_eq!((ok(&second, hop).await, ok(&second, path).await), expected);
     assert_eq!(counts(&second), (0, 1));
+}
+
+/// N47 (#381): the reverse adjacency, appended to a stored index when the
+/// database closes, is said at 'all', and at 'on' when it brings the stored
+/// indexes close to the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn storing_the_reverse_adjacency_is_said() {
+    let size = ursa_engine::notices::size;
+    let stored = |fixture: &Fixture, before: u64, after: u64| {
+        format!(
+            "stored the reverse adjacency of g in {} (+{}, {} in all)",
+            fixture.db().display(),
+            size(after - before),
+            size(after)
+        )
+    };
+    let fixture = Fixture::new(20_000).await;
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "all").await;
+    ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+    ursa_engine::database::flush(&ctx.state());
+    let before = read_manifest(&fixture.index_dir())[0].size;
+    taken(&said);
+    ok(&ctx, "SELECT count(*) FROM pagerank(g)").await;
+    ursa_engine::database::flush(&ctx.state());
+    let after = read_manifest(&fixture.index_dir())[0].size;
+    assert!(after > before);
+    assert_eq!(taken(&said), [stored(&fixture, before, after)]);
+    close(ctx);
+
+    // At 'on', only when it brings them close to the limit.
+    for (limit, heard) in [(after * 100, false), (after + after / 20, true)] {
+        let fixture = Fixture::new(20_000).await;
+        let ctx = open(&fixture.db()).await;
+        let said = notices(&ctx, "on").await;
+        ok(&ctx, &format!("SET ursa.index_storage_limit = {limit}")).await;
+        ok(&ctx, "SELECT count(*) FROM degree(g)").await;
+        ursa_engine::database::flush(&ctx.state());
+        ok(&ctx, "SELECT count(*) FROM pagerank(g)").await;
+        ursa_engine::database::flush(&ctx.state());
+        let lines = taken(&said);
+        if heard {
+            assert_eq!(
+                lines,
+                [format!(
+                    "{}; the stored indexes now take {} of ursa.index_storage_limit ({})",
+                    stored(&fixture, before, after),
+                    size(after),
+                    ursa_engine::options::ByteSize(limit)
+                )]
+            );
+        } else {
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+        close(ctx);
+    }
 }

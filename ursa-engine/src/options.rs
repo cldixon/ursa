@@ -24,6 +24,9 @@ use datafusion::prelude::SessionConfig;
 pub const MIN_DEFAULT_INDEX_STORAGE_LIMIT: u64 = 4 << 30;
 /// The most the default `ursa.index_storage_limit` is: 64 GiB.
 pub const MAX_DEFAULT_INDEX_STORAGE_LIMIT: u64 = 64 << 30;
+/// The default `ursa.index_storage_limit` is a multiple of this, 4 GiB, so it
+/// does not move between opens as the free space changes a little (#381).
+pub const DEFAULT_INDEX_STORAGE_STEP: u64 = 4 << 30;
 /// The share of the space available to indexes that the default
 /// `ursa.index_storage_limit` takes, in percent.
 pub const DEFAULT_INDEX_STORAGE_SHARE: u64 = 25;
@@ -31,7 +34,8 @@ pub const DEFAULT_INDEX_STORAGE_SHARE: u64 = 25;
 /// The default `ursa.index_storage_limit` of a database whose indexes could
 /// use `available` bytes (the free space on its disk plus what its stored
 /// indexes already take; `None` if the free space cannot be read): 25% of
-/// it, in whole GiB, at least 4 GiB and at most 64 GiB (#353).
+/// it, rounded down to a multiple of 4 GiB, at least 4 GiB and at most 64 GiB
+/// (#353, #381).
 ///
 /// Relative, so a large disk keeps the indexes of several large graphs (an
 /// index of 95.7M edges takes about 1.3 GiB, and 2.3 GiB once an algorithm
@@ -46,7 +50,7 @@ pub fn default_index_storage_limit(available: Option<u64>) -> u64 {
         return MIN_DEFAULT_INDEX_STORAGE_LIMIT;
     };
     let share = (available as u128 * DEFAULT_INDEX_STORAGE_SHARE as u128 / 100) as u64;
-    (share >> 30 << 30).clamp(
+    (share / DEFAULT_INDEX_STORAGE_STEP * DEFAULT_INDEX_STORAGE_STEP).clamp(
         MIN_DEFAULT_INDEX_STORAGE_LIMIT,
         MAX_DEFAULT_INDEX_STORAGE_LIMIT,
     )
@@ -352,9 +356,12 @@ mod tests {
         assert_eq!(default_index_storage_limit(None), 4 * gib);
         assert_eq!(default_index_storage_limit(Some(0)), 4 * gib);
         assert_eq!(default_index_storage_limit(Some(10 * gib)), 4 * gib);
-        // 25%, in whole GiB.
-        assert_eq!(default_index_storage_limit(Some(100 * gib)), 25 * gib);
-        assert_eq!(default_index_storage_limit(Some(103 * gib)), 25 * gib);
+        // 25%, rounded down to a multiple of 4 GiB.
+        assert_eq!(default_index_storage_limit(Some(100 * gib)), 24 * gib);
+        assert_eq!(default_index_storage_limit(Some(103 * gib)), 24 * gib);
+        assert_eq!(default_index_storage_limit(Some(87 * gib)), 20 * gib);
+        assert_eq!(default_index_storage_limit(Some(95 * gib)), 20 * gib);
+        assert_eq!(default_index_storage_limit(Some(96 * gib)), 24 * gib);
         assert_eq!(default_index_storage_limit(Some(1 << 50)), 64 * gib);
         assert_eq!(default_index_storage_limit(Some(u64::MAX)), 64 * gib);
     }

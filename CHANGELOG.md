@@ -296,6 +296,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: a database always opens** (#381, N44). A catalog statement that
+  fails when the database opens, such as a view over a data file that was
+  moved, renamed or deleted, or a database copied without its files, no
+  longer makes the database unopenable (`cannot open m.ursa: statement 1 of
+  its catalog failed`), with every statement, `DROP` included, failing the
+  same way. The object it defines is unavailable instead, and one notice
+  says why: `ursa: view v is unavailable: no file found at '…/t.csv'; DROP
+  VIEW v or restore the file`. Everything else works, in a writable or a
+  read-only open; `SHOW TABLES` and `.tables` still list it, and using it
+  fails with that message, as a broken view does in DuckDB. A view or graph
+  that uses an unavailable object is unavailable too, with its own notice.
+  `DROP` (with or without `IF EXISTS`) and `CREATE OR REPLACE` repair it.
+  Its statement stays in the catalog as it was, so restoring the file and
+  opening the database again brings it back.
+- **SQL: `SHOW ursa.index_storage_limit` shows just the value** (behaviour
+  change, #381, N46), `21GiB` or `8GiB`, like every other setting, not
+  `21GiB (the default: …)`. Where it comes from starts its description,
+  which `SHOW ursa.index_storage_limit VERBOSE` and `SHOW ALL VERBOSE` show.
+  The default limit is rounded down to a multiple of 4 GiB (it was a whole
+  GiB), so it no longer moves between runs as the free space changes a
+  little.
+- **SQL: storing an index's reverse adjacency is said** (#381, N47). When
+  the database closes and appends the reverse adjacency (or evaluated
+  weights) to a stored index, `ursa.notices = 'all'` says `stored the
+  reverse adjacency of g in club.ursa (+1.0 GiB, 2.3 GiB in all)`, and
+  `'on'` says it too when it brings the stored indexes to 90% of
+  `ursa.index_storage_limit` or more. A chunk that cannot be written is
+  said at `'on'`.
 - **`ursa`: JSON and NDJSON write `null` for a null** (behaviour change,
   #350). Every row object has every column, in column order, as DuckDB
   writes them: `SELECT NULL AS a, '' AS b` is `[{"a":null,"b":""}]`, which
