@@ -168,6 +168,19 @@ a,b,l
 ,"","[1, 2]"
 ```
 
+A string inside a list, struct or map is in single quotes where it needs them, as in DuckDB: when it is empty, is `NULL` in any case, starts or ends with a space, or holds any of `' " \ , : = [ ] { } ( )`. A `'` or `\` inside the quotes has a `\` before it. A null inside is a bare `NULL`, so it cannot be mistaken for the string `'NULL'`:
+
+```bash
+ursa --format csv -c "SELECT ['a, b', 'c'] AS l, ['x]', NULL, 'NULL'] AS m"
+```
+
+```text
+l,m
+"['a, b', c]","['x]', NULL, 'NULL']"
+```
+
+The table writes nested values the same way. This text is for reading: JSON is the lossless format for nested results, since it keeps each value's type, so read lists, structs and maps (such as `vertices(p)` on a graph with string ids) as `json` or `ndjson`.
+
 `csv`, `tsv`, `json`, `ndjson` and `arrow` write every row and never cut a value. A `table` shows at most 40 rows (see [Long results](#long-results)).
 
 ### Tables
