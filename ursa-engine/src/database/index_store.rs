@@ -712,10 +712,7 @@ impl IndexStore {
                 };
                 let size = state.entries[entry].size;
                 let need = encode(size).size();
-                let what = match kind {
-                    CHUNK_WEIGHTS => "evaluated weights",
-                    _ => "in-adjacency",
-                };
+                let what = chunk_noun(kind);
                 let room = room_for(&state, need, &[], std::slice::from_ref(&file), limit);
                 let Ok(evicted) = room else {
                     notifier.say(NoticeLevel::On, || match room {
@@ -747,14 +744,37 @@ impl IndexStore {
                 };
                 let result =
                     index_file::append_chunk(&self.dir.join(&file), main, kind, &name, encode);
-                if let Ok(appended_len) = result {
-                    if let Some(live) = state.live.get_mut(&file) {
-                        live.chunks.insert((kind, name));
+                match result {
+                    Ok(appended_len) => {
+                        if let Some(live) = state.live.get_mut(&file) {
+                            live.chunks.insert((kind, name));
+                        }
+                        if let Some(len) = appended_len {
+                            state.entries[entry].size = len;
+                            let _ = write_manifest(&self.dir, &state.entries);
+                            let stored =
+                                state.reserved + state.entries.iter().map(|e| e.size).sum::<u64>();
+                            say_appended(
+                                &notifier,
+                                &Appended {
+                                    what: chunk_noun(kind),
+                                    graph: &graph,
+                                    database: &self.database,
+                                    added: len.saturating_sub(size),
+                                    total: len,
+                                    stored,
+                                    limit,
+                                },
+                            );
+                        }
                     }
-                    if let Some(len) = appended_len {
-                        state.entries[entry].size = len;
-                        let _ = write_manifest(&self.dir, &state.entries);
-                    }
+                    Err(e) => notifier.say(NoticeLevel::On, || {
+                        format!(
+                            "could not store the {} of {graph} in {}: {e}",
+                            chunk_noun(kind),
+                            self.database
+                        )
+                    }),
                 }
             }
         }
@@ -1014,9 +1034,91 @@ fn sync_dir(dir: &Path) {
     let _ = dir;
 }
 
+/// What a chunk of an index file holds, as notices name it.
+fn chunk_noun(kind: u32) -> &'static str {
+    match kind {
+        CHUNK_WEIGHTS => "evaluated weights",
+        _ => "reverse adjacency",
+    }
+}
+
+/// The share of `ursa.index_storage_limit`, in percent, past which storing a
+/// chunk is said at `ursa.notices = 'on'`, not only at `'all'`.
+const NEAR_LIMIT_PERCENT: u64 = 90;
+
+/// A chunk appended to an index file (#381).
+struct Appended<'a> {
+    what: &'static str,
+    graph: &'a str,
+    database: &'a str,
+    /// The bytes it added to the file.
+    added: u64,
+    /// The file's bytes now.
+    total: u64,
+    /// The bytes of every stored index now.
+    stored: u64,
+    limit: u64,
+}
+
+/// Say that a chunk was stored: at `'all'`, and at `'on'` too when it brings
+/// the stored indexes close to the limit, which the next index stored may
+/// then have to make room under.
+fn say_appended(notifier: &Notifier, appended: &Appended) {
+    let near =
+        appended.stored.saturating_mul(100) >= appended.limit.saturating_mul(NEAR_LIMIT_PERCENT);
+    let level = if near {
+        NoticeLevel::On
+    } else {
+        NoticeLevel::All
+    };
+    notifier.say(level, || appended_notice(appended, near));
+}
+
+fn appended_notice(appended: &Appended, near: bool) -> String {
+    let mut text = format!(
+        "stored the {} of {} in {} (+{}, {} in all)",
+        appended.what,
+        appended.graph,
+        appended.database,
+        notices::size(appended.added),
+        notices::size(appended.total)
+    );
+    if near {
+        text.push_str(&format!(
+            "; the stored indexes now take {} of ursa.index_storage_limit ({})",
+            notices::size(appended.stored),
+            ByteSize(appended.limit)
+        ));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_notice_for_a_stored_reverse_adjacency() {
+        let gib = 1u64 << 30;
+        let appended = Appended {
+            what: "reverse adjacency",
+            graph: "bsky23p",
+            database: "bsky10.ursa",
+            added: gib + gib / 10,
+            total: 2 * gib + gib / 2,
+            stored: 2 * gib + gib / 2,
+            limit: 20 * gib,
+        };
+        assert_eq!(
+            appended_notice(&appended, false),
+            "stored the reverse adjacency of bsky23p in bsky10.ursa (+1.1 GiB, 2.5 GiB in all)"
+        );
+        assert_eq!(
+            appended_notice(&appended, true),
+            "stored the reverse adjacency of bsky23p in bsky10.ursa (+1.1 GiB, 2.5 GiB in all); \
+             the stored indexes now take 2.5 GiB of ursa.index_storage_limit (20GiB)"
+        );
+    }
 
     #[test]
     fn eviction_only_makes_room_and_never_below_a_lowered_limit() {
