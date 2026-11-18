@@ -6,6 +6,10 @@ Ursa is a SQL engine for graphs. Point the `ursa` command-line tool at an edge l
 
 The same engine is also a Python library, with a Polars-shaped API: see [From Python](#from-python) below.
 
+## Try it in your browser
+
+[Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) is the `ursa` shell in a web page, with nothing to install. It runs the same engine, compiled to WebAssembly, in your browser. Pick a dataset from its menu, or import a file of your own: it stays on your machine.
+
 ## Install
 
 On Linux or macOS:
@@ -159,6 +163,7 @@ Nothing after that line changes.
 
 ## Next steps
 
+- [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev): try Ursa SQL in your browser.
 - [Getting started with Ursa SQL](sql/getting-started.md): install `ursa`, define a graph and run algorithms on it.
 - [Quickstart](quickstart.md): a ten-minute Python session that uses most of the API.
 - [Guides](guides/index.md): the Python library, one task per page, with code that runs.
