@@ -342,6 +342,33 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     keeps reading the index it mapped while another process replaces it.
     Mapped pages count in a process's RSS once read, as shared, reclaimable
     file cache.
+- **SQL: an index build interns a vertex table's keys while it interns the
+  edges, not before them** (#385, N49). With the edge scan parallel (#351),
+  reading the keys first was the serial part of a build with a vertex table:
+  a `.csv.gz` decompresses on one core, and the edges waited for it. Now the
+  keys and the edges are read and interned at once, on threads of their
+  own: the edges with a provisional numbering, until the last key is in;
+  then those are renumbered into the keys' numbering (one lookup per
+  distinct endpoint, then in place, in parallel) and the rest go straight
+  into it. The node numbering, the edges kept and the stored index are byte
+  for byte the ones interning the keys first gives, wherever the switch
+  falls; a test checks it with the keys in CSV, gzipped CSV and Parquet. On
+  4 cores, 96M edges behind a filter over 160M rows of zstd Parquet and a
+  40M-key vertex table: 19.8 s → 18.6 s with the keys in a 1.1 GiB
+  `.csv.gz` of three columns (its single-core decompression, about 14 s, is
+  now most of the build); a small `.csv.gz` or Parquet of the keys is as
+  before, within noise. The browser still reads the keys first.
+- **SQL: the build's read-ahead is a setting, scaled and capped**
+  (#385, N45). The partitions an index build decodes ahead of the one it is
+  interning held up to a fixed 1 GiB, which raised a build's peak memory by
+  about 0.7 GB. It is now `ursa.build_read_ahead`: `auto` by default, 256 MiB
+  per partition of the source (so 1 GiB from 4 partitions up, as before), at
+  most an eighth of the memory available to the process (`MemAvailable`, or
+  the cgroup's limit if lower), or a size `SET` for the session; `0` reads
+  the partitions one after another. A smaller read-ahead costs time: on the
+  96M-edge build above (4 cores), 1 GiB took 8.6 s at 4.2 GB peak RSS, 512
+  MiB 9.5 s at 3.8 GB, 256 MiB 9.7 s at 3.4 GB, and `0` 10.4 s at 3.1 GB.
+  The index is the same under any value.
 - **Weak and strong connected components run in parallel, with the same
   labels** (#383). Both kernels ran on about one core (63 s and 82 s on the
   full Bluesky graph, on 16 cores). Weak components now find, per thread and

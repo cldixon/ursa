@@ -105,6 +105,57 @@ impl ConfigField for IndexStorageLimit {
     }
 }
 
+/// `ursa.build_read_ahead`: `auto` (the default: 256 MiB per partition of
+/// the plan read, at most 1 GiB and at most an eighth of the memory
+/// available) or a size `SET` for the session; 0 reads a build's partitions
+/// one after another (#385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadAhead {
+    /// Scaled with the partitions read, and capped by the memory available.
+    #[default]
+    Auto,
+    /// A size `SET` for the session.
+    Bytes(ByteSize),
+}
+
+impl ReadAhead {
+    /// `auto` (or `default`), in any case, or a size ([`ByteSize::parse`]).
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "auto" | "default" => Ok(Self::Auto),
+            _ => ByteSize::parse(text).map(Self::Bytes),
+        }
+    }
+
+    /// The size `SET`, if one was.
+    pub fn bytes(&self) -> Option<u64> {
+        match self {
+            Self::Auto => None,
+            Self::Bytes(b) => Some(b.0),
+        }
+    }
+}
+
+impl fmt::Display for ReadAhead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Bytes(b) => b.fmt(f),
+        }
+    }
+}
+
+impl ConfigField for ReadAhead {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        *self = ReadAhead::parse(value)?;
+        Ok(())
+    }
+}
+
 /// A number of bytes, written as plain bytes (`1048576`) or with a binary
 /// unit (`512KiB`, `64MiB`, `8GiB`, `1TiB`; `B` for bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +302,13 @@ extensions_options! {
         /// the graph; otherwise the paths and prefixes held. Default
         /// 10000000.
         pub max_paths: usize, default = crate::graph::path_search::MAX_PATHS
+        /// The most bytes of decoded rows an index build reads ahead of the
+        /// rows it is interning, so the partitions of its edge and vertex
+        /// tables decode in parallel.
+        /// Default auto: 256MiB per partition read, at most 1GiB and at most
+        /// an eighth of the memory available. 0 reads the partitions one
+        /// after another.
+        pub build_read_ahead: ReadAhead, default = ReadAhead::Auto
     }
 }
 
@@ -286,6 +344,16 @@ pub fn max_paths(config: &SessionConfig) -> Option<usize> {
         .get::<UrsaOptions>()
         .map_or(crate::graph::path_search::MAX_PATHS, |o| o.max_paths);
     (n > 0).then_some(n)
+}
+
+/// The session's `ursa.build_read_ahead`, if it was `SET`; `None` when it
+/// is `auto` (see `graph::in_order`).
+pub fn build_read_ahead_set(config: &SessionConfig) -> Option<u64> {
+    config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .and_then(|o| o.build_read_ahead.bytes())
 }
 
 /// The session's `ursa.index_storage_limit`, if it was `SET`; `None` when it

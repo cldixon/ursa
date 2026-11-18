@@ -45,6 +45,14 @@ use std::hash::BuildHasher;
 /// [`EdgeInterner::n_dropped`] counts them, and [`EdgeInterner::kept_rows`]
 /// says which rows were kept, for anything read per edge row alongside them
 /// (weights).
+///
+/// **Edges before the node set is known.** So that edges can be interned
+/// while the nodes are still being read (#385), a second interner made with
+/// [`EdgeInterner::provisional`] interns them with a numbering of its own;
+/// once the node set is fixed, [`EdgeInterner::adopt`] renumbers them into
+/// it. The result is exactly that of pushing the same edges after
+/// [`EdgeInterner::close_nodes`]: the same dense endpoints, the same dropped
+/// edges and the same [`EdgeInterner::kept_rows`].
 #[derive(Debug)]
 pub struct EdgeInterner {
     map: Option<IdMap>,
@@ -60,6 +68,10 @@ pub struct EdgeInterner {
     /// row was kept; started at the first dropped row.
     kept: Option<BooleanBufferBuilder>,
     dropped: u64,
+    /// Interning edges before the node set is known: an edge with a null
+    /// endpoint is kept as `(MISS, MISS)` rather than refused, for
+    /// [`Self::adopt`] to drop (see the type's docs).
+    provisional: bool,
 }
 
 impl EdgeInterner {
@@ -77,6 +89,114 @@ impl EdgeInterner {
             rows: 0,
             kept: None,
             dropped: 0,
+            provisional: false,
+        }
+    }
+
+    /// An interner for the edges of a graph whose node set is still being
+    /// read: it interns them as [`Self::push`] does, numbered among
+    /// themselves, except that an edge with a null endpoint is held for
+    /// [`Self::adopt`] to drop rather than refused. Sized as by
+    /// [`Self::with_capacity`].
+    pub fn provisional(n_edges: usize) -> Self {
+        EdgeInterner {
+            provisional: true,
+            ..Self::with_capacity(n_edges)
+        }
+    }
+
+    /// Take in the edges `provisional` ([`Self::provisional`]) interned while
+    /// this interner's nodes were being read, once [`Self::close_nodes`] has
+    /// fixed them and before any edge is pushed here. The edges end up exactly
+    /// as if they had been pushed here instead, in the same order: those whose
+    /// endpoints are both nodes take the nodes' dense ids, the others are
+    /// dropped, counted and marked in [`Self::kept_rows`]. Edges pushed here
+    /// afterwards follow them.
+    ///
+    /// Each distinct endpoint is looked up once, then the edges are renumbered
+    /// and compacted in place, so this holds no second copy of them.
+    ///
+    /// # Panics
+    ///
+    /// If the node set is not fixed, or edges were pushed here already.
+    pub fn adopt(&mut self, provisional: EdgeInterner) -> Result<(), IdError> {
+        use crate::parallel::*;
+        assert!(
+            self.closed && self.rows == 0 && self.src_dense.is_empty(),
+            "adopt takes edges before any other, once the node set is fixed"
+        );
+        let EdgeInterner {
+            map: edge_map,
+            src_dense: mut src,
+            dst_dense: mut dst,
+            ..
+        } = provisional;
+        let Some(edge_map) = edge_map else {
+            // No edge was pushed.
+            return Ok(());
+        };
+        let map = self.map.get_or_insert_with(|| match &edge_map {
+            IdMap::Int64 { .. } => IdMap::new_int64(),
+            IdMap::Utf8 { .. } => IdMap::new_utf8(),
+        });
+        // The node each provisional id is, or MISS for an id that is no node.
+        let renumber: Vec<u32> = match (&*map, &edge_map) {
+            (IdMap::Int64 { to_dense, .. }, IdMap::Int64 { to_user, .. }) => to_user
+                .values()
+                .par_iter()
+                .map(|&id| to_dense.get(id).unwrap_or(MISS))
+                .collect(),
+            (IdMap::Utf8 { ids, .. }, IdMap::Utf8 { ids: edge_ids, .. }) => (0..edge_ids.len()
+                as u32)
+                .into_par_iter()
+                .map(|i| ids.get(edge_ids.value(i)).unwrap_or(MISS))
+                .collect(),
+            _ => return Err(IdError::MixedTypes),
+        };
+        drop(edge_map);
+        const CHUNK: usize = 1 << 16;
+        for ends in [&mut src, &mut dst] {
+            ends.par_chunks_mut(CHUNK).for_each(|ends| {
+                for e in ends {
+                    if *e != MISS {
+                        *e = renumber[*e as usize];
+                    }
+                }
+            });
+        }
+        drop(renumber);
+        // Keep the edges between nodes, in order, compacting in place.
+        let len = src.len();
+        let mut kept = 0;
+        for i in 0..len {
+            let keep = src[i] != MISS && dst[i] != MISS;
+            if keep {
+                (src[kept], dst[kept]) = (src[i], dst[i]);
+                kept += 1;
+            }
+            self.count_row(i, len, keep);
+        }
+        src.truncate(kept);
+        dst.truncate(kept);
+        (self.src_dense, self.dst_dense) = (src, dst);
+        self.rows = len;
+        Ok(())
+    }
+
+    /// Count row `i` of a chunk of `len` rows, pushed since the node set was
+    /// fixed, as kept or dropped.
+    #[inline]
+    fn count_row(&mut self, i: usize, len: usize, keep: bool) {
+        if !keep {
+            self.dropped += 1;
+            if self.kept.is_none() {
+                let mut kept = BooleanBufferBuilder::new(self.rows_hint.max(self.rows + len));
+                kept.append_n(self.rows + i, true);
+                self.kept = Some(kept);
+            }
+        }
+        if let Some(kept) = &mut self.kept {
+            kept.append(keep);
         }
     }
 
@@ -194,17 +314,8 @@ impl EdgeInterner {
             if keep {
                 self.src_dense.push(s[i]);
                 self.dst_dense.push(d[i]);
-            } else {
-                self.dropped += 1;
-                if self.kept.is_none() {
-                    let mut kept = BooleanBufferBuilder::new(self.rows_hint.max(self.rows + len));
-                    kept.append_n(self.rows + i, true);
-                    self.kept = Some(kept);
-                }
             }
-            if let Some(kept) = &mut self.kept {
-                kept.append(keep);
-            }
+            self.count_row(i, len, keep);
         }
         self.rows += len;
         Ok(())
@@ -235,6 +346,7 @@ impl EdgeInterner {
         if self.closed {
             return self.push_closed(src, dst, kind);
         }
+        let provisional = self.provisional;
         let map = self.map.get_or_insert_with(|| kind.new_map());
         let (sd, dd) = (&mut self.src_dense, &mut self.dst_dense);
         if let IdMap::Int64 { to_dense, .. } = map {
@@ -272,6 +384,11 @@ impl EdgeInterner {
                 } else {
                     for i in 0..s.len() {
                         if s.is_null(i) || d.is_null(i) {
+                            if provisional {
+                                sd.push(MISS);
+                                dd.push(MISS);
+                                continue;
+                            }
                             return Err(IdError::Null);
                         }
                         sd.push(map.intern_i64(s.value(i))?);
@@ -297,6 +414,11 @@ impl EdgeInterner {
                 }
                 for i in 0..s.len() {
                     if s.is_null(i) || d.is_null(i) {
+                        if provisional {
+                            sd.push(MISS);
+                            dd.push(MISS);
+                            continue;
+                        }
                         return Err(IdError::Null);
                     }
                     sd.push(map.intern_str(s.value(i))?);
@@ -1282,6 +1404,82 @@ mod tests {
             interner.push(&Int64Array::from(vec![1]), &Int64Array::from(vec![1])),
             Err(IdError::MixedTypes)
         );
+    }
+
+    /// The dense endpoints, ids, dropped count and kept rows of `interner`.
+    type Built = (Vec<u32>, Vec<u32>, ArrayRef, u64, Option<Vec<bool>>);
+
+    fn built(mut interner: EdgeInterner) -> Built {
+        let dropped = interner.n_dropped();
+        let kept = interner.kept_rows().map(|k| k.iter().collect());
+        let (map, sd, dd) = interner.finish();
+        (sd, dd, map.user_id_array(), dropped, kept)
+    }
+
+    /// Edges interned provisionally while the nodes are read, then adopted,
+    /// give what pushing them after the nodes gives, wherever the switch
+    /// from provisional to closed falls (#385).
+    #[test]
+    fn edges_adopted_after_the_nodes_are_the_edges_pushed_after_them() {
+        let ints = |v: &[Option<i64>]| -> ArrayRef { Arc::new(Int64Array::from(v.to_vec())) };
+        let strs = |v: &[Option<i64>]| -> ArrayRef {
+            Arc::new(StringArray::from(
+                v.iter()
+                    .map(|x| x.map(|x| format!("n{x}")))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        type Ids<'a> = &'a [Option<i64>];
+        let nodes = [Some(5), Some(1), None, Some(9), Some(1), Some(30), Some(2)];
+        // Chunks of edges: dangling ids (7, 8, 40), nulls, repeats, and ids
+        // first seen in another order than the nodes give them.
+        let chunks: [(Ids, Ids); 4] = [
+            (&[Some(9), Some(7), Some(1)], &[Some(1), Some(5), Some(9)]),
+            (&[None, Some(2), Some(30)], &[Some(1), Some(8), Some(2)]),
+            (&[Some(2), Some(5), Some(40)], &[Some(30), None, Some(1)]),
+            (&[Some(1), Some(9)], &[Some(5), Some(9)]),
+        ];
+        for make in [ints, strs] {
+            let with_nodes = || {
+                let mut nodes_interner = EdgeInterner::with_capacity(8);
+                nodes_interner.push_nodes(make(&nodes).as_ref()).unwrap();
+                nodes_interner.close_nodes();
+                nodes_interner
+            };
+            let mut closed = with_nodes();
+            for (s, d) in chunks {
+                closed.push(make(s).as_ref(), make(d).as_ref()).unwrap();
+            }
+            let expected = built(closed);
+            assert_eq!(expected.3, 5, "dropped");
+            // The first `split` chunks provisional, the rest pushed after.
+            for split in 0..=chunks.len() {
+                let mut early = EdgeInterner::provisional(8);
+                for (s, d) in &chunks[..split] {
+                    early.push(make(s).as_ref(), make(d).as_ref()).unwrap();
+                }
+                let mut interner = with_nodes();
+                interner.adopt(early).unwrap();
+                for (s, d) in &chunks[split..] {
+                    interner.push(make(s).as_ref(), make(d).as_ref()).unwrap();
+                }
+                let got = built(interner);
+                assert_eq!(got.0, expected.0, "src, split {split}");
+                assert_eq!(got.1, expected.1, "dst, split {split}");
+                assert_eq!(got.2.as_ref(), expected.2.as_ref(), "ids, split {split}");
+                assert_eq!((got.3, &got.4), (expected.3, &expected.4), "split {split}");
+            }
+        }
+        // No node at all: every edge is dropped.
+        let mut early = EdgeInterner::provisional(2);
+        early
+            .push(&Int64Array::from(vec![1, 2]), &Int64Array::from(vec![2, 1]))
+            .unwrap();
+        let mut interner = EdgeInterner::with_capacity(2);
+        interner.close_nodes();
+        interner.adopt(early).unwrap();
+        assert_eq!(interner.n_dropped(), 2);
+        assert_eq!(interner.finish().1, Vec::<u32>::new());
     }
 
     #[test]
