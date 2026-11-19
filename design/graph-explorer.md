@@ -26,7 +26,7 @@ The phases, each of which ships something a user can use:
 | 4 | History → SQL: `.graph sql`, shared explorations, export | #281 |
 | 5 | Beyond the web: the notebook widget and HTML export on the same core | #343 |
 
-Phases 3 and 5 do not depend on Phase 2 and can run beside it.
+Most of Phases 3 and 5 does not depend on Phase 2 and can run beside it.
 
 ## 1. Current state and gaps
 
@@ -163,7 +163,7 @@ A node's identity is `(label, key)`, so two vertex tables may reuse a key. An ed
 
 By **provenance first, names second**.
 
-- **Provenance:** graph functions and `GRAPH_TABLE` mark their output fields with Arrow field metadata. `ursa.role` is one of `node`, `src`, `dst`, `seed`, `distance`, `path_nodes`, `path_edges`, `path_elements`, `metric`, `category`, `property`. `ursa.graph` names the property graph, `ursa.label` the vertex or edge table, and for `GRAPH_TABLE`, `ursa.var` the pattern variable and `ursa.pattern` (on the schema) the pattern's edges as pairs of variables. Metadata follows a column through `SELECT`, `WHERE`, `ORDER BY`, `LIMIT` and joins, and is lost when an expression computes a new value (`round(pagerank, 4)`), which is right: the new column is no longer known to be a node key. The first task of that issue is to confirm which DataFusion 55 operators keep field metadata, and to carry it through aliases if they do not.
+- **Provenance:** graph functions and `GRAPH_TABLE` mark their output fields with Arrow field metadata. `ursa.role` is one of `node`, `src`, `dst`, `seed`, `distance`, `path_nodes`, `path_edges`, `path_elements`, `metric`, `category`, `property`. `ursa.graph` names the property graph, `ursa.label` the vertex or edge table, and for `GRAPH_TABLE`, `ursa.var` the pattern variable and `ursa.pattern` (on the schema) the pattern's edges as pairs of variables. Metadata follows a column through `SELECT`, `WHERE`, `ORDER BY`, `LIMIT` and joins, and is lost when an expression computes a new value (`round(pagerank, 4)`), which is right: the new column is no longer known to be a node key. The first task of that issue is to confirm which DataFusion 55 operators keep field metadata, and to carry it through aliases if they do not. Roles also keep the view independent of column names, which #415 proposes to change (`shortest_path`'s `hop` to `step`, `random_walk`'s `node` to `id`).
 - **Names and types:** when there is no metadata (a plain `SELECT` over a Parquet file), the fallback reads names: `src`/`dst`, `source`/`target`, `from`/`to` are endpoints; `id` or `node` is a node key; `seed`, `id`, `distance` together are a hop result; a list column whose elements have the node keys' type is a path.
 
 A node key or an endpoint must be an integer, a string, or another discrete type, and both endpoints must be the same type. **A float or a list is never a node id.** That alone removes today's `id → pagerank` drawings.
@@ -178,7 +178,7 @@ The first rule that matches draws the result. The pane's status line says which:
 | 1 | a path column (`vertices(p)`, optionally `edges(p)` or `element_id(p)`) | **Paths.** Each row is a path; its consecutive nodes are edges. The union of all rows is drawn, highlighted. One row (`ANY SHORTEST`): a **route**, its ends marked, laid out left to right. Several rows with the same ends (`ALL SHORTEST`, `SHORTEST k`): **layers**, by position in the path. Other columns (`steps`, a cost) label the path. |
 | 2 | `seed`, `id` and `distance` (a `hop` result) | **Rings.** Nodes are the seeds and the reached nodes. Edges are the graph's edges among them (`induced_edges`). One seed: concentric rings by distance. Several: layers by distance from the nearest seed. Distance colours the nodes unless `COLOR BY` says otherwise. |
 | 3 | endpoint columns (`src` and `dst` by role or name; or exactly two node variables' keys from `GRAPH_TABLE`) | **Edges.** One edge a row. Other columns are edge attributes; a numeric `weight` sets edge width. |
-| 4 | three or more node variables' keys from `GRAPH_TABLE` | **Pattern matches.** For each row, one edge for each edge of the pattern whose two ends are both in `COLUMNS`. `a.club` and other properties attach to their variable's node. |
+| 4 | three or more node variables' keys from `GRAPH_TABLE` | **Pattern matches.** For each row, one edge for each edge of the pattern whose two ends are both in `COLUMNS`. `a.club` and other properties attach to their variable's node. Variables of different vertex tables are nodes of different labels, coloured by label unless `COLOR BY` says otherwise. |
 | 5 | one node key column (`pagerank`, `louvain`, `algorithms`, `degree`, a vertex table) | **Nodes.** The nodes, and the graph's edges among them. The first numeric metric sizes them and the first category colours them, by what the column is: `pagerank`, `betweenness`, `closeness`, `degree`, `triangle_count` and `clustering_coefficient` size; `louvain`, `label_propagation` and `connected_components` colour. When the rows are every node of the graph, this is `.graph g SIZE BY … COLOR BY …`. |
 | 6 | none of these | Not a graph. The message names the columns and their types, and shows the `AS` clause that would draw it. |
 
