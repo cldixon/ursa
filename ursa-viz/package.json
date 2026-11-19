@@ -1,0 +1,10 @@
+{
+  "name": "ursa-viz-browser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:browser": "bun tests/browser/view.ts",
+    "bench": "bun tests/browser/bench.ts",
+    "bench:report": "bun bench/report.ts"
+  }
+}

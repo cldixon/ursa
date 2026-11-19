@@ -160,6 +160,21 @@ checks them:
 bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONLY=<name>; MODE=flat|multilevel
 ```
 
+## Benchmark
+
+[`BENCH.md`](BENCH.md) has the baseline: time to first frame and to layout
+done, frame time while panning and zooming, pick latency, memory and bytes
+uploaded, on R-MAT graphs and grids of 1K to 1M edges, under WebGPU and
+WebGL2, plus the layout alone natively. Not in CI; to rerun it (after the
+build above), from `ursa-viz/`:
+
+```sh
+bun add --no-save playwright@1.63.0   # once, if Playwright is not installed
+bun run bench                         # writes bench/results.json
+SIZES=1k,10k BACKENDS=webgl2 NATIVE=0 bun run bench   # a quick subset
+HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
+```
+
 ## Not yet
 
 - **A 1M-edge R-MAT graph fully converged in seconds.** Coarse to fine

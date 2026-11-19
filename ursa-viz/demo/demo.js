@@ -15,16 +15,23 @@ canvas.height = Math.round(canvas.clientHeight * dpr);
 const stats = (window.stats = { phase: "loading" });
 
 const t0 = performance.now();
-await init();
+// The wasm's exports: `memory` is what the bench reads.
+window.wasm = await init();
+stats.initMs = performance.now() - t0;
+const tg = performance.now();
 const g = fromParams(params);
-stats.generateMs = performance.now() - t0;
+stats.generateMs = performance.now() - tg;
 const t1 = performance.now();
+// Page-clock marks (ms since navigation), for the bench: when the graph was
+// ready, the first frame with layout positions, the layout's end.
+stats.graphReadyAt = t1;
 const view = await createView(canvas, g.n, g.src, g.dst);
 stats.createMs = performance.now() - t1;
 if (g.community) view.colorBy(g.community);
 window.view = view;
 // An image of the view; frames pause while it is taken.
 let paused = false;
+window.pauseFrames = (on) => { paused = on; };
 window.snapshot = async () => {
   paused = true;
   try { return await view.snapshot(); } finally { paused = false; }
@@ -38,13 +45,17 @@ let pending = null;
 worker.onmessage = ({ data }) => {
   if (data.type === "positions") {
     pending = data.xy;
+    stats.firstPositionsAt ??= performance.now();
+    stats.workerMemoryBytes = data.memoryBytes;
     stats.iterations = data.iterations;
     stats.level = data.level;
     if (data.msPerIteration !== undefined) stats.msPerIteration = data.msPerIteration;
     if (data.buildMs !== undefined) stats.buildMs = data.buildMs;
+    if (data.workerInitMs !== undefined) stats.workerInitMs = data.workerInitMs;
   } else if (data.type === "done") {
     stats.layoutDone = true;
     stats.layoutMs = data.layoutMs;
+    stats.layoutDoneAt = performance.now();
   }
 };
 const multilevel = params.get("multilevel") !== "0";
@@ -52,14 +63,25 @@ const maxIterations = Number(params.get("iterations") ?? 300);
 stats.multilevel = multilevel;
 worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations, multilevel }, []);
 
-// Frames: draw every animation frame, recording how long each draw takes.
+// Frames: draw every animation frame, recording how long each draw takes,
+// and the positions uploaded (8 bytes a node each time).
+stats.uploads = 0;
+stats.uploadBytes = 0;
 const frameMs = [];
 let frames = 0, since = performance.now();
 function frame() {
   if (paused) { requestAnimationFrame(frame); return; }
   const t = performance.now();
-  if (pending) { view.setPositions(pending); pending = null; }
+  let uploaded = false;
+  if (pending) {
+    view.setPositions(pending);
+    stats.uploads++;
+    stats.uploadBytes += pending.byteLength;
+    pending = null;
+    uploaded = true;
+  }
   view.render();
+  if (uploaded && stats.firstFrameAt === undefined) stats.firstFrameAt = performance.now();
   frameMs.push(performance.now() - t);
   if (frameMs.length > 120) frameMs.shift();
   frames++;
