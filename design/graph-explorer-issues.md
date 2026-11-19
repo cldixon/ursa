@@ -133,7 +133,7 @@ This is the stopgap for the full rules (P1-3), small enough to ship first.
 
 **Goal.** Precise timers and memory measurement now, and the precondition for a shared-memory build later (§6).
 
-**Scope.** Add `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin` to `SECURITY_HEADERS` in `web/src/headers.ts`, so the Worker and the preview both send them. Document them beside the CSP. Verified compatible with a proxy in front of the preview (`design/graph-explorer/coi-proxy.ts`): datasets load by range, `.graph` draws, share links work, no console violation.
+**Scope.** Add `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin` to `SECURITY_HEADERS` in `web/src/headers.ts`, so the Worker and the preview both send them. Document them beside the CSP. Verified compatible with a proxy in front of the preview (`design/graph-explorer/coi-proxy.ts`): datasets load by range, `.graph` draws, `.share` makes its link, no console error. The e2e suite has not been run under them yet: that is this issue's check.
 
 **Acceptance.** `self.crossOriginIsolated === true` on the page and in both workers. e2e passes. The headers are on every response, including `/data/*` (206 responses) and `/engine/*.wasm`.
 

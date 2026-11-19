@@ -74,7 +74,7 @@ What `.graph` draws today after each kind of result on the karate graph (`graph-
 | `createView` on the page's thread | 0.19–0.35 s, **blocking** | it builds a `Topology` and an undirected CSR only to read degrees and seed positions (`View::new`) |
 | Layout worker: topology and hierarchy | 0.71 s | `new Layout(…)` |
 | First drawing | 1.08 s after Enter | |
-| Layout done | 6–11 s | 7.5 s in the README; slower when software rendering takes the cores |
+| Layout done | 6–11 s | 6 s in `web/README.md`; 10.7 s here, with software rendering taking the cores |
 | One redraw, 1M edges | **3.9 s** | software rendering |
 | One redraw, 300K / 100K / 10K / 1K edges | 1.45 s / 0.73 s / 0.22 s / 0.05 s | not linear in edges: it is fill, not vertices |
 | Pick | 0.25 ms at 46K nodes, 0.5 ms at 131K, 4.9 ms at 1M | a linear scan |
@@ -448,7 +448,7 @@ Today there are three wasm instances, each with its own memory: the engine in a 
 
 **3. Would one shared memory fix that?** It would, and it would also let the layout run on every core, which is the larger prize: native `Fa2State` already runs on all cores with the same bits. But a shared wasm memory is a `SharedArrayBuffer`, which needs three things:
 
-- **Cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). For the shell this is free: every resource is same-origin already, as the CSP requires. Tested with the two headers added in front of the preview server (`graph-explorer/coi-proxy.ts`): `crossOriginIsolated` is true, a shared `WebAssembly.Memory` can be made, the datasets load with range requests, `.graph` draws, share links work, and the console reports no violation. The headers are compatible with the CSP as it stands; `frame-ancestors 'none'` already forbids embedding.
+- **Cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). For the shell this is free: every resource is same-origin already, as the CSP requires. Tested with the two headers added in front of the preview server (`graph-explorer/coi-proxy.ts`): `crossOriginIsolated` is true, a shared `WebAssembly.Memory` can be made, the datasets load with range requests, `.graph` draws, `.share` makes its link, and the console reports no error. The headers are compatible with the CSP as it stands; `frame-ancestors 'none'` already forbids embedding.
 - **A threaded wasm build:** `-C target-feature=+atomics,+bulk-memory` with a rebuilt standard library, which is nightly-only (`-Z build-std`). The workspace pins stable 1.97. DataFusion, tokio and object_store would run threaded in the browser for the first time.
 - **A host that sends the headers.** A notebook does not (Jupyter, Colab and VS Code's webviews are not cross-origin isolated), and neither does an HTML file opened from disk. So the widget and the export can never rely on it, and the unshared build has to stay.
 
