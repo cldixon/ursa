@@ -59,6 +59,7 @@ def test_the_catalog_covers_every_graph_function() -> None:
         "closeness",
         "label_propagation",
         "louvain",
+        "layout_fa2",
         "layout_fr",
         "layout_random",
         "layout_circle",

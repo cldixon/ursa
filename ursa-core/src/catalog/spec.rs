@@ -57,6 +57,9 @@ pub enum ParamType {
     OptionalFloat,
     /// A non-negative integer below 2^32.
     Count,
+    /// A non-negative integer below 2^32, or null for the function's own
+    /// choice (`layout_fa2`'s `iterations`, which coarse to fine schedules).
+    OptionalCount,
     /// A non-negative integer below 2^64, or null for the kernel's fixed
     /// default seed.
     Seed,
@@ -454,6 +457,82 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
         shape: Shape::PerNode,
         build: |v| Call::Louvain {
             resolution: v.float("resolution"),
+            seed: v.seed("seed"),
+        },
+    },
+    FunctionSpec {
+        name: "layout_fa2",
+        family: Family::Layout,
+        summary: "ForceAtlas2 force-directed layout, coarse to fine by default: a coarsened graph \
+                  first, then each finer level from its shape, in far fewer iterations of the \
+                  graph itself. Positions are the same bits on any thread count.",
+        networkx: None,
+        params: &[
+            param(
+                "multilevel",
+                ParamType::Bool,
+                Value::Bool(true),
+                "Lay out coarse to fine; false runs flat ForceAtlas2.",
+            ),
+            param(
+                "iterations",
+                ParamType::OptionalCount,
+                Value::Null,
+                "Flat: iterations to run (null is 300). Coarse to fine: iterations of the \
+                 graph itself, coarser levels more (null schedules them by the graph's size).",
+            ),
+            param(
+                "k",
+                ParamType::Float,
+                Value::Float(1.0),
+                "Repulsion strength; scales the drawing rather than changing its shape.",
+            ),
+            param(
+                "gravity",
+                ParamType::Float,
+                Value::Float(1.0),
+                "Pull toward the origin, which keeps components in one picture.",
+            ),
+            param(
+                "strong_gravity",
+                ParamType::Bool,
+                Value::Bool(false),
+                "Gravity grows with distance, pulling a sprawling periphery in.",
+            ),
+            param(
+                "lin_log",
+                ParamType::Bool,
+                Value::Bool(false),
+                "LinLog attraction, ln(1 + d), for more distinct clusters; the same on one \
+                 machine, not bit-identical across platforms.",
+            ),
+            param(
+                "theta",
+                ParamType::OptionalFloat,
+                Value::Null,
+                "Barnes-Hut opening angle, smaller more exact and slower; null is 1.0 coarse \
+                 to fine, 0.5 flat.",
+            ),
+            param(
+                "jitter_tolerance",
+                ParamType::Float,
+                Value::Float(1.0),
+                "Swinging tolerated before the step size is cut; larger converges faster and \
+                 shakes more.",
+            ),
+            SEED,
+        ],
+        outputs: XY,
+        shape: Shape::PerNode,
+        build: |v| Call::LayoutFa2 {
+            multilevel: v.bool("multilevel"),
+            iterations: v.optional_count("iterations"),
+            k: v.float("k"),
+            gravity: v.float("gravity"),
+            strong_gravity: v.bool("strong_gravity"),
+            lin_log: v.bool("lin_log"),
+            theta: v.optional_float("theta"),
+            jitter_tolerance: v.float("jitter_tolerance"),
             seed: v.seed("seed"),
         },
     },

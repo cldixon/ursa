@@ -311,6 +311,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
   weight per edge) and `from_positions` (start positions and masses);
   `layout_fa2` and `layout_fr` give the same bits as before.
+- **Layouts in SQL: `layout_fa2` and `layout_fr`** (#395). Both are table
+  functions of `(id, x, y)`, like the algorithms, and work inside
+  `algorithms(g, …)`, where their columns are `x` and `y`, or
+  `<name>_x` and `<name>_y` (`pos => layout_fa2()`). `layout_fa2` is
+  ForceAtlas2 coarse to fine by default (`layout_fa2_multilevel`);
+  `multilevel => false` runs it flat. Its named arguments are
+  `iterations` (NULL: 300 flat, the size-based schedule coarse to fine;
+  given, coarse to fine, the graph's own iterations, the levels above more),
+  `k`, `gravity`, `strong_gravity`, `lin_log`, `theta` (NULL: 1.0 coarse to
+  fine, 0.5 flat), `jitter_tolerance` and `seed`; `layout_fr` takes
+  `iterations`, `k`, `gravity` and `seed`. Positions are `ursa-core`'s, bit
+  for bit, and the same on any thread count, so they can be saved with
+  `COPY … TO 'layout.parquet'`. The layouts take no weight. A graph with a
+  vertex table gives every vertex a position. `layout_random` and
+  `layout_circle` stay hidden. The catalog gains `layout_fa2` and an
+  `OptionalCount` parameter type; the Python library has
+  `ursa._graph.layout_fa2`, not yet exported, as the other layouts.
 - **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
   in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
   to 1M edges, under WebGPU and WebGL2, and records time to first frame and

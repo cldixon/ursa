@@ -6,12 +6,12 @@
 //! accepted values and output types, shared with the Python library, so a call
 //! means the same thing in both. This module only adds SQL's choices:
 //!
-//! - **Which functions.** Every algorithm, every statistic and the neighbour
-//!   aggregation. The layouts (`layout_fr`, `layout_random`,
-//!   `layout_circle`) are left out ([`in_sql`]), hidden until the
-//!   visualization work, as they are from the Python library's public API. A
-//!   call fails as an unknown function would, and no message or listing names
-//!   them.
+//! - **Which functions.** Every algorithm, every statistic, the neighbour
+//!   aggregation, and the force-directed layouts `layout_fa2` and `layout_fr`
+//!   (#395), which return `(id, x, y)`. The trivial layouts (`layout_random`,
+//!   `layout_circle`) are left out ([`in_sql`]), as they are from the Python
+//!   library's public API: a call fails as an unknown function would, and no
+//!   message or listing names them.
 //! - **Node values.** The neighbour aggregation (`neighbors_agg`) reads one
 //!   value per node. SQL gives them as a query of `(id, value)` rows,
 //!   `values => (SELECT id, age FROM people)` ([`VALUES`], a parameter only
@@ -44,8 +44,11 @@ pub const URSA_FUNCTIONS: &str = "ursa_functions";
 /// it rejects is unknown to SQL: not callable, not suggested, not listed by
 /// `ursa_functions()`.
 fn in_sql(spec: &FunctionSpec) -> bool {
-    spec.family != Family::Layout
+    spec.family != Family::Layout || SQL_LAYOUTS.contains(&spec.name)
 }
+
+/// The layouts SQL offers.
+const SQL_LAYOUTS: &[&str] = &["layout_fa2", "layout_fr"];
 
 /// The catalog function called `name`, if SQL can call it.
 pub fn lookup(name: &str) -> Option<&'static FunctionSpec> {
@@ -138,6 +141,7 @@ pub fn sql_type(name: &str, ty: ParamType) -> &'static str {
         ParamType::Float => "number",
         ParamType::OptionalFloat => "number or NULL",
         ParamType::Count => "integer",
+        ParamType::OptionalCount => "integer or NULL",
         ParamType::Seed => "integer or NULL",
         ParamType::Bool => "boolean",
         ParamType::Choice(_) | ParamType::Direction(_) | ParamType::Dtype => "string",
@@ -241,6 +245,7 @@ pub(crate) fn expected_text(want: Expected) -> &'static str {
         Expected::Number => "a number",
         Expected::FiniteNumber => "a finite number",
         Expected::Count => "a non-negative integer below 2^32",
+        Expected::CountOrNull => "a non-negative integer below 2^32, or NULL",
         Expected::Seed => "a non-negative integer or NULL",
         Expected::NumberOrNull => "a number or NULL",
         Expected::Bool => "a boolean",
@@ -580,23 +585,26 @@ mod tests {
     }
 
     #[test]
-    fn layouts_are_hidden() {
-        for name in ["layout_fr", "layout_random", "layout_circle"] {
+    fn the_trivial_layouts_are_hidden() {
+        for name in ["layout_random", "layout_circle"] {
             assert!(catalog::lookup(name).is_some(), "{name} is in the catalog");
             assert!(lookup(name).is_none(), "{name} is hidden from SQL");
             assert!(names().all(|n| n != name));
             assert!(specs().all(|s| s.name != name));
         }
-        // No suggestion leads to a hidden name.
-        for typo in [
-            "layout_f",
-            "layout_frr",
-            "layout_randm",
-            "layout_circl",
-            "layout",
-        ] {
-            assert_eq!(did_you_mean(typo, names()), None, "{typo}");
+        for name in ["layout_fa2", "layout_fr"] {
+            assert!(lookup(name).is_some(), "{name} is in SQL");
+            assert!(names().any(|n| n == name));
         }
+        // No suggestion leads to a hidden name.
+        for typo in ["layout_randm", "layout_circl"] {
+            let suggestion = did_you_mean(typo, names());
+            assert!(
+                !matches!(suggestion, Some("layout_random" | "layout_circle")),
+                "{typo}: {suggestion:?}"
+            );
+        }
+        assert_eq!(did_you_mean("layout_frr", names()), Some("layout_fr"));
     }
 
     #[test]

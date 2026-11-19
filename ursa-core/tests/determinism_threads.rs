@@ -378,3 +378,49 @@ fn connected_components_are_thread_count_independent() {
         }
     }
 }
+
+/// The catalog's `layout_fa2` (what SQL's `layout_fa2(g, ...)` runs), coarse
+/// to fine and flat, with its named parameters, across thread counts.
+#[test]
+fn catalog_layout_fa2_is_thread_count_independent() {
+    use arrow::array::{Array, Float32Array};
+    use ursa_core::catalog::{self, Arg, Evaluator, Inputs};
+
+    let topo = seeded_graph(2000, 5000);
+    let calls: [Vec<(&str, Arg)>; 3] = [
+        vec![],
+        vec![("iterations", Arg::Int(30)), ("seed", Arg::Int(4))],
+        vec![
+            ("multilevel", Arg::Bool(false)),
+            ("iterations", Arg::Int(40)),
+            ("strong_gravity", Arg::Bool(true)),
+            ("theta", Arg::Float(0.8)),
+        ],
+    ];
+    let spec = catalog::lookup("layout_fa2").unwrap();
+    for args in calls {
+        let call = spec.resolve(args.clone()).unwrap().call;
+        let run = || {
+            let columns = Evaluator::new(&topo, None)
+                .evaluate(&call, Inputs::default())
+                .unwrap();
+            columns
+                .iter()
+                .map(|c| {
+                    let c = c.as_any().downcast_ref::<Float32Array>().unwrap();
+                    c.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let baseline = on_pool(1, run);
+        assert_eq!(baseline.len(), 2);
+        assert_eq!(baseline[0].len(), topo.n_nodes());
+        for threads in [2, 3, 8] {
+            assert_eq!(
+                on_pool(threads, run),
+                baseline,
+                "{args:?} on {threads} threads"
+            );
+        }
+    }
+}
