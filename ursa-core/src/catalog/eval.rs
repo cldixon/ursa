@@ -12,9 +12,10 @@ use super::stats;
 use crate::algo::{
     betweenness, betweenness_weighted, closeness_directed, closeness_weighted_directed,
     clustering_from_triangles, connected_components_strong, connected_components_weak, degree,
-    label_propagation, layout_circle, layout_fr, layout_random, louvain, louvain_weighted,
-    neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles, symmetric_view,
-    symmetric_view_weighted, undirected_view, LayoutParams, PageRankParams, UndirectedView,
+    label_propagation, layout_circle, layout_fa2, layout_fa2_multilevel, layout_fr, layout_random,
+    louvain, louvain_weighted, neighbor_aggregate, pagerank, pagerank_weighted, per_node_triangles,
+    symmetric_view, symmetric_view_weighted, undirected_view, Fa2Multilevel, Fa2Params,
+    LayoutParams, MultilevelParams, PageRankParams, UndirectedView,
 };
 use crate::topology::{Direction, EdgeMask, Topology};
 
@@ -264,6 +265,38 @@ impl<'a> Evaluator<'a> {
         let (topo, mask) = (self.topo, self.mask);
         let one = |a: ArrayRef| vec![a];
         match *call {
+            Call::LayoutFa2 {
+                multilevel,
+                iterations,
+                k,
+                gravity,
+                strong_gravity,
+                lin_log,
+                theta,
+                jitter_tolerance,
+                seed,
+            } => {
+                let base = if multilevel {
+                    MultilevelParams::default().fa2
+                } else {
+                    Fa2Params::default()
+                };
+                let fa2 = Fa2Params {
+                    iterations: iterations.unwrap_or(base.iterations),
+                    k: k as f32,
+                    gravity: gravity as f32,
+                    strong_gravity,
+                    lin_log,
+                    theta: theta.map_or(base.theta, |t| t as f32),
+                    jitter_tolerance: jitter_tolerance as f32,
+                    seed,
+                };
+                if multilevel {
+                    xy(coarse_to_fine(topo, mask, fa2, iterations))
+                } else {
+                    xy(layout_fa2(topo, mask, fa2))
+                }
+            }
             Call::LayoutFr {
                 iterations,
                 k,
@@ -418,6 +451,42 @@ fn layout_params(iterations: u32, k: f64, gravity: f64, seed: Option<u64>) -> La
         seed,
         ..LayoutParams::default()
     }
+}
+
+/// Coarse to fine with `fa2`'s force law. `iterations`, if given, is the
+/// input graph's (the schedule's otherwise): each level up gets 1.5 times as
+/// many as the one below, up to the larger of it and the schedule's cap, the
+/// coarsest its usual 300. A graph too small to coarsen is its own coarsest
+/// level, and gets `iterations` too.
+fn coarse_to_fine(
+    topo: &Topology,
+    mask: Option<&EdgeMask>,
+    fa2: Fa2Params,
+    iterations: Option<u32>,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut params = MultilevelParams {
+        fa2,
+        ..MultilevelParams::default()
+    };
+    let Some(n) = iterations else {
+        return layout_fa2_multilevel(topo, mask, params);
+    };
+    if topo.n_nodes() == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    // No work budget: the input graph gets the floor, `n`, exactly.
+    params.finest_work = 0.0;
+    params.min_iterations = n;
+    params.max_iterations = params.max_iterations.max(n);
+    let view = undirected_view(topo, mask);
+    let adj = view.get();
+    let mut state = Fa2Multilevel::new(adj, params);
+    if state.level_sizes().len() == 1 {
+        params.coarsest_iterations = n;
+        state = Fa2Multilevel::new(adj, params);
+    }
+    state.step(adj, f64::INFINITY);
+    state.into_positions()
 }
 
 fn xy((x, y): (Vec<f32>, Vec<f32>)) -> Vec<ArrayRef> {

@@ -147,6 +147,72 @@ LIMIT 3;
 
 The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. (In 0.6.0, `count` and `n_unique` return floats, and strings take only those two.) A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
 
+## Lay out a graph
+
+**New in 0.12.** `layout_fa2` and `layout_fr` are force-directed layouts: each returns one row per node, its `id` and its position, `x` and `y`. `layout_fa2` is ForceAtlas2, laid out coarse to fine: a coarsened graph first, then each finer level from its shape, which takes far fewer iterations of the graph itself than flat ForceAtlas2. `multilevel => false` runs flat ForceAtlas2 instead:
+
+```sql
+SELECT id, round(x, 2) AS x, round(y, 2) AS y
+FROM layout_fa2(karate)
+ORDER BY id
+LIMIT 3;
+```
+
+```text
+┌───────┬─────────┬─────────┐
+│  id   │    x    │    y    │
+│ Int64 │ Float32 │ Float32 │
+├───────┼─────────┼─────────┤
+│     0 │    19.8 │    4.06 │
+│     1 │    9.05 │    7.98 │
+│     2 │   -0.08 │   -2.24 │
+└───────┴─────────┴─────────┘
+```
+
+A layout is deterministic: the same call gives the same positions, bit for bit, on any number of threads, so it can be computed once and saved:
+
+```sql
+COPY (SELECT * FROM layout_fa2(karate, seed => 7)) TO 'karate_layout.parquet';
+
+SELECT count(*) AS nodes FROM 'karate_layout.parquet';
+```
+
+```text
+┌────────┐
+│ count  │
+│ UInt64 │
+├────────┤
+│     34 │
+└────────┘
+┌───────┐
+│ nodes │
+│ Int64 │
+├───────┤
+│    34 │
+└───────┘
+```
+
+Inside `algorithms`, a layout's columns are `x` and `y`, or prefixed by its name:
+
+```sql
+SELECT id, degree, round(pos_x, 2) AS x, round(pos_y, 2) AS y
+FROM algorithms(karate, degree(direction => 'both'), pos => layout_fa2(iterations => 50))
+ORDER BY degree DESC
+LIMIT 2;
+```
+
+```text
+┌───────┬────────┬─────────┬─────────┐
+│  id   │ degree │    x    │    y    │
+│ Int64 │ UInt32 │ Float32 │ Float32 │
+├───────┼────────┼─────────┼─────────┤
+│    33 │     17 │  -15.81 │   -5.63 │
+│     0 │     16 │    17.9 │    7.93 │
+└───────┴────────┴─────────┴─────────┘
+```
+
+The [function reference](/docs/reference/functions/#layouts) lists every parameter: `iterations`, `seed`, and ForceAtlas2's `k`, `gravity`, `strong_gravity`, `lin_log`, `theta` and `jitter_tolerance`. The layouts take no weight.
+
 ## Subgraphs
 
 A subgraph is a graph over a view that filters the edges:

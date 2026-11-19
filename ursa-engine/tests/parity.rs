@@ -11,9 +11,9 @@
 //! The Python side is recorded in `fixtures/parity.json` by
 //! `fixtures/generate_parity.py`; see that script for how to regenerate it.
 //!
-//! The layouts are hidden in SQL until the visualization work, as they are
-//! from Python's public API, so their cases cannot run as queries. They run
-//! through the engine's internal path instead: the edge rows read by the
+//! `layout_fa2` and `layout_fr` run as queries. The other layouts are hidden
+//! in SQL, as they are from Python's public API, so their cases cannot run as
+//! queries. They run through the engine's internal path instead: the edge rows read by the
 //! session, the index built by `ursa_io::build_topology_batches` as a graph
 //! node builds it, the call resolved by the engine's argument rules and
 //! evaluated by `ursa_core::catalog`'s dispatch, as a graph node evaluates it.
@@ -154,7 +154,7 @@ fn keyed(rows: Vec<Vec<Cell>>, per_node: bool) -> BTreeMap<Cell, Vec<Cell>> {
     map
 }
 
-/// A layout case, which SQL does not offer, run through the engine's internal
+/// A case of a layout SQL does not offer, run through the engine's internal
 /// path (see the module docs): its columns and rows, as a query would return
 /// them.
 async fn hidden_layout(
@@ -371,7 +371,9 @@ async fn sql_matches_the_python_library() {
         } else {
             (expected_columns, expected)
         };
-        if catalog::lookup(function).is_some_and(|s| s.family == Family::Layout) {
+        let hidden = catalog::lookup(function)
+            .is_some_and(|s| s.family == Family::Layout && functions::lookup(function).is_none());
+        if hidden {
             let id_type = match expected_columns[0].1.as_str() {
                 "int64" => DataType::Int64,
                 _ => DataType::Utf8,

@@ -296,6 +296,30 @@ LIMIT 3;
 
 The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. (In 0.6.0, `count` and `n_unique` return floats, and strings take only those two.) A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
 
+## Lay out a graph
+
+`layout_fa2` lays a graph out for drawing: one row per node, its `id` and its position, `x` and `y`. It is ForceAtlas2, coarse to fine by default (`multilevel => false` runs it flat), and deterministic: the same call gives the same positions whatever the number of threads, so a layout can be saved and drawn later.
+
+```sql
+SELECT id, round(x, 2) AS x, round(y, 2) AS y
+FROM layout_fa2(karate)
+ORDER BY id
+LIMIT 3;
+```
+
+```text
+┌───────┬─────────┬─────────┐
+│  id   │    x    │    y    │
+│ Int64 │ Float32 │ Float32 │
+├───────┼─────────┼─────────┤
+│     0 │    19.8 │    4.06 │
+│     1 │    9.05 │    7.98 │
+│     2 │   -0.08 │   -2.24 │
+└───────┴─────────┴─────────┘
+```
+
+`layout_fr` is Fruchterman-Reingold. Both go inside `algorithms` too, their columns prefixed by a name: `algorithms(karate, degree(), pos => layout_fa2())` gives `pos_x` and `pos_y`.
+
 ## Direction
 
 Every edge is stored from `src` to `dst`. Algorithms that walk edges take a `direction`:

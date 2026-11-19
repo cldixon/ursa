@@ -211,7 +211,7 @@ async fn algorithms_errors() {
             "SELECT * FROM algorithms(karate, upper('x'))",
             "algorithms(): there is no graph function 'upper'. The graph functions are: degree, \
              pagerank, connected_components, triangle_count, clustering_coefficient, \
-             betweenness, closeness, label_propagation, louvain",
+             betweenness, closeness, label_propagation, louvain, layout_fa2, layout_fr",
         ),
         (
             "SELECT * FROM algorithms(karate, pagerank(0.9))",
@@ -576,6 +576,8 @@ betweenness,algorithm
 closeness,algorithm
 label_propagation,algorithm
 louvain,algorithm
+layout_fa2,layout
+layout_fr,layout
 neighbors_agg,aggregation
 density,statistic
 avg_path_length,statistic
@@ -741,13 +743,16 @@ async fn every_function_runs_on_an_empty_graph() {
     }
 }
 
-/// The layouts are hidden in SQL until the visualization work: a call fails
-/// as an unknown function does, and nothing suggests or lists them.
+/// The trivial layouts (`layout_random`, `layout_circle`) are hidden in SQL,
+/// as they are from Python's public API: a call fails as an unknown function
+/// does, and nothing suggests or lists them. `layout_fa2` and `layout_fr`
+/// are offered (`tests/layouts.rs`).
 #[tokio::test]
-async fn layouts_are_hidden() {
+async fn trivial_layouts_are_hidden() {
     let ctx = session().await;
     let per_node = "degree, pagerank, connected_components, triangle_count, \
-                    clustering_coefficient, betweenness, closeness, label_propagation, louvain";
+                    clustering_coefficient, betweenness, closeness, label_propagation, louvain, \
+                    layout_fa2, layout_fr";
     let all = format!(
         "{per_node}, neighbors_agg, density, avg_path_length, diameter, describe, hop, \
          shortest_path, random_walk, algorithms"
@@ -760,7 +765,7 @@ async fn layouts_are_hidden() {
              {per_node}"
         )
     };
-    for layout in ["layout_fr", "layout_random", "layout_circle"] {
+    for layout in ["layout_random", "layout_circle"] {
         for sql in [
             format!("SELECT * FROM {layout}(karate)"),
             format!("SELECT * FROM {layout}(karate, seed => 1)"),
@@ -786,18 +791,35 @@ async fn layouts_are_hidden() {
         );
     }
     // A near miss suggests no hidden name.
-    for typo in ["layout_f", "layout_frr", "layout_circl", "layout_randm"] {
-        let sql = format!("SELECT * FROM {typo}(karate)");
-        assert_eq!(error(&ctx, &sql).await, unknown(typo), "{sql}");
-        let sql = format!("SELECT * FROM algorithms(karate, {typo}())");
-        assert_eq!(error(&ctx, &sql).await, unknown_nested(typo), "{sql}");
+    for typo in ["layout_circl", "layout_randm"] {
+        for sql in [
+            format!("SELECT * FROM {typo}(karate)"),
+            format!("SELECT * FROM algorithms(karate, {typo}())"),
+        ] {
+            let message = error(&ctx, &sql).await;
+            assert!(
+                message.starts_with(&format!(
+                    "{}there is no graph function '{typo}'",
+                    if sql.contains("algorithms") {
+                        "algorithms(): "
+                    } else {
+                        ""
+                    }
+                )),
+                "{sql}: {message}"
+            );
+            assert!(
+                !message.contains("layout_circle") && !message.contains("layout_random"),
+                "{sql}: {message}"
+            );
+        }
     }
     assert_eq!(
         csv(
             &ctx,
-            "SELECT count(*) AS n FROM ursa_functions() WHERE family = 'layout'"
+            "SELECT name FROM ursa_functions() WHERE family = 'layout' ORDER BY name"
         )
         .await,
-        "n\n0\n"
+        "name\nlayout_fa2\nlayout_fr\n"
     );
 }

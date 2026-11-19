@@ -50,6 +50,11 @@ impl GraphVerb {
             "iterations" => &self.iterations,
             "k" => &self.k,
             "gravity" => &self.gravity,
+            "multilevel" => &self.multilevel,
+            "strong_gravity" => &self.strong_gravity,
+            "lin_log" => &self.lin_log,
+            "theta" => &self.theta,
+            "jitter_tolerance" => &self.jitter_tolerance,
             _ => return None,
         };
         field.clone()
@@ -100,6 +105,7 @@ impl GraphVerb {
                     Expected::Number | Expected::NumberOrNull => "a number",
                     Expected::FiniteNumber => "a finite number",
                     Expected::Count => "a non-negative integer below 2**32",
+                    Expected::CountOrNull => "a non-negative integer below 2**32, or None",
                     Expected::Seed => "a non-negative integer",
                     Expected::Bool => "a bool",
                 };

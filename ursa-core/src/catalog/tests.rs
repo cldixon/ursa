@@ -94,6 +94,7 @@ fn the_catalog_covers_the_python_api() {
             "diameter",
             "label_propagation",
             "layout_circle",
+            "layout_fa2",
             "layout_fr",
             "layout_random",
             "louvain",
@@ -146,6 +147,20 @@ fn defaults_are_the_python_apis() {
             ("iterations", UInt(300)),
             ("k", Float(1.0)),
             ("gravity", Float(0.02)),
+            ("seed", Null),
+        ]
+    );
+    assert_eq!(
+        defaults("layout_fa2"),
+        [
+            ("multilevel", Bool(true)),
+            ("iterations", Null),
+            ("k", Float(1.0)),
+            ("gravity", Float(1.0)),
+            ("strong_gravity", Bool(false)),
+            ("lin_log", Bool(false)),
+            ("theta", Null),
+            ("jitter_tolerance", Float(1.0)),
             ("seed", Null),
         ]
     );

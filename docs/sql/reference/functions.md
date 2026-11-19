@@ -6,7 +6,7 @@
 
 Every graph function Ursa's SQL engine offers. The page is generated from `SELECT * FROM ursa_functions()`, so it matches the engine you run.
 
-An algorithm or a statistic takes the graph as its first argument, then named parameters with `=>`. It returns one row per node: the node's `id` and its output columns. `neighbors_agg` does too, from a value per node it reads. A traversal returns rows of its own: the nodes reached, a path's edges, or walks. `algorithms` runs several per-node functions in one call.
+An algorithm or a statistic takes the graph as its first argument, then named parameters with `=>`. It returns one row per node: the node's `id` and its output columns. `neighbors_agg` does too, from a value per node it reads, and so does a layout, its columns the node's position, `x` and `y`. A traversal returns rows of its own: the nodes reached, a path's edges, or walks. `algorithms` runs several per-node functions in one call.
 
 A parameter's default is the SQL literal used when the parameter is left out. `required` means the call must give it. A `string` parameter with choices takes one of them, quoted: `direction => 'both'`. An `expression` parameter takes an expression over the edge table's columns: `weight => log10(1 + weight)`, or for `neighbors_agg`'s `attribute` over the node table's. A `query` parameter takes a subquery in parentheses.
 
@@ -273,6 +273,49 @@ neighbors_agg(graph, values => NULL, direction => 'out', attribute => NULL, agg 
 **Directions:** `'out'`, `'in'`, `'both'`
 
 **Returns:** `neighbors_agg` (Float64; UInt32 for count and n_unique; the values' type for min and max of strings, dates or times, may be NULL)
+
+## Layouts
+
+[`layout_fa2`](#layout_fa2) · [`layout_fr`](#layout_fr)
+
+### layout_fa2
+
+ForceAtlas2 force-directed layout, coarse to fine by default: a coarsened graph first, then each finer level from its shape, in far fewer iterations of the graph itself. Positions are the same bits on any thread count.
+
+```text
+layout_fa2(graph, multilevel => true, iterations => NULL, k => 1.0, gravity => 1.0, strong_gravity => false, lin_log => false, theta => NULL, jitter_tolerance => 1.0, seed => NULL)
+```
+
+| Parameter | Type | Default | Choices | Description |
+|---|---|---|---|---|
+| `multilevel` | boolean | `true` | – | Lay out coarse to fine; false runs flat ForceAtlas2. |
+| `iterations` | integer or NULL | `NULL` | – | Flat: iterations to run (null is 300). Coarse to fine: iterations of the graph itself, coarser levels more (null schedules them by the graph's size). |
+| `k` | number | `1.0` | – | Repulsion strength; scales the drawing rather than changing its shape. |
+| `gravity` | number | `1.0` | – | Pull toward the origin, which keeps components in one picture. |
+| `strong_gravity` | boolean | `false` | – | Gravity grows with distance, pulling a sprawling periphery in. |
+| `lin_log` | boolean | `false` | – | LinLog attraction, ln(1 + d), for more distinct clusters; the same on one machine, not bit-identical across platforms. |
+| `theta` | number or NULL | `NULL` | – | Barnes-Hut opening angle, smaller more exact and slower; null is 1.0 coarse to fine, 0.5 flat. |
+| `jitter_tolerance` | number | `1.0` | – | Swinging tolerated before the step size is cut; larger converges faster and shakes more. |
+| `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
+
+**Returns:** One row per node: `id` (the node), `x` (Float32), `y` (Float32)
+
+### layout_fr
+
+Fruchterman-Reingold force-directed layout.
+
+```text
+layout_fr(graph, iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)
+```
+
+| Parameter | Type | Default | Choices | Description |
+|---|---|---|---|---|
+| `iterations` | integer | `300` | – | Simulation steps. |
+| `k` | number | `1.0` | – | Ideal edge length; sets the units of the positions. |
+| `gravity` | number | `0.02` | – | Pull toward the origin, which keeps components together. |
+| `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
+
+**Returns:** One row per node: `id` (the node), `x` (Float32), `y` (Float32)
 
 ## Traversals
 

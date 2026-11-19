@@ -476,6 +476,47 @@ def louvain(
 # lake is a workflow, not a workaround.
 
 
+def layout_fa2(
+    edges: EdgeFrame,
+    multilevel: bool = True,
+    iterations: int | None = None,
+    k: float = 1.0,
+    gravity: float = 1.0,
+    strong_gravity: bool = False,
+    lin_log: bool = False,
+    theta: float | None = None,
+    jitter_tolerance: float = 1.0,
+    seed: int | None = None,
+) -> LayoutExpr:
+    """ForceAtlas2 layout; ``(x, y)`` as two ``f32`` columns.
+
+    Coarse to fine by default: a coarsened graph is laid out first, then each
+    finer level from its shape, in far fewer iterations of the graph itself
+    than flat ForceAtlas2 needs. ``multilevel=False`` runs flat ForceAtlas2
+    for ``iterations`` (300 when ``None``). Coarse to fine, ``iterations`` is
+    the graph's own, the coarser levels getting more; ``None`` schedules them
+    by the graph's size. ``theta`` is the Barnes-Hut opening angle (``None``:
+    1.0 coarse to fine, 0.5 flat).
+
+    Deterministic: a given ``seed`` reproduces a layout exactly, and the result
+    is bit-identical across thread counts (``lin_log`` is not bit-identical
+    across platforms). The SQL engine's ``layout_fa2(g, ...)`` is the same call.
+    """
+    return _layout_expr(
+        "layout_fa2",
+        edges=_ir.check_edges(edges, "layout_fa2"),
+        multilevel=multilevel,
+        iterations=iterations,
+        k=k,
+        gravity=gravity,
+        strong_gravity=strong_gravity,
+        lin_log=lin_log,
+        theta=theta,
+        jitter_tolerance=jitter_tolerance,
+        seed=seed,
+    )
+
+
 def layout_fr(
     edges: EdgeFrame,
     iterations: int = 300,

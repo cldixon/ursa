@@ -336,14 +336,14 @@ Error: Ambiguous reference to unqualified field id
 
 Write `JOIN algorithms(karate, degree(), pagerank()) USING (id)` instead.
 
-**Layouts.** `layout_fr`, `layout_circle` and `layout_random` are not in SQL. The error lists what is:
+**Layouts.** `layout_fa2` (ForceAtlas2, coarse to fine; `multilevel => false` for flat) and `layout_fr` return one row per node, `id`, `x` and `y`, deterministic on any thread count. In `algorithms`, name them: `pos => layout_fa2()` gives `pos_x` and `pos_y`. They take no `weight`. `layout_circle` and `layout_random` are not in SQL; the error lists what is:
 
 ```sql
-SELECT * FROM layout_fr(karate);
+SELECT * FROM layout_circle(karate);
 ```
 
 ```text
-Error: there is no graph function 'layout_fr'. The graph functions are: degree, pagerank, connected_components, triangle_count, clustering_coefficient, betweenness, closeness, label_propagation, louvain, neighbors_agg, density, avg_path_length, diameter, describe, hop, shortest_path, random_walk, algorithms
+Error: there is no graph function 'layout_circle'. The graph functions are: degree, pagerank, connected_components, triangle_count, clustering_coefficient, betweenness, closeness, label_propagation, louvain, layout_fa2, layout_fr, neighbors_agg, density, avg_path_length, diameter, describe, hop, shortest_path, random_walk, algorithms
 ```
 
 **`log` is base 10.** In DataFusion, as in PostgreSQL and DuckDB, `log(x)` is the base-10 logarithm, not the natural one as in Python. Write `ln(x)` for the natural log, and `log10(x)` when you mean base 10, so the reader does not have to know:

@@ -425,10 +425,11 @@ fn code(text: &str) -> String {
     format!("`{text}`")
 }
 
-const FAMILIES: [(&str, &str); 5] = [
+const FAMILIES: [(&str, &str); 6] = [
     ("algorithm", "Algorithms"),
     ("statistic", "Statistics"),
     ("aggregation", "Neighbour aggregation"),
+    ("layout", "Layouts"),
     ("traversal", "Traversals"),
     ("combinator", "Combining functions"),
 ];
@@ -447,7 +448,8 @@ fn reference(rows: &[serde_json::Value]) -> String {
          `SELECT * FROM ursa_functions()`, so it matches the engine you run.\n\n\
          An algorithm or a statistic takes the graph as its first argument, then named \
          parameters with `=>`. It returns one row per node: the node's `id` and its output \
-         columns. `neighbors_agg` does too, from a value per node it reads. A traversal \
+         columns. `neighbors_agg` does too, from a value per node it reads, and so does a \
+         layout, its columns the node's position, `x` and `y`. A traversal \
          returns rows of its own: the nodes reached, a path's edges, or walks. \
          `algorithms` runs several per-node functions in one call.\n\n\
          A parameter's default is the SQL literal used when the parameter is left out. \
@@ -555,7 +557,7 @@ fn function_section(row: &serde_json::Value) -> String {
     if !outputs.is_empty() {
         let mut columns: Vec<String> = Vec::new();
         let shape = match text(row, "family") {
-            "algorithm" => {
+            "algorithm" | "layout" => {
                 columns.push(format!("{} (the node)", code("id")));
                 "One row per node: "
             }
