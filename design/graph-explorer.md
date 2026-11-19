@@ -611,21 +611,21 @@ Two rules for the numbers:
 - **Risks:** wheel size (the bundle is about 1 MB gzipped, behind an extra); notebooks' sandboxes (no workers from blob URLs in some hosts: the widget falls back to laying out in the kernel only).
 - **Done when:** the same graph result gives the same picture, read back, in the shell, a notebook and an exported file.
 
-## 11. Open questions for the maintainer
+## 11. Decisions
 
-Each with a recommendation.
+**Decided (2026-11-19): the maintainer accepted every recommendation below.** They were put as open questions, each with a recommendation; they stand as decisions now, and the issues are filed on them.
 
-1. **A new SQL function for the edges among a set of nodes?** Recommended: yes, `induced_edges(g, nodes => …)`. Without it expansion needs an edge-table scan (180 ms at 1M edges in the browser, growing with the graph). The alternative name is `subgraph_edges`; a `hop(…, edges => true)` variant would not serve rule 5.
-2. **Provenance as Arrow field metadata, visible in exported Arrow and Parquet files?** Recommended: yes, under an `ursa.` prefix. It is the standard place for it, and a file that remembers its graph is a feature. Strip it only if a consumer breaks.
-3. **Do the rules replace "the first two columns"?** Recommended: yes, as a behaviour change in 0.12, keeping two same-typed discrete columns as edges. The cases it breaks are the nonsense ones.
-4. **Actions as dot-commands echoed in the terminal, or silent with a history panel only?** Recommended: commands, echoed, with `.graph echo off`. It is what makes history, sharing and tests free.
-5. **Where does the model live: `ursa-viz` or `ursa-core`?** Recommended: `ursa-viz`'s core, with `ursa-engine` depending on it without default features. `ursa-core` stays algorithms only.
-6. **Send COOP and COEP from the shell now?** Recommended: yes. Verified compatible, and it keeps the threaded option open. The cost is that the shell can never embed a cross-origin resource without CORP, which the CSP already forbids.
-7. **A threaded wasm build at all?** Recommended: a one-week spike at the end of Phase 3, layout only, on a nightly toolchain kept out of the release build. Decide on its numbers. Do not start with it.
-8. **`follow` mode off by default?** Recommended: off. Neo4j Browser draws every result because every result is a graph; a SQL shell's are mostly tables.
-9. **The default expansion cap, and its order?** Recommended: 100, by degree then key. The number is Neo4j's; the order is what makes it reproducible.
-10. **No new epic?** Recommended: none. #280 takes Phases 0, 1 and 3, #281 takes 2 and 4, #343 takes 5, and #277 stays the epic. Each of the three gets a checklist of its issues.
-11. **Is 5M edges the right ceiling for Phase 3?** Recommended: yes for the browser. Past it the layout, not the drawing, is the limit, and the answer is saved positions or the native engine, not a larger tab.
+1. **A new SQL function for the edges among a set of nodes?** Decided: yes, `induced_edges(g, nodes => …)`. Without it expansion needs an edge-table scan (180 ms at 1M edges in the browser, growing with the graph). The alternative name is `subgraph_edges`; a `hop(…, edges => true)` variant would not serve rule 5.
+2. **Provenance as Arrow field metadata, visible in exported Arrow and Parquet files?** Decided: yes, under an `ursa.` prefix. It is the standard place for it, and a file that remembers its graph is a feature. Strip it only if a consumer breaks.
+3. **Do the rules replace "the first two columns"?** Decided: yes, as a behaviour change in 0.12, keeping two same-typed discrete columns as edges. The cases it breaks are the nonsense ones.
+4. **Actions as dot-commands echoed in the terminal, or silent with a history panel only?** Decided: commands, echoed, with `.graph echo off`. It is what makes history, sharing and tests free.
+5. **Where does the model live: `ursa-viz` or `ursa-core`?** Decided: `ursa-viz`'s core, with `ursa-engine` depending on it without default features. `ursa-core` stays algorithms only.
+6. **Send COOP and COEP from the shell now?** Decided: yes. Verified compatible, and it keeps the threaded option open. The cost is that the shell can never embed a cross-origin resource without CORP, which the CSP already forbids.
+7. **A threaded wasm build at all?** Decided: a one-week spike at the end of Phase 3, layout only, on a nightly toolchain kept out of the release build. Decide on its numbers. Do not start with it.
+8. **`follow` mode off by default?** Decided: off. Neo4j Browser draws every result because every result is a graph; a SQL shell's are mostly tables.
+9. **The default expansion cap, and its order?** Decided: 100, by degree then key. The number is Neo4j's; the order is what makes it reproducible.
+10. **No new epic?** Decided: none. #280 takes Phases 0, 1 and 3, #281 takes 2 and 4, #343 takes 5, and #277 stays the epic. Each of the three gets a checklist of its issues.
+11. **Is 5M edges the right ceiling for Phase 3?** Decided: yes for the browser. Past it the layout, not the drawing, is the limit, and the answer is saved positions or the native engine, not a larger tab.
 
 ## Appendix: reproducing the measurements
 
