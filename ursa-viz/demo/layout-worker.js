@@ -2,17 +2,20 @@
 import init, { Layout } from "../pkg/ursa_viz.js";
 
 let layout = null;
+let wasm = null;
 let running = false;
 
 self.onmessage = async ({ data }) => {
   if (data.type === "start") {
-    await init();
+    const ti = performance.now();
+    wasm = await init();
     const t0 = performance.now();
+    const workerInitMs = t0 - ti;
     layout = new Layout(data.n, data.src, data.dst, data.multilevel ?? true);
     const buildMs = performance.now() - t0;
     running = true;
     // Coarse to fine has a place for every node before any iteration: draw it.
-    post({ buildMs });
+    post({ buildMs, workerInitMs });
     loop(data.budgetMs ?? 100, layout.total ?? data.maxIterations ?? 1000, t0);
   } else if (data.type === "stop") {
     running = false;
@@ -21,7 +24,7 @@ self.onmessage = async ({ data }) => {
 
 function post(extra) {
   const xy = new Float32Array(layout.positions());
-  self.postMessage({ type: "positions", xy, iterations: layout.iterations, level: layout.level, ...extra }, [xy.buffer]);
+  self.postMessage({ type: "positions", xy, iterations: layout.iterations, level: layout.level, memoryBytes: wasm.memory.buffer.byteLength, ...extra }, [xy.buffer]);
 }
 
 /**

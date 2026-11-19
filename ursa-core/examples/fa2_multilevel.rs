@@ -12,6 +12,16 @@
 //!
 //! Build with `--no-default-features` for one core, as the browser runs it.
 //!
+//! `bench [sizes] [graphs]` instead times the layout alone on the graph view
+//! benchmark's graphs (`ursa-viz/tests/browser/bench.ts` runs it), and prints
+//! JSON: for each graph, the hierarchy, coarse to fine in one call, and flat
+//! ForceAtlas2's time per iteration. Sizes are `1k,10k,100k,1m` (edges),
+//! graphs `rmat,grid`:
+//!
+//! ```sh
+//! cargo run -p ursa-core --release --example fa2_multilevel -- bench 1k,10k,100k,1m rmat,grid
+//! ```
+//!
 //! For each graph it prints, every few iterations of flat ForceAtlas2 and over
 //! the multilevel schedule:
 //!
@@ -224,7 +234,76 @@ fn dump_edges(name: &str, adj: &UndirectedCsr) {
     }
 }
 
+/// The bench's graphs, as `ursa-viz/tests/browser/bench.ts` names them.
+fn bench_graph(graph: &str, size: &str) -> Topology {
+    match (graph, size) {
+        ("rmat", "1k") => rmat(7, 1_000),
+        ("rmat", "10k") => rmat(11, 10_000),
+        ("rmat", "100k") => rmat(14, 100_000),
+        ("rmat", "1m") => rmat(17, 1_000_000),
+        ("grid", "1k") => grid(23, 23),
+        ("grid", "10k") => grid(71, 71),
+        ("grid", "100k") => grid(224, 224),
+        ("grid", "1m") => grid(707, 707),
+        other => panic!("no bench graph {other:?}"),
+    }
+}
+
+/// `bench`: the layout alone, timed, as JSON on stdout.
+fn bench(sizes: &str, graphs: &str) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let parallel = cfg!(feature = "rayon");
+    let mut rows = Vec::new();
+    for graph in graphs.split(',') {
+        for size in sizes.split(',') {
+            let topo = bench_graph(graph, size);
+            let adj = topo.undirected();
+            let params = MultilevelParams::default();
+            let t = Instant::now();
+            let ml = Fa2Multilevel::new(adj, params);
+            let hierarchy = t.elapsed().as_secs_f64();
+            let (levels, total) = (ml.level_sizes().len(), ml.total_work());
+            drop(ml);
+            let t = Instant::now();
+            let one = ursa_core::algo::layout_fa2_multilevel(&topo, None, params);
+            let multilevel = t.elapsed().as_secs_f64();
+            std::hint::black_box(one);
+            // Flat: enough iterations for a steady time, at most ~2 s.
+            let mut flat = Fa2State::new(adj, Fa2Params::default());
+            let t = Instant::now();
+            flat.step(adj, 1);
+            let first = t.elapsed().as_secs_f64();
+            let its = ((2.0 / first.max(1e-6)) as u32).clamp(1, 100);
+            let t = Instant::now();
+            flat.step(adj, its);
+            let per = t.elapsed().as_secs_f64() / f64::from(its);
+            eprintln!(
+                "native {graph} {size}: coarse to fine {multilevel:.3} s, flat {:.2} ms/it",
+                per * 1e3
+            );
+            rows.push(format!(
+                "{{\"graph\":\"{graph}\",\"size\":\"{size}\",\"nodes\":{},\"edges\":{},\"levels\":{levels},\"totalWork\":{total:.1},\"hierarchyMs\":{:.1},\"multilevelMs\":{:.1},\"flatMsPerIteration\":{:.3},\"flatIterationsTimed\":{its}}}",
+                topo.n_nodes(),
+                adj.targets.len() / 2,
+                hierarchy * 1e3,
+                multilevel * 1e3,
+                per * 1e3,
+            ));
+        }
+    }
+    println!(
+        "{{\"rayon\":{parallel},\"threads\":{},\"graphs\":[{}]}}",
+        if parallel { threads } else { 1 },
+        rows.join(",")
+    );
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("bench") {
+        let arg = |i: usize, d: &str| std::env::args().nth(i).unwrap_or_else(|| d.into());
+        bench(&arg(2, "1k,10k,100k,1m"), &arg(3, "rmat,grid"));
+        return;
+    }
     let which = std::env::args().nth(1).unwrap_or_else(|| "clusters".into());
     let flat_max: u32 = std::env::args()
         .nth(2)

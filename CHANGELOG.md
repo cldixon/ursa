@@ -311,6 +311,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
   weight per edge) and `from_positions` (start positions and masses);
   `layout_fa2` and `layout_fr` give the same bits as before.
+- **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
+  in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
+  to 1M edges, under WebGPU and WebGL2, and records time to first frame and
+  to layout done (coarse to fine, and flat per iteration), synced frame times
+  while panning and zooming (median and p95), pick latency, wasm and JS
+  memory, and bytes uploaded; then the layout alone natively, on one thread
+  and on all (`fa2_multilevel`'s new `bench` mode). It writes
+  `bench/results.json`; `bun run bench:report` makes the tables. The
+  baseline, from a container without a GPU: a first frame in 0.1 s up to
+  100K edges and 1.1 s at 1M, a layout done in 8 s for a 1M-edge R-MAT
+  graph and 32 s for a 1M-edge grid, wasm 1.4 times slower than native on
+  one thread. Not in CI.
 
 ### Changed
 
