@@ -27,6 +27,7 @@ mod label_prop;
 mod layout;
 mod linked;
 mod louvain;
+mod multilevel;
 mod neighbor_agg;
 mod pagerank;
 /// Public because it is independently useful — a deterministic spatial index over
@@ -59,6 +60,7 @@ pub use layout::{
     Positions,
 };
 pub use louvain::{louvain, louvain_weighted};
+pub use multilevel::{layout_fa2_multilevel, Fa2Multilevel, MultilevelParams};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, random_walk_masked, Walks};

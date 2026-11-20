@@ -1,0 +1,224 @@
+---
+// The landing page: an ordinary Astro page, not a Starlight one, in the docs'
+// fonts and colours. The example is the "First query" of docs/index.md.
+import { Code } from "astro:components";
+import Logo from "../components/Logo.astro";
+import { GITHUB_URL, INSTALL, SHELL_URL, TOUR_URL } from "../consts";
+import "../styles/fonts.css";
+import "../styles/landing.css";
+
+const query = `CREATE PROPERTY GRAPH club
+  EDGE TABLES ('karate_edges.csv' SOURCE KEY (src) DESTINATION KEY (dst));
+
+SELECT id, round(pagerank, 4) AS pagerank
+FROM pagerank(club, direction => 'both')
+ORDER BY pagerank DESC
+LIMIT 5;`;
+// The query above as a Share link, which the shell shows and runs on y. Made
+// with web/scripts/share-link.ts: make it again when the query changes.
+const queryLive =
+	"https://ursa-shell.cl-dixon.workers.dev/#run=WyJDUkVBVEUgUFJPUEVSVFkgR1JBUEggY2x1YlxuICBFREdFIFRBQkxFUyAoJ2thcmF0ZV9lZGdlcy5jc3YnIFNPVVJDRSBLRVkgKHNyYykgREVTVElOQVRJT04gS0VZIChkc3QpKTsiLCJTRUxFQ1QgaWQsIHJvdW5kKHBhZ2VyYW5rLCA0KSBBUyBwYWdlcmFua1xuRlJPTSBwYWdlcmFuayhjbHViLCBkaXJlY3Rpb24gPT4gJ2JvdGgnKVxuT1JERVIgQlkgcGFnZXJhbmsgREVTQ1xuTElNSVQgNTsiXQ";
+
+const output = `┌───────┬──────────┐
+│  id   │ pagerank │
+│ Int64 │ Float64  │
+├───────┼──────────┤
+│    33 │   0.1009 │
+│     0 │    0.097 │
+│    32 │   0.0717 │
+│     2 │   0.0571 │
+│     1 │   0.0529 │
+└───────┴──────────┘`;
+
+const features = [
+	{
+		title: "Files are tables",
+		text: "Query Parquet, CSV, JSON and Arrow where they are, on your disk or in S3, GCS and Azure. Nothing to load first.",
+		href: "/docs/import-export/files/",
+	},
+	{
+		title: "A graph is an edge table",
+		text: "CREATE PROPERTY GRAPH, from the SQL standard, names an edge table and its endpoints. Node attributes are optional.",
+		href: "/docs/graphs/property-graphs/",
+	},
+	{
+		title: "Algorithms are table functions",
+		text: "PageRank, components, Louvain, betweenness, shortest paths and more. Join them to anything on id.",
+		href: "/docs/graphs/algorithms/",
+	},
+	{
+		title: "Patterns in SQL/PGQ",
+		text: "GRAPH_TABLE matches nodes, edges and paths of any length, and runs DuckPGQ's examples as written.",
+		href: "/docs/graphs/pattern-matching/",
+	},
+	{
+		title: "Like DuckDB",
+		text: "One binary, no server, a familiar shell and dot-commands, and a database file that keeps your work and graph indexes.",
+		href: "/docs/duckdb/",
+	},
+	{
+		title: "Results you can check",
+		text: "Parallel, deterministic Rust kernels, each pinned to the NetworkX function it matches.",
+		href: "/docs/reference/functions/",
+	},
+];
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Ursa: graph analytics in SQL</title>
+		<meta
+			name="description"
+			content="Ursa is a SQL engine for graph analytics, with a DuckDB-like command-line tool over Parquet, CSV and JSON."
+		/>
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="canonical" href="https://ursa.cldixon.dev/" />
+		<script is:inline>
+			// The theme the docs' toggle chose (Starlight keeps it under this key), or the system's.
+			(() => {
+				let stored = "";
+				try {
+					stored = localStorage.getItem("starlight-theme") || "";
+				} catch {}
+				const theme =
+					stored === "light" || stored === "dark"
+						? stored
+						: matchMedia("(prefers-color-scheme: light)").matches
+							? "light"
+							: "dark";
+				document.documentElement.dataset.theme = theme;
+			})();
+		</script>
+	</head>
+	<body>
+		<header class="bar">
+			<a class="brand" href="/" aria-label="Ursa home">
+				<Logo />
+				<span>Ursa</span>
+			</a>
+			<nav>
+				<a href="/docs/">Docs</a>
+				<a href={SHELL_URL}>Ursa Shell</a>
+				<a href={GITHUB_URL} class="hide-narrow">GitHub</a>
+				<button id="theme" type="button" aria-label="Switch between light and dark" title="Switch between light and dark">
+					<svg class="moon" viewBox="0 0 24 24" aria-hidden="true"
+						><path
+							d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="1.6"
+							stroke-linejoin="round"></path></svg
+					>
+					<svg class="sun" viewBox="0 0 24 24" aria-hidden="true"
+						><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+							><circle cx="12" cy="12" r="4"></circle><path
+								d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"
+							></path></g
+						></svg
+					>
+				</button>
+			</nav>
+		</header>
+
+		<main>
+			<section class="hero">
+				<h1>Graph analytics in SQL</h1>
+				<p class="lede">
+					Ursa is a SQL engine for graphs. Point the <code>ursa</code> command-line tool at an edge list in Parquet,
+					CSV or JSON, name it as a graph, and run PageRank, Louvain, shortest paths and the rest as table functions.
+					It works like DuckDB: one binary, no server.
+				</p>
+				<div class="install">
+					<code id="install">{INSTALL}</code>
+					<button type="button" id="copy" aria-label="Copy the install command" title="Copy">
+						<svg viewBox="0 0 24 24" aria-hidden="true"
+							><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+								><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"
+								></path></g
+							></svg
+						>
+						<span class="copied" hidden>Copied</span>
+					</button>
+				</div>
+				<p class="install-note">
+					On Linux or macOS. For Windows and other ways to install, see <a href="/docs/installation/">Installation</a>.
+				</p>
+				<div class="actions">
+					<a class="button primary" href="/docs/">Read the docs</a>
+					<a class="button" href={TOUR_URL}>Take the tour in your browser</a>
+				</div>
+				<p class="shell-note">
+					<a href={SHELL_URL}>Ursa Shell</a> is the <code>ursa</code> shell in a web page: the same engine, compiled to
+					WebAssembly, runs in your browser, with nothing to install.
+				</p>
+			</section>
+
+			<section class="example" aria-labelledby="example-title">
+				<h2 id="example-title">A file is a table. Name it as a graph, then run an algorithm.</h2>
+				<div class="panes">
+					<figure class="pane">
+						<figcaption>Query</figcaption>
+						<Code code={query} lang="sql" themes={{ light: "github-light", dark: "github-dark" }} defaultColor={false} />
+					</figure>
+					<figure class="pane">
+						<figcaption>Result</figcaption>
+						<pre class="result"><code>{output}</code></pre>
+					</figure>
+				</div>
+				<p class="example-note">
+					Zachary's karate club: 78 friendships between 34 members. <a href={queryLive}>Try this query live</a> in Ursa
+					Shell, or go on from here with the <a href="/docs/quickstart/">Quickstart</a>.
+				</p>
+			</section>
+
+			<section class="features" aria-label="Features">
+				{
+					features.map((f) => (
+						<a class="feature" href={f.href}>
+							<h3>{f.title}</h3>
+							<p>{f.text}</p>
+						</a>
+					))
+				}
+			</section>
+
+			<section class="python">
+				<p>
+					The same engine is also a Python library with a Polars-shaped API: <code>pip install ursa-graph</code>. Its
+					documentation is at <a href="https://cldixon.github.io/ursa/">cldixon.github.io/ursa</a>.
+				</p>
+			</section>
+		</main>
+
+		<footer>
+			<span>Ursa is open source, MIT or Apache-2.0.</span>
+			<span><a href="/docs/">Docs</a> · <a href={SHELL_URL}>Ursa Shell</a> · <a href={GITHUB_URL}>GitHub</a></span>
+		</footer>
+
+		<script>
+			const root = document.documentElement;
+			document.getElementById("theme")?.addEventListener("click", () => {
+				const next = root.dataset.theme === "dark" ? "light" : "dark";
+				root.dataset.theme = next;
+				try {
+					localStorage.setItem("starlight-theme", next);
+				} catch {}
+			});
+			const copy = document.getElementById("copy");
+			copy?.addEventListener("click", async () => {
+				const text = document.getElementById("install")?.textContent ?? "";
+				try {
+					await navigator.clipboard.writeText(text);
+					const note = copy.querySelector<HTMLElement>(".copied");
+					if (note) {
+						note.hidden = false;
+						setTimeout(() => (note.hidden = true), 1500);
+					}
+				} catch {}
+			});
+		</script>
+	</body>
+</html>

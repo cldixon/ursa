@@ -25,6 +25,22 @@
   --selection: #1f3e8c24;
   --scrollbar: #c9c6be;
   --scrollbar-hover: #a19e95;
+  /* The graph view's colours (graph.js hands them to ursa-viz): its ground,
+     edge ink and plain nodes, and the categories COLOR BY colours, eight hues
+     in a fixed order told apart with colour-vision deficiencies too, then
+     "other". By night the same hues, stepped for the sky. */
+  --graph-bg: #ffffff;
+  --graph-edge: #595966;
+  --graph-node: #2a2a2a;
+  --graph-c0: #2a78d6;
+  --graph-c1: #eb6834;
+  --graph-c2: #1baf7a;
+  --graph-c3: #eda100;
+  --graph-c4: #e87ba4;
+  --graph-c5: #008300;
+  --graph-c6: #6250d6;
+  --graph-c7: #e34948;
+  --graph-other: #a3a097;
   color-scheme: light;
 }
 
@@ -52,6 +68,18 @@
     --selection: #aabfff33;
     --scrollbar: #3a3935;
     --scrollbar-hover: #5a5852;
+    --graph-bg: #0b0b0a;
+    --graph-edge: #b4b8c8;
+    --graph-node: #e8e4dc;
+    --graph-c0: #3987e5;
+    --graph-c1: #d95926;
+    --graph-c2: #199e70;
+    --graph-c3: #c98500;
+    --graph-c4: #d55181;
+    --graph-c5: #0ca30c;
+    --graph-c6: #9085e9;
+    --graph-c7: #e66767;
+    --graph-other: #6b6963;
     color-scheme: dark;
   }
 }
@@ -79,6 +107,18 @@
   --selection: #aabfff33;
   --scrollbar: #3a3935;
   --scrollbar-hover: #5a5852;
+  --graph-bg: #0b0b0a;
+  --graph-edge: #b4b8c8;
+  --graph-node: #e8e4dc;
+  --graph-c0: #3987e5;
+  --graph-c1: #d95926;
+  --graph-c2: #199e70;
+  --graph-c3: #c98500;
+  --graph-c4: #d55181;
+  --graph-c5: #0ca30c;
+  --graph-c6: #9085e9;
+  --graph-c7: #e66767;
+  --graph-other: #6b6963;
   color-scheme: dark;
 }
 
@@ -280,6 +320,15 @@ html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transp
 
 /* ---------------------------------------------------------------- terminal */
 
+/* The terminal, and the graph view beside it when open (.graph). */
+.workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+/* Half each, whatever their padding. */
+.workspace > .terminal { flex: 1 1 50%; min-width: 0; }
+
 /* xterm.js draws the terminal; this is the room it fills. Its colours are set
    from app.js (THEMES), to match these tokens. */
 .terminal {
@@ -301,6 +350,111 @@ html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transp
   box-sizing: border-box;
 }
 
+/* ---------------------------------------------------------------- graph view */
+
+/* Beside the terminal, half the width; under it on a phone. ursa-viz draws
+   in the --graph-* colours, ink on white by day and starlight on the sky by
+   night: switching the theme recolours an open view (graph.js). */
+.graph-pane {
+  flex: 1 1 50%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+.graph-pane[hidden] { display: none; }
+.graph-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 6px 0 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--muted);
+}
+.graph-status {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+/* The legend: what sizes the nodes, and each colour named, in text. */
+.graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  padding: 6px 14px 7px;
+  border-bottom: 1px solid var(--border);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+.graph-legend[hidden] { display: none; }
+.graph-legend .key { color: var(--fg); }
+.graph-legend ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.graph-legend li { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.graph-legend .swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--graph-other);
+}
+.graph-legend .count { color: var(--muted); }
+.graph-legend .size-key { display: inline-flex; align-items: center; gap: 4px; }
+.graph-legend .dot { display: inline-block; border-radius: 50%; background: var(--graph-node); }
+.graph-legend .dot.small { width: 4px; height: 4px; }
+.graph-legend .dot.large { width: 11px; height: 11px; }
+.swatch.c0 { background: var(--graph-c0); }
+.swatch.c1 { background: var(--graph-c1); }
+.swatch.c2 { background: var(--graph-c2); }
+.swatch.c3 { background: var(--graph-c3); }
+.swatch.c4 { background: var(--graph-c4); }
+.swatch.c5 { background: var(--graph-c5); }
+.swatch.c6 { background: var(--graph-c6); }
+.swatch.c7 { background: var(--graph-c7); }
+.graph-close {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 6px;
+  color: var(--fg);
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.graph-close svg { width: 18px; height: 18px; display: block; }
+.graph-close:hover { color: var(--prompt); }
+.graph-close:focus-visible, .graph-stage canvas:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.graph-stage { flex: 1; min-height: 0; position: relative; }
+.graph-stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+}
+.graph-stage canvas:active { cursor: grabbing; }
+
 /* A phone: one row, the logo first (its name left to screen readers). Under
    420px, New, Share and Import are icons, their labels still naming them. */
 @media (max-width: 640px) {
@@ -312,6 +466,10 @@ html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transp
   .dropdown { position: static; }
   .dropdown-menu { top: calc(100% + 4px); left: 8px; right: 8px; min-width: 0; }
   .terminal { padding: 12px 8px 4px; }
+  /* The graph view under the terminal. */
+  .workspace { flex-direction: column; }
+  .workspace > .terminal { min-height: 0; }
+  .graph-pane { border-left: 0; border-top: 1px solid var(--border); }
   .brand .label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 }
 @media (max-width: 420px) {

@@ -5,7 +5,7 @@
 // around it, as a real terminal is around the CLI: xterm.js draws the screen,
 // and the line editor here sends the shell each typed line and writes back
 // what it printed. The page adds what only a page can do: the Datasets menu,
-// Share, Import, downloads, and the theme.
+// Share, Import, downloads, the Graph view (graph.js) and the theme.
 import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { DATASETS } from "./datasets.js";
@@ -124,10 +124,12 @@ $("theme").onclick = (e) => {
     localStorage.setItem("ursa-theme", next);
   } catch {}
   term.options.theme = xtermTheme(next);
+  graphLoaded?.retheme();
   if (byPointer(e)) term.focus();
 };
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   term.options.theme = xtermTheme(currentTheme());
+  graphLoaded?.retheme();
 });
 
 // ---------------------------------------------------------------- terminal
@@ -271,6 +273,11 @@ term.attachCustomKeyEventHandler((e) => {
   // Tab and Shift+Tab move the focus on, as anywhere on a page (there is no
   // completion for them to do), so the keyboard can leave the terminal.
   if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return false;
+  // Esc closes the Graph view, the terminal keeping the focus.
+  if (e.key === "Escape" && graphOpen()) {
+    if (e.type === "keydown") closeGraph();
+    return false;
+  }
   // Shift+Enter starts a new line in what is typed. xterm would send Enter for
   // it (on keydown, and again on keypress), so it never reaches xterm.
   if (e.key === "Enter" && e.shiftKey && !e.isComposing) {
@@ -776,6 +783,12 @@ function setAside() {
 function fitLines(sql, width) {
   const out = [];
   for (const line of sql.split("\n")) {
+    // A dot-command is one line: broken, its rest would run as a command of
+    // its own (.graph karate SIZE BY pagerank / COLOR BY club).
+    if (line.trimStart().startsWith(".")) {
+      out.push(line);
+      continue;
+    }
     const indent = line.match(/^\s*/)[0];
     const comment = line.trimStart().startsWith("--");
     let pad = indent + (comment ? "-- " : "  ");
@@ -839,6 +852,8 @@ async function feed(line, { echo }) {
     statement = [];
     ok = (await hostCommand(r.command)) !== false;
   } else {
+    // A plain .help starts with the tour and .graph, before the list.
+    if (!r.err && /^\s*\.help\s*;?\s*$/.test(line)) await write(HELP_FIRST.flatMap((l) => wrapWords(l, term.cols - 1)).join("\r\n") + "\r\n\r\n");
     await write(r.out + r.err);
     if (r.flow === "exit") await write("This shell lives in the page: New starts a fresh session.\r\n");
     if (!r.pending) {
@@ -858,8 +873,16 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
+  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph (its src and dst columns, or the first two), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); Esc closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
+  [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
+];
+
+// What `.help` says first: where to start, and how to draw a graph.
+const HELP_FIRST = [
+  "New here? .tour runs a five-step tour, and .dataset loads a sample graph.",
+  "Draw a graph: .graph karate draws a property graph, and .graph alone the last result.",
 ];
 
 const SHORTCUTS = `Enter            Run the line (a statement runs once it ends with ;)
@@ -883,6 +906,9 @@ async function hostCommand(line) {
   const [name, ...rest] = line.trim().replace(/;\s*$/, "").split(/\s+/);
   const arg = rest.join(" ");
   switch (name) {
+    case ".graph":
+      // The query as typed: its spaces may be in a string.
+      return drawGraph(line.trim().slice(name.length).trim());
     case ".clear":
       term.clear();
       await write("\x1b[H\x1b[2J");
@@ -913,6 +939,10 @@ async function hostCommand(line) {
       }
       return true;
     }
+    case ".tour":
+      if (arg) return errorLine("usage: .tour");
+      loadDataset(DATASETS.find((d) => d.id === "tour"));
+      return true;
     case ".dataset": {
       if (!arg) {
         const rows = DATASETS.map((d) => `('${d.id}', '${d.title.replace(/'/g, "''")}')`).join(", ");
@@ -927,6 +957,121 @@ async function hostCommand(line) {
   }
   return errorLine(`unknown command ${name}`);
 }
+
+// ---------------------------------------------------------------- the Graph view
+
+// The pane beside the terminal (under it on a phone), and graph.js, which
+// draws in it: imported on the first `.graph`, so a session that draws no
+// graph downloads none of it (it loads ursa-viz, a few MB, in turn).
+const graphPane = $("graph-pane");
+let graphModule = null;
+// graph.js once loaded, for the test hooks.
+let graphLoaded = null;
+const graphOpen = () => !graphPane.hidden;
+const loadGraphModule = () =>
+  (graphModule ??= import("./graph.js").then(
+    (m) => (graphLoaded = m),
+    (e) => {
+      graphModule = null;
+      throw e;
+    },
+  ));
+
+// When each step of the last `.graph` ended (performance.now()), for tests
+// and tests/graph-timing.ts: enter, engine, viz, posted, view, the worker's
+// workerStart, workerLoaded and hierarchy, firstPositions, firstDraw, done.
+let graphTimes = null;
+
+/**
+ * `.graph ?SOURCE? ?NODES (query)? ?SIZE BY x? ?COLOR BY y?`: draw the last
+ * result, a query's result, or a property graph (WebShell.graph says which
+ * rows are edges, and what sizes and colours the nodes), replacing what the
+ * pane drew. The terminal keeps the focus: queries can still be typed.
+ *
+ * The pane opens with "Loading graph view…" as soon as the engine takes more
+ * than a moment (at once, for a big graph; not at all, for a typo), and the
+ * graph view's code starts loading then, while the engine still works.
+ */
+async function drawGraph(text) {
+  const times = (graphTimes = { enter: performance.now() });
+  const wasOpen = graphOpen();
+  const status = $("graph-status");
+  const before = status.textContent;
+  let opened = false;
+  const open = () => {
+    if (opened) return;
+    opened = true;
+    graphPane.hidden = false;
+    status.textContent = "Loading graph view…";
+    loadGraphModule().then((m) => m.preload(), () => {});
+  };
+  const soon = setTimeout(open, 150);
+  let graph;
+  try {
+    graph = await engine("graph", { text });
+    times.engine = performance.now();
+  } catch (e) {
+    clearTimeout(soon);
+    // The pane as it was: closed, or with its drawing.
+    if (opened && !wasOpen) closeGraph();
+    else if (opened) status.textContent = before;
+    if (e.crash) throw e;
+    return errorLine(e.message);
+  }
+  clearTimeout(soon);
+  open();
+  let drawn;
+  try {
+    const module = await loadGraphModule();
+    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, times });
+  } catch (e) {
+    // Closed (Esc) before it was drawn: nothing went wrong.
+    if (!graphOpen()) return true;
+    closeGraph();
+    return errorLine(`the graph view could not start: ${String(e?.message ?? e)}`);
+  }
+  const count = (n, one) => `${n.toLocaleString("en-US")} ${one}${n === 1 ? "" : "s"}`;
+  const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
+  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  return true;
+}
+
+/** Close the pane: the terminal takes the whole width again, and the focus. */
+function closeGraph() {
+  if (graphPane.hidden) return;
+  const hadFocus = graphPane.contains(document.activeElement);
+  graphPane.hidden = true;
+  graphModule?.then((m) => m.close(), () => {});
+  $("graph-stage").replaceChildren();
+  $("graph-status").textContent = "";
+  $("graph-legend").replaceChildren();
+  $("graph-legend").hidden = true;
+  if (hadFocus) term.focus();
+}
+
+/** The view failed while drawing (a lost GPU, a layout that stopped): say so. */
+function graphFailed(message) {
+  closeGraph();
+  enqueue(async () => {
+    setAside();
+    await errorLine(message);
+  });
+}
+
+$("graph-close").onclick = () => {
+  closeGraph();
+  term.focus();
+};
+graphPane.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  e.preventDefault();
+  closeGraph();
+  term.focus();
+});
+$("graph").onclick = (e) => {
+  run(".graph");
+  if (byPointer(e)) term.focus();
+};
 
 /** Run `sql` in the shell for a listing the page makes; not recorded. */
 async function quiet(sql) {
@@ -980,7 +1125,21 @@ async function restart({ clear = true } = {}) {
   history_replace("");
   if (clear) term.reset();
   cursorRow = 0;
-  await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n`);
+  // Where to start: the sample graphs. Broken between words when the
+  // terminal is too narrow (a phone) to hold it on one line.
+  const hint = wrapWords("Pick a sample graph from the Datasets menu, or type .dataset karate", term.cols - 1);
+  await write(`Ursa Web Shell running...\r\nUrsa v${r.version}\r\nEnter ".help" for usage hints.\r\n${hint.join("\r\n")}\r\n`);
+}
+
+/** `text`'s words in lines no wider than `width` (a longer word gets a line of its own). */
+function wrapWords(text, width) {
+  const lines = [];
+  for (const word of text.split(" ")) {
+    const last = lines.length - 1;
+    if (last >= 0 && lines[last].length + 1 + word.length <= width) lines[last] += ` ${word}`;
+    else lines.push(word);
+  }
+  return lines;
 }
 
 /** Start a fresh session; what was queued for the old one is skipped. */
@@ -988,6 +1147,8 @@ function fresh() {
   const session = ++generation;
   // A question waiting (a shared link's) is answered no.
   answer?.("");
+  // What the pane drew belongs to the old session.
+  closeGraph();
   enqueue(async () => {
     if (session === generation) await restart();
   });
@@ -1226,4 +1387,12 @@ window.ursaShell = {
   rows: () => term.rows,
   selection: () => term.getSelection(),
   datasets: DATASETS,
+  // The Graph view: whether it is open, and (once graph.js is loaded) what it
+  // draws, a frame's inked pixels, and the node at a canvas pixel.
+  graphOpen,
+  graph: () => graphLoaded?.info() ?? null,
+  // When each step of the last .graph ended, in ms after Enter.
+  graphTimings: () => graphTimes && Object.fromEntries(Object.entries(graphTimes).map(([k, v]) => [k, Math.round(v - graphTimes.enter)])),
+  graphInked: async () => graphLoaded?.inked() ?? null,
+  graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
 };

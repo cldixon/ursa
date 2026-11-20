@@ -24,6 +24,11 @@
 //!   database's catalog (#327). Such a saved setting is no longer applied:
 //!   opening the database says so (a notice), and a writable open removes it
 //!   from the catalog, so it is said once.
+//! - A stored statement that fails when the database is opened (a view over
+//!   a file that is gone) does not stop it opening (#381): its object is
+//!   unavailable, with one notice, and fails only when used; `DROP` and
+//!   `CREATE OR REPLACE` repair it, and its statement is kept as it is.
+//!   See `replay`.
 //! - `TEMPORARY` views and external tables run and are not stored.
 //! - In a read-only session, every statement that defines or drops anything
 //!   is refused.
@@ -50,16 +55,19 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{ResetStatement, Statement as DFStatement};
 use datafusion::sql::planner::object_name_to_table_reference;
 use datafusion::sql::sqlparser::ast::{ObjectName, ObjectType, Set, Statement as SQLStatement};
-use ursa_engine::database::{self as db, Database, OpenOptions};
+use ursa_engine::database::{self as db, Database, OpenOptions, UnavailableTable};
 use ursa_engine::graph;
 use ursa_engine::notices::{self, NoticeLevel, Notifier};
 use ursa_engine::options::ByteSize;
+use ursa_engine::paths::looks_like_location;
 
 use crate::parser::{Attach, UrsaStatement};
 use crate::{graph_ddl, parse_sql_for, paths, run};
@@ -198,29 +206,173 @@ async fn run_index_storage_limit(
 
 /// Run the catalog's statements on `ctx`, in order. A statement that fails is
 /// retried after the others, in case an edit of the file put it before what it
-/// depends on; the first one that still fails is the error.
+/// depends on.
+///
+/// A statement that still fails does not stop the database opening (#381):
+/// the object it defines is unavailable
+/// ([`ursa_engine::database::unavailable`]), and one notice says why. So is
+/// each object whose statement fails because it uses an unavailable one, with
+/// its own notice. The statements stay in the catalog as they are, so
+/// restoring what they read and opening the database again brings the objects
+/// back.
 async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
     let mut pending: Vec<(usize, String)> = database.statements().into_iter().enumerate().collect();
+    let mut unavailable: Vec<Unavailable> = Vec::new();
+    // Statements that do not define an object (an edited file): kept, skipped.
+    let mut skipped: Vec<(usize, String)> = Vec::new();
     while !pending.is_empty() {
-        let mut failed = Vec::new();
         let before = pending.len();
+        let mut failed = Vec::new();
         for (index, sql) in pending {
             if let Err(e) = replay_one(ctx, database, &sql).await {
-                failed.push((index, sql, e));
+                failed.push((index, sql, ursa_engine::user_message(&e)));
             }
         }
-        if failed.len() == before {
-            let (index, sql, err) = failed.swap_remove(0);
-            return Err(DataFusionError::Execution(format!(
-                "cannot open {}: statement {} of its catalog failed: {}\n  the statement: {sql}",
-                database.name(),
-                index + 1,
-                ursa_engine::user_message(&err)
-            )));
+        // A statement that failed for using an unavailable object is
+        // unavailable too.
+        let mut still = Vec::new();
+        for (index, sql, cause) in failed {
+            let uses = unavailable
+                .iter()
+                .find(|u| cause.contains(&u.message))
+                .map(|u| (u.kind, u.name.clone()));
+            match (uses, defined_object(ctx, &sql)) {
+                (Some((kind, name)), Some(object)) => {
+                    let message = format!(
+                        "{} {} is unavailable: it uses {kind} {name}, which is unavailable; \
+                         repair {name}, or {}",
+                        object.kind, object.name, object.drop
+                    );
+                    unavailable.push(object.mark(ctx, index, message));
+                }
+                _ => still.push((index, sql, cause)),
+            }
         }
-        pending = failed.into_iter().map(|(i, sql, _)| (i, sql)).collect();
+        if !still.is_empty() && still.len() == before {
+            // No progress: the first that still fails is unavailable in its
+            // own right.
+            let (index, sql, cause) = still.remove(0);
+            match defined_object(ctx, &sql) {
+                Some(object) => {
+                    let message = format!(
+                        "{} {} is unavailable: {cause}; {} or restore the file",
+                        object.kind, object.name, object.drop
+                    );
+                    unavailable.push(object.mark(ctx, index, message));
+                }
+                None => skipped.push((
+                    index,
+                    format!(
+                        "statement {} of the catalog of {} failed, and is skipped (it is kept \
+                         in the catalog): {cause}\n  the statement: {sql}",
+                        index + 1,
+                        database.name()
+                    ),
+                )),
+            }
+        }
+        pending = still.into_iter().map(|(i, sql, _)| (i, sql)).collect();
+    }
+    let mut notices: Vec<(usize, String)> = unavailable
+        .into_iter()
+        .map(|u| (u.index, u.message))
+        .chain(skipped)
+        .collect();
+    notices.sort();
+    let notifier = Notifier::of(ctx.state().config());
+    for (_, notice) in notices {
+        notifier.say(NoticeLevel::On, || notice);
     }
     Ok(())
+}
+
+/// An object of the catalog that could not be defined when it was opened.
+struct Unavailable {
+    /// The statement's place in the catalog, for the order of the notices.
+    index: usize,
+    kind: &'static str,
+    name: String,
+    /// Why, and how to repair it: what its notice says, and what using it
+    /// fails with.
+    message: String,
+}
+
+/// The object a catalog statement defines, as messages name it.
+struct DefinedObject {
+    /// `view`, `table` or `graph`.
+    kind: &'static str,
+    /// Its name as written.
+    name: String,
+    /// The statement that drops it: `DROP VIEW v`.
+    drop: String,
+    /// What it is in the session.
+    target: Target,
+}
+
+enum Target {
+    Table(TableReference, TableType),
+    Graph(String),
+}
+
+impl DefinedObject {
+    /// Mark the object unavailable in `ctx`, with `message`.
+    fn mark(self, ctx: &SessionContext, index: usize, message: String) -> Unavailable {
+        match self.target {
+            Target::Table(reference, table_type) => {
+                // A name already taken (a duplicate entry) keeps its table.
+                let _ = ctx.register_table(
+                    reference,
+                    Arc::new(UnavailableTable::new(message.clone(), table_type)),
+                );
+            }
+            Target::Graph(name) => graph::registry_of(ctx).mark_unavailable(&name, message.clone()),
+        }
+        Unavailable {
+            index,
+            kind: self.kind,
+            name: self.name,
+            message,
+        }
+    }
+}
+
+/// The view, external table or graph the stored statement `sql` defines, if
+/// it parses as one.
+fn defined_object(ctx: &SessionContext, sql: &str) -> Option<DefinedObject> {
+    let statements = parse_sql_for(ctx, sql).ok()?;
+    let [statement] = <[UrsaStatement; 1]>::try_from(statements).ok()?;
+    let table = |name: &ObjectName, kind: &'static str, table_type| {
+        let reference = object_name_to_table_reference(name.clone(), normalizes(ctx)).ok()?;
+        Some(DefinedObject {
+            kind,
+            name: name.to_string(),
+            drop: format!(
+                "DROP {} {name}",
+                if kind == "view" { "VIEW" } else { "TABLE" }
+            ),
+            target: Target::Table(reference, table_type),
+        })
+    };
+    match &statement {
+        UrsaStatement::CreatePropertyGraph(g) => {
+            let name = graph_ddl::graph_name(g.name.clone(), normalizes(ctx)).ok()?;
+            Some(DefinedObject {
+                kind: "graph",
+                name: g.name.to_string(),
+                drop: format!("DROP PROPERTY GRAPH {}", g.name),
+                target: Target::Graph(name),
+            })
+        }
+        UrsaStatement::DataFusion(df) => match df.as_ref() {
+            DFStatement::CreateExternalTable(t) => table(&t.name, "table", TableType::Base),
+            DFStatement::Statement(s) => match s.as_ref() {
+                SQLStatement::CreateView(v) => table(&v.name, "view", TableType::View),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Run one stored statement, its relative paths resolved against the
@@ -236,13 +388,50 @@ async fn replay_one(ctx: &SessionContext, database: &Database, sql: &str) -> Res
     paths::rewrite_locations(ctx, &mut statement, |location| {
         database.replayed_location(location)
     });
-    if !matches!(effect(ctx, &statement)?, Effect::Define { .. }) {
+    let Effect::Define { key, .. } = effect(ctx, &statement)? else {
         return Err(DataFusionError::Plan(format!(
             "a catalog entry must define a view, an external table or a graph, not run {}",
             statement.kind()
         )));
-    }
+    };
+    check_available(ctx, &statement, Some(&key)).await?;
     run(ctx, statement).await.map(|_| ())
+}
+
+/// Refuse `statement` if it reads a view or table that is unavailable (see
+/// [`replay`]), with why. `defines` is the object it defines, which it may
+/// replace. Graphs are checked where they are used.
+async fn check_available(
+    ctx: &SessionContext,
+    statement: &UrsaStatement,
+    defines: Option<&Key>,
+) -> Result<()> {
+    let UrsaStatement::DataFusion(df) = statement else {
+        return Ok(());
+    };
+    let state = ctx.state();
+    let Ok(references) = state.resolve_table_references(df) else {
+        return Ok(());
+    };
+    let options = &state.config().options().catalog;
+    for reference in references {
+        if matches!(&reference, TableReference::Bare { table } if looks_like_location(table)) {
+            continue;
+        }
+        let resolved = reference
+            .clone()
+            .resolve(&options.default_catalog, &options.default_schema);
+        if defines == Some(&Key::Table(resolved.to_string())) {
+            continue;
+        }
+        let Ok(schema) = state.schema_for_ref(reference) else {
+            continue;
+        };
+        if let Ok(Some(provider)) = schema.table(&resolved.table).await {
+            db::check_available(provider.as_ref())?;
+        }
+    }
+    Ok(())
 }
 
 /// `ATTACH 'club.ursa'` in a session without a database.
@@ -310,6 +499,13 @@ pub(crate) async fn execute(
             database.name(),
             leading_words(&statement)
         )));
+    }
+    if !matches!(effect, Effect::Drop { .. }) {
+        let defines = match &effect {
+            Effect::Define { key, .. } => Some(key),
+            _ => None,
+        };
+        check_available(ctx, &statement, defines).await?;
     }
     match effect {
         Effect::None if sets_index_storage_limit(&statement) => {

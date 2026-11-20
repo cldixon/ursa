@@ -18,7 +18,7 @@ filtered edge frame, which keeps the parent graph's whole node set; SQL as a
 graph over the filtered edges with a vertex table of the parent's nodes, in
 the parent's node order (``views`` in the file), which defines the same node
 set. Every algorithm, statistic, traversal and neighbour aggregation runs on
-the views; the layouts do not.
+the views; of the layouts, the two SQL offers (``layout_fa2``, ``layout_fr``) do.
 
 The traversals (``hop``, ``shortest_path``, ``random_walk``, #238) are cases
 too, with their rows in the Python library's order, and the file records the
@@ -50,8 +50,9 @@ import ursa as ur
 from ursa import _graph
 
 # The layouts are held back from Python's public API (see ``ursa/__init__.py``)
-# but live in ``ursa._graph``. SQL hides them too, so ``tests/parity.rs`` runs
-# their cases through the engine's internal path rather than as queries.
+# but live in ``ursa._graph``. SQL offers ``layout_fa2`` and ``layout_fr`` and
+# hides the others, so ``tests/parity.rs`` runs those through the engine's
+# internal path rather than as queries.
 
 OUT = Path(__file__).with_name("parity.json")
 
@@ -81,7 +82,9 @@ WEIGHTS: dict[str, Callable[[], Any]] = {
 # The Python function each SQL function runs as. Statistics are asked for their
 # one-row frame (``lazy=True``) rather than the plain number.
 STATISTICS = {"density", "avg_path_length", "diameter"}
-LAYOUTS = {"layout_fr", "layout_random", "layout_circle"}
+LAYOUTS = {"layout_fa2", "layout_fr", "layout_random", "layout_circle"}
+# The layouts SQL hides, as Python's public API does; these run on no view.
+HIDDEN_LAYOUTS = {"layout_random", "layout_circle"}
 
 # (function, keyword arguments): each runs as ``ur.<function>(edges, **kwargs)``
 # and as ``SELECT * FROM <function>(g, name => value, ...)``. A ``weight`` is a
@@ -109,6 +112,21 @@ CALLS: list[tuple[str, dict[str, Any]]] = [
     ("betweenness", {"sample": 0.5, "seed": 3}),
     ("label_propagation", {}),
     ("label_propagation", {"max_iter": 5, "seed": 2}),
+    ("layout_fa2", {}),
+    ("layout_fa2", {"seed": 3}),
+    ("layout_fa2", {"multilevel": False, "iterations": 50, "seed": 2}),
+    (
+        "layout_fa2",
+        {
+            "iterations": 20,
+            "k": 2.0,
+            "gravity": 0.5,
+            "strong_gravity": True,
+            "theta": 0.8,
+            "jitter_tolerance": 0.5,
+            "seed": 4,
+        },
+    ),
     ("layout_fr", {"seed": 1}),
     ("layout_fr", {"iterations": 50, "k": 2.0, "gravity": 0.1, "seed": 5}),
     ("layout_random", {}),
@@ -421,7 +439,7 @@ def main() -> None:
         views[view] = {"csv": csv, "filter": condition, "vertices": vertices}
         calls = CALLS + (WEIGHTED_CALLS if dataset in WEIGHTED_DATASETS else [])
         for function, kwargs in calls:
-            if function not in LAYOUTS:
+            if function not in HIDDEN_LAYOUTS:
                 cases.append(case(view, csv, edges, function, kwargs))
         for function, args, call in traversal_cases(dataset):
             table = call(edges).collect().to_arrow()

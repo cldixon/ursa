@@ -1,0 +1,1885 @@
+{
+  "date": "2026-11-19T17:12:32.226Z",
+  "machine": {
+    "platform": "linux 6.18.44-fc-v653",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4,
+    "memoryBytes": 16869126144,
+    "chromium": "153.0.8010.12",
+    "headless": true,
+    "backends": {
+      "webgpu": "BrowserWebGpu",
+      "webgl2": "Gl"
+    }
+  },
+  "method": {
+    "frames": 120,
+    "picks": 200,
+    "viewport": "1000x700 at devicePixelRatio 1",
+    "frameTiming": "wall time per frame: view.pan or view.zoom, view.render, then a GPU sync point (see syncKind); no GPU timestamp queries",
+    "flatIterations": {
+      "1k": 300,
+      "10k": 300,
+      "100k": 30,
+      "1m": 5
+    }
+  },
+  "browser": [
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "1k",
+      "mode": "multilevel",
+      "nodes": 128,
+      "edges": 1000,
+      "done": true,
+      "errors": [],
+      "initMs": 33.5,
+      "generateMs": 6.7,
+      "createViewMs": 23,
+      "firstFrameMs": 74.3,
+      "layoutDoneMs": 89.1,
+      "workerLayoutMs": 27.5,
+      "hierarchyMs": 1.5,
+      "workerInitMs": 25.2,
+      "iterations": 407,
+      "msPerIteration": null,
+      "uploads": 2,
+      "bytesPerUpload": 1024,
+      "uploadBytes": 2048,
+      "edgeIndexBytes": 8000,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.175,
+          "p95": 0.25,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.18,
+          "p95": 0.25,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.195,
+          "p95": 0.26,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.2,
+          "p95": 0.265,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0,
+        "p95": 0.005,
+        "n": 200
+      },
+      "pickHits": 4,
+      "memory": {
+        "pageWasmBytes": 1507328,
+        "workerWasmBytes": 1507328,
+        "jsHeapUsedBytes": 2286827,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.038,
+        "p95": 0.058,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "1k",
+      "mode": "flat",
+      "nodes": 128,
+      "edges": 1000,
+      "done": true,
+      "errors": [],
+      "initMs": 34.5,
+      "generateMs": 3.5,
+      "createViewMs": 25.4,
+      "firstFrameMs": 84.5,
+      "layoutDoneMs": 114.3,
+      "workerLayoutMs": 42.9,
+      "hierarchyMs": 0.6,
+      "workerInitMs": 29,
+      "iterations": 300,
+      "msPerIteration": 0.14,
+      "uploads": 3,
+      "bytesPerUpload": 1024,
+      "uploadBytes": 3072,
+      "edgeIndexBytes": 8000,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "10k",
+      "mode": "multilevel",
+      "nodes": 2048,
+      "edges": 10000,
+      "done": true,
+      "errors": [],
+      "initMs": 33.5,
+      "generateMs": 19.1,
+      "createViewMs": 27.1,
+      "firstFrameMs": 91.5,
+      "layoutDoneMs": 645.8,
+      "workerLayoutMs": 578.9,
+      "hierarchyMs": 9.9,
+      "workerInitMs": 24.5,
+      "iterations": 625,
+      "msPerIteration": null,
+      "uploads": 4,
+      "bytesPerUpload": 16384,
+      "uploadBytes": 65536,
+      "edgeIndexBytes": 80000,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.185,
+          "p95": 0.245,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.185,
+          "p95": 0.245,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.18,
+          "p95": 0.235,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.18,
+          "p95": 0.24,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.015,
+        "p95": 0.06,
+        "n": 200
+      },
+      "pickHits": 9,
+      "memory": {
+        "pageWasmBytes": 2162688,
+        "workerWasmBytes": 2293760,
+        "jsHeapUsedBytes": 2523167,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.046,
+        "p95": 0.049,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "10k",
+      "mode": "flat",
+      "nodes": 2048,
+      "edges": 10000,
+      "done": true,
+      "errors": [],
+      "initMs": 31.5,
+      "generateMs": 18.1,
+      "createViewMs": 29.4,
+      "firstFrameMs": 90.1,
+      "layoutDoneMs": 1267.7,
+      "workerLayoutMs": 1195.6,
+      "hierarchyMs": 2.9,
+      "workerInitMs": 28.7,
+      "iterations": 300,
+      "msPerIteration": 3.85,
+      "uploads": 14,
+      "bytesPerUpload": 16384,
+      "uploadBytes": 229376,
+      "edgeIndexBytes": 80000,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "100k",
+      "mode": "multilevel",
+      "nodes": 16384,
+      "edges": 100000,
+      "done": true,
+      "errors": [],
+      "initMs": 40.5,
+      "generateMs": 116.4,
+      "createViewMs": 44.2,
+      "firstFrameMs": 161,
+      "layoutDoneMs": 5305,
+      "workerLayoutMs": 5217.5,
+      "hierarchyMs": 60.9,
+      "workerInitMs": 26.4,
+      "iterations": 762,
+      "msPerIteration": null,
+      "uploads": 52,
+      "bytesPerUpload": 131072,
+      "uploadBytes": 6815744,
+      "edgeIndexBytes": 800000,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.21,
+          "p95": 0.4,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.215,
+          "p95": 0.405,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.18,
+          "p95": 0.26,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.185,
+          "p95": 0.265,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.065,
+        "p95": 0.115,
+        "n": 200
+      },
+      "pickHits": 10,
+      "memory": {
+        "pageWasmBytes": 7208960,
+        "workerWasmBytes": 10944512,
+        "jsHeapUsedBytes": 10718717,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.045,
+        "p95": 0.047,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "100k",
+      "mode": "flat",
+      "nodes": 16384,
+      "edges": 100000,
+      "done": true,
+      "errors": [],
+      "initMs": 37.7,
+      "generateMs": 127.4,
+      "createViewMs": 48.9,
+      "firstFrameMs": 120.8,
+      "layoutDoneMs": 1457.3,
+      "workerLayoutMs": 1364.2,
+      "hierarchyMs": 16.6,
+      "workerInitMs": 27.3,
+      "iterations": 30,
+      "msPerIteration": 43.29,
+      "uploads": 17,
+      "bytesPerUpload": 131072,
+      "uploadBytes": 2228224,
+      "edgeIndexBytes": 800000,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "1m",
+      "mode": "multilevel",
+      "nodes": 131072,
+      "edges": 1000000,
+      "done": true,
+      "errors": [],
+      "initMs": 40.1,
+      "generateMs": 1300.1,
+      "createViewMs": 309.8,
+      "firstFrameMs": 1081.9,
+      "layoutDoneMs": 8179.5,
+      "workerLayoutMs": 7812.5,
+      "hierarchyMs": 700.5,
+      "workerInitMs": 27.2,
+      "iterations": 272,
+      "msPerIteration": null,
+      "uploads": 49,
+      "bytesPerUpload": 1048576,
+      "uploadBytes": 51380224,
+      "edgeIndexBytes": 8000000,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.345,
+          "p95": 0.465,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.35,
+          "p95": 0.47,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.32,
+          "p95": 0.415,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.32,
+          "p95": 0.42,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.55,
+        "p95": 0.685,
+        "n": 200
+      },
+      "pickHits": 41,
+      "memory": {
+        "pageWasmBytes": 56885248,
+        "workerWasmBytes": 112132096,
+        "jsHeapUsedBytes": 14896592,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.116,
+        "p95": 0.135,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "rmat",
+      "size": "1m",
+      "mode": "flat",
+      "nodes": 131072,
+      "edges": 1000000,
+      "done": true,
+      "errors": [],
+      "initMs": 50.6,
+      "generateMs": 1213.3,
+      "createViewMs": 262.1,
+      "firstFrameMs": 683.8,
+      "layoutDoneMs": 3321.9,
+      "workerLayoutMs": 2867,
+      "hierarchyMs": 211.2,
+      "workerInitMs": 31.8,
+      "iterations": 5,
+      "msPerIteration": 528.54,
+      "uploads": 6,
+      "bytesPerUpload": 1048576,
+      "uploadBytes": 6291456,
+      "edgeIndexBytes": 8000000,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "1k",
+      "mode": "multilevel",
+      "nodes": 529,
+      "edges": 1012,
+      "done": true,
+      "errors": [],
+      "initMs": 29,
+      "generateMs": 0.2,
+      "createViewMs": 23.3,
+      "firstFrameMs": 78.7,
+      "layoutDoneMs": 204.9,
+      "workerLayoutMs": 134.3,
+      "hierarchyMs": 2.5,
+      "workerInitMs": 33,
+      "iterations": 408,
+      "msPerIteration": null,
+      "uploads": 3,
+      "bytesPerUpload": 4232,
+      "uploadBytes": 12696,
+      "edgeIndexBytes": 8096,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.19,
+          "p95": 0.275,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.19,
+          "p95": 0.28,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.175,
+          "p95": 0.26,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.18,
+          "p95": 0.265,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.005,
+        "p95": 0.015,
+        "n": 200
+      },
+      "pickHits": 18,
+      "memory": {
+        "pageWasmBytes": 1572864,
+        "workerWasmBytes": 1572864,
+        "jsHeapUsedBytes": 2748610,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.038,
+        "p95": 0.049,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "1k",
+      "mode": "flat",
+      "nodes": 529,
+      "edges": 1012,
+      "done": true,
+      "errors": [],
+      "initMs": 39.1,
+      "generateMs": 0.2,
+      "createViewMs": 14.4,
+      "firstFrameMs": 61,
+      "layoutDoneMs": 237,
+      "workerLayoutMs": 183,
+      "hierarchyMs": 0.6,
+      "workerInitMs": 26.1,
+      "iterations": 300,
+      "msPerIteration": 0.6,
+      "uploads": 4,
+      "bytesPerUpload": 4232,
+      "uploadBytes": 16928,
+      "edgeIndexBytes": 8096,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "10k",
+      "mode": "multilevel",
+      "nodes": 5041,
+      "edges": 9940,
+      "done": true,
+      "errors": [],
+      "initMs": 30,
+      "generateMs": 0.9,
+      "createViewMs": 26.2,
+      "firstFrameMs": 94.6,
+      "layoutDoneMs": 1621.4,
+      "workerLayoutMs": 1549.5,
+      "hierarchyMs": 12.6,
+      "workerInitMs": 29.4,
+      "iterations": 417,
+      "msPerIteration": null,
+      "uploads": 16,
+      "bytesPerUpload": 40328,
+      "uploadBytes": 645248,
+      "edgeIndexBytes": 79520,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.18,
+          "p95": 0.24,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.185,
+          "p95": 0.245,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.185,
+          "p95": 0.245,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.19,
+          "p95": 0.25,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.02,
+        "p95": 0.075,
+        "n": 200
+      },
+      "pickHits": 56,
+      "memory": {
+        "pageWasmBytes": 2228224,
+        "workerWasmBytes": 2621440,
+        "jsHeapUsedBytes": 3434978,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.045,
+        "p95": 0.059,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "10k",
+      "mode": "flat",
+      "nodes": 5041,
+      "edges": 9940,
+      "done": true,
+      "errors": [],
+      "initMs": 40.1,
+      "generateMs": 0.9,
+      "createViewMs": 22,
+      "firstFrameMs": 71.8,
+      "layoutDoneMs": 3397.4,
+      "workerLayoutMs": 3330.8,
+      "hierarchyMs": 2.9,
+      "workerInitMs": 29.6,
+      "iterations": 300,
+      "msPerIteration": 10.64,
+      "uploads": 37,
+      "bytesPerUpload": 40328,
+      "uploadBytes": 1492136,
+      "edgeIndexBytes": 79520,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "100k",
+      "mode": "multilevel",
+      "nodes": 50176,
+      "edges": 99904,
+      "done": true,
+      "errors": [],
+      "initMs": 31.1,
+      "generateMs": 4.9,
+      "createViewMs": 61.7,
+      "firstFrameMs": 153.4,
+      "layoutDoneMs": 15861.2,
+      "workerLayoutMs": 15750.9,
+      "hierarchyMs": 38.4,
+      "workerInitMs": 26.5,
+      "iterations": 329,
+      "msPerIteration": null,
+      "uploads": 190,
+      "bytesPerUpload": 401408,
+      "uploadBytes": 76267520,
+      "edgeIndexBytes": 799232,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.25,
+          "p95": 0.32,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.255,
+          "p95": 0.33,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.26,
+          "p95": 0.385,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 0.265,
+          "p95": 0.395,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.215,
+        "p95": 0.33,
+        "n": 200
+      },
+      "pickHits": 70,
+      "memory": {
+        "pageWasmBytes": 9502720,
+        "workerWasmBytes": 12976128,
+        "jsHeapUsedBytes": 37591064,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.067,
+        "p95": 0.074,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "100k",
+      "mode": "flat",
+      "nodes": 50176,
+      "edges": 99904,
+      "done": true,
+      "errors": [],
+      "initMs": 39.8,
+      "generateMs": 8.1,
+      "createViewMs": 47.4,
+      "firstFrameMs": 120.4,
+      "layoutDoneMs": 4837.7,
+      "workerLayoutMs": 4735.9,
+      "hierarchyMs": 11.6,
+      "workerInitMs": 29.4,
+      "iterations": 30,
+      "msPerIteration": 153.37,
+      "uploads": 31,
+      "bytesPerUpload": 401408,
+      "uploadBytes": 12443648,
+      "edgeIndexBytes": 799232,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "1m",
+      "mode": "multilevel",
+      "nodes": 499849,
+      "edges": 998284,
+      "done": true,
+      "errors": [],
+      "initMs": 31.4,
+      "generateMs": 32.1,
+      "createViewMs": 297.6,
+      "firstFrameMs": 655,
+      "layoutDoneMs": 32406.7,
+      "workerLayoutMs": 32046,
+      "hierarchyMs": 274.9,
+      "workerInitMs": 29.2,
+      "iterations": 51,
+      "msPerIteration": null,
+      "uploads": 53,
+      "bytesPerUpload": 3998792,
+      "uploadBytes": 211935976,
+      "edgeIndexBytes": 7986272,
+      "syncKind": "none: onSubmittedWorkDone rejected (OperationError: A valid external Instance reference no longer exists.)",
+      "pan": {
+        "cpuMs": {
+          "median": 1.1,
+          "p95": 1.68,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 1.11,
+          "p95": 1.685,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 1.065,
+          "p95": 1.27,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 1.07,
+          "p95": 1.275,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 16.67,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 1.835,
+        "p95": 2.695,
+        "n": 200
+      },
+      "pickHits": 91,
+      "memory": {
+        "pageWasmBytes": 79757312,
+        "workerWasmBytes": 121896960,
+        "jsHeapUsedBytes": 10238552,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 0.513,
+        "p95": 0.617,
+        "n": 5
+      },
+      "requested": "webgpu"
+    },
+    {
+      "backend": "BrowserWebGpu",
+      "graph": "grid",
+      "size": "1m",
+      "mode": "flat",
+      "nodes": 499849,
+      "edges": 998284,
+      "done": true,
+      "errors": [],
+      "initMs": 45.3,
+      "generateMs": 30,
+      "createViewMs": 246.7,
+      "firstFrameMs": 445.4,
+      "layoutDoneMs": 11828.1,
+      "workerLayoutMs": 11518.7,
+      "hierarchyMs": 116.5,
+      "workerInitMs": 24.7,
+      "iterations": 5,
+      "msPerIteration": 2272.77,
+      "uploads": 6,
+      "bytesPerUpload": 3998792,
+      "uploadBytes": 23992752,
+      "edgeIndexBytes": 7986272,
+      "requested": "webgpu"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "1k",
+      "mode": "multilevel",
+      "nodes": 128,
+      "edges": 1000,
+      "done": true,
+      "errors": [],
+      "initMs": 35.5,
+      "generateMs": 4.7,
+      "createViewMs": 97.4,
+      "firstFrameMs": 264.7,
+      "layoutDoneMs": 285.8,
+      "workerLayoutMs": 29.3,
+      "hierarchyMs": 1.6,
+      "workerInitMs": 28.2,
+      "iterations": 407,
+      "msPerIteration": null,
+      "uploads": 2,
+      "bytesPerUpload": 1024,
+      "uploadBytes": 2048,
+      "edgeIndexBytes": 8000,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.47,
+          "p95": 0.735,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 17.45,
+          "p95": 19.42,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 33.335,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.47,
+          "p95": 0.725,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 17.63,
+          "p95": 21.69,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 16.665,
+          "p95": 33.335,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0,
+        "p95": 0.005,
+        "n": 200
+      },
+      "pickHits": 4,
+      "memory": {
+        "pageWasmBytes": 1900544,
+        "workerWasmBytes": 1507328,
+        "jsHeapUsedBytes": 2873610,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 15.569,
+        "p95": 15.927,
+        "n": 5
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "1k",
+      "mode": "flat",
+      "nodes": 128,
+      "edges": 1000,
+      "done": true,
+      "errors": [],
+      "initMs": 32.5,
+      "generateMs": 6.5,
+      "createViewMs": 77.8,
+      "firstFrameMs": 258.6,
+      "layoutDoneMs": 282,
+      "workerLayoutMs": 43.2,
+      "hierarchyMs": 0.6,
+      "workerInitMs": 34.7,
+      "iterations": 300,
+      "msPerIteration": 0.14,
+      "uploads": 2,
+      "bytesPerUpload": 1024,
+      "uploadBytes": 2048,
+      "edgeIndexBytes": 8000,
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "10k",
+      "mode": "multilevel",
+      "nodes": 2048,
+      "edges": 10000,
+      "done": true,
+      "errors": [],
+      "initMs": 53,
+      "generateMs": 12.9,
+      "createViewMs": 101.6,
+      "firstFrameMs": 685.4,
+      "layoutDoneMs": 1343.1,
+      "workerLayoutMs": 783.9,
+      "hierarchyMs": 35.8,
+      "workerInitMs": 44.3,
+      "iterations": 625,
+      "msPerIteration": null,
+      "uploads": 2,
+      "bytesPerUpload": 16384,
+      "uploadBytes": 32768,
+      "edgeIndexBytes": 80000,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.58,
+          "p95": 2.835,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 74.34,
+          "p95": 92.8,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 83.325,
+          "p95": 100,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.5,
+          "p95": 0.68,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 66.18,
+          "p95": 75.72,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 66.665,
+          "p95": 83.335,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.01,
+        "p95": 0.025,
+        "n": 200
+      },
+      "pickHits": 9,
+      "memory": {
+        "pageWasmBytes": 2228224,
+        "workerWasmBytes": 2293760,
+        "jsHeapUsedBytes": 3174410,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 69.116,
+        "p95": 74.328,
+        "n": 5
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "10k",
+      "mode": "flat",
+      "nodes": 2048,
+      "edges": 10000,
+      "done": true,
+      "errors": [],
+      "initMs": 46.6,
+      "generateMs": 17.9,
+      "createViewMs": 70.7,
+      "firstFrameMs": 505.6,
+      "layoutDoneMs": 1878.5,
+      "workerLayoutMs": 1357.5,
+      "hierarchyMs": 2.9,
+      "workerInitMs": 32.8,
+      "iterations": 300,
+      "msPerIteration": 4.37,
+      "uploads": 14,
+      "bytesPerUpload": 16384,
+      "uploadBytes": 229376,
+      "edgeIndexBytes": 80000,
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "100k",
+      "mode": "multilevel",
+      "nodes": 16384,
+      "edges": 100000,
+      "done": true,
+      "errors": [],
+      "initMs": 35.5,
+      "generateMs": 123.1,
+      "createViewMs": 118.7,
+      "firstFrameMs": 3674.1,
+      "layoutDoneMs": 10546.3,
+      "workerLayoutMs": 7113.3,
+      "hierarchyMs": 90.5,
+      "workerInitMs": 56.5,
+      "iterations": 762,
+      "msPerIteration": null,
+      "uploads": 10,
+      "bytesPerUpload": 131072,
+      "uploadBytes": 1310720,
+      "edgeIndexBytes": 800000,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.925,
+          "p95": 5.23,
+          "n": 23
+        },
+        "frameMs": {
+          "median": 526.33,
+          "p95": 642.085,
+          "n": 23
+        },
+        "rafIntervalMs": {
+          "median": 533.31,
+          "p95": 649.975,
+          "n": 23
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.82,
+          "p95": 2.7,
+          "n": 22
+        },
+        "frameMs": {
+          "median": 571.34,
+          "p95": 643.205,
+          "n": 22
+        },
+        "rafIntervalMs": {
+          "median": 583.305,
+          "p95": 666.635,
+          "n": 22
+        }
+      },
+      "pickMs": {
+        "median": 0.065,
+        "p95": 0.165,
+        "n": 200
+      },
+      "pickHits": 10,
+      "memory": {
+        "pageWasmBytes": 7340032,
+        "workerWasmBytes": 10944512,
+        "jsHeapUsedBytes": 3119564,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 529.907,
+        "p95": 529.907,
+        "n": 1
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "100k",
+      "mode": "flat",
+      "nodes": 16384,
+      "edges": 100000,
+      "done": true,
+      "errors": [],
+      "initMs": 51.5,
+      "generateMs": 127.6,
+      "createViewMs": 371.2,
+      "firstFrameMs": 4115.9,
+      "layoutDoneMs": 7013.3,
+      "workerLayoutMs": 2607.2,
+      "hierarchyMs": 22,
+      "workerInitMs": 54.3,
+      "iterations": 30,
+      "msPerIteration": 82.96,
+      "uploads": 3,
+      "bytesPerUpload": 131072,
+      "uploadBytes": 393216,
+      "edgeIndexBytes": 800000,
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "1m",
+      "mode": "multilevel",
+      "nodes": 131072,
+      "edges": 1000000,
+      "done": true,
+      "errors": [],
+      "initMs": 75.8,
+      "generateMs": 1442.1,
+      "createViewMs": 366.8,
+      "firstFrameMs": 30679.6,
+      "layoutDoneMs": 35505.6,
+      "workerLayoutMs": 9861.6,
+      "hierarchyMs": 1060.4,
+      "workerInitMs": 65.1,
+      "iterations": 272,
+      "msPerIteration": null,
+      "uploads": 2,
+      "bytesPerUpload": 1048576,
+      "uploadBytes": 2097152,
+      "edgeIndexBytes": 8000000,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.765,
+          "p95": 3.965,
+          "n": 15
+        },
+        "frameMs": {
+          "median": 4449.175,
+          "p95": 5950.025,
+          "n": 15
+        },
+        "rafIntervalMs": {
+          "median": 4499.82,
+          "p95": 5966.425,
+          "n": 15
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.785,
+          "p95": 1.53,
+          "n": 15
+        },
+        "frameMs": {
+          "median": 4892.495,
+          "p95": 6121.085,
+          "n": 15
+        },
+        "rafIntervalMs": {
+          "median": 4899.805,
+          "p95": 6133.09,
+          "n": 15
+        }
+      },
+      "pickMs": {
+        "median": 0.575,
+        "p95": 1.03,
+        "n": 200
+      },
+      "pickHits": 41,
+      "memory": {
+        "pageWasmBytes": 58654720,
+        "workerWasmBytes": 112132096,
+        "jsHeapUsedBytes": 10409600,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 4427.136,
+        "p95": 4427.136,
+        "n": 1
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "rmat",
+      "size": "1m",
+      "mode": "flat",
+      "nodes": 131072,
+      "edges": 1000000,
+      "done": true,
+      "errors": [],
+      "initMs": 37.6,
+      "generateMs": 1379.3,
+      "createViewMs": 327.1,
+      "firstFrameMs": 23849.2,
+      "layoutDoneMs": 23846.4,
+      "workerLayoutMs": 3168.6,
+      "hierarchyMs": 189.3,
+      "workerInitMs": 38.2,
+      "iterations": 5,
+      "msPerIteration": 592.93,
+      "uploads": 1,
+      "bytesPerUpload": 1048576,
+      "uploadBytes": 1048576,
+      "edgeIndexBytes": 8000000,
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "1k",
+      "mode": "multilevel",
+      "nodes": 529,
+      "edges": 1012,
+      "done": true,
+      "errors": [],
+      "initMs": 37.6,
+      "generateMs": 0.3,
+      "createViewMs": 102,
+      "firstFrameMs": 328.7,
+      "layoutDoneMs": 417.7,
+      "workerLayoutMs": 130.9,
+      "hierarchyMs": 2.2,
+      "workerInitMs": 39.5,
+      "iterations": 408,
+      "msPerIteration": null,
+      "uploads": 2,
+      "bytesPerUpload": 4232,
+      "uploadBytes": 8464,
+      "edgeIndexBytes": 8096,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.505,
+          "p95": 0.855,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 24.99,
+          "p95": 27.825,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 33.33,
+          "p95": 33.335,
+          "n": 120
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.5,
+          "p95": 0.85,
+          "n": 120
+        },
+        "frameMs": {
+          "median": 24.49,
+          "p95": 28.38,
+          "n": 120
+        },
+        "rafIntervalMs": {
+          "median": 33.33,
+          "p95": 33.335,
+          "n": 120
+        }
+      },
+      "pickMs": {
+        "median": 0.005,
+        "p95": 0.015,
+        "n": 200
+      },
+      "pickHits": 18,
+      "memory": {
+        "pageWasmBytes": 1900544,
+        "workerWasmBytes": 1572864,
+        "jsHeapUsedBytes": 2698688,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 23.315,
+        "p95": 23.418,
+        "n": 5
+      },
+      "requested": "webgl2",
+      "rerun": "rerun alone: the full run's first case after software WebGL2's 1M-edge R-MAT read 5.8 s to first frame, the previous page still draining"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "1k",
+      "mode": "flat",
+      "nodes": 529,
+      "edges": 1012,
+      "done": true,
+      "errors": [],
+      "initMs": 36.6,
+      "generateMs": 0.2,
+      "createViewMs": 77.6,
+      "firstFrameMs": 297.3,
+      "layoutDoneMs": 451.4,
+      "workerLayoutMs": 192,
+      "hierarchyMs": 0.8,
+      "workerInitMs": 43.6,
+      "iterations": 300,
+      "msPerIteration": 0.63,
+      "uploads": 3,
+      "bytesPerUpload": 4232,
+      "uploadBytes": 12696,
+      "edgeIndexBytes": 8096,
+      "requested": "webgl2",
+      "rerun": "rerun alone: the full run's first case after software WebGL2's 1M-edge R-MAT read 5.8 s to first frame, the previous page still draining"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "10k",
+      "mode": "multilevel",
+      "nodes": 5041,
+      "edges": 9940,
+      "done": true,
+      "errors": [],
+      "initMs": 38.3,
+      "generateMs": 1.4,
+      "createViewMs": 86.3,
+      "firstFrameMs": 797.8,
+      "layoutDoneMs": 2615.7,
+      "workerLayoutMs": 1871.9,
+      "hierarchyMs": 12,
+      "workerInitMs": 53.7,
+      "iterations": 417,
+      "msPerIteration": null,
+      "uploads": 13,
+      "bytesPerUpload": 40328,
+      "uploadBytes": 524264,
+      "edgeIndexBytes": 79520,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.54,
+          "p95": 1.735,
+          "n": 105
+        },
+        "frameMs": {
+          "median": 132.355,
+          "p95": 154.405,
+          "n": 105
+        },
+        "rafIntervalMs": {
+          "median": 133.33,
+          "p95": 150,
+          "n": 105
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.53,
+          "p95": 0.775,
+          "n": 117
+        },
+        "frameMs": {
+          "median": 117.405,
+          "p95": 142.32,
+          "n": 117
+        },
+        "rafIntervalMs": {
+          "median": 116.665,
+          "p95": 149.995,
+          "n": 117
+        }
+      },
+      "pickMs": {
+        "median": 0.02,
+        "p95": 0.08,
+        "n": 200
+      },
+      "pickHits": 56,
+      "memory": {
+        "pageWasmBytes": 2359296,
+        "workerWasmBytes": 2621440,
+        "jsHeapUsedBytes": 2457358,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 126.177,
+        "p95": 130.044,
+        "n": 5
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "10k",
+      "mode": "flat",
+      "nodes": 5041,
+      "edges": 9940,
+      "done": true,
+      "errors": [],
+      "initMs": 50.4,
+      "generateMs": 8.9,
+      "createViewMs": 104.8,
+      "firstFrameMs": 787.9,
+      "layoutDoneMs": 4189.3,
+      "workerLayoutMs": 3426.2,
+      "hierarchyMs": 2.6,
+      "workerInitMs": 35.8,
+      "iterations": 300,
+      "msPerIteration": 10.95,
+      "uploads": 24,
+      "bytesPerUpload": 40328,
+      "uploadBytes": 967872,
+      "edgeIndexBytes": 79520,
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "100k",
+      "mode": "multilevel",
+      "nodes": 50176,
+      "edges": 99904,
+      "done": true,
+      "errors": [],
+      "initMs": 36.7,
+      "generateMs": 8,
+      "createViewMs": 121.5,
+      "firstFrameMs": 6480.8,
+      "layoutDoneMs": 22017.7,
+      "workerLayoutMs": 16138.3,
+      "hierarchyMs": 50.4,
+      "workerInitMs": 43,
+      "iterations": 329,
+      "msPerIteration": null,
+      "uploads": 14,
+      "bytesPerUpload": 401408,
+      "uploadBytes": 5619712,
+      "edgeIndexBytes": 799232,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 0.605,
+          "p95": 2,
+          "n": 15
+        },
+        "frameMs": {
+          "median": 1177.31,
+          "p95": 1224.1,
+          "n": 15
+        },
+        "rafIntervalMs": {
+          "median": 1183.285,
+          "p95": 1233.285,
+          "n": 15
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 0.63,
+          "p95": 1.08,
+          "n": 15
+        },
+        "frameMs": {
+          "median": 895.13,
+          "p95": 1042.725,
+          "n": 15
+        },
+        "rafIntervalMs": {
+          "median": 899.965,
+          "p95": 1049.96,
+          "n": 15
+        }
+      },
+      "pickMs": {
+        "median": 0.205,
+        "p95": 0.37,
+        "n": 200
+      },
+      "pickHits": 70,
+      "memory": {
+        "pageWasmBytes": 10027008,
+        "workerWasmBytes": 13238272,
+        "jsHeapUsedBytes": 42688550,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 1181.031,
+        "p95": 1181.031,
+        "n": 1
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "100k",
+      "mode": "flat",
+      "nodes": 50176,
+      "edges": 99904,
+      "done": true,
+      "errors": [],
+      "initMs": 42,
+      "generateMs": 5.7,
+      "createViewMs": 1125.2,
+      "firstFrameMs": 7456.8,
+      "layoutDoneMs": 12301.9,
+      "workerLayoutMs": 5101.9,
+      "hierarchyMs": 11.7,
+      "workerInitMs": 34.1,
+      "iterations": 30,
+      "msPerIteration": 165.49,
+      "uploads": 4,
+      "bytesPerUpload": 401408,
+      "uploadBytes": 1605632,
+      "edgeIndexBytes": 799232,
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "1m",
+      "mode": "multilevel",
+      "nodes": 499849,
+      "edges": 998284,
+      "done": true,
+      "errors": [],
+      "initMs": 53,
+      "generateMs": 35.4,
+      "createViewMs": 1655.6,
+      "firstFrameMs": 57859.1,
+      "layoutDoneMs": 81342.2,
+      "workerLayoutMs": 32932.8,
+      "hierarchyMs": 294.2,
+      "workerInitMs": 44.5,
+      "iterations": 51,
+      "msPerIteration": null,
+      "uploads": 3,
+      "bytesPerUpload": 3998792,
+      "uploadBytes": 11996376,
+      "edgeIndexBytes": 7986272,
+      "syncKind": "webgl2 readPixels(1x1)",
+      "pan": {
+        "cpuMs": {
+          "median": 1.675,
+          "p95": 3.785,
+          "n": 15
+        },
+        "frameMs": {
+          "median": 11605.98,
+          "p95": 11895.19,
+          "n": 15
+        },
+        "rafIntervalMs": {
+          "median": 11616.2,
+          "p95": 11899.53,
+          "n": 15
+        }
+      },
+      "zoom": {
+        "cpuMs": {
+          "median": 1.445,
+          "p95": 1.595,
+          "n": 15
+        },
+        "frameMs": {
+          "median": 9589.48,
+          "p95": 11103.14,
+          "n": 15
+        },
+        "rafIntervalMs": {
+          "median": 9599.615,
+          "p95": 11432.88,
+          "n": 15
+        }
+      },
+      "pickMs": {
+        "median": 2.21,
+        "p95": 2.525,
+        "n": 200
+      },
+      "pickHits": 91,
+      "memory": {
+        "pageWasmBytes": 85852160,
+        "workerWasmBytes": 121896960,
+        "jsHeapUsedBytes": 10421634,
+        "crossOriginIsolated": true,
+        "userAgentSpecificError": "SecurityError: Failed to execute 'measureUserAgentSpecificMemory' on 'Performance': performance.measureUserAgentSpecificMemory is not available."
+      },
+      "burstMsPerFrame": {
+        "median": 11516.239,
+        "p95": 11516.239,
+        "n": 1
+      },
+      "requested": "webgl2"
+    },
+    {
+      "backend": "Gl",
+      "graph": "grid",
+      "size": "1m",
+      "mode": "flat",
+      "nodes": 499849,
+      "edges": 998284,
+      "done": true,
+      "errors": [],
+      "initMs": 32.1,
+      "generateMs": 29.6,
+      "createViewMs": 310.8,
+      "firstFrameMs": 57110.2,
+      "layoutDoneMs": 57097.5,
+      "workerLayoutMs": 12321.1,
+      "hierarchyMs": 115.3,
+      "workerInitMs": 45.4,
+      "iterations": 5,
+      "msPerIteration": 2432.16,
+      "uploads": 1,
+      "bytesPerUpload": 3998792,
+      "uploadBytes": 3998792,
+      "edgeIndexBytes": 7986272,
+      "requested": "webgl2"
+    }
+  ],
+  "native": {
+    "oneThread": {
+      "rayon": false,
+      "threads": 1,
+      "graphs": [
+        {
+          "graph": "rmat",
+          "size": "1k",
+          "nodes": 128,
+          "edges": 579,
+          "levels": 2,
+          "totalWork": 407.4,
+          "hierarchyMs": 0.1,
+          "multilevelMs": 15.8,
+          "flatMsPerIteration": 0.08,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "rmat",
+          "size": "10k",
+          "nodes": 2048,
+          "edges": 8334,
+          "levels": 6,
+          "totalWork": 624.9,
+          "hierarchyMs": 1.8,
+          "multilevelMs": 422.5,
+          "flatMsPerIteration": 2.774,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "rmat",
+          "size": "100k",
+          "nodes": 16384,
+          "edges": 88822,
+          "levels": 8,
+          "totalWork": 762.2,
+          "hierarchyMs": 24.8,
+          "multilevelMs": 3454.5,
+          "flatMsPerIteration": 24.725,
+          "flatIterationsTimed": 72
+        },
+        {
+          "graph": "rmat",
+          "size": "1m",
+          "nodes": 131072,
+          "edges": 928785,
+          "levels": 11,
+          "totalWork": 272.4,
+          "hierarchyMs": 357,
+          "multilevelMs": 5334.4,
+          "flatMsPerIteration": 377.629,
+          "flatIterationsTimed": 4
+        },
+        {
+          "graph": "grid",
+          "size": "1k",
+          "nodes": 529,
+          "edges": 1012,
+          "levels": 5,
+          "totalWork": 407.9,
+          "hierarchyMs": 0.2,
+          "multilevelMs": 73.8,
+          "flatMsPerIteration": 0.61,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "grid",
+          "size": "10k",
+          "nodes": 5041,
+          "edges": 9940,
+          "levels": 8,
+          "totalWork": 417,
+          "hierarchyMs": 1.2,
+          "multilevelMs": 1047.9,
+          "flatMsPerIteration": 8.376,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "grid",
+          "size": "100k",
+          "nodes": 50176,
+          "edges": 99904,
+          "levels": 11,
+          "totalWork": 328.6,
+          "hierarchyMs": 9.9,
+          "multilevelMs": 9377.7,
+          "flatMsPerIteration": 95.71,
+          "flatIterationsTimed": 22
+        },
+        {
+          "graph": "grid",
+          "size": "1m",
+          "nodes": 499849,
+          "edges": 998284,
+          "levels": 15,
+          "totalWork": 51.4,
+          "hierarchyMs": 107,
+          "multilevelMs": 20606,
+          "flatMsPerIteration": 1238.388,
+          "flatIterationsTimed": 1
+        }
+      ]
+    },
+    "allThreads": {
+      "rayon": true,
+      "threads": 4,
+      "graphs": [
+        {
+          "graph": "rmat",
+          "size": "1k",
+          "nodes": 128,
+          "edges": 579,
+          "levels": 2,
+          "totalWork": 407.4,
+          "hierarchyMs": 0.2,
+          "multilevelMs": 34.2,
+          "flatMsPerIteration": 0.081,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "rmat",
+          "size": "10k",
+          "nodes": 2048,
+          "edges": 8334,
+          "levels": 6,
+          "totalWork": 624.9,
+          "hierarchyMs": 2.0,
+          "multilevelMs": 219.8,
+          "flatMsPerIteration": 0.882,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "rmat",
+          "size": "100k",
+          "nodes": 16384,
+          "edges": 88822,
+          "levels": 8,
+          "totalWork": 762.2,
+          "hierarchyMs": 12.9,
+          "multilevelMs": 1260.6,
+          "flatMsPerIteration": 8.946,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "rmat",
+          "size": "1m",
+          "nodes": 131072,
+          "edges": 928785,
+          "levels": 11,
+          "totalWork": 272.4,
+          "hierarchyMs": 160.8,
+          "multilevelMs": 1851.4,
+          "flatMsPerIteration": 88.41,
+          "flatIterationsTimed": 21
+        },
+        {
+          "graph": "grid",
+          "size": "1k",
+          "nodes": 529,
+          "edges": 1012,
+          "levels": 5,
+          "totalWork": 407.9,
+          "hierarchyMs": 0.5,
+          "multilevelMs": 103.3,
+          "flatMsPerIteration": 0.239,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "grid",
+          "size": "10k",
+          "nodes": 5041,
+          "edges": 9940,
+          "levels": 8,
+          "totalWork": 417.0,
+          "hierarchyMs": 1.3,
+          "multilevelMs": 502.8,
+          "flatMsPerIteration": 2.874,
+          "flatIterationsTimed": 100
+        },
+        {
+          "graph": "grid",
+          "size": "100k",
+          "nodes": 50176,
+          "edges": 99904,
+          "levels": 11,
+          "totalWork": 328.6,
+          "hierarchyMs": 7.0,
+          "multilevelMs": 3571.1,
+          "flatMsPerIteration": 32.82,
+          "flatIterationsTimed": 71
+        },
+        {
+          "graph": "grid",
+          "size": "1m",
+          "nodes": 499849,
+          "edges": 998284,
+          "levels": 15,
+          "totalWork": 51.4,
+          "hierarchyMs": 75.0,
+          "multilevelMs": 7502.6,
+          "flatMsPerIteration": 393.162,
+          "flatIterationsTimed": 4
+        }
+      ]
+    }
+  }
+}

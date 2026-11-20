@@ -79,6 +79,10 @@ An index is stored under a key made from two things: the plan that produces the 
 
 Some algorithms, such as PageRank, in-degree and anything with `direction => 'both'`, also need the reverse of the index: each node's incoming edges. The first query that builds it adds it to the stored index when the database closes. A later process reads it from disk only when an algorithm asks for it, so a query that does not need it does not pay to load it.
 
+Loading a stored index does not read all of it. On Linux and macOS the file is memory-mapped: a query that follows the edges of a few nodes, such as `hop`, `shortest_path` or a `MATCH` from a bound node, reads only those parts of the file, so it answers in a fraction of a second in a new process however large the graph. An algorithm over the whole graph, such as PageRank, reads all of it, from the operating system's file cache when the file is there, and checks the file's checksums before it runs. A file found damaged then is dropped and the index built again, with a notice. On Windows the file is read whole when it is loaded, on all cores. Mapped pages count toward a process's memory as the operating system's file cache: they are shared between processes reading the same index, and released under memory pressure.
+
+Indexes stored by ursa 0.10 use an older file format. They still load, read whole, and the first writer to load one rewrites it in the current format, with a notice.
+
 Evaluated weights are stored with the index too, one set per weight expression, when the database closes. A later weighted query with the same expression over the same files reads them instead of reading the edges again. A changed expression or source file never uses stored weights: it reads the edges and evaluates them afresh. Stored weights count toward the storage limit, and they are evicted with their index.
 
 Edges that are not read from files, such as an in-memory table, have no stable key. Their index is built once per session and not stored.
@@ -95,7 +99,7 @@ ursa: graph indexes built 0, loaded 1
 
 ### The storage limit
 
-A database keeps at most `ursa.index_storage_limit` of stored indexes. By default the limit is 25% of the free space on the database's disk, counting the indexes it already stores, in whole GiB, at least 4 GiB and at most 64 GiB. It is worked out once per process, when it is first needed. So a large disk keeps the indexes of several large graphs, and indexes, which are only a cache, never take most of a disk. In a database, `SHOW ursa.index_storage_limit` says the limit in effect and where it comes from, for example `25GiB (the default: 25% of 100.2 GiB: the 97.9 GiB free on the disk of club.ursa and the 2.3 GiB its indexes take; at least 4GiB, at most 64GiB)`.
+A database keeps at most `ursa.index_storage_limit` of stored indexes. By default the limit is 25% of the free space on the database's disk, counting the indexes it already stores, rounded down to a multiple of 4 GiB, at least 4 GiB and at most 64 GiB. It is worked out once per process, when it is first needed. So a large disk keeps the indexes of several large graphs, and indexes, which are only a cache, never take most of a disk. Because it depends on the free space, the default differs from disk to disk, and changes when the free space does by more than a 4 GiB step. In a database, `SHOW ursa.index_storage_limit` says the limit in effect, such as `24GiB`, as every setting's value is just the value. `SHOW ursa.index_storage_limit VERBOSE` says where it comes from in its `description`, for example `the default: 25% of 100.2 GiB (the 97.9 GiB free on the disk of club.ursa when it was opened and the 2.3 GiB its indexes take), rounded down to a multiple of 4GiB, at least 4GiB, at most 64GiB. The most bytes of graph indexes …`.
 
 Set it with `SET`:
 
@@ -105,12 +109,12 @@ SHOW ursa.index_storage_limit;
 ```
 
 ```text
-┌──────────────────────────┬─────────────────────────────┐
-│           name           │            value            │
-│           Utf8           │            Utf8             │
-├──────────────────────────┼─────────────────────────────┤
-│ ursa.index_storage_limit │ 8GiB (SET for this session) │
-└──────────────────────────┴─────────────────────────────┘
+┌──────────────────────────┬───────┐
+│           name           │ value │
+│           Utf8           │ Utf8  │
+├──────────────────────────┼───────┤
+│ ursa.index_storage_limit │ 8GiB  │
+└──────────────────────────┴───────┘
 ```
 
 `SET` lasts for the session, as in DuckDB and Postgres, in any database, writable or read-only: nothing is written to the database. `RESET ursa.index_storage_limit` (or `SET … = 'auto'`) goes back to the default. To keep a limit for every session, put the `SET` in `~/.ursarc`, which the interactive shell runs at startup, or in a file you pass with `-init`, which scripts (`-c`, `--file`) run too:
@@ -146,14 +150,15 @@ ursa: built the index for bsky (95.7M edges) in 30.7 s; stored in club.ursa (1.3
 ursa: built the index for big (812.0M edges) in 4 min 5 s; not stored: it takes 12.1 GiB, more than ursa.index_storage_limit (8GiB); SET ursa.index_storage_limit = '32GiB' to keep it
 ursa: evicted the stored index for old (1.4 GiB, the least recently used) from club.ursa to stay within ursa.index_storage_limit (8GiB)
 ursa: built the index for bsky (95.7M edges) in 30.7 s; not stored: club.ursa is open read-only
+ursa: stored the reverse adjacency of bsky in club.ursa (+1.0 GiB, 2.3 GiB in all); the stored indexes now take 7.6 GiB of ursa.index_storage_limit (8GiB)
 ```
 
 Which notices are printed is `ursa.notices`:
 
 | Value | Prints |
 |---|---|
-| `on` (the default) | an index build that takes more than a second (when it starts, and when it is done); every index that is not stored or is evicted; a failed write; a `SET` of the limit below what is stored; a limit saved by 0.8 or 0.9 |
-| `all` | also every build, load and store, however quick |
+| `on` (the default) | an index build that takes more than a second (when it starts, and when it is done); every index that is not stored or is evicted; a reverse adjacency stored that brings the stored indexes to 90% of the limit or more; a failed write; a `SET` of the limit below what is stored; a limit saved by 0.8 or 0.9; an object of the catalog that is [unavailable](#when-a-file-is-missing) |
+| `all` | also every build, load and store, however quick, and every reverse adjacency stored |
 | `off` | nothing |
 
 `ursa --quiet` (`-q`) prints no notices; errors are still printed. `ursa.notices` lasts for the session and is not stored in the database.
@@ -201,3 +206,21 @@ The catalog is plain JSON, so you can read it and diff it:
 A catalog written by ursa 0.8 or 0.9 may also have `"settings"`, with a saved `ursa.index_storage_limit`. It is no longer applied, and a writable open removes it (see [the storage limit](#the-storage-limit)).
 
 Copy or move `club.ursa` together with `club.ursa.d/`, and, to keep the stored indexes, the data files inside its directory with them. Without `club.ursa.d/`, the catalog still opens, and the indexes are built again. A damaged or out-of-date index file is treated as missing, never as an error. Indexes stored by ursa 0.7 or earlier use the old key: the first writer to open the database with 0.8 removes them, says so, and builds each again when it is first used.
+
+## When a file is missing
+
+A database always opens. If a definition in its catalog fails when the database opens, because a data file was moved, renamed or deleted, the database was copied without its files, or the credentials for an `s3://` path expired, that view, table or graph is *unavailable*. Ursa says so once, on stderr:
+
+```text
+ursa: view ties is unavailable: no file found at '/home/me/club/karate_edges.csv'; DROP VIEW ties or restore the file
+ursa: graph karate is unavailable: it uses view ties, which is unavailable; repair ties, or DROP PROPERTY GRAPH karate
+```
+
+Everything else works. An unavailable object is still listed by `SHOW TABLES` and `.tables`, and using it fails with the same message, as a broken view does in DuckDB. A view or graph that uses an unavailable object is unavailable too, with its own message.
+
+Its statement stays in the catalog as it was, so nothing is lost: restore the file, open the database again, and the object is back, with everything that uses it. Or repair it in a writable session:
+
+- `DROP VIEW ties` (or `DROP VIEW IF EXISTS ties`, `DROP TABLE`, `DROP PROPERTY GRAPH`) removes it from the catalog;
+- `CREATE OR REPLACE VIEW ties AS …` defines it again, in its place in the catalog. `CREATE VIEW ties` without `OR REPLACE` says it already exists.
+
+An object that uses one you repaired stays unavailable until the database is opened again. A read-only session opens the database the same way, and cannot repair it.

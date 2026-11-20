@@ -85,11 +85,15 @@ CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (d
 SELECT * FROM pagerank(club, direction => 'both') ORDER BY pagerank DESC LIMIT 3;
 ```
 
+**[Try it live](https://ursa-shell.cl-dixon.workers.dev/#run=WyJDUkVBVEUgVklFVyB0aWVzIEFTIFNFTEVDVCAqIEZST00gJ2thcmF0ZV9lZGdlcy5jc3YnOyIsIkNSRUFURSBQUk9QRVJUWSBHUkFQSCBjbHViIEVER0UgVEFCTEVTICh0aWVzIFNPVVJDRSBLRVkgKHNyYykgREVTVElOQVRJT04gS0VZIChkc3QpKTsiLCJTRUxFQ1QgKiBGUk9NIHBhZ2VyYW5rKGNsdWIsIGRpcmVjdGlvbiA9PiAnYm90aCcpIE9SREVSIEJZIHBhZ2VyYW5rIERFU0MgTElNSVQgMzsiXQ)**: this query in Ursa Shell, in your browser. Or take the [five-step tour](https://ursa-shell.cl-dixon.workers.dev/?dataset=tour): PageRank, Louvain, a drawing of the graph and a shortest path, on the karate club.
+
 Algorithms give the same values in SQL and in Python. Install `ursa` with one line on Linux or macOS:
 
 ```bash
 curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 ```
+
+Or try it in your browser, with nothing to install, in [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev).
 
 On Windows, `irm https://cldixon.github.io/ursa/install.ps1 | iex` in PowerShell. Or `cargo install ursa-cli`, or a binary from the [releases page](https://github.com/cldixon/ursa/releases). See the [SQL docs](https://cldixon.github.io/ursa/sql/).
 

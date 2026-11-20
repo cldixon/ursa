@@ -1,0 +1,73 @@
+name: Bench smoke
+
+# Tier T0 of benchmarks/SQL_PERFORMANCE.md: the Bluesky benchmark (bluesky_cloud/run.py)
+# and the cross-library comparison (compare/) run end to end on a small synthetic
+# graph, against the released ursa binary and the pinned Python libraries. Seconds,
+# no AWS, no dataset. It checks the harnesses still run and every engine still
+# agrees with ursa-sql. It is not a timing gate.
+on:
+  pull_request:
+    paths:
+      - "benchmarks/bluesky_cloud/**"
+      - "benchmarks/compare/**"
+      - ".github/workflows/bench-smoke.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/bluesky_cloud/**"
+      - "benchmarks/compare/**"
+      - ".github/workflows/bench-smoke.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  URSA_VERSION: "0.10.0"
+
+jobs:
+  smoke:
+    name: harness smoke (ursa 0.10.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the released ursa
+        run: |
+          curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION="$URSA_VERSION" sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Python libraries for the comparison
+        run: |
+          uv venv /tmp/cmpvenv -p 3.12
+          uv pip install -p /tmp/cmpvenv/bin/python "ursa-graph==0.5.0" "igraph==1.0.0" \
+            "networkx==3.7" "rustworkx==0.18.1" pyarrow numpy scipy
+
+      - name: Synthetic data
+        run: |
+          ursa --version
+          python3 benchmarks/bluesky_cloud/smoke_data.py /tmp/smoke/data
+
+      - name: Bluesky benchmark (run.py), every step
+        run: python3 benchmarks/bluesky_cloud/run.py --data /tmp/smoke/data --work /tmp/smoke/work --before 2024-03-01
+
+      - name: Cross-library comparison, every engine
+        run: |
+          py=/tmp/cmpvenv/bin/python
+          $py benchmarks/compare/prep.py --source /tmp/smoke/data/deidentified_follows_edgelist.parquet --out /tmp/cmp/smoke
+          $py benchmarks/compare/compare.py --graph /tmp/cmp/smoke --out /tmp/cmp/out --python $py --timeout 300
+
+      - name: Job summary
+        if: always()
+        run: |
+          for f in /tmp/smoke/work/out/summary.md /tmp/cmp/out/summary.md; do
+            [ -f "$f" ] && { cat "$f"; echo; } >> "$GITHUB_STEP_SUMMARY"
+          done

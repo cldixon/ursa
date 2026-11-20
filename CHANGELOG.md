@@ -15,7 +15,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the engine crates are `ursa-engine` and `ursa-sql`). This is its first
   release. It is versioned apart from the Python package. Changes on `main`
   since then are released as `ursa-cli` 0.7.0 (2026-11-06), 0.8.0
-  (2026-11-07), 0.9.0 (2026-11-10) and 0.10.0 (2026-11-17).
+  (2026-11-07), 0.9.0 (2026-11-10), 0.10.0 (2026-11-17) and 0.11.0
+  (2026-11-18).
   - Any Parquet or CSV file is a table: `SELECT * FROM 'edges.parquet'`,
     with globs, directories, compressed CSV, and `s3://`, `gs://`, `az://`
     and `https://` URLs. Built on DataFusion 55.2. DuckDB's FROM-first
@@ -150,6 +151,77 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is a page on the graph SQL and `.help shortcuts` the keys. New `.version`
   and `.print`. In a colour terminal what is typed is highlighted (keywords,
   strings, comments, dot-commands), the prompt is orange, and errors are red.
+- **Ursa Web Shell: a guided tour, and "Try it live" links from the docs**
+  (#391, and the discoverability half of #390). The Datasets menu's first
+  item, `Tour: the karate club` (also `.tour`, or `?dataset=tour` in the
+  URL), tells one story in five steps, each with a comment for a newcomer:
+  the club's data and its property graph, PageRank (the two leaders come out
+  on top), Louvain (its two factions match the club's real split for 33 of
+  34 members), a drawing of the club, and every shortest path between the
+  two leaders with `GRAPH_TABLE … ALL SHORTEST`. Its tables fit a phone. The
+  karate dataset stays as it was, next to it. Each dataset now ends with a
+  comment that says how to draw it (`.graph lesmis`; for rmat, that the
+  layout takes a few seconds), and `.help` starts with `.tour` and `.graph`.
+  The README, the SQL docs' landing page and the website (its landing page,
+  the docs' overview, Introduction and Quickstart) link to the shell with
+  their example preloaded, as a Share link that shows its statements and
+  runs them on `y`, or with `?dataset=`. `web/scripts/share-link.ts` makes
+  such links, encoded as the shell's Share does. The e2e test runs the tour
+  on a phone and replays every docs link.
+- **Ursa Web Shell: a start hint.** Under the banner, one line points to the
+  sample graphs: `Pick a sample graph from the Datasets menu, or type
+  .dataset karate` (broken between words on a narrow screen).
+- **Ursa Web Shell: the browser e2e suite runs in CI** (#392). The "Ursa
+  Shell (browser e2e)" job builds the engine and the page, stages the sample
+  datasets locally, serves them as the Worker does and runs `web/tests/e2e.ts`
+  in headless Chromium, on pull requests that touch the shell or the crates
+  in it; screenshots and logs are uploaded when it fails.
+- **Ursa Web Shell: the Graph view.** `.graph` draws the last result as a
+  graph in a pane beside the terminal (under it on a phone), and so does
+  the new Graph button: each row is an edge from its `src` column to its
+  `dst` column, or else from its first column to its second, with ids of
+  any type. `.graph QUERY` draws a query's result and `.graph NAME` a
+  property graph (every edge table, and every vertex, edges or not) or a
+  table. The shell says what it draws, `Drawing 78 edges, 34 nodes (Esc
+  closes)`, and keeps the keys: queries can be typed while the graph shows,
+  and the terminal refits to its half. The drawing is `ursa-viz`'s (WebGPU,
+  or else WebGL2), its ForceAtlas2 layout converging live in a worker,
+  nodes sized by degree: drag or the arrow keys pan, the wheel or `+` and
+  `-` zoom, a double-click or `0` fits, and a click names a node. It is
+  ink on white by day and starlight by night. Esc or the close button
+  closes it; New and the Datasets menu do too. It is loaded on the first
+  `.graph` only (about 1 MB gzipped), and draws at most 2,000,000 edges.
+  `WebShell.graph(text)` gives the page the graph: node ids mapped to
+  dense indexes in the order they are first seen, with clear errors when
+  there is nothing to draw.
+- **Ursa Web Shell: sizes, colours and a legend for the Graph view**
+  (#389). `.graph [SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
+  `.graph karate SIZE BY pagerank COLOR BY louvain` sizes nodes by PageRank
+  and colours them by Louvain community. x and y name a column of `NODES
+  (SELECT id, … FROM …)`, a vertex column of the property graph, `degree`,
+  or a per-node algorithm, run on the graph with defaults through
+  `algorithms(G, …)` and joined on id. A query or the last result takes
+  `NODES` and `degree` only. Errors say what fits: an unknown name lists the
+  graph's columns and the algorithms, `SIZE BY` text suggests `COLOR BY`,
+  and too many categories suggests `SIZE BY`. `COLOR BY` colours the eight
+  largest categories and draws the rest as "other"; the pane's legend names
+  what sizes the nodes and each colour's category and count. The engine does
+  it all (`WebShell.graph` returns `size`, `color` and the legend; with no
+  clause, the graph as before).
+- **Ursa Web Shell: the Graph view in each theme's own colours.** The view
+  draws on the theme's background with its own edge ink and a categorical
+  palette stepped for white and for the dark sky, so the CSS inversion is
+  gone; switching the theme recolours an open view. `ursa-viz` has
+  `setTheme({background, edge, node, palette})` and a `Theme` in Rust, and
+  its `Layout` a `levels` getter.
+- **Ursa Web Shell: the Graph view says how far it is, and draws sooner**
+  (#390). The pane shows "Loading graph view…" within a moment of Enter,
+  then "Laying out · level k of n", then the counts and "Done". `ursa-viz`
+  and the layout worker start loading while the engine runs the query, the
+  layout gets the graph before the view is built, and nothing is drawn
+  before its first positions: `.graph rmat` (1M edges) first draws 0.95 s
+  after Enter in headless Chromium, from 4.6 s, and finishes its layout at
+  6.0 s, from 12.1 s.
 - **`ursa`: shell fixes.**
   - A null in a column of type `Null` (`SELECT NULL AS n`) shows `NULL`, as
     other nulls do; it was a blank cell. So does a dictionary's null value.
@@ -212,9 +284,165 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     property 's'; its properties are club, id", with a hint to name an edge
     to read its columns, where DataFusion named an internal relation
     (`__ursa_1.s`).
+- **A new website for Ursa SQL, in `site/`**, to be served at
+  `https://ursa.cldixon.dev`: a landing page at `/` and the docs at `/docs/`,
+  built with Astro and Starlight and laid out after duckdb.org's docs, ready
+  to deploy as Workers static assets (worker `ursa-site`; not deployed yet).
+  The docs are the eight `docs/sql/` pages, regrouped under Get started and
+  Topics. `docs/sql/` stays, served by the Zensical site, until the cutover.
+  - `ursa-cli`'s docs test runs the SQL on the new pages too
+    (`site_docs_run`, with `{/* skip */}` for MDX), and
+    `function_reference_is_current` checks the site's copy of the function
+    reference as well. CI builds the site.
+  - Zensical builds into `zensical-site/` instead of `site/`, which is now
+    the new website's source.
+- **Coarse-to-fine ForceAtlas2, and the graph view lays out with it.**
+  `ursa_core::algo::layout_fa2_multilevel` and its incremental form
+  `Fa2Multilevel` coarsen the graph (heavy-edge matching, with a hub's
+  leftover leaves joining it, and isolated nodes set aside on a ring), lay
+  out its 50-node top level, then refine each finer level in a few
+  iterations. The output is the same bits on any thread count, and however
+  the work is split into steps. On one core a 10,000-node grid comes out as
+  a flat sheet in 2 s, where flat ForceAtlas2 leaves it folded after 1,500
+  iterations; a 16K-node R-MAT graph is as good in 3.5 s as flat after 17 s;
+  clustered graphs separate as well as flat. The `ursa-viz` worker uses it by
+  default (`&multilevel=0` in the demo for flat), drawing every node from the
+  first frame: a 1M-edge R-MAT graph takes shape in about 8 s in the browser,
+  where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
+  weight per edge) and `from_positions` (start positions and masses);
+  `layout_fa2` and `layout_fr` give the same bits as before.
+- **Layouts in SQL: `layout_fa2` and `layout_fr`** (#395). Both are table
+  functions of `(id, x, y)`, like the algorithms, and work inside
+  `algorithms(g, …)`, where their columns are `x` and `y`, or
+  `<name>_x` and `<name>_y` (`pos => layout_fa2()`). `layout_fa2` is
+  ForceAtlas2 coarse to fine by default (`layout_fa2_multilevel`);
+  `multilevel => false` runs it flat. Its named arguments are
+  `iterations` (NULL: 300 flat, the size-based schedule coarse to fine;
+  given, coarse to fine, the graph's own iterations, the levels above more),
+  `k`, `gravity`, `strong_gravity`, `lin_log`, `theta` (NULL: 1.0 coarse to
+  fine, 0.5 flat), `jitter_tolerance` and `seed`; `layout_fr` takes
+  `iterations`, `k`, `gravity` and `seed`. Positions are `ursa-core`'s, bit
+  for bit, and the same on any thread count, so they can be saved with
+  `COPY … TO 'layout.parquet'`. The layouts take no weight. A graph with a
+  vertex table gives every vertex a position. `layout_random` and
+  `layout_circle` stay hidden. The catalog gains `layout_fa2` and an
+  `OptionalCount` parameter type; the Python library has
+  `ursa._graph.layout_fa2`, not yet exported, as the other layouts.
+- **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
+  in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
+  to 1M edges, under WebGPU and WebGL2, and records time to first frame and
+  to layout done (coarse to fine, and flat per iteration), synced frame times
+  while panning and zooming (median and p95), pick latency, wasm and JS
+  memory, and bytes uploaded; then the layout alone natively, on one thread
+  and on all (`fa2_multilevel`'s new `bench` mode). It writes
+  `bench/results.json`; `bun run bench:report` makes the tables. The
+  baseline, from a container without a GPU: a first frame in 0.1 s up to
+  100K edges and 1.1 s at 1M, a layout done in 8 s for a 1M-edge R-MAT
+  graph and 32 s for a 1M-edge grid, wasm 1.4 times slower than native on
+  one thread. Not in CI.
 
 ### Changed
 
+- **SQL: a stored graph index is memory-mapped, not read whole** (#382).
+  Loading one read the whole file on one core, so at full scale (2.42B
+  edges, an 18.6 GiB index) every query in a new process paid 15 s, even a
+  `hop` that touches a few thousand edges. Now the index file is mapped
+  (Linux, macOS): a traversal or path search reads only the adjacency lists
+  it visits, and an algorithm over the whole graph reads the file at the file
+  cache's speed, on all cores. On a 250M-edge graph (a 1.9 GiB index), a
+  1-step `hop` in a new process takes 0.16 s (was 6.6 s) and 0.2 GB of
+  memory (was 2.4 GB); `degree` 0.33 s (was 6.7 s); PageRank 2.8 s (was
+  18 s). Results and node numbering are unchanged. On Windows, which cannot
+  replace a mapped file, the index is read whole as before, but on all
+  cores.
+  - **Index file format version 3.** The layout is version 2's (raw
+    little-endian arrays at 64-byte-aligned offsets); each section now has
+    its own CRC-32 in the section table, and the trailer's CRC covers the
+    header, key and table. Loading checks those and the per-node sections
+    (offsets, node ids) at once; the edge arrays' CRCs are checked, in
+    parallel, before a whole-graph algorithm runs, and a mismatch drops the
+    stored index and builds it again, with a notice. A traversal relies on the
+    checked offsets and the kernels' bounds checks instead.
+  - **Indexes stored by 0.10 keep loading** (read whole and checked, as
+    before), and the first writer to load one rewrites it as version 3, with
+    a notice (`rewriting the stored index for g in club.ursa (…) in the
+    current format: …`). Version 1 files are still built again.
+  - A stored index is still never changed in place (a new one is renamed
+    over it, an eviction removes it, a chunk is only appended), so a process
+    keeps reading the index it mapped while another process replaces it.
+    Mapped pages count in a process's RSS once read, as shared, reclaimable
+    file cache.
+- **SQL: an index build interns a vertex table's keys while it interns the
+  edges, not before them** (#385, N49). With the edge scan parallel (#351),
+  reading the keys first was the serial part of a build with a vertex table:
+  a `.csv.gz` decompresses on one core, and the edges waited for it. Now the
+  keys and the edges are read and interned at once, on threads of their
+  own: the edges with a provisional numbering, until the last key is in;
+  then those are renumbered into the keys' numbering (one lookup per
+  distinct endpoint, then in place, in parallel) and the rest go straight
+  into it. The node numbering, the edges kept and the stored index are byte
+  for byte the ones interning the keys first gives, wherever the switch
+  falls; a test checks it with the keys in CSV, gzipped CSV and Parquet. On
+  4 cores, 96M edges behind a filter over 160M rows of zstd Parquet and a
+  40M-key vertex table: 19.8 s → 18.6 s with the keys in a 1.1 GiB
+  `.csv.gz` of three columns (its single-core decompression, about 14 s, is
+  now most of the build); a small `.csv.gz` or Parquet of the keys is as
+  before, within noise. The browser still reads the keys first.
+- **SQL: the build's read-ahead is a setting, scaled and capped**
+  (#385, N45). The partitions an index build decodes ahead of the one it is
+  interning held up to a fixed 1 GiB, which raised a build's peak memory by
+  about 0.7 GB. It is now `ursa.build_read_ahead`: `auto` by default, 256 MiB
+  per partition of the source (so 1 GiB from 4 partitions up, as before), at
+  most an eighth of the memory available to the process (`MemAvailable`, or
+  the cgroup's limit if lower), or a size `SET` for the session; `0` reads
+  the partitions one after another. A smaller read-ahead costs time: on the
+  96M-edge build above (4 cores), 1 GiB took 8.6 s at 4.2 GB peak RSS, 512
+  MiB 9.5 s at 3.8 GB, 256 MiB 9.7 s at 3.4 GB, and `0` 10.4 s at 3.1 GB.
+  The index is the same under any value.
+- **Weak and strong connected components run in parallel, with the same
+  labels** (#383). Both kernels ran on about one core (63 s and 82 s on the
+  full Bluesky graph, on 16 cores). Weak components now find, per thread and
+  range of edges, the edges that join two union-find sets, and replay only
+  those through the serial union-find, so every root is the one the serial
+  kernel picks. Strong components are found in parallel by trimming and
+  colouring rounds, over out-edges only (no transpose), and a serial DFS in
+  Tarjan's order, testing one bit per edge, then names each by Tarjan's root.
+  Labels are bit for bit the serial kernels', which tests pin per node and
+  compare at several pool sizes. On a 256M-edge R-MAT graph on a shared
+  4-core machine: weak 10.4 s to 6.3 s, strong 21.1 s to 13.8 s (the strong
+  kernel's serial DFS takes 0.25 s of it), with 120 MiB more heap at most
+  for weak and 70 MiB less for strong, on a 2 GiB graph. The serial kernels
+  still run on one thread, below 65,536 edges, and without the `rayon`
+  feature. `Linked::of`, run before every compact kernel, also no longer
+  makes an atomic update per edge.
+- **SQL: a database always opens** (#381, N44). A catalog statement that
+  fails when the database opens, such as a view over a data file that was
+  moved, renamed or deleted, or a database copied without its files, no
+  longer makes the database unopenable (`cannot open m.ursa: statement 1 of
+  its catalog failed`), with every statement, `DROP` included, failing the
+  same way. The object it defines is unavailable instead, and one notice
+  says why: `ursa: view v is unavailable: no file found at '…/t.csv'; DROP
+  VIEW v or restore the file`. Everything else works, in a writable or a
+  read-only open; `SHOW TABLES` and `.tables` still list it, and using it
+  fails with that message, as a broken view does in DuckDB. A view or graph
+  that uses an unavailable object is unavailable too, with its own notice.
+  `DROP` (with or without `IF EXISTS`) and `CREATE OR REPLACE` repair it.
+  Its statement stays in the catalog as it was, so restoring the file and
+  opening the database again brings it back.
+- **SQL: `SHOW ursa.index_storage_limit` shows just the value** (behaviour
+  change, #381, N46), `21GiB` or `8GiB`, like every other setting, not
+  `21GiB (the default: …)`. Where it comes from starts its description,
+  which `SHOW ursa.index_storage_limit VERBOSE` and `SHOW ALL VERBOSE` show.
+  The default limit is rounded down to a multiple of 4 GiB (it was a whole
+  GiB), so it no longer moves between runs as the free space changes a
+  little.
+- **SQL: storing an index's reverse adjacency is said** (#381, N47). When
+  the database closes and appends the reverse adjacency (or evaluated
+  weights) to a stored index, `ursa.notices = 'all'` says `stored the
+  reverse adjacency of g in club.ursa (+1.0 GiB, 2.3 GiB in all)`, and
+  `'on'` says it too when it brings the stored indexes to 90% of
+  `ursa.index_storage_limit` or more. A chunk that cannot be written is
+  said at `'on'`.
 - **`ursa`: JSON and NDJSON write `null` for a null** (behaviour change,
   #350). Every row object has every column, in column order, as DuckDB
   writes them: `SELECT NULL AS a, '' AS b` is `[{"a":null,"b":""}]`, which
@@ -224,6 +452,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   #350), as DuckDB does, so it can be told from a null, which is still an
   empty field: `SELECT NULL AS a, '' AS b` is `,""`, which was `,`. The
   browser shell's CSV export does the same.
+- **`ursa`: a string inside a list, struct or map is quoted in its text**
+  (behaviour change, #386), as in DuckDB, so different values print
+  differently in CSV, TSV and the table: `['a, b', 'c']` is `['a, b', c]`
+  and `['a', 'b', 'c']` is `[a, b, c]`, which both were `[a, b, c]`, and
+  `['x]', NULL, 'NULL']` is `['x]', NULL, 'NULL']`, which was
+  `[x], NULL, NULL]`. A string is quoted when it is empty, is `NULL` in any
+  case, starts or ends with whitespace, or holds any of
+  `' " \ , : = [ ] { } ( )`; a `'` or `\` in it is escaped with `\`. Struct
+  field names and map keys follow the same rule, and a null inside a nested
+  value is `NULL` in the table too. The browser shell's table and CSV export
+  do the same. JSON stays the lossless format for nested results.
 - **SQL: an index build decodes its source's partitions in parallel**
   (#351, N30). The build read its edge plan one partition at a time to keep
   the order that numbers the nodes, so a filtered view over a large Parquet
@@ -252,6 +491,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `index=cached`, for one already in the session) says that the edge and
   vertex scans drawn under it will not run, where the plan read as if the
   index were not used.
+- **SQL: `EXPLAIN` no longer draws the scans a held index skips** (#384,
+  N48). Under a path search whose index the session holds, the edge and
+  vertex scans are now counted on its line rather than drawn as its
+  children: `PathSearchExec: graph=g, search=…, index=stored, sources: 2
+  files, not read`. A path search over an index not held, and `EXPLAIN
+  ANALYZE`, are as before.
+- **SQL: `ANY SHORTEST` counts the paths it keeps, and the path limit is a
+  setting, `ursa.max_paths`** (#384, N50). A path search stopped at a fixed
+  10M paths, counting every partial path it held, and told an `ANY
+  SHORTEST` query to use `ANY SHORTEST`: from one well-followed Bluesky
+  account, the `{1,3}` histogram failed, where `hop` answers at once. Under
+  `ANY SHORTEST` (and `SHORTEST k`), whose search holds at most one (`k`)
+  partial path per node, the limit now counts the paths kept, never fewer
+  than one (`k`) per node of the graph, so one start node is never refused.
+  The limit is `SET ursa.max_paths = …` (default 10000000; 0 for none), and
+  the error names it, with the remedy that fits the query: a lower upper
+  bound or `ANY SHORTEST` without a selector, `hop(…)` with one.
 - **Isolated vertices cost the algorithms next to nothing** (#326). A vertex
   table's keys with no edges are nodes, and on real data they can be most of
   them (37.2M of the Bluesky follows graph's 39.65M). `pagerank`, `louvain`,

@@ -163,20 +163,20 @@ fn show_ursa_settings() {
              SHOW ursa.index_storage_limit",
         ])),
         format!(
-            "name,value\nursa.index_storage_limit,\"{AUTO_LIMIT}\"\nname,value\n\
-             ursa.index_storage_limit,1GiB (SET for this session)\n"
+            "name,value\nursa.index_storage_limit,{AUTO_LIMIT}\nname,value\n\
+             ursa.index_storage_limit,1GiB\n"
         )
     );
     let all = ok(ursa(&["--format", "csv", "-c", "SHOW ALL"]));
     assert!(
-        all.contains(&format!("\nursa.index_storage_limit,\"{AUTO_LIMIT}\"\n")),
+        all.contains(&format!("\nursa.index_storage_limit,{AUTO_LIMIT}\n")),
         "{all}"
     );
 }
 
-/// What SHOW says of `ursa.index_storage_limit` without a database.
-const AUTO_LIMIT: &str = "auto (the default: in a database, 25% of the free space on its \
-                          disk; at least 4GiB, at most 64GiB)";
+/// What SHOW says of `ursa.index_storage_limit` without a database: just the
+/// value (#381).
+const AUTO_LIMIT: &str = "auto";
 
 #[test]
 fn commands_and_files_run_in_order() {
@@ -1100,6 +1100,8 @@ betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
 label_propagation,algorithm,2,\"\"
 louvain,algorithm,3,\"\"
+layout_fa2,layout,9,\"\"
+layout_fr,layout,4,\"\"
 neighbors_agg,aggregation,4,out in both
 density,statistic,1,out in both
 avg_path_length,statistic,2,out in both

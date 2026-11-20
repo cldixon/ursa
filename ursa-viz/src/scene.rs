@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use ursa_core::algo::{Fa2Params, Fa2State};
+use ursa_core::algo::{Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams};
 use ursa_core::topology::Topology;
 
 /// A graph to show: `n_nodes` nodes, and one edge per `(src[i], dst[i])`, as
@@ -97,33 +97,105 @@ impl Graph {
 }
 
 /// ForceAtlas2, run a few iterations at a time so the view can draw it as it
-/// converges. The positions are `Fa2State`'s, so a layout stepped here is the
-/// same as `layout_fa2` with as many iterations.
+/// converges: flat ([`LiveLayout::new`]), whose positions are `Fa2State`'s, so
+/// a layout stepped here is the same as `layout_fa2` with as many iterations;
+/// or coarse to fine ([`LiveLayout::multilevel`]), `Fa2Multilevel`'s, the same
+/// as `layout_fa2_multilevel` once done.
 #[derive(Debug)]
 pub struct LiveLayout {
     topology: Arc<Topology>,
-    state: Fa2State,
+    engine: Engine,
+}
+
+#[derive(Debug)]
+enum Engine {
+    Flat(Fa2State),
+    // Boxed: one per view, and twice the size of the flat state.
+    Multilevel(Box<Fa2Multilevel>),
 }
 
 impl LiveLayout {
     pub fn new(graph: &Graph, params: Fa2Params) -> Self {
         let topology = Arc::clone(graph.topology());
         let state = Fa2State::new(topology.undirected(), params);
-        Self { topology, state }
+        Self {
+            topology,
+            engine: Engine::Flat(state),
+        }
     }
 
-    /// Run `iterations` more iterations.
+    /// Coarse to fine: the graph's hierarchy is built here, and every node
+    /// has a position from the start (its coarsest ancestor's, spread out).
+    pub fn multilevel(graph: &Graph, params: MultilevelParams) -> Self {
+        let topology = Arc::clone(graph.topology());
+        let state = Fa2Multilevel::new(topology.undirected(), params);
+        Self {
+            topology,
+            engine: Engine::Multilevel(Box::new(state)),
+        }
+    }
+
+    /// Run `iterations` more iterations. Coarse to fine, that is work worth
+    /// as many iterations of the whole graph, spent on as many iterations of
+    /// the current level as it buys.
     pub fn step(&mut self, iterations: u32) {
-        self.state.step(self.topology.undirected(), iterations);
+        let adj = self.topology.undirected();
+        match &mut self.engine {
+            Engine::Flat(s) => s.step(adj, iterations),
+            Engine::Multilevel(s) => s.step(adj, f64::from(iterations)),
+        }
     }
 
+    /// Iterations run so far: for coarse to fine, the work done, in
+    /// iterations of the whole graph.
     pub fn iterations(&self) -> u32 {
-        self.state.iterations()
+        match &self.engine {
+            Engine::Flat(s) => s.iterations(),
+            Engine::Multilevel(s) => s.work_done().round() as u32,
+        }
+    }
+
+    /// The work of the whole schedule, in iterations of the whole graph, for
+    /// coarse to fine; `None` for flat, which runs for as long as it is
+    /// stepped.
+    pub fn total(&self) -> Option<u32> {
+        match &self.engine {
+            Engine::Flat(_) => None,
+            Engine::Multilevel(s) => Some(s.total_work().round() as u32),
+        }
+    }
+
+    /// Whether coarse to fine has run its schedule (never, for flat).
+    pub fn is_done(&self) -> bool {
+        match &self.engine {
+            Engine::Flat(_) => false,
+            Engine::Multilevel(s) => s.is_done(),
+        }
+    }
+
+    /// The level being laid out: 0 is the graph itself (always, for flat).
+    pub fn level(&self) -> usize {
+        match &self.engine {
+            Engine::Flat(_) => 0,
+            Engine::Multilevel(s) => s.level(),
+        }
+    }
+
+    /// How many levels there are to lay out: the coarse levels and the
+    /// graph itself (1, for flat).
+    pub fn levels(&self) -> usize {
+        match &self.engine {
+            Engine::Flat(_) => 1,
+            Engine::Multilevel(s) => s.coarse_levels() + 1,
+        }
     }
 
     /// The positions now: `x` and `y`, one per node.
     pub fn positions(&self) -> (&[f32], &[f32]) {
-        self.state.positions()
+        match &self.engine {
+            Engine::Flat(s) => s.positions(),
+            Engine::Multilevel(s) => s.positions(),
+        }
     }
 }
 
@@ -265,11 +337,93 @@ impl NodeStyle {
     }
 }
 
-/// A plain categorical palette (`0xRRGGBBAA`), distinct on white.
-pub const PALETTE: [u32; 10] = [
-    0x1f77b4ff, 0xff7f0eff, 0x2ca02cff, 0xd62728ff, 0x9467bdff, 0x8c564bff, 0xe377c2ff, 0x7f7f7fff,
-    0xbcbd22ff, 0x17becfff,
+/// A categorical palette (`0xRRGGBBAA`) for a light background: eight hues,
+/// blue, orange, aqua, yellow, magenta, green, violet and red, told apart
+/// with colour-vision deficiencies too (adjacent pairs at least 9 ΔE OKLab
+/// apart under protanopia, deuteranopia and tritanopia simulation).
+pub const PALETTE: [u32; 8] = [
+    0x2a78d6ff, 0xeb6834ff, 0x1baf7aff, 0xeda100ff, 0xe87ba4ff, 0x008300ff, 0x6250d6ff, 0xe34948ff,
 ];
+
+/// [`PALETTE`]'s hues, in the same order, stepped for a dark background:
+/// each at least 3:1 against near-black.
+pub const DARK_PALETTE: [u32; 8] = [
+    0x3987e5ff, 0xd95926ff, 0x199e70ff, 0xc98500ff, 0xd55181ff, 0x0ca30cff, 0x9085e9ff, 0xe66767ff,
+];
+
+/// The colours a view draws with, each `0xRRGGBBAA`: the background, the
+/// edges' ink (their opacity is [`crate::render::Renderer::edge_alpha`]
+/// times this alpha), the nodes' colour when they are not coloured by
+/// category, and the categories' colours (category `c` is
+/// `palette[c % palette.len()]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Theme {
+    pub background: u32,
+    pub edge: u32,
+    pub node: u32,
+    pub palette: Vec<u32>,
+}
+
+impl Theme {
+    /// Ink on white: the default.
+    pub fn light() -> Self {
+        Self {
+            background: 0xffffffff,
+            edge: 0x595966ff,
+            node: NODE_COLOR,
+            palette: PALETTE.to_vec(),
+        }
+    }
+
+    /// Light on near-black.
+    pub fn dark() -> Self {
+        Self {
+            background: 0x0b0b0aff,
+            edge: 0xb4b8c8ff,
+            node: 0xe8e4dcff,
+            palette: DARK_PALETTE.to_vec(),
+        }
+    }
+
+    /// Category colours with this theme's palette.
+    pub fn colors(&self, categories: &[u32]) -> Vec<u32> {
+        if self.palette.is_empty() {
+            return vec![self.node; categories.len()];
+        }
+        categories
+            .iter()
+            .map(|&c| self.palette[c as usize % self.palette.len()])
+            .collect()
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::light()
+    }
+}
+
+/// A CSS hex colour, `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa` (the `#` is
+/// optional), as `0xRRGGBBAA`.
+pub fn parse_color(text: &str) -> Option<u32> {
+    let hex = text.trim();
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let long: String = match hex.len() {
+        3 | 4 => hex.chars().flat_map(|c| [c, c]).collect(),
+        6 | 8 => hex.to_string(),
+        _ => return None,
+    };
+    let v = u32::from_str_radix(&long, 16).ok()?;
+    Some(if long.len() == 6 { (v << 8) | 0xff } else { v })
+}
+
+/// `0xRRGGBBAA` as red, green, blue and alpha from 0 to 1.
+pub fn rgba(color: u32) -> [f32; 4] {
+    color.to_be_bytes().map(|b| f32::from(b) / 255.0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -308,6 +462,45 @@ mod tests {
     }
 
     #[test]
+    fn a_multilevel_live_layout_is_layout_fa2_multilevel() {
+        // A grid big enough to coarsen, stepped in uneven budgets: the end is
+        // the one-shot layout, uncentered.
+        let (w, h) = (30u32, 30u32);
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if x + 1 < w {
+                    src.push(i);
+                    dst.push(i + 1);
+                }
+                if y + 1 < h {
+                    src.push(i);
+                    dst.push(i + w);
+                }
+            }
+        }
+        let g = Graph::new((w * h) as usize, src, dst).unwrap();
+        let params = MultilevelParams::default();
+        let mut live = LiveLayout::multilevel(&g, params);
+        assert!(live.level() > 0, "a 900-node grid is coarsened");
+        assert_eq!(live.levels(), live.level() + 1, "it starts at the coarsest");
+        assert_eq!(
+            live.positions().0.len(),
+            900,
+            "every node has a place at once"
+        );
+        let total = live.total().unwrap();
+        while !live.is_done() {
+            live.step(7);
+        }
+        assert!(live.iterations().abs_diff(total) <= 1);
+        let mut state = Fa2Multilevel::new(g.topology().undirected(), params);
+        state.step(g.topology().undirected(), f64::INFINITY);
+        assert_eq!(live.positions(), state.positions());
+    }
+
+    #[test]
     fn the_camera_fits_pans_and_zooms_around_the_cursor() {
         let mut c = Camera::new(200.0, 100.0);
         c.fit((-10.0, -5.0, 10.0, 5.0));
@@ -330,6 +523,26 @@ mod tests {
     }
 
     #[test]
+    fn themes_parse_css_colours_and_colour_categories() {
+        assert_eq!(parse_color("#0b0b0a"), Some(0x0b0b0aff));
+        assert_eq!(parse_color("ffffff80"), Some(0xffffff80));
+        assert_eq!(parse_color(" #fa0 "), Some(0xffaa00ff));
+        assert_eq!(parse_color("#fa08"), Some(0xffaa0088));
+        for bad in ["", "#", "#12345", "#ggg", "rgb(1, 2, 3)", "#+1234"] {
+            assert_eq!(parse_color(bad), None, "{bad}");
+        }
+        assert_eq!(rgba(0xff000080), [1.0, 0.0, 0.0, 128.0 / 255.0]);
+        let dark = Theme::dark();
+        assert_eq!(dark.colors(&[0, 9]), vec![DARK_PALETTE[0], DARK_PALETTE[1]]);
+        let plain = Theme {
+            palette: vec![],
+            ..Theme::light()
+        };
+        assert_eq!(plain.colors(&[3]), vec![NODE_COLOR]);
+        assert_eq!(Theme::default(), Theme::light());
+    }
+
+    #[test]
     fn bounds_skip_non_finite_positions() {
         assert_eq!(bounds(&[], &[]), None);
         assert_eq!(
@@ -349,7 +562,7 @@ mod tests {
             vec![2.0, 2.0]
         );
         assert_eq!(
-            NodeStyle::colors_from(&[0, 1, 10]),
+            NodeStyle::colors_from(&[0, 1, 8]),
             vec![PALETTE[0], PALETTE[1], PALETTE[0]]
         );
         let s = NodeStyle::by_degree(&[0, 4, 1000]);

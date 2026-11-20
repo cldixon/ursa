@@ -418,7 +418,7 @@ async fn attach_opens_a_database_in_an_empty_session() {
 }
 
 #[tokio::test]
-async fn a_catalog_that_does_not_replay_is_a_clear_error() {
+async fn a_statement_that_does_not_replay_leaves_its_object_unavailable() {
     let dir = karate_dir();
     let path = dir.path().join("club.ursa");
     std::fs::write(
@@ -426,14 +426,14 @@ async fn a_catalog_that_does_not_replay_is_a_clear_error() {
         r#"{"format": "ursa", "version": 1, "statements": ["CREATE VIEW v AS SELECT * FROM 'gone.csv'"]}"#,
     )
     .unwrap();
-    let e = open_err(&path, &quick()).await;
+    // The database opens (#381); using the view says why it is unavailable.
+    let ctx = open(&path).await;
+    let e = err(&ctx, "SELECT * FROM v").await;
     // Replay looks for the file in the database's directory, and says where.
     assert_eq!(
         e,
         format!(
-            "cannot open {}: statement 1 of its catalog failed: no file found at '{}'\n  \
-             the statement: CREATE VIEW v AS SELECT * FROM 'gone.csv'",
-            path.display(),
+            "view v is unavailable: no file found at '{}'; DROP VIEW v or restore the file",
             std::path::absolute(dir.path())
                 .unwrap()
                 .join("gone.csv")

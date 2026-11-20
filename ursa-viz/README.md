@@ -36,32 +36,107 @@ later, in a notebook widget or a native window through the same `View`.
   them: no interleaving on upload. Everything is a vertex or index buffer,
   never a storage buffer, because WebGL2 has none.
 
+## Colours
+
+`setTheme({background, edge, node, palette})` takes CSS hex colours, each
+optional: the background, the edges' ink (their opacity is `edgeAlpha` times
+its alpha), the nodes' colour when not coloured by category, and the
+categories' colours (`colorBy(categories)` gives category `c` the colour
+`palette[c % palette.length]`). The view keeps the categories, so a new theme
+recolours them. `setThemeNamed("light" | "dark")` takes the built-in ones
+(`Theme::light()`, `Theme::dark()`): ink on white, and light on near-black,
+with an eight-hue palette (`PALETTE`, `DARK_PALETTE`: blue, orange, aqua,
+yellow, magenta, green, violet, red) stepped for each, adjacent hues apart
+under each kind of colour-vision deficiency. The shell's Graph view passes
+its page's `--graph-*` tokens.
+
 ## How it lays out
 
-The layout is `ursa-core`'s ForceAtlas2 (`Fa2State`), stepped a few
-iterations at a time: stepping 10 then 290 iterations gives the same bits as
-`layout_fa2` with 300. In the browser it runs in a **Web Worker** (`Layout`),
-which posts the positions after each batch (transferred, not copied), so a
+Coarse to fine (`ursa-core`'s `Fa2Multilevel`), as sfdp and OpenOrd do it:
+lay out a coarsened graph of a few dozen nodes, then each finer level from
+there, in far fewer iterations of the full graph than flat ForceAtlas2 needs.
+
+- **Coarsening** merges nodes, in index order, so the hierarchy is a pure
+  function of the graph: heavy-edge matching (each node pairs with the
+  neighbour of greatest edge weight over the product of their masses), then
+  *hub absorption*: a node left unmatched, all of whose neighbours a maximal
+  matching has taken (a star's leaves, an R-MAT hub's), joins the group of
+  the neighbour it is most tied to. So a star collapses in one level, and a
+  level at least halves the connected graph. A merged node's ForceAtlas2 mass
+  is its members' summed `deg + 1`, and a merged edge weighs as many input
+  edges as it stands for, so a coarse layout has the forces, and the scale, of
+  the graph it stands for. Isolated nodes leave the hierarchy (in 2-D a ring's
+  1/d forces cancel inside it, so they do not shape the rest) and come back on
+  a ring just outside the drawing. Coarsening stops at 50 nodes.
+- **Prolongation**: each node starts at its group's place, its group spread on
+  a small golden-angle spiral (radius growing with the root of the group's
+  size, scaled to the level's mean edge length).
+- **Schedule**: 300 iterations on the coarsest level; on the graph itself,
+  about 30M (nodes + adjacency entries) of work, between 10 and 200
+  iterations (200 for the 4K- to 16K-node graphs, 15 at 1M edges); each level
+  up, 1.5 times as many as the one below, up to 200. The coarse levels are
+  cheap in nodes but not always in edges (R-MAT's stay dense), so the growth
+  is what keeps them from costing more than the graph itself. Barnes–Hut
+  `theta` is 1.0, not flat's 0.5: an iteration at 1M edges is 2.6 times
+  faster, and the layout as good, since the levels above have placed the far
+  field the approximation blurs.
+
+It is stepped a budget at a time, a budget being worth some iterations of the
+full graph, and every node has a position from the start: the current
+level's, prolonged down. The schedule is fixed, so the end is the same bits
+however the work is split, and on any thread count (`layout_fa2_multilevel`
+in one call). `&multilevel=0` runs flat ForceAtlas2 (`Fa2State`) instead,
+the same bits as `layout_fa2`.
+
+In the browser it runs in a **Web Worker** (`Layout`), which posts the
+positions after each batch of about 100 ms (transferred, not copied), so a
 slow iteration never holds up a frame: the page draws at the display's rate
-whatever the layout costs.
+whatever the layout costs. `Layout`'s `level` and `levels` say how far it
+is: coarse to fine counts `level` down from `levels - 1` to 0, the graph
+itself.
 
 ## Measured
 
-Headless Chromium on 4 container cores, release build (`wasm-release`):
+Time to a converged layout: coarse to fine to the end of its schedule; flat
+until it is as good by the graph's own measure (the cluster ratio, the
+grid's fold measure, else edge length over the mean distance between
+nodes), measured by `ursa-core/examples/fa2_multilevel.rs` on one core,
+release build:
 
-| graph | nodes | edges | layout, ms per iteration (worker) |
+| graph | nodes | edges | flat | coarse to fine |
+|---|---|---|---|---|
+| clusters | 4,000 | 24K | 1.5 s (270 it) | 0.9 s |
+| grid | 10,000 | 20K | not in 1,500 it (23 s) | 2.0 s |
+| R-MAT | 16K | 100K | 17 s (530 it) | 3.5 s |
+| R-MAT | 131K | 1M | 51 s (160 it); settles by 500 it, 172 s | 5.0 s |
+
+At 1M edges, coarse to fine is as good by edge length as flat after 160
+iterations, and looks as flat does after 500: the global shape is the same,
+but its edges are longer (mean edge length over mean distance, 0.69 against
+flat's 0.50 after 600 iterations; see "Not yet").
+
+In headless Chromium on 4 container cores, release build (`wasm-release`):
+
+| graph | flat, ms per iteration | flat, to converge | coarse to fine |
 |---|---|---|---|
-| clusters | 4,000 | 24K | 5.5 |
-| grid | 10,000 | 20K | 26 |
-| R-MAT | 16K | 100K | 49 |
-| R-MAT | 131K | 1M | 519 |
+| clusters | 7.5 | 2.0 s | 1.4 s |
+| grid | 24 | not in 1,500 it (36 s) | 3.2 s |
+| R-MAT 16K, 100K edges | 47 | 25 s | 5.3 s |
+| R-MAT 131K, 1M edges | 525 | 84 s; settles in 4.4 min | 7.5 s |
 
-The same 1M-edge iteration takes about 330 ms natively on one core.
+Flat's time to converge is its time per iteration times the iterations the
+native run needed. Coarse to fine's includes building the hierarchy (0.7 s
+at 1M edges) and posting positions every 100 ms.
 
+- **Quality:** on the clustered graph, the mean distance between nodes of
+  one cluster is 0.07 of the mean between clusters, flat or coarse to fine.
+  On the grid, the correlation of layout distance with grid distance is 0.98
+  coarse to fine, an unfolded sheet; flat ForceAtlas2 leaves it folded (0.14
+  after 300 iterations, 0.58 after 1,500). `ursa-core/tests/layout_multilevel.rs`
+  checks both.
 - **Correctness:** frames are read back from the GPU and checked, as the
-  harness below does. On the clustered graph, the mean distance between nodes
-  of one cluster is 0.07 of the mean between clusters.
-- **Size:** the wasm is 4.0 MB raw, about 0.96 MB gzipped.
+  harness below does.
+- **Size:** the wasm is 4.1 MB raw.
 - **Draw cost:** this machine has no GPU, so its frame rates are not a
   measure; a laptop's GPU is.
 
@@ -74,29 +149,50 @@ bunx serve ursa-viz      # then open /demo/?graph=rmat&scale=17&edges=1000000
 ```
 
 The demo takes `?graph=rmat&scale=&edges=`, `?graph=grid&w=&h=` or
-`?graph=clusters&k=&size=`, plus `&iterations=`. Drag to pan, wheel to zoom,
+`?graph=clusters&k=&size=`, plus `&multilevel=0` for flat ForceAtlas2 and,
+flat, `&iterations=`. Drag to pan, wheel to zoom,
 double-click to fit, click a node to pick it.
 
 The browser harness runs the demo on each test graph, reads frames back and
 checks them:
 
 ```sh
-bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONLY=<name>
+bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONLY=<name>; MODE=flat|multilevel
+```
+
+## Benchmark
+
+[`BENCH.md`](BENCH.md) has the baseline: time to first frame and to layout
+done, frame time while panning and zooming, pick latency, memory and bytes
+uploaded, on R-MAT graphs and grids of 1K to 1M edges, under WebGPU and
+WebGL2, plus the layout alone natively. Not in CI; to rerun it (after the
+build above), from `ursa-viz/`:
+
+```sh
+bun add --no-save playwright@1.63.0   # once, if Playwright is not installed
+bun run bench                         # writes bench/results.json
+SIZES=1k,10k BACKENDS=webgl2 NATIVE=0 bun run bench   # a quick subset
+HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
 ```
 
 ## Not yet
 
-- **Converging large graphs in seconds.** Flat ForceAtlas2 needs hundreds of
-  iterations, which at 1M edges is minutes in the browser. The next step is
-  coarse to fine (multilevel, as sfdp and OpenOrd do): lay out a coarsened
-  graph of a few thousand nodes, then refine at full size in far fewer
-  iterations. That is also what straightens out a grid's folds, which flat
-  ForceAtlas2 leaves.
+- **A 1M-edge R-MAT graph fully converged in seconds.** Coarse to fine
+  draws its shape in 7.5 s, and it looks as flat ForceAtlas2 does after
+  500 iterations; but by edge length it is where flat is after about 170, as
+  its finest level gets only 15 iterations. R-MAT's coarse levels stay dense
+  (half the nodes, nearly all the edges), so they cost about what the graph
+  does. Cheaper iterations (attraction gathers 2M random reads; repulsion
+  could be approximated harder far out) would buy the rest.
+- **The view's own layout.** `View::step`, for a page that lays out on its
+  own thread, is still flat ForceAtlas2; the worker's `Layout` is coarse to
+  fine.
+- **Small components out past the ring.** A few nodes of R-MAT's small
+  components end up far outside the ring of isolated nodes, as under flat
+  ForceAtlas2, and fitting the view to them shrinks the drawing.
 - **Snapshots under headless WebGPU.** Reading a frame back works on WebGL2.
   Under headless Chromium's software WebGPU (SwiftShader), the map is
   rejected ("A valid external Instance reference no longer exists"), though
   plain WebGPU reads back there. To check on real hardware, and with wgpu 30,
   which needs wasm-bindgen 0.2.127 or later (the workspace is on 0.2.126).
-- **The shell's Graph view:** results with `src`/`dst` columns, sized and
-  coloured by their other columns.
 - **The DataFrame API:** a notebook widget over the same view.

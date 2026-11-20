@@ -27,6 +27,7 @@ use std::fmt;
 use std::sync::{Mutex, OnceLock};
 
 use arrow::array::{Array, BooleanArray};
+use arrow::buffer::ScalarBuffer;
 
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
@@ -172,6 +173,12 @@ impl EdgeMask {
 }
 
 /// One direction's adjacency in CSR form.
+///
+/// The arrays are Arrow [`ScalarBuffer`]s: a built adjacency owns them (a
+/// `Vec` moved in, no copy), and one read from a stored index can borrow them
+/// from a memory-mapped file instead of copying them (the SQL engine's
+/// `.ursa` database, #382). Either way they read as slices (`&adj.targets[..]`),
+/// and cloning one clones a reference, not the array.
 #[derive(Debug, Clone)]
 pub struct Adjacency {
     /// Prefix-summed degrees; length `n_nodes + 1`. Neighbours of node `u` live
@@ -179,17 +186,39 @@ pub struct Adjacency {
     ///
     /// `u64` offsets so a graph with more than `u32::MAX` edges still indexes
     /// correctly (target *nodes* remain `u32`).
-    pub offsets: Vec<u64>,
+    pub offsets: ScalarBuffer<u64>,
     /// Dense target node per CSR slot; length `n_edges`.
-    pub targets: Vec<u32>,
+    pub targets: ScalarBuffer<u32>,
     /// Original edge row per CSR slot; length `n_edges`. The attribute-gather hook.
-    pub edge_ids: Vec<u32>,
+    pub edge_ids: ScalarBuffer<u32>,
 }
 
 impl Adjacency {
     /// Check that this is a well-formed adjacency over `n_nodes` nodes (see
     /// [`Topology::from_parts`]). `which` names it in the message.
     fn check(&self, n_nodes: usize, which: &str) -> Result<(), String> {
+        self.check_shape(n_nodes, which)?;
+        let m = self.targets.len();
+        let bad = |why: &str| Err(format!("the {which}-adjacency {why}"));
+        if self.targets.iter().any(|&t| t as usize >= n_nodes) {
+            return bad("has a target out of range");
+        }
+        let mut seen = vec![false; m];
+        for &e in self.edge_ids.iter() {
+            match seen.get_mut(e as usize) {
+                Some(s) if !*s => *s = true,
+                _ => return bad("has edge ids that are not a permutation of its edges"),
+            }
+        }
+        Ok(())
+    }
+
+    /// The part of [`Self::check`] that reads only the offsets: the lengths of
+    /// the arrays, and `n_nodes + 1` non-decreasing offsets from 0 to the slot
+    /// count. It costs `O(n_nodes)` and reads neither targets nor edge ids, so
+    /// it leaves a memory-mapped adjacency's large arrays unread. Every
+    /// neighbour slice ([`Self::neighbors`]) is then in bounds.
+    fn check_shape(&self, n_nodes: usize, which: &str) -> Result<(), String> {
         let m = self.targets.len();
         let bad = |why: String| Err(format!("the {which}-adjacency {why}"));
         if m > u32::MAX as usize {
@@ -212,16 +241,6 @@ impl Adjacency {
         }
         if self.offsets.windows(2).any(|w| w[0] > w[1]) {
             return bad("has decreasing offsets".into());
-        }
-        if self.targets.iter().any(|&t| t as usize >= n_nodes) {
-            return bad("has a target out of range".into());
-        }
-        let mut seen = vec![false; m];
-        for &e in &self.edge_ids {
-            match seen.get_mut(e as usize) {
-                Some(s) if !*s => *s = true,
-                _ => return bad("has edge ids that are not a permutation of its edges".into()),
-            }
         }
         Ok(())
     }
@@ -286,9 +305,9 @@ impl Adjacency {
         }
 
         Adjacency {
-            offsets,
-            targets,
-            edge_ids,
+            offsets: offsets.into(),
+            targets: targets.into(),
+            edge_ids: edge_ids.into(),
         }
     }
 
@@ -366,9 +385,9 @@ impl Adjacency {
         });
 
         Adjacency {
-            offsets,
-            targets,
-            edge_ids,
+            offsets: offsets.into(),
+            targets: targets.into(),
+            edge_ids: edge_ids.into(),
         }
     }
 
@@ -387,9 +406,9 @@ impl Adjacency {
         let m = out.targets.len();
         if m == 0 || n_nodes == 0 {
             return Adjacency {
-                offsets: vec![0; n_nodes + 1],
-                targets: Vec::new(),
-                edge_ids: Vec::new(),
+                offsets: vec![0; n_nodes + 1].into(),
+                targets: Vec::new().into(),
+                edge_ids: Vec::new().into(),
             };
         }
         // Same chunking rule as `build` (serial on a rayon worker; see
@@ -503,9 +522,9 @@ impl Adjacency {
         }
 
         Adjacency {
-            offsets,
-            targets,
-            edge_ids,
+            offsets: offsets.into(),
+            targets: targets.into(),
+            edge_ids: edge_ids.into(),
         }
     }
 
@@ -571,9 +590,10 @@ impl UndirectedCsr {
 /// the transpose is built instead.
 pub type IncomingLoader = Box<dyn FnOnce() -> Option<Adjacency> + Send>;
 
-/// The pending [`IncomingLoader`] of a topology, taken on first use.
+/// The pending [`IncomingLoader`] of a topology, taken on first use, and
+/// whether what it reads is checksummed (so only its shape is checked).
 #[derive(Default)]
-struct LazyIncoming(Mutex<Option<IncomingLoader>>);
+struct LazyIncoming(Mutex<Option<(IncomingLoader, bool)>>);
 
 impl fmt::Debug for LazyIncoming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -587,7 +607,7 @@ impl fmt::Debug for LazyIncoming {
 }
 
 impl LazyIncoming {
-    fn take(&self) -> Option<IncomingLoader> {
+    fn take(&self) -> Option<(IncomingLoader, bool)> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
@@ -686,9 +706,9 @@ impl Topology {
             n_nodes,
             n_edges,
             out: Adjacency {
-                offsets,
-                targets,
-                edge_ids: (0..n_edges as u32).collect(),
+                offsets: offsets.into(),
+                targets: targets.into(),
+                edge_ids: (0..n_edges as u32).collect::<Vec<u32>>().into(),
             },
             inc: OnceLock::new(),
             inc_loader: LazyIncoming::default(),
@@ -745,6 +765,33 @@ impl Topology {
         })
     }
 
+    /// [`Self::from_parts`] for parts whose integrity the caller vouches for
+    /// with a checksum (a stored index, #382): only their shape is checked,
+    /// in `O(n_nodes)` (the arrays' lengths, and `n_nodes + 1` non-decreasing
+    /// offsets from 0 to the slot count), never the targets or edge ids, so
+    /// arrays memory-mapped from a file stay unread until a kernel reads them.
+    ///
+    /// Every neighbour slice is in bounds. A target or edge id that is out of
+    /// range (a file damaged in a way its checksum would catch, read before
+    /// the checksum is checked) can only make a kernel panic on a bounds
+    /// check: no kernel reads one unchecked.
+    pub fn from_checksummed_parts(n_nodes: usize, out: Adjacency) -> Result<Topology, String> {
+        if n_nodes > u32::MAX as usize {
+            return Err(format!("{n_nodes} nodes is beyond the u32 dense-index cap"));
+        }
+        out.check_shape(n_nodes, "out")?;
+        Ok(Topology {
+            n_nodes,
+            n_edges: out.targets.len(),
+            out,
+            inc: OnceLock::new(),
+            inc_loader: LazyIncoming::default(),
+            undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: false,
+        })
+    }
+
     /// This topology, with its in-adjacency read by `loader` the first time
     /// it is asked for ([`Topology::incoming`]) instead of transposed from the
     /// out-CSR. This is how a stored index keeps its in-adjacency on disk until
@@ -757,16 +804,30 @@ impl Topology {
     /// already there, and on a symmetric view, whose transpose is itself.
     pub fn with_incoming_loader(self, loader: IncomingLoader) -> Topology {
         if self.inc.get().is_none() && !self.self_transpose {
-            *self.inc_loader.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(loader);
+            *self.inc_loader.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((loader, false));
         }
         self
     }
 
-    /// The stored in-adjacency `loader` reads, if it is well formed.
-    fn load_incoming(&self, loader: IncomingLoader) -> Option<Adjacency> {
+    /// [`Self::with_incoming_loader`], for a loader whose in-adjacency is
+    /// checksummed: only its shape is checked, as
+    /// [`Self::from_checksummed_parts`] checks the out-adjacency's.
+    pub fn with_checksummed_incoming_loader(self, loader: IncomingLoader) -> Topology {
+        if self.inc.get().is_none() && !self.self_transpose {
+            *self.inc_loader.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((loader, true));
+        }
+        self
+    }
+
+    /// The stored in-adjacency `loader` reads, if it is well formed (in shape
+    /// only, if `checksummed`).
+    fn load_incoming(&self, loader: IncomingLoader, checksummed: bool) -> Option<Adjacency> {
         let incoming = loader()?;
-        (incoming.targets.len() == self.n_edges && incoming.check(self.n_nodes, "in").is_ok())
-            .then_some(incoming)
+        let checked = match checksummed {
+            true => incoming.check_shape(self.n_nodes, "in"),
+            false => incoming.check(self.n_nodes, "in"),
+        };
+        (incoming.targets.len() == self.n_edges && checked.is_ok()).then_some(incoming)
     }
 
     /// The in-adjacency if it has been built (or loaded), without building or
@@ -805,7 +866,7 @@ impl Topology {
         self.inc.get_or_init(|| {
             self.inc_loader
                 .take()
-                .and_then(|loader| self.load_incoming(loader))
+                .and_then(|(loader, checksummed)| self.load_incoming(loader, checksummed))
                 .unwrap_or_else(|| Adjacency::transpose(&self.out, self.n_nodes))
         })
     }
@@ -993,9 +1054,9 @@ mod tests {
 
     fn adjacency(offsets: &[u64], targets: &[u32], edge_ids: &[u32]) -> Adjacency {
         Adjacency {
-            offsets: offsets.to_vec(),
-            targets: targets.to_vec(),
-            edge_ids: edge_ids.to_vec(),
+            offsets: offsets.to_vec().into(),
+            targets: targets.to_vec().into(),
+            edge_ids: edge_ids.to_vec().into(),
         }
     }
 

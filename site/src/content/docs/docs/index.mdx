@@ -1,0 +1,66 @@
+---
+title: Documentation
+description: The documentation of Ursa, a SQL engine for graph analytics with a DuckDB-like command-line tool.
+tableOfContents: false
+editUrl: false
+prev: false
+---
+
+import TopicCard from "../../../components/TopicCard.astro";
+import TopicGrid from "../../../components/TopicGrid.astro";
+
+Ursa is a SQL engine for graph analytics: point the `ursa` command-line tool at Parquet, CSV or JSON files and run graph algorithms on them in SQL.
+
+## Start here
+
+<TopicGrid>
+	<TopicCard title="Installation" href="/docs/installation/" icon="download">
+		Install `ursa` on Linux, macOS or Windows, or try a nightly build.
+	</TopicCard>
+	<TopicCard title="Quickstart" href="/docs/quickstart/" icon="rocket">
+		Query a file, define a graph and run PageRank in five minutes.
+	</TopicCard>
+	<TopicCard title="How-to Guides" href="/docs/guides/" icon="list-format">
+		Short answers to common tasks, from reading S3 to shortest paths.
+	</TopicCard>
+</TopicGrid>
+
+## Topics
+
+<TopicGrid>
+	<TopicCard title="Import & Export" href="/docs/import-export/files/" icon="cloud-download">
+		Files are tables: Parquet, CSV, JSON and Arrow, local or in object storage.
+	</TopicCard>
+	<TopicCard title="SQL" href="/docs/sql/introduction/" icon="document">
+		What Ursa SQL is, and the statements it adds to DataFusion's SQL.
+	</TopicCard>
+	<TopicCard title="Property graphs" href="/docs/graphs/property-graphs/" icon="random">
+		Name an edge table as a graph with `CREATE PROPERTY GRAPH`.
+	</TopicCard>
+	<TopicCard title="Algorithms" href="/docs/graphs/algorithms/" icon="analytics">
+		PageRank, components, communities and more, as table functions.
+	</TopicCard>
+	<TopicCard title="Pattern matching" href="/docs/graphs/pattern-matching/" icon="magnifier">
+		Find patterns and paths with SQL/PGQ's `GRAPH_TABLE`.
+	</TopicCard>
+	<TopicCard title="CLI & Shell" href="/docs/cli/shell/" icon="laptop">
+		The interactive shell, dot-commands, scripts and output modes.
+	</TopicCard>
+	<TopicCard title="Database & Storage" href="/docs/database/database-file/" icon="database">
+		What a `.ursa` file keeps, and how stored graph indexes work.
+	</TopicCard>
+	<TopicCard title="Coming from DuckDB" href="/docs/duckdb/" icon="approve-check-circle">
+		What carries over from DuckDB, and what does not.
+	</TopicCard>
+	<TopicCard title="Function reference" href="/docs/reference/functions/" icon="open-book">
+		Every graph function, its parameters and its output.
+	</TopicCard>
+</TopicGrid>
+
+## Try it without installing
+
+[Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) is the `ursa` shell in a web page. It runs the same engine, compiled to WebAssembly, in your browser: pick a dataset from its menu, or import a file of your own, which stays on your machine.
+
+New to Ursa? **[Take the tour](https://ursa-shell.cl-dixon.workers.dev/?dataset=tour)**: five steps on Zachary's karate club, from PageRank and Louvain to a drawing of the graph and a shortest path.
+
+Looking for the Python library? Its documentation is at [cldixon.github.io/ursa](https://cldixon.github.io/ursa/).

@@ -15,9 +15,11 @@
 //! - `SHOW ALL [VERBOSE]`: DataFusion's rows with Ursa's named as `SET` names
 //!   them, ordered by name.
 //!
-//! `ursa.index_storage_limit` is shown as the limit in effect and where it
-//! comes from (`8GiB (SET for this session)`, or the database's default and
-//! the free space it is a share of), not as `auto` (#353).
+//! `ursa.index_storage_limit` is shown as the limit in effect (`8GiB`), not
+//! as `auto` (#353), and like every other setting its value is just the value
+//! (#381). Where it comes from (`SET for this session`, or the database's
+//! default and the free space it is a share of) starts its description, which
+//! `VERBOSE` shows.
 //!
 //! Every other `SHOW` is DataFusion's.
 
@@ -85,54 +87,69 @@ async fn answer(ctx: &SessionContext, request: Show) -> Result<DataFrame> {
         "CASE WHEN name IN ({}) THEN '{PREFIX}.' || name ELSE name END",
         quoted(&names)
     );
-    // `ursa.index_storage_limit` is shown as the limit in effect and where it
-    // comes from, not as `auto`.
+    // `ursa.index_storage_limit` is shown as the limit in effect, not as
+    // `auto`; its description starts with where that comes from.
+    let (limit, source) = index_storage_limit_shown(ctx);
+    let is_limit = format!("name IN ('{LIMIT}', '{PREFIX}.{LIMIT}')");
     let value = format!(
-        "CASE WHEN name IN ('{LIMIT}', '{PREFIX}.{LIMIT}') THEN {} ELSE value END",
-        quoted(&[index_storage_limit_shown(ctx)])
+        "CASE WHEN {is_limit} THEN {} ELSE value END",
+        quoted(&[limit])
     );
-    let query = match request {
-        Show::One { name, verbose } => {
-            if !names.contains(&name) {
-                return Err(unknown_setting(&name, &names));
-            }
-            let full = format!("{PREFIX}.{name}");
-            format!(
+    let description = format!(
+        "CASE WHEN {is_limit} THEN {} || description ELSE description END AS description",
+        quoted(&[format!("{source}. ")])
+    );
+    let query =
+        match request {
+            Show::One { name, verbose } => {
+                if !names.contains(&name) {
+                    return Err(unknown_setting(&name, &names));
+                }
+                let full = format!("{PREFIX}.{name}");
+                format!(
                 "SELECT '{full}' AS name, {value} AS value{} FROM information_schema.df_settings \
                  WHERE name IN ('{name}', '{full}')",
-                if verbose { ", description" } else { "" }
+                if verbose { format!(", {description}") } else { String::new() }
             )
-        }
-        Show::All { verbose } => format!(
+            }
+            Show::All { verbose } => {
+                format!(
             "SELECT {as_set} AS name, {value} AS value{} FROM information_schema.df_settings \
              ORDER BY name",
-            if verbose { ", description" } else { "" }
-        ),
-    };
+            if verbose { format!(", {description}") } else { String::new() }
+        )
+            }
+        };
     ctx.sql(&query).await
 }
 
 /// `ursa.index_storage_limit` without the prefix.
 const LIMIT: &str = "index_storage_limit";
 
-/// What `SHOW` says of `ursa.index_storage_limit`: the limit in effect and
-/// where it comes from (#353). `50MiB (SET for this session)`, or the
-/// database's default and what it is a share of, or, without a database,
-/// `auto` and how a database works it out.
-fn index_storage_limit_shown(ctx: &SessionContext) -> String {
+/// What `SHOW` says of `ursa.index_storage_limit`: the limit in effect, just
+/// the value as for every other setting (#381), and where it comes from, for
+/// the description (#353). `50MiB`, `SET for this session`; or the database's
+/// default and what it is a share of; or, without a database, `auto` and how a
+/// database works it out.
+fn index_storage_limit_shown(ctx: &SessionContext) -> (String, String) {
     let state = ctx.state();
     if let Some(bytes) = options::index_storage_limit_set(state.config()) {
-        return format!("{} (SET for this session)", ByteSize(bytes));
+        return (
+            ByteSize(bytes).to_string(),
+            "SET for this session".to_string(),
+        );
     }
+    let step = ByteSize(options::DEFAULT_INDEX_STORAGE_STEP);
     let bounds = format!(
-        "at least {}, at most {}",
+        "rounded down to a multiple of {step}, at least {}, at most {}",
         ByteSize(options::MIN_DEFAULT_INDEX_STORAGE_LIMIT),
         ByteSize(options::MAX_DEFAULT_INDEX_STORAGE_LIMIT)
     );
     let share = options::DEFAULT_INDEX_STORAGE_SHARE;
     let Some(database) = ursa_engine::database::database(&state) else {
-        return format!(
-            "auto (the default: in a database, {share}% of the free space on its disk; {bounds})"
+        return (
+            "auto".to_string(),
+            format!("the default: in a database, {share}% of the free space on its disk, {bounds}"),
         );
     };
     let default = database.default_index_storage_limit();
@@ -142,19 +159,23 @@ fn index_storage_limit_shown(ctx: &SessionContext) -> String {
             database.name()
         ),
         (Some(free), 0) => format!(
-            "{share}% of the {} free on the disk of {}; {bounds}",
+            "{share}% of the {} free on the disk of {} when it was opened, {bounds}",
             notices::size(free),
             database.name()
         ),
         (Some(free), stored) => format!(
-            "{share}% of {}: the {} free on the disk of {} and the {} its indexes take; {bounds}",
+            "{share}% of {} (the {} free on the disk of {} when it was opened and the {} its \
+             indexes take), {bounds}",
             notices::size(free.saturating_add(stored)),
             notices::size(free),
             database.name(),
             notices::size(stored)
         ),
     };
-    format!("{} (the default: {of})", ByteSize(default.bytes))
+    (
+        ByteSize(default.bytes).to_string(),
+        format!("the default: {of}"),
+    )
 }
 
 /// Answer `RESET ursa.<setting>`, which DataFusion 55 refuses for an

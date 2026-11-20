@@ -13,7 +13,7 @@ curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 It downloads the newest `ursa` for your machine from the [releases page](https://github.com/cldixon/ursa/releases), checks it against its SHA-256 checksum, and puts it in `~/.local/bin`. It needs no `sudo`. If `~/.local/bin` is not on your `PATH`, it prints the line to add. To choose the version or the directory, set `URSA_VERSION` or `URSA_INSTALL_DIR` after the pipe:
 
 ```bash
-curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.10.0 URSA_INSTALL_DIR=/opt/bin sh
+curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.11.0 URSA_INSTALL_DIR=/opt/bin sh
 ```
 
 On Windows, in PowerShell. This installs to `%LOCALAPPDATA%\ursa\bin` and adds it to your user `PATH`:
@@ -32,18 +32,18 @@ Or download a prebuilt binary yourself from the [releases page](https://github.c
 
 | Platform              | Archive                                             |
 | --------------------- | --------------------------------------------------- |
-| Linux x86_64          | `ursa-cli-v0.10.0-x86_64-unknown-linux-gnu.tar.gz`  |
-| Linux aarch64         | `ursa-cli-v0.10.0-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS (Intel)         | `ursa-cli-v0.10.0-x86_64-apple-darwin.tar.gz`       |
-| macOS (Apple silicon) | `ursa-cli-v0.10.0-aarch64-apple-darwin.tar.gz`      |
-| Windows x64           | `ursa-cli-v0.10.0-x86_64-pc-windows-msvc.zip`       |
+| Linux x86_64          | `ursa-cli-v0.11.0-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux aarch64         | `ursa-cli-v0.11.0-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS (Intel)         | `ursa-cli-v0.11.0-x86_64-apple-darwin.tar.gz`       |
+| macOS (Apple silicon) | `ursa-cli-v0.11.0-aarch64-apple-darwin.tar.gz`      |
+| Windows x64           | `ursa-cli-v0.11.0-x86_64-pc-windows-msvc.zip`       |
 
 Each archive has a `.sha256` file next to it. For example, on an Apple silicon Mac:
 
 ```bash
-curl -LO https://github.com/cldixon/ursa/releases/download/ursa-cli-v0.10.0/ursa-cli-v0.10.0-aarch64-apple-darwin.tar.gz
-tar xzf ursa-cli-v0.10.0-aarch64-apple-darwin.tar.gz
-sudo mv ursa-cli-v0.10.0-aarch64-apple-darwin/ursa /usr/local/bin/
+curl -LO https://github.com/cldixon/ursa/releases/download/ursa-cli-v0.11.0/ursa-cli-v0.11.0-aarch64-apple-darwin.tar.gz
+tar xzf ursa-cli-v0.11.0-aarch64-apple-darwin.tar.gz
+sudo mv ursa-cli-v0.11.0-aarch64-apple-darwin/ursa /usr/local/bin/
 ```
 
 The binary is called `ursa`. Check it runs:
@@ -53,7 +53,7 @@ ursa --version
 ```
 
 ```text
-ursa 0.10.0
+ursa 0.11.0
 ```
 
 ### Nightly builds
@@ -73,7 +73,7 @@ $env:URSA_CHANNEL = 'nightly'; irm https://cldixon.github.io/ursa/install.ps1 | 
 The download is checked against its SHA-256 checksum, as a stable one is. A nightly names its version, build date and commit:
 
 ```text
-ursa 0.11.0-nightly.20261117 (a1b2c3d4e)
+ursa 0.12.0-nightly.20261119 (a1b2c3d4e)
 ```
 
 Only the newest nightly is kept, on the [`nightly` release](https://github.com/cldixon/ursa/releases/tag/nightly). To go back to stable, run the installer again without the nightly option (in PowerShell, `Remove-Item Env:URSA_CHANNEL` first). When you report a bug, include the output of `ursa --version`: it says which channel and commit you have. To build `main` yourself instead: `cargo install --git https://github.com/cldixon/ursa ursa-cli`.
@@ -295,6 +295,30 @@ LIMIT 3;
 ```
 
 The aggregations are `mean` (the default), `sum`, `min`, `max`, `count` and `n_unique`. `count` and `n_unique` return integers. Strings, dates and times take `count`, `n_unique`, `min` and `max`, and `min` and `max` return a value of their type. (In 0.6.0, `count` and `n_unique` return floats, and strings take only those two.) A node whose neighbours have no values gets NULL for `mean`, `min` and `max`, and 0 for the others.
+
+## Lay out a graph
+
+`layout_fa2` lays a graph out for drawing: one row per node, its `id` and its position, `x` and `y`. It is ForceAtlas2, coarse to fine by default (`multilevel => false` runs it flat), and deterministic: the same call gives the same positions whatever the number of threads, so a layout can be saved and drawn later.
+
+```sql
+SELECT id, round(x, 2) AS x, round(y, 2) AS y
+FROM layout_fa2(karate)
+ORDER BY id
+LIMIT 3;
+```
+
+```text
+┌───────┬─────────┬─────────┐
+│  id   │    x    │    y    │
+│ Int64 │ Float32 │ Float32 │
+├───────┼─────────┼─────────┤
+│     0 │    19.8 │    4.06 │
+│     1 │    9.05 │    7.98 │
+│     2 │   -0.08 │   -2.24 │
+└───────┴─────────┴─────────┘
+```
+
+`layout_fr` is Fruchterman-Reingold. Both go inside `algorithms` too, their columns prefixed by a name: `algorithms(karate, degree(), pos => layout_fa2())` gives `pos_x` and `pos_y`.
 
 ## Direction
 

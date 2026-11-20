@@ -24,6 +24,9 @@ use datafusion::prelude::SessionConfig;
 pub const MIN_DEFAULT_INDEX_STORAGE_LIMIT: u64 = 4 << 30;
 /// The most the default `ursa.index_storage_limit` is: 64 GiB.
 pub const MAX_DEFAULT_INDEX_STORAGE_LIMIT: u64 = 64 << 30;
+/// The default `ursa.index_storage_limit` is a multiple of this, 4 GiB, so it
+/// does not move between opens as the free space changes a little (#381).
+pub const DEFAULT_INDEX_STORAGE_STEP: u64 = 4 << 30;
 /// The share of the space available to indexes that the default
 /// `ursa.index_storage_limit` takes, in percent.
 pub const DEFAULT_INDEX_STORAGE_SHARE: u64 = 25;
@@ -31,7 +34,8 @@ pub const DEFAULT_INDEX_STORAGE_SHARE: u64 = 25;
 /// The default `ursa.index_storage_limit` of a database whose indexes could
 /// use `available` bytes (the free space on its disk plus what its stored
 /// indexes already take; `None` if the free space cannot be read): 25% of
-/// it, in whole GiB, at least 4 GiB and at most 64 GiB (#353).
+/// it, rounded down to a multiple of 4 GiB, at least 4 GiB and at most 64 GiB
+/// (#353, #381).
 ///
 /// Relative, so a large disk keeps the indexes of several large graphs (an
 /// index of 95.7M edges takes about 1.3 GiB, and 2.3 GiB once an algorithm
@@ -46,7 +50,7 @@ pub fn default_index_storage_limit(available: Option<u64>) -> u64 {
         return MIN_DEFAULT_INDEX_STORAGE_LIMIT;
     };
     let share = (available as u128 * DEFAULT_INDEX_STORAGE_SHARE as u128 / 100) as u64;
-    (share >> 30 << 30).clamp(
+    (share / DEFAULT_INDEX_STORAGE_STEP * DEFAULT_INDEX_STORAGE_STEP).clamp(
         MIN_DEFAULT_INDEX_STORAGE_LIMIT,
         MAX_DEFAULT_INDEX_STORAGE_LIMIT,
     )
@@ -97,6 +101,57 @@ impl ConfigField for IndexStorageLimit {
 
     fn set(&mut self, _key: &str, value: &str) -> Result<()> {
         *self = IndexStorageLimit::parse(value)?;
+        Ok(())
+    }
+}
+
+/// `ursa.build_read_ahead`: `auto` (the default: 256 MiB per partition of
+/// the plan read, at most 1 GiB and at most an eighth of the memory
+/// available) or a size `SET` for the session; 0 reads a build's partitions
+/// one after another (#385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadAhead {
+    /// Scaled with the partitions read, and capped by the memory available.
+    #[default]
+    Auto,
+    /// A size `SET` for the session.
+    Bytes(ByteSize),
+}
+
+impl ReadAhead {
+    /// `auto` (or `default`), in any case, or a size ([`ByteSize::parse`]).
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "auto" | "default" => Ok(Self::Auto),
+            _ => ByteSize::parse(text).map(Self::Bytes),
+        }
+    }
+
+    /// The size `SET`, if one was.
+    pub fn bytes(&self) -> Option<u64> {
+        match self {
+            Self::Auto => None,
+            Self::Bytes(b) => Some(b.0),
+        }
+    }
+}
+
+impl fmt::Display for ReadAhead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Bytes(b) => b.fmt(f),
+        }
+    }
+}
+
+impl ConfigField for ReadAhead {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        *self = ReadAhead::parse(value)?;
         Ok(())
     }
 }
@@ -241,6 +296,19 @@ extensions_options! {
         /// indexes not stored or evicted), 'all' (every index build, load
         /// and store) or 'off'. Default on.
         pub notices: NoticeLevel, default = NoticeLevel::On
+        /// The most paths one GRAPH_TABLE path search holds before it stops
+        /// with an error; 0 for no limit. Under ANY SHORTEST (and SHORTEST
+        /// k) it counts the paths kept, never fewer than one (k) per node of
+        /// the graph; otherwise the paths and prefixes held. Default
+        /// 10000000.
+        pub max_paths: usize, default = crate::graph::path_search::MAX_PATHS
+        /// The most bytes of decoded rows an index build reads ahead of the
+        /// rows it is interning, so the partitions of its edge and vertex
+        /// tables decode in parallel.
+        /// Default auto: 256MiB per partition read, at most 1GiB and at most
+        /// an eighth of the memory available. 0 reads the partitions one
+        /// after another.
+        pub build_read_ahead: ReadAhead, default = ReadAhead::Auto
     }
 }
 
@@ -266,6 +334,26 @@ pub fn notice_level(config: &SessionConfig) -> NoticeLevel {
         .extensions
         .get::<UrsaOptions>()
         .map_or(NoticeLevel::default(), |o| o.notices)
+}
+
+/// The session's `ursa.max_paths`: `None` when it is 0, no limit.
+pub fn max_paths(config: &SessionConfig) -> Option<usize> {
+    let n = config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .map_or(crate::graph::path_search::MAX_PATHS, |o| o.max_paths);
+    (n > 0).then_some(n)
+}
+
+/// The session's `ursa.build_read_ahead`, if it was `SET`; `None` when it
+/// is `auto` (see `graph::in_order`).
+pub fn build_read_ahead_set(config: &SessionConfig) -> Option<u64> {
+    config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .and_then(|o| o.build_read_ahead.bytes())
 }
 
 /// The session's `ursa.index_storage_limit`, if it was `SET`; `None` when it
@@ -336,9 +424,12 @@ mod tests {
         assert_eq!(default_index_storage_limit(None), 4 * gib);
         assert_eq!(default_index_storage_limit(Some(0)), 4 * gib);
         assert_eq!(default_index_storage_limit(Some(10 * gib)), 4 * gib);
-        // 25%, in whole GiB.
-        assert_eq!(default_index_storage_limit(Some(100 * gib)), 25 * gib);
-        assert_eq!(default_index_storage_limit(Some(103 * gib)), 25 * gib);
+        // 25%, rounded down to a multiple of 4 GiB.
+        assert_eq!(default_index_storage_limit(Some(100 * gib)), 24 * gib);
+        assert_eq!(default_index_storage_limit(Some(103 * gib)), 24 * gib);
+        assert_eq!(default_index_storage_limit(Some(87 * gib)), 20 * gib);
+        assert_eq!(default_index_storage_limit(Some(95 * gib)), 20 * gib);
+        assert_eq!(default_index_storage_limit(Some(96 * gib)), 24 * gib);
         assert_eq!(default_index_storage_limit(Some(1 << 50)), 64 * gib);
         assert_eq!(default_index_storage_limit(Some(u64::MAX)), 64 * gib);
     }

@@ -17,7 +17,9 @@
 // shows control characters as escapes and downloads nothing; awkward file
 // names import; and every response carries the security headers, which the
 // page runs under with no Content Security Policy violation. An error on
-// screen fails the run, except the ones a test asks for.
+// screen fails the run, except the ones a test asks for. It also runs the
+// tour on a phone, and opens every "Try it live" link in the README, the SQL
+// docs and the website (a Share link is answered y).
 import { chromium, type Page } from "playwright";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
@@ -45,7 +47,12 @@ const page = await context.newPage();
 page.on("pageerror", (e) => failures.push(`page error: ${e.message}`));
 
 async function ready(p: Page) {
-  await p.waitForFunction(() => (window as any).ursaShell && !(window as any).ursaShell.busy(), null, { timeout: 120_000 });
+  // Not busy, and started: the banner and a prompt are on screen. A fresh page
+  // is not busy for a moment before its session starts (and clears the screen).
+  await p.waitForFunction(() => {
+    const shell = (window as any).ursaShell;
+    return shell && !shell.busy() && shell.screen().includes("memory U");
+  }, null, { timeout: 120_000 });
 }
 async function idle(p: Page = page) {
   await p.evaluate(() => (window as any).ursaShell.idle());
@@ -75,11 +82,18 @@ function contrast(a: string, b: string) {
   return (hi + 0.05) / (lo + 0.05);
 }
 /** The colour of the types under a table's header (the shell's grey), and the terminal's background. */
+// xterm draws its rows on the next animation frame: wait for the span.
 const greyText = (p: Page = page) =>
-  p.evaluate(() => {
-    const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
-    return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
-  });
+  p
+    .waitForFunction(
+      () => {
+        const span = [...document.querySelectorAll(".xterm-rows span")].findLast((s) => s.textContent!.trim() === "Int64");
+        return span ? [getComputedStyle(span).color, getComputedStyle(document.querySelector(".terminal")!).backgroundColor] : null;
+      },
+      null,
+      { timeout: 5_000 },
+    )
+    .then((h) => h.jsonValue() as Promise<string[]>, () => null);
 
 /** Type `text` at the prompt, a line at a time, each with Enter; wait for it. */
 async function type(text: string, p: Page = page) {
@@ -109,7 +123,7 @@ const t0 = Date.now();
 await page.goto(base);
 await ready(page);
 const banner = await screen();
-check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
+check(/Ursa Web Shell running\.\.\.\nUrsa v\d\S*\nEnter "\.help" for usage hints\.\nPick a sample graph from the Datasets menu, or type \.dataset karate\nmemory U/.test(banner), "banner", `${banner.match(/Ursa v\S+/)?.[0]} (${Date.now() - t0} ms)`);
 await page.click("#terminal");
 
 // The keyboard can leave the terminal: Tab and Shift+Tab move the focus on
@@ -225,6 +239,11 @@ const help = await after(".help");
 check(help.includes(".describe NAME") && help.includes(".share") && help.includes("Run .help graph"), ".help lists the shell's and the page's commands");
 await type(".help graph");
 check((await after(".help graph")).includes("ANY SHORTEST | ALL SHORTEST | SHORTEST k"), ".help graph");
+{
+  // .help starts with where to begin: the tour, and how to draw a graph.
+  const first = help.split("\n.clear")[0];
+  check(first.includes(".tour") && first.includes(".graph karate"), ".help names .tour and .graph before the list", JSON.stringify(first.slice(0, 120)));
+}
 await type(".help shortcuts");
 check((await after(".help shortcuts")).includes("Shift+Enter"), ".help shortcuts (the page's keys)");
 await type(".help timer");
@@ -701,6 +720,10 @@ await idle(phone);
 const columns: number = await phone.evaluate(() => (window as any).ursaShell.cols());
 const widest = Math.max(...(await screen(phone)).split("\n").filter((l) => /^[┌│└├]/.test(l)).map((l) => [...l].length));
 check(widest <= columns, "tables fit a phone's width", `widest ${widest}, ${columns} columns`);
+{
+  const hint = (await screen(phone)).split("\n").slice(3, 6);
+  check(hint.join(" ").startsWith("Pick a sample graph from the Datasets menu, or type .dataset karate") && hint.every((l) => [...l].length < columns), "the banner's hint breaks between words on a phone", JSON.stringify(hint));
+}
 if (shots) await phone.screenshot({ path: `${shots}/shell-phone.png` });
 // The dataset's SQL is broken at spaces to fit: no line fills the width, as a
 // line the terminal wraps (mid-word) does.
@@ -748,6 +771,419 @@ for (const scheme of ["light", "dark"] as const) {
   const ratio = colors ? contrast(colors[0], colors[1]) : 0;
   check(ratio >= 4.5, `dim text contrast, ${scheme}`, `${ratio.toFixed(2)}:1 (${colors?.join(" on ")})`);
   await ctx.close();
+}
+
+// The Graph view (.graph): a result, a query or a property graph drawn in a
+// pane beside the terminal (under it on a phone), loaded only when first
+// asked for. Headless Chromium draws it with WebGL2 (SwiftShader).
+/** A context watched for Content Security Policy violations, as the main one is. */
+async function watchedContext(options: Parameters<typeof browser.newContext>[0]) {
+  const ctx = await browser.newContext(options);
+  await ctx.addInitScript(() => {
+    document.addEventListener("securitypolicyviolation", (e) =>
+      console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+    );
+  });
+  ctx.on("console", (m) => {
+    if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
+  });
+  ctx.on("page", (p) => p.on("pageerror", (e) => failures.push(`page error: ${e.message}`)));
+  return ctx;
+}
+const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
+const graphOpen = (p: Page): Promise<boolean> => p.evaluate(() => (window as any).ursaShell.graphOpen());
+/** Wait until the view has drawn a frame and its layout has run to the end. */
+async function graphSettled(p: Page) {
+  await p.waitForFunction(
+    () => {
+      const g = (window as any).ursaShell.graph();
+      return g && g.frames > 0 && g.layoutDone;
+    },
+    null,
+    { timeout: 60_000, polling: 200 },
+  );
+}
+/** The terminal's columns, once a resize has settled. */
+async function settledCols(p: Page) {
+  let last = -1;
+  for (let i = 0; i < 20; i++) {
+    await p.waitForTimeout(100);
+    const now: number = await p.evaluate(() => (window as any).ursaShell.cols());
+    if (now === last) return now;
+    last = now;
+  }
+  return last;
+}
+for (const scheme of ["light", "dark"] as const) {
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: scheme });
+  const g = await gctx.newPage();
+  const vizRequests: string[] = [];
+  g.on("request", (r) => {
+    if (/\/viz\/|\/graph(-worker)?\.js/.test(r.url())) vizRequests.push(new URL(r.url()).pathname);
+  });
+  await g.goto(base);
+  await ready(g);
+  await g.click("#terminal");
+  const fullCols = await settledCols(g);
+  if (scheme === "light") {
+    // Errors, each said plainly: nothing to draw yet, too few columns, no rows,
+    // an unknown name, a query that fails.
+    await type(".graph", g);
+    check((await after(".graph", g)).startsWith("Error: no result to draw yet"), ".graph with no result says so", (await after(".graph", g)).split("\n")[0]);
+    for (const [sql, says] of [
+      ["SELECT 1 AS x", "the result has 1 column"],
+      ["SELECT 1 AS src, 2 AS dst WHERE false", "the result has no rows"],
+      ["nothing_here", "no graph or table named 'nothing_here'"],
+      ["SELECT * FROM no_such_table", "no_such_table"],
+    ]) {
+      await type(`.graph ${sql}`, g);
+      const out = await after(`.graph ${sql}`, g);
+      check(out.startsWith("Error: ") && out.includes(says) && !(await graphOpen(g)), `.graph ${sql}: an error`, out.split("\n")[0]);
+    }
+  }
+  await type(".dataset karate", g);
+  check(!(await errors(g)) && vizRequests.length === 0 && !(await graphOpen(g)), `${scheme}: the graph view is not downloaded before .graph`, vizRequests.join(", "));
+
+  // .graph draws the last result: karate's 78 ties between its 34 members.
+  await type("SELECT * FROM ties;", g);
+  await type(".graph", g);
+  const drawing = (await after(".graph", g)).split("\n")[0];
+  check(drawing === "Drawing 78 edges, 34 nodes (Esc closes)", `${scheme}: .graph draws the last result`, drawing);
+  check(vizRequests.some((u) => u.startsWith("/viz/") && u.endsWith(".wasm")) && vizRequests.includes("/graph.js"), `${scheme}: .graph loads the graph view`, vizRequests.join(", "));
+  await graphSettled(g);
+  let info = await graphInfo(g);
+  check(info.nodes === 34 && info.edges === 78 && info.iterations > 0 && info.layoutDone, `${scheme}: the view holds the graph, its layout run to the end`, JSON.stringify(info));
+  const inked = await g.evaluate(() => (window as any).ursaShell.graphInked());
+  check(inked && inked.inked > 500, `${scheme}: the view draws the graph (non-blank pixels)`, `${inked?.inked} of ${inked?.width}x${inked?.height} px, ${info.backend}`);
+  const pane = (await g.locator("#graph-pane").boundingBox())!;
+  const termBox = (await g.locator("#terminal").boundingBox())!;
+  const split = await settledCols(g);
+  check(pane.x >= termBox.x + termBox.width - 1 && Math.abs(pane.width - termBox.width) < 4 && split < fullCols * 0.6, `${scheme}: the pane sits beside the terminal, which refits`, `terminal ${termBox.width}px, ${split} of ${fullCols} columns; pane ${pane.width}px`);
+  const label = await g.evaluate(() => [document.getElementById("graph-pane")!.getAttribute("aria-label"), document.getElementById("graph-close")!.getAttribute("aria-label"), document.querySelector("#graph-stage canvas")?.getAttribute("aria-label")]);
+  check(label.every(Boolean), `${scheme}: the pane, its close button and canvas are labelled`, JSON.stringify(label));
+  check((await focused(g)) === "terminal", `${scheme}: the terminal keeps the focus while the graph shows`, await focused(g));
+  if (shots) await g.screenshot({ path: `${shots}/graph-split-${scheme}.png` });
+  if (scheme === "dark") {
+    await gctx.close();
+    continue;
+  }
+
+  // Typing works while the pane is open.
+  await type("SELECT 6 * 7 AS answer;", g);
+  check(lastTable(await after("SELECT 6 * 7", g)).rows[0]?.[0] === "42" && (await graphOpen(g)), "queries run while the graph shows");
+
+  // A click on a node names it in the pane's header.
+  const box = (await g.locator("#graph-stage canvas").boundingBox())!;
+  const hit: { x: number; y: number } | null = await g.evaluate(([w, h]) => {
+    for (let y = 2; y < h; y += 2)
+      for (let x = 2; x < w; x += 2) if ((window as any).ursaShell.graphNodeAt(x * 2, y * 2) !== null) return { x, y };
+    return null;
+  }, [box.width, box.height]);
+  if (hit) await g.mouse.click(box.x + hit.x, box.y + hit.y);
+  const status = await g.locator("#graph-status").textContent();
+  check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\)/.test(status ?? ""), "a click on a node names it", status ?? "no node found");
+  // Double-click fits, and the wheel zooms, without errors.
+  await g.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
+  await g.mouse.wheel(0, -200);
+
+  // Esc, in the terminal, closes it: the terminal takes the whole width again.
+  await g.click("#terminal");
+  await g.keyboard.press("Escape");
+  check(!(await graphOpen(g)) && (await settledCols(g)) === fullCols && (await focused(g)) === "terminal", "Esc closes the graph view and the terminal refits", `${await settledCols(g)} of ${fullCols} columns`);
+
+  // .graph NAME: a property graph.
+  await type(".graph karate", g);
+  check((await after(".graph karate", g)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), ".graph karate draws the property graph", (await after(".graph karate", g)).split("\n")[0]);
+  // .graph QUERY replaces the drawing.
+  await type(".graph SELECT src, dst FROM ties WHERE src = 1;", g);
+  const replaced = (await after(".graph SELECT src, dst FROM ties WHERE src = 1", g)).split("\n")[0];
+  await graphSettled(g);
+  info = await graphInfo(g);
+  check(/^Drawing 8 edges, 9 nodes \(replacing the last drawing; Esc closes\)$/.test(replaced) && info.edges === 8 && info.nodes === 9, ".graph QUERY replaces the drawing", replaced);
+  // Esc with the focus in the pane closes it, and the focus goes back to the terminal.
+  await g.focus("#graph-stage canvas");
+  await g.keyboard.press("Escape");
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "Esc in the pane closes it, focus back in the terminal", await focused(g));
+
+  // The Graph button draws the last result; a click hands the keys back to the terminal.
+  await type("SELECT * FROM ties;", g);
+  await g.click("#graph");
+  await idle(g);
+  check((await after(".graph", g)).startsWith("Drawing 78 edges, 34 nodes") && (await graphOpen(g)) && (await focused(g)) === "terminal", "the Graph button draws the last result", (await after(".graph", g)).split("\n")[0]);
+  const buttonLabel = await g.evaluate(() => document.getElementById("graph")!.textContent!.trim());
+  check(buttonLabel === "Graph", "the Graph button is named", buttonLabel);
+  // The close button closes it.
+  await g.click("#graph-close");
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "the close button closes the pane", await focused(g));
+  check((await errors(g)) === 0, "no errors from the graph view (since the dataset cleared the screen)", `${await errors(g)}`);
+  // New, or a dataset, closes the pane.
+  await type(".graph karate", g);
+  await g.click("#new");
+  await idle(g);
+  check(!(await graphOpen(g)), "New closes the graph view");
+  await type(".dataset karate", g);
+  await type(".graph karate", g);
+  check(await graphOpen(g), ".graph karate after a fresh session");
+  await type(".dataset florentine", g);
+  check(!(await graphOpen(g)), "a dataset closes the graph view");
+  await gctx.close();
+}
+// SIZE BY and COLOR BY (#389): Karate's two factions in two colours, in each
+// theme, read back from the view's pixels (the view draws in the theme's own
+// colours: no CSS inversion), a theme switch with the pane open, the legend,
+// NODES (…), and each error said plainly. And the status line (#390), from
+// Enter to Done.
+/** Statuses the pane's header showed, in order, since the last call. */
+const statuses = (p: Page): Promise<string[]> =>
+  p.evaluate(() => {
+    const w = window as any;
+    const seen: string[] = w.__statuses ?? [];
+    w.__statuses = [];
+    if (!w.__statusObserver) {
+      const el = document.getElementById("graph-status")!;
+      w.__statusObserver = new MutationObserver(() => w.__statuses.push(el.textContent));
+      w.__statusObserver.observe(el, { childList: true, characterData: true, subtree: true });
+    }
+    return seen;
+  });
+/** The palette colours drawn: how many of each (8 hues, then other) cover more than `min` pixels. */
+const huesDrawn = async (p: Page, min = 40) => {
+  const inked: any = await p.evaluate(() => (window as any).ursaShell.graphInked());
+  return { inked, hues: (inked?.palette ?? []).filter((n: number) => n > min).length };
+};
+/** The legend as text: what sizes the nodes, what colours them, then each colour's name and count. */
+const legendText = (p: Page) =>
+  p.evaluate(() => {
+    const legend = document.getElementById("graph-legend")!;
+    if (legend.hidden) return "";
+    return [...legend.querySelectorAll(".size, .color-head, li")].map((e) => e.textContent!.replace(/\s+/g, " ").trim()).join(" ");
+  });
+for (const scheme of ["light", "dark"] as const) {
+  const sctx = await watchedContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: scheme });
+  const s = await sctx.newPage();
+  await s.goto(`${base}/?dataset=karate`);
+  await ready(s);
+  await idle(s);
+  await s.click("#terminal");
+  await statuses(s);
+  if (scheme === "light") {
+    for (const [args, says] of [
+      ["karate SIZE BY nope", "SIZE BY nope: graph 'karate' has no vertex column or algorithm named 'nope'. Its vertex columns are"],
+      ["karate COLOR BY wcc", "the algorithms are degree, pagerank"],
+      ["karate SIZE BY club", "SIZE BY club needs numbers, and club is text; colour nodes by it instead: COLOR BY club"],
+      ["karate COLOR BY pagerank", "distinct values over 34 nodes are too many categories to tell apart by colour. A measure is better shown by size: SIZE BY pagerank"],
+      ["karate COLOR BY id", "COLOR BY id: 34 distinct values over 34 nodes are too many categories to tell apart by colour. Colour by a column with fewer values, or size nodes by this one: SIZE BY id"],
+      ["karate COLOR BY name", "COLOR BY name: graph 'karate' has no vertex column or algorithm named 'name'. Its vertex columns are club, id;"],
+      ["SELECT src, dst FROM ties SIZE BY pagerank", "SIZE BY pagerank runs pagerank() on a property graph, and this draws rows"],
+      ["SELECT src, dst FROM ties COLOR BY club", "no column named 'club'. Rows drawn as edges are sized or coloured by degree, or by a column of NODES"],
+      ["karate SIZE BY", "SIZE BY needs a numeric column or an algorithm"],
+      ["karate SIZE BY pagerank SIZE BY degree", "SIZE BY is given twice"],
+      ["karate NODES (SELECT id, 1 AS one FROM members)", "NODES (…) gives values for SIZE BY or COLOR BY to use"],
+      ["karate NODES (SELECT id FROM members) SIZE BY id", "NODES (…) needs two columns or more"],
+    ]) {
+      await type(`.graph ${args}`, s);
+      const out = await after(`.graph ${args}`, s);
+      // Compared without spaces: the terminal wraps long lines.
+      const squeezed = (t: string) => t.replace(/\s+/g, "");
+      check(out.startsWith("Error: ") && squeezed(out).includes(squeezed(says)) && !(await graphOpen(s)), `.graph ${args}: a clear error`, out.split("\n").slice(0, 3).join(" "));
+    }
+  }
+
+  // Sized by PageRank, coloured by Louvain: run through algorithms(karate, …).
+  await statuses(s);
+  await type(".graph karate SIZE BY pagerank COLOR BY louvain", s);
+  check((await after(".graph karate SIZE BY", s)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), `${scheme}: .graph karate SIZE BY pagerank COLOR BY louvain draws`, (await after(".graph karate SIZE BY", s)).split("\n")[0]);
+  await graphSettled(s);
+  const seen = await statuses(s);
+  const loading = seen.findIndex((t) => t.startsWith("Loading graph view…"));
+  const laying = seen.findIndex((t) => / · Laying out · level \d+ of \d+$/.test(t));
+  const done = seen.findIndex((t) => t === "34 nodes · 78 edges · Done");
+  check(laying >= 0 && done > laying && (loading < 0 || loading < laying), `${scheme}: the status shows the layout's progress, then Done`, JSON.stringify(seen));
+  const legend = await legendText(s);
+  check(/^size: pagerank 0\.\d+–0\.\d+ colour: louvain (\S+ \(\d+\) ?){2,8}$/.test(legend), `${scheme}: the legend names what sizes and colours the nodes`, legend);
+  const counts = [...legend.matchAll(/\((\d+)\)/g)].reduce((a, m) => a + Number(m[1]), 0);
+  check(counts === 34, `${scheme}: the legend counts every node`, `${counts}`);
+  const filter = await s.evaluate(() => getComputedStyle(document.querySelector("#graph-stage canvas")!).filter);
+  let drawn = await huesDrawn(s);
+  const bg = scheme === "light" ? [255, 255, 255] : [11, 11, 10];
+  check(drawn.hues >= 2 && filter === "none" && drawn.inked.corner.every((v: number, i: number) => Math.abs(v - bg[i]) <= 2), `${scheme}: two colours or more, in the theme's own palette, on its own ground (no inversion)`, `${JSON.stringify(drawn.inked.palette)}, corner ${drawn.inked.corner}, filter ${filter}`);
+  if (shots) {
+    await s.waitForTimeout(300);
+    await s.screenshot({ path: `${shots}/graph-styled-${scheme}.png` });
+    await s.locator("#graph-pane").screenshot({ path: `${shots}/graph-legend-${scheme}.png`, clip: undefined });
+  }
+
+  // The theme switched with the pane open: the view is drawn in the other's colours.
+  await s.click("#theme");
+  const other = scheme === "light" ? [11, 11, 10] : [255, 255, 255];
+  drawn = await huesDrawn(s);
+  check(drawn.hues >= 2 && drawn.inked.corner.every((v: number, i: number) => Math.abs(v - other[i]) <= 2), `${scheme}: switching the theme recolours the open view`, `${JSON.stringify(drawn.inked.palette)}, corner ${drawn.inked.corner}`);
+  if (shots) await s.screenshot({ path: `${shots}/graph-styled-${scheme}-switched.png` });
+  await s.click("#theme");
+
+  if (scheme === "light") {
+    // A vertex column, and degree; a click names the node's values.
+    await type(".graph karate SIZE BY degree COLOR BY club", s);
+    await graphSettled(s);
+    const clubs = await legendText(s);
+    check(/^size: degree 1–17 colour: club (Mr\. Hi|Officer) \(\d+\) (Mr\. Hi|Officer) \(\d+\)$/.test(clubs), "COLOR BY a vertex column, SIZE BY degree", clubs);
+    const box = (await s.locator("#graph-stage canvas").boundingBox())!;
+    const hit: { x: number; y: number } | null = await s.evaluate(([w, h]) => {
+      for (let y = 2; y < h; y += 2)
+        for (let x = 2; x < w; x += 2) if ((window as any).ursaShell.graphNodeAt(x * 2, y * 2) !== null) return { x, y };
+      return null;
+    }, [box.width, box.height]);
+    if (hit) await s.mouse.click(box.x + hit.x, box.y + hit.y);
+    const status = await s.locator("#graph-status").textContent();
+    check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\) · degree \d+ · club (Mr\. Hi|Officer)$/.test(status ?? ""), "a click names the node's size and colour values", status ?? "no node found");
+    await s.click("#terminal");
+
+    // NODES (…): values for a query's rows, joined on id.
+    // Karate's members are 0 to 33: the four past 29 have no values.
+    const nodes = ".graph SELECT src, dst FROM ties NODES (SELECT id, CASE WHEN club = 'Officer' THEN 'officer' END AS side, id * 2 AS twice FROM members WHERE id < 30) SIZE BY twice COLOR BY side";
+    await type(nodes, s);
+    const drew = (await after(".graph SELECT src, dst FROM ties NODES", s)).split("\n").find((l) => l.startsWith("Drawing")) ?? "";
+    check(drew === "Drawing 78 edges, 34 nodes (replacing the last drawing; Esc closes)", ".graph QUERY NODES (…) draws", drew);
+    await graphSettled(s);
+    const sides = await legendText(s);
+    check(/^size: twice 0–58 colour: side officer \(\d+\) no value \(\d+\)$/.test(sides), "NODES (…) columns size and colour a query's nodes", sides);
+    drawn = await huesDrawn(s, 10);
+    check(drawn.inked.palette[0] > 10 && drawn.inked.palette[8] > 10, "NODES (…): a category's colour, and other's grey for no value", JSON.stringify(drawn.inked.palette));
+    await s.keyboard.press("Escape");
+    check(!(await graphOpen(s)) && (await legendText(s)) === "", "Esc closes the pane and its legend");
+    check((await errors(s)) === 12, "no errors from styled drawings but the ones asked for", `${await errors(s)}`);
+  }
+  await sctx.close();
+}
+// A big graph says so at once (#390): rmat's million edges show a status
+// within a second of Enter, and the layout's levels before it is done.
+{
+  const rctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const r = await rctx.newPage();
+  await r.goto(`${base}/?dataset=rmat`);
+  await ready(r);
+  await idle(r);
+  await r.click("#terminal");
+  // Each status as it is set, and when: the page is too busy drawing a
+  // million edges (in software, headless) to be polled on time.
+  await r.evaluate(() => {
+    const w = window as any;
+    const el = document.getElementById("graph-status")!;
+    w.__timed = [];
+    new MutationObserver(() => w.__timed.push([performance.now(), el.textContent])).observe(el, { childList: true, characterData: true, subtree: true });
+  });
+  await r.keyboard.type(".graph rmat");
+  const enter: number = await r.evaluate(() => performance.now());
+  await r.keyboard.press("Enter");
+  await graphSettled(r);
+  const timed: [number, string][] = await r.evaluate(() => (window as any).__timed);
+  const first = timed[0];
+  const laying = timed.filter(([, t]) => / · Laying out · level \d+ of \d+$/.test(t)).map(([, t]) => t.match(/level (\d+) of (\d+)/)!.slice(1).map(Number));
+  const doneAt = timed.findIndex(([, t]) => t.endsWith(" · Done"));
+  const times = await r.evaluate(() => (window as any).ursaShell.graphTimings());
+  check(
+    first && first[0] - enter < 1_000 && first[1] === "Loading graph view…" && laying.length > 1 && laying[0][1] > 1 && doneAt > 0,
+    "a big graph: its status within a second, then its layout's levels, then Done",
+    `"${first?.[1]}" at ${Math.round((first?.[0] ?? 0) - enter)} ms; levels ${JSON.stringify(laying.slice(0, 3))}…; ms after Enter ${JSON.stringify(times)}`,
+  );
+  await r.keyboard.press("Escape");
+  check(!(await graphOpen(r)) && (await errors(r)) === 0, "a big graph's view closes");
+  await rctx.close();
+}
+
+// A phone: the pane goes under the terminal, which refits to its new height.
+{
+  const pctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  const p = await pctx.newPage();
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  const rows0: number = await p.evaluate(() => (window as any).ursaShell.rows());
+  await p.click("#terminal");
+  await type(".graph karate", p);
+  await graphSettled(p);
+  const pane = (await p.locator("#graph-pane").boundingBox())!;
+  const termBox = (await p.locator("#terminal").boundingBox())!;
+  const rows1: number = await p.evaluate(() => (window as any).ursaShell.rows());
+  const bar = (await p.locator("header.bar").boundingBox())!;
+  check(pane.y >= termBox.y + termBox.height - 1 && pane.width > 380 && rows1 < rows0 && bar.height <= 56, "a phone: the graph view is stacked under the terminal", `terminal ${rows0} → ${rows1} rows, pane at ${pane.y}px`);
+  if (shots) await p.screenshot({ path: `${shots}/graph-stacked-phone.png` });
+  await pctx.close();
+}
+
+// The tour (`.tour`, ?dataset=tour, the first item of the Datasets menu): on a
+// phone, it runs end to end with no error, its tables fit the screen, its
+// Louvain step matches the club's real split but for one member, and it draws
+// the club.
+{
+  const tctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  const p = await tctx.newPage();
+  await p.goto(`${base}/?dataset=tour`);
+  await ready(p);
+  await idle(p);
+  const text = await screen(p);
+  const cols: number = await p.evaluate(() => (window as any).ursaShell.cols());
+  const tour = datasets.find((d) => d.id === "tour")!;
+  const wide = text.split("\n").filter((l) => /^[┌│└├]/.test(l) && [...l].length > cols);
+  check(!text.includes("Error: ") && (await tables(p)) === queries(tour.commands) && text.includes("That's the tour"), "the tour runs end to end", `${await tables(p)} tables`);
+  check(wide.length === 0, "the tour's tables fit a phone", `${cols} columns; ${wide[0] ?? ""}`);
+  const lines = text.split("\n");
+  const factions = lastTable(lines.slice(0, lines.findIndex((l) => l.includes("Step 4"))).join("\n"));
+  check(JSON.stringify(factions.rows) === '[["0","Mr. Hi","16"],["1","Mr. Hi","1"],["1","Officer","17"]]', "the tour's factions match the club's split", JSON.stringify(factions.rows));
+  check(JSON.stringify(lastTable(text).rows.map((r) => r[1])) === '["[0, 8, 33]","[0, 13, 33]","[0, 19, 33]","[0, 31, 33]"]', "the tour's shortest paths", JSON.stringify(lastTable(text).rows));
+  await graphSettled(p);
+  const info = await graphInfo(p);
+  check((await graphOpen(p)) && info.nodes === 34 && info.edges === 78, "the tour draws the club", JSON.stringify(info));
+  const tourLegend = await legendText(p);
+  check(/colou?r: club/.test(tourLegend) && tourLegend.includes("Mr. Hi (17)") && tourLegend.includes("Officer (17)") && /size: pagerank/.test(tourLegend), "the tour colours the club by side and sizes it by PageRank", tourLegend);
+  if (shots) await p.screenshot({ path: `${shots}/tour-phone.png` });
+  // .tour runs it again, in a fresh session.
+  await p.click("#terminal");
+  await type(".tour", p);
+  const again = await screen(p);
+  check(again.startsWith("Ursa Web Shell running") && !again.includes("Error: ") && (await tables(p)) === queries(tour.commands), ".tour", `${await tables(p)} tables`);
+  await tctx.close();
+}
+
+// The docs' "Try it live" links (README, the SQL docs, the website): each
+// opens here, and a Share link replays its example after y, with no error.
+{
+  const { linkCommands } = await import("../scripts/share-link.ts");
+  const root = `${import.meta.dir}/../..`;
+  const links = new Set<string>();
+  for (const file of ["README.md", "docs/sql/index.md", "site/src/content/docs/docs/sql/introduction.md", "site/src/content/docs/docs/index.mdx", "site/src/content/docs/docs/quickstart.md", "site/src/pages/index.astro", "site/src/consts.ts"]) {
+    const text = await Bun.file(`${root}/${file}`).text();
+    for (const m of text.matchAll(/https:\/\/ursa-shell\.cl-dixon\.workers\.dev\/(#run=[A-Za-z0-9_-]+|\?dataset=\w+)/g)) links.add(m[1]);
+  }
+  for (const m of (await Bun.file(`${root}/site/src/consts.ts`).text()).matchAll(/\$\{SHELL_URL\}\/(\?dataset=\w+)/g)) links.add(m[1]);
+  check([...links].some((l) => l.startsWith("#run=")) && links.has("?dataset=tour"), "the docs link to the shell", [...links].map((l) => l.slice(0, 20)).join(", "));
+  const lctx = await watchedContext({ viewport: { width: 1280, height: 900 } });
+  for (const link of links) {
+    let p: Page;
+    if (link.startsWith("#run=")) {
+      const commands = linkCommands(link);
+      p = await lctx.newPage();
+      await p.goto(`${base}/${link}`);
+      await p.waitForFunction(() => (window as any).ursaShell?.screen().includes("? [y/N] "), null, { timeout: 120_000 });
+      check((await screen(p)).includes(`This link runs ${commands.length} shared commands:`), `a docs link asks first (${commands.length} commands)`);
+      await p.keyboard.press("y");
+    } else {
+      p = await lctx.newPage();
+      await p.goto(`${base}/${link}`);
+      await ready(p);
+    }
+    await idle(p);
+    const text = await screen(p);
+    const id = link.slice(0, 32);
+    if (link.startsWith("#run=")) {
+      const t = lastTable(text);
+      check(!text.includes("Error: ") && text.includes("Replaying") && t.head[0] === "id" && t.rows[0]?.[0] === "33", `the docs link ${id}… replays its example`, JSON.stringify(t.rows.slice(0, 2)));
+    } else {
+      check(!text.includes("Error: ") && (await tables(p)) > 0, `the docs link ${link} loads`, `${await tables(p)} tables`);
+    }
+    await p.close();
+  }
+  await lctx.close();
 }
 
 // The security headers, on every kind of response.

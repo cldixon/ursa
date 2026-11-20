@@ -19,6 +19,7 @@
       <button id="new" type="button" title="Start a new session"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">New</span></button>
       <button id="share" type="button" title="Copy a link that replays this session"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3A4 4 0 0 0 13 5.3l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">Share</span></button>
       <button id="import" type="button" title="Add a CSV, Parquet or JSON file from your computer"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7.5 10.5 12 15l4.5-4.5M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">Import</span></button>
+      <button id="graph" type="button" title="Draw the last result as a graph (.graph)"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M7.2 7.6 10.6 15M8.4 6.4l8 1.4M17.6 9.6 13.4 15.6"/><circle cx="6" cy="6" r="2.2"/><circle cx="18.6" cy="8.2" r="2.2"/><circle cx="12" cy="17.6" r="2.4"/></g></svg><span class="label">Graph</span></button>
       <div class="dropdown">
         <button id="datasets" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="dataset-menu">
           Datasets
@@ -50,6 +51,18 @@
     </div>
   </header>
 
-  <main id="terminal" class="terminal" aria-label="Ursa shell"></main>
+  <div class="workspace">
+    <main id="terminal" class="terminal" aria-label="Ursa shell"></main>
+    <!-- The Graph view (.graph): beside the terminal, or under it on a phone.
+         public/graph.js fills it, loaded on the first .graph. -->
+    <section id="graph-pane" class="graph-pane" aria-label="Graph view" hidden>
+      <div class="graph-head">
+        <span id="graph-status" class="graph-status" aria-live="polite"></span>
+        <button id="graph-close" type="button" class="graph-close" title="Close the graph view (Esc)" aria-label="Close the graph view"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+      </div>
+      <div id="graph-legend" class="graph-legend" aria-label="Legend" hidden></div>
+      <div id="graph-stage" class="graph-stage"></div>
+    </section>
+  </div>
 </body>
 </html>

@@ -37,6 +37,8 @@ pub enum Expected {
     FiniteNumber,
     /// A non-negative integer below 2^32 ([`ParamType::Count`]).
     Count,
+    /// A non-negative integer below 2^32, or null ([`ParamType::OptionalCount`]).
+    CountOrNull,
     /// A non-negative integer below 2^64, or null ([`ParamType::Seed`]).
     Seed,
     /// A boolean ([`ParamType::Bool`]).
@@ -85,6 +87,7 @@ impl fmt::Display for ParamError {
                     Expected::NumberOrNull => "a number or null",
                     Expected::FiniteNumber => "a finite number",
                     Expected::Count => "a non-negative integer below 2^32",
+                    Expected::CountOrNull => "a non-negative integer below 2^32, or null",
                     Expected::Seed => "a non-negative integer or null",
                     Expected::Bool => "a boolean",
                 };
@@ -156,6 +159,22 @@ pub enum Call {
     },
     Louvain {
         resolution: f64,
+        seed: Option<u64>,
+    },
+    LayoutFa2 {
+        /// Coarse to fine ([`crate::algo::layout_fa2_multilevel`]); flat
+        /// ([`crate::algo::layout_fa2`]) otherwise.
+        multilevel: bool,
+        /// Flat: iterations (`None` is 300). Coarse to fine: iterations of
+        /// the input graph, the levels above more (`None` is the schedule's).
+        iterations: Option<u32>,
+        k: f64,
+        gravity: f64,
+        strong_gravity: bool,
+        lin_log: bool,
+        /// `None` is the mode's default: 1.0 coarse to fine, 0.5 flat.
+        theta: Option<f64>,
+        jitter_tolerance: f64,
         seed: Option<u64>,
     },
     LayoutFr {
@@ -230,6 +249,7 @@ impl Call {
             Call::Betweenness { .. } => "betweenness",
             Call::LabelPropagation { .. } => "label_propagation",
             Call::Louvain { .. } => "louvain",
+            Call::LayoutFa2 { .. } => "layout_fa2",
             Call::LayoutFr { .. } => "layout_fr",
             Call::LayoutRandom { .. } => "layout_random",
             Call::LayoutCircle { .. } => "layout_circle",
@@ -277,6 +297,7 @@ impl Call {
                 Call::Betweenness { seed, .. }
                 | Call::LabelPropagation { seed, .. }
                 | Call::Louvain { seed, .. }
+                | Call::LayoutFa2 { seed, .. }
                 | Call::LayoutFr { seed, .. }
                 | Call::LayoutRandom { seed, .. },
                 "seed",
@@ -286,10 +307,30 @@ impl Call {
                 Value::UInt(u64::from(*iterations))
             }
             (
-                Call::LayoutFr { k, .. } | Call::LayoutRandom { k, .. } | Call::LayoutCircle { k },
+                Call::LayoutFa2 { k, .. }
+                | Call::LayoutFr { k, .. }
+                | Call::LayoutRandom { k, .. }
+                | Call::LayoutCircle { k },
                 "k",
             ) => Value::Float(*k),
-            (Call::LayoutFr { gravity, .. }, "gravity") => Value::Float(*gravity),
+            (Call::LayoutFa2 { gravity, .. } | Call::LayoutFr { gravity, .. }, "gravity") => {
+                Value::Float(*gravity)
+            }
+            (Call::LayoutFa2 { multilevel, .. }, "multilevel") => Value::Bool(*multilevel),
+            (Call::LayoutFa2 { iterations, .. }, "iterations") => {
+                opt_u64(iterations.map(u64::from))
+            }
+            (Call::LayoutFa2 { strong_gravity, .. }, "strong_gravity") => {
+                Value::Bool(*strong_gravity)
+            }
+            (Call::LayoutFa2 { lin_log, .. }, "lin_log") => Value::Bool(*lin_log),
+            (Call::LayoutFa2 { theta, .. }, "theta") => opt_f64(*theta),
+            (
+                Call::LayoutFa2 {
+                    jitter_tolerance, ..
+                },
+                "jitter_tolerance",
+            ) => Value::Float(*jitter_tolerance),
             (Call::NeighborAgg { agg, .. }, "agg") => Value::Str(agg_name(*agg)),
             (Call::Diameter { approximate, .. }, "approximate") => Value::Bool(*approximate),
             (Call::Describe { full, .. }, "full") => Value::Bool(*full),
@@ -400,6 +441,13 @@ impl Values {
         }
     }
 
+    pub(crate) fn optional_count(&self, name: &str) -> Option<u32> {
+        match self.get(name) {
+            Value::UInt(u) => Some(u32::try_from(u).expect("a count is validated below 2^32")),
+            _ => None,
+        }
+    }
+
     pub(crate) fn seed(&self, name: &str) -> Option<u64> {
         match self.get(name) {
             Value::UInt(u) => Some(u),
@@ -444,6 +492,11 @@ fn check(param: &ParamSpec, arg: Arg) -> Result<Value, ParamErrorKind> {
         ParamType::Count => match arg {
             Arg::Int(i) if (0..=i128::from(u32::MAX)).contains(&i) => Ok(Value::UInt(i as u64)),
             _ => expected(Expected::Count),
+        },
+        ParamType::OptionalCount => match arg {
+            Arg::Null => Ok(Value::Null),
+            Arg::Int(i) if (0..=i128::from(u32::MAX)).contains(&i) => Ok(Value::UInt(i as u64)),
+            _ => expected(Expected::CountOrNull),
         },
         ParamType::Seed => match arg {
             Arg::Null => Ok(Value::Null),

@@ -74,6 +74,7 @@ use futures::future::BoxFuture;
 use object_store::ObjectStoreExt;
 use ursa_core::{IdMap, Topology};
 
+use crate::database::mapped::Unverified;
 use crate::database::{database_of_config, IndexKey, IndexStore};
 use crate::notices::{self, NoticeLevel, Notifier};
 
@@ -99,6 +100,9 @@ pub struct GraphIndex {
     weights: WeightCache,
     /// Weights stored with the index on disk, read on first use.
     stored: Option<StoredWeights>,
+    /// The checksums of a memory-mapped stored index not checked yet
+    /// (`crate::database::mapped`).
+    unverified: Option<Arc<Unverified>>,
 }
 
 /// Reads the weight columns stored under a key, one `f64` per edge row each
@@ -127,7 +131,30 @@ impl GraphIndex {
             rows: OnceLock::new(),
             weights: WeightCache::default(),
             stored: None,
+            unverified: None,
         }
+    }
+
+    /// This index, read from a memory-mapped file whose checksums
+    /// `unverified` has not checked yet.
+    pub fn with_unverified(mut self, unverified: Option<Arc<Unverified>>) -> Self {
+        self.unverified = unverified;
+        self
+    }
+
+    /// Check the checksums of the stored index this was mapped from that
+    /// were deferred (its edge arrays, and its in-adjacency once read), before
+    /// something reads it whole: a whole-graph algorithm. Nothing to do for an
+    /// index built in this process or read whole. `Err` says what is damaged.
+    /// Blocking: it reads the arrays.
+    pub fn verify_stored(&self) -> std::result::Result<(), String> {
+        self.unverified.as_ref().map_or(Ok(()), |u| u.verify())
+    }
+
+    /// Whether a checksum of the stored index this was mapped from has been
+    /// found not to match: it is not used again.
+    pub fn is_damaged(&self) -> bool {
+        self.unverified.as_ref().is_some_and(|u| u.is_damaged())
     }
 
     /// This index, built from edge rows of which `kept` says which were kept
@@ -575,11 +602,19 @@ impl IndexCache {
         self.builds.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Uncount a load whose index turned out damaged (a checksum checked
+    /// after it loaded, see `crate::database::mapped`): it is built instead.
+    pub fn record_damaged_load(&self) {
+        let _ = self
+            .loads
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
     /// The index for `key`, if it is built and cached; nothing is built.
     pub fn get(&self, key: &(String, Vec<FileIdentity>)) -> Option<Arc<GraphIndex>> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let slot = slots.get_mut(&key.0).filter(|s| s.files == key.1)?;
-        let index = slot.cell.get().cloned()?;
+        let index = slot.cell.get().filter(|i| !i.is_damaged()).cloned()?;
         slot.used = self.clock.fetch_add(1, Ordering::Relaxed);
         Some(index)
     }
@@ -597,7 +632,7 @@ impl IndexCache {
             slots
                 .get(&key.0)
                 .filter(|s| s.files == key.1)
-                .is_some_and(|s| s.cell.get().is_some())
+                .is_some_and(|s| s.cell.get().is_some_and(|i| !i.is_damaged()))
         };
         if cached {
             return Some(IndexHeld::Cached);
@@ -679,7 +714,10 @@ impl IndexCache {
             let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             let used = self.clock.fetch_add(1, Ordering::Relaxed);
             match slots.get_mut(&fingerprint) {
-                Some(slot) if slot.files == files => {
+                // A stored index found damaged is built again.
+                Some(slot)
+                    if slot.files == files && !slot.cell.get().is_some_and(|i| i.is_damaged()) =>
+                {
                     slot.used = used;
                     Arc::clone(&slot.cell)
                 }
@@ -715,7 +753,7 @@ impl IndexCache {
                 let reader = notifier.clone();
                 // Reading a file and checking it is blocking work.
                 let loaded = crate::run_blocking(move || {
-                    let loaded = store.load(&key, &reader);
+                    let loaded = IndexStore::load(&store, &key, &reader);
                     loaded.map(|(index, size)| (index, size, store))
                 })
                 .await

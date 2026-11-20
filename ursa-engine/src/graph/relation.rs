@@ -1860,6 +1860,9 @@ impl GraphFunctions {
         if let Some(graph) = self.registry.get(name) {
             return Ok(graph);
         }
+        if let Some(why) = self.registry.unavailable(name) {
+            return Err(plan(why));
+        }
         let names = self.registry.names();
         let hint = match did_you_mean(name, names.iter().map(String::as_str)) {
             Some(s) => format!("; did you mean '{s}'?"),

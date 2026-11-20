@@ -80,7 +80,9 @@ pub use index::{
     IndexHeld, Weights,
 };
 pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
-pub(crate) use session::{edge_order_rule, query_planner, register_functions, with_algorithms};
+pub(crate) use session::{
+    collapse_held_rule, edge_order_rule, query_planner, register_functions, with_algorithms,
+};
 
 /// One graph, as `CREATE PROPERTY GRAPH` defined it: its vertex and edge
 /// tables (SQL/PGQ's element tables), with their keys resolved (#295).
@@ -412,6 +414,9 @@ pub struct GraphRegistry {
     /// The session's catalogs before the file-table wrapper: graph schemas are
     /// registered and dropped there (the wrapper cannot drop a schema).
     catalogs: OnceLock<Arc<dyn CatalogProviderList>>,
+    /// Graphs of the session's database that could not be defined when it
+    /// was opened, by name, with why (see [`crate::database::unavailable`]).
+    unavailable: RwLock<BTreeMap<String, String>>,
 }
 
 impl GraphRegistry {
@@ -488,6 +493,35 @@ impl GraphRegistry {
 
     pub(crate) fn catalogs(&self) -> Option<&Arc<dyn CatalogProviderList>> {
         self.catalogs.get()
+    }
+
+    /// Mark the graph called `name` unavailable: it could not be defined when
+    /// the database was opened, and `message` says why. Using it fails with
+    /// `message` until it is dropped or replaced.
+    pub fn mark_unavailable(&self, name: &str, message: impl Into<String>) {
+        self.unavailable
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), message.into());
+    }
+
+    /// Why the graph called `name` is unavailable, if it is.
+    pub fn unavailable(&self, name: &str) -> Option<String> {
+        self.unavailable
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    /// Forget that the graph called `name` is unavailable (it was dropped or
+    /// replaced); whether it was.
+    pub fn clear_unavailable(&self, name: &str) -> bool {
+        self.unavailable
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .is_some()
     }
 
     /// The names of all graphs, sorted: for "did you mean" suggestions.

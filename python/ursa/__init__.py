@@ -50,7 +50,8 @@ from ._expr import Expr, col, dst, id, lit, src
 from ._frames import EdgeFrame, NodeFrame
 
 # --- Graph verbs & algorithms ----------------------------------------------
-# The layout kernels (`layout_fr` / `layout_random` / `layout_circle` in `_graph`)
+# The layout kernels (`layout_fa2` / `layout_fr` / `layout_random` / `layout_circle`
+# in `_graph`)
 # are deliberately NOT exported: they are held back from the public API until
 # the visualization work resumes (see the `viz-parked` tag). The engine support
 # stays so the kernels keep compiling and testing.
