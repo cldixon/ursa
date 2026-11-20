@@ -447,6 +447,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     keeps reading the index it mapped while another process replaces it.
     Mapped pages count in a process's RSS once read, as shared, reclaimable
     file cache.
+- **SQL: a new process no longer hashes every node id of a stored index
+  before its first query** (#421). Loading a stored index rebuilt the
+  id-to-node hash table from the stored ids, one id at a time on one core:
+  0.4 s for 2M string ids, 5.5 s for 20M, in every new process, even for a
+  `hop` from one seed, which undid most of the gain of mapping the file
+  (#382). Now the table is stored in the index file and used as it lies
+  there, and the id column is borrowed from the mapped file instead of
+  copied to the heap. On a graph of 20M nodes with 32-byte string ids and
+  30M edges (4 shared cores), in a new process each time: a 1-step `hop`
+  from one seed takes 0.29 s (was 7.0 s) and 1.06 GB at peak (was 1.80 GB);
+  `count(*) FROM degree(g)` 0.57 s (was 6.95 s); PageRank 22.6 s (was
+  32.5 s) and 3.21 GB (was 3.95 GB). What a load still reads is the
+  per-node sections, to check their CRCs and that the ids are UTF-8, on all
+  cores. Results and node numbering are unchanged.
+  - **Index file format version 4**: version 3 plus one section, the ids'
+    lookup table (an open-addressing table of `u32` node indexes, 6 bytes a
+    node; its layout and hashes are fixed and documented in
+    `ursa_core::id_map`). The file of the graph above grows from 1.52 GB to
+    1.64 GB, and building and storing its index takes as long as before.
+  - **Indexes stored by 0.11 (version 3) and 0.10 (version 2) keep
+    loading.** They have no table, so one is built in memory, but only when
+    a query first looks a node up by its id (seeds, sources, a join on ids):
+    an algorithm over the whole graph never builds it, and a `hop` on the
+    version 3 file of the graph above takes 2.1 s. The first writer to load
+    such a file rewrites it as version 4, with the notice `rewriting the
+    stored index for g in club.ursa (…) in the current format: …`.
+  - `ursa_core::IdMap::from_stored_ids` and `IdMap::lookup_table` are the
+    two halves of this; `IdMap::from_user_ids` still interns eagerly.
 - **SQL: an index build interns a vertex table's keys while it interns the
   edges, not before them** (#385, N49). With the edge scan parallel (#351),
   reading the keys first was the serial part of a build with a vertex table:

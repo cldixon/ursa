@@ -6,7 +6,7 @@
 //! **memory-mapped** where it can be, and read **in parallel** where it
 //! cannot.
 //!
-//! **The format** (`index_file`, version 3) is the version 2 layout: raw
+//! **The format** (`index_file`, versions 3 and 4) is the version 2 layout: raw
 //! little-endian arrays at 64-byte-aligned offsets, each a ready `&[u64]` or
 //! `&[u32]` in place, with no decode step. What changes is the checksum. A
 //! version 2 file had one CRC over the whole main part, so nothing in it could
@@ -19,8 +19,12 @@
 //! **What is resident and what is mapped.** Loading checks the header, key
 //! and table, then the `O(nodes)` sections in full: the out-adjacency's
 //! offsets (CRC, and that they rise from 0 to the edge count, so every
-//! neighbour slice is in bounds) and the node ids (CRC, then the id map is
-//! built from them, as before). The `O(edges)` sections, the targets and edge
+//! neighbour slice is in bounds), the node ids (CRC, and that the strings are
+//! UTF-8) and, in version 4, the ids' lookup table (CRC). The id map is those
+//! two arrays as they lie in the map (`IdMap::from_stored_ids`): no id is
+//! hashed or copied when the file loads (#421). A version 3 file has no
+//! table, so one is built in memory, the first time a query looks an id up.
+//! The `O(edges)` sections, the targets and edge
 //! ids, are borrowed from the map as Arrow buffers (`ursa_core::Adjacency`
 //! holds `ScalarBuffer`s) and not read: their CRCs are **deferred**
 //! ([`Unverified`]). The in-adjacency chunk, when a query first asks for it,
@@ -66,9 +70,10 @@
 //! disk, as before.
 //!
 //! **Compatibility.** A version 2 file (written by 0.10) is read as before,
-//! whole and checked, then rewritten as version 3 by a writable database
-//! (a notice says so), so the next process maps it. Version 1 files are not
-//! read, as before: they are built again.
+//! whole and checked, and a version 3 file (0.11) is mapped; a writable
+//! database then rewrites either as version 4 (a notice says so), so the
+//! next process maps it and finds its ids' lookup table in it. Version 1
+//! files are not read, as before: they are built again.
 
 use std::fs::File;
 use std::ops::Range;
@@ -274,6 +279,72 @@ pub fn crc(bytes: &[u8]) -> u32 {
     }
 }
 
+/// Whether `values` and `offsets` are the bytes and offsets of valid strings:
+/// string `i` is `values[offsets[i]..offsets[i + 1]]`, and each is UTF-8.
+/// This is what makes them a `StringArray` (`StringArray::new_unchecked`),
+/// checked in parallel pieces: the ids of a stored index are read once here,
+/// on all cores, when it loads.
+///
+/// The offsets must rise (not strictly) and end within `values`, which the
+/// caller has checked.
+pub fn are_strings(values: &[u8], offsets: &[i32]) -> bool {
+    /// The strings `offsets` bounds, a run of them at a time.
+    fn piece(values: &[u8], offsets: &[i32]) -> bool {
+        const RUN: usize = 1 << 12;
+        // One element is shared between runs: the end of one and the start
+        // of the next.
+        let mut at = 0;
+        while at + 1 < offsets.len() {
+            let run = &offsets[at..(at + RUN + 1).min(offsets.len())];
+            let (first, last) = (run[0] as usize, run[run.len() - 1] as usize);
+            let bytes = &values[first..last];
+            // ASCII is UTF-8 wherever it is cut. Otherwise the run must be
+            // UTF-8 as a whole, and cut only between characters.
+            if !bytes.is_ascii() {
+                let Ok(text) = std::str::from_utf8(bytes) else {
+                    return false;
+                };
+                if !run
+                    .iter()
+                    .all(|&o| text.is_char_boundary(o as usize - first))
+                {
+                    return false;
+                }
+            }
+            at += RUN;
+        }
+        true
+    }
+    let Some(strings) = offsets.len().checked_sub(1) else {
+        return false;
+    };
+    let threads = threads_for(values.len()).min(strings.max(1));
+    if threads <= 1 {
+        return piece(values, offsets);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let each = strings.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let pieces: Vec<_> = (0..threads)
+                .map(|t| {
+                    let from = (t * each).min(strings);
+                    let to = ((t + 1) * each).min(strings);
+                    scope.spawn(move || piece(values, &offsets[from..=to]))
+                })
+                .collect();
+            // A piece left unjoined here is joined as the scope ends.
+            pieces
+                .into_iter()
+                .all(|p| p.join().expect("a string check does not panic"))
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        piece(values, offsets)
+    }
+}
+
 /// One deferred checksum: the bytes `range` of a mapped file, and their CRC.
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -376,6 +447,13 @@ impl Unverified {
         Err(damage)
     }
 
+    /// Whether `ptr` points into the mapped bytes: for tests that an array
+    /// is borrowed from the map, not built or copied.
+    #[cfg(test)]
+    pub fn holds(&self, ptr: *const u8) -> bool {
+        self.data.as_slice().as_ptr_range().contains(&ptr)
+    }
+
     /// Whether a checksum has been found not to match.
     pub fn is_damaged(&self) -> bool {
         self.lock().damage.is_some()
@@ -392,6 +470,71 @@ impl Unverified {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn strings_are_checked_as_arrow_checks_them() {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+        // What `StringArray::try_new` accepts is what `are_strings` accepts.
+        let agree = |values: &[u8], offsets: &[i32]| {
+            let arrow = StringArray::try_new(
+                OffsetBuffer::new(ScalarBuffer::from(offsets.to_vec())),
+                Buffer::from(values.to_vec()),
+                None,
+            )
+            .is_ok();
+            assert_eq!(
+                are_strings(values, offsets),
+                arrow,
+                "{values:?} {offsets:?}"
+            );
+            arrow
+        };
+        assert!(agree(b"", &[0]));
+        assert!(agree(b"abc", &[0, 1, 1, 3]));
+        assert!(agree("h\u{e9}llo".as_bytes(), &[0, 3, 6]));
+        // Cut inside a character, and bytes that are no character.
+        assert!(!agree("h\u{e9}llo".as_bytes(), &[0, 2, 6]));
+        assert!(!agree(&[b'a', 0xff, b'b'], &[0, 1, 3]));
+        assert!(!agree(&[0xe2, 0x82], &[0, 2]));
+        // Bytes past the last offset are not part of any string.
+        assert!(are_strings(&[b'a', 0xff], &[0, 1]));
+
+        // Long enough for several threads and many runs, with the one
+        // damaged byte or offset anywhere.
+        let n = 300_000usize;
+        let mut values = Vec::new();
+        let mut offsets = vec![0i32];
+        for i in 0..n {
+            let id = match i % 5 {
+                0 => format!("n\u{e9}-{i:0200}"),
+                _ => format!("did:plc:{i:0300}"),
+            };
+            values.extend_from_slice(id.as_bytes());
+            offsets.push(values.len() as i32);
+        }
+        assert!(threads_for(values.len()) > 1 || cfg!(target_arch = "wasm32"));
+        assert!(are_strings(&values, &offsets));
+        for at in [
+            0,
+            1,
+            values.len() / 3,
+            values.len() / 2 + 7,
+            values.len() - 1,
+        ] {
+            let mut damaged = values.clone();
+            damaged[at] = 0xff;
+            assert!(!are_strings(&damaged, &offsets), "byte {at}");
+        }
+        for i in [0, n / 4, n / 2, n - 5] {
+            // The first id of each five starts "n\u{e9}": one byte further
+            // is inside the character.
+            let i = i - i % 5;
+            let mut cut = offsets.clone();
+            cut[i] += 2;
+            assert!(!are_strings(&values, &cut), "offset {i}");
+        }
+    }
 
     #[test]
     fn a_parallel_crc_is_the_serial_one() {
