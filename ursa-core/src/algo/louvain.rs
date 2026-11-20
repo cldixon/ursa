@@ -128,7 +128,7 @@ fn louvain_over(
             }
             level = Some(Linked::from_sorted(c + isolated, pos));
         }
-        graph = graph.aggregate(&comm, c);
+        graph = graph.aggregate_owned(&comm, c);
         if c + isolated == 1 {
             break;
         }
@@ -371,6 +371,10 @@ struct Graph {
     k: Vec<f64>,
     /// `2m` — total weighted degree over all nodes.
     m2: f64,
+    /// Every weight and self-loop is a non-negative integer and `m2 < 2^52`,
+    /// so every sum [`Graph::aggregate`] forms (of these values and their
+    /// halves) is exact, and the same in any order (#359).
+    exact: bool,
 }
 
 /// Split `0..n` into at most `parts` contiguous node ranges of roughly equal
@@ -403,6 +407,17 @@ fn split_blocks<'a, T>(
     let mut pieces = Vec::with_capacity(bounds.len() - 1);
     for w in bounds.windows(2) {
         let (head, rest) = buf.split_at_mut(offsets[w[1]] - offsets[w[0]]);
+        pieces.push(head);
+        buf = rest;
+    }
+    pieces
+}
+
+/// Carve `buf` into the consecutive pieces `[bounds[i]..bounds[i + 1]]`.
+fn split_at_bounds<'a, T>(mut buf: &'a mut [T], bounds: &[usize]) -> Vec<&'a mut [T]> {
+    let mut pieces = Vec::with_capacity(bounds.len() - 1);
+    for w in bounds.windows(2) {
+        let (head, rest) = buf.split_at_mut(w[1] - w[0]);
         pieces.push(head);
         buf = rest;
     }
@@ -689,7 +704,20 @@ impl Graph {
         wts.truncate(new_total);
         wts.shrink_to_fit();
         drop(offsets);
-        Graph::finalize(new_offsets, targets, wts, self_loop)
+        let mut graph = Graph::finalize(new_offsets, targets, wts, self_loop, false);
+        graph.exact = graph.is_exact();
+        graph
+    }
+
+    /// Whether every weight and self-loop is a non-negative integer and `m2 <
+    /// 2^52`: then each sum `aggregate` forms is of multiples of ½ below
+    /// `2^52`, all exact, so its order cannot change a bit. An unweighted
+    /// graph always is (its weights count parallel edges).
+    fn is_exact(&self) -> bool {
+        let whole = |x: &f64| *x >= 0.0 && x.fract() == 0.0;
+        self.m2 < (1u64 << 52) as f64
+            && self.weights.par_iter().all(whole)
+            && self.self_loop.par_iter().all(whole)
     }
 
     /// Collapse each community into a super-node.
@@ -698,8 +726,126 @@ impl Graph {
     /// weights into a dense per-community accumulator; its neighbours come out
     /// sorted by community id. Every float sum therefore runs in a fixed order.
     /// Communities are independent, so contiguous blocks of them are built in
-    /// parallel, each with one scratch accumulator reused across its communities.
+    /// parallel, each worker with one scratch accumulator reused across its
+    /// communities.
+    ///
+    /// Memory (#359): this runs while `self` is still held, so it is sized
+    /// exactly rather than grown. A counting pass finds each community's number
+    /// of distinct neighbouring communities (and its self-loop), which gives
+    /// the final offsets; the adjacency is then written straight into its final
+    /// arrays, allocated once at their exact size, with no per-block buffers
+    /// and no concatenation. The counting pass costs a second scan of `self`.
     fn aggregate(&self, comm: &[u32], c: usize) -> Graph {
+        self.collapse(comm, c, |v| comm[v as usize])
+    }
+
+    /// [`Graph::aggregate`], consuming the graph so that, when it is
+    /// [`exact`](Graph::exact), most of it is given back before the
+    /// aggregated graph is allocated (#359).
+    ///
+    /// Each node's segment is first collapsed in place: its neighbours are
+    /// relabelled to their communities, edges inside its own community are
+    /// folded into its self-loop, and the rest are sorted and coalesced, one
+    /// entry per neighbouring community, written over the segment's front.
+    /// The segments are then moved down (as in `from_topology`'s pass 4) and
+    /// the arrays shrunk, so only one entry per (node, neighbouring
+    /// community) is held while the aggregated graph is built from them. The
+    /// sums are grouped differently (per node first), which changes nothing
+    /// when every one of them is exact; an inexact graph takes the plain
+    /// path, which sums in the one fixed order.
+    fn aggregate_owned(mut self, comm: &[u32], c: usize) -> Graph {
+        if !self.exact {
+            // Only the degrees can go first: aggregating never reads them.
+            self.k = Vec::new();
+            return self.aggregate(comm, c);
+        }
+        let Graph {
+            offsets,
+            mut targets,
+            mut weights,
+            mut self_loop,
+            k,
+            ..
+        } = self;
+        drop(k);
+        let n = self_loop.len();
+        let bounds = node_blocks(&offsets, 4 * current_num_threads());
+        let ranges: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+        let lens: Vec<usize> = split_blocks(&mut targets, &offsets, &bounds)
+            .into_par_iter()
+            .zip(split_blocks(&mut weights, &offsets, &bounds))
+            .zip(split_at_bounds(&mut self_loop, &bounds))
+            .zip(ranges.par_iter())
+            .map_init(
+                Vec::new,
+                |scratch: &mut Vec<(u32, f64)>, (((ts, ws), loops), &(lo, hi))| {
+                    let base = offsets[lo];
+                    let mut lens = Vec::with_capacity(hi - lo);
+                    let mut k = 0;
+                    for u in lo..hi {
+                        let cu = comm[u];
+                        let seg = offsets[u] - base..offsets[u + 1] - base;
+                        scratch.clear();
+                        for (&v, &w) in ts[seg.clone()].iter().zip(&ws[seg]) {
+                            let cv = comm[v as usize];
+                            if cv == cu {
+                                loops[u - lo] += w / 2.0;
+                            } else {
+                                scratch.push((cv, w));
+                            }
+                        }
+                        scratch.sort_unstable_by_key(|&(cv, _)| cv);
+                        let first = k;
+                        for &(cv, w) in scratch.iter() {
+                            // `k` never passes the segment's start, which is read.
+                            if k > first && ts[k - 1] == cv {
+                                ws[k - 1] += w;
+                            } else {
+                                ts[k] = cv;
+                                ws[k] = w;
+                                k += 1;
+                            }
+                        }
+                        lens.push(k - first);
+                    }
+                    lens
+                },
+            )
+            .collect::<Vec<_>>()
+            .concat();
+        let mut new_offsets = vec![0usize; n + 1];
+        for u in 0..n {
+            new_offsets[u + 1] = new_offsets[u] + lens[u];
+        }
+        drop(lens);
+        for w in bounds.windows(2) {
+            let (from, to) = (offsets[w[0]], new_offsets[w[0]]);
+            let len = new_offsets[w[1]] - to;
+            targets.copy_within(from..from + len, to);
+            weights.copy_within(from..from + len, to);
+        }
+        drop(offsets);
+        let total = new_offsets[n];
+        targets.truncate(total);
+        targets.shrink_to_fit();
+        weights.truncate(total);
+        weights.shrink_to_fit();
+        // Neighbours are communities now, and no edge is inside one.
+        let by_node = Graph {
+            offsets: new_offsets,
+            targets,
+            weights,
+            self_loop,
+            k: Vec::new(),
+            m2: 0.0,
+            exact: true,
+        };
+        by_node.collapse(comm, c, |cv| cv)
+    }
+
+    /// The aggregation behind [`Graph::aggregate`]: node `u` joins community
+    /// `comm[u]`, and a neighbour `v` counts toward community `label(v)`.
+    fn collapse(&self, comm: &[u32], c: usize, label: impl Fn(u32) -> u32 + Sync) -> Graph {
         let n = self.n();
         // Members of each community, ascending, via a counting sort on `comm`.
         let mut start = vec![0usize; c + 1];
@@ -715,34 +861,79 @@ impl Graph {
             members[cursor[cu as usize]] = u as u32;
             cursor[cu as usize] += 1;
         }
-        // Contiguous community blocks of roughly equal member count, each emitting
-        // its slice of the CSR; the dense scratch is per worker, not per block.
-        let blocks: Vec<(usize, usize)> = node_blocks(&start, 4 * current_num_threads())
-            .windows(2)
-            .map(|w| (w[0], w[1]))
-            .collect();
+        drop(cursor);
+        // Contiguous community blocks of roughly equal member count; the dense
+        // scratch is per worker, not per block. Only the work split depends on
+        // this: every community's result is computed on its own.
+        let bounds = node_blocks(&start, 4 * current_num_threads());
+        let blocks: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
 
-        type Block = (Vec<usize>, Vec<u32>, Vec<f64>, Vec<f64>);
-        let built: Vec<Block> = blocks
+        // Pass 1: count each community's distinct neighbouring communities, and
+        // sum its self-loop (in the same member and adjacency order as ever).
+        let counted: Vec<(Vec<usize>, Vec<f64>)> = blocks
             .par_iter()
             .map_init(
-                || (vec![0.0f64; c], vec![false; c], Vec::<u32>::new()),
-                |(acc, seen, touched), &(lo, hi)| {
-                    let (mut lens, mut ts, mut ws, mut loops) =
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                || (vec![false; c], Vec::<u32>::new()),
+                |(seen, touched), &(lo, hi)| {
+                    let mut lens = Vec::with_capacity(hi - lo);
+                    let mut loops = Vec::with_capacity(hi - lo);
                     for cu in lo..hi {
                         let mut self_loop = 0.0f64;
                         for &u in &members[start[cu]..start[cu + 1]] {
                             self_loop += self.self_loop[u as usize];
                             let (nbrs, wts) = self.neighbors(u);
                             for (&v, &wt) in nbrs.iter().zip(wts) {
-                                let cv = comm[v as usize] as usize;
+                                let cv = label(v) as usize;
                                 if cv == cu {
                                     // Each intra-community edge is seen from both
-                                    // endpoints, so halve to land one loop-weight per
-                                    // undirected edge.
+                                    // endpoints, so halve to land one loop-weight
+                                    // per undirected edge.
                                     self_loop += wt / 2.0;
-                                } else {
+                                } else if !std::mem::replace(&mut seen[cv], true) {
+                                    touched.push(cv as u32);
+                                }
+                            }
+                        }
+                        for &cv in touched.iter() {
+                            seen[cv as usize] = false;
+                        }
+                        lens.push(touched.len());
+                        touched.clear();
+                        loops.push(self_loop);
+                    }
+                    (lens, loops)
+                },
+            )
+            .collect();
+        let mut offsets = Vec::with_capacity(c + 1);
+        offsets.push(0usize);
+        let mut self_loop = Vec::with_capacity(c);
+        for (lens, loops) in counted {
+            for len in lens {
+                offsets.push(offsets.last().unwrap() + len);
+            }
+            self_loop.extend(loops);
+        }
+
+        // Pass 2: sum each community's edge weights per neighbouring community
+        // and write them, sorted by community id, into its exact place.
+        let total = offsets[c];
+        let mut targets = vec![0u32; total];
+        let mut weights = vec![0.0f64; total];
+        split_blocks(&mut targets, &offsets, &bounds)
+            .into_par_iter()
+            .zip(split_blocks(&mut weights, &offsets, &bounds))
+            .zip(blocks.par_iter())
+            .for_each_init(
+                || (vec![0.0f64; c], vec![false; c], Vec::<u32>::new()),
+                |(acc, seen, touched), ((ts, ws), &(lo, hi))| {
+                    let mut k = 0;
+                    for cu in lo..hi {
+                        for &u in &members[start[cu]..start[cu + 1]] {
+                            let (nbrs, wts) = self.neighbors(u);
+                            for (&v, &wt) in nbrs.iter().zip(wts) {
+                                let cv = label(v) as usize;
+                                if cv != cu {
                                     if !std::mem::replace(&mut seen[cv], true) {
                                         touched.push(cv as u32);
                                     }
@@ -753,31 +944,16 @@ impl Graph {
                         touched.sort_unstable();
                         for &cv in touched.iter() {
                             seen[cv as usize] = false;
-                            ts.push(cv);
-                            ws.push(std::mem::take(&mut acc[cv as usize]));
+                            ts[k] = cv;
+                            ws[k] = std::mem::take(&mut acc[cv as usize]);
+                            k += 1;
                         }
-                        lens.push(touched.len());
                         touched.clear();
-                        loops.push(self_loop);
                     }
-                    (lens, ts, ws, loops)
+                    debug_assert_eq!(k, ts.len());
                 },
-            )
-            .collect();
-
-        let mut offsets = Vec::with_capacity(c + 1);
-        offsets.push(0usize);
-        let (mut targets, mut weights, mut self_loop) =
-            (Vec::new(), Vec::new(), Vec::with_capacity(c));
-        for (lens, ts, ws, loops) in built {
-            for len in lens {
-                offsets.push(offsets.last().unwrap() + len);
-            }
-            targets.extend(ts);
-            weights.extend(ws);
-            self_loop.extend(loops);
-        }
-        Graph::finalize(offsets, targets, weights, self_loop)
+            );
+        Graph::finalize(offsets, targets, weights, self_loop, self.exact)
     }
 
     fn finalize(
@@ -785,6 +961,7 @@ impl Graph {
         targets: Vec<u32>,
         weights: Vec<f64>,
         self_loop: Vec<f64>,
+        exact: bool,
     ) -> Graph {
         let k: Vec<f64> = (0..self_loop.len())
             .into_par_iter()
@@ -798,6 +975,7 @@ impl Graph {
             self_loop,
             k,
             m2,
+            exact,
         }
     }
 }
@@ -983,6 +1161,60 @@ mod tests {
     fn random_weighted(n: u32, m: usize) -> (Topology, Vec<f64>) {
         let (src, dst, w) = random_edges(n, m);
         (Topology::build(n as usize, src, dst), w)
+    }
+
+    /// Every array of a graph, floats as bits.
+    type Bits = (Vec<usize>, Vec<u32>, Vec<u64>, Vec<u64>, Vec<u64>, u64);
+    fn graph_bits(g: &Graph) -> Bits {
+        let b = |xs: &[f64]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        (
+            g.offsets.clone(),
+            g.targets.clone(),
+            b(&g.weights),
+            b(&g.self_loop),
+            b(&g.k),
+            g.m2.to_bits(),
+        )
+    }
+
+    /// The consuming aggregation (#359) collapses each node's segment in place
+    /// before aggregating, which regroups the sums: for an exact graph
+    /// (integer weights) it must give the plain aggregation's graph bit for
+    /// bit, over Louvain's own partition and over coarse and fine ones, at
+    /// every level; an inexact graph must take the plain path.
+    #[test]
+    fn aggregating_in_place_is_exact() {
+        let n = 5000u32;
+        let (src, dst, w) = random_edges(n, 120_000);
+        let t = Topology::build(n as usize, src.clone(), dst.clone());
+        let whole: Vec<f64> = w.iter().map(|x| (x * 7.0).round()).collect();
+        let keep: Vec<bool> = (0..src.len()).map(|e| e % 5 != 2).collect();
+        let mask = EdgeMask::from_bools(&keep);
+        assert!(!Graph::from_topology(&t, Some(&w), None, None).exact);
+        for weights in [None, Some(whole.as_slice())] {
+            for mask in [None, Some(&mask)] {
+                let build = || Graph::from_topology(&t, weights, mask, None);
+                assert!(build().exact);
+                let louvain = one_level(&build(), 1.0, 1, None, PACE);
+                let partitions: [Vec<u32>; 3] = [
+                    louvain,
+                    (0..n).map(|u| u / 7).collect(),
+                    (0..n).map(|u| u % 3).collect(),
+                ];
+                for comm in partitions {
+                    let c = *comm.iter().max().unwrap() as usize + 1;
+                    let want = build().aggregate(&comm, c);
+                    let got = build().aggregate_owned(&comm, c);
+                    assert!(got.exact);
+                    assert!(graph_bits(&got) == graph_bits(&want));
+                    // The next level down, too.
+                    let next = one_level(&want, 1.0, 1, None, PACE);
+                    let c2 = *next.iter().max().unwrap() as usize + 1;
+                    let want2 = want.aggregate(&next, c2);
+                    assert!(graph_bits(&got.aggregate_owned(&next, c2)) == graph_bits(&want2));
+                }
+            }
+        }
     }
 
     /// The edge list behind [`random_weighted`]: sources, targets, weights.
