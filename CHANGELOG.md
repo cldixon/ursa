@@ -343,6 +343,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Triangle counting uses about a third of the CPU, with the same counts**
+  (#420). `triangle_count`, and so `clustering_coefficient` and the SQL
+  functions over them, was the slowest step on the full Bluesky graph (1,828 s
+  on 16 cores). The kernel still orients each edge toward its higher-ranked
+  end, by `(degree, id)`, and finds each triangle once. Now the nodes are
+  numbered by rank and each list holds ranks, so for an edge `u → v` only the
+  entries of `u`'s list after `v` are read; a list of 32 entries or more is
+  marked once in a per-thread position table and the lists it meets are looked
+  up there; of two lists, one 8 times the other's length is searched, not
+  merged; and each node's credits are added once per list entry, not once per
+  triangle, so threads no longer write the hubs' counters all the time.
+  Per-node counts are bit for bit the old kernel's: a new test pins them on
+  ten graphs (hubs, a clique with leaves, R-MAT, self-loops, parallel and
+  reciprocal edges, vertices with no edge, masks), recorded before the change,
+  and the old kernel is kept in the tests as a reference. On R-MAT graphs on a
+  shared 4-core machine: 16M edges (384M triangles) 35.3 to 12.6 CPU-s, 64M
+  edges (6.19B triangles) 376 to 120 CPU-s. Nodes of degree under 2 get no rank, so the
+  pass costs the same among 16M vertices with no edge (38.0 to 13.9 CPU-s).
+  It adds 4 bytes per node of degree 2 or more, plus up to as much again per
+  thread for the position tables.
+- **Betweenness with a small sample holds half the scratch memory** (#454).
+  With fewer than 64 sources per thread, the kernel ran `2 × threads` sources
+  at a time, each with its own state of 24 bytes per node (more when
+  weighted), all kept for the whole run: about 30 GB at Bluesky's size on 16
+  threads. It now runs `threads` at a time, which keeps every thread as busy.
+  Results are bit for bit the same (each node's sum is taken in source order
+  whatever the window; the reference-kernel and thread-count tests cover it).
+  On a 32M-edge, 2.1M-node R-MAT graph with 105 sources on 4 threads: peak
+  RSS 1,019 MB to 814 MB (the graph alone is 576 MB), time unchanged (61 s
+  and 60 s, within the noise of a shared machine).
 - **SQL: a stored graph index is memory-mapped, not read whole** (#382).
   Loading one read the whole file on one core, so at full scale (2.42B
   edges, an 18.6 GiB index) every query in a new process paid 15 s, even a
