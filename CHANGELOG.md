@@ -343,6 +343,51 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: a vertex table's key must identify one row** (behaviour change,
+  #411). A vertex table with a duplicate or a NULL key is refused, with one
+  message, by everything that reads it as a graph's nodes: the algorithms,
+  statistics and traversals, `g.nodes`, and `GRAPH_TABLE` (`graph 'gs':
+  vertex table 'v' has 1 row with a duplicate key (id = 1) and 1 row with a
+  NULL key; a vertex table's KEY must identify one row. Deduplicate it in a
+  view …`). SQL/PGQ requires a unique, non-null key, and DuckPGQ takes it
+  from a primary key. Before, the graph was accepted and the three disagreed:
+  the algorithms counted a duplicated key once and skipped a NULL key, while
+  `g.nodes` and `GRAPH_TABLE` returned every row, so one node was two matches
+  and `g.nodes JOIN degree(g)` repeated it; only `neighbors_agg(attribute
+  =>)` noticed, with a message about `values =>`. `CREATE PROPERTY GRAPH`
+  still accepts the table (it is read when a query runs); queries over it
+  now fail until it is deduplicated, for example in a view with `SELECT
+  DISTINCT ON (key) *`. An index build counts the rows as it numbers the
+  keys; `g.nodes` and a `GRAPH_TABLE` node count the key column when the
+  query runs (`EXPLAIN` reads nothing), once per version of a table's
+  files: the count is kept for the session and, with a database, recorded
+  beside its stored indexes (`indexes/vertex_keys.json`), and a stored index
+  built from the same keys stands for it, so a later process, read-only
+  included, reads only the files' metadata. A changed file is counted
+  again; a table that does not read only files is counted by each query.
+  Stored indexes of graphs with a vertex table are
+  built again once, under a new key, so none built before the check is
+  reused. Not covered: the keys of an edge table between two vertex tables
+  are checked where a pattern reads those tables' rows, not in its index.
+- **SQL: `GRAPH_TABLE` refuses a node label that contradicts its edge**
+  (behaviour change, #410). An edge matches only between the vertex tables
+  its edge table `REFERENCES`. `(a:Person)-[k:knows]->(b:School)`, where
+  `knows` goes from students to students, joined `know.dst` to
+  `School.school_id` on values that happened to be equal and returned rows
+  for edges that are not in the graph. It is now an error that names the
+  edge table, its vertex tables and the pattern as written. The standard
+  gives such a pattern no rows; Ursa refuses it, as DuckPGQ does, since it
+  is almost always a mistake, and an empty result would hide it.
+- **SQL: `GRAPH_TABLE` refuses text left over after a `WHERE` condition or a
+  `COLUMNS` item** (behaviour change, #409). `WHERE a.id = 0 b.id = 3` ran as
+  `WHERE a.id = 0`, and `COLUMNS (a.id AS a nonsense, b.id AS b)` returned
+  one column: the SQL parser stopped at the first token it could not use and
+  the rest was dropped. Both are now syntax errors that name the token and
+  its position in the pattern, for the pattern's `WHERE`, a node's or edge's
+  `WHERE`, and `COLUMNS`. `KEEP …` and `ONE ROW PER …`, which were ignored
+  the same way, are refused as not supported yet. Only queries that were
+  already wrong are affected.
+
 - **Triangle counting uses about a third of the CPU, with the same counts**
   (#420). `triangle_count`, and so `clustering_coefficient` and the SQL
   functions over them, was the slowest step on the full Bluesky graph (1,828 s

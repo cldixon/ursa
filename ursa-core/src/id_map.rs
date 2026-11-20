@@ -72,6 +72,37 @@ pub struct EdgeInterner {
     /// endpoint is kept as `(MISS, MISS)` rather than refused, for
     /// [`Self::adopt`] to drop (see the type's docs).
     provisional: bool,
+    /// Nodes given to [`Self::push_nodes`] so far, each id once.
+    nodes: u32,
+    /// The rows given to [`Self::push_nodes`] that were not a node of their own.
+    key_rows: KeyRows,
+}
+
+/// The rows given to [`EdgeInterner::push_nodes`] that are not a node of
+/// their own: a table of nodes whose key identifies each row has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyRows {
+    /// Rows whose id an earlier row had.
+    pub duplicates: u64,
+    /// Rows whose id is null.
+    pub nulls: u64,
+    /// The smallest id given more than once (an integer by value, a string by
+    /// its bytes), if any was.
+    pub duplicate: Option<String>,
+}
+
+impl KeyRows {
+    /// Whether every row was a node of its own.
+    pub fn is_unique(&self) -> bool {
+        self.duplicates == 0 && self.nulls == 0
+    }
+}
+
+/// The smallest duplicated id so far, kept as its type.
+#[derive(Debug, Default)]
+struct Duplicate {
+    int: Option<i64>,
+    str: Option<String>,
 }
 
 impl EdgeInterner {
@@ -90,6 +121,8 @@ impl EdgeInterner {
             kept: None,
             dropped: 0,
             provisional: false,
+            nodes: 0,
+            key_rows: KeyRows::default(),
         }
     }
 
@@ -202,41 +235,94 @@ impl EdgeInterner {
 
     /// Intern one chunk of node ids, in order, before any edge: each id not
     /// seen yet takes the next dense id. A null is not a node and is skipped;
-    /// an id given twice is one node. The id type is fixed as by
-    /// [`Self::push`], whose edges must then have the same type.
+    /// an id given twice is one node. Both are counted ([`Self::key_rows`]),
+    /// for a caller whose nodes must each be one row. The id type is fixed as
+    /// by [`Self::push`], whose edges must then have the same type.
     pub fn push_nodes(&mut self, ids: &dyn Array) -> Result<(), IdError> {
         if self.closed || !self.src_dense.is_empty() {
             return Err(IdError::NodesAfterEdges);
         }
         let kind = id_kind(ids.data_type())?;
         let map = self.map.get_or_insert_with(|| kind.new_map());
+        // Dense ids follow first-seen order, so an id seen before is one
+        // below the count of nodes so far.
+        let mut nodes = self.nodes;
+        let mut duplicates = 0u64;
+        let mut smallest = Duplicate::default();
         match (kind, &*map) {
             (IdKind::Int64, IdMap::Int64 { .. }) => {
                 if let IdMap::Int64 { to_dense, .. } = map {
                     to_dense.budget_rows(self.rows_hint.max(ids.len()));
                 }
                 let a = as_int64(ids);
+                let mut intern = |id: i64| -> Result<(), IdError> {
+                    if map.intern_i64(id)? == nodes {
+                        nodes += 1;
+                    } else {
+                        duplicates += 1;
+                        if smallest.int.is_none_or(|s| id < s) {
+                            smallest.int = Some(id);
+                        }
+                    }
+                    Ok(())
+                };
                 if a.null_count() == 0 {
                     for &id in a.values().iter() {
-                        map.intern_i64(id)?;
+                        intern(id)?;
                     }
                 } else {
                     for id in a.iter().flatten() {
-                        map.intern_i64(id)?;
+                        intern(id)?;
                     }
                 }
             }
             (IdKind::Utf8, IdMap::Utf8 { .. }) => {
                 let view = StrView::new(ids);
                 for i in 0..view.len() {
-                    if !view.is_null(i) {
-                        map.intern_str(view.value(i))?;
+                    if view.is_null(i) {
+                        continue;
+                    }
+                    let id = view.value(i);
+                    if map.intern_str(id)? == nodes {
+                        nodes += 1;
+                    } else {
+                        duplicates += 1;
+                        if smallest.str.as_deref().is_none_or(|s| id < s) {
+                            smallest.str = Some(id.to_string());
+                        }
                     }
                 }
             }
             _ => return Err(IdError::MixedTypes),
         }
+        self.nodes = nodes;
+        self.key_rows.nulls += ids.null_count() as u64;
+        if duplicates > 0 {
+            self.key_rows.duplicates += duplicates;
+            let found = match smallest {
+                Duplicate { int: Some(id), .. } => Some((id.to_string(), Some(id))),
+                Duplicate { str: Some(id), .. } => Some((id, None)),
+                _ => None,
+            };
+            // Keep the smallest across chunks: an integer by value.
+            if let Some((text, int)) = found {
+                let smaller = match (&self.key_rows.duplicate, int) {
+                    (None, _) => true,
+                    (Some(kept), Some(id)) => kept.parse::<i64>().is_ok_and(|kept| id < kept),
+                    (Some(kept), None) => text < *kept,
+                };
+                if smaller {
+                    self.key_rows.duplicate = Some(text);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The rows given to [`Self::push_nodes`] that were not a node of their
+    /// own: those whose id an earlier row had, and those with a null id.
+    pub fn key_rows(&self) -> &KeyRows {
+        &self.key_rows
     }
 
     /// Fix the node set: from now on [`Self::push`] drops an edge whose source
@@ -1403,6 +1489,52 @@ mod tests {
         assert_eq!(
             interner.push(&Int64Array::from(vec![1]), &Int64Array::from(vec![1])),
             Err(IdError::MixedTypes)
+        );
+    }
+
+    #[test]
+    fn node_rows_that_are_no_node_of_their_own_are_counted() {
+        // Unique keys: nothing to report.
+        let mut interner = EdgeInterner::with_capacity(0);
+        interner
+            .push_nodes(&Int64Array::from(vec![3, 1, 2]))
+            .unwrap();
+        assert!(interner.key_rows().is_unique());
+
+        // Duplicates and nulls, across chunks; the smallest duplicate by value.
+        let mut interner = EdgeInterner::with_capacity(0);
+        interner
+            .push_nodes(&Int64Array::from(vec![Some(10), Some(9), None, Some(10)]))
+            .unwrap();
+        interner
+            .push_nodes(&Int64Array::from(vec![Some(9), Some(9), Some(4), None]))
+            .unwrap();
+        assert_eq!(
+            interner.key_rows(),
+            &KeyRows {
+                duplicates: 3,
+                nulls: 2,
+                duplicate: Some("9".to_string()),
+            }
+        );
+        interner.close_nodes();
+        let (map, ..) = interner.finish();
+        assert_eq!(map.len(), 3);
+
+        let mut interner = EdgeInterner::with_capacity(0);
+        interner
+            .push_nodes(&StringArray::from(vec![Some("b"), Some("a"), Some("b")]))
+            .unwrap();
+        interner
+            .push_nodes(&StringArray::from(vec![Some("a"), None]))
+            .unwrap();
+        assert_eq!(
+            interner.key_rows(),
+            &KeyRows {
+                duplicates: 2,
+                nulls: 1,
+                duplicate: Some("a".to_string()),
+            }
         );
     }
 
