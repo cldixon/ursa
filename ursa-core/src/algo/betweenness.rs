@@ -107,11 +107,15 @@ fn add_into(bc: &mut [f64], acc: &[f64]) {
 ///   for exact betweenness at `n = 1M`). `per_source` adds straight into the
 ///   chunk's partial.
 /// - **Per source** (fewer chunks than threads — e.g. a small `sample`, where one
-///   chunk would otherwise run serially): within each chunk, a window of sources
-///   runs in parallel, each leaving its dependencies in its own scratch, and they
-///   are folded into the chunk's partial in source order (serially over the
-///   reached nodes, or in parallel over node blocks when the window reached much
-///   of the graph — [`fold_dense`]).
+///   chunk would otherwise run serially): within each chunk, a window of `threads`
+///   sources runs in parallel, each leaving its dependencies in its own scratch,
+///   and they are folded into the chunk's partial in source order (serially over
+///   the reached nodes, or in parallel over node blocks when the window reached
+///   much of the graph — [`fold_dense`]). Every scratch of the window is held
+///   for the whole run, at 24 bytes per node or more each, so the window is no
+///   wider than the pool: one source per thread keeps every thread busy, and a
+///   second per thread only doubled the memory (#454). A node's additions are in
+///   source order whatever the window, so its width changes no result.
 ///
 /// Scratch (`make_scratch`) is pooled and reused across chunks and windows, so the
 /// `n`-sized buffers are allocated once per worker rather than once per chunk;
@@ -124,11 +128,11 @@ fn accumulate_sources<S: BrandesState + Send + Sync>(
     per_source: impl Fn(u32, Option<&mut [f64]>, &mut S) + Sync,
 ) -> Vec<f64> {
     let threads = current_num_threads();
-    let window = 2 * threads;
     let n_chunks = sources.len().div_ceil(SRC_CHUNK);
     let mut bc = vec![0.0f64; n];
 
     if threads > 1 && n_chunks < threads {
+        let window = threads;
         let mut slots: Vec<S> = (0..window.min(sources.len()))
             .map(|_| make_scratch())
             .collect();
@@ -161,6 +165,7 @@ fn accumulate_sources<S: BrandesState + Send + Sync>(
     }
 
     let pool = std::sync::Mutex::new(Vec::<S>::new());
+    let window = 2 * threads;
     for group in sources.chunks(SRC_CHUNK * window) {
         let partials: Vec<Vec<f64>> = group
             .par_chunks(SRC_CHUNK)

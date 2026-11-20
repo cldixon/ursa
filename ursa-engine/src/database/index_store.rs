@@ -4,6 +4,8 @@
 //! indexes/
 //!   manifest.json    one entry per stored index
 //!   <hash>.idx       one index per file (see `index_file`)
+//!   vertex_keys.json the vertex tables whose keys were counted and are one
+//!                    row each (#411; see `crate::graph::vertex_keys`)
 //! ```
 //!
 //! The manifest is the source of truth: an index file it does not list is
@@ -431,6 +433,35 @@ impl IndexStore {
         if changed {
             let _ = write_manifest(&self.dir, &state.entries);
         }
+    }
+
+    /// Whether the keys `key` names (a vertex table's: the fingerprint of
+    /// their plan and the files it reads) were counted and found to be one
+    /// row each, by this process or an earlier one (#411; see
+    /// `crate::graph::vertex_keys`). Read from `vertex_keys.json` each time:
+    /// it is small, and another process may have written it.
+    pub fn keys_counted(&self, key: &IndexKey) -> bool {
+        read_key_counts(&self.dir).contains(key)
+    }
+
+    /// Record that the keys `key` names are one row each. A read-only store
+    /// records nothing. Best effort: a count that is not recorded is made
+    /// again.
+    pub fn record_keys_counted(&self, key: IndexKey) {
+        if !self.writable {
+            return;
+        }
+        // One writer at a time in this process; a database has one writing
+        // process.
+        let _state = self.state();
+        let mut counted = read_key_counts(&self.dir);
+        // A newer version of a table's files replaces the older one.
+        counted.retain(|k| k.fingerprint != key.fingerprint);
+        counted.push(key);
+        if counted.len() > KEY_COUNTS_KEPT {
+            counted.drain(..counted.len() - KEY_COUNTS_KEPT);
+        }
+        let _ = write_key_counts(&self.dir, &counted);
     }
 
     /// Whether the manifest lists an index stored under `key`. Nothing is
@@ -1102,6 +1133,58 @@ fn read_manifest_checked(dir: &Path) -> Manifest {
             .unwrap_or_default(),
         foreign: None,
     }
+}
+
+/// The record of the vertex tables whose keys were counted: beside the
+/// manifest, as `{"format": "ursa-vertex-keys", "version": 1, "counted":
+/// [key, …]}`, each key as a stored index's.
+const KEY_COUNTS: &str = "vertex_keys.json";
+const KEY_COUNTS_FORMAT: &str = "ursa-vertex-keys";
+const KEY_COUNTS_VERSION: u64 = 1;
+/// How many vertex tables' counts a database keeps, the newest.
+const KEY_COUNTS_KEPT: usize = 64;
+
+/// The keys recorded in `dir`: none if the record is missing or is not one
+/// this build reads.
+fn read_key_counts(dir: &Path) -> Vec<IndexKey> {
+    let Ok(text) = std::fs::read_to_string(dir.join(KEY_COUNTS)) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    if value.get("format").and_then(Value::as_str) != Some(KEY_COUNTS_FORMAT)
+        || value.get("version").and_then(Value::as_u64) != Some(KEY_COUNTS_VERSION)
+    {
+        return Vec::new();
+    }
+    value
+        .get("counted")
+        .and_then(Value::as_array)
+        .map(|keys| keys.iter().filter_map(IndexKey::from_json).collect())
+        .unwrap_or_default()
+}
+
+/// Rewrite the record of counted keys in `dir` atomically.
+fn write_key_counts(dir: &Path, counted: &[IndexKey]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let value = json!({
+        "format": KEY_COUNTS_FORMAT,
+        "version": KEY_COUNTS_VERSION,
+        "counted": counted.iter().map(IndexKey::to_json).collect::<Vec<_>>(),
+    });
+    let mut text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+    text.push('\n');
+    // Not `.tmp`: a writer removes those when it tidies the directory.
+    let temp = dir.join(format!("{KEY_COUNTS}.new"));
+    {
+        let mut file = File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, dir.join(KEY_COUNTS))?;
+    sync_dir(dir);
+    Ok(())
 }
 
 /// Rewrite the manifest in `dir` atomically.

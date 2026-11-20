@@ -343,6 +343,81 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: a vertex table's key must identify one row** (behaviour change,
+  #411). A vertex table with a duplicate or a NULL key is refused, with one
+  message, by everything that reads it as a graph's nodes: the algorithms,
+  statistics and traversals, `g.nodes`, and `GRAPH_TABLE` (`graph 'gs':
+  vertex table 'v' has 1 row with a duplicate key (id = 1) and 1 row with a
+  NULL key; a vertex table's KEY must identify one row. Deduplicate it in a
+  view …`). SQL/PGQ requires a unique, non-null key, and DuckPGQ takes it
+  from a primary key. Before, the graph was accepted and the three disagreed:
+  the algorithms counted a duplicated key once and skipped a NULL key, while
+  `g.nodes` and `GRAPH_TABLE` returned every row, so one node was two matches
+  and `g.nodes JOIN degree(g)` repeated it; only `neighbors_agg(attribute
+  =>)` noticed, with a message about `values =>`. `CREATE PROPERTY GRAPH`
+  still accepts the table (it is read when a query runs); queries over it
+  now fail until it is deduplicated, for example in a view with `SELECT
+  DISTINCT ON (key) *`. An index build counts the rows as it numbers the
+  keys; `g.nodes` and a `GRAPH_TABLE` node count the key column when the
+  query runs (`EXPLAIN` reads nothing), once per version of a table's
+  files: the count is kept for the session and, with a database, recorded
+  beside its stored indexes (`indexes/vertex_keys.json`), and a stored index
+  built from the same keys stands for it, so a later process, read-only
+  included, reads only the files' metadata. A changed file is counted
+  again; a table that does not read only files is counted by each query.
+  Stored indexes of graphs with a vertex table are
+  built again once, under a new key, so none built before the check is
+  reused. Not covered: the keys of an edge table between two vertex tables
+  are checked where a pattern reads those tables' rows, not in its index.
+- **SQL: `GRAPH_TABLE` refuses a node label that contradicts its edge**
+  (behaviour change, #410). An edge matches only between the vertex tables
+  its edge table `REFERENCES`. `(a:Person)-[k:knows]->(b:School)`, where
+  `knows` goes from students to students, joined `know.dst` to
+  `School.school_id` on values that happened to be equal and returned rows
+  for edges that are not in the graph. It is now an error that names the
+  edge table, its vertex tables and the pattern as written. The standard
+  gives such a pattern no rows; Ursa refuses it, as DuckPGQ does, since it
+  is almost always a mistake, and an empty result would hide it.
+- **SQL: `GRAPH_TABLE` refuses text left over after a `WHERE` condition or a
+  `COLUMNS` item** (behaviour change, #409). `WHERE a.id = 0 b.id = 3` ran as
+  `WHERE a.id = 0`, and `COLUMNS (a.id AS a nonsense, b.id AS b)` returned
+  one column: the SQL parser stopped at the first token it could not use and
+  the rest was dropped. Both are now syntax errors that name the token and
+  its position in the pattern, for the pattern's `WHERE`, a node's or edge's
+  `WHERE`, and `COLUMNS`. `KEEP …` and `ONE ROW PER …`, which were ignored
+  the same way, are refused as not supported yet. Only queries that were
+  already wrong are affected.
+
+- **Triangle counting uses about a third of the CPU, with the same counts**
+  (#420). `triangle_count`, and so `clustering_coefficient` and the SQL
+  functions over them, was the slowest step on the full Bluesky graph (1,828 s
+  on 16 cores). The kernel still orients each edge toward its higher-ranked
+  end, by `(degree, id)`, and finds each triangle once. Now the nodes are
+  numbered by rank and each list holds ranks, so for an edge `u → v` only the
+  entries of `u`'s list after `v` are read; a list of 32 entries or more is
+  marked once in a per-thread position table and the lists it meets are looked
+  up there; of two lists, one 8 times the other's length is searched, not
+  merged; and each node's credits are added once per list entry, not once per
+  triangle, so threads no longer write the hubs' counters all the time.
+  Per-node counts are bit for bit the old kernel's: a new test pins them on
+  ten graphs (hubs, a clique with leaves, R-MAT, self-loops, parallel and
+  reciprocal edges, vertices with no edge, masks), recorded before the change,
+  and the old kernel is kept in the tests as a reference. On R-MAT graphs on a
+  shared 4-core machine: 16M edges (384M triangles) 35.3 to 12.6 CPU-s, 64M
+  edges (6.19B triangles) 376 to 120 CPU-s. Nodes of degree under 2 get no rank, so the
+  pass costs the same among 16M vertices with no edge (38.0 to 13.9 CPU-s).
+  It adds 4 bytes per node of degree 2 or more, plus up to as much again per
+  thread for the position tables.
+- **Betweenness with a small sample holds half the scratch memory** (#454).
+  With fewer than 64 sources per thread, the kernel ran `2 × threads` sources
+  at a time, each with its own state of 24 bytes per node (more when
+  weighted), all kept for the whole run: about 30 GB at Bluesky's size on 16
+  threads. It now runs `threads` at a time, which keeps every thread as busy.
+  Results are bit for bit the same (each node's sum is taken in source order
+  whatever the window; the reference-kernel and thread-count tests cover it).
+  On a 32M-edge, 2.1M-node R-MAT graph with 105 sources on 4 threads: peak
+  RSS 1,019 MB to 814 MB (the graph alone is 576 MB), time unchanged (61 s
+  and 60 s, within the noise of a shared machine).
 - **SQL: a stored graph index is memory-mapped, not read whole** (#382).
   Loading one read the whole file on one core, so at full scale (2.42B
   edges, an 18.6 GiB index) every query in a new process paid 15 s, even a
