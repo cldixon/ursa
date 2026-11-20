@@ -71,7 +71,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
@@ -124,11 +124,16 @@ impl ExtensionPlanner for GraphPlanner {
         session_state: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let unique = |graph: &str, source: &Expr, destination: &Expr| {
+            key_names(session_state, graph, source, destination)
+        };
         if let Some(node) = node.as_any().downcast_ref::<GraphTraversalNode>() {
-            return plan_traversal(node, logical_inputs, physical_inputs).map(Some);
+            let unique = unique(&node.graph, &node.source, &node.destination);
+            return plan_traversal(node, logical_inputs, physical_inputs, unique).map(Some);
         }
         if let Some(node) = node.as_any().downcast_ref::<PathSearchNode>() {
-            let mut exec = plan_path_search(node, logical_inputs, physical_inputs)?;
+            let unique = unique(&node.graph, &node.source, &node.destination);
+            let mut exec = plan_path_search(node, logical_inputs, physical_inputs, unique)?;
             exec.held = held_index(&exec.shape.edges, &exec.input, session_state).await;
             return Ok(Some(Arc::new(exec)));
         }
@@ -153,6 +158,7 @@ impl ExtensionPlanner for GraphPlanner {
             logical_inputs,
             physical_inputs,
             next,
+            unique(&node.graph, &node.source, &node.destination),
         )?;
         // A neighbour aggregation's node values are the last input.
         let values = node
@@ -180,12 +186,44 @@ impl ExtensionPlanner for GraphPlanner {
     }
 }
 
-/// The vertex keys input at `at`, if the node has one.
+/// The vertex table whose keys are the nodes of `graph`'s edges from
+/// `source` to `destination` (the endpoint columns of a graph node), when
+/// they are one vertex table's: its keys must then identify one row each
+/// (#411). `None` for the keys of two vertex tables (a `GRAPH_TABLE` search
+/// over an edge table between two of them), which may share values.
+fn key_names(
+    session: &dyn Session,
+    graph: &str,
+    source: &Expr,
+    destination: &Expr,
+) -> Option<KeyNames> {
+    let graph = session
+        .config()
+        .get_extension::<super::GraphRegistry>()?
+        .get(graph)?;
+    let (Expr::Column(source), Expr::Column(destination)) = (source, destination) else {
+        return None;
+    };
+    let table = source.relation.as_ref()?;
+    let edges = graph.edge_tables.iter().find(|e| {
+        &e.table == table && e.source == source.name && e.destination == destination.name
+    })?;
+    let from = graph.endpoint_vertex(edges, true)?;
+    let to = graph.endpoint_vertex(edges, false)?;
+    (from.name == to.name).then(|| KeyNames {
+        table: from.name.clone(),
+        key: from.key.clone(),
+    })
+}
+
+/// The vertex keys input at `at`, if the node has one; `unique` as
+/// [`VertexInput::unique`].
 fn vertex_input(
     has: bool,
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
     at: usize,
+    unique: Option<KeyNames>,
 ) -> Result<Option<VertexInput>> {
     if !has {
         return Ok(None);
@@ -194,6 +232,7 @@ fn vertex_input(
         (Some(logical), Some(physical)) => Ok(Some(VertexInput {
             plan: Arc::clone(physical),
             fingerprint: fingerprint(logical),
+            unique,
         })),
         _ => Err(DataFusionError::Internal(
             "a graph node's vertex keys were not planned".to_string(),
@@ -232,6 +271,7 @@ fn plan_traversal(
     node: &GraphTraversalNode,
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
+    unique: Option<KeyNames>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let expected = 1
         + usize::from(node.weighted.is_some())
@@ -257,6 +297,7 @@ fn plan_traversal(
         logical_inputs,
         physical_inputs,
         next,
+        unique,
     )?;
     next += usize::from(vertices.is_some());
     Ok(Arc::new(GraphTraversalExec::new(
@@ -295,6 +336,7 @@ fn plan_path_search(
     node: &PathSearchNode,
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
+    unique: Option<KeyNames>,
 ) -> Result<PathSearchExec> {
     let expected = 2 + usize::from(node.vertices.is_some()) + usize::from(node.targets.is_some());
     if physical_inputs.len() != expected || logical_inputs.len() != expected {
@@ -303,7 +345,13 @@ fn plan_path_search(
             physical_inputs.len()
         )));
     }
-    let vertices = vertex_input(node.vertices.is_some(), logical_inputs, physical_inputs, 1)?;
+    let vertices = vertex_input(
+        node.vertices.is_some(),
+        logical_inputs,
+        physical_inputs,
+        1,
+        unique,
+    )?;
     let starts = 1 + usize::from(vertices.is_some());
     Ok(PathSearchExec::new(
         PathShape {
@@ -636,6 +684,41 @@ struct VertexInput {
     plan: Arc<dyn ExecutionPlan>,
     /// The keys' plan's fingerprint, or `None` if it cannot be cached.
     fingerprint: Option<String>,
+    /// The vertex table the keys are of, when they are one table's: a build
+    /// then refuses a key that repeats or is NULL (#411; see
+    /// [`super::vertex_keys`]).
+    unique: Option<KeyNames>,
+}
+
+/// A vertex table and its key, as a refusal of its keys names them.
+#[derive(Debug, Clone)]
+struct KeyNames {
+    table: String,
+    key: String,
+}
+
+/// The node set `interner` was given is fixed: refuse it if `unique` names
+/// its vertex table and a key repeats or is NULL.
+fn close_keys(
+    interner: &mut EdgeInterner,
+    unique: Option<&KeyNames>,
+    graph: &str,
+    id_type: &DataType,
+) -> Result<()> {
+    if let Some(names) = unique {
+        let rows = interner.key_rows();
+        if !rows.is_unique() {
+            return Err(super::vertex_keys::key_error(
+                graph,
+                &names.table,
+                &names.key,
+                rows,
+                *id_type == DataType::Utf8,
+            ));
+        }
+    }
+    interner.close_nodes();
+    Ok(())
 }
 
 /// What a [`GraphAlgorithmExec`] computes, besides its children.
@@ -1331,11 +1414,14 @@ async fn index_key(
         Some(VertexInput {
             plan,
             fingerprint: Some(vertices),
+            ..
         }) => {
             files.extend(file_identities(plan, context).await?);
             files.sort();
             files.dedup();
-            format!("{edges}\n-- vertex keys --\n{vertices}")
+            // "unique": an index stored before a build checked its keys
+            // (#411) has another key, and is built afresh.
+            format!("{edges}\n-- unique vertex keys --\n{vertices}")
         }
     };
     Ok(Some((fingerprint, files)))
@@ -1772,12 +1858,13 @@ fn take_chunk(
     chunk: Chunk,
     graph: &str,
     id_type: &DataType,
+    unique: Option<&KeyNames>,
 ) -> Result<Option<GraphIndex>> {
     match chunk {
         Chunk::Nodes(keys) => interner
             .push_nodes(keys.as_ref())
             .map_err(|e| build_error(graph, e))?,
-        Chunk::NodesDone => interner.close_nodes(),
+        Chunk::NodesDone => close_keys(interner, unique, graph, id_type)?,
         Chunk::Edges(src, dst) => interner
             .push(src.as_ref(), dst.as_ref())
             .map_err(|e| build_error(graph, e))?,
@@ -1856,6 +1943,8 @@ fn intern_keys(
     done: tokio::sync::oneshot::Sender<EdgeInterner>,
     hint: usize,
     graph: &str,
+    id_type: &DataType,
+    unique: Option<&KeyNames>,
 ) -> Result<()> {
     let mut interner = EdgeInterner::with_capacity(hint);
     while let Some(chunk) = rx.blocking_recv() {
@@ -1864,7 +1953,7 @@ fn intern_keys(
                 .push_nodes(keys.as_ref())
                 .map_err(|e| build_error(graph, e))?,
             Chunk::NodesDone => {
-                interner.close_nodes();
+                close_keys(&mut interner, unique, graph, id_type)?;
                 // The edges' thread is gone only if it stopped on an error.
                 let _ = done.send(interner);
                 return Ok(());
@@ -2055,9 +2144,11 @@ async fn build_streamed_with(
             let (keys_tx, keys_rx) = tokio::sync::mpsc::channel::<Chunk>(2);
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             nodes = Some(done_rx);
-            let graph = shape.graph.clone();
-            let interning =
-                tokio::task::spawn_blocking(move || intern_keys(keys_rx, done_tx, hint, &graph));
+            let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
+            let unique = vertices.unique.clone();
+            let interning = tokio::task::spawn_blocking(move || {
+                intern_keys(keys_rx, done_tx, hint, &graph, &id_type, unique.as_ref())
+            });
             let batches = InOrder::with_budget(&vertices.plan, context, key_budget);
             let id_type = shape.id_type.clone();
             let reading =
@@ -2092,10 +2183,13 @@ async fn build_streamed_with(
     let (read, built) = {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
         let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
+        let unique = shape.vertices.as_ref().and_then(|v| v.unique.clone());
         let interning = async move {
             let mut interner = EdgeInterner::with_capacity(hint);
             while let Some(chunk) = rx.recv().await {
-                if let Some(index) = take_chunk(&mut interner, chunk, &graph, &id_type)? {
+                if let Some(index) =
+                    take_chunk(&mut interner, chunk, &graph, &id_type, unique.as_ref())?
+                {
                     return Ok(Some(index));
                 }
             }
@@ -2421,6 +2515,7 @@ mod tests {
                 vertices: Some(VertexInput {
                     plan: vertices,
                     fingerprint: None,
+                    unique: None,
                 }),
             };
             let build = |read_ahead| {

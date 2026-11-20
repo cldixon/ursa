@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::catalog::{SchemaProvider, Session, TableProvider};
 use datafusion::common::{Column, TableReference};
 use datafusion::datasource::{provider_as_source, TableType, ViewTable};
@@ -290,7 +291,19 @@ pub fn nodes_plan_from(
             .map(|f| Expr::Column(Column::new(Some(vertex_def.table.clone()), f.name()))),
     );
     // Only the vertex table's rows: an endpoint that is not one of its keys
-    // is no node, and its edges are dropped (#311).
+    // is no node, and its edges are dropped (#311). Each row is one node: a
+    // key that repeats or is NULL is refused, as an index build refuses it
+    // (#411).
+    let vertices = match source_as_provider(&vertices) {
+        Ok(provider) => provider_as_source(super::vertex_keys::unique_keys(
+            &def.name,
+            &vertex_def.name,
+            &vertex_def.table,
+            &vertex_def.key,
+            provider,
+        )),
+        Err(_) => vertices,
+    };
     LogicalPlanBuilder::scan(vertex_def.table.clone(), vertices, None)?
         .project(vertex_exprs)?
         .build()

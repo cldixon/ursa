@@ -72,6 +72,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::Token;
 use futures::FutureExt;
 use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Call, FunctionSpec};
@@ -1436,7 +1437,19 @@ impl GraphFunctions {
         let relation_of = |source: &super::pattern::Source,
                            context: &dyn RelationPlannerContext|
          -> Result<LogicalPlan> {
-            let table = source_of(&source.table, context)?;
+            let mut table = source_of(&source.table, context)?;
+            // A node's rows are its vertex table's: one node each (#411).
+            if let Some((name, key)) = &source.vertex {
+                if let Ok(provider) = source_as_provider(&table) {
+                    table = provider_as_source(super::vertex_keys::unique_keys(
+                        &graph.name,
+                        name,
+                        &source.table,
+                        key,
+                        provider,
+                    ));
+                }
+            }
             let mut scan = LogicalPlanBuilder::scan(source.table.clone(), table, None)?;
             if let Some(columns) = &source.columns {
                 scan = scan.project(columns.iter().map(|(column, name)| {
@@ -1956,19 +1969,28 @@ fn path_functions<V: VisitMut>(
     }
 }
 
-/// One SQL expression, as written in a GRAPH_TABLE pattern.
+/// One SQL expression, as written in a GRAPH_TABLE pattern: all of `text`
+/// (#409; the pattern's parser reports leftover text with its position).
 fn parse_sql_expr(text: &str) -> Result<ast::Expr> {
     Parser::new(&GenericDialect {})
         .try_with_sql(text)
-        .and_then(|mut p| p.parse_expr())
+        .and_then(|mut p| {
+            let expr = p.parse_expr()?;
+            p.expect_token(&Token::EOF)?;
+            Ok(expr)
+        })
         .map_err(|e| plan(format!("in GRAPH_TABLE: {e} in '{text}'")))
 }
 
-/// The `COLUMNS` list, as SQL select items.
+/// The `COLUMNS` list, as SQL select items: all of `text`.
 fn parse_select_items(text: &str) -> Result<Vec<ast::SelectItem>> {
     Parser::new(&GenericDialect {})
         .try_with_sql(text)
-        .and_then(|mut p| p.parse_comma_separated(Parser::parse_select_item))
+        .and_then(|mut p| {
+            let items = p.parse_comma_separated(Parser::parse_select_item)?;
+            p.expect_token(&Token::EOF)?;
+            Ok(items)
+        })
         .map_err(|e| plan(format!("in GRAPH_TABLE: {e} in COLUMNS ({text})")))
 }
 

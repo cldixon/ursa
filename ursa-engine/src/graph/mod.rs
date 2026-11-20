@@ -70,6 +70,7 @@ pub mod pattern;
 mod relation;
 mod session;
 pub mod traversal;
+mod vertex_keys;
 
 pub use catalog_table::UrsaFunctions;
 pub use exec::{

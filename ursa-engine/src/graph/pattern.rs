@@ -67,6 +67,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use super::{EdgeTable, Label, Properties, PropertyGraph, VertexTable};
@@ -289,6 +290,85 @@ impl<'a> Tokens<'a> {
         let to = self.tokens[self.at - 1].2;
         Some(self.text[from..to].trim().to_string())
     }
+
+    /// [`Self::text_until`], for text that is SQL: a condition or the
+    /// `COLUMNS` list. Text left over after it is an error (#409): SQL's
+    /// parser stops at the first token it cannot use, so `WHERE a.id = 0
+    /// b.id = 3` would otherwise run as `WHERE a.id = 0`.
+    fn sql_until(
+        &mut self,
+        sql: Sql,
+        stop: impl Fn(&Self, usize) -> bool,
+    ) -> Result<Option<String>> {
+        let from = self.tokens.get(self.at).map(|(_, start, _)| *start);
+        let text = self.text_until(stop);
+        if let (Some(text), Some(from)) = (&text, from) {
+            check_sql(text, from, sql)?;
+        }
+        Ok(text)
+    }
+}
+
+/// What a piece of a pattern's text is, as SQL.
+#[derive(Clone, Copy)]
+enum Sql {
+    /// A `WHERE` condition: one expression.
+    Condition,
+    /// The `COLUMNS` list: select items.
+    Columns,
+}
+
+/// Refuse `text`, which starts at byte `from` of the pattern, when it is
+/// `sql` followed by something else. A syntax error in the SQL itself is
+/// left to the planner, which reports it when it parses the text.
+fn check_sql(text: &str, from: usize, sql: Sql) -> Result<()> {
+    let Ok(mut parser) = Parser::new(&GenericDialect {}).try_with_sql(text) else {
+        return Ok(());
+    };
+    let parsed = match sql {
+        Sql::Condition => parser.parse_expr().is_ok(),
+        Sql::Columns => parser
+            .parse_comma_separated(Parser::parse_select_item)
+            .is_ok(),
+    };
+    if !parsed {
+        return Ok(());
+    }
+    let next = parser.peek_token();
+    if next.token == Token::EOF {
+        return Ok(());
+    }
+    if let Some(clause) = unsupported_clause(&next.token, &parser.peek_nth_token(1).token) {
+        return pattern_err(clause);
+    }
+    let read = offset(text, next.span.start).unwrap_or(text.len());
+    let (after, hint) = match sql {
+        Sql::Condition => ("the WHERE condition", "join conditions with AND or OR"),
+        Sql::Columns => ("the COLUMNS item", "separate items with commas"),
+    };
+    pattern_err(format!(
+        "unexpected '{}' (at character {} of the pattern) after {after} '{}'; {hint}",
+        next.token,
+        from + read + 1,
+        text[..read].trim_end()
+    ))
+}
+
+/// The refusal of a SQL/PGQ clause Ursa does not have, if `token` (and the
+/// token after it, `next`) starts one: `KEEP …` or `ONE ROW PER …`.
+fn unsupported_clause(token: &Token, next: &Token) -> Option<&'static str> {
+    let is = |token: &Token, word: &str| matches!(token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word));
+    if is(token, "KEEP") {
+        Some(
+            "KEEP is not supported yet; write the selector or path mode before each path, as MATCH ANY SHORTEST (a)-[e]->*(b) or MATCH TRAIL (a)-[e]->*(b)",
+        )
+    } else if is(token, "ONE") && is(next, "ROW") {
+        Some(
+            "ONE ROW PER is not supported yet; a GRAPH_TABLE returns one row per match, as ONE ROW PER MATCH does",
+        )
+    } else {
+        None
+    }
 }
 
 /// The byte offset of a tokenizer location in `text`.
@@ -326,7 +406,7 @@ pub fn parse(body: &str) -> Result<Pattern> {
     }
     let condition = if t.is_word(0, "WHERE") {
         t.next();
-        let condition = t.text_until(|t, n| t.is_word(n, "COLUMNS"));
+        let condition = t.sql_until(Sql::Condition, |t, n| t.is_word(n, "COLUMNS"))?;
         if condition.is_none() {
             return pattern_err("WHERE needs a condition");
         }
@@ -340,6 +420,11 @@ pub fn parse(body: &str) -> Result<Pattern> {
                 "a GRAPH_TABLE needs COLUMNS (…), listing what to return, such as COLUMNS (a.id AS a, b.id AS b)",
             );
         }
+        if let Some(token) = t.peek(0) {
+            if let Some(clause) = unsupported_clause(token, t.peek(1).unwrap_or(&Token::EOF)) {
+                return pattern_err(clause);
+            }
+        }
         return pattern_err(format!(
             "expected ',', WHERE or COLUMNS after the pattern, found {}",
             t.found()
@@ -347,7 +432,7 @@ pub fn parse(body: &str) -> Result<Pattern> {
     }
     t.next();
     t.expect(&Token::LParen, "'(' after COLUMNS")?;
-    let Some(columns) = t.text_until(|_, _| false) else {
+    let Some(columns) = t.sql_until(Sql::Columns, |_, _| false)? else {
         return pattern_err("COLUMNS (…) lists nothing");
     };
     t.expect(&Token::RParen, "')' to close COLUMNS")?;
@@ -489,7 +574,7 @@ fn parse_spec(t: &mut Tokens, close: &Token) -> Result<Spec> {
     if t.is_word(0, "WHERE") {
         t.next();
         let close = close.clone();
-        spec.condition = t.text_until(move |t, n| t.peek(n) == Some(&close));
+        spec.condition = t.sql_until(Sql::Condition, move |t, n| t.peek(n) == Some(&close))?;
         if spec.condition.is_none() {
             return pattern_err("WHERE needs a condition");
         }
@@ -662,6 +747,9 @@ pub struct Source {
     /// Whether the match joins it: a node whose key is a segment's column
     /// ([`Lowered::aliases`]) is read only for its start keys, if at all.
     pub joined: bool,
+    /// For a node of a vertex table: the table's element name and its key,
+    /// which must identify one row (#411).
+    pub vertex: Option<(String, String)>,
 }
 
 /// A variable's columns, as [`Source::columns`] lists them.
@@ -969,6 +1057,18 @@ pub fn lower(
                     graph.vertex_tables[0].labels()[0].name
                 )),
             }
+        }
+    }
+
+    // An edge binds only between the vertex tables its edge table REFERENCES
+    // (#410): a node of another table is refused, not joined on key values
+    // that happen to be equal.
+    for step in &steps {
+        let e = bindings[&step.edge].edge.expect("resolved");
+        let left = vertex_table(&bindings[&step.left]);
+        let right = vertex_table(&bindings[&step.right]);
+        if !fits(graph, e, left, right, step.direction) {
+            return pattern_err(contradiction(graph, e, step, &bindings));
         }
     }
 
@@ -1331,6 +1431,10 @@ pub fn lower(
             table,
             columns,
             joined: !aliases.iter().any(|a| &a.var == var),
+            vertex: match b.is_edge {
+                true => None,
+                false => vertex_table(b).map(|v| (v.name.clone(), v.key.clone())),
+            },
         });
     }
 
@@ -1429,6 +1533,48 @@ fn fits(
         Direction::Left => backward,
         Direction::Any => forward || backward,
     }
+}
+
+/// The refusal of `step`, whose edge table `e` does not connect the vertex
+/// tables its nodes are bound to.
+fn contradiction(
+    graph: &PropertyGraph,
+    e: &EdgeTable,
+    step: &Step,
+    bindings: &BTreeMap<String, Binding>,
+) -> String {
+    let end = |source: bool| graph.endpoint_vertex(e, source).map(|v| v.name.as_str());
+    let (from, to) = (end(true).unwrap_or("?"), end(false).unwrap_or("?"));
+    // A node as written, and the vertex table it is bound to.
+    let node = |var: &str| {
+        let b = &bindings[var];
+        let table = vertex_table(b).map(|v| v.name.as_str()).unwrap_or("?");
+        let written = match (var.starts_with("__ursa_"), &b.label) {
+            (true, Some(label)) => format!("(:{label})"),
+            (true, None) => "()".to_string(),
+            (false, Some(label)) => format!("({var}:{label})"),
+            (false, None) => format!("({var})"),
+        };
+        (written, table)
+    };
+    let (left, left_table) = node(&step.left);
+    let (right, right_table) = node(&step.right);
+    let (arrow, written, either) = match step.direction {
+        Direction::Right => ("->", format!("from '{left_table}' to '{right_table}'"), ""),
+        Direction::Left => ("<-", format!("from '{right_table}' to '{left_table}'"), ""),
+        Direction::Any => (
+            "-",
+            format!("between '{left_table}' and '{right_table}'"),
+            " in either direction",
+        ),
+    };
+    format!(
+        "edge table '{}' of graph '{}' goes from vertex table '{from}' to '{to}', but {} is written {left}{arrow}{right}, {written}; no edge of '{}' connects them{either}, so the pattern can match nothing",
+        e.name,
+        graph.name,
+        describe_var(&step.edge, true),
+        e.name,
+    )
 }
 
 /// The columns an element table exposes, as (column, property name): `None`
