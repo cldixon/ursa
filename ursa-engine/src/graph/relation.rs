@@ -1145,8 +1145,7 @@ fn keys_plan(
     plan.map(LogicalPlanBuilder::build).transpose()
 }
 
-/// The column of a graph node's vertex keys.
-const VERTEX_KEY: &str = "__ursa_key";
+use super::vertex_keys::VERTEX_KEY;
 
 /// The vertex keys `keys` (of the vertex table `table` of `graph`) are node
 /// ids of the endpoints' type `id_type`: both integers or both strings.

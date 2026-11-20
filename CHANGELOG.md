@@ -359,8 +359,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   now fail until it is deduplicated, for example in a view with `SELECT
   DISTINCT ON (key) *`. An index build counts the rows as it numbers the
   keys; `g.nodes` and a `GRAPH_TABLE` node count the key column when the
-  query is planned, once per session for a table that reads only files (again
-  when a file changes). Stored indexes of graphs with a vertex table are
+  query runs (`EXPLAIN` reads nothing), once per version of a table's
+  files: the count is kept for the session and, with a database, recorded
+  beside its stored indexes (`indexes/vertex_keys.json`), and a stored index
+  built from the same keys stands for it, so a later process, read-only
+  included, reads only the files' metadata. A changed file is counted
+  again; a table that does not read only files is counted by each query.
+  Stored indexes of graphs with a vertex table are
   built again once, under a new key, so none built before the check is
   reused. Not covered: the keys of an edge table between two vertex tables
   are checked where a pattern reads those tables' rows, not in its index.

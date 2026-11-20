@@ -1414,14 +1414,20 @@ async fn index_key(
         Some(VertexInput {
             plan,
             fingerprint: Some(vertices),
-            ..
+            unique,
         }) => {
             files.extend(file_identities(plan, context).await?);
             files.sort();
             files.dedup();
-            // "unique": an index stored before a build checked its keys
-            // (#411) has another key, and is built afresh.
-            format!("{edges}\n-- unique vertex keys --\n{vertices}")
+            // An index whose build refused a key that repeats or is NULL
+            // (#411) says so in its key: one stored before builds checked
+            // has another key and is built afresh, and a stored index with
+            // this key shows its vertex table's keys are one row each
+            // (see `vertex_keys`).
+            match unique {
+                Some(_) => format!("{edges}{}{vertices}", super::vertex_keys::UNIQUE_KEYS),
+                None => format!("{edges}\n-- vertex keys --\n{vertices}"),
+            }
         }
     };
     Ok(Some((fingerprint, files)))

@@ -7,6 +7,8 @@
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::prelude::SessionContext;
+use ursa_engine::database::OpenOptions;
+use ursa_engine::graph::vertex_key_counts;
 
 /// Run every statement in `sql`; the batches of the last one.
 async fn run(ctx: &SessionContext, sql: &str) -> datafusion::error::Result<Vec<RecordBatch>> {
@@ -495,4 +497,160 @@ async fn a_vertex_file_is_counted_again_when_it_changes() {
     for sql in queries {
         assert_eq!(ok(&ctx, sql).await, four, "{sql}");
     }
+}
+
+#[tokio::test]
+async fn the_keys_are_counted_when_a_query_runs_not_when_it_is_planned() {
+    let ctx = ursa_engine::new_session();
+    ok(&ctx, DIRTY).await;
+    // EXPLAIN reads nothing, so it does not fail; the plan shows the count.
+    let plan = ok(&ctx, "EXPLAIN SELECT * FROM gs.nodes").await;
+    assert_contains(&plan, "VertexKeyCheckExec: graph=gs, table=v, key=id");
+    ok(
+        &ctx,
+        "EXPLAIN SELECT * FROM GRAPH_TABLE (gs MATCH (a)-[]->(b) COLUMNS (a.name))",
+    )
+    .await;
+    assert_eq!(vertex_key_counts(&ctx), 0);
+    assert_eq!(err(&ctx, "SELECT * FROM gs.nodes").await, DIRTY_KEYS);
+    assert_eq!(vertex_key_counts(&ctx), 1);
+}
+
+/// A directory with a graph `files` over `nodes.csv` and `edges.csv`,
+/// defined in the database `graphs.ursa`.
+struct Stored {
+    dir: tempfile::TempDir,
+}
+
+impl Stored {
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = Self { dir };
+        stored.write_nodes("1,x\n2,w\n3,q\n");
+        std::fs::write(stored.dir.path().join("edges.csv"), "src,dst\n1,2\n2,3\n").unwrap();
+        let ctx = stored.open(false).await;
+        ok(
+            &ctx,
+            &format!(
+                "CREATE PROPERTY GRAPH files
+                   VERTEX TABLES ('{0}/nodes.csv' AS nodes KEY (id))
+                   EDGE TABLES ('{0}/edges.csv' AS edges
+                     SOURCE KEY (src) REFERENCES nodes (id)
+                     DESTINATION KEY (dst) REFERENCES nodes (id))",
+                stored.dir.path().display()
+            ),
+        )
+        .await;
+        drop(ctx);
+        stored
+    }
+
+    fn write_nodes(&self, rows: &str) {
+        std::fs::write(
+            self.dir.path().join("nodes.csv"),
+            format!("id,name\n{rows}"),
+        )
+        .unwrap();
+    }
+
+    /// A new session on the database, as a new process would open it.
+    async fn open(&self, read_only: bool) -> SessionContext {
+        let options = match read_only {
+            true => OpenOptions::read_only(),
+            false => OpenOptions::default(),
+        };
+        ursa_sql::open_session(&self.dir.path().join("graphs.ursa"), &options)
+            .await
+            .unwrap()
+    }
+
+    fn record(&self) -> std::path::PathBuf {
+        self.dir
+            .path()
+            .join("graphs.ursa.d/indexes/vertex_keys.json")
+    }
+}
+
+const NODES: &str = "SELECT count(*) AS n FROM files.nodes";
+const MATCH: &str = "SELECT * FROM GRAPH_TABLE (files
+                       MATCH (a WHERE a.id = 1)-[]->(b) COLUMNS (b.name))";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_records_the_count_for_later_processes() {
+    let stored = Stored::new().await;
+    let three = ok(&ursa_engine::new_session(), "SELECT 3 AS n").await;
+
+    // The first process counts the keys once, and records it.
+    let ctx = stored.open(false).await;
+    assert_eq!(ok(&ctx, NODES).await, three);
+    ok(&ctx, MATCH).await;
+    assert_eq!(vertex_key_counts(&ctx), 1);
+    drop(ctx);
+    assert!(stored.record().is_file());
+
+    // Later processes read nothing but the files' metadata, read-only too.
+    for read_only in [false, true, false] {
+        let ctx = stored.open(read_only).await;
+        assert_eq!(ok(&ctx, NODES).await, three);
+        ok(&ctx, MATCH).await;
+        assert_eq!(vertex_key_counts(&ctx), 0, "read_only: {read_only}");
+        drop(ctx);
+    }
+
+    // A changed file is counted again, and refused.
+    stored.write_nodes("1,x\n2,w\n3,q\n2,again\n");
+    let ctx = stored.open(false).await;
+    for sql in [NODES, MATCH] {
+        assert_contains(
+            &err(&ctx, sql).await,
+            "graph 'files': vertex table 'nodes' has 1 row with a duplicate key (id = 2)",
+        );
+    }
+    drop(ctx);
+    // A refusal is not recorded: the next process counts again.
+    let ctx = stored.open(false).await;
+    err(&ctx, NODES).await;
+    assert_eq!(vertex_key_counts(&ctx), 1);
+    drop(ctx);
+
+    // Clean again, with another size: counted once more, then recorded.
+    stored.write_nodes("1,x\n2,w\n3,q\n4,new\n");
+    let ctx = stored.open(false).await;
+    ok(&ctx, NODES).await;
+    assert_eq!(vertex_key_counts(&ctx), 1);
+    drop(ctx);
+    let ctx = stored.open(false).await;
+    ok(&ctx, MATCH).await;
+    assert_eq!(vertex_key_counts(&ctx), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_index_shows_the_keys_were_counted() {
+    let stored = Stored::new().await;
+    // An algorithm builds the index, whose build counts the keys, and the
+    // database stores it.
+    let ctx = stored.open(false).await;
+    ok(&ctx, "SELECT * FROM degree(files)").await;
+    assert_eq!(vertex_key_counts(&ctx), 0);
+    drop(ctx);
+    assert!(!stored.record().exists());
+
+    // A later process reads the nodes without counting them, read-only too.
+    for read_only in [true, false] {
+        let ctx = stored.open(read_only).await;
+        ok(&ctx, NODES).await;
+        ok(&ctx, MATCH).await;
+        assert_eq!(vertex_key_counts(&ctx), 0, "read_only: {read_only}");
+        drop(ctx);
+    }
+    assert!(!stored.record().exists());
+
+    // The stored index is of the old file: a changed one is counted.
+    stored.write_nodes("1,x\n2,w\n3,q\n2,again\n");
+    let ctx = stored.open(false).await;
+    assert_contains(
+        &err(&ctx, NODES).await,
+        "has 1 row with a duplicate key (id = 2)",
+    );
+    assert_eq!(vertex_key_counts(&ctx), 1);
 }
