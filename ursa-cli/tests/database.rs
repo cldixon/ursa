@@ -654,7 +654,7 @@ fn notices_go_to_stderr_and_leave_stdout_alone() {
     assert!(
         lines[0].starts_with("ursa: built the index for karate (78 edges) in ")
             && lines[0].contains(
-                "; not stored: it takes 2.7 KiB, more than ursa.index_storage_limit (1KiB); SET \
+                "; not stored: it takes 3.0 KiB, more than ursa.index_storage_limit (1KiB); SET \
                  ursa.index_storage_limit = '1MiB' to keep it"
             ),
         "{stderr}"

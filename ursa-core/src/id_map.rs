@@ -527,7 +527,17 @@ impl IntIds {
 #[derive(Debug, Clone)]
 pub struct StrIds {
     store: StrStore,
-    table: HashTable<u32>,
+    table: StrTable,
+}
+
+/// How a [`StrIds`] finds an id.
+#[derive(Debug, Clone)]
+enum StrTable {
+    /// Grown while ids are interned.
+    Hash(HashTable<u32>),
+    /// The table of an id column read back from a stored index
+    /// ([`IdMap::from_stored_ids`]): given with it, or built when first used.
+    Stored(StoredTable),
 }
 
 /// The hash `StrIds` indexes ids by.
@@ -576,12 +586,39 @@ impl StrIds {
                 bytes: Vec::new(),
                 offsets: vec![0],
             },
-            table: HashTable::new(),
+            table: StrTable::Hash(HashTable::new()),
+        }
+    }
+
+    /// The ids of a stored index: `array` is the id column and `table` its
+    /// lookup table, if it was stored too.
+    fn stored(array: StringArray, table: Option<ScalarBuffer<u32>>) -> Self {
+        StrIds {
+            store: StrStore::Frozen(array),
+            table: StrTable::Stored(StoredTable::new(table)),
         }
     }
 
     fn len(&self) -> usize {
         self.store.len()
+    }
+
+    /// The stored lookup table of these ids, built if it is not there yet;
+    /// `None` for ids that are found through a hash table grown in memory.
+    fn stored_slots(&self) -> Option<Result<&ScalarBuffer<u32>, IdError>> {
+        match &self.table {
+            StrTable::Hash(_) => None,
+            StrTable::Stored(table) => Some(table.slots(|| self.build_slots())),
+        }
+    }
+
+    /// The lookup table of these ids, as a stored index holds it.
+    fn build_slots(&self) -> Result<Vec<u32>, IdError> {
+        build_slots(
+            self.len(),
+            |i| stored_hash_str(self.value(i as u32)),
+            |a, b| self.value(a) == self.value(b),
+        )
     }
 
     #[inline]
@@ -592,16 +629,36 @@ impl StrIds {
     /// The dense index of `id`, if interned.
     #[inline]
     fn get(&self, id: &str) -> Option<u32> {
-        let hash = hash_str(id);
-        self.table
-            .find(hash, |&i| self.store.value(i) == id)
-            .copied()
+        match &self.table {
+            StrTable::Hash(table) => table
+                .find(hash_str(id), |&i| self.store.value(i) == id)
+                .copied(),
+            StrTable::Stored(table) => {
+                let slots = table.slots(|| self.build_slots()).ok()?;
+                let n = self.store.len();
+                probe(slots, stored_hash_str(id), |i| {
+                    (i as usize) < n && self.store.value(i) == id
+                })
+            }
+        }
     }
 
     /// The dense index of `id`, interning it if new. One hash either way.
     fn intern(&mut self, id: &str) -> Result<u32, IdError> {
         let hash = hash_str(id);
+        if let StrTable::Stored(_) = &self.table {
+            // Interning into a stored index's ids (not done by any caller):
+            // move to a table that grows.
+            let mut table = HashTable::with_capacity(self.len());
+            for i in 0..self.len() as u32 {
+                table.insert_unique(hash_str(self.value(i)), i, |&j| hash_str(self.value(j)));
+            }
+            self.table = StrTable::Hash(table);
+        }
         let StrIds { store, table } = self;
+        let StrTable::Hash(table) = table else {
+            unreachable!("moved to a hash table above")
+        };
         if let Some(&i) = table.find(hash, |&i| store.value(i) == id) {
             return Ok(i);
         }
@@ -696,6 +753,13 @@ enum IntTable {
         hi: i64,
     },
     Hash(FxHashMap<i64, u32>),
+    /// The table of an id column read back from a stored index
+    /// ([`IdMap::from_stored_ids`]), with the ids it finds: given with them,
+    /// or built when first used.
+    Stored {
+        ids: Int64Array,
+        table: StoredTable,
+    },
 }
 
 impl IntIndex {
@@ -708,6 +772,27 @@ impl IntIndex {
                 hi: 0,
             },
             rows: 0,
+        }
+    }
+
+    /// The index of a stored index's ids: `ids` is the id column and `table`
+    /// its lookup table, if it was stored too.
+    fn stored(ids: Int64Array, table: Option<ScalarBuffer<u32>>) -> Self {
+        IntIndex {
+            table: IntTable::Stored {
+                ids,
+                table: StoredTable::new(table),
+            },
+            rows: 0,
+        }
+    }
+
+    /// The stored lookup table of this index, built if it is not there yet;
+    /// `None` for a direct table or a hash map grown in memory.
+    fn stored_slots(&self) -> Option<Result<&ScalarBuffer<u32>, IdError>> {
+        match &self.table {
+            IntTable::Stored { ids, table } => Some(table.slots(|| build_int_slots(ids.values()))),
+            _ => None,
         }
     }
 
@@ -731,6 +816,13 @@ impl IntIndex {
                 }
             }
             IntTable::Hash(map) => map.get(&user).copied(),
+            IntTable::Stored { ids, table } => {
+                let values = ids.values();
+                let slots = table.slots(|| build_int_slots(values)).ok()?;
+                probe(slots, stored_hash_i64(user), |i| {
+                    values.get(i as usize) == Some(&user)
+                })
+            }
         }
     }
 
@@ -739,10 +831,16 @@ impl IntIndex {
     fn intern(&mut self, user: i64, to_user: &mut IntIds) -> Result<u32, IdError> {
         use std::collections::hash_map::Entry;
         let next = to_user.len();
-        if let IntTable::Direct { base, slot, .. } = &self.table {
-            if user.wrapping_sub(*base) as u64 >= slot.len() as u64 {
-                self.make_room(user, next as u64 + 1, to_user);
+        match &self.table {
+            IntTable::Direct { base, slot, .. } => {
+                if user.wrapping_sub(*base) as u64 >= slot.len() as u64 {
+                    self.make_room(user, next as u64 + 1, to_user);
+                }
             }
+            IntTable::Hash(_) => {}
+            // Interning into a stored index's ids (not done by any caller):
+            // move to a map that grows.
+            IntTable::Stored { .. } => self.table = IntTable::Hash(hash_map_of(to_user)),
         }
         match &mut self.table {
             IntTable::Direct { base, slot, lo, hi } => {
@@ -773,6 +871,7 @@ impl IntIndex {
                     }
                 }
             }
+            IntTable::Stored { .. } => unreachable!("moved to a hash map above"),
         }
     }
 
@@ -797,12 +896,7 @@ impl IntIndex {
         let budget = (DIRECT_SLOTS_PER_ID * ids).max(rows) + DIRECT_MIN_SLOTS;
         let limit = budget.min(u32::MAX as u64) as u128;
         if need > limit {
-            let mut map = FxHashMap::default();
-            map.reserve(to_user.len());
-            for (i, &id) in to_user.values().iter().enumerate() {
-                map.insert(id, i as u32);
-            }
-            self.table = IntTable::Hash(map);
+            self.table = IntTable::Hash(hash_map_of(to_user));
             return;
         }
         // Grow past `user` by the table's current length, so each growth at
@@ -854,6 +948,207 @@ impl IntIndex {
             slot.shrink_to_fit();
         }
     }
+}
+
+/// A hash map from each of `to_user`'s ids to its dense index.
+fn hash_map_of(to_user: &IntIds) -> FxHashMap<i64, u32> {
+    let mut map = FxHashMap::default();
+    map.reserve(to_user.len());
+    for (i, &id) in to_user.values().iter().enumerate() {
+        map.insert(id, i as u32);
+    }
+    map
+}
+
+/// The lookup table of a stored index's ids: `slots[p]` is a dense index, or
+/// [`MISS`] for an empty slot. It is the one structure of an [`IdMap`] that
+/// can be used as it lies in a file, so a process that maps a stored index
+/// finds a seed's node by reading a slot or two rather than by hashing every
+/// id first (#421).
+///
+/// **The layout**, which is part of the stored index format (version 4):
+///
+/// - `n + n / 2 + 1` slots for `n` ids ([`lookup_table_len`]), so at most two
+///   in three are taken and there is always an empty one.
+/// - An id's first slot is `(hash * slots) >> 64`, of its 64-bit hash
+///   ([`stored_hash_i64`], [`stored_hash_str`]) and the slot count as 128-bit
+///   integers; it goes in the first empty slot from there on, wrapping at the
+///   end (linear probing).
+/// - A lookup reads slots from the id's first until it finds the id (it
+///   compares the id itself, never only a hash) or an empty slot. Any table
+///   that holds every dense index once and keeps that walk unbroken serves,
+///   whatever order its ids went in; [`build_slots`] puts them in dense order.
+///
+/// A table that does not keep to this (a damaged file whose checksum still
+/// matched) cannot make a lookup wrong or unsafe, only miss: a slot's index
+/// is used only if it is in range and its id is the one asked for, and a walk
+/// ends after one turn of the table.
+///
+/// A stored index without one (format versions 2 and 3) has its table built
+/// here, when an id is first looked up: a query that runs an algorithm over
+/// the whole graph and names no node never needs it.
+#[derive(Debug, Clone)]
+struct StoredTable {
+    /// The slots, once they are given or built; or why they cannot be built.
+    slots: OnceLock<Result<ScalarBuffer<u32>, IdError>>,
+}
+
+impl StoredTable {
+    fn new(slots: Option<ScalarBuffer<u32>>) -> Self {
+        let table = StoredTable {
+            slots: OnceLock::new(),
+        };
+        if let Some(slots) = slots {
+            let _ = table.slots.set(Ok(slots));
+        }
+        table
+    }
+
+    /// The slots, built with `build` if they are not there yet.
+    #[inline]
+    fn slots(
+        &self,
+        build: impl FnOnce() -> Result<Vec<u32>, IdError>,
+    ) -> Result<&ScalarBuffer<u32>, IdError> {
+        self.slots
+            .get_or_init(|| build().map(ScalarBuffer::from))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
+/// How many slots the stored lookup table of `n_ids` ids has (see
+/// [`IdMap::lookup_table`]).
+pub fn lookup_table_len(n_ids: usize) -> u64 {
+    let n = n_ids as u64;
+    n + n / 2 + 1
+}
+
+/// The slot a walk for an id of `hash` starts at, in a table of `slots`.
+#[inline]
+fn first_slot(hash: u64, slots: usize) -> usize {
+    ((hash as u128 * slots as u128) >> 64) as usize
+}
+
+/// MurmurHash3's 64-bit finalizer: every input bit reaches every output bit.
+#[inline]
+fn mix(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+/// The hash a stored lookup table places an integer id by: [`mix`] of its
+/// bits. Part of the stored index format, so it must never change.
+#[inline]
+fn stored_hash_i64(id: i64) -> u64 {
+    mix(id as u64)
+}
+
+/// The hash a stored lookup table places a string id by. Part of the stored
+/// index format, so it must never change, and it is spelled out here rather
+/// than taken from a hashing crate, whose output may differ between versions
+/// and between 32- and 64-bit targets.
+///
+/// With `K = 0x9e3779b97f4a7c15` and wrapping arithmetic: start from
+/// `len * K`; for each 8 bytes of the id, read as a little-endian word `w`
+/// (the last padded with zero bytes, and skipped if empty),
+/// `h = (rotl(h, 5) ^ w) * K`; the hash is [`mix`] of the result.
+#[inline]
+fn stored_hash_str(id: &str) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let bytes = id.as_bytes();
+    let mut h = (bytes.len() as u64).wrapping_mul(K);
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let w = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+    }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+    }
+    mix(h)
+}
+
+/// The dense index in `slots` of the id of `hash`, where `is(i)` says
+/// whether dense index `i` is in range and has that id.
+#[inline]
+fn probe(slots: &[u32], hash: u64, is: impl Fn(u32) -> bool) -> Option<u32> {
+    let len = slots.len();
+    if len == 0 {
+        return None;
+    }
+    let mut at = first_slot(hash, len);
+    for _ in 0..len {
+        let i = slots[at];
+        if i == MISS {
+            return None;
+        }
+        if is(i) {
+            return Some(i);
+        }
+        at += 1;
+        if at == len {
+            at = 0;
+        }
+    }
+    None
+}
+
+/// The stored lookup table of `n` distinct ids, of which `hash(i)` is the
+/// hash of id `i` and `same(a, b)` says whether ids `a` and `b` are equal
+/// ([`IdError::DuplicateId`] if two are). The ids go in dense order, so the
+/// table is the same whatever the thread count; their hashes are computed in
+/// parallel first.
+fn build_slots(
+    n: usize,
+    hash: impl Fn(usize) -> u64 + Sync,
+    same: impl Fn(u32, u32) -> bool,
+) -> Result<Vec<u32>, IdError> {
+    use crate::parallel::*;
+    if n >= u32::MAX as usize {
+        return Err(IdError::TooManyNodes);
+    }
+    let len = usize::try_from(lookup_table_len(n)).map_err(|_| IdError::TooManyNodes)?;
+    // Not from inside a parallel loop: see `parallel::in_worker`.
+    let hashes: Vec<u64> = if intern_in_parallel(n) {
+        (0..n).into_par_iter().map(&hash).collect()
+    } else {
+        (0..n).map(&hash).collect()
+    };
+    let mut slots = vec![MISS; len];
+    for (i, &h) in hashes.iter().enumerate() {
+        let mut at = first_slot(h, len);
+        loop {
+            let taken = slots[at];
+            if taken == MISS {
+                slots[at] = i as u32;
+                break;
+            }
+            if hashes[taken as usize] == h && same(taken, i as u32) {
+                return Err(IdError::DuplicateId);
+            }
+            at += 1;
+            if at == len {
+                at = 0;
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// [`build_slots`] of integer ids.
+fn build_int_slots(ids: &[i64]) -> Result<Vec<u32>, IdError> {
+    build_slots(
+        ids.len(),
+        |i| stored_hash_i64(ids[i]),
+        |a, b| ids[a as usize] == ids[b as usize],
+    )
 }
 
 /// Chunks at least this long intern their known ids in parallel (see
@@ -959,8 +1254,12 @@ pub enum IdError {
     /// The distinct string ids total more than `i32::MAX` bytes, beyond the `Utf8`
     /// id column's offset range.
     IdBytesOverflow,
-    /// An id appears twice in a list of distinct ids ([`IdMap::from_user_ids`]).
+    /// An id appears twice in a list of distinct ids ([`IdMap::from_user_ids`],
+    /// or the first lookup in an [`IdMap::from_stored_ids`] given no table).
     DuplicateId,
+    /// The lookup table given with a stored index's ids is not one of as
+    /// many ids ([`IdMap::from_stored_ids`]).
+    LookupTable,
     /// Nodes were given to an [`EdgeInterner`] after its first edge, or after
     /// its node set was fixed.
     NodesAfterEdges,
@@ -992,6 +1291,9 @@ impl std::fmt::Display for IdError {
             }
             IdError::NodesAfterEdges => {
                 write!(f, "nodes must be given before the first edge")
+            }
+            IdError::LookupTable => {
+                write!(f, "the node ids' lookup table does not fit them")
             }
             IdError::IdBytesOverflow => write!(
                 f,
@@ -1195,6 +1497,99 @@ impl IdMap {
         Ok(map)
     }
 
+    /// The map of a stored index, around its id column as it lies in the
+    /// file: `ids[i]` is the user id of dense node `i`, and `table` is the
+    /// column's lookup table ([`Self::lookup_table`]) if the file has it.
+    /// Neither is copied or read here, so this costs the same for any number
+    /// of nodes; `ids` then is [`Self::user_id_array`].
+    ///
+    /// Without a table, one is built when an id is first looked up
+    /// ([`Self::dense_from_array`]), and that is when an id that appears
+    /// twice is found ([`IdError::DuplicateId`]): a map used only to name
+    /// the nodes of a result never builds it. A table that is given is
+    /// trusted to hold every id (the file's checksum vouches for it); one
+    /// that does not can only fail to find an id (see [`StoredTable`]).
+    ///
+    /// `ids` must be `Int64` or a string type with no nulls
+    /// ([`IdError::Null`]), and `table` must have [`lookup_table_len`] slots
+    /// ([`IdError::LookupTable`]). A `LargeUtf8` or `Utf8View` column is
+    /// copied into a `Utf8` one first.
+    pub fn from_stored_ids(
+        ids: ArrayRef,
+        table: Option<ScalarBuffer<u32>>,
+    ) -> Result<Self, IdError> {
+        if ids.null_count() > 0 {
+            return Err(IdError::Null);
+        }
+        if ids.len() >= u32::MAX as usize {
+            return Err(IdError::TooManyNodes);
+        }
+        if table
+            .as_ref()
+            .is_some_and(|t| t.len() as u64 != lookup_table_len(ids.len()))
+        {
+            return Err(IdError::LookupTable);
+        }
+        Ok(match id_kind(ids.data_type())? {
+            IdKind::Int64 => {
+                let array = as_int64(ids.as_ref()).clone();
+                IdMap::Int64 {
+                    to_user: IntIds(IntStore::Frozen(array.clone())),
+                    to_dense: IntIndex::stored(array, table),
+                    id_array: OnceLock::from(ids),
+                }
+            }
+            IdKind::Utf8 => {
+                let (array, ids) = match ids.as_any().downcast_ref::<StringArray>() {
+                    Some(array) => (array.clone(), ids),
+                    None => {
+                        let view = StrView::new(ids.as_ref());
+                        let bytes: usize = (0..view.len()).map(|i| view.value(i).len()).sum();
+                        i32::try_from(bytes).map_err(|_| IdError::IdBytesOverflow)?;
+                        let array = gather_strings(|i| view.value(i), 0..view.len());
+                        (array.clone(), Arc::new(array) as ArrayRef)
+                    }
+                };
+                IdMap::Utf8 {
+                    ids: StrIds::stored(array, table),
+                    id_array: OnceLock::from(ids),
+                }
+            }
+        })
+    }
+
+    /// The map's lookup table, as a stored index holds it beside the id
+    /// column, for [`Self::from_stored_ids`] to be given when the index is
+    /// read back: [`lookup_table_len`] slots, each a dense index or
+    /// `u32::MAX` for an empty one. Its layout is fixed (see
+    /// [`StoredTable`]), and it is the same for the same ids on every
+    /// machine and with any number of threads. A map that came with its
+    /// table, or has built it, hands that one out.
+    pub fn lookup_table(&self) -> Result<ScalarBuffer<u32>, IdError> {
+        match self {
+            IdMap::Int64 {
+                to_user, to_dense, ..
+            } => match to_dense.stored_slots() {
+                Some(slots) => slots.cloned(),
+                None => build_int_slots(to_user.values()).map(ScalarBuffer::from),
+            },
+            IdMap::Utf8 { ids, .. } => match ids.stored_slots() {
+                Some(slots) => slots.cloned(),
+                None => ids.build_slots().map(ScalarBuffer::from),
+            },
+        }
+    }
+
+    /// Make sure ids can be looked up: build the lookup table of a stored
+    /// index's ids that came without one.
+    fn ready(&self) -> Result<(), IdError> {
+        let slots = match self {
+            IdMap::Int64 { to_dense, .. } => to_dense.stored_slots(),
+            IdMap::Utf8 { ids, .. } => ids.stored_slots(),
+        };
+        slots.map_or(Ok(()), |slots| slots.map(|_| ()))
+    }
+
     #[inline]
     fn intern_i64(&mut self, user: i64) -> Result<u32, IdError> {
         match self {
@@ -1291,6 +1686,7 @@ impl IdMap {
         if arr.is_empty() {
             return Ok(Vec::new());
         }
+        self.ready()?;
         match self {
             IdMap::Int64 { to_dense, .. } => {
                 if !matches!(id_kind(arr.data_type())?, IdKind::Int64) {
@@ -2099,5 +2495,248 @@ mod tests {
         assert_eq!(IdMap::from_user_ids(&null).unwrap_err(), IdError::Null);
         let empty = Int64Array::from(Vec::<i64>::new());
         assert!(IdMap::from_user_ids(&empty).unwrap().is_empty());
+    }
+
+    /// Integer and string id columns of `n` ids, some of them long, with a
+    /// non-ASCII one, and integers that are neither compact nor ordered.
+    fn stored_columns(n: usize) -> [ArrayRef; 2] {
+        let ints: Vec<i64> = (0..n as i64)
+            .map(|i| match i % 3 {
+                0 => i * 1_000_003,
+                1 => -i * 17 - 1,
+                _ => i64::MAX - i,
+            })
+            .collect();
+        let strings: Vec<String> = (0..n)
+            .map(|i| match i % 4 {
+                0 => format!("did:plc:{i:024}"),
+                1 => format!("n{i}"),
+                2 => format!("h\u{e9}llo-{i}"),
+                _ => format!("{i}"),
+            })
+            .collect();
+        [
+            Arc::new(Int64Array::from(ints)),
+            Arc::new(StringArray::from(strings)),
+        ]
+    }
+
+    /// Every id of `ids` resolves to its own row in `map`, ids that are not
+    /// there and nulls to nothing, and the map names its nodes as `ids`.
+    fn assert_finds_every_id(map: &IdMap, ids: &ArrayRef) {
+        assert_eq!(map.len(), ids.len());
+        assert_eq!(map.user_id_array().as_ref(), ids.as_ref());
+        let dense = map.dense_from_array(ids.as_ref()).unwrap();
+        let expected: Vec<Option<u32>> = (0..ids.len() as u32).map(Some).collect();
+        assert_eq!(dense, expected);
+        let rows = [0u32, ids.len() as u32 - 1, ids.len() as u32 / 2];
+        assert_eq!(
+            map.gather_user(&rows).as_ref(),
+            arrow::compute::take(
+                ids.as_ref(),
+                &arrow::array::UInt32Array::from(rows.to_vec()),
+                None
+            )
+            .unwrap()
+            .as_ref()
+        );
+        let missing: ArrayRef = match map {
+            IdMap::Int64 { .. } => Arc::new(Int64Array::from(vec![Some(4), None, Some(i64::MIN)])),
+            IdMap::Utf8 { .. } => Arc::new(StringArray::from(vec![Some("nobody"), None, Some("")])),
+        };
+        assert_eq!(
+            map.dense_from_array(missing.as_ref()).unwrap(),
+            vec![None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_stored_id_column_is_wrapped_and_its_table_built_on_the_first_lookup() {
+        for n in [1, 2, 7, 1000, PARALLEL_MIN_ROWS + 11] {
+            for ids in stored_columns(n) {
+                let map = IdMap::from_stored_ids(Arc::clone(&ids), None).unwrap();
+                // The column itself, not a copy; and no table yet.
+                assert!(Arc::ptr_eq(&map.user_id_array(), &ids));
+                let built = match &map {
+                    IdMap::Int64 { to_dense, .. } => match &to_dense.table {
+                        IntTable::Stored { table, .. } => table.slots.get().is_some(),
+                        _ => panic!("a stored table"),
+                    },
+                    IdMap::Utf8 { ids, .. } => match &ids.table {
+                        StrTable::Stored(table) => table.slots.get().is_some(),
+                        StrTable::Hash(_) => panic!("a stored table"),
+                    },
+                };
+                assert!(!built);
+                // Naming nodes, and resolving no ids, do not build it.
+                map.gather_user(&[0]);
+                map.dense_from_array(ids.slice(0, 0).as_ref()).unwrap();
+                assert_finds_every_id(&map, &ids);
+                // The same numbering as the map built by interning.
+                let eager = IdMap::from_user_ids(ids.as_ref()).unwrap();
+                assert_eq!(
+                    eager.dense_from_array(ids.as_ref()).unwrap(),
+                    map.dense_from_array(ids.as_ref()).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lookup_table_round_trips_and_is_the_same_from_any_map() {
+        for n in [1, 5, 1000, PARALLEL_MIN_ROWS + 11] {
+            for ids in stored_columns(n) {
+                // From the interned map, the lazily built one, and with any
+                // number of threads: one table.
+                let interned = IdMap::from_user_ids(ids.as_ref()).unwrap();
+                let table = interned.lookup_table().unwrap();
+                assert_eq!(table.len() as u64, lookup_table_len(n));
+                assert_eq!(table.iter().filter(|&&s| s != MISS).count(), n);
+                let lazy = IdMap::from_stored_ids(Arc::clone(&ids), None).unwrap();
+                assert_eq!(lazy.lookup_table().unwrap(), table);
+                let one = rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap();
+                assert_eq!(one.install(|| interned.lookup_table().unwrap()), table);
+
+                let map = IdMap::from_stored_ids(Arc::clone(&ids), Some(table.clone())).unwrap();
+                assert_finds_every_id(&map, &ids);
+                assert_eq!(map.lookup_table().unwrap(), table);
+            }
+        }
+        // An empty graph has a table of one empty slot.
+        let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+        let table = IdMap::from_stored_ids(Arc::clone(&empty), None)
+            .unwrap()
+            .lookup_table()
+            .unwrap();
+        assert_eq!(table.as_ref(), &[MISS]);
+        let map = IdMap::from_stored_ids(empty, Some(table)).unwrap();
+        assert_eq!(
+            map.dense_from_array(&StringArray::from(vec!["a"])).unwrap(),
+            vec![None]
+        );
+    }
+
+    /// The stored hashes are part of the index file format: these values
+    /// must never change.
+    #[test]
+    fn the_stored_hashes_are_fixed() {
+        assert_eq!(stored_hash_i64(0), 0);
+        assert_eq!(stored_hash_i64(1), 0xb456_bcfc_34c2_cb2c);
+        assert_eq!(stored_hash_i64(-1), 0x64b5_720b_4b82_5f21);
+        assert_eq!(stored_hash_str(""), 0);
+        assert_eq!(stored_hash_str("a"), 0x22ff_c5de_116a_704f);
+        assert_eq!(stored_hash_str("12345678"), 0xbfc9_3f21_27fd_2a1f);
+        assert_eq!(
+            stored_hash_str("did:plc:abcdefghijklmnopqrstuvwx"),
+            0xc6ca_9151_df88_303c
+        );
+        // A table laid out by hand: three slots for one id.
+        let one: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let table = IdMap::from_stored_ids(one, None)
+            .unwrap()
+            .lookup_table()
+            .unwrap();
+        // 0xb456… * 2 >> 64 = 1.
+        assert_eq!(table.as_ref(), &[MISS, 0]);
+    }
+
+    #[test]
+    fn a_stored_column_with_an_id_twice_is_an_error_at_the_first_lookup() {
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![5, 6, 5]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "b"]));
+        for ids in [ints, strings] {
+            let map = IdMap::from_stored_ids(Arc::clone(&ids), None).unwrap();
+            assert_eq!(map.len(), ids.len());
+            assert_eq!(
+                map.dense_from_array(ids.as_ref()).unwrap_err(),
+                IdError::DuplicateId
+            );
+            assert_eq!(map.lookup_table().unwrap_err(), IdError::DuplicateId);
+        }
+    }
+
+    #[test]
+    fn stored_ids_that_are_null_or_whose_table_does_not_fit_are_errors() {
+        let null: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        assert_eq!(
+            IdMap::from_stored_ids(null, None).unwrap_err(),
+            IdError::Null
+        );
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let short = ScalarBuffer::from(vec![MISS; 4]);
+        assert_eq!(
+            IdMap::from_stored_ids(Arc::clone(&ids), Some(short)).unwrap_err(),
+            IdError::LookupTable
+        );
+        let floats: ArrayRef = Arc::new(arrow::array::Float64Array::from(vec![1.0]));
+        assert!(matches!(
+            IdMap::from_stored_ids(floats, None).unwrap_err(),
+            IdError::Unsupported(_)
+        ));
+    }
+
+    /// A table that is not the ids' (a damaged file whose checksum matched)
+    /// only ever misses: no panic, no endless walk, no wrong node.
+    #[test]
+    fn a_wrong_lookup_table_only_misses() {
+        for ids in stored_columns(100) {
+            let n = ids.len();
+            let len = lookup_table_len(n) as usize;
+            let good = IdMap::from_stored_ids(Arc::clone(&ids), None)
+                .unwrap()
+                .lookup_table()
+                .unwrap();
+            let full_of = |slot: u32| ScalarBuffer::from(vec![slot; len]);
+            let reversed: Vec<u32> = good.iter().rev().copied().collect();
+            let tables = [
+                full_of(MISS),
+                // No empty slot, and indices out of range.
+                full_of(0),
+                full_of(n as u32 + 5),
+                ScalarBuffer::from(reversed),
+            ];
+            for table in tables {
+                let map = IdMap::from_stored_ids(Arc::clone(&ids), Some(table)).unwrap();
+                let dense = map.dense_from_array(ids.as_ref()).unwrap();
+                for (i, d) in dense.into_iter().enumerate() {
+                    assert!(d.is_none() || d == Some(i as u32));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_and_view_strings_are_stored_ids_too() {
+        let strings = vec!["a", "bb", "a-long-string-id-that-is-not-inlined"];
+        let large: ArrayRef = Arc::new(LargeStringArray::from(strings.clone()));
+        let view: ArrayRef = Arc::new(StringViewArray::from(strings.clone()));
+        let expected: ArrayRef = Arc::new(StringArray::from(strings));
+        for ids in [large, view] {
+            let map = IdMap::from_stored_ids(Arc::clone(&ids), None).unwrap();
+            assert_eq!(map.user_id_array().as_ref(), expected.as_ref());
+            assert_eq!(
+                map.dense_from_array(ids.as_ref()).unwrap(),
+                vec![Some(0), Some(1), Some(2)]
+            );
+        }
+    }
+
+    #[test]
+    fn interning_into_stored_ids_moves_them_to_a_growing_table() {
+        for ids in stored_columns(50) {
+            let mut map = IdMap::from_stored_ids(Arc::clone(&ids), None).unwrap();
+            let next = match &mut map {
+                IdMap::Int64 { .. } => map.intern_i64(4).unwrap(),
+                IdMap::Utf8 { .. } => map.intern_str("someone new").unwrap(),
+            };
+            assert_eq!(next, 50);
+            map.freeze();
+            assert_eq!(map.len(), 51);
+            let dense = map.dense_from_array(ids.as_ref()).unwrap();
+            assert_eq!(dense, (0..50).map(Some).collect::<Vec<_>>());
+        }
     }
 }

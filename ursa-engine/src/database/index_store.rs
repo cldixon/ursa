@@ -39,8 +39,10 @@
 //! checked only before a whole-graph algorithm reads them (`super::mapped`):
 //! one found damaged then is dropped the same way (a read-only store only
 //! stops using it), and the index built again. A file 0.10 wrote (format
-//! version 2) is read whole, and a writer rewrites it in the current format,
-//! with a notice.
+//! version 2) is read whole, and one 0.11 wrote (version 3) is mapped but
+//! has no lookup table for its node ids, which is then built in memory when
+//! a query first looks an id up; a writer rewrites either in the current
+//! format, with a notice.
 //!
 //! **The limit** is the session's `ursa.index_storage_limit` in effect: what
 //! it `SET`, or the database's default, a share of the free space on its disk
@@ -516,8 +518,9 @@ impl IndexStore {
                     }
                 }
                 drop(state);
-                if stored.version == index_file::VERSION_2 && self.writable {
-                    self.upgrade(key, &index, &entry.graph, has_incoming, notifier);
+                if stored.version != index_file::VERSION && self.writable {
+                    let version = stored.version;
+                    self.upgrade(key, &index, &entry.graph, version, has_incoming, notifier);
                 }
                 Some((index, entry.size))
             }
@@ -536,18 +539,26 @@ impl IndexStore {
     }
 
     /// Store again, in the current format, `index`, just read from a file
-    /// written by 0.10 (format version 2), so later processes map it instead
-    /// of reading it whole. Its in-adjacency, if the file has one, is read
-    /// first, to be stored with it; weights stored with it are evaluated
-    /// again when next needed.
+    /// of an older format `version`: one 0.10 wrote (version 2), so later
+    /// processes map it instead of reading it whole, or one 0.11 wrote
+    /// (version 3), so they find its node ids' lookup table in the file
+    /// instead of building it. Its in-adjacency, if the file has one, is
+    /// read first, to be stored with it; weights stored with it are
+    /// evaluated again when next needed.
     fn upgrade(
         self: &Arc<Self>,
         key: &IndexKey,
         index: &Arc<GraphIndex>,
         graph: &str,
+        version: u32,
         has_incoming: bool,
         notifier: &Notifier,
     ) {
+        // What a process pays for the old format, until the file is rewritten.
+        let until = match version {
+            index_file::VERSION_2 => "it is read whole",
+            _ => "each process that looks a node up by its id builds the ids' lookup table",
+        };
         if has_incoming {
             index.topology.incoming();
         }
@@ -555,12 +566,12 @@ impl IndexStore {
         notifier.say(NoticeLevel::On, || match saved {
             Saved::Stored { size, .. } => format!(
                 "rewriting the stored index for {graph} in {} ({}) in the current format: an \
-                 older version of ursa stored it, and it is read whole until it is rewritten",
+                 older version of ursa stored it, and {until} until it is rewritten",
                 self.database,
                 notices::size(size)
             ),
             _ => format!(
-                "an older version of ursa stored the index for {graph} in {}; it is read whole \
+                "an older version of ursa stored the index for {graph} in {}; {until} \
                  until it can be rewritten in the current format, and was {}",
                 self.database,
                 saved.describe(&self.database)
