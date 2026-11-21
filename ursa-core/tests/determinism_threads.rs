@@ -192,10 +192,10 @@ fn closeness_weighted_is_thread_count_independent() {
 #[test]
 fn louvain_is_thread_count_independent() {
     let t = seeded_graph(400, 4000);
-    let reference = on_pool(1, || louvain(&t, None, 1.0, Some(7)));
+    let reference = on_pool(1, || louvain(&t, None, 1.0, Some(7), false));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || louvain(&t, None, 1.0, Some(7))),
+            on_pool(threads, || louvain(&t, None, 1.0, Some(7), false)),
             reference,
             "louvain diverged at {threads} threads"
         );
@@ -210,13 +210,91 @@ fn louvain_weighted_large_is_thread_count_independent() {
     let w: Vec<f64> = (0..t.n_edges())
         .map(|i| ((i % 89) as f64 + 1.0).sqrt() / 7.0)
         .collect();
-    let reference = on_pool(1, || louvain_weighted(&t, &w, None, 1.0, Some(7)));
+    let reference = on_pool(1, || louvain_weighted(&t, &w, None, 1.0, Some(7), false));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || louvain_weighted(&t, &w, None, 1.0, Some(7))),
+            on_pool(threads, || louvain_weighted(
+                &t,
+                &w,
+                None,
+                1.0,
+                Some(7),
+                false
+            )),
             reference,
             "weighted louvain diverged at {threads} threads"
         );
+    }
+}
+
+/// Modularity (γ = 1) of `comm` over `t`'s kept edges, read as undirected.
+fn modularity(t: &Topology, w: Option<&[f64]>, keep: Option<&[bool]>, comm: &[u32]) -> f64 {
+    let k = comm.iter().max().map_or(0, |&c| c as usize + 1);
+    let (mut tot, mut intra, mut m2) = (vec![0.0f64; k], 0.0f64, 0.0f64);
+    let out = t.out();
+    for u in 0..t.n_nodes() as u32 {
+        for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+            if keep.is_some_and(|k| !k[e as usize]) {
+                continue;
+            }
+            let wt = w.map_or(1.0, |w| w[e as usize]);
+            let (cu, cv) = (comm[u as usize] as usize, comm[v as usize] as usize);
+            tot[cu] += wt;
+            tot[cv] += wt;
+            m2 += 2.0 * wt;
+            if cu == cv {
+                intra += 2.0 * wt;
+            }
+        }
+    }
+    intra / m2 - tot.iter().map(|t| (t / m2) * (t / m2)).sum::<f64>()
+}
+
+/// Parallel Louvain (#387): the same labels, and so the same modularity bits,
+/// on 1, 2, 3, 4 and 8 threads; unweighted and with inexact weights, masked
+/// and not, on a graph whose runs hold hundreds of nodes each (so decisions
+/// really are split across threads) and with nodes no kept edge touches (the
+/// compact path).
+#[test]
+fn louvain_parallel_is_thread_count_independent() {
+    let n = 60_000;
+    let t = seeded_graph(n, 150_000);
+    let w: Vec<f64> = (0..t.n_edges())
+        .map(|i| ((i % 89) as f64 + 1.0).sqrt() / 7.0)
+        .collect();
+    // Keep two edges in three, and none touching the top tenth of the nodes,
+    // which leaves them isolated.
+    let out = t.out();
+    let mut keep = vec![false; t.n_edges()];
+    for u in 0..n as u32 {
+        for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+            keep[e as usize] = e % 3 != 1 && u < (n as u32 * 9 / 10) && v < (n as u32 * 9 / 10);
+        }
+    }
+    let mask = ursa_core::EdgeMask::from_bools(&keep);
+    for weighted in [false, true] {
+        for masked in [false, true] {
+            let ws = weighted.then_some(w.as_slice());
+            let m = masked.then_some(&mask);
+            let run = || match ws {
+                Some(w) => louvain_weighted(&t, w, m, 1.0, Some(7), true),
+                None => louvain(&t, m, 1.0, Some(7), true),
+            };
+            let q = |comm: &[u32]| {
+                modularity(&t, ws, masked.then_some(keep.as_slice()), comm).to_bits()
+            };
+            let reference = on_pool(1, run);
+            assert!(*reference.iter().max().unwrap() > 0);
+            for &threads in &THREADS {
+                let got = on_pool(threads, run);
+                assert_eq!(
+                    got, reference,
+                    "parallel louvain (weighted {weighted}, masked {masked}) diverged at \
+                     {threads} threads"
+                );
+                assert_eq!(q(&got), q(&reference));
+            }
+        }
     }
 }
 
