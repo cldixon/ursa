@@ -6,7 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+homepage = "https://cldixon.github.io/ursa/"
+keywords = ["graph", "visualization", "wgpu", "layout"]
+categories = ["visualization", "graphics"]
+# Published with the SQL engine's crates: `ursa-engine` depends on the model
+# here (default features off) to write graph results (#425).
 
 # A library first: the view takes a graph as a node count and dense src/dst
 # ids, so it knows nothing of SQL, DataFusion or Python. The `web` feature

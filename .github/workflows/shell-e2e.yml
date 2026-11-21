@@ -171,6 +171,12 @@ jobs:
           done
           echo "the preview server did not start"; cat e2e-out/preview.log; exit 1
 
+      # `.graph`'s data path without a browser (#425): the UGR bytes the
+      # engine's graph::view writes (ursa-engine's fixtures), read by
+      # ursa-viz/ui/ugr.js and shaped by public/graph-data.js.
+      - name: The engine's graphs, read by the page
+        run: bun test tests/graph-data.test.ts
+
       - name: Run the e2e suite
         run: bun run test:e2e "http://localhost:$PORT" e2e-out 2>&1 | tee e2e-out/e2e.log
 

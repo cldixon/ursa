@@ -110,6 +110,10 @@ jobs:
         run: |
           cargo test -p ursa-viz --no-default-features --locked
           ! cargo tree -p ursa-viz --no-default-features --locked | grep wgpu
+          # The engine writes graph results (graph::view, #425), and neither
+          # it nor the CLI may bring in a GPU for that.
+          ! cargo tree -p ursa-engine -e normal --locked | grep wgpu
+          ! cargo tree -p ursa-cli -e normal --locked | grep wgpu
 
       # Ensures ursa-py (PyO3 extension) also compiles.
       - name: check workspace

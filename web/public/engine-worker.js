@@ -13,12 +13,13 @@
 //                                               what is pending unless alone)
 //   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
 //   export    {format}         -> {bytes}        (the last result, every row)
-//   graph     {text}           -> {n, src, dst, ids, skipped}  (a graph to draw:
-//                                               the last result, a query's or a
-//                                               property graph's; see WebShell.graph)
-//                                  and with SIZE BY: {size, sizeBy}; with COLOR BY:
-//                                  {color, colorBy, colorLabels, colorCounts,
-//                                   colorOther, colorMissing}
+//   graph     {text}           -> {ugr, skipped}  (a graph to draw: the last
+//                                               result, a query's or a property
+//                                               graph's; see WebShell.graph. `ugr`
+//                                               is the graph result as one UGR
+//                                               buffer, transferred, which
+//                                               graph.js reads; `skipped` the rows
+//                                               left out for a NULL endpoint)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
 let shell = null;
@@ -85,20 +86,11 @@ async function handle({ id, op, ...args }) {
       postMessage({ id, ok: true, bytes }, [bytes.buffer]);
     } else if (op === "graph") {
       const g = await shell.graph(args.text ?? "");
-      const reply = { id, ok: true, n: g.n, src: g.src, dst: g.dst, ids: g.ids, skipped: g.skipped };
-      const transfer = [reply.src.buffer, reply.dst.buffer];
-      const size = g.size;
-      if (size) {
-        Object.assign(reply, { size, sizeBy: g.sizeBy });
-        transfer.push(size.buffer);
-      }
-      const color = g.color;
-      if (color) {
-        Object.assign(reply, { color, colorBy: g.colorBy, colorLabels: g.colorLabels, colorCounts: g.colorCounts, colorOther: g.colorOther, colorMissing: g.colorMissing });
-        transfer.push(color.buffer);
-      }
+      // One buffer, the engine's whole answer: nothing is copied per array.
+      const ugr = g.takeUgr();
+      const skipped = g.skipped;
       g.free();
-      postMessage(reply, transfer);
+      postMessage({ id, ok: true, ugr, skipped }, [ugr.buffer]);
     } else {
       throw new Error(`unknown op ${op}`);
     }
