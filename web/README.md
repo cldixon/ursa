@@ -113,7 +113,12 @@ static assets and an R2 bucket.
     close button closes the pane, and New or a dataset does too. In the
     pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
     double-click or `0` fits, and a click on a node names it in the pane's
-    header. A lost WebGL context or GPU device, or a layout that stops,
+    header. On a touch screen (#428) one finger pans and two pinch: the
+    view zooms by the change in the fingers' distance around the point
+    between them, and pans as that point moves, so what is between the
+    fingers stays there. A tap names a node (a second finger cancels it),
+    and a double tap fits. The canvas draws at most 2 pixels for each CSS
+    pixel, whatever the screen's ratio. A lost WebGL context or GPU device, or a layout that stops,
     closes the pane with an error in the terminal.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
@@ -189,8 +194,9 @@ in both themes; `SIZE BY` and `COLOR BY` from an algorithm, a vertex column and
 `NODES (…)`, each of their errors, at least two palette colours read back in
 each theme with no inversion, a theme switch with the pane open, the legend's
 text, and the status from Enter to Done, within a second for rmat; a node picked, typing while it shows, Esc and the close
-button, the terminal refitting beside it and under it on a phone, the Graph
-button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
+button, the terminal refitting beside it and under it on a phone, a pinch, a
+one-finger drag, a tap and a double tap from Chromium's touch input with each
+node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
 phone checks: Tab out of the terminal, the menu's keys, the focus after a
 click, no mid-word wraps and a one-row bar at 320px, a 16px input, and the grey
 text's contrast; and the security headers, 404s for malformed and traversing

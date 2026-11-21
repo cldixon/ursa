@@ -194,6 +194,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WebShell.graph(text)` gives the page the graph: node ids mapped to
   dense indexes in the order they are first seen, with clear errors when
   there is nothing to draw.
+- **Ursa Web Shell: pinch to zoom the Graph view** (#428). A phone had no
+  way to zoom: one finger panned, and the wheel and `+`/`-` need a mouse or
+  a keyboard. Two fingers now pinch: the view zooms by the change in their
+  distance around the point between them and pans as that point moves, so
+  what is between the fingers stays between them. A second finger cancels
+  the first one's tap, a finger left down after a pinch goes on panning, and
+  a double tap fits the graph in view, as a double-click does. The canvas
+  draws at most 2 pixels for each CSS pixel, so a phone with a ratio of 3
+  fills under half the pixels each frame. The mouse, the wheel and the keys
+  are as before.
 - **Ursa Web Shell: sizes, colours and a legend for the Graph view**
   (#389). `.graph [SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
   `.graph karate SIZE BY pagerank COLOR BY louvain` sizes nodes by PageRank

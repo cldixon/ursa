@@ -1111,6 +1111,149 @@ for (const scheme of ["light", "dark"] as const) {
   await pctx.close();
 }
 
+// #428: a phone zooms the graph. Two fingers pinch (zoom by the change in
+// their distance, around the point between them, and pan as it moves), one
+// drags, a tap names a node and a double tap fits. Touches are Chromium's own
+// (CDP Input.dispatchTouchEvent); where each node is drawn is read back from
+// the view's picking, before and after.
+{
+  const zctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true });
+  const p = await zctx.newPage();
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  await p.click("#terminal");
+  await type(".graph karate", p);
+  await graphSettled(p);
+  const box = (await p.locator("#graph-stage canvas").boundingBox())!;
+  const canvasWidth: number = (await graphInfo(p)).width;
+  // Canvas pixels for each CSS pixel: 2, though the screen has 3.
+  const ratio = canvasWidth / box.width;
+  check(Math.abs(ratio - 2) < 0.01, "a phone with 3 pixels a CSS pixel draws 2: the canvas's pixel ratio is capped", `${canvasWidth} px for ${box.width} CSS px`);
+  type Spot = { x: number; y: number; round: boolean };
+  /** Where each node is drawn, in CSS pixels of the canvas: the middle of the pixels that pick it; `round` if its whole disc is seen (no node over it, not at an edge). */
+  const spots = (): Promise<Record<number, Spot>> =>
+    p.evaluate((ratio) => {
+      const shell = (window as any).ursaShell;
+      const { width, height } = shell.graph();
+      const seen: Record<number, { n: number; sx: number; sy: number; x0: number; x1: number; y0: number; y1: number }> = {};
+      for (let y = 0; y < height; y++)
+        for (let x = 0; x < width; x++) {
+          const node = shell.graphNodeAt(x + 0.5, y + 0.5);
+          if (node === null) continue;
+          const s = (seen[node] ??= { n: 0, sx: 0, sy: 0, x0: x, x1: x, y0: y, y1: y });
+          s.n++;
+          s.sx += x + 0.5;
+          s.sy += y + 0.5;
+          s.x0 = Math.min(s.x0, x);
+          s.x1 = Math.max(s.x1, x + 1);
+          s.y0 = Math.min(s.y0, y);
+          s.y1 = Math.max(s.y1, y + 1);
+        }
+      const out: Record<number, { x: number; y: number; round: boolean }> = {};
+      for (const [node, s] of Object.entries(seen)) {
+        const [w, h] = [s.x1 - s.x0, s.y1 - s.y0];
+        const round = s.x0 > 0 && s.y0 > 0 && s.x1 < width && s.y1 < height && Math.abs(w - h) <= 1 && s.n > 0.74 * w * h && Math.abs(s.sx / s.n - (s.x0 + s.x1) / 2) < 0.75 && Math.abs(s.sy / s.n - (s.y0 + s.y1) / 2) < 0.75;
+        out[Number(node)] = { x: s.sx / s.n / ratio, y: s.sy / s.n / ratio, round };
+      }
+      return out;
+    }, ratio);
+  const cdp = await zctx.newCDPSession(p);
+  type Finger = { x: number; y: number };
+  const touch = (type: "touchStart" | "touchMove" | "touchEnd", fingers: Finger[]) =>
+    cdp.send("Input.dispatchTouchEvent", { type, touchPoints: fingers.map((f, id) => ({ x: box.x + f.x, y: box.y + f.y, id })) });
+  /** Fingers down at `from`, moved in steps to `to`, and lifted. */
+  async function gesture(from: Finger[], to: Finger[], steps = 12) {
+    await touch("touchStart", from);
+    for (let i = 1; i <= steps; i++) await touch("touchMove", from.map((f, k) => ({ x: f.x + ((to[k].x - f.x) * i) / steps, y: f.y + ((to[k].y - f.y) * i) / steps })));
+    await touch("touchEnd", []);
+  }
+  const tap = async (at: Finger) => {
+    await touch("touchStart", [at]);
+    await touch("touchEnd", []);
+  };
+  const mid = ([a, b]: Finger[]) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const gap = ([a, b]: Finger[]) => Math.hypot(a.x - b.x, a.y - b.y);
+  /** How far, in CSS pixels, the nodes `of` are from where a zoom by `factor` that takes `m0` to `m1` puts them. */
+  const off = (before: Record<number, Spot>, now: Record<number, Spot>, of: number[], m0: Finger, m1: Finger, factor: number) =>
+    Math.max(...of.map((n) => (now[n]?.round ? Math.hypot(now[n].x - (m1.x + factor * (before[n].x - m0.x)), now[n].y - (m1.y + factor * (before[n].y - m0.y))) : Infinity)));
+
+  const fitted = await spots();
+  const middle = { x: box.width / 2, y: box.height / 2 };
+  // The node nearest the middle, and the one furthest from it that a zoom by 1.8 around it keeps in view.
+  const round = Object.entries(fitted).filter(([, s]) => s.round).map(([n, s]) => ({ n: Number(n), ...s }));
+  const a = round.toSorted((u, v) => Math.hypot(u.x - middle.x, u.y - middle.y) - Math.hypot(v.x - middle.x, v.y - middle.y))[0];
+  const stays = (s: Spot) => {
+    const [x, y] = [a.x + 30 + 1.8 * (s.x - a.x), a.y + 20 + 1.8 * (s.y - a.y)];
+    return x > 24 && y > 24 && x < box.width - 24 && y < box.height - 24;
+  };
+  const b = a && round.filter((s) => s.n !== a.n && stays(s)).toSorted((u, v) => Math.hypot(v.x - a.x, v.y - a.y) - Math.hypot(u.x - a.x, u.y - a.y))[0];
+  check(!!a && !!b && Math.hypot(b.x - a.x, b.y - a.y) > 40, "two nodes to watch through a pinch", `${round.length} whole discs of ${Object.keys(fitted).length} nodes; ${a?.n} and ${b?.n}`);
+  if (a && b) {
+    // Fingers either side of node a spread from 100 to 180 CSS pixels apart
+    // (a zoom by 1.8) as the point between them moves 30 right and 20 down.
+    const from = [{ x: a.x - 50, y: a.y }, { x: a.x + 50, y: a.y }];
+    const to = [{ x: a.x + 30 - 90, y: a.y + 20 }, { x: a.x + 30 + 90, y: a.y + 20 }];
+    await gesture(from, to);
+    const pinched = await spots();
+    const scale = Math.hypot(pinched[b.n].x - pinched[a.n].x, pinched[b.n].y - pinched[a.n].y) / Math.hypot(b.x - a.x, b.y - a.y);
+    check(Math.abs(scale - 1.8) < 0.03, "a pinch zooms: two fingers spread to 1.8 times apart scale the drawing by 1.8", `${scale.toFixed(3)}`);
+    const slip = Math.hypot(pinched[a.n].x - mid(to).x, pinched[a.n].y - mid(to).y);
+    check(slip <= 2, "the point between the fingers stays between them (within 2 px)", `${slip.toFixed(2)} px`);
+    check(off(fitted, pinched, [a.n, b.n], mid(from), mid(to), gap(to) / gap(from)) <= 2, "every node is where the pinch puts it", `${off(fitted, pinched, [a.n, b.n], mid(from), mid(to), 1.8).toFixed(2)} px`);
+    check((await graphInfo(p)).picked === null, "a pinch names no node: the second finger cancels the tap");
+
+    // One finger held on node a while the other moves in: a zoom out around
+    // the moving point between them, and still no tap, on a node or not.
+    const from2 = [{ x: pinched[a.n].x, y: pinched[a.n].y }, { x: pinched[a.n].x + 150, y: pinched[a.n].y + 30 }];
+    const to2 = [from2[0], { x: pinched[a.n].x + 100, y: pinched[a.n].y - 40 }];
+    await gesture(from2, to2);
+    const pinched2 = await spots();
+    const factor2 = gap(to2) / gap(from2);
+    check(factor2 < 0.75 && off(pinched, pinched2, [a.n, b.n], mid(from2), mid(to2), factor2) <= 2, "a pinch in, one finger still: zoomed out around the point between them", `factor ${factor2.toFixed(3)}, ${off(pinched, pinched2, [a.n, b.n], mid(from2), mid(to2), factor2).toFixed(2)} px off`);
+    check((await graphInfo(p)).picked === null, "a finger held on a node through a pinch does not name it");
+
+    // One finger drags: a pan.
+    const start = { x: pinched2[a.n].x + 40, y: pinched2[a.n].y + 40 };
+    await gesture([start], [{ x: start.x - 25, y: start.y + 35 }]);
+    const panned = await spots();
+    check(off(pinched2, panned, [a.n, b.n], start, { x: start.x - 25, y: start.y + 35 }, 1) <= 2 && (await graphInfo(p)).picked === null, "one finger drags the drawing with it, and names no node");
+
+    // A tap names the node under it; a double tap fits the graph again.
+    await tap(panned[a.n]);
+    const tapped = (await graphInfo(p)).picked;
+    check(tapped?.index === a.n && /node \S+ \(degree \d+\)/.test((await p.locator("#graph-status").textContent()) ?? ""), "a tap names the node under the finger", JSON.stringify(tapped));
+    await p.waitForTimeout(400);
+    const empty = { x: 6, y: 6 };
+    await tap(empty);
+    check(off(pinched2, await spots(), [a.n], start, { x: start.x - 25, y: start.y + 35 }, 1) <= 2, "one tap beside the graph leaves the view where it is");
+    await p.waitForTimeout(400);
+    await tap(empty);
+    await p.waitForTimeout(60);
+    await tap(empty);
+    const refitted = await spots();
+    check(off(fitted, refitted, [a.n, b.n], middle, middle, 1) <= 1, "a double tap fits the graph in view again", `${off(fitted, refitted, [a.n, b.n], middle, middle, 1).toFixed(2)} px off`);
+
+    // A mouse still drags and zooms with its wheel on the same canvas, and the keys work.
+    await p.mouse.move(box.x + 20, box.y + 20);
+    await p.mouse.wheel(0, -150);
+    const wheeled = await spots();
+    const wheel = Math.hypot(wheeled[b.n].x - wheeled[a.n].x, wheeled[b.n].y - wheeled[a.n].y) / Math.hypot(b.x - a.x, b.y - a.y);
+    const wheelOff = off(fitted, wheeled, [a.n, b.n], { x: 20, y: 20 }, { x: 20, y: 20 }, wheel);
+    check(wheel > 1.02 && wheelOff <= 2, "the wheel still zooms in around the pointer", `by ${wheel.toFixed(3)}, ${wheelOff.toFixed(2)} px off`);
+    await p.focus("#graph-stage canvas");
+    await p.keyboard.press("0");
+    check(off(fitted, await spots(), [a.n, b.n], middle, middle, 1) <= 1, "0 still fits");
+    await p.mouse.move(box.x + 30, box.y + 30);
+    await p.mouse.down();
+    await p.mouse.move(box.x + 50, box.y + 42, { steps: 4 });
+    await p.mouse.up();
+    check(off(fitted, await spots(), [a.n, b.n], { x: 30, y: 30 }, { x: 50, y: 42 }, 1) <= 1 && (await graphInfo(p)).picked === null, "a mouse still drags the drawing");
+  }
+  if (shots) await p.screenshot({ path: `${shots}/graph-pinched-phone.png` });
+  await zctx.close();
+}
+
 // The tour (`.tour`, ?dataset=tour, the first item of the Datasets menu): on a
 // phone, it runs end to end with no error, its tables fit the screen, its
 // Louvain step matches the club's real split but for one member, and it draws
