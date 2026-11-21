@@ -18,7 +18,10 @@
 // - memory: the page's and the layout worker's wasm memory, and
 //   `performance.measureUserAgentSpecificMemory` (the server sends
 //   COOP/COEP, so the page is cross-origin isolated) or `performance.memory`;
-// - bytes uploaded per layout step (positions, 8 bytes a node) and in all.
+// - bytes uploaded per layout step (positions, 8 bytes a node) and in all;
+// - the highlight layer: the burst again with a path of 100 nodes
+//   highlighted, and with a node hidden too; the time to set a highlight
+//   and a selection, and the bytes each uploads.
 //
 // Then, unless NATIVE=0, the layout alone natively (ursa-core's
 // `fa2_multilevel` example in `bench` mode), on one thread and on all.
@@ -211,18 +214,65 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
           view.fit();
           // Draw cost without the compositor's pacing: a burst of frames in
           // one task (pan and render each), one sync at the end, per frame.
-          const burst: number[] = [];
-          for (let k = 0; k < 5; k++) {
-            await raf();
-            const t0 = performance.now();
-            for (let i = 0; i < 10; i++) { view.pan(i % 2 ? 3 : -3, 0); view.render(); }
+          const burstRun = async () => {
+            const burst: number[] = [];
+            for (let k = 0; k < 5; k++) {
+              await raf();
+              const t0 = performance.now();
+              for (let i = 0; i < 10; i++) { view.pan(i % 2 ? 3 : -3, 0); view.render(); }
+              await sync();
+              burst.push((performance.now() - t0) / 10);
+              if (performance.now() - t0 > budgetMs / 3) break;
+            }
+            view.fit();
+            view.render();
             await sync();
-            burst.push((performance.now() - t0) / 10);
-            if (performance.now() - t0 > budgetMs / 3) break;
+            return burst;
+          };
+          const burst = await burstRun();
+          // The highlight layer (#435): the same burst with a highlight set
+          // (a path of 100 nodes: wide edges, halos, the rest dimmed), then
+          // with a node hidden as well (the edges read the flags). And what
+          // setting one costs: its time, and the bytes it uploads.
+          const n = view.nodeCount;
+          const path = Uint32Array.from({ length: Math.min(100, n) }, (_, i) => Math.floor((i * (n - 1)) / 99));
+          const bytes = () => ({ flags: view.flagBytesUploaded, edges: view.highlightBytesUploaded });
+          const b0 = bytes();
+          const setMs: number[] = [];
+          for (let k = 0; k < 20; k++) {
+            view.clearHighlights();
+            const t0 = performance.now();
+            view.setHighlights(Uint32Array.of(0, path.length), path);
+            setMs.push(performance.now() - t0);
           }
-          view.fit();
-          view.render();
-          await sync();
+          const b1 = bytes();
+          const highlightBurst = await burstRun();
+          const selectMs: number[] = [];
+          for (let k = 0; k < 50; k++) {
+            const t0 = performance.now();
+            view.setSelection(Uint32Array.of((k * 7919) % n));
+            selectMs.push(performance.now() - t0);
+          }
+          const b2 = bytes();
+          view.setSelection(new Uint32Array());
+          view.setHidden(Uint32Array.of(0));
+          const hiddenBurst = await burstRun();
+          view.setHidden(new Uint32Array());
+          view.clearHighlights();
+          const highlight = {
+            pathNodes: path.length,
+            burstMs: highlightBurst,
+            hiddenBurstMs: hiddenBurst,
+            setMs,
+            // Each of the 20 sets after the first clears and sets again.
+            flagBytesPerSet: (b1.flags - b0.flags) / 20,
+            edgeBytesPerSet: (b1.edges - b0.edges) / 20,
+            selectMs,
+            // The old node's flags and the new one's; and the new node again,
+            // to draw in front.
+            flagBytesPerSelection: (b2.flags - b1.flags) / 50,
+            frontBytesPerSelection: (b2.edges - b1.edges) / 50,
+          };
           // Picks at pseudo-random pixels (a fixed sequence).
           let seed = 12345;
           const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
@@ -252,7 +302,7 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             }
           }
           w.pauseFrames(false);
-          return { syncKind, pan, zoom, burstMs: burst, pickMs, pickHits: hits, memory };
+          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, memory };
         },
         { frames: FRAMES, picks: PICKS, budgetMs: FRAME_BUDGET_MS },
       ),
@@ -264,6 +314,16 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
     result.pickMs = summary(result.pickMs);
     result.burstMsPerFrame = summary(result.burstMs);
     delete result.burstMs;
+    const h = result.highlight;
+    result.highlight = {
+      ...h,
+      burstMs: undefined,
+      hiddenBurstMs: undefined,
+      burstMsPerFrame: summary(h.burstMs),
+      hiddenBurstMsPerFrame: summary(h.hiddenBurstMs),
+      setMs: summary(h.setMs),
+      selectMs: summary(h.selectMs),
+    };
   }
   await page.close();
   return result;
@@ -293,6 +353,9 @@ for (const backend of BACKENDS) {
             : `${backend}→${r.backend} ${graph} ${size} ${mode}: ${r.nodes} nodes, ${r.edges} edges · first frame ${f(r.firstFrameMs)} ms · layout ${f(r.layoutDoneMs)} ms` +
                 (r.msPerIteration != null ? ` (${f(r.msPerIteration)} ms/it)` : "") +
                 (r.pan ? ` · pan ${f(r.pan.frameMs.median)}/${f(r.pan.frameMs.p95)} ms · zoom ${f(r.zoom.frameMs.median)}/${f(r.zoom.frameMs.p95)} ms · pick ${f(r.pickMs.median)} ms` : "") +
+                (r.highlight
+                  ? ` · burst ${f(r.burstMsPerFrame.median)} ms, highlighted ${f(r.highlight.burstMsPerFrame.median)} ms, with a hidden node ${f(r.highlight.hiddenBurstMsPerFrame.median)} ms · set highlight ${r.highlight.setMs.median} ms (${r.highlight.flagBytesPerSet} + ${r.highlight.edgeBytesPerSet} B) · select ${r.highlight.selectMs.median} ms (${r.highlight.flagBytesPerSelection} + ${r.highlight.frontBytesPerSelection} B)`
+                  : "") +
                 (r.errors.length ? ` · errors: ${r.errors.join("; ").slice(0, 200)}` : "") +
                 ` [${((performance.now() - t) / 1000).toFixed(0)} s]`,
         );

@@ -9,6 +9,8 @@
 //   feed      {line}           -> {out, err, flow, command, prompt, pending}
 //   cancel    {}               -> {prompt}       (drop a half-typed statement)
 //   width     {columns}        -> {}             (tables fit the terminal)
+//   memory    {}               -> {bytes}        (the engine's WebAssembly memory,
+//                                               for graphMemory)
 //   highlight {text, alone?}   -> {text}         (typed text in ANSI colour, after
 //                                               what is pending unless alone)
 //   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
@@ -23,6 +25,8 @@
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
 let shell = null;
+// The engine's wasm exports, once loaded.
+let wasm = null;
 let columns = 80;
 let hostCommands = [];
 let shortcuts = "";
@@ -30,7 +34,7 @@ let shortcuts = "";
 const ready = (async () => {
   const t0 = performance.now();
   const engine = await (await fetch(new URL("./engine/engine.json", import.meta.url))).json();
-  await init({ module_or_path: new URL(engine.wasm, self.location.origin) });
+  wasm = await init({ module_or_path: new URL(engine.wasm, self.location.origin) });
   // Relative paths are the datasets' files.
   WebShell.setBaseUrl(new URL("/data/", self.location.origin).href);
   return { version: version(), ms: performance.now() - t0 };
@@ -74,6 +78,8 @@ async function handle({ id, op, ...args }) {
       columns = args.columns;
       shell?.setWidth(columns);
       postMessage({ id, ok: true });
+    } else if (op === "memory") {
+      postMessage({ id, ok: true, bytes: wasm.memory.buffer.byteLength });
     } else if (op === "highlight") {
       // As the next line of what is typed, unless asked for the text alone.
       const text = shell && !args.alone ? shell.highlight(args.text) : WebShell.highlightText(args.text);

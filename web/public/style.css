@@ -41,6 +41,11 @@
   --graph-c6: #6250d6;
   --graph-c7: #e34948;
   --graph-other: #a3a097;
+  /* The highlight layer's: a path and its halos, the selection's rings and
+     the pins', each at least 3:1 against the ground. */
+  --graph-highlight: #d9480f;
+  --graph-selection: #0b63ce;
+  --graph-pin: #7a3fc0;
   color-scheme: light;
 }
 
@@ -80,6 +85,9 @@
     --graph-c6: #9085e9;
     --graph-c7: #e66767;
     --graph-other: #6b6963;
+    --graph-highlight: #ffa94d;
+    --graph-selection: #6cb2ff;
+    --graph-pin: #c9a3ff;
     color-scheme: dark;
   }
 }
@@ -119,6 +127,9 @@
   --graph-c6: #9085e9;
   --graph-c7: #e66767;
   --graph-other: #6b6963;
+  --graph-highlight: #ffa94d;
+  --graph-selection: #6cb2ff;
+  --graph-pin: #c9a3ff;
   color-scheme: dark;
 }
 
