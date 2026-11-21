@@ -348,6 +348,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `layout_circle` stay hidden. The catalog gains `layout_fa2` and an
   `OptionalCount` parameter type; the Python library has
   `ursa._graph.layout_fa2`, not yet exported, as the other layouts.
+- **A graph-result model and a wire format for it, in a GPU-free
+  `ursa-viz`** (#424). `ursa_viz::model` is the data every drawing will be
+  made of: `GraphResult` (nodes identified by a label and a typed key, so two
+  vertex tables may reuse a key; edges with a label and their row; `f32`,
+  `u32` and dictionary columns for both; paths, seeds and distances;
+  encodings; the SQL and the rule that drew it) and `GraphDelta` (add,
+  remove and restore nodes and edges, set columns, highlights, encodings and
+  positions). Indexes are append-only and a removed node keeps its slot;
+  every op carries its inverse, so `apply(&delta)` then
+  `apply(&delta.invert())` restores a result bit for bit, with no query.
+  `to_bytes` and `from_bytes` speak UGR (`ursa-viz/UGR.md`): a JSON header
+  and aligned little-endian arrays, which `ursa-viz/ui/ugr.js` reads as
+  typed arrays over the buffer without a copy. A million edges are 8.5 MB.
+  wgpu is now the crate's `render` feature, on by default: with
+  `default-features = false` it builds with no GPU dependency, for the
+  engine to produce results with. The view and the shell draw as before.
 - **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
   in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
   to 1M edges, under WebGPU and WebGL2, and records time to first frame and
