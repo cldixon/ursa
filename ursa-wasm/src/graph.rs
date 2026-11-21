@@ -1,6 +1,6 @@
 //! A result as a graph, for the page's Graph view (`.graph`, drawn by
 //! `ursa-viz`): each row an edge, from its `src` column to its `dst` column
-//! (or the first two columns), the ids of any type mapped to dense node
+//! (or the first two columns, when both hold ids), the ids mapped to dense node
 //! indexes `0..n`, in the order they are first seen, so the same result always
 //! gives the same graph.
 //!
@@ -52,8 +52,45 @@ fn plan_err<T>(message: impl Into<String>) -> Result<T> {
     Err(DataFusionError::Plan(message.into()))
 }
 
+/// The kind of id a column of type `t` holds, if it can be a node's id: an
+/// integer, a string or a date. A float, a boolean, a list or a struct is a
+/// value, not an id (a score, a flag, a path), and drawing it as a node is
+/// nonsense.
+fn id_kind(t: &DataType) -> Option<&'static str> {
+    match t {
+        DataType::Dictionary(_, values) => id_kind(values),
+        DataType::Decimal128(_, 0) | DataType::Decimal256(_, 0) => Some("integer"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some("string"),
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => Some("date"),
+        t if t.is_integer() => Some("integer"),
+        _ => None,
+    }
+}
+
+/// What a column that is no id is, in a word, for the message.
+fn value_kind(t: &DataType) -> &'static str {
+    match t {
+        DataType::Boolean => "a boolean",
+        DataType::Struct(_) => "a struct",
+        DataType::Map(_, _) => "a map",
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => "a list",
+        t if t.is_floating()
+            || matches!(t, DataType::Decimal128(_, _) | DataType::Decimal256(_, _)) =>
+        {
+            "a number that is not whole"
+        }
+        _ => "not an id",
+    }
+}
+
 /// The columns that hold each edge's endpoints: `src` and `dst` (in any
-/// case), or else the first two.
+/// case), or else the first two. Either way both must hold ids: an integer, a
+/// string or a date. The first two columns must also be ids of one kind, since
+/// nothing but their position says they are a pair.
 pub(crate) fn endpoint_columns(schema: &Schema) -> Result<(usize, usize)> {
     let n = schema.fields().len();
     if n < 2 {
@@ -69,10 +106,59 @@ pub(crate) fn endpoint_columns(schema: &Schema) -> Result<(usize, usize)> {
             .iter()
             .position(|f| f.name().eq_ignore_ascii_case(name))
     };
-    Ok(match (find("src"), find("dst")) {
-        (Some(s), Some(d)) => (s, d),
-        _ => (0, 1),
-    })
+    let (s, d, named) = match (find("src"), find("dst")) {
+        (Some(s), Some(d)) => (s, d, true),
+        _ => (0, 1, false),
+    };
+    let (source, destination) = (schema.field(s), schema.field(d));
+    let kinds = (
+        id_kind(source.data_type()),
+        id_kind(destination.data_type()),
+    );
+    let what = match kinds {
+        (Some(a), Some(b)) if named || a == b => return Ok((s, d)),
+        (Some(a), Some(b)) => format!(
+            "'{}' holds {a} ids and '{}' holds {b} ids, so they are not the two ends of an edge",
+            source.name(),
+            destination.name()
+        ),
+        _ => [(source, kinds.0), (destination, kinds.1)]
+            .iter()
+            .filter(|(_, kind)| kind.is_none())
+            .map(|(f, _)| {
+                format!(
+                    "'{}' is {} ({})",
+                    f.name(),
+                    value_kind(f.data_type()),
+                    f.data_type()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" and "),
+    };
+    // A column named after a per-node algorithm is that algorithm's result.
+    let metric = schema
+        .fields()
+        .iter()
+        .find_map(|f| per_node_algorithm(&f.name().to_ascii_lowercase()))
+        .unwrap_or("pagerank");
+    plan_err(format!(
+        "cannot draw {} as edges: {what}. An edge's ends are node ids (integers, strings or \
+         dates, both of one kind). To draw an algorithm's result, draw the graph and size or \
+         colour it: .graph NAME SIZE BY {metric}. To draw other rows, name the ends: \
+         .graph SELECT … AS src, … AS dst FROM …",
+        if named {
+            "columns src and dst".to_string()
+        } else {
+            format!(
+                "the first two columns ({}: {}, {}: {})",
+                source.name(),
+                source.data_type(),
+                destination.name(),
+                destination.data_type()
+            )
+        }
+    ))
 }
 
 /// The edges of a result (`schema`, `batches`), from its endpoint columns.
@@ -1209,6 +1295,138 @@ mod tests {
             .to_string();
         assert!(err.contains("2,000,001 edges"), "{err}");
         assert!(err.contains("at most 2,000,000"), "{err}");
+    }
+
+    fn schema_of(columns: &[(&str, DataType)]) -> Schema {
+        Schema::new(
+            columns
+                .iter()
+                .map(|(name, t)| Field::new(*name, t.clone(), true))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn refusal(columns: &[(&str, DataType)]) -> String {
+        endpoint_columns(&schema_of(columns))
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn list_of(t: DataType) -> DataType {
+        DataType::List(Arc::new(Field::new("item", t, true)))
+    }
+
+    #[test]
+    fn a_score_is_not_a_node() {
+        // SELECT * FROM pagerank(karate): id, then the score.
+        let err = refusal(&[("id", DataType::Int64), ("pagerank", DataType::Float64)]);
+        assert!(
+            err.contains("the first two columns (id: Int64, pagerank: Float64)"),
+            "{err}"
+        );
+        assert!(
+            err.contains("'pagerank' is a number that is not whole (Float64)"),
+            "{err}"
+        );
+        assert!(err.contains(".graph NAME SIZE BY pagerank"), "{err}");
+        assert!(err.contains("AS src, … AS dst"), "{err}");
+        // The hint names the algorithm the result is of, wherever its column is.
+        let err = refusal(&[
+            ("id", DataType::Int64),
+            ("score", DataType::Float32),
+            ("louvain", DataType::Int64),
+        ]);
+        assert!(err.contains(".graph NAME SIZE BY louvain"), "{err}");
+        // Floats in both places, and a decimal with a fraction.
+        let err = refusal(&[("a", DataType::Float64), ("b", DataType::Float32)]);
+        assert!(
+            err.contains("'a' is a number") && err.contains("and 'b' is a number"),
+            "{err}"
+        );
+        let err = refusal(&[("a", DataType::Int64), ("b", DataType::Decimal128(10, 2))]);
+        assert!(err.contains("'b' is a number that is not whole"), "{err}");
+    }
+
+    #[test]
+    fn a_path_a_flag_and_a_struct_are_not_nodes() {
+        // COLUMNS (path_length(p), vertices(p), edges(p)), and its neighbours.
+        let err = refusal(&[
+            ("path_length(p)", DataType::Int64),
+            ("vertices(p)", list_of(DataType::Int64)),
+        ]);
+        assert!(err.contains("'vertices(p)' is a list (List("), "{err}");
+        let err = refusal(&[
+            (
+                "a",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
+            ),
+            ("b", DataType::Utf8),
+        ]);
+        assert!(err.contains("'a' is a list"), "{err}");
+        let err = refusal(&[("id", DataType::Int64), ("member", DataType::Boolean)]);
+        assert!(err.contains("'member' is a boolean (Boolean)"), "{err}");
+        let point = DataType::Struct(vec![Field::new("x", DataType::Int64, true)].into());
+        let err = refusal(&[("id", DataType::Int64), ("at", point)]);
+        assert!(err.contains("'at' is a struct"), "{err}");
+    }
+
+    #[test]
+    fn the_first_two_columns_are_ids_of_one_kind() {
+        // An id and a name are not an edge.
+        let err = refusal(&[("id", DataType::Int64), ("name", DataType::Utf8)]);
+        assert!(
+            err.contains("'id' holds integer ids and 'name' holds string ids"),
+            "{err}"
+        );
+        // Ids of one kind draw as before, whatever their width.
+        for (a, b) in [
+            (DataType::Int64, DataType::Int64),
+            (DataType::Int32, DataType::UInt64),
+            (DataType::Utf8, DataType::Utf8View),
+            (DataType::Date32, DataType::Date32),
+            (DataType::Decimal128(38, 0), DataType::Int64),
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                DataType::Utf8,
+            ),
+        ] {
+            let columns = [("a", a), ("b", b), ("score", DataType::Float64)];
+            assert_eq!(endpoint_columns(&schema_of(&columns)).unwrap(), (0, 1));
+        }
+    }
+
+    #[test]
+    fn src_and_dst_must_be_ids_too() {
+        let err = refusal(&[
+            ("src", DataType::Int64),
+            ("dst", DataType::Float64),
+            ("id", DataType::Int64),
+        ]);
+        assert!(
+            err.contains("cannot draw columns src and dst as edges"),
+            "{err}"
+        );
+        assert!(
+            err.contains("'dst' is a number that is not whole (Float64)"),
+            "{err}"
+        );
+        let err = refusal(&[
+            ("x", DataType::Int64),
+            ("DST", DataType::Int64),
+            ("Src", list_of(DataType::Int64)),
+        ]);
+        assert!(err.contains("'Src' is a list"), "{err}");
+        // Named ends of two kinds are still a pair: their names say so, and
+        // their ids compare as text.
+        let mixed = schema_of(&[
+            ("w", DataType::Float64),
+            ("dst", DataType::Utf8),
+            ("src", DataType::Int64),
+        ]);
+        assert_eq!(endpoint_columns(&mixed).unwrap(), (2, 1));
+        // One of the two names alone is not the pair: the first two columns are.
+        let err = refusal(&[("src", DataType::Int64), ("pagerank", DataType::Float64)]);
+        assert!(err.contains("the first two columns"), "{err}");
     }
 
     #[test]

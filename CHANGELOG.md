@@ -839,6 +839,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Ursa Web Shell: `.graph` no longer draws scores or paths as nodes**
+  (#427). The two columns `.graph` reads as each edge's ends must hold ids:
+  integers, strings or dates, and, when they are the first two columns
+  rather than `src` and `dst`, both of one kind. A float, a boolean, a list
+  or a struct is refused, naming the columns and their types and what to
+  type instead. After `SELECT * FROM pagerank(karate) LIMIT 5`, `.graph`
+  drew five edges from each id to its score; after an `ANY SHORTEST` query,
+  one edge from a number to a list. Now: `cannot draw the first two columns
+  (id: Int64, pagerank: Float64) as edges: 'pagerank' is a number that is
+  not whole (Float64). … To draw an algorithm's result, draw the graph and
+  size or colour it: .graph NAME SIZE BY pagerank. To draw other rows, name
+  the ends: .graph SELECT … AS src, … AS dst FROM …`. Columns named `src`
+  and `dst` of those types are refused the same way. Two integer or two
+  string columns draw as before.
 - `ursa --format csv` and `tsv` write lists, structs and maps, as DuckDB
   does, as their text form, quoted where CSV needs it (`"[1, 2]"`, with
   `NULL` for a null inside one). They failed with "Nested type List(Int64)
