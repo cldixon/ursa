@@ -88,3 +88,20 @@ const GOLDEN: [u64; 4] = [
     0x5bc8_dd0e_8dc4_0c10,
     0xef23_fee1_7b62_24ae,
 ];
+
+/// `layout_layers` (#436) uses only `+ - * /`, so its bits are pinned for
+/// every platform: node `v` of the seeded graph on layer `v % 7`.
+#[test]
+fn layers_have_pinned_bits() {
+    use ursa_core::algo::{layout_layers, LayersParams};
+    let topo = seeded_graph(1500, 3000);
+    let layer: Vec<u32> = (0..1500).map(|v| v % 7).collect();
+    let got = hash(&layout_layers(
+        topo.undirected(),
+        &layer,
+        LayersParams::default(),
+    ));
+    assert_eq!(got, LAYERS_GOLDEN, "got {got:#x}");
+}
+
+const LAYERS_GOLDEN: u64 = 0x2569_a4a6_6a54_96f5;

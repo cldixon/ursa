@@ -112,6 +112,11 @@ static assets and an R2 bucket.
     times `.graph rmat` (1M edges): in headless Chromium, the first drawing
     went from 4.6 s after Enter to 0.95 s, and the layout's end from 12.1 s
     to 6.0 s.
+    The layout worker (`graph-worker.js`) also lays out **rings and layers**
+    (#436): a graph that carries `layout: {kind: "rings" | "layers", level}`,
+    each node's distance from a seed or its layer, is laid out in one
+    message, with no levels to wait for. Nothing sets it yet: the rules
+    that draw a `hop` result as rings and paths as layers are #433.
     `graph.js` is imported on the first `.graph`, and it loads `ursa-viz`
     (about 1 MB gzipped), so a session that draws nothing downloads neither.
     The terminal keeps the focus and refits to its half (xterm's fit addon,

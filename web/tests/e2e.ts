@@ -853,6 +853,42 @@ for (const scheme of ["light", "dark"] as const) {
   await graphSettled(g);
   let info = await graphInfo(g);
   check(info.nodes === 34 && info.edges === 78 && info.iterations > 0 && info.layoutDone, `${scheme}: the view holds the graph, its layout run to the end`, JSON.stringify(info));
+  if (scheme === "light") {
+    // The layout worker's fixed layouts (#436): rings and layers are done in
+    // one message. A seed, three neighbours, and two children of the second.
+    const fixed: any = await g.evaluate(async () => {
+      const { module } = await (await fetch("/viz/viz.json")).json();
+      const run = (kind: string) =>
+        new Promise((resolve) => {
+          const worker = new Worker("/graph-worker.js", { type: "module" });
+          const seen: any[] = [];
+          worker.onmessage = ({ data }) => {
+            seen.push(data.type === "positions" ? { type: data.type, xy: Array.from(data.xy as Float32Array), total: data.total, levels: data.levels } : data);
+            if (data.type === "done" || data.type === "error") {
+              worker.terminate();
+              resolve(seen);
+            }
+          };
+          const level = Uint32Array.of(0, 1, 1, 1, 2, 2);
+          worker.postMessage({ type: "start", module: new URL(module, location.origin).href, n: 6, src: Uint32Array.of(0, 0, 0, 2, 2), dst: Uint32Array.of(1, 2, 3, 4, 5), layout: { kind, level } });
+        });
+      return { rings: await run("rings"), layers: await run("layers"), other: await run("spiral") };
+    });
+    const types = (m: any[]) => m.map((x) => x.type).join(",");
+    const ringXy: number[] = fixed.rings[0]?.xy ?? [];
+    const radii = [0, 1, 2, 3, 4, 5].map((v) => Math.hypot(ringXy[v], ringXy[6 + v]));
+    check(
+      types(fixed.rings) === "positions,done" && fixed.rings[0].total === 0 && radii.every((r, v) => Math.abs(r - [0, 1, 1, 1, 2, 2][v]) < 1e-5),
+      "the layout worker lays out rings in one message: each node at its distance",
+      `${types(fixed.rings)}; radii ${radii.map((r) => r.toFixed(3))}`,
+    );
+    check(
+      types(fixed.layers) === "positions,done" && JSON.stringify(fixed.layers[0].xy) === JSON.stringify([-1, 0, 0, 0, 1, 1, 0, 0.5, 0, -0.5, 0.25, -0.25]),
+      "the layout worker lays out layers in one message: each layer a line, left to right",
+      `${types(fixed.layers)}; ${JSON.stringify(fixed.layers[0]?.xy)}`,
+    );
+    check(types(fixed.other) === "error" && fixed.other[0].message === "no layout called spiral", "the layout worker refuses a layout it does not know", JSON.stringify(fixed.other));
+  }
   const inked = await g.evaluate(() => (window as any).ursaShell.graphInked());
   check(inked && inked.inked > 500, `${scheme}: the view draws the graph (non-blank pixels)`, `${inked?.inked} of ${inked?.width}x${inked?.height} px, ${info.backend}`);
   const pane = (await g.locator("#graph-pane").boundingBox())!;

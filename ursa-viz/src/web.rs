@@ -409,6 +409,51 @@ impl Layout {
         Ok(Layout { layout })
     }
 
+    /// Concentric rings, for a neighbourhood (a `hop` result): `distance[i]`
+    /// is node `i`'s distance from a seed, 0 for a seed and `0xFFFFFFFF` for
+    /// a node that has none. One seed is at the centre with distance `d` on
+    /// the circle of radius `d`; several seeds get a ring system each, side
+    /// by side. The order on each ring shortens the edges. The layout is
+    /// [`Layout::done`] at once: read [`Layout::positions`], no stepping.
+    /// The same input gives the same bits every time.
+    pub fn rings(
+        n_nodes: u32,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        distance: &[u32],
+    ) -> Result<Layout, JsValue> {
+        console_error_panic_hook::set_once();
+        let graph = checked_graph(n_nodes, src, dst)?;
+        let params = ursa_core::algo::RingsParams::default();
+        let layout = LiveLayout::rings(&graph, distance, params).map_err(js_err)?;
+        Ok(Layout { layout })
+    }
+
+    /// Layers left to right, for paths: `layer[i]` is node `i`'s position
+    /// along its path (or its distance from the nearest of several seeds),
+    /// `0xFFFFFFFF` for a node that has none. Layer `l` is the vertical line
+    /// at `x = l`, and one path alone is a straight line. Done at once, like
+    /// [`Layout::rings`].
+    pub fn layers(
+        n_nodes: u32,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        layer: &[u32],
+    ) -> Result<Layout, JsValue> {
+        console_error_panic_hook::set_once();
+        let graph = checked_graph(n_nodes, src, dst)?;
+        let params = ursa_core::algo::LayersParams::default();
+        let layout = LiveLayout::layers(&graph, layer, params).map_err(js_err)?;
+        Ok(Layout { layout })
+    }
+
+    /// Which layout this is: `"force"`, `"rings"` or `"layers"`. Rings and
+    /// layers that have grown are `"force"`.
+    #[wasm_bindgen(getter)]
+    pub fn kind(&self) -> String {
+        self.layout.kind().name().to_string()
+    }
+
     /// Grow the layout to the graph of `n_nodes` nodes and the edges
     /// `(src[i], dst[i])`: the graph it had, with the same node indexes,
     /// plus new nodes after them and any new edges.
@@ -459,13 +504,15 @@ impl Layout {
     }
 
     /// The whole schedule's work, in iterations of the whole graph, coarse to
-    /// fine; `undefined` for flat, which runs as long as it is stepped.
+    /// fine; `undefined` for flat, which runs as long as it is stepped; 0 for
+    /// rings and layers.
     #[wasm_bindgen(getter)]
     pub fn total(&self) -> Option<u32> {
         self.layout.total()
     }
 
-    /// Whether coarse to fine has finished its schedule (never, for flat).
+    /// Whether the layout has finished its schedule: never, for flat; from
+    /// the start, for rings and layers.
     #[wasm_bindgen(getter)]
     pub fn done(&self) -> bool {
         self.layout.is_done()
