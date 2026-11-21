@@ -374,6 +374,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   same rows from `WHERE src IN (…) AND dst IN (…)` on the edge table cost a
   scan of it. The columns carry the `ursa.*` metadata (`src`, `dst`, and a
   new role, `edge`). `ursa_core::algo::induced_edges` is the kernel.
+  - In the browser's engine, on the 1M-edge R-MAT graph: the 4,832 edges
+    among 5,000 nodes in 12 ms with the nodes from a query and 18 ms with
+    them as a list, where the edge-table scan takes 190 ms; a two-ring `hop`
+    neighbourhood and its 9,926 edges in 20 ms, where the scan form takes
+    120 ms. From a stored index, a fixed 20,000-edge answer takes the same
+    time on graphs of 125K, 1M and 4M edges.
+  - A list of 65 or more literal node ids (`seeds => [3, 17, …]`,
+    `nodes => […]`, for every traversal) is planned as one column in memory
+    instead of one expression per id: the same rows and the same errors,
+    and 5,000 ids plan in a few milliseconds instead of 70. `EXPLAIN` shows
+    it as `TableScan: node_ids`.
 
 ### Changed
 

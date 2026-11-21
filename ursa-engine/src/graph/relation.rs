@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::compute::can_cast_types;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::default_table_source::{provider_as_source, source_as_provider};
@@ -55,6 +56,7 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::SchemaError;
 use datafusion::common::{Column, DFSchema, TableReference};
 use datafusion::datasource::listing::ListingTable;
+use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::expr_fn::cast;
 use datafusion::logical_expr::planner::{
@@ -635,6 +637,9 @@ impl NodeIds<'_> {
                 schema: Arc::new(DFSchema::try_from(schema)?),
             }));
         }
+        if let Some(ids) = self.literal_ids(&elems) {
+            return ids;
+        }
         let empty = Arc::new(DFSchema::empty());
         let simplifier = ExprSimplifier::new(
             SimplifyContext::builder()
@@ -699,6 +704,89 @@ impl NodeIds<'_> {
         LogicalPlanBuilder::values(rows).and_then(LogicalPlanBuilder::build)
     }
 
+    /// A long list of plain literals (`[3, 17, …]`, `['a', 'b', …]`) as a
+    /// scan of one column in memory, already of the graph's id type: the
+    /// same rows [`Self::values`] plans as `VALUES`, without planning,
+    /// simplifying and optimizing an expression per id. The Graph view asks
+    /// for the edges among thousands of nodes this way (#432), where the
+    /// expressions cost several times the traversal.
+    ///
+    /// `None` for a short list, whose plan stays the `VALUES` that `EXPLAIN`
+    /// has always shown, and for a list with any element that is not a
+    /// literal id of the graph's type: [`Self::values`] then plans it, and
+    /// words its errors.
+    fn literal_ids(&self, elems: &[ast::Expr]) -> Option<Result<LogicalPlan>> {
+        if elems.len() < LITERAL_IDS_MIN {
+            return None;
+        }
+        // An integer as written, with its sign.
+        fn integer(e: &ast::Expr) -> Option<i64> {
+            match e {
+                ast::Expr::Value(v) => match &v.value {
+                    Value::Number(text, false) => text.parse().ok(),
+                    _ => None,
+                },
+                ast::Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr,
+                } => match expr.as_ref() {
+                    ast::Expr::Value(v) => match &v.value {
+                        Value::Number(text, false) => format!("-{text}").parse().ok(),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        fn string(e: &ast::Expr) -> Option<&str> {
+            match e {
+                ast::Expr::Value(v) => match &v.value {
+                    Value::SingleQuotedString(text) => Some(text),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let column: ArrayRef = match self.id_type {
+            DataType::Int64 => Arc::new(
+                elems
+                    .iter()
+                    .map(|e| {
+                        integer(e).or_else(|| {
+                            string(e)
+                                .filter(|text| traversal::is_integer_text(text))
+                                .and_then(|text| text.parse().ok())
+                        })
+                    })
+                    .collect::<Option<Int64Array>>()?,
+            ),
+            _ => Arc::new(StringArray::from(
+                elems
+                    .iter()
+                    .map(|e| {
+                        string(e)
+                            .map(str::to_string)
+                            .or_else(|| integer(e).map(|i| i.to_string()))
+                    })
+                    .collect::<Option<Vec<String>>>()?,
+            )),
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            self.id_type.clone(),
+            false,
+        )]));
+        let plan = RecordBatch::try_new(Arc::clone(&schema), vec![column])
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            .and_then(|batch| MemTable::try_new(schema, vec![vec![batch]]))
+            .and_then(|table| {
+                LogicalPlanBuilder::scan(NODE_IDS_TABLE, provider_as_source(Arc::new(table)), None)
+            })
+            .and_then(LogicalPlanBuilder::build);
+        Some(plan)
+    }
+
     /// The node ids given to `param` are not of the graph's id type: `got`
     /// says what they are.
     fn not_ids(&self, param: &TraversalParam, got: &str) -> DataFusionError {
@@ -711,6 +799,13 @@ impl NodeIds<'_> {
         ))
     }
 }
+
+/// From this many elements, a list of literal node ids is planned as a
+/// column in memory, not as `VALUES` (see [`NodeIds::literal_ids`]).
+const LITERAL_IDS_MIN: usize = 65;
+
+/// The name of that column's table in a plan.
+const NODE_IDS_TABLE: &str = "node_ids";
 
 /// Whether values of type `from` can be node ids of type `id_type`: NULL, or
 /// a type Arrow casts to it.

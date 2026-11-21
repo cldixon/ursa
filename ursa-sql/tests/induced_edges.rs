@@ -474,3 +474,115 @@ async fn explains_bad_calls() {
     .await;
     assert!(two.contains("one column"), "{two}");
 }
+
+/// A long list of literal ids is planned as a column, not as an expression
+/// per id (the Graph view sends thousands): the same rows as the query form,
+/// for integers, negative and quoted ones, and strings, and the same errors.
+#[tokio::test]
+async fn a_long_list_is_the_same_set() {
+    let ctx = session().await;
+    let ids: Vec<i64> = (0..5000).map(|i| (i * 7919 + 13) % 4096).collect();
+    let list = |cell: &dyn Fn(i64) -> String| {
+        let cells: Vec<String> = ids.iter().map(|&i| cell(i)).collect();
+        format!("[{}]", cells.join(", "))
+    };
+    let from_query = rows(
+        &ctx,
+        "SELECT * FROM induced_edges(rmat, nodes => \
+         (SELECT (i * 7919 + 13) % 4096 FROM generate_series(0, 4999) AS t(i)))",
+    )
+    .await;
+    assert!(from_query.len() > 10_000, "{}", from_query.len());
+    for (what, nodes) in [
+        ("integers", list(&|i| i.to_string())),
+        ("quoted integers", list(&|i| format!("'{i}'"))),
+        // Ids that are no node, and a negative one, among them.
+        (
+            "with strangers",
+            format!("[-7, 99999999, {}", &list(&|i| i.to_string())[1..]),
+        ),
+    ] {
+        let sql = format!("SELECT * FROM induced_edges(rmat, nodes => {nodes})");
+        assert_eq!(rows(&ctx, &sql).await, from_query, "{what}");
+    }
+    // `hop`'s seeds are planned the same way.
+    let seeds = list(&|i| i.to_string());
+    assert_eq!(
+        rows(
+            &ctx,
+            &format!("SELECT count(*) FROM hop(rmat, seeds => {seeds})")
+        )
+        .await,
+        rows(
+            &ctx,
+            "SELECT count(*) FROM hop(rmat, seeds => \
+             (SELECT (i * 7919 + 13) % 4096 FROM generate_series(0, 4999) AS t(i)))"
+        )
+        .await
+    );
+    // String ids, and integers read as their strings.
+    let names = rows(&ctx, "SELECT id FROM degree(lesmis) ORDER BY id").await;
+    assert!(names.len() >= 65, "{}", names.len());
+    let quoted: Vec<String> = names
+        .iter()
+        .map(|n| format!("'{}'", n.replace('\'', "''")))
+        .collect();
+    let sql = format!(
+        "SELECT * FROM induced_edges(lesmis, nodes => [{}, 7, -1])",
+        quoted.join(", ")
+    );
+    assert_eq!(
+        rows(&ctx, &sql).await,
+        rows(
+            &ctx,
+            "SELECT * FROM induced_edges(lesmis, nodes => (SELECT id FROM degree(lesmis)))"
+        )
+        .await
+    );
+    // One bad value in a long list is named as in a short one.
+    let hundred = (0..100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (bad, got) in [
+        ("'a'", "'a'"),
+        ("1.5", "1.5"),
+        ("true", "true"),
+        ("' 1'", "' 1'"),
+    ] {
+        assert_eq!(
+            err(
+                &ctx,
+                &format!("SELECT * FROM induced_edges(rmat, nodes => [{hundred}, {bad}])")
+            )
+            .await,
+            format!(
+                "induced_edges(nodes =>) must be node ids of graph 'rmat', which are integers; \
+                 got {got}"
+            )
+        );
+    }
+    // NULL and an expression still work in a long list: no node, and its value.
+    assert_eq!(
+        rows(
+            &ctx,
+            &format!(
+                "SELECT count(*) FROM induced_edges(rmat, nodes => [{hundred}, NULL, 50 + 50])"
+            )
+        )
+        .await,
+        rows(
+            &ctx,
+            "SELECT count(*) FROM induced_edges(rmat, nodes => \
+             (SELECT * FROM generate_series(0, 100)))"
+        )
+        .await
+    );
+    let plan = rows(
+        &ctx,
+        &format!("EXPLAIN SELECT * FROM induced_edges(rmat, nodes => [{hundred}])"),
+    )
+    .await
+    .join("\n");
+    assert!(plan.contains("TableScan: node_ids"), "{plan}");
+}
