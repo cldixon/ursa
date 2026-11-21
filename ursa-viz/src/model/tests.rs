@@ -1324,3 +1324,35 @@ fn no_changed_byte_makes_the_decoder_panic() {
         }
     }
 }
+
+#[test]
+fn the_last_nodes_come_off_only_when_no_edge_names_them_whatever_came_and_went() {
+    // What the result keeps to answer that without reading its edges.
+    let mut r = build(vec![
+        Op::AddNodeLabel(NodeLabel::new("n", KeyType::Int)),
+        Op::AddEdgeLabel("e".into()),
+        Op::AddNodes(NodeBatch::of_label(0, 0..6i64)),
+        Op::AddEdges(EdgeBatch::of_label(0, vec![0, 3, 1, 5], vec![1, 0, 2, 4])),
+    ]);
+    assert_eq!(r.named, [(0, 1), (1, 3), (3, 5)]);
+    let pop_node = |key: i64| delta(vec![Op::PopNodes(NodeBatch::of_label(0, [key]))]);
+    let pop_edge = |s, d| delta(vec![Op::PopEdges(EdgeBatch::of_label(0, vec![s], vec![d]))]);
+    assert!(message(r.apply(&pop_node(5))).contains("an edge still names"));
+    r.apply(&pop_edge(5, 4)).unwrap();
+    assert_eq!(r.named, [(0, 1), (1, 3)]);
+    r.apply(&pop_node(5)).unwrap();
+    r.apply(&pop_node(4)).unwrap();
+    // Node 3 is named by edge 1, under an edge that names less.
+    assert!(message(r.apply(&pop_node(3))).contains("an edge still names"));
+    // An edge to a node already named adds nothing; one past it does.
+    r.apply(&delta(vec![Op::AddEdges(EdgeBatch::of_label(
+        0,
+        vec![2, 2],
+        vec![3, 2],
+    ))]))
+    .unwrap();
+    assert_eq!(r.named, [(0, 1), (1, 3)]);
+    // Over the wire, it is derived again.
+    let back = GraphResult::from_bytes(&r.to_bytes()).unwrap();
+    assert_eq!(back.named, r.named);
+}

@@ -16,6 +16,9 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::highlight::{flag, BadHighlight, HighlightState};
+use crate::model::{
+    EdgeBatch, GraphDelta, GraphResult, KeyType, NodeBatch, NodeLabel, Op, Positions, Provenance,
+};
 use crate::scene::{parse_color, Graph, Growth, LiveLayout, NodeStyle, Theme};
 use crate::view::View;
 
@@ -55,6 +58,32 @@ pub async fn create_view(
         )));
     }
     let graph = Graph::new(n_nodes as usize, src, dst).map_err(js_err)?;
+    view_on(canvas, Scene::Graph(graph)).await
+}
+
+/// A view of a graph result, on `canvas`: `bytes` is the result as UGR
+/// (`ursa-viz/UGR.md`). Its nodes are drawn where the result puts them (or
+/// where a layout would start them), sized and coloured by its encodings
+/// (by degree, without), with its paths and seeds highlighted and its
+/// removed nodes hidden. [`GraphView::apply_delta`] then changes it in
+/// place.
+#[wasm_bindgen(js_name = createViewFromResult)]
+pub async fn create_view_from_result(
+    canvas: HtmlCanvasElement,
+    bytes: &[u8],
+) -> Result<GraphView, JsValue> {
+    console_error_panic_hook::set_once();
+    let result = GraphResult::from_bytes(bytes).map_err(js_err)?;
+    view_on(canvas, Scene::Result(Box::new(result))).await
+}
+
+/// What a new view draws.
+enum Scene {
+    Graph(Graph),
+    Result(Box<GraphResult>),
+}
+
+async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, JsValue> {
     let (width, height) = (canvas.width().max(1), canvas.height().max(1));
     let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
@@ -113,7 +142,12 @@ pub async fn create_view(
         config.format = plain;
     }
     surface.configure(&device, &config);
-    let view = View::new(&device, config.format, graph, width, height);
+    let view = match scene {
+        Scene::Graph(graph) => View::new(&device, config.format, graph, width, height),
+        Scene::Result(result) => {
+            View::from_result(&device, &queue, config.format, *result, width, height)
+        }
+    };
     Ok(GraphView {
         view,
         _instance: instance,
@@ -444,6 +478,78 @@ impl GraphView {
             .map_err(js_err)
     }
 
+    /// Apply a delta to the scene in place: `bytes` is a delta as UGR, for
+    /// a view made by [`create_view_from_result`]. New nodes and edges are
+    /// written after the ones there are, removed nodes and edges are hidden
+    /// in their slots, and only the styles that changed are written, so it
+    /// costs what the delta holds, not what the graph does. No node's or
+    /// edge's index changes.
+    ///
+    /// **Undo** is the inverse delta ([`invert_delta`]) applied the same
+    /// way, with `positions` (`x` then `y`, one per node after the delta,
+    /// as [`GraphView::positions`] gave them before the step) to put every
+    /// node back where it was. A delta and its inverse leave the frame as
+    /// it was, bit for bit.
+    ///
+    /// A new node the delta gives no position starts beside a node a new
+    /// edge joins it to, until the layout places it ([`Layout::grow`], then
+    /// [`GraphView::set_positions`]).
+    ///
+    /// If the delta does not fit the result, this throws and nothing
+    /// changes. Returns what it did ([`DeltaStats`]).
+    #[wasm_bindgen(js_name = applyDelta)]
+    pub fn apply_delta(
+        &mut self,
+        bytes: &[u8],
+        positions: Option<Vec<f32>>,
+    ) -> Result<DeltaStats, JsValue> {
+        let delta = GraphDelta::from_bytes(bytes).map_err(js_err)?;
+        let xy = positions.as_deref().map(|xy| xy.split_at(xy.len() / 2));
+        let applied = self
+            .view
+            .apply_at(&self.device, &self.queue, &delta, xy)
+            .map_err(js_err)?;
+        let (node_capacity, edge_capacity) = self.view.renderer().capacity();
+        Ok(DeltaStats {
+            nodes: applied.changes.nodes.1 as u32,
+            edges: applied.changes.edges.1 as u32,
+            bytes_uploaded: applied.bytes_uploaded as f64,
+            grew: applied.grew,
+            node_capacity: node_capacity as u32,
+            edge_capacity: edge_capacity as u32,
+        })
+    }
+
+    /// What is shown now, for a status line and a legend, for a view made
+    /// from a result (`undefined` otherwise):
+    ///
+    /// ```js
+    /// { nodes, edges,                // shown
+    ///   hiddenNodes, hiddenEdges,    // removed, or at a removed node
+    ///   nodeSlots, edgeSlots,        // the next node's and edge's index
+    ///   size: { column, range },     // column null: by degree
+    ///   color: { column, entries: [{ category, label, color, count }], other, none } | null }
+    /// ```
+    ///
+    /// It follows every [`GraphView::apply_delta`]. Counted on the first
+    /// call after a delta, in time proportional to the graph, and kept.
+    pub fn info(&self) -> Result<JsValue, JsValue> {
+        match self.view.info() {
+            Some(info) => {
+                let json = serde_json::to_string(&info).map_err(js_err)?;
+                js_sys::JSON::parse(&json)
+            }
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
+
+    /// The result drawn, with every delta applied, as UGR; `undefined` for
+    /// a view not made from one.
+    #[wasm_bindgen(js_name = resultBytes)]
+    pub fn result_bytes(&self) -> Option<Vec<u8>> {
+        self.view.result().map(GraphResult::to_bytes)
+    }
+
     /// Draw these positions: `x` then `y`, one per node each, as
     /// [`Layout::positions`] gives them.
     #[wasm_bindgen(js_name = setPositions)]
@@ -475,6 +581,156 @@ impl GraphView {
             )));
         }
         Ok(())
+    }
+}
+
+/// What [`GraphView::apply_delta`] did.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaStats {
+    /// The node and edge slots there are now: the next node's and the next
+    /// edge's index. Hidden ones are counted ([`GraphView::info`] has the
+    /// shown).
+    pub nodes: u32,
+    pub edges: u32,
+    /// Bytes written to the GPU: 16 for a new node, 8 for an edge and for a
+    /// node restyled, 4 for a node whose flags changed, and the highlight
+    /// layer's instances.
+    #[wasm_bindgen(js_name = bytesUploaded)]
+    pub bytes_uploaded: f64,
+    /// Whether a buffer doubled to hold it: its contents were copied on the
+    /// GPU, not uploaded again.
+    pub grew: bool,
+    /// The nodes and edges the buffers have room for.
+    #[wasm_bindgen(js_name = nodeCapacity)]
+    pub node_capacity: u32,
+    #[wasm_bindgen(js_name = edgeCapacity)]
+    pub edge_capacity: u32,
+}
+
+/// The delta that undoes `bytes`, a delta as UGR: each op's inverse, in
+/// reverse order. It needs no result and no query.
+#[wasm_bindgen(js_name = invertDelta)]
+pub fn invert_delta(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let delta = GraphDelta::from_bytes(bytes).map_err(js_err)?;
+    Ok(delta.invert().to_bytes())
+}
+
+/// A result as UGR for a page with no engine (the demo, the tests): the
+/// graph of `n_nodes` nodes and the edges `(src[i], dst[i])`, its nodes of
+/// one label, `node`, keyed `0..n_nodes`, and its edges of one, `edge`.
+/// `xy` (`x` then `y`, one per node) gives it positions.
+#[wasm_bindgen(js_name = resultFromEdges)]
+pub fn result_from_edges(
+    n_nodes: u32,
+    src: Vec<u32>,
+    dst: Vec<u32>,
+    xy: Option<Vec<f32>>,
+) -> Result<Vec<u8>, JsValue> {
+    let n = n_nodes as usize;
+    let mut nodes = NodeBatch::of_label(0, 0..i64::from(n_nodes));
+    let mut ops = vec![
+        Op::AddNodeLabel(NodeLabel::new("node", KeyType::Int)),
+        Op::AddEdgeLabel("edge".into()),
+    ];
+    if let Some(xy) = xy {
+        if xy.len() != 2 * n {
+            return Err(js_err(format!(
+                "expected {} values (x then y); got {}",
+                2 * n,
+                xy.len()
+            )));
+        }
+        let positions = Positions {
+            x: xy[..n].to_vec(),
+            y: xy[n..].to_vec(),
+        };
+        // An empty result takes positions before its nodes do.
+        ops.push(Op::SetPositions {
+            old: None,
+            new: Some(Positions::default()),
+        });
+        nodes.positions = Some(positions);
+    }
+    ops.push(Op::AddNodes(nodes));
+    ops.push(Op::AddEdges(EdgeBatch::of_label(0, src, dst)));
+    GraphResult::build(None, Provenance::default(), &GraphDelta::new(ops))
+        .map(|r| r.to_bytes())
+        .map_err(js_err)
+}
+
+/// Builds a delta as UGR for a page with no engine (the demo, the tests),
+/// against a result of [`result_from_edges`]: its ops in the order they
+/// are added.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct DeltaBuilder {
+    ops: Vec<Op>,
+}
+
+#[wasm_bindgen]
+impl DeltaBuilder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `count` new nodes, keyed `first_key..first_key + count`: use the
+    /// result's node count, so the keys are new. `xy` (`x` then `y`) puts
+    /// them, for a result that has positions.
+    #[wasm_bindgen(js_name = addNodes)]
+    pub fn add_nodes(
+        mut self,
+        first_key: u32,
+        count: u32,
+        xy: Option<Vec<f32>>,
+    ) -> Result<DeltaBuilder, JsValue> {
+        let keys = i64::from(first_key)..i64::from(first_key) + i64::from(count);
+        let mut nodes = NodeBatch::of_label(0, keys);
+        if let Some(xy) = xy {
+            let n = count as usize;
+            if xy.len() != 2 * n {
+                return Err(js_err(format!(
+                    "expected {} values (x then y); got {}",
+                    2 * n,
+                    xy.len()
+                )));
+            }
+            nodes.positions = Some(Positions {
+                x: xy[..n].to_vec(),
+                y: xy[n..].to_vec(),
+            });
+        }
+        self.ops.push(Op::AddNodes(nodes));
+        Ok(self)
+    }
+
+    /// New edges, `(src[i], dst[i])` by node index.
+    #[wasm_bindgen(js_name = addEdges)]
+    pub fn add_edges(mut self, src: Vec<u32>, dst: Vec<u32>) -> DeltaBuilder {
+        self.ops
+            .push(Op::AddEdges(EdgeBatch::of_label(0, src, dst)));
+        self
+    }
+
+    /// Remove (hide) nodes, by index. They keep their slots.
+    #[wasm_bindgen(js_name = removeNodes)]
+    pub fn remove_nodes(mut self, nodes: Vec<u32>) -> DeltaBuilder {
+        self.ops.push(Op::RemoveNodes(nodes));
+        self
+    }
+
+    /// Remove edges, by index. They keep their slots.
+    #[wasm_bindgen(js_name = removeEdges)]
+    pub fn remove_edges(mut self, edges: Vec<u32>) -> DeltaBuilder {
+        self.ops.push(Op::RemoveEdges(edges));
+        self
+    }
+
+    /// The delta as UGR.
+    #[wasm_bindgen(js_name = toBytes)]
+    pub fn to_bytes(self) -> Vec<u8> {
+        GraphDelta::new(self.ops).to_bytes()
     }
 }
 

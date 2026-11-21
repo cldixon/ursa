@@ -102,6 +102,9 @@ pub struct HighlightState {
     drawn: Vec<u8>,
     /// `src, dst` per highlighted edge.
     edges: Vec<u32>,
+    /// The nodes from here on are new ([`HighlightState::resize`]): the
+    /// renderer has no flags for them yet.
+    unsent_from: usize,
 }
 
 impl HighlightState {
@@ -111,7 +114,31 @@ impl HighlightState {
             flags: vec![0; n_nodes],
             drawn: vec![0; n_nodes],
             edges: Vec::new(),
+            unsent_from: n_nodes,
         }
+    }
+
+    /// As many nodes as `n_nodes`: new ones at the end, unflagged, or the
+    /// last ones taken off, and with them the highlighted edges that name
+    /// them. The other nodes keep their flags. A new node's flags are
+    /// uploaded ([`HighlightState::take_dirty`]) whatever they are.
+    pub fn resize(&mut self, n_nodes: usize) {
+        if n_nodes < self.flags.len() {
+            let gone = |v: u32| v as usize >= n_nodes;
+            if self.edges.iter().any(|&v| gone(v)) {
+                let kept: Vec<u32> = self
+                    .edges
+                    .chunks_exact(2)
+                    .filter(|e| !gone(e[0]) && !gone(e[1]))
+                    .flatten()
+                    .copied()
+                    .collect();
+                self.edges = kept;
+            }
+        }
+        self.flags.resize(n_nodes, 0);
+        self.drawn.resize(n_nodes, 0);
+        self.unsent_from = self.unsent_from.min(n_nodes);
     }
 
     pub fn n_nodes(&self) -> usize {
@@ -329,8 +356,9 @@ impl HighlightState {
     /// selection is a few bytes and a new highlight a few writes.
     pub fn take_dirty(&mut self) -> Vec<Range<usize>> {
         let mut runs: Vec<Range<usize>> = Vec::new();
+        let unsent_from = std::mem::replace(&mut self.unsent_from, self.flags.len());
         for (i, (new, old)) in self.flags.iter().zip(&mut self.drawn).enumerate() {
-            if new == old {
+            if new == old && i < unsent_from {
                 continue;
             }
             *old = *new;
@@ -352,6 +380,33 @@ impl HighlightState {
 mod tests {
     use super::*;
     use crate::model::*;
+
+    #[test]
+    fn new_nodes_are_unflagged_and_uploaded_and_nodes_taken_off_take_their_edges() {
+        let mut h = HighlightState::new(4);
+        h.set_bits(flag::SELECTED, &[1], true).unwrap();
+        h.set_edges(&[0, 1, 2, 3]).unwrap();
+        assert_eq!(h.take_dirty(), vec![1..2]);
+
+        h.resize(6);
+        assert_eq!(h.flags(), [0, flag::SELECTED, 0, 0, 0, 0]);
+        // The renderer has nothing for the new slots: they are sent, though 0.
+        assert_eq!(h.take_dirty(), vec![4..6]);
+        assert!(h.take_dirty().is_empty());
+        h.set_bits(flag::PINNED, &[5], true).unwrap();
+        h.set_edges(&[0, 1, 4, 5, 2, 3]).unwrap();
+        assert_eq!(h.take_dirty(), vec![5..6]);
+
+        // Off again: the edge that named them goes, the others stay.
+        h.resize(4);
+        assert_eq!(h.flags(), [0, flag::SELECTED, 0, 0]);
+        assert_eq!(h.edges(), [0, 1, 2, 3]);
+        assert!(h.take_dirty().is_empty());
+        // The slots come back unflagged, and are sent again.
+        h.resize(5);
+        assert_eq!(h.flags()[4], 0);
+        assert_eq!(h.take_dirty(), vec![4..5]);
+    }
 
     #[test]
     fn the_themes_marks_stand_out_from_the_background() {

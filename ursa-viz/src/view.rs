@@ -11,9 +11,10 @@ use wasm_bindgen::JsCast;
 use ursa_core::algo::Fa2Params;
 
 use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
-use crate::model::GraphResult;
+use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
+use crate::model::{GraphDelta, GraphResult, ModelError, Op};
 use crate::render::{node_radius_scale, FrontNode, Renderer};
-use crate::scene::{bounds, Camera, Graph, LiveLayout, NodeStyle, Theme};
+use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Theme};
 
 pub struct View {
     graph: Graph,
@@ -43,6 +44,23 @@ pub struct View {
     fitted_zoom: f32,
     /// Draw nodes as well as edges.
     pub draw_nodes: bool,
+    /// The result drawn, for a view made from one ([`View::from_result`]):
+    /// what [`View::apply`] changes.
+    live: Option<LiveResult>,
+    /// The graph changed since the layout on this thread last saw it.
+    layout_stale: bool,
+}
+
+/// What [`View::apply`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// The slots the delta changed.
+    pub changes: Changes,
+    /// Bytes written to the GPU for it, everything counted: nodes, edges,
+    /// flags, and the highlight layer's instances.
+    pub bytes_uploaded: u64,
+    /// Whether a buffer grew to hold it (its contents copied on the GPU).
+    pub grew: bool,
 }
 
 impl View {
@@ -77,9 +95,209 @@ impl View {
             follow: true,
             fitted_zoom: 1.0,
             draw_nodes: true,
+            live: None,
+            layout_stale: false,
         };
         view.fit();
         view
+    }
+
+    /// A view of `result`: its nodes where it puts them (or where a layout
+    /// would start them), sized and coloured by its encodings (by degree,
+    /// without), its paths and seeds highlighted and its removed nodes
+    /// hidden. [`View::apply`] then changes it in place.
+    pub fn from_result(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        result: GraphResult,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let theme = Theme::light();
+        let (live, drawn) = LiveResult::new(result, &theme);
+        let Drawn {
+            graph,
+            x,
+            y,
+            style,
+            categories,
+            highlight,
+        } = drawn;
+        let lines = live.line_indices(0..graph.n_edges());
+        let renderer = Renderer::new(device, format, &x, &y, &style, &lines);
+        let mut view = Self {
+            graph,
+            layout: None,
+            x,
+            y,
+            style,
+            theme,
+            categories,
+            highlight,
+            front: Vec::new(),
+            camera: Camera::new(width as f32, height as f32),
+            renderer,
+            follow: true,
+            fitted_zoom: 1.0,
+            draw_nodes: true,
+            live: Some(live),
+            layout_stale: false,
+        };
+        view.upload_flags(device, queue, false);
+        view.fit();
+        view
+    }
+
+    /// The result drawn, with every delta applied, if the view was made
+    /// from one.
+    pub fn result(&self) -> Option<&GraphResult> {
+        self.live.as_ref().map(LiveResult::result)
+    }
+
+    /// What is shown, for a status line and a legend, if the view was made
+    /// from a result ([`LiveResult::info`]).
+    pub fn info(&self) -> Option<Info> {
+        self.live.as_ref().map(|live| live.info(&self.theme))
+    }
+
+    /// Apply a delta to the scene in place, in time proportional to the
+    /// delta: new nodes and edges are written after the ones there are (the
+    /// buffers grow by doubling), removed nodes are hidden by their flag
+    /// and removed edges by their slot, and only the styles that changed
+    /// are written. Undo is the inverse delta ([`GraphDelta::invert`]): no
+    /// index changes, and the frame after a delta and its inverse is the
+    /// frame before, bit for bit.
+    ///
+    /// The view must have been made from a result ([`View::from_result`]).
+    /// If the delta does not fit the result, nothing changes.
+    pub fn apply(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        delta: &GraphDelta,
+    ) -> Result<Applied, ModelError> {
+        self.apply_at(device, queue, delta, None)
+    }
+
+    /// [`View::apply`], and then draw every node at `positions` (`x` and
+    /// `y`, one per node after the delta): an undo, with the positions
+    /// saved before its step ([`View::positions`]).
+    pub fn apply_at(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        delta: &GraphDelta,
+        positions: Option<(&[f32], &[f32])>,
+    ) -> Result<Applied, ModelError> {
+        let Some(live) = self.live.as_mut() else {
+            return Err(ModelError(
+                "this view was not made from a result, so it has none to apply a delta to".into(),
+            ));
+        };
+        if let Some((x, y)) = positions {
+            let mut n = self.graph.n_nodes();
+            for op in &delta.ops {
+                match op {
+                    Op::AddNodes(batch) => n += batch.len(),
+                    Op::PopNodes(batch) => n = n.saturating_sub(batch.len()),
+                    _ => {}
+                }
+            }
+            if x.len() != n || y.len() != n {
+                return Err(ModelError(format!(
+                    "{} x and {} y positions for the {n} nodes there are after the delta",
+                    x.len(),
+                    y.len()
+                )));
+            }
+        }
+        let mut changes = live.apply(
+            delta,
+            &mut Parts {
+                graph: &mut self.graph,
+                x: &mut self.x,
+                y: &mut self.y,
+                style: &mut self.style,
+                categories: &mut self.categories,
+                highlight: &mut self.highlight,
+                theme: &self.theme,
+            },
+        )?;
+        if let Some((x, y)) = positions {
+            self.x.copy_from_slice(x);
+            self.y.copy_from_slice(y);
+            changes.positions = true;
+        }
+        let ((n0, n1), (m0, m1)) = (changes.nodes, changes.edges);
+        let grows = self.renderer.grows();
+        self.renderer.resize(device, queue, n1, m1);
+
+        let from = changes.new_nodes_from;
+        let (radius, color) = (&self.style.radius, &self.style.color);
+        let mut bytes = 0;
+        if changes.positions {
+            self.renderer.set_positions(queue, &self.x, &self.y);
+            bytes += 8 * n1 as u64;
+            bytes += self
+                .renderer
+                .write_styles(queue, from, &radius[from..], &color[from..]);
+        } else {
+            bytes += self.renderer.write_nodes(
+                queue,
+                from,
+                &self.x[from..],
+                &self.y[from..],
+                &radius[from..],
+                &color[from..],
+            );
+        }
+        for run in &changes.restyled {
+            bytes += self.renderer.write_styles(
+                queue,
+                run.start,
+                &radius[run.clone()],
+                &color[run.clone()],
+            );
+        }
+        let new_edges = changes.new_edges_from..m1;
+        let runs = std::iter::once(&new_edges).chain(&changes.edge_runs);
+        for run in runs {
+            let lines = live.line_indices(run.clone());
+            bytes += self.renderer.write_edges(queue, run.start, &lines);
+        }
+        // The highlight layer holds positions, radii and colours of its own.
+        let layer =
+            changes.positions || changes.highlights || !changes.restyled.is_empty() || n1 < n0;
+        bytes += self.upload_flags(device, queue, layer);
+
+        if (n0, m0) != (n1, m1) {
+            self.layout_stale = true;
+        }
+        if self.follow && (n0 != n1 || changes.positions) {
+            self.fit_camera();
+        }
+        Ok(Applied {
+            changes,
+            bytes_uploaded: bytes,
+            grew: self.renderer.grows() != grows,
+        })
+    }
+
+    /// Upload the flags that changed and, if they did or `layer` says so,
+    /// the highlight layer's instances. Returns the bytes written.
+    fn upload_flags(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layer: bool) -> u64 {
+        let uploaded = |r: &Renderer| {
+            r.flag_bytes_uploaded() + r.highlight_bytes_uploaded() + r.front_bytes_uploaded()
+        };
+        let before = uploaded(&self.renderer);
+        let dirty = self.highlight.take_dirty();
+        self.renderer.set_flags(queue, &self.highlight, &dirty);
+        if layer || !dirty.is_empty() {
+            self.front = self.highlight.front_nodes().collect();
+            self.upload_highlight(device, queue, true, true);
+        }
+        uploaded(&self.renderer) - before
     }
 
     pub fn graph(&self) -> &Graph {
@@ -113,6 +331,19 @@ impl View {
             return;
         }
         let graph = &self.graph;
+        if std::mem::take(&mut self.layout_stale) {
+            // The graph changed under the layout ([`View::apply`]): grow it,
+            // or, if nodes went, start again from what is drawn.
+            if let Some(mut layout) = self.layout.take() {
+                let fits = layout.positions().0.len() <= graph.n_nodes();
+                self.layout = if fits && layout.grow(graph, Growth::default()).is_ok() {
+                    Some(layout)
+                } else {
+                    let (x, y) = (self.x.clone(), self.y.clone());
+                    LiveLayout::from_positions(graph, Fa2Params::default(), x, y).ok()
+                };
+            }
+        }
         let layout = self
             .layout
             .get_or_insert_with(|| LiveLayout::new(graph, Fa2Params::default()));
