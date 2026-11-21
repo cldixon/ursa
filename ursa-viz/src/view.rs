@@ -12,7 +12,7 @@ use ursa_core::algo::Fa2Params;
 
 use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
 use crate::model::GraphResult;
-use crate::render::{node_radius_scale, Renderer};
+use crate::render::{node_radius_scale, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, LiveLayout, NodeStyle, Theme};
 
 pub struct View {
@@ -32,6 +32,8 @@ pub struct View {
     categories: Option<Vec<u32>>,
     /// Each node's flags, and the highlighted edges.
     highlight: HighlightState,
+    /// The nodes drawn in front ([`flag::FRONT`], and not hidden), in order.
+    front: Vec<u32>,
     camera: Camera,
     renderer: Renderer,
     /// Fit the camera to the layout as it moves, until the user pans or zooms.
@@ -69,6 +71,7 @@ impl View {
             theme: Theme::light(),
             categories: None,
             highlight,
+            front: Vec::new(),
             camera: Camera::new(width as f32, height as f32),
             renderer,
             follow: true,
@@ -105,7 +108,7 @@ impl View {
     }
 
     /// Run `iterations` more layout iterations and upload the new positions.
-    pub fn step(&mut self, queue: &wgpu::Queue, iterations: u32) {
+    pub fn step(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, iterations: u32) {
         if iterations == 0 {
             return;
         }
@@ -117,26 +120,28 @@ impl View {
         let (x, y) = layout.positions();
         self.x.copy_from_slice(x);
         self.y.copy_from_slice(y);
-        self.upload(queue);
+        self.upload(device, queue);
     }
 
     /// Draw these positions (one per node), from a layout run elsewhere.
-    pub fn set_positions(&mut self, queue: &wgpu::Queue, x: &[f32], y: &[f32]) {
+    pub fn set_positions(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        x: &[f32],
+        y: &[f32],
+    ) {
         assert_eq!(x.len(), self.graph.n_nodes());
         assert_eq!(y.len(), self.graph.n_nodes());
         self.x.copy_from_slice(x);
         self.y.copy_from_slice(y);
-        self.upload(queue);
+        self.upload(device, queue);
     }
 
-    fn upload(&mut self, queue: &wgpu::Queue) {
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.renderer.set_positions(queue, &self.x, &self.y);
-        // The highlighted edges hold their ends' positions. They fit the
-        // buffer they are in: only a new set of edges can grow it.
-        if !self.highlight.edges().is_empty() {
-            self.renderer
-                .write_highlight_edges(queue, &self.highlight_ends());
-        }
+        // The highlighted edges and the nodes in front hold positions.
+        self.upload_highlight(device, queue, true, true);
         if self.follow {
             self.fit_camera();
         }
@@ -148,9 +153,10 @@ impl View {
     }
 
     /// Change the flags or the highlighted edges, and upload what changed:
-    /// the flags of the nodes that changed (four bytes each), and the
-    /// highlighted edges (16 bytes each). The graph's edges, positions and
-    /// styles are not uploaded. On an error nothing changes.
+    /// the flags of the nodes that changed (four bytes each), the
+    /// highlighted edges (16 bytes each) and the nodes in front (20 bytes
+    /// each). The graph's edges, positions and styles are not uploaded. On
+    /// an error nothing changes.
     pub fn set_highlight(
         &mut self,
         device: &wgpu::Device,
@@ -159,17 +165,51 @@ impl View {
     ) -> Result<(), BadHighlight> {
         let mut next = self.highlight.clone();
         change(&mut next)?;
+        let flags_changed = next.flags() != self.highlight.flags();
+        // Hiding a node takes its highlighted edges with it.
         let edges_changed = next.edges() != self.highlight.edges()
-            || (next.any_hidden() || self.highlight.any_hidden())
-                && next.flags() != self.highlight.flags();
+            || flags_changed && (next.any_hidden() || self.highlight.any_hidden());
         self.highlight = next;
         let dirty = self.highlight.take_dirty();
         self.renderer.set_flags(queue, &self.highlight, &dirty);
-        if edges_changed {
-            self.renderer
-                .set_highlight_edges(device, queue, &self.highlight_ends());
+        if flags_changed {
+            self.front = self.highlight.front_nodes().collect();
         }
+        self.upload_highlight(device, queue, edges_changed, flags_changed);
         Ok(())
+    }
+
+    /// Write the highlighted edges, the nodes in front, or both, as they
+    /// are now. Nothing is written for a set that was and stays empty.
+    fn upload_highlight(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        edges: bool,
+        front: bool,
+    ) {
+        if edges && !(self.highlight.edges().is_empty() && self.renderer.highlight_edges() == 0) {
+            let ends = self.highlight_ends();
+            self.renderer.set_highlight_edges(device, queue, &ends);
+        }
+        if front && !(self.front.is_empty() && self.renderer.front_nodes() == 0) {
+            let flags = self.highlight.flags();
+            let nodes: Vec<FrontNode> = self
+                .front
+                .iter()
+                .map(|&i| {
+                    let i = i as usize;
+                    FrontNode::new(
+                        self.x[i],
+                        self.y[i],
+                        self.style.radius[i],
+                        self.style.color[i],
+                        flags[i],
+                    )
+                })
+                .collect();
+            self.renderer.set_front_nodes(device, queue, &nodes);
+        }
     }
 
     /// The highlight and the hidden nodes of `result`
@@ -212,11 +252,13 @@ impl View {
         self.camera.to_pixel(self.x[i], self.y[i])
     }
 
-    pub fn set_style(&mut self, queue: &wgpu::Queue, style: NodeStyle) {
+    pub fn set_style(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, style: NodeStyle) {
         assert_eq!(style.radius.len(), self.graph.n_nodes());
         assert_eq!(style.color.len(), self.graph.n_nodes());
         self.renderer.set_style(queue, &style);
         self.style = style;
+        // The nodes in front hold their radius and colour.
+        self.upload_highlight(device, queue, false, true);
     }
 
     pub fn style(&self) -> &NodeStyle {
@@ -229,29 +271,34 @@ impl View {
 
     /// Colour nodes by category, one per node, with the theme's palette;
     /// `None` draws every node in the theme's node colour.
-    pub fn color_by(&mut self, queue: &wgpu::Queue, categories: Option<Vec<u32>>) {
+    pub fn color_by(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        categories: Option<Vec<u32>>,
+    ) {
         if let Some(c) = &categories {
             assert_eq!(c.len(), self.graph.n_nodes());
         }
         self.categories = categories;
-        self.recolor(queue);
+        self.recolor(device, queue);
     }
 
     /// Draw with `theme`: its background, edge ink and highlight colours,
     /// and node colours from its palette (or its node colour).
-    pub fn set_theme(&mut self, queue: &wgpu::Queue, theme: Theme) {
+    pub fn set_theme(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, theme: Theme) {
         self.renderer.set_theme(&theme);
         self.theme = theme;
-        self.recolor(queue);
+        self.recolor(device, queue);
     }
 
-    fn recolor(&mut self, queue: &wgpu::Queue) {
+    fn recolor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut style = self.style.clone();
         style.color = match &self.categories {
             Some(c) => self.theme.colors(c),
             None => vec![self.theme.node; self.graph.n_nodes()],
         };
-        self.set_style(queue, style);
+        self.set_style(device, queue, style);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

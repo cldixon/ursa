@@ -12,7 +12,7 @@
 //! - **Highlighted edges** are instanced quads too, one per edge, a width in
 //!   pixels wide with round ends, in the theme's highlight colour.
 //! - **Nodes in front** (selected, hovered, highlighted, a route's end): the
-//!   node pipeline again, for those nodes alone.
+//!   node shader again, over a small buffer of those nodes alone.
 //!
 //! While a highlight is set, the edges and the nodes not in front draw at
 //! the dim level (one uniform): the edges' ink that much fainter, the nodes
@@ -23,10 +23,12 @@
 //! of their own (four bytes a node, the flags byte first: a vertex buffer's
 //! stride is a multiple of four), so a selection uploads a few bytes and
 //! never the styles. A highlighted edge is its two ends' positions (16
+//! bytes) and a node in front its position, radius, colour and flags (20
 //! bytes), gathered again when the positions change: an instance cannot
-//! index the position buffers, and WebGL2 has no storage buffer or texture
-//! fetch cheap enough to stand in. Everything is a vertex or index buffer,
-//! never a storage buffer.
+//! index the position buffers, and WebGL2 has no storage buffer to stand
+//! in. They are few, so a frame with a highlight draws a few more
+//! instances, not every node twice. Everything is a vertex or index
+//! buffer, never a storage buffer.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -353,19 +355,16 @@ pub struct Renderer {
     flags: wgpu::Buffer,
     lines: wgpu::Buffer,
     /// The highlighted edges: each its two ends' positions.
-    wide: wgpu::Buffer,
-    /// How many highlighted edges `wide` has room for, and how many it holds.
-    wide_capacity: u32,
-    n_wide: u32,
+    wide: Instances,
+    /// The nodes in front, each a [`FrontNode`].
+    front: Instances,
     n_nodes: u32,
     n_indices: u32,
     /// What the flags ask of a frame ([`Renderer::set_flags`]).
     dims_the_rest: bool,
-    any_front: bool,
     any_hidden: bool,
-    /// Bytes of flags and of highlighted edges written to the GPU so far.
+    /// Bytes of flags written to the GPU so far.
     flag_bytes_uploaded: u64,
-    highlight_bytes_uploaded: u64,
     /// The background, white unless set.
     pub background: wgpu::Color,
     /// The edges' ink, `0xRRGGBBAA` (grey unless set; see [`crate::scene::Theme`]).
@@ -420,18 +419,91 @@ fn buffer(
     })
 }
 
-/// A buffer for `capacity` highlighted edges, 16 bytes each.
-fn wide_buffer(device: &wgpu::Device, capacity: u32) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("highlighted edges"),
-        size: u64::from(capacity) * WIDE_STRIDE,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
 /// A highlighted edge on the GPU: `x, y` of each end.
 const WIDE_STRIDE: u64 = 16;
+const FRONT_STRIDE: u64 = std::mem::size_of::<FrontNode>() as u64;
+
+/// A node in front, as its own pass reads it: what the node pipeline reads
+/// from five buffers, in one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct FrontNode {
+    pub x: f32,
+    pub y: f32,
+    /// In pixels, before the view's shrinking.
+    pub radius: f32,
+    /// R, G, B, A.
+    pub color: [u8; 4],
+    /// The flags byte, then three unused.
+    pub flags: [u8; 4],
+}
+
+impl FrontNode {
+    pub fn new(x: f32, y: f32, radius: f32, color: u32, flags: u8) -> Self {
+        Self {
+            x,
+            y,
+            radius,
+            color: color.to_be_bytes(),
+            flags: [flags, 0, 0, 0],
+        }
+    }
+}
+
+/// A small instance buffer that is rewritten whole: the highlighted edges,
+/// or the nodes in front. It grows by doubling.
+struct Instances {
+    label: &'static str,
+    buffer: wgpu::Buffer,
+    stride: u64,
+    capacity: u32,
+    len: u32,
+    bytes_uploaded: u64,
+}
+
+impl Instances {
+    fn new(device: &wgpu::Device, label: &'static str, stride: u64) -> Self {
+        let capacity = 16;
+        Self {
+            label,
+            buffer: Self::buffer(device, label, stride, capacity),
+            stride,
+            capacity,
+            len: 0,
+            bytes_uploaded: 0,
+        }
+    }
+
+    fn buffer(device: &wgpu::Device, label: &str, stride: u64, capacity: u32) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: u64::from(capacity) * stride,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Hold exactly these instances.
+    fn set<T: Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[T]) {
+        debug_assert_eq!(std::mem::size_of::<T>() as u64, self.stride);
+        let n = instances.len() as u32;
+        if n > self.capacity {
+            self.capacity = n.next_power_of_two();
+            self.buffer = Self::buffer(device, self.label, self.stride, self.capacity);
+        }
+        self.len = n;
+        if n > 0 {
+            let bytes: &[u8] = bytemuck::cast_slice(instances);
+            queue.write_buffer(&self.buffer, 0, bytes);
+            self.bytes_uploaded += bytes.len() as u64;
+        }
+    }
+
+    /// The part of the buffer that holds instances.
+    fn slice(&self) -> wgpu::BufferSlice<'_> {
+        self.buffer.slice(..u64::from(self.len) * self.stride)
+    }
+}
 
 impl Renderer {
     /// Pipelines for drawing into textures of `format`, and buffers for a
@@ -565,12 +637,30 @@ impl Renderer {
             per(&node_flags, instance),
         ];
         let nodes = pipeline("nodes", "node_vs", "node_fs", triangles, &node_buffers);
+        // The same attributes, from one buffer of `FrontNode`s.
+        let front_attr = |format, offset, shader_location| wgpu::VertexAttribute {
+            format,
+            offset,
+            shader_location,
+        };
+        let front_attrs = [
+            front_attr(float, 0, 0),
+            front_attr(float, 4, 1),
+            front_attr(float, 8, 2),
+            front_attr(wgpu::VertexFormat::Unorm8x4, 12, 3),
+            front_attr(wgpu::VertexFormat::Uint8x4, 16, 4),
+        ];
+        let front_buffers = [wgpu::VertexBufferLayout {
+            array_stride: FRONT_STRIDE,
+            step_mode: instance,
+            attributes: &front_attrs,
+        }];
         let front_nodes = pipeline(
             "nodes in front",
             "front_node_vs",
             "node_fs",
             triangles,
-            &node_buffers,
+            &front_buffers,
         );
         let wide_attrs = [
             wgpu::VertexAttribute {
@@ -598,7 +688,6 @@ impl Renderer {
         );
         let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
         let theme = Theme::light();
-        let wide_capacity = 16;
         Self {
             edges,
             hiding_edges,
@@ -618,16 +707,13 @@ impl Renderer {
                 bytemuck::cast_slice(line_indices),
                 wgpu::BufferUsages::INDEX,
             ),
-            wide: wide_buffer(device, wide_capacity),
-            wide_capacity,
-            n_wide: 0,
+            wide: Instances::new(device, "highlighted edges", WIDE_STRIDE),
+            front: Instances::new(device, "nodes in front", FRONT_STRIDE),
             n_nodes: n_nodes as u32,
             n_indices: line_indices.len() as u32,
             dims_the_rest: false,
-            any_front: false,
             any_hidden: false,
             flag_bytes_uploaded: 0,
-            highlight_bytes_uploaded: 0,
             background: wgpu::Color::WHITE,
             edge_color: theme.edge,
             highlight_color: theme.highlight,
@@ -675,8 +761,8 @@ impl Renderer {
 
     /// Upload the flags of the nodes in `dirty` (see
     /// [`HighlightState::take_dirty`]), four bytes a node, and note what
-    /// `highlight` asks of a frame: whether the rest is dimmed, whether any
-    /// node is in front, whether any is hidden. Nothing else is uploaded.
+    /// `highlight` asks of a frame: whether the rest is dimmed, and whether
+    /// any node is hidden. Nothing else is uploaded.
     ///
     /// [`HighlightState::take_dirty`]: crate::highlight::HighlightState::take_dirty
     pub fn set_flags(
@@ -692,37 +778,42 @@ impl Renderer {
             self.flag_bytes_uploaded += bytes.len() as u64;
         }
         self.dims_the_rest = highlight.dims_the_rest();
-        self.any_front = highlight.any_front();
         self.any_hidden = highlight.any_hidden();
     }
 
-    /// Draw these highlighted edges: each `[x, y, x, y]`, its two ends. The
-    /// buffer grows by doubling; the graph's own edges are never touched.
+    /// Draw these highlighted edges: each `[x, y, x, y]`, its two ends, 16
+    /// bytes. Call it again when the positions change. The buffer grows by
+    /// doubling; the graph's own edges are never touched.
     pub fn set_highlight_edges(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         ends: &[[f32; 4]],
     ) {
-        let n = ends.len() as u32;
-        if n > self.wide_capacity {
-            self.wide_capacity = n.next_power_of_two();
-            self.wide = wide_buffer(device, self.wide_capacity);
-        }
-        self.n_wide = n;
-        self.write_highlight_edges(queue, ends);
+        self.wide.set(device, queue, ends);
     }
 
-    /// The same highlighted edges at new positions: as many as were last
-    /// set ([`Renderer::set_highlight_edges`]).
-    pub fn write_highlight_edges(&mut self, queue: &wgpu::Queue, ends: &[[f32; 4]]) {
-        assert_eq!(ends.len() as u32, self.n_wide, "set the edges first");
-        if ends.is_empty() {
-            return;
-        }
-        let bytes: &[u8] = bytemuck::cast_slice(ends);
-        queue.write_buffer(&self.wide, 0, bytes);
-        self.highlight_bytes_uploaded += bytes.len() as u64;
+    /// Draw these nodes in front, over the highlighted edges: the nodes
+    /// flagged [`crate::highlight::flag::FRONT`], 20 bytes each. Call it
+    /// again when their positions, styles or flags change. The pass over
+    /// every node leaves them out by their flags.
+    pub fn set_front_nodes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nodes: &[FrontNode],
+    ) {
+        self.front.set(device, queue, nodes);
+    }
+
+    /// How many highlighted edges are drawn.
+    pub fn highlight_edges(&self) -> u32 {
+        self.wide.len
+    }
+
+    /// How many nodes are drawn in front.
+    pub fn front_nodes(&self) -> u32 {
+        self.front.len
     }
 
     /// Bytes of flags written to the GPU so far.
@@ -732,7 +823,12 @@ impl Renderer {
 
     /// Bytes of highlighted edges written to the GPU so far.
     pub fn highlight_bytes_uploaded(&self) -> u64 {
-        self.highlight_bytes_uploaded
+        self.wide.bytes_uploaded
+    }
+
+    /// Bytes of nodes in front written to the GPU so far.
+    pub fn front_bytes_uploaded(&self) -> u64 {
+        self.front.bytes_uploaded
     }
 
     /// Draw the scene into `target` as `camera` sees it.
@@ -808,28 +904,24 @@ impl Renderer {
                 pass.set_index_buffer(self.lines.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.n_indices, 0, 0..1);
             }
-            let draw_nodes = draw_nodes && self.n_nodes > 0;
-            let bind_nodes = |pass: &mut wgpu::RenderPass| {
+            if draw_nodes && self.n_nodes > 0 {
+                pass.set_pipeline(&self.nodes);
                 pass.set_vertex_buffer(0, self.x.slice(..));
                 pass.set_vertex_buffer(1, self.y.slice(..));
                 pass.set_vertex_buffer(2, self.radius.slice(..));
                 pass.set_vertex_buffer(3, self.color.slice(..));
                 pass.set_vertex_buffer(4, self.flags.slice(..));
-            };
-            if draw_nodes {
-                pass.set_pipeline(&self.nodes);
-                bind_nodes(&mut pass);
                 pass.draw(0..6, 0..self.n_nodes);
             }
-            if self.n_wide > 0 {
+            if self.wide.len > 0 {
                 pass.set_pipeline(&self.wide_edges);
-                pass.set_vertex_buffer(0, self.wide.slice(..u64::from(self.n_wide) * WIDE_STRIDE));
-                pass.draw(0..6, 0..self.n_wide);
+                pass.set_vertex_buffer(0, self.wide.slice());
+                pass.draw(0..6, 0..self.wide.len);
             }
-            if draw_nodes && self.any_front {
+            if draw_nodes && self.front.len > 0 {
                 pass.set_pipeline(&self.front_nodes);
-                bind_nodes(&mut pass);
-                pass.draw(0..6, 0..self.n_nodes);
+                pass.set_vertex_buffer(0, self.front.slice());
+                pass.draw(0..6, 0..self.front.len);
             }
         }
         queue.submit([encoder.finish()]);
@@ -896,6 +988,15 @@ mod tests {
         ] {
             assert!(names.contains(&name), "{name} is missing from {names:?}");
         }
+    }
+
+    #[test]
+    fn a_node_in_front_is_twenty_bytes_laid_out_as_its_pipeline_reads_them() {
+        assert_eq!(FRONT_STRIDE, 20);
+        let node = FrontNode::new(1.0, 2.0, 3.0, 0x11223344, 0x50);
+        let bytes: &[u8] = bytemuck::bytes_of(&node);
+        assert_eq!(&bytes[8..12], &3.0f32.to_ne_bytes());
+        assert_eq!(&bytes[12..], &[0x11, 0x22, 0x33, 0x44, 0x50, 0, 0, 0]);
     }
 
     #[test]

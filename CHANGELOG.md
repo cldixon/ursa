@@ -385,6 +385,30 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **A highlight layer in the graph view** (#435): a path, a selection or a
+  hover can be seen. `ursa-viz` keeps a flags byte per node (selected,
+  hovered, pinned, dimmed, highlighted, hidden, seed) in a buffer of its
+  own, and draws from it: a halo on highlighted nodes, a ring on a route's
+  ends and on seeds, rings for the selection, the hover and pins, and
+  nothing for a hidden node or its edges. Highlighted edges are instanced
+  quads, 3 px wide with round ends, over the line list. While a highlight is
+  set, everything else draws at 35%. `GraphView` gains `setHighlights`
+  (UGR's path and seed sections), `clearHighlights`, `setSelection`,
+  `setHovered`, `setPinned`, `setHidden`, `setFlags`, `flags`,
+  `setHighlightEdges`, `nodePixel` and the `NodeFlag` bits; in Rust,
+  `ursa_viz::highlight::HighlightState` (no GPU) and
+  `View::set_result_highlights`, which reads a `GraphResult`'s highlights
+  and removed nodes. `Theme` and `setTheme` gain `highlight`, `selection`
+  and `pin`, at least 3:1 against the background in both built-in themes,
+  and the shell's stylesheet the matching `--graph-highlight`,
+  `--graph-selection` and `--graph-pin` tokens. It is all vertex buffers, so
+  it draws on WebGL2 as on WebGPU. Setting a highlight uploads the flags
+  that changed and 16 to 20 bytes for each highlighted edge and node, never
+  the graph's edges; a selection of one node uploads 24 bytes. At 1M edges
+  a frame with a path highlighted costs within 3% of one without
+  (`ursa-viz/BENCH.md`). The shell does not drive the layer yet. `View`'s
+  methods that upload (`step`, `set_positions`, `set_style`, `color_by`,
+  `set_theme`) now take the device as well as the queue.
 - **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
   in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
   to 1M edges, under WebGPU and WebGL2, and records time to first frame and

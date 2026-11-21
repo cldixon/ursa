@@ -16,7 +16,7 @@
 // a 3-pixel line in the highlight colour with its nodes at full strength and
 // everything else at 35%; a route's ends and a selected node carry their
 // rings; a hidden node and its edges are gone; and a selection of one node
-// uploads four bytes. ONLY=highlight runs these alone.
+// uploads 24 bytes. ONLY=highlight runs these alone.
 import { chromium } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -284,13 +284,15 @@ if (HIGHLIGHT_CASES.length) {
           if (!(out.halo > 0.15 && out.halo < 0.6)) problem(`the halo of path node ${i} is ${out.halo} of the highlight colour 2 px out, not about a third`);
         }
 
-        // 5. A selection of one node: four bytes, a ring in the selection
+        // 5. A selection of one node: a few bytes, a ring in the selection
         // colour, and nothing dimmed by it.
         view.clearHighlights();
         const lone = [...Array(n).keys()].filter((i) => !onPath.has(i)).sort((a, b) => nearNode(at_node[b], [b]) - nearNode(at_node[a], [a]))[0];
-        const bytes0 = view.flagBytesUploaded;
+        // Everything it uploads: its flags, and the node again to draw in front.
+        const uploaded = () => view.flagBytesUploaded + view.highlightBytesUploaded;
+        const bytes0 = uploaded();
         view.setSelection(Uint32Array.of(lone));
-        out.selectionBytes = view.flagBytesUploaded - bytes0;
+        out.selectionBytes = uploaded() - bytes0;
         out.nodes = n;
         const selected = await frame("selected");
         {
@@ -355,14 +357,16 @@ if (HIGHLIGHT_CASES.length) {
     ).catch((e) => ({ problems: [String(e)], pngs: {} }));
     for (const p of r.problems) fail(p);
     if (r.backend && r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
-    // The runs of nodes the path changed, 4 bytes a node, and five edges of 16.
+    // The runs of nodes the path changed, 4 bytes a node; then five edges
+    // of 16 bytes and six nodes in front of 20.
     if (!(r.flagBytes > 0 && r.flagBytes <= 4 * r.nodes)) fail(`highlighting the path uploaded ${r.flagBytes} bytes of flags`);
-    if (r.edgeBytes !== 16 * (PATH.length - 1)) fail(`highlighting the path uploaded ${r.edgeBytes} bytes of highlighted edges, not ${16 * (PATH.length - 1)}`);
+    const instanceBytes = 16 * (PATH.length - 1) + 20 * PATH.length;
+    if (r.edgeBytes !== instanceBytes) fail(`highlighting the path uploaded ${r.edgeBytes} bytes of edges and nodes in front, not ${instanceBytes}`);
     if (!(r.selectionBytes > 0 && r.selectionBytes <= r.nodes)) fail(`selecting one node uploaded ${r.selectionBytes} bytes; at most ${r.nodes} (one a node) are allowed`);
     if (shots) for (const [tag, png] of Object.entries(r.pngs as Record<string, string>)) await Bun.write(`${shots}/viz-highlight-${themeName}-${tag}.png`, Buffer.from(png.split(",")[1], "base64"));
     console.log(
       `${name}: ${r.backend} · path widths ${r.widths?.join(", ")} px · ${r.dimmedNodes} other nodes at 35% · other edges at ${r.edgeDim} (${r.edgesChecked} checked) · ` +
-        `flags ${r.flagBytes} B and edges ${r.edgeBytes} B for the path · ${r.selectionBytes} B for a selection of one of ${r.nodes} nodes · hidden node's edges gone ${r.hiddenEdges}`,
+        `flags ${r.flagBytes} B and instances ${r.edgeBytes} B for the path · ${r.selectionBytes} B for a selection of one of ${r.nodes} nodes · hidden node's edges gone ${r.hiddenEdges}`,
     );
     await page.close();
   }

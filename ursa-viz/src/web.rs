@@ -151,7 +151,7 @@ impl GraphView {
 
     /// Run `iterations` more layout iterations.
     pub fn step(&mut self, iterations: u32) {
-        self.view.step(&self.queue, iterations);
+        self.view.step(&self.device, &self.queue, iterations);
     }
 
     /// Draw a frame.
@@ -222,7 +222,7 @@ impl GraphView {
         self.check_len(values.len())?;
         let mut style = self.view.style().clone();
         style.radius = NodeStyle::sizes_from(&values, min_px, max_px);
-        self.view.set_style(&self.queue, style);
+        self.view.set_style(&self.device, &self.queue, style);
         Ok(())
     }
 
@@ -232,7 +232,8 @@ impl GraphView {
     #[wasm_bindgen(js_name = colorBy)]
     pub fn color_by(&mut self, categories: Vec<u32>) -> Result<(), JsValue> {
         self.check_len(categories.len())?;
-        self.view.color_by(&self.queue, Some(categories));
+        self.view
+            .color_by(&self.device, &self.queue, Some(categories));
         Ok(())
     }
 
@@ -285,7 +286,7 @@ impl GraphView {
                 .map(|c| color("palette", c))
                 .collect::<Result<_, _>>()?;
         }
-        self.view.set_theme(&self.queue, next);
+        self.view.set_theme(&self.device, &self.queue, next);
         Ok(())
     }
 
@@ -303,7 +304,7 @@ impl GraphView {
                 )))
             }
         };
-        self.view.set_theme(&self.queue, theme);
+        self.view.set_theme(&self.device, &self.queue, theme);
         Ok(())
     }
 
@@ -412,11 +413,14 @@ impl GraphView {
         self.view.renderer().flag_bytes_uploaded() as f64
     }
 
-    /// Bytes of highlighted edges written to the GPU so far: 16 for each
-    /// edge, each time the edges or the positions change.
+    /// Bytes of the highlight layer's own instances written to the GPU so
+    /// far: 16 for each highlighted edge and 20 for each node drawn in
+    /// front (selected, hovered, highlighted or a seed), each time they or
+    /// the positions change.
     #[wasm_bindgen(getter, js_name = highlightBytesUploaded)]
     pub fn highlight_bytes_uploaded(&self) -> f64 {
-        self.view.renderer().highlight_bytes_uploaded() as f64
+        let renderer = self.view.renderer();
+        (renderer.highlight_bytes_uploaded() + renderer.front_bytes_uploaded()) as f64
     }
 
     /// Where node `node` is drawn: `[x, y]` in canvas pixels from the top
@@ -452,7 +456,8 @@ impl GraphView {
                 xy.len()
             )));
         }
-        self.view.set_positions(&self.queue, &xy[..n], &xy[n..]);
+        self.view
+            .set_positions(&self.device, &self.queue, &xy[..n], &xy[n..]);
         Ok(())
     }
 

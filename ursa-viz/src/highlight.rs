@@ -55,7 +55,7 @@ pub const MARK_REACH: f32 = 8.0;
 /// Changed nodes closer than this are uploaded as one run.
 const MERGE_GAP: usize = 8;
 /// More runs than this are uploaded as one, from the first to the last.
-const MAX_RUNS: usize = 64;
+const MAX_RUNS: usize = 1024;
 
 /// Why a highlight could not be set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +153,16 @@ impl HighlightState {
     /// Whether any node is drawn in front ([`flag::FRONT`]).
     pub fn any_front(&self) -> bool {
         self.any(flag::FRONT)
+    }
+
+    /// The nodes drawn in front: flagged [`flag::FRONT`] and not hidden, in
+    /// index order.
+    pub fn front_nodes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.flags
+            .iter()
+            .enumerate()
+            .filter(|(_, &f)| f & flag::FRONT != 0 && f & flag::HIDDEN == 0)
+            .map(|(i, _)| i as u32)
     }
 
     /// Whether any node is hidden, so its edges must be too.
@@ -384,6 +394,12 @@ mod tests {
         h.set_only(flag::SELECTED, &[3]).unwrap();
         assert_eq!(h.take_dirty(), vec![3..4, 700..701]);
         assert!(h.any_front());
+        assert_eq!(h.front_nodes().collect::<Vec<_>>(), vec![3]);
+        // Hidden, it is not drawn in front either.
+        h.set_bits(flag::HIDDEN, &[3], true).unwrap();
+        assert_eq!(h.front_nodes().count(), 0);
+        h.set_bits(flag::HIDDEN, &[3], false).unwrap();
+        h.take_dirty();
         // A selection alone does not dim the rest.
         assert!(!h.dims_the_rest());
     }
@@ -393,9 +409,15 @@ mod tests {
         let mut h = HighlightState::new(10_000);
         h.set_bits(flag::PINNED, &[10, 14, 40], true).unwrap();
         assert_eq!(h.take_dirty(), vec![10..15, 40..41]);
-        let scattered: Vec<u32> = (0..100).map(|i| i * 100).collect();
+        // A path's worth of scattered nodes is still a write each.
+        let mut h = HighlightState::new(1_000_000);
+        let path: Vec<u32> = (0..100).map(|i| i * 10_000).collect();
+        h.set_bits(flag::HIGHLIGHTED, &path, true).unwrap();
+        assert_eq!(h.take_dirty().len(), 100);
+        // Thousands are one write, from the first to the last.
+        let scattered: Vec<u32> = (0..2000).map(|i| i * 500).collect();
         h.set_bits(flag::PINNED, &scattered, true).unwrap();
-        assert_eq!(h.take_dirty(), vec![0..9901]);
+        assert_eq!(h.take_dirty(), vec![0..999_501]);
     }
 
     #[test]
