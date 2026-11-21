@@ -1,21 +1,27 @@
-//! Louvain's memory on a large R-MAT graph (#352).
+//! Louvain's memory and time on a large graph (#352, #387).
 //!
-//! Builds one R-MAT edge list over its own nodes, runs Louvain on it once,
-//! unweighted or (with `--weighted`) with inexact per-edge weights, and prints
-//! the run's wall time, the peak heap it allocated above what the topology
-//! already held, and a fingerprint of its result: the community count, the
-//! modularity (and its bits) and a hash of the labels, so two builds can be
-//! checked to agree bit for bit. Run it under `/usr/bin/time -v` for the
-//! process's peak RSS.
+//! Builds one edge list over its own nodes, runs Louvain on it once,
+//! unweighted or (with `--weighted`) with inexact per-edge weights, serial or
+//! (with `--parallel`) with local moving in parallel sub-rounds, and prints
+//! the run's wall time and CPU time, the peak heap it allocated above what the
+//! topology already held, and a fingerprint of its result: the community
+//! count, the modularity (and its bits) and a hash of the labels, so two
+//! builds (or thread counts) can be checked to agree bit for bit. Run it under
+//! `/usr/bin/time -v` for the process's peak RSS, and set `RAYON_NUM_THREADS`
+//! to vary the thread count.
 //!
 //! ```text
 //! cargo run --release -p ursa-core --example louvain_memory -- \
-//!     --edges 40000000 [--weighted]
+//!     --edges 40000000 [--weighted] [--parallel] [--planted 30]
 //! ```
 //!
-//! The R-MAT edges are those of the Graph500 generator (quadrants 0.57, 0.19,
-//! 0.19, 0.05; `edges / 16` node slots), from a seeded stream, so every run
-//! sees the same graph.
+//! The graph is R-MAT by default: the edges of the Graph500 generator
+//! (quadrants 0.57, 0.19, 0.19, 0.05; `edges / 16` node slots), from a seeded
+//! stream, so every run sees the same graph. `--planted P` makes a
+//! planted-partition graph instead: `edges / 8` nodes in communities of 8 to
+//! 519 nodes, a skewed choice of each edge's source, and P% of the edges with a
+//! destination drawn from the whole graph (the rest inside the source's
+//! community).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,7 +97,7 @@ fn rmat(edges: usize, scale: u32, seed: u64) -> (Vec<u32>, Vec<u32>) {
 
 /// The R-MAT edges over their own nodes (numbered in slot order), and the
 /// node count.
-fn graph(edges: usize) -> (usize, Vec<u32>, Vec<u32>) {
+fn rmat_graph(edges: usize) -> (usize, Vec<u32>, Vec<u32>) {
     let scale = ((edges / 16).max(2) as f64).log2().round() as u32;
     let (mut src, mut dst) = rmat(edges, scale, 42);
     let mut own = vec![u32::MAX; 1 << scale];
@@ -109,6 +115,40 @@ fn graph(edges: usize) -> (usize, Vec<u32>, Vec<u32>) {
     (n as usize, src, dst)
 }
 
+/// A planted-partition graph: `edges / 8` nodes cut into consecutive
+/// communities of 8 to 519 nodes; each edge's source skewed toward low ids
+/// (`n · r²`), and its destination drawn from the whole graph for `percent`%
+/// of the edges, from the source's community otherwise.
+fn planted_graph(edges: usize, percent: usize) -> (usize, Vec<u32>, Vec<u32>) {
+    let n = (edges / 8).max(16);
+    let mut st = 7u64;
+    let mut start = vec![0u32; n];
+    let mut size = vec![0u32; n];
+    let mut lo = 0usize;
+    while lo < n {
+        let len = (8 + (next(&mut st) % 512) as usize).min(n - lo);
+        for u in lo..lo + len {
+            start[u] = lo as u32;
+            size[u] = len as u32;
+        }
+        lo += len;
+    }
+    let unit = |st: &mut u64| (next(st) >> 11) as f64 / (1u64 << 53) as f64;
+    let (src, dst) = (0..edges)
+        .map(|_| {
+            let r = unit(&mut st);
+            let s = ((n as f64 * r * r) as usize).min(n - 1);
+            let d = if (next(&mut st) % 100) < percent as u64 {
+                (next(&mut st) % n as u64) as u32
+            } else {
+                start[s] + (next(&mut st) % u64::from(size[s])) as u32
+            };
+            (s as u32, d)
+        })
+        .unzip();
+    (n, src, dst)
+}
+
 /// Inexact, deterministic per-edge weights in `(0, 3]`.
 fn weights(edges: usize) -> Vec<f64> {
     (0..edges)
@@ -123,32 +163,60 @@ fn arg(args: &[String], name: &str, default: usize) -> usize {
         .map_or(default, |v| v.replace('_', "").parse().expect("a number"))
 }
 
+/// The process's CPU time (user + system) in seconds, from `/proc` (Linux;
+/// `None` elsewhere). Assumes the usual 100 clock ticks a second.
+fn cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields after the parenthesised command name; utime and stime are the
+    // 14th and 15th fields of the line.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split(' ').collect();
+    let ticks: f64 = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+    Some(ticks / 100.0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let edges = arg(&args, "--edges", 5_000_000);
     let weighted = args.iter().any(|a| a == "--weighted");
+    let parallel = args.iter().any(|a| a == "--parallel");
+    let planted = args
+        .iter()
+        .any(|a| a == "--planted")
+        .then(|| arg(&args, "--planted", 30));
+    let make = || match planted {
+        None => rmat_graph(edges),
+        Some(p) => planted_graph(edges, p),
+    };
 
-    let (n, src, dst) = graph(edges);
+    let (n, src, dst) = make();
     let topo = Topology::build(n, src, dst);
     let w = weighted.then(|| weights(edges));
     println!(
-        "R-MAT {edges} edges, {n} nodes, {}",
-        if weighted { "weighted" } else { "unweighted" }
+        "{} {edges} edges, {n} nodes, {}, {}, RAYON_NUM_THREADS={}",
+        planted.map_or("R-MAT".to_string(), |p| format!(
+            "planted partition ({p}% between)"
+        )),
+        if weighted { "weighted" } else { "unweighted" },
+        if parallel { "parallel" } else { "serial" },
+        std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset".into())
     );
 
     let base = HELD.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
+    let cpu0 = cpu_seconds();
     let start = Instant::now();
     let comm = match &w {
-        None => louvain(&topo, None, 1.0, Some(1)),
-        Some(w) => louvain_weighted(&topo, w, None, 1.0, Some(1)),
+        None => louvain(&topo, None, 1.0, Some(1), parallel),
+        Some(w) => louvain_weighted(&topo, w, None, 1.0, Some(1), parallel),
     };
     let secs = start.elapsed().as_secs_f64();
+    let cpu = cpu_seconds().zip(cpu0).map(|(b, a)| b - a);
     let peak = PEAK.load(Ordering::Relaxed) - base;
     drop(topo);
 
     // Modularity of the partition over the symmetrised graph (γ = 1).
-    let (_, src, dst) = graph(edges);
+    let (_, src, dst) = make();
     let k = comm.iter().max().map_or(0, |&c| c as usize + 1);
     let (mut tot, mut intra, mut m2) = (vec![0.0f64; k], 0.0f64, 0.0f64);
     for (i, (&s, &d)) in src.iter().zip(&dst).enumerate() {
@@ -166,8 +234,9 @@ fn main() {
     for &c in &comm {
         hash = (hash ^ u64::from(c)).wrapping_mul(0x100_0000_01b3);
     }
+    let busy = cpu.map_or("?".to_string(), |c| format!("{:.2}", c / secs));
     println!(
-        "louvain: {secs:.2} s, peak heap above the topology {:.0} MB",
+        "louvain: {secs:.2} s, cores busy {busy}, peak heap above the topology {:.0} MB",
         peak as f64 / 1e6
     );
     println!(

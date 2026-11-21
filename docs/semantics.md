@@ -57,6 +57,7 @@ In the table, `G` is a NetworkX `DiGraph` with the same rows, and `U = nx.Graph(
 | `ur.connected_components(edges)` | `nx.connected_components(U)` | Weak components. |
 | `ur.connected_components(edges, mode="strong")` | `nx.strongly_connected_components(G)` | |
 | `ur.louvain(edges)` | `nx.community.louvain_communities(U)` | Compare the modularity, not the labels. |
+| `ur.louvain(edges, parallel=True)` | none | Parallel sub-rounds (#387): deterministic, but other communities than the serial run. Compare the modularity. |
 | `ur.label_propagation(edges)` | `nx.community.label_propagation_communities(U)` | Compare the modularity, not the labels. |
 | `ur.shortest_path(edges, s, t)` | `nx.shortest_path(G, s, t)` | With `weight=`: `nx.dijkstra_path(G, s, t, weight=...)`. |
 

@@ -97,6 +97,8 @@ LIMIT 5;
 
 Weights must be non-negative and not null. The graph index does not depend on the weight, so trying several weightings reuses one index.
 
+On a large graph and a machine with many cores, `louvain(g, parallel => true)` moves nodes in parallel. It is deterministic like the default: the same `seed` gives the same communities on any number of threads. But they are not the communities the serial default finds, and NetworkX has no equivalent to compare them with; compare the modularity instead.
+
 ## Aggregate over neighbours
 
 `neighbors_agg` aggregates a value of each node over its neighbours. It returns one row per node. Take the karate members again. Some of them have friends in both clubs. This query counts them, by club:

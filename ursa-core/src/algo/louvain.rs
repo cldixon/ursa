@@ -17,8 +17,15 @@
 //! edges accumulate). [`louvain`] uses unit edge weights; [`louvain_weighted`]
 //! takes a per-edge weight (gathered via `edge_ids`). `resolution` (γ) scales the
 //! null-model term: larger γ favours smaller communities.
+//!
+//! With `parallel`, local moving runs in fixed sub-rounds instead (#387, see
+//! [`one_level_parallel`]): the same objective and the same aggregation, but
+//! nodes decide in parallel, so it finds different communities from the serial
+//! default. They are still the same for a given seed on any thread count.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::Mutex;
 
 use crate::parallel::*;
 
@@ -29,13 +36,18 @@ use crate::topology::{EdgeMask, Topology};
 /// Community label per node (contiguous `0..k`). Deterministic given `seed`
 /// (defaulting to a fixed seed when `None`, so an unseeded run is reproducible).
 /// A subgraph `mask` restricts the working graph to kept edges only.
+///
+/// `parallel` runs local moving in parallel sub-rounds ([`one_level_parallel`]):
+/// faster on many cores, and as deterministic (the same labels on any thread
+/// count), but not the serial run's labels. It has no NetworkX equivalent.
 pub fn louvain(
     topo: &Topology,
     mask: Option<&EdgeMask>,
     resolution: f64,
     seed: Option<u64>,
+    parallel: bool,
 ) -> Vec<u32> {
-    louvain_impl(topo, None, mask, resolution, seed)
+    louvain_impl(topo, None, mask, resolution, seed, parallel)
 }
 
 /// Weighted Louvain: as [`louvain`], but edge weights come from `weights` (per
@@ -46,13 +58,14 @@ pub fn louvain_weighted(
     mask: Option<&EdgeMask>,
     resolution: f64,
     seed: Option<u64>,
+    parallel: bool,
 ) -> Vec<u32> {
     assert_eq!(
         weights.len(),
         topo.n_edges(),
         "weights length must equal the edge count"
     );
-    louvain_impl(topo, Some(weights), mask, resolution, seed)
+    louvain_impl(topo, Some(weights), mask, resolution, seed, parallel)
 }
 
 fn louvain_impl(
@@ -61,6 +74,7 @@ fn louvain_impl(
     mask: Option<&EdgeMask>,
     resolution: f64,
     seed: Option<u64>,
+    parallel: bool,
 ) -> Vec<u32> {
     let n = topo.n_nodes();
     if n == 0 {
@@ -76,7 +90,8 @@ fn louvain_impl(
         return (0..n as u32).collect();
     }
     let linked = (linked.n_isolated() > 0).then_some(linked);
-    louvain_over(topo, weights, mask, resolution, seed, linked, PACE)
+    let pace = Pace { parallel, ..PACE };
+    louvain_over(topo, weights, mask, resolution, seed, linked, pace)
 }
 
 /// Louvain over `topo`, compact over the linked nodes when `linked` is given
@@ -109,7 +124,11 @@ fn louvain_over(
     let mut level = linked.clone();
 
     loop {
-        let comm = one_level(&graph, resolution, seed, level.as_ref(), pace);
+        let comm = if pace.parallel {
+            one_level_parallel(&graph, resolution, seed, level.as_ref(), pace)
+        } else {
+            one_level(&graph, resolution, seed, level.as_ref(), pace)
+        };
         let c = comm.iter().copied().max().map_or(0, |m| m as usize + 1);
         // Compose this level's assignment onto the original nodes.
         for label in node_comm.iter_mut() {
@@ -192,19 +211,49 @@ const MAX_SWEEPS: usize = 64;
 
 /// When a level stops: [`SWEEP_GAIN_THRESHOLD`] and [`MAX_SWEEPS`], checked
 /// every sweep's worth of work. Tests shorten the sweep to stop levels mid-way.
+/// With `parallel`, levels run [`one_level_parallel`], which checks after each
+/// real sweep and has its own stop on few moves ([`MIN_MOVED_SHARE`]).
 #[derive(Debug, Clone, Copy)]
 struct Pace {
     threshold: f64,
     max_sweeps: usize,
-    /// The work between checks, if not a sweep of the working graph.
+    /// The work between checks, if not a sweep of the working graph (serial
+    /// local moving only).
     sweep: Option<usize>,
+    /// Local moving in parallel sub-rounds (#387).
+    parallel: bool,
 }
 
 const PACE: Pace = Pace {
     threshold: SWEEP_GAIN_THRESHOLD,
     max_sweeps: MAX_SWEEPS,
     sweep: None,
+    parallel: false,
 };
+
+/// How many runs [`one_level_parallel`] cuts a level's visit order into. A
+/// constant, never the thread count, so the result is the same on any number
+/// of threads. On the prototype (#387) quality hardly depended on it (64,
+/// 1,024 and 16,384 runs gave modularity within 0.0006 of each other), and
+/// fewer, larger runs are faster.
+const RUNS: usize = 64;
+
+/// [`one_level_parallel`] stops a level after a sweep that moves fewer than
+/// one node in this many (of the full level's nodes). Without it, a level of
+/// stale decisions has a long tail of sweeps that each move a handful of nodes
+/// for almost nothing (the prototype ran all 64 sweeps on a planted-partition
+/// graph).
+const MIN_MOVED_SHARE: usize = 1000;
+
+/// A run whose listed active nodes are at least one in this many of its
+/// nodes finds them by scanning the run (in order, in parallel); a sparser one
+/// sorts its list instead.
+const DENSE_RUN: usize = 16;
+
+/// Movers per piece of [`one_level_parallel`]'s marking step. A constant, so
+/// the pieces, and the order their gains are summed in, never depend on the
+/// thread count.
+const MARK_CHUNK: usize = 256;
 
 /// One full local-moving phase over `graph`, returning a contiguous `0..k`
 /// community label per node.
@@ -353,6 +402,343 @@ fn one_level(
         }
     }
     renumber(&comm)
+}
+
+/// One local-moving phase in parallel sub-rounds (#387), returning a
+/// contiguous `0..k` community label per node.
+///
+/// The level's seeded visit order (the one [`one_level`] starts from) is cut
+/// into [`RUNS`] runs of equal length. A sweep takes the runs in turn. In each,
+/// every active node of the run picks its best community in parallel against
+/// the state (`comm`, `tot`, community sizes) as it was when the run started,
+/// writing nothing; the moves are then applied in run order on one thread
+/// (`comm`, `tot` and sizes); and, in parallel, the neighbours of the movers
+/// outside their new community are marked active (setting a flag is the same
+/// in any order) and the run's change in intra-community weight is summed.
+/// Each node's arithmetic is [`one_level`]'s: weights summed in adjacency
+/// order, candidates scanned in ascending community id, the same `1e-12` rule.
+///
+/// Nodes of one run decide on stale state, so two single-node communities could
+/// swap places for ever: a single node may only join another single node of
+/// the same run with a lower community id (the rule of Lu, Halappanavar and
+/// Kalyanaraman's Grappolo). A single node in another run decides on the state
+/// this run leaves, so it needs no guard.
+///
+/// Deterministic on any thread count: the runs depend only on the node count,
+/// the seed and [`RUNS`]; a decision reads only state frozen at the start of
+/// its run; and every float sum has a fixed order (per node; `tot` in run
+/// order; the gain in fixed chunks of [`MARK_CHUNK`] movers, in order). Which
+/// thread marks a node active does not matter, and each run's active nodes are
+/// taken in run order.
+///
+/// Each run keeps a list of the nodes activated in it, so late sweeps touch
+/// only those. Each worker sums a node's weights in a small table sized to the
+/// node's degree ([`Tally`]), not in a dense array per thread.
+///
+/// A level stops after a sweep that moves no node, raises modularity by less
+/// than the pace's threshold, or moves fewer than one node in
+/// [`MIN_MOVED_SHARE`]; or after the pace's `max_sweeps` sweeps. The gain is
+/// the sweep's real change in modularity, not the sum of the movers' gains
+/// against stale state: two nodes that each join the other's community (or a
+/// handful that keep trading places) estimate a gain every sweep and make none,
+/// and the real gain stops them.
+///
+/// With `level`, `graph` is compact (see [`louvain_over`]): the runs are cut
+/// from the full level's order, isolated nodes included, and each holds the
+/// linked nodes that fall in it. An isolated node never moves and nothing moves
+/// to it, and compact ids keep the order of node ids, so the compact level
+/// makes the full level's moves, in the same order.
+fn one_level_parallel(
+    graph: &Graph,
+    resolution: f64,
+    seed: u64,
+    level: Option<&Linked>,
+    pace: Pace,
+) -> Vec<u32> {
+    let n = graph.n();
+    let n_full = level.map_or(n, Linked::n);
+    let run_len = n_full.div_ceil(RUNS).max(1);
+    // The visit order of the working graph's nodes, and where each run starts
+    // in it (`RUNS + 1` boundaries).
+    let full = shuffled_order(n_full, seed);
+    let (order, bounds): (Vec<u32>, Vec<usize>) = match level {
+        None => (full, (0..=RUNS).map(|r| (r * run_len).min(n)).collect()),
+        Some(l) => {
+            let (order, gaps, _) = l.compact_order(&full);
+            drop(full);
+            let mut bounds = vec![0usize];
+            let mut skipped = 0usize;
+            for (i, &gap) in gaps.iter().enumerate() {
+                // `i + skipped` is the node's place in the full order.
+                skipped += gap as usize;
+                while bounds.len() <= RUNS && i + skipped >= bounds.len() * run_len {
+                    bounds.push(i);
+                }
+            }
+            bounds.resize(RUNS + 1, order.len());
+            (order, bounds)
+        }
+    };
+    // Each node's place in `order`.
+    let mut place = vec![0u32; n];
+    for (i, &u) in order.iter().enumerate() {
+        place[u as usize] = i as u32;
+    }
+
+    let mut comm: Vec<u32> = (0..n as u32).collect();
+    let mut tot: Vec<f64> = graph.k.clone();
+    let mut size: Vec<u32> = vec![1; n];
+    let active: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(true)).collect();
+    // The places (in `order`) of the nodes activated in each run since it
+    // last ran.
+    let mut listed: Vec<Vec<u32>> = vec![Vec::new(); RUNS];
+    let tallies: Vec<Mutex<Tally>> = (0..current_num_threads().max(1))
+        .map(|_| Mutex::new(Tally::default()))
+        .collect();
+
+    // The community each mover of the current run left, by its place in the
+    // run (`EMPTY` for a node that did not move).
+    let longest = bounds.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    let mut left: Vec<u32> = vec![EMPTY; longest];
+    let (m2, res) = (graph.m2, resolution);
+
+    let mut sweeps = 0usize;
+    loop {
+        // The sweep's modularity gain, exactly (not the movers' estimates
+        // against stale state): the change in intra-community weight, in
+        // ordered pairs, and in the sum of squared community totals.
+        let (mut intra, mut squares, mut moved) = (0.0f64, 0.0f64, 0usize);
+        for r in 0..RUNS {
+            let (lo, hi) = (bounds[r], bounds[r + 1]);
+            let mut list = std::mem::take(&mut listed[r]);
+            if lo == hi {
+                continue;
+            }
+            // Decide, in parallel, against the state at the start of the run:
+            // each active node of the run, in run order, and keep the movers
+            // with their new community. A decided node is no longer active
+            // (nothing marks nodes while the run decides).
+            let movers: Vec<(u32, u32)> = {
+                let state = (comm.as_slice(), tot.as_slice(), size.as_slice());
+                let pick = |u: u32| {
+                    let flag = &active[u as usize];
+                    if !flag.load(Relaxed) {
+                        return None;
+                    }
+                    flag.store(false, Relaxed);
+                    let mut tally = tallies[worker_index() % tallies.len()]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let same_run = |v: u32| (lo..hi).contains(&(place[v as usize] as usize));
+                    let c = decide(graph, state, res, u, &mut tally, same_run);
+                    (c != state.0[u as usize]).then_some((u, c))
+                };
+                if sweeps == 0 || list.len() * DENSE_RUN >= hi - lo {
+                    order[lo..hi].par_iter().filter_map(|&u| pick(u)).collect()
+                } else {
+                    list.sort_unstable();
+                    for i in list.iter_mut() {
+                        *i = order[*i as usize];
+                    }
+                    list.par_iter().filter_map(|&u| pick(u)).collect()
+                }
+            };
+            drop(list);
+            if movers.is_empty() {
+                continue;
+            }
+
+            // Apply, in run order, on one thread.
+            for &(u, c) in &movers {
+                let ci = comm[u as usize];
+                let ku = graph.k[u as usize];
+                let (from, to) = (tot[ci as usize], tot[c as usize]);
+                tot[ci as usize] = from - ku;
+                tot[c as usize] = to + ku;
+                squares += (from - ku) * (from - ku) - from * from;
+                squares += (to + ku) * (to + ku) - to * to;
+                size[ci as usize] -= 1;
+                size[c as usize] += 1;
+                comm[u as usize] = c;
+                left[place[u as usize] as usize - lo] = ci;
+            }
+            moved += movers.len();
+
+            // Mark the movers' neighbours outside their new community, in
+            // parallel (each node woken is listed once, in its own run), and
+            // sum the change in intra-community weight over the movers' edges:
+            // in fixed chunks of movers, each in adjacency order, the chunks
+            // in order.
+            let (comm_r, active_r, place_r, left_r) = (&comm, &active, &place, &left);
+            // The community a node of this run left, if it moved in it.
+            let moved_from = |v: u32| {
+                let i = place_r[v as usize] as usize;
+                (lo..hi)
+                    .contains(&i)
+                    .then(|| left_r[i - lo])
+                    .filter(|&c| c != EMPTY)
+            };
+            let marked: Vec<(Vec<u32>, f64)> = movers
+                .par_chunks(MARK_CHUNK)
+                .map(|chunk| {
+                    let (mut woken, mut delta) = (Vec::new(), 0.0f64);
+                    for &(u, c) in chunk {
+                        let ci = moved_from(u).expect("a mover");
+                        let (nbrs, ws) = graph.neighbors(u);
+                        for (&v, &w) in nbrs.iter().zip(ws) {
+                            let cv = comm_r[v as usize];
+                            // An edge to another mover is counted from both
+                            // ends; any other, from this one for both.
+                            let (bv, w) = match moved_from(v) {
+                                Some(bv) => (bv, w),
+                                None => (cv, 2.0 * w),
+                            };
+                            let (now, was) = (cv == c, bv == ci);
+                            if now != was {
+                                delta += if now { w } else { -w };
+                            }
+                            let flag = &active_r[v as usize];
+                            if cv != c && !flag.load(Relaxed) && !flag.swap(true, Relaxed) {
+                                woken.push(place_r[v as usize]);
+                            }
+                        }
+                    }
+                    (woken, delta)
+                })
+                .collect();
+            for (woken, delta) in marked {
+                intra += delta;
+                for i in woken {
+                    let run = bounds.partition_point(|&b| b <= i as usize) - 1;
+                    listed[run].push(i);
+                }
+            }
+            for &(u, _) in &movers {
+                left[place[u as usize] as usize - lo] = EMPTY;
+            }
+        }
+        sweeps += 1;
+        let gain = intra / m2 - res * squares / (m2 * m2);
+        if moved == 0
+            || gain < pace.threshold
+            || sweeps >= pace.max_sweeps
+            || moved.saturating_mul(MIN_MOVED_SHARE) < n_full
+        {
+            break;
+        }
+    }
+    renumber(&comm)
+}
+
+/// The best community for node `u` against `(comm, tot, size)` (its own when
+/// it stays): the arithmetic of [`one_level`], with [`one_level_parallel`]'s
+/// single-node guard.
+#[inline]
+fn decide(
+    graph: &Graph,
+    (comm, tot, size): (&[u32], &[f64], &[u32]),
+    resolution: f64,
+    u: u32,
+    tally: &mut Tally,
+    same_run: impl Fn(u32) -> bool,
+) -> u32 {
+    let ci = comm[u as usize];
+    let ku = graph.k[u as usize];
+    let (nbrs, ws) = graph.neighbors(u);
+    tally.begin(nbrs.len(), graph.n());
+    for (&v, &w) in nbrs.iter().zip(ws) {
+        tally.add(comm[v as usize], w, v);
+    }
+    tally.touched.sort_unstable_by_key(|&(c, _, _)| c);
+    let w_ci = tally
+        .touched
+        .binary_search_by_key(&ci, |&(c, _, _)| c)
+        .map_or(0.0, |i| tally.vals[tally.touched[i].1 as usize]);
+    let stay = w_ci - resolution * (tot[ci as usize] - ku) * ku / graph.m2;
+    let (mut best_c, mut best_gain) = (ci, stay);
+    let single = size[ci as usize] == 1;
+    for &(c, slot, member) in &tally.touched {
+        // Two single nodes deciding in the same run would swap for ever: only
+        // the higher id may join the lower. (A single node's community is met
+        // through its one member.)
+        if c == ci || (single && c > ci && size[c as usize] == 1 && same_run(member)) {
+            continue;
+        }
+        let g = tally.vals[slot as usize] - resolution * tot[c as usize] * ku / graph.m2;
+        if g > best_gain + 1e-12 {
+            best_gain = g;
+            best_c = c;
+        }
+    }
+    tally.end();
+    best_c
+}
+
+/// A worker's scratch for [`decide`]: the weight from one node into each
+/// neighbouring community. An open-addressing table sized to the node's degree
+/// (twice it, to a power of two), or, for a hub whose table would be as large
+/// as the graph, a dense array over community ids. Only the slots a node
+/// touched are reset after it, so a worker holds the table of the largest
+/// degree it has met, not 9 bytes for every node of the graph.
+#[derive(Default)]
+struct Tally {
+    /// The community in each slot (`EMPTY` when free).
+    keys: Vec<u32>,
+    vals: Vec<f64>,
+    /// The communities met, with their slots and the first neighbour met in
+    /// each, in the order met.
+    touched: Vec<(u32, u32, u32)>,
+    /// `64 - log2(capacity)` of the table; 0 when dense.
+    shift: u32,
+}
+
+const EMPTY: u32 = u32::MAX;
+
+impl Tally {
+    /// Ready the table for a node of `degree` neighbours among `n` communities.
+    fn begin(&mut self, degree: usize, n: usize) {
+        let cap = (2 * degree).next_power_of_two().max(16);
+        let (len, shift) = if cap >= n {
+            (n, 0)
+        } else {
+            (cap, 64 - cap.trailing_zeros())
+        };
+        if self.keys.len() < len {
+            self.keys.resize(len, EMPTY);
+            self.vals.resize(len, 0.0);
+        }
+        self.shift = shift;
+    }
+
+    /// Add `w`, the weight of the edge to neighbour `v`, to community `c`'s.
+    #[inline]
+    fn add(&mut self, c: u32, w: f64, v: u32) {
+        let slot = if self.shift == 0 {
+            c as usize
+        } else {
+            let mask = (1usize << (64 - self.shift)) - 1;
+            let mut i = (u64::from(c).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+            while self.keys[i] != EMPTY && self.keys[i] != c {
+                i = (i + 1) & mask;
+            }
+            i
+        };
+        if self.keys[slot] == EMPTY {
+            self.keys[slot] = c;
+            self.vals[slot] = w;
+            self.touched.push((c, slot as u32, v));
+        } else {
+            self.vals[slot] += w;
+        }
+    }
+
+    /// Free the slots the node touched.
+    fn end(&mut self) {
+        for &(_, slot, _) in &self.touched {
+            self.keys[slot as usize] = EMPTY;
+        }
+        self.touched.clear();
+    }
 }
 
 /// An undirected, weighted working graph in flat CSR form (`u32` targets and
@@ -1016,21 +1402,33 @@ mod tests {
                 }
                 // Levels that end with the queue, and levels stopped mid-way
                 // by the gain threshold or the work budget, whose stopping
-                // point counts the isolated nodes' visits.
+                // point counts the isolated nodes' visits. Then parallel
+                // levels (#387), whole and stopped after one or two sweeps.
                 let short = |threshold, max_sweeps, sweep| Pace {
                     threshold,
                     max_sweeps,
                     sweep: Some(sweep),
+                    parallel: false,
+                };
+                let par = |threshold, max_sweeps| Pace {
+                    threshold,
+                    max_sweeps,
+                    sweep: None,
+                    parallel: true,
                 };
                 let paces = [
                     PACE,
+                    par(SWEEP_GAIN_THRESHOLD, MAX_SWEEPS),
                     short(1e-2, 64, n / 3 + 1),
                     short(-1.0, 2, n / 2 + 3),
                     short(-1.0, 3, 7),
+                    par(1e-2, 64),
+                    par(-1.0, 1),
+                    par(-1.0, 2),
                 ];
                 for s in [None, Some(1), Some(77)] {
                     for (ws, res) in [(None, 1.0), (Some(w.as_slice()), 1.0), (None, 0.3)] {
-                        for pace in paces.into_iter().take(if n > 5000 { 1 } else { 4 }) {
+                        for pace in paces.into_iter().take(if n > 5000 { 2 } else { 8 }) {
                             let full = louvain_over(&t, ws, mask, res, s, None, pace);
                             let compact =
                                 louvain_over(&t, ws, mask, res, s, Some(linked.clone()), pace);
@@ -1087,20 +1485,20 @@ mod tests {
             w.push(((i % 97) as f64 + 1.0).sqrt() / 3.0);
         }
         let t = Topology::build(n as usize, src, dst);
-        let first = louvain_weighted(&t, &w, None, 1.0, Some(5));
+        let first = louvain_weighted(&t, &w, None, 1.0, Some(5), false);
         assert!(
             first.iter().max().unwrap() > &0,
             "found more than one community"
         );
         for _ in 0..5 {
-            assert_eq!(louvain_weighted(&t, &w, None, 1.0, Some(5)), first);
+            assert_eq!(louvain_weighted(&t, &w, None, 1.0, Some(5), false), first);
         }
     }
 
     #[test]
     fn recovers_two_communities() {
         let t = two_cliques();
-        let comm = louvain(&t, None, 1.0, Some(1));
+        let comm = louvain(&t, None, 1.0, Some(1), false);
         assert!(comm[0] == comm[1] && comm[1] == comm[2] && comm[2] == comm[3]);
         assert!(comm[4] == comm[5] && comm[5] == comm[6] && comm[6] == comm[7]);
         assert_ne!(comm[0], comm[4]);
@@ -1113,21 +1511,21 @@ mod tests {
     fn deterministic_given_a_seed() {
         let t = two_cliques();
         assert_eq!(
-            louvain(&t, None, 1.0, Some(5)),
-            louvain(&t, None, 1.0, Some(5))
+            louvain(&t, None, 1.0, Some(5), false),
+            louvain(&t, None, 1.0, Some(5), false)
         );
     }
 
     #[test]
     fn no_edges_is_all_singletons() {
         let t = Topology::build(3, vec![], vec![]);
-        assert_eq!(louvain(&t, None, 1.0, None), vec![0, 1, 2]);
+        assert_eq!(louvain(&t, None, 1.0, None, false), vec![0, 1, 2]);
     }
 
     #[test]
     fn empty_graph_is_empty() {
         let t = Topology::build(0, vec![], vec![]);
-        assert!(louvain(&t, None, 1.0, None).is_empty());
+        assert!(louvain(&t, None, 1.0, None, false).is_empty());
     }
 
     #[test]
@@ -1136,8 +1534,8 @@ mod tests {
         let t = two_cliques();
         let ones = vec![1.0; t.n_edges()];
         assert_eq!(
-            louvain_weighted(&t, &ones, None, 1.0, Some(1)),
-            louvain(&t, None, 1.0, Some(1))
+            louvain_weighted(&t, &ones, None, 1.0, Some(1), false),
+            louvain(&t, None, 1.0, Some(1), false)
         );
     }
 
@@ -1150,7 +1548,7 @@ mod tests {
         let dst = vec![1, 2, 0, 4, 5, 3, 3];
         let t = Topology::build(6, src, dst);
         let heavy_bridge = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0];
-        let comm = louvain_weighted(&t, &heavy_bridge, None, 1.0, Some(1));
+        let comm = louvain_weighted(&t, &heavy_bridge, None, 1.0, Some(1), false);
         assert_eq!(comm[2], comm[3], "a heavy bridge binds its endpoints");
     }
 
@@ -1294,9 +1692,9 @@ mod tests {
             for weighted in [false, true] {
                 for seed in [1u64, 9] {
                     let comm = if weighted {
-                        louvain_weighted(&t, &w, mask, 1.0, Some(seed))
+                        louvain_weighted(&t, &w, mask, 1.0, Some(seed), false)
                     } else {
-                        louvain(&t, mask, 1.0, Some(seed))
+                        louvain(&t, mask, 1.0, Some(seed), false)
                     };
                     let q = modularity(s, d, weighted.then_some(ww.as_slice()), &comm);
                     let k = comm.iter().max().unwrap() + 1;
@@ -1374,11 +1772,122 @@ mod tests {
         }
         let t = Topology::build((k * size) as usize, src, dst);
         for seed in 0..5 {
-            let comm = louvain(&t, None, 1.0, Some(seed));
+            let comm = louvain(&t, None, 1.0, Some(seed), false);
             for u in 0..(k * size) as usize {
                 assert_eq!(comm[u], comm[u - u % size as usize], "seed {seed}");
             }
             assert_eq!(*comm.iter().max().unwrap(), k - 1, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn parallel_recovers_cliques() {
+        let t = two_cliques();
+        for seed in 0..5 {
+            let comm = louvain(&t, None, 1.0, Some(seed), true);
+            assert_eq!(comm, vec![0, 0, 0, 0, 1, 1, 1, 1], "seed {seed}");
+        }
+        // A ring of eight 5-cliques, as above.
+        let (k, size) = (8u32, 5u32);
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for c in 0..k {
+            for a in 0..size {
+                for b in a + 1..size {
+                    src.push(c * size + a);
+                    dst.push(c * size + b);
+                }
+            }
+            src.push(c * size);
+            dst.push(((c + 1) % k) * size + 1);
+        }
+        let t = Topology::build((k * size) as usize, src, dst);
+        for seed in 0..5 {
+            let comm = louvain(&t, None, 1.0, Some(seed), true);
+            for u in 0..(k * size) as usize {
+                assert_eq!(comm[u], comm[u - u % size as usize], "seed {seed}");
+            }
+            assert_eq!(*comm.iter().max().unwrap(), k - 1, "seed {seed}");
+        }
+    }
+
+    /// Two single nodes deciding in the same run must not swap: on many
+    /// disjoint edges, every pair of nodes still ends up together, and a
+    /// level stops (the work stays bounded) rather than running every sweep.
+    #[test]
+    fn parallel_single_nodes_do_not_swap() {
+        let pairs = 10_000u32;
+        let src: Vec<u32> = (0..pairs).map(|i| 2 * i).collect();
+        let dst: Vec<u32> = (0..pairs).map(|i| 2 * i + 1).collect();
+        let t = Topology::build(2 * pairs as usize, src, dst);
+        let comm = louvain(&t, None, 1.0, Some(3), true);
+        for i in 0..pairs as usize {
+            assert_eq!(comm[2 * i], comm[2 * i + 1]);
+        }
+        assert_eq!(*comm.iter().max().unwrap(), pairs - 1);
+        // One level of local moving: each pair merges in the first sweep, as
+        // the guard lets exactly one of its nodes move.
+        let g = Graph::from_topology(&t, None, None, None);
+        let pace = Pace {
+            max_sweeps: 1,
+            parallel: true,
+            ..PACE
+        };
+        let level = one_level_parallel(&g, 1.0, 3, None, pace);
+        assert_eq!(*level.iter().max().unwrap(), pairs - 1);
+    }
+
+    /// The table and the dense array sum the same weights to the same bits,
+    /// and leave no trace for the next node.
+    #[test]
+    fn tally_table_and_dense_agree() {
+        let sums = |tally: &mut Tally, n: usize| {
+            let mut out = Vec::new();
+            for round in 0..3u32 {
+                tally.begin(30, n);
+                for i in 0..30u32 {
+                    let c = (i * 7 + round) % 23;
+                    tally.add(c, f64::from(i + 1).sqrt() / 3.0, i);
+                }
+                tally.touched.sort_unstable_by_key(|&(c, _, _)| c);
+                out.push(
+                    tally
+                        .touched
+                        .iter()
+                        .map(|&(c, slot, v)| (c, tally.vals[slot as usize].to_bits(), v))
+                        .collect::<Vec<_>>(),
+                );
+                tally.end();
+            }
+            out
+        };
+        let (mut table, mut dense) = (Tally::default(), Tally::default());
+        let hashed = sums(&mut table, 1 << 20);
+        assert_ne!(table.shift, 0, "a table");
+        assert_eq!(hashed, sums(&mut dense, 50));
+        assert_eq!(dense.shift, 0, "dense");
+        assert!(table.keys.iter().chain(&dense.keys).all(|&k| k == EMPTY));
+    }
+
+    /// The parallel run's scratch is a hash table for most nodes and a dense
+    /// array for a hub; both sum in adjacency order, so a star (one hub) with
+    /// inexact weights gives the same result as ever, run after run.
+    #[test]
+    fn parallel_runs_are_reproducible_with_hubs() {
+        let n = 3000u32;
+        let (mut src, mut dst, mut w) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 1..n {
+            src.push(0);
+            dst.push(i);
+            w.push((f64::from(i % 97) + 1.0).sqrt() / 3.0);
+            src.push(i);
+            dst.push(1 + (i * 7 + 3) % (n - 1));
+            w.push((f64::from(i % 89) + 1.0).sqrt() / 7.0);
+        }
+        let t = Topology::build(n as usize, src, dst);
+        let first = louvain_weighted(&t, &w, None, 1.0, Some(5), true);
+        assert!(*first.iter().max().unwrap() > 0);
+        for _ in 0..3 {
+            assert_eq!(louvain_weighted(&t, &w, None, 1.0, Some(5), true), first);
         }
     }
 

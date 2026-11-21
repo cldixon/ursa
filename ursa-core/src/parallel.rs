@@ -55,6 +55,18 @@ pub fn in_worker() -> bool {
     false
 }
 
+/// The index of the calling thread in its rayon pool (`0..current_num_threads()`),
+/// for per-worker scratch; `0` off a worker and without `rayon`.
+#[cfg(feature = "rayon")]
+pub fn worker_index() -> usize {
+    rayon::current_thread_index().unwrap_or(0)
+}
+
+#[cfg(not(feature = "rayon"))]
+pub fn worker_index() -> usize {
+    0
+}
+
 #[cfg(not(feature = "rayon"))]
 mod serial {
     /// `into_par_iter()` -> `into_iter()`. Covers ranges (`0..n`) and owned

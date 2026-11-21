@@ -87,6 +87,39 @@ async fn run_an_algorithm_matches_getting_started() {
 /// graph DDL), and the joins written with `ON`: DataFusion 55 cannot plan a
 /// chain of four `USING` joins, for plain tables too (see
 /// `four_using_joins_are_ambiguous_in_datafusion`).
+/// `louvain(g, parallel => true)` (#387): a community per node, the same as
+/// a column of `algorithms()`, and only a boolean is accepted.
+#[tokio::test]
+async fn louvain_runs_in_parallel_on_request() {
+    let ctx = karate().await;
+    let alone = table(
+        &ctx,
+        "SELECT id, louvain FROM louvain(karate, seed => 1, parallel => true) ORDER BY id",
+    )
+    .await
+    .unwrap();
+    let within = table(
+        &ctx,
+        "SELECT id, c AS louvain FROM algorithms(karate, c => louvain(seed => 1, parallel => true)) \
+         ORDER BY id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(alone, within);
+    let count = table(
+        &ctx,
+        "SELECT count(*) AS n, count(DISTINCT louvain) > 1 AS split \
+         FROM louvain(karate, parallel => true)",
+    )
+    .await
+    .unwrap();
+    assert!(count.contains("| 34 | true  |"), "{count}");
+    assert_eq!(
+        error(&ctx, "SELECT * FROM louvain(karate, parallel => 1)").await,
+        "louvain(parallel =>) must be a boolean; got 1"
+    );
+}
+
 #[tokio::test]
 async fn combine_algorithms_and_attributes() {
     let ctx = karate().await;

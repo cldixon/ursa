@@ -341,7 +341,7 @@ fn bench_small(c: &mut Criterion) {
             });
         }
         g.bench_function(BenchmarkId::new("louvain", name), |b| {
-            b.iter(|| louvain(&t, None, 1.0, Some(42)))
+            b.iter(|| louvain(&t, None, 1.0, Some(42), false))
         });
     }
     g.finish();
