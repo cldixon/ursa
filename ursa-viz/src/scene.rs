@@ -85,6 +85,13 @@ impl Graph {
         Ok(())
     }
 
+    /// Make room for `edges` more edges, so that appending up to as many
+    /// moves none.
+    pub fn reserve(&mut self, edges: usize) {
+        self.src.reserve(edges);
+        self.dst.reserve(edges);
+    }
+
     /// Keep the first `n_nodes` nodes and the first `n_edges` edges, which
     /// must name only those nodes: what undoes an [`append`](Self::append).
     pub fn truncate(&mut self, n_nodes: usize, n_edges: usize) -> Result<(), BadEdge> {

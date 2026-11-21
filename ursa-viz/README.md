@@ -191,8 +191,8 @@ the device.
 A scene is a base result and the deltas applied to it (#441, the design's
 §3 and §6). A view made from a result applies a delta **in time
 proportional to the delta, not to the graph**: an expansion of 100 nodes
-and 300 edges on a view of a million edges uploads 6 KB and takes a tenth
-of a millisecond outside the frame ([`BENCH.md`](BENCH.md#deltas)).
+and 300 edges on a view of a million edges uploads 5 KB and takes 0.7 ms
+outside the frame in Chromium ([`BENCH.md`](BENCH.md#deltas)).
 
 ```js
 const view = await createViewFromResult(canvas, resultBytes);  // a GraphResult as UGR
@@ -214,9 +214,10 @@ What a delta does to what is drawn:
   buffers are append-only: they grow by doubling, what they held is copied
   on the GPU (`copyBufferSubData` on WebGL2; nothing is uploaded again),
   and a delta writes only its own slots: 16 bytes a node (position, radius,
-  colour) and 4 of flags, 8 an edge. A view starts with buffers the size of
-  its graph, so its first addition doubles them; a million-edge view then
-  takes 48,000 more edges before the next.
+  colour) and 4 of flags, 8 an edge. A view made from a result starts with
+  room for a sixty-fourth more, rounded up to a power of two (a million
+  edges: 1,048,576), on the GPU and in the result's own arrays, so its
+  first deltas move nothing.
 - **A removed node keeps its slot, hidden by its flag**: 4 bytes. Its edges
   are left out by the pipeline that reads the flags (the highlight layer's,
   used only while a node is hidden), so none of them is written.
@@ -230,10 +231,10 @@ What a delta does to what is drawn:
   its colour is its category's in the theme's palette (a text column's
   values in order of appearance; a null gets the node colour). A delta
   restyles what it has to and writes only the nodes whose radius or colour
-  came out different, in runs: the two ends of a new edge between nodes
-  that were not neighbours, when nodes are sized by degree; every node,
-  when a new node's value widens the column's range, or a column that
-  sizes or colours is set.
+  came out different, in runs (4 bytes a node, 8 if a colour changed): the
+  two ends of a new edge between nodes that were not neighbours, when nodes
+  are sized by degree; every node, when a new node's value widens the
+  column's range, or a column that sizes or colours is set.
 - **Highlights and positions:** `SetHighlights` redraws the highlight layer
   from the result's paths and seeds. `SetPositions`, or the positions given
   with the delta, move every node (8 bytes a node, as a layout step does).
@@ -260,8 +261,10 @@ page's to keep: a layout moves the nodes after a step, so the page saves
 ```
 
 The colour legend lists the twelve categories with the most shown nodes;
-`other` counts the rest and `none` the nodes with no value. It is counted on
-the first call after a delta (in time proportional to the graph) and kept.
+`other` counts the rest and `none` the nodes with no value. The node counts
+are kept as deltas come. The shown edges are counted, on the first call
+after a delta, only while a node is hidden (its edges are not shown); the
+legend, only when a column colours the nodes.
 
 How it is built: `live::LiveResult` holds the result and, for each delta,
 works out which slots changed (`live::Changes`), with no GPU, so the
@@ -274,6 +277,8 @@ since, so a delta never builds the adjacency again; `scene::Graph` builds
 its own again only when a layout on this thread next asks for it. The
 model answers "does an edge still name one of the last nodes?" without
 reading the edges, so undoing an expansion costs what the expansion did.
+While the camera follows the drawing, it is refitted from the last fit's
+bounds and the new nodes', not from every position.
 
 `ursa-viz/tests/browser/view.ts` reads frames back on WebGL2 and checks it
 (`ONLY=delta`): a growth changes only the pixels around what it added,
@@ -511,9 +516,10 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   status line and legend until then; `info()` is what they will read.
 - **A history in the view.** Undo is the inverse delta and the positions
   the page saved; the stack of steps is the explore session's (#443).
-- **Room to grow from the start.** A view's buffers are the size of its
-  graph, so the first addition doubles them (a copy on the GPU of what they
-  held). Making them with headroom would move that cost to the first frame.
+- **Doubling under a delta.** The delta that outgrows the buffers pays for
+  the copy of what they held (on the GPU, and of the result's arrays):
+  about 12 ms at a million edges here, once per doubling. Growing ahead of
+  need, in an idle moment, would hide it.
 - **Edge styles.** A delta's edge columns are kept in the result; edges are
   all drawn alike, so nothing of them is uploaded.
 - **Encodings in physical pixels.** A result's sizes are 3 to 14 px (or by

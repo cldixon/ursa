@@ -40,6 +40,14 @@ use crate::scene::{bounds, Graph, LiveLayout, NodeStyle, Theme, NO_CATEGORY};
 /// The radii a column maps to ([`NodeStyle::sizes_from`]), in pixels.
 pub const SIZE_BY_RADII: (f32, f32) = (3.0, 14.0);
 
+/// How many slots a view of `len` starts with room for, beyond its own: a
+/// sixty-fourth more and a few. Its first deltas then move nothing: not
+/// what the result holds, nor what is drawn, nor the GPU's buffers
+/// (`render::starting_capacity`).
+pub fn room(len: usize) -> usize {
+    len / 64 + 64
+}
+
 /// Changed slots closer than this are written as one run.
 const MERGE_GAP: usize = 8;
 
@@ -221,13 +229,16 @@ pub struct LiveResult {
     degrees: Degrees,
     /// The range of the column that sizes the nodes, if one does.
     size_range: Option<(f32, f32)>,
+    /// How many nodes and edges are removed, kept as deltas remove and
+    /// restore them.
+    hidden_nodes: usize,
+    removed_edges: usize,
     counts: OnceLock<Counts>,
 }
 
 /// What [`LiveResult::info`] counts, until the next delta.
 #[derive(Debug, Clone)]
 struct Counts {
-    hidden_nodes: usize,
     shown_edges: usize,
     /// Shown nodes per category, most first; then those in no category.
     categories: Vec<(u32, usize)>,
@@ -327,10 +338,13 @@ impl LiveResult {
     /// coloured as the result's encodings say (by degree, in the theme's
     /// node colour, without), with its highlights and its removed nodes
     /// hidden.
-    pub fn new(result: GraphResult, theme: &Theme) -> (Self, Drawn) {
-        let n = result.n_nodes();
-        let graph = Graph::new(n, result.src().to_vec(), result.dst().to_vec())
+    pub fn new(mut result: GraphResult, theme: &Theme) -> (Self, Drawn) {
+        let (n, m) = (result.n_nodes(), result.n_edges());
+        let (more_nodes, more_edges) = (room(n), room(m));
+        result.reserve(more_nodes, more_edges);
+        let mut graph = Graph::new(n, result.src().to_vec(), result.dst().to_vec())
             .expect("a result's edges name its nodes");
+        graph.reserve(more_edges);
         let (x, y) = match result.positions() {
             Some(p) => (p.x.clone(), p.y.clone()),
             None => {
@@ -343,8 +357,11 @@ impl LiveResult {
         highlight
             .set_result(&result)
             .expect("the highlight has the result's nodes");
+        let removed = |flags: &[u8]| flags.iter().filter(|&&f| f & REMOVED != 0).count();
         let mut live = Self {
             degrees: Degrees::new(&graph),
+            hidden_nodes: removed(result.node_flags()),
+            removed_edges: removed(result.edge_flags()),
             result,
             size_range: None,
             counts: OnceLock::new(),
@@ -365,6 +382,15 @@ impl LiveResult {
         for i in 0..n {
             live.style_node(i, &mut drawn.parts(theme));
         }
+        live.degrees.degree.reserve(more_nodes);
+        drawn.x.reserve(more_nodes);
+        drawn.y.reserve(more_nodes);
+        drawn.style.radius.reserve(more_nodes);
+        drawn.style.color.reserve(more_nodes);
+        if let Some(categories) = &mut drawn.categories {
+            categories.reserve(more_nodes);
+        }
+        drawn.highlight.reserve(more_nodes);
         (live, drawn)
     }
 
@@ -509,10 +535,21 @@ impl LiveResult {
                         }
                     }
                 }
-                Op::RemoveNodes(_) | Op::RestoreNodes(_) | Op::SetHighlights { .. } => {
+                Op::RemoveNodes(nodes) => {
+                    self.hidden_nodes += nodes.len();
                     changes.highlights = true;
                 }
+                Op::RestoreNodes(nodes) => {
+                    self.hidden_nodes -= nodes.len();
+                    changes.highlights = true;
+                }
+                Op::SetHighlights { .. } => changes.highlights = true,
                 Op::RemoveEdges(edges) | Op::RestoreEdges(edges) => {
+                    if matches!(op, Op::RemoveEdges(_)) {
+                        self.removed_edges += edges.len();
+                    } else {
+                        self.removed_edges -= edges.len();
+                    }
                     flagged.extend(edges.iter().map(|&e| e as usize));
                     // A removed edge of a path is not highlighted.
                     changes.highlights |= !self.result.highlights().paths.is_empty();
@@ -698,18 +735,10 @@ impl LiveResult {
     fn counts(&self) -> &Counts {
         self.counts.get_or_init(|| {
             let result = &self.result;
-            let hidden_nodes = result
-                .node_flags()
-                .iter()
-                .filter(|&&f| f & REMOVED != 0)
-                .count();
-            let removed_edges = result
-                .edge_flags()
-                .iter()
-                .filter(|&&f| f & REMOVED != 0)
-                .count();
-            let shown_edges = if hidden_nodes == 0 {
-                result.n_edges() - removed_edges
+            // An edge is shown when neither it nor either end is removed:
+            // with no node removed, there is nothing to read.
+            let shown_edges = if self.hidden_nodes == 0 {
+                result.n_edges() - self.removed_edges
             } else {
                 (0..result.n_edges())
                     .filter(|&e| result.edge_is_shown(e))
@@ -718,20 +747,28 @@ impl LiveResult {
             let mut by_category: HashMap<u32, usize> = HashMap::new();
             let mut uncategorized = 0;
             if let Some(values) = self.color_column() {
-                for i in 0..result.n_nodes() {
-                    if result.node_is_removed(i) {
+                // A text column's categories are its codes: counted in place.
+                let mut by_code = match values {
+                    Values::Dict { values, .. } => vec![0usize; values.len()],
+                    _ => Vec::new(),
+                };
+                let flags = result.node_flags();
+                for (i, &flag) in flags.iter().enumerate() {
+                    if flag & REMOVED != 0 {
                         continue;
                     }
                     match category(values, i) {
                         NO_CATEGORY => uncategorized += 1,
+                        c if (c as usize) < by_code.len() => by_code[c as usize] += 1,
                         c => *by_category.entry(c).or_insert(0) += 1,
                     }
                 }
+                let counted = by_code.iter().enumerate().filter(|c| *c.1 > 0);
+                by_category.extend(counted.map(|(c, &count)| (c as u32, count)));
             }
             let mut categories: Vec<(u32, usize)> = by_category.into_iter().collect();
             categories.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             Counts {
-                hidden_nodes,
                 shown_edges,
                 categories,
                 uncategorized,
@@ -740,8 +777,13 @@ impl LiveResult {
     }
 
     /// What is shown now, for a status line and a legend, with the legend's
-    /// colours as `theme` draws them. Counted on the first call after a
-    /// delta (in time proportional to the graph), and kept until the next.
+    /// colours as `theme` draws them.
+    ///
+    /// The counts of nodes cost nothing. The shown edges are counted, in
+    /// time proportional to the edges, only while a node is removed (its
+    /// edges are not shown); the legend's categories, in time proportional
+    /// to the nodes, only when a column colours them. Both on the first
+    /// call after a delta, and kept until the next.
     pub fn info(&self, theme: &Theme) -> Info {
         let counts = self.counts();
         let result = &self.result;
@@ -768,9 +810,9 @@ impl LiveResult {
             }
         });
         Info {
-            nodes: result.n_nodes() - counts.hidden_nodes,
+            nodes: result.n_nodes() - self.hidden_nodes,
             edges: counts.shown_edges,
-            hidden_nodes: counts.hidden_nodes,
+            hidden_nodes: self.hidden_nodes,
             hidden_edges: result.n_edges() - counts.shown_edges,
             node_slots: result.n_nodes(),
             edge_slots: result.n_edges(),

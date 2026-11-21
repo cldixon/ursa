@@ -112,6 +112,8 @@ fn a_small_delta_on_a_million_edges_costs_what_it_holds() {
     assert!(uploaded >= 100 * 20 + 300 * 8);
     assert!(uploaded <= 64 * 1024, "{uploaded} bytes, over 64 KB");
 
+    let first = times[0];
+    println!("the first, cold: {:.3} ms", first.as_secs_f64() * 1e3);
     times.sort();
     let (best, median) = (times[0], times[times.len() / 2]);
     println!(
@@ -123,7 +125,12 @@ fn a_small_delta_on_a_million_edges_costs_what_it_holds() {
     let undo = undo_times[undo_times.len() / 2];
     println!("its inverse: median {:.3} ms", undo.as_secs_f64() * 1e3);
     if !cfg!(debug_assertions) {
-        for (what, took) in [("a delta", median), ("its inverse", undo)] {
+        // The first has room made for it when the view is: it moves nothing.
+        for (what, took) in [
+            ("the first delta", first),
+            ("a delta", median),
+            ("its inverse", undo),
+        ] {
             assert!(
                 took <= Duration::from_millis(2),
                 "{what} took {took:?}, over 2 ms"

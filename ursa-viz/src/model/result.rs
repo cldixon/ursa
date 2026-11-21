@@ -170,6 +170,12 @@ impl Strings {
         self.offsets.len() - 1
     }
 
+    /// Room for `count` more strings of `bytes` bytes in all.
+    pub fn reserve(&mut self, count: usize, bytes: usize) {
+        self.offsets.reserve(count);
+        self.bytes.reserve(bytes);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -661,6 +667,39 @@ impl GraphResult {
             Target::Nodes => self.n_nodes(),
             Target::Edges => self.n_edges(),
         }
+    }
+
+    /// Make room for `nodes` more nodes and `edges` more edges, so that a
+    /// delta that adds up to as many moves nothing the result holds: a view
+    /// that takes deltas does this once, when it is made, and not under the
+    /// first of them.
+    pub fn reserve(&mut self, nodes: usize, edges: usize) {
+        fn columns(columns: &mut [Column], more: usize) {
+            for column in columns {
+                match &mut column.values {
+                    Values::F32(v) => v.reserve(more),
+                    Values::U32(v) | Values::Dict { codes: v, .. } => v.reserve(more),
+                }
+            }
+        }
+        // A key is a few bytes of text.
+        self.node_keys.reserve(nodes, 8 * nodes);
+        self.node_label.reserve(nodes);
+        self.node_flags.reserve(nodes);
+        columns(&mut self.node_columns, nodes);
+        if let Some(p) = &mut self.positions {
+            p.x.reserve(nodes);
+            p.y.reserve(nodes);
+        }
+        self.index.reserve(nodes);
+        self.src.reserve(edges);
+        self.dst.reserve(edges);
+        self.edge_label.reserve(edges);
+        self.edge_flags.reserve(edges);
+        if let Some(rows) = &mut self.edge_rows {
+            rows.reserve(edges);
+        }
+        columns(&mut self.edge_columns, edges);
     }
 
     // Invariants.

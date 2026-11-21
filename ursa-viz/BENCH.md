@@ -323,8 +323,7 @@ edges is 6.1 s here, 4.4 s there): compare along a row, not with them.
   bytes of flags (100 runs of one node, four bytes each; 780 a set here,
   counting the clear before it) and 3,584 bytes of instances (99 edges of 16
   bytes, 100 nodes in front of 20), in 0.4 ms at 131K nodes. The graph's
-  million edges (8 MB of indexes) are in a buffer that cannot be written
-  after it is made.
+  million edges (8 MB of indexes) are not written.
 - **A selection of one node** writes 8 bytes of flags (the node deselected
   and the node selected) and 20 for the node drawn in front. Its 0.4 ms at
   131K nodes is the CPU's: the view copies and compares the flags, a byte a
@@ -333,6 +332,71 @@ edges is 6.1 s here, 4.4 s there): compare along a row, not with them.
   second time over every node, leaving the others out in the shader. On
   software WebGL2 that cost 26 ms a frame at 2,048 nodes (a third of the
   frame), which is why they have a buffer of their own.
+
+## Deltas
+
+What a scene that changes in place costs (#441): a view made from a result
+(`createViewFromResult`) takes a delta of 100 new nodes and 300 new edges
+(an expansion: each new node joined to one hub and to two random nodes),
+then its inverse, 30 times. `ONLY="delta rmat" bun tests/browser/view.ts`
+measures it in Chromium on R-MAT with 131,072 nodes and 1,000,000 edges,
+software WebGL2, the same container with no GPU;
+`cargo test -p ursa-viz --no-default-features --release --test delta_scale -- --nocapture`
+measures everything but the GPU writes natively, on a uniform random graph
+of the same size.
+
+| | bytes uploaded | `applyDelta`, median | its inverse | the first, cold |
+|---|---|---|---|---|
+| Chromium, wasm, WebGL2 | 5,172 | 0.5 ms | 0.3 ms | 2.0 ms |
+| native, no GPU writes | 5,252 | 0.13 ms | 0.02 ms | 0.31 ms |
+
+The issue's budget is 64 KB and 2 ms outside the frame.
+
+- **The bytes are the delta's**: 100 nodes of 16 bytes (position, radius,
+  colour) and 4 of flags, 300 edges of 8, and the radii of the older nodes
+  that gained a neighbour (nodes are sized by degree), 4 bytes a node in
+  runs: 5 KB, against the 8 MB of edge indexes and 2.6 MB of node data the
+  view holds. The delta itself is 3,880 bytes of UGR.
+- **The time is the delta's too**: nothing in `applyDelta` reads every
+  node or edge. One build back, a delta and its inverse together took
+  0.95 ms on R-MAT with 100,000 edges and 0.90 ms with 1,000,000 (200
+  pairs each). More than half of that was the writes of the older nodes'
+  radii, some 200 scattered nodes each way: the same expansion with every
+  edge to the one hub took 0.43 and 0.24 ms. (Those radii were then written
+  with their colours, two writes a run; now alone, which is the 0.8 ms of
+  the table's pair.)
+- **The largest of the 30 was 4.9 ms**, once: a pause of the page's, not of
+  the delta's (the next was back at the median).
+- **The first delta** pays for the wasm's first run of this code, and no
+  more than that: a view made from a result has room for a sixty-fourth
+  more nodes and edges than it starts with (rounded up to a power of two:
+  1,048,576 edges here), on the GPU and in the result's arrays. Before it
+  had, the first delta took 11 to 13 ms, most of it moving the result's
+  arrays, native or wasm.
+- **The delta that outgrows the buffers** doubles them: the GPU copies what
+  they held (`copyBufferSubData` on WebGL2, an index buffer included) and
+  nothing is uploaded again. `tests/browser/view.ts` checks on the karate
+  club that the pixels away from the additions are untouched by it.
+- **Undo** is the inverse delta: 0.3 ms, and 4 bytes for each older node
+  whose radius goes back. With the positions saved before the step (an
+  undo after the layout has moved), it also uploads 8 bytes a node, as one
+  layout step does.
+- **Read back:** after the 31 deltas and their inverses, the frame is the
+  first frame, byte for byte; and on the karate club after each of a
+  growth, a growth past the buffers, a removed node, removed edges and a
+  refused delta.
+- **`info()`** after a delta: 0.5 ms here (its first call) with nothing
+  hidden and no colour column, where it reads no node or edge. With a node hidden it counts the
+  shown edges (every edge is read), and with a colour column the nodes of
+  each category, once after each delta.
+- **What it took.** Three things read the whole graph in the first draft,
+  and together cost 2.2 ms a delta in Chromium: fitting the camera (the
+  bounds of every position, 1.4 ms at 131K nodes), comparing every node's
+  flags to find the changed ones, and, for an undo, the model reading every
+  edge to see that none still named the nodes taken off (0.75 ms native).
+  Now the camera's bounds are widened by the new nodes', the new nodes'
+  flags are written without reading the others, and the model keeps the
+  greatest node index its edges name, as it rises along them.
 
 ## Caveats
 

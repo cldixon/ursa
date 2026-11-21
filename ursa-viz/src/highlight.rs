@@ -118,6 +118,12 @@ impl HighlightState {
         }
     }
 
+    /// Make room for `nodes` more nodes.
+    pub fn reserve(&mut self, nodes: usize) {
+        self.flags.reserve(nodes);
+        self.drawn.reserve(nodes);
+    }
+
     /// As many nodes as `n_nodes`: new ones at the end, unflagged, or the
     /// last ones taken off, and with them the highlighted edges that name
     /// them. The other nodes keep their flags. A new node's flags are

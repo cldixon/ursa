@@ -444,9 +444,10 @@ const EDGE_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::INDEX
     .union(wgpu::BufferUsages::COPY_SRC);
 
 /// The room a view that takes deltas starts with for `len` slots: a
-/// sixty-fourth more and a few, rounded up to a power of two.
+/// sixty-fourth more and a few ([`crate::live::room`]), rounded up to a
+/// power of two.
 pub fn starting_capacity(len: usize) -> usize {
-    (len + len / 64 + 64).next_power_of_two()
+    (len + crate::live::room(len)).next_power_of_two()
 }
 
 /// The capacity to grow to for `needed` slots when there is room for

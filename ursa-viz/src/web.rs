@@ -531,8 +531,11 @@ impl GraphView {
     ///   color: { column, entries: [{ category, label, color, count }], other, none } | null }
     /// ```
     ///
-    /// It follows every [`GraphView::apply_delta`]. Counted on the first
-    /// call after a delta, in time proportional to the graph, and kept.
+    /// It follows every [`GraphView::apply_delta`]. The node counts cost
+    /// nothing; the shown edges are counted (in time proportional to the
+    /// edges) only while a node is hidden, and the legend (in time
+    /// proportional to the nodes) only when a column colours them, on the
+    /// first call after a delta.
     pub fn info(&self) -> Result<JsValue, JsValue> {
         match self.view.info() {
             Some(info) => {
