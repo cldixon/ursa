@@ -99,7 +99,9 @@ static assets and an R2 bucket.
     category and count, in text.
   - **Theme:** `ursa-viz` draws in the page's `--graph-*` tokens
     (`style.css`: background, edge ink, plain nodes, eight categorical hues
-    and "other", stepped for each theme), set with `view.setTheme(…)`; the
+    and "other", stepped for each theme; and `--graph-highlight`,
+    `--graph-selection` and `--graph-pin` for the view's highlight layer,
+    #435, which nothing in the shell drives yet), set with `view.setTheme(…)`; the
     theme toggle (or the system's) recolours an open view. No CSS filter.
   - **Progress** (#390): the pane opens with "Loading graph view…" as soon
     as the engine takes more than 150 ms (not at all, for a quick error),

@@ -98,6 +98,10 @@ export function theme() {
     node: token("node"),
     // COLOR BY's eight categories, then "other" (index 8, as the engine numbers it).
     palette: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => token(`c${i}`)).concat(token("other")),
+    // The highlight layer's: paths and halos, selection rings, pins.
+    highlight: token("highlight"),
+    selection: token("selection"),
+    pin: token("pin"),
   };
 }
 

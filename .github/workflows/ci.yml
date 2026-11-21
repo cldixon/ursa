@@ -190,6 +190,14 @@ jobs:
           WEBGPU: "0"
           ONLY: clusters
 
+      # The highlight layer (#435), frames read back on WebGL2 in both
+      # themes: a path's wide edges, the dimming, the rings, a hidden node.
+      - name: The highlight layer in Chromium
+        run: bun ursa-viz/tests/browser/view.ts
+        env:
+          WEBGPU: "0"
+          ONLY: highlight
+
       # The UGR wire format (#424), Rust to JavaScript: ui/ugr.js reads the
       # fixtures the Rust encoder wrote, bit for bit.
       - name: The UGR reader in JavaScript

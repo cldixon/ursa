@@ -20,11 +20,12 @@ later, in a notebook widget or a native window through the same `View`.
 |---|---|
 | `model` | the graph-result model, deltas and the UGR wire format (below). No GPU. |
 | `scene` | the graph, the live layout, node styles, the camera. No GPU; tested natively. |
+| `highlight` | each node's flags (selected, pinned, hidden, …) and the highlighted edges. No GPU. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
 | `web` (feature) | the wasm-bindgen API: `createView` for a canvas, `Layout` for a worker (`step`, `grow`). |
 
-With `default-features = false` the crate is `model` and `scene` alone, with
+With `default-features = false` the crate is `model`, `scene` and `highlight`, with
 no wgpu in its dependencies: what an engine needs to produce a graph, and
 nothing to draw one.
 
@@ -108,14 +109,92 @@ edges in `tests/model_scale.rs`.
 - Positions are two vertex buffers, `x` and `y`, exactly as the layout holds
   them: no interleaving on upload. Everything is a vertex or index buffer,
   never a storage buffer, because WebGL2 has none.
+- **Highlights** are a second layer (below): flags in a buffer of their own,
+  and the highlighted edges as instanced quads over the line list.
+
+## Highlights: paths, selection, pins, hidden nodes
+
+A path, a selection or a hover is drawn by a layer of its own (#435, the
+design's §4 and §6), so that pointing at something never uploads the graph.
+
+Each node has a **flags** byte (`highlight::flag`, and `NodeFlag` in
+JavaScript):
+
+| bit | flag | drawn as |
+|---|---|---|
+| 1 | selected | a 2 px ring in the selection colour |
+| 2 | hovered | a 1 px ring in the selection colour |
+| 4 | pinned | a small ring in the pin colour, hugging the disc |
+| 8 | dimmed | the node at 35%, whatever else is set |
+| 16 | highlighted | a halo in the highlight colour |
+| 32 | hidden | nothing: not the node, not its edges; it cannot be picked |
+| 64 | seed | a ring in the highlight colour: a seed, or a route's end |
+
+**Highlighted edges** are drawn wide (3 px, round ends) in the highlight
+colour, over the other edges and under the nodes in front.
+
+**While a highlight is set** (a node is highlighted or a seed, or an edge is
+highlighted), everything else draws at 35%: the edges' ink that much
+fainter, and the nodes that far from the background's colour to their own
+(still opaque, so the edges under them do not show through). The nodes that
+are selected, hovered, highlighted or a seed stay at full strength, are
+drawn last, over everything, and are never smaller than 3 px in radius, so
+a path shows in a graph whose nodes have shrunk to dots. A selection or a
+hover alone dims nothing.
+
+```js
+view.setHighlights(offsets, nodes, seeds);  // UGR's highlights.paths.offsets, .nodes and highlights.seeds
+view.clearHighlights();
+view.setSelection(Uint32Array.of(33));      // exactly these nodes; an empty array clears
+view.setHovered(view.pick(x, y));           // or undefined
+view.setPinned(nodes); view.setHidden(nodes);
+view.setFlags(flags);                       // or every node's byte at once (view.flags() reads them)
+view.setHighlightEdges(pairs);              // and any edges: src, dst node indexes
+```
+
+`setHighlights` highlights the paths' nodes, draws the steps between their
+consecutive nodes wide, and rings each path's two ends and each seed. In
+Rust, `View::set_result_highlights(&GraphResult)` does the same from a
+result's highlights (its paths' own edges, where it names them) and hides
+its removed nodes; `View::set_highlight` takes any change to the
+`HighlightState`.
+
+How it is drawn, on WebGL2 as on WebGPU:
+
+- The flags are a vertex buffer of their own, four bytes a node (the flags
+  byte, then three unused: a vertex buffer's stride is a multiple of four).
+  Changing flags uploads only the runs of nodes that changed: 4 bytes for a
+  selection or a hover of one node (and 20 to draw it in front), never the
+  styles or the edges.
+- A highlighted edge is an instance of a quad: its two ends' positions, 16
+  bytes, in a small buffer of their own, written again when the positions
+  change (an instance cannot index the position buffers without a storage
+  buffer). The line list's index buffer is not writable after it is made.
+- The nodes in front are a small buffer too (position, radius, colour and
+  flags, 20 bytes a node), drawn by the node shader after the highlighted
+  edges; the pass over every node leaves them out by their flags. So a
+  frame with a highlight draws a few more instances, not every node twice.
+- The dimming is one uniform. The edges' shader reads the flags only while a
+  node is hidden (a second pipeline), so a frame with nothing hidden costs
+  what it did.
+
+`ursa-viz/tests/browser/view.ts` reads frames back on WebGL2 in both themes
+and checks all of it: the path's width and colour, the dimming, the rings,
+the hidden node and the bytes uploaded. Under WebGPU, whose frames cannot be
+read back headless, it checks that the same calls draw with no error from
+the device.
 
 ## Colours
 
-`setTheme({background, edge, node, palette})` takes CSS hex colours, each
-optional: the background, the edges' ink (their opacity is `edgeAlpha` times
-its alpha), the nodes' colour when not coloured by category, and the
-categories' colours (`colorBy(categories)` gives category `c` the colour
-`palette[c % palette.length]`). The view keeps the categories, so a new theme
+`setTheme({background, edge, node, palette, highlight, selection, pin})`
+takes CSS hex colours, each optional: the background, the edges' ink (their
+opacity is `edgeAlpha` times its alpha), the nodes' colour when not coloured
+by category, the categories' colours (`colorBy(categories)` gives category
+`c` the colour `palette[c % palette.length]`), and the highlight layer's:
+`highlight` for highlighted edges, halos and a route's ends, `selection` for
+the rings of selected and hovered nodes, `pin` for the pins' rings. The
+built-in themes' three are at least 3:1 against their background (light:
+`#d9480f`, `#0b63ce`, `#7a3fc0`; dark: `#ffa94d`, `#6cb2ff`, `#c9a3ff`). The view keeps the categories, so a new theme
 recolours them. `setThemeNamed("light" | "dark")` takes the built-in ones
 (`Theme::light()`, `Theme::dark()`): ink on white, and light on near-black,
 with an eight-hue palette (`PALETTE`, `DARK_PALETTE`: blue, orange, aqua,
@@ -269,16 +348,21 @@ wasm-bindgen --target web --out-dir ursa-viz/pkg target/wasm32-unknown-unknown/w
 bunx serve ursa-viz      # then open /demo/?graph=rmat&scale=17&edges=1000000
 ```
 
-The demo takes `?graph=rmat&scale=&edges=`, `?graph=grid&w=&h=` or
-`?graph=clusters&k=&size=`, plus `&multilevel=0` for flat ForceAtlas2 and,
-flat, `&iterations=`. Drag to pan, wheel to zoom,
-double-click to fit, click a node to pick it.
+The demo takes `?graph=rmat&scale=&edges=`, `?graph=grid&w=&h=`,
+`?graph=clusters&k=&size=` or `?graph=karate`, plus `&multilevel=0` for flat
+ForceAtlas2 (and, flat, `&iterations=`), `&theme=dark` and
+`&highlight=path` to start with a path highlighted. Drag to pan, wheel to
+zoom, double-click to fit. The pointer's node is hovered; a click selects
+it, shift-click adds to the selection, and two selected nodes draw the
+shortest path between them. `p` pins the selection, `h` hides it, `u` shows
+everything again and Escape clears.
 
 The browser harness runs the demo on each test graph, reads frames back and
 checks them:
 
 ```sh
 bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONLY=<name>; MODE=flat|multilevel
+ONLY=highlight bun ursa-viz/tests/browser/view.ts     # the highlight layer alone (always on WebGL2)
 ```
 
 ## Benchmark
@@ -318,4 +402,11 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   rejected ("A valid external Instance reference no longer exists"), though
   plain WebGPU reads back there. To check on real hardware, and with wgpu 30,
   which needs wasm-bindgen 0.2.127 or later (the workspace is on 0.2.126).
+- **Highlights from the shell.** The layer and its API are in the view;
+  `.graph`, `.path` and the pointer do not drive it yet (#433, #438, #441).
+- **Highlights' own widths and colours.** Every highlighted edge is 3 px in
+  the one highlight colour (`Renderer::highlight_width` sets the width for
+  all); a width or a colour per edge would be 8 more bytes an instance.
+- **A group flag.** The design lists "group" among the per-node flags; it
+  comes with groups (Phase 3). Three bytes a node are free for it.
 - **The DataFrame API:** a notebook widget over the same view.
