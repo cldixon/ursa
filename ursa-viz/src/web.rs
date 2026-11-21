@@ -416,8 +416,10 @@ impl Layout {
     /// Each new node starts beside its parent: `parents[i]` for new node
     /// `oldNodeCount + i`, or, where that is `0xFFFFFFFF` or `parents` is
     /// left out, its lowest-indexed neighbour already drawn. The nodes in
-    /// `pinned` do not move at all, the other old nodes move a tenth as
-    /// readily as the new, and the schedule is short: [`Layout::total`]
+    /// `pinned` do not move at all, nor do the parents, nor the old nodes
+    /// more than two hops from a new one; the old nodes nearer than that
+    /// move a tenth as readily as the new. A drawing of more than 5,000
+    /// nodes is held whole. The schedule is short: [`Layout::total`]
     /// iterations (60 for a small addition), run by [`Layout::step`] until
     /// [`Layout::done`]. The same layout grown by the same additions has the
     /// same bits every time. On an error the layout is as it was.

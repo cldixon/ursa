@@ -11,10 +11,12 @@
 //!    multilevel prolongation places a group's members around their parent
 //!    ([`super::Fa2Multilevel`]), so no two start at one point.
 //! 2. **Holds the old ones**: pinned nodes are fixed
-//!    ([`Fa2State::set_fixed`]) and do not move by a bit; the rest get ten
-//!    times the inertia ([`Fa2State::set_inertia`]), so they give way a
-//!    little. Both still repel and attract, which is what the new nodes
-//!    settle against.
+//!    ([`Fa2State::set_fixed`]) and do not move by a bit, and so are the
+//!    nodes the new ones came from and everything more than a couple of
+//!    hops away; the old nodes in between get ten times the inertia
+//!    ([`Fa2State::set_inertia`]), so they give way a little. All of them
+//!    still repel and attract, which is what the new nodes settle against.
+//!    [`WarmParams`] says why each is held, with the measurements.
 //! 3. **Runs a short, fixed schedule** ([`warm_iterations`]): 60 iterations
 //!    for a small addition.
 //!

@@ -8,7 +8,8 @@
 //! in its topology. Both can drive the same view.
 //!
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
-//!   stepped a few iterations per frame), node styles and the camera. No GPU.
+//!   stepped a few iterations per frame, and grown when the graph gains
+//!   nodes), node styles and the camera. No GPU.
 //! - [`render`]: drawing with wgpu: WebGPU or WebGL2 in the browser, Vulkan,
 //!   Metal or DX12 natively. Edges are a line list over the node positions,
 //!   so a layout step uploads 8 bytes a node and never the edges.

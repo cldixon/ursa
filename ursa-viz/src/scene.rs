@@ -233,13 +233,18 @@ impl LiveLayout {
     /// Nothing that is drawn jumps. Each new node starts on a golden-angle
     /// spiral around its parent ([`Growth::parents`]), as the multilevel
     /// layout places a group's members. Then flat ForceAtlas2 runs warm
-    /// from the positions the layout has now: [`Growth::pinned`] nodes are
-    /// fixed and do not move by a bit, the other old nodes have ten times a
-    /// new node's inertia, and the schedule is short (60 iterations for a
-    /// small addition; [`Self::total`] says how many, [`Self::step`] runs
-    /// them and [`Self::is_done`] says when they are done). A drawing of more
-    /// than [`WarmParams::freeze_above`] nodes is held whole, so growing it
-    /// costs what the new nodes do.
+    /// from the positions the layout has now. [`Growth::pinned`] nodes are
+    /// fixed and do not move by a bit; so are the new nodes' parents, and
+    /// the old nodes more than two hops from a new one. The old nodes
+    /// nearer than that have ten times a new node's inertia, so they make
+    /// room without rearranging. A drawing of more than
+    /// [`WarmParams::freeze_above`] nodes is held whole, so growing it costs
+    /// what the new nodes do. [`WarmParams`] has each of these as a knob.
+    ///
+    /// The schedule is short: 60 iterations for a small addition.
+    /// [`Self::total`] says how many, [`Self::step`] runs them and
+    /// [`Self::is_done`] says when they are done. A graph that gained no
+    /// node has none to run, unless [`WarmParams::iterations`] says so.
     ///
     /// The same layout grown by the same additions in the same order has the
     /// same bits, on any thread count (`ursa_core::algo::fa2_grow`). A
