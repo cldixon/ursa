@@ -190,6 +190,15 @@ jobs:
           WEBGPU: "0"
           ONLY: clusters
 
+      # Rings and layers (#436) on karate: each done in the worker's one
+      # message, every node where its level puts it, none over another.
+      - name: The fixed layouts in Chromium
+        run: bun ursa-viz/tests/browser/view.ts
+        env:
+          WEBGPU: "0"
+          MODE: fixed
+          ONLY: karate
+
       # The UGR wire format (#424), Rust to JavaScript: ui/ugr.js reads the
       # fixtures the Rust encoder wrote, bit for bit.
       - name: The UGR reader in JavaScript
