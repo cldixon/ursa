@@ -12,7 +12,8 @@
 //
 // Drag (or the arrow keys) pans, the wheel (or + and -) zooms, a double-click
 // (or 0) fits the graph in view, and a click on a node names it in the
-// pane's header. Colours are the page's --graph-* tokens (style.css), read
+// pane's header. On a touch screen one finger pans, two pinch to zoom (and
+// pan), a tap names a node and a double tap fits. Colours are the page's --graph-* tokens (style.css), read
 // again when the theme changes (retheme).
 //
 // Time to the first drawing: preload() starts fetching ursa-viz and a layout
@@ -100,6 +101,30 @@ export function theme() {
   };
 }
 
+/** The most canvas pixels drawn for each CSS pixel. */
+const MAX_PIXEL_RATIO = 2;
+/** Two taps this close, in ms and in CSS pixels, are a double tap. */
+const DOUBLE_TAP_MS = 300;
+const DOUBLE_TAP_PX = 30;
+/** A finger that moves no further than this, in CSS pixels, taps; a mouse has less. */
+const TAP_SLOP_PX = 8;
+
+/**
+ * What two pointers ask of the view when they move from `a0`, `b0` to `a1`,
+ * `b1` ({x, y} each, in canvas pixels): a pan by their midpoint's movement
+ * `(dx, dy)`, then a zoom by `factor`, the change in their distance, around
+ * the new midpoint `(x, y)`. So what was between the fingers stays between
+ * them. Fingers that start on one point zoom by nothing.
+ */
+export function pinch(a0, b0, a1, b1) {
+  const mid = (a, b) => [(a.x + b.x) / 2, (a.y + b.y) / 2];
+  const [x0, y0] = mid(a0, b0);
+  const [x, y] = mid(a1, b1);
+  const before = Math.hypot(a0.x - b0.x, a0.y - b0.y);
+  const after = Math.hypot(a1.x - b1.x, a1.y - b1.y);
+  return { dx: x - x0, dy: y - y0, factor: before > 0 && after > 0 ? after / before : 1, x, y };
+}
+
 /**
  * Draw `graph` (from the engine: {n, src, dst, ids}, dense node indexes and
  * each node's id, and with SIZE BY or COLOR BY, {size, sizeBy} and {color,
@@ -128,7 +153,9 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     times.posted = performance.now();
   }
 
-  const dpr = window.devicePixelRatio || 1;
+  // At most 2 canvas pixels a CSS pixel: a phone at 3 would fill 2.25 times
+  // the pixels each frame for a picture no sharper to the eye.
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
   const canvas = document.createElement("canvas");
   canvas.tabIndex = 0;
   canvas.setAttribute("role", "application");
@@ -137,7 +164,7 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
   canvas.setAttribute(
     "aria-label",
     `Graph of ${plural(graph.n, "node")} and ${plural(graph.src.length, "edge")}${styled ? `, ${styled} (see the legend)` : ""}. ` +
-      "Drag or arrow keys to pan, wheel or plus and minus to zoom, double-click or 0 to fit, click a node to name it.",
+      "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click, double tap or 0 to fit, click a node to name it.",
   );
   stage.replaceChildren(canvas);
   const size = () => [Math.max(1, Math.round(canvas.clientWidth * dpr)), Math.max(1, Math.round(canvas.clientHeight * dpr))];
@@ -288,28 +315,77 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     fail("the graph view lost its WebGL context (the GPU was reset or is busy elsewhere); run .graph to draw it again");
   });
 
-  // Pointer: drag to pan, wheel to zoom, double-click to fit, click to pick.
+  // Pointers: one drags to pan, and a press without a drag picks the node
+  // under it. Two pinch: they zoom by the change in their distance, around
+  // the point between them, and pan as that point moves. Each pointer's
+  // place is kept in canvas pixels (`at`), by its id.
+  const pointers = new Map();
+  // The one-pointer gesture: {id, moved}, moved once it is a drag or was part
+  // of a pinch, and so no tap.
   let drag = null;
+  // The last tap of a finger or pen, {t, x, y}: a second one beside it fits.
+  let lastTap = null;
+  const at = (e) => {
+    const box = canvas.getBoundingClientRect();
+    return { x: (e.clientX - box.left) * dpr, y: (e.clientY - box.top) * dpr };
+  };
   on(canvas, "pointerdown", (e) => {
     if (e.button !== 0) return;
-    drag = { x: e.clientX, y: e.clientY, moved: false };
-    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, at(e));
+    // A second finger: what the first began is no tap. A third is ignored.
+    if (pointers.size === 1) drag = { id: e.pointerId, moved: false, from: pointers.get(e.pointerId), slop: (e.pointerType === "mouse" ? 1.5 : TAP_SLOP_PX) * dpr };
+    else if (drag) drag.moved = true;
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      // The pointer is gone already: its moves come while it is over the canvas.
+    }
   });
   on(canvas, "pointermove", (e) => {
-    if (!drag) return;
-    const dx = (e.clientX - drag.x) * dpr;
-    const dy = (e.clientY - drag.y) * dpr;
-    if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
-    view.pan(dx, dy);
-    drag.x = e.clientX;
-    drag.y = e.clientY;
-    redraw();
+    const was = pointers.get(e.pointerId);
+    if (!was) return;
+    const now = at(e);
+    const [first, second] = pointers.keys();
+    if (second !== undefined) {
+      // The first two pointers pinch; any other only rests on the glass.
+      if (e.pointerId === first || e.pointerId === second) {
+        const other = pointers.get(e.pointerId === first ? second : first);
+        const { dx, dy, factor, x, y } = pinch(was, other, now, other);
+        view.pan(dx, dy);
+        view.zoom(factor, x, y);
+        redraw();
+      }
+    } else {
+      const [dx, dy] = [now.x - was.x, now.y - was.y];
+      // A press that slips a little is still a click or a tap.
+      if (drag && !drag.moved && Math.hypot(now.x - drag.from.x, now.y - drag.from.y) > drag.slop) drag.moved = true;
+      view.pan(dx, dy);
+      redraw();
+    }
+    pointers.set(e.pointerId, now);
   });
-  on(canvas, "pointerup", (e) => {
-    if (drag && !drag.moved) pick(e.offsetX * dpr, e.offsetY * dpr);
-    drag = null;
-  });
-  on(canvas, "pointercancel", () => (drag = null));
+  const release = (e, cancelled) => {
+    if (!pointers.delete(e.pointerId)) return;
+    const tap = !cancelled && drag && drag.id === e.pointerId && !drag.moved;
+    // A finger lifted from a pinch leaves the other panning, and no tap.
+    if (pointers.size === 0) drag = null;
+    if (!tap) return;
+    const { x, y } = at(e);
+    if (e.pointerType !== "mouse") {
+      // A mouse's double-click is the browser's (dblclick, below); a
+      // finger's or a pen's second tap beside the first is found here.
+      const near = lastTap && e.timeStamp - lastTap.t < DOUBLE_TAP_MS && Math.hypot(x - lastTap.x, y - lastTap.y) < DOUBLE_TAP_PX * dpr;
+      lastTap = near ? null : { t: e.timeStamp, x, y };
+      if (near) {
+        view.fit();
+        redraw();
+        return;
+      }
+    }
+    pick(x, y);
+  };
+  on(canvas, "pointerup", (e) => release(e, false));
+  on(canvas, "pointercancel", (e) => release(e, true));
   on(
     canvas,
     "wheel",

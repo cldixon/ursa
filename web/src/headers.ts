@@ -24,6 +24,26 @@
  *
  * Downloads (.export) are blob: URLs opened by a link with `download`, a
  * navigation, which the policy does not govern; nothing loads a blob: URL.
+ *
+ * Beside it, three headers make the page cross-origin isolated
+ * (`crossOriginIsolated === true`, on the page and in its workers), which
+ * gives it precise timers and `performance.measureUserAgentSpecificMemory()`
+ * now, and lets a later build share one `WebAssembly.Memory` between threads
+ * (`SharedArrayBuffer`; design/graph-explorer.md §6, #429):
+ *
+ * - `Cross-Origin-Opener-Policy: same-origin`: the page shares its browsing
+ *   context group with no other origin. A window that opens the shell, or
+ *   that the shell opens, gets no handle to it; the page opens none.
+ * - `Cross-Origin-Embedder-Policy: require-corp`: every resource the page or
+ *   a worker loads must be same-origin or opt in (CORP or CORS). All of them
+ *   are same-origin already, as the policy above requires. The workers'
+ *   scripts carry the header too, which a worker needs to be isolated itself.
+ * - `Cross-Origin-Resource-Policy: same-origin`: no other origin may embed
+ *   these responses (a no-cors `<img>`, `<script>` or fetch). It is what
+ *   `require-corp` asks of a resource, said outright on every response.
+ *
+ * The cost: the shell can never load a cross-origin resource that sends
+ * neither CORP nor CORS headers, which `default-src 'none'` forbids anyway.
  */
 export const CONTENT_SECURITY_POLICY = [
 	"default-src 'none'",
@@ -43,6 +63,9 @@ export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
 	"content-security-policy": CONTENT_SECURITY_POLICY,
 	"x-content-type-options": "nosniff",
 	"referrer-policy": "no-referrer",
+	"cross-origin-opener-policy": "same-origin",
+	"cross-origin-embedder-policy": "require-corp",
+	"cross-origin-resource-policy": "same-origin",
 };
 
 /**
