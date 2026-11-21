@@ -183,7 +183,7 @@ impl Coarse {
     }
 }
 
-const NONE: u32 = u32::MAX;
+pub(super) const NONE: u32 = u32::MAX;
 
 /// Group the nodes of one level: `group[i]` per node, and the group count.
 /// The three passes of the module docs.
@@ -335,7 +335,7 @@ fn contract(
 
 /// ForceAtlas2's mass for each node of `adj`: `deg + 1`, as [`Fa2State`]
 /// gives it.
-fn degree_mass(adj: &UndirectedCsr) -> Vec<f32> {
+pub(super) fn degree_mass(adj: &UndirectedCsr) -> Vec<f32> {
     let n = adj.offsets.len().saturating_sub(1);
     (0..n).map(|i| 1.0 + adj.degree(i as u32) as f32).collect()
 }
@@ -432,7 +432,7 @@ fn prolong(coarse: &Coarse, x: &[f32], y: &[f32], spread: f32) -> Positions {
 /// in view. The connected part does not feel the ring: a ring's 1/d forces
 /// cancel inside it, which is also why dropping these nodes from the coarse
 /// levels leaves the rest of the layout as it would have been.
-fn ring_of(x: &[f32], y: &[f32]) -> (f32, f32, f32) {
+pub(super) fn ring_of(x: &[f32], y: &[f32]) -> (f32, f32, f32) {
     let n = x.len().max(1) as f32;
     let (mut sx, mut sy) = (0.0f32, 0.0f32);
     for i in 0..x.len() {
@@ -453,7 +453,7 @@ const RING: f32 = 3.0;
 /// `(x, y)` turned by the golden angle, renormalised so the error of repeated
 /// turns does not build up.
 #[inline]
-fn rotate(x: f32, y: f32) -> (f32, f32) {
+pub(super) fn rotate(x: f32, y: f32) -> (f32, f32) {
     let (rx, ry) = (
         x * GOLDEN_COS - y * GOLDEN_SIN,
         x * GOLDEN_SIN + y * GOLDEN_COS,

@@ -39,6 +39,7 @@ mod rng;
 pub use rng::sample_indices;
 mod triangle;
 mod undirected;
+mod warm;
 
 pub use betweenness::{betweenness, betweenness_weighted};
 pub use bfs::{
@@ -61,6 +62,7 @@ pub use layout::{
 };
 pub use louvain::{louvain, louvain_weighted};
 pub use multilevel::{layout_fa2_multilevel, Fa2Multilevel, MultilevelParams};
+pub use warm::{fa2_grow, place_new_nodes, warm_iterations, WarmParams};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, random_walk_masked, Walks};

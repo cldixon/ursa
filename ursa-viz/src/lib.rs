@@ -23,5 +23,5 @@ pub mod view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub mod web;
 
-pub use scene::{Camera, Graph, LiveLayout, NodeStyle};
+pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};
 pub use view::View;

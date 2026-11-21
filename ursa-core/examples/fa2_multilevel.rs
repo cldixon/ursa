@@ -22,6 +22,18 @@
 //! cargo run -p ursa-core --release --example fa2_multilevel -- bench 1k,10k,100k,1m rmat,grid
 //! ```
 //!
+//! `grow [sizes] [new nodes]` times a warm start (`fa2_grow`, #442): each
+//! R-MAT graph is laid out coarse to fine, then one node gains that many new
+//! neighbours (16 and 100 by default), as a click to expand does. It prints
+//! what the click costs after the engine has answered (rebuilding the
+//! adjacency, placing the new nodes, the warm schedule) and how far the old
+//! nodes moved. `GROW_FREEZE` overrides `WarmParams::freeze_above`, and
+//! `GROW_FREE_PARENT=1` lets the expanded node move:
+//!
+//! ```sh
+//! cargo run -p ursa-core --release --example fa2_multilevel -- grow 1k,10k,100k,1m 16,100
+//! ```
+//!
 //! For each graph it prints, every few iterations of flat ForceAtlas2 and over
 //! the multilevel schedule:
 //!
@@ -41,7 +53,9 @@
 //! alone, not the measuring.
 use std::time::Instant;
 
-use ursa_core::algo::{Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams};
+use ursa_core::algo::{
+    fa2_grow, Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams, WarmParams,
+};
 use ursa_core::topology::{Topology, UndirectedCsr};
 
 /// xorshift64 → [0, 1), as `graphs.js` has it.
@@ -56,6 +70,11 @@ fn rng(seed: u64) -> impl FnMut() -> f64 {
 }
 
 fn rmat(scale: u32, edges: usize) -> Topology {
+    let (src, dst) = rmat_edges(scale, edges);
+    Topology::build(1 << scale, src, dst)
+}
+
+fn rmat_edges(scale: u32, edges: usize) -> (Vec<u32>, Vec<u32>) {
     let mut next = rng(42);
     let (mut src, mut dst) = (Vec::with_capacity(edges), Vec::with_capacity(edges));
     for _ in 0..edges {
@@ -75,7 +94,7 @@ fn rmat(scale: u32, edges: usize) -> Topology {
         src.push(u);
         dst.push(v);
     }
-    Topology::build(1 << scale, src, dst)
+    (src, dst)
 }
 
 fn grid(w: u32, h: u32) -> Topology {
@@ -298,7 +317,148 @@ fn bench(sizes: &str, graphs: &str) {
     );
 }
 
+/// `grow`: a warm start timed, and how far it moved the drawing.
+fn grow(sizes: &str, adds: &str) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let parallel = cfg!(feature = "rayon");
+    println!(
+        "warm start (fa2_grow): rayon {parallel}, {} threads",
+        if parallel { threads } else { 1 }
+    );
+    println!(
+        "{:>5} {:>7} {:>8} {:>5} {:>6} {:>4} | {:>8} {:>8} {:>8} {:>8} | {:>9} {:>9} {:>8}",
+        "graph", "nodes", "edges", "new", "held", "its", "build ms", "place ms", "run ms", "total ms",
+        "mean move", "max move", "nearest"
+    );
+    for size in sizes.split(',') {
+        let (scale, edges) = match size {
+            "1k" => (7, 1_000),
+            "10k" => (11, 10_000),
+            "100k" => (14, 100_000),
+            "1m" => (17, 1_000_000),
+            other => panic!("no bench graph {other:?}"),
+        };
+        let (src, dst) = rmat_edges(scale, edges);
+        let n0 = 1usize << scale;
+        let topo = Topology::build(n0, src.clone(), dst.clone());
+        let adj = topo.undirected();
+        let ml_params = MultilevelParams::default();
+        let mut ml = Fa2Multilevel::new(adj, ml_params);
+        ml.step(adj, f64::INFINITY);
+        let (x0, y0) = (ml.positions().0.to_vec(), ml.positions().1.to_vec());
+        // The view: the box of the connected part (isolated nodes sit on a
+        // ring three times as far out, and nobody looks at them).
+        let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+        for i in 0..n0 {
+            if adj.degree(i as u32) > 0 {
+                lo = (lo.0.min(x0[i]), lo.1.min(y0[i]));
+                hi = (hi.0.max(x0[i]), hi.1.max(y0[i]));
+            }
+        }
+        let view = f64::from((hi.0 - lo.0).max(hi.1 - lo.1));
+        // The node to expand: the first of a middling degree.
+        let hub = (0..n0 as u32)
+            .find(|&u| (8..=32).contains(&adj.degree(u)))
+            .expect("a node of degree 8 to 32");
+        let mass: Vec<f32> = (0..n0 as u32).map(|u| 1.0 + adj.degree(u) as f32).collect();
+        for add in adds.split(',') {
+            let add: u32 = add.parse().expect("new nodes");
+            let (mut src, mut dst) = (src.clone(), dst.clone());
+            let mut next = rng(99);
+            for j in 0..add {
+                src.push(hub);
+                dst.push(n0 as u32 + j);
+                // A third of the new nodes are tied to another node drawn,
+                // as `induced_edges` finds: one that has neighbours, since
+                // an isolated node that gains its first edge has the whole
+                // drawing to cross, and that is not what is measured here.
+                if j % 3 == 0 {
+                    let other = loop {
+                        let v = (next() * n0 as f64) as u32;
+                        if adj.degree(v) > 0 {
+                            break v;
+                        }
+                    };
+                    src.push(n0 as u32 + j);
+                    dst.push(other);
+                }
+            }
+            let mut params = WarmParams::default();
+            if let Some(v) = std::env::var("GROW_FREEZE").ok().and_then(|v| v.parse().ok()) {
+                params.freeze_above = v;
+            }
+            if std::env::var("GROW_FREE_PARENT").is_ok() {
+                params.hold_parents = false;
+            }
+            // Best of five: the click's cost, not the first touch of memory.
+            let mut best = [f64::MAX; 3];
+            let mut out = None;
+            for _ in 0..5 {
+                let mut state =
+                    Fa2State::from_positions(ml_params.fa2, x0.clone(), y0.clone(), mass.clone());
+                let (s, d) = (src.clone(), dst.clone());
+                let t = Instant::now();
+                let grown = Topology::build(n0 + add as usize, s, d);
+                let gadj = grown.undirected();
+                let build = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let its = fa2_grow(&mut state, gadj, None, &[], params);
+                let place = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                state.step(gadj, its);
+                let run = t.elapsed().as_secs_f64();
+                for (b, v) in best.iter_mut().zip([build, place, run]) {
+                    *b = b.min(v);
+                }
+                out = Some((state, its));
+            }
+            let (state, its) = out.unwrap();
+            let (x, y) = state.positions();
+            let (mut total, mut worst) = (0.0f64, 0.0f64);
+            for i in 0..n0 {
+                let d = f64::from(((x[i] - x0[i]).powi(2) + (y[i] - y0[i]).powi(2)).sqrt());
+                total += d;
+                worst = worst.max(d);
+            }
+            // The nearest another node comes to a new one, by brute force
+            // over the new nodes only.
+            let mut nearest = f64::MAX;
+            for i in n0..x.len() {
+                for j in 0..x.len() {
+                    if i != j {
+                        let d = f64::from(((x[i] - x[j]).powi(2) + (y[i] - y[j]).powi(2)).sqrt());
+                        nearest = nearest.min(d);
+                    }
+                }
+            }
+            let held = if n0 > params.freeze_above { "fixed" } else { "x10" };
+            println!(
+                "{:>5} {:>7} {:>8} {:>5} {:>6} {:>4} | {:>8.2} {:>8.2} {:>8.2} {:>8.2} | {:>8.3}% {:>8.3}% {:>7.3}%",
+                size,
+                n0,
+                adj.targets.len() / 2,
+                add,
+                held,
+                its,
+                best[0] * 1e3,
+                best[1] * 1e3,
+                best[2] * 1e3,
+                (best[0] + best[1] + best[2]) * 1e3,
+                100.0 * total / n0 as f64 / view,
+                100.0 * worst / view,
+                100.0 * nearest / view,
+            );
+        }
+    }
+    println!("moves and the nearest node to a new one are in % of the view's width");
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("grow") {
+        let arg = |i: usize, d: &str| std::env::args().nth(i).unwrap_or_else(|| d.into());
+        grow(&arg(2, "1k,10k,100k,1m"), &arg(3, "16,100"));
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("bench") {
         let arg = |i: usize, d: &str| std::env::args().nth(i).unwrap_or_else(|| d.into());
         bench(&arg(2, "1k,10k,100k,1m"), &arg(3, "rmat,grid"));

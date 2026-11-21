@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use ursa_core::algo::{Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams};
+use ursa_core::algo::{fa2_grow, Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams, WarmParams};
 use ursa_core::topology::Topology;
 
 /// A graph to show: `n_nodes` nodes, and one edge per `(src[i], dst[i])`, as
@@ -101,6 +101,10 @@ impl Graph {
 /// a layout stepped here is the same as `layout_fa2` with as many iterations;
 /// or coarse to fine ([`LiveLayout::multilevel`]), `Fa2Multilevel`'s, the same
 /// as `layout_fa2_multilevel` once done.
+///
+/// Either can then **grow** ([`LiveLayout::grow`]): the graph gains nodes and
+/// edges, the new nodes start beside the ones they came from, and a short
+/// warm schedule settles them while what was drawn is held.
 #[derive(Debug)]
 pub struct LiveLayout {
     topology: Arc<Topology>,
@@ -112,7 +116,67 @@ enum Engine {
     Flat(Fa2State),
     // Boxed: one per view, and twice the size of the flat state.
     Multilevel(Box<Fa2Multilevel>),
+    /// A layout that has grown, or was given its positions: flat
+    /// ForceAtlas2 with what was drawn held, for `total` iterations.
+    Warm {
+        state: Fa2State,
+        run: u32,
+        total: u32,
+    },
 }
+
+/// What a layout gains in [`LiveLayout::grow`], besides the grown graph.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Growth<'a> {
+    /// The node each new node came from (the expanded one), one entry per
+    /// new node in index order; `u32::MAX`, or no list at all, for "its
+    /// lowest-indexed neighbour already drawn".
+    pub parents: Option<&'a [u32]>,
+    /// Every node pinned now, as node indexes: these do not move at all.
+    pub pinned: &'a [u32],
+    /// The schedule and how firmly the old nodes are held.
+    pub params: WarmParams,
+}
+
+/// A [`LiveLayout::grow`] that does not fit the layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadGrowth {
+    /// The graph has fewer nodes than the layout: a layout grows, and
+    /// hidden nodes keep their index.
+    Shrunk { had: usize, got: usize },
+    /// `parents` is not one entry per new node.
+    Parents { new_nodes: usize, got: usize },
+    /// A pinned index at or past the node count.
+    Pinned { node: u32, n_nodes: usize },
+    /// Positions that are not `x` then `y` for every node.
+    Positions { n_nodes: usize, got: usize },
+}
+
+impl std::fmt::Display for BadGrowth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BadGrowth::Shrunk { had, got } => write!(
+                f,
+                "the layout has {had} nodes, but the grown graph has {got}"
+            ),
+            BadGrowth::Parents { new_nodes, got } => write!(
+                f,
+                "expected one parent per new node ({new_nodes}); got {got}"
+            ),
+            BadGrowth::Pinned { node, n_nodes } => write!(
+                f,
+                "pinned node {node}, but the graph has {n_nodes} nodes"
+            ),
+            BadGrowth::Positions { n_nodes, got } => write!(
+                f,
+                "expected x then y for {n_nodes} nodes ({} values); got {got}",
+                n_nodes * 2
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BadGrowth {}
 
 impl LiveLayout {
     pub fn new(graph: &Graph, params: Fa2Params) -> Self {
@@ -135,14 +199,114 @@ impl LiveLayout {
         }
     }
 
+    /// A layout that starts from the positions `x`, `y` (one per node) and
+    /// has nothing left to run: saved positions, another layout's (rings,
+    /// layers), or the ones an undo restores. It is there to
+    /// [`grow`](Self::grow) from.
+    pub fn from_positions(
+        graph: &Graph,
+        params: Fa2Params,
+        x: Vec<f32>,
+        y: Vec<f32>,
+    ) -> Result<Self, BadGrowth> {
+        let n = graph.n_nodes();
+        if x.len() != n || y.len() != n {
+            return Err(BadGrowth::Positions {
+                n_nodes: n,
+                got: x.len() + y.len(),
+            });
+        }
+        let topology = Arc::clone(graph.topology());
+        let mass = degree_mass(&topology);
+        Ok(Self {
+            topology,
+            engine: Engine::Warm {
+                state: Fa2State::from_positions(params, x, y, mass),
+                run: 0,
+                total: 0,
+            },
+        })
+    }
+
+    /// Grow the layout to `graph`: the graph it had, with the same node
+    /// indexes, plus new nodes after them and any new edges.
+    ///
+    /// Nothing that is drawn jumps. Each new node starts on a golden-angle
+    /// spiral around its parent ([`Growth::parents`]), as the multilevel
+    /// layout places a group's members. Then flat ForceAtlas2 runs warm
+    /// from the positions the layout has now: [`Growth::pinned`] nodes are
+    /// fixed and do not move by a bit, the other old nodes have ten times a
+    /// new node's inertia, and the schedule is short (60 iterations for a
+    /// small addition; [`Self::total`] says how many, [`Self::step`] runs
+    /// them and [`Self::is_done`] says when they are done). A drawing of more
+    /// than [`WarmParams::freeze_above`] nodes is held whole, so growing it
+    /// costs what the new nodes do.
+    ///
+    /// The same layout grown by the same additions in the same order has the
+    /// same bits, on any thread count (`ursa_core::algo::fa2_grow`). A
+    /// coarse-to-fine layout can be grown before its schedule is done; it
+    /// grows from the positions it has reached, and the rest of that
+    /// schedule is dropped.
+    pub fn grow(&mut self, graph: &Graph, growth: Growth<'_>) -> Result<(), BadGrowth> {
+        let had = self.positions().0.len();
+        let n = graph.n_nodes();
+        if n < had {
+            return Err(BadGrowth::Shrunk { had, got: n });
+        }
+        if let Some(p) = growth.parents {
+            if p.len() != n - had {
+                return Err(BadGrowth::Parents {
+                    new_nodes: n - had,
+                    got: p.len(),
+                });
+            }
+        }
+        if let Some(&node) = growth.pinned.iter().find(|&&p| p as usize >= n) {
+            return Err(BadGrowth::Pinned { node, n_nodes: n });
+        }
+        let placeholder = Engine::Warm {
+            state: Fa2State::from_positions(Fa2Params::default(), vec![], vec![], vec![]),
+            run: 0,
+            total: 0,
+        };
+        let mut state = match std::mem::replace(&mut self.engine, placeholder) {
+            Engine::Flat(s) | Engine::Warm { state: s, .. } => s,
+            Engine::Multilevel(m) => {
+                let (x, y) = m.positions();
+                // The masses are the grown graph's, set below.
+                Fa2State::from_positions(m.params().fa2, x.to_vec(), y.to_vec(), vec![1.0; had])
+            }
+        };
+        self.topology = Arc::clone(graph.topology());
+        let total = fa2_grow(
+            &mut state,
+            self.topology.undirected(),
+            growth.parents,
+            growth.pinned,
+            growth.params,
+        );
+        self.engine = Engine::Warm {
+            state,
+            run: 0,
+            total,
+        };
+        Ok(())
+    }
+
     /// Run `iterations` more iterations. Coarse to fine, that is work worth
     /// as many iterations of the whole graph, spent on as many iterations of
-    /// the current level as it buys.
+    /// the current level as it buys. A grown layout runs no more than its
+    /// warm schedule has left.
     pub fn step(&mut self, iterations: u32) {
         let adj = self.topology.undirected();
         match &mut self.engine {
             Engine::Flat(s) => s.step(adj, iterations),
             Engine::Multilevel(s) => s.step(adj, f64::from(iterations)),
+            Engine::Warm { state, run, total } => {
+                let iterations = iterations.min(*total - *run);
+                state.step(adj, iterations);
+                *run += iterations;
+            }
         }
     }
 
@@ -152,6 +316,7 @@ impl LiveLayout {
         match &self.engine {
             Engine::Flat(s) => s.iterations(),
             Engine::Multilevel(s) => s.work_done().round() as u32,
+            Engine::Warm { run, .. } => *run,
         }
     }
 
@@ -162,6 +327,7 @@ impl LiveLayout {
         match &self.engine {
             Engine::Flat(_) => None,
             Engine::Multilevel(s) => Some(s.total_work().round() as u32),
+            Engine::Warm { total, .. } => Some(*total),
         }
     }
 
@@ -170,13 +336,14 @@ impl LiveLayout {
         match &self.engine {
             Engine::Flat(_) => false,
             Engine::Multilevel(s) => s.is_done(),
+            Engine::Warm { run, total, .. } => run >= total,
         }
     }
 
     /// The level being laid out: 0 is the graph itself (always, for flat).
     pub fn level(&self) -> usize {
         match &self.engine {
-            Engine::Flat(_) => 0,
+            Engine::Flat(_) | Engine::Warm { .. } => 0,
             Engine::Multilevel(s) => s.level(),
         }
     }
@@ -185,7 +352,7 @@ impl LiveLayout {
     /// graph itself (1, for flat).
     pub fn levels(&self) -> usize {
         match &self.engine {
-            Engine::Flat(_) => 1,
+            Engine::Flat(_) | Engine::Warm { .. } => 1,
             Engine::Multilevel(s) => s.coarse_levels() + 1,
         }
     }
@@ -193,10 +360,18 @@ impl LiveLayout {
     /// The positions now: `x` and `y`, one per node.
     pub fn positions(&self) -> (&[f32], &[f32]) {
         match &self.engine {
-            Engine::Flat(s) => s.positions(),
+            Engine::Flat(s) | Engine::Warm { state: s, .. } => s.positions(),
             Engine::Multilevel(s) => s.positions(),
         }
     }
+}
+
+/// ForceAtlas2's mass for each node: its undirected degree plus one.
+fn degree_mass(topology: &Topology) -> Vec<f32> {
+    let adj = topology.undirected();
+    (0..topology.n_nodes() as u32)
+        .map(|u| 1.0 + adj.degree(u) as f32)
+        .collect()
 }
 
 /// The smallest box holding every position: `(min_x, min_y, max_x, max_y)`,

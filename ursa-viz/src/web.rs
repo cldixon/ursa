@@ -15,7 +15,7 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use crate::scene::{parse_color, Graph, LiveLayout, NodeStyle, Theme};
+use crate::scene::{parse_color, Graph, Growth, LiveLayout, NodeStyle, Theme};
 use crate::view::View;
 
 fn js_err(e: impl std::fmt::Display) -> JsValue {
@@ -345,6 +345,19 @@ impl GraphView {
     }
 }
 
+/// The graph of `n_nodes` nodes and the edges `(src[i], dst[i])`, or why it
+/// is not one.
+fn checked_graph(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Graph, JsValue> {
+    if src.len() != dst.len() {
+        return Err(js_err(format!(
+            "src has {} edges but dst has {}",
+            src.len(),
+            dst.len()
+        )));
+    }
+    Graph::new(n_nodes as usize, src, dst).map_err(js_err)
+}
+
 /// The layout alone, with no canvas: for a Web Worker, so a slow iteration
 /// never holds up a frame. Post [`Layout::positions`] to the page and give
 /// them to [`GraphView::setPositions`].
@@ -366,14 +379,7 @@ impl Layout {
         multilevel: Option<bool>,
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
-        if src.len() != dst.len() {
-            return Err(js_err(format!(
-                "src has {} edges but dst has {}",
-                src.len(),
-                dst.len()
-            )));
-        }
-        let graph = Graph::new(n_nodes as usize, src, dst).map_err(js_err)?;
+        let graph = checked_graph(n_nodes, src, dst)?;
         let layout = if multilevel.unwrap_or(true) {
             LiveLayout::multilevel(&graph, ursa_core::algo::MultilevelParams::default())
         } else {
@@ -382,8 +388,63 @@ impl Layout {
         Ok(Layout { layout })
     }
 
+    /// A layout of the graph that starts from `xy` (`x` then `y`, one per
+    /// node each, as [`Layout::positions`] gives them) and has nothing left
+    /// to run: saved positions, or the ones an undo restores. It is there to
+    /// [`Layout::grow`] from.
+    #[wasm_bindgen(js_name = fromPositions)]
+    pub fn from_positions(
+        n_nodes: u32,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        xy: &[f32],
+    ) -> Result<Layout, JsValue> {
+        console_error_panic_hook::set_once();
+        let graph = checked_graph(n_nodes, src, dst)?;
+        let n = (n_nodes as usize).min(xy.len());
+        let (x, y) = xy.split_at(n);
+        let params = ursa_core::algo::MultilevelParams::default().fa2;
+        let layout =
+            LiveLayout::from_positions(&graph, params, x.to_vec(), y.to_vec()).map_err(js_err)?;
+        Ok(Layout { layout })
+    }
+
+    /// Grow the layout to the graph of `n_nodes` nodes and the edges
+    /// `(src[i], dst[i])`: the graph it had, with the same node indexes,
+    /// plus new nodes after them and any new edges.
+    ///
+    /// Each new node starts beside its parent: `parents[i]` for new node
+    /// `oldNodeCount + i`, or, where that is `0xFFFFFFFF` or `parents` is
+    /// left out, its lowest-indexed neighbour already drawn. The nodes in
+    /// `pinned` do not move at all, the other old nodes move a tenth as
+    /// readily as the new, and the schedule is short: [`Layout::total`]
+    /// iterations (60 for a small addition), run by [`Layout::step`] until
+    /// [`Layout::done`]. The same layout grown by the same additions has the
+    /// same bits every time. On an error the layout is as it was.
+    pub fn grow(
+        &mut self,
+        n_nodes: u32,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        parents: Option<Vec<u32>>,
+        pinned: Option<Vec<u32>>,
+    ) -> Result<(), JsValue> {
+        let graph = checked_graph(n_nodes, src, dst)?;
+        self.layout
+            .grow(
+                &graph,
+                Growth {
+                    parents: parents.as_deref(),
+                    pinned: pinned.as_deref().unwrap_or(&[]),
+                    params: ursa_core::algo::WarmParams::default(),
+                },
+            )
+            .map_err(js_err)
+    }
+
     /// Run `iterations` more iterations: coarse to fine, work worth that many
-    /// iterations of the whole graph.
+    /// iterations of the whole graph. A grown layout runs no more than its
+    /// warm schedule has left.
     pub fn step(&mut self, iterations: u32) {
         self.layout.step(iterations);
     }
