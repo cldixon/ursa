@@ -540,6 +540,19 @@ if (DELTA_CASES.length) {
       if (differ(grown, await frame("grown in the grown buffers"))) problem("after the buffers grew, the same delta drew another frame");
       undo(growth);
 
+      // A node far outside the drawing: the camera, which follows, fits
+      // it in, and fits back when it goes.
+      const reach = Math.max(...Array.from(xy.subarray(0, n))) - Math.min(...Array.from(xy.subarray(0, n)));
+      const outlier = new viz.DeltaBuilder().addNodes(n, 1, Float32Array.of(xy[0] + 3 * reach, xy[n])).addEdges(Uint32Array.of(n), Uint32Array.of(0)).toBytes();
+      view.applyDelta(outlier);
+      out.cameraMoved = Math.hypot(pixel(0)[0] - old[0][0], pixel(0)[1] - old[0][1]);
+      if (!(out.cameraMoved > 50)) problem(`a node far outside the drawing moved the camera by ${out.cameraMoved.toFixed(1)} px`);
+      const [fx, fy] = pixel(n);
+      if (!(fx > 0 && fx < W && fy > 0 && fy < H)) problem(`the far node is drawn at ${fx.toFixed(0)}, ${fy.toFixed(0)}: outside the canvas`);
+      if (!differ(first, await frame("with a far node"))) problem("a far node changed no pixel");
+      undo(outlier);
+      await same("a node outside the drawing");
+
       // A removed node is hidden as `setHidden` hides it: four bytes.
       const hub = 33;
       const hide = new viz.DeltaBuilder().removeNodes(Uint32Array.of(hub)).toBytes();
