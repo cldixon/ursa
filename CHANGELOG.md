@@ -480,6 +480,29 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   (`ursa-viz/BENCH.md`). The shell does not drive the layer yet. `View`'s
   methods that upload (`step`, `set_positions`, `set_style`, `color_by`,
   `set_theme`) now take the device as well as the queue.
+- **Scenes that change in place in the graph view** (#441): a view made
+  from a graph result applies a delta in time proportional to the delta, not
+  to the graph. `createViewFromResult(canvas, bytes)` takes a result as UGR
+  and `GraphView.applyDelta(bytes, positions?)` a delta: new nodes and edges
+  are written after the ones there are (the GPU buffers grow by doubling,
+  what they held copied on the GPU), a removed node is hidden by its flag
+  and a removed edge in its slot, and only the nodes whose radius or colour
+  a delta changed are written. Sizes and colours follow the result's
+  encodings (`size_by`, `color_by`; by degree without). Undo is the inverse
+  delta (`invertDelta(bytes)`) with the positions saved before the step: no
+  index changes, and a delta and its inverse leave the frame as it was, bit
+  for bit, which the browser tests read back on WebGL2. `GraphView.info()`
+  gives what a status line and a legend show (shown and hidden nodes and
+  edges, what sizes the nodes, the colour legend with counts) and follows
+  every delta. In Rust: `View::from_result`, `View::apply` and `apply_at`,
+  `View::info`, and `ursa_viz::live::LiveResult`, the bookkeeping without a
+  GPU. A delta of 100 nodes and 300 edges on a view of a million edges
+  uploads 5 KB and takes 0.5 ms in Chromium (`ursa-viz/BENCH.md`).
+  `scene::Graph` gains `append` and `truncate`, and builds its adjacency
+  again only when a layout asks; `GraphResult` gains `reserve`, and taking
+  nodes off its end no longer reads every edge. `Theme::colors` draws the
+  category `u32::MAX` (none) in the node colour. The shell's `.graph` does
+  not send deltas yet.
 - **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
   in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
   to 1M edges, under WebGPU and WebGL2, and records time to first frame and

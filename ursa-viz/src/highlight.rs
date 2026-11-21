@@ -102,6 +102,9 @@ pub struct HighlightState {
     drawn: Vec<u8>,
     /// `src, dst` per highlighted edge.
     edges: Vec<u32>,
+    /// The nodes from here on are new ([`HighlightState::resize`]): the
+    /// renderer has no flags for them yet.
+    unsent_from: usize,
 }
 
 impl HighlightState {
@@ -111,7 +114,56 @@ impl HighlightState {
             flags: vec![0; n_nodes],
             drawn: vec![0; n_nodes],
             edges: Vec::new(),
+            unsent_from: n_nodes,
         }
+    }
+
+    /// Make room for `nodes` more nodes.
+    pub fn reserve(&mut self, nodes: usize) {
+        self.flags.reserve(nodes);
+        self.drawn.reserve(nodes);
+    }
+
+    /// As many nodes as `n_nodes`: new ones at the end, unflagged, or the
+    /// last ones taken off, and with them the highlighted edges that name
+    /// them. The other nodes keep their flags. A new node's flags are
+    /// uploaded ([`HighlightState::take_dirty`]) whatever they are.
+    ///
+    /// Returns whether anything drawn went with the nodes taken off: one of
+    /// them was flagged, or a highlighted edge named one.
+    pub fn resize(&mut self, n_nodes: usize) -> bool {
+        let mut lost = false;
+        if n_nodes < self.flags.len() {
+            lost = self.flags[n_nodes..].iter().any(|&f| f != 0);
+            let gone = |v: u32| v as usize >= n_nodes;
+            if self.edges.iter().any(|&v| gone(v)) {
+                let kept: Vec<u32> = self
+                    .edges
+                    .chunks_exact(2)
+                    .filter(|e| !gone(e[0]) && !gone(e[1]))
+                    .flatten()
+                    .copied()
+                    .collect();
+                self.edges = kept;
+                lost = true;
+            }
+        }
+        self.flags.resize(n_nodes, 0);
+        self.drawn.resize(n_nodes, 0);
+        self.unsent_from = self.unsent_from.min(n_nodes);
+        lost
+    }
+
+    /// The new nodes ([`HighlightState::resize`]) the renderer has no flags
+    /// for yet, as a range, taken as sent: what [`take_dirty`] would give
+    /// for them, without reading the other nodes. For when no other flag
+    /// changed.
+    ///
+    /// [`take_dirty`]: HighlightState::take_dirty
+    pub fn take_unsent(&mut self) -> Range<usize> {
+        let new = std::mem::replace(&mut self.unsent_from, self.flags.len())..self.flags.len();
+        self.drawn[new.clone()].copy_from_slice(&self.flags[new.clone()]);
+        new
     }
 
     pub fn n_nodes(&self) -> usize {
@@ -329,8 +381,9 @@ impl HighlightState {
     /// selection is a few bytes and a new highlight a few writes.
     pub fn take_dirty(&mut self) -> Vec<Range<usize>> {
         let mut runs: Vec<Range<usize>> = Vec::new();
+        let unsent_from = std::mem::replace(&mut self.unsent_from, self.flags.len());
         for (i, (new, old)) in self.flags.iter().zip(&mut self.drawn).enumerate() {
-            if new == old {
+            if new == old && i < unsent_from {
                 continue;
             }
             *old = *new;
@@ -352,6 +405,37 @@ impl HighlightState {
 mod tests {
     use super::*;
     use crate::model::*;
+
+    #[test]
+    fn new_nodes_are_unflagged_and_uploaded_and_nodes_taken_off_take_their_edges() {
+        let mut h = HighlightState::new(4);
+        h.set_bits(flag::SELECTED, &[1], true).unwrap();
+        h.set_edges(&[0, 1, 2, 3]).unwrap();
+        assert_eq!(h.take_dirty(), vec![1..2]);
+
+        h.resize(6);
+        assert_eq!(h.flags(), [0, flag::SELECTED, 0, 0, 0, 0]);
+        // The renderer has nothing for the new slots: they are sent, though 0.
+        assert_eq!(h.take_dirty(), vec![4..6]);
+        assert!(h.take_dirty().is_empty());
+        h.set_bits(flag::PINNED, &[5], true).unwrap();
+        h.set_edges(&[0, 1, 4, 5, 2, 3]).unwrap();
+        assert_eq!(h.take_dirty(), vec![5..6]);
+
+        // Off again: the edge that named them goes, the others stay.
+        assert!(h.resize(4), "a pinned node and an edge went");
+        assert_eq!(h.flags(), [0, flag::SELECTED, 0, 0]);
+        assert_eq!(h.edges(), [0, 1, 2, 3]);
+        assert!(h.take_dirty().is_empty());
+        // The slots come back unflagged, and are sent again.
+        assert!(!h.resize(6));
+        assert_eq!(h.flags()[4..], [0, 0]);
+        assert_eq!(h.take_unsent(), 4..6);
+        assert_eq!(h.take_unsent(), 6..6);
+        assert!(h.take_dirty().is_empty());
+        // Unflagged nodes go without a trace.
+        assert!(!h.resize(5));
+    }
 
     #[test]
     fn the_themes_marks_stand_out_from_the_background() {

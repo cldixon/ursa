@@ -211,6 +211,15 @@ jobs:
           MODE: fixed
           ONLY: karate
 
+      # Scenes that change in place (#441), frames read back on WebGL2: a
+      # delta changes only what it adds, and its inverse restores the frame
+      # byte for byte.
+      - name: Deltas in Chromium
+        run: bun ursa-viz/tests/browser/view.ts
+        env:
+          WEBGPU: "0"
+          ONLY: delta karate
+
       # The UGR wire format (#424), Rust to JavaScript: ui/ugr.js reads the
       # fixtures the Rust encoder wrote, bit for bit.
       - name: The UGR reader in JavaScript

@@ -847,6 +847,7 @@ fn read_result(h: ResultH, r: &Reader<'_>) -> Result<GraphResult, UgrError> {
         encodings: h.encodings,
         provenance: h.provenance,
         index: HashMap::new(),
+        named: Vec::new(),
     };
     result.validate()?;
     Ok(result)
