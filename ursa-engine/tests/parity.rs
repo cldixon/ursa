@@ -231,8 +231,10 @@ fn traversal_parameters_match_python() {
     let document: Value =
         serde_json::from_str(&std::fs::read_to_string(&fixtures).unwrap()).unwrap();
     let signatures = document["traversal_signatures"].as_object().unwrap();
-    assert_eq!(signatures.len(), traversal::TRAVERSALS.len());
-    for spec in traversal::TRAVERSALS {
+    // The traversals Python has: `induced_edges` is SQL's own (#432).
+    let shared = || traversal::TRAVERSALS.iter().filter(|t| t.python);
+    assert_eq!(signatures.len(), shared().count());
+    for spec in shared() {
         let python: Vec<(String, Value)> = signatures[spec.name]
             .as_array()
             .unwrap()
@@ -441,7 +443,7 @@ async fn sql_matches_the_python_library() {
     for f in ursa_engine::graph::functions::specs() {
         assert!(functions.contains(f.name), "no parity case for {}", f.name);
     }
-    for t in traversal::TRAVERSALS {
+    for t in traversal::TRAVERSALS.iter().filter(|t| t.python) {
         assert!(functions.contains(t.name), "no parity case for {}", t.name);
     }
     // And every layout, through the internal path.

@@ -553,6 +553,7 @@ fn traversal_node(
         edges.source,
         edges.destination,
         vertex_label(graph),
+        graph.edges.name.clone(),
     )
 }
 
