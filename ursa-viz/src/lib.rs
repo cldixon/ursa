@@ -11,6 +11,8 @@
 //!   the engine produces and every front end reads.
 //! - [`live`]: a result as the view draws it, kept in step with its deltas:
 //!   which slots a delta changes, in time proportional to the delta. No GPU.
+//! - [`interact`]: the selection set and the hovered node: what a click
+//!   selects. No GPU.
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
 //!   stepped a few iterations per frame, and grown when the graph gains
 //!   nodes), node styles and the camera. No GPU.
@@ -23,11 +25,12 @@
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
 //! With `default-features = false` the crate is [`model`], [`scene`],
-//! [`highlight`] and [`live`] alone: no GPU and no browser, which is how the engine depends on it.
+//! [`highlight`], [`interact`] and [`live`] alone: no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
 pub mod highlight;
+pub mod interact;
 pub mod live;
 pub mod model;
 #[cfg(feature = "render")]
@@ -39,6 +42,7 @@ pub mod view;
 pub mod web;
 
 pub use highlight::HighlightState;
+pub use interact::{Interact, Selection};
 pub use live::{Changes, LiveResult};
 pub use model::{GraphDelta, GraphResult};
 pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};

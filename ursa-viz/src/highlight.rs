@@ -102,6 +102,9 @@ pub struct HighlightState {
     drawn: Vec<u8>,
     /// `src, dst` per highlighted edge.
     edges: Vec<u32>,
+    /// `src, dst` per edge of the selection: drawn as the highlighted edges
+    /// are, but they dim nothing.
+    selection_edges: Vec<u32>,
     /// The nodes from here on are new ([`HighlightState::resize`]): the
     /// renderer has no flags for them yet.
     unsent_from: usize,
@@ -114,6 +117,7 @@ impl HighlightState {
             flags: vec![0; n_nodes],
             drawn: vec![0; n_nodes],
             edges: Vec::new(),
+            selection_edges: Vec::new(),
             unsent_from: n_nodes,
         }
     }
@@ -136,16 +140,17 @@ impl HighlightState {
         if n_nodes < self.flags.len() {
             lost = self.flags[n_nodes..].iter().any(|&f| f != 0);
             let gone = |v: u32| v as usize >= n_nodes;
-            if self.edges.iter().any(|&v| gone(v)) {
-                let kept: Vec<u32> = self
-                    .edges
-                    .chunks_exact(2)
-                    .filter(|e| !gone(e[0]) && !gone(e[1]))
-                    .flatten()
-                    .copied()
-                    .collect();
-                self.edges = kept;
-                lost = true;
+            for edges in [&mut self.edges, &mut self.selection_edges] {
+                if edges.iter().any(|&v| gone(v)) {
+                    let kept: Vec<u32> = edges
+                        .chunks_exact(2)
+                        .filter(|e| !gone(e[0]) && !gone(e[1]))
+                        .flatten()
+                        .copied()
+                        .collect();
+                    *edges = kept;
+                    lost = true;
+                }
             }
         }
         self.flags.resize(n_nodes, 0);
@@ -180,10 +185,23 @@ impl HighlightState {
         &self.edges
     }
 
-    /// The highlighted edges to draw: those with neither end hidden.
+    /// The selection's edges ([`HighlightState::set_selection_edges`]),
+    /// `src, dst` each, hidden ends included.
+    pub fn selection_edges(&self) -> &[u32] {
+        &self.selection_edges
+    }
+
+    /// Whether any edge is drawn wide: highlighted, or the selection's.
+    pub fn any_wide_edges(&self) -> bool {
+        !(self.edges.is_empty() && self.selection_edges.is_empty())
+    }
+
+    /// The wide edges to draw: the highlighted edges, then the selection's,
+    /// those with neither end hidden.
     pub fn shown_edges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.edges
             .chunks_exact(2)
+            .chain(self.selection_edges.chunks_exact(2))
             .map(|e| (e[0], e[1]))
             .filter(|&(s, d)| !self.is(s, flag::HIDDEN) && !self.is(d, flag::HIDDEN))
     }
@@ -274,6 +292,19 @@ impl HighlightState {
         self.check_nodes(pairs)?;
         self.edges.clear();
         self.edges.extend_from_slice(pairs);
+        Ok(())
+    }
+
+    /// The selection's edges: `src, dst` per edge, drawn wide as the
+    /// highlighted edges are, but dimming nothing: a selection is not a
+    /// highlight. [`HighlightState::clear_highlight`] keeps them.
+    pub fn set_selection_edges(&mut self, pairs: &[u32]) -> Result<(), BadHighlight> {
+        if !pairs.len().is_multiple_of(2) {
+            return Err(BadHighlight::OddEdges { len: pairs.len() });
+        }
+        self.check_nodes(pairs)?;
+        self.selection_edges.clear();
+        self.selection_edges.extend_from_slice(pairs);
         Ok(())
     }
 
@@ -405,6 +436,44 @@ impl HighlightState {
 mod tests {
     use super::*;
     use crate::model::*;
+
+    #[test]
+    fn a_selections_edges_are_drawn_wide_and_dim_nothing() {
+        let mut h = HighlightState::new(5);
+        h.set_bits(flag::SELECTED, &[1], true).unwrap();
+        h.set_selection_edges(&[0, 1, 1, 2]).unwrap();
+        assert!(h.any_wide_edges());
+        assert!(!h.dims_the_rest(), "a selection is not a highlight");
+        assert_eq!(h.shown_edges().collect::<Vec<_>>(), [(0, 1), (1, 2)]);
+
+        // With a highlight too: its edges first, and clearing it keeps the selection's.
+        h.set_edges(&[3, 4]).unwrap();
+        assert!(h.dims_the_rest());
+        assert_eq!(
+            h.shown_edges().collect::<Vec<_>>(),
+            [(3, 4), (0, 1), (1, 2)]
+        );
+        h.clear_highlight();
+        assert_eq!(h.selection_edges(), [0, 1, 1, 2]);
+        assert!(!h.dims_the_rest());
+
+        // An edge at a hidden node is not drawn; one at a node taken off goes.
+        h.set_bits(flag::HIDDEN, &[0], true).unwrap();
+        assert_eq!(h.shown_edges().collect::<Vec<_>>(), [(1, 2)]);
+        assert!(h.resize(2));
+        assert_eq!(h.selection_edges(), [0, 1]);
+
+        assert_eq!(
+            h.set_selection_edges(&[0]),
+            Err(BadHighlight::OddEdges { len: 1 })
+        );
+        assert_eq!(
+            h.set_selection_edges(&[0, 9]),
+            Err(BadHighlight::Node { node: 9, nodes: 2 })
+        );
+        h.set_selection_edges(&[]).unwrap();
+        assert!(!h.any_wide_edges());
+    }
 
     #[test]
     fn new_nodes_are_unflagged_and_uploaded_and_nodes_taken_off_take_their_edges() {

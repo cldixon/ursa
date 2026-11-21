@@ -435,6 +435,7 @@ impl View {
         let flags_changed = next.flags() != self.highlight.flags();
         // Hiding a node takes its highlighted edges with it.
         let edges_changed = next.edges() != self.highlight.edges()
+            || next.selection_edges() != self.highlight.selection_edges()
             || flags_changed && (next.any_hidden() || self.highlight.any_hidden());
         self.highlight = next;
         let dirty = self.highlight.take_dirty();
@@ -455,7 +456,7 @@ impl View {
         edges: bool,
         front: bool,
     ) {
-        if edges && !(self.highlight.edges().is_empty() && self.renderer.highlight_edges() == 0) {
+        if edges && !(!self.highlight.any_wide_edges() && self.renderer.highlight_edges() == 0) {
             let ends = self.highlight_ends();
             self.renderer.set_highlight_edges(device, queue, &ends);
         }
