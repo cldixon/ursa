@@ -30,8 +30,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::array::{Array, AsArray, RecordBatch};
+use datafusion::arrow::compute::{cast, concat_batches};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, UInt64Type};
 use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::provider_as_source;
@@ -39,8 +40,8 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::SessionContext;
 use ursa_viz::model::{
-    Column as ModelColumn, EdgeBatch, Encodings, GraphDelta, GraphResult, KeyType, NodeBatch,
-    NodeLabel, Op, Provenance, Role, Strings, Target, Values, NULL,
+    Column as ModelColumn, ColumnRole, EdgeBatch, Encodings, GraphDelta, GraphResult, Highlights,
+    KeyType, NodeBatch, NodeLabel, Op, Provenance, Role, Strings, Target, Values, NO_ROW, NULL,
 };
 
 use crate::graph::schema::graph_table;
@@ -54,11 +55,13 @@ mod style;
 #[cfg(test)]
 mod tests;
 
-use build::{build_indexed, from_shape, EdgeList, NodeIndex};
+use build::{build_indexed, EdgeList, NodeIndex};
 pub use clauses::{identifier, parse, Name, Style};
 pub use rules::Rule;
+use rules::{MatchEdge, Shape};
 use style::{
-    color_by, degree_column, resolve, run_algorithms, size_by, vertex_column, Found, NodeValues,
+    color_by, degree_column, resolve, run_algorithms, size_by, vertex_column, ColorBy, Found,
+    NodeValues,
 };
 
 /// The most edges a view draws: about what a laptop's browser lays out and
@@ -75,6 +78,9 @@ pub const MAX_CATEGORIES: usize = 8;
 /// names, and the size column has the name itself. [`Legend::by`] is the
 /// name without it.
 pub const COLOR_SUFFIX: &str = " (colour)";
+/// What the size column is called when a column of the rule's (a hop's
+/// `distance`, a pattern's property) already has `SIZE BY`'s name.
+pub const SIZE_SUFFIX: &str = " (size)";
 
 pub(crate) fn plan_err<T>(message: impl Into<String>) -> Result<T> {
     Err(DataFusionError::Plan(message.into()))
@@ -186,6 +192,48 @@ impl GraphView {
     pub fn legend(&self) -> Option<Legend> {
         Legend::of(&self.result)
     }
+
+    /// What the result was drawn as, for a status line (see [`drawn_as`]).
+    pub fn drawn_as(&self) -> String {
+        drawn_as(&self.result)
+    }
+}
+
+/// What `result` was drawn as, by its provenance: the rule, the graph, the
+/// columns read, and the rule's notes. `a path on karate (members, ties)`;
+/// `nodes of karate (id, pagerank, community)`; `edges (src, dst)`; `the
+/// graph karate`. A status line says `drawn as` and then this. Empty when
+/// the result names no rule. (The page's `graph-data.js` says the same.)
+pub fn drawn_as(result: &GraphResult) -> String {
+    let provenance = result.provenance();
+    let Some(rule) = provenance.rule.as_deref() else {
+        return String::new();
+    };
+    let paths = result.highlights().paths.len();
+    let (what, joins) = match rule {
+        "graph" => ("the graph".to_string(), " "),
+        "edges" => ("edges".to_string(), " of "),
+        "path" if paths > 1 => (format!("{} paths", thousands(paths)), " on "),
+        "path" => ("a path".to_string(), " on "),
+        "rings" => ("rings".to_string(), " on "),
+        "pattern" => ("pattern matches".to_string(), " on "),
+        "nodes" => ("nodes".to_string(), " of "),
+        other => (other.to_string(), " on "),
+    };
+    let mut out = what;
+    if let Some(graph) = result.graph() {
+        out.push_str(joins);
+        out.push_str(graph);
+    }
+    if !provenance.roles.is_empty() {
+        let columns: Vec<&str> = provenance.roles.iter().map(|r| r.column.as_str()).collect();
+        out.push_str(&format!(" ({})", columns.join(", ")));
+    }
+    for note in &provenance.notes {
+        out.push_str(" · ");
+        out.push_str(note);
+    }
+    out
 }
 
 /// `COLOR BY`'s legend: the categories coloured, the largest first, and the
@@ -213,9 +261,8 @@ impl Legend {
         let Values::Dict { values, codes } = &result.node_column(name)?.values else {
             return None;
         };
-        let size = result.encodings().size_by.as_deref();
         let by = match name.strip_suffix(COLOR_SUFFIX) {
-            Some(by) if size == Some(by) => by,
+            Some(by) if result.node_column(by).is_some() => by,
             _ => name,
         };
         let top = values.len().min(MAX_CATEGORIES);
@@ -268,69 +315,443 @@ pub async fn draw(
     source: Source,
     style: &Style,
 ) -> Result<GraphView> {
-    let (edges, key_type) = draw_edges(ctx, sql, &source, style).await?;
-    let (graph, provenance) = match source {
-        Source::Graph(g) => (
-            Some(g.name.clone()),
-            Provenance {
-                sql: None,
-                rule: Some(Rule::Graph.name().to_string()),
-            },
-        ),
-        Source::Rows { schema, sql, .. } => (
-            None,
-            Provenance {
-                sql,
-                rule: Some(rules::shape_of(&schema)?.rule().name().to_string()),
-            },
-        ),
+    let (mut drawing, text) = match source {
+        Source::Graph(g) => {
+            let (edges, index) = property_graph_indexed(ctx, &g).await?;
+            (Drawing::of_graph(edges, index, g), None)
+        }
+        Source::Rows {
+            schema,
+            batches,
+            sql: text,
+        } => (read_rows(ctx, sql, schema, batches).await?, text),
     };
-    to_view(edges, &key_type, graph, provenance)
+    apply_style(ctx, sql, &mut drawing, style).await?;
+    let provenance = Provenance {
+        sql: text,
+        rule: Some(drawing.rule.name().to_string()),
+        roles: drawing
+            .roles
+            .iter()
+            .map(|(column, role)| ColumnRole::new(column, role))
+            .collect(),
+        notes: std::mem::take(&mut drawing.notes),
+    };
+    let graph = drawing.graph.as_ref().map(|g| g.name.clone());
+    to_view(drawing.edges, &drawing.index.key_type, graph, provenance)
 }
 
-/// The drawing of `source`, and the type its ids were read as.
-async fn draw_edges(
+/// What the result → graph rules (design §3, [`rules`]) make of a result:
+/// its rows as a graph, drawn by the first rule that matches, with that
+/// rule's defaults. This is `.graph` after a query, with no clauses.
+///
+/// Rules 2 and 5 read the graph's edges among the result's nodes
+/// (`induced_edges`), from the graph the columns say they are from
+/// (`ursa.graph`), or else the session's only property graph.
+pub async fn interpret(
     ctx: &SessionContext,
     sql: &dyn RunSql,
-    source: &Source,
-    style: &Style,
-) -> Result<(EdgeList, DataType)> {
-    let (mut edges, index) = match source {
-        Source::Graph(g) => property_graph_indexed(ctx, g).await?,
-        Source::Rows {
-            schema, batches, ..
-        } => from_shape(rules::shape_of(schema)?, batches)?,
-    };
-    if style.size.is_none() && style.color.is_none() {
-        if style.nodes.is_some() {
-            return plan_err(
-                "NODES (…) gives values for SIZE BY or COLOR BY to use; add one, as in \
-                 .graph … NODES (SELECT id, score FROM …) SIZE BY score",
-            );
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<GraphView> {
+    let source = Source::of_rows((schema, batches));
+    draw(ctx, sql, source, &Style::default()).await
+}
+
+/// A drawing before its style: the nodes and edges a rule read, and what
+/// `SIZE BY` and `COLOR BY` may use.
+struct Drawing {
+    edges: EdgeList,
+    index: NodeIndex,
+    rule: Rule,
+    /// The graph the nodes belong to, if known: what an algorithm runs on.
+    graph: Option<Arc<PropertyGraph>>,
+    /// The result's own rows, when each is a node (rule 5).
+    own: Option<NodeValues>,
+    /// The rule's defaults for `SIZE BY` and `COLOR BY`.
+    size: Option<Name>,
+    color: Option<Name>,
+    roles: Vec<(String, String)>,
+    notes: Vec<String>,
+}
+
+impl Drawing {
+    fn of_graph(edges: EdgeList, index: NodeIndex, graph: Arc<PropertyGraph>) -> Drawing {
+        Drawing {
+            edges,
+            index,
+            rule: Rule::Graph,
+            graph: Some(graph),
+            own: None,
+            size: None,
+            color: None,
+            roles: Vec::new(),
+            notes: Vec::new(),
         }
-        return Ok((edges, index.key_type));
     }
-    let graph = match source {
-        Source::Graph(g) => Some(g.as_ref()),
-        Source::Rows { .. } => None,
+}
+
+/// The graph a result's nodes belong to: the one its columns name, or else
+/// (`or_the_only`) the session's only property graph.
+fn graph_of(
+    ctx: &SessionContext,
+    reading: &rules::Reading,
+    or_the_only: bool,
+    notes: &mut Vec<String>,
+) -> Option<Arc<PropertyGraph>> {
+    let registry = registry_of(ctx);
+    if let Some(name) = &reading.graph {
+        let found = registry.get(name);
+        if found.is_none() {
+            notes.push(format!("the graph '{name}' is not in this session"));
+        }
+        return found;
+    }
+    let mut all = registry.all();
+    match (or_the_only, all.len()) {
+        (true, 1) => all.pop(),
+        _ => None,
+    }
+}
+
+/// The drawing of a result's rows, by the rule that matches them.
+async fn read_rows(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<Drawing> {
+    let reading = rules::read(&schema)?;
+    let mut notes = reading.notes.clone();
+    let name = |column: usize| schema.field(column).name().as_str();
+    // One batch, for the rules that read rows by position.
+    let whole = || concat_batches(&schema, &batches);
+    let label_names = |keys: &[usize]| -> (Vec<String>, Vec<u16>) {
+        let mut labels: Vec<String> = Vec::new();
+        let of_key = keys
+            .iter()
+            .map(|&k| {
+                let label = reading.label_of(k).unwrap_or("");
+                let at = labels.iter().position(|l| l == label).unwrap_or_else(|| {
+                    labels.push(label.to_string());
+                    labels.len() - 1
+                });
+                at as u16
+            })
+            .collect();
+        (labels, of_key)
     };
+    let mut own = None;
+    let (mut size, mut color) = (None, None);
+    let graph = graph_of(
+        ctx,
+        &reading,
+        matches!(reading.shape, Shape::Hop { .. } | Shape::Nodes { .. }),
+        &mut notes,
+    );
+    // The label of each key column, for the nodes' properties.
+    let mut key_labels: Vec<(usize, u16)> = Vec::new();
+    let (mut edges, index) = match &reading.shape {
+        Shape::Edges { src, dst } => {
+            let (labels, of_key) = label_names(&[*src, *dst]);
+            if labels.len() > 1 {
+                // Two vertex tables: a node is its table and its key.
+                let batch = whole()?;
+                key_labels = vec![(*src, of_key[0]), (*dst, of_key[1])];
+                let edge = MatchEdge {
+                    from: 0,
+                    to: 1,
+                    directed: true,
+                    label: reading.edge_label.clone().unwrap_or_default(),
+                };
+                build::matches_of(&batch, &key_labels, &labels, &[edge])?
+            } else {
+                let (mut edges, index) = build::edges_of(&batches, *src, *dst)?;
+                if reading.marked {
+                    edges.labels = labels;
+                    edges.edge_labels = reading.edge_label.iter().cloned().collect();
+                }
+                if !reading.attributes.is_empty() {
+                    let batch = whole()?;
+                    let (s, d) = (batch.column(*src), batch.column(*dst));
+                    let kept: Vec<usize> = (0..batch.num_rows())
+                        .filter(|&i| s.is_valid(i) && d.is_valid(i))
+                        .collect();
+                    for &a in &reading.attributes {
+                        let role = meta_role(&schema, a);
+                        edges.edge_columns.push(build::edge_attribute(
+                            name(a),
+                            role,
+                            batch.column(a),
+                            &kept,
+                        )?);
+                    }
+                }
+                (edges, index)
+            }
+        }
+        Shape::Path {
+            nodes,
+            edges,
+            elements,
+        } => {
+            let (mut drawn, index) =
+                build::paths_of(&whole()?, *nodes, *edges, *elements, &reading)?;
+            let anchor = nodes.or(*elements).expect("a path column");
+            if reading.label_of(anchor).is_some() {
+                drawn.labels = label_names(&[anchor]).0;
+            }
+            (drawn, index)
+        }
+        Shape::Steps { src, dst, step } => {
+            let batch = whole()?;
+            let (mut edges, index, kept) = build::steps_of(&batch, *src, *dst, *step)?;
+            let (labels, _) = label_names(&[*src, *dst]);
+            if labels.len() == 1 {
+                edges.labels = labels;
+            }
+            for &a in &reading.attributes {
+                let role = meta_role(&schema, a);
+                edges.edge_columns.push(build::edge_attribute(
+                    name(a),
+                    role,
+                    batch.column(a),
+                    &kept,
+                )?);
+            }
+            (edges, index)
+        }
+        Shape::Hop { seed, id, distance } => {
+            let batch = whole()?;
+            let (mut edges, index, rows) = build::hop_of(&batch, *seed, *id, *distance)?;
+            if reading.label_of(*id).is_some() {
+                edges.labels = label_names(&[*id]).0;
+            }
+            let read = match &graph {
+                Some(g) => induced(ctx, sql, g, &mut edges, &index).await,
+                None => Err("there is no property graph to read the edges from".to_string()),
+            };
+            if let Err(why) = read {
+                // The rows' own edges: each seed's to the nodes one step away.
+                for i in 0..rows.reached.len() {
+                    if rows.distance[i] == 1 && rows.seeds[i] != NULL && rows.reached[i] != NULL {
+                        edges.src.push(rows.seeds[i]);
+                        edges.dst.push(rows.reached[i]);
+                    }
+                }
+                notes.push(format!(
+                    "{why}: only each seed's edges to the nodes one step away are drawn"
+                ));
+            }
+            (edges, index)
+        }
+        Shape::Matches { keys, edges } => {
+            let (labels, of_key) = label_names(keys);
+            key_labels = keys.iter().copied().zip(of_key).collect();
+            build::matches_of(&whole()?, &key_labels, &labels, edges)?
+        }
+        Shape::Nodes { id } => {
+            let batch = whole()?;
+            let (mut edges, index) = build::nodes_of(&batch, *id)?;
+            if reading.label_of(*id).is_some() {
+                edges.labels = label_names(&[*id]).0;
+            }
+            let read = match &graph {
+                Some(g) => induced(ctx, sql, g, &mut edges, &index).await,
+                None => Err("there is no property graph to read the edges from".to_string()),
+            };
+            if let Err(why) = read {
+                notes.push(format!("{why}: the nodes are drawn without edges"));
+            }
+            let named = |column: usize| Name {
+                ident: name(column).to_string(),
+                shown: name(column).to_string(),
+            };
+            size = reading.size.map(named);
+            color = reading.color.map(named);
+            own = Some(NodeValues::of_rows(
+                Arc::clone(&schema),
+                batches.clone(),
+                *id,
+            ));
+            (edges, index)
+        }
+    };
+    if key_labels.is_empty() {
+        if let Shape::Edges { src, dst } = &reading.shape {
+            key_labels = vec![(*src, 0), (*dst, 0)];
+        }
+    }
+    // The properties of the pattern's variables, on their nodes.
+    if !reading.properties.is_empty() {
+        let batch = whole()?;
+        let several = edges.labels.len() > 1;
+        for &(column, key) in &reading.properties {
+            let label = key_labels
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, l)| *l)
+                .filter(|_| several);
+            let values = style::Column::of_keys(
+                Arc::clone(batch.column(key)),
+                Arc::clone(batch.column(column)),
+                label,
+            )
+            .per_node(&index, edges.n as usize)?;
+            let taken = |n: &str| edges.node_columns.iter().any(|c| c.name == n);
+            if !taken(name(column)) {
+                edges
+                    .node_columns
+                    .push(style::property_column(name(column), &values)?);
+            }
+        }
+    }
+    Ok(Drawing {
+        edges,
+        index,
+        rule: reading.shape.rule(),
+        graph,
+        own,
+        size,
+        color,
+        roles: reading.roles,
+        notes,
+    })
+}
+
+/// The model's role of column `column`, if its metadata says one the model
+/// has.
+fn meta_role(schema: &SchemaRef, column: usize) -> Option<Role> {
+    use crate::graph::provenance as meta;
+    match schema.field(column).metadata().get(meta::ROLE)?.as_str() {
+        meta::ROLE_METRIC => Some(Role::Metric),
+        meta::ROLE_CATEGORY => Some(Role::Category),
+        meta::ROLE_PROPERTY => Some(Role::Property),
+        meta::ROLE_DISTANCE => Some(Role::Distance),
+        _ => None,
+    }
+}
+
+/// Add `graph`'s edges among the nodes of `edges` (`induced_edges`), each
+/// with its row in the edge table. `Err` says why they could not be read.
+async fn induced(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    graph: &PropertyGraph,
+    edges: &mut EdgeList,
+    index: &NodeIndex,
+) -> std::result::Result<(), String> {
+    use crate::graph::provenance as meta;
+    let quoted = !index.key_type.is_integer();
+    let mut list = String::with_capacity(edges.ids.len() * 8);
+    for (i, id) in edges.ids.iter().enumerate() {
+        if i > 0 {
+            list.push(',');
+        }
+        if quoted {
+            list.push('\'');
+            list.push_str(&id.replace('\'', "''"));
+            list.push('\'');
+        } else {
+            list.push_str(id);
+        }
+    }
+    let query = format!(
+        "SELECT src, dst, edge FROM induced_edges(\"{}\", nodes => [{list}]) LIMIT {}",
+        graph.name.replace('"', "\"\""),
+        MAX_EDGES + 1
+    );
+    drop(list);
+    let (schema, batches) = sql.run(ctx, &query).await.map_err(|e| {
+        format!(
+            "the edges of '{}' could not be read ({})",
+            graph.name,
+            crate::user_message(&e)
+        )
+    })?;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if rows > MAX_EDGES {
+        return Err(format!(
+            "there are more than {} edges among the nodes, the most the graph view draws",
+            thousands(MAX_EDGES)
+        ));
+    }
+    let fail = |e: DataFusionError| crate::user_message(&e);
+    let mut edge_rows = Vec::with_capacity(rows);
+    for b in &batches {
+        let (s, d) = (
+            index.lookup(b.column(0)).map_err(fail)?,
+            index.lookup(b.column(1)).map_err(fail)?,
+        );
+        let row = cast(b.column(2), &DataType::UInt64).map_err(|e| e.to_string())?;
+        let row = row.as_primitive::<UInt64Type>();
+        for i in 0..b.num_rows() {
+            if let (Some(s), Some(d)) = (s[i], d[i]) {
+                edges.src.push(s);
+                edges.dst.push(d);
+                edge_rows.push(if row.is_valid(i) {
+                    row.value(i)
+                } else {
+                    NO_ROW
+                });
+            }
+        }
+    }
+    if edge_rows.iter().any(|&r| r != NO_ROW) {
+        edges.edge_rows = Some(edge_rows);
+    }
+    if let Some(label) = schema.field(2).metadata().get(meta::LABEL) {
+        edges.edge_labels = vec![label.clone()];
+    }
+    Ok(())
+}
+
+/// `SIZE BY` and `COLOR BY` on `drawing`: what `style` asks, or else the
+/// rule's defaults.
+async fn apply_style(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    drawing: &mut Drawing,
+    style: &Style,
+) -> Result<()> {
+    if style.size.is_none() && style.color.is_none() && style.nodes.is_some() {
+        return plan_err(
+            "NODES (…) gives values for SIZE BY or COLOR BY to use; add one, as in \
+             .graph … NODES (SELECT id, score FROM …) SIZE BY score",
+        );
+    }
+    let graph = drawing.graph.clone();
+    let graph = graph.as_deref();
     let nodes = match &style.nodes {
         Some(query) => Some(NodeValues::of_query(ctx, sql, query).await?),
         None => None,
     };
-    // Where each name's values come from; the algorithms run together.
+    let own = drawing.own.as_ref();
+    // Where each name's values come from; the algorithms run together. A
+    // default that cannot be drawn is left out; what was asked for is an
+    // error.
     let mut found = Vec::new();
-    for (clause, name) in [("SIZE BY", &style.size), ("COLOR BY", &style.color)] {
-        if let Some(name) = name {
-            found.push((
+    for (clause, asked, default) in [
+        ("SIZE BY", &style.size, &drawing.size),
+        ("COLOR BY", &style.color, &drawing.color),
+    ] {
+        match (asked, default) {
+            (Some(name), _) => found.push((
                 clause,
-                name,
-                resolve(ctx, graph, nodes.as_ref(), clause, name).await?,
-            ));
+                name.clone(),
+                resolve(ctx, graph, nodes.as_ref(), own, clause, name).await?,
+                true,
+            )),
+            (None, Some(name)) => {
+                if let Ok(f) = resolve(ctx, None, None, own, clause, name).await {
+                    found.push((clause, name.clone(), f, false));
+                }
+            }
+            (None, None) => {}
         }
     }
     let mut algorithms: Vec<&'static str> = Vec::new();
-    for (_, _, f) in &found {
+    for (_, _, f, _) in &found {
         if let Found::Algorithm(name) = f {
             if !algorithms.contains(name) {
                 algorithms.push(name);
@@ -341,22 +762,83 @@ async fn draw_edges(
         (Some(g), false) => Some(run_algorithms(ctx, sql, g, &algorithms).await?),
         _ => None,
     };
-    for (clause, name, f) in found {
+    let edges = &mut drawing.edges;
+    for (clause, name, f, asked) in found {
         let column = match f {
             Found::Nodes(i) => nodes.as_ref().expect("NODES was given").column(i),
+            Found::Own(i) => own.expect("the result's rows").column(i),
             Found::Vertex => vertex_column(ctx, graph.expect("a graph"), &name.ident).await?,
             Found::Algorithm(algorithm) => computed.as_ref().expect("ran").column_named(algorithm),
-            Found::Degree => degree_column(&edges),
+            Found::Degree => degree_column(edges),
         };
-        let values = column.per_node(&index, edges.n as usize)?;
+        let values = column.per_node(&drawing.index, edges.n as usize)?;
         if clause == "SIZE BY" {
-            edges.size = Some(size_by(&name.shown, &values)?);
+            match size_by(&name.shown, &values) {
+                Ok(size) => edges.size = Some(size),
+                Err(e) if asked => return Err(e),
+                Err(_) => {}
+            }
         } else {
-            edges.color = Some(color_by(&name.shown, &values)?);
+            match color_by(&name.shown, &values) {
+                Ok(color) => edges.color = Some(color),
+                Err(e) if asked => return Err(e),
+                Err(_) => {}
+            }
         }
     }
-    Ok((edges, index.key_type))
+    if edges.color.is_none() {
+        edges.color = default_color(edges);
+    }
+    Ok(())
 }
+
+/// What colours the nodes when nothing else does: a hop's distances, or the
+/// vertex tables when there are several.
+fn default_color(edges: &EdgeList) -> Option<ColorBy> {
+    // Each node's group, and the groups' names, in their own order (not by
+    // size: distance 0, then 1, then 2).
+    let (by, names, codes): (&str, Vec<String>, Vec<u32>) = if edges.labels.len() > 1 {
+        (
+            LABEL,
+            edges.labels.clone(),
+            edges.node_label.iter().map(|&l| u32::from(l)).collect(),
+        )
+    } else if edges.level.as_deref() == Some(build::DISTANCE) {
+        let column = edges
+            .node_columns
+            .iter()
+            .find(|c| c.name == build::DISTANCE)?;
+        let Values::U32(level) = &column.values else {
+            return None;
+        };
+        let furthest = level.iter().filter(|&&d| d != NULL).max()?;
+        (
+            build::DISTANCE,
+            (0..=*furthest).map(|d| d.to_string()).collect(),
+            level.clone(),
+        )
+    } else {
+        return None;
+    };
+    let mut counts = vec![0u32; names.len()];
+    let mut missing = 0;
+    for &c in &codes {
+        match counts.get_mut(c as usize) {
+            Some(n) => *n += 1,
+            None => missing += 1,
+        }
+    }
+    Some(ColorBy {
+        by: by.to_string(),
+        values: names,
+        counts,
+        codes,
+        missing,
+    })
+}
+
+/// What the nodes are coloured by when they are of several vertex tables.
+pub const LABEL: &str = "label";
 
 /// The edges of `graph`: every edge table's source and destination columns,
 /// and every vertex table's keys, so nodes with no edges are drawn too.
@@ -436,9 +918,9 @@ fn key_type_of(key_type: &DataType, ids: &[String]) -> KeyType {
     }
 }
 
-/// `edges` as a [`GraphResult`]: one node label and one edge label, both
-/// `""`, the node columns of `SIZE BY` and `COLOR BY`, and the encodings
-/// that name them.
+/// `edges` as a [`GraphResult`]: its node and edge labels (one of each,
+/// `""`, when the rule names none), the node columns of the rule and of
+/// `SIZE BY` and `COLOR BY`, the highlights, and the encodings.
 fn to_view(
     edges: EdgeList,
     key_type: &DataType,
@@ -456,51 +938,106 @@ fn to_view(
         skipped,
         size,
         color,
+        mut labels,
+        node_label,
+        mut edge_labels,
+        edge_label,
+        edge_rows,
+        node_columns,
+        edge_columns,
+        paths,
+        seeds,
+        level,
+        layout,
     } = edges;
-    let label = NodeLabel::new("", key_type_of(key_type, &ids));
+    if labels.is_empty() {
+        labels.push(String::new());
+    }
+    if edge_labels.is_empty() {
+        edge_labels.push(String::new());
+    }
+    let key = key_type_of(key_type, &ids);
     let nodes = NodeBatch {
-        labels: vec![0; n as usize],
+        labels: if node_label.is_empty() {
+            vec![0; n as usize]
+        } else {
+            node_label
+        },
         keys: ids.iter().collect::<Strings>(),
         ..NodeBatch::default()
     };
     drop(ids);
-    let base = GraphDelta::new(vec![
-        Op::AddNodeLabel(label),
-        Op::AddEdgeLabel(String::new()),
-        Op::AddNodes(nodes),
-        Op::AddEdges(EdgeBatch::of_label(0, src, dst)),
-    ]);
+    let mut batch = EdgeBatch::of_label(0, src, dst);
+    if !edge_label.is_empty() {
+        batch.labels = edge_label;
+    }
+    batch.rows = edge_rows;
+    let mut ops: Vec<Op> = labels
+        .into_iter()
+        .map(|name| Op::AddNodeLabel(NodeLabel::new(name, key)))
+        .collect();
+    ops.extend(edge_labels.into_iter().map(Op::AddEdgeLabel));
+    ops.push(Op::AddNodes(nodes));
+    ops.push(Op::AddEdges(batch));
+    let base = GraphDelta::new(ops);
     let mut result = GraphResult::build(graph, provenance, &base).map_err(model)?;
     drop(base);
 
-    let mut encodings = Encodings::default();
-    let mut columns = Vec::new();
+    let mut encodings = Encodings {
+        layout,
+        ..Encodings::default()
+    };
+    let mut columns: Vec<(Target, ModelColumn)> = Vec::new();
+    columns.extend(node_columns.into_iter().map(|c| (Target::Nodes, c)));
+    columns.extend(edge_columns.into_iter().map(|c| (Target::Edges, c)));
+    // A column of the rule's keeps its name; SIZE BY's and COLOR BY's give way.
+    let taken = |columns: &[(Target, ModelColumn)], name: &str| {
+        columns
+            .iter()
+            .any(|(t, c)| *t == Target::Nodes && c.name == name)
+    };
     if let Some(size) = size {
-        encodings.size_by = Some(size.by.clone());
-        columns.push(ModelColumn::new(
-            size.by,
-            Some(Role::Metric),
-            Values::F32(size.values),
+        let name = if taken(&columns, &size.by) {
+            format!("{}{SIZE_SUFFIX}", size.by)
+        } else {
+            size.by
+        };
+        encodings.size_by = Some(name.clone());
+        columns.push((
+            Target::Nodes,
+            ModelColumn::new(name, Some(Role::Metric), Values::F32(size.values)),
         ));
     }
     if let Some(color) = color {
-        let name = if encodings.size_by.as_deref() == Some(color.by.as_str()) {
+        let name = if taken(&columns, &color.by) {
             format!("{}{COLOR_SUFFIX}", color.by)
         } else {
             color.by
         };
         encodings.color_by = Some(name.clone());
-        columns.push(ModelColumn::new(
-            name,
-            Some(Role::Category),
-            Values::Dict {
-                values: color.values.iter().collect(),
-                codes: color.codes,
-            },
+        columns.push((
+            Target::Nodes,
+            ModelColumn::new(
+                name,
+                Some(Role::Category),
+                Values::Dict {
+                    values: color.values.iter().collect(),
+                    codes: color.codes,
+                },
+            ),
         ));
     }
-    for column in columns {
-        let op = result.set_column_op(Target::Nodes, column);
+    for (target, column) in columns {
+        let op = result.set_column_op(target, column);
+        result.apply(&GraphDelta::new(vec![op])).map_err(model)?;
+    }
+    let highlights = Highlights {
+        paths,
+        seeds,
+        distance: level,
+    };
+    if !highlights.is_empty() {
+        let op = result.set_highlights_op(highlights);
         result.apply(&GraphDelta::new(vec![op])).map_err(model)?;
     }
     if encodings != Encodings::default() {

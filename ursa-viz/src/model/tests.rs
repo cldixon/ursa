@@ -24,6 +24,7 @@ fn sample() -> GraphResult {
         Provenance {
             sql: Some("FROM GRAPH_TABLE (town MATCH (a)-[e]->(b) COLUMNS (a.id, b.id))".into()),
             rule: Some("edges".into()),
+            ..Provenance::default()
         },
         &delta(vec![
             Op::AddNodeLabel(NodeLabel::new("people", KeyType::Int)),
@@ -984,6 +985,7 @@ fn a_delta_round_trips_bit_for_bit() {
             step.with_provenance(Provenance {
                 sql: Some("SELECT 1".into()),
                 rule: None,
+                ..Provenance::default()
             }),
         ] {
             let bytes = d.to_bytes();

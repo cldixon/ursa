@@ -428,6 +428,31 @@ pub struct Provenance {
     pub sql: Option<String>,
     /// The result → graph rule that fired (`"path"`, `"rings"`, `"edges"`, …).
     pub rule: Option<String>,
+    /// The columns of the SQL's result that the rule read, and what each
+    /// was read as. Left out of the wire format when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ColumnRole>,
+    /// What a status line adds to the rule: what was left out, and what else
+    /// the result could have been drawn as. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// A column of a result, and what a rule read it as: the engine's
+/// `ursa.role` (`"node"`, `"src"`, `"path_nodes"`, `"step"`, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnRole {
+    pub column: String,
+    pub role: String,
+}
+
+impl ColumnRole {
+    pub fn new(column: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            role: role.into(),
+        }
+    }
 }
 
 /// Flag bit: the node or edge was removed. It keeps its slot and its data,
