@@ -228,6 +228,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Ursa Web Shell: the Graph view times itself** (#430).
+  `window.ursaShell.graphTimings()` gains `frames` (the count, and the p50,
+  p95 and max of the time in `render()` and of the time between frames
+  while the view moves, over the last 120), `pick` (the last and the p95),
+  `actions` (for each: the command, the ms in the engine, the ms applying
+  its answer, and the ms from the input to the frame that showed it) and
+  `longTasks` (the page's tasks over 50 ms). `graphMemory()` gives each
+  wasm instance's memory (engine, view, layout worker) and
+  `performance.measureUserAgentSpecificMemory()`. A frame's end is when the
+  page's thread is free of it, not when `render()` returns: with no GPU the
+  browser rasterises on that thread afterwards. Keeping them costs a frame
+  three clock reads, a timer and two writes into arrays made once.
+  `web/tests/graph-timing.ts` prints them, with the frame times of a
+  scripted wheel zoom on `.graph rmat`.
 - **Ursa Web Shell: the Graph view in each theme's own colours.** The view
   draws on the theme's background with its own edge ink and a categorical
   palette stepped for white and for the dark sky, so the CSS inversion is
