@@ -259,6 +259,68 @@ async fn integer_ids_of_different_widths() {
     assert_eq!(int(&ctx, "SELECT count(*) FROM g.nodes").await, 34);
 }
 
+/// An edge table whose endpoints are two integer types is one graph of Int64
+/// ids (#416): files written by different tools mix INT32 and INT64. It was
+/// refused, though a vertex key of another width was not.
+#[tokio::test]
+async fn endpoints_of_two_integer_widths() {
+    let ctx = karate_session().await;
+    ok(
+        &ctx,
+        "CREATE TABLE e AS SELECT * FROM (VALUES (1::int, 2::bigint), (2::int, 3::bigint)) \
+           t(src, dst);
+         CREATE PROPERTY GRAPH gs EDGE TABLES (e SOURCE KEY (src) DESTINATION KEY (dst))",
+    )
+    .await;
+    let batches = ok(
+        &ctx,
+        "SELECT * FROM degree(gs, direction => 'both') ORDER BY id",
+    )
+    .await;
+    assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        pretty(&batches),
+        "+----+--------+
+| id | degree |
++----+--------+
+| 1  | 1      |
+| 2  | 2      |
+| 3  | 1      |
++----+--------+"
+    );
+    assert_eq!(
+        int(
+            &ctx,
+            "SELECT count(*) FROM shortest_path(gs, source => 1, target => 3)"
+        )
+        .await,
+        2
+    );
+
+    // Every pair of widths, signed or not, is the same graph as ties itself.
+    ok(&ctx, KARATE_EDGES_ONLY).await;
+    let expected = pretty(&ok(&ctx, "SELECT * FROM degree(karate_edges_only) ORDER BY id").await);
+    for (source, destination) in [
+        ("SMALLINT", "BIGINT"),
+        ("BIGINT", "INT"),
+        ("INT UNSIGNED", "BIGINT"),
+        ("TINYINT UNSIGNED", "BIGINT UNSIGNED"),
+    ] {
+        ok(
+            &ctx,
+            &format!(
+                "CREATE OR REPLACE VIEW widths AS
+                   SELECT CAST(src AS {source}) AS src, CAST(dst AS {destination}) AS dst FROM ties;
+                 CREATE OR REPLACE PROPERTY GRAPH w
+                   EDGE TABLES (widths SOURCE KEY (src) DESTINATION KEY (dst))"
+            ),
+        )
+        .await;
+        let got = pretty(&ok(&ctx, "SELECT * FROM degree(w) ORDER BY id").await);
+        assert_eq!(got, expected, "{source} and {destination}");
+    }
+}
+
 #[tokio::test]
 async fn graphs_and_algorithms_join_on_id() {
     let ctx = karate_session().await;
@@ -493,8 +555,8 @@ async fn definitions_are_checked_when_created() {
         ),
         (
             "CREATE PROPERTY GRAPH g EDGE TABLES (mixed SOURCE KEY (src) DESTINATION KEY (dst))",
-            "the source and destination columns of edge table 'mixed' must have the same type, \
-             but src is Int64 and dst is Utf8View",
+            "the source and destination columns of edge table 'mixed' must both be integers or \
+             both be strings, but src is Int64 and dst is Utf8View",
         ),
         (
             "CREATE PROPERTY GRAPH g EDGE TABLES (floats SOURCE KEY (src) DESTINATION KEY (dst))",

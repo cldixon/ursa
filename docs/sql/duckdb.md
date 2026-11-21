@@ -49,6 +49,8 @@ SELECT * EXCLUDE (dst) FROM 'karate_edges.csv' LIMIT 1;
 SELECT src, count(*) AS friends FROM 'karate_edges.csv' GROUP BY ALL ORDER BY friends DESC LIMIT 1;
 ```
 
+A FROM-first query works wherever a query does: in a subquery, in `CREATE VIEW v AS FROM t`, in `COPY (FROM t) TO …`, and after `EXPLAIN` and `DESCRIBE` (`DESCRIBE FROM 'karate_edges.csv'` lists the file's columns).
+
 ```text
 ┌───────┬───────┐
 │  src  │  dst  │

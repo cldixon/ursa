@@ -23,14 +23,16 @@
 //!   the relation planner as a column of the node's edge plan, not a literal
 //!   resolved here.
 //! - **Messages**, worded for SQL: `pagerank(damping =>) must be a number; got
-//!   'high'`.
+//!   'high'`, and for a number outside the parameter's range (#416, declared
+//!   once, in the catalog): `pagerank(damping =>) must be between 0 and 1; got
+//!   -1`.
 
 use std::fmt;
 
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::catalog::{
     self, Arg, Call, ColumnType, Expected, Family, FunctionSpec, OutputSpec, ParamError,
-    ParamErrorKind, ParamSpec, ParamType, Shape, Value,
+    ParamErrorKind, ParamSpec, ParamType, Range, Shape, Value,
 };
 
 /// The multi-algorithm table function: `algorithms(g, degree(), c => louvain())`.
@@ -102,6 +104,7 @@ pub const VALUES: ParamSpec = ParamSpec {
     name: "values",
     ty: ParamType::Attribute,
     default: Value::Null,
+    range: Range::ANY,
     doc: "A query of two columns, node ids then values: the value of each node. Give this or \
           attribute.",
 };
@@ -224,6 +227,11 @@ fn param_error(spec: &FunctionSpec, e: &ParamError, args: &[(String, Literal)]) 
             expected_text(want),
             given()
         )),
+        ParamErrorKind::OutOfRange(range) => plan(format!(
+            "{f}({p} =>) must be {}; got {}",
+            range_text(&range).unwrap_or_else(|| "a number".into()),
+            given()
+        )),
         ParamErrorKind::NotOneOf(options) => {
             let options: Vec<String> = options.iter().map(|o| format!("'{o}'")).collect();
             plan(format!(
@@ -250,6 +258,14 @@ pub(crate) fn expected_text(want: Expected) -> &'static str {
         Expected::NumberOrNull => "a number or NULL",
         Expected::Bool => "a boolean",
     }
+}
+
+/// The numbers a parameter accepts, in words: `between 0 and 1`, `above 0 and
+/// at most 1`, `at least 1`; `None` for a parameter with no limit. The text of
+/// the `range` field of `ursa_functions()` and of the error for a value
+/// outside it (#416).
+pub fn range_text(range: &Range) -> Option<String> {
+    range.describe()
 }
 
 /// "pagerank() has no parameter 'dampng'; did you mean 'damping'? ...".
@@ -428,14 +444,31 @@ mod tests {
         );
         // An integer is a number, as Python's float parameters take an int.
         assert!(call("pagerank", &[("damping", num("1"))]).is_ok());
+        // The ends of a range that are values (#416), and a NULL where the
+        // type takes one.
+        for (function, param, value) in [
+            ("pagerank", "damping", num("0")),
+            ("pagerank", "max_iter", num("1")),
+            ("pagerank", "tol", num("0")),
+            ("betweenness", "sample", num("1")),
+            ("betweenness", "sample", num("1e-9")),
+            ("betweenness", "sample", Literal::Null),
+            ("avg_path_length", "sample", num("1.0")),
+            ("layout_fa2", "gravity", num("0")),
+            ("layout_fa2", "theta", num("0")),
+            ("layout_fa2", "theta", Literal::Null),
+            ("layout_fa2", "iterations", num("0")),
+            ("layout_fr", "iterations", num("0")),
+        ] {
+            assert!(
+                call(function, &[(param, value)]).is_ok(),
+                "{function} {param}"
+            );
+        }
         assert_eq!(
-            call(
-                "louvain",
-                &[("seed", num("7")), ("resolution", num("-0.5"))]
-            )
-            .unwrap(),
+            call("louvain", &[("seed", num("7")), ("resolution", num("0.5"))]).unwrap(),
             Call::Louvain {
-                resolution: -0.5,
+                resolution: 0.5,
                 seed: Some(7)
             }
         );
@@ -515,6 +548,32 @@ mod tests {
             message(call("betweenness", &[("sample", s("half"))])),
             "betweenness(sample =>) must be a number or NULL; got 'half'"
         );
+        // A number outside the parameter's range (#416): the range, and the
+        // value as written.
+        for (function, param, value, range) in [
+            ("pagerank", "damping", "-1", "between 0 and 1"),
+            ("pagerank", "damping", "1.5", "between 0 and 1"),
+            ("pagerank", "max_iter", "0", "at least 1"),
+            ("pagerank", "tol", "-1", "at least 0"),
+            ("label_propagation", "max_iter", "0", "at least 1"),
+            ("betweenness", "sample", "2", "above 0 and at most 1"),
+            ("betweenness", "sample", "-1", "above 0 and at most 1"),
+            ("betweenness", "sample", "0", "above 0 and at most 1"),
+            ("avg_path_length", "sample", "5", "above 0 and at most 1"),
+            ("louvain", "resolution", "-1", "above 0"),
+            ("louvain", "resolution", "0.0", "above 0"),
+            ("layout_fa2", "k", "0", "above 0"),
+            ("layout_fa2", "gravity", "-0.5", "at least 0"),
+            ("layout_fa2", "theta", "-1", "at least 0"),
+            ("layout_fa2", "jitter_tolerance", "0", "above 0"),
+            ("layout_fr", "k", "-2", "above 0"),
+            ("layout_fr", "gravity", "-1e-3", "at least 0"),
+        ] {
+            assert_eq!(
+                message(call(function, &[(param, num(value))])),
+                format!("{function}({param} =>) must be {range}; got {value}")
+            );
+        }
         assert_eq!(
             message(call("diameter", &[("approximate", num("1"))])),
             "diameter(approximate =>) must be a boolean; got 1"

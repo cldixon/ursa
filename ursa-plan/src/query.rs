@@ -111,6 +111,10 @@ impl GraphVerb {
                 };
                 DataFusionError::Execution(format!("{call}({name}=) must be {want}; got {shown}"))
             }
+            ParamErrorKind::OutOfRange(range) => DataFusionError::Execution(format!(
+                "{call}({name}=) must be {}; got {shown}",
+                range.describe().unwrap_or_else(|| "a number".into())
+            )),
             ParamErrorKind::NotOneOf(accepted) if name == "direction" => {
                 let Some(d) = value.as_str() else {
                     return DataFusionError::Execution(format!(

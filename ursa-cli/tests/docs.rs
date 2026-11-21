@@ -532,13 +532,18 @@ fn function_section(row: &serde_json::Value) -> String {
                 .filter_map(|c| c.as_str())
                 .map(|c| code(&format!("'{c}'")))
                 .collect();
+            // A numeric parameter's range (#416) follows what it does.
+            let doc = match p.get("range").and_then(|r| r.as_str()) {
+                Some(range) => format!("{} Must be {range}.", text(p, "doc")),
+                None => text(p, "doc").to_string(),
+            };
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {} |\n",
                 code(text(p, "name")),
                 cell(text(p, "type")),
                 code(text(p, "default")),
                 cell(&choices.join(", ")),
-                cell(text(p, "doc")),
+                cell(&doc),
             ));
         }
         out.push('\n');

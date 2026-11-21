@@ -15,7 +15,7 @@ Never guess function names, parameters or defaults. Ask the engine:
 SELECT name, family, summary FROM ursa_functions() ORDER BY family, name;
 ```
 
-`ursa_functions()` has one row per graph function: `name`, `family` (`algorithm`, `statistic`, `traversal`, `combinator`), `summary`, `networkx` (the NetworkX call it matches), `parameters` (a list of `{name, type, default, choices, doc}`), `directions` and `outputs`. Read it as JSON to see the parameters:
+`ursa_functions()` has one row per graph function: `name`, `family` (`algorithm`, `statistic`, `traversal`, `combinator`), `summary`, `networkx` (the NetworkX call it matches), `parameters` (a list of `{name, type, default, choices, range, doc}`; `range` is the numbers a numeric parameter accepts, such as `between 0 and 1`, and a value outside it is an error), `directions` and `outputs`. Read it as JSON to see the parameters:
 
 ```bash
 ursa --format json -c "SELECT * FROM ursa_functions() WHERE name = 'pagerank'"
@@ -58,7 +58,7 @@ CREATE PROPERTY GRAPH karate
 
 - `VERTEX TABLES` is optional. Without it, the nodes are the edges' endpoints: `CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));`
 - Paths: `.parquet`, `.csv`, `.json`/`.jsonl`/`.ndjson` (newline-delimited JSON), `.arrow`, compressed CSV or JSON (`.csv.gz`, `.jsonl.zst`), a directory, or a glob (`'edges/*.parquet'`). `read_parquet(path)`, `read_csv(path, header => false, delim => '|')` and `read_json(path, format => 'array')` read a file whatever its extension; the first argument may be a list of paths. Unaliased expressions get DataFusion's names (`SELECT 42` is `Int64(42)`), so alias them with `AS`. URLs work: `s3://`, `gs://`, `az://`, `https://`. Credentials come from the environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`), AWS profiles (`AWS_PROFILE`, `~/.aws/`), gcloud's application default credentials, or the machine's role. There is no SQL statement for credentials. For a public S3 bucket, set `AWS_SKIP_SIGNATURE=true`.
-- The source and destination columns must have the same type, integer or string. Cast in the view if they don't.
+- The source and destination columns must both be integers (of any width) or both strings. Cast in the view if they aren't.
 - A graph is a schema: `karate.edges` and `karate.nodes` are tables.
 - With `VERTEX TABLES`, the vertex table's keys are the nodes: a node on no edge is still a node (degree 0, a row in every algorithm's result). An edge whose source or destination is not a key is dropped, as in DuckPGQ; `describe(g)` counts them in `n_dropped_edges`. `g.nodes` lists exactly the nodes the algorithms see; `g.edges` is every row of the edge table. (From `ursa` 0.7; in 0.6.0 the algorithms see only the edges' endpoints.) Keys with no edges cost the algorithms next to nothing (from 0.8), but they count: PageRank's scores sum to 1 over every key, so more keys means lower scores, and each is a community of its own, so count communities as `SELECT count(*) FROM (SELECT louvain FROM louvain(g) GROUP BY louvain HAVING count(*) > 1)`, not `count(DISTINCT louvain)`.
 - A subgraph is a graph over a view that filters the edges. With the parent's `VERTEX TABLES`, it keeps every node (as a Python filtered frame does); without, its nodes are only the endpoints of the kept edges. `describe(g, nodes => 'touched')` counts only the nodes on a kept edge.
