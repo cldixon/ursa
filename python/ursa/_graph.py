@@ -456,15 +456,25 @@ def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = N
 
 
 def louvain(
-    edges: EdgeFrame, weight: Expr | None = None, resolution: float = 1.0, seed: int | None = None
+    edges: EdgeFrame,
+    weight: Expr | None = None,
+    resolution: float = 1.0,
+    seed: int | None = None,
+    parallel: bool = False,
 ) -> GraphExpr:
-    """Community detection via Louvain modularity optimization."""
+    """Community detection via Louvain modularity optimization.
+
+    ``parallel=True`` moves nodes in parallel sub-rounds: faster on many cores,
+    and a given ``seed`` still gives the same communities on any thread count,
+    but not the ones the serial default finds. It has no NetworkX equivalent
+    (the default matches ``nx.community.louvain_communities``)."""
     return _graph_expr(
         "louvain",
         edges=_ir.check_edges(edges, "louvain"),
         weight=weight,
         resolution=resolution,
         seed=seed,
+        parallel=parallel,
     )
 
 

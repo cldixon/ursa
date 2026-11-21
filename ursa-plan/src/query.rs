@@ -55,6 +55,7 @@ impl GraphVerb {
             "lin_log" => &self.lin_log,
             "theta" => &self.theta,
             "jitter_tolerance" => &self.jitter_tolerance,
+            "parallel" => &self.parallel,
             _ => return None,
         };
         field.clone()
