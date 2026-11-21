@@ -400,10 +400,14 @@ impl<'a> Evaluator<'a> {
             Call::LabelPropagation { max_iter, seed } => one(Arc::new(UInt32Array::from(
                 label_propagation(topo, mask, max_iter, seed),
             ))),
-            Call::Louvain { resolution, seed } => {
+            Call::Louvain {
+                resolution,
+                seed,
+                parallel,
+            } => {
                 let labels = match weights {
-                    Some(w) => louvain_weighted(topo, w, mask, resolution, seed),
-                    None => louvain(topo, mask, resolution, seed),
+                    Some(w) => louvain_weighted(topo, w, mask, resolution, seed, parallel),
+                    None => louvain(topo, mask, resolution, seed, parallel),
                 };
                 one(Arc::new(UInt32Array::from(labels)))
             }

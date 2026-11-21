@@ -155,7 +155,7 @@ fn main() {
         ("pagerank", |t| {
             pagerank(t, None, PageRankParams::default()).len()
         }),
-        ("louvain", |t| louvain(t, None, 1.0, Some(1)).len()),
+        ("louvain", |t| louvain(t, None, 1.0, Some(1), false).len()),
         ("label_propagation", |t| {
             label_propagation(t, None, 20, Some(1)).len()
         }),

@@ -409,7 +409,8 @@ mod tests {
             call("louvain", &[]).unwrap(),
             Call::Louvain {
                 resolution: 1.0,
-                seed: None
+                seed: None,
+                parallel: false
             }
         );
         assert_eq!(call("triangle_count", &[]).unwrap(), Call::TriangleCount);
@@ -469,7 +470,8 @@ mod tests {
             call("louvain", &[("seed", num("7")), ("resolution", num("0.5"))]).unwrap(),
             Call::Louvain {
                 resolution: 0.5,
-                seed: Some(7)
+                seed: Some(7),
+                parallel: false
             }
         );
         assert_eq!(
@@ -675,7 +677,7 @@ mod tests {
         );
         assert_eq!(
             nested_signature(lookup("louvain").unwrap()),
-            "louvain(weight => NULL, resolution => 1.0, seed => NULL)"
+            "louvain(weight => NULL, resolution => 1.0, seed => NULL, parallel => false)"
         );
     }
 
@@ -693,7 +695,7 @@ mod tests {
         );
         assert_eq!(
             display_call(&call("louvain", &[]).unwrap(), None),
-            "louvain(resolution => 1.0, seed => NULL)"
+            "louvain(resolution => 1.0, seed => NULL, parallel => false)"
         );
         assert_eq!(
             display_call(&call("triangle_count", &[]).unwrap(), None),

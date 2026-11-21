@@ -139,7 +139,12 @@ fn defaults_are_the_python_apis() {
     );
     assert_eq!(
         defaults("louvain"),
-        [("weight", Null), ("resolution", Float(1.0)), ("seed", Null)]
+        [
+            ("weight", Null),
+            ("resolution", Float(1.0)),
+            ("seed", Null),
+            ("parallel", Bool(false))
+        ]
     );
     assert_eq!(
         defaults("layout_fr"),
@@ -344,7 +349,8 @@ fn resolves_arguments_and_fills_defaults() {
         .call,
         Call::Louvain {
             resolution: 2.0,
-            seed: None
+            seed: None,
+            parallel: false
         }
     );
     assert_eq!(
