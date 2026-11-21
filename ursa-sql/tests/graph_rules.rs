@@ -219,11 +219,13 @@ async fn vertices_alone_is_the_paths_union() {
 #[tokio::test]
 async fn three_variables_draw_both_edges_of_each_match() {
     let ctx = karate().await;
-    let sql = "SELECT * FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[]-(b)-[]-(c) \
-               COLUMNS (a.id AS a, b.id AS b, c.id AS c)) LIMIT 20";
+    // Every two-step walk from 0 through its neighbours 1 and 2.
+    let sql =
+        "SELECT * FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[]-(b WHERE b.id < 3)-[]-(c) \
+               COLUMNS (a.id AS a, b.id AS b, c.id AS c))";
     let view = after(&ctx, sql).await;
     assert_eq!(view.drawn_as(), "pattern matches on karate (a, b, c)");
-    // Not only a–b: a–b and b–c of each of the 20 matches, each edge once.
+    // Not only a–b: a–b and b–c of each match, each edge once.
     let (_, batches) = Sql.run(&ctx, sql).await.unwrap();
     let mut expected: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {
