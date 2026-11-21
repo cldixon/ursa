@@ -34,8 +34,8 @@ use ursa_shell::shell::{Flow, Shell};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use crate::graph::{self, EdgeList, Source};
 use crate::{encode, js_error, Stored};
+use ursa_engine::graph::view::{self, GraphView, Rows};
 
 /// Where added files live: `memory://uploads/`.
 pub(crate) fn uploads_url() -> Url {
@@ -77,99 +77,42 @@ pub struct WebShell {
     ctx: SessionContext,
 }
 
-/// A graph for the page's Graph view, from [`WebShell::graph`]: `n` nodes,
-/// the edges `(src[i], dst[i])` as dense node indexes, and each node's id.
+/// A graph for the page's Graph view, from [`WebShell::graph`]: a graph
+/// result (`ursa-viz`'s model) as one UGR buffer, which the page reads with
+/// `ursa-viz/ui/ugr.js`.
 #[wasm_bindgen]
-pub struct GraphData(EdgeList);
+pub struct GraphData {
+    ugr: Vec<u8>,
+    skipped: u32,
+}
+
+impl From<GraphView> for GraphData {
+    fn from(view: GraphView) -> Self {
+        GraphData {
+            ugr: view.result.to_bytes(),
+            skipped: view.skipped as u32,
+        }
+    }
+}
 
 #[wasm_bindgen]
 impl GraphData {
-    /// The number of nodes.
-    #[wasm_bindgen(getter)]
-    pub fn n(&self) -> u32 {
-        self.0.n
-    }
-
-    /// Each edge's source node, `0..n` (a `Uint32Array`).
-    #[wasm_bindgen(getter)]
-    pub fn src(&self) -> Vec<u32> {
-        self.0.src.clone()
-    }
-
-    /// Each edge's destination node (a `Uint32Array`).
-    #[wasm_bindgen(getter)]
-    pub fn dst(&self) -> Vec<u32> {
-        self.0.dst.clone()
-    }
-
-    /// Each node's id, as the shell prints it, by node index.
-    #[wasm_bindgen(getter)]
-    pub fn ids(&self) -> Vec<String> {
-        self.0.ids.clone()
+    /// The graph as UGR bytes (`ursa-viz/UGR.md`), in a `Uint8Array` with a
+    /// buffer of its own, to transfer: the nodes' ids, the edges as dense
+    /// node indexes, the node columns `SIZE BY` and `COLOR BY` made (the
+    /// result's encodings name them; `COLOR BY`'s is a dictionary column
+    /// whose values are the categories, the largest first), and the SQL and
+    /// the rule it came from. It gives the bytes once: a second call gives
+    /// none.
+    #[wasm_bindgen(js_name = takeUgr)]
+    pub fn take_ugr(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.ugr)
     }
 
     /// Rows left out because an endpoint is NULL.
     #[wasm_bindgen(getter)]
     pub fn skipped(&self) -> u32 {
-        self.0.skipped as u32
-    }
-
-    /// `SIZE BY`'s value for each node (a `Float32Array`, NaN for a node with
-    /// none), or `undefined` when not asked.
-    #[wasm_bindgen(getter)]
-    pub fn size(&self) -> Option<Vec<f32>> {
-        self.0.size.as_ref().map(|s| s.values.clone())
-    }
-
-    /// What sizes the nodes, as typed after `SIZE BY`, or `undefined`.
-    #[wasm_bindgen(getter, js_name = sizeBy)]
-    pub fn size_by(&self) -> Option<String> {
-        self.0.size.as_ref().map(|s| s.by.clone())
-    }
-
-    /// `COLOR BY`'s colour index for each node (a `Uint32Array`): `0..k` for
-    /// the `k` largest categories (at most 8), most nodes first, and `k`
-    /// for the rest and for nodes with no value. `undefined` when not asked.
-    #[wasm_bindgen(getter)]
-    pub fn color(&self) -> Option<Vec<u32>> {
-        self.0.color.as_ref().map(|c| c.index.clone())
-    }
-
-    /// What colours the nodes, as typed after `COLOR BY`, or `undefined`.
-    #[wasm_bindgen(getter, js_name = colorBy)]
-    pub fn color_by(&self) -> Option<String> {
-        self.0.color.as_ref().map(|c| c.by.clone())
-    }
-
-    /// The legend of [`Self::color`]: each coloured category's value, as the
-    /// shell prints it, by colour index (empty when not asked).
-    #[wasm_bindgen(getter, js_name = colorLabels)]
-    pub fn color_labels(&self) -> Vec<String> {
-        self.0
-            .color
-            .as_ref()
-            .map_or_else(Vec::new, |c| c.labels.clone())
-    }
-
-    /// How many nodes each coloured category has, by colour index.
-    #[wasm_bindgen(getter, js_name = colorCounts)]
-    pub fn color_counts(&self) -> Vec<u32> {
-        self.0
-            .color
-            .as_ref()
-            .map_or_else(Vec::new, |c| c.counts.clone())
-    }
-
-    /// Nodes in the categories past the coloured ones ("other").
-    #[wasm_bindgen(getter, js_name = colorOther)]
-    pub fn color_other(&self) -> u32 {
-        self.0.color.as_ref().map_or(0, |c| c.other)
-    }
-
-    /// Nodes with no value to colour them by.
-    #[wasm_bindgen(getter, js_name = colorMissing)]
-    pub fn color_missing(&self) -> u32 {
-        self.0.color.as_ref().map_or(0, |c| c.missing)
+        self.skipped
     }
 }
 
@@ -314,8 +257,8 @@ impl WebShell {
     /// ids (integers, strings or dates; the first two of one kind): a float,
     /// a boolean, a list or a struct is an error that says what to draw.
     ///
-    /// `SIZE BY x` and `COLOR BY y` give each node a value
-    /// ([`GraphData::size`], [`GraphData::color`] and its legend). A name is,
+    /// `SIZE BY x` and `COLOR BY y` give each node a value, as a node column
+    /// of the result. A name is,
     /// in turn: a column of `NODES (SELECT id, … FROM …)`; a column of the
     /// property graph's vertex tables; `degree`; or a per-node algorithm
     /// (`pagerank`, `louvain`, `betweenness`, …) run on the property graph
@@ -324,6 +267,9 @@ impl WebShell {
     ///
     /// Rejects, with a message to show, when there is nothing to draw, more
     /// than 2,000,000 edges, or a name or clause that does not fit.
+    ///
+    /// The engine resolves all of it (`ursa_engine::graph::view`); this hands
+    /// it the shell's session and its last result.
     pub fn graph(&self, text: String) -> Promise {
         let ctx = self.ctx.clone();
         let last = match self.borrow() {
@@ -333,7 +279,7 @@ impl WebShell {
         future_to_promise(async move {
             graph_of(&ctx, last, &text)
                 .await
-                .map(|g| GraphData(g).into())
+                .map(|g| GraphData::from(g).into())
                 .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
         })
     }
@@ -409,25 +355,8 @@ async fn feed(
 }
 
 /// What [`WebShell::graph`] draws, given the shell's last result.
-async fn graph_of(
-    ctx: &SessionContext,
-    last: Option<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>)>,
-    text: &str,
-) -> Result<EdgeList> {
-    let (text, style) = graph::parse(text)?;
-    let source = if !text.is_empty() {
-        Source::of_text(ctx, &text).await?
-    } else {
-        let Some((schema, batches)) = last else {
-            return Err(DataFusionError::Plan(
-                "no result to draw yet: run a query whose rows are edges (columns src and dst, \
-                 or else the first two), then .graph; or .graph NAME for a property graph"
-                    .into(),
-            ));
-        };
-        Source::Rows(schema, batches)
-    };
-    graph::draw(ctx, source, &style).await
+async fn graph_of(ctx: &SessionContext, last: Option<Rows>, text: &str) -> Result<GraphView> {
+    view::of_command(ctx, &ursa_sql::Sql, text, last).await
 }
 
 /// Put `bytes` at `name` in `uploads`; the URL SQL reads it by.
@@ -610,6 +539,13 @@ mod tests {
         }
     }
 
+    fn ids(g: &GraphView) -> Vec<&str> {
+        g.result.node_keys().iter().collect()
+    }
+
+    /// The whole of `.graph`, through the shell's SQL and its last result.
+    /// What `graph::view` draws of each source and style is tested in
+    /// `ursa-engine` (`tests/graph_view.rs`).
     #[tokio::test]
     async fn graph_draws_the_last_result_a_query_or_a_property_graph() {
         let shell = WebShell::new();
@@ -622,24 +558,32 @@ mod tests {
         run(&shell, "SELECT w, a AS Src, b AS DST FROM knows;").await;
         // The last result: src and dst by name, not position.
         let g = graph_of(&shell.ctx, last(), "").await.unwrap();
-        assert_eq!(g.ids, vec!["bob", "ann", "cy"]);
-        assert_eq!((g.src, g.dst), (vec![0, 2], vec![1, 0]));
+        assert_eq!(ids(&g), ["bob", "ann", "cy"]);
+        assert_eq!((g.result.src(), g.result.dst()), (&[0, 2][..], &[1, 0][..]));
+        assert_eq!(g.result.provenance().rule.as_deref(), Some("edges"));
 
         // A query, with or without its semicolon; the first two columns.
         let g = graph_of(&shell.ctx, last(), " SELECT b, a FROM knows; ")
             .await
             .unwrap();
-        assert_eq!(g.ids, vec!["ann", "bob", "cy"]);
+        assert_eq!(ids(&g), ["ann", "bob", "cy"]);
+        assert_eq!(
+            g.result.provenance().sql.as_deref(),
+            Some("SELECT b, a FROM knows")
+        );
+        // Ursa's dialect: a FROM-first query.
         let g = graph_of(&shell.ctx, last(), "FROM knows").await.unwrap();
-        assert_eq!(g.n, 3);
+        assert_eq!(g.result.n_nodes(), 3);
         // A table by name.
-        assert_eq!(graph_of(&shell.ctx, last(), "knows").await.unwrap().n, 3);
+        let g = graph_of(&shell.ctx, last(), "knows").await.unwrap();
+        assert_eq!(g.result.n_nodes(), 3);
 
         // A property graph: its vertices first, so dee, with no edges, is drawn.
         run(&shell, "CREATE PROPERTY GRAPH social VERTEX TABLES (people KEY (name)) EDGE TABLES (knows SOURCE KEY (a) REFERENCES people (name) DESTINATION KEY (b) REFERENCES people (name));").await;
         let g = graph_of(&shell.ctx, last(), "Social").await.unwrap();
-        assert_eq!(g.ids, vec!["ann", "bob", "cy", "dee"]);
-        assert_eq!((g.src, g.dst), (vec![1, 2], vec![0, 1]));
+        assert_eq!(ids(&g), ["ann", "bob", "cy", "dee"]);
+        assert_eq!((g.result.src(), g.result.dst()), (&[1, 2][..], &[0, 1][..]));
+        assert_eq!(g.result.graph(), Some("social"));
 
         // What cannot be drawn says why.
         for (text, says) in [
@@ -647,6 +591,7 @@ mod tests {
             ("SELECT 1 AS x", "1 column"),
             ("SELECT * FROM knows WHERE false", "no rows"),
             ("SELECT nope", "nope"),
+            ("-- nothing", "no query to draw"),
         ] {
             let err = graph_of(&shell.ctx, last(), text).await.unwrap_err();
             assert!(
@@ -660,105 +605,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_styles_size_and_colour_nodes() {
+    async fn graph_styles_reach_the_page_as_ugr_bytes() {
+        use ursa_viz::model::{GraphResult, Values};
         let shell = WebShell::new();
         let last = || shell.borrow().unwrap().last_result().cloned();
         // Two triangles joined by one edge: two communities.
         run(&shell, "CREATE VIEW people AS SELECT * FROM (VALUES (1, 'red', 10, 'a'), (2, 'red', 20, 'b'), (3, 'red', 30, 'c'), (4, 'blue', 40, 'd'), (5, 'blue', 50, 'e'), (6, 'blue', 60, 'f')) AS t(id, side, age, name);").await;
-        run(&shell, "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (4, 5), (5, 6), (6, 4), (3, 4)) AS t(src, dst);").await;
+        run(&shell, "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (4, 5), (5, 6), (6, 4), (3, NULL), (3, 4)) AS t(src, dst);").await;
         run(&shell, "CREATE PROPERTY GRAPH club VERTEX TABLES (people KEY (id)) EDGE TABLES (ties SOURCE KEY (src) REFERENCES people (id) DESTINATION KEY (dst) REFERENCES people (id));").await;
 
-        // Algorithms, run on the graph, joined on id.
+        // Algorithms, run on the graph through the shell's SQL, joined on id.
         let g = graph_of(&shell.ctx, last(), "club SIZE BY pagerank COLOR BY louvain")
             .await
             .unwrap();
-        let size = g.size.unwrap();
-        assert_eq!(size.by, "pagerank");
-        assert_eq!(size.values.len(), 6);
-        assert!(
-            size.values.iter().all(|v| v.is_finite() && *v > 0.0),
-            "{size:?}"
-        );
+        assert_eq!(g.legend().unwrap().counts, vec![3, 3]);
+        // The page's copy: the bytes once, and what was skipped.
+        let view = g.clone();
+        let mut data = GraphData::from(g);
+        assert_eq!(data.skipped(), 1);
+        let bytes = data.take_ugr();
+        assert!(data.take_ugr().is_empty());
+        let read = GraphResult::from_bytes(&bytes).unwrap();
+        assert_eq!(read, view.result);
+        assert_eq!(read.encodings().size_by.as_deref(), Some("pagerank"));
+        assert_eq!(read.encodings().color_by.as_deref(), Some("louvain"));
+        let Values::F32(size) = &read.node_column("pagerank").unwrap().values else {
+            panic!("pagerank is numbers");
+        };
         // 3 and 4, the bridge's ends, rank highest.
-        assert!(size.values[2] > size.values[0], "{size:?}");
-        let color = g.color.unwrap();
-        assert_eq!(color.counts, vec![3, 3]);
-        assert_eq!(color.index[..3], [color.index[0]; 3]);
-        assert_eq!(color.index[3..], [color.index[3]; 3]);
-        assert_ne!(color.index[0], color.index[3]);
+        assert!(size[2] > size[0] && size.len() == 6, "{size:?}");
 
-        // Vertex columns come before algorithms; degree is the drawing's.
-        let g = graph_of(&shell.ctx, last(), "club SIZE BY age COLOR BY Side")
-            .await
-            .unwrap();
-        assert_eq!(
-            g.size.unwrap().values,
-            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
-        );
-        let color = g.color.unwrap();
-        assert_eq!(
-            (color.labels, color.counts),
-            (vec!["red".to_string(), "blue".into()], vec![3, 3])
-        );
-        let g = graph_of(&shell.ctx, last(), "club SIZE BY degree")
-            .await
-            .unwrap();
-        assert_eq!(g.size.unwrap().values, vec![2.0, 2.0, 3.0, 3.0, 2.0, 2.0]);
-
-        // NODES gives values for rows, and wins over the graph's own.
+        // A query with a subquery in NODES, and an error from a clause.
         let g = graph_of(
             &shell.ctx,
             last(),
-            "SELECT src, dst FROM ties NODES (SELECT id, id * 1.5 AS score, CASE WHEN id < 4 THEN 'x' END AS tag FROM people WHERE id <> 6) SIZE BY score COLOR BY tag",
+            "FROM ties NODES (FROM people) SIZE BY age",
         )
         .await
         .unwrap();
-        let size = g.size.unwrap();
-        assert_eq!(&size.values[..5], &[1.5, 3.0, 4.5, 6.0, 7.5]);
-        assert!(size.values[5].is_nan());
-        assert_eq!(size.missing, 1);
-        let color = g.color.unwrap();
-        assert_eq!((color.labels, color.missing), (vec!["x".to_string()], 3));
-        let g = graph_of(
-            &shell.ctx,
-            last(),
-            "club NODES (SELECT id, 7 AS age FROM people) SIZE BY age",
-        )
-        .await
-        .unwrap();
-        assert_eq!(g.size.unwrap().values, vec![7.0; 6]);
-        // Rows: degree, from the edges drawn.
-        run(&shell, "SELECT * FROM ties;").await;
-        let g = graph_of(&shell.ctx, last(), "SIZE BY degree")
+        assert_eq!(g.result.encodings().size_by.as_deref(), Some("age"));
+        let err = graph_of(&shell.ctx, last(), "ties COLOR BY louvain")
             .await
-            .unwrap();
-        assert_eq!(g.size.unwrap().values.len(), 6);
-        // The key itself is a vertex column too.
-        let g = graph_of(&shell.ctx, last(), "club COLOR BY id")
-            .await
-            .unwrap();
-        assert_eq!(g.color.unwrap().labels, vec!["1", "2", "3", "4", "5", "6"]);
-        // Without a style, as before.
-        let g = graph_of(&shell.ctx, last(), "club").await.unwrap();
-        assert!(g.size.is_none() && g.color.is_none());
-
-        for (text, says) in [
-            ("club SIZE BY nope", "SIZE BY nope: graph 'club' has no vertex column or algorithm named 'nope'. Its vertex columns are age, id, name, side; the algorithms are degree, pagerank"),
-            ("club COLOR BY wcc", "no vertex column or algorithm named 'wcc'"),
-            ("club SIZE BY side", "SIZE BY side needs numbers, and side is text; colour nodes by it instead: COLOR BY side"),
-            ("SELECT src, dst FROM ties SIZE BY pagerank", "SIZE BY pagerank runs pagerank() on a property graph, and this draws rows"),
-            ("ties COLOR BY louvain", "draw the graph by name (.graph NAME COLOR BY louvain)"),
-            ("SIZE BY age", "SIZE BY age: no column named 'age'. Rows drawn as edges are sized or coloured by degree, or by a column of NODES"),
-            ("NODES (SELECT id, age FROM people) SIZE BY agee", "NODES (…) has age"),
-            ("club NODES (SELECT id FROM people) SIZE BY id", "NODES (…) needs two columns or more"),
-            ("club NODES (SELECT id, age FROM people)", "NODES (…) gives values for SIZE BY or COLOR BY to use"),
-            ("club NODES (SELECT 'zz' AS id, 1 AS v) SIZE BY v", "SIZE BY v: no node has a value"),
-            ("club SIZE BY", "SIZE BY needs"),
-        ] {
-            let err = graph_of(&shell.ctx, last(), text).await.unwrap_err();
-            let message = ursa_engine::user_message(&err);
-            assert!(message.contains(says), "{text}: {message}");
-        }
+            .unwrap_err();
+        assert!(
+            ursa_engine::user_message(&err)
+                .contains("draw the graph by name (.graph NAME COLOR BY louvain)"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
