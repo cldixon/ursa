@@ -296,6 +296,16 @@ pub struct Fa2State {
     /// most 50% per step so one bad iteration cannot destabilise the run.
     speed: f32,
     iterations: u32,
+    /// Nodes held where they are ([`Self::set_fixed`]); `None` is none, and
+    /// the path `layout_fa2` has always run.
+    fixed: Option<Vec<bool>>,
+    /// How many times harder each node is to move ([`Self::set_inertia`]);
+    /// `None` is 1 for all.
+    inertia: Option<Vec<f32>>,
+    /// The fixed nodes' quadtree, kept between steps; `None` until a step
+    /// needs it, and again whenever the mask, a mass or the node count
+    /// changes.
+    held: Option<Held>,
 }
 
 impl Fa2State {
@@ -315,6 +325,9 @@ impl Fa2State {
             prev: vec![(0.0, 0.0); n],
             speed: 1.0,
             iterations: 0,
+            fixed: None,
+            inertia: None,
+            held: None,
         }
     }
 
@@ -336,7 +349,97 @@ impl Fa2State {
             prev: vec![(0.0, 0.0); n],
             speed: 1.0,
             iterations: 0,
+            fixed: None,
+            inertia: None,
+            held: None,
         }
+    }
+
+    /// Hold nodes in place: a node whose `fixed` entry is true is never
+    /// displaced, not by a bit, and still repels, attracts and weighs on the
+    /// quadtree as any other, so the rest settle around it. That is a pinned
+    /// node, or the drawing a warm start grows from ([`super::fa2_grow`]). `None`
+    /// frees every node, and is the state [`Self::new`] makes.
+    ///
+    /// A fixed node's own force is not computed: it would move nothing, and it
+    /// stays out of the adaptive speed's sums, which measure how the nodes
+    /// that can move are doing. The fixed nodes get a quadtree of their own,
+    /// built once and kept, so an iteration costs what the free nodes do,
+    /// however large the fixed part of the graph is. (A mask that fixes
+    /// nothing is the same as none, bit for bit.)
+    pub fn set_fixed(&mut self, fixed: Option<Vec<bool>>) {
+        if let Some(f) = &fixed {
+            assert_eq!(f.len(), self.x.len(), "one fixed flag per node");
+        }
+        self.fixed = fixed;
+        self.held = None;
+    }
+
+    /// The mask [`Self::set_fixed`] set.
+    pub fn fixed(&self) -> Option<&[bool]> {
+        self.fixed.as_deref()
+    }
+
+    /// Make nodes harder to move: a node's displacement is divided by its
+    /// `inertia` entry, and its weight in the adaptive speed's sums with it.
+    /// The forces are the same, so the layout it tends to is the same; a node
+    /// of inertia 10 gets there a tenth as fast, which in a short schedule
+    /// means it gives way a little to what is new instead of rearranging
+    /// around it. Every entry must be finite and above zero. `None` is 1 for
+    /// all, the state [`Self::new`] makes.
+    pub fn set_inertia(&mut self, inertia: Option<Vec<f32>>) {
+        if let Some(m) = &inertia {
+            assert_eq!(m.len(), self.x.len(), "one inertia per node");
+            assert!(
+                m.iter().all(|v| v.is_finite() && *v > 0.0),
+                "inertia must be finite and above zero"
+            );
+        }
+        self.inertia = inertia;
+    }
+
+    /// The factors [`Self::set_inertia`] set.
+    pub fn inertia(&self) -> Option<&[f32]> {
+        self.inertia.as_deref()
+    }
+
+    /// The repulsion mass of each node.
+    pub fn mass(&self) -> &[f32] {
+        &self.mass
+    }
+
+    /// Replace the repulsion masses: a graph that gained edges has new
+    /// degrees, and ForceAtlas2's mass is `deg + 1`.
+    pub fn set_mass(&mut self, mass: Vec<f32>) {
+        assert_eq!(mass.len(), self.x.len(), "one mass per node");
+        self.mass = mass;
+        self.held = None;
+    }
+
+    /// Append nodes at the positions `x`, `y` with the masses `mass`, after
+    /// the ones the state has, whose positions stay as they are: the state
+    /// then lays out a graph that has grown, and the next [`Self::step`]
+    /// takes that graph's adjacency. New nodes are free and of inertia 1,
+    /// whatever masks are set. The adaptive speed and the previous forces
+    /// start afresh, as in [`Self::from_positions`]: they measured a
+    /// different graph.
+    pub fn extend(&mut self, x: &[f32], y: &[f32], mass: &[f32]) {
+        assert_eq!(x.len(), y.len(), "one y per x");
+        assert_eq!(x.len(), mass.len(), "one mass per node");
+        self.x.extend_from_slice(x);
+        self.y.extend_from_slice(y);
+        self.mass.extend_from_slice(mass);
+        let n = self.x.len();
+        if let Some(f) = &mut self.fixed {
+            f.resize(n, false);
+        }
+        if let Some(m) = &mut self.inertia {
+            m.resize(n, 1.0);
+        }
+        self.prev.clear();
+        self.prev.resize(n, (0.0, 0.0));
+        self.speed = 1.0;
+        self.held = None;
     }
 
     /// The positions now, uncentered.
@@ -379,6 +482,9 @@ impl Fa2State {
             self.iterations += iterations;
             return;
         }
+        if self.fixed.as_ref().is_some_and(|f| f.contains(&true)) {
+            return self.step_held(adj, weights, iterations);
+        }
         let params = self.params;
         for _ in 0..iterations {
             let tree = QuadTree::build(&self.x, &self.y, &self.mass);
@@ -391,7 +497,7 @@ impl Fa2State {
                     // 1/d magnitude, not FR's 1/d² — ForceAtlas2's repulsion decays
                     // more slowly, which is what spreads a large graph out instead of
                     // packing it into a disc.
-                    let (mut fx, mut fy) = tree.accumulate(
+                    let (fx, fy) = tree.accumulate(
                         &self.x,
                         &self.y,
                         &self.mass,
@@ -404,61 +510,7 @@ impl Fa2State {
                             (dx * f, dy * f)
                         },
                     );
-
-                    // Attraction, gathered — same reason as everywhere else in this
-                    // crate. Linear in distance by default: the force vector is just
-                    // the displacement, which is why there is no division here.
-                    let (xi, yi) = (self.x[i], self.y[i]);
-                    if let Some(w) = weights {
-                        // Weighted: the same law, times the edge's weight. A
-                        // branch of its own, so the unweighted loop below is
-                        // the one `layout_fa2` has always run.
-                        let base = adj.offsets[i] as usize;
-                        for (e, &j) in adj.neighbors(i as u32).iter().enumerate() {
-                            let j = j as usize;
-                            let we = w[base + e];
-                            let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
-                            let f = if params.lin_log {
-                                let d = (dx * dx + dy * dy).sqrt().max(1e-4);
-                                we * (1.0 + d).ln() / d
-                            } else {
-                                we
-                            };
-                            fx -= dx * f;
-                            fy -= dy * f;
-                        }
-                    } else {
-                        for &j in adj.neighbors(i as u32) {
-                            let j = j as usize;
-                            let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
-                            if params.lin_log {
-                                let d = (dx * dx + dy * dy).sqrt().max(1e-4);
-                                // ln(1+d) magnitude along the unit vector. The one
-                                // transcendental in this file, and the reason LinLog is
-                                // excluded from the cross-platform determinism claim.
-                                let f = (1.0 + d).ln() / d;
-                                fx -= dx * f;
-                                fy -= dy * f;
-                            } else {
-                                fx -= dx;
-                                fy -= dy;
-                            }
-                        }
-                    }
-
-                    // Gravity: constant magnitude toward the origin, scaled by mass so
-                    // a hub is not dragged around by its periphery. Strong gravity
-                    // drops the 1/d and pulls proportionally to distance instead.
-                    let dist = (xi * xi + yi * yi).sqrt().max(1e-4);
-                    let g = if params.strong_gravity {
-                        params.gravity * mi
-                    } else {
-                        params.gravity * mi / dist
-                    };
-                    fx -= xi * g;
-                    fy -= yi * g;
-
-                    (fx, fy)
+                    self.pull(adj, weights, i, fx, fy)
                 })
                 .collect();
 
@@ -472,45 +524,257 @@ impl Fa2State {
             // reproducibility, since the result feeds back into every node's step.
             let (mut swing_total, mut traction_total) = (0.0f32, 0.0f32);
             for i in 0..n {
-                let (fx, fy) = forces[i];
-                let (px, py) = self.prev[i];
-                let swing = ((fx - px).powi(2) + (fy - py).powi(2)).sqrt();
-                let traction = (((fx + px) * 0.5).powi(2) + ((fy + py) * 0.5).powi(2)).sqrt();
-                swing_total += self.mass[i] * swing;
-                traction_total += self.mass[i] * traction;
+                let (swing, traction) = swing_traction(forces[i], self.prev[i]);
+                let weight = self.weight(i);
+                swing_total += weight * swing;
+                traction_total += weight * traction;
             }
-
-            let target = if swing_total > 0.0 {
-                params.jitter_tolerance * traction_total / swing_total
-            } else {
-                // Nothing swung, which happens on iteration one (prev is zero) and at
-                // convergence. Keep the current speed rather than dividing by zero.
-                self.speed
-            };
-            // Rise by at most 50% per iteration. Falling is unconstrained: an
-            // unstable layout should be able to slam the brakes immediately.
-            self.speed = if target > self.speed * 1.5 {
-                self.speed * 1.5
-            } else {
-                target.max(1e-6)
-            };
+            self.adapt_speed(swing_total, traction_total);
 
             for i in 0..n {
-                let (fx, fy) = forces[i];
-                let swing = ((fx - self.prev[i].0).powi(2) + (fy - self.prev[i].1).powi(2)).sqrt();
-                // Per-node damping: a node that is swinging takes a smaller step than
-                // one moving steadily, even though both see the same global speed.
-                let factor = self.speed / (1.0 + self.speed * swing.sqrt());
-                // Cap the displacement so an outlier force cannot fling a node across
-                // the drawing, which FR handles with its cooling schedule instead.
-                let mag = (fx * fx + fy * fy).sqrt().max(1e-6);
-                let capped = (factor * mag).min(10.0 * self.k) / mag;
-                self.x[i] += fx * capped;
-                self.y[i] += fy * capped;
+                self.displace(i, forces[i]);
             }
 
             self.prev = forces;
             self.iterations += 1;
+        }
+    }
+
+    /// [`Self::step_weighted`] with fixed nodes. They do not move, so they
+    /// are indexed once ([`Held`]) and never have a force computed; each
+    /// iteration builds a quadtree of the free nodes only, and a free node's
+    /// repulsion is what the fixed nodes' tree does to it, then what the
+    /// free nodes' does. The adaptive speed's sums run over the free nodes,
+    /// in index order. Every step is a pure function of the state, as in the
+    /// path without a mask, so the bits do not depend on the thread count or
+    /// on how the iterations are split into calls.
+    fn step_held(&mut self, adj: &UndirectedCsr, weights: Option<&[f32]>, iterations: u32) {
+        let params = self.params;
+        let held = match self.held.take() {
+            Some(held) => held,
+            None => Held::new(self),
+        };
+        let free = &held.free;
+        let free_mass: Vec<f32> = free.iter().map(|&i| self.mass[i as usize]).collect();
+        let mut fx = vec![0.0f32; free.len()];
+        let mut fy = vec![0.0f32; free.len()];
+        for _ in 0..iterations {
+            for (k, &i) in free.iter().enumerate() {
+                fx[k] = self.x[i as usize];
+                fy[k] = self.y[i as usize];
+            }
+            let tree = QuadTree::build(&fx, &fy, &free_mass);
+
+            let forces: Vec<(f32, f32)> = (0..free.len())
+                .into_par_iter()
+                .map_init(traversal_stack, |stack, k| {
+                    let i = free[k] as usize;
+                    let mi = self.mass[i];
+                    let law = |dx: f32, dy: f32, mj: f32| {
+                        let d2 = (dx * dx + dy * dy).max(1e-4);
+                        let f = self.k * mi * mj / d2;
+                        (dx * f, dy * f)
+                    };
+                    let (hx, hy) = held.tree.accumulate_at(
+                        &held.x,
+                        &held.y,
+                        &held.mass,
+                        (fx[k], fy[k]),
+                        params.theta,
+                        stack,
+                        law,
+                    );
+                    let (mx, my) =
+                        tree.accumulate(&fx, &fy, &free_mass, k, params.theta, stack, law);
+                    self.pull(adj, weights, i, hx + mx, hy + my)
+                })
+                .collect();
+
+            let (mut swing_total, mut traction_total) = (0.0f32, 0.0f32);
+            for (k, &i) in free.iter().enumerate() {
+                let i = i as usize;
+                let (swing, traction) = swing_traction(forces[k], self.prev[i]);
+                let weight = self.weight(i);
+                swing_total += weight * swing;
+                traction_total += weight * traction;
+            }
+            self.adapt_speed(swing_total, traction_total);
+
+            for (k, &i) in free.iter().enumerate() {
+                let i = i as usize;
+                self.displace(i, forces[k]);
+                self.prev[i] = forces[k];
+            }
+            self.iterations += 1;
+        }
+        self.held = Some(held);
+    }
+
+    /// Attraction and gravity on node `i`, added to its repulsion `(fx, fy)`.
+    #[inline]
+    fn pull(
+        &self,
+        adj: &UndirectedCsr,
+        weights: Option<&[f32]>,
+        i: usize,
+        mut fx: f32,
+        mut fy: f32,
+    ) -> (f32, f32) {
+        let params = &self.params;
+        let mi = self.mass[i];
+        // Attraction, gathered — same reason as everywhere else in this
+        // crate. Linear in distance by default: the force vector is just
+        // the displacement, which is why there is no division here.
+        let (xi, yi) = (self.x[i], self.y[i]);
+        if let Some(w) = weights {
+            // Weighted: the same law, times the edge's weight. A
+            // branch of its own, so the unweighted loop below is
+            // the one `layout_fa2` has always run.
+            let base = adj.offsets[i] as usize;
+            for (e, &j) in adj.neighbors(i as u32).iter().enumerate() {
+                let j = j as usize;
+                let we = w[base + e];
+                let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
+                let f = if params.lin_log {
+                    let d = (dx * dx + dy * dy).sqrt().max(1e-4);
+                    we * (1.0 + d).ln() / d
+                } else {
+                    we
+                };
+                fx -= dx * f;
+                fy -= dy * f;
+            }
+        } else {
+            for &j in adj.neighbors(i as u32) {
+                let j = j as usize;
+                let (dx, dy) = (xi - self.x[j], yi - self.y[j]);
+                if params.lin_log {
+                    let d = (dx * dx + dy * dy).sqrt().max(1e-4);
+                    // ln(1+d) magnitude along the unit vector. The one
+                    // transcendental in this file, and the reason LinLog is
+                    // excluded from the cross-platform determinism claim.
+                    let f = (1.0 + d).ln() / d;
+                    fx -= dx * f;
+                    fy -= dy * f;
+                } else {
+                    fx -= dx;
+                    fy -= dy;
+                }
+            }
+        }
+
+        // Gravity: constant magnitude toward the origin, scaled by mass so
+        // a hub is not dragged around by its periphery. Strong gravity
+        // drops the 1/d and pulls proportionally to distance instead.
+        let dist = (xi * xi + yi * yi).sqrt().max(1e-4);
+        let g = if params.strong_gravity {
+            params.gravity * mi
+        } else {
+            params.gravity * mi / dist
+        };
+        fx -= xi * g;
+        fy -= yi * g;
+
+        (fx, fy)
+    }
+
+    /// Node `i`'s weight in the adaptive speed's sums: its mass, and for a
+    /// node with inertia as much less as it moves.
+    #[inline]
+    fn weight(&self, i: usize) -> f32 {
+        match &self.inertia {
+            None => self.mass[i],
+            Some(m) => self.mass[i] / m[i],
+        }
+    }
+
+    /// The global speed for this iteration, from the swing and traction of
+    /// the nodes that can move.
+    fn adapt_speed(&mut self, swing_total: f32, traction_total: f32) {
+        let target = if swing_total > 0.0 {
+            self.params.jitter_tolerance * traction_total / swing_total
+        } else {
+            // Nothing swung, which happens on iteration one (prev is zero) and at
+            // convergence. Keep the current speed rather than dividing by zero.
+            self.speed
+        };
+        // Rise by at most 50% per iteration. Falling is unconstrained: an
+        // unstable layout should be able to slam the brakes immediately.
+        self.speed = if target > self.speed * 1.5 {
+            self.speed * 1.5
+        } else {
+            target.max(1e-6)
+        };
+    }
+
+    /// Move node `i` by its force `(fx, fy)`, at the speed
+    /// [`Self::adapt_speed`] set; `self.prev[i]` is still the force before.
+    #[inline]
+    fn displace(&mut self, i: usize, (fx, fy): (f32, f32)) {
+        let swing = ((fx - self.prev[i].0).powi(2) + (fy - self.prev[i].1).powi(2)).sqrt();
+        // Per-node damping: a node that is swinging takes a smaller step than
+        // one moving steadily, even though both see the same global speed.
+        let factor = self.speed / (1.0 + self.speed * swing.sqrt());
+        // Cap the displacement so an outlier force cannot fling a node across
+        // the drawing, which FR handles with its cooling schedule instead.
+        let mag = (fx * fx + fy * fy).sqrt().max(1e-6);
+        let capped = (factor * mag).min(10.0 * self.k) / mag;
+        match &self.inertia {
+            None => {
+                self.x[i] += fx * capped;
+                self.y[i] += fy * capped;
+            }
+            Some(m) => {
+                self.x[i] += fx * capped / m[i];
+                self.y[i] += fy * capped / m[i];
+            }
+        }
+    }
+}
+
+/// A node's swing and traction: how far its force turned since the last
+/// iteration, and how much of it kept its direction.
+#[inline]
+fn swing_traction((fx, fy): (f32, f32), (px, py): (f32, f32)) -> (f32, f32) {
+    let swing = ((fx - px).powi(2) + (fy - py).powi(2)).sqrt();
+    let traction = (((fx + px) * 0.5).powi(2) + ((fy + py) * 0.5).powi(2)).sqrt();
+    (swing, traction)
+}
+
+/// The fixed nodes of a state, indexed once: they do not move, so neither
+/// does their quadtree.
+#[derive(Debug, Clone)]
+struct Held {
+    /// The fixed nodes' positions and masses, in index order, and the tree
+    /// over them.
+    x: Vec<f32>,
+    y: Vec<f32>,
+    mass: Vec<f32>,
+    tree: QuadTree,
+    /// The nodes that are not fixed, in index order.
+    free: Vec<u32>,
+}
+
+impl Held {
+    fn new(state: &Fa2State) -> Self {
+        let fixed = state.fixed.as_deref().unwrap_or(&[]);
+        let (mut x, mut y, mut mass, mut free) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..state.x.len() {
+            if fixed.get(i).copied().unwrap_or(false) {
+                x.push(state.x[i]);
+                y.push(state.y[i]);
+                mass.push(state.mass[i]);
+            } else {
+                free.push(i as u32);
+            }
+        }
+        let tree = QuadTree::build(&x, &y, &mass);
+        Held {
+            x,
+            y,
+            mass,
+            tree,
+            free,
         }
     }
 }

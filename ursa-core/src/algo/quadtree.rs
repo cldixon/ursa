@@ -102,6 +102,9 @@ const NO_CHILD: u32 = u32::MAX;
 
 /// A Barnes–Hut quadtree. Rebuilt from scratch each layout iteration — the
 /// positions move every step, so there is nothing to update incrementally.
+/// (The exception is a layout's fixed nodes, which do not move: they get a
+/// tree of their own, built once, and [`QuadTree::accumulate_at`] reads it.)
+#[derive(Debug, Clone)]
 pub struct QuadTree {
     cells: Vec<Cell>,
     /// Node indices in Morton order. A cell's members are `order[start..start+len]`.
@@ -361,6 +364,63 @@ impl QuadTree {
         }
         (fx, fy)
     }
+
+    /// [`Self::accumulate`] for a point `(px, py)` that is not one of the
+    /// tree's nodes: the force on it from every node of the tree. With no
+    /// node of its own to leave out, any cell far enough away is accepted,
+    /// and every member of a leaf that is not is summed. The order is the
+    /// same depth-first Morton order, so the sum is as reproducible.
+    ///
+    /// For a layout with fixed nodes: they are indexed once, and each moving
+    /// node asks what they do to it.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn accumulate_at<F>(
+        &self,
+        x: &[f32],
+        y: &[f32],
+        weight: &[f32],
+        (px, py): (f32, f32),
+        theta: f32,
+        stack: &mut Vec<u32>,
+        mut pair: F,
+    ) -> (f32, f32)
+    where
+        F: FnMut(f32, f32, f32) -> (f32, f32),
+    {
+        if self.cells.is_empty() {
+            return (0.0, 0.0);
+        }
+        let theta2 = theta * theta;
+        let (mut fx, mut fy) = (0.0f32, 0.0f32);
+
+        stack.clear();
+        stack.push(0);
+        while let Some(ci) = stack.pop() {
+            let cell = self.cells[ci as usize];
+            let (dx, dy) = (px - cell.com_x, py - cell.com_y);
+            let d2 = dx * dx + dy * dy;
+            if cell.size * cell.size < theta2 * d2 {
+                let (cx, cy) = pair(dx, dy, cell.mass);
+                fx += cx;
+                fy += cy;
+                continue;
+            }
+            if cell.child == NO_CHILD {
+                for k in cell.start..cell.start + cell.len {
+                    let j = self.order[k as usize] as usize;
+                    let (cx, cy) = pair(px - x[j], py - y[j], weight[j]);
+                    fx += cx;
+                    fy += cy;
+                }
+                continue;
+            }
+            for c in (cell.child..cell.child + cell.n_children).rev() {
+                stack.push(c);
+            }
+        }
+        (fx, fy)
+    }
 }
 
 /// The first `k` in `lo..hi` for which `pred(k)` is false, assuming `pred` is
@@ -546,6 +606,42 @@ mod tests {
             // Bit-identical, not merely close: this is the determinism claim.
             assert_eq!(fa, fb, "node {i}");
         }
+    }
+
+    #[test]
+    fn a_point_outside_the_tree_feels_every_node() {
+        // Exact at theta 0, and close at 0.5, against brute force over all
+        // the nodes: none is left out, as none is the point itself.
+        let (x, y) = lattice(20);
+        let w: Vec<f32> = (0..x.len()).map(|i| 1.0 + (i % 5) as f32).collect();
+        let tree = QuadTree::build(&x, &y, &w);
+        let mut stack = traversal_stack();
+        for p in [(3.3f32, 7.1f32), (-40.0, 2.0), (9.5, 9.5)] {
+            let (mut bx, mut by) = (0.0f32, 0.0f32);
+            for j in 0..x.len() {
+                let (cx, cy) = inv_square(p.0 - x[j], p.1 - y[j], w[j]);
+                bx += cx;
+                by += cy;
+            }
+            let exact = tree.accumulate_at(&x, &y, &w, p, 0.0, &mut stack, inv_square);
+            assert!(
+                (exact.0 - bx).abs() <= 1e-3 * bx.abs().max(1.0),
+                "{exact:?} {bx}"
+            );
+            assert!(
+                (exact.1 - by).abs() <= 1e-3 * by.abs().max(1.0),
+                "{exact:?} {by}"
+            );
+            let near = tree.accumulate_at(&x, &y, &w, p, 0.5, &mut stack, inv_square);
+            let scale = (bx * bx + by * by).sqrt().max(1e-6);
+            let err = ((near.0 - bx).powi(2) + (near.1 - by).powi(2)).sqrt() / scale;
+            assert!(err < 0.05, "relative error {err} at {p:?}");
+        }
+        let empty = QuadTree::build(&[], &[], &[]);
+        assert_eq!(
+            empty.accumulate_at(&[], &[], &[], (1.0, 1.0), 0.5, &mut stack, inv_square),
+            (0.0, 0.0)
+        );
     }
 
     #[test]

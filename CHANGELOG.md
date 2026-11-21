@@ -331,6 +331,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   where flat needs minutes. `Fa2State` gains `step_weighted` (an attraction
   weight per edge) and `from_positions` (start positions and masses);
   `layout_fa2` and `layout_fr` give the same bits as before.
+- **ForceAtlas2 with fixed nodes and a warm start, for a layout that
+  grows** (#442). `Fa2State` gains `set_fixed` (a per-node mask: a fixed
+  node is not displaced by a bit, and still repels and attracts),
+  `set_inertia` (a per-node factor its displacement is divided by),
+  `extend` (append nodes at given positions) and `set_mass`.
+  `ursa_core::algo::fa2_grow` puts them together for a view that expands a
+  node: the new nodes start on a golden-angle spiral around the node they
+  came from (`place_new_nodes`), pinned nodes and the expanded node are
+  fixed, the old nodes within two hops of a new one get ten times the
+  inertia and the rest are fixed, and 60 iterations settle it
+  (`warm_iterations`; `WarmParams` has the knobs). Fixed nodes have a
+  quadtree of their own, built once (`QuadTree::accumulate_at`), so an
+  iteration costs what the free nodes do: 100 new neighbours in a laid-out
+  1M-edge graph take 2 ms to place and 10 ms to settle on one thread, after
+  52 ms rebuilding the adjacency (`fa2_multilevel`'s new `grow` mode;
+  `ursa-viz/BENCH.md`). In `ursa-viz`, `LiveLayout::grow` and
+  `LiveLayout::from_positions`, and `Layout.grow` and `Layout.fromPositions`
+  in the wasm API; expanding a node to degree 16 in a 500-node view moves
+  the old nodes 0.003% of the view's width on average. The same additions
+  in the same order give the same bits on any thread count. A layout that
+  uses none of this has the bits it had (`tests/layout_golden.rs`).
 - **Layouts in SQL: `layout_fa2` and `layout_fr`** (#395). Both are table
   functions of `(id, x, y)`, like the algorithms, and work inside
   `algorithms(g, …)`, where their columns are `x` and `y`, or
