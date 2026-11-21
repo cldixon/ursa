@@ -18,10 +18,83 @@ later, in a notebook widget or a native window through the same `View`.
 
 | module | what |
 |---|---|
+| `model` | the graph-result model, deltas and the UGR wire format (below). No GPU. |
 | `scene` | the graph, the live layout, node styles, the camera. No GPU; tested natively. |
-| `render` | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
-| `view` | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
+| `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
+| `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
 | `web` (feature) | the wasm-bindgen API: `createView` for a canvas, `Layout` for a worker. |
+
+With `default-features = false` the crate is `model` and `scene` alone, with
+no wgpu in its dependencies: what an engine needs to produce a graph, and
+nothing to draw one.
+
+## The model: one result, every front end
+
+`model` (#424, [the design](../design/graph-explorer.md) §3 and §6) is the
+data everything drawn is made of. The engine will produce it and the shell,
+the notebook widget and an exported page will read it; the view above does
+not use it yet (#426 and after).
+
+- **`GraphResult`**: nodes, edges, their columns, highlights, encodings and
+  provenance.
+  - A node is a key in a label (a vertex table). The key is an integer or
+    text, by its label, and `(label, key)` is its identity, so two tables may
+    reuse a key.
+  - An edge is `src`, `dst` (node indexes), a label (an edge table) and,
+    where the engine knows it, its row in that table.
+  - Columns are properties and metrics, one value a node or an edge: `f32`,
+    `u32`, or text as a dictionary and codes.
+  - Highlights are paths (ordered nodes, and the edges between), seeds, and a
+    distance per node. Encodings say which columns size, colour and group,
+    and the layout. Provenance is the SQL and the rule that drew it.
+- **`GraphDelta`**: a change, as ops applied all or none: add nodes and
+  edges, remove and restore them, set a column, the highlights, the
+  encodings, the positions.
+  - Indexes are append-only. New nodes and edges get new slots at the end; a
+    removed one keeps its slot and its data, and only stops being drawn. So
+    an index, once given out, stays good.
+  - Every op carries its own inverse (`SetColumn` holds the column it
+    replaces), and applies only to the state it was made for. So
+    `delta.invert()` reads nothing, and `apply(&delta)` then
+    `apply(&delta.invert())` restores the result bit for bit: undo is one
+    step and no query.
+- **UGR**, the wire format: `to_bytes` and `from_bytes` on both. A JSON
+  header, then aligned little-endian arrays, which JavaScript reads as typed
+  arrays over the buffer with no copy ([`ui/ugr.js`](ui/ugr.js)).
+  [`UGR.md`](UGR.md) specifies it byte for byte. A million edges are 8.5 MB,
+  8 bytes an edge plus the keys.
+- **`Selection`**: the nodes and edges a user picked, by index.
+
+```rust
+use ursa_viz::model::*;
+
+let base = GraphDelta::new(vec![
+    Op::AddNodeLabel(NodeLabel::new("members", KeyType::Int)),
+    Op::AddEdgeLabel("ties".into()),
+    Op::AddNodes(NodeBatch::of_label(0, [1i64, 2, 3])),
+    Op::AddEdges(EdgeBatch::of_label(0, vec![0, 1], vec![1, 2])),
+]);
+let mut result = GraphResult::build(Some("karate".into()), Provenance::default(), &base)?;
+let bytes = result.to_bytes();                       // to the page, the widget, a file
+assert_eq!(GraphResult::from_bytes(&bytes)?, result);
+
+let step = GraphDelta::new(vec![Op::RemoveNodes(vec![1])]);
+result.apply(&step)?;                                // node 1's edges are no longer shown
+result.apply(&step.invert())?;                       // undo
+assert_eq!(result.to_bytes(), bytes);
+```
+
+```js
+import { readResult } from "./ui/ugr.js";
+const { nodes, edges } = readResult(buffer);         // edges.src is a Uint32Array over `buffer`
+```
+
+Its tests: the model's invariants, every op and its inverse, and the format
+(round trips, a truncated or malformed buffer refused with a message, any
+changed byte never a panic) in `cargo test -p ursa-viz`; the JavaScript
+reader against fixtures the Rust encoder wrote, in
+`bun test ursa-viz/tests/ugr.test.ts`; and the size and speed at a million
+edges in `tests/model_scale.rs`.
 
 ## How it draws
 

@@ -309,8 +309,10 @@ impl WebShell {
     /// is empty for the last result, a property graph's name for its edges
     /// (and its vertices' keys), a table's name for its rows, or a query.
     /// Each row is an edge from its `src` column to its `dst` column (in any
-    /// case), or else from its first column to its second; the ids, of any
-    /// type, become node indexes in the order they are first seen.
+    /// case), or else from its first column to its second; the ids become
+    /// node indexes in the order they are first seen. Both columns must hold
+    /// ids (integers, strings or dates; the first two of one kind): a float,
+    /// a boolean, a list or a struct is an error that says what to draw.
     ///
     /// `SIZE BY x` and `COLOR BY y` give each node a value
     /// ([`GraphData::size`], [`GraphData::color`] and its legend). A name is,

@@ -194,6 +194,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WebShell.graph(text)` gives the page the graph: node ids mapped to
   dense indexes in the order they are first seen, with clear errors when
   there is nothing to draw.
+- **Ursa Web Shell: pinch to zoom the Graph view** (#428). A phone had no
+  way to zoom: one finger panned, and the wheel and `+`/`-` need a mouse or
+  a keyboard. Two fingers now pinch: the view zooms by the change in their
+  distance around the point between them and pans as that point moves, so
+  what is between the fingers stays between them. A second finger cancels
+  the first one's tap, a finger left down after a pinch goes on panning, and
+  a double tap fits the graph in view, as a double-click does. The canvas
+  draws at most 2 pixels for each CSS pixel, so a phone with a ratio of 3
+  fills under half the pixels each frame. The mouse, the wheel and the keys
+  are as before.
 - **Ursa Web Shell: sizes, colours and a legend for the Graph view**
   (#389). `.graph [SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
   `.graph karate SIZE BY pagerank COLOR BY louvain` sizes nodes by PageRank
@@ -208,6 +218,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   what sizes the nodes and each colour's category and count. The engine does
   it all (`WebShell.graph` returns `size`, `color` and the legend; with no
   clause, the graph as before).
+- **Ursa Web Shell: the page runs cross-origin isolated** (#429). Every
+  response, from the Worker and the local preview alike, carries
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
+  require-corp` and `Cross-Origin-Resource-Policy: same-origin`, beside the
+  Content Security Policy. `crossOriginIsolated` is true on the page and in
+  the engine's and the layout's workers, which gives precise timers and
+  `performance.measureUserAgentSpecificMemory()` now, and is what a build
+  with shared memory would need. Every resource was same-origin already, so
+  datasets (by range), Import, downloads, Share links, fonts and the Graph
+  view work as before.
 - **Ursa Web Shell: the Graph view in each theme's own colours.** The view
   draws on the theme's background with its own edge ink and a categorical
   palette stepped for white and for the dark sky, so the CSS inversion is
@@ -328,6 +348,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `layout_circle` stay hidden. The catalog gains `layout_fa2` and an
   `OptionalCount` parameter type; the Python library has
   `ursa._graph.layout_fa2`, not yet exported, as the other layouts.
+- **A graph-result model and a wire format for it, in a GPU-free
+  `ursa-viz`** (#424). `ursa_viz::model` is the data every drawing will be
+  made of: `GraphResult` (nodes identified by a label and a typed key, so two
+  vertex tables may reuse a key; edges with a label and their row; `f32`,
+  `u32` and dictionary columns for both; paths, seeds and distances;
+  encodings; the SQL and the rule that drew it) and `GraphDelta` (add,
+  remove and restore nodes and edges, set columns, highlights, encodings and
+  positions). Indexes are append-only and a removed node keeps its slot;
+  every op carries its inverse, so `apply(&delta)` then
+  `apply(&delta.invert())` restores a result bit for bit, with no query.
+  `to_bytes` and `from_bytes` speak UGR (`ursa-viz/UGR.md`): a JSON header
+  and aligned little-endian arrays, which `ursa-viz/ui/ugr.js` reads as
+  typed arrays over the buffer without a copy. A million edges are 8.5 MB.
+  wgpu is now the crate's `render` feature, on by default: with
+  `default-features = false` it builds with no GPU dependency, for the
+  engine to produce results with. The view and the shell draw as before.
 - **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
   in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
   to 1M edges, under WebGPU and WebGL2, and records time to first frame and
@@ -861,6 +897,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Ursa Web Shell: `.graph` no longer draws scores or paths as nodes**
+  (#427). The two columns `.graph` reads as each edge's ends must hold ids:
+  integers, strings or dates, and, when they are the first two columns
+  rather than `src` and `dst`, both of one kind. A float, a boolean, a list
+  or a struct is refused, naming the columns and their types and what to
+  type instead. After `SELECT * FROM pagerank(karate) LIMIT 5`, `.graph`
+  drew five edges from each id to its score; after an `ANY SHORTEST` query,
+  one edge from a number to a list. Now: `cannot draw the first two columns
+  (id: Int64, pagerank: Float64) as edges: 'pagerank' is a number that is
+  not whole (Float64). … To draw an algorithm's result, draw the graph and
+  size or colour it: .graph NAME SIZE BY pagerank. To draw other rows, name
+  the ends: .graph SELECT … AS src, … AS dst FROM …`. Columns named `src`
+  and `dst` of those types are refused the same way. Two integer or two
+  string columns draw as before.
 - `ursa --format csv` and `tsv` write lists, structs and maps, as DuckDB
   does, as their text form, quoted where CSV needs it (`"[1, 2]"`, with
   `NULL` for a null inside one). They failed with "Nested type List(Int64)

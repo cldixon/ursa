@@ -66,8 +66,14 @@ static assets and an R2 bucket.
     query's and `.graph NAME` a property graph's (or a table's). The engine
     makes the graph (`WebShell.graph`, the `graph` op of the worker): each
     row an edge from its `src` to its `dst` column (in any case), else from
-    its first column to its second, the ids of any type numbered `0..n` in
-    the order they are first seen, at most 2,000,000 edges. `ursa-viz` draws
+    its first column to its second, the ids numbered `0..n` in the order
+    they are first seen, at most 2,000,000 edges. The two columns must hold
+    ids: integers, strings or dates, and the first two both of one kind. A
+    float, a boolean, a list or a struct is refused with what to type
+    instead (#427), so `.graph` after `SELECT * FROM pagerank(karate)` no
+    longer draws each id tied to its score, nor a path query one edge to a
+    list: `.graph karate SIZE BY pagerank` draws an algorithm's result, and
+    `SELECT … AS src, … AS dst` names the ends of other rows. `ursa-viz` draws
     it (WebGPU, else WebGL2) with its ForceAtlas2 layout running in
     `graph-worker.js`, nodes sized by degree unless asked otherwise.
   - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES
@@ -113,7 +119,12 @@ static assets and an R2 bucket.
     close button closes the pane, and New or a dataset does too. In the
     pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
     double-click or `0` fits, and a click on a node names it in the pane's
-    header. A lost WebGL context or GPU device, or a layout that stops,
+    header. On a touch screen (#428) one finger pans and two pinch: the
+    view zooms by the change in the fingers' distance around the point
+    between them, and pans as that point moves, so what is between the
+    fingers stays there. A tap names a node (a second finger cancels it),
+    and a double tap fits. The canvas draws at most 2 pixels for each CSS
+    pixel, whatever the screen's ratio. A lost WebGL context or GPU device, or a layout that stops,
     closes the pane with an error in the terminal.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
   bucket with HEAD, byte ranges and validators; `/engine/<hash>.wasm` serves the
@@ -122,8 +133,17 @@ static assets and an R2 bucket.
   the Worker and `bun run preview` alike: a Content Security Policy (the page's
   own scripts, worker, fetches, fonts and images; WebAssembly compiles under
   `'wasm-unsafe-eval'`; `style-src` allows `'unsafe-inline'` for the `<style>`
-  elements xterm.js adds; no framing), `X-Content-Type-Options: nosniff` and
-  `Referrer-Policy: no-referrer`. The page has no inline script: the theme is
+  elements xterm.js adds; no framing), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, and the three that make the page
+  cross-origin isolated (#429): `Cross-Origin-Opener-Policy: same-origin`,
+  `Cross-Origin-Embedder-Policy: require-corp` and
+  `Cross-Origin-Resource-Policy: same-origin`. So `crossOriginIsolated` is
+  true on the page and in the engine's and the layout's workers: timers are
+  precise, `performance.measureUserAgentSpecificMemory()` works, and a
+  `SharedArrayBuffer` can be made, which a threaded build would need. Every
+  resource is same-origin, as the policy requires, so nothing else changes;
+  a cross-origin resource could only be added if it sends CORP or CORS
+  headers. The page has no inline script: the theme is
   set before the first paint by `public/theme.js`.
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
   `build.ts` also builds the graph view (`scripts/viz.ts`: `ursa-viz` with
@@ -189,11 +209,14 @@ in both themes; `SIZE BY` and `COLOR BY` from an algorithm, a vertex column and
 `NODES (…)`, each of their errors, at least two palette colours read back in
 each theme with no inversion, a theme switch with the pane open, the legend's
 text, and the status from Enter to Done, within a second for rmat; a node picked, typing while it shows, Esc and the close
-button, the terminal refitting beside it and under it on a phone, the Graph
-button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
+button, the terminal refitting beside it and under it on a phone, a pinch, a
+one-finger drag, a tap and a double tap from Chromium's touch input with each
+node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
 phone checks: Tab out of the terminal, the menu's keys, the focus after a
 click, no mid-word wraps and a one-row bar at 320px, a 16px input, and the grey
-text's contrast; and the security headers, 404s for malformed and traversing
+text's contrast; and the security headers, cross-origin isolation (its headers
+on every kind of response, a dataset's ranges included, and
+`crossOriginIsolated` on the page and in both workers), 404s for malformed and traversing
 paths, and no Content Security Policy violation in the console.
 
 ```sh

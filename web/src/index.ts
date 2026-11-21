@@ -17,7 +17,8 @@
  *   and engine.json, which names the current .wasm).
  *
  * Every response carries the security headers in headers.ts (a Content
- * Security Policy, nosniff, no referrer). A path that does not decode (a
+ * Security Policy, nosniff, no referrer, and the three that make the page
+ * cross-origin isolated). A path that does not decode (a
  * malformed `%` escape) is not found.
  *
  * `Env` (the `ASSETS` and R2 `DATA` bindings) is generated from

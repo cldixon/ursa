@@ -104,6 +104,13 @@ jobs:
       - name: test ursa-viz (natively)
         run: cargo test -p ursa-viz --locked
 
+      # The GPU-free core (#424): the model and the UGR wire format build and
+      # pass with no wgpu in the tree, which is how the engine depends on them.
+      - name: test ursa-viz without the GPU
+        run: |
+          cargo test -p ursa-viz --no-default-features --locked
+          ! cargo tree -p ursa-viz --no-default-features --locked | grep wgpu
+
       # Ensures ursa-py (PyO3 extension) also compiles.
       - name: check workspace
         run: cargo check --workspace --locked
@@ -182,6 +189,11 @@ jobs:
         env:
           WEBGPU: "0"
           ONLY: clusters
+
+      # The UGR wire format (#424), Rust to JavaScript: ui/ugr.js reads the
+      # fixtures the Rust encoder wrote, bit for bit.
+      - name: The UGR reader in JavaScript
+        run: bun test ursa-viz/tests/ugr.test.ts
 
   web:
     # The Ursa Shell's Worker (web/, #279): generate the binding types from

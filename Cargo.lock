@@ -4751,6 +4751,8 @@ dependencies = [
  "futures-channel",
  "js-sys",
  "naga",
+ "serde",
+ "serde_json",
  "ursa-core",
  "wasm-bindgen",
  "wasm-bindgen-futures",
