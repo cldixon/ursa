@@ -83,4 +83,5 @@ A few things differ:
 - [Statements](statements.md): reading and writing files, `CREATE PROPERTY GRAPH`, `SHOW GRAPHS`, `DESCRIBE GRAPH`, `ATTACH` and the settings.
 - [Differences from DuckDB](duckdb.md): what carries over from DuckDB, and what does not.
 - [Function reference](reference/functions.md): every graph function, its parameters and its output.
+- [Result metadata](reference/metadata.md): how a result says what its columns are (a node, a metric, a path), for programs that read one.
 - [The agent skill](https://github.com/cldixon/ursa/tree/main/skills): teach a coding agent to write Ursa SQL.

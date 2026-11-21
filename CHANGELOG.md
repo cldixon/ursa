@@ -340,6 +340,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   100K edges and 1.1 s at 1M, a layout done in 8 s for a 1M-edge R-MAT
   graph and 32 s for a 1M-edge grid, wasm 1.4 times slower than native on
   one thread. Not in CI.
+- **SQL: a result says what its columns are** (#431). Every graph function
+  and `GRAPH_TABLE` marks the columns it returns with Arrow field metadata
+  under an `ursa.` prefix, so a reader (the Graph view, a notebook) does not
+  guess from names. No value, column name or type changes.
+  - `ursa.role` is what a column is: `node` (an algorithm's `id`), `metric`
+    or `category` (its output: `pagerank` is a metric, `louvain` a
+    category), `seed`, `node` and `distance` (`hop`), `src`, `dst` and
+    `step` (`shortest_path`), `walk`, `step` and `node` (`random_walk`), and
+    in `GRAPH_TABLE` `node` (a node variable's key), `property`,
+    `path_nodes` (`vertices(p)`), `path_edges` (`edges(p)`) and
+    `path_elements` (`element_id(p)`). `ursa.graph` names the property
+    graph, `ursa.label` the vertex or edge table, and `ursa.var` the pattern
+    variable. A `GRAPH_TABLE`'s schema has `ursa.pattern`: the pattern's
+    edges as JSON, each with its two node variables and its direction.
+  - The metadata follows a column through `SELECT`, `AS`, `WHERE`,
+    `ORDER BY`, `LIMIT`, `DISTINCT`, subqueries, views, joins, `UNION` and
+    `GROUP BY` keys. A computed column (`round(pagerank, 4)`, `id + 1`) has
+    none. In an inner join, a plain column equated with a node's key
+    (`FROM members JOIN pagerank(g) USING (id)`) is marked as a node too.
+  - `COPY … TO` a Parquet or an Arrow file keeps it: the file remembers its
+    graph. `arrow_metadata(column, 'ursa.role')` reads it in SQL.
+  - Docs: a "Result metadata" reference page.
 
 ### Changed
 
