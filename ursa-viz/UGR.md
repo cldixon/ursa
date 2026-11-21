@@ -134,7 +134,8 @@ It also listed no labels for edges and no flags; the model has both.
 
 ## A delta
 
-The header, with `"kind": "delta"`:
+The header, with `"kind": "delta"` (three of the ops of the fixture
+`tests/fixtures/expand.ugr`, without their sections):
 
 ```json
 {
@@ -142,10 +143,10 @@ The header, with `"kind": "delta"`:
   "provenance": {"sql": "SELECT * FROM hop(town, seeds => [1], n => 1)", "rule": "rings"},
   "ops": [
     {"op": "add_node_label", "name": "pets", "key": "text"},
-    {"op": "add_nodes", "count": 2, "columns": [{"name": "club", "type": "dict"}], "positions": true},
+    {"op": "add_nodes", "count": 2, "columns": [{"name": "club", "type": "dict"}, {"name": "pagerank", "type": "f32"}], "positions": true},
     {"op": "remove_nodes", "count": 2}
   ],
-  "body": 96,
+  "body": 128,
   "sections": []
 }
 ```

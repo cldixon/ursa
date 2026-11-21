@@ -394,7 +394,8 @@ fn a_column_in_use_cannot_be_dropped_or_retyped() {
 
 #[test]
 fn validate_catches_what_apply_would_not_let_in() {
-    let breakages: Vec<(fn(&mut GraphResult), &str)> = vec![
+    type Breakage = fn(&mut GraphResult);
+    let breakages: Vec<(Breakage, &str)> = vec![
         (|r| r.node_label[0] = 7, "node 0 has the label 7"),
         (
             |r| r.node_label[4] = 0,
@@ -1164,7 +1165,8 @@ fn a_malformed_buffer_is_refused_with_a_message() {
     assert!(with(&|b| b[8] = b'[').starts_with("UGR: the header: "));
     assert!(with(&|b| b[20] = 0xff).starts_with("UGR: the header: "));
 
-    let cases: Vec<(Box<dyn Fn(&mut Value, &mut Vec<u8>)>, &str)> = vec![
+    type Change = Box<dyn Fn(&mut Value, &mut Vec<u8>)>;
+    let cases: Vec<(Change, &str)> = vec![
         (
             Box::new(|h, _| h["kind"] = "table".into()),
             "the header: unknown variant `table`",

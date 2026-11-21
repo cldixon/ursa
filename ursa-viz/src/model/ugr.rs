@@ -48,7 +48,7 @@ fn bad<T>(message: impl Into<String>) -> Result<T, UgrError> {
 /// What a UGR buffer holds.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    Result(GraphResult),
+    Result(Box<GraphResult>),
     Delta(GraphDelta),
 }
 
@@ -56,7 +56,7 @@ pub enum Message {
 pub fn decode(bytes: &[u8]) -> Result<Message, UgrError> {
     let (header, reader) = open(bytes)?;
     match header {
-        Header::Result(h) => Ok(Message::Result(read_result(h, &reader)?)),
+        Header::Result(h) => Ok(Message::Result(Box::new(read_result(*h, &reader)?))),
         Header::Delta(h) => Ok(Message::Delta(read_delta(h, &reader)?)),
     }
 }
@@ -70,7 +70,7 @@ impl GraphResult {
     /// Decode a result, checking every invariant of the model.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, UgrError> {
         match decode(bytes)? {
-            Message::Result(result) => Ok(result),
+            Message::Result(result) => Ok(*result),
             Message::Delta(_) => bad("the buffer holds a delta, not a result"),
         }
     }
@@ -97,7 +97,7 @@ impl GraphDelta {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Header {
-    Result(ResultH),
+    Result(Box<ResultH>),
     Delta(DeltaH),
 }
 
@@ -450,7 +450,7 @@ fn write_result(r: &GraphResult) -> Vec<u8> {
     };
     let highlights = w.highlights("highlights", &r.highlights);
     w.finish(|body, sections| {
-        Header::Result(ResultH {
+        Header::Result(Box::new(ResultH {
             graph: r.graph.clone(),
             nodes,
             edges,
@@ -459,7 +459,7 @@ fn write_result(r: &GraphResult) -> Vec<u8> {
             provenance: r.provenance.clone(),
             body,
             sections,
-        })
+        }))
     })
 }
 
