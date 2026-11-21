@@ -65,18 +65,51 @@ static assets and an R2 bucket.
     pane beside the terminal, or under it under 640px; `.graph QUERY` draws a
     query's and `.graph NAME` a property graph's (or a table's). The engine
     makes the graph (`ursa-engine`'s `graph::view`, through `WebShell.graph`
-    and the `graph` op of the worker; see "The engine's graph" below): each
-    row an edge from its `src` to its `dst` column (in any case), else from
-    its first column to its second, the ids numbered `0..n` in the order
-    they are first seen, at most 2,000,000 edges. The two columns must hold
-    ids: integers, strings or dates, and the first two both of one kind. A
-    float, a boolean, a list or a struct is refused with what to type
-    instead (#427), so `.graph` after `SELECT * FROM pagerank(karate)` no
-    longer draws each id tied to its score, nor a path query one edge to a
-    list: `.graph karate SIZE BY pagerank` draws an algorithm's result, and
-    `SELECT … AS src, … AS dst` names the ends of other rows. `ursa-viz` draws
-    it (WebGPU, else WebGL2) with its ForceAtlas2 layout running in
-    `graph-worker.js`, nodes sized by degree unless asked otherwise.
+    and the `graph` op of the worker; see "The engine's graph" below), at
+    most 2,000,000 edges and 4,000,000 nodes. `ursa-viz` draws it (WebGPU,
+    else WebGL2) with its ForceAtlas2 layout running in `graph-worker.js`,
+    nodes sized by degree unless asked otherwise.
+  - **What a result is drawn as** (#433, design §3): rows are drawn by the
+    first result → graph rule that matches them. The engine reads what each
+    column is from its `ursa.*` metadata (`docs/sql/reference/metadata.md`),
+    which the graph functions and `GRAPH_TABLE` write, and else from its
+    name and type:
+    1. **Paths**: a path column (`vertices(p)`, with `edges(p)` or
+       `element_id(p)`), the steps of `shortest_path()`, or, unmarked, a list
+       of ids. Each row is a path; the drawing is their union, each edge
+       once, and the paths are the result's highlights.
+    2. **Rings**: `seed`, `id` and `distance`, a `hop` result. The seeds and
+       the nodes reached, with the graph's real edges among them
+       (`induced_edges`), coloured by distance.
+    3. **Edges**: `src` and `dst` by role, two node variables of a pattern,
+       or by name `src`/`dst`, `source`/`target`, `from`/`to`, or else the
+       first two columns when both are ids of one kind. A row an edge, as
+       before; a numeric `weight` is an edge column.
+    4. **Pattern matches**: three or more node variables of `GRAPH_TABLE`.
+       One edge for each edge of the pattern whose two ends are in `COLUMNS`,
+       each distinct edge once; `a.club` is a column of `a`'s nodes; nodes
+       of two vertex tables are two labels, coloured by label.
+    5. **Nodes**: one node key (`pagerank`, `algorithms`, a vertex table's
+       `id`). The nodes, and the graph's edges among them; the first metric
+       sizes them and the first category colours them, unless `SIZE BY` or
+       `COLOR BY` says otherwise.
+    6. **Not a graph**: the error names the columns and their types and what
+       would draw them.
+
+    An id is an integer, a string or a date: a float or a list is never a
+    node (#427). The graph a hop's or a node table's edges are read from is
+    the one its columns name (`ursa.graph`), or else the session's only
+    property graph; with none the nodes are drawn without edges (a hop's with
+    its seeds' edges one step away), and the status line says so. The pane's
+    status line says what the result was drawn as (`34 nodes · 78 edges ·
+    drawn as nodes of karate (id, pagerank, community) · Done`), with what
+    was left out and what else it could have been, and so does the
+    terminal's line (`Drawing 5 edges, 6 nodes as a path on karate (members,
+    ties) (Esc closes)`). The messages name the `AS …` clause that overrides
+    the rules; the clause itself is #434. The result also carries what a
+    later view draws: the paths, the seeds, each node's level (a hop's
+    distance, a path's step) and the layout the rule asks for (rings or
+    layers), which `graph-data.js` reads as `graph.layout = {kind, level}`.
   - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES
     (query)] [SIZE BY x] [COLOR BY y]`, the clauses in any order after the
     source. `.graph karate SIZE BY pagerank COLOR BY louvain` sizes Karate's
@@ -111,8 +144,10 @@ static assets and an R2 bucket.
     `src`, `dst`, each node's id (decoded when asked for), the size column
     as it is, and the colour column, a dictionary whose values are the
     categories by rank, as colour indexes and the legend. The result's
-    provenance says the SQL and the rule that drew it (`edges`, or `graph`
-    for a property graph); nothing shows it yet (#433 will).
+    provenance says the SQL, the rule that drew it (`graph` for a property
+    graph, `path`, `rings`, `edges`, `pattern` or `nodes` for rows), the
+    columns the rule read and its notes; `graph-data.js`'s `drawnAs` makes
+    them the words the status line and the terminal show (#433).
     `bun test tests/graph-data.test.ts` runs that path without a browser,
     on the fixtures `ursa-engine`'s `tests/graph_view.rs` writes.
   - **Theme:** `ursa-viz` draws in the page's `--graph-*` tokens

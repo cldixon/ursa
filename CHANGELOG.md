@@ -385,6 +385,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **`.graph` draws what a result means** (#433). After a graph query, the
+  Web Shell's `.graph` (`ursa-engine`'s `graph::view`) now reads what each
+  column is, from the `ursa.*` metadata the graph functions and `GRAPH_TABLE`
+  write and else from its name and type, and draws the result by the first
+  rule that matches: **paths** (`vertices(p)`, with `edges(p)` or
+  `element_id(p)`, the steps of `shortest_path()`, or a list of ids) as the
+  union of the rows' paths; a **`hop` result** (`seed`, `id`, `distance`) as
+  its seeds and the nodes reached, with the graph's real edges among them
+  and coloured by distance, where it drew a star; **edges** as before
+  (`src`/`dst`, now also `source`/`target` and `from`/`to`, two pattern
+  variables, or the first two id columns); **pattern matches** of three or
+  more node variables as every edge of the pattern, where it drew only the
+  first two columns; and **nodes** (`pagerank`, `algorithms`, a table with
+  an `id`) with the graph's edges among them (`induced_edges`), sized by
+  their first metric and coloured by their first category, where it refused
+  or drew each id tied to its score. What is no graph says what its columns
+  are and what would draw them. The pane's status line and the terminal say
+  what the result was drawn as (`drawn as a path on karate (members,
+  ties)`). A result's provenance (UGR) gains `roles` and `notes`, and its
+  highlights carry the paths, the seeds and each node's distance or step,
+  with the layout the rule asks for. A plain edge table is drawn as it was:
+  the same nodes and edges, in the same order.
 - **`.graph` is resolved in the engine** (#425). What turns a source and its
   `NODES`, `SIZE BY` and `COLOR BY` clauses into a graph moved from
   `ursa-wasm` to `ursa-engine` (`graph::view`), so the CLI and the notebook

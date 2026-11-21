@@ -831,7 +831,7 @@ for (const scheme of ["light", "dark"] as const) {
     await type(".graph", g);
     check((await after(".graph", g)).startsWith("Error: no result to draw yet"), ".graph with no result says so", (await after(".graph", g)).split("\n")[0]);
     for (const [sql, says] of [
-      ["SELECT 1 AS x", "the result has 1 column"],
+      ["SELECT 1 AS x", "it has 1 column (x: Int64)"],
       ["SELECT 1 AS src, 2 AS dst WHERE false", "the result has no rows"],
       ["nothing_here", "no graph or table named 'nothing_here'"],
       ["SELECT * FROM no_such_table", "no_such_table"],
@@ -848,7 +848,7 @@ for (const scheme of ["light", "dark"] as const) {
   await type("SELECT * FROM ties;", g);
   await type(".graph", g);
   const drawing = (await after(".graph", g)).split("\n")[0];
-  check(drawing === "Drawing 78 edges, 34 nodes (Esc closes)", `${scheme}: .graph draws the last result`, drawing);
+  check(drawing === "Drawing 78 edges, 34 nodes as edges (src, dst) (Esc closes)", `${scheme}: .graph draws the last result, and says what as`, drawing);
   check(vizRequests.some((u) => u.startsWith("/viz/") && u.endsWith(".wasm")) && vizRequests.includes("/graph.js"), `${scheme}: .graph loads the graph view`, vizRequests.join(", "));
   await graphSettled(g);
   let info = await graphInfo(g);
@@ -893,13 +893,14 @@ for (const scheme of ["light", "dark"] as const) {
 
   // .graph NAME: a property graph.
   await type(".graph karate", g);
-  check((await after(".graph karate", g)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), ".graph karate draws the property graph", (await after(".graph karate", g)).split("\n")[0]);
+  check((await after(".graph karate", g)).startsWith("Drawing 78 edges, 34 nodes as the graph karate (Esc closes)"), ".graph karate draws the property graph", (await after(".graph karate", g)).split("\n")[0]);
   // .graph QUERY replaces the drawing.
   await type(".graph SELECT src, dst FROM ties WHERE src = 1;", g);
-  const replaced = (await after(".graph SELECT src, dst FROM ties WHERE src = 1", g)).split("\n")[0];
+  // Its line wraps in the narrower terminal.
+  const replaced = (await after(".graph SELECT src, dst FROM ties WHERE src = 1", g)).split("\n").slice(0, 2).join("").replace(/\s+/g, " ").split(" memory U")[0].trim();
   await graphSettled(g);
   info = await graphInfo(g);
-  check(/^Drawing 8 edges, 9 nodes \(replacing the last drawing; Esc closes\)$/.test(replaced) && info.edges === 8 && info.nodes === 9, ".graph QUERY replaces the drawing", replaced);
+  check(/^Drawing 8 edges, 9 nodes as edges \(src, dst\) \(replacing the last drawing; E ?s ?c ?c ?l ?o ?s ?e ?s ?\)$/.test(replaced) && info.edges === 8 && info.nodes === 9, ".graph QUERY replaces the drawing", replaced);
   // Esc with the focus in the pane closes it, and the focus goes back to the terminal.
   await g.focus("#graph-stage canvas");
   await g.keyboard.press("Escape");
@@ -928,9 +929,11 @@ for (const scheme of ["light", "dark"] as const) {
   check(!(await graphOpen(g)), "a dataset closes the graph view");
   await gctx.close();
 }
-// #427: the ends of an edge are ids. A score or a path is not a node: .graph
-// says so, and what to type instead, where it drew nonsense (each id tied to
-// its PageRank; one edge from a path's length to its list of vertices).
+// #427 and #433: the ends of an edge are ids, and .graph draws what a result
+// means. A score or a path is not a node: where it drew nonsense (each id tied
+// to its PageRank; one edge from a path's length to its list of vertices) it
+// now draws the nodes sized by the score, and the path; and what is no graph
+// says so, and what to type instead.
 {
   const actx = await watchedContext({ viewport: { width: 1280, height: 800 } });
   const s = await actx.newPage();
@@ -941,11 +944,11 @@ for (const scheme of ["light", "dark"] as const) {
   // Compared without spaces: the terminal wraps long lines.
   const squeezed = (t: string) => t.replace(/\s+/g, "");
   const shortest = "FROM GRAPH_TABLE (karate MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26) COLUMNS (path_length(p), vertices(p), edges(p)));";
+  // What is not a graph says what it is and what would draw it (rule 6).
   for (const [query, says] of [
-    ["SELECT * FROM pagerank(karate) LIMIT 5;", ["cannot draw the first two columns (id: Int64, pagerank: Float64) as edges: 'pagerank' is a number that is not whole (Float64)", ".graph NAME SIZE BY pagerank", ".graph SELECT … AS src, … AS dst FROM …"]],
-    ["SELECT * FROM algorithms(karate, pagerank(), community => louvain(seed => 1));", ["'pagerank' is a number that is not whole (Float64)", ".graph NAME SIZE BY pagerank"]],
-    [shortest, ["cannot draw the first two columns (path_length(p): Int64, vertices(p): List(", "'vertices(p)' is a list", "AS src, … AS dst"]],
-    ["SELECT src, pagerank AS dst FROM ties JOIN pagerank(karate) ON id = src;", ["cannot draw columns src and dst as edges: 'dst' is a number that is not whole (Float64)"]],
+    ["SELECT pagerank FROM pagerank(karate) LIMIT 5;", ["cannot draw this result as a graph: it has 1 column (pagerank: Float64), which is not edges", "None of its columns can be a node's id", ".graph SELECT … AS src, … AS dst FROM …"]],
+    ["SELECT club, count(*) AS n FROM members GROUP BY club;", ["cannot draw this result as a graph: it has 2 columns (club: Utf8", "n: Int64), which are not edges", "if club and n are the two ends of an edge: .graph AS edges(club, n)", ".graph AS nodes(club)"]],
+    ["SELECT src, dst / 2.0 AS dst FROM ties;", ["cannot draw columns src and dst as edges: 'dst' is a number that is not whole (Float64)"]],
   ] as [string, string[]][]) {
     await type(query, s);
     const before = await errors(s);
@@ -953,19 +956,62 @@ for (const scheme of ["light", "dark"] as const) {
     const out = await after(".graph", s);
     check(
       out.startsWith("Error: cannot draw ") && says.every((part) => squeezed(out).includes(squeezed(part))) && (await errors(s)) === before + 1 && !(await graphOpen(s)),
-      `.graph after ${query.slice(0, 44)}…: scores and paths are not nodes`,
+      `.graph after ${query.slice(0, 44)}…: not a graph, and what would be`,
       out.split("\n").slice(0, 4).join(" "),
     );
   }
-  // The same of a query given to .graph, and of an id beside a name.
-  for (const [sql, says] of [
-    ["SELECT id, pagerank FROM pagerank(karate)", "'pagerank' is a number that is not whole (Float64)"],
-    ["SELECT id, club FROM members", "'id' holds integer ids and 'club' holds string ids, so they are not the two ends of an edge"],
-  ]) {
-    await type(`.graph ${sql}`, s);
-    const out = await after(`.graph ${sql}`, s);
-    check(out.startsWith("Error: cannot draw ") && squeezed(out).includes(squeezed(says)) && !(await graphOpen(s)), `.graph ${sql}: refused`, out.split("\n").slice(0, 3).join(" "));
+
+  // The result → graph rules (#433): .graph draws what the last result means.
+  // Each: the query, what the terminal and the pane say it was drawn as, its
+  // nodes and edges, and what the legend shows.
+  const hop = "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both');";
+  const three = "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[]-(b WHERE b.id = 1)-[]-(c) COLUMNS (a.id AS a, b.id AS b, c.id AS c));";
+  for (const [what, query, as, nodes, edges, legend] of [
+    // A path: the route, six nodes in order, not one edge from 5 to a list.
+    ["a path", shortest.replace("path_length(p), vertices(p), edges(p)", "path_length(p) AS steps, vertices(p) AS members, edges(p) AS ties"), "a path on karate (members, ties)", 6, 5, ""],
+    // A hop: the seed, distance 1 and 2, with the real edges; not a star.
+    ["a hop", hop, "rings on karate (seed, id, distance)", 26, 59, "colour: distance0 (1)1 (16)2 (9)"],
+    // A node table: five nodes sized by PageRank with the edges among them, not ids tied to scores.
+    ["a node table", "SELECT * FROM pagerank(karate) LIMIT 5;", "nodes of karate (id, pagerank)", 5, 7, "size: pagerank"],
+    // Every node, with a metric and a category: the graph, sized and coloured.
+    ["algorithms()", "SELECT * FROM algorithms(karate, pagerank(direction => 'both'), community => louvain(seed => 1));", "nodes of karate (id, pagerank, community)", 34, 78, "colour: community"],
+    // Three variables: both edges of each match (0–1, and 1's nine ties), not only a–b.
+    ["a three-variable match", three, "pattern matches on karate (a, b, c)", 10, 9, ""],
+    // shortest_path(): the same edges, as a route.
+    ["shortest_path()", "SELECT * FROM shortest_path(karate, source => 16, target => 26, direction => 'both');", "a path on karate (src, dst, hop)", 6, 5, ""],
+  ] as [string, string, string, number, number, string][]) {
+    await type(query, s);
+    const before = await errors(s);
+    await type(".graph", s);
+    const out = squeezed(await after(".graph", s));
+    await graphSettled(s);
+    const drawn = await graphInfo(s);
+    const status = (await s.locator("#graph-status").textContent()) ?? "";
+    const shown = ((await s.locator("#graph-legend").textContent()) ?? "").trim();
+    const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+    check(
+      out.startsWith(squeezed(`Drawing ${count(edges, "edge")}, ${count(nodes, "node")} as ${as} (`)) &&
+        drawn.nodes === nodes &&
+        drawn.edges === edges &&
+        drawn.drawnAs === as &&
+        status === `${count(nodes, "node")} · ${count(edges, "edge")} · drawn as ${as} · Done` &&
+        (legend === "" ? shown === "" : shown.includes(legend)) &&
+        (await errors(s)) === before,
+      `.graph after ${what}: drawn as ${as}`,
+      `${out.slice(0, 90)} | ${status} | ${shown} | ${JSON.stringify(drawn)}`,
+    );
+    await s.keyboard.press("Escape");
   }
+  // A node table that is no graph's: the nodes, without edges, and it says so.
+  await type(".graph SELECT 'x' AS id, 0.5 AS pagerank UNION ALL SELECT 'y', 0.25", s);
+  await graphSettled(s);
+  {
+    const drawn = await graphInfo(s);
+    const status = (await s.locator("#graph-status").textContent()) ?? "";
+    check(drawn.nodes === 2 && drawn.edges === 0 && status.includes("drawn as nodes (id, pagerank) · the edges of 'karate' could not be read") && status.includes("the nodes are drawn without edges"), "a node table of no graph draws its nodes, and says there are no edges", `${status} | ${JSON.stringify(drawn)}`);
+  }
+  await s.keyboard.press("Escape");
+  check(!(await graphOpen(s)), "Esc closes the drawing of a node table");
   // Two columns of ids, whatever their names, draw as before: integers, and strings.
   for (const sql of ["SELECT src AS a, dst AS b FROM ties", "SELECT src::VARCHAR, dst::VARCHAR, 0.5 FROM ties"]) {
     await type(`.graph ${sql}`, s);
@@ -1040,12 +1086,12 @@ for (const scheme of ["light", "dark"] as const) {
   // Sized by PageRank, coloured by Louvain: run through algorithms(karate, …).
   await statuses(s);
   await type(".graph karate SIZE BY pagerank COLOR BY louvain", s);
-  check((await after(".graph karate SIZE BY", s)).startsWith("Drawing 78 edges, 34 nodes (Esc closes)"), `${scheme}: .graph karate SIZE BY pagerank COLOR BY louvain draws`, (await after(".graph karate SIZE BY", s)).split("\n")[0]);
+  check((await after(".graph karate SIZE BY", s)).startsWith("Drawing 78 edges, 34 nodes as the graph karate (Esc closes)"), `${scheme}: .graph karate SIZE BY pagerank COLOR BY louvain draws`, (await after(".graph karate SIZE BY", s)).split("\n")[0]);
   await graphSettled(s);
   const seen = await statuses(s);
   const loading = seen.findIndex((t) => t.startsWith("Loading graph view…"));
   const laying = seen.findIndex((t) => / · Laying out · level \d+ of \d+$/.test(t));
-  const done = seen.findIndex((t) => t === "34 nodes · 78 edges · Done");
+  const done = seen.findIndex((t) => t === "34 nodes · 78 edges · drawn as the graph karate · Done");
   check(laying >= 0 && done > laying && (loading < 0 || loading < laying), `${scheme}: the status shows the layout's progress, then Done`, JSON.stringify(seen));
   const legend = await legendText(s);
   check(/^size: pagerank 0\.\d+–0\.\d+ colour: louvain (\S+ \(\d+\) ?){2,8}$/.test(legend), `${scheme}: the legend names what sizes and colours the nodes`, legend);
@@ -1090,8 +1136,8 @@ for (const scheme of ["light", "dark"] as const) {
     // Karate's members are 0 to 33: the four past 29 have no values.
     const nodes = ".graph SELECT src, dst FROM ties NODES (SELECT id, CASE WHEN club = 'Officer' THEN 'officer' END AS side, id * 2 AS twice FROM members WHERE id < 30) SIZE BY twice COLOR BY side";
     await type(nodes, s);
-    const drew = (await after(".graph SELECT src, dst FROM ties NODES", s)).split("\n").find((l) => l.startsWith("Drawing")) ?? "";
-    check(drew === "Drawing 78 edges, 34 nodes (replacing the last drawing; Esc closes)", ".graph QUERY NODES (…) draws", drew);
+    const drew = (await after(".graph SELECT src, dst FROM ties NODES", s)).split("\n").filter((l, i, all) => l.startsWith("Drawing") || all[i - 1]?.startsWith("Drawing")).join("");
+    check(drew.replace(/\s+/g, "") === "Drawing 78 edges, 34 nodes as edges (src, dst) (replacing the last drawing; Esc closes)".replace(/\s+/g, ""), ".graph QUERY NODES (…) draws", drew);
     await graphSettled(s);
     const sides = await legendText(s);
     check(/^size: twice 0–58 colour: side officer \(\d+\) no value \(\d+\)$/.test(sides), "NODES (…) columns size and colour a query's nodes", sides);

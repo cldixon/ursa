@@ -701,9 +701,10 @@ async fn a_node_table_is_nodes_with_the_edges_among_them() {
     // Ids that are not the graph's: no edges, and why.
     let view = interpreted(&ctx, "SELECT * FROM (VALUES ('a'), ('b')) AS t(id)").await;
     assert_eq!(view.result.n_edges(), 0);
+    assert_eq!(view.result.graph(), None);
     assert!(
         view.drawn_as()
-            .contains("the edges of 'karate' could not be read"),
+            .starts_with("nodes (id) · the edges of 'karate' could not be read"),
         "{}",
         view.drawn_as()
     );

@@ -231,11 +231,14 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   };
   current = state;
   renderLegend(legend, graph);
+  state.drawnAs = graph.drawnAs;
 
   // The header: the graph's size and how far the layout is, or the node last clicked.
   const header = () => {
     const counts = `${plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
     const picked = state.picked;
+    // The rule that drew it (graph-data.js's drawnAs): the pane never guesses silently.
+    const drawn = graph.drawnAs ? ` · drawn as ${graph.drawnAs}` : "";
     let text;
     if (picked) {
       const extra = [];
@@ -243,15 +246,15 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
       if (graph.color) extra.push(`${graph.colorBy} ${categoryName(graph, graph.color[picked.index], picked.index)}`);
       text = `${counts} · node ${picked.id} (degree ${number(picked.degree)})${extra.map((e) => ` · ${e}`).join("")}`;
     } else if (state.layoutDone) {
-      text = `${counts} · Done`;
+      text = `${counts}${drawn} · Done`;
     } else if (state.levels !== null) {
-      text = `${counts} · Laying out · level ${state.levels - state.level} of ${state.levels}`;
+      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}`;
     } else {
       text = `Loading graph view… ${counts}`;
     }
     // Only when it changes: the line is a live region.
     if (status.textContent !== text) status.textContent = text;
-    status.title = `${counts} · drawn with ${state.backend}`;
+    status.title = `${counts}${drawn} · drawn with ${state.backend}`;
   };
   state.header = header;
   header();
@@ -442,7 +445,7 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   state.cleanup.push(() => legend.replaceChildren());
   state.cleanup.push(() => (legend.hidden = true));
 
-  return { nodes: state.nodes, edges: state.edges, backend: state.backend };
+  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs };
 }
 
 /** A node's COLOR BY category, as the legend names it. */
@@ -525,7 +528,7 @@ export function close() {
 export function info() {
   if (!current) return null;
   const { nodes, edges, backend, iterations, level, levels, layoutDone, picked, frames } = current;
-  return { nodes, edges, backend, iterations, level, levels, layoutDone, picked, frames, width: current.canvas.width, height: current.canvas.height };
+  return { nodes, edges, backend, iterations, level, levels, layoutDone, picked, frames, drawnAs: current.drawnAs, width: current.canvas.width, height: current.canvas.height };
 }
 
 /**

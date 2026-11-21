@@ -8,18 +8,23 @@
 //! 1. [`clauses`] splits the text into its source and its [`Style`].
 //! 2. A [`Source`] is found: the last result, a query's, a table's rows, or a
 //!    property graph.
-//! 3. [`rules`] chooses the result → graph rule that draws it. Today rows are
-//!    edges, from their `src` and `dst` columns or else the first two, both
-//!    ids ([`rules::endpoint_columns`]); a property graph is its edge tables
-//!    and its vertex tables' keys, so a node with no edges is drawn too.
-//!    The rest of the design's rules (#433) slot in there.
+//! 3. [`rules`] chooses the result → graph rule that draws it (design §3,
+//!    #433), by what its columns are: their `ursa.*` metadata, or else their
+//!    names and types. Rows are paths, a hop's rings, edges, a pattern's
+//!    matches, or nodes; or they are not a graph, and the error says what
+//!    would be. A property graph is its edge tables and its vertex tables'
+//!    keys, so a node with no edges is drawn too. [`interpret`] is this step
+//!    alone, on a result.
 //! 4. Ids become dense node indexes `0..n`, in the order they are first
 //!    seen, so the same rows always give the same graph.
 //! 5. `SIZE BY` and `COLOR BY` each become a node column, which the result's
 //!    encodings name.
 //!
-//! The result's provenance says the SQL it came from and the rule that drew
-//! it. [`GraphView::legend`] is the legend of `COLOR BY`.
+//! The result's provenance says the SQL it came from, the rule that drew
+//! it, the columns the rule read and what it left out ([`drawn_as`] is the
+//! sentence a status line shows). Its highlights are the paths, the seeds
+//! and each node's level, for the view to draw. [`GraphView::legend`] is the
+//! legend of `COLOR BY`.
 //!
 //! This module runs SQL text (a source that is a query, `NODES (…)`, the
 //! algorithms of `SIZE BY pagerank`), and the SQL front end is `ursa-sql`,
@@ -179,9 +184,11 @@ impl Source {
 /// A graph to draw, and what was left out of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphView {
-    /// The nodes, the edges, and the columns `SIZE BY` and `COLOR BY` made,
-    /// which its encodings name. Every node has the one label `""`, and no
-    /// edge's row is known.
+    /// The nodes, the edges, and the columns the rule and `SIZE BY` and
+    /// `COLOR BY` made, which its encodings name. A property graph's nodes
+    /// and a plain table's have the one label `""`, and their edges' rows
+    /// are not known; a rule that reads metadata names the vertex and edge
+    /// tables, and gives the rows it knows.
     pub result: GraphResult,
     /// Rows left out because an endpoint is NULL.
     pub skipped: usize,
@@ -443,12 +450,15 @@ async fn read_rows(
     };
     let mut own = None;
     let (mut size, mut color) = (None, None);
-    let graph = graph_of(
+    let mut graph = graph_of(
         ctx,
         &reading,
         matches!(reading.shape, Shape::Hop { .. } | Shape::Nodes { .. }),
         &mut notes,
     );
+    // The session's only graph is a guess until its edges are read: ids
+    // that are not its own are of no graph.
+    let guessed = reading.graph.is_none();
     // The label of each key column, for the nodes' properties.
     let mut key_labels: Vec<(usize, u16)> = Vec::new();
     let (mut edges, index) = match &reading.shape {
@@ -532,6 +542,9 @@ async fn read_rows(
                 None => Err("there is no property graph to read the edges from".to_string()),
             };
             if let Err(why) = read {
+                if guessed {
+                    graph = None;
+                }
                 // The rows' own edges: each seed's to the nodes one step away.
                 for i in 0..rows.reached.len() {
                     if rows.distance[i] == 1 && rows.seeds[i] != NULL && rows.reached[i] != NULL {
@@ -561,6 +574,9 @@ async fn read_rows(
                 None => Err("there is no property graph to read the edges from".to_string()),
             };
             if let Err(why) = read {
+                if guessed {
+                    graph = None;
+                }
                 notes.push(format!("{why}: the nodes are drawn without edges"));
             }
             let named = |column: usize| Name {
