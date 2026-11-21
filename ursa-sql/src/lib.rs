@@ -105,6 +105,33 @@ async fn execute_inner(
     }
 }
 
+/// How `ursa_engine::graph::view` runs SQL text (a `.graph` source that is a
+/// query, its `NODES (…)`, the algorithms of `SIZE BY pagerank`): Ursa's
+/// whole dialect, every statement in turn, giving the rows of the last.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sql;
+
+#[async_trait::async_trait]
+impl ursa_engine::graph::view::RunSql for Sql {
+    async fn run(
+        &self,
+        ctx: &SessionContext,
+        text: &str,
+    ) -> Result<ursa_engine::graph::view::Rows> {
+        let mut last = None;
+        for (statement, sql) in parse_sql_with_text_for(ctx, text)? {
+            last = Some(execute_with_text(ctx, statement, &sql).await?);
+        }
+        let Some(frame) = last else {
+            return Err(DataFusionError::Plan(
+                "no query to draw; .graph SELECT src, dst FROM …".into(),
+            ));
+        };
+        let schema = std::sync::Arc::new(frame.schema().as_arrow().clone());
+        Ok((schema, frame.collect().await?))
+    }
+}
+
 /// Run one statement, leaving the database's catalog alone.
 pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Result<DataFrame> {
     match statement {

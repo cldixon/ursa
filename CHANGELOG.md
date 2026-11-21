@@ -228,6 +228,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Ursa Web Shell: the Graph view times itself** (#430).
+  `window.ursaShell.graphTimings()` gains `frames` (the count, and the p50,
+  p95 and max of the time in `render()` and of the time between frames
+  while the view moves, over the last 120), `pick` (the last and the p95),
+  `actions` (for each: the command, the ms in the engine, the ms applying
+  its answer, and the ms from the input to the frame that showed it) and
+  `longTasks` (the page's tasks over 50 ms). `graphMemory()` gives each
+  wasm instance's memory (engine, view, layout worker) and
+  `performance.measureUserAgentSpecificMemory()`. A frame's end is when the
+  page's thread is free of it, not when `render()` returns: with no GPU the
+  browser rasterises on that thread afterwards. Keeping them costs a frame
+  three clock reads, a timer and two writes into arrays made once.
+  `web/tests/graph-timing.ts` prints them, with the frame times of a
+  scripted wheel zoom on `.graph rmat`.
 - **Ursa Web Shell: the Graph view in each theme's own colours.** The view
   draws on the theme's background with its own edge ink and a categorical
   palette stepped for white and for the dark sky, so the CSS inversion is
@@ -385,6 +399,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **`.graph` is resolved in the engine** (#425). What turns a source and its
+  `NODES`, `SIZE BY` and `COLOR BY` clauses into a graph moved from
+  `ursa-wasm` to `ursa-engine` (`graph::view`), so the CLI and the notebook
+  can draw what the web shell draws. It writes a `ursa_viz::model::GraphResult`:
+  the ids as nodes of one label with typed keys, the edges, a node column
+  for `SIZE BY` and a dictionary column for `COLOR BY` (every category, the
+  largest first) which the encodings name, and the SQL and the rule that drew
+  it (`edges`, or `graph` for a property graph). `GraphView::legend` gives
+  the legend. `ursa-engine` depends on `ursa-viz` without its default
+  features, so no GPU code is in the engine or the CLI; `ursa-viz` is now
+  published with the engine's crates. SQL text is run through a `RunSql`
+  the caller hands in (`ursa_sql::Sql`), since `ursa-sql` depends on the
+  engine. In the web shell, `WebShell.graph` returns one UGR buffer, which
+  the worker transfers and `graph.js` reads with `ursa-viz/ui/ugr.js` as
+  typed arrays over it, in place of an array copied per getter. What
+  `.graph` draws, its messages and its legend are unchanged.
 - **A highlight layer in the graph view** (#435): a path, a selection or a
   hover can be seen. `ursa-viz` keeps a flags byte per node (selected,
   hovered, pinned, dimmed, highlighted, hidden, seed) in a buffer of its

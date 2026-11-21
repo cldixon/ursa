@@ -979,7 +979,8 @@ const loadGraphModule = () =>
 
 // When each step of the last `.graph` ended (performance.now()), for tests
 // and tests/graph-timing.ts: enter, engine, viz, posted, view, the worker's
-// workerStart, workerLoaded and hierarchy, firstPositions, firstDraw, done.
+// workerStart, workerLoaded and hierarchy, firstPositions, firstDraw, done;
+// and `command`, what was typed. graphTimings() (below) gives them.
 let graphTimes = null;
 
 /**
@@ -993,7 +994,7 @@ let graphTimes = null;
  * graph view's code starts loading then, while the engine still works.
  */
 async function drawGraph(text) {
-  const times = (graphTimes = { enter: performance.now() });
+  const times = (graphTimes = { enter: performance.now(), command: `.graph ${text}`.trim() });
   const wasOpen = graphOpen();
   const status = $("graph-status");
   const before = status.textContent;
@@ -1391,8 +1392,28 @@ window.ursaShell = {
   // draws, a frame's inked pixels, and the node at a canvas pixel.
   graphOpen,
   graph: () => graphLoaded?.info() ?? null,
-  // When each step of the last .graph ended, in ms after Enter.
-  graphTimings: () => graphTimes && Object.fromEntries(Object.entries(graphTimes).map(([k, v]) => [k, Math.round(v - graphTimes.enter)])),
+  // The last .graph: when each step ended, in ms after Enter; and what the
+  // view costs to use (#430, graph-timings.js): `frames` (how many, and the
+  // p50, p95 and max of the time in render() and of the time between frames
+  // while the view moves), `pick` (the last and the p95), `actions` (each
+  // one's command, its ms in the engine and applying the answer, and its ms
+  // from the input to the page being free of the frame that showed it) and
+  // `longTasks` (the page's tasks over 50 ms: start, in ms after Enter, and
+  // duration).
+  graphTimings: () =>
+    graphTimes && {
+      ...Object.fromEntries(Object.entries(graphTimes).filter(([, v]) => typeof v === "number").map(([k, v]) => [k, Math.round(v - graphTimes.enter)])),
+      ...graphLoaded?.readTimings(graphTimes.enter),
+    },
+  // For tests: forget the frames and picks timed so far.
+  graphTimingsReset: () => graphLoaded?.resetTimings(),
+  // Memory: each wasm instance's (`wasm.engine`, `wasm.view`, `wasm.layout`,
+  // in bytes) and, cross-origin isolated, what the browser measures for the
+  // page and its workers (`userAgent`; see graph.js's memory()).
+  graphMemory: async (options) => {
+    const [{ bytes }, rest] = await Promise.all([engine("memory"), graphLoaded?.memory(options)]);
+    return { crossOriginIsolated, userAgent: null, ...rest, wasm: { engine: bytes, view: null, layout: null, ...rest?.wasm } };
+  },
   graphInked: async () => graphLoaded?.inked() ?? null,
   graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
 };

@@ -64,7 +64,8 @@ static assets and an R2 bucket.
     `.graph` (or the Graph button) draws the last result as a graph in a
     pane beside the terminal, or under it under 640px; `.graph QUERY` draws a
     query's and `.graph NAME` a property graph's (or a table's). The engine
-    makes the graph (`WebShell.graph`, the `graph` op of the worker): each
+    makes the graph (`ursa-engine`'s `graph::view`, through `WebShell.graph`
+    and the `graph` op of the worker; see "The engine's graph" below): each
     row an edge from its `src` to its `dst` column (in any case), else from
     its first column to its second, the ids numbered `0..n` in the order
     they are first seen, at most 2,000,000 edges. The two columns must hold
@@ -93,10 +94,27 @@ static assets and an R2 bucket.
     categories, the rest "other", and refuses a fractional column with more
     than eight values or any with more than eight that are over half the
     nodes (it suggests `SIZE BY`). The engine parses and resolves it all
-    (`ursa-wasm/src/graph.rs`) and returns each node's size and colour index
-    with the legend's labels and counts. The legend, under the pane's
+    (`ursa-engine/src/graph/view/`) into two node columns of the result,
+    from which the page reads each node's size and colour index and the
+    legend's labels and counts. The legend, under the pane's
     header, names what sizes the nodes (with its range) and each colour's
     category and count, in text.
+  - **The engine's graph** (#425): `.graph` is resolved in `ursa-engine`
+    (`graph::view`: the clauses, the source, the ids as dense node indexes,
+    `SIZE BY`, `COLOR BY` and `NODES`), not in `ursa-wasm`, so the CLI and
+    the notebook can draw what the shell draws. It makes a graph result
+    (`ursa-viz`'s `model`), which `WebShell.graph` hands the worker as one
+    UGR buffer (`ursa-viz/UGR.md`), and the worker transfers it to the page:
+    `{ugr, skipped}`. `graph.js` reads it with `ursa-viz/ui/ugr.js`
+    (`build.ts` copies it to `dist/ugr.js`), as typed arrays over the buffer
+    with no copy, and `public/graph-data.js` makes it the drawing: `n`,
+    `src`, `dst`, each node's id (decoded when asked for), the size column
+    as it is, and the colour column, a dictionary whose values are the
+    categories by rank, as colour indexes and the legend. The result's
+    provenance says the SQL and the rule that drew it (`edges`, or `graph`
+    for a property graph); nothing shows it yet (#433 will).
+    `bun test tests/graph-data.test.ts` runs that path without a browser,
+    on the fixtures `ursa-engine`'s `tests/graph_view.rs` writes.
   - **Theme:** `ursa-viz` draws in the page's `--graph-*` tokens
     (`style.css`: background, edge ink, plain nodes, eight categorical hues
     and "other", stepped for each theme; and `--graph-highlight`,
@@ -114,6 +132,46 @@ static assets and an R2 bucket.
     times `.graph rmat` (1M edges): in headless Chromium, the first drawing
     went from 4.6 s after Enter to 0.95 s, and the layout's end from 12.1 s
     to 6.0 s.
+  - **Timings** (#430): `graphTimings()` also says what the view costs to
+    use, so the targets of `design/graph-explorer.md` §9 can be read from
+    the page:
+
+    | field | what |
+    |---|---|
+    | `frames` | `count`, the frames drawn since the page loaded; `render`, the time in `view.render()` of the last 120; `interval`, the time from one frame's start to the next's, of the last 120 frames that input asked for (a drag, a wheel, a key) and that began within 100 ms of the page's thread being free of the frame before: the view moving. It is the frame's whole cost; `render` is only the call. Each is `{count, p50, p95, max}` in ms. |
+    | `pick` | `{count, last, p95}`: the time in `view.pick()` of a click, over the last 120. |
+    | `actions` | the last 32, oldest first: `{command, at, engine, delta, frame}`. `command` is what was typed (`.graph karate`) or the input (`click`, `fit`, `key +`); `at` is when the input arrived, in ms after the last `.graph`'s Enter; `engine` is the ms the engine took and `delta` the ms applying its answer to the view (both `null` for an input that needs neither); `frame` is the ms from the input to when the page's thread was free of the frame that showed it: with no GPU the browser rasterises a frame on that thread after `render()` returns (4 s at a million edges), so this is when the pixels are there, where `firstDraw` is when `render()` returned. A click, which draws nothing, is shown by the next frame the browser paints. |
+    | `longTasks` | the page's last 64 tasks over 50 ms: `{start, duration}`, `start` in ms after Enter. |
+
+    `await window.ursaShell.graphMemory()` gives `wasm.engine`, `wasm.view`
+    and `wasm.layout`, the bytes of each WebAssembly instance's memory (the
+    engine's worker, the view on the page, the layout's worker), and
+    `userAgent`, `performance.measureUserAgentSpecificMemory()`'s answer for
+    the page and its workers (`{bytes, breakdown}`), which the cross-origin
+    isolation of #429 allows. The browser answers after a garbage collection
+    of its choosing, so after `timeoutMs` (10 s) `userAgent` is `null` and
+    `userAgentError` says so.
+
+    Keeping these costs a frame three clock reads, a timer and two writes
+    into arrays made once (`graph-timings.js`): under a microsecond, and no
+    allocation.
+    Percentiles are worked out when `graphTimings()` is read.
+    `tests/graph-timing.ts` prints all of it: the steps, the `.graph`
+    action, the long tasks, the frame times of a scripted wheel zoom, a pick
+    and the heaps. It runs the full Chromium (`channel: "chromium"`), since
+    Playwright's headless shell has no `measureUserAgentSpecificMemory`;
+    `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`
+    tests the arithmetic.
+
+    On `.graph rmat` (1M edges, headless Chromium, software WebGL2, median
+    of three, 2026-11-21): `firstDraw` 1.28 s after Enter, but the `.graph`
+    action's `frame` 5.85 s, since the browser spends 4.5 to 6.3 s
+    rasterising that first frame on the page's thread after `render()`
+    returns (0.7 ms); frames while a wheel zoom runs are 3.4 s apart at the
+    p95; a pick takes 2.3 ms and a click is shown 16 ms after it; the wasm
+    heaps are 49 MiB (engine), 52 MiB (view) and 97 MiB (layout worker),
+    of 219 MiB for the page and its workers. On karate: frames 16.7 ms
+    apart (p95 20 ms), `render()` 1.4 ms, a pick 0.2 ms.
     `graph.js` is imported on the first `.graph`, and it loads `ursa-viz`
     (about 1 MB gzipped), so a session that draws nothing downloads neither.
     The terminal keeps the focus and refits to its half (xterm's fit addon,
