@@ -362,6 +362,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `COPY … TO` a Parquet or an Arrow file keeps it: the file remembers its
     graph. `arrow_metadata(column, 'ursa.role')` reads it in SQL.
   - Docs: a "Result metadata" reference page.
+- **SQL: `induced_edges(g, nodes => …)`, the graph's edges among a set of
+  nodes** (#432). A traversal like `hop`: `nodes` is a list, a query of one
+  column, or one id, and each row is an edge whose two ends are both in the
+  set, as `src` and `dst` (in the direction the graph stores) and `edge`, its
+  row in the edge table as `edges(p)` numbers it. Parallel edges are rows of
+  their own, rows are ordered by `edge`, and an id that is not in the graph
+  is on no edge. It reads the index (a stored one where there is one):
+  the nodes are marked in a bitmap and each one's out-edges walked, so the
+  time is the sum of the nodes' out-degrees, whatever the graph's size. The
+  same rows from `WHERE src IN (…) AND dst IN (…)` on the edge table cost a
+  scan of it. The columns carry the `ursa.*` metadata (`src`, `dst`, and a
+  new role, `edge`). `ursa_core::algo::induced_edges` is the kernel.
 
 ### Changed
 

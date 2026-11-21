@@ -1110,6 +1110,7 @@ describe,statistic,3,out in both
 hop,traversal,3,out in both
 shortest_path,traversal,4,out in both
 random_walk,traversal,4,\"\"
+induced_edges,traversal,1,\"\"
 algorithms,combinator,0,\"\"
 "
     );

@@ -26,7 +26,8 @@ The metadata changes no value, no column name and no type. A plain table, and a 
 | `category` | a group per node | `louvain`, `label_propagation`, `connected_components` |
 | `seed` | the node a row started from | `hop`'s `seed` |
 | `distance` | the fewest steps from the seed | `hop`'s `distance` |
-| `src`, `dst` | the two ends of an edge | `shortest_path`'s `src` and `dst` |
+| `src`, `dst` | the two ends of an edge | `shortest_path`'s and `induced_edges`' `src` and `dst` |
+| `edge` | an edge's row in its edge table | `induced_edges`' `edge` |
 | `step` | a row's position in its path or walk | `shortest_path`'s `hop`, `random_walk`'s `step` |
 | `walk` | which walk a row is in | `random_walk`'s `walk_id` |
 | `property` | a property of a pattern variable | `a.club`, `e.weight` in `GRAPH_TABLE` |

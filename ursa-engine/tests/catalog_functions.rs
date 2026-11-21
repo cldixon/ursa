@@ -586,6 +586,7 @@ describe,statistic
 hop,traversal
 shortest_path,traversal
 random_walk,traversal
+induced_edges,traversal
 algorithms,combinator
 "
     );
@@ -651,6 +652,7 @@ random_walk,start,node ids,required
 random_walk,steps,integer,required
 random_walk,walks_per_node,integer,1
 random_walk,seed,integer or NULL,NULL
+induced_edges,nodes,node ids,required
 "
     );
     assert_eq!(
@@ -673,6 +675,9 @@ shortest_path,cost,Float64
 random_walk,walk_id,Int64
 random_walk,step,Int64
 random_walk,node,Int64 or Utf8
+induced_edges,src,Int64 or Utf8
+induced_edges,dst,Int64 or Utf8
+induced_edges,edge,Int64
 "
     );
     assert_eq!(
@@ -755,7 +760,7 @@ async fn trivial_layouts_are_hidden() {
                     layout_fa2, layout_fr";
     let all = format!(
         "{per_node}, neighbors_agg, density, avg_path_length, diameter, describe, hop, \
-         shortest_path, random_walk, algorithms"
+         shortest_path, random_walk, induced_edges, algorithms"
     );
     let unknown =
         |name: &str| format!("there is no graph function '{name}'. The graph functions are: {all}");
