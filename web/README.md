@@ -66,8 +66,14 @@ static assets and an R2 bucket.
     query's and `.graph NAME` a property graph's (or a table's). The engine
     makes the graph (`WebShell.graph`, the `graph` op of the worker): each
     row an edge from its `src` to its `dst` column (in any case), else from
-    its first column to its second, the ids of any type numbered `0..n` in
-    the order they are first seen, at most 2,000,000 edges. `ursa-viz` draws
+    its first column to its second, the ids numbered `0..n` in the order
+    they are first seen, at most 2,000,000 edges. The two columns must hold
+    ids: integers, strings or dates, and the first two both of one kind. A
+    float, a boolean, a list or a struct is refused with what to type
+    instead (#427), so `.graph` after `SELECT * FROM pagerank(karate)` no
+    longer draws each id tied to its score, nor a path query one edge to a
+    list: `.graph karate SIZE BY pagerank` draws an algorithm's result, and
+    `SELECT … AS src, … AS dst` names the ends of other rows. `ursa-viz` draws
     it (WebGPU, else WebGL2) with its ForceAtlas2 layout running in
     `graph-worker.js`, nodes sized by degree unless asked otherwise.
   - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES

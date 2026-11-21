@@ -928,6 +928,54 @@ for (const scheme of ["light", "dark"] as const) {
   check(!(await graphOpen(g)), "a dataset closes the graph view");
   await gctx.close();
 }
+// #427: the ends of an edge are ids. A score or a path is not a node: .graph
+// says so, and what to type instead, where it drew nonsense (each id tied to
+// its PageRank; one edge from a path's length to its list of vertices).
+{
+  const actx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const s = await actx.newPage();
+  await s.goto(`${base}/?dataset=karate`);
+  await ready(s);
+  await idle(s);
+  await s.click("#terminal");
+  // Compared without spaces: the terminal wraps long lines.
+  const squeezed = (t: string) => t.replace(/\s+/g, "");
+  const shortest = "FROM GRAPH_TABLE (karate MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b WHERE b.id = 26) COLUMNS (path_length(p), vertices(p), edges(p)));";
+  for (const [query, says] of [
+    ["SELECT * FROM pagerank(karate) LIMIT 5;", ["cannot draw the first two columns (id: Int64, pagerank: Float64) as edges: 'pagerank' is a number that is not whole (Float64)", ".graph NAME SIZE BY pagerank", ".graph SELECT … AS src, … AS dst FROM …"]],
+    ["SELECT * FROM algorithms(karate, pagerank(), community => louvain(seed => 1));", ["'pagerank' is a number that is not whole (Float64)", ".graph NAME SIZE BY pagerank"]],
+    [shortest, ["cannot draw the first two columns (path_length(p): Int64, vertices(p): List(", "'vertices(p)' is a list", "AS src, … AS dst"]],
+    ["SELECT src, pagerank AS dst FROM ties JOIN pagerank(karate) ON id = src;", ["cannot draw columns src and dst as edges: 'dst' is a number that is not whole (Float64)"]],
+  ] as [string, string[]][]) {
+    await type(query, s);
+    const before = await errors(s);
+    await type(".graph", s);
+    const out = await after(".graph", s);
+    check(
+      out.startsWith("Error: cannot draw ") && says.every((part) => squeezed(out).includes(squeezed(part))) && (await errors(s)) === before + 1 && !(await graphOpen(s)),
+      `.graph after ${query.slice(0, 44)}…: scores and paths are not nodes`,
+      out.split("\n").slice(0, 4).join(" "),
+    );
+  }
+  // The same of a query given to .graph, and of an id beside a name.
+  for (const [sql, says] of [
+    ["SELECT id, pagerank FROM pagerank(karate)", "'pagerank' is a number that is not whole (Float64)"],
+    ["SELECT id, club FROM members", "'id' holds integer ids and 'club' holds string ids, so they are not the two ends of an edge"],
+  ]) {
+    await type(`.graph ${sql}`, s);
+    const out = await after(`.graph ${sql}`, s);
+    check(out.startsWith("Error: cannot draw ") && squeezed(out).includes(squeezed(says)) && !(await graphOpen(s)), `.graph ${sql}: refused`, out.split("\n").slice(0, 3).join(" "));
+  }
+  // Two columns of ids, whatever their names, draw as before: integers, and strings.
+  for (const sql of ["SELECT src AS a, dst AS b FROM ties", "SELECT src::VARCHAR, dst::VARCHAR, 0.5 FROM ties"]) {
+    await type(`.graph ${sql}`, s);
+    const out = (await after(`.graph ${sql}`, s)).split("\n")[0];
+    check(out.startsWith("Drawing 78 edges, 34 nodes") && (await graphOpen(s)), `.graph ${sql}: two id columns draw as before`, out);
+  }
+  await s.keyboard.press("Escape");
+  check(!(await graphOpen(s)), "Esc closes the drawing of two id columns");
+  await actx.close();
+}
 // SIZE BY and COLOR BY (#389): Karate's two factions in two colours, in each
 // theme, read back from the view's pixels (the view draws in the theme's own
 // colours: no CSS inversion), a theme switch with the pane open, the legend,
