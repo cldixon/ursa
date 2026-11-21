@@ -289,6 +289,51 @@ The moves are the same on both, to the bit.
   mass is `deg + 1`, so everything repels it harder than a moment before
   (`GROW_FREE_PARENT=1 GROW_REACH=4000000000`).
 
+## The highlight layer
+
+What a highlight costs a frame, and what setting one costs (#435). After the
+pan and zoom runs, `bun run bench` repeats the burst (ten frames in one
+task, each a pan and a render, one sync at the end) with a path of 100
+nodes highlighted (99 wide edges, 100 nodes in front with halos, everything
+else dimmed), then with one node hidden as well (the edges' shader reads
+the flags). It also times `setHighlights` for that path (20 times, cleared
+in between) and `setSelection` of one node (50 times), and counts the bytes
+each uploads. R-MAT, coarse to fine, the same container with no GPU, and
+busier than when the tables above were measured (its plain burst at 1M
+edges is 6.1 s here, 4.4 s there): compare along a row, not with them.
+
+| backend | nodes | edges | burst, ms/frame | with the path highlighted | and a node hidden | `setHighlights`, ms (median) | `setSelection`, ms (median) |
+|---|---|---|---|---|---|---|---|
+| webgl2 | 2,048 | 10,000 | 81.2 | 84.0 | 84.8 | 0.16 | 0.03 |
+| webgl2 | 16,384 | 100,000 | 550.8 | 561.5 | 608.1 | 0.33 | 0.07 |
+| webgl2 | 131,072 | 1,000,000 | 6,150 | 6,335 | 6,392 | 0.44 | 0.46 |
+| webgpu | 131,072 | 1,000,000 | 0.14 | 0.16 | 0.13 | 0.37 | 0.42 |
+
+- **A frame with a highlight costs what a frame costs**, within the noise
+  of this machine: 3% more at 1M edges on software WebGL2 (one burst each
+  at that size, at six seconds a frame), where every one of the million
+  lines is rasterised on the CPU either way. The layer adds 99 quads, 100
+  discs and one uniform. The WebGPU row is the submit's CPU cost alone (see
+  the caveats): it says the wasm side adds nothing measurable.
+- **A hidden node** switches the edges to the pipeline that reads the flags:
+  4% at 1M edges here, 10% at 100K, which is also within the run-to-run
+  spread. A real GPU will say whether a per-vertex flag and a discard cost
+  anything; the view only pays it while a node is hidden.
+- **Setting a highlight uploads no edges.** A path of 100 nodes writes 400
+  bytes of flags (100 runs of one node, four bytes each; 780 a set here,
+  counting the clear before it) and 3,584 bytes of instances (99 edges of 16
+  bytes, 100 nodes in front of 20), in 0.4 ms at 131K nodes. The graph's
+  million edges (8 MB of indexes) are in a buffer that cannot be written
+  after it is made.
+- **A selection of one node** writes 8 bytes of flags (the node deselected
+  and the node selected) and 20 for the node drawn in front. Its 0.4 ms at
+  131K nodes is the CPU's: the view copies and compares the flags, a byte a
+  node, to find what changed.
+- An earlier draft drew the nodes in front by running the node pipeline a
+  second time over every node, leaving the others out in the shader. On
+  software WebGL2 that cost 26 ms a frame at 2,048 nodes (a third of the
+  frame), which is why they have a buffer of their own.
+
 ## Rings and layers
 
 The fixed layouts (`layout_rings`, `layout_layers`, #436), natively, by

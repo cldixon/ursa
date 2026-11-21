@@ -22,14 +22,16 @@
 // layout's hierarchy is built while the page sets up its canvas; and nothing
 // is drawn until the layout's first positions, not a random cloud first.
 
+import * as timings from "./graph-timings.js";
+
 let viz = null;
-/** ursa-viz, loaded and initialised once. */
+/** ursa-viz, loaded and initialised once: its module, its wasm exports and its URL. */
 function loadViz() {
   viz ??= (async () => {
     const manifest = await (await fetch("/viz/viz.json")).json();
     const module = await import(manifest.module);
-    await module.default();
-    return { module, url: new URL(manifest.module, location.origin).href };
+    const wasm = await module.default();
+    return { module, wasm, url: new URL(manifest.module, location.origin).href };
   })().catch((e) => {
     viz = null; // try again next time
     throw e;
@@ -98,6 +100,10 @@ export function theme() {
     node: token("node"),
     // COLOR BY's eight categories, then "other" (index 8, as the engine numbers it).
     palette: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => token(`c${i}`)).concat(token("other")),
+    // The highlight layer's: paths and halos, selection rings, pins.
+    highlight: token("highlight"),
+    selection: token("selection"),
+    pin: token("pin"),
   };
 }
 
@@ -217,6 +223,8 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     layoutDone: false,
     picked: null,
     frames: 0,
+    // The layout worker's wasm memory, in bytes, as its last message gave it.
+    layoutMemory: null,
     paused: false,
     pending: null,
     frame: 0,
@@ -224,6 +232,13 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     cleanup: [],
   };
   current = state;
+  // The `.graph` action, for graphTimings: shown by the first frame.
+  {
+    const shown = timings.action(times.command ?? ".graph", times.enter ?? times.viz);
+    if (times.engine !== undefined && times.enter !== undefined) shown.engine = times.engine - times.enter;
+    shown.delta = times.view - (times.engine ?? times.viz);
+    state.cleanup.push(() => timings.drop(shown));
+  }
   renderLegend(legend, graph);
 
   // The header: the graph's size and how far the layout is, or the node last clicked.
@@ -268,22 +283,34 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
       state.pending = null;
     }
     try {
+      const start = performance.now();
       view.render();
+      const end = performance.now();
+      timings.frameDrawn(start, end);
       state.frames++;
-      times.firstDraw ??= performance.now();
+      times.firstDraw ??= end;
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
     }
   };
-  const redraw = () => {
+  // `input` unless the layout or a test asked: graphTimings' frame intervals
+  // are of frames the user's movement asked for.
+  const redraw = (input = true) => {
+    if (input) timings.frameAsked();
     if (!state.frame) state.frame = requestAnimationFrame(draw);
   };
   state.redraw = redraw;
+  // An action with nothing to draw (a click names a node in the header) is
+  // shown by the next frame the browser paints.
+  const shownSoon = () => {
+    if (!state.frame) requestAnimationFrame(() => current === state && timings.painted());
+  };
 
   // The layout, in a worker of its own: a slow iteration never holds up a frame.
   worker.onmessage = ({ data }) => {
     if (current !== state) return;
     if (data.times) for (const [k, v] of Object.entries(data.times)) times[k] ??= v - (performance.timeOrigin - data.origin);
+    if (data.memory) state.layoutMemory = data.memory;
     if (data.type === "positions") {
       times.firstPositions ??= performance.now();
       state.pending = data.xy;
@@ -292,7 +319,7 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
       state.levels = data.levels;
       state.positioned = true;
       header();
-      redraw();
+      redraw(false);
     } else if (data.type === "done") {
       times.done ??= performance.now();
       state.layoutDone = true;
@@ -379,12 +406,15 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
       const near = lastTap && e.timeStamp - lastTap.t < DOUBLE_TAP_MS && Math.hypot(x - lastTap.x, y - lastTap.y) < DOUBLE_TAP_PX * dpr;
       lastTap = near ? null : { t: e.timeStamp, x, y };
       if (near) {
+        timings.action("fit", e.timeStamp);
         view.fit();
         redraw();
         return;
       }
     }
+    timings.action("click", e.timeStamp);
     pick(x, y);
+    shownSoon();
   };
   on(canvas, "pointerup", (e) => release(e, false));
   on(canvas, "pointercancel", (e) => release(e, true));
@@ -398,7 +428,8 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     },
     { passive: false },
   );
-  on(canvas, "dblclick", () => {
+  on(canvas, "dblclick", (e) => {
+    timings.action("fit", e.timeStamp);
     view.fit();
     redraw();
   });
@@ -413,11 +444,14 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     else if (e.key === "0") view.fit();
     else return;
     e.preventDefault();
+    timings.action(`key ${e.key}`, e.timeStamp);
     redraw();
   });
 
   function pick(x, y) {
+    const start = performance.now();
     const node = view.pick(x, y);
+    timings.picked(performance.now() - start);
     state.picked = node === undefined ? null : { index: node, id: state.ids[node], degree: state.degree[node] };
     header();
   }
@@ -555,8 +589,48 @@ export async function inked() {
     return { width: state.canvas.width, height: state.canvas.height, inked: count, corner: [px[0], px[1], px[2]], palette: counts };
   } finally {
     state.paused = false;
-    state.redraw?.();
+    state.redraw?.(false);
   }
+}
+
+/**
+ * For graphTimings (#430): what drawing and using the view cost, times on
+ * the page's clock given from `origin` (the last `.graph`'s Enter). See
+ * graph-timings.js's read().
+ */
+export const readTimings = (origin) => timings.read(origin);
+/** For tests: forget the frames and picks timed so far. */
+export const resetTimings = () => timings.reset();
+
+/**
+ * For graphMemory (#430): `wasm`, the bytes of the view's WebAssembly memory
+ * and of the layout worker's (as its last message gave it; null with nothing
+ * drawn), and `userAgent`, performance.measureUserAgentSpecificMemory()'s
+ * answer ({bytes, breakdown}) for the page and its workers. That needs
+ * cross-origin isolation (#429), and the browser may wait for a garbage
+ * collection before it answers: after `timeoutMs` (10 s), or without
+ * isolation, `userAgent` is null and `userAgentError` says why.
+ */
+export async function memory({ timeoutMs = 10_000 } = {}) {
+  const loaded = viz ? await viz.catch(() => null) : null;
+  const out = {
+    crossOriginIsolated: globalThis.crossOriginIsolated === true,
+    wasm: { view: loaded?.wasm?.memory?.buffer.byteLength ?? null, layout: current?.layoutMemory ?? null },
+    userAgent: null,
+  };
+  if (!out.crossOriginIsolated || !performance.measureUserAgentSpecificMemory) {
+    out.userAgentError = out.crossOriginIsolated ? "not supported by this browser" : "the page is not cross-origin isolated";
+    return out;
+  }
+  try {
+    let timer;
+    const late = new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(`no answer in ${timeoutMs} ms`)), timeoutMs)));
+    const m = await Promise.race([performance.measureUserAgentSpecificMemory(), late]).finally(() => clearTimeout(timer));
+    out.userAgent = { bytes: m.bytes, breakdown: m.breakdown.filter((b) => b.bytes > 0).map((b) => ({ bytes: b.bytes, types: b.types, urls: b.attribution.map((a) => a.url) })) };
+  } catch (e) {
+    out.userAgentError = String(e?.message ?? e);
+  }
+  return out;
 }
 
 /** For tests: the node drawn at the canvas pixel (x, y), as a click picks it, or null. */

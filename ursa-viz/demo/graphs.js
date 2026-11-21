@@ -57,11 +57,48 @@ export function clusters(k, size, inside = 6, between = 1, seed = 7) {
   return { n, src: Uint32Array.from(src), dst: Uint32Array.from(dst), community: Uint32Array.from({ length: n }, (_, i) => Math.floor(i / size)) };
 }
 
-/** Zachary's karate club: 34 nodes, 78 edges. */
+/** Zachary's karate club: 34 nodes, 78 edges. Small enough to read. */
 export function karate() {
-  const pairs = "0-1 0-2 0-3 0-4 0-5 0-6 0-7 0-8 0-10 0-11 0-12 0-13 0-17 0-19 0-21 0-31 1-2 1-3 1-7 1-13 1-17 1-19 1-21 1-30 2-3 2-7 2-8 2-9 2-13 2-27 2-28 2-32 3-7 3-12 3-13 4-6 4-10 5-6 5-10 5-16 6-16 8-30 8-32 8-33 9-33 13-33 14-32 14-33 15-32 15-33 18-32 18-33 19-33 20-32 20-33 22-32 22-33 23-25 23-27 23-29 23-32 23-33 24-25 24-27 24-31 25-31 26-29 26-33 27-33 28-31 28-33 29-32 29-33 30-32 30-33 31-32 31-33 32-33".split(" ").map((e) => e.split("-").map(Number));
-  return { n: 34, src: Uint32Array.from(pairs, (p) => p[0]), dst: Uint32Array.from(pairs, (p) => p[1]) };
+  const adjacency = {
+    0: [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 17, 19, 21, 31], 1: [2, 3, 7, 13, 17, 19, 21, 30],
+    2: [3, 7, 8, 9, 13, 27, 28, 32], 3: [7, 12, 13], 4: [6, 10], 5: [6, 10, 16], 6: [16], 8: [30, 32, 33],
+    9: [33], 13: [33], 14: [32, 33], 15: [32, 33], 18: [32, 33], 19: [33], 20: [32, 33], 22: [32, 33],
+    23: [25, 27, 29, 32, 33], 24: [25, 27, 31], 25: [31], 26: [29, 33], 27: [33], 28: [31, 33], 29: [32, 33],
+    30: [32, 33], 31: [32, 33], 32: [33],
+  };
+  const src = [], dst = [];
+  for (const [u, vs] of Object.entries(adjacency)) for (const v of vs) { src.push(Number(u)); dst.push(v); }
+  return { n: 34, src: Uint32Array.from(src), dst: Uint32Array.from(dst) };
 }
+
+/**
+ * A shortest path from `from` to `to` (node indexes), edges taken either
+ * way: its nodes in order, or null if there is none.
+ */
+export function shortestPath(g, from, to) {
+  const heads = new Int32Array(g.n).fill(-1), next = new Int32Array(2 * g.src.length), other = new Uint32Array(2 * g.src.length);
+  for (let e = 0; e < g.src.length; e++) {
+    const u = g.src[e], v = g.dst[e];
+    other[2 * e] = v; next[2 * e] = heads[u]; heads[u] = 2 * e;
+    other[2 * e + 1] = u; next[2 * e + 1] = heads[v]; heads[v] = 2 * e + 1;
+  }
+  const parent = new Int32Array(g.n).fill(-1);
+  const queue = new Uint32Array(g.n);
+  let head = 0, tail = 0;
+  queue[tail++] = from; parent[from] = from;
+  while (head < tail && parent[to] < 0) {
+    const u = queue[head++];
+    for (let i = heads[u]; i >= 0; i = next[i]) {
+      const v = other[i];
+      if (parent[v] < 0) { parent[v] = u; queue[tail++] = v; }
+    }
+  }
+  if (parent[to] < 0) return null;
+  const path = [to];
+  while (path[path.length - 1] !== from) path.push(parent[path[path.length - 1]]);
+  return path.reverse();
+}
+
 
 const NONE = 0xffffffff;
 
@@ -140,6 +177,7 @@ function whole(params) {
   const kind = params.get("graph") ?? "rmat";
   if (kind === "karate") return karate();
   if (kind === "grid") return grid(Number(params.get("w") ?? 100), Number(params.get("h") ?? 100));
+  if (kind === "karate") return karate();
   if (kind === "clusters") return clusters(Number(params.get("k") ?? 8), Number(params.get("size") ?? 500));
   return rmat(Number(params.get("scale") ?? 14), Number(params.get("edges") ?? 100000));
 }

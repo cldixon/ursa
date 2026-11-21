@@ -658,13 +658,20 @@ pub const DARK_PALETTE: [u32; 8] = [
 /// edges' ink (their opacity is [`crate::render::Renderer::edge_alpha`]
 /// times this alpha), the nodes' colour when they are not coloured by
 /// category, and the categories' colours (category `c` is
-/// `palette[c % palette.len()]`).
+/// `palette[c % palette.len()]`). Then the highlight layer's
+/// ([`crate::highlight`]): highlighted edges, halos and the rings of a
+/// route's ends; the rings of selected and hovered nodes; and the rings of
+/// pinned ones. The built-in themes' are at least 3:1 against their
+/// background ([`contrast`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub background: u32,
     pub edge: u32,
     pub node: u32,
     pub palette: Vec<u32>,
+    pub highlight: u32,
+    pub selection: u32,
+    pub pin: u32,
 }
 
 impl Theme {
@@ -675,6 +682,9 @@ impl Theme {
             edge: 0x595966ff,
             node: NODE_COLOR,
             palette: PALETTE.to_vec(),
+            highlight: 0xd9480fff,
+            selection: 0x0b63ceff,
+            pin: 0x7a3fc0ff,
         }
     }
 
@@ -685,6 +695,9 @@ impl Theme {
             edge: 0xb4b8c8ff,
             node: 0xe8e4dcff,
             palette: DARK_PALETTE.to_vec(),
+            highlight: 0xffa94dff,
+            selection: 0x6cb2ffff,
+            pin: 0xc9a3ffff,
         }
     }
 
@@ -726,6 +739,23 @@ pub fn parse_color(text: &str) -> Option<u32> {
 /// `0xRRGGBBAA` as red, green, blue and alpha from 0 to 1.
 pub fn rgba(color: u32) -> [f32; 4] {
     color.to_be_bytes().map(|b| f32::from(b) / 255.0)
+}
+
+/// The WCAG contrast ratio of two colours (`0xRRGGBBAA`, alpha ignored):
+/// from 1, the same, to 21, black on white.
+pub fn contrast(a: u32, b: u32) -> f32 {
+    let luminance = |c: u32| {
+        let [r, g, b, _] = rgba(c).map(|v| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    };
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 #[cfg(test)]

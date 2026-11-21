@@ -1,11 +1,19 @@
 // The graph view, bare: a generated graph, its layout running in a worker,
-// drawn every frame. Drag to pan, wheel to zoom, double-click to fit, click a
-// node to see its index. ?graph=rmat&scale=17&edges=1000000 | grid | clusters
-// | karate; &multilevel=0 for flat ForceAtlas2 (coarse to fine is the
-// default). &layout=rings&seeds=0&hops=2 draws a neighbourhood as rings, and
-// &layout=layers&from=16&to=26 the shortest paths as layers (graphs.js).
+// drawn every frame. Drag to pan, wheel to zoom, double-click to fit.
+// ?graph=rmat&scale=17&edges=1000000 | grid | clusters | karate;
+// &multilevel=0 for flat ForceAtlas2 (coarse to fine is the default);
+// &theme=dark. &layout=rings&seeds=0&hops=2 draws a neighbourhood as
+// rings, and &layout=layers&from=16&to=26 the shortest paths as layers
+// (graphs.js).
+//
+// The highlight layer: the pointer's node is hovered, a click selects it
+// (shift-click adds to the selection, a click on nothing clears it), and a
+// second selected node draws the shortest path from the first. With a
+// selection, `p` pins or unpins it, `h` hides it and `u` shows everything
+// again; Escape clears the path and the selection. &highlight=path starts
+// with a path drawn (on karate, one of five edges).
 import init, { createView } from "../pkg/ursa_viz.js";
-import { fromParams } from "./graphs.js";
+import { fromParams, shortestPath } from "./graphs.js";
 
 const params = new URLSearchParams(location.search);
 const canvas = document.getElementById("view");
@@ -29,8 +37,20 @@ const t1 = performance.now();
 stats.graphReadyAt = t1;
 const view = await createView(canvas, g.n, g.src, g.dst);
 stats.createMs = performance.now() - t1;
+const dark = params.get("theme") === "dark";
+if (dark) {
+  view.setThemeNamed("dark");
+  document.documentElement.classList.add("dark");
+}
 if (g.community) view.colorBy(g.community);
 window.view = view;
+// Path `nodes`, in order, highlighted: UGR's sections, for one path.
+const highlightPath = (nodes) => view.setHighlights(Uint32Array.of(0, nodes.length), Uint32Array.from(nodes));
+// On karate, a path of five edges; else from node 0 to the last node reached.
+if (params.get("highlight") === "path") {
+  const path = params.get("graph") === "karate" ? [16, 5, 0, 2, 32, 14] : shortestPath(g, g.src[0], g.dst[g.dst.length - 1]);
+  if (path) highlightPath(path);
+}
 // An image of the view; frames pause while it is taken.
 let paused = false;
 window.pauseFrames = (on) => { paused = on; };
@@ -113,16 +133,51 @@ requestAnimationFrame(frame);
 // Input.
 let drag = null;
 canvas.addEventListener("pointerdown", (e) => { drag = { x: e.clientX, y: e.clientY, moved: false }; canvas.setPointerCapture(e.pointerId); });
+const selection = new Set(), pinned = new Set(), hidden = new Set();
+let hovered;
 canvas.addEventListener("pointermove", (e) => {
-  if (!drag) return;
+  if (!drag) {
+    // Hover: one node's flags change, so a few bytes are uploaded.
+    const at = view.pick(e.offsetX * dpr, e.offsetY * dpr);
+    if (at !== hovered) view.setHovered((hovered = at));
+    return;
+  }
   const dx = (e.clientX - drag.x) * dpr, dy = (e.clientY - drag.y) * dpr;
   if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
   view.pan(dx, dy);
   drag.x = e.clientX; drag.y = e.clientY;
 });
 canvas.addEventListener("pointerup", (e) => {
-  if (drag && !drag.moved) stats.picked = view.pick(e.offsetX * dpr, e.offsetY * dpr);
+  if (drag && !drag.moved) {
+    const at = (stats.picked = view.pick(e.offsetX * dpr, e.offsetY * dpr));
+    if (!e.shiftKey || at === undefined) selection.clear();
+    if (at !== undefined) selection.add(at);
+    view.setSelection(Uint32Array.from(selection));
+    // Two nodes selected: the shortest path between them.
+    const [a, b] = [...selection];
+    const path = selection.size === 2 ? shortestPath(g, a, b) : null;
+    if (path) highlightPath(path);
+    else view.clearHighlights();
+  }
   drag = null;
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "p") {
+    for (const v of selection) pinned.has(v) ? pinned.delete(v) : pinned.add(v);
+    view.setPinned(Uint32Array.from(pinned));
+  } else if (e.key === "h") {
+    for (const v of selection) hidden.add(v);
+    selection.clear();
+    view.setSelection(new Uint32Array());
+    view.setHidden(Uint32Array.from(hidden));
+  } else if (e.key === "u") {
+    hidden.clear();
+    view.setHidden(new Uint32Array());
+  } else if (e.key === "Escape") {
+    selection.clear();
+    view.setSelection(new Uint32Array());
+    view.clearHighlights();
+  }
 });
 canvas.addEventListener("wheel", (e) => { e.preventDefault(); view.zoom(Math.exp(-e.deltaY * 0.0015), e.offsetX * dpr, e.offsetY * dpr); }, { passive: false });
 canvas.addEventListener("dblclick", () => view.fit());

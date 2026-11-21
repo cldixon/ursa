@@ -615,8 +615,11 @@ check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New duri
   await page.keyboard.press("End");
   await settle();
   for (const width of [640, 1100]) {
+    // The columns before the resize: read after it, they may be the new
+    // ones already, and the wait below would never end.
+    const before: number = await shell("cols");
     await page.setViewportSize({ width, height: 900 });
-    await page.waitForFunction((n) => (window as any).ursaShell.cols() !== n, await shell("cols"));
+    await page.waitForFunction((n) => (window as any).ursaShell.cols() !== n, before);
     await settle();
     await settle();
     const n: number = await shell("cols");
@@ -921,6 +924,67 @@ for (const scheme of ["light", "dark"] as const) {
   // Double-click fits, and the wheel zooms, without errors.
   await g.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
   await g.mouse.wheel(0, -200);
+
+  // #430: graphTimings() says what the view cost to draw and to use. A wheel
+  // zoom in and back out, an event a frame for 30 frames, so the view is
+  // moving; then two keys with the focus on the canvas.
+  await g.evaluate(
+    ([x, y]) =>
+      new Promise<void>((done) => {
+        const canvas = document.querySelector("#graph-stage canvas")!;
+        let n = 0;
+        const step = () => {
+          if (n === 30) return done();
+          canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: n++ < 15 ? -30 : 30, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      }),
+    [box.x + box.width / 2, box.y + box.height / 2],
+  );
+  await g.focus("#graph-stage canvas");
+  await g.keyboard.press("+");
+  await g.keyboard.press("0");
+  await g.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  const t: any = await g.evaluate(() => (window as any).ursaShell.graphTimings());
+  const spread = (q: any) => q && q.count > 0 && 0 <= q.p50 && q.p50 <= q.p95 && q.p95 <= q.max && q.max < 10_000;
+  check(
+    t.enter === 0 && t.engine >= 0 && t.firstDraw >= t.engine && t.done >= t.firstPositions,
+    "graphTimings still gives when each step of .graph ended",
+    JSON.stringify(Object.fromEntries(Object.entries(t).filter(([, v]) => typeof v === "number"))),
+  );
+  info = await graphInfo(g);
+  check(
+    t.frames.count >= info.frames && info.frames > 30 && spread(t.frames.render) && t.frames.render.count === Math.min(120, t.frames.count) && spread(t.frames.interval) && t.frames.interval.count <= 120,
+    "graphTimings.frames: the time in render() and between frames while the view moved",
+    JSON.stringify(t.frames),
+  );
+  check(!!hit && t.pick.count >= 1 && t.pick.last >= 0 && t.pick.last < 100 && t.pick.p95 >= 0 && t.pick.p95 < 100, "graphTimings.pick: the last pick and the p95", JSON.stringify(t.pick));
+  const acted = (command: string) => t.actions.findLast((a: any) => a.command === command);
+  const drew = t.actions.findLast((a: any) => a.command.startsWith(".graph"));
+  check(
+    drew && drew.at === 0 && drew.engine >= 0 && Math.abs(drew.engine - t.engine) <= 1 && drew.delta >= 0 && drew.frame >= drew.engine && drew.frame >= t.firstDraw - 1 && drew.frame < 10_000,
+    "graphTimings.actions: .graph's time in the engine, making the view, and from Enter to its frame",
+    JSON.stringify(drew),
+  );
+  const inputs = ["click", "fit", "key +", "key 0"].map(acted);
+  check(
+    inputs.every((a: any) => a && a.at > drew.frame && a.frame >= 0 && a.frame < 5_000 && a.engine === null && a.delta === null),
+    "graphTimings.actions: a click, a fit and each key, from input to the frame that showed it",
+    JSON.stringify(inputs),
+  );
+  check(
+    Array.isArray(t.longTasks) && t.longTasks.length <= 64 && t.longTasks.every((l: any) => Number.isFinite(l.start) && l.duration >= 50),
+    "graphTimings.longTasks: the page's tasks over 50 ms",
+    JSON.stringify(t.longTasks),
+  );
+  const mem: any = await g.evaluate(() => (window as any).ursaShell.graphMemory({ timeoutMs: 2_000 }));
+  const pages = (bytes: any) => Number.isInteger(bytes) && bytes > 0 && bytes % 65536 === 0;
+  check(
+    mem.crossOriginIsolated === true && pages(mem.wasm.engine) && pages(mem.wasm.view) && pages(mem.wasm.layout) && (mem.userAgent ? mem.userAgent.bytes > mem.wasm.view : typeof mem.userAgentError === "string"),
+    "graphMemory: each wasm instance's memory, and the browser's measure of the page",
+    JSON.stringify({ ...mem, userAgent: mem.userAgent && { bytes: mem.userAgent.bytes, parts: mem.userAgent.breakdown.length } }),
+  );
 
   // Esc, in the terminal, closes it: the terminal takes the whole width again.
   await g.click("#terminal");
