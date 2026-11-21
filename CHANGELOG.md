@@ -228,6 +228,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Ursa Web Shell: the Graph view times itself** (#430).
+  `window.ursaShell.graphTimings()` gains `frames` (the count, and the p50,
+  p95 and max of the time in `render()` and of the time between frames
+  while the view moves, over the last 120), `pick` (the last and the p95),
+  `actions` (for each: the command, the ms in the engine, the ms applying
+  its answer, and the ms from the input to the frame that showed it) and
+  `longTasks` (the page's tasks over 50 ms). `graphMemory()` gives each
+  wasm instance's memory (engine, view, layout worker) and
+  `performance.measureUserAgentSpecificMemory()`. A frame's end is when the
+  page's thread is free of it, not when `render()` returns: with no GPU the
+  browser rasterises on that thread afterwards. Keeping them costs a frame
+  three clock reads, a timer and two writes into arrays made once.
+  `web/tests/graph-timing.ts` prints them, with the frame times of a
+  scripted wheel zoom on `.graph rmat`.
 - **Ursa Web Shell: the Graph view in each theme's own colours.** The view
   draws on the theme's background with its own edge ink and a categorical
   palette stepped for white and for the dark sky, so the CSS inversion is
@@ -423,6 +437,30 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the worker transfers and `graph.js` reads with `ursa-viz/ui/ugr.js` as
   typed arrays over it, in place of an array copied per getter. What
   `.graph` draws, its messages and its legend are unchanged.
+- **A highlight layer in the graph view** (#435): a path, a selection or a
+  hover can be seen. `ursa-viz` keeps a flags byte per node (selected,
+  hovered, pinned, dimmed, highlighted, hidden, seed) in a buffer of its
+  own, and draws from it: a halo on highlighted nodes, a ring on a route's
+  ends and on seeds, rings for the selection, the hover and pins, and
+  nothing for a hidden node or its edges. Highlighted edges are instanced
+  quads, 3 px wide with round ends, over the line list. While a highlight is
+  set, everything else draws at 35%. `GraphView` gains `setHighlights`
+  (UGR's path and seed sections), `clearHighlights`, `setSelection`,
+  `setHovered`, `setPinned`, `setHidden`, `setFlags`, `flags`,
+  `setHighlightEdges`, `nodePixel` and the `NodeFlag` bits; in Rust,
+  `ursa_viz::highlight::HighlightState` (no GPU) and
+  `View::set_result_highlights`, which reads a `GraphResult`'s highlights
+  and removed nodes. `Theme` and `setTheme` gain `highlight`, `selection`
+  and `pin`, at least 3:1 against the background in both built-in themes,
+  and the shell's stylesheet the matching `--graph-highlight`,
+  `--graph-selection` and `--graph-pin` tokens. It is all vertex buffers, so
+  it draws on WebGL2 as on WebGPU. Setting a highlight uploads the flags
+  that changed and 16 to 20 bytes for each highlighted edge and node, never
+  the graph's edges; a selection of one node uploads 24 bytes. At 1M edges
+  a frame with a path highlighted costs within 3% of one without
+  (`ursa-viz/BENCH.md`). The shell does not drive the layer yet. `View`'s
+  methods that upload (`step`, `set_positions`, `set_style`, `color_by`,
+  `set_theme`) now take the device as well as the queue.
 - **A benchmark for the graph view** (`ursa-viz/BENCH.md`). `bun run bench`
   in `ursa-viz/` runs the demo in Chromium on R-MAT graphs and grids of 1K
   to 1M edges, under WebGPU and WebGL2, and records time to first frame and

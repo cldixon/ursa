@@ -12,13 +12,16 @@
 //
 // The first message after "start" carries `times` (performance.now() here, and
 // `origin`, this worker's time origin): when it got the graph and when its
-// hierarchy was built, for the page's timings.
+// hierarchy was built, for the page's timings. Every "positions" and "done"
+// carries `memory`, the bytes of this worker's WebAssembly memory.
 
 let loaded = null;
+// ursa-viz's wasm exports, once loaded: `memory` is what graphMemory reports.
+let wasm = null;
 /** ursa-viz, the same build as the page's: its URL carries its hash. */
 function load(url) {
   loaded ??= import(url).then(async (m) => {
-    await m.default();
+    wasm = await m.default();
     return m;
   });
   return loaded;
@@ -48,7 +51,7 @@ self.onmessage = async ({ data }) => {
 
 function post(layout) {
   const xy = new Float32Array(layout.positions());
-  const message = { type: "positions", xy, iterations: layout.iterations, level: layout.level, levels: layout.levels, total: layout.total };
+  const message = { type: "positions", xy, iterations: layout.iterations, level: layout.level, levels: layout.levels, total: layout.total, memory: wasm.memory.buffer.byteLength };
   if (times) {
     message.times = times;
     message.origin = performance.timeOrigin;
@@ -74,5 +77,5 @@ async function run(layout, budgetMs) {
     post(layout);
     await new Promise((r) => setTimeout(r, 0));
   }
-  self.postMessage({ type: "done", iterations: layout.iterations });
+  self.postMessage({ type: "done", iterations: layout.iterations, memory: wasm.memory.buffer.byteLength });
 }

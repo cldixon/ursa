@@ -20,11 +20,12 @@
 //!   binding to drive.
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
-//! With `default-features = false` the crate is [`model`] and [`scene`]
-//! alone: no GPU and no browser, which is how the engine depends on it.
+//! With `default-features = false` the crate is [`model`], [`scene`] and
+//! [`highlight`] alone: no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
+pub mod highlight;
 pub mod model;
 #[cfg(feature = "render")]
 pub mod render;
@@ -34,6 +35,7 @@ pub mod view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub mod web;
 
+pub use highlight::HighlightState;
 pub use model::{GraphDelta, GraphResult};
 pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};
 #[cfg(feature = "render")]
