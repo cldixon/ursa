@@ -386,7 +386,9 @@ fn fa2_masks_are_thread_count_independent() {
         );
         state.step(adj, 10);
         state.set_fixed(Some((0..1500).map(|i| i % 7 == 0).collect()));
-        state.set_inertia(Some((0..1500).map(|i| 1.0 + (i % 4) as f32 * 3.0).collect()));
+        state.set_inertia(Some(
+            (0..1500).map(|i| 1.0 + (i % 4) as f32 * 3.0).collect(),
+        ));
         state.step(adj, 40);
         state.into_positions()
     };
@@ -402,8 +404,8 @@ fn fa2_masks_are_thread_count_independent() {
 #[test]
 fn fa2_grow_is_thread_count_independent() {
     // A layout grown three times: neighbours of one node with pins, then of
-    // another with the first lot now old, then with the whole drawing
-    // frozen. The same sequence must give the same bits on every pool, and
+    // another with the first lot now old and everything free to move, then
+    // with the whole drawing frozen. The same sequence must give the same bits on every pool, and
     // twice on the same one.
     let n0 = 1200usize;
     let (src0, dst0) = seeded_edges(n0, 2400);
@@ -426,7 +428,16 @@ fn fa2_grow_is_thread_count_independent() {
     }
     let steps: [(&[u32], WarmParams); 3] = [
         (&[3, 17, 500], WarmParams::default()),
-        (&[17, 1201], WarmParams::default()),
+        (
+            &[17, 1201],
+            // The whole component free, the expanded node too: the path
+            // with inertia and no tree of fixed nodes to lean on.
+            WarmParams {
+                reach: u32::MAX,
+                hold_parents: false,
+                ..WarmParams::default()
+            },
+        ),
         (
             &[],
             WarmParams {

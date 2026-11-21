@@ -27,8 +27,9 @@
 //! neighbours (16 and 100 by default), as a click to expand does. It prints
 //! what the click costs after the engine has answered (rebuilding the
 //! adjacency, placing the new nodes, the warm schedule) and how far the old
-//! nodes moved. `GROW_FREEZE` overrides `WarmParams::freeze_above`, and
-//! `GROW_FREE_PARENT=1` lets the expanded node move:
+//! nodes moved. `GROW_FREEZE` overrides `WarmParams::freeze_above`,
+//! `GROW_REACH` `WarmParams::reach`, and `GROW_FREE_PARENT=1` lets the
+//! expanded node move:
 //!
 //! ```sh
 //! cargo run -p ursa-core --release --example fa2_multilevel -- grow 1k,10k,100k,1m 16,100
@@ -53,9 +54,7 @@
 //! alone, not the measuring.
 use std::time::Instant;
 
-use ursa_core::algo::{
-    fa2_grow, Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams, WarmParams,
-};
+use ursa_core::algo::{fa2_grow, Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams, WarmParams};
 use ursa_core::topology::{Topology, UndirectedCsr};
 
 /// xorshift64 → [0, 1), as `graphs.js` has it.
@@ -327,8 +326,19 @@ fn grow(sizes: &str, adds: &str) {
     );
     println!(
         "{:>5} {:>7} {:>8} {:>5} {:>6} {:>4} | {:>8} {:>8} {:>8} {:>8} | {:>9} {:>9} {:>8}",
-        "graph", "nodes", "edges", "new", "held", "its", "build ms", "place ms", "run ms", "total ms",
-        "mean move", "max move", "nearest"
+        "graph",
+        "nodes",
+        "edges",
+        "new",
+        "held",
+        "its",
+        "build ms",
+        "place ms",
+        "run ms",
+        "total ms",
+        "mean move",
+        "max move",
+        "nearest"
     );
     for size in sizes.split(',') {
         let (scale, edges) = match size {
@@ -384,8 +394,17 @@ fn grow(sizes: &str, adds: &str) {
                 }
             }
             let mut params = WarmParams::default();
-            if let Some(v) = std::env::var("GROW_FREEZE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(v) = std::env::var("GROW_FREEZE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 params.freeze_above = v;
+            }
+            if let Some(v) = std::env::var("GROW_REACH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                params.reach = v;
             }
             if std::env::var("GROW_FREE_PARENT").is_ok() {
                 params.hold_parents = false;
@@ -431,7 +450,11 @@ fn grow(sizes: &str, adds: &str) {
                     }
                 }
             }
-            let held = if n0 > params.freeze_above { "fixed" } else { "x10" };
+            let held = if n0 > params.freeze_above {
+                "fixed"
+            } else {
+                "x10"
+            };
             println!(
                 "{:>5} {:>7} {:>8} {:>5} {:>6} {:>4} | {:>8.2} {:>8.2} {:>8.2} {:>8.2} | {:>8.3}% {:>8.3}% {:>7.3}%",
                 size,

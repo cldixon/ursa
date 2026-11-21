@@ -52,6 +52,20 @@ pub struct WarmParams {
     /// user has just clicked. Held, its new neighbours settle around it
     /// where it is.
     pub hold_parents: bool,
+    /// How many hops from a new node an old node may be and still move:
+    /// those further off are fixed for this schedule. 2 is the new nodes'
+    /// neighbours and theirs, so the nodes around an expanded node, which
+    /// are the ones that have to make room. `u32::MAX` is every node of a
+    /// component that gained one.
+    ///
+    /// A finished layout is not at rest: ForceAtlas2 keeps moving the
+    /// leaves of a drawing outwards long after its shape has settled, so
+    /// 60 more iterations move nodes that have nothing to do with what was
+    /// added, at any inertia (2% of the view's width on average and 11% at
+    /// most for the 128-node R-MAT graph, with one node added;
+    /// `examples/fa2_multilevel.rs grow`, `GROW_REACH`). The reach is what
+    /// keeps the rest of the drawing where the user left it.
+    pub reach: u32,
     /// With more old nodes than this, they are all fixed, not only the
     /// pinned ones. A fixed node costs an iteration nothing
     /// ([`Fa2State::set_fixed`]), so growing a large drawing costs what the
@@ -67,6 +81,7 @@ impl Default for WarmParams {
             inertia: 10.0,
             spread: 0.2,
             hold_parents: true,
+            reach: 2,
             freeze_above: 5_000,
         }
     }
@@ -233,9 +248,9 @@ pub fn place_new_nodes(
 /// (indexes into `adj`, in any order) are fixed; the other old nodes get
 /// [`WarmParams::inertia`], or are fixed too past
 /// [`WarmParams::freeze_above`]; the new nodes are free. Also fixed: the new
-/// nodes' parents ([`WarmParams::hold_parents`]), a node
-/// with no edge, and an old node in a connected component that gained no
-/// node. The masks replace
+/// nodes' parents ([`WarmParams::hold_parents`]), a node with no edge, and
+/// an old node more than [`WarmParams::reach`] hops from every new one. The
+/// masks replace
 /// whatever the state had, so a node unpinned since the last call is free
 /// again, and a node new in the last call is old in this one.
 ///
@@ -260,25 +275,29 @@ pub fn fa2_grow(
     // Held as well, whatever the size:
     // - a node with no edge. Nothing pulls it, so ForceAtlas2 only drives
     //   it outwards, for ever (`multilevel`'s `ring_of` has the sum).
-    // - an old node in a component that gained no node. Nothing about it
-    //   changed, and a small component beside the drawing is seldom at
-    //   rest either: it too is on its way out, and would drift a little
-    //   further on every expansion.
-    let mut touched = vec![n == n_old; n];
+    // - an old node more than `reach` hops from every new node, which
+    //   includes every component that gained none (`WarmParams::reach`).
+    // Breadth first from the new nodes, so `hops` is the least distance.
+    let mut hops = vec![if n == n_old { 0 } else { u32::MAX }; n];
     let mut queue: VecDeque<u32> = (n_old as u32..n as u32).collect();
     for &u in &queue {
-        touched[u as usize] = true;
+        hops[u as usize] = 0;
     }
     while let Some(u) = queue.pop_front() {
+        let next = hops[u as usize] + 1;
+        if next > params.reach {
+            continue;
+        }
         for &v in adj.neighbors(u) {
-            if !touched[v as usize] {
-                touched[v as usize] = true;
+            if hops[v as usize] == u32::MAX {
+                hops[v as usize] = next;
                 queue.push_back(v);
             }
         }
     }
+    let touched = |i: usize| hops[i] != u32::MAX;
     let mut fixed: Vec<bool> = (0..n)
-        .map(|i| (i < n_old && (freeze || !touched[i])) || adj.degree(i as u32) == 0)
+        .map(|i| (i < n_old && (freeze || !touched(i))) || adj.degree(i as u32) == 0)
         .collect();
     for &p in pinned {
         assert!((p as usize) < n, "pinned node {p} of {n}");
@@ -603,6 +622,7 @@ mod tests {
         let (x0, y0) = (state.positions().0[hub], state.positions().1[hub]);
         let params = WarmParams {
             hold_parents: false,
+            reach: u32::MAX,
             ..WarmParams::default()
         };
         let n = fa2_grow(&mut state, adj, None, &[], params);
@@ -647,6 +667,61 @@ mod tests {
     }
 
     #[test]
+    fn only_the_nodes_near_the_new_ones_are_free() {
+        // A path 0-1-2-3-4-5; node 0 gains node 6.
+        let path = |n: u32| ((0..n - 1).collect::<Vec<_>>(), (1..n).collect::<Vec<_>>());
+        let (src, dst) = path(6);
+        let old = Topology::build(6, src.clone(), dst.clone());
+        let start = {
+            let mut state = Fa2State::new(old.undirected(), Fa2Params::default());
+            state.step(old.undirected(), 30);
+            state
+        };
+        let (mut src, mut dst) = (src, dst);
+        src.push(0);
+        dst.push(6);
+        let grown = Topology::build(7, src, dst);
+        let fixed_for = |reach: u32, hold_parents: bool| {
+            let mut state = start.clone();
+            let params = WarmParams {
+                reach,
+                hold_parents,
+                ..WarmParams::default()
+            };
+            fa2_grow(&mut state, grown.undirected(), None, &[], params);
+            state.fixed().map(<[bool]>::to_vec)
+        };
+        // Two hops by default: the parent and its neighbour. The parent is
+        // held all the same.
+        assert_eq!(
+            fixed_for(2, true),
+            Some(vec![true, false, true, true, true, true, false])
+        );
+        assert_eq!(
+            fixed_for(1, false),
+            Some(vec![false, true, true, true, true, true, false])
+        );
+        assert_eq!(
+            fixed_for(0, false),
+            Some(vec![true, true, true, true, true, true, false])
+        );
+        assert_eq!(fixed_for(u32::MAX, false), None);
+        // The old nodes that are free have the inertia; the new one has none.
+        let mut state = start.clone();
+        fa2_grow(
+            &mut state,
+            grown.undirected(),
+            None,
+            &[],
+            WarmParams::default(),
+        );
+        assert_eq!(
+            state.inertia(),
+            Some(&[10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 1.0][..])
+        );
+    }
+
+    #[test]
     fn growing_is_the_same_however_it_is_stepped() {
         let run = |chunks: &[u32]| {
             let (mut state, _old, grown) = expanded(7);
@@ -677,7 +752,11 @@ mod tests {
         assert_eq!(bits(&x[..500]), x0);
         assert_eq!(bits(&y[..500]), y0);
         for i in 500..516 {
-            assert_ne!((x[i], y[i]), (start.0[i], start.1[i]), "new node {i} stayed");
+            assert_ne!(
+                (x[i], y[i]),
+                (start.0[i], start.1[i]),
+                "new node {i} stayed"
+            );
         }
     }
 
@@ -701,7 +780,13 @@ mod tests {
             dst.push(2000 + j);
         }
         let grown = Topology::build(2030, src, dst);
-        let n = fa2_grow(&mut state, grown.undirected(), None, &[], WarmParams::default());
+        let n = fa2_grow(
+            &mut state,
+            grown.undirected(),
+            None,
+            &[],
+            WarmParams::default(),
+        );
         state.step(grown.undirected(), n);
         let (x, y) = state.positions();
         let view = width(&x0).max(width(&y0));

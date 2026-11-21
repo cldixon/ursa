@@ -62,12 +62,12 @@ pub use layout::{
 };
 pub use louvain::{louvain, louvain_weighted};
 pub use multilevel::{layout_fa2_multilevel, Fa2Multilevel, MultilevelParams};
-pub use warm::{fa2_grow, place_new_nodes, warm_iterations, WarmParams};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, random_walk_masked, Walks};
 pub use triangle::{per_node_triangles, triangle_count, undirected_view, UndirectedView};
 pub use undirected::{symmetric_view, symmetric_view_weighted};
+pub use warm::{fa2_grow, place_new_nodes, warm_iterations, WarmParams};
 
 // ---------------------------------------------------------------------------
 // Frontier kernels (BFS / k-hop / unweighted shortest path).

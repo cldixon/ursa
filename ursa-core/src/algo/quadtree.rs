@@ -624,8 +624,14 @@ mod tests {
                 by += cy;
             }
             let exact = tree.accumulate_at(&x, &y, &w, p, 0.0, &mut stack, inv_square);
-            assert!((exact.0 - bx).abs() <= 1e-3 * bx.abs().max(1.0), "{exact:?} {bx}");
-            assert!((exact.1 - by).abs() <= 1e-3 * by.abs().max(1.0), "{exact:?} {by}");
+            assert!(
+                (exact.0 - bx).abs() <= 1e-3 * bx.abs().max(1.0),
+                "{exact:?} {bx}"
+            );
+            assert!(
+                (exact.1 - by).abs() <= 1e-3 * by.abs().max(1.0),
+                "{exact:?} {by}"
+            );
             let near = tree.accumulate_at(&x, &y, &w, p, 0.5, &mut stack, inv_square);
             let scale = (bx * bx + by * by).sqrt().max(1e-6);
             let err = ((near.0 - bx).powi(2) + (near.1 - by).powi(2)).sqrt() / scale;

@@ -284,7 +284,10 @@ fn a_layout_given_its_positions_grows_from_them() {
         assert_eq!((&gx[..3], &gy[..3]), (&x[..], &y[..]));
         for i in 3..5 {
             let d = ((gx[i] - 5.0).powi(2) + gy[i].powi(2)).sqrt();
-            assert!(d > 0.1 && d < 2.5, "new node {i} starts {d} from its parent");
+            assert!(
+                d > 0.1 && d < 2.5,
+                "new node {i} starts {d} from its parent"
+            );
         }
     }
 

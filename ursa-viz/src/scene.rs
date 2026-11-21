@@ -163,10 +163,9 @@ impl std::fmt::Display for BadGrowth {
                 f,
                 "expected one parent per new node ({new_nodes}); got {got}"
             ),
-            BadGrowth::Pinned { node, n_nodes } => write!(
-                f,
-                "pinned node {node}, but the graph has {n_nodes} nodes"
-            ),
+            BadGrowth::Pinned { node, n_nodes } => {
+                write!(f, "pinned node {node}, but the graph has {n_nodes} nodes")
+            }
             BadGrowth::Positions { n_nodes, got } => write!(
                 f,
                 "expected x then y for {n_nodes} nodes ({} values); got {got}",
