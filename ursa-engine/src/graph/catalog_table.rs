@@ -19,7 +19,7 @@
 //! | `family`     | `algorithm`, `statistic`, `aggregation`, `traversal` or `combinator` |
 //! | `summary`    | one line on what it computes                             |
 //! | `networkx`   | the NetworkX call it matches, or NULL                    |
-//! | `parameters` | list of {name, type, default, choices, doc}, call order  |
+//! | `parameters` | list of {name, type, default, choices, range, doc}, call order |
 //! | `directions` | the `direction =>` values it accepts; empty if none     |
 //! | `outputs`    | list of {name, type, nullable}: its columns besides `id` |
 //!
@@ -27,7 +27,10 @@
 //! `integer`, `integer or NULL`, `boolean`, `string`, `expression`, `query`
 //! for `neighbors_agg`'s values, and for a traversal's node ids `node ids` or
 //! `node id`), and its `default` is the
-//! literal SQL would write (`0.85`, `'out'`, `NULL`), or `required`. A
+//! literal SQL would write (`0.85`, `'out'`, `NULL`), or `required`. Its
+//! `range` is the numbers it accepts, in words (`between 0 and 1`, `above 0
+//! and at most 1`, `at least 1`), or NULL when any value of its type is
+//! accepted (#416); a value outside it is an error that says the range. A
 //! traversal's node-id output columns have the graph's id type, `Int64 or
 //! Utf8`, and `neighbors_agg`'s column a type that depends on its `agg` and
 //! its values ([`NEIGHBORS_AGG_TYPE`]).
@@ -82,6 +85,7 @@ fn parameter_fields() -> Fields {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
+        Field::new("range", DataType::Utf8, true),
         Field::new("doc", DataType::Utf8, false),
     ])
 }
@@ -174,6 +178,10 @@ pub fn functions_batch() -> Result<RecordBatch> {
             choices.append(true);
             params
                 .field_builder::<StringBuilder>(4)
+                .expect("range")
+                .append_option(functions::range_text(&p.range));
+            params
+                .field_builder::<StringBuilder>(5)
                 .expect("doc")
                 .append_value(functions::sql_doc(p));
             params.append(true);
@@ -241,8 +249,13 @@ pub fn functions_batch() -> Result<RecordBatch> {
                     .append_value(c);
             }
             choice_list.append(true);
+            // No traversal parameter has a range: any count is a traversal.
             params
                 .field_builder::<StringBuilder>(4)
+                .expect("range")
+                .append_null();
+            params
+                .field_builder::<StringBuilder>(5)
                 .expect("doc")
                 .append_value(p.doc);
             params.append(true);

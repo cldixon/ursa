@@ -327,6 +327,48 @@ async fn planning_errors() {
             "SELECT * FROM pagerank(karate, max_iter => -1)",
             "pagerank(max_iter =>) must be a non-negative integer below 2^32; got -1",
         ),
+        // A number outside a parameter's range (#416) used to give a
+        // plausible-looking result: a negative PageRank, the start vector.
+        (
+            "SELECT * FROM pagerank(karate, damping => -1)",
+            "pagerank(damping =>) must be between 0 and 1; got -1",
+        ),
+        (
+            "SELECT * FROM pagerank(karate, damping => 1.5)",
+            "pagerank(damping =>) must be between 0 and 1; got 1.5",
+        ),
+        (
+            "SELECT * FROM pagerank(karate, max_iter => 0)",
+            "pagerank(max_iter =>) must be at least 1; got 0",
+        ),
+        (
+            "SELECT * FROM pagerank(karate, tol => -1)",
+            "pagerank(tol =>) must be at least 0; got -1",
+        ),
+        (
+            "SELECT * FROM betweenness(karate, sample => 2)",
+            "betweenness(sample =>) must be above 0 and at most 1; got 2",
+        ),
+        (
+            "SELECT * FROM betweenness(karate, sample => -1)",
+            "betweenness(sample =>) must be above 0 and at most 1; got -1",
+        ),
+        (
+            "SELECT * FROM avg_path_length(karate, sample => 5)",
+            "avg_path_length(sample =>) must be above 0 and at most 1; got 5",
+        ),
+        (
+            "SELECT * FROM louvain(karate, resolution => -1)",
+            "louvain(resolution =>) must be above 0; got -1",
+        ),
+        (
+            "SELECT * FROM label_propagation(karate, max_iter => 0)",
+            "label_propagation(max_iter =>) must be at least 1; got 0",
+        ),
+        (
+            "SELECT * FROM algorithms(karate, pagerank(damping => -1))",
+            "algorithms(): pagerank(damping =>) must be between 0 and 1; got -1",
+        ),
         (
             "SELECT * FROM pagerank(karate, direction => 'in')",
             "pagerank(direction => 'in') is not supported; use one of 'out', 'both'",

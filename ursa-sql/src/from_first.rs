@@ -6,8 +6,10 @@
 //! often written FROM-first (`FROM GRAPH_TABLE (g MATCH … COLUMNS (…))`).
 //! So, before the statement is parsed, a `FROM` that starts a query, with no
 //! `SELECT` after it in that query, becomes `SELECT * FROM`. A query starts
-//! a statement, follows `(`, `AS`, `EXPLAIN` or a set operator (`UNION
-//! [ALL | DISTINCT]`, `INTERSECT`, `EXCEPT`). `FROM t SELECT a`, which
+//! a statement, follows `(`, `AS`, `EXPLAIN` (and its `ANALYZE` and
+//! `VERBOSE`), a statement's `DESCRIBE` or `DESC` (#417: `DESCRIBE FROM t`
+//! described a query of no columns, so it returned no rows) or a set operator
+//! (`UNION [ALL | DISTINCT]`, `INTERSECT`, `EXCEPT`). `FROM t SELECT a`, which
 //! sqlparser already reads as `SELECT a FROM t`, is left alone, as are
 //! `TRIM(FROM s)`, `x IS DISTINCT FROM y`, strings and comments.
 //!
@@ -86,6 +88,8 @@ fn starts_query(tokens: &[&TokenWithSpan], i: usize, word: &dyn Fn(usize, &str) 
         Token::Word(_) => {
             word(p, "AS")
                 || word(p, "EXPLAIN")
+                || explain_option(p, word)
+                || describes(tokens, p, word)
                 || word(p, "UNION")
                 || word(p, "INTERSECT")
                 || word(p, "EXCEPT")
@@ -96,6 +100,23 @@ fn starts_query(tokens: &[&TokenWithSpan], i: usize, word: &dyn Fn(usize, &str) 
         }
         _ => false,
     }
+}
+
+/// Whether the word at `p` is `ANALYZE` or `VERBOSE` after `EXPLAIN`:
+/// `EXPLAIN ANALYZE FROM t`, `EXPLAIN ANALYZE VERBOSE FROM t`.
+fn explain_option(p: usize, word: &dyn Fn(usize, &str) -> bool) -> bool {
+    let option = |i: usize| word(i, "ANALYZE") || word(i, "VERBOSE");
+    option(p)
+        && p > 0
+        && (word(p - 1, "EXPLAIN") || (option(p - 1) && p > 1 && word(p - 2, "EXPLAIN")))
+}
+
+/// Whether the word at `p` is the `DESCRIBE` or `DESC` that starts a
+/// statement: `DESCRIBE FROM t`. Not the `DESC` of an `ORDER BY`, nor a
+/// column or an alias of that name.
+fn describes(tokens: &[&TokenWithSpan], p: usize, word: &dyn Fn(usize, &str) -> bool) -> bool {
+    (word(p, "DESCRIBE") || word(p, "DESC"))
+        && (p == 0 || matches!(tokens[p - 1].token, Token::SemiColon))
 }
 
 /// The index of the `(` that the `)` at `close` closes.
@@ -171,6 +192,19 @@ mod tests {
             ),
             ("CREATE VIEW v AS FROM t", "CREATE VIEW v AS SELECT * FROM t"),
             ("EXPLAIN FROM t", "EXPLAIN SELECT * FROM t"),
+            ("EXPLAIN ANALYZE FROM t", "EXPLAIN ANALYZE SELECT * FROM t"),
+            ("EXPLAIN VERBOSE FROM t", "EXPLAIN VERBOSE SELECT * FROM t"),
+            (
+                "explain analyze verbose FROM t",
+                "explain analyze verbose SELECT * FROM t",
+            ),
+            // #417: described as a query of no columns, it returned no rows.
+            ("DESCRIBE FROM t", "DESCRIBE SELECT * FROM t"),
+            ("desc FROM 'f.csv'", "desc SELECT * FROM 'f.csv'"),
+            (
+                "SELECT 1; DESCRIBE FROM t WHERE x > 1",
+                "SELECT 1; DESCRIBE SELECT * FROM t WHERE x > 1",
+            ),
             ("COPY (FROM t) TO 'x.csv'", "COPY (SELECT * FROM t) TO 'x.csv'"),
             (
                 "FROM t WHERE x IN (SELECT y FROM u)",
@@ -197,6 +231,10 @@ mod tests {
             // A column named `from` (#328).
             "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (from) DESTINATION KEY (to))",
             "SELECT * FROM t WHERE x IN (from, to)",
+            // Not the DESCRIBE that starts a statement (#417).
+            "SELECT x AS describe FROM t",
+            "SELECT x desc FROM t",
+            "SELECT analyze FROM t",
         ] {
             assert_eq!(rewrite(sql), sql);
         }

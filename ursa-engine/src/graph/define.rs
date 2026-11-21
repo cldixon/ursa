@@ -641,14 +641,17 @@ fn validate(def: &PropertyGraph, schema_of: &dyn Fn(&TableReference) -> SchemaRe
         let table = &e.table;
         let source = column_type(&edges, table, &e.source, "SOURCE KEY")?;
         let destination = column_type(&edges, table, &e.destination, "DESTINATION KEY")?;
-        if source != destination {
+        // Two integer types, or two string types, are one id type: the index
+        // widens integers to Int64 (#416), as DuckDB casts them.
+        let families = (IdFamily::of(&source), IdFamily::of(&destination));
+        if source != destination && !matches!(families, (Some(s), Some(d)) if s == d) {
             return plan_err(format!(
-                "the source and destination columns of edge table '{table}' must have the same \
-                 type, but {} is {source} and {} is {destination}",
+                "the source and destination columns of edge table '{table}' must both be \
+                 integers or both be strings, but {} is {source} and {} is {destination}",
                 e.source, e.destination
             ));
         }
-        let Some(family) = IdFamily::of(&source) else {
+        let Some(family) = families.0 else {
             return plan_err(format!(
                 "the endpoints of edge table '{table}' ({} and {}) are {source}; node ids must \
                  be integers or strings",

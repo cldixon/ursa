@@ -98,6 +98,114 @@ impl ParamType {
     }
 }
 
+/// One end of a [`Range`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bound {
+    pub value: f64,
+    /// Whether `value` itself is allowed.
+    pub inclusive: bool,
+}
+
+/// The numbers a numeric parameter accepts (#416): every finite number of its
+/// type unless an end is set. A null, where the type takes one, is always
+/// accepted.
+///
+/// Only values with no meaning are outside a range (a damping factor of -1, a
+/// sampled fraction of 2), or values that return something other than what
+/// the function is for (zero iterations). A front end shows the range beside
+/// the parameter and words the error ([`Range::describe`] is the shared
+/// wording: `between 0 and 1`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Range {
+    pub min: Option<Bound>,
+    pub max: Option<Bound>,
+}
+
+// A bound is never NaN, so equality is total.
+impl Eq for Range {}
+
+const fn bound(value: f64, inclusive: bool) -> Option<Bound> {
+    Some(Bound { value, inclusive })
+}
+
+impl Range {
+    /// No limit.
+    pub const ANY: Range = Range {
+        min: None,
+        max: None,
+    };
+
+    /// `min <= x <= max`.
+    pub const fn between(min: f64, max: f64) -> Range {
+        Range {
+            min: bound(min, true),
+            max: bound(max, true),
+        }
+    }
+
+    /// `min <= x`.
+    pub const fn at_least(min: f64) -> Range {
+        Range {
+            min: bound(min, true),
+            max: None,
+        }
+    }
+
+    /// `min < x`.
+    pub const fn above(min: f64) -> Range {
+        Range {
+            min: bound(min, false),
+            max: None,
+        }
+    }
+
+    /// `min < x <= max`.
+    pub const fn above_up_to(min: f64, max: f64) -> Range {
+        Range {
+            min: bound(min, false),
+            max: bound(max, true),
+        }
+    }
+
+    /// Whether the range limits anything.
+    pub fn is_limited(&self) -> bool {
+        self.min.is_some() || self.max.is_some()
+    }
+
+    /// Whether `x` is in the range.
+    pub fn contains(&self, x: f64) -> bool {
+        let above = self
+            .min
+            .is_none_or(|b| x > b.value || (b.inclusive && x == b.value));
+        let below = self
+            .max
+            .is_none_or(|b| x < b.value || (b.inclusive && x == b.value));
+        above && below
+    }
+
+    /// The range in words, to follow "must be": `between 0 and 1`, `above 0
+    /// and at most 1`, `at least 1`, `above 0`. `None` for [`Range::ANY`].
+    pub fn describe(&self) -> Option<String> {
+        let low = |b: Bound| {
+            let word = if b.inclusive { "at least" } else { "above" };
+            format!("{word} {}", b.value)
+        };
+        let high = |b: Bound| {
+            let word = if b.inclusive { "at most" } else { "below" };
+            format!("{word} {}", b.value)
+        };
+        match (self.min, self.max) {
+            (None, None) => None,
+            (Some(min), Some(max)) if min.inclusive && max.inclusive => {
+                Some(format!("between {} and {}", min.value, max.value))
+            }
+            (Some(min), Some(max)) => Some(format!("{} and {}", low(min), high(max))),
+            (Some(min), None) => Some(low(min)),
+            (None, Some(max)) => Some(high(max)),
+        }
+    }
+}
+
 /// One parameter of a function.
 #[derive(Debug, Clone, Copy)]
 pub struct ParamSpec {
@@ -105,8 +213,18 @@ pub struct ParamSpec {
     pub ty: ParamType,
     /// The value when the argument is not given.
     pub default: Value,
+    /// The numbers a numeric parameter accepts; [`Range::ANY`] otherwise.
+    pub range: Range,
     /// One line on what it does.
     pub doc: &'static str,
+}
+
+impl ParamSpec {
+    /// The parameter, accepting only numbers in `range`.
+    pub const fn within(mut self, range: Range) -> ParamSpec {
+        self.range = range;
+        self
+    }
 }
 
 /// The Arrow type of an output column, before any `dtype` narrowing.
@@ -233,6 +351,7 @@ const fn param(name: &'static str, ty: ParamType, default: Value, doc: &'static 
         name,
         ty,
         default,
+        range: Range::ANY,
         doc,
     }
 }
@@ -280,7 +399,8 @@ const LAYOUT_K: ParamSpec = param(
     ParamType::Float,
     Value::Float(1.0),
     "Ideal edge length; sets the units of the positions.",
-);
+)
+.within(Range::above(0.0));
 const XY: &[OutputSpec] = &[out("x", ColumnType::Float32), out("y", ColumnType::Float32)];
 
 /// Every graph function the Python API exposes, besides the traversals.
@@ -311,19 +431,22 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::Float,
                 Value::Float(0.85),
                 "Probability of following an edge.",
-            ),
+            )
+            .within(Range::between(0.0, 1.0)),
             param(
                 "max_iter",
                 ParamType::Count,
                 Value::UInt(30),
                 "Iteration cap.",
-            ),
+            )
+            .within(Range::at_least(1.0)),
             param(
                 "tol",
                 ParamType::Float,
                 Value::Float(1e-6),
                 "Convergence tolerance on the L1 change.",
-            ),
+            )
+            .within(Range::at_least(0.0)),
             WEIGHT,
             DTYPE,
             DIRECTION_OUT_OR_BOTH,
@@ -388,7 +511,8 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::OptionalFloat,
                 Value::Null,
                 "Estimate from this fraction of the sources; null is exact.",
-            ),
+            )
+            .within(Range::above_up_to(0.0, 1.0)),
             WEIGHT,
             SEED,
             DTYPE,
@@ -428,7 +552,8 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::Count,
                 Value::UInt(20),
                 "Iteration cap.",
-            ),
+            )
+            .within(Range::at_least(1.0)),
             SEED,
         ],
         outputs: &[out("label_propagation", ColumnType::UInt32)],
@@ -450,7 +575,8 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::Float,
                 Value::Float(1.0),
                 "Modularity resolution; larger gives smaller communities.",
-            ),
+            )
+            .within(Range::above(0.0)),
             SEED,
         ],
         outputs: &[out("louvain", ColumnType::UInt32)],
@@ -486,13 +612,15 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::Float,
                 Value::Float(1.0),
                 "Repulsion strength; scales the drawing rather than changing its shape.",
-            ),
+            )
+            .within(Range::above(0.0)),
             param(
                 "gravity",
                 ParamType::Float,
                 Value::Float(1.0),
                 "Pull toward the origin, which keeps components in one picture.",
-            ),
+            )
+            .within(Range::at_least(0.0)),
             param(
                 "strong_gravity",
                 ParamType::Bool,
@@ -512,14 +640,16 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 Value::Null,
                 "Barnes-Hut opening angle, smaller more exact and slower; null is 1.0 coarse \
                  to fine, 0.5 flat.",
-            ),
+            )
+            .within(Range::at_least(0.0)),
             param(
                 "jitter_tolerance",
                 ParamType::Float,
                 Value::Float(1.0),
                 "Swinging tolerated before the step size is cut; larger converges faster and \
                  shakes more.",
-            ),
+            )
+            .within(Range::above(0.0)),
             SEED,
         ],
         outputs: XY,
@@ -554,7 +684,8 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::Float,
                 Value::Float(0.02),
                 "Pull toward the origin, which keeps components together.",
-            ),
+            )
+            .within(Range::at_least(0.0)),
             SEED,
         ],
         outputs: XY,
@@ -651,7 +782,8 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
                 ParamType::OptionalFloat,
                 Value::Null,
                 "Estimate from this fraction of the sources; null is exact.",
-            ),
+            )
+            .within(Range::above_up_to(0.0, 1.0)),
             DIRECTION_ALL,
         ],
         outputs: &[out("avg_path_length", ColumnType::Float64)],

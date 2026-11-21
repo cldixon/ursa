@@ -400,6 +400,26 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Graph function parameters are range-checked** (behaviour change, #416).
+  A number with no meaning for its parameter was accepted and gave a
+  plausible-looking result: `pagerank(g, damping => -1)` returned a negative
+  PageRank, `max_iter => 0` the uniform start vector, `betweenness(g, sample
+  => 2)` exact values and `sample => -1` wrong ones, `louvain(g, resolution
+  => -1)` one community. Each is now an error that names the parameter, its
+  range and the value: `pagerank(damping =>) must be between 0 and 1; got
+  -1`. The ranges: `damping` between 0 and 1; `max_iter` (`pagerank`,
+  `label_propagation`) at least 1; `tol` at least 0 (`tol => 0` still runs
+  every iteration); `sample` (`betweenness`, `avg_path_length`) above 0 and
+  at most 1; `resolution` above 0; and for the layouts `k` and
+  `jitter_tolerance` above 0, `gravity` and `theta` at least 0. Every value
+  inside its range computes what it did. The ranges are declared once, in
+  the function catalog, so `ursa_functions()` has them (a `range` field in
+  each parameter, NULL where any value is accepted), `.functions NAME` and
+  the function reference show them, and the Python verbs that take these
+  parameters (`ur.pagerank`, `ur.betweenness`, `ur.label_propagation`,
+  `ur.louvain`) raise the same error, worded `pagerank(damping=) must be
+  between 0 and 1; got -1`. Python's `ur.avg_path_length(sample=)` is
+  unchanged.
 - **SQL: a vertex table's key must identify one row** (behaviour change,
   #411). A vertex table with a duplicate or a NULL key is refused, with one
   message, by everything that reads it as a graph's nodes: the algorithms,
@@ -896,6 +916,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **SQL: `DESCRIBE FROM t` lists the columns** (#417). It returned a table
+  of no rows, for a table or a file (`DESCRIBE FROM 'edges.csv'`): the
+  FROM-first rewrite did not run under `DESCRIBE`, so the statement described
+  a query of no columns. `DESC FROM t`, `EXPLAIN ANALYZE FROM t` and
+  `EXPLAIN VERBOSE FROM t`, which failed to parse, work too.
+- **SQL: an edge table's endpoints may be integers of different widths**
+  (#416). `SOURCE KEY (src) DESTINATION KEY (dst)` with an `INT` and a
+  `BIGINT` column was refused ("must have the same type"), though a vertex
+  key of another width was accepted and node ids are `BIGINT` whatever the
+  stored type. Any two integer types are now one graph, as are two string
+  types; an integer against a string is still an error.
 - **Ursa Web Shell: `.graph` no longer draws scores or paths as nodes**
   (#427). The two columns `.graph` reads as each edge's ends must hold ids:
   integers, strings or dates, and, when they are the first two columns

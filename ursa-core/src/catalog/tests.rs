@@ -364,6 +364,112 @@ fn values_round_trip_through_resolve() {
     }
 }
 
+/// A number outside a parameter's range is refused, with the range (#416);
+/// the ends that are values, and a null, are accepted.
+#[test]
+fn checks_ranges() {
+    use super::Range;
+    let out_of = |function: &str, param: &str, arg: Arg| match call(function, &[(param, arg)]) {
+        Err(ParamError {
+            kind: ParamErrorKind::OutOfRange(range),
+            ..
+        }) => range.describe().unwrap(),
+        other => panic!("{function}({param}) should be out of range: {other:?}"),
+    };
+    assert_eq!(
+        out_of("pagerank", "damping", Arg::Int(-1)),
+        "between 0 and 1"
+    );
+    assert_eq!(
+        out_of("pagerank", "damping", Arg::Float(1.5)),
+        "between 0 and 1"
+    );
+    assert_eq!(out_of("pagerank", "max_iter", Arg::Int(0)), "at least 1");
+    assert_eq!(out_of("pagerank", "tol", Arg::Float(-1e-9)), "at least 0");
+    assert_eq!(
+        out_of("label_propagation", "max_iter", Arg::Int(0)),
+        "at least 1"
+    );
+    for bad in [Arg::Int(2), Arg::Int(-1), Arg::Int(0), Arg::Float(1.0001)] {
+        for function in ["betweenness", "avg_path_length"] {
+            assert_eq!(
+                out_of(function, "sample", bad.clone()),
+                "above 0 and at most 1"
+            );
+        }
+    }
+    assert_eq!(out_of("louvain", "resolution", Arg::Int(-1)), "above 0");
+    assert_eq!(out_of("louvain", "resolution", Arg::Float(0.0)), "above 0");
+    for function in ["layout_fa2", "layout_fr", "layout_random", "layout_circle"] {
+        assert_eq!(out_of(function, "k", Arg::Int(0)), "above 0");
+    }
+    assert_eq!(
+        out_of("layout_fa2", "gravity", Arg::Float(-0.1)),
+        "at least 0"
+    );
+    assert_eq!(
+        out_of("layout_fr", "gravity", Arg::Float(-0.1)),
+        "at least 0"
+    );
+    assert_eq!(out_of("layout_fa2", "theta", Arg::Int(-1)), "at least 0");
+    assert_eq!(
+        out_of("layout_fa2", "jitter_tolerance", Arg::Int(0)),
+        "above 0"
+    );
+
+    for (function, param, arg) in [
+        ("pagerank", "damping", Arg::Int(0)),
+        ("pagerank", "damping", Arg::Int(1)),
+        ("pagerank", "max_iter", Arg::Int(1)),
+        ("pagerank", "tol", Arg::Float(0.0)),
+        ("betweenness", "sample", Arg::Float(1.0)),
+        ("betweenness", "sample", Arg::Float(f64::MIN_POSITIVE)),
+        ("betweenness", "sample", Arg::Null),
+        ("avg_path_length", "sample", Arg::Int(1)),
+        ("layout_fa2", "gravity", Arg::Int(0)),
+        ("layout_fa2", "theta", Arg::Int(0)),
+        ("layout_fa2", "theta", Arg::Null),
+        ("layout_fa2", "iterations", Arg::Int(0)),
+        ("layout_fr", "iterations", Arg::Int(0)),
+    ] {
+        assert!(
+            call(function, &[(param, arg)]).is_ok(),
+            "{function} {param}"
+        );
+    }
+
+    // Every default is in its parameter's range, and only numbers have one.
+    for spec in FUNCTIONS {
+        for p in spec.params {
+            match p.default {
+                Value::Float(f) => assert!(p.range.contains(f), "{} {}", spec.name, p.name),
+                Value::UInt(u) => assert!(p.range.contains(u as f64), "{} {}", spec.name, p.name),
+                _ => {}
+            }
+            let numeric = matches!(
+                p.ty,
+                ParamType::Float
+                    | ParamType::OptionalFloat
+                    | ParamType::Count
+                    | ParamType::OptionalCount
+            );
+            assert!(numeric || !p.range.is_limited(), "{} {}", spec.name, p.name);
+        }
+    }
+
+    assert_eq!(Range::ANY.describe(), None);
+    assert!(Range::ANY.contains(-1e300));
+    assert_eq!(
+        ParamError {
+            function: "pagerank",
+            param: "damping".into(),
+            kind: ParamErrorKind::OutOfRange(Range::between(0.0, 1.0)),
+        }
+        .to_string(),
+        "pagerank(): 'damping' must be between 0 and 1"
+    );
+}
+
 fn kind(r: Result<Resolved, ParamError>) -> (String, ParamErrorKind) {
     let e = r.unwrap_err();
     (e.param, e.kind)

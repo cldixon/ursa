@@ -23,7 +23,7 @@ ur.pagerank(edges, damping: float = 0.85, max_iter: int = 30, tol: float = 1e-6,
             weight=None, dtype: str = "f64", direction: str = "out")
 ```
 
-PageRank over the directed rows. The scores sum to 1. A node with no out-edges spreads its score to all nodes. With `weight=`, each out-edge takes a share of the score in proportion to its weight. `direction="both"` runs on the [undirected view](#the-direction-parameter), which is `nx.pagerank(G.to_undirected())`. `direction="in"` is not supported. Output type: `float64`, or `float32` with `dtype="f32"`.
+PageRank over the directed rows. The scores sum to 1. A node with no out-edges spreads its score to all nodes. With `weight=`, each out-edge takes a share of the score in proportion to its weight. `direction="both"` runs on the [undirected view](#the-direction-parameter), which is `nx.pagerank(G.to_undirected())`. `direction="in"` is not supported. `damping` is between 0 and 1, `max_iter` at least 1 and `tol` at least 0 (`tol=0` runs every iteration); a value outside its range raises `ComputeError`. Output type: `float64`, or `float32` with `dtype="f32"`.
 
 ### `ur.connected_components`
 
@@ -64,7 +64,7 @@ ur.betweenness(edges, sample: float | None = None, weight=None, seed: int | None
                dtype: str = "f64", direction: str = "out")
 ```
 
-Betweenness centrality (Brandes), not normalized. The default is directed: each ordered pair counts once. `direction="both"` runs on the [undirected view](#the-direction-parameter) and counts each unordered pair once, which is `nx.betweenness_centrality(G.to_undirected(), normalized=False)`. `direction="in"` is not supported. The exact computation is O(n·m). `sample=` (a fraction in `(0, 1]`) estimates it from a random subset of source nodes, scaled to the full count. `seed` makes the estimate reproducible. With `weight=`, the shortest paths are weighted.
+Betweenness centrality (Brandes), not normalized. The default is directed: each ordered pair counts once. `direction="both"` runs on the [undirected view](#the-direction-parameter) and counts each unordered pair once, which is `nx.betweenness_centrality(G.to_undirected(), normalized=False)`. `direction="in"` is not supported. The exact computation is O(n·m). `sample=` (a fraction in `(0, 1]`; any other number raises `ComputeError`) estimates it from a random subset of source nodes, scaled to the full count. `seed` makes the estimate reproducible. With `weight=`, the shortest paths are weighted.
 
 ### `ur.label_propagation`
 
@@ -72,7 +72,7 @@ Betweenness centrality (Brandes), not normalized. The default is directed: each 
 ur.label_propagation(edges, max_iter: int = 20, seed: int | None = None)
 ```
 
-Community detection by label propagation, on the undirected view. One integer label per node. The result is a heuristic: compare the modularity, not the labels.
+Community detection by label propagation, on the undirected view. One integer label per node. `max_iter` is at least 1. The result is a heuristic: compare the modularity, not the labels.
 
 ### `ur.louvain`
 
@@ -80,7 +80,7 @@ Community detection by label propagation, on the undirected view. One integer la
 ur.louvain(edges, weight=None, resolution: float = 1.0, seed: int | None = None)
 ```
 
-Community detection by Louvain modularity optimization, on the undirected view. One integer label per node. A larger `resolution` gives more, smaller communities. With `weight=`, the modularity is weighted.
+Community detection by Louvain modularity optimization, on the undirected view. One integer label per node. A larger `resolution` gives more, smaller communities; it must be above 0. With `weight=`, the modularity is weighted.
 
 ## Neighbour aggregation
 
