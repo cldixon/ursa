@@ -443,6 +443,37 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     instead of one expression per id: the same rows and the same errors,
     and 5,000 ids plan in a few milliseconds instead of 70. `EXPLAIN` shows
     it as `TableScan: node_ids`.
+- **Parallel Louvain, opt-in: `louvain(g, parallel => true)`** (#387). In
+  Python `ur.louvain(edges, parallel=True)`; in Rust a `parallel` argument
+  to `ursa_core::algo::louvain` and `louvain_weighted`. Local moving runs in
+  64 fixed sub-rounds of the seeded visit order: the nodes of a sub-round
+  choose their community in parallel against the state at its start, and
+  the moves are applied in order. The same seed gives the same labels on any
+  number of threads, but not the labels the serial default finds, and
+  NetworkX has no equivalent. The default stays serial and its results are
+  unchanged, bit for bit.
+  - Pinned instead by: the same labels and modularity bits on 1, 2, 3, 4 and
+    8 threads; golden label hashes on karate, planted-partition and R-MAT
+    graphs; and a mean modularity within 2% of the serial run's on the same
+    graphs (measured: from 1.5% below to slightly above).
+  - Two single-node communities in one sub-round could swap for ever, so a
+    single node joins another single node of its sub-round only if that one
+    has the lower id. A level stops when a sweep moves fewer than one node in
+    1,000, or its real modularity gain (not the movers' estimates) is under
+    1e-7, or after 64 sweeps.
+  - Memory: each thread keeps a hash table sized to the degree of the node it
+    is on (a dense array only for a hub as large as the graph), not one
+    entry per node; each sub-round keeps a list of its active nodes, so late
+    sweeps do not scan the graph; isolated nodes are skipped as in the
+    serial run (#326). Peak memory is the serial run's.
+  - On a shared 4-core machine: R-MAT at 80M edges in 22.3 s instead of
+    41.9 s, and planted-partition graphs at 80M edges in 75.5 s instead of
+    159.0 s (30% of edges between communities) and 123.3 s instead of
+    333.9 s (60%), at 3.5 cores busy instead of 1.1, with the same peak
+    memory and modularity from 0.7% below to slightly above the serial
+    run's. On one thread it does about 1.7 times the serial run's work.
+  - `examples/louvain_memory.rs` takes `--parallel`, and `--planted P` for a
+    planted-partition graph with P% of edges between communities.
 
 ### Changed
 

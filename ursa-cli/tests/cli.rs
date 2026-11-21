@@ -1169,7 +1169,7 @@ clustering_coefficient,algorithm,0,\"\"
 betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
 label_propagation,algorithm,2,\"\"
-louvain,algorithm,3,\"\"
+louvain,algorithm,4,\"\"
 layout_fa2,layout,9,\"\"
 layout_fr,layout,4,\"\"
 neighbors_agg,aggregation,4,out in both

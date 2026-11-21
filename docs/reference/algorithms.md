@@ -77,10 +77,12 @@ Community detection by label propagation, on the undirected view. One integer la
 ### `ur.louvain`
 
 ```py
-ur.louvain(edges, weight=None, resolution: float = 1.0, seed: int | None = None)
+ur.louvain(edges, weight=None, resolution: float = 1.0, seed: int | None = None, parallel: bool = False)
 ```
 
 Community detection by Louvain modularity optimization, on the undirected view. One integer label per node. A larger `resolution` gives more, smaller communities; it must be above 0. With `weight=`, the modularity is weighted.
+
+`parallel=True` moves nodes in parallel sub-rounds, which is faster on a machine with many cores. A given `seed` still gives the same communities on any number of threads, but not the communities the serial default finds, and NetworkX has no equivalent of it. Its modularity is within about 2% of the serial run's on the graphs it is tested on (karate, planted partitions, R-MAT).
 
 ## Neighbour aggregation
 
