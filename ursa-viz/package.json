@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test:browser": "bun tests/browser/view.ts",
+    "test:ugr": "bun test tests/ugr.test.ts",
     "bench": "bun tests/browser/bench.ts",
     "bench:report": "bun bench/report.ts"
   }

@@ -7,22 +7,34 @@
 //! maps a result's ids to dense indexes, and the DataFrame API already has them
 //! in its topology. Both can drive the same view.
 //!
+//! - [`model`]: the graph-result model, deltas and the UGR wire format: what
+//!   the engine produces and every front end reads.
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
 //!   stepped a few iterations per frame, and grown when the graph gains
 //!   nodes), node styles and the camera. No GPU.
-//! - [`render`]: drawing with wgpu: WebGPU or WebGL2 in the browser, Vulkan,
-//!   Metal or DX12 natively. Edges are a line list over the node positions,
-//!   so a layout step uploads 8 bytes a node and never the edges.
-//! - [`view`]: a scene and its renderer, for a platform binding to drive.
+//! - `render` (feature `render`, on by default): drawing with wgpu: WebGPU
+//!   or WebGL2 in the browser, Vulkan, Metal or DX12 natively. Edges are a
+//!   line list over the node positions, so a layout step uploads 8 bytes a
+//!   node and never the edges.
+//! - `view` (feature `render`): a scene and its renderer, for a platform
+//!   binding to drive.
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
+//!
+//! With `default-features = false` the crate is [`model`] and [`scene`]
+//! alone: no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
+pub mod model;
+#[cfg(feature = "render")]
 pub mod render;
 pub mod scene;
+#[cfg(feature = "render")]
 pub mod view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub mod web;
 
+pub use model::{GraphDelta, GraphResult};
 pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};
+#[cfg(feature = "render")]
 pub use view::View;
