@@ -44,6 +44,7 @@ use ursa_core::catalog::{
 use ursa_core::{Direction, IdMap, Topology};
 
 use super::functions::{did_you_mean, expected_text, plan, sql_value, Literal};
+use super::provenance;
 
 /// What a traversal parameter takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +119,9 @@ impl OutputType {
 pub struct TraversalOutput {
     pub name: &'static str,
     pub ty: OutputType,
+    /// What the column is, as its field's `ursa.role` says (see
+    /// [`super::provenance`]); `None` for a column with no role.
+    pub role: Option<&'static str>,
 }
 
 /// One traversal.
@@ -164,12 +168,26 @@ impl TraversalSpec {
         self.params.iter().any(TraversalParam::is_weight)
     }
 
-    /// The output schema over a graph whose node ids are `id_type`.
-    pub fn schema(&self, id_type: &DataType) -> Schema {
+    /// The output schema over `graph`, whose node ids are `id_type` and
+    /// whose nodes are the keys of the vertex table `vertices` (its element
+    /// name), if it has one. Each field says what it is
+    /// ([`super::provenance`]): a node key carries the vertex table as its
+    /// label.
+    pub fn schema(&self, graph: &str, vertices: Option<&str>, id_type: &DataType) -> Schema {
         Schema::new(
             self.outputs
                 .iter()
-                .map(|o| Field::new(o.name, o.ty.data_type(id_type), false))
+                .map(|o| {
+                    let field = Field::new(o.name, o.ty.data_type(id_type), false);
+                    let label = match o.ty {
+                        OutputType::Id => vertices,
+                        _ => None,
+                    };
+                    match o.role {
+                        Some(role) => provenance::field(field, role, graph, label),
+                        None => field,
+                    }
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -201,8 +219,8 @@ const fn param(
     }
 }
 
-const fn out(name: &'static str, ty: OutputType) -> TraversalOutput {
-    TraversalOutput { name, ty }
+const fn out(name: &'static str, ty: OutputType, role: Option<&'static str>) -> TraversalOutput {
+    TraversalOutput { name, ty, role }
 }
 
 const DIRECTION: TraversalParam = param(
@@ -239,9 +257,13 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             DIRECTION,
         ],
         outputs: &[
-            out("seed", OutputType::Id),
-            out("id", OutputType::Id),
-            out("distance", OutputType::Int64),
+            out("seed", OutputType::Id, Some(provenance::ROLE_SEED)),
+            out("id", OutputType::Id, Some(provenance::ROLE_NODE)),
+            out(
+                "distance",
+                OutputType::Int64,
+                Some(provenance::ROLE_DISTANCE),
+            ),
         ],
     },
     TraversalSpec {
@@ -275,10 +297,10 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             DIRECTION,
         ],
         outputs: &[
-            out("src", OutputType::Id),
-            out("dst", OutputType::Id),
-            out("hop", OutputType::Int64),
-            out("cost", OutputType::Float64),
+            out("src", OutputType::Id, Some(provenance::ROLE_SRC)),
+            out("dst", OutputType::Id, Some(provenance::ROLE_DST)),
+            out("hop", OutputType::Int64, Some(provenance::ROLE_STEP)),
+            out("cost", OutputType::Float64, None),
         ],
     },
     TraversalSpec {
@@ -313,9 +335,9 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             ),
         ],
         outputs: &[
-            out("walk_id", OutputType::Int64),
-            out("step", OutputType::Int64),
-            out("node", OutputType::Id),
+            out("walk_id", OutputType::Int64, Some(provenance::ROLE_WALK)),
+            out("step", OutputType::Int64, Some(provenance::ROLE_STEP)),
+            out("node", OutputType::Id, Some(provenance::ROLE_NODE)),
         ],
     },
 ];

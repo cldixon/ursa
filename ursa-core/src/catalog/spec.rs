@@ -19,6 +19,17 @@ pub enum Family {
     Statistic,
 }
 
+/// What a per-node function's value is to a reader of its column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    /// A quantity of the node: a score, a count, a coefficient. It can size
+    /// a node, be averaged and be ordered.
+    Metric,
+    /// A group the node is in: a community or a component. Its value is a
+    /// name, not a quantity.
+    Category,
+}
+
 /// How many rows a function's outputs have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
@@ -296,6 +307,21 @@ impl FunctionSpec {
                 _ => None,
             })
             .unwrap_or(&[])
+    }
+
+    /// What the function's per-node value is: a metric (`pagerank`,
+    /// `degree`) or a category (`louvain`'s community). `None` for a
+    /// statistic, whose row is not about a node, and for a layout, whose
+    /// columns are positions.
+    pub fn output_kind(&self) -> Option<OutputKind> {
+        match self.family {
+            Family::Algorithm => Some(match self.name {
+                "connected_components" | "label_propagation" | "louvain" => OutputKind::Category,
+                _ => OutputKind::Metric,
+            }),
+            Family::Aggregation => Some(OutputKind::Metric),
+            Family::Layout | Family::Statistic => None,
+        }
     }
 
     /// Whether the function takes a `weight`.

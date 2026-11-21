@@ -106,6 +106,7 @@ use super::node::{
     WEIGHTED_SOURCE,
 };
 use super::path_search::{self, PathColumns, PathSearchNode, Search};
+use super::schema_metadata::{SchemaMetadataExec, SchemaMetadataNode};
 use super::traversal::{self, Traversal, TraversalParam, TraversalParamType};
 use crate::notices::{NoticeLevel, Notifier};
 
@@ -127,6 +128,12 @@ impl ExtensionPlanner for GraphPlanner {
         let unique = |graph: &str, source: &Expr, destination: &Expr| {
             key_names(session_state, graph, source, destination)
         };
+        if let Some(node) = node.as_any().downcast_ref::<SchemaMetadataNode>() {
+            return Ok(Some(Arc::new(SchemaMetadataExec::try_new(
+                Arc::clone(&physical_inputs[0]),
+                Arc::new(node.schema().as_arrow().clone()),
+            )?)));
+        }
         if let Some(node) = node.as_any().downcast_ref::<GraphTraversalNode>() {
             let unique = unique(&node.graph, &node.source, &node.destination);
             return plan_traversal(node, logical_inputs, physical_inputs, unique).map(Some);

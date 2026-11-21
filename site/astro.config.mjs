@@ -116,6 +116,7 @@ export default defineConfig({
 							collapsed: true,
 							items: [
 								{ label: "Function reference", slug: "docs/reference/functions" },
+								{ label: "Result metadata", slug: "docs/reference/metadata" },
 								{ label: "Changelog", slug: "docs/changelog" },
 								{ label: "Python library", link: "https://cldixon.github.io/ursa/" },
 							],
