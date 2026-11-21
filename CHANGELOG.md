@@ -366,6 +366,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the old nodes 0.003% of the view's width on average. The same additions
   in the same order give the same bits on any thread count. A layout that
   uses none of this has the bits it had (`tests/layout_golden.rs`).
+- **Rings and layers: fixed layouts for neighbourhoods and paths** (#436).
+  `ursa_core::algo::layout_rings` draws a `hop` result from each node's
+  distance: the seed at the centre, distance `d` on the circle of radius
+  `d`, a crowded ring widened so that no two nodes are nearer than a
+  quarter of a unit, and several seeds as one ring system each, side by
+  side. `layout_layers` draws paths from each node's position along them:
+  layer `l` on the line at `x = l`, one path alone a straight line. The
+  order on a ring or a line is chosen by four barycentre sweeps (ties by
+  node index), and each node is then placed as near its neighbours' mean as
+  its spacing allows. Neither iterates: 2 ms for 2,048 nodes and 8,334
+  edges, 0.3 s at 1M edges, on one thread (`ursa-viz/BENCH.md`). Both are
+  serial, so the same input gives the same bits on any thread count;
+  layers are the same bits on every platform. In `ursa-viz`,
+  `LiveLayout::rings` and `LiveLayout::layers` (done at once, and they
+  grow like any layout), `Layout.rings`, `Layout.layers` and `Layout.kind`
+  in the wasm API, and the shell's layout worker takes
+  `layout: {kind, level}` and posts one message. On karate, two hops from
+  node 0 are two rings of 16 and 9 nodes, and all shortest paths from 16 to
+  26 are six layers, drawn without a crossing. No existing layout changes.
 - **Layouts in SQL: `layout_fa2` and `layout_fr`** (#395). Both are table
   functions of `(id, x, y)`, like the algorithms, and work inside
   `algorithms(g, …)`, where their columns are `x` and `y`, or

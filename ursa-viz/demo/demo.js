@@ -2,7 +2,9 @@
 // drawn every frame. Drag to pan, wheel to zoom, double-click to fit.
 // ?graph=rmat&scale=17&edges=1000000 | grid | clusters | karate;
 // &multilevel=0 for flat ForceAtlas2 (coarse to fine is the default);
-// &theme=dark.
+// &theme=dark. &layout=rings&seeds=0&hops=2 draws a neighbourhood as
+// rings, and &layout=layers&from=16&to=26 the shortest paths as layers
+// (graphs.js).
 //
 // The highlight layer: the pointer's node is hovered, a click selects it
 // (shift-click adds to the selection, a click on nothing clears it), and a
@@ -65,6 +67,7 @@ let pending = null;
 worker.onmessage = ({ data }) => {
   if (data.type === "positions") {
     pending = data.xy;
+    stats.positionMessages = (stats.positionMessages ?? 0) + 1;
     stats.firstPositionsAt ??= performance.now();
     stats.workerMemoryBytes = data.memoryBytes;
     stats.iterations = data.iterations;
@@ -81,7 +84,8 @@ worker.onmessage = ({ data }) => {
 const multilevel = params.get("multilevel") !== "0";
 const maxIterations = Number(params.get("iterations") ?? 300);
 stats.multilevel = multilevel;
-worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations, multilevel }, []);
+stats.layout = g.layout ?? "force";
+worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations, multilevel, layout: g.layout, level: g.level }, []);
 
 // Frames: draw every animation frame, recording how long each draw takes,
 // and the positions uploaded (8 bytes a node each time).
@@ -113,7 +117,9 @@ function frame() {
     stats.drawMsMedian = sorted[Math.floor(sorted.length / 2)];
     statsEl.textContent =
       `${stats.backend} · ${stats.nodes.toLocaleString()} nodes · ${stats.edges.toLocaleString()} edges\n` +
-      (multilevel
+      (g.layout
+        ? `layout ${g.layout}` + (stats.layoutDone ? ` · done in ${stats.layoutMs.toFixed(1)} ms` : "") + "\n"
+        : multilevel
         ? `layout coarse to fine, level ${stats.level ?? "–"} · ${stats.iterations} it of work` +
           (stats.layoutDone ? ` · done in ${(stats.layoutMs / 1000).toFixed(1)} s` : "") + "\n"
         : `layout ${stats.iterations}/${maxIterations} it · ${stats.msPerIteration?.toFixed(1) ?? "–"} ms/it (worker)` +
