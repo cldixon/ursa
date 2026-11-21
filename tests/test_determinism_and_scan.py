@@ -59,6 +59,17 @@ def test_louvain_is_reproducible():
         assert r == runs[0]
 
 
+def test_parallel_louvain_is_reproducible():
+    # #387: opt-in parallel local moving, deterministic like the default.
+    edges = _two_cliques()
+    frame = ur.louvain(edges, seed=1, parallel=True)
+    runs = [{r["id"]: r["louvain"] for r in frame.collect().to_dicts()} for _ in range(3)]
+    for r in runs[1:]:
+        assert r == runs[0]
+    assert len(set(runs[0].values())) == 2
+    assert runs[0][0] == runs[0][3] and runs[0][4] == runs[0][7]
+
+
 # --- #40.3: sampled betweenness takes a reproducible seed ------------------
 def test_betweenness_sample_seed_is_reproducible():
     src = [0, 1, 2, 3, 4, 5, 6, 0, 2, 4]

@@ -604,12 +604,21 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
             )
             .within(Range::above(0.0)),
             SEED,
+            param(
+                "parallel",
+                ParamType::Bool,
+                Value::Bool(false),
+                "Move nodes in parallel sub-rounds: faster on many cores, and the same labels \
+                 on any thread count, but different communities from the serial default, with \
+                 no NetworkX equivalent.",
+            ),
         ],
         outputs: &[out("louvain", ColumnType::UInt32)],
         shape: Shape::PerNode,
         build: |v| Call::Louvain {
             resolution: v.float("resolution"),
             seed: v.seed("seed"),
+            parallel: v.bool("parallel"),
         },
     },
     FunctionSpec {

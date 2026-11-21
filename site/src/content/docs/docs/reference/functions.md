@@ -161,7 +161,7 @@ label_propagation(graph, max_iter => 20, seed => NULL)
 Community labels by Louvain modularity optimization. A node with no edges is a community of its own: count communities of more than one member with GROUP BY louvain HAVING count(*) > 1.
 
 ```text
-louvain(graph, weight => NULL, resolution => 1.0, seed => NULL)
+louvain(graph, weight => NULL, resolution => 1.0, seed => NULL, parallel => false)
 ```
 
 | Parameter | Type | Default | Choices | Description |
@@ -169,6 +169,7 @@ louvain(graph, weight => NULL, resolution => 1.0, seed => NULL)
 | `weight` | expression | `NULL` | – | A non-negative weight per edge; null is unweighted. |
 | `resolution` | number | `1.0` | – | Modularity resolution; larger gives smaller communities. Must be above 0. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
+| `parallel` | boolean | `false` | – | Move nodes in parallel sub-rounds: faster on many cores, and the same labels on any thread count, but different communities from the serial default, with no NetworkX equivalent. |
 
 **Returns:** One row per node: `id` (the node), `louvain` (UInt32)
 
