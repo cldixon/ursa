@@ -593,9 +593,9 @@ pub struct DeltaStats {
     /// shown).
     pub nodes: u32,
     pub edges: u32,
-    /// Bytes written to the GPU: 16 for a new node, 8 for an edge and for a
-    /// node restyled, 4 for a node whose flags changed, and the highlight
-    /// layer's instances.
+    /// Bytes written to the GPU: 16 for a new node, 8 for an edge, 4 for a
+    /// node resized (8 if any was recoloured), 4 for a node whose flags
+    /// changed, and the highlight layer's instances.
     #[wasm_bindgen(js_name = bytesUploaded)]
     pub bytes_uploaded: f64,
     /// Whether a buffer doubled to hold it: its contents were copied on the

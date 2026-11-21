@@ -17,6 +17,15 @@
 // everything else at 35%; a route's ends and a selected node carry their
 // rings; a hidden node and its edges are gone; and a selection of one node
 // uploads 24 bytes. ONLY=highlight runs these alone.
+//
+// Then scenes that change in place (#441), on WebGL2 again. On the karate
+// club, a view made from a result takes deltas: new nodes and edges change
+// only the pixels around them and upload only their bytes, also when the
+// buffers double to hold them; removed nodes and edges are gone; a delta
+// that does not fit changes nothing; and after each delta's inverse the
+// frame read back is the first frame, byte for byte. On R-MAT with 1M
+// edges, a delta of 100 nodes and 300 edges uploads at most 64 KB and takes
+// at most 2 ms. ONLY=delta runs these alone (ONLY="delta karate" the first).
 import { chromium } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -399,6 +408,334 @@ if (HIGHLIGHT_CASES.length) {
     await page.waitForTimeout(300);
     for (const e of errors) failures.push(`highlight on ${backend}: ${e}`);
     console.log(`highlight on ${backend}: a path, a selection, a pin and a hidden node drawn with ${errors.length} errors`);
+    await gpu.close();
+  }
+}
+// Scenes that change in place.
+const DELTA_CASES = ["delta karate", "delta rmat 1M"].filter((c) => !ONLY || c.startsWith(ONLY));
+if (DELTA_CASES.length) {
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  const open = async (name: string, query: string) => {
+    const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+    page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+    page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+    await page.goto(`${base}?${query}`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    await page.waitForTimeout(500); // the last positions drawn
+    return page;
+  };
+  if (DELTA_CASES.includes("delta karate")) {
+    const name = "delta karate";
+    const fail = (what: string) => failures.push(`${name}: ${what}`);
+    // 1. The result has positions, so new nodes bring theirs: inside the
+    // drawing, where they do not move the camera.
+    let page = await open(name, "graph=karate&result=xy");
+    const r: any = await page.evaluate(async (theme) => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+      const canvas = document.getElementById("view") as HTMLCanvasElement;
+      const W = canvas.width, H = canvas.height, n = g.n, m = g.src.length;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 100));
+      const out: any = { backend: view.backend, problems: [] as string[], pngs: {} as Record<string, string> };
+      const problem = (what: string) => out.problems.push(what);
+      const frame = async (tag: string) => {
+        const px: Uint8Array = await view.snapshot();
+        const c = document.createElement("canvas");
+        c.width = W; c.height = H;
+        c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(px), W), 0, 0);
+        out.pngs[tag] = c.toDataURL("image/png");
+        return px;
+      };
+      const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      const far = (a: number[], b: number[]) => Math.max(...a.map((v, k) => Math.abs(v - b[k])));
+      const at = (px: Uint8Array, p: number[]) => { const i = 4 * (Math.floor(p[1]) * W + Math.floor(p[0])); return [px[i], px[i + 1], px[i + 2]]; };
+      const pixel = (i: number) => Array.from(view.nodePixel(i) as Float32Array);
+      const toSegment = (p: number[], a: number[], b: number[]) => {
+        const dx = b[0] - a[0], dy = b[1] - a[1];
+        const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+        return Math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy);
+      };
+      // The changed pixels farther than `reach` from every one of `near`
+      // (points, and segments as pairs of points).
+      const strays = (a: Uint8Array, b: Uint8Array, points: number[][], segments: number[][][], reach: number) => {
+        let changed = 0, stray = 0;
+        for (let i = 0; i < a.length; i += 4) {
+          if (a[i] === b[i] && a[i + 1] === b[i + 1] && a[i + 2] === b[i + 2] && a[i + 3] === b[i + 3]) continue;
+          changed++;
+          const p = [((i / 4) % W) + 0.5, Math.floor(i / 4 / W) + 0.5];
+          if (points.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1]) <= reach)) continue;
+          if (segments.some(([q, r]) => toSegment(p, q, r) <= 2.5)) continue;
+          stray++;
+        }
+        return { changed, stray };
+      };
+      const first = await frame("first");
+      const info0 = JSON.stringify(view.info());
+      out.info0 = view.info();
+      const undo = (delta: Uint8Array, positions?: Float32Array) => view.applyDelta(viz.invertDelta(delta), positions);
+      const same = async (what: string) => {
+        const d = differ(first, await frame(`after ${what}`));
+        if (d) problem(`after ${what} and its inverse, ${d} bytes of the frame differ from the first`);
+        if (JSON.stringify(view.info()) !== info0) problem(`after ${what} and its inverse, info() is ${JSON.stringify(view.info())}`);
+      };
+
+      // Three nodes between others, a ring through them, and two edges to old nodes.
+      const xy = view.positions();
+      const between = (a: number, b: number, t: number) => [xy[a] + (xy[b] - xy[a]) * t, xy[n + a] + (xy[n + b] - xy[n + a]) * t];
+      const spots = [between(0, 33, 0.5), between(5, 26, 0.5), between(16, 14, 0.4)];
+      const grow = () => new viz.DeltaBuilder()
+        .addNodes(n, 3, Float32Array.from([...spots.map((p) => p[0]), ...spots.map((p) => p[1])]))
+        .addEdges(Uint32Array.of(n, n + 1, n + 2, n, 11), Uint32Array.of(0, n, n + 1, n + 2, n + 2))
+        .toBytes();
+      const old = [0, 11].map(pixel);
+      const growth = grow();
+      let applied = view.applyDelta(growth);
+      out.growth = { nodes: applied.nodes, edges: applied.edges, bytes: applied.bytesUploaded, grew: applied.grew, nodeCapacity: applied.nodeCapacity, edgeCapacity: applied.edgeCapacity };
+      if (view.nodeCount !== n + 3 || view.edgeCount !== m + 5) problem(`the view has ${view.nodeCount} nodes and ${view.edgeCount} edges after the delta`);
+      const grown = await frame("grown");
+      out.infoGrown = view.info();
+      const fresh = [n, n + 1, n + 2].map(pixel);
+      if (far(pixel(0), old[0]) > 0) problem("the delta moved the camera, though its nodes are inside the drawing");
+      for (const [k, p] of fresh.entries()) {
+        const c = at(grown, p);
+        if (far(c, theme.node) > 6) problem(`new node ${n + k} is rgb(${c}) at its centre, not the node colour`);
+        if (view.pick(p[0], p[1]) !== n + k) problem(`new node ${n + k} cannot be picked`);
+      }
+      // What changed is around the new nodes and edges, and the two old
+      // nodes that grew with their degree: what the buffers held is intact.
+      const ends = [[fresh[0], old[0]], [fresh[1], fresh[0]], [fresh[2], fresh[1]], [fresh[0], fresh[2]], [old[1], fresh[2]]];
+      out.grownPixels = strays(first, grown, [...fresh, ...old], ends, 14);
+      if (!out.grownPixels.changed) problem("the delta drew nothing");
+      if (out.grownPixels.stray) problem(`the delta changed ${out.grownPixels.stray} pixels away from what it added`);
+      applied = undo(growth);
+      out.shrinkBytes = applied.bytesUploaded;
+      await same("a growth");
+
+      // The same again draws the same.
+      applied = view.applyDelta(grow());
+      out.regrowBytes = applied.bytesUploaded;
+      if (differ(grown, await frame("grown again"))) problem("the same delta drew another frame the second time");
+      undo(growth);
+      await same("a second growth");
+
+      // More than the buffers have room for: they double, what they held
+      // is copied on the GPU, and only the delta's own bytes are uploaded.
+      // A hundred nodes along the line from node 16 to node 14, each with
+      // an edge to the next and one to an old node.
+      const many = 100, line = Array.from({ length: many }, (_, k) => between(16, 14, (k + 1) / (many + 1)));
+      const bigSrc = new Uint32Array(2 * many), bigDst = new Uint32Array(2 * many);
+      for (let k = 0; k < many; k++) { bigSrc[2 * k] = n + k; bigDst[2 * k] = k + 1 < many ? n + k + 1 : 14; bigSrc[2 * k + 1] = n + k; bigDst[2 * k + 1] = k % n; }
+      const big = new viz.DeltaBuilder().addNodes(n, many, Float32Array.from([...line.map((p) => p[0]), ...line.map((p) => p[1])])).addEdges(bigSrc, bigDst).toBytes();
+      applied = view.applyDelta(big);
+      out.big = { bytes: applied.bytesUploaded, grew: applied.grew, nodeCapacity: applied.nodeCapacity, edgeCapacity: applied.edgeCapacity };
+      const bigger = await frame("grown past the buffers");
+      const added = Array.from({ length: many }, (_, k) => pixel(n + k)), all = Array.from({ length: n }, (_, i) => pixel(i));
+      out.bigPixels = strays(first, bigger, [...added, ...all], Array.from({ length: 2 * many }, (_, e) => [pixel(bigSrc[e]), pixel(bigDst[e])]), 14);
+      if (out.bigPixels.changed < 1000) problem(`100 new nodes and 200 edges changed only ${out.bigPixels.changed} pixels`);
+      if (out.bigPixels.stray) problem(`growing the buffers changed ${out.bigPixels.stray} pixels away from what was added`);
+      undo(big);
+      await same("a growth past the buffers");
+      // Back in the grown buffers, the small growth draws what it drew.
+      view.applyDelta(grow());
+      if (differ(grown, await frame("grown in the grown buffers"))) problem("after the buffers grew, the same delta drew another frame");
+      undo(growth);
+
+      // A removed node is hidden as `setHidden` hides it: four bytes.
+      const hub = 33;
+      const hide = new viz.DeltaBuilder().removeNodes(Uint32Array.of(hub)).toBytes();
+      out.hideBytes = view.applyDelta(hide).bytesUploaded;
+      const hidden = await frame("hidden");
+      out.infoHidden = view.info();
+      if (far(at(hidden, pixel(hub)), theme.node) < 60) problem(`removed node ${hub} is still drawn`);
+      if (view.pick(...pixel(hub)) === hub) problem(`removed node ${hub} can be picked`);
+      undo(hide);
+      await same("removing a node");
+      view.setHidden(Uint32Array.of(hub));
+      if (differ(hidden, await frame("set hidden"))) problem("a removed node is not drawn as a hidden one is");
+      view.setHidden(new Uint32Array());
+
+      // Removed edges are gone, and nothing else: eight bytes each.
+      const cut = [0, 20, 40, 77];
+      const remove = new viz.DeltaBuilder().removeEdges(Uint32Array.from(cut)).toBytes();
+      out.cutBytes = view.applyDelta(remove).bytesUploaded;
+      const without = await frame("cut");
+      out.cutPixels = strays(first, without, [], cut.map((e) => [pixel(g.src[e]), pixel(g.dst[e])]), 0);
+      if (out.cutPixels.changed < 40) problem(`removing four edges changed only ${out.cutPixels.changed} pixels`);
+      if (out.cutPixels.stray) problem(`removing four edges changed ${out.cutPixels.stray} pixels away from them`);
+      undo(remove);
+      await same("removing edges");
+
+      // A delta that does not fit throws and changes nothing.
+      let threw = "";
+      try { view.applyDelta(new viz.DeltaBuilder().addNodes(n, 1, Float32Array.of(0, 0)).addEdges(Uint32Array.of(n), Uint32Array.of(999)).toBytes()); } catch (e) { threw = String(e); }
+      out.threw = threw;
+      if (!threw.includes("999")) problem(`a delta naming node 999 did not say so: "${threw}"`);
+      if (view.nodeCount !== n) problem(`a refused delta left ${view.nodeCount} nodes`);
+      await same("a refused delta");
+      w.pauseFrames(false);
+      return out;
+    }, THEMES.light).catch((e) => ({ problems: [String(e)], pngs: {} }));
+    for (const p of r.problems) fail(p);
+    if (r.backend && r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
+    // Three nodes of 16 bytes and 4 of flags, five edges of 8, and the
+    // radii of the two old nodes whose degree changed.
+    const growthBytes = 3 * 20 + 5 * 8 + 2 * 4;
+    if (r.growth?.bytes !== growthBytes) fail(`the growth uploaded ${r.growth?.bytes} bytes, not ${growthBytes}`);
+    // A view of a result starts with room: 128 nodes and 256 edges here.
+    if (!(r.growth && !r.growth.grew && r.growth.nodeCapacity === 128 && r.growth.edgeCapacity === 256)) fail(`the growth should fit the buffers as made: ${JSON.stringify(r.growth)}`);
+    if (!(r.big?.grew && r.big.nodeCapacity === 256 && r.big.edgeCapacity === 512)) fail(`the buffers did not double for 100 nodes and 200 edges: ${JSON.stringify(r.big)}`);
+    if (r.big?.bytes > 100 * 20 + 200 * 8 + 34 * 4) fail(`the growth that doubled the buffers uploaded ${r.big?.bytes} bytes: more than its own`);
+    if (r.regrowBytes !== growthBytes) fail(`the second growth uploaded ${r.regrowBytes} bytes, not ${growthBytes}`);
+    if (r.shrinkBytes !== 8) fail(`undoing the growth uploaded ${r.shrinkBytes} bytes, not the 8 of two radii`);
+    if (r.hideBytes !== 4) fail(`removing a node uploaded ${r.hideBytes} bytes, not 4`);
+    if (r.cutBytes !== 32) fail(`removing four edges uploaded ${r.cutBytes} bytes, not 32`);
+    if (r.info0 && !(r.info0.nodes === 34 && r.info0.edges === 78 && r.info0.size.column === null && r.info0.color === null)) fail(`info() of the karate club: ${JSON.stringify(r.info0)}`);
+    if (r.infoGrown && !(r.infoGrown.nodes === 37 && r.infoGrown.edges === 83 && r.infoGrown.nodeSlots === 37)) fail(`info() after the growth: ${JSON.stringify(r.infoGrown)}`);
+    // Node 33 has 17 of the 78 edges.
+    if (r.infoHidden && !(r.infoHidden.nodes === 33 && r.infoHidden.hiddenNodes === 1 && r.infoHidden.edges === 61 && r.infoHidden.nodeSlots === 34)) fail(`info() with node 33 removed: ${JSON.stringify(r.infoHidden)}`);
+    if (shots) for (const [tag, png] of Object.entries(r.pngs as Record<string, string>)) await Bun.write(`${shots}/viz-delta-${tag.replace(/ /g, "-")}.png`, Buffer.from(png.split(",")[1], "base64"));
+    console.log(
+      `${name}: ${r.backend} · growth of 3 nodes and 5 edges ${r.growth?.bytes} B, ${r.grownPixels?.changed} pixels changed, ${r.grownPixels?.stray} astray · of 100 nodes and 200 edges ${r.big?.bytes} B (buffers doubled to ${r.big?.nodeCapacity} nodes, ${r.big?.edgeCapacity} edges), ${r.bigPixels?.changed} pixels changed, ${r.bigPixels?.stray} astray · ` +
+        `undo ${r.shrinkBytes} B · removed node ${r.hideBytes} B · four removed edges ${r.cutBytes} B, ${r.cutPixels?.changed} pixels changed, ${r.cutPixels?.stray} astray · every inverse restored the first frame: ${r.problems.length === 0}`,
+    );
+    await page.close();
+
+    // 2. The result has no positions: the view places the new nodes, the
+    // camera follows, a layout moves everything, and the undo puts every
+    // node back with the positions saved before the step.
+    page = await open(name, "graph=karate&result=1");
+    const u: any = await page.evaluate(async (theme) => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph, n = g.n;
+      const canvas = document.getElementById("view") as HTMLCanvasElement;
+      const W = canvas.width;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 100));
+      const problems: string[] = [];
+      const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      const first: Uint8Array = await view.snapshot();
+      const saved: Float32Array = view.positions();
+      const delta = new viz.DeltaBuilder().addNodes(n, 4).addEdges(Uint32Array.of(n, n + 1, n + 2, n + 3), Uint32Array.of(0, 0, n, 33)).toBytes();
+      const applied = view.applyDelta(delta);
+      const grown: Uint8Array = await view.snapshot();
+      const placed: Float32Array = view.positions();
+      if (!placed.every(Number.isFinite)) problems.push("a new node has no place");
+      let drawn = 0;
+      for (let k = 0; k < 4; k++) {
+        const [x, y] = view.nodePixel(n + k), i = 4 * (Math.floor(y) * W + Math.floor(x));
+        if (Math.max(Math.abs(grown[i] - theme.node[0]), Math.abs(grown[i + 1] - theme.node[1]), Math.abs(grown[i + 2] - theme.node[2])) <= 40) drawn++;
+      }
+      if (drawn < 3) problems.push(`only ${drawn} of 4 placed nodes are drawn where the view says they are`);
+      // A layout's next positions: everything moves.
+      view.setPositions(placed.map((v, i) => (i < placed.length / 2 ? v * 1.3 + 0.2 : v * 0.8 - 0.1)));
+      const moved = differ(first, await view.snapshot());
+      if (!moved) problems.push("moving every node changed no pixel");
+      const undone = view.applyDelta(viz.invertDelta(delta), saved);
+      const d = differ(first, await view.snapshot());
+      if (d) problems.push(`after a growth, a layout and the undo with its saved positions, ${d} bytes of the frame differ from the first`);
+      if (view.nodeCount !== n) problems.push(`the undo left ${view.nodeCount} nodes`);
+      w.pauseFrames(false);
+      return { problems, bytes: applied.bytesUploaded, undoBytes: undone.bytesUploaded, moved };
+    }, THEMES.light).catch((e) => ({ problems: [String(e)] }));
+    for (const p of u.problems) fail(p);
+    console.log(`${name}, placed by the view: growth ${u.bytes} B · undo with the step's positions ${u.undoBytes} B (8 a node) · the first frame restored: ${u.problems.length === 0}`);
+    await page.close();
+  }
+  if (DELTA_CASES.includes("delta rmat 1M")) {
+    const name = "delta rmat 1M";
+    const fail = (what: string) => failures.push(`${name}: ${what}`);
+    // Flat, one iteration: the layout is not what is measured.
+    const page = await open(name, "graph=rmat&scale=17&edges=1000000&result=1&multilevel=0&iterations=1");
+    const r: any = await page.evaluate(async () => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph, n = g.n;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 200));
+      const first: Uint8Array = await view.snapshot();
+      // An expansion: 100 nodes off one hub, each with two more edges.
+      let state = 441;
+      const next = () => (state = (Math.imul(state, 1103515245) + 12345) >>> 0) % n;
+      const src = new Uint32Array(300), dst = new Uint32Array(300);
+      for (let i = 0; i < 100; i++) for (let k = 0; k < 3; k++) { src[3 * i + k] = n + i; dst[3 * i + k] = k ? next() : g.src[0]; }
+      const delta = new viz.DeltaBuilder().addNodes(n, 100).addEdges(src, dst).toBytes();
+      const inverse = viz.invertDelta(delta);
+      const timed = (f: () => any) => { const t = performance.now(); const v = f(); return [v, performance.now() - t]; };
+      const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)];
+      // The first one, cold.
+      const [grew, growMs] = timed(() => view.applyDelta(delta));
+      const [, drawGrownMs] = timed(() => view.render());
+      view.applyDelta(inverse);
+      const applyMs: number[] = [], undoMs: number[] = [], drawMs: number[] = [], plainMs: number[] = [];
+      let applied: any;
+      for (let i = 0; i < 30; i++) {
+        // A frame is seconds here, with no GPU: only a few are drawn.
+        if (i < 2) plainMs.push(timed(() => view.render())[1]);
+        let ms;
+        [applied, ms] = timed(() => view.applyDelta(delta));
+        applyMs.push(ms);
+        if (i < 2) drawMs.push(timed(() => view.render())[1]);
+        undoMs.push(timed(() => view.applyDelta(inverse))[1]);
+      }
+      const [, infoMs] = timed(() => view.info());
+      const last: Uint8Array = await view.snapshot();
+      let differ = 0;
+      for (let i = 0; i < first.length; i++) if (first[i] !== last[i]) differ++;
+      w.pauseFrames(false);
+      return {
+        backend: view.backend, nodes: n, edges: g.src.length, deltaBytes: delta.length,
+        grew: grew.grew, growBytes: grew.bytesUploaded, growMs, drawGrownMs, nodeCapacity: grew.nodeCapacity, edgeCapacity: grew.edgeCapacity,
+        bytes: applied.bytesUploaded, regrew: applied.grew, applyMs: median(applyMs), applyMax: Math.max(...applyMs), undoMs: median(undoMs),
+        drawMs: median(drawMs), plainMs: median(plainMs), infoMs, differ,
+      };
+    }).catch((e) => ({ error: String(e) }));
+    if (r.error) fail(r.error);
+    else {
+      if (r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
+      for (const [what, bytes] of [["the first delta", r.growBytes], ["a delta", r.bytes]]) if (!(bytes > 0 && bytes <= 64 * 1024)) fail(`${what} uploaded ${bytes} bytes; at most 64 KB are allowed`);
+      // A view of a result has room for it: 1,048,576 edges.
+      if (r.grew || r.regrew) fail(`the buffers should have room for the delta: first ${r.grew}, later ${r.regrew}`);
+      for (const [what, ms] of [["the first delta", r.growMs], ["a delta", r.applyMs], ["its inverse", r.undoMs]]) if (!(ms <= 2)) fail(`${what} took ${ms.toFixed(2)} ms outside the frame; at most 2 ms are allowed`);
+      if (r.differ) fail(`after 31 deltas and their inverses, ${r.differ} bytes of the frame differ from the first`);
+      console.log(
+        `${name}: ${r.backend} · ${r.nodes.toLocaleString()} nodes, ${r.edges.toLocaleString()} edges · a delta of 100 nodes and 300 edges (${r.deltaBytes} B of UGR): ${r.bytes} B uploaded, ` +
+          `applyDelta ${r.applyMs.toFixed(2)} ms median (${r.applyMax.toFixed(2)} max), its inverse ${r.undoMs.toFixed(2)} ms · the frame after it ${r.drawMs.toFixed(1)} ms against ${r.plainMs.toFixed(1)} plain · ` +
+          `the first delta: ${r.growBytes} B, ${r.growMs.toFixed(2)} ms, its frame ${r.drawGrownMs.toFixed(1)} ms (buffers of ${r.nodeCapacity.toLocaleString()} nodes and ${r.edgeCapacity.toLocaleString()} edges) · info() ${r.infoMs.toFixed(2)} ms · first frame restored: ${r.differ === 0}`,
+      );
+    }
+    await page.close();
+  }
+  await gl.close();
+  // The same under WebGPU, whose validation is the stricter: buffers that
+  // grow (copies on the GPU), slots written, removed nodes and edges, and
+  // their inverses, with no error from the device.
+  if (webgpu && DELTA_CASES.includes("delta karate")) {
+    const gpu = await chromium.launch({ args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan"] });
+    const page = await gpu.newPage({ viewport: { width: 1000, height: 700 } });
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+    await page.goto(`${base}?graph=karate&result=1`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 60_000, polling: 100 });
+    const backend = await page.evaluate(async () => {
+      const w = window as any, view = w.view, viz = w.viz, n = w.graph.n;
+      const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await frames();
+      const saved = view.positions();
+      const deltas = [
+        new viz.DeltaBuilder().addNodes(n, 200).addEdges(Uint32Array.from({ length: 400 }, (_, i) => n + (i % 200)), Uint32Array.from({ length: 400 }, (_, i) => (i * 7) % n)).toBytes(),
+        new viz.DeltaBuilder().removeNodes(Uint32Array.of(33, n + 1)).removeEdges(Uint32Array.of(0, 5, 100)).toBytes(),
+      ];
+      if (!view.applyDelta(deltas[0]).grew) throw new Error("200 nodes did not grow the buffers");
+      await frames();
+      view.applyDelta(deltas[1]);
+      await frames();
+      view.applyDelta(viz.invertDelta(deltas[1]));
+      await frames();
+      view.applyDelta(viz.invertDelta(deltas[0]), saved);
+      await frames();
+      return view.backend;
+    });
+    await page.waitForTimeout(300);
+    for (const e of errors) failures.push(`delta on ${backend}: ${e}`);
+    console.log(`delta on ${backend}: buffers grown, slots written, nodes and edges removed and all undone with ${errors.length} errors`);
     await gpu.close();
   }
 }

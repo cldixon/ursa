@@ -103,6 +103,8 @@ pub struct Changes {
     pub new_edges_from: usize,
     /// Older nodes whose radius or colour changed, as runs.
     pub restyled: Vec<Range<usize>>,
+    /// Whether any of their colours did: if not, only radii are written.
+    pub recolored: bool,
     /// Older edges that were removed or restored, as runs.
     pub edge_runs: Vec<Range<usize>>,
     /// Every node's position changed (a step's positions were restored).
@@ -126,9 +128,9 @@ impl Changes {
 
     /// The bytes the renderer writes for these changes, apart from the
     /// flags (four bytes for each node whose flags changed) and the
-    /// highlight layer's own instances: 16 for each new node, 8 for each
-    /// restyled one and for each edge written, and 8 a node when every
-    /// position changed.
+    /// highlight layer's own instances: 16 for each new node, 4 for each
+    /// restyled one (8 if any was recoloured), 8 for each edge written, and
+    /// 8 a node when every position changed.
     pub fn upload_bytes(&self) -> u64 {
         let len = |runs: &[Range<usize>]| runs.iter().map(|r| r.len() as u64).sum::<u64>();
         let new_nodes = (self.nodes.1 - self.new_nodes_from) as u64;
@@ -139,7 +141,8 @@ impl Changes {
         } else {
             16 * new_nodes
         };
-        nodes + 8 * len(&self.restyled) + 8 * (new_edges + len(&self.edge_runs))
+        let style = if self.recolored { 8 } else { 4 };
+        nodes + style * len(&self.restyled) + 8 * (new_edges + len(&self.edge_runs))
     }
 }
 
@@ -387,8 +390,8 @@ impl LiveResult {
     }
 
     /// Set node `i`'s radius, colour and category from the result. Whether
-    /// its radius or colour changed.
-    fn style_node(&self, i: usize, parts: &mut Parts<'_>) -> bool {
+    /// its radius or colour changed, and whether its colour did.
+    fn style_node(&self, i: usize, parts: &mut Parts<'_>) -> (bool, bool) {
         let radius = match (self.size_column(), self.size_range) {
             (Some(values), Some(range)) => {
                 NodeStyle::size_from(number(values, i), range, SIZE_BY_RADII.0, SIZE_BY_RADII.1)
@@ -402,11 +405,11 @@ impl LiveResult {
             }
             _ => parts.theme.node,
         };
-        let changed =
-            parts.style.radius[i].to_bits() != radius.to_bits() || parts.style.color[i] != color;
+        let resized = parts.style.radius[i].to_bits() != radius.to_bits();
+        let recolored = parts.style.color[i] != color;
         parts.style.radius[i] = radius;
         parts.style.color[i] = color;
-        changed
+        (resized || recolored, recolored)
     }
 
     /// The edges of `range` as the renderer draws them: `src, dst` each, or
@@ -559,8 +562,10 @@ impl LiveResult {
             self.place(low_n, low_m, parts);
         }
 
-        // The flags: new nodes unflagged, and the result's highlights and
-        // removed nodes if they changed.
+        // The flags: new nodes unflagged (a slot that was taken off and
+        // filled again too), and the result's highlights and removed nodes
+        // if they changed, or if a flagged node went.
+        changes.highlights |= parts.highlight.resize(low_n);
         parts.highlight.resize(n1);
         if changes.highlights {
             parts
@@ -595,19 +600,25 @@ impl LiveResult {
         for i in low_n..n1 {
             self.style_node(i, parts);
         }
-        let restyled: Vec<usize> = if restyle_all {
-            (0..low_n).filter(|&i| self.style_node(i, parts)).collect()
+        let again: Vec<usize> = if restyle_all {
+            (0..low_n).collect()
         } else if self.size_range.is_none() {
+            // Sized by degree: the ends of the edges that changed one.
             touched.retain(|&i| i < low_n);
             touched.sort_unstable();
             touched.dedup();
             touched
-                .into_iter()
-                .filter(|&i| self.style_node(i, parts))
-                .collect()
         } else {
             Vec::new()
         };
+        let mut restyled = Vec::new();
+        for i in again {
+            let (changed, recolored) = self.style_node(i, parts);
+            if changed {
+                restyled.push(i);
+            }
+            changes.recolored |= recolored;
+        }
         changes.restyled = runs(restyled);
 
         flagged.retain(|&e| e < low_m);

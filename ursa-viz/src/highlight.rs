@@ -122,8 +122,13 @@ impl HighlightState {
     /// last ones taken off, and with them the highlighted edges that name
     /// them. The other nodes keep their flags. A new node's flags are
     /// uploaded ([`HighlightState::take_dirty`]) whatever they are.
-    pub fn resize(&mut self, n_nodes: usize) {
+    ///
+    /// Returns whether anything drawn went with the nodes taken off: one of
+    /// them was flagged, or a highlighted edge named one.
+    pub fn resize(&mut self, n_nodes: usize) -> bool {
+        let mut lost = false;
         if n_nodes < self.flags.len() {
+            lost = self.flags[n_nodes..].iter().any(|&f| f != 0);
             let gone = |v: u32| v as usize >= n_nodes;
             if self.edges.iter().any(|&v| gone(v)) {
                 let kept: Vec<u32> = self
@@ -134,11 +139,25 @@ impl HighlightState {
                     .copied()
                     .collect();
                 self.edges = kept;
+                lost = true;
             }
         }
         self.flags.resize(n_nodes, 0);
         self.drawn.resize(n_nodes, 0);
         self.unsent_from = self.unsent_from.min(n_nodes);
+        lost
+    }
+
+    /// The new nodes ([`HighlightState::resize`]) the renderer has no flags
+    /// for yet, as a range, taken as sent: what [`take_dirty`] would give
+    /// for them, without reading the other nodes. For when no other flag
+    /// changed.
+    ///
+    /// [`take_dirty`]: HighlightState::take_dirty
+    pub fn take_unsent(&mut self) -> Range<usize> {
+        let new = std::mem::replace(&mut self.unsent_from, self.flags.len())..self.flags.len();
+        self.drawn[new.clone()].copy_from_slice(&self.flags[new.clone()]);
+        new
     }
 
     pub fn n_nodes(&self) -> usize {
@@ -398,14 +417,18 @@ mod tests {
         assert_eq!(h.take_dirty(), vec![5..6]);
 
         // Off again: the edge that named them goes, the others stay.
-        h.resize(4);
+        assert!(h.resize(4), "a pinned node and an edge went");
         assert_eq!(h.flags(), [0, flag::SELECTED, 0, 0]);
         assert_eq!(h.edges(), [0, 1, 2, 3]);
         assert!(h.take_dirty().is_empty());
         // The slots come back unflagged, and are sent again.
-        h.resize(5);
-        assert_eq!(h.flags()[4], 0);
-        assert_eq!(h.take_dirty(), vec![4..5]);
+        assert!(!h.resize(6));
+        assert_eq!(h.flags()[4..], [0, 0]);
+        assert_eq!(h.take_unsent(), 4..6);
+        assert_eq!(h.take_unsent(), 6..6);
+        assert!(h.take_dirty().is_empty());
+        // Unflagged nodes go without a trace.
+        assert!(!h.resize(5));
     }
 
     #[test]

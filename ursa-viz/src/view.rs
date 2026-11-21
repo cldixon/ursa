@@ -13,7 +13,7 @@ use ursa_core::algo::Fa2Params;
 use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
-use crate::render::{node_radius_scale, FrontNode, Renderer};
+use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Theme};
 
 pub struct View {
@@ -49,6 +49,21 @@ pub struct View {
     live: Option<LiveResult>,
     /// The graph changed since the layout on this thread last saw it.
     layout_stale: bool,
+    /// The box around the positions as last fitted, while the camera
+    /// follows and nothing has moved since: a delta that only adds nodes
+    /// widens it by theirs, without reading every position again.
+    fitted: Option<Fitted>,
+}
+
+type Bounds = Option<(f32, f32, f32, f32)>;
+
+/// The bounds the camera is fitted to.
+#[derive(Debug, Clone, Default)]
+struct Fitted {
+    bounds: Bounds,
+    /// The bounds before each delta that added nodes since, with the node
+    /// count it had: taking those nodes off again is the bounds before.
+    before: Vec<(usize, Bounds)>,
 }
 
 /// What [`View::apply`] did.
@@ -97,6 +112,7 @@ impl View {
             draw_nodes: true,
             live: None,
             layout_stale: false,
+            fitted: None,
         };
         view.fit();
         view
@@ -125,7 +141,14 @@ impl View {
             highlight,
         } = drawn;
         let lines = live.line_indices(0..graph.n_edges());
-        let renderer = Renderer::new(device, format, &x, &y, &style, &lines);
+        let mut renderer = Renderer::new(device, format, &x, &y, &style, &lines);
+        // Room for the first deltas, so that they do not grow the buffers.
+        renderer.reserve(
+            device,
+            queue,
+            starting_capacity(graph.n_nodes()),
+            starting_capacity(graph.n_edges()),
+        );
         let mut view = Self {
             graph,
             layout: None,
@@ -143,6 +166,7 @@ impl View {
             draw_nodes: true,
             live: Some(live),
             layout_stale: false,
+            fitted: None,
         };
         view.upload_flags(device, queue, false);
         view.fit();
@@ -241,7 +265,7 @@ impl View {
             bytes += 8 * n1 as u64;
             bytes += self
                 .renderer
-                .write_styles(queue, from, &radius[from..], &color[from..]);
+                .write_styles(queue, from, &radius[from..], Some(&color[from..]));
         } else {
             bytes += self.renderer.write_nodes(
                 queue,
@@ -253,12 +277,10 @@ impl View {
             );
         }
         for run in &changes.restyled {
-            bytes += self.renderer.write_styles(
-                queue,
-                run.start,
-                &radius[run.clone()],
-                &color[run.clone()],
-            );
+            let color = changes.recolored.then(|| &color[run.clone()]);
+            bytes += self
+                .renderer
+                .write_styles(queue, run.start, &radius[run.clone()], color);
         }
         let new_edges = changes.new_edges_from..m1;
         let runs = std::iter::once(&new_edges).chain(&changes.edge_runs);
@@ -266,16 +288,29 @@ impl View {
             let lines = live.line_indices(run.clone());
             bytes += self.renderer.write_edges(queue, run.start, &lines);
         }
-        // The highlight layer holds positions, radii and colours of its own.
-        let layer =
-            changes.positions || changes.highlights || !changes.restyled.is_empty() || n1 < n0;
-        bytes += self.upload_flags(device, queue, layer);
+        if changes.highlights {
+            bytes += self.upload_flags(device, queue, true);
+        } else {
+            // No flag changed: the new nodes' are all there is to write,
+            // and nothing reads every node's.
+            let new = self.highlight.take_unsent();
+            let flags = &self.highlight.flags()[new.clone()];
+            bytes += self.renderer.write_flags(queue, new.start, flags);
+            // The highlight layer holds positions, radii and colours of
+            // its own.
+            if changes.positions || !changes.restyled.is_empty() {
+                let layer = |r: &Renderer| r.highlight_bytes_uploaded() + r.front_bytes_uploaded();
+                let before = layer(&self.renderer);
+                self.upload_highlight(device, queue, changes.positions, true);
+                bytes += layer(&self.renderer) - before;
+            }
+        }
 
         if (n0, m0) != (n1, m1) {
             self.layout_stale = true;
         }
-        if self.follow && (n0 != n1 || changes.positions) {
-            self.fit_camera();
+        if n0 != n1 || changes.positions {
+            self.refit(&changes);
         }
         Ok(Applied {
             changes,
@@ -373,6 +408,7 @@ impl View {
         self.renderer.set_positions(queue, &self.x, &self.y);
         // The highlighted edges and the nodes in front hold positions.
         self.upload_highlight(device, queue, true, true);
+        self.fitted = None;
         if self.follow {
             self.fit_camera();
         }
@@ -556,10 +592,64 @@ impl View {
     }
 
     fn fit_camera(&mut self) {
-        if let Some(b) = bounds(&self.x, &self.y) {
+        let b = bounds(&self.x, &self.y);
+        self.fit_to(b);
+        self.fitted = Some(Fitted {
+            bounds: b,
+            before: Vec::new(),
+        });
+    }
+
+    fn fit_to(&mut self, bounds: Bounds) {
+        if let Some(b) = bounds {
             self.camera.fit(b);
             self.fitted_zoom = self.camera.pixels_per_unit;
         }
+    }
+
+    /// Fit the camera after a delta that changed the nodes or moved them,
+    /// if it follows. The bounds are those of every position, as
+    /// [`View::fit_camera`] finds them, but found from the last fit's where
+    /// the delta only added nodes or took the last additions off: a box is
+    /// the same whichever order its points are added in.
+    fn refit(&mut self, changes: &Changes) {
+        let (n0, n1) = changes.nodes;
+        let fitted = match self.fitted.take() {
+            Some(fitted) if self.follow && !changes.positions => fitted,
+            _ => {
+                // Not following, or everything moved: start again.
+                if self.follow {
+                    self.fit_camera();
+                }
+                return;
+            }
+        };
+        let Fitted {
+            bounds: was,
+            mut before,
+        } = fitted;
+        let added = changes.new_nodes_from == n0 && n1 > n0;
+        let undone = n1 < n0 && changes.new_nodes_from == n1;
+        let now = if added {
+            before.push((n0, was));
+            let new = bounds(&self.x[n0..], &self.y[n0..]);
+            match (was, new) {
+                (Some(a), Some(b)) => {
+                    Some((a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+                }
+                (a, b) => a.or(b),
+            }
+        } else if undone && before.last().is_some_and(|b| b.0 == n1) {
+            before.pop().expect("it has a last").1
+        } else {
+            self.fit_camera();
+            return;
+        };
+        self.fit_to(now);
+        self.fitted = Some(Fitted {
+            bounds: now,
+            before,
+        });
     }
 
     /// The node drawn under the pixel `(px, py)`, if any: the nearest node

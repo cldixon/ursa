@@ -96,12 +96,17 @@ impl Scene {
         gpu.lines.truncate(2 * changes.new_edges_from.min(m));
         gpu.lines.resize(2 * m, 0xdead_beef);
         gpu.flags.resize(n, 0xee);
-        let mut styles = vec![changes.new_nodes_from..n];
-        styles.extend(changes.restyled.iter().cloned());
-        for run in styles {
+        let new = changes.new_nodes_from..n;
+        gpu.radius[new.clone()].copy_from_slice(&bits(&d.style.radius[new.clone()]));
+        gpu.color[new.clone()].copy_from_slice(&d.style.color[new.clone()]);
+        bytes += 8 * new.len() as u64;
+        for run in &changes.restyled {
             gpu.radius[run.clone()].copy_from_slice(&bits(&d.style.radius[run.clone()]));
-            gpu.color[run.clone()].copy_from_slice(&d.style.color[run.clone()]);
-            bytes += 8 * run.len() as u64;
+            bytes += 4 * run.len() as u64;
+            if changes.recolored {
+                gpu.color[run.clone()].copy_from_slice(&d.style.color[run.clone()]);
+                bytes += 4 * run.len() as u64;
+            }
         }
         let positions = if changes.positions {
             0..n
@@ -111,11 +116,10 @@ impl Scene {
         gpu.x[positions.clone()].copy_from_slice(&bits(&d.x[positions.clone()]));
         gpu.y[positions.clone()].copy_from_slice(&bits(&d.y[positions.clone()]));
         bytes += 8 * positions.len() as u64;
-        let mut edges = vec![changes.new_edges_from..m];
-        edges.extend(changes.edge_runs.iter().cloned());
-        for run in edges {
-            gpu.lines[2 * run.start..2 * run.end]
-                .copy_from_slice(&self.live.line_indices(run.clone()));
+        let new_edges = changes.new_edges_from..m;
+        for run in std::iter::once(&new_edges).chain(&changes.edge_runs) {
+            let lines = self.live.line_indices(run.clone());
+            gpu.lines[2 * run.start..2 * run.end].copy_from_slice(&lines);
             bytes += 8 * run.len() as u64;
         }
         assert_eq!(
@@ -217,8 +221,9 @@ fn new_nodes_and_edges_take_the_slots_after_the_last() {
     assert_eq!(changes.restyled, vec![1..5]);
     assert!(changes.edge_runs.is_empty());
     assert!(!changes.positions && !changes.highlights);
-    // 16 bytes a new node, 8 a restyled one, 8 an edge; 4 a new node's flags.
-    assert_eq!(changes.upload_bytes(), 2 * 16 + 4 * 8 + 3 * 8);
+    // 16 bytes a new node, 4 a resized one, 8 an edge; 4 a new node's flags.
+    assert!(!changes.recolored);
+    assert_eq!(changes.upload_bytes(), 2 * 16 + 4 * 4 + 3 * 8);
     assert_eq!(scene.uploaded, changes.upload_bytes() + 2 * 4);
     // What was there is where it was.
     assert_eq!(scene.gpu.x[..5], before.x[..]);
@@ -228,7 +233,7 @@ fn new_nodes_and_edges_take_the_slots_after_the_last() {
     // Its inverse is a shorter range: only the three older nodes are written.
     let back = scene.apply(&delta.invert()).unwrap();
     assert_eq!((back.new_nodes_from, back.new_edges_from), (5, 6));
-    assert_eq!(back.upload_bytes(), 4 * 8);
+    assert_eq!(back.upload_bytes(), 4 * 4);
     assert_eq!(scene.gpu, before);
 }
 
@@ -481,6 +486,7 @@ fn a_changed_column_writes_only_the_nodes_it_changed() {
     let set = GraphDelta::new(vec![scene.result().set_column_op(Target::Nodes, kind)]);
     let changes = scene.apply(&set).unwrap();
     assert_eq!(changes.restyled, vec![2..5]);
+    assert!(changes.recolored);
     assert_eq!(changes.upload_bytes(), 3 * 8);
     let palette = &scene.theme.palette;
     assert_eq!(scene.drawn.style.color[2], palette[1]);
@@ -597,6 +603,30 @@ fn a_delta_may_take_slots_off_and_fill_them_again() {
     assert_eq!(scene.gpu, before);
 }
 
+#[test]
+fn a_flag_set_on_a_node_goes_with_it_and_not_to_the_next_in_its_slot() {
+    let mut scene = Scene::new(kite());
+    scene.apply(&growth(5, 1, &[(4, 5)])).unwrap();
+    // The page selects the new node (the view's flag, not the result's).
+    scene
+        .drawn
+        .highlight
+        .set_bits(flag::SELECTED, &[5], true)
+        .unwrap();
+    scene.drawn.highlight.take_dirty();
+    scene.gpu.flags[5] = flag::SELECTED;
+    // One delta takes it off and puts another node in its slot.
+    let swap = GraphDelta::new(vec![
+        Op::PopEdges(EdgeBatch::of_label(0, vec![4], vec![5])),
+        Op::PopNodes(NodeBatch::of_label(0, [5i64])),
+        Op::AddNodes(NodeBatch::of_label(0, [6i64])),
+    ]);
+    let changes = scene.apply(&swap).unwrap();
+    assert!(changes.highlights, "a flagged node went");
+    assert_eq!(scene.drawn.highlight.flags()[5], 0);
+    assert_eq!(scene.gpu.flags[5], 0);
+}
+
 /// A fixed generator: the same steps every run.
 struct Rng(u64);
 
@@ -633,7 +663,7 @@ fn any_run_of_steps_and_undos_draws_what_a_new_view_would() {
                 let kind = r.node_column("kind").unwrap().values.clone();
                 let texts = ["a", "b", "c", "d", "e"];
                 let kinds: Vec<Option<&str>> = (0..count)
-                    .map(|_| Some(texts[rng.below(5)]).filter(|_| rng.below(5) > 0))
+                    .map(|_| (rng.below(5) > 0).then(|| texts[rng.below(5)]))
                     .collect();
                 let ranks = (0..count).map(|_| rng.below(12) as f32 - 2.0).collect();
                 let nodes = NodeBatch::of_label(0, next_key..next_key + count as i64)

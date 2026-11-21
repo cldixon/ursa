@@ -443,6 +443,12 @@ const EDGE_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::INDEX
     .union(wgpu::BufferUsages::COPY_DST)
     .union(wgpu::BufferUsages::COPY_SRC);
 
+/// The room a view that takes deltas starts with for `len` slots: a
+/// sixty-fourth more and a few, rounded up to a power of two.
+pub fn starting_capacity(len: usize) -> usize {
+    (len + len / 64 + 64).next_power_of_two()
+}
+
 /// The capacity to grow to for `needed` slots when there is room for
 /// `capacity`: unchanged if they fit, else the next power of two, which is
 /// at least double.
@@ -812,6 +818,23 @@ impl Renderer {
         n_nodes: usize,
         n_edges: usize,
     ) {
+        self.reserve(device, queue, n_nodes, n_edges);
+        self.n_nodes = n_nodes as u32;
+        self.n_indices = 2 * n_edges as u32;
+    }
+
+    /// Make room for `n_nodes` nodes and `n_edges` edges, if there is not:
+    /// the buffers grow to the next power of two that holds them, and what
+    /// they held is copied on the GPU. A view that will take deltas reserves
+    /// some room when it is made, so that its first delta does not pay for
+    /// the copy.
+    pub fn reserve(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        n_nodes: usize,
+        n_edges: usize,
+    ) {
         let (n_nodes, n_edges) = (n_nodes as u32, n_edges as u32);
         let node_capacity = grown_capacity(self.node_capacity, n_nodes);
         let edge_capacity = grown_capacity(self.edge_capacity, n_edges);
@@ -833,7 +856,7 @@ impl Renderer {
             };
             if node_capacity > self.node_capacity {
                 let size = u64::from(node_capacity) * NODE_STRIDE;
-                let keep = u64::from(self.n_nodes.min(n_nodes)) * NODE_STRIDE;
+                let keep = u64::from(self.n_nodes) * NODE_STRIDE;
                 grow(&mut self.x, "x", NODE_USAGE, size, keep);
                 grow(&mut self.y, "y", NODE_USAGE, size, keep);
                 grow(&mut self.radius, "radius", NODE_USAGE, size, keep);
@@ -843,15 +866,27 @@ impl Renderer {
             }
             if edge_capacity > self.edge_capacity {
                 let size = u64::from(edge_capacity) * EDGE_STRIDE;
-                let keep = u64::from(self.n_indices / 2).min(u64::from(n_edges)) * EDGE_STRIDE;
+                let keep = u64::from(self.n_indices / 2) * EDGE_STRIDE;
                 grow(&mut self.lines, "edges", EDGE_USAGE, size, keep);
                 self.edge_capacity = edge_capacity;
             }
             queue.submit([encoder.finish()]);
             self.grows += 1;
         }
-        self.n_nodes = n_nodes;
-        self.n_indices = 2 * n_edges;
+    }
+
+    /// Write the flags of the nodes from `first` on, four bytes a node,
+    /// when they are all that changed and what the flags ask of a frame did
+    /// not ([`Renderer::set_flags`] otherwise). Returns the bytes written.
+    pub fn write_flags(&mut self, queue: &wgpu::Queue, first: usize, flags: &[u8]) -> u64 {
+        debug_assert!(first + flags.len() <= self.node_capacity as usize);
+        if flags.is_empty() {
+            return 0;
+        }
+        let bytes = flag_bytes(flags);
+        queue.write_buffer(&self.flags, first as u64 * NODE_STRIDE, &bytes);
+        self.flag_bytes_uploaded += bytes.len() as u64;
+        bytes.len() as u64
     }
 
     /// Write the nodes from `first` on: their positions, radii and colours
@@ -878,23 +913,27 @@ impl Renderer {
         4 * NODE_STRIDE * x.len() as u64
     }
 
-    /// Write the radii and colours of the nodes from `first` on, eight bytes
-    /// a node. Returns the bytes written.
+    /// Write the radii of the nodes from `first` on, and their colours if
+    /// given: four bytes a node each. Returns the bytes written.
     pub fn write_styles(
         &self,
         queue: &wgpu::Queue,
         first: usize,
         radius: &[f32],
-        color: &[u32],
+        color: Option<&[u32]>,
     ) -> u64 {
         debug_assert!(first + radius.len() <= self.node_capacity as usize);
         if radius.is_empty() {
             return 0;
         }
         let at = first as u64 * NODE_STRIDE;
+        let mut bytes = NODE_STRIDE * radius.len() as u64;
         queue.write_buffer(&self.radius, at, bytemuck::cast_slice(radius));
-        queue.write_buffer(&self.color, at, &rgba_bytes(color));
-        2 * NODE_STRIDE * radius.len() as u64
+        if let Some(color) = color {
+            queue.write_buffer(&self.color, at, &rgba_bytes(color));
+            bytes += NODE_STRIDE * color.len() as u64;
+        }
+        bytes
     }
 
     /// Write the edges from `first` on: `src, dst` each, eight bytes an
@@ -1174,6 +1213,12 @@ mod tests {
         // takes it to the next power of two.
         assert_eq!(grown_capacity(1_000_000, 1_000_300), 1 << 20);
         assert_eq!(grown_capacity(0, 1), 1);
+        // A view that takes deltas starts with room: a million edges with
+        // room for 48,576 more, and the karate club's 78 for 178.
+        assert_eq!(starting_capacity(1_000_000), 1 << 20);
+        assert_eq!(starting_capacity(1 << 20), 1 << 21);
+        assert_eq!(starting_capacity(78), 256);
+        assert_eq!(starting_capacity(0), 64);
         // A thousand additions of 300 edges grow a million-edge buffer once.
         let (mut capacity, mut grows) = (1_000_000, 0);
         for step in 1..=1000 {
