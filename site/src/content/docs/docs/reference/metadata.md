@@ -7,6 +7,8 @@ A result says what its columns are. Every graph function and `GRAPH_TABLE` marks
 
 The metadata changes no value, no column name and no type. A plain table, and a query over files only, has none.
 
+The Web Shell's `.graph` reads it to draw a result as what it is: a `hop` result as its seeds and the nodes reached with the graph's edges among them, `vertices(p)` as paths, three pattern variables as every edge of the pattern, and an algorithm's `id` and score as nodes sized by the score. Without it, `.graph` goes by the columns' names and types.
+
 ## The keys
 
 | Key | On | Value |

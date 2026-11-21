@@ -1,0 +1,43 @@
+{
+  "drawnAs": "2 paths (members)",
+  "dst": [
+    1,
+    2,
+    3,
+    2
+  ],
+  "graph": null,
+  "ids": [
+    "16",
+    "5",
+    "0",
+    "6"
+  ],
+  "layout": {
+    "kind": "layers",
+    "level": [
+      0,
+      1,
+      2,
+      1
+    ]
+  },
+  "n": 4,
+  "provenance": {
+    "roles": [
+      {
+        "column": "members",
+        "role": "path_nodes"
+      }
+    ],
+    "rule": "path",
+    "sql": "SELECT * FROM (VALUES (2, [16, 5, 0]), (2, [16, 6, 0])) AS t(steps, members)"
+  },
+  "skipped": 0,
+  "src": [
+    0,
+    1,
+    0,
+    3
+  ]
+}

@@ -6,7 +6,10 @@
 
 use std::sync::{Arc, OnceLock};
 
-use ursa_core::algo::{fa2_grow, Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams, WarmParams};
+use ursa_core::algo::{
+    fa2_grow, layout_layers, layout_rings, Fa2Multilevel, Fa2Params, Fa2State, LayersParams,
+    MultilevelParams, RingsParams, WarmParams,
+};
 use ursa_core::topology::Topology;
 
 /// A graph to show: `n_nodes` nodes, and one edge per `(src[i], dst[i])`, as
@@ -186,9 +189,14 @@ fn check_edges(n_nodes: usize, first: usize, src: &[u32], dst: &[u32]) -> Result
 /// or coarse to fine ([`LiveLayout::multilevel`]), `Fa2Multilevel`'s, the same
 /// as `layout_fa2_multilevel` once done.
 ///
-/// Either can then **grow** ([`LiveLayout::grow`]): the graph gains nodes and
-/// edges, the new nodes start beside the ones they came from, and a short
-/// warm schedule settles them while what was drawn is held.
+/// A result whose nodes have a level needs no iterations at all:
+/// [`LiveLayout::rings`] (a neighbourhood, by distance from its seeds) and
+/// [`LiveLayout::layers`] (paths, by position along them) are **fixed**
+/// layouts, done as soon as they are made.
+///
+/// Any of them can then **grow** ([`LiveLayout::grow`]): the graph gains
+/// nodes and edges, the new nodes start beside the ones they came from, and
+/// a short warm schedule settles them while what was drawn is held.
 #[derive(Debug)]
 pub struct LiveLayout {
     topology: Arc<Topology>,
@@ -207,7 +215,56 @@ enum Engine {
         run: u32,
         total: u32,
     },
+    /// Rings or layers: positions that were right when they were made, with
+    /// nothing to run.
+    Fixed {
+        kind: LayoutKind,
+        x: Vec<f32>,
+        y: Vec<f32>,
+    },
 }
+
+/// Which layout a [`LiveLayout`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    /// ForceAtlas2: flat, coarse to fine, or warm after growing.
+    Force,
+    /// Concentric rings by distance from the seeds ([`LiveLayout::rings`]).
+    Rings,
+    /// Layers left to right ([`LiveLayout::layers`]).
+    Layers,
+}
+
+impl LayoutKind {
+    /// `"force"`, `"rings"` or `"layers"`: the names `.graph … LAYOUT` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            LayoutKind::Force => "force",
+            LayoutKind::Rings => "rings",
+            LayoutKind::Layers => "layers",
+        }
+    }
+}
+
+/// Levels that are not one per node of the graph ([`LiveLayout::rings`],
+/// [`LiveLayout::layers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadLevels {
+    pub n_nodes: usize,
+    pub got: usize,
+}
+
+impl std::fmt::Display for BadLevels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected one level per node ({}); got {}",
+            self.n_nodes, self.got
+        )
+    }
+}
+
+impl std::error::Error for BadLevels {}
 
 /// What a layout gains in [`LiveLayout::grow`], besides the grown graph.
 #[derive(Debug, Clone, Copy, Default)]
@@ -311,6 +368,62 @@ impl LiveLayout {
         })
     }
 
+    /// Concentric rings, for a neighbourhood (a `hop` result):
+    /// `distance[v]` is node `v`'s distance from a seed, 0 for a seed and
+    /// [`ursa_core::algo::NO_LEVEL`] for a node that has none. One seed is
+    /// at the centre with distance `d` on the circle of radius `d`; several
+    /// seeds get a ring system each, side by side. The order on each ring
+    /// shortens the graph's edges. It is `ursa_core::algo::layout_rings`,
+    /// and it is done at once: [`Self::is_done`] from the start, with no
+    /// iterations to run.
+    pub fn rings(graph: &Graph, distance: &[u32], params: RingsParams) -> Result<Self, BadLevels> {
+        Self::fixed(graph, distance, LayoutKind::Rings, |adj| {
+            layout_rings(adj, distance, params)
+        })
+    }
+
+    /// Layers left to right, for paths: `layer[v]` is node `v`'s position
+    /// along its path (or its distance from the nearest of several seeds),
+    /// [`ursa_core::algo::NO_LEVEL`] for a node that has none. Layer `l` is
+    /// a vertical line at `x = l`, and one path alone is a straight line. It
+    /// is `ursa_core::algo::layout_layers`, done at once like
+    /// [`Self::rings`].
+    pub fn layers(graph: &Graph, layer: &[u32], params: LayersParams) -> Result<Self, BadLevels> {
+        Self::fixed(graph, layer, LayoutKind::Layers, |adj| {
+            layout_layers(adj, layer, params)
+        })
+    }
+
+    fn fixed(
+        graph: &Graph,
+        levels: &[u32],
+        kind: LayoutKind,
+        place: impl FnOnce(&ursa_core::topology::UndirectedCsr) -> (Vec<f32>, Vec<f32>),
+    ) -> Result<Self, BadLevels> {
+        let n = graph.n_nodes();
+        if levels.len() != n {
+            return Err(BadLevels {
+                n_nodes: n,
+                got: levels.len(),
+            });
+        }
+        let topology = Arc::clone(graph.topology());
+        let (x, y) = place(topology.undirected());
+        Ok(Self {
+            topology,
+            engine: Engine::Fixed { kind, x, y },
+        })
+    }
+
+    /// Which layout this is. A fixed layout that has grown is a force
+    /// layout from then on.
+    pub fn kind(&self) -> LayoutKind {
+        match &self.engine {
+            Engine::Fixed { kind, .. } => *kind,
+            _ => LayoutKind::Force,
+        }
+    }
+
     /// Grow the layout to `graph`: the graph it had, with the same node
     /// indexes, plus new nodes after them and any new edges.
     ///
@@ -334,7 +447,9 @@ impl LiveLayout {
     /// same bits, on any thread count (`ursa_core::algo::fa2_grow`). A
     /// coarse-to-fine layout can be grown before its schedule is done; it
     /// grows from the positions it has reached, and the rest of that
-    /// schedule is dropped.
+    /// schedule is dropped. Rings and layers grow from their positions too,
+    /// as a force layout (coarse to fine's force law): the new nodes settle
+    /// beside their parents, not on a ring or a layer.
     pub fn grow(&mut self, graph: &Graph, growth: Growth<'_>) -> Result<(), BadGrowth> {
         let had = self.positions().0.len();
         let n = graph.n_nodes();
@@ -363,6 +478,9 @@ impl LiveLayout {
                 let (x, y) = m.positions();
                 // The masses are the grown graph's, set below.
                 Fa2State::from_positions(m.params().fa2, x.to_vec(), y.to_vec(), vec![1.0; had])
+            }
+            Engine::Fixed { x, y, .. } => {
+                Fa2State::from_positions(MultilevelParams::default().fa2, x, y, vec![1.0; had])
             }
         };
         self.topology = Arc::clone(graph.topology());
@@ -395,6 +513,7 @@ impl LiveLayout {
                 state.step(adj, iterations);
                 *run += iterations;
             }
+            Engine::Fixed { .. } => {}
         }
     }
 
@@ -405,33 +524,37 @@ impl LiveLayout {
             Engine::Flat(s) => s.iterations(),
             Engine::Multilevel(s) => s.work_done().round() as u32,
             Engine::Warm { run, .. } => *run,
+            Engine::Fixed { .. } => 0,
         }
     }
 
     /// The work of the whole schedule, in iterations of the whole graph, for
     /// coarse to fine; `None` for flat, which runs for as long as it is
-    /// stepped.
+    /// stepped; 0 for rings and layers.
     pub fn total(&self) -> Option<u32> {
         match &self.engine {
             Engine::Flat(_) => None,
             Engine::Multilevel(s) => Some(s.total_work().round() as u32),
             Engine::Warm { total, .. } => Some(*total),
+            Engine::Fixed { .. } => Some(0),
         }
     }
 
-    /// Whether coarse to fine has run its schedule (never, for flat).
+    /// Whether the layout has run its schedule: never, for flat; from the
+    /// start, for rings and layers.
     pub fn is_done(&self) -> bool {
         match &self.engine {
             Engine::Flat(_) => false,
             Engine::Multilevel(s) => s.is_done(),
             Engine::Warm { run, total, .. } => run >= total,
+            Engine::Fixed { .. } => true,
         }
     }
 
     /// The level being laid out: 0 is the graph itself (always, for flat).
     pub fn level(&self) -> usize {
         match &self.engine {
-            Engine::Flat(_) | Engine::Warm { .. } => 0,
+            Engine::Flat(_) | Engine::Warm { .. } | Engine::Fixed { .. } => 0,
             Engine::Multilevel(s) => s.level(),
         }
     }
@@ -440,7 +563,7 @@ impl LiveLayout {
     /// graph itself (1, for flat).
     pub fn levels(&self) -> usize {
         match &self.engine {
-            Engine::Flat(_) | Engine::Warm { .. } => 1,
+            Engine::Flat(_) | Engine::Warm { .. } | Engine::Fixed { .. } => 1,
             Engine::Multilevel(s) => s.coarse_levels() + 1,
         }
     }
@@ -450,6 +573,7 @@ impl LiveLayout {
         match &self.engine {
             Engine::Flat(s) | Engine::Warm { state: s, .. } => s.positions(),
             Engine::Multilevel(s) => s.positions(),
+            Engine::Fixed { x, y, .. } => (x, y),
         }
     }
 }
@@ -797,6 +921,52 @@ mod tests {
         let (x, y) = live.positions();
         let (ex, ey) = state.positions();
         assert_eq!((x, y), (ex, ey));
+    }
+
+    #[test]
+    fn rings_and_layers_are_done_at_once_and_grow() {
+        // A seed, two neighbours and one node two hops out.
+        let g = Graph::new(4, vec![0, 0, 1], vec![1, 2, 3]).unwrap();
+        let level = [0, 1, 1, 2];
+        let rings = LiveLayout::rings(&g, &level, RingsParams::default()).unwrap();
+        assert_eq!(rings.kind(), LayoutKind::Rings);
+        assert!(rings.is_done());
+        assert_eq!((rings.iterations(), rings.total()), (0, Some(0)));
+        assert_eq!((rings.level(), rings.levels()), (0, 1));
+        let (ex, ey) = layout_rings(g.topology().undirected(), &level, RingsParams::default());
+        assert_eq!(rings.positions(), (&ex[..], &ey[..]));
+        let (x, y) = rings.positions();
+        for v in 0..4 {
+            assert!((x[v].hypot(y[v]) - level[v] as f32).abs() < 1e-5);
+        }
+
+        let mut layers = LiveLayout::layers(&g, &level, LayersParams::default()).unwrap();
+        assert_eq!(layers.kind().name(), "layers");
+        assert!(layers.is_done());
+        let before = (layers.positions().0.to_vec(), layers.positions().1.to_vec());
+        assert_eq!(before.0, vec![-1.0, 0.0, 0.0, 1.0]);
+        // Stepping a fixed layout does nothing.
+        layers.step(50);
+        assert_eq!(layers.positions(), (&before.0[..], &before.1[..]));
+
+        // One level too few.
+        let err = LiveLayout::rings(&g, &level[..3], RingsParams::default()).unwrap_err();
+        assert_eq!(err.to_string(), "expected one level per node (4); got 3");
+
+        // A fixed layout grows as any other: node 3 gains a neighbour, which
+        // starts beside it, and the layout is a force layout from then on.
+        let grown = Graph::new(5, vec![0, 0, 1, 3], vec![1, 2, 3, 4]).unwrap();
+        layers
+            .grow(&grown, Growth::default())
+            .expect("a fixed layout grows");
+        assert_eq!(layers.kind(), LayoutKind::Force);
+        assert!(!layers.is_done());
+        while !layers.is_done() {
+            layers.step(10);
+        }
+        let (x, y) = layers.positions();
+        assert_eq!(x.len(), 5);
+        assert!(x.iter().chain(y).all(|v| v.is_finite()));
     }
 
     #[test]

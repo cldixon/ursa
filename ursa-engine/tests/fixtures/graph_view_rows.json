@@ -49,6 +49,7 @@
   ],
   "colorMissing": 1,
   "colorOther": 4,
+  "drawnAs": "edges (src, dst)",
   "dst": [
     1,
     2,
@@ -104,6 +105,16 @@
   ],
   "n": 25,
   "provenance": {
+    "roles": [
+      {
+        "column": "src",
+        "role": "src"
+      },
+      {
+        "column": "dst",
+        "role": "dst"
+      }
+    ],
     "rule": "edges",
     "sql": "SELECT 'n' || CAST(value AS VARCHAR) AS src, CASE WHEN value = 7 THEN NULL WHEN value = 24 THEN 'é' ELSE 'n' || CAST(value + 1 AS VARCHAR) END AS dst FROM generate_series(1, 24)"
   },

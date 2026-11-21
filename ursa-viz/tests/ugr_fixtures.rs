@@ -121,6 +121,7 @@ fn plain() -> GraphResult {
     let provenance = Provenance {
         sql: Some("SELECT src, dst FROM 'edges.parquet'".into()),
         rule: Some("edges".into()),
+        ..Provenance::default()
     };
     GraphResult::build(None, provenance, &delta).unwrap()
 }
@@ -148,6 +149,7 @@ fn town() -> GraphResult {
     let provenance = Provenance {
         sql: Some("FROM GRAPH_TABLE (town MATCH (a)-[e]->(b) COLUMNS (a.id, b.id))".into()),
         rule: Some("pattern".into()),
+        ..Provenance::default()
     };
     let mut r = GraphResult::build(Some("town".into()), provenance, &delta).unwrap();
     for (target, column) in [
@@ -270,6 +272,7 @@ fn expand() -> (GraphDelta, Value) {
     .with_provenance(Provenance {
         sql: Some("SELECT * FROM hop(town, seeds => [1], n => 1)".into()),
         rule: Some("rings".into()),
+        ..Provenance::default()
     });
     let mut after = town;
     after

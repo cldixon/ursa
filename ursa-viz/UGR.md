@@ -100,7 +100,7 @@ sections):
 | `nodes.positions` | whether the nodes have positions |
 | `highlights` | how many `paths` and `seeds`, and `distance`: the name of the `u32` node column holding each node's distance from the seeds, or `null` |
 | `encodings` | the node columns that size, colour and group (`null`: none), and `layout`: `"force"`, `"rings"` or `"layers"` |
-| `provenance` | the `sql` that made the result and the result → graph `rule` that fired, each or `null` |
+| `provenance` | the `sql` that made the result and the result → graph `rule` that fired, each or `null`; and, each left out when empty, `roles` (the columns of the SQL's result the rule read, as `{"column", "role"}`, the role being the engine's `ursa.role`) and `notes` (what a status line adds: what was left out, what else the result could be drawn as) |
 
 A reader ignores a field it does not know. A field or a value this version
 does not define, where one it does define is required, is an error.

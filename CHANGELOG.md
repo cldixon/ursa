@@ -366,6 +366,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the old nodes 0.003% of the view's width on average. The same additions
   in the same order give the same bits on any thread count. A layout that
   uses none of this has the bits it had (`tests/layout_golden.rs`).
+- **Rings and layers: fixed layouts for neighbourhoods and paths** (#436).
+  `ursa_core::algo::layout_rings` draws a `hop` result from each node's
+  distance: the seed at the centre, distance `d` on the circle of radius
+  `d`, a crowded ring widened so that no two nodes are nearer than a
+  quarter of a unit, and several seeds as one ring system each, side by
+  side. `layout_layers` draws paths from each node's position along them:
+  layer `l` on the line at `x = l`, one path alone a straight line. The
+  order on a ring or a line is chosen by four barycentre sweeps (ties by
+  node index), and each node is then placed as near its neighbours' mean as
+  its spacing allows. Neither iterates: 2 ms for 2,048 nodes and 8,334
+  edges, 0.3 s at 1M edges, on one thread (`ursa-viz/BENCH.md`). Both are
+  serial, so the same input gives the same bits on any thread count;
+  layers are the same bits on every platform. In `ursa-viz`,
+  `LiveLayout::rings` and `LiveLayout::layers` (done at once, and they
+  grow like any layout), `Layout.rings`, `Layout.layers` and `Layout.kind`
+  in the wasm API, and the shell's layout worker takes
+  `layout: {kind, level}` and posts one message. On karate, two hops from
+  node 0 are two rings of 16 and 9 nodes, and all shortest paths from 16 to
+  26 are six layers, drawn without a crossing. No existing layout changes.
 - **Layouts in SQL: `layout_fa2` and `layout_fr`** (#395). Both are table
   functions of `(id, x, y)`, like the algorithms, and work inside
   `algorithms(g, …)`, where their columns are `x` and `y`, or
@@ -399,6 +418,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **`.graph` draws what a result means** (#433). After a graph query, the
+  Web Shell's `.graph` (`ursa-engine`'s `graph::view`) now reads what each
+  column is, from the `ursa.*` metadata the graph functions and `GRAPH_TABLE`
+  write and else from its name and type, and draws the result by the first
+  rule that matches: **paths** (`vertices(p)`, with `edges(p)` or
+  `element_id(p)`, the steps of `shortest_path()`, or a list of ids) as the
+  union of the rows' paths; a **`hop` result** (`seed`, `id`, `distance`) as
+  its seeds and the nodes reached, with the graph's real edges among them
+  and coloured by distance, where it drew a star; **edges** as before
+  (`src`/`dst`, now also `source`/`target` and `from`/`to`, two pattern
+  variables, or the first two id columns); **pattern matches** of three or
+  more node variables as every edge of the pattern, where it drew only the
+  first two columns; and **nodes** (`pagerank`, `algorithms`, a table with
+  an `id`) with the graph's edges among them (`induced_edges`), sized by
+  their first metric and coloured by their first category, where it refused
+  or drew each id tied to its score. What is no graph says what its columns
+  are and what would draw them. The pane's status line and the terminal say
+  what the result was drawn as (`drawn as a path on karate (members,
+  ties)`). A result's provenance (UGR) gains `roles` and `notes`, and its
+  highlights carry the paths, the seeds and each node's distance or step,
+  with the layout the rule asks for. A plain edge table is drawn as it was:
+  the same nodes and edges, in the same order.
 - **`.graph` is resolved in the engine** (#425). What turns a source and its
   `NODES`, `SIZE BY` and `COLOR BY` clauses into a graph moved from
   `ursa-wasm` to `ursa-engine` (`graph::view`), so the CLI and the notebook

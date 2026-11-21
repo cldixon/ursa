@@ -11,7 +11,11 @@ self.onmessage = async ({ data }) => {
     wasm = await init();
     const t0 = performance.now();
     const workerInitMs = t0 - ti;
-    layout = new Layout(data.n, data.src, data.dst, data.multilevel ?? true);
+    // A fixed layout (rings or layers by `data.level`) is done as it is made.
+    layout =
+      data.layout === "rings" ? Layout.rings(data.n, data.src, data.dst, data.level)
+      : data.layout === "layers" ? Layout.layers(data.n, data.src, data.dst, data.level)
+      : new Layout(data.n, data.src, data.dst, data.multilevel ?? true);
     const buildMs = performance.now() - t0;
     running = true;
     // Coarse to fine has a place for every node before any iteration: draw it.

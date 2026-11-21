@@ -251,11 +251,13 @@ impl WebShell {
     /// `text` is `[SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`. SOURCE
     /// is empty for the last result, a property graph's name for its edges
     /// (and its vertices' keys), a table's name for its rows, or a query.
-    /// Each row is an edge from its `src` column to its `dst` column (in any
-    /// case), or else from its first column to its second; the ids become
-    /// node indexes in the order they are first seen. Both columns must hold
-    /// ids (integers, strings or dates; the first two of one kind): a float,
-    /// a boolean, a list or a struct is an error that says what to draw.
+    /// Rows are drawn by the first result → graph rule that matches them
+    /// (`ursa_engine::graph::view::rules`), read by their `ursa.*` metadata
+    /// and else by their names: paths, a hop's rings, edges (`src` and `dst`,
+    /// or else the first two columns when both are ids of one kind), a
+    /// pattern's matches, or nodes with the graph's edges among them. The
+    /// result's provenance says which, and what was not a graph is an error
+    /// that says what would be.
     ///
     /// `SIZE BY x` and `COLOR BY y` give each node a value, as a node column
     /// of the result. A name is,
@@ -634,6 +636,18 @@ mod tests {
         };
         // 3 and 4, the bridge's ends, rank highest.
         assert!(size[2] > size[0] && size.len() == 6, "{size:?}");
+
+        // The last result keeps what its columns are, so the rules read it:
+        // a hop's rings, with the graph's edges.
+        run(
+            &shell,
+            "SELECT * FROM hop(club, seeds => [3], n => 1, direction => 'both');",
+        )
+        .await;
+        let g = graph_of(&shell.ctx, last(), "").await.unwrap();
+        assert_eq!(g.drawn_as(), "rings on club (seed, id, distance)");
+        // 3 and its neighbours 1, 2 and 4: the triangle and the bridge.
+        assert_eq!((g.result.n_nodes(), g.result.n_edges()), (4, 4));
 
         // A query with a subquery in NODES, and an error from a clause.
         let g = graph_of(

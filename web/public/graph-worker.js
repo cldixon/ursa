@@ -6,9 +6,14 @@
 //
 //   {type: "init", module}                 -> {type: "ready"}  (ursa-viz loaded,
 //                                             ahead of the graph: graph.js preload)
-//   {type: "start", module, n, src, dst}
+//   {type: "start", module, n, src, dst, layout?}
 //     -> {type: "positions", xy, iterations, level, levels, total} ..., then {type: "done", iterations}
 //     or {type: "error", message}
+//
+// `layout` picks a fixed layout instead: {kind: "rings" | "layers", level},
+// `level` a Uint32Array of each node's distance from a seed (rings) or its
+// layer (layers), 0xFFFFFFFF for none. A fixed layout is done as it is made:
+// one "positions" message, then "done".
 //
 // The first message after "start" carries `times` (performance.now() here, and
 // `origin`, this worker's time origin): when it got the graph and when its
@@ -39,15 +44,24 @@ self.onmessage = async ({ data }) => {
     times = { workerStart: performance.now() };
     const { Layout } = await load(data.module);
     times.workerLoaded = performance.now();
-    const layout = new Layout(data.n, data.src, data.dst);
+    const layout = make(Layout, data);
     times.hierarchy = performance.now();
-    // Coarse to fine has a place for every node before any iteration: draw it.
+    // Coarse to fine has a place for every node before any iteration, and a
+    // fixed layout has its last: draw it.
     post(layout);
     await run(layout, data.budgetMs ?? 100);
   } catch (e) {
     self.postMessage({ type: "error", message: String(e?.message ?? e) });
   }
 };
+
+/** The layout the page asked for: coarse to fine, or rings or layers by `layout.level`. */
+function make(Layout, { n, src, dst, layout }) {
+  if (!layout) return new Layout(n, src, dst);
+  if (layout.kind === "rings") return Layout.rings(n, src, dst, layout.level);
+  if (layout.kind === "layers") return Layout.layers(n, src, dst, layout.level);
+  throw new Error(`no layout called ${layout.kind}`);
+}
 
 function post(layout) {
   const xy = new Float32Array(layout.positions());
