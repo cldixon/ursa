@@ -1083,13 +1083,26 @@ async fn traversals_use_a_stored_index() {
     let hop = "SELECT count(*) FROM hop(g, seeds => [0, 1, 2], n => 2, direction => 'both')";
     let path =
         "SELECT count(*) FROM shortest_path(g, source => 0, target => 1, direction => 'both')";
+    // The edges among 200 nodes, and the scan of the file they stand for.
+    let induced = "SELECT src, dst FROM induced_edges(g, nodes => \
+                   (SELECT * FROM generate_series(0, 199))) ORDER BY src, dst";
+    let scan = in_dir(
+        fixture.dir.path(),
+        "SELECT src, dst FROM 'edges.parquet' WHERE src < 200 AND dst < 200 ORDER BY src, dst",
+    );
     let first = open(&fixture.db()).await;
     let expected = (ok(&first, hop).await, ok(&first, path).await);
+    let edges = ok(&first, induced).await;
+    assert_eq!(edges, ok(&first, &scan).await);
+    assert!(edges.len() > 20, "{}", edges.len());
     assert_eq!(counts(&first), (1, 0));
     close(first);
     assert_eq!(read_manifest(&fixture.index_dir()).len(), 1);
 
     let second = open(&fixture.db()).await;
+    // From the stored index: loaded, never built.
+    assert_eq!(ok(&second, induced).await, edges);
+    assert_eq!(counts(&second), (0, 1));
     assert_eq!((ok(&second, hop).await, ok(&second, path).await), expected);
     assert_eq!(counts(&second), (0, 1));
 }

@@ -248,6 +248,7 @@ FROM hop(karate,
 - `hop(g, seeds =>, n =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `n` steps; `distance` is the fewest steps from the seed. The seed itself is not a row.
 - `shortest_path(g, source =>, target =>, weight =>, direction =>)`: one edge per row with `hop` and `cost`. Exactly one source and one target.
 - `random_walk(g, start =>, steps =>, walks_per_node =>, seed =>)`: one row per step.
+- `induced_edges(g, nodes =>)`: the graph's edges whose two ends are both in `nodes` (a list or a query, as seeds), one `(src, dst, edge)` row per edge; `edge` is its row in the edge table. Read from the index: use it instead of `WHERE src IN (…) AND dst IN (…)` on the edge table.
 
 ## Pattern matching: GRAPH_TABLE
 
@@ -343,7 +344,7 @@ SELECT * FROM layout_circle(karate);
 ```
 
 ```text
-Error: there is no graph function 'layout_circle'. The graph functions are: degree, pagerank, connected_components, triangle_count, clustering_coefficient, betweenness, closeness, label_propagation, louvain, layout_fa2, layout_fr, neighbors_agg, density, avg_path_length, diameter, describe, hop, shortest_path, random_walk, algorithms
+Error: there is no graph function 'layout_circle'. The graph functions are: degree, pagerank, connected_components, triangle_count, clustering_coefficient, betweenness, closeness, label_propagation, louvain, layout_fa2, layout_fr, neighbors_agg, density, avg_path_length, diameter, describe, hop, shortest_path, random_walk, induced_edges, algorithms
 ```
 
 **`log` is base 10.** In DataFusion, as in PostgreSQL and DuckDB, `log(x)` is the base-10 logarithm, not the natural one as in Python. Write `ln(x)` for the natural log, and `log10(x)` when you mean base 10, so the reader does not have to know:

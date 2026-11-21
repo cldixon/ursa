@@ -319,7 +319,7 @@ layout_fr(graph, iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)
 
 ## Traversals
 
-[`hop`](#hop) · [`shortest_path`](#shortest_path) · [`random_walk`](#random_walk)
+[`hop`](#hop) · [`shortest_path`](#shortest_path) · [`random_walk`](#random_walk) · [`induced_edges`](#induced_edges)
 
 ### hop
 
@@ -378,6 +378,22 @@ random_walk(graph, start => …, steps => …, walks_per_node => 1, seed => NULL
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 
 **Returns:** `walk_id` (Int64), `step` (Int64), `node` (Int64 or Utf8)
+
+### induced_edges
+
+The graph's edges whose two ends are both in nodes: one (src, dst, edge) row per edge, in the direction the graph stores it, edge its row in the edge table. Read from the index, in time proportional to the nodes' degrees. Parallel edges are separate rows; rows are ordered by edge.
+
+```text
+induced_edges(graph, nodes => …)
+```
+
+| Parameter | Type | Default | Choices | Description |
+|---|---|---|---|---|
+| `nodes` | node ids | `required` | – | The nodes whose edges to return: a list, a query of one column, or one id. |
+
+**Returns:** `src` (Int64 or Utf8), `dst` (Int64 or Utf8), `edge` (Int64)
+
+**NetworkX:** `G.subgraph(nodes).edges()`
 
 ## Combining functions
 

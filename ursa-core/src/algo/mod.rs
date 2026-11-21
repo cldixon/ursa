@@ -23,6 +23,7 @@ mod clustering;
 mod components;
 mod degree;
 mod hop;
+mod induced;
 mod label_prop;
 mod layout;
 mod linked;
@@ -55,6 +56,7 @@ pub use degree::degree;
 pub use hop::{
     k_hop, k_hop_distances_masked, k_hop_masked, k_hop_reached_masked, k_hop_reached_set,
 };
+pub use induced::{induced_edges, InducedEdges};
 pub use label_prop::label_propagation;
 pub use layout::{
     layout_circle, layout_fa2, layout_fr, layout_random, Fa2Params, Fa2State, LayoutParams,

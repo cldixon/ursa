@@ -455,7 +455,8 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
     }
 }
 
-/// Run a traversal (`hop`, `shortest_path`, `random_walk`) over the edges its
+/// Run a traversal (`hop`, `shortest_path`, `random_walk`, `induced_edges`)
+/// over the edges its
 /// first input produces.
 ///
 /// Its inputs, in order:
@@ -498,6 +499,9 @@ pub struct GraphTraversalNode {
     pub id_type: DataType,
     /// The graph's vertex table (see [`GraphAlgorithmNode::vertex_label`]).
     pub vertex_label: Option<String>,
+    /// The graph's edge table (its element name): the label of an edge row
+    /// in the output's field metadata.
+    pub edge_label: String,
     schema: DFSchemaRef,
 }
 
@@ -515,6 +519,7 @@ impl GraphTraversalNode {
         source: Expr,
         destination: Expr,
         vertex_label: Option<String>,
+        edge_label: String,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
         check_vertices(&graph, vertices.as_deref())?;
@@ -546,6 +551,7 @@ impl GraphTraversalNode {
         let schema = Arc::new(DFSchema::try_from(spec.schema(
             &graph,
             vertex_label.as_deref(),
+            &edge_label,
             &id_type,
         ))?);
         Ok(Self {
@@ -561,6 +567,7 @@ impl GraphTraversalNode {
             destination,
             id_type,
             vertex_label,
+            edge_label,
             schema,
         })
     }
@@ -584,6 +591,7 @@ type TraversalKey<'a> = (
     &'a Option<String>,
     &'a Vec<String>,
     &'a Option<String>,
+    &'a String,
 );
 
 impl GraphTraversalNode {
@@ -594,6 +602,7 @@ impl GraphTraversalNode {
             &self.weight,
             &self.written,
             &self.vertex_label,
+            &self.edge_label,
         )
     }
 }
@@ -718,6 +727,7 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
             source,
             destination,
             self.vertex_label.clone(),
+            self.edge_label.clone(),
         )
     }
 

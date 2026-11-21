@@ -1109,6 +1109,7 @@ impl ExecutionPlan for GraphTraversalExec {
                     &shape.traversal,
                     &nodes,
                     weights,
+                    &|e| index.edge_row(e),
                     shape.schema,
                 )
             })

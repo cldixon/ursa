@@ -482,6 +482,51 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 └───────┴───────┴───────┴─────────┘
 ```
 
+`induced_edges` returns the graph's edges among a set of nodes: the edges whose two ends are both in the set. Each row is one edge, with its two ends as the graph stores its direction and `edge`, its row in the edge table. The nodes can be a list or a query, as `hop`'s seeds:
+
+```sql
+SELECT * FROM induced_edges(karate, nodes => [0, 1, 2, 3]);
+```
+
+```text
+┌───────┬───────┬───────┐
+│  src  │  dst  │ edge  │
+│ Int64 │ Int64 │ Int64 │
+├───────┼───────┼───────┤
+│     0 │     1 │     0 │
+│     0 │     2 │     1 │
+│     0 │     3 │     2 │
+│     1 │     2 │    16 │
+│     1 │     3 │    17 │
+│     2 │     3 │    24 │
+└───────┴───────┴───────┘
+```
+
+It reads the graph's index, so its time depends on how many edges the nodes have, not on the size of the graph. A filter on the edge table, `WHERE src IN (…) AND dst IN (…)`, gives the same rows by reading every edge. With a query for the nodes, it returns the part of a graph another function picked. The ten highest-ranked members and the ties among them:
+
+```sql
+SELECT src, dst
+FROM induced_edges(karate, nodes => (
+  SELECT id FROM pagerank(karate, direction => 'both') ORDER BY pagerank DESC LIMIT 10
+))
+LIMIT 5;
+```
+
+```text
+┌───────┬───────┐
+│  src  │  dst  │
+│ Int64 │ Int64 │
+├───────┼───────┤
+│     0 │     1 │
+│     0 │     2 │
+│     0 │     3 │
+│     0 │     8 │
+│     0 │    13 │
+└───────┴───────┘
+```
+
+A node that is not in the graph is on no edge. Parallel edges are rows of their own, and rows are ordered by `edge`.
+
 ## Files in object storage
 
 Anything that works with a local path works with a URL. Credentials come from the standard environment variables (`AWS_*`, `GOOGLE_*`, `AZURE_*`) or the usual config files (see [Credentials](#credentials) below):

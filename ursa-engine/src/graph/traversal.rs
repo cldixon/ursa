@@ -1,4 +1,5 @@
-//! The traversals in SQL: `hop`, `shortest_path` and `random_walk`.
+//! The traversals in SQL: `hop`, `shortest_path`, `random_walk` and
+//! `induced_edges`.
 //!
 //! A traversal returns rows of its own (reached pairs, path edges, walk
 //! steps), not one row per node, and some of its parameters are sets of node
@@ -26,6 +27,11 @@
 //! deliberate difference: SQL's `hop` names its columns `(seed, id,
 //! distance)`, where Python's `EdgeFrame` has `(src, dst)` and no distance
 //! (#328); the parity test compares `seed` and `id` with `src` and `dst`.
+//!
+//! `induced_edges` (#432) is SQL's own: the Python library has no function
+//! for the edges among a node set ([`TraversalSpec::python`] is false), so
+//! the parity test leaves it out and `tests/traversals.rs` holds it to the
+//! join it stands for.
 
 use std::sync::Arc;
 
@@ -35,7 +41,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use ursa_core::algo::{
-    k_hop_distances_masked, random_walk_masked, shortest_path_masked,
+    induced_edges, k_hop_distances_masked, random_walk_masked, shortest_path_masked,
     shortest_path_weighted_with_cost_masked,
 };
 use ursa_core::catalog::{
@@ -135,6 +141,9 @@ pub struct TraversalSpec {
     /// The parameters besides the graph, in SQL's order: the node ids first.
     pub params: &'static [TraversalParam],
     pub outputs: &'static [TraversalOutput],
+    /// Whether the Python library has the traversal, with the same
+    /// parameters and rows: the parity test holds those to it.
+    pub python: bool,
 }
 
 impl TraversalSpec {
@@ -170,17 +179,24 @@ impl TraversalSpec {
 
     /// The output schema over `graph`, whose node ids are `id_type` and
     /// whose nodes are the keys of the vertex table `vertices` (its element
-    /// name), if it has one. Each field says what it is
-    /// ([`super::provenance`]): a node key carries the vertex table as its
-    /// label.
-    pub fn schema(&self, graph: &str, vertices: Option<&str>, id_type: &DataType) -> Schema {
+    /// name), if it has one, and whose edges are the edge table `edges`.
+    /// Each field says what it is ([`super::provenance`]): a node key
+    /// carries the vertex table as its label, an edge row the edge table.
+    pub fn schema(
+        &self,
+        graph: &str,
+        vertices: Option<&str>,
+        edges: &str,
+        id_type: &DataType,
+    ) -> Schema {
         Schema::new(
             self.outputs
                 .iter()
                 .map(|o| {
                     let field = Field::new(o.name, o.ty.data_type(id_type), false);
-                    let label = match o.ty {
-                        OutputType::Id => vertices,
+                    let label = match (o.ty, o.role) {
+                        (OutputType::Id, _) => vertices,
+                        (_, Some(provenance::ROLE_EDGE)) => Some(edges),
                         _ => None,
                     };
                     match o.role {
@@ -265,6 +281,7 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
                 Some(provenance::ROLE_DISTANCE),
             ),
         ],
+        python: true,
     },
     TraversalSpec {
         name: "shortest_path",
@@ -302,6 +319,7 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             out("hop", OutputType::Int64, Some(provenance::ROLE_STEP)),
             out("cost", OutputType::Float64, None),
         ],
+        python: true,
     },
     TraversalSpec {
         name: "random_walk",
@@ -339,6 +357,27 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             out("step", OutputType::Int64, Some(provenance::ROLE_STEP)),
             out("node", OutputType::Id, Some(provenance::ROLE_NODE)),
         ],
+        python: true,
+    },
+    TraversalSpec {
+        name: "induced_edges",
+        summary: "The graph's edges whose two ends are both in nodes: one (src, dst, edge) row \
+                  per edge, in the direction the graph stores it, edge its row in the edge \
+                  table. Read from the index, in time proportional to the nodes' degrees. \
+                  Parallel edges are separate rows; rows are ordered by edge.",
+        networkx: Some("G.subgraph(nodes).edges()"),
+        params: &[param(
+            "nodes",
+            TraversalParamType::Nodes,
+            None,
+            "The nodes whose edges to return: a list, a query of one column, or one id.",
+        )],
+        outputs: &[
+            out("src", OutputType::Id, Some(provenance::ROLE_SRC)),
+            out("dst", OutputType::Id, Some(provenance::ROLE_DST)),
+            out("edge", OutputType::Int64, Some(provenance::ROLE_EDGE)),
+        ],
+        python: false,
     },
 ];
 
@@ -363,6 +402,7 @@ pub enum Traversal {
         walks_per_node: u32,
         seed: Option<u64>,
     },
+    InducedEdges,
 }
 
 impl Traversal {
@@ -371,6 +411,7 @@ impl Traversal {
             Traversal::Hop { .. } => "hop",
             Traversal::ShortestPath { .. } => "shortest_path",
             Traversal::RandomWalk { .. } => "random_walk",
+            Traversal::InducedEdges => "induced_edges",
         };
         lookup(name).expect("every traversal has a spec")
     }
@@ -615,19 +656,23 @@ pub fn resolve(spec: &'static TraversalSpec, literals: &[(String, Literal)]) -> 
             walks_per_node: count("walks_per_node"),
             seed: seed("seed"),
         },
+        "induced_edges" => Traversal::InducedEdges,
         other => unreachable!("no traversal {other}"),
     })
 }
 
 /// Run `traversal` over a graph. `nodes` holds, per node parameter in order,
 /// its ids as dense indexes (`None` for an id not in the graph or a null);
-/// `weights` is one `f64` per edge row for a weighted shortest path.
+/// `weights` is one `f64` per edge row for a weighted shortest path;
+/// `edge_row` gives the edge table's row of an edge of the index (see
+/// `GraphIndex::edge_row`).
 pub fn batch(
     topology: &Topology,
     ids: &IdMap,
     traversal: &Traversal,
     nodes: &[Vec<Option<u32>>],
     weights: Option<&[f64]>,
+    edge_row: &dyn Fn(u32) -> u64,
     schema: Arc<Schema>,
 ) -> Result<RecordBatch> {
     // An id not in the graph reaches nothing (#225), as in ursa-plan.
@@ -687,6 +732,16 @@ pub fn batch(
                 Arc::new(Int64Array::from(walks.walk_id)),
                 Arc::new(Int64Array::from(walks.step)),
                 ids.gather_user(&walks.node),
+            ]
+        }
+        Traversal::InducedEdges => {
+            // An id not in the graph is on no edge (#225), as for `hop`.
+            let edges = induced_edges(topology, &known(0));
+            let rows: Vec<i64> = edges.edge.iter().map(|&e| edge_row(e) as i64).collect();
+            vec![
+                ids.gather_user(&edges.src),
+                ids.gather_user(&edges.dst),
+                Arc::new(Int64Array::from(rows)),
             ]
         }
     };
