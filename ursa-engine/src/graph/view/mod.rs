@@ -1,0 +1,511 @@
+//! A result as a graph (design §3 and §6, #425): what `.graph` draws, as a
+//! [`GraphResult`] any front end can show: the browser shell, and the CLI
+//! and the notebook after it.
+//!
+//! [`of_command`] reads `.graph`'s text,
+//! `[SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
+//!
+//! 1. [`clauses`] splits the text into its source and its [`Style`].
+//! 2. A [`Source`] is found: the last result, a query's, a table's rows, or a
+//!    property graph.
+//! 3. [`rules`] chooses the result → graph rule that draws it. Today rows are
+//!    edges, from their `src` and `dst` columns or else the first two, both
+//!    ids ([`rules::endpoint_columns`]); a property graph is its edge tables
+//!    and its vertex tables' keys, so a node with no edges is drawn too.
+//!    The rest of the design's rules (#433) slot in there.
+//! 4. Ids become dense node indexes `0..n`, in the order they are first
+//!    seen, so the same rows always give the same graph.
+//! 5. `SIZE BY` and `COLOR BY` each become a node column, which the result's
+//!    encodings name.
+//!
+//! The result's provenance says the SQL it came from and the rule that drew
+//! it. [`GraphView::legend`] is the legend of `COLOR BY`.
+//!
+//! This module runs SQL text (a source that is a query, `NODES (…)`, the
+//! algorithms of `SIZE BY pagerank`), and the SQL front end is `ursa-sql`,
+//! which depends on this crate. So the caller hands in how to run it, as a
+//! [`RunSql`]: `ursa_sql::Sql` for Ursa's whole dialect, or [`DataFusionSql`]
+//! for DataFusion's alone.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::common::TableReference;
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::provider_as_source;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::LogicalPlanBuilder;
+use datafusion::prelude::SessionContext;
+use ursa_viz::model::{
+    Column as ModelColumn, EdgeBatch, Encodings, GraphDelta, GraphResult, KeyType, NodeBatch,
+    NodeLabel, Op, Provenance, Role, Strings, Target, Values, NULL,
+};
+
+use crate::graph::schema::graph_table;
+use crate::graph::{edges_plan, registry_of, GraphDef, PropertyGraph};
+
+mod build;
+pub mod clauses;
+pub mod rules;
+mod style;
+
+#[cfg(test)]
+mod tests;
+
+use build::{build_indexed, from_shape, EdgeList, NodeIndex};
+pub use clauses::{identifier, parse, Name, Style};
+pub use rules::Rule;
+use style::{
+    color_by, degree_column, resolve, run_algorithms, size_by, vertex_column, Found, NodeValues,
+};
+
+/// The most edges a view draws: about what a laptop's browser lays out and
+/// draws, and 16 MB of node indexes to hand it.
+pub const MAX_EDGES: usize = 2_000_000;
+/// The most nodes, for a property graph whose vertex tables are large.
+pub const MAX_NODES: usize = 4_000_000;
+/// The most categories `COLOR BY` colours; the rest are drawn as "other". A
+/// front end's palette has as many colours, then other's.
+pub const MAX_CATEGORIES: usize = 8;
+
+/// What the colour column is called when `SIZE BY` and `COLOR BY` name the
+/// same thing: the name, then this. A result's node columns have distinct
+/// names, and the size column has the name itself. [`Legend::by`] is the
+/// name without it.
+pub const COLOR_SUFFIX: &str = " (colour)";
+
+pub(crate) fn plan_err<T>(message: impl Into<String>) -> Result<T> {
+    Err(DataFusionError::Plan(message.into()))
+}
+
+/// A result's schema and its rows.
+pub type Rows = (SchemaRef, Vec<RecordBatch>);
+
+/// How SQL text is run on a session: every statement, giving the rows of the
+/// last.
+#[async_trait]
+pub trait RunSql: Send + Sync {
+    async fn run(&self, ctx: &SessionContext, text: &str) -> Result<Rows>;
+}
+
+/// [`RunSql`] by `SessionContext::sql`: DataFusion's dialect and one
+/// statement, without Ursa's own (`GRAPH_TABLE`, `FROM`-first queries,
+/// `CREATE PROPERTY GRAPH`). A front end with `ursa-sql` uses `ursa_sql::Sql`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DataFusionSql;
+
+#[async_trait]
+impl RunSql for DataFusionSql {
+    async fn run(&self, ctx: &SessionContext, text: &str) -> Result<Rows> {
+        let frame = ctx.sql(text).await?;
+        let schema = Arc::new(frame.schema().as_arrow().clone());
+        Ok((schema, frame.collect().await?))
+    }
+}
+
+/// `n` with thousands separators: 2,000,000.
+pub(crate) fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What `.graph` draws: a property graph, or rows.
+pub enum Source {
+    Graph(Arc<PropertyGraph>),
+    Rows {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        /// The SQL the rows are the result of, if known, for the provenance.
+        sql: Option<String>,
+    },
+}
+
+impl Source {
+    /// What `.graph TEXT` names: the property graph TEXT names, a table's
+    /// rows, or a query's result (its last statement's).
+    pub async fn of_text(ctx: &SessionContext, sql: &dyn RunSql, text: &str) -> Result<Source> {
+        if let Some(name) = identifier(text) {
+            if let Some(graph) = registry_of(ctx).get(&name) {
+                return Ok(Source::Graph(graph));
+            }
+            let table = TableReference::bare(name.as_str());
+            if !ctx.table_exist(table.clone())? {
+                return plan_err(format!(
+                    "no graph or table named '{name}'; .graphs lists the graphs and .tables the \
+                     tables, or give a query: .graph SELECT src, dst FROM …"
+                ));
+            }
+            let frame = ctx.table(table).await?;
+            let schema = Arc::new(frame.schema().as_arrow().clone());
+            return Ok(Source::Rows {
+                schema,
+                batches: frame.collect().await?,
+                sql: Some(format!("SELECT * FROM {}", text.trim())),
+            });
+        }
+        let (schema, batches) = sql.run(ctx, text).await?;
+        Ok(Source::Rows {
+            schema,
+            batches,
+            sql: Some(text.trim().to_string()),
+        })
+    }
+
+    /// Rows whose SQL is not known: the shell's last result.
+    pub fn of_rows((schema, batches): Rows) -> Source {
+        Source::Rows {
+            schema,
+            batches,
+            sql: None,
+        }
+    }
+}
+
+/// A graph to draw, and what was left out of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphView {
+    /// The nodes, the edges, and the columns `SIZE BY` and `COLOR BY` made,
+    /// which its encodings name. Every node has the one label `""`, and no
+    /// edge's row is known.
+    pub result: GraphResult,
+    /// Rows left out because an endpoint is NULL.
+    pub skipped: usize,
+}
+
+impl GraphView {
+    /// The legend of `COLOR BY`, if it was asked.
+    pub fn legend(&self) -> Option<Legend> {
+        Legend::of(&self.result)
+    }
+}
+
+/// `COLOR BY`'s legend: the categories coloured, the largest first, and the
+/// nodes that are in none of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legend {
+    /// What the nodes are coloured by, as typed.
+    pub by: String,
+    /// The categories coloured, at most [`MAX_CATEGORIES`], by colour index:
+    /// their values as the shell prints them.
+    pub labels: Vec<String>,
+    /// How many nodes each has.
+    pub counts: Vec<u32>,
+    /// Nodes in the categories past the coloured ones.
+    pub other: u32,
+    /// Nodes with no value (NULL, or none given).
+    pub missing: u32,
+}
+
+impl Legend {
+    /// The legend of the column `result`'s encodings colour by: a dictionary
+    /// column whose values are in order of rank, as [`of_command`] writes it.
+    pub fn of(result: &GraphResult) -> Option<Legend> {
+        let name = result.encodings().color_by.as_deref()?;
+        let Values::Dict { values, codes } = &result.node_column(name)?.values else {
+            return None;
+        };
+        let size = result.encodings().size_by.as_deref();
+        let by = match name.strip_suffix(COLOR_SUFFIX) {
+            Some(by) if size == Some(by) => by,
+            _ => name,
+        };
+        let top = values.len().min(MAX_CATEGORIES);
+        let mut legend = Legend {
+            by: by.to_string(),
+            labels: values.iter().take(top).map(str::to_string).collect(),
+            counts: vec![0; top],
+            other: 0,
+            missing: 0,
+        };
+        for &code in codes {
+            match code {
+                NULL => legend.missing += 1,
+                c if (c as usize) < top => legend.counts[c as usize] += 1,
+                _ => legend.other += 1,
+            }
+        }
+        Some(legend)
+    }
+}
+
+/// What `.graph TEXT` draws: `[SOURCE] [NODES (query)] [SIZE BY x]
+/// [COLOR BY y]`. With no source, it is `last`: the shell's last result.
+pub async fn of_command(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    text: &str,
+    last: Option<Rows>,
+) -> Result<GraphView> {
+    let (text, style) = parse(text)?;
+    let source = if !text.is_empty() {
+        Source::of_text(ctx, sql, &text).await?
+    } else {
+        let Some(rows) = last else {
+            return plan_err(
+                "no result to draw yet: run a query whose rows are edges (columns src and dst, \
+                 or else the first two), then .graph; or .graph NAME for a property graph",
+            );
+        };
+        Source::of_rows(rows)
+    };
+    draw(ctx, sql, source, &style).await
+}
+
+/// The graph `source` draws, styled as `style` says (`SIZE BY`, `COLOR BY`,
+/// `NODES`).
+pub async fn draw(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    source: Source,
+    style: &Style,
+) -> Result<GraphView> {
+    let (edges, key_type) = draw_edges(ctx, sql, &source, style).await?;
+    let (graph, provenance) = match source {
+        Source::Graph(g) => (
+            Some(g.name.clone()),
+            Provenance {
+                sql: None,
+                rule: Some(Rule::Graph.name().to_string()),
+            },
+        ),
+        Source::Rows { schema, sql, .. } => (
+            None,
+            Provenance {
+                sql,
+                rule: Some(rules::shape_of(&schema)?.rule().name().to_string()),
+            },
+        ),
+    };
+    to_view(edges, &key_type, graph, provenance)
+}
+
+/// The drawing of `source`, and the type its ids were read as.
+async fn draw_edges(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    source: &Source,
+    style: &Style,
+) -> Result<(EdgeList, DataType)> {
+    let (mut edges, index) = match source {
+        Source::Graph(g) => property_graph_indexed(ctx, g).await?,
+        Source::Rows {
+            schema, batches, ..
+        } => from_shape(rules::shape_of(schema)?, batches)?,
+    };
+    if style.size.is_none() && style.color.is_none() {
+        if style.nodes.is_some() {
+            return plan_err(
+                "NODES (…) gives values for SIZE BY or COLOR BY to use; add one, as in \
+                 .graph … NODES (SELECT id, score FROM …) SIZE BY score",
+            );
+        }
+        return Ok((edges, index.key_type));
+    }
+    let graph = match source {
+        Source::Graph(g) => Some(g.as_ref()),
+        Source::Rows { .. } => None,
+    };
+    let nodes = match &style.nodes {
+        Some(query) => Some(NodeValues::of_query(ctx, sql, query).await?),
+        None => None,
+    };
+    // Where each name's values come from; the algorithms run together.
+    let mut found = Vec::new();
+    for (clause, name) in [("SIZE BY", &style.size), ("COLOR BY", &style.color)] {
+        if let Some(name) = name {
+            found.push((
+                clause,
+                name,
+                resolve(ctx, graph, nodes.as_ref(), clause, name).await?,
+            ));
+        }
+    }
+    let mut algorithms: Vec<&'static str> = Vec::new();
+    for (_, _, f) in &found {
+        if let Found::Algorithm(name) = f {
+            if !algorithms.contains(name) {
+                algorithms.push(name);
+            }
+        }
+    }
+    let computed = match (graph, algorithms.is_empty()) {
+        (Some(g), false) => Some(run_algorithms(ctx, sql, g, &algorithms).await?),
+        _ => None,
+    };
+    for (clause, name, f) in found {
+        let column = match f {
+            Found::Nodes(i) => nodes.as_ref().expect("NODES was given").column(i),
+            Found::Vertex => vertex_column(ctx, graph.expect("a graph"), &name.ident).await?,
+            Found::Algorithm(algorithm) => computed.as_ref().expect("ran").column_named(algorithm),
+            Found::Degree => degree_column(&edges),
+        };
+        let values = column.per_node(&index, edges.n as usize)?;
+        if clause == "SIZE BY" {
+            edges.size = Some(size_by(&name.shown, &values)?);
+        } else {
+            edges.color = Some(color_by(&name.shown, &values)?);
+        }
+    }
+    Ok((edges, index.key_type))
+}
+
+/// The edges of `graph`: every edge table's source and destination columns,
+/// and every vertex table's keys, so nodes with no edges are drawn too.
+async fn property_graph_indexed(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+) -> Result<(EdgeList, NodeIndex)> {
+    let state = ctx.state();
+    let mut vertices = Vec::new();
+    for v in &graph.vertex_tables {
+        let batches = scan_columns(ctx, graph, &v.table, &[v.key.as_str()]).await?;
+        vertices.extend(batches.iter().map(|b| Arc::clone(b.column(0))));
+    }
+    let mut edges = Vec::new();
+    for e in &graph.edge_tables {
+        let def = GraphDef {
+            name: graph.name.clone(),
+            edges: e.clone(),
+            vertices: None,
+        };
+        let plan = edges_plan(&state, &def).await?;
+        let batches = DataFrame::new(state.clone(), plan)
+            .select_columns(&[e.source.as_str(), e.destination.as_str()])?
+            .collect()
+            .await?;
+        edges.extend(
+            batches
+                .iter()
+                .map(|b| (Arc::clone(b.column(0)), Arc::clone(b.column(1)))),
+        );
+    }
+    if graph.edge_tables.is_empty() {
+        return plan_err(format!(
+            "graph '{}' has no edge tables: there are no edges to draw",
+            graph.name
+        ));
+    }
+    build_indexed(&vertices, &edges)
+}
+
+/// The columns `columns` of one of `graph`'s tables, every row.
+pub(crate) async fn scan_columns(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+    table: &TableReference,
+    columns: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    let state = ctx.state();
+    let provider = graph_table(&state, &graph.name, table).await?;
+    let plan =
+        LogicalPlanBuilder::scan(table.clone(), provider_as_source(provider), None)?.build()?;
+    DataFrame::new(state.clone(), plan)
+        .select_columns(columns)?
+        .collect()
+        .await
+}
+
+/// The type of the keys of a label whose ids were read as `key_type` and
+/// print as `ids`: integers, where every one is an `i64` in decimal.
+fn key_type_of(key_type: &DataType, ids: &[String]) -> KeyType {
+    let fits = match key_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => true,
+        // Past i64::MAX a key is text.
+        DataType::UInt64 => ids.iter().all(|id| id.parse::<i64>().is_ok()),
+        _ => false,
+    };
+    if fits {
+        KeyType::Int
+    } else {
+        KeyType::Text
+    }
+}
+
+/// `edges` as a [`GraphResult`]: one node label and one edge label, both
+/// `""`, the node columns of `SIZE BY` and `COLOR BY`, and the encodings
+/// that name them.
+fn to_view(
+    edges: EdgeList,
+    key_type: &DataType,
+    graph: Option<String>,
+    provenance: Provenance,
+) -> Result<GraphView> {
+    let model = |e: ursa_viz::model::ModelError| {
+        DataFusionError::Plan(format!("the graph cannot be drawn: {e}"))
+    };
+    let EdgeList {
+        n,
+        src,
+        dst,
+        ids,
+        skipped,
+        size,
+        color,
+    } = edges;
+    let label = NodeLabel::new("", key_type_of(key_type, &ids));
+    let nodes = NodeBatch {
+        labels: vec![0; n as usize],
+        keys: ids.iter().collect::<Strings>(),
+        ..NodeBatch::default()
+    };
+    drop(ids);
+    let base = GraphDelta::new(vec![
+        Op::AddNodeLabel(label),
+        Op::AddEdgeLabel(String::new()),
+        Op::AddNodes(nodes),
+        Op::AddEdges(EdgeBatch::of_label(0, src, dst)),
+    ]);
+    let mut result = GraphResult::build(graph, provenance, &base).map_err(model)?;
+    drop(base);
+
+    let mut encodings = Encodings::default();
+    let mut columns = Vec::new();
+    if let Some(size) = size {
+        encodings.size_by = Some(size.by.clone());
+        columns.push(ModelColumn::new(
+            size.by,
+            Some(Role::Metric),
+            Values::F32(size.values),
+        ));
+    }
+    if let Some(color) = color {
+        let name = if encodings.size_by.as_deref() == Some(color.by.as_str()) {
+            format!("{}{COLOR_SUFFIX}", color.by)
+        } else {
+            color.by
+        };
+        encodings.color_by = Some(name.clone());
+        columns.push(ModelColumn::new(
+            name,
+            Some(Role::Category),
+            Values::Dict {
+                values: color.values.iter().collect(),
+                codes: color.codes,
+            },
+        ));
+    }
+    for column in columns {
+        let op = result.set_column_op(Target::Nodes, column);
+        result.apply(&GraphDelta::new(vec![op])).map_err(model)?;
+    }
+    if encodings != Encodings::default() {
+        let op = result.set_encodings_op(encodings);
+        result.apply(&GraphDelta::new(vec![op])).map_err(model)?;
+    }
+    Ok(GraphView { result, skipped })
+}

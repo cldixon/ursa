@@ -64,7 +64,8 @@ static assets and an R2 bucket.
     `.graph` (or the Graph button) draws the last result as a graph in a
     pane beside the terminal, or under it under 640px; `.graph QUERY` draws a
     query's and `.graph NAME` a property graph's (or a table's). The engine
-    makes the graph (`WebShell.graph`, the `graph` op of the worker): each
+    makes the graph (`ursa-engine`'s `graph::view`, through `WebShell.graph`
+    and the `graph` op of the worker; see "The engine's graph" below): each
     row an edge from its `src` to its `dst` column (in any case), else from
     its first column to its second, the ids numbered `0..n` in the order
     they are first seen, at most 2,000,000 edges. The two columns must hold
@@ -93,10 +94,27 @@ static assets and an R2 bucket.
     categories, the rest "other", and refuses a fractional column with more
     than eight values or any with more than eight that are over half the
     nodes (it suggests `SIZE BY`). The engine parses and resolves it all
-    (`ursa-wasm/src/graph.rs`) and returns each node's size and colour index
-    with the legend's labels and counts. The legend, under the pane's
+    (`ursa-engine/src/graph/view/`) into two node columns of the result,
+    from which the page reads each node's size and colour index and the
+    legend's labels and counts. The legend, under the pane's
     header, names what sizes the nodes (with its range) and each colour's
     category and count, in text.
+  - **The engine's graph** (#425): `.graph` is resolved in `ursa-engine`
+    (`graph::view`: the clauses, the source, the ids as dense node indexes,
+    `SIZE BY`, `COLOR BY` and `NODES`), not in `ursa-wasm`, so the CLI and
+    the notebook can draw what the shell draws. It makes a graph result
+    (`ursa-viz`'s `model`), which `WebShell.graph` hands the worker as one
+    UGR buffer (`ursa-viz/UGR.md`), and the worker transfers it to the page:
+    `{ugr, skipped}`. `graph.js` reads it with `ursa-viz/ui/ugr.js`
+    (`build.ts` copies it to `dist/ugr.js`), as typed arrays over the buffer
+    with no copy, and `public/graph-data.js` makes it the drawing: `n`,
+    `src`, `dst`, each node's id (decoded when asked for), the size column
+    as it is, and the colour column, a dictionary whose values are the
+    categories by rank, as colour indexes and the legend. The result's
+    provenance says the SQL and the rule that drew it (`edges`, or `graph`
+    for a property graph); nothing shows it yet (#433 will).
+    `bun test tests/graph-data.test.ts` runs that path without a browser,
+    on the fixtures `ursa-engine`'s `tests/graph_view.rs` writes.
   - **Theme:** `ursa-viz` draws in the page's `--graph-*` tokens
     (`style.css`: background, edge ink, plain nodes, eight categorical hues
     and "other", stepped for each theme; and `--graph-highlight`,

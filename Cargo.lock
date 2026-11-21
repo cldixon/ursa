@@ -4660,6 +4660,7 @@ dependencies = [
  "url",
  "ursa-core",
  "ursa-io",
+ "ursa-viz",
 ]
 
 [[package]]
@@ -4736,6 +4737,7 @@ dependencies = [
 name = "ursa-sql"
 version = "0.12.0-dev"
 dependencies = [
+ "async-trait",
  "datafusion",
  "tempfile",
  "tokio",
@@ -4777,6 +4779,7 @@ dependencies = [
  "ursa-engine",
  "ursa-shell",
  "ursa-sql",
+ "ursa-viz",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]

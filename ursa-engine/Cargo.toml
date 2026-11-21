@@ -17,6 +17,10 @@ categories = ["database-implementations", "algorithms"]
 # kernels take their serial path, whose results are bit-identical (#278).
 ursa-core = { path = "../ursa-core", version = "0.12.0-dev", default-features = false }
 ursa-io = { path = "../ursa-io", version = "0.12.0-dev" }
+# The graph-result model and its wire format (UGR), which `graph::view`
+# writes. Default features are off, so there is no GPU (wgpu) in the engine
+# (design/graph-explorer.md §11, decision 5).
+ursa-viz = { path = "../ursa-viz", version = "0.12.0-dev", default-features = false }
 datafusion = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }

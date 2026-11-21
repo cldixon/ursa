@@ -106,7 +106,7 @@ On Windows, `irm https://cldixon.github.io/ursa/install.ps1 | iex` in PowerShell
 | `ursa-io` | Rust | Reading sources: Parquet and CSV scans (local or object storage) through DataFusion, with the CSV options and type inference. No plan types, so every engine reads a file the same way. |
 | `ursa-core` | Rust | The CSR topology index and the kernels. Parallel with `rayon`; compiles for `wasm32` without it. |
 | `ursa-py` | Rust | PyO3 bindings. Arrow crosses as zero-copy capsules; the GIL is released during compute. |
-| `ursa-engine` | Rust | The SQL engine: a DataFusion session with graph plan nodes, the graph catalog, the index cache and the `.ursa` database file. |
+| `ursa-engine` | Rust | The SQL engine: a DataFusion session with graph plan nodes, the graph catalog, the index cache and the `.ursa` database file. Its `graph::view` turns a result into a graph to draw. |
 | `ursa-sql` | Rust | Ursa's SQL statements (`CREATE PROPERTY GRAPH`, `SHOW GRAPHS`, `ATTACH`, …) on top of DataFusion's parser. |
 | `ursa-cli` | Rust | The `ursa` command-line tool and its interactive shell. |
 

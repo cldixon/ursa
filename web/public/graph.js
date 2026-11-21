@@ -21,6 +21,13 @@
 // show() hands the worker the graph before it builds the view, so the
 // layout's hierarchy is built while the page sets up its canvas; and nothing
 // is drawn until the layout's first positions, not a random cloud first.
+//
+// The graph comes from the engine as one UGR buffer (ursa-viz/UGR.md), a
+// graph result: ugr.js (ursa-viz/ui/ugr.js, copied in by the build) reads it
+// as typed arrays over the buffer, and graph-data.js makes it the drawing.
+
+import { drawingOf } from "./graph-data.js";
+import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
 
@@ -132,18 +139,19 @@ export function pinch(a0, b0, a1, b1) {
 }
 
 /**
- * Draw `graph` (from the engine: {n, src, dst, ids}, dense node indexes and
- * each node's id, and with SIZE BY or COLOR BY, {size, sizeBy} and {color,
- * colorBy, colorLabels, colorCounts, colorOther, colorMissing}) in `stage`,
- * replacing what was drawn. `status` is the pane's header line and `legend`
+ * Draw the engine's graph (`sent`: {ugr, skipped}, a graph result as a UGR
+ * buffer, and the rows left out of it; graph-data.js's drawingOf says what is
+ * read from it: dense node indexes, each node's id, and what SIZE BY and
+ * COLOR BY made, with the legend) in `stage`, replacing what was drawn. `status` is the pane's header line and `legend`
  * the legend under it; `onError(message)` is called if the view fails once
  * drawing (a lost GPU device or WebGL context, a layout that stopped).
  * `times` gets the moments each step ended (performance.now()), for
  * graphTimings. Resolves once the view is made (it draws when the layout's
  * first positions come), to {nodes, edges, backend}.
  */
-export async function show(stage, graph, { status, legend, onError, times = {} }) {
+export async function show(stage, sent, { status, legend, onError, times = {} }) {
   close();
+  const graph = drawingOf(readResult(sent.ugr), sent.skipped);
   const mine = ++seq;
   status.textContent = `Loading graph view… ${plural(graph.n, "node")} · ${plural(graph.src.length, "edge")}`;
   const { module, url } = await loadViz();
@@ -452,7 +460,7 @@ export async function show(stage, graph, { status, legend, onError, times = {} }
     const start = performance.now();
     const node = view.pick(x, y);
     timings.picked(performance.now() - start);
-    state.picked = node === undefined ? null : { index: node, id: state.ids[node], degree: state.degree[node] };
+    state.picked = node === undefined ? null : { index: node, id: state.ids.get(node), degree: state.degree[node] };
     header();
   }
 

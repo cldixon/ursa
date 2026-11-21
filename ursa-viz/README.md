@@ -32,9 +32,11 @@ nothing to draw one.
 ## The model: one result, every front end
 
 `model` (#424, [the design](../design/graph-explorer.md) §3 and §6) is the
-data everything drawn is made of. The engine will produce it and the shell,
-the notebook widget and an exported page will read it; the view above does
-not use it yet (#426 and after).
+data everything drawn is made of. The engine produces it
+(`ursa_engine::graph::view`, #425: what `.graph` draws), and the web shell
+reads it as UGR with `ui/ugr.js`; the notebook widget and an exported page
+will read it the same way. The view above does not take it directly yet
+(#426 and after): the shell hands it the arrays it read.
 
 - **`GraphResult`**: nodes, edges, their columns, highlights, encodings and
   provenance.

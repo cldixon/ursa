@@ -73,6 +73,7 @@ mod schema_metadata;
 mod session;
 pub mod traversal;
 mod vertex_keys;
+pub mod view;
 
 pub use catalog_table::UrsaFunctions;
 pub use exec::{
