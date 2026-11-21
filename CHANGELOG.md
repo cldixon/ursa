@@ -208,6 +208,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   what sizes the nodes and each colour's category and count. The engine does
   it all (`WebShell.graph` returns `size`, `color` and the legend; with no
   clause, the graph as before).
+- **Ursa Web Shell: the page runs cross-origin isolated** (#429). Every
+  response, from the Worker and the local preview alike, carries
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
+  require-corp` and `Cross-Origin-Resource-Policy: same-origin`, beside the
+  Content Security Policy. `crossOriginIsolated` is true on the page and in
+  the engine's and the layout's workers, which gives precise timers and
+  `performance.measureUserAgentSpecificMemory()` now, and is what a build
+  with shared memory would need. Every resource was same-origin already, so
+  datasets (by range), Import, downloads, Share links, fonts and the Graph
+  view work as before.
 - **Ursa Web Shell: the Graph view in each theme's own colours.** The view
   draws on the theme's background with its own edge ink and a categorical
   palette stepped for white and for the dark sky, so the CSS inversion is

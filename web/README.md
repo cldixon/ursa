@@ -122,8 +122,17 @@ static assets and an R2 bucket.
   the Worker and `bun run preview` alike: a Content Security Policy (the page's
   own scripts, worker, fetches, fonts and images; WebAssembly compiles under
   `'wasm-unsafe-eval'`; `style-src` allows `'unsafe-inline'` for the `<style>`
-  elements xterm.js adds; no framing), `X-Content-Type-Options: nosniff` and
-  `Referrer-Policy: no-referrer`. The page has no inline script: the theme is
+  elements xterm.js adds; no framing), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, and the three that make the page
+  cross-origin isolated (#429): `Cross-Origin-Opener-Policy: same-origin`,
+  `Cross-Origin-Embedder-Policy: require-corp` and
+  `Cross-Origin-Resource-Policy: same-origin`. So `crossOriginIsolated` is
+  true on the page and in the engine's and the layout's workers: timers are
+  precise, `performance.measureUserAgentSpecificMemory()` works, and a
+  `SharedArrayBuffer` can be made, which a threaded build would need. Every
+  resource is same-origin, as the policy requires, so nothing else changes;
+  a cross-origin resource could only be added if it sends CORP or CORS
+  headers. The page has no inline script: the theme is
   set before the first paint by `public/theme.js`.
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
   `build.ts` also builds the graph view (`scripts/viz.ts`: `ursa-viz` with
@@ -193,7 +202,9 @@ button, the terminal refitting beside it and under it on a phone, the Graph
 button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
 phone checks: Tab out of the terminal, the menu's keys, the focus after a
 click, no mid-word wraps and a one-row bar at 320px, a 16px input, and the grey
-text's contrast; and the security headers, 404s for malformed and traversing
+text's contrast; and the security headers, cross-origin isolation (its headers
+on every kind of response, a dataset's ranges included, and
+`crossOriginIsolated` on the page and in both workers), 404s for malformed and traversing
 paths, and no Content Security Policy violation in the console.
 
 ```sh

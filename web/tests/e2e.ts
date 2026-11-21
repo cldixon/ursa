@@ -1218,6 +1218,102 @@ for (const path of [
   const body = await r.text();
   check(r.status >= 400 && !body.includes('"devDependencies"') && !body.includes("root:"), `${path} stays blocked`, `${r.status}`);
 }
+
+// #429: the shell runs cross-origin isolated. The three headers are on every
+// response (a range of a dataset and the engine's .wasm too), and the page
+// and both its workers, the engine's and the layout's, say they are isolated.
+{
+  const engine: { wasm: string } = await (await fetch(`${base}/engine/engine.json`)).json();
+  const viz: { module: string } = await (await fetch(`${base}/viz/viz.json`)).json();
+  const isolating = (r: Response) =>
+    r.headers.get("cross-origin-opener-policy") === "same-origin" && r.headers.get("cross-origin-embedder-policy") === "require-corp" && r.headers.get("cross-origin-resource-policy") === "same-origin";
+  const sent = (r: Response) => ["opener", "embedder", "resource"].map((h) => r.headers.get(`cross-origin-${h}-policy`) ?? "none").join(", ");
+  for (const path of [
+    "/",
+    "/?dataset=karate",
+    "/app.js",
+    "/engine-worker.js",
+    "/graph-worker.js",
+    "/graph.js",
+    "/style.css",
+    "/fonts/ursa-box.woff2",
+    "/favicon.svg",
+    "/engine/engine.json",
+    engine.wasm,
+    "/viz/viz.json",
+    viz.module,
+    viz.module.replace(/\.js$/, "_bg.wasm"),
+    "/data/manifest.json",
+    "/data/karate_edges.parquet",
+    "/data/no_such_file.csv",
+    "/no/such/page",
+  ]) {
+    const r = await fetch(`${base}${path}`);
+    await r.body?.cancel();
+    check(isolating(r), `cross-origin isolation headers on ${path} (${r.status})`, sent(r));
+  }
+  {
+    // As the engine reads Parquet: a HEAD, then ranges; and a range past the end.
+    const head = await fetch(`${base}/data/karate_edges.parquet`, { method: "HEAD" });
+    check(head.status === 200 && isolating(head), "cross-origin isolation headers on a dataset's HEAD", `${head.status}: ${sent(head)}`);
+    const range = await fetch(`${base}/data/karate_edges.parquet`, { headers: { range: "bytes=0-99" } });
+    const bytes = (await range.arrayBuffer()).byteLength;
+    check(range.status === 206 && bytes === 100 && isolating(range), "cross-origin isolation headers on a range of a dataset (206)", `${range.status}, ${bytes} bytes: ${sent(range)}`);
+    const tail = await fetch(`${base}/data/karate_edges.parquet`, { headers: { range: "bytes=-8" } });
+    check(tail.status === 206 && (await tail.arrayBuffer()).byteLength === 8 && isolating(tail), "cross-origin isolation headers on a dataset's last bytes (206)", `${tail.status}: ${sent(tail)}`);
+    const past = await fetch(`${base}/data/karate_edges.parquet`, { headers: { range: "bytes=99999999-" } });
+    check(past.status === 416 && isolating(past), "cross-origin isolation headers on a range past the end (416)", `${past.status}: ${sent(past)}`);
+  }
+
+  const ictx = await watchedContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const p = await ictx.newPage();
+  const pageErrors: string[] = [];
+  const consoleErrors: string[] = [];
+  const failed: string[] = [];
+  p.on("pageerror", (e) => pageErrors.push(e.message));
+  p.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
+  p.on("requestfailed", (r) => failed.push(`${new URL(r.url()).pathname}: ${r.failure()?.errorText}`));
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  await p.click("#terminal");
+  const onPage = await p.evaluate(() => ({
+    isolated: self.crossOriginIsolated,
+    shared: typeof SharedArrayBuffer === "function" && new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true }).buffer instanceof SharedArrayBuffer,
+    memory: typeof (performance as any).measureUserAgentSpecificMemory,
+  }));
+  check(onPage.isolated === true, "the page is cross-origin isolated", JSON.stringify(onPage));
+  check(onPage.shared && onPage.memory === "function", "an isolated page can make a shared WebAssembly.Memory and measure its memory", JSON.stringify(onPage));
+  // The dataset loaded by range requests, and a query over it answers.
+  await type("SELECT count(*) AS ties FROM ties;", p);
+  check(lastTable(await after("SELECT count(*)", p)).rows[0]?.[0] === "78", "isolated: a dataset's Parquet is read and queried");
+  // The Graph view: ursa-viz and the layout's worker load and draw.
+  await type(".graph karate SIZE BY pagerank COLOR BY club", p);
+  await graphSettled(p);
+  const drawn = await p.evaluate(() => (window as any).ursaShell.graphInked());
+  check(drawn && drawn.inked > 500, "isolated: the Graph view draws", `${drawn?.inked} px inked`);
+  const workers = await Promise.all(
+    p.workers().map(async (w) => ({ name: new URL(w.url()).pathname, isolated: await w.evaluate(() => self.crossOriginIsolated).catch((e) => String(e)) })),
+  );
+  for (const name of ["/engine-worker.js", "/graph-worker.js"]) {
+    const found = workers.filter((w) => w.name === name);
+    check(found.length > 0 && found.every((w) => w.isolated === true), `the worker ${name} is cross-origin isolated`, JSON.stringify(workers));
+  }
+  // The fonts loaded: the terminal's, and the box-drawing font.
+  const fonts = await p.evaluate(async () => {
+    await document.fonts.ready;
+    return [...document.fonts].filter((f) => f.status === "loaded").map((f) => f.family.replace(/"/g, ""));
+  });
+  check(fonts.includes("IBM Plex Mono") && fonts.some((f) => /ursa box/i.test(f)), "isolated: the fonts load", [...new Set(fonts)].join(", "));
+  // A download (.export) and a Share link.
+  const [download] = await Promise.all([p.waitForEvent("download"), type(".export csv", p)]);
+  check(/\.csv$/.test(download.suggestedFilename()), "isolated: .export downloads the last result", download.suggestedFilename());
+  await type(".share", p);
+  const shared = await after(".share", p);
+  check(p.url().includes("#run=") && /link that replays \d+ commands/.test(shared), "isolated: .share makes its link", shared.split("\n")[0]);
+  check((await errors(p)) === 0 && pageErrors.length === 0 && consoleErrors.length === 0 && failed.length === 0, "isolated: no error on the screen, in the console or on the network", [...pageErrors, ...consoleErrors, ...failed].slice(0, 3).join(" | "));
+  await ictx.close();
+}
 check(violations.length === 0, "no Content Security Policy violations", violations.slice(0, 3).join(" | "));
 
 await browser.close();
