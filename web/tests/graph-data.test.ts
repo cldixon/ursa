@@ -32,7 +32,9 @@ function shape(buffer: ArrayBuffer, skipped: number) {
     ids: Array.from({ length: g.ids.length }, (_, i) => g.ids.get(i)),
     graph: g.name,
     provenance: g.provenance,
+    drawnAs: g.drawnAs,
   };
+  if (g.layout) out.layout = { kind: g.layout.kind, level: Array.from(g.layout.level) };
   if (g.size) {
     out.sizeBy = g.sizeBy;
     out.size = Array.from(new Uint32Array(g.size.buffer, g.size.byteOffset, g.size.length));
@@ -48,7 +50,7 @@ function shape(buffer: ArrayBuffer, skipped: number) {
   return out;
 }
 
-for (const name of ["graph_view_karate", "graph_view_rows"]) {
+for (const name of ["graph_view_karate", "graph_view_rows", "graph_view_hop", "graph_view_paths"]) {
   test(`${name}: the page reads what the engine drew`, () => {
     const expected = json(name);
     expect(shape(ugr(name), expected.skipped)).toEqual(expected);
@@ -91,4 +93,35 @@ test("a column the encodings name must be there, and of a kind that draws", () =
   expect(() => drawingOf({ ...r, encodings: { ...r.encodings, size_by: "nope" } })).toThrow("no node column 'nope'");
   expect(() => drawingOf({ ...r, encodings: { ...r.encodings, size_by: "club" } })).toThrow("sizes are numbers");
   expect(() => drawingOf({ ...r, encodings: { ...r.encodings, color_by: "degree" } })).toThrow("not categories");
+});
+
+test("a hop result: rings by distance, coloured by distance, and said so", () => {
+  const buffer = ugr("graph_view_hop");
+  const result = readResult(buffer);
+  const g: any = drawingOf(result);
+  expect(g.drawnAs).toBe("rings on karate (seed, id, distance)");
+  expect(g.provenance.roles.map((r: any) => r.role)).toEqual(["seed", "node", "distance"]);
+  // One ring per distance: the seed, its 16 neighbours, and 9 at two steps.
+  expect(g.layout.kind).toBe("rings");
+  expect(g.layout.level.buffer).toBe(buffer);
+  const ring = (d: number) => g.layout.level.filter((v: number) => v === d).length;
+  expect([ring(0), ring(1), ring(2)]).toEqual([1, 16, 9]);
+  expect(Array.from(result.highlights.seeds)).toEqual([0]);
+  // The colour column is "distance (colour)" on the wire; the legend says "distance".
+  expect(g.colorBy).toBe("distance");
+  expect(g.colorLabels).toEqual(["0", "1", "2"]);
+  expect(g.colorCounts).toEqual([1, 16, 9]);
+});
+
+test("paths: the union of the rows, in layers by step", () => {
+  const result = readResult(ugr("graph_view_paths"));
+  const g: any = drawingOf(result);
+  expect(g.drawnAs).toBe("2 paths (members)");
+  expect([g.n, g.src.length]).toEqual([4, 4]);
+  expect(g.layout.kind).toBe("layers");
+  expect(Array.from(g.layout.level)).toEqual([0, 1, 2, 1]);
+  expect(result.highlights.paths.map((p: any) => [Array.from(p.nodes), Array.from(p.edges)])).toEqual([
+    [[0, 1, 2], [0, 1]],
+    [[0, 3, 2], [2, 3]],
+  ]);
 });

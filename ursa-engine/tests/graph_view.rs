@@ -20,11 +20,11 @@ use datafusion::common::TableReference;
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 use ursa_engine::graph::view::{
-    of_command, DataFusionSql, GraphView, Rows, RunSql, MAX_CATEGORIES,
+    interpret, of_command, DataFusionSql, GraphView, Rows, RunSql, MAX_CATEGORIES,
 };
 use ursa_engine::graph::{create_graph, EdgeTable, GraphDef, VertexTable};
 use ursa_engine::{new_session, user_message};
-use ursa_viz::model::{GraphResult, KeyType, Values, NULL};
+use ursa_viz::model::{GraphResult, Key, KeyType, Layout, Path as ModelPath, Role, Values, NULL};
 
 fn def(name: &str, edges: (&str, &str, &str), vertices: Option<(&str, &str)>) -> GraphDef {
     GraphDef {
@@ -169,10 +169,11 @@ async fn the_last_result_a_query_a_table_or_a_property_graph() {
     let err = refusal(&ctx, "", rows(&ctx, "SELECT 42 AS answer").await).await;
     assert!(err.contains("1 column"), "{err}");
     // #427: a score is not a node.
-    let err = refusal(&ctx, "SELECT 1 AS id, 0.5 AS pagerank", None).await;
+    let err = refusal(&ctx, "SELECT 1 AS a, 0.5 AS score", None).await;
     assert!(
-        err.contains("cannot draw the first two columns")
-            && err.contains(".graph NAME SIZE BY pagerank"),
+        err.contains(
+            "cannot draw this result as a graph: it has 2 columns (a: Int64, score: Float64)"
+        ) && err.contains(".graph AS nodes(a)"),
         "{err}"
     );
 }
@@ -304,8 +305,20 @@ fn expect(view: &GraphView) -> Value {
         "dst": r.dst(),
         "ids": ids(view),
         "graph": r.graph(),
-        "provenance": {"sql": r.provenance().sql, "rule": r.provenance().rule},
+        "provenance": serde_json::to_value(r.provenance()).unwrap(),
+        "drawnAs": view.drawn_as(),
     });
+    // A layout of rings or layers, with each node's level.
+    if let (Some(level), true) = (
+        r.highlights().distance.as_deref(),
+        r.encodings().layout != Layout::Force,
+    ) {
+        let Values::U32(level) = &r.node_column(level).unwrap().values else {
+            panic!("a u32 column");
+        };
+        let kind = serde_json::to_value(r.encodings().layout).unwrap();
+        out["layout"] = json!({"kind": kind, "level": level});
+    }
     if r.encodings().size_by.is_some() {
         out["sizeBy"] = json!(r.encodings().size_by);
         out["size"] = json!(size(view).iter().map(|v| v.to_bits()).collect::<Vec<_>>());
@@ -403,4 +416,357 @@ async fn views_encode_to_the_fixtures_the_page_reads() {
     };
     assert!(codes.contains(&NULL) && codes.contains(&9));
     check_fixture("graph_view_rows", &view);
+
+    // The rules (#433): a hop result as rings, and paths as layers.
+    let last = rows(
+        &ctx,
+        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+    )
+    .await;
+    let view = draw(&ctx, "", last).await;
+    assert_eq!((view.result.n_nodes(), view.result.n_edges()), (26, 59));
+    check_fixture("graph_view_hop", &view);
+    let view = draw(
+        &ctx,
+        "SELECT * FROM (VALUES (2, [16, 5, 0]), (2, [16, 6, 0])) AS t(steps, members)",
+        None,
+    )
+    .await;
+    assert_eq!(view.drawn_as(), "2 paths (members)");
+    check_fixture("graph_view_paths", &view);
+}
+
+/// A session with karate as a property graph.
+async fn karate() -> SessionContext {
+    let ctx = new_session();
+    for (name, file) in [
+        ("members", "karate_nodes.csv"),
+        ("ties", "karate_edges.csv"),
+    ] {
+        run(
+            &ctx,
+            &format!(
+                "CREATE VIEW {name} AS SELECT * FROM '{}'",
+                data(file).display()
+            ),
+        )
+        .await;
+    }
+    create_graph(
+        &ctx,
+        def("karate", ("ties", "src", "dst"), Some(("members", "id"))),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    ctx
+}
+
+async fn interpreted(ctx: &SessionContext, sql: &str) -> GraphView {
+    let (schema, batches) = DataFusionSql.run(ctx, sql).await.unwrap();
+    interpret(ctx, &DataFusionSql, schema, batches)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {}", user_message(&e)))
+}
+
+fn u32s<'a>(view: &'a GraphView, column: &str) -> &'a [u32] {
+    match &view.result.node_column(column).expect(column).values {
+        Values::U32(values) => values,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Every edge joins nodes that are neighbours in karate, and is one of its
+/// edge table's rows.
+async fn real_edges(ctx: &SessionContext, view: &GraphView) {
+    let (_, ties) = DataFusionSql
+        .run(ctx, "SELECT src, dst FROM ties")
+        .await
+        .unwrap();
+    let mut pairs = Vec::new();
+    for b in &ties {
+        let cast = |i: usize| {
+            datafusion::arrow::compute::cast(
+                b.column(i),
+                &datafusion::arrow::datatypes::DataType::Int64,
+            )
+            .unwrap()
+        };
+        let (s, d) = (cast(0), cast(1));
+        let (s, d) = (
+            s.as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .clone(),
+            d.as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .clone(),
+        );
+        pairs.extend((0..b.num_rows()).map(|i| (s.value(i), d.value(i))));
+    }
+    let r = &view.result;
+    let key = |i: u32| match r.node_key(i as usize) {
+        Key::Int(v) => v,
+        other => panic!("{other:?}"),
+    };
+    for e in 0..r.n_edges() {
+        let ends = (key(r.src()[e]), key(r.dst()[e]));
+        let row = r.edge_row(e).expect("the edge's row") as usize;
+        assert_eq!(pairs[row], ends, "edge {e}");
+    }
+}
+
+#[tokio::test]
+async fn a_hop_result_is_rings_with_the_graphs_real_edges() {
+    let ctx = karate().await;
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!(r.provenance().rule.as_deref(), Some("rings"));
+    assert_eq!(view.drawn_as(), "rings on karate (seed, id, distance)");
+    assert_eq!(r.graph(), Some("karate"));
+    // The seed and the 25 nodes within two steps; not a star: the 59 edges
+    // of karate among them, each with its row.
+    assert_eq!((r.n_nodes(), r.n_edges()), (26, 59));
+    real_edges(&ctx, &view).await;
+    assert_eq!(r.node_labels()[0].name, "members");
+    assert_eq!(r.edge_labels(), ["ties"]);
+    // The seed, and each node's distance: 0, then 16 at 1 and 9 at 2.
+    let seed = r.node(0, &Key::Int(0)).unwrap();
+    assert_eq!(r.highlights().seeds, [seed]);
+    assert_eq!(r.highlights().distance.as_deref(), Some("distance"));
+    let distance = u32s(&view, "distance");
+    assert_eq!(distance[seed as usize], 0);
+    let count = |d: u32| distance.iter().filter(|&&x| x == d).count();
+    assert_eq!((count(0), count(1), count(2)), (1, 16, 9));
+    assert_eq!(
+        r.node_column("distance").unwrap().role,
+        Some(Role::Distance)
+    );
+    // One seed: rings. Distance colours the nodes, nearest first.
+    assert_eq!(r.encodings().layout, Layout::Rings);
+    let legend = view.legend().unwrap();
+    assert_eq!(legend.by, "distance");
+    assert_eq!(legend.labels, ["0", "1", "2"]);
+    assert_eq!(legend.counts, [1, 16, 9]);
+
+    // Several seeds: layers, by distance from the nearest; COLOR BY says
+    // otherwise.
+    let last = rows(
+        &ctx,
+        "SELECT * FROM hop(karate, seeds => [0, 33], n => 1, direction => 'both')",
+    )
+    .await;
+    let view = draw(&ctx, "COLOR BY club", last).await;
+    let r = &view.result;
+    assert_eq!(r.encodings().layout, Layout::Layers);
+    assert_eq!(r.highlights().seeds.len(), 2);
+    assert_eq!(view.legend().unwrap().by, "club");
+    let distance = u32s(&view, "distance");
+    assert!(distance.iter().all(|&d| d <= 1), "{distance:?}");
+    real_edges(&ctx, &view).await;
+
+    // Without metadata (a file read back, say), by the three names; the
+    // graph is the session's only one.
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM (VALUES (0, 1, 1), (0, 2, 1), (0, 9, 2)) AS t(seed, id, distance)",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!(view.drawn_as(), "rings on karate (seed, id, distance)");
+    assert_eq!(ids(&view), ["0", "1", "2", "9"]);
+    // 0–1, 0–2, 1–2 and 2–9.
+    assert_eq!(r.n_edges(), 4);
+    real_edges(&ctx, &view).await;
+
+    // With no graph to read the edges from: each seed's edges to the nodes
+    // one step away, and the status line says so.
+    let alone = new_session();
+    let view = interpreted(
+        &alone,
+        "SELECT * FROM (VALUES (0, 1, 1), (0, 2, 1), (0, 9, 2)) AS t(seed, id, distance)",
+    )
+    .await;
+    assert_eq!(ends(&view), (&[0, 0][..], &[1, 2][..]));
+    assert_eq!(view.result.n_nodes(), 4);
+    assert_eq!(
+        view.drawn_as(),
+        "rings (seed, id, distance) · there is no property graph to read the edges from: only \
+         each seed's edges to the nodes one step away are drawn"
+    );
+    // A hop result without its distance: edges seed–id, with a note.
+    let view = interpreted(
+        &ctx,
+        "SELECT seed, id FROM hop(karate, seeds => [0], n => 1, direction => 'both')",
+    )
+    .await;
+    assert_eq!(view.result.provenance().rule.as_deref(), Some("edges"));
+    assert_eq!(view.result.n_edges(), 16);
+    assert!(view.drawn_as().contains("no distance column, so no rings"));
+}
+
+#[tokio::test]
+async fn a_node_table_is_nodes_with_the_edges_among_them() {
+    let ctx = karate().await;
+    // The five top nodes by PageRank, sized by it, with the edges among them.
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM pagerank(karate, direction => 'both') ORDER BY pagerank DESC LIMIT 5",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!(view.drawn_as(), "nodes of karate (id, pagerank)");
+    assert_eq!(ids(&view), ["33", "0", "32", "2", "1"]);
+    assert_eq!(r.encodings().size_by.as_deref(), Some("pagerank"));
+    assert!(size(&view).windows(2).all(|w| w[0] >= w[1]));
+    // 33–32, 0–2, 0–1, 32–2, 2–1.
+    assert_eq!(r.n_edges(), 5);
+    real_edges(&ctx, &view).await;
+
+    // Every node, with a metric and a category: the graph, sized and
+    // coloured.
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM algorithms(karate, pagerank(direction => 'both'), \
+         community => louvain(seed => 1))",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!((r.n_nodes(), r.n_edges()), (34, 78));
+    assert_eq!(view.drawn_as(), "nodes of karate (id, pagerank, community)");
+    assert_eq!(
+        (
+            r.encodings().size_by.as_deref(),
+            r.encodings().color_by.as_deref()
+        ),
+        (Some("pagerank"), Some("community"))
+    );
+    assert_eq!(view.legend().unwrap().counts.iter().sum::<u32>(), 34);
+    real_edges(&ctx, &view).await;
+
+    // What the clauses say comes first, and reads the result's own columns
+    // and the graph's.
+    let last = rows(&ctx, "SELECT * FROM pagerank(karate)").await;
+    let view = draw(&ctx, "SIZE BY degree COLOR BY club", last.clone()).await;
+    assert_eq!(view.result.encodings().size_by.as_deref(), Some("degree"));
+    assert_eq!(view.legend().unwrap().by, "club");
+    let view = draw(&ctx, "COLOR BY louvain", last).await;
+    assert_eq!(view.result.encodings().size_by.as_deref(), Some("pagerank"));
+    assert_eq!(view.legend().unwrap().by, "louvain");
+
+    // Without metadata: `id` by name, the session's only graph, and a
+    // column named for what it is.
+    let view = interpreted(
+        &ctx,
+        "SELECT id, CASE WHEN id < 10 THEN 1 ELSE 2 END AS community, club FROM members \
+         WHERE id < 20",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!(view.drawn_as(), "nodes of karate (id, community)");
+    assert_eq!(r.n_nodes(), 20);
+    assert_eq!(view.legend().unwrap().counts, [10, 10]);
+    real_edges(&ctx, &view).await;
+    // One column of keys is a graph too; a key twice is one node, and a
+    // NULL is skipped.
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM (VALUES (0), (1), (1), (NULL), (2)) AS t(id)",
+    )
+    .await;
+    assert_eq!(ids(&view), ["0", "1", "2"]);
+    assert_eq!((view.result.n_edges(), view.skipped), (3, 1));
+
+    // With no graph, the nodes are drawn without edges, and it says so.
+    let alone = new_session();
+    let view = interpreted(
+        &alone,
+        "SELECT * FROM (VALUES ('a', 0.5), ('b', 0.25)) AS t(id, pagerank)",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!((r.n_nodes(), r.n_edges()), (2, 0));
+    assert_eq!(r.encodings().size_by.as_deref(), Some("pagerank"));
+    assert_eq!(
+        view.drawn_as(),
+        "nodes (id, pagerank) · there is no property graph to read the edges from: the nodes \
+         are drawn without edges"
+    );
+    // Ids that are not the graph's: no edges, and why.
+    let view = interpreted(&ctx, "SELECT * FROM (VALUES ('a'), ('b')) AS t(id)").await;
+    assert_eq!(view.result.n_edges(), 0);
+    assert_eq!(view.result.graph(), None);
+    assert!(
+        view.drawn_as()
+            .starts_with("nodes (id) · the edges of 'karate' could not be read"),
+        "{}",
+        view.drawn_as()
+    );
+}
+
+#[tokio::test]
+async fn paths_and_edges_without_metadata() {
+    let ctx = new_session();
+    // A list of ids is a path: the union of the rows' paths, each edge once.
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM (VALUES (2, ['a', 'b', 'c']), (2, ['a', 'd', 'c']), (1, ['c', 'b']), \
+         (0, NULL)) AS t(steps, members)",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!(r.provenance().rule.as_deref(), Some("path"));
+    assert_eq!(ids(&view), ["a", "b", "c", "d"]);
+    // a–b, b–c, a–d, d–c; c–b is b–c again.
+    assert_eq!(ends(&view), (&[0, 1, 0, 3][..], &[1, 2, 3, 2][..]));
+    assert_eq!(view.skipped, 1);
+    assert_eq!(
+        r.highlights().paths,
+        [
+            ModelPath {
+                nodes: vec![0, 1, 2],
+                edges: vec![0, 1]
+            },
+            ModelPath {
+                nodes: vec![0, 3, 2],
+                edges: vec![2, 3]
+            },
+            ModelPath {
+                nodes: vec![2, 1],
+                edges: vec![1]
+            },
+        ]
+    );
+    // Different ends: no layers. Each node's step is its first.
+    assert_eq!(r.encodings().layout, Layout::Force);
+    assert_eq!(u32s(&view, "step"), [0, 1, 0, 1]);
+    // One row is a route, laid out in layers by position.
+    let view = interpreted(&ctx, "SELECT [16, 5, 0, 8] AS route").await;
+    assert_eq!(view.drawn_as(), "a path (route)");
+    assert_eq!(view.result.encodings().layout, Layout::Layers);
+    assert_eq!(u32s(&view, "step"), [0, 1, 2, 3]);
+    assert_eq!(view.result.node_labels()[0].key, KeyType::Int);
+
+    // A plain edge table is what it was: its nodes, its edges, their order.
+    // A numeric `weight` is now an edge column.
+    let view = interpreted(
+        &ctx,
+        "SELECT * FROM (VALUES (1, 2, 0.5), (2, 3, 1.5), (NULL, 3, 9.0)) AS t(src, dst, weight)",
+    )
+    .await;
+    let r = &view.result;
+    assert_eq!(view.drawn_as(), "edges (src, dst)");
+    assert_eq!(ids(&view), ["1", "2", "3"]);
+    assert_eq!(ends(&view), (&[0, 1][..], &[1, 2][..]));
+    assert!(r.highlights().is_empty() && r.node_columns().is_empty());
+    assert_eq!(
+        r.edge_column("weight").unwrap().values,
+        Values::F32(vec![0.5, 1.5])
+    );
 }

@@ -77,8 +77,8 @@ pub mod ugr;
 
 pub use delta::{BatchColumn, BatchValues, EdgeBatch, GraphDelta, NodeBatch, Op};
 pub use result::{
-    Column, Encodings, GraphResult, Highlights, Key, KeyType, Layout, ModelError, NodeLabel, Path,
-    Positions, Provenance, Role, Strings, Target, Values, NO_ROW, NULL, REMOVED,
+    Column, ColumnRole, Encodings, GraphResult, Highlights, Key, KeyType, Layout, ModelError,
+    NodeLabel, Path, Positions, Provenance, Role, Strings, Target, Values, NO_ROW, NULL, REMOVED,
 };
 pub use select::Selection;
 pub use ugr::UgrError;

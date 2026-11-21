@@ -88,6 +88,8 @@ impl ColorBy {
 pub(crate) enum Found {
     /// A column of NODES's query, by index.
     Nodes(usize),
+    /// A column of the result drawn, whose rows are nodes (rule 5).
+    Own(usize),
     /// A column of the property graph's vertex tables.
     Vertex,
     /// A per-node algorithm, run on the graph.
@@ -125,11 +127,15 @@ pub(crate) async fn resolve(
     ctx: &SessionContext,
     graph: Option<&PropertyGraph>,
     nodes: Option<&NodeValues>,
+    own: Option<&NodeValues>,
     clause: &str,
     name: &Name,
 ) -> Result<Found> {
     if let Some(i) = nodes.and_then(|n| n.find(&name.ident)) {
         return Ok(Found::Nodes(i));
+    }
+    if let Some(i) = own.and_then(|n| n.find(&name.ident)) {
+        return Ok(Found::Own(i));
     }
     let mut columns = Vec::new();
     if let Some(g) = graph {
@@ -147,6 +153,7 @@ pub(crate) async fn resolve(
     let shown = &name.shown;
     let nodes_columns = nodes
         .map(|n| format!("; NODES (…) has {}", n.value_names().join(", ")))
+        .or_else(|| own.map(|n| format!("; the result has {}", n.value_names().join(", "))))
         .unwrap_or_default();
     match (graph, algorithm) {
         (Some(_), Some(algorithm)) => Ok(Found::Algorithm(algorithm)),
@@ -213,6 +220,7 @@ pub(crate) async fn vertex_column(
     let mut column = Column {
         ids: Some(Vec::new()),
         values: Vec::new(),
+        label: None,
     };
     for (table, key, names) in vertex_columns(ctx, graph).await? {
         let Some(i) = find_name(names.iter().map(String::as_str), ident) else {
@@ -243,6 +251,7 @@ pub(crate) fn degree_column(edges: &EdgeList) -> Column {
     Column {
         ids: None,
         values: vec![Arc::new(UInt32Array::from(degree))],
+        label: None,
     }
 }
 
@@ -308,6 +317,15 @@ impl NodeValues {
         })
     }
 
+    /// A result's own rows as node values: the nodes' ids are in column `id`.
+    pub(crate) fn of_rows(schema: SchemaRef, batches: Vec<RecordBatch>, id: usize) -> NodeValues {
+        NodeValues {
+            schema,
+            batches,
+            id,
+        }
+    }
+
     /// The column called `ident`, other than the ids.
     fn find(&self, ident: &str) -> Option<usize> {
         let names = self.schema.fields().iter().map(|f| f.name().as_str());
@@ -339,6 +357,7 @@ impl NodeValues {
                 .iter()
                 .map(|b| Arc::clone(b.column(i)))
                 .collect(),
+            label: None,
         }
     }
 }
@@ -347,9 +366,21 @@ impl NodeValues {
 pub(crate) struct Column {
     ids: Option<Vec<ArrayRef>>,
     values: Vec<ArrayRef>,
+    /// The vertex table the ids are keys of, if the values are one table's.
+    label: Option<u16>,
 }
 
 impl Column {
+    /// `values`, each the value of the node of vertex table `label` whose
+    /// key is at its place in `ids`.
+    pub(crate) fn of_keys(ids: ArrayRef, values: ArrayRef, label: Option<u16>) -> Column {
+        Column {
+            ids: Some(vec![ids]),
+            values: vec![values],
+            label,
+        }
+    }
+
     /// One value per node, in node order: NULL for a node with none. An id
     /// given twice keeps its first value.
     pub(crate) fn per_node(&self, index: &NodeIndex, n: usize) -> Result<ArrayRef> {
@@ -376,7 +407,7 @@ impl Column {
         let mut at = vec![(missing, 0usize); n];
         let mut given = vec![false; n];
         for (b, ids) in ids.iter().enumerate() {
-            for (row, node) in index.lookup(ids)?.into_iter().enumerate() {
+            for (row, node) in index.lookup_in(self.label, ids)?.into_iter().enumerate() {
                 if let Some(node) = node {
                     let node = node as usize;
                     if !given[node] {
@@ -493,4 +524,33 @@ pub(crate) fn color_by(by: &str, values: &ArrayRef) -> Result<ColorBy> {
             .collect(),
         missing: values.null_count() as u32,
     })
+}
+
+/// One value per node as a node column: numbers as they are (NaN for none),
+/// anything else as text.
+pub(crate) fn property_column(name: &str, values: &ArrayRef) -> Result<ursa_viz::model::Column> {
+    use ursa_viz::model::{Column as ModelColumn, Role, Values};
+    if values.data_type().is_numeric() {
+        let numbers = cast(values, &DataType::Float32)?;
+        let numbers = numbers
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("cast to Float32");
+        let values = numbers.iter().map(|v| v.unwrap_or(f32::NAN)).collect();
+        return Ok(ModelColumn::new(
+            name,
+            Some(Role::Property),
+            Values::F32(values),
+        ));
+    }
+    let options = FormatOptions::default();
+    let shown = ArrayFormatter::try_new(values.as_ref(), &options)?;
+    let texts: Vec<Option<String>> = (0..values.len())
+        .map(|i| values.is_valid(i).then(|| shown.value(i).to_string()))
+        .collect();
+    Ok(ModelColumn::new(
+        name,
+        Some(Role::Property),
+        Values::dict(texts.iter().map(|t| t.as_deref())),
+    ))
 }
