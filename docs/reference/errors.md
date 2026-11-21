@@ -39,6 +39,7 @@ A message names the step or the argument it is about, says what was wrong, and s
 |---|---|
 | A step and the column it names | `sort() references unknown column 'x'; the frame has ['id', 'age'].` |
 | A call and the argument | `pagerank(max_iter=) must be a non-negative integer below 2**32; got -1` |
+| A call and a number outside the argument's range | `pagerank(damping=) must be between 0 and 1; got -1` |
 | A call and a value it does not take | `hop(direction='up') is not supported; use one of 'out', 'in', 'both'` |
 | Operand types that do not combine | `cannot compare string with int64 (string > int64); compare values of one type` |
 | A scan and its path | `scan_edges('edges.parquet'): no file matches the path; check it (a glob must match at least one file)` |

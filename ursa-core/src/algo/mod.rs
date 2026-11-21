@@ -39,6 +39,7 @@ mod rng;
 pub use rng::sample_indices;
 mod triangle;
 mod undirected;
+mod warm;
 
 pub use betweenness::{betweenness, betweenness_weighted};
 pub use bfs::{
@@ -66,6 +67,7 @@ pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};
 pub use random_walk::{random_walk, random_walk_masked, Walks};
 pub use triangle::{per_node_triangles, triangle_count, undirected_view, UndirectedView};
 pub use undirected::{symmetric_view, symmetric_view_weighted};
+pub use warm::{fa2_grow, place_new_nodes, warm_iterations, WarmParams};
 
 // ---------------------------------------------------------------------------
 // Frontier kernels (BFS / k-hop / unweighted shortest path).

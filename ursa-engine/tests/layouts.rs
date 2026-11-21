@@ -459,6 +459,27 @@ async fn layout_errors() {
             "SELECT * FROM layout_fr(karate, iterations => NULL)",
             "layout_fr(iterations =>) must be a non-negative integer below 2^32; got NULL",
         ),
+        // Numbers with no meaning for a force (#416).
+        (
+            "SELECT * FROM layout_fa2(karate, k => 0)",
+            "layout_fa2(k =>) must be above 0; got 0",
+        ),
+        (
+            "SELECT * FROM layout_fa2(karate, gravity => -1)",
+            "layout_fa2(gravity =>) must be at least 0; got -1",
+        ),
+        (
+            "SELECT * FROM layout_fa2(karate, theta => -0.5)",
+            "layout_fa2(theta =>) must be at least 0; got -0.5",
+        ),
+        (
+            "SELECT * FROM layout_fa2(karate, jitter_tolerance => 0)",
+            "layout_fa2(jitter_tolerance =>) must be above 0; got 0",
+        ),
+        (
+            "SELECT * FROM layout_fr(karate, k => -2)",
+            "layout_fr(k =>) must be above 0; got -2",
+        ),
     ]);
     for (sql, want) in cases {
         assert_eq!(error(&ctx, sql).await, want, "{sql}");

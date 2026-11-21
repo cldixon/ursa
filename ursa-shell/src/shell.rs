@@ -870,7 +870,7 @@ impl<O: Write, E: Write> Shell<O, E> {
         let parameters = self
             .rows(&format!(
                 "SELECT p['name'], p['type'], p['default'], array_to_string(p['choices'], ', '), \
-                        p['doc'] \
+                        p['doc'], coalesce(p['range'], '') \
                  FROM (SELECT unnest(parameters) AS p FROM ursa_functions() \
                        WHERE name = {literal})"
             ))
@@ -892,7 +892,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             .max()
             .unwrap_or(0);
         for row in &parameters {
-            let [name, kind, value, choices, doc] = &row[..] else {
+            let [name, kind, value, choices, doc, range] = &row[..] else {
                 continue;
             };
             let value = default(value);
@@ -901,6 +901,9 @@ impl<O: Write, E: Write> Shell<O, E> {
             );
             if !choices.is_empty() {
                 line.push_str(&format!(" One of: {choices}."));
+            }
+            if !range.is_empty() {
+                line.push_str(&format!(" Must be {range}."));
             }
             text.push_str(line.trim_end());
             text.push('\n');
@@ -1723,7 +1726,12 @@ mod tests {
             "{direction}"
         );
         assert!(direction.ends_with("One of: out, both."), "{direction}");
-        assert!(lines.iter().any(|l| l.trim_start().starts_with("damping ")));
+        // A numeric parameter with a range says it (#416).
+        let damping = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("damping "))
+            .unwrap();
+        assert!(damping.ends_with("Must be between 0 and 1."), "{damping}");
         assert!(
             out.ends_with("\nOutput columns:\n  pagerank  Float64\n"),
             "{out}"

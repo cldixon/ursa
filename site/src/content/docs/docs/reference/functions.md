@@ -47,9 +47,9 @@ pagerank(graph, damping => 0.85, max_iter => 30, tol => 1e-6, weight => NULL, di
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
-| `damping` | number | `0.85` | – | Probability of following an edge. |
-| `max_iter` | integer | `30` | – | Iteration cap. |
-| `tol` | number | `1e-6` | – | Convergence tolerance on the L1 change. |
+| `damping` | number | `0.85` | – | Probability of following an edge. Must be between 0 and 1. |
+| `max_iter` | integer | `30` | – | Iteration cap. Must be at least 1. |
+| `tol` | number | `1e-6` | – | Convergence tolerance on the L1 change. Must be at least 0. |
 | `weight` | expression | `NULL` | – | A non-negative weight per edge; null is unweighted. |
 | `direction` | string | `'out'` | `'out'`, `'both'` | Follow the rows as stored, or read the graph as undirected. |
 
@@ -109,7 +109,7 @@ betweenness(graph, sample => NULL, weight => NULL, seed => NULL, direction => 'o
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
-| `sample` | number or NULL | `NULL` | – | Estimate from this fraction of the sources; null is exact. |
+| `sample` | number or NULL | `NULL` | – | Estimate from this fraction of the sources; null is exact. Must be above 0 and at most 1. |
 | `weight` | expression | `NULL` | – | A non-negative weight per edge; null is unweighted. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 | `direction` | string | `'out'` | `'out'`, `'both'` | Follow the rows as stored, or read the graph as undirected. |
@@ -149,7 +149,7 @@ label_propagation(graph, max_iter => 20, seed => NULL)
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
-| `max_iter` | integer | `20` | – | Iteration cap. |
+| `max_iter` | integer | `20` | – | Iteration cap. Must be at least 1. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 
 **Returns:** One row per node: `id` (the node), `label_propagation` (UInt32)
@@ -167,7 +167,7 @@ louvain(graph, weight => NULL, resolution => 1.0, seed => NULL)
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
 | `weight` | expression | `NULL` | – | A non-negative weight per edge; null is unweighted. |
-| `resolution` | number | `1.0` | – | Modularity resolution; larger gives smaller communities. |
+| `resolution` | number | `1.0` | – | Modularity resolution; larger gives smaller communities. Must be above 0. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 
 **Returns:** One row per node: `id` (the node), `louvain` (UInt32)
@@ -206,7 +206,7 @@ avg_path_length(graph, sample => NULL, direction => 'out')
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
-| `sample` | number or NULL | `NULL` | – | Estimate from this fraction of the sources; null is exact. |
+| `sample` | number or NULL | `NULL` | – | Estimate from this fraction of the sources; null is exact. Must be above 0 and at most 1. |
 | `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
 
 **Directions:** `'out'`, `'in'`, `'both'`
@@ -293,12 +293,12 @@ layout_fa2(graph, multilevel => true, iterations => NULL, k => 1.0, gravity => 1
 |---|---|---|---|---|
 | `multilevel` | boolean | `true` | – | Lay out coarse to fine; false runs flat ForceAtlas2. |
 | `iterations` | integer or NULL | `NULL` | – | Flat: iterations to run (null is 300). Coarse to fine: iterations of the graph itself, coarser levels more (null schedules them by the graph's size). |
-| `k` | number | `1.0` | – | Repulsion strength; scales the drawing rather than changing its shape. |
-| `gravity` | number | `1.0` | – | Pull toward the origin, which keeps components in one picture. |
+| `k` | number | `1.0` | – | Repulsion strength; scales the drawing rather than changing its shape. Must be above 0. |
+| `gravity` | number | `1.0` | – | Pull toward the origin, which keeps components in one picture. Must be at least 0. |
 | `strong_gravity` | boolean | `false` | – | Gravity grows with distance, pulling a sprawling periphery in. |
 | `lin_log` | boolean | `false` | – | LinLog attraction, ln(1 + d), for more distinct clusters; the same on one machine, not bit-identical across platforms. |
-| `theta` | number or NULL | `NULL` | – | Barnes-Hut opening angle, smaller more exact and slower; null is 1.0 coarse to fine, 0.5 flat. |
-| `jitter_tolerance` | number | `1.0` | – | Swinging tolerated before the step size is cut; larger converges faster and shakes more. |
+| `theta` | number or NULL | `NULL` | – | Barnes-Hut opening angle, smaller more exact and slower; null is 1.0 coarse to fine, 0.5 flat. Must be at least 0. |
+| `jitter_tolerance` | number | `1.0` | – | Swinging tolerated before the step size is cut; larger converges faster and shakes more. Must be above 0. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 
 **Returns:** One row per node: `id` (the node), `x` (Float32), `y` (Float32)
@@ -314,8 +314,8 @@ layout_fr(graph, iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
 | `iterations` | integer | `300` | – | Simulation steps. |
-| `k` | number | `1.0` | – | Ideal edge length; sets the units of the positions. |
-| `gravity` | number | `0.02` | – | Pull toward the origin, which keeps components together. |
+| `k` | number | `1.0` | – | Ideal edge length; sets the units of the positions. Must be above 0. |
+| `gravity` | number | `0.02` | – | Pull toward the origin, which keeps components together. Must be at least 0. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 
 **Returns:** One row per node: `id` (the node), `x` (Float32), `y` (Float32)
