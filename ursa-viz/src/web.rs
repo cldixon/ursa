@@ -15,6 +15,7 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+use crate::highlight::{flag, BadHighlight, HighlightState};
 use crate::scene::{parse_color, Graph, Growth, LiveLayout, NodeStyle, Theme};
 use crate::view::View;
 
@@ -236,11 +237,14 @@ impl GraphView {
     }
 
     /// The colours to draw with, as CSS hex colours (`#rrggbb`, `#rgb`,
-    /// with alpha or not): `{background, edge, node, palette}`, each
-    /// optional, a missing one kept. `edge` is the edges' ink (their
-    /// opacity is [`GraphView::set_edge_alpha`] times its alpha), `node` the
-    /// nodes' colour when they are not coloured by category, and `palette`
-    /// the categories' colours (an array). Takes effect on the next
+    /// with alpha or not): `{background, edge, node, palette, highlight,
+    /// selection, pin}`, each optional, a missing one kept. `edge` is the
+    /// edges' ink (their opacity is [`GraphView::set_edge_alpha`] times its
+    /// alpha), `node` the nodes' colour when they are not coloured by
+    /// category, and `palette` the categories' colours (an array).
+    /// `highlight` colours highlighted edges, halos and the rings of a
+    /// route's ends; `selection` the rings of selected and hovered nodes;
+    /// `pin` the rings of pinned ones. Takes effect on the next
     /// [`GraphView::render`]; the default is ink on white.
     #[wasm_bindgen(js_name = setTheme)]
     pub fn set_theme(&mut self, theme: JsValue) -> Result<(), JsValue> {
@@ -260,6 +264,9 @@ impl GraphView {
             ("background", &mut next.background),
             ("edge", &mut next.edge),
             ("node", &mut next.node),
+            ("highlight", &mut next.highlight),
+            ("selection", &mut next.selection),
+            ("pin", &mut next.pin),
         ] {
             let value = field(name)?;
             if !value.is_undefined() && !value.is_null() {
@@ -312,6 +319,127 @@ impl GraphView {
         self.view.renderer_mut().edge_alpha = alpha.clamp(0.0, 1.0);
     }
 
+    /// Every node's flags, one byte each ([`NodeFlag`]'s bits, or'd):
+    /// selected, hovered and pinned draw a ring; highlighted a halo; a seed
+    /// (or a route's end) a ring in the highlight colour; dimmed draws the
+    /// node at 35%; hidden draws neither the node nor its edges. While any
+    /// node is highlighted or a seed, or any edge is highlighted, the edges
+    /// and every node that is not selected, hovered, highlighted or a seed
+    /// draw at 35%.
+    ///
+    /// Only the flags that changed are uploaded (four bytes a node:
+    /// [`GraphView::flag_bytes_uploaded`]), never the edges or the styles.
+    #[wasm_bindgen(js_name = setFlags)]
+    pub fn set_flags(&mut self, flags: &[u8]) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_flags(flags))
+    }
+
+    /// Every node's flags, as [`GraphView::set_flags`] takes them.
+    pub fn flags(&self) -> Vec<u8> {
+        self.view.highlight().flags().to_vec()
+    }
+
+    /// The edges to draw highlighted: `src, dst` node indexes per edge, wide
+    /// (3 px) in the theme's highlight colour, over the others. They need
+    /// not be edges of the graph. Each uploads its two ends' positions (16
+    /// bytes), again when the positions change; the graph's edges are never
+    /// uploaded again. An empty array clears them.
+    #[wasm_bindgen(js_name = setHighlightEdges)]
+    pub fn set_highlight_edges(&mut self, pairs: &[u32]) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_edges(pairs))
+    }
+
+    /// Highlight paths and seeds, replacing the highlight there was: the
+    /// paths' nodes get a halo, the steps between their consecutive nodes
+    /// are drawn wide, each path's two ends and each seed carry a ring, and
+    /// everything else is dimmed. The arguments are UGR's sections
+    /// (`highlights.paths.offsets`, `highlights.paths.nodes`,
+    /// `highlights.seeds`): path `p` is `nodes[offsets[p]..offsets[p + 1]]`.
+    /// `seeds` may be left out. Selection, hover, pins and hidden nodes are
+    /// kept.
+    #[wasm_bindgen(js_name = setHighlights)]
+    pub fn set_highlights(
+        &mut self,
+        offsets: &[u32],
+        nodes: &[u32],
+        seeds: Option<Vec<u32>>,
+    ) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_paths(offsets, nodes, seeds.as_deref().unwrap_or(&[])))
+    }
+
+    /// No path, seed or highlighted edge: nothing is dimmed. Selection,
+    /// hover, pins and hidden nodes are kept.
+    #[wasm_bindgen(js_name = clearHighlights)]
+    pub fn clear_highlights(&mut self) -> Result<(), JsValue> {
+        self.highlight(|h| {
+            h.clear_highlight();
+            Ok(())
+        })
+    }
+
+    /// The selected nodes: exactly these, each with a ring in the selection
+    /// colour. An empty array selects none.
+    #[wasm_bindgen(js_name = setSelection)]
+    pub fn set_selection(&mut self, nodes: &[u32]) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_only(flag::SELECTED, nodes))
+    }
+
+    /// The node under the pointer, with a thin ring, or none (`undefined`).
+    #[wasm_bindgen(js_name = setHovered)]
+    pub fn set_hovered(&mut self, node: Option<u32>) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_only(flag::HOVERED, node.as_slice()))
+    }
+
+    /// The pinned nodes: exactly these, each with a small ring in the pin
+    /// colour. The view only draws the pin; holding the node in place is
+    /// the layout's ([`Layout::grow`]'s `pinned`).
+    #[wasm_bindgen(js_name = setPinned)]
+    pub fn set_pinned(&mut self, nodes: &[u32]) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_only(flag::PINNED, nodes))
+    }
+
+    /// The hidden nodes: exactly these. A hidden node is not drawn, nor
+    /// are its edges, and it cannot be picked; it keeps its index.
+    #[wasm_bindgen(js_name = setHidden)]
+    pub fn set_hidden(&mut self, nodes: &[u32]) -> Result<(), JsValue> {
+        self.highlight(|h| h.set_only(flag::HIDDEN, nodes))
+    }
+
+    /// Bytes of flags written to the GPU so far: 4 for each node whose
+    /// flags changed.
+    #[wasm_bindgen(getter, js_name = flagBytesUploaded)]
+    pub fn flag_bytes_uploaded(&self) -> f64 {
+        self.view.renderer().flag_bytes_uploaded() as f64
+    }
+
+    /// Bytes of highlighted edges written to the GPU so far: 16 for each
+    /// edge, each time the edges or the positions change.
+    #[wasm_bindgen(getter, js_name = highlightBytesUploaded)]
+    pub fn highlight_bytes_uploaded(&self) -> f64 {
+        self.view.renderer().highlight_bytes_uploaded() as f64
+    }
+
+    /// Where node `node` is drawn: `[x, y]` in canvas pixels from the top
+    /// left.
+    #[wasm_bindgen(js_name = nodePixel)]
+    pub fn node_pixel(&self, node: u32) -> Result<Vec<f32>, JsValue> {
+        let n = self.view.graph().n_nodes();
+        if node as usize >= n {
+            return Err(js_err(BadHighlight::Node { node, nodes: n }));
+        }
+        let (x, y) = self.view.node_pixel(node as usize);
+        Ok(vec![x, y])
+    }
+
+    fn highlight(
+        &mut self,
+        change: impl FnOnce(&mut HighlightState) -> Result<(), BadHighlight>,
+    ) -> Result<(), JsValue> {
+        self.view
+            .set_highlight(&self.device, &self.queue, change)
+            .map_err(js_err)
+    }
+
     /// Draw these positions: `x` then `y`, one per node each, as
     /// [`Layout::positions`] gives them.
     #[wasm_bindgen(js_name = setPositions)]
@@ -344,6 +472,31 @@ impl GraphView {
         Ok(())
     }
 }
+
+/// The bits of a node's flags byte ([`GraphView::set_flags`]): or them
+/// together.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeFlag {
+    Selected = 1,
+    Hovered = 2,
+    Pinned = 4,
+    Dimmed = 8,
+    Highlighted = 16,
+    Hidden = 32,
+    Seed = 64,
+}
+
+// The JavaScript enum is the Rust constants.
+const _: () = {
+    assert!(NodeFlag::Selected as u8 == flag::SELECTED);
+    assert!(NodeFlag::Hovered as u8 == flag::HOVERED);
+    assert!(NodeFlag::Pinned as u8 == flag::PINNED);
+    assert!(NodeFlag::Dimmed as u8 == flag::DIMMED);
+    assert!(NodeFlag::Highlighted as u8 == flag::HIGHLIGHTED);
+    assert!(NodeFlag::Hidden as u8 == flag::HIDDEN);
+    assert!(NodeFlag::Seed as u8 == flag::SEED);
+};
 
 /// The graph of `n_nodes` nodes and the edges `(src[i], dst[i])`, or why it
 /// is not one.
