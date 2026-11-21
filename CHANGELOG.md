@@ -667,6 +667,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   On a 32M-edge, 2.1M-node R-MAT graph with 105 sources on 4 threads: peak
   RSS 1,019 MB to 814 MB (the graph alone is 576 MB), time unchanged (61 s
   and 60 s, within the noise of a shared machine).
+- **Unweighted Louvain holds about half the memory, with the same
+  communities** (#450). An unweighted run's level-0 working graph stored an
+  8-byte `f64` per adjacency slot for a weight that counts parallel edges
+  (1, or 2 for a reciprocal pair). It now stores that count in one byte, 5
+  bytes a slot instead of 12; a graph with more than 255 parallel edges
+  between two nodes, a weighted run, and every aggregated level keep `f64`s.
+  Local moving (serial and `parallel => true`) and the aggregation read
+  either store through the same code, compiled once for each. Results are
+  unchanged, bit for bit. On R-MAT graphs (4 shared cores), Louvain's peak
+  heap went from 488 to 227 MB at 20M edges and from 1,295 to 630 MB at 50M
+  (peak RSS 1.72 → 1.11 GB), serial or parallel, at the same speed or
+  slightly faster; weighted runs are unchanged.
 - **SQL: a stored graph index is memory-mapped, not read whole** (#382).
   Loading one read the whole file on one core, so at full scale (2.42B
   edges, an 18.6 GiB index) every query in a new process paid 15 s, even a
