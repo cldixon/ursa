@@ -22,7 +22,7 @@ later, in a notebook widget or a native window through the same `View`.
 | `scene` | the graph, the live layout, node styles, the camera. No GPU; tested natively. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
-| `web` (feature) | the wasm-bindgen API: `createView` for a canvas, `Layout` for a worker. |
+| `web` (feature) | the wasm-bindgen API: `createView` for a canvas, `Layout` for a worker (`step`, `grow`). |
 
 With `default-features = false` the crate is `model` and `scene` alone, with
 no wgpu in its dependencies: what an engine needs to produce a graph, and
@@ -168,6 +168,54 @@ whatever the layout costs. `Layout`'s `level` and `levels` say how far it
 is: coarse to fine counts `level` down from `levels - 1` to 0, the graph
 itself.
 
+## Growing a layout
+
+A view that expands a node gains a few neighbours, and what is drawn must
+not jump (#442). `LiveLayout::grow` (the worker's `Layout.grow`) takes the
+grown graph, with the same node indexes and the new nodes after them:
+
+```js
+// 500 nodes drawn; node 33 gains 16 neighbours, nodes 500..515.
+layout.grow(516, src, dst, parents /* Uint32Array(16).fill(33), or undefined */, pinned);
+while (!layout.done) layout.step(10);   // 60 iterations in all; layout.total
+```
+
+- **Placement**: each new node starts on a golden-angle spiral around its
+  parent, as prolongation places a group's members. The parent is the node
+  named, or the new node's lowest-indexed neighbour already drawn, or, for a
+  new node tied only to new ones, theirs. A new node tied to nothing goes on
+  a ring around the drawing.
+- **What is held**: pinned nodes are fixed (`Fa2State::set_fixed`): they do
+  not move by a bit, and still repel and attract. So are the expanded nodes
+  themselves, nodes with no edge, and old nodes more than two hops from a new
+  one. The old nodes within two hops have ten times a new node's inertia
+  (`Fa2State::set_inertia`), so they make room without rearranging. A drawing
+  of more than 5,000 nodes is held whole. `WarmParams` has each of these as a
+  knob.
+- **Schedule**: 60 iterations of flat ForceAtlas2 for up to 100 new nodes
+  (or a tenth of the drawing), 200 for more.
+- **Cost**: the fixed nodes have a quadtree of their own, built once, and no
+  force is computed for them, so an iteration costs what the free nodes do.
+  On one thread, 100 new neighbours in a drawing of 131K nodes and 929K edges
+  take 2 ms to place and 10 ms for all 60 iterations; rebuilding the
+  adjacency for the grown graph takes 52 ms, and is the rest of the click
+  ([`BENCH.md`](BENCH.md#growing-a-layout)).
+- The same layout grown by the same additions in the same order has the same
+  bits, on any thread count and however the iterations are split
+  (`ursa-core/tests/determinism_threads.rs`). A layout that never grows has
+  the bits it always had (`ursa-core/tests/layout_golden.rs`).
+
+`LiveLayout::from_positions` (`Layout.fromPositions`) makes a layout from
+positions already known (saved ones, another layout's, an undo's), to grow
+from. `tests/grow.rs` holds the acceptance: expanding a node to degree 16 in
+a 500-node view moves the old nodes 0.003% of the view's width on average
+and 0.4% at most, and pinned nodes not at all.
+
+What it does not do: keep discs from touching. ForceAtlas2 has no notion of
+a node's size, and the leaves of one hub settle about a third as far apart
+as the average pair of nodes in the drawing; the test bounds that ratio, not
+pixels.
+
 ## Measured
 
 Time to a converged layout: coarse to fine to the end of its schedule; flat
@@ -257,6 +305,8 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   (half the nodes, nearly all the edges), so they cost about what the graph
   does. Cheaper iterations (attraction gathers 2M random reads; repulsion
   could be approximated harder far out) would buy the rest.
+- **Growing from the shell.** `Layout.grow` is in the wasm API; the
+  shell's layout worker does not call it yet (`{type: "grow"}`, with #443).
 - **The view's own layout.** `View::step`, for a page that lays out on its
   own thread, is still flat ForceAtlas2; the worker's `Layout` is coarse to
   fine.

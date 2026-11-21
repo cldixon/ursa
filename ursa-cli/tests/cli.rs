@@ -1051,6 +1051,76 @@ fn traversals_match_getting_started() {
     );
 }
 
+/// #416 and #417's repros, as the review ran them: a number outside a
+/// parameter's range is an error on stderr, not a plausible table, and
+/// `DESCRIBE FROM` lists the columns.
+#[test]
+fn out_of_range_parameters_and_describe_from() {
+    let graph = format!(
+        "CREATE PROPERTY GRAPH k EDGE TABLES ('{}' SOURCE KEY (src) DESTINATION KEY (dst));",
+        karate_edges()
+    );
+    for (call, message) in [
+        (
+            "pagerank(k, damping => -1)",
+            "pagerank(damping =>) must be between 0 and 1; got -1",
+        ),
+        (
+            "pagerank(k, max_iter => 0)",
+            "pagerank(max_iter =>) must be at least 1; got 0",
+        ),
+        (
+            "betweenness(k, sample => 2)",
+            "betweenness(sample =>) must be above 0 and at most 1; got 2",
+        ),
+        (
+            "avg_path_length(k, sample => 5)",
+            "avg_path_length(sample =>) must be above 0 and at most 1; got 5",
+        ),
+        (
+            "louvain(k, resolution => -1)",
+            "louvain(resolution =>) must be above 0; got -1",
+        ),
+    ] {
+        let stderr = err(ursa(&["-c", &format!("{graph} SELECT * FROM {call}")]));
+        assert!(stderr.contains(message), "{call}: {stderr}");
+    }
+    // The ends of the ranges still run.
+    let out = ok(ursa(&[
+        "--format",
+        "csv",
+        "-c",
+        &format!(
+            "{graph} SELECT count(*) AS n FROM pagerank(k, damping => 1, max_iter => 1, tol => 0)"
+        ),
+    ]));
+    assert_eq!(out, "n\n34\n");
+
+    let described = ok(ursa(&[
+        "--format",
+        "csv",
+        "-c",
+        &format!("DESCRIBE FROM '{}'", karate_edges()),
+    ]));
+    assert_eq!(
+        described,
+        ok(ursa(&[
+            "--format",
+            "csv",
+            "-c",
+            &format!("DESCRIBE SELECT * FROM '{}'", karate_edges()),
+        ]))
+    );
+    assert!(
+        described.contains("\nsrc,") && described.contains("\ndst,"),
+        "{described}"
+    );
+
+    // `.functions NAME` shows a parameter's range.
+    let out = ok(ursa(&["-c", ".functions betweenness"]));
+    assert!(out.contains("Must be above 0 and at most 1."), "{out}");
+}
+
 /// Getting Started, "Find out what is available": `ursa_functions()`, which
 /// an agent reads as JSON.
 #[test]
@@ -1068,15 +1138,15 @@ fn ursa_functions_lists_the_catalog() {
 \"networkx\":\"nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))\",\
 \"parameters\":[\
 {\"name\":\"damping\",\"type\":\"number\",\"default\":\"0.85\",\"choices\":[],\
-\"doc\":\"Probability of following an edge.\"},\
+\"range\":\"between 0 and 1\",\"doc\":\"Probability of following an edge.\"},\
 {\"name\":\"max_iter\",\"type\":\"integer\",\"default\":\"30\",\"choices\":[],\
-\"doc\":\"Iteration cap.\"},\
+\"range\":\"at least 1\",\"doc\":\"Iteration cap.\"},\
 {\"name\":\"tol\",\"type\":\"number\",\"default\":\"1e-6\",\"choices\":[],\
-\"doc\":\"Convergence tolerance on the L1 change.\"},\
+\"range\":\"at least 0\",\"doc\":\"Convergence tolerance on the L1 change.\"},\
 {\"name\":\"weight\",\"type\":\"expression\",\"default\":\"NULL\",\"choices\":[],\
-\"doc\":\"A non-negative weight per edge; null is unweighted.\"},\
+\"range\":null,\"doc\":\"A non-negative weight per edge; null is unweighted.\"},\
 {\"name\":\"direction\",\"type\":\"string\",\"default\":\"'out'\",\"choices\":[\"out\",\"both\"],\
-\"doc\":\"Follow the rows as stored, or read the graph as undirected.\"}],\
+\"range\":null,\"doc\":\"Follow the rows as stored, or read the graph as undirected.\"}],\
 \"directions\":[\"out\",\"both\"],\
 \"outputs\":[{\"name\":\"pagerank\",\"type\":\"Float64\",\"nullable\":false}]}]\n"
     );

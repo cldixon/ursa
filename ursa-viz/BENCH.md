@@ -215,6 +215,80 @@ What stands out, for setting targets:
   R-MAT edges, 4 MiB at the 1M-edge grid, about 10 posts a second. The
   100K-edge grid made 190 posts over its 16 s layout, 76 MB in all.
 
+## Growing a layout
+
+A warm start (`fa2_grow`, #442), natively, by `fa2_multilevel`'s `grow` mode:
+each R-MAT graph is laid out coarse to fine, then one node of degree 8 to 32
+gains 16 or 100 new neighbours, a third of them also tied to another node
+drawn. Not part of `bun run bench`; to rerun it:
+
+```sh
+cargo run -p ursa-core --release --example fa2_multilevel -- grow 1k,10k,100k,1m 16,100
+cargo run -p ursa-core --release --no-default-features --example fa2_multilevel -- grow
+```
+
+Run 2026-11-21 on the same machine (4 cores), best of five. *build* is
+`Topology::build` and its undirected view for the grown graph, *place* is
+`fa2_grow` (the spiral, the masses, the masks), *run* is the whole warm
+schedule, 60 iterations. *held* is how the old nodes are held: `x10` is ten
+times the inertia within two hops of a new node and fixed beyond, `fixed` is
+all of them (more than 5,000 nodes). Moves are of the old nodes, in % of the
+width of the drawing's connected part; *nearest* is the least distance from
+a new node to any other, in the same unit.
+
+One thread, as the browser runs it:
+
+| graph | nodes | edges | new | held | build ms | place ms | run ms | total ms | mean move | max move | nearest |
+|---|--:|--:|--:|---|--:|--:|--:|--:|--:|--:|--:|
+| 1k | 128 | 579 | 16 | x10 | 0.04 | 0.01 | 1.4 | 1.5 | 2.6% | 14% | 2.0% |
+| 1k | 128 | 579 | 100 | x10 | 0.05 | 0.01 | 4.0 | 4.0 | 16% | 38% | 1.5% |
+| 10k | 2,048 | 8,334 | 16 | x10 | 0.5 | 0.05 | 25 | 26 | 0.03% | 1.4% | 0.09% |
+| 10k | 2,048 | 8,334 | 100 | x10 | 0.5 | 0.06 | 37 | 37 | 0.07% | 1.8% | 0.09% |
+| 100k | 16,384 | 88,822 | 16 | fixed | 4.8 | 0.3 | 1.5 | 6.5 | 0 | 0 | 0.03% |
+| 100k | 16,384 | 88,822 | 100 | fixed | 3.8 | 0.2 | 4.8 | 8.9 | 0 | 0 | 0.02% |
+| 1m | 131,072 | 928,785 | 16 | fixed | 62 | 1.8 | 7.6 | 71 | 0 | 0 | 0.02% |
+| 1m | 131,072 | 928,785 | 100 | fixed | 52 | 2.0 | 10 | 64 | 0 | 0 | 0.01% |
+
+Rayon, 4 threads:
+
+| graph | new | held | build ms | place ms | run ms | total ms |
+|---|--:|---|--:|--:|--:|--:|
+| 1k | 16 | x10 | 0.1 | 0.01 | 4.9 | 5.0 |
+| 1k | 100 | x10 | 0.07 | 0.01 | 5.1 | 5.2 |
+| 10k | 16 | x10 | 0.3 | 0.05 | 10 | 11 |
+| 10k | 100 | x10 | 0.3 | 0.05 | 15 | 15 |
+| 100k | 16 | fixed | 3.3 | 0.3 | 3.5 | 7.1 |
+| 100k | 100 | fixed | 3.3 | 0.3 | 6.3 | 9.9 |
+| 1m | 16 | fixed | 25 | 2.0 | 11 | 37 |
+| 1m | 100 | fixed | 25 | 2.2 | 13 | 40 |
+
+The moves are the same on both, to the bit.
+
+- **Adding 100 neighbours to a laid-out 1M-edge graph costs 64 ms on one
+  thread, 40 ms on four**, of which 52 and 25 ms rebuild the adjacency. That
+  is under the design's 100 ms from click to frame, natively; the engine's
+  `hop` and `induced_edges` (about 10 ms each), the delta and the frame are
+  on top, and wasm is about 1.4 times slower than native on one thread. The
+  first frame needs only *build* and *place*: the schedule can run over the
+  frames after it.
+- **Holding the drawing whole is what makes that so.** With every old node
+  free at ten times the inertia (`GROW_FREEZE=10000000 GROW_REACH=4000000000`),
+  the same 60 iterations take 1.7 s at 1M edges and 170 ms at 100K on four
+  threads, and move the old nodes 0.4% and 0.1% of the width on average.
+- **A finished layout is not at rest.** ForceAtlas2 keeps carrying leaves
+  outwards long after the shape has settled, so 60 more iterations move
+  nodes that have nothing to do with what was added: with one node added and
+  every old node free at ten times the inertia, 2.1% of the width on average
+  and 11.5% at most in the 128-node graph (0.12% and 1.6% in the 2,048-node
+  one). Freeing only the nodes within two hops brings that to 1.0% and 0.03%.
+  R-MAT's 128-node graph is the hard case: two hops from a hub is most of
+  it, and 16 new neighbours are an eighth of the graph. The largest moves
+  left are of old nodes that gained an edge to a new node across the drawing.
+- **The expanded node is held.** Free, a node of degree 30 that gains 16
+  neighbours moves 18% of the width in the 128-node graph: its ForceAtlas2
+  mass is `deg + 1`, so everything repels it harder than a moment before
+  (`GROW_FREE_PARENT=1 GROW_REACH=4000000000`).
+
 ## Caveats
 
 - **No GPU.** WebGL2 runs on SwiftShader, on the same 4 cores as the layout

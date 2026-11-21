@@ -59,6 +59,45 @@ async fn from_first_queries_select_every_column() {
     same(&ctx, "SELECT * FROM v", "SELECT * FROM t WHERE x = 2").await;
     let explain = ok(&ctx, "EXPLAIN FROM t").await;
     assert!(explain.contains("projection=[x, y]"), "{explain}");
+    let explain = ok(&ctx, "EXPLAIN VERBOSE FROM t").await;
+    assert!(explain.contains("projection=[x, y]"), "{explain}");
+    let explain = ok(&ctx, "EXPLAIN ANALYZE FROM t").await;
+    assert!(explain.contains("Plan with Metrics"), "{explain}");
+}
+
+/// `DESCRIBE FROM t` lists the columns, as `DESCRIBE SELECT * FROM t` does
+/// (#417): it returned a table of no rows.
+#[tokio::test]
+async fn describe_from_lists_the_columns() {
+    let ctx = ursa_engine::new_session();
+    ok(
+        &ctx,
+        "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v(x, y)",
+    )
+    .await;
+    let karate = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../python/ursa/datasets/data/karate_edges.csv"
+    );
+    for (sql, expected) in [
+        ("DESCRIBE FROM t", "DESCRIBE SELECT * FROM t"),
+        ("DESC FROM t", "DESCRIBE SELECT * FROM t"),
+        ("describe from t where x > 1", "DESCRIBE SELECT * FROM t"),
+        ("SELECT 1; DESCRIBE FROM t", "DESCRIBE SELECT * FROM t"),
+        (
+            &format!("DESCRIBE FROM '{karate}'"),
+            &format!("DESCRIBE SELECT * FROM '{karate}'"),
+        ),
+    ] {
+        same(&ctx, sql, expected).await;
+    }
+    let described = ok(&ctx, "DESCRIBE FROM t").await;
+    assert!(
+        described.contains("| x ") && described.contains("| y "),
+        "{described}"
+    );
+    let file = ok(&ctx, &format!("DESCRIBE FROM '{karate}'")).await;
+    assert!(file.contains("| src ") && file.contains("| dst "), "{file}");
 }
 
 #[tokio::test]

@@ -209,7 +209,7 @@ DESCRIBE GRAPH karate;
 SELECT * FROM ursa_functions();
 ```
 
-`ursa_functions()` lists every graph function with its parameters, their defaults, the NetworkX function it matches, and a one-line description.
+`ursa_functions()` lists every graph function with its parameters, their defaults and the range of numbers each accepts, the NetworkX function it matches, and a one-line description. A number outside a parameter's range is an error that says the range: `pagerank(damping =>) must be between 0 and 1; got -1`.
 
 ## Next steps
 

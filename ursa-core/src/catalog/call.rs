@@ -5,7 +5,9 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use super::eval::OutputDtype;
-use super::spec::{lookup, parse_direction, FunctionSpec, ParamSpec, ParamType, Value, FUNCTIONS};
+use super::spec::{
+    lookup, parse_direction, FunctionSpec, ParamSpec, ParamType, Range, Value, FUNCTIONS,
+};
 use crate::algo::AggKind;
 use crate::topology::Direction;
 
@@ -52,8 +54,11 @@ pub enum ParamErrorKind {
     Unknown,
     /// The parameter was given more than once.
     Duplicate,
-    /// The argument has the wrong type or is out of range.
+    /// The argument has the wrong type, or is not a value of that type (a
+    /// negative count, a NaN).
     Expected(Expected),
+    /// The argument is a number outside the parameter's [`Range`] (#416).
+    OutOfRange(Range),
     /// The argument is not one of these strings (a choice, a direction the
     /// function accepts, or a dtype).
     NotOneOf(&'static [&'static str]),
@@ -93,6 +98,11 @@ impl fmt::Display for ParamError {
                 };
                 write!(f, "{function}(): '{param}' must be {want}")
             }
+            ParamErrorKind::OutOfRange(range) => write!(
+                f,
+                "{function}(): '{param}' must be {}",
+                range.describe().unwrap_or_else(|| "a number".into())
+            ),
             ParamErrorKind::NotOneOf(options) => {
                 let options: Vec<String> = options.iter().map(|o| format!("'{o}'")).collect();
                 write!(
@@ -474,8 +484,22 @@ impl Values {
     }
 }
 
-/// Validate one argument against its parameter.
+/// Validate one argument against its parameter: its type, then its range.
 fn check(param: &ParamSpec, arg: Arg) -> Result<Value, ParamErrorKind> {
+    let value = check_type(param, arg)?;
+    let number = match value {
+        Value::Float(f) => Some(f),
+        Value::UInt(u) => Some(u as f64),
+        _ => None,
+    };
+    match number {
+        Some(x) if !param.range.contains(x) => Err(ParamErrorKind::OutOfRange(param.range)),
+        _ => Ok(value),
+    }
+}
+
+/// Validate one argument against its parameter's type.
+fn check_type(param: &ParamSpec, arg: Arg) -> Result<Value, ParamErrorKind> {
     let expected = |e| Err(ParamErrorKind::Expected(e));
     let number = |arg: Arg, want: Expected| match arg {
         Arg::Int(i) => Ok(Value::Float(i as f64)),

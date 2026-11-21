@@ -10,7 +10,8 @@
 //! - [`model`]: the graph-result model, deltas and the UGR wire format: what
 //!   the engine produces and every front end reads.
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
-//!   stepped a few iterations per frame), node styles and the camera. No GPU.
+//!   stepped a few iterations per frame, and grown when the graph gains
+//!   nodes), node styles and the camera. No GPU.
 //! - `render` (feature `render`, on by default): drawing with wgpu: WebGPU
 //!   or WebGL2 in the browser, Vulkan, Metal or DX12 natively. Edges are a
 //!   line list over the node positions, so a layout step uploads 8 bytes a
@@ -34,6 +35,6 @@ pub mod view;
 pub mod web;
 
 pub use model::{GraphDelta, GraphResult};
-pub use scene::{Camera, Graph, LiveLayout, NodeStyle};
+pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};
 #[cfg(feature = "render")]
 pub use view::View;

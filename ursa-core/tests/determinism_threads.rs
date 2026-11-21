@@ -24,6 +24,7 @@ use ursa_core::algo::{
     louvain, louvain_weighted, pagerank, pagerank_weighted, symmetric_view_weighted, Fa2Multilevel,
     Fa2Params, LayoutParams, MultilevelParams, PageRankParams,
 };
+use ursa_core::algo::{fa2_grow, Fa2State, WarmParams};
 use ursa_core::Topology;
 
 /// A deterministic pseudo-random directed graph via a hand-rolled LCG, so the test
@@ -348,6 +349,135 @@ fn layout_fa2_multilevel_is_thread_count_independent() {
             got_stepped, baseline,
             "stepped diverged on {threads} threads"
         );
+    }
+}
+
+/// The edges of `seeded_graph(n, m)`, to build a graph that grows from it.
+fn seeded_edges(n: usize, m: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let (mut src, mut dst) = (Vec::with_capacity(m), Vec::with_capacity(m));
+    for _ in 0..m {
+        src.push(next() % n as u32);
+        dst.push(next() % n as u32);
+    }
+    (src, dst)
+}
+
+#[test]
+fn fa2_masks_are_thread_count_independent() {
+    // Fixed nodes and mixed inertia on the plain state: the masks change
+    // which forces are computed and how the speed's sums are weighted, and
+    // neither may depend on the pool.
+    let topo = seeded_graph(1500, 3000);
+    let adj = topo.undirected();
+    let run = || {
+        let mut state = Fa2State::new(
+            adj,
+            Fa2Params {
+                seed: Some(5),
+                ..Fa2Params::default()
+            },
+        );
+        state.step(adj, 10);
+        state.set_fixed(Some((0..1500).map(|i| i % 7 == 0).collect()));
+        state.set_inertia(Some(
+            (0..1500).map(|i| 1.0 + (i % 4) as f32 * 3.0).collect(),
+        ));
+        state.step(adj, 40);
+        state.into_positions()
+    };
+    let baseline = on_pool(1, run);
+    assert!(baseline.0.iter().chain(&baseline.1).all(|v| v.is_finite()));
+    for threads in THREADS {
+        let got = on_pool(threads, run);
+        assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
+        assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
+    }
+}
+
+#[test]
+fn fa2_grow_is_thread_count_independent() {
+    // A layout grown three times: neighbours of one node with pins, then of
+    // another with the first lot now old and everything free to move, then
+    // with the whole drawing frozen. The same sequence must give the same bits on every pool, and
+    // twice on the same one.
+    let n0 = 1200usize;
+    let (src0, dst0) = seeded_edges(n0, 2400);
+    let mut graphs = vec![Topology::build(n0, src0.clone(), dst0.clone())];
+    let (mut src, mut dst, mut n) = (src0, dst0, n0 as u32);
+    for (hub, add) in [(17u32, 16u32), (900, 40), (1210, 150)] {
+        for j in 0..add {
+            src.push(hub);
+            dst.push(n + j);
+            if j % 5 == 0 {
+                // Ties among the new nodes, and back into the drawing.
+                src.push(n + j);
+                dst.push(n + (j + 1) % add);
+                src.push(n + j);
+                dst.push((j * 37) % n0 as u32);
+            }
+        }
+        n += add;
+        graphs.push(Topology::build(n as usize, src.clone(), dst.clone()));
+    }
+    let steps: [(&[u32], WarmParams); 3] = [
+        (&[3, 17, 500], WarmParams::default()),
+        (
+            &[17, 1201],
+            // The whole component free, the expanded node too: the path
+            // with inertia and no tree of fixed nodes to lean on.
+            WarmParams {
+                reach: u32::MAX,
+                hold_parents: false,
+                ..WarmParams::default()
+            },
+        ),
+        (
+            &[],
+            WarmParams {
+                freeze_above: 1000,
+                ..WarmParams::default()
+            },
+        ),
+    ];
+    let run = || {
+        let adj = graphs[0].undirected();
+        let mut state = Fa2State::new(adj, Fa2Params::default());
+        state.step(adj, 80);
+        let mut scheduled = Vec::new();
+        for (g, (pinned, params)) in graphs[1..].iter().zip(&steps) {
+            let adj = g.undirected();
+            let iterations = fa2_grow(&mut state, adj, None, pinned, *params);
+            scheduled.push(iterations);
+            // Uneven chunks, as a view steps it.
+            let mut left = iterations;
+            for chunk in [7u32, 1, 30].iter().cycle() {
+                if left == 0 {
+                    break;
+                }
+                let c = (*chunk).min(left);
+                state.step(adj, c);
+                left -= c;
+            }
+        }
+        let (x, y) = state.positions();
+        (x.to_vec(), y.to_vec(), scheduled)
+    };
+    let baseline = on_pool(1, run);
+    assert_eq!(baseline.2, [60, 60, 200]);
+    assert_eq!(baseline.0.len(), 1200 + 16 + 40 + 150);
+    assert!(baseline.0.iter().chain(&baseline.1).all(|v| v.is_finite()));
+    assert_eq!(on_pool(1, run), baseline, "a second run differs");
+    for threads in THREADS {
+        let got = on_pool(threads, run);
+        assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
+        assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
     }
 }
 
