@@ -70,6 +70,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
+use super::provenance::{self, PatternEdge};
 use super::{EdgeTable, Label, Properties, PropertyGraph, VertexTable};
 
 /// The table function Ursa's parser rewrites `GRAPH_TABLE ( … )` into.
@@ -857,6 +858,69 @@ pub struct Lowered {
     pub conditions: Vec<String>,
     /// The `COLUMNS` list as written.
     pub columns: String,
+    /// What each variable is, for the result's field metadata
+    /// ([`super::provenance`]): every named node, edge and path variable.
+    pub variables: Vec<Variable>,
+    /// The pattern's edges, in the order written, for the result's
+    /// `ursa.pattern`.
+    pub edges: Vec<PatternEdge>,
+}
+
+/// A pattern variable, as a result's field metadata describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variable {
+    pub var: String,
+    pub kind: VariableKind,
+}
+
+/// What a pattern variable binds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariableKind {
+    /// A node: its vertex table (element name), if the graph has one, and
+    /// the property names of its key.
+    Node {
+        label: Option<String>,
+        keys: Vec<String>,
+    },
+    /// An edge of the edge table `label`.
+    Edge { label: String },
+    /// A path over the edge table `edges`, between nodes of the vertex table
+    /// `vertices`, if the graph has one.
+    Path {
+        edges: String,
+        vertices: Option<String>,
+    },
+}
+
+impl Lowered {
+    /// The field metadata of `column` of the relation `relation` (a
+    /// variable), if it is something a result should say: a node's key, a
+    /// property, or a path's nodes, edges or elements.
+    pub fn provenance(
+        &self,
+        graph: &str,
+        relation: &str,
+        column: &str,
+    ) -> Option<BTreeMap<String, String>> {
+        use super::path_search::{EDGES, ELEMENTS, VERTICES};
+        let variable = self.variables.iter().find(|v| v.var == relation)?;
+        let (role, label) = match &variable.kind {
+            VariableKind::Node { label, keys } => match keys.iter().any(|k| k == column) {
+                true => (provenance::ROLE_NODE, label.as_deref()),
+                false => (provenance::ROLE_PROPERTY, label.as_deref()),
+            },
+            VariableKind::Edge { label } => (provenance::ROLE_PROPERTY, Some(label.as_str())),
+            VariableKind::Path { edges, vertices } => match column {
+                VERTICES => (provenance::ROLE_PATH_NODES, vertices.as_deref()),
+                EDGES => (provenance::ROLE_PATH_EDGES, Some(edges.as_str())),
+                ELEMENTS => (provenance::ROLE_PATH_ELEMENTS, None),
+                _ => return None,
+            },
+        };
+        let mut metadata = provenance::metadata(role, graph, label);
+        metadata.insert(provenance::VAR.to_string(), relation.to_string());
+        Some(metadata)
+    }
 }
 
 /// Resolve `pattern` against `graph`. `schema_of` gives a table's columns
@@ -1492,6 +1556,62 @@ pub fn lower(
         .iter()
         .enumerate()
         .any(|(i, s)| s.direction == Direction::Any && !is_searched(i));
+    // What the result says about its columns (`provenance`): the named
+    // variables, and the pattern's edges.
+    let named = |var: &str| (!var.starts_with("__ursa_")).then(|| var.to_string());
+    let mut variables: Vec<Variable> = order
+        .iter()
+        .filter(|var| named(var).is_some())
+        .map(|var| {
+            let b = &bindings[var];
+            let kind = match b.is_edge {
+                true => VariableKind::Edge {
+                    label: b.edge.expect("resolved").name.clone(),
+                },
+                false => VariableKind::Node {
+                    label: vertex_table(b).map(|v| v.name.clone()),
+                    keys: key_names(var),
+                },
+            };
+            Variable {
+                var: var.clone(),
+                kind,
+            }
+        })
+        .collect();
+    for step in &steps {
+        let Some(path) = &pattern.paths[step.path].var else {
+            continue;
+        };
+        if variables.iter().any(|v| &v.var == path) {
+            continue;
+        }
+        variables.push(Variable {
+            var: path.clone(),
+            kind: VariableKind::Path {
+                edges: bindings[&step.edge].edge.expect("resolved").name.clone(),
+                vertices: vertex_table(&bindings[&step.left]).map(|v| v.name.clone()),
+            },
+        });
+    }
+    let edges = steps
+        .iter()
+        .map(|step| {
+            let (from, to) = match step.direction {
+                Direction::Left => (&step.right, &step.left),
+                Direction::Right | Direction::Any => (&step.left, &step.right),
+            };
+            PatternEdge {
+                from: named(from),
+                to: named(to),
+                directed: step.direction != Direction::Any,
+                edge: named(&step.edge),
+                label: bindings[&step.edge].edge.expect("resolved").name.clone(),
+                quantifier: step.quantifier.map(|q| (q.min, q.max)),
+                path: pattern.paths[step.path].var.clone(),
+            }
+        })
+        .collect();
     Ok(Lowered {
         sources,
         segments,
@@ -1500,6 +1620,8 @@ pub fn lower(
         union,
         conditions,
         columns: pattern.columns.clone(),
+        variables,
+        edges,
     })
 }
 

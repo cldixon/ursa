@@ -87,6 +87,8 @@ use super::node::{
     WEIGHTED_DESTINATION, WEIGHTED_SOURCE,
 };
 use super::path_search::{PathColumns, PathSearchNode, Search};
+use super::provenance;
+use super::schema_metadata::SchemaMetadataNode;
 use super::traversal::{self, TraversalParam, TraversalParamType, TraversalSpec};
 use super::{GraphDef, GraphRegistry, PropertyGraph, VertexTable};
 
@@ -456,6 +458,7 @@ fn values_node(
         edges.weights,
         outputs,
         true,
+        vertex_label(graph),
     )
 }
 
@@ -549,6 +552,7 @@ fn traversal_node(
         written,
         edges.source,
         edges.destination,
+        vertex_label(graph),
     )
 }
 
@@ -1043,7 +1047,14 @@ fn node(
         edges.weights,
         outputs,
         per_node,
+        vertex_label(graph),
     )
+}
+
+/// The element name of `graph`'s vertex table, if it has one: the label of
+/// its node keys in a result's field metadata (`provenance`).
+fn vertex_label(graph: &GraphDef) -> Option<String> {
+    graph.vertices.as_ref().map(|v| v.name.clone())
 }
 
 /// A graph node's edge inputs: the edge table projected to the endpoints, and
@@ -1736,6 +1747,26 @@ impl GraphFunctions {
                     }
                 }
             }
+            // Each column says what it is (`provenance`): a variable's key,
+            // a property, a path's nodes. A computed column says nothing.
+            let projection = projection.into_iter().map(|expr| {
+                let column = match &expr {
+                    Expr::Alias(alias) => alias.expr.as_ref(),
+                    other => other,
+                };
+                let metadata = match column {
+                    Expr::Column(Column {
+                        relation: Some(TableReference::Bare { table }),
+                        name,
+                        ..
+                    }) => lowered.provenance(&graph.name, table, name),
+                    _ => None,
+                };
+                match metadata {
+                    Some(metadata) => provenance::marked(expr, metadata),
+                    None => expr,
+                }
+            });
             branches.push(branch.project(projection)?.build()?);
         }
         // The joins of an undirected edge are a UNION ALL, which names
@@ -1775,7 +1806,15 @@ impl GraphFunctions {
         for branch in branches {
             plan = plan.union(branch)?;
         }
-        plan.build()
+        // The schema says which pattern was matched.
+        let pattern = provenance::pattern_json(&lowered.edges);
+        let node = SchemaMetadataNode::try_new(
+            Arc::new(plan.build()?),
+            BTreeMap::from([(provenance::PATTERN.to_string(), pattern)]),
+        )?;
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(node),
+        }))
     }
 
     fn first_argument_is_a_graph(

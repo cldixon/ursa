@@ -230,6 +230,41 @@ fn weights_directions_and_dtypes_are_where_python_has_them() {
     }
 }
 
+/// Every per-node function says whether its value is a metric or a category
+/// (SQL marks the column with it, #431). A new algorithm is added here, so
+/// its kind is a decision and not the default.
+#[test]
+fn every_per_node_value_is_a_metric_or_a_category() {
+    use super::OutputKind::{Category, Metric};
+    let kinds: Vec<(&str, Option<super::OutputKind>)> = FUNCTIONS
+        .iter()
+        .map(|s| (s.name, s.output_kind()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("degree", Some(Metric)),
+            ("pagerank", Some(Metric)),
+            ("connected_components", Some(Category)),
+            ("triangle_count", Some(Metric)),
+            ("clustering_coefficient", Some(Metric)),
+            ("betweenness", Some(Metric)),
+            ("closeness", Some(Metric)),
+            ("label_propagation", Some(Category)),
+            ("louvain", Some(Category)),
+            ("layout_fa2", None),
+            ("layout_fr", None),
+            ("layout_random", None),
+            ("layout_circle", None),
+            ("neighbors_agg", Some(Metric)),
+            ("density", None),
+            ("avg_path_length", None),
+            ("diameter", None),
+            ("describe", None),
+        ]
+    );
+}
+
 #[test]
 fn outputs_and_their_types() {
     for spec in FUNCTIONS {

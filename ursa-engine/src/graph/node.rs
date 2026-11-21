@@ -38,9 +38,10 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore};
-use ursa_core::catalog::Call;
+use ursa_core::catalog::{Call, FunctionSpec, OutputKind};
 
 use super::functions::{display_call, plan};
+use super::provenance;
 use super::traversal::Traversal;
 
 /// The source column of a node's weighted edge plan.
@@ -97,6 +98,10 @@ pub struct GraphAlgorithmNode {
     /// `Int64` and every string type as `Utf8`, as the Python library reads
     /// them.
     pub id_type: DataType,
+    /// The graph's vertex table (its element name), if it has one: the label
+    /// of the node keys, for the output's field metadata
+    /// ([`super::provenance`]).
+    pub vertex_label: Option<String>,
     schema: DFSchemaRef,
 }
 
@@ -113,6 +118,7 @@ impl GraphAlgorithmNode {
         weights: Vec<String>,
         outputs: Vec<Output>,
         per_node: bool,
+        vertex_label: Option<String>,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
         check_vertices(&graph, vertices.as_deref())?;
@@ -126,8 +132,16 @@ impl GraphAlgorithmNode {
             }
         }
         let mut fields = Vec::new();
+        // Each field says what it is (`provenance`): the node key, then a
+        // metric or a category per algorithm. A statistic's columns and a
+        // layout's positions have no role.
         if per_node {
-            fields.push(Field::new("id", id_type.clone(), false));
+            fields.push(provenance::field(
+                Field::new("id", id_type.clone(), false),
+                provenance::ROLE_NODE,
+                &graph,
+                vertex_label.as_deref(),
+            ));
         }
         for o in &outputs {
             let spec = super::functions::outputs(o.call.spec())[o.field];
@@ -138,7 +152,11 @@ impl GraphAlgorithmNode {
                 }
                 _ => spec.ty.data_type(),
             };
-            fields.push(Field::new(&o.name, ty, spec.nullable));
+            let field = Field::new(&o.name, ty, spec.nullable);
+            fields.push(match output_role(o.call.spec(), field.data_type()) {
+                Some(role) => provenance::field(field, role, &graph, None),
+                None => field,
+            });
         }
         let schema = Arc::new(DFSchema::try_from(Schema::new(fields))?);
         Ok(Self {
@@ -153,6 +171,7 @@ impl GraphAlgorithmNode {
             outputs,
             per_node,
             id_type,
+            vertex_label,
             schema,
         })
     }
@@ -180,6 +199,17 @@ impl GraphAlgorithmNode {
             })
             .collect();
         outputs.join(", ")
+    }
+}
+
+/// What a per-node output column of `spec` is, as its field's `ursa.role`
+/// says: the catalog's kind, a metric or a category. A neighbour aggregation
+/// is a metric when it is a number (`min` of names is not).
+fn output_role(spec: &FunctionSpec, ty: &DataType) -> Option<&'static str> {
+    match spec.output_kind()? {
+        OutputKind::Category => Some(provenance::ROLE_CATEGORY),
+        OutputKind::Metric if ty.is_numeric() => Some(provenance::ROLE_METRIC),
+        OutputKind::Metric => None,
     }
 }
 
@@ -249,11 +279,23 @@ pub(crate) fn id_type(t: &DataType) -> Option<DataType> {
 }
 
 /// What identifies a node besides its plans and expressions.
-type Key<'a> = (&'a String, &'a Vec<Output>, &'a Vec<String>, bool);
+type Key<'a> = (
+    &'a String,
+    &'a Vec<Output>,
+    &'a Vec<String>,
+    bool,
+    &'a Option<String>,
+);
 
 impl GraphAlgorithmNode {
     fn key(&self) -> Key<'_> {
-        (&self.graph, &self.outputs, &self.weights, self.per_node)
+        (
+            &self.graph,
+            &self.outputs,
+            &self.weights,
+            self.per_node,
+            &self.vertex_label,
+        )
     }
 }
 
@@ -378,6 +420,7 @@ impl UserDefinedLogicalNodeCore for GraphAlgorithmNode {
             self.weights.clone(),
             self.outputs.clone(),
             self.per_node,
+            self.vertex_label.clone(),
         )
     }
 
@@ -453,6 +496,8 @@ pub struct GraphTraversalNode {
     pub destination: Expr,
     /// The node id type (see [`GraphAlgorithmNode::id_type`]).
     pub id_type: DataType,
+    /// The graph's vertex table (see [`GraphAlgorithmNode::vertex_label`]).
+    pub vertex_label: Option<String>,
     schema: DFSchemaRef,
 }
 
@@ -469,6 +514,7 @@ impl GraphTraversalNode {
         written: Vec<String>,
         source: Expr,
         destination: Expr,
+        vertex_label: Option<String>,
     ) -> Result<Self> {
         let id_type = endpoint_id_type(&graph, &input, &source, &destination)?;
         check_vertices(&graph, vertices.as_deref())?;
@@ -497,7 +543,11 @@ impl GraphTraversalNode {
                 )));
             }
         }
-        let schema = Arc::new(DFSchema::try_from(spec.schema(&id_type))?);
+        let schema = Arc::new(DFSchema::try_from(spec.schema(
+            &graph,
+            vertex_label.as_deref(),
+            &id_type,
+        ))?);
         Ok(Self {
             graph,
             traversal,
@@ -510,6 +560,7 @@ impl GraphTraversalNode {
             source,
             destination,
             id_type,
+            vertex_label,
             schema,
         })
     }
@@ -532,11 +583,18 @@ type TraversalKey<'a> = (
     &'a Traversal,
     &'a Option<String>,
     &'a Vec<String>,
+    &'a Option<String>,
 );
 
 impl GraphTraversalNode {
     fn key(&self) -> TraversalKey<'_> {
-        (&self.graph, &self.traversal, &self.weight, &self.written)
+        (
+            &self.graph,
+            &self.traversal,
+            &self.weight,
+            &self.written,
+            &self.vertex_label,
+        )
     }
 }
 
@@ -659,6 +717,7 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
             self.written.clone(),
             source,
             destination,
+            self.vertex_label.clone(),
         )
     }
 

@@ -153,6 +153,8 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
             let reads = ursa_engine::read_functions::open_reads(&state, &statement).await?;
             let plan = state.statement_to_plan(*statement).await?;
             drop(reads);
+            // A column an inner join equates with a node key is one (#431).
+            let plan = ursa_engine::graph::provenance::carry_through_joins(plan)?;
             ursa_engine::graph::check_ddl(&state, &plan).await?;
             ctx.execute_logical_plan(plan).await
         }
