@@ -180,7 +180,9 @@ How it is drawn, on WebGL2 as on WebGPU:
 
 `ursa-viz/tests/browser/view.ts` reads frames back on WebGL2 in both themes
 and checks all of it: the path's width and colour, the dimming, the rings,
-the hidden node and the bytes uploaded.
+the hidden node and the bytes uploaded. Under WebGPU, whose frames cannot be
+read back headless, it checks that the same calls draw with no error from
+the device.
 
 ## Colours
 

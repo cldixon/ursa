@@ -371,6 +371,36 @@ if (HIGHLIGHT_CASES.length) {
     await page.close();
   }
   await gl.close();
+  // The same layer under WebGPU, whose validation is the stricter: every
+  // pipeline of the layer draws (a path, a selection, a pin, a hidden node)
+  // with no error from the device. Its frames cannot be read back here.
+  if (webgpu) {
+    const gpu = await chromium.launch({ args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan"] });
+    const page = await gpu.newPage({ viewport: { width: 1000, height: 700 } });
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+    await page.goto(`${base}?graph=karate&highlight=path`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 60_000, polling: 100 });
+    const backend = await page.evaluate(async () => {
+      const view = (window as any).view;
+      const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await frames();
+      view.setSelection(Uint32Array.of(3));
+      view.setPinned(Uint32Array.of(7));
+      view.setHovered(9);
+      await frames();
+      view.setHidden(Uint32Array.of(33));
+      await frames();
+      view.clearHighlights();
+      await frames();
+      return view.backend;
+    });
+    await page.waitForTimeout(300);
+    for (const e of errors) failures.push(`highlight on ${backend}: ${e}`);
+    console.log(`highlight on ${backend}: a path, a selection, a pin and a hidden node drawn with ${errors.length} errors`);
+    await gpu.close();
+  }
 }
 server.stop();
 if (failures.length) {
