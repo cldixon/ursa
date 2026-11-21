@@ -414,8 +414,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     among 5,000 nodes in 12 ms with the nodes from a query and 18 ms with
     them as a list, where the edge-table scan takes 190 ms; a two-ring `hop`
     neighbourhood and its 9,926 edges in 20 ms, where the scan form takes
-    120 ms. From a stored index, a fixed 20,000-edge answer takes the same
-    time on graphs of 125K, 1M and 4M edges.
+    120 ms. From a stored index, natively, a fixed 20,000-edge answer among
+    5,000 nodes takes 20, 21 and 27 ms on graphs of 125K, 1M and 4M edges
+    (an unoptimized build; 32 times the edges, 1.3 times the time).
   - A list of 65 or more literal node ids (`seeds => [3, 17, …]`,
     `nodes => […]`, for every traversal) is planned as one column in memory
     instead of one expression per id: the same rows and the same errors,
