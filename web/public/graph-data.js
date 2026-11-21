@@ -25,6 +25,7 @@ const COLOR_SUFFIX = " (colour)";
  *
  *   n, src, dst    the nodes' count and the edges' ends, as dense node indexes
  *   ids            each node's id as the shell prints it: {length, get(i)}
+ *   labelOf(i)     node i's label (the vertex table it is of), or null
  *   skipped        rows left out because an endpoint is NULL
  *   name           the property graph drawn, or null
  *   provenance     {sql, rule}: the SQL it came from and the rule that drew it
@@ -48,6 +49,7 @@ export function drawingOf(result, skipped = 0) {
     skipped,
     name: result.graph,
     provenance: result.provenance,
+    labelOf: (i) => nodes.labelNames[nodes.labels[i]]?.name || null,
   };
   const column = (name) => {
     const found = nodes.columns.find((c) => c.name === name);

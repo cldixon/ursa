@@ -273,9 +273,10 @@ term.attachCustomKeyEventHandler((e) => {
   // Tab and Shift+Tab move the focus on, as anywhere on a page (there is no
   // completion for them to do), so the keyboard can leave the terminal.
   if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return false;
-  // Esc closes the Graph view, the terminal keeping the focus.
+  // Esc clears the Graph view's selection, or else closes the view, the
+  // terminal keeping the focus.
   if (e.key === "Escape" && graphOpen()) {
-    if (e.type === "keydown") closeGraph();
+    if (e.type === "keydown" && !graphLoaded?.clearSelection()) closeGraph();
     return false;
   }
   // Shift+Enter starts a new line in what is typed. xterm would send Enter for
@@ -873,7 +874,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph (its src and dst columns, or the first two when both are ids), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); Esc closes it"],
+  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph (its src and dst columns, or the first two when both are ids), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); click a node to select it (Shift+click adds), Esc clears the selection, then closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
   [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
@@ -1066,6 +1067,8 @@ $("graph-close").onclick = () => {
 graphPane.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   e.preventDefault();
+  // A selection is cleared first; Esc again closes the pane.
+  if (graphLoaded?.clearSelection()) return;
   closeGraph();
   term.focus();
 });
@@ -1416,4 +1419,6 @@ window.ursaShell = {
   },
   graphInked: async () => graphLoaded?.inked() ?? null,
   graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
+  // For tests: where the node with a key is drawn, {index, x, y} in CSS pixels of the canvas.
+  graphNodePlace: (id) => graphLoaded?.nodePlace(id) ?? null,
 };

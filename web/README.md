@@ -139,8 +139,8 @@ static assets and an R2 bucket.
     | field | what |
     |---|---|
     | `frames` | `count`, the frames drawn since the page loaded; `render`, the time in `view.render()` of the last 120; `interval`, the time from one frame's start to the next's, of the last 120 frames that input asked for (a drag, a wheel, a key) and that began within 100 ms of the page's thread being free of the frame before: the view moving. It is the frame's whole cost; `render` is only the call. Each is `{count, p50, p95, max}` in ms. |
-    | `pick` | `{count, last, p95}`: the time in `view.pick()` of a click, over the last 120. |
-    | `actions` | the last 32, oldest first: `{command, at, engine, delta, frame}`. `command` is what was typed (`.graph karate`) or the input (`click`, `fit`, `key +`); `at` is when the input arrived, in ms after the last `.graph`'s Enter; `engine` is the ms the engine took and `delta` the ms applying its answer to the view (both `null` for an input that needs neither); `frame` is the ms from the input to when the page's thread was free of the frame that showed it: with no GPU the browser rasterises a frame on that thread after `render()` returns (4 s at a million edges), so this is when the pixels are there, where `firstDraw` is when `render()` returned. A click, which draws nothing, is shown by the next frame the browser paints. |
+    | `pick` | `{count, last, p95}`: the time in `view.pick()` of a click or a hover, over the last 120. |
+    | `actions` | the last 32, oldest first: `{command, at, engine, delta, frame}`. `command` is what was typed (`.graph karate`) or the input (`click`, `fit`, `key +`); `at` is when the input arrived, in ms after the last `.graph`'s Enter; `engine` is the ms the engine took and `delta` the ms applying its answer to the view (both `null` for an input that needs neither); `frame` is the ms from the input to when the page's thread was free of the frame that showed it: with no GPU the browser rasterises a frame on that thread after `render()` returns (4 s at a million edges), so this is when the pixels are there, where `firstDraw` is when `render()` returned. A click that changes no selection draws nothing, and is shown by the next frame the browser paints. |
     | `longTasks` | the page's last 64 tasks over 50 ms: `{start, duration}`, `start` in ms after Enter. |
 
     `await window.ursaShell.graphMemory()` gives `wasm.engine`, `wasm.view`
@@ -178,8 +178,16 @@ static assets and an R2 bucket.
     then the engine's width); Esc (in the terminal or the pane) or the
     close button closes the pane, and New or a dataset does too. In the
     pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
-    double-click or `0` fits, and a click on a node names it in the pane's
-    header. On a touch screen (#428) one finger pans and two pinch: the
+    double-click or `0` fits. A click on a node selects it (#438):
+    it carries a ring, its edges are drawn wide, and the pane's header, a
+    live region, reads `Selected node 33: label members, degree 17, club
+    Officer`. Shift+click adds a node (or takes it out), a click on empty
+    space clears the selection, and so does Esc, which closes the pane only
+    when nothing is selected. A mouse or a pen over a node rings it and
+    shows a tooltip beside it: its key, label, `SIZE BY` and `COLOR BY`
+    values and degree; the pointer is looked up once a frame at most. The
+    selection set is `ursa-viz`'s (`interact`); `graph.js` tells it what
+    was clicked. On a touch screen (#428) one finger pans and two pinch: the
     view zooms by the change in the fingers' distance around the point
     between them, and pans as that point moves, so what is between the
     fingers stays there. A tap names a node (a second finger cancels it),
@@ -268,7 +276,7 @@ sequences and `.export`), New, the theme toggle and history; the Graph view
 in both themes; `SIZE BY` and `COLOR BY` from an algorithm, a vertex column and
 `NODES (…)`, each of their errors, at least two palette colours read back in
 each theme with no inversion, a theme switch with the pane open, the legend's
-text, and the status from Enter to Done, within a second for rmat; a node picked, typing while it shows, Esc and the close
+text, and the status from Enter to Done, within a second for rmat; a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

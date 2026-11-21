@@ -875,16 +875,88 @@ for (const scheme of ["light", "dark"] as const) {
   await type("SELECT 6 * 7 AS answer;", g);
   check(lastTable(await after("SELECT 6 * 7", g)).rows[0]?.[0] === "42" && (await graphOpen(g)), "queries run while the graph shows");
 
-  // A click on a node names it in the pane's header.
+  // #438: hover and selection. Node 33 is karate's officer, of degree 17.
   const box = (await g.locator("#graph-stage canvas").boundingBox())!;
-  const hit: { x: number; y: number } | null = await g.evaluate(([w, h]) => {
-    for (let y = 2; y < h; y += 2)
-      for (let x = 2; x < w; x += 2) if ((window as any).ursaShell.graphNodeAt(x * 2, y * 2) !== null) return { x, y };
-    return null;
-  }, [box.width, box.height]);
-  if (hit) await g.mouse.click(box.x + hit.x, box.y + hit.y);
-  const status = await g.locator("#graph-status").textContent();
-  check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\)/.test(status ?? ""), "a click on a node names it", status ?? "no node found");
+  const place = (id: number): Promise<{ index: number; x: number; y: number } | null> => g.evaluate((id) => (window as any).ursaShell.graphNodePlace(id), id);
+  const statusText = async () => (await g.locator("#graph-status").textContent()) ?? "";
+  const frames2 = () => g.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
+  const n33 = (await place(33))!;
+  const n0 = (await place(0))!;
+  {
+    // Hovering it shows its tooltip, beside it, and rings it.
+    await g.mouse.move(box.x + n33.x, box.y + n33.y);
+    await g.waitForFunction(() => (window as any).ursaShell.graph()?.hovered?.id == 33, null, { timeout: 5_000 }).catch(() => {});
+    const tip = await g.evaluate(() => {
+      const el = document.querySelector<HTMLElement>("#graph-stage .graph-tip");
+      const stage = document.getElementById("graph-stage")!.getBoundingClientRect();
+      const b = el?.getBoundingClientRect();
+      return el && b ? { hidden: el.hidden, text: Array.from(el.children, (c) => c.textContent).join(" | "), inside: b.left >= stage.left && b.right <= stage.right && b.top >= stage.top && b.bottom <= stage.bottom, ariaHidden: el.getAttribute("aria-hidden") } : null;
+    });
+    info = await graphInfo(g);
+    check(!!tip && !tip.hidden && /^node 33 \| (label \S+ \| )?degree 17$/.test(tip.text) && tip.inside && info.hovered?.index === n33.index, "hovering node 33 shows its tooltip: its key and degree", JSON.stringify(tip));
+    check(info.selection.length === 0 && !(await statusText()).includes("Selected"), "a hover selects nothing");
+
+    // Many moves in one frame are one pick.
+    const picks = await g.evaluate(async ([x, y]) => {
+      const shell = (window as any).ursaShell;
+      const canvas = document.querySelector("#graph-stage canvas")!;
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const before = shell.graph().hoverPicks;
+      for (let i = 0; i < 25; i++) canvas.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, pointerType: "mouse", clientX: x + (i % 5), clientY: y + (i % 3), bubbles: true }));
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      return shell.graph().hoverPicks - before;
+    }, [box.x + n33.x, box.y + n33.y]);
+    check(picks === 1, "25 pointer moves in a frame are one pick", `${picks} picks`);
+
+    // Off the node, the tooltip goes.
+    await g.mouse.move(box.x + 3, box.y + 3);
+    await frames2();
+    check((await g.evaluate(() => document.querySelector<HTMLElement>("#graph-stage .graph-tip")?.hidden)) === true && (await graphInfo(g)).hovered === null, "off the node, the tooltip goes");
+
+    // A click selects it: the status, a live region, names it, and a frame is drawn.
+    const drawnBefore = (await graphInfo(g)).frames;
+    await g.mouse.click(box.x + n33.x, box.y + n33.y);
+    await frames2();
+    info = await graphInfo(g);
+    const live = await g.locator("#graph-status").getAttribute("aria-live");
+    check(/^Selected node 33: (label \S+, )?degree 17 · 34 nodes · 78 edges$/.test(await statusText()) && live === "polite" && info.selection.length === 1 && info.picked?.index === n33.index && info.frames > drawnBefore, "a click on node 33 selects it, and the status names it", await statusText());
+    const selectedInk = await g.evaluate(() => (window as any).ursaShell.graphInked());
+
+    // Shift+click adds node 0; Shift+click on it again takes it out.
+    await g.keyboard.down("Shift");
+    await g.mouse.click(box.x + n0.x, box.y + n0.y);
+    await g.keyboard.up("Shift");
+    info = await graphInfo(g);
+    check(/^Selected 2 nodes: 33, 0 · 34 nodes · 78 edges$/.test(await statusText()) && info.selection.map((n: any) => n.index).join() === `${n33.index},${n0.index}`, "Shift+click selects two", await statusText());
+    await g.keyboard.down("Shift");
+    await g.mouse.click(box.x + n0.x, box.y + n0.y);
+    await g.keyboard.up("Shift");
+    check(/^Selected node 33: /.test(await statusText()), "Shift+click on a selected node takes it out", await statusText());
+
+    // A drag on empty space pans, and keeps the selection.
+    await g.mouse.move(box.x + 4, box.y + 4);
+    await g.mouse.down();
+    await g.mouse.move(box.x + 24, box.y + 14, { steps: 4 });
+    await g.mouse.up();
+    const moved = (await place(33))!;
+    check(Math.abs(moved.x - n33.x - 20) <= 1.5 && Math.abs(moved.y - n33.y - 10) <= 1.5 && /^Selected node 33: /.test(await statusText()), "a drag on empty space pans, and keeps the selection", JSON.stringify(moved));
+
+    // A click on empty space clears it, and the frame loses the selection's ink.
+    await g.mouse.click(box.x + 4, box.y + 4);
+    await frames2();
+    info = await graphInfo(g);
+    const clearedInk = await g.evaluate(() => (window as any).ursaShell.graphInked());
+    check(info.selection.length === 0 && /^34 nodes · 78 edges · Done$/.test(await statusText()), "a click on empty space clears the selection", await statusText());
+    check(selectedInk.inked > clearedInk.inked, "the selected node's ring and wide edges are drawn", `${selectedInk.inked} px inked selected, ${clearedInk.inked} cleared`);
+
+    // Esc, with the focus in the pane, clears a selection and leaves the pane open.
+    const again = (await place(33))!;
+    await g.mouse.click(box.x + again.x, box.y + again.y);
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
+    check((await graphOpen(g)) && (await graphInfo(g)).selection.length === 0 && !(await statusText()).includes("Selected"), "Esc clears the selection before it closes the pane", await statusText());
+    await g.click("#terminal");
+  }
   // Double-click fits, and the wheel zooms, without errors.
   await g.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
   await g.mouse.wheel(0, -200);
@@ -950,8 +1022,16 @@ for (const scheme of ["light", "dark"] as const) {
     JSON.stringify({ ...mem, userAgent: mem.userAgent && { bytes: mem.userAgent.bytes, parts: mem.userAgent.breakdown.length } }),
   );
 
-  // Esc, in the terminal, closes it: the terminal takes the whole width again.
-  await g.click("#terminal");
+  // Esc, in the terminal, clears a selection first, then closes the pane: the
+  // terminal takes the whole width again.
+  {
+    const at33 = (await g.evaluate(() => (window as any).ursaShell.graphNodePlace(33)))!;
+    await g.mouse.click(box.x + at33.x, box.y + at33.y);
+    const selected = (await graphInfo(g)).picked?.id;
+    await g.click("#terminal");
+    await g.keyboard.press("Escape");
+    check(selected == 33 && (await graphOpen(g)) && (await graphInfo(g)).selection.length === 0, "Esc in the terminal clears the selection first", `selected ${selected}`);
+  }
   await g.keyboard.press("Escape");
   check(!(await graphOpen(g)) && (await settledCols(g)) === fullCols && (await focused(g)) === "terminal", "Esc closes the graph view and the terminal refits", `${await settledCols(g)} of ${fullCols} columns`);
 
@@ -967,7 +1047,7 @@ for (const scheme of ["light", "dark"] as const) {
   // Esc with the focus in the pane closes it, and the focus goes back to the terminal.
   await g.focus("#graph-stage canvas");
   await g.keyboard.press("Escape");
-  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "Esc in the pane closes it, focus back in the terminal", await focused(g));
+  check(!(await graphOpen(g)) && (await focused(g)) === "terminal", "Esc in the pane, with nothing selected, closes it, focus back in the terminal", await focused(g));
 
   // The Graph button draws the last result; a click hands the keys back to the terminal.
   await type("SELECT * FROM ties;", g);
@@ -1147,7 +1227,15 @@ for (const scheme of ["light", "dark"] as const) {
     }, [box.width, box.height]);
     if (hit) await s.mouse.click(box.x + hit.x, box.y + hit.y);
     const status = await s.locator("#graph-status").textContent();
-    check(!!hit && /34 nodes · 78 edges · node \d+ \(degree \d+\) · degree \d+ · club (Mr\. Hi|Officer)$/.test(status ?? ""), "a click names the node's size and colour values", status ?? "no node found");
+    check(!!hit && /^Selected node \d+: label members, degree \d+, club (Mr\. Hi|Officer) · 34 nodes · 78 edges$/.test(status ?? ""), "a click names the node's label, size and colour values", status ?? "no node found");
+    {
+      // The tooltip has the same: the key, the label, SIZE BY, COLOR BY and the degree.
+      await s.mouse.move(box.x + 3, box.y + 3);
+      if (hit) await s.mouse.move(box.x + hit.x, box.y + hit.y);
+      await s.waitForFunction(() => document.querySelector<HTMLElement>("#graph-stage .graph-tip")?.hidden === false, null, { timeout: 5_000 }).catch(() => {});
+      const tip = await s.evaluate(() => Array.from(document.querySelector("#graph-stage .graph-tip")?.children ?? [], (c) => c.textContent).join(" | "));
+      check(/^node \d+ \| label members \| degree \d+ \| club (Mr\. Hi|Officer) \| degree \d+$/.test(tip), "the tooltip has the node's key, label, SIZE BY and COLOR BY values and degree", tip);
+    }
     await s.click("#terminal");
 
     // NODES (…): values for a query's rows, joined on id.
@@ -1334,7 +1422,7 @@ for (const scheme of ["light", "dark"] as const) {
     // A tap names the node under it; a double tap fits the graph again.
     await tap(panned[a.n]);
     const tapped = (await graphInfo(p)).picked;
-    check(tapped?.index === a.n && /node \S+ \(degree \d+\)/.test((await p.locator("#graph-status").textContent()) ?? ""), "a tap names the node under the finger", JSON.stringify(tapped));
+    check(tapped?.index === a.n && /^Selected node \S+: /.test((await p.locator("#graph-status").textContent()) ?? ""), "a tap selects the node under the finger", JSON.stringify(tapped));
     await p.waitForTimeout(400);
     const empty = { x: 6, y: 6 };
     await tap(empty);

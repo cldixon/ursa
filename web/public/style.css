@@ -464,7 +464,31 @@ html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transp
   touch-action: none;
   cursor: grab;
 }
+.graph-stage canvas.over-node { cursor: pointer; }
 .graph-stage canvas:active { cursor: grabbing; }
+/* The hovered node's tooltip: beside it, and never in the pointer's way. */
+.graph-tip {
+  position: absolute;
+  z-index: 1;
+  max-width: min(280px, 80%);
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.18);
+}
+.graph-tip[hidden] { display: none; }
+.graph-tip div { overflow: hidden; text-overflow: ellipsis; }
+.graph-tip .key { color: var(--muted); }
+.graph-tip .id { font-weight: 600; }
 
 /* A phone: one row, the logo first (its name left to screen readers). Under
    420px, New, Share and Import are icons, their labels still naming them. */
