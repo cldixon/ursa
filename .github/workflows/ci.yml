@@ -212,6 +212,8 @@ jobs:
           node-version: 22
       - run: bun install --frozen-lockfile
       - run: bun run check
+      # The Graph view's timings (#430): the arithmetic behind graphTimings().
+      - run: bun test tests/graph-timings.test.ts
 
   pytest:
     name: Python (pytest, ${{ matrix.os }} py${{ matrix.python }})
