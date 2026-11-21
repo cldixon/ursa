@@ -33,8 +33,16 @@ pub use file_table::{open_file_table, open_files, FileFormat, FileOptions};
 pub use stores::{ensure_object_store, ensure_object_store_for};
 
 /// A session with Ursa's defaults.
+///
+/// Unlike DataFusion's default, a Parquet file's schema metadata is kept when
+/// it is read (`datafusion.execution.parquet.skip_metadata = false`), so the
+/// `ursa.*` column roles a result was written with (#431) come back with it,
+/// as they do from an Arrow file. `SET datafusion.execution.parquet.skip_metadata = true`
+/// drops them again.
 pub fn new_session() -> SessionContext {
-    new_session_with_config(SessionConfig::new())
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.skip_metadata = false;
+    new_session_with_config(config)
 }
 
 /// A session with Ursa's file tables over `config`. `information_schema` is

@@ -595,6 +595,14 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **A Parquet file's schema metadata is kept when Ursa reads it.** Ursa's
+  sessions set `datafusion.execution.parquet.skip_metadata = false`, so the
+  `ursa.*` column roles (#431) of a result written to Parquet come back with
+  it when the file is read, as they do from an Arrow file, and `.graph` draws
+  the file as it drew the result. DataFusion's default drops every Parquet
+  file's metadata; `SET datafusion.execution.parquet.skip_metadata = true`
+  restores that.
+
 - **Graph function parameters are range-checked** (behaviour change, #416).
   A number with no meaning for its parameter was accepted and gave a
   plausible-looking result: `pagerank(g, damping => -1)` returned a negative
