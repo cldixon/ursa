@@ -4,6 +4,8 @@
 //! indexes/
 //!   manifest.json    one entry per stored index
 //!   <hash>.idx       one index per file (see `index_file`)
+//!   vertex_keys.json the vertex tables whose keys were counted and are one
+//!                    row each (#411; see `crate::graph::vertex_keys`)
 //! ```
 //!
 //! The manifest is the source of truth: an index file it does not list is
@@ -39,8 +41,10 @@
 //! checked only before a whole-graph algorithm reads them (`super::mapped`):
 //! one found damaged then is dropped the same way (a read-only store only
 //! stops using it), and the index built again. A file 0.10 wrote (format
-//! version 2) is read whole, and a writer rewrites it in the current format,
-//! with a notice.
+//! version 2) is read whole, and one 0.11 wrote (version 3) is mapped but
+//! has no lookup table for its node ids, which is then built in memory when
+//! a query first looks an id up; a writer rewrites either in the current
+//! format, with a notice.
 //!
 //! **The limit** is the session's `ursa.index_storage_limit` in effect: what
 //! it `SET`, or the database's default, a share of the free space on its disk
@@ -431,6 +435,35 @@ impl IndexStore {
         }
     }
 
+    /// Whether the keys `key` names (a vertex table's: the fingerprint of
+    /// their plan and the files it reads) were counted and found to be one
+    /// row each, by this process or an earlier one (#411; see
+    /// `crate::graph::vertex_keys`). Read from `vertex_keys.json` each time:
+    /// it is small, and another process may have written it.
+    pub fn keys_counted(&self, key: &IndexKey) -> bool {
+        read_key_counts(&self.dir).contains(key)
+    }
+
+    /// Record that the keys `key` names are one row each. A read-only store
+    /// records nothing. Best effort: a count that is not recorded is made
+    /// again.
+    pub fn record_keys_counted(&self, key: IndexKey) {
+        if !self.writable {
+            return;
+        }
+        // One writer at a time in this process; a database has one writing
+        // process.
+        let _state = self.state();
+        let mut counted = read_key_counts(&self.dir);
+        // A newer version of a table's files replaces the older one.
+        counted.retain(|k| k.fingerprint != key.fingerprint);
+        counted.push(key);
+        if counted.len() > KEY_COUNTS_KEPT {
+            counted.drain(..counted.len() - KEY_COUNTS_KEPT);
+        }
+        let _ = write_key_counts(&self.dir, &counted);
+    }
+
     /// Whether the manifest lists an index stored under `key`. Nothing is
     /// read but the manifest: [`Self::load`] still checks the file.
     pub fn contains(&self, key: &IndexKey) -> bool {
@@ -516,8 +549,9 @@ impl IndexStore {
                     }
                 }
                 drop(state);
-                if stored.version == index_file::VERSION_2 && self.writable {
-                    self.upgrade(key, &index, &entry.graph, has_incoming, notifier);
+                if stored.version != index_file::VERSION && self.writable {
+                    let version = stored.version;
+                    self.upgrade(key, &index, &entry.graph, version, has_incoming, notifier);
                 }
                 Some((index, entry.size))
             }
@@ -536,18 +570,26 @@ impl IndexStore {
     }
 
     /// Store again, in the current format, `index`, just read from a file
-    /// written by 0.10 (format version 2), so later processes map it instead
-    /// of reading it whole. Its in-adjacency, if the file has one, is read
-    /// first, to be stored with it; weights stored with it are evaluated
-    /// again when next needed.
+    /// of an older format `version`: one 0.10 wrote (version 2), so later
+    /// processes map it instead of reading it whole, or one 0.11 wrote
+    /// (version 3), so they find its node ids' lookup table in the file
+    /// instead of building it. Its in-adjacency, if the file has one, is
+    /// read first, to be stored with it; weights stored with it are
+    /// evaluated again when next needed.
     fn upgrade(
         self: &Arc<Self>,
         key: &IndexKey,
         index: &Arc<GraphIndex>,
         graph: &str,
+        version: u32,
         has_incoming: bool,
         notifier: &Notifier,
     ) {
+        // What a process pays for the old format, until the file is rewritten.
+        let until = match version {
+            index_file::VERSION_2 => "it is read whole",
+            _ => "each process that looks a node up by its id builds the ids' lookup table",
+        };
         if has_incoming {
             index.topology.incoming();
         }
@@ -555,12 +597,12 @@ impl IndexStore {
         notifier.say(NoticeLevel::On, || match saved {
             Saved::Stored { size, .. } => format!(
                 "rewriting the stored index for {graph} in {} ({}) in the current format: an \
-                 older version of ursa stored it, and it is read whole until it is rewritten",
+                 older version of ursa stored it, and {until} until it is rewritten",
                 self.database,
                 notices::size(size)
             ),
             _ => format!(
-                "an older version of ursa stored the index for {graph} in {}; it is read whole \
+                "an older version of ursa stored the index for {graph} in {}; {until} \
                  until it can be rewritten in the current format, and was {}",
                 self.database,
                 saved.describe(&self.database)
@@ -1091,6 +1133,58 @@ fn read_manifest_checked(dir: &Path) -> Manifest {
             .unwrap_or_default(),
         foreign: None,
     }
+}
+
+/// The record of the vertex tables whose keys were counted: beside the
+/// manifest, as `{"format": "ursa-vertex-keys", "version": 1, "counted":
+/// [key, …]}`, each key as a stored index's.
+const KEY_COUNTS: &str = "vertex_keys.json";
+const KEY_COUNTS_FORMAT: &str = "ursa-vertex-keys";
+const KEY_COUNTS_VERSION: u64 = 1;
+/// How many vertex tables' counts a database keeps, the newest.
+const KEY_COUNTS_KEPT: usize = 64;
+
+/// The keys recorded in `dir`: none if the record is missing or is not one
+/// this build reads.
+fn read_key_counts(dir: &Path) -> Vec<IndexKey> {
+    let Ok(text) = std::fs::read_to_string(dir.join(KEY_COUNTS)) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    if value.get("format").and_then(Value::as_str) != Some(KEY_COUNTS_FORMAT)
+        || value.get("version").and_then(Value::as_u64) != Some(KEY_COUNTS_VERSION)
+    {
+        return Vec::new();
+    }
+    value
+        .get("counted")
+        .and_then(Value::as_array)
+        .map(|keys| keys.iter().filter_map(IndexKey::from_json).collect())
+        .unwrap_or_default()
+}
+
+/// Rewrite the record of counted keys in `dir` atomically.
+fn write_key_counts(dir: &Path, counted: &[IndexKey]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let value = json!({
+        "format": KEY_COUNTS_FORMAT,
+        "version": KEY_COUNTS_VERSION,
+        "counted": counted.iter().map(IndexKey::to_json).collect::<Vec<_>>(),
+    });
+    let mut text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+    text.push('\n');
+    // Not `.tmp`: a writer removes those when it tidies the directory.
+    let temp = dir.join(format!("{KEY_COUNTS}.new"));
+    {
+        let mut file = File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, dir.join(KEY_COUNTS))?;
+    sync_dir(dir);
+    Ok(())
 }
 
 /// Rewrite the manifest in `dir` atomically.

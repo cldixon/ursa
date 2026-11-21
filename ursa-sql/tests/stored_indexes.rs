@@ -1164,6 +1164,115 @@ async fn an_index_stored_by_0_10_loads_and_is_rewritten_in_the_current_format() 
     assert_eq!(taken(&said), Vec::<String>::new());
 }
 
+/// #421: an index stored by 0.11 (format version 3) has no lookup table for
+/// its node ids. It loads and gives the same results, for a query that names
+/// nodes too; a writer rewrites it in the current format, and the next
+/// process finds the table in the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_stored_by_0_11_loads_and_is_rewritten_with_its_lookup_table() {
+    use ursa_engine::database::index_file::{read_file, Encoded, VERSION, VERSION_3};
+    let fixture = Fixture::new(20_000).await;
+    let hop =
+        "SELECT seed, id, distance FROM hop(g, seeds => [0, 1, 2, -5], n => 2) ORDER BY seed, id";
+    let first = open(&fixture.db()).await;
+    let expected = ok(&first, QUERY).await;
+    let hops = ok(&first, hop).await;
+    assert!(hops.len() > 3, "{hops:?}");
+    close(first);
+    let (path, key) = the_index(&fixture);
+    assert_eq!(version_of(&path), VERSION);
+    // The same index, as 0.11 wrote it.
+    let stored = read_file(&path, &key).unwrap();
+    let mut v3 = Vec::new();
+    Encoded::new(&key, &stored.topology, &stored.ids)
+        .unwrap()
+        .as_version_3()
+        .write_to(&mut v3)
+        .unwrap();
+    drop(stored);
+    std::fs::write(&path, &v3).unwrap();
+    assert_eq!(version_of(&path), VERSION_3);
+
+    // A reader loads it and leaves it as it is: an algorithm, then a
+    // traversal from seeds, which builds the lookup table.
+    let reader = open_read_only(&fixture.db()).await;
+    assert_eq!(ok(&reader, QUERY).await, expected);
+    assert_eq!(ok(&reader, hop).await, hops);
+    assert_eq!(counts(&reader), (0, 1));
+    close(reader);
+    assert_eq!(version_of(&path), VERSION_3);
+
+    // A writer loads it and rewrites it, saying so.
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    assert_eq!(ok(&ctx, hop).await, hops);
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+    let said = taken(&said);
+    assert!(
+        said.iter()
+            .any(|n| n.contains("rewriting the stored index for g")
+                && n.contains("older version")
+                && n.contains("lookup table")),
+        "{said:?}"
+    );
+    close(ctx);
+    let (path, _) = the_index(&fixture);
+    assert_eq!(version_of(&path), VERSION);
+
+    // The next process maps it: the same results, nothing said.
+    let ctx = open(&fixture.db()).await;
+    let said = notices(&ctx, "on").await;
+    assert_eq!(ok(&ctx, hop).await, hops);
+    assert_eq!(ok(&ctx, QUERY).await, expected);
+    assert_eq!(counts(&ctx), (0, 1));
+    assert_eq!(taken(&said), Vec::<String>::new());
+}
+
+/// #421: a later process finds nodes by their string ids through the lookup
+/// table stored with the index, and gives the results of the process that
+/// built it: for seeds that are nodes, one that is not, and a join on ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_process_finds_string_ids_through_the_stored_lookup_table() {
+    let fixture = Fixture::new(20_000).await;
+    let dir = fixture.dir.path();
+    let queries = [
+        "SELECT seed, id, distance FROM hop(s, seeds => ['node-0', 'node-17', 'nobody'], n => 2) ORDER BY seed, id",
+        "SELECT count(*) FROM hop(s, seeds => (SELECT id FROM degree(s) WHERE id LIKE '%7'), n => 1)",
+        "SELECT id, round(pagerank, 8) FROM pagerank(s) ORDER BY pagerank DESC, id LIMIT 10",
+        "SELECT count(*), sum(length(id)) FROM degree(s)",
+    ];
+    let first = open(&fixture.db()).await;
+    ok(
+        &first,
+        &in_dir(
+            dir,
+            "CREATE VIEW named AS SELECT 'node-' || src AS src, 'node-' || dst AS dst FROM 'edges.parquet';
+             CREATE PROPERTY GRAPH s EDGE TABLES (named SOURCE KEY (src) DESTINATION KEY (dst));",
+        ),
+    )
+    .await;
+    let mut expected = Vec::new();
+    for query in queries {
+        expected.push(ok(&first, query).await);
+    }
+    assert!(expected[0].len() > 2, "{:?}", expected[0]);
+    assert_eq!(counts(&first), (1, 0));
+    close(first);
+
+    for read_only in [true, false] {
+        let ctx = match read_only {
+            true => open_read_only(&fixture.db()).await,
+            false => open(&fixture.db()).await,
+        };
+        for (query, expected) in queries.iter().zip(&expected) {
+            assert_eq!(&ok(&ctx, query).await, expected, "{query}");
+        }
+        assert_eq!(counts(&ctx), (0, 1));
+        close(ctx);
+    }
+}
+
 /// The byte offset of section `kind` in the version 3 index file `bytes`.
 fn section_offset(bytes: &[u8], kind: u32) -> usize {
     let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());

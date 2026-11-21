@@ -71,7 +71,7 @@ edge := -[ … ]->   from left to right
 ```
 
 - **Variables** name what a node or edge binds to, so conditions and `COLUMNS` can refer to it. A variable used twice is the same node: `MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)` finds triangles.
-- **Labels** say which table a variable reads: `(p:person)` or `(p IS person)`. A table's labels are its name and the labels its definition gives. Without a label, a variable reads the only table it can: the one its edges `REFERENCES`, or the graph's only vertex or edge table. When that cannot be told, the query is refused and asks for a label.
+- **Labels** say which table a variable reads: `(p:person)` or `(p IS person)`. A table's labels are its name and the labels its definition gives. Without a label, a variable reads the only table it can: the one its edges `REFERENCES`, or the graph's only vertex or edge table. When that cannot be told, the query is refused and asks for a label. A label that contradicts the edge is refused too: an edge matches only between the vertex tables its edge table `REFERENCES`, so `(a:person)-[:knows]->(s:school)` is an error when `knows` goes from `person` to `person`. The standard gives such a pattern no rows; Ursa reports it, as DuckPGQ does, because it is almost always a mistake.
 - **Conditions** go inside a node or edge (`(a WHERE a.age > 30)`), or after the pattern, where they can use every variable.
 - **Properties.** A variable's properties are its table's columns, or what its labels' `PROPERTIES` clauses give, under their property names.
 - **Either way.** `-[e]-` matches each edge in both directions, so each friendship of two members is two matches; an edge from a node to itself matches once.
@@ -292,6 +292,9 @@ These are refused with a message:
 - a path variable, selector or path mode on a path of more than one edge;
 - a condition inside a quantified edge, or an edge variable of one in `COLUMNS` (use `edges(p)`);
 - a quantified edge between two vertex tables;
-- label expressions (`:a|b`) and parenthesized path patterns (`((a)-[e]->(b))*`).
+- label expressions (`:a|b`) and parenthesized path patterns (`((a)-[e]->(b))*`);
+- `KEEP` and `ONE ROW PER`: write the selector or path mode before the path, and every match is one row.
+
+Text left over after a `WHERE` condition or a `COLUMNS` item is a syntax error that names it and its position, so a missing `AND` or comma is reported: `WHERE a.id = 0 b.id = 3` does not run as `WHERE a.id = 0`.
 
 `COLUMNS` is required. `GRAPH TABLE`, in two words, works too.

@@ -4,14 +4,14 @@
 //! full key it was built for (the edge plan's fingerprint and the identity of
 //! every source file), followed by optional **chunks**: parts of the index
 //! that are built later, or that only some queries need, such as the
-//! in-adjacency. Version 3, all integers little-endian.
+//! in-adjacency. Version 4, all integers little-endian.
 //!
 //! The **main part** comes first:
 //!
 //! ```text
 //! offset  size  field
 //!      0     8  magic            "URSAIDX\0"
-//!      8     4  version          3
+//!      8     4  version          4
 //!     12     4  flags            bit 0: string ids
 //!     16     8  n_nodes
 //!     24     8  n_edges
@@ -42,7 +42,14 @@
 //! Its sections, in this order: the out-adjacency's offsets (`u64`,
 //! `n_nodes + 1`), targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`);
 //! then the ids, either `i64` values (`n_nodes`) or, for string ids,
-//! Arrow-style `i32` offsets (`n_nodes + 1`, from 0) and UTF-8 bytes.
+//! Arrow-style `i32` offsets (`n_nodes + 1`, from 0) and UTF-8 bytes; then
+//! the ids' **lookup table** (kind 12, `u32`): the open-addressing table
+//! that finds an id's node, `n_nodes + n_nodes / 2 + 1` slots, each a node or
+//! `u32::MAX` for an empty one. Its layout and the hashes it places ids by
+//! are fixed (`ursa_core::id_map`, `StoredTable`). With it a process that
+//! has just mapped the file finds a seed's node by reading a slot or two and
+//! comparing the id there, where before it hashed every id of the graph into
+//! a table of its own first (#421).
 //!
 //! A graph with a vertex table leaves out the edge rows whose source or
 //! destination is not one of its keys (#311). When it left some out, the
@@ -87,9 +94,14 @@
 //! chunk, so a reader in another process (`--readonly`) never sees them
 //! change.
 //!
-//! **Version 2** (0.10) is the same layout with 24-byte table entries (no
-//! section CRCs) and one CRC over every byte before the trailer. It is still
-//! read, whole and checked (see [`read_file`]).
+//! **Version 3** (0.11) is version 4 without the lookup table. It is still
+//! read, and mapped as version 4 is; the table is then built in memory, the
+//! first time a query looks an id up (one that runs an algorithm over the
+//! whole graph and names no node never does). **Version 2** (0.10) is the
+//! same layout with 24-byte table entries (no section CRCs) and one CRC over
+//! every byte before the trailer. It is still read, whole and checked (see
+//! [`read_file`]), and its lookup table built in the same way. A writer
+//! stores either again as version 4 (`IndexStore`).
 //!
 //! **Why raw arrays, not Arrow IPC.** The arrays have different lengths and
 //! no schema: an IPC stream would need one record batch per array, or padding
@@ -104,13 +116,17 @@
 //! borrowed from that.
 //!
 //! **Corruption.** The main part is read only if its length matches the
-//! trailer, the trailer's CRC matches, the version is 2 or 3, the key matches
+//! trailer, the trailer's CRC matches, the version is 2, 3 or 4, the key matches
 //! the key asked for, every section lies within it, the padding is zero, the
 //! CRC of every section but the edge arrays matches (all of them, for a file
 //! that is not mapped), and the arrays form a valid topology and id map
 //! (`ursa_core::Topology::from_checksummed_parts`, which checks the offsets;
-//! `IdMap::from_user_ids`; a version 2 file, whose sections have no CRC of
-//! their own, is checked in full by `Topology::from_parts`). Anything else is
+//! `IdMap::from_stored_ids`, which takes the ids and their table as they
+//! lie, the table's CRC vouching that it is the one written for them; a
+//! version 2 file, whose sections have no CRC of their own, is checked in
+//! full by `Topology::from_parts`). An id stored twice, which no writer
+//! stores, is found when a version 2 or 3 file's table is built, and is then
+//! the error of the query that looked an id up. Anything else is
 //! an error, which the store treats as a miss. The edge arrays' CRCs of a
 //! mapped file are checked before a whole-graph algorithm runs
 //! (`super::mapped::Unverified`). A chunk that does not check out is ignored,
@@ -118,19 +134,20 @@
 //!
 //! **Version 1** files (the in-adjacency, if any, inside the main part) are
 //! not read: they are a miss like any other unreadable file, so the index is
-//! built again once and stored as version 3 in their place.
+//! built again once and stored as version 4 in their place.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::ArrowNativeType;
 use serde_json::{json, Value};
+use ursa_core::id_map::lookup_table_len;
 use ursa_core::{Adjacency, IdMap, Topology};
 
 use super::mapped::{Region, Unverified};
@@ -142,7 +159,9 @@ pub const MAGIC: [u8; 8] = *b"URSAIDX\0";
 const END_MAGIC: [u8; 4] = *b"XDIU";
 /// The index file version this build writes. It reads this one and
 /// [`VERSION_2`].
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+/// The version 0.11 wrote: version 4 without the ids' lookup table.
+pub const VERSION_3: u32 = 3;
 /// The version 0.10 wrote: no section CRCs, one CRC over the main part.
 pub const VERSION_2: u32 = 2;
 /// The first bytes of every chunk.
@@ -178,6 +197,7 @@ const IDS_STR_OFFSETS: u32 = 8;
 const IDS_STR_BYTES: u32 = 9;
 const WEIGHTS_F64: u32 = 10;
 const KEPT_ROWS: u32 = 11;
+const ID_TABLE: u32 = 12;
 
 /// The version of the key's form. Version 2 (#327) is the portable key:
 /// paths inside the database's directory relative to it, and only the file
@@ -273,13 +293,38 @@ enum Data<'a> {
     StrBytes(StringArray),
     /// Bytes, as they are.
     Bytes(Buffer),
+    /// The lookup table of an id map.
+    IdTable(IdTable<'a>),
+}
+
+/// The lookup table of `ids`, built when the file is written (not when it is
+/// laid out, which only needs its length, and happens in the query that built
+/// the index).
+struct IdTable<'a> {
+    ids: &'a IdMap,
+    slots: OnceLock<Result<ScalarBuffer<u32>, String>>,
+}
+
+impl IdTable<'_> {
+    fn build(&self) -> Result<&ScalarBuffer<u32>, String> {
+        self.slots
+            .get_or_init(|| self.ids.lookup_table().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// The table, which [`Encoded::write_to`] has built by now.
+    fn slots(&self) -> &[u32] {
+        self.build()
+            .expect("write_to builds the lookup table before it is written")
+    }
 }
 
 impl Data<'_> {
     fn width(&self) -> u64 {
         match self {
             Data::U64(_) | Data::F64(_) | Data::Ints(_) => 8,
-            Data::U32(_) | Data::StrOffsets(_) => 4,
+            Data::U32(_) | Data::StrOffsets(_) | Data::IdTable(_) => 4,
             Data::StrBytes(_) | Data::Bytes(_) => 1,
         }
     }
@@ -293,6 +338,7 @@ impl Data<'_> {
             Data::StrOffsets(a) => a.len() + 1,
             Data::StrBytes(a) => str_bytes(a).len(),
             Data::Bytes(b) => b.len(),
+            Data::IdTable(t) => return lookup_table_len(t.ids.len()),
         }) as u64
     }
 }
@@ -311,7 +357,8 @@ fn align(n: u64, to: u64) -> u64 {
 /// An index laid out for writing: its header fields, key, sections and where
 /// each goes.
 pub struct Encoded<'a> {
-    /// [`VERSION`], or [`VERSION_2`] for a test of reading what 0.10 wrote.
+    /// [`VERSION`]; or [`VERSION_3`] or [`VERSION_2`], for a test of reading
+    /// what 0.11 or 0.10 wrote.
     version: u32,
     flags: u32,
     n_nodes: u64,
@@ -360,6 +407,13 @@ impl<'a> Encoded<'a> {
                 id_array.data_type()
             )));
         }
+        sections.push((
+            ID_TABLE,
+            Data::IdTable(IdTable {
+                ids,
+                slots: OnceLock::new(),
+            }),
+        ));
         let n_dropped = match kept {
             Some(kept) if n_dropped > 0 => {
                 sections.push((KEPT_ROWS, Data::Bytes(kept.sliced())));
@@ -418,6 +472,18 @@ impl<'a> Encoded<'a> {
     /// reading such a file.
     #[doc(hidden)]
     pub fn as_version_2(self) -> Self {
+        self.in_version(VERSION_2)
+    }
+
+    /// This index laid out as version 3, as 0.11 wrote it: for tests of
+    /// reading such a file.
+    #[doc(hidden)]
+    pub fn as_version_3(self) -> Self {
+        self.in_version(VERSION_3)
+    }
+
+    /// This index laid out as an older `version`, which has no lookup table.
+    fn in_version(self, version: u32) -> Self {
         let Self {
             flags,
             n_nodes,
@@ -427,8 +493,12 @@ impl<'a> Encoded<'a> {
             sections,
             ..
         } = self;
-        let sections = sections.into_iter().map(|(k, d, _)| (k, d)).collect();
-        Self::laid_out(VERSION_2, flags, n_nodes, n_edges, n_dropped, key, sections)
+        let sections = sections
+            .into_iter()
+            .filter(|(k, _, _)| *k != ID_TABLE)
+            .map(|(k, d, _)| (k, d))
+            .collect();
+        Self::laid_out(version, flags, n_nodes, n_edges, n_dropped, key, sections)
     }
 
     /// The size of the main part, in bytes.
@@ -439,6 +509,11 @@ impl<'a> Encoded<'a> {
     /// Write the main part to `out`. Returns its identity.
     pub fn write_to(&self, out: impl Write) -> io::Result<MainPart> {
         let v2 = self.version == VERSION_2;
+        for (_, data, _) in &self.sections {
+            if let Data::IdTable(table) = data {
+                table.build().map_err(io::Error::other)?;
+            }
+        }
         // Each section's CRC goes in the table, before the section: one pass
         // over the arrays first (in parallel), then one to write them.
         let crcs: Vec<Option<u32>> = self
@@ -470,8 +545,8 @@ impl<'a> Encoded<'a> {
         for ((kind, data, offset), crc) in self.sections.iter().zip(&crcs) {
             sink.put(&section_entry(*kind, data, *offset, *crc))?;
         }
-        // Version 3's trailer CRC covers the header, key and table; the
-        // sections have their own.
+        // The trailer CRC (but version 2's) covers the header, key and
+        // table; the sections have their own.
         let meta_crc = sink.crc.clone().finalize();
         sink.hash = v2;
         for (_, data, offset) in &self.sections {
@@ -621,8 +696,8 @@ impl<'a> EncodedChunk<'a> {
     }
 }
 
-/// A section table entry: with the section's CRC in a version 3 main part,
-/// without in a chunk.
+/// A section table entry: with the section's CRC in a main part (but
+/// version 2's), without in a chunk.
 fn section_entry(kind: u32, data: &Data<'_>, offset: u64, crc: Option<u32>) -> Vec<u8> {
     let mut entry = Vec::with_capacity(SECTION_ENTRY_LEN as usize);
     entry.extend_from_slice(&kind.to_le_bytes());
@@ -654,6 +729,7 @@ fn data_crc(data: &Data<'_>) -> u32 {
             Data::Ints(a) => Some(bytes_of(a.values())),
             Data::StrBytes(a) => Some(str_bytes(a)),
             Data::Bytes(b) => Some(b.as_slice()),
+            Data::IdTable(t) => Some(bytes_of(t.slots())),
             Data::StrOffsets(_) => None,
         };
         if let Some(bytes) = bytes {
@@ -712,6 +788,7 @@ impl<W: Write> Sink<W> {
             }
             Data::StrBytes(a) => self.put(str_bytes(a)),
             Data::Bytes(b) => self.put(b.as_slice()),
+            Data::IdTable(t) => self.put_all(t.slots(), |x| x.to_le_bytes()),
         }
     }
 
@@ -754,8 +831,8 @@ pub struct Stored {
     pub main: MainPart,
     /// The chunks that check out, in file order.
     pub chunks: Vec<ChunkInfo>,
-    /// The file's version: [`VERSION`], or [`VERSION_2`] for a file 0.10
-    /// wrote.
+    /// The file's version: [`VERSION`], or [`VERSION_3`] or [`VERSION_2`]
+    /// for a file 0.11 or 0.10 wrote.
     pub version: u32,
     /// The checksums of a mapped file that are checked only when something
     /// reads the arrays whole; `None` when every one was checked as it loaded.
@@ -776,14 +853,36 @@ pub fn incoming_reads() -> u64 {
     INCOMING_READS.load(Ordering::Relaxed)
 }
 
+thread_local! {
+    /// How many in-adjacencies this thread has read. Tests run in parallel
+    /// in one process, so a test that must see *no* read counts its own
+    /// thread's: the loader runs on the thread that asks for the
+    /// in-adjacency.
+    static THREAD_INCOMING_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one in-adjacency read, for the process and for this thread.
+fn count_incoming_read() {
+    INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+    THREAD_INCOMING_READS.with(|n| n.set(n.get() + 1));
+}
+
+/// How many in-adjacencies this thread has read from index files.
+pub fn thread_incoming_reads() -> u64 {
+    THREAD_INCOMING_READS.with(std::cell::Cell::get)
+}
+
 /// Read the index file at `path`, which must be stored under `key`.
 ///
 /// The header, key and section table are read first, so a file for another
-/// key costs only those. Then, for a version 3 file on a platform that maps
-/// files (`super::mapped`), the file is mapped, up to the end of its last
-/// chunk that checks out: the arrays are borrowed from the map, the small
-/// sections (offsets, ids) are checked now, and the edge arrays' checksums
-/// are deferred to [`Stored::unverified`]. Otherwise the main part is read
+/// key costs only those. Then, for a version 3 or 4 file on a platform that
+/// maps files (`super::mapped`), the file is mapped, up to the end of its
+/// last chunk that checks out: the arrays are borrowed from the map, the
+/// small sections (offsets, ids, the ids' lookup table) are checked now, and
+/// the edge arrays' checksums are deferred to [`Stored::unverified`]. The
+/// ids are not hashed: a version 4 file's lookup table is used as it lies,
+/// and an older file's is built when a query first looks an id up
+/// (`IdMap::from_stored_ids`). Otherwise the main part is read
 /// whole, in parallel, and every checksum is checked before any array is
 /// used. The chunks are only listed; the in-adjacency's is read when the
 /// topology is first asked for it.
@@ -792,7 +891,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
     let len = file.metadata().map_err(|e| e.to_string())?.len();
     let head = read_head(&mut file, len, key)?;
     let (chunks, end) = list_chunks(&mut file, head.main_len, len);
-    let mapped = head.version == VERSION && super::mapped::MAPS;
+    let mapped = head.version != VERSION_2 && super::mapped::MAPS;
     let data = match mapped {
         true => super::mapped::map(&file, end)?,
         false => super::mapped::read_whole(&file, head.main_len)?,
@@ -818,7 +917,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
                         crc: chunk.data_crc,
                     })
                     .ok()?;
-                INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+                count_incoming_read();
                 Some(incoming)
             }))
         }
@@ -827,7 +926,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
             let (n_nodes, n_edges) = (topology.n_nodes(), topology.n_edges());
             topology.with_incoming_loader(Box::new(move || {
                 let incoming = read_incoming(&path, main, &chunk, n_nodes, n_edges).ok()?;
-                INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+                count_incoming_read();
                 Some(incoming)
             }))
         }
@@ -1206,7 +1305,7 @@ struct Entry {
     width: u64,
     offset: u64,
     count: u64,
-    /// The section's CRC (version 3; zero in version 2).
+    /// The section's CRC (zero in version 2, which has none).
     crc: u32,
 }
 
@@ -1234,7 +1333,7 @@ struct Head {
 }
 
 /// Read and check the header, key, section table and trailer of the index
-/// file in `file`, `len` bytes, which must be stored under `key`. Version 3's
+/// file in `file`, `len` bytes, which must be stored under `key`. The
 /// trailer CRC (over the header, key and table) is checked here; version 2's
 /// covers the sections, so [`parse`] checks it.
 fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<Head, DecodeError> {
@@ -1255,9 +1354,9 @@ fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<H
         return Err("not an Ursa index file".into());
     }
     let version = u32_at(&header, 8);
-    if version != VERSION && version != VERSION_2 {
+    if ![VERSION, VERSION_3, VERSION_2].contains(&version) {
         return Err(format!(
-            "index format version {version}; this build reads {VERSION_2} and {VERSION}"
+            "index format version {version}; this build reads {VERSION_2} to {VERSION}"
         ));
     }
     let flags = u32_at(&header, 12);
@@ -1291,7 +1390,7 @@ fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<H
         return Err("the file is truncated".into());
     }
     let crc = u32_at(&trailer, 8);
-    if version == VERSION {
+    if version != VERSION_2 {
         let mut meta = crc32fast::Hasher::new();
         meta.update(&header);
         meta.update(&rest);
@@ -1462,12 +1561,24 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
             return Err("the string ids' offsets are malformed".into());
         }
         let values = data.slice_with_length(strings.offset as usize, strings.count as usize);
-        Arc::new(
-            StringArray::try_new(OffsetBuffer::new(offsets), values, None)
-                .map_err(|e| format!("the string ids are malformed: {e}"))?,
-        )
+        if !super::mapped::are_strings(&values, &offsets) {
+            return Err("the string ids are malformed: they are not UTF-8".into());
+        }
+        // SAFETY: the offsets start at 0, never decrease and end at
+        // `values.len()` (checked above), and they bound valid UTF-8 strings
+        // (`are_strings`); there are no nulls.
+        Arc::new(unsafe { StringArray::new_unchecked(OffsetBuffer::new(offsets), values, None) })
     };
-    let ids = IdMap::from_user_ids(ids.as_ref()).map_err(|e| e.to_string())?;
+    // The ids' lookup table, as it lies in the file; an older file has none,
+    // and the id map builds it if a query looks an id up.
+    let table = match head.version {
+        VERSION => {
+            let slots = usize::try_from(lookup_table_len(n_nodes)).map_err(|e| e.to_string())?;
+            Some(scalars::<u32>(data, &take(ID_TABLE, 4, Some(slots))?))
+        }
+        _ => None,
+    };
+    let ids = IdMap::from_stored_ids(ids, table).map_err(|e| e.to_string())?;
     if ids.len() != n_nodes {
         return Err("the id map does not match the topology".into());
     }
@@ -1547,6 +1658,7 @@ fn read<T, const N: usize>(
 mod tests {
     use super::*;
     use datafusion::arrow::array::ArrayRef;
+    use datafusion::arrow::datatypes::DataType;
 
     fn key() -> IndexKey {
         IndexKey::new(
@@ -1698,14 +1810,14 @@ mod tests {
         assert_eq!(main.len, std::fs::metadata(&path).unwrap().len());
 
         // No chunk: the transpose is built, nothing is read.
-        let reads = incoming_reads();
+        let reads = thread_incoming_reads();
         let stored = read_file(&path, &key()).unwrap();
         assert!(stored.chunks.is_empty());
         assert_eq!(
             stored.topology.incoming().targets,
             topology.incoming().targets
         );
-        assert_eq!(incoming_reads(), reads);
+        assert_eq!(thread_incoming_reads(), reads);
 
         // Appended once; a second append finds it there.
         let incoming = topology.incoming().clone();
@@ -1727,7 +1839,7 @@ mod tests {
         // Listed, not read, until asked for.
         assert!(stored.topology.incoming_if_built().is_none());
         let back = stored.topology.incoming();
-        assert!(incoming_reads() > reads);
+        assert!(thread_incoming_reads() > reads);
         assert_eq!(
             (&back.offsets, &back.targets, &back.edge_ids),
             (&incoming.offsets, &incoming.targets, &incoming.edge_ids)
@@ -1815,8 +1927,8 @@ mod tests {
         assert!(read_weights(&path, main, chunk(b"w1"), 4).is_err());
     }
 
-    /// The section table entry of `kind` in the version 3 main part `bytes`:
-    /// its offset and length in bytes.
+    /// The section table entry of `kind` in the main part `bytes` (version
+    /// 3 or 4): its offset and length in bytes.
     fn section_of(bytes: &[u8], kind: u32) -> (usize, usize) {
         let n_sections = u32_at(bytes, 40) as usize;
         let table = align(HEADER_LEN + u64_at(bytes, 32), 8) as usize;
@@ -1883,6 +1995,153 @@ mod tests {
             std::fs::write(&path, &v2[..cut]).unwrap();
             assert!(read_file(&path, &key()).is_err(), "cut at {cut}");
         }
+    }
+
+    /// Graphs with integer and with string ids, each id on several edges.
+    fn graphs() -> [(Arc<Topology>, Arc<IdMap>); 2] {
+        let n = 300i64;
+        let (src, dst): (Vec<i64>, Vec<i64>) = (0..n)
+            .map(|i| (i * 7 - 50, ((i * 13) % n) * 7 - 50))
+            .unzip();
+        let name = |v: &[i64]| -> ArrayRef {
+            Arc::new(StringArray::from(
+                v.iter()
+                    .map(|i| format!("did:plc:{i:024}"))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        [
+            built(name(&src), name(&dst)),
+            built(
+                Arc::new(Int64Array::from(src)),
+                Arc::new(Int64Array::from(dst)),
+            ),
+        ]
+    }
+
+    /// Every id of `ids` is found at its own node in `stored`, and one that
+    /// is not there is not found.
+    fn finds_every_id(stored: &IdMap, ids: &IdMap) {
+        let column = ids.user_id_array();
+        assert_eq!(stored.user_id_array().as_ref(), column.as_ref());
+        let expected: Vec<Option<u32>> = (0..ids.len() as u32).map(Some).collect();
+        assert_eq!(stored.dense_from_array(column.as_ref()).unwrap(), expected);
+        let missing: ArrayRef = match column.data_type() {
+            DataType::Int64 => Arc::new(Int64Array::from(vec![i64::MAX])),
+            _ => Arc::new(StringArray::from(vec!["nobody"])),
+        };
+        assert_eq!(stored.dense_from_array(&missing).unwrap(), vec![None]);
+    }
+
+    /// #421: the ids' lookup table is a section of the file, and a loaded
+    /// index finds ids through it as it lies there.
+    #[test]
+    fn the_id_lookup_table_is_stored_and_used_as_it_lies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        for (topology, ids) in graphs() {
+            let bytes = encode(&key(), &topology, &ids);
+            assert_eq!(u32_at(&bytes, 8), VERSION);
+            let (at, len) = section_of(&bytes, ID_TABLE);
+            let table = ids.lookup_table().unwrap();
+            assert_eq!(len, 4 * table.len());
+            assert_eq!(len as u64, 4 * lookup_table_len(ids.len()));
+            let stored_table: Vec<u32> = read(&bytes[at..at + len], u32::from_le_bytes).collect();
+            assert_eq!(stored_table, table.as_ref());
+
+            std::fs::write(&path, &bytes).unwrap();
+            let stored = read_file(&path, &key()).unwrap();
+            assert_eq!(stored.version, VERSION);
+            finds_every_id(&stored.ids, &ids);
+            // The loaded map's table is the file's: borrowed from the map
+            // (or the read buffer), never built.
+            let loaded = stored.ids.lookup_table().unwrap();
+            assert_eq!(loaded, table);
+            if super::super::mapped::MAPS {
+                let mapped = stored.unverified.as_ref().unwrap();
+                assert!(mapped.holds(loaded.inner().as_ptr()));
+                // And so are the ids themselves.
+                let column = stored.ids.user_id_array().to_data();
+                assert!(mapped.holds(column.buffers()[0].as_ptr()));
+            }
+            // Stored again from the loaded index: the same file.
+            assert_eq!(encode(&key(), &stored.topology, &stored.ids), bytes);
+            // A table that is not the ids' cannot be told from theirs by its
+            // CRC alone, so the CRC is what vouches for it: a flipped bit is
+            // an error when the file loads.
+            let mut flipped = bytes.clone();
+            flipped[at + len / 2] ^= 1;
+            std::fs::write(&path, &flipped).unwrap();
+            assert!(read_file(&path, &key()).is_err());
+        }
+    }
+
+    /// #421: a file 0.11 wrote has no lookup table. It is mapped all the
+    /// same, and its ids are found through a table built on demand.
+    #[test]
+    fn a_version_3_file_from_0_11_is_read_and_its_lookup_table_built_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        for (topology, ids) in graphs() {
+            let v4 = encode(&key(), &topology, &ids);
+            let encoded = Encoded::new(&key(), &topology, &ids)
+                .unwrap()
+                .as_version_3();
+            let mut v3 = Vec::new();
+            let main = encoded.write_to(&mut v3).unwrap();
+            assert_eq!(v3.len() as u64, encoded.file_size());
+            assert_eq!(u32_at(&v3, 8), VERSION_3);
+            assert!(v3.len() < v4.len());
+            let n_sections = u32_at(&v3, 40) as usize;
+            let table = align(HEADER_LEN + u64_at(&v3, 32), 8) as usize;
+            assert!((0..n_sections).all(|i| u32_at(&v3, table + 32 * i) != ID_TABLE));
+
+            std::fs::write(&path, &v3).unwrap();
+            let stored = read_file(&path, &key()).unwrap();
+            assert_eq!(stored.version, VERSION_3);
+            assert_eq!(stored.main, main);
+            assert_eq!(stored.unverified.is_some(), super::super::mapped::MAPS);
+            same(&topology, &stored.topology);
+            finds_every_id(&stored.ids, &ids);
+            // Stored again, it is the version 4 file.
+            assert_eq!(encode(&key(), &stored.topology, &stored.ids), v4);
+
+            // With an in-adjacency appended, as 0.11 appended it.
+            let incoming = topology.incoming().clone();
+            append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+                EncodedChunk::incoming(&incoming, at)
+            })
+            .unwrap()
+            .unwrap();
+            let stored = read_file(&path, &key()).unwrap();
+            assert_eq!(stored.topology.incoming().targets, incoming.targets);
+        }
+    }
+
+    /// An id stored twice, which no writer stores: a version 4 file cannot
+    /// be written with one, and an older file with one is an error when an
+    /// id is first looked up.
+    #[test]
+    fn an_id_stored_twice_is_an_error() {
+        let (topology, _) = a_graph();
+        let n = topology.n_nodes();
+        let twice: ArrayRef = Arc::new(Int64Array::from(vec![7i64; n]));
+        let ids = IdMap::from_stored_ids(Arc::clone(&twice), None).unwrap();
+        let mut out = Vec::new();
+        let err = Encoded::new(&key(), &topology, &ids)
+            .unwrap()
+            .write_to(&mut out)
+            .unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
+        let mut v3 = Vec::new();
+        Encoded::new(&key(), &topology, &ids)
+            .unwrap()
+            .as_version_3()
+            .write_to(&mut v3)
+            .unwrap();
+        let (_, back) = decode(&v3, &key()).unwrap();
+        assert_eq!(back.len(), n);
+        assert!(back.dense_from_array(&twice).is_err());
     }
 
     #[test]
@@ -2030,7 +2289,7 @@ mod tests {
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(
             decode(&bytes, &key()).unwrap_err(),
-            "index format version 1; this build reads 2 and 3"
+            "index format version 1; this build reads 2 to 4"
         );
     }
 

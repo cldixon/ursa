@@ -15,7 +15,7 @@ use super::relation::GraphFunctions;
 /// `config` with an index cache, and with file-scan work stealing off so a
 /// graph's edges are read in file order (see [`super::exec`]).
 pub(crate) fn with_algorithms(config: SessionConfig) -> SessionConfig {
-    let mut config = super::index::with_index_cache(config);
+    let mut config = super::vertex_keys::with_key_checks(super::index::with_index_cache(config));
     config
         .options_mut()
         .execution

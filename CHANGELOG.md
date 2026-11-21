@@ -194,6 +194,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WebShell.graph(text)` gives the page the graph: node ids mapped to
   dense indexes in the order they are first seen, with clear errors when
   there is nothing to draw.
+- **Ursa Web Shell: pinch to zoom the Graph view** (#428). A phone had no
+  way to zoom: one finger panned, and the wheel and `+`/`-` need a mouse or
+  a keyboard. Two fingers now pinch: the view zooms by the change in their
+  distance around the point between them and pans as that point moves, so
+  what is between the fingers stays between them. A second finger cancels
+  the first one's tap, a finger left down after a pinch goes on panning, and
+  a double tap fits the graph in view, as a double-click does. The canvas
+  draws at most 2 pixels for each CSS pixel, so a phone with a ratio of 3
+  fills under half the pixels each frame. The mouse, the wheel and the keys
+  are as before.
 - **Ursa Web Shell: sizes, colours and a legend for the Graph view**
   (#389). `.graph [SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
   `.graph karate SIZE BY pagerank COLOR BY louvain` sizes nodes by PageRank
@@ -208,6 +218,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   what sizes the nodes and each colour's category and count. The engine does
   it all (`WebShell.graph` returns `size`, `color` and the legend; with no
   clause, the graph as before).
+- **Ursa Web Shell: the page runs cross-origin isolated** (#429). Every
+  response, from the Worker and the local preview alike, carries
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
+  require-corp` and `Cross-Origin-Resource-Policy: same-origin`, beside the
+  Content Security Policy. `crossOriginIsolated` is true on the page and in
+  the engine's and the layout's workers, which gives precise timers and
+  `performance.measureUserAgentSpecificMemory()` now, and is what a build
+  with shared memory would need. Every resource was same-origin already, so
+  datasets (by range), Import, downloads, Share links, fonts and the Graph
+  view work as before.
 - **Ursa Web Shell: the Graph view in each theme's own colours.** The view
   draws on the theme's background with its own edge ink and a categorical
   palette stepped for white and for the dark sky, so the CSS inversion is
@@ -363,6 +383,81 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `ur.louvain`) raise the same error, worded `pagerank(damping=) must be
   between 0 and 1; got -1`. Python's `ur.avg_path_length(sample=)` is
   unchanged.
+- **SQL: a vertex table's key must identify one row** (behaviour change,
+  #411). A vertex table with a duplicate or a NULL key is refused, with one
+  message, by everything that reads it as a graph's nodes: the algorithms,
+  statistics and traversals, `g.nodes`, and `GRAPH_TABLE` (`graph 'gs':
+  vertex table 'v' has 1 row with a duplicate key (id = 1) and 1 row with a
+  NULL key; a vertex table's KEY must identify one row. Deduplicate it in a
+  view …`). SQL/PGQ requires a unique, non-null key, and DuckPGQ takes it
+  from a primary key. Before, the graph was accepted and the three disagreed:
+  the algorithms counted a duplicated key once and skipped a NULL key, while
+  `g.nodes` and `GRAPH_TABLE` returned every row, so one node was two matches
+  and `g.nodes JOIN degree(g)` repeated it; only `neighbors_agg(attribute
+  =>)` noticed, with a message about `values =>`. `CREATE PROPERTY GRAPH`
+  still accepts the table (it is read when a query runs); queries over it
+  now fail until it is deduplicated, for example in a view with `SELECT
+  DISTINCT ON (key) *`. An index build counts the rows as it numbers the
+  keys; `g.nodes` and a `GRAPH_TABLE` node count the key column when the
+  query runs (`EXPLAIN` reads nothing), once per version of a table's
+  files: the count is kept for the session and, with a database, recorded
+  beside its stored indexes (`indexes/vertex_keys.json`), and a stored index
+  built from the same keys stands for it, so a later process, read-only
+  included, reads only the files' metadata. A changed file is counted
+  again; a table that does not read only files is counted by each query.
+  Stored indexes of graphs with a vertex table are
+  built again once, under a new key, so none built before the check is
+  reused. Not covered: the keys of an edge table between two vertex tables
+  are checked where a pattern reads those tables' rows, not in its index.
+- **SQL: `GRAPH_TABLE` refuses a node label that contradicts its edge**
+  (behaviour change, #410). An edge matches only between the vertex tables
+  its edge table `REFERENCES`. `(a:Person)-[k:knows]->(b:School)`, where
+  `knows` goes from students to students, joined `know.dst` to
+  `School.school_id` on values that happened to be equal and returned rows
+  for edges that are not in the graph. It is now an error that names the
+  edge table, its vertex tables and the pattern as written. The standard
+  gives such a pattern no rows; Ursa refuses it, as DuckPGQ does, since it
+  is almost always a mistake, and an empty result would hide it.
+- **SQL: `GRAPH_TABLE` refuses text left over after a `WHERE` condition or a
+  `COLUMNS` item** (behaviour change, #409). `WHERE a.id = 0 b.id = 3` ran as
+  `WHERE a.id = 0`, and `COLUMNS (a.id AS a nonsense, b.id AS b)` returned
+  one column: the SQL parser stopped at the first token it could not use and
+  the rest was dropped. Both are now syntax errors that name the token and
+  its position in the pattern, for the pattern's `WHERE`, a node's or edge's
+  `WHERE`, and `COLUMNS`. `KEEP …` and `ONE ROW PER …`, which were ignored
+  the same way, are refused as not supported yet. Only queries that were
+  already wrong are affected.
+
+- **Triangle counting uses about a third of the CPU, with the same counts**
+  (#420). `triangle_count`, and so `clustering_coefficient` and the SQL
+  functions over them, was the slowest step on the full Bluesky graph (1,828 s
+  on 16 cores). The kernel still orients each edge toward its higher-ranked
+  end, by `(degree, id)`, and finds each triangle once. Now the nodes are
+  numbered by rank and each list holds ranks, so for an edge `u → v` only the
+  entries of `u`'s list after `v` are read; a list of 32 entries or more is
+  marked once in a per-thread position table and the lists it meets are looked
+  up there; of two lists, one 8 times the other's length is searched, not
+  merged; and each node's credits are added once per list entry, not once per
+  triangle, so threads no longer write the hubs' counters all the time.
+  Per-node counts are bit for bit the old kernel's: a new test pins them on
+  ten graphs (hubs, a clique with leaves, R-MAT, self-loops, parallel and
+  reciprocal edges, vertices with no edge, masks), recorded before the change,
+  and the old kernel is kept in the tests as a reference. On R-MAT graphs on a
+  shared 4-core machine: 16M edges (384M triangles) 35.3 to 12.6 CPU-s, 64M
+  edges (6.19B triangles) 376 to 120 CPU-s. Nodes of degree under 2 get no rank, so the
+  pass costs the same among 16M vertices with no edge (38.0 to 13.9 CPU-s).
+  It adds 4 bytes per node of degree 2 or more, plus up to as much again per
+  thread for the position tables.
+- **Betweenness with a small sample holds half the scratch memory** (#454).
+  With fewer than 64 sources per thread, the kernel ran `2 × threads` sources
+  at a time, each with its own state of 24 bytes per node (more when
+  weighted), all kept for the whole run: about 30 GB at Bluesky's size on 16
+  threads. It now runs `threads` at a time, which keeps every thread as busy.
+  Results are bit for bit the same (each node's sum is taken in source order
+  whatever the window; the reference-kernel and thread-count tests cover it).
+  On a 32M-edge, 2.1M-node R-MAT graph with 105 sources on 4 threads: peak
+  RSS 1,019 MB to 814 MB (the graph alone is 576 MB), time unchanged (61 s
+  and 60 s, within the noise of a shared machine).
 - **SQL: a stored graph index is memory-mapped, not read whole** (#382).
   Loading one read the whole file on one core, so at full scale (2.42B
   edges, an 18.6 GiB index) every query in a new process paid 15 s, even a
@@ -392,6 +487,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     keeps reading the index it mapped while another process replaces it.
     Mapped pages count in a process's RSS once read, as shared, reclaimable
     file cache.
+- **SQL: a new process no longer hashes every node id of a stored index
+  before its first query** (#421). Loading a stored index rebuilt the
+  id-to-node hash table from the stored ids, one id at a time on one core:
+  0.4 s for 2M string ids, 5.5 s for 20M, in every new process, even for a
+  `hop` from one seed, which undid most of the gain of mapping the file
+  (#382). Now the table is stored in the index file and used as it lies
+  there, and the id column is borrowed from the mapped file instead of
+  copied to the heap. On a graph of 20M nodes with 32-byte string ids and
+  30M edges (4 shared cores), in a new process each time: a 1-step `hop`
+  from one seed takes 0.29 s (was 7.0 s) and 1.06 GB at peak (was 1.80 GB);
+  `count(*) FROM degree(g)` 0.57 s (was 6.95 s); PageRank 22.6 s (was
+  32.5 s) and 3.21 GB (was 3.95 GB). What a load still reads is the
+  per-node sections, to check their CRCs and that the ids are UTF-8, on all
+  cores. Results and node numbering are unchanged.
+  - **Index file format version 4**: version 3 plus one section, the ids'
+    lookup table (an open-addressing table of `u32` node indexes, 6 bytes a
+    node; its layout and hashes are fixed and documented in
+    `ursa_core::id_map`). The file of the graph above grows from 1.52 GB to
+    1.64 GB, and building and storing its index takes as long as before.
+  - **Indexes stored by 0.11 (version 3) and 0.10 (version 2) keep
+    loading.** They have no table, so one is built in memory, but only when
+    a query first looks a node up by its id (seeds, sources, a join on ids):
+    an algorithm over the whole graph never builds it, and a `hop` on the
+    version 3 file of the graph above takes 2.1 s. The first writer to load
+    such a file rewrites it as version 4, with the notice `rewriting the
+    stored index for g in club.ursa (…) in the current format: …`.
+  - `ursa_core::IdMap::from_stored_ids` and `IdMap::lookup_table` are the
+    two halves of this; `IdMap::from_user_ids` still interns eagerly.
 - **SQL: an index build interns a vertex table's keys while it interns the
   edges, not before them** (#385, N49). With the edge scan parallel (#351),
   reading the keys first was the serial part of a build with a vertex table:
@@ -767,6 +890,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   key of another width was accepted and node ids are `BIGINT` whatever the
   stored type. Any two integer types are now one graph, as are two string
   types; an integer against a string is still an error.
+- **Ursa Web Shell: `.graph` no longer draws scores or paths as nodes**
+  (#427). The two columns `.graph` reads as each edge's ends must hold ids:
+  integers, strings or dates, and, when they are the first two columns
+  rather than `src` and `dst`, both of one kind. A float, a boolean, a list
+  or a struct is refused, naming the columns and their types and what to
+  type instead. After `SELECT * FROM pagerank(karate) LIMIT 5`, `.graph`
+  drew five edges from each id to its score; after an `ANY SHORTEST` query,
+  one edge from a number to a list. Now: `cannot draw the first two columns
+  (id: Int64, pagerank: Float64) as edges: 'pagerank' is a number that is
+  not whole (Float64). … To draw an algorithm's result, draw the graph and
+  size or colour it: .graph NAME SIZE BY pagerank. To draw other rows, name
+  the ends: .graph SELECT … AS src, … AS dst FROM …`. Columns named `src`
+  and `dst` of those types are refused the same way. Two integer or two
+  string columns draw as before.
 - `ursa --format csv` and `tsv` write lists, structs and maps, as DuckDB
   does, as their text form, quoted where CSV needs it (`"[1, 2]"`, with
   `NULL` for a null inside one). They failed with "Nested type List(Int64)
