@@ -853,6 +853,25 @@ pub fn incoming_reads() -> u64 {
     INCOMING_READS.load(Ordering::Relaxed)
 }
 
+thread_local! {
+    /// How many in-adjacencies this thread has read. Tests run in parallel
+    /// in one process, so a test that must see *no* read counts its own
+    /// thread's: the loader runs on the thread that asks for the
+    /// in-adjacency.
+    static THREAD_INCOMING_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one in-adjacency read, for the process and for this thread.
+fn count_incoming_read() {
+    INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+    THREAD_INCOMING_READS.with(|n| n.set(n.get() + 1));
+}
+
+/// How many in-adjacencies this thread has read from index files.
+pub fn thread_incoming_reads() -> u64 {
+    THREAD_INCOMING_READS.with(std::cell::Cell::get)
+}
+
 /// Read the index file at `path`, which must be stored under `key`.
 ///
 /// The header, key and section table are read first, so a file for another
@@ -898,7 +917,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
                         crc: chunk.data_crc,
                     })
                     .ok()?;
-                INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+                count_incoming_read();
                 Some(incoming)
             }))
         }
@@ -907,7 +926,7 @@ pub fn read_file(path: &Path, key: &IndexKey) -> Result<Stored, DecodeError> {
             let (n_nodes, n_edges) = (topology.n_nodes(), topology.n_edges());
             topology.with_incoming_loader(Box::new(move || {
                 let incoming = read_incoming(&path, main, &chunk, n_nodes, n_edges).ok()?;
-                INCOMING_READS.fetch_add(1, Ordering::Relaxed);
+                count_incoming_read();
                 Some(incoming)
             }))
         }
@@ -1791,14 +1810,14 @@ mod tests {
         assert_eq!(main.len, std::fs::metadata(&path).unwrap().len());
 
         // No chunk: the transpose is built, nothing is read.
-        let reads = incoming_reads();
+        let reads = thread_incoming_reads();
         let stored = read_file(&path, &key()).unwrap();
         assert!(stored.chunks.is_empty());
         assert_eq!(
             stored.topology.incoming().targets,
             topology.incoming().targets
         );
-        assert_eq!(incoming_reads(), reads);
+        assert_eq!(thread_incoming_reads(), reads);
 
         // Appended once; a second append finds it there.
         let incoming = topology.incoming().clone();
@@ -1820,7 +1839,7 @@ mod tests {
         // Listed, not read, until asked for.
         assert!(stored.topology.incoming_if_built().is_none());
         let back = stored.topology.incoming();
-        assert!(incoming_reads() > reads);
+        assert!(thread_incoming_reads() > reads);
         assert_eq!(
             (&back.offsets, &back.targets, &back.edge_ids),
             (&incoming.offsets, &incoming.targets, &incoming.edge_ids)
