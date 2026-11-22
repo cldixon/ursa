@@ -200,9 +200,9 @@ follows a load that changes.
 
 Measured in the shell on `.graph rmat` (1M edges, headless Chromium,
 software WebGL2: [`BENCH.md`](BENCH.md#the-frame-budget)): frames of a
-scripted wheel zoom are 25 to 46 ms apart at the 95th percentile over four
-runs, where they were 3.3 s; they draw 512 edges and 170 nodes, which is all
-this renderer shows in a frame. Ordering the million edges takes the layout
+scripted wheel zoom are 26 to 31 ms apart at the 95th percentile over three
+runs, where they were 3.3 s; they draw 512 to 1,081 edges and 170 to 360
+nodes, which is all this renderer shows in a frame. Ordering the million edges takes the layout
 worker 0.3 s. It has not been measured on a GPU.
 
 ## Making a view
