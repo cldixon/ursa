@@ -65,7 +65,7 @@ use datafusion::sql::parser::{ResetStatement, Statement as DFStatement};
 use datafusion::sql::planner::object_name_to_table_reference;
 use datafusion::sql::sqlparser::ast::{ObjectName, ObjectType, Set, Statement as SQLStatement};
 use ursa_engine::database::{self as db, Database, OpenOptions, UnavailableTable};
-use ursa_engine::graph;
+use ursa_engine::graph::{self, GraphSpec};
 use ursa_engine::notices::{self, NoticeLevel, Notifier};
 use ursa_engine::options::ByteSize;
 use ursa_engine::paths::looks_like_location;
@@ -237,7 +237,7 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
                 .iter()
                 .find(|u| cause.contains(&u.message))
                 .map(|u| (u.kind, u.name.clone()));
-            match (uses, defined_object(ctx, &sql)) {
+            match (uses, defined_object(ctx, database, &sql)) {
                 (Some((kind, name)), Some(object)) => {
                     let message = object.unavailable_using(kind, &name);
                     unavailable.push(object.mark(ctx, index, message));
@@ -249,7 +249,7 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
             // No progress: the first that still fails is unavailable in its
             // own right.
             let (index, sql, cause) = still.remove(0);
-            match defined_object(ctx, &sql) {
+            match defined_object(ctx, database, &sql) {
                 Some(object) => {
                     let message = object.unavailable_for(&cause);
                     unavailable.push(object.mark(ctx, index, message));
@@ -305,7 +305,9 @@ struct DefinedObject {
 
 enum Target {
     Table(TableReference, TableType),
-    Graph(String),
+    /// A graph's name, and its definition if the statement could be read:
+    /// what `SHOW GRAPHS` lists while it is unavailable.
+    Graph(String, Option<GraphSpec>),
 }
 
 impl DefinedObject {
@@ -319,7 +321,9 @@ impl DefinedObject {
                     Arc::new(UnavailableTable::new(message.clone(), *table_type)),
                 );
             }
-            Target::Graph(name) => graph::mark_unavailable(ctx, name, message.clone()),
+            Target::Graph(name, definition) => {
+                graph::mark_unavailable(ctx, name, message.clone(), definition.clone())
+            }
         }
         Unavailable {
             index,
@@ -340,7 +344,9 @@ impl DefinedObject {
                     Arc::new(UnavailableTable::new(message, *table_type)),
                 );
             }
-            Target::Graph(name) => graph::mark_unavailable(ctx, name, message),
+            Target::Graph(name, definition) => {
+                graph::mark_unavailable(ctx, name, message, definition.clone())
+            }
         }
     }
 
@@ -351,7 +357,7 @@ impl DefinedObject {
                 let provider = ctx.table_provider(reference.clone()).await.ok()?;
                 db::as_unavailable(provider.as_ref()).map(|t| t.message().to_string())
             }
-            Target::Graph(name) => graph::registry_of(ctx).unavailable(name),
+            Target::Graph(name, _) => graph::registry_of(ctx).unavailable(name),
         }
     }
 
@@ -411,7 +417,7 @@ async fn retry_dependants(ctx: &SessionContext, database: &Database) {
     loop {
         let mut waiting = Vec::new();
         for sql in database.statements() {
-            let Some(object) = defined_object(ctx, &sql) else {
+            let Some(object) = defined_object(ctx, database, &sql) else {
                 continue;
             };
             if let Some(message) = object.unavailable_in(ctx).await {
@@ -450,8 +456,9 @@ async fn retry_dependants(ctx: &SessionContext, database: &Database) {
 }
 
 /// The view, external table or graph the stored statement `sql` defines, if
-/// it parses as one.
-fn defined_object(ctx: &SessionContext, sql: &str) -> Option<DefinedObject> {
+/// it parses as one. A graph's definition has its paths as replay resolves
+/// them.
+fn defined_object(ctx: &SessionContext, database: &Database, sql: &str) -> Option<DefinedObject> {
     let statements = parse_sql_for(ctx, sql).ok()?;
     let [statement] = <[UrsaStatement; 1]>::try_from(statements).ok()?;
     let table = |name: &ObjectName, kind: &'static str, table_type| {
@@ -469,11 +476,21 @@ fn defined_object(ctx: &SessionContext, sql: &str) -> Option<DefinedObject> {
     match &statement {
         UrsaStatement::CreatePropertyGraph(g) => {
             let name = graph_ddl::graph_name(g.name.clone(), normalizes(ctx)).ok()?;
+            let mut resolved = statement.clone();
+            paths::rewrite_locations(ctx, &mut resolved, |location| {
+                database.replayed_location(location)
+            });
+            let definition = match resolved {
+                UrsaStatement::CreatePropertyGraph(r) => {
+                    graph_ddl::graph_def(*r, normalizes(ctx)).ok()
+                }
+                _ => None,
+            };
             Some(DefinedObject {
                 kind: "graph",
                 name: g.name.to_string(),
                 drop: format!("DROP PROPERTY GRAPH {}", g.name),
-                target: Target::Graph(name),
+                target: Target::Graph(name, definition),
             })
         }
         UrsaStatement::DataFusion(df) => match df.as_ref() {

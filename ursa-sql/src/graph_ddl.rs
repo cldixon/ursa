@@ -47,7 +47,7 @@ pub(crate) async fn describe(ctx: &SessionContext, statement: DescribeGraph) -> 
 
 /// The definition `statement` makes, with its identifiers normalized. Vertex
 /// keys left out are resolved by the engine, which can see the tables.
-fn graph_def(statement: CreatePropertyGraph, normalize: bool) -> Result<GraphSpec> {
+pub(crate) fn graph_def(statement: CreatePropertyGraph, normalize: bool) -> Result<GraphSpec> {
     let normalizer = IdentNormalizer::new(normalize);
     let name = graph_name(statement.name, normalize)?;
     let mut vertex_tables = Vec::new();

@@ -254,22 +254,24 @@ Dropping a graph leaves its tables and views alone.
 
 ## SHOW GRAPHS
 
-Lists the graphs, one row per edge table, with its endpoint columns, and the vertex table and key its endpoints refer to:
+Lists the graphs, one row per edge table, with its endpoint columns, the vertex table and key its endpoints refer to, and whether the graph can be used:
 
 ```sql
 SHOW GRAPHS;
 ```
 
 ```text
-┌────────┬────────────┬────────┬─────────────┬──────────────┬────────────┐
-│  name  │ edge_table │ source │ destination │ vertex_table │ vertex_key │
-│  Utf8  │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
-├────────┼────────────┼────────┼─────────────┼──────────────┼────────────┤
-│ club   │ ties       │ src    │ dst         │ members      │ id         │
-│ club   │ wrote      │ author │ post        │ members      │ id         │
-│ karate │ ties       │ src    │ dst         │ members      │ id         │
-└────────┴────────────┴────────┴─────────────┴──────────────┴────────────┘
+┌────────┬────────────┬────────┬─────────────┬──────────────┬────────────┬────────┬────────┐
+│  name  │ edge_table │ source │ destination │ vertex_table │ vertex_key │ status │ reason │
+│  Utf8  │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │  Utf8  │  Utf8  │
+├────────┼────────────┼────────┼─────────────┼──────────────┼────────────┼────────┼────────┤
+│ club   │ ties       │ src    │ dst         │ members      │ id         │ ok     │ NULL   │
+│ club   │ wrote      │ author │ post        │ members      │ id         │ ok     │ NULL   │
+│ karate │ ties       │ src    │ dst         │ members      │ id         │ ok     │ NULL   │
+└────────┴────────────┴────────┴─────────────┴──────────────┴────────────┴────────┴────────┘
 ```
+
+`status` is `ok` for a graph you can use. A graph of the [database](database.md) that could not be defined when the database was opened, because a file it reads was moved or deleted, is listed too, from its stored definition, with `status` `unavailable` and `reason` saying why and how to repair it: what the notice said when the database opened, and what using the graph says. A vertex key the definition leaves out is NULL for such a graph, since finding it needs the table. See [when a file is missing](database.md#when-a-file-is-missing).
 
 ## DESCRIBE GRAPH
 

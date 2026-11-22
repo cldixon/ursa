@@ -719,13 +719,13 @@ fn find_out_what_is_available_matches_getting_started() {
     assert_eq!(
         out,
         "\
-┌───────────────────┬────────────┬────────┬─────────────┬──────────────┬────────────┐
-│       name        │ edge_table │ source │ destination │ vertex_table │ vertex_key │
-│       Utf8        │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
-├───────────────────┼────────────┼────────┼─────────────┼──────────────┼────────────┤
-│ karate            │ ties       │ src    │ dst         │ members      │ id         │
-│ karate_edges_only │ ties       │ src    │ dst         │ NULL         │ NULL       │
-└───────────────────┴────────────┴────────┴─────────────┴──────────────┴────────────┘
+┌───────────────────┬────────────┬────────┬─────────────┬──────────────┬────────────┬────────┬────────┐
+│       name        │ edge_table │ source │ destination │ vertex_table │ vertex_key │ status │ reason │
+│       Utf8        │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │  Utf8  │  Utf8  │
+├───────────────────┼────────────┼────────┼─────────────┼──────────────┼────────────┼────────┼────────┤
+│ karate            │ ties       │ src    │ dst         │ members      │ id         │ ok     │ NULL   │
+│ karate_edges_only │ ties       │ src    │ dst         │ NULL         │ NULL       │ ok     │ NULL   │
+└───────────────────┴────────────┴────────┴─────────────┴──────────────┴────────────┴────────┴────────┘
 ┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
 │ table_name │ column_name │ data_type │    role     │    origin    │
 │    Utf8    │    Utf8     │   Utf8    │    Utf8     │     Utf8     │
@@ -750,8 +750,8 @@ fn find_out_what_is_available_matches_getting_started() {
     assert_eq!(
         out,
         "\
-[{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\"},\
-{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":null,\"vertex_key\":null}]
+[{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\",\"status\":\"ok\",\"reason\":null},\
+{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":null,\"vertex_key\":null,\"status\":\"ok\",\"reason\":null}]
 [{\"table_name\":\"nodes\",\"column_name\":\"id\",\"data_type\":\"Int64\",\"role\":\"node id\",\"origin\":\"ties.src, ties.dst\"},\
 {\"table_name\":\"edges\",\"column_name\":\"src\",\"data_type\":\"Int64\",\"role\":\"source\",\"origin\":\"ties.src\"},\
 {\"table_name\":\"edges\",\"column_name\":\"dst\",\"data_type\":\"Int64\",\"role\":\"destination\",\"origin\":\"ties.dst\"}]
@@ -779,12 +779,12 @@ fn a_graph_over_file_paths() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-┌────────────┬──────────────────────────────────────────────────┬────────┬─────────────┬──────────────┬────────────┐
-│    name    │                    edge_table                    │ source │ destination │ vertex_table │ vertex_key │
-│    Utf8    │                       Utf8                       │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
-├────────────┼──────────────────────────────────────────────────┼────────┼─────────────┼──────────────┼────────────┤
-│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src    │ dst         │ NULL         │ NULL       │
-└────────────┴──────────────────────────────────────────────────┴────────┴─────────────┴──────────────┴────────────┘
+┌────────────┬──────────────────────────────────────────────────┬────────┬─────────────┬──────────────┬────────────┬────────┬────────┐
+│    name    │                    edge_table                    │ source │ destination │ vertex_table │ vertex_key │ status │ reason │
+│    Utf8    │                       Utf8                       │  Utf8  │    Utf8     │     Utf8     │    Utf8    │  Utf8  │  Utf8  │
+├────────────┼──────────────────────────────────────────────────┼────────┼─────────────┼──────────────┼────────────┼────────┼────────┤
+│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src    │ dst         │ NULL         │ NULL       │ ok     │ NULL   │
+└────────────┴──────────────────────────────────────────────────┴────────┴─────────────┴──────────────┴────────────┴────────┴────────┘
 ┌──────────┬────────┐
 │    id    │ degree │
 │   Utf8   │ UInt32 │
@@ -1838,6 +1838,45 @@ fn a_file_that_cannot_be_read_is_named_once() {
              with the Parquet magic number PAR1\n"
         )
     );
+}
+
+/// An empty Parquet file is an error naming it, as in DuckDB, not zero rows:
+/// named, in a glob or in a directory, however it is read.
+#[test]
+fn an_empty_parquet_file_is_an_error_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let good = dir.join("a.parquet").display().to_string();
+    ursa(&["-c", &format!("COPY (SELECT 1 AS a, 2 AS b) TO '{good}';")]);
+    std::fs::write(dir.join("b.parquet"), b"").unwrap();
+    let empty = dir.join("b.parquet").display().to_string();
+    let glob = dir.join("*.parquet").display().to_string();
+    let directory = format!("{}/", dir.display());
+    for sql in [
+        format!("SELECT * FROM '{empty}';"),
+        format!("SELECT * FROM read_parquet('{empty}');"),
+        format!("SELECT * FROM '{glob}';"),
+        format!("SELECT * FROM read_parquet('{glob}');"),
+        format!("SELECT * FROM read_parquet(['{good}', '{empty}']);"),
+        format!("SELECT * FROM '{directory}';"),
+        format!("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION '{directory}';"),
+        format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{glob}' SOURCE KEY (a) DESTINATION KEY (b));"
+        ),
+    ] {
+        let message = err(ursa(&["-c", &sql]));
+        assert!(
+            message.contains(&format!(
+                "cannot read '{empty}': it is not a valid Parquet file: the file is empty"
+            )),
+            "{sql}: {message}"
+        );
+    }
+    let out = ursa(&[
+        "-c",
+        &format!("SELECT count(*) FROM read_parquet('{good}');"),
+    ]);
+    assert!(out.status.success(), "{out:?}");
 }
 
 /// #332: a truncated or fake Parquet file is an error naming it, however it

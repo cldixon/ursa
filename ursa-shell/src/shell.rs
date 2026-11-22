@@ -1888,7 +1888,7 @@ mod tests {
         assert_eq!(out, "x\n2\n");
         assert_eq!(
             std::fs::read_to_string(&all).unwrap(),
-            "x\n1\nbetween\nname,edge_table,source,destination,vertex_table,vertex_key\n"
+            "x\n1\nbetween\nname,edge_table,source,destination,vertex_table,vertex_key,status,reason\n"
         );
 
         let (out, err) = feed(
