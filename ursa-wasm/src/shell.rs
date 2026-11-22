@@ -355,7 +355,8 @@ impl WebShell {
     }
 
     /// A graph to draw (the page's `.graph`), resolving to a [`GraphData`].
-    /// `text` is `[SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`. SOURCE
+    /// `text` is `[SOURCE] [ON graph] [AS …] [NODES (query)] [SIZE BY x]
+    /// [COLOR BY y] [LAYOUT force|rings|layers]`. SOURCE
     /// is empty for the last result, a property graph's name for its edges
     /// (and its vertices' keys), a table's name for its rows, or a query.
     /// Rows are drawn by the first result → graph rule that matches them
@@ -366,13 +367,20 @@ impl WebShell {
     /// result's provenance says which, and what was not a graph is an error
     /// that says what would be.
     ///
+    /// `AS edges(src, dst [, weight])`, `AS nodes(id)`, `AS path(nodes [,
+    /// edges])` or `AS hops(seed, id, distance)` says what the rows are and
+    /// names the columns, in place of the rules (#434). `ON graph` names the
+    /// property graph the ids belong to, and `LAYOUT` the layout, whatever
+    /// the rule chose (the result's `encodings.layout`).
+    ///
     /// `SIZE BY x` and `COLOR BY y` give each node a value, as a node column
     /// of the result. A name is,
     /// in turn: a column of `NODES (SELECT id, … FROM …)`; a column of the
     /// property graph's vertex tables; `degree`; or a per-node algorithm
     /// (`pagerank`, `louvain`, `betweenness`, …) run on the property graph
     /// through `algorithms(G, …)`, undirected and seeded. Rows (a query, a
-    /// table, the last result) take NODES's columns and degree only.
+    /// table, the last result) whose graph is not known (by their columns,
+    /// or `ON graph`) take NODES's columns and degree only.
     ///
     /// Rejects, with a message to show, when there is nothing to draw, more
     /// than 2,000,000 edges, or a name or clause that does not fit.

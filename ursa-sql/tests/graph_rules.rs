@@ -5,7 +5,8 @@
 //!
 //! The rules themselves, from schemas with and without metadata, are in
 //! `ursa-engine`'s `graph::view` tests; this holds them to what `GRAPH_TABLE`
-//! and the graph functions really return.
+//! and the graph functions really return. The last test overrides them with
+//! `AS …`, `ON graph` and `LAYOUT` (#434).
 
 use std::path::{Path, PathBuf};
 
@@ -396,4 +397,123 @@ async fn a_pattern_over_two_vertex_tables_keeps_their_keys_apart() {
     assert_eq!(view.result.provenance().rule.as_deref(), Some("edges"));
     assert_eq!(ids(&view), ["1", "2", "3", "1", "2"]);
     assert_eq!(view.result.n_edges(), 3);
+}
+
+/// `.graph CLAUSES` after `sql`: the last result, read as the clauses say.
+async fn drawn(ctx: &SessionContext, sql: &str, clauses: &str) -> Result<GraphView, String> {
+    let last = Sql.run(ctx, sql).await.unwrap();
+    of_command(ctx, &Sql, clauses, Some(last))
+        .await
+        .map_err(|e| ursa_engine::user_message(&e))
+}
+
+/// `AS …` is rule 0 (#434): a graph query's result drawn as the clause
+/// says, not as its metadata would have it.
+#[tokio::test]
+async fn as_overrides_what_a_graph_query_says_it_is() {
+    let ctx = karate().await;
+    // A hop result is rings by rule 2; as edges it is the star it was before
+    // #433, and as nodes the reached nodes with the ties among them.
+    let hop = "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+    let rows: usize = Sql
+        .run(&ctx, hop)
+        .await
+        .unwrap()
+        .1
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    let rings = after(&ctx, hop).await;
+    let view = drawn(&ctx, hop, "AS edges(seed, id)").await.unwrap();
+    assert_eq!(view.drawn_as(), "edges of karate (seed, id)");
+    assert_eq!(view.result.n_edges(), rows);
+    assert!(view.result.src().iter().all(|&s| s == 0));
+    assert!(view.result.highlights().is_empty());
+    assert_eq!(view.result.encodings().layout, Layout::Force);
+    let view = drawn(&ctx, hop, "AS nodes(id)").await.unwrap();
+    assert_eq!(view.drawn_as(), "nodes of karate (id)");
+    assert!(view.result.highlights().is_empty());
+    let all = ties(&ctx).await;
+    assert!(!pairs(&view).is_empty());
+    assert!(pairs(&view).iter().all(|p| all.contains(p)));
+    // The rule's own reading, laid out otherwise.
+    let view = drawn(&ctx, hop, "LAYOUT force").await.unwrap();
+    assert_eq!(view.drawn_as(), rings.drawn_as());
+    assert_eq!(view.result.encodings().layout, Layout::Force);
+    assert_eq!(view.result.highlights(), rings.result.highlights());
+    assert_eq!(pairs(&view), pairs(&rings));
+
+    // A pattern's three variables are both edges of each match by rule 4;
+    // as edges(a, c), the two ends of each two-step walk.
+    let three = "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[]-(b WHERE b.id = 1)-[]-(c) \
+                 COLUMNS (a.id AS a, b.id AS b, c.id AS c))";
+    let view = drawn(&ctx, three, "AS edges(a, c)").await.unwrap();
+    assert_eq!(view.drawn_as(), "edges of karate (a, c)");
+    let walks: usize = Sql
+        .run(&ctx, three)
+        .await
+        .unwrap()
+        .1
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!((walks, view.result.n_edges()), (9, 9));
+    // Every edge starts at a (node 0); the result names no edge table for them.
+    assert!(view.result.src().iter().all(|&s| s == 0));
+    assert_eq!(view.result.edge_labels(), [""]);
+
+    // A path's members without its ties: the same route, its edges' rows
+    // not known.
+    let route = "FROM GRAPH_TABLE (karate MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b \
+                 WHERE b.id = 26) COLUMNS (path_length(p) AS steps, vertices(p) AS members, \
+                 edges(p) AS ties))";
+    let view = drawn(&ctx, route, "AS path(members)").await.unwrap();
+    assert_eq!(view.drawn_as(), "a path on karate (members)");
+    assert_eq!(ids(&view), ["16", "5", "0", "8", "33", "26"]);
+    assert_eq!(view.result.edge_row(0), None);
+    let view = drawn(&ctx, route, "AS path(members, ties)").await.unwrap();
+    assert_eq!(view.drawn_as(), "a path on karate (members, ties)");
+    assert!(view.result.edge_row(0).is_some());
+
+    // The message of rule 6 names a clause that now draws: club and n.
+    let counts = "SELECT club, count(*) AS n FROM members GROUP BY club";
+    let err = drawn(&ctx, counts, "").await.unwrap_err();
+    assert!(err.contains(".graph AS nodes(club)"), "{err}");
+    let view = drawn(&ctx, counts, "AS nodes(club)").await.unwrap();
+    assert_eq!(view.result.n_nodes(), 2);
+
+    // What does not fit says what to write.
+    for (sql, clauses, says) in [
+        (
+            hop,
+            "AS hops(seed, id, dist)",
+            "AS hops(seed, id, dist): the result has no column dist. The result's columns are \
+             seed (",
+        ),
+        (
+            "SELECT * FROM pagerank(karate)",
+            "AS edges(id, pagerank)",
+            "column pagerank is a number that is not whole (Float64), and an edge's end is an id",
+        ),
+        (
+            route,
+            "AS path(steps)",
+            "and a path's nodes are a list of ids (integers, strings or dates), as vertices(p) \
+             gives",
+        ),
+        (
+            "SELECT * FROM pagerank(karate)",
+            "LAYOUT rings",
+            "LAYOUT rings places each node by its distance from a seed or its step along a path, \
+             and nodes have neither",
+        ),
+        (
+            hop,
+            "ON lesmis",
+            "ON lesmis: there is no property graph named 'lesmis'. The graphs are karate",
+        ),
+    ] {
+        let err = drawn(&ctx, sql, clauses).await.unwrap_err();
+        assert!(err.contains(says), "{clauses}: {err}");
+    }
 }

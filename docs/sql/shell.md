@@ -80,18 +80,23 @@ memory U .help
 .exit                Exit the shell (also Ctrl-D)
 .functions ?NAME?    List the graph functions, or show one's parameters
 .graphs              List the graphs (SHOW GRAPHS)
+.headers on|off      Turn the header row of csv and tsv output on or off
 .help ?PATTERN?      Show help for the commands matching PATTERN
 .maxrows N           Show at most N rows of a table (default 40; 0 shows all)
 .maxwidth N          Draw tables at most N characters wide (0: the screen's width)
-.mode MODE           Set the output mode: table, csv, tsv, json or ndjson
+.mode MODE           Set the output mode: table, csv, tsv, json, ndjson, markdown or line
+.once FILE           Send the output of the next command only to FILE
 .open FILE.ursa      Open a database file, before anything is defined (as ATTACH)
+.output ?FILE?       Send output to FILE, or back to the screen if FILE is omitted
 .print STRING...     Print literal STRING
 .quit                Exit the shell (also Ctrl-D)
 .read FILE           Run the SQL and dot-commands in FILE
+.schema ?PATTERN?    Show the statements that define the views, tables and graphs
 .tables              List the tables and views
 .timer on|off        Show how long each statement takes (real, user and sys)
 .version             Show the version
 
+DuckDB's .mode names duckbox, box and jsonlines work too
 Run .help graph for the graph SQL: property graphs, MATCH and algorithms
 Run .help shortcuts for keyboard shortcuts
 ```
@@ -103,6 +108,7 @@ Run .help shortcuts for keyboard shortcuts
 | `.functions`      | `SELECT name, family, summary FROM ursa_functions();`, with the first sentence of each summary |
 | `.open club.ursa` | `ATTACH 'club.ursa';`                      |
 | `.tables`         | a query on `information_schema.tables`, without the graphs' own tables |
+| `.schema`         | the statements in the database's catalog, each ending with `;` |
 
 `.functions NAME` shows one function: its summary, then its parameters one a line (name, type, default, what it does, and the values it takes), then its output columns:
 
@@ -123,7 +129,19 @@ A name that is not a function gets a suggestion, as a mistyped command does. `SE
 
 `.describe NAME` takes the name as `.tables` and `.graphs` list it, in any case unless it is quoted: `.describe Mixed` describes a table created as `"Mixed"`. A qualified name (`s.t`) works too.
 
-`.mode` with no argument shows the current mode, `.maxrows` how many rows a table shows, `.maxwidth` how wide a table may be, and `.timer` whether the timer is on. A mistyped command, or the start of one (`.q`, `.tab`), gets a suggestion; it is not run:
+`.mode` with no argument shows the current mode, `.maxrows` how many rows a table shows, `.maxwidth` how wide a table may be, `.timer` whether the timer is on, and `.headers` whether CSV and TSV start with a header row.
+
+`.schema` prints the statements that define the database's views, external tables and graphs, as the [database file](database.md) stores them, in the order they are defined, each ending with `;`: paste them into another shell to define the same objects. Paths are as stored, relative to the database's directory. In a session without a database file, it prints the views' statements. `.schema PATTERN` keeps the objects whose name matches PATTERN, in any case: a `LIKE` pattern (`.schema %edges%`) or, as in DuckDB, a glob (`.schema karate*`).
+
+`.output FILE` sends everything the shell prints to FILE, results and the text of dot-commands alike, until `.output` with no file sends it back to the screen. `.once FILE` does the same for the next command only (a statement, or a line of statements, or a dot-command), which is how to save the output of `SHOW GRAPHS` or `DESCRIBE GRAPH`, which `COPY … TO` cannot. The file is created, or emptied if it exists. Errors still go to the screen, and a table written to a file is as wide as it needs, without colour:
+
+```text
+memory U .mode markdown
+memory U .once degrees.md
+memory U SELECT * FROM degree(karate) ORDER BY degree DESC LIMIT 3;
+```
+
+A mistyped command, or the start of one (`.q`, `.tab`), gets a suggestion; it is not run:
 
 ```text
 memory U .grpahs
@@ -132,7 +150,7 @@ Error: unknown command '.grpahs'; did you mean '.graphs'? Enter .help for the li
 
 ## Output modes
 
-The shell prints `table` by default. `.mode csv`, `.mode tsv`, `.mode json` and `.mode ndjson` switch it. On the command line, `--format` sets the mode for the shell and for `-c` alike:
+The shell prints `table` by default. `.mode csv`, `.mode tsv`, `.mode json`, `.mode ndjson`, `.mode markdown` and `.mode line` switch it. DuckDB's names for the same modes work too: `duckbox` and `box` are `table`, `jsonlines` is `ndjson`, and `lines` is `line`. On the command line, `--format` sets the mode for the shell and for `-c` alike:
 
 ```bash
 ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 2"
@@ -143,6 +161,35 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 ```
 
 `--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows: a second result, or none at all (a script of only `CREATE` statements), is an error. `.mode` cannot switch to it.
+
+`markdown` writes a Markdown table, as DuckDB's `.mode markdown` does, to paste into an issue, a document or a chat. Each name is centred over its column, a number column's separator ends in `:` so it is right-aligned where the table is rendered, and a null is `NULL`. A `|` in a value is written `\|` and a line break `\n`, so each row stays one row of the table:
+
+```sql
+.mode markdown
+SELECT id, club FROM 'karate_nodes.csv' LIMIT 2;
+```
+
+```text
+| id |  club  |
+|---:|--------|
+| 0  | Mr. Hi |
+| 1  | Mr. Hi |
+```
+
+`line` writes one `column = value` line per column, the names right-aligned, and a blank line between rows, as DuckDB's `.mode line` does. It is the readable mode for a wide row:
+
+```sql
+.mode line
+SELECT name, family, networkx FROM ursa_functions() WHERE name = 'pagerank';
+```
+
+```text
+    name = pagerank
+  family = algorithm
+networkx = nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))
+```
+
+`.headers off` leaves out the header row of `csv` and `tsv`, as in DuckDB; `.headers on` puts it back. The other modes always name their columns.
 
 ### Reading results in a program
 
@@ -181,7 +228,7 @@ l,m
 
 The table writes nested values the same way. This text is for reading: JSON is the lossless format for nested results, since it keeps each value's type, so read lists, structs and maps (such as `vertices(p)` on a graph with string ids) as `json` or `ndjson`.
 
-`csv`, `tsv`, `json`, `ndjson` and `arrow` write every row and never cut a value. A `table` shows at most 40 rows (see [Long results](#long-results)).
+`csv`, `tsv`, `json`, `ndjson`, `markdown`, `line` and `arrow` write every row and never cut a value. A `table` shows at most 40 rows (see [Long results](#long-results)).
 
 ### Tables
 
@@ -224,7 +271,7 @@ memory U SELECT * FROM generate_series(1, 100000);
   100,000 rows (40 shown)
 ```
 
-`.maxrows N` (in the shell, a script or an init file) or `--max-rows N` (on the command line) changes how many: half from the start and half from the end. `.maxrows 0` and `--max-rows 0` show every row. The other modes, `csv`, `tsv`, `json`, `ndjson` and `arrow`, always write every row, so use one of them to save or read a whole result.
+`.maxrows N` (in the shell, a script or an init file) or `--max-rows N` (on the command line) changes how many: half from the start and half from the end. `.maxrows 0` and `--max-rows 0` show every row. The other modes, `csv`, `tsv`, `json`, `ndjson`, `markdown`, `line` and `arrow`, always write every row, so use one of them to save or read a whole result.
 
 ### Wide results
 

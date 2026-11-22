@@ -36,7 +36,8 @@ static assets and an R2 bucket.
     is a page on the graph SQL, whose forms the e2e test runs), and the page's
     own, which the shell lists in `.help` and hands back to the page:
     `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
-    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?`,
+    CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME? ?AS …? ?SIZE BY x? ?COLOR BY y?`
+    (`.help graph` lists every clause),
     `.history ?N?` and `.share`. The explore commands (`.expand`, `.find`, `.hide`, `.show`,
     `.undo`, `.redo`, `.graph history`) are the shell's own list
     (`ursa-shell`'s `EXPLORE_COMMANDS`), handed back the same way.
@@ -108,10 +109,43 @@ static assets and an R2 bucket.
     was left out and what else it could have been, and so does the
     terminal's line (`Drawing 5 edges, 6 nodes as a path on karate (members,
     ties) (Esc closes)`). The messages name the `AS …` clause that overrides
-    the rules; the clause itself is #434. The result also carries what a
+    the rules (below). The result also carries what a
     later view draws: the paths, the seeds, each node's level (a hop's
     distance, a path's step) and the layout the rule asks for (rings or
     layers), which `graph-data.js` reads as `graph.layout = {kind, level}`.
+  - **Saying what a result is** (#434): `.graph [SOURCE] [ON graph] [AS
+    edges(src, dst [, weight]) | nodes(id) | path(nodes [, edges]) |
+    hops(seed, id, distance)] [NODES (query)] [SIZE BY x] [COLOR BY y]
+    [LAYOUT force|rings|layers]`, the clauses in any order after the source.
+    - **`AS …` is rule 0**: it says what the rows are and names the columns,
+      and nothing is inferred, so a result whose columns have any names is
+      drawn: `.graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)`.
+      `AS edges` draws a row an edge (its optional weight is an edge
+      column), `AS nodes` the nodes with the graph's edges among them, `AS
+      path` a list of ids a row (with a list of the edges' rows), and `AS
+      hops` a hop's rings. A name is matched as SQL matches it (in any case
+      unless quoted). A column that is missing, or is not what the shape
+      needs (an id for a node, a list of ids for a path, a whole number for
+      a distance, a number for a weight), is an error that names it and
+      lists the result's columns with their types.
+    - **`ON graph`** names the property graph the ids belong to, where the
+      columns do not say (`ursa.graph`) or say otherwise: the graph `AS
+      nodes` and `AS hops` read their edges from, and the one `SIZE BY
+      pagerank` runs on for rows drawn as edges.
+    - **`LAYOUT`** sets the result's `encodings.layout`, whatever the rule
+      chose: `LAYOUT force` lays a hop result out by its edges, `LAYOUT
+      layers` puts its rings in rows. Rings and layers place a node by its
+      level (a hop's distance, a path's step), so a drawing without one
+      (edges, nodes, a property graph) refuses them and says what has one.
+    - A property graph is drawn whole: `.graph karate AS …` and `.graph
+      karate ON …` say so. SQL's own `AS` and `ON` stay the query's (an
+      alias, a join's condition); only `FROM t AS edges(a, b)`, a table
+      alias named for a form (or `edge`, `node`, `paths`, `hop`, which are
+      told the form they meant) with a column list, is read as the clause.
+      After a source that is one name, everything is clauses, so `.graph
+      karate LAYOUT spiral` is told what `LAYOUT` takes, not handed to SQL.
+    - `.help graph` lists the clauses (the shell adds them to the page where
+      the host has a `.graph` command).
   - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES
     (query)] [SIZE BY x] [COLOR BY y]`, the clauses in any order after the
     source. `.graph karate SIZE BY pagerank COLOR BY louvain` sizes Karate's
@@ -124,7 +158,8 @@ static assets and an R2 bucket.
     `seed => 1` where it is random): `pagerank`, `louvain`, `betweenness`,
     `closeness`, `label_propagation`, `connected_components`,
     `triangle_count`, `clustering_coefficient`. A source that is rows (a
-    query, a table, the last result) takes `NODES` and `degree` only.
+    query, a table, the last result) takes `NODES` and `degree` only, unless
+    its graph is known: by its columns, or by `ON graph`.
     `SIZE BY` needs numbers; `COLOR BY` colours the eight largest
     categories, the rest "other", and refuses a fractional column with more
     than eight values or any with more than eight that are over half the
