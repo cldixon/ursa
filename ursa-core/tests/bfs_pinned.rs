@@ -227,6 +227,9 @@ fn compute() -> Vec<(String, u64)> {
     let mut got = Vec::new();
     for (name, e, m, exact) in fixtures() {
         let t = e.topology();
+        // With the in-adjacency built, direction `out` may go bottom-up too
+        // (it does not build one just for that).
+        t.incoming();
         let sources = [0, hub(&e), e.n as u32 / 2, e.n as u32 - 1];
         for dir in DIRS {
             for (i, &s) in sources.iter().enumerate() {
@@ -311,6 +314,7 @@ fn bfs_results_match_the_golden_hashes_on_1_and_4_threads() {
 fn hop_rows_in_order() -> Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> {
     let e = rmat(240_000, 15, 5);
     let t = e.topology();
+    t.incoming();
     let m = mask(e.src.len(), 99);
     let mut out = Vec::new();
     for dir in DIRS {

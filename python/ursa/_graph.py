@@ -259,7 +259,11 @@ class _Hop:
 
 
 def hop(edges: EdgeFrame, n: int = 1, direction: str = "out") -> _Hop:
-    """``n``-hop expansion. Returns a lazy EdgeFrame so traversal composes."""
+    """``n``-hop expansion. Returns a lazy EdgeFrame so traversal composes.
+
+    The rows come in no particular order, which can differ from one run to
+    another; sort the result when the order matters.
+    """
     return _Hop(_ir.check_edges(edges, "hop"), n, direction)
 
 

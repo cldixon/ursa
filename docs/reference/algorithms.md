@@ -108,7 +108,7 @@ Traversals return an `EdgeFrame` or a `NodeFrame` with rows of their own. The sh
 ur.hop(edges, n: int = 1, direction: str = "out").from_(seeds) -> EdgeFrame
 ```
 
-The nodes within `n` hops of each seed. `seeds` is an iterable of ids, or a `NodeFrame` whose `id` column gives them. An id is an integer or a string. On a graph of integer ids, a string that spells an integer, such as `'7'`, is that integer, and any other string is an error. On a graph of string ids, an integer is its string. A float, a bool or any other value raises `TypeError`. A seed that is not in the graph reaches nothing. The result has one row per `(seed, reached)` pair, in the columns `src` and `dst`. `direction` is `"out"`, `"in"`, or `"both"`.
+The nodes within `n` hops of each seed. `seeds` is an iterable of ids, or a `NodeFrame` whose `id` column gives them. An id is an integer or a string. On a graph of integer ids, a string that spells an integer, such as `'7'`, is that integer, and any other string is an error. On a graph of string ids, an integer is its string. A float, a bool or any other value raises `TypeError`. A seed that is not in the graph reaches nothing. The result has one row per `(seed, reached)` pair, in the columns `src` and `dst`, in no particular order (it can differ from one run to another; sort it when the order matters). `direction` is `"out"`, `"in"`, or `"both"`.
 
 ### `ur.shortest_path`
 

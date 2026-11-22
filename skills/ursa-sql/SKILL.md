@@ -245,7 +245,7 @@ FROM hop(karate,
          n => 2);
 ```
 
-- `hop(g, seeds =>, n =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `n` steps; `distance` is the fewest steps from the seed. The seed itself is not a row.
+- `hop(g, seeds =>, n =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `n` steps; `distance` is the fewest steps from the seed. The seed itself is not a row. Rows come in no particular order: add `ORDER BY` when it matters.
 - `shortest_path(g, source =>, target =>, weight =>, direction =>)`: one edge per row with `hop` and `cost`. Exactly one source and one target.
 - `random_walk(g, start =>, steps =>, walks_per_node =>, seed =>)`: one row per step.
 - `induced_edges(g, nodes =>)`: the graph's edges whose two ends are both in `nodes` (a list or a query, as seeds), one `(src, dst, edge)` row per edge; `edge` is its row in the edge table. Read from the index: use it instead of `WHERE src IN (…) AND dst IN (…)` on the edge table.

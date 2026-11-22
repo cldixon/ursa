@@ -753,6 +753,47 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **`hop`'s rows come back in no particular order** (behaviour change,
+  #452). SQL `hop(…)` and Python `ur.hop(…).from_(…)` return the same rows
+  as before, with the same distances, but not always in the same order: the
+  nodes found at one distance from a seed may come back in another order,
+  and the order can differ from one run to another (for example once the
+  graph's in-adjacency has been built or read). Each seed's rows still come
+  together, seeds in the order given, nearer nodes first, and the order does
+  not depend on the number of threads. Add `ORDER BY` (in Python, `.sort`)
+  where the order matters. `hop`'s reference entry says so.
+- **Breadth-first searches switch direction on large levels: `hop`,
+  `diameter`, `avg_path_length` and `bfs_distances` use 3 to 11 times less
+  CPU on large graphs, with the same results** (#452). A level whose edges are a large
+  share of the edges not yet read is now expanded bottom-up: each node not
+  yet reached reads its edges the other way and stops at the first that
+  leads to the level (direction-optimizing BFS, Beamer, Asanović and
+  Patterson, 2012). A search from one source splits such a level across
+  threads. Distances, reached sets, `diameter` and `avg_path_length` are
+  unchanged: a new test pins hashes recorded before the change (karate, two
+  R-MAT graphs, a disconnected graph, a sparse directed graph, a path; every
+  direction, masked and not; several seed sets and depths; `hop`'s rows
+  compared sorted), on one thread and four, and without `rayon`. Only the
+  order of `hop`'s rows changes (above). In direction `out` a search goes
+  bottom-up only when the in-adjacency is already built or stored; it never
+  builds one for this. `shortest_path` keeps the top-down search, because
+  which shortest path it returns depends on the order. On R-MAT graphs
+  (shared 4-core machine, best of two runs, CPU-seconds):
+
+  | graph | query | before | now |
+  |---|---|---|---|
+  | 64M edges, 4M nodes | full BFS from 3 sources, 1 thread | 2.30 s | 0.44 s |
+  | 64M edges, 4M nodes | `hop`, n = 3, from the hub | 1.03 s | 0.14 s |
+  | 64M edges, 4M nodes | `hop`, n = 3, `both`, 16 seeds | 28.8 s | 3.8 s |
+  | 64M edges, 1M nodes | full BFS from 3 sources, 1 thread | 1.14 s | 0.10 s |
+  | 64M edges, 1M nodes | `hop`, n = 2, from the hub | 0.34 s | 0.03 s |
+  | 16M edges, 1M nodes | `avg_path_length`, 64 sources | 4.07 s | 1.06 s |
+
+  A `hop` from many seeds that are not hubs gains less (16 seeds, n = 2:
+  1.3–2.6×), as most of its time goes to the rows. Peak memory is the same
+  within 1% (`avg_path_length` and `diameter` hold 1 byte per node per
+  thread instead of 4).
+
 - **A Parquet file's schema metadata is kept when Ursa reads it.** Ursa's
   sessions set `datafusion.execution.parquet.skip_metadata = false`, so the
   `ursa.*` column roles (#431) of a result written to Parquet come back with

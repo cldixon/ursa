@@ -433,7 +433,13 @@ async fn sql_matches_the_python_library() {
                 );
             }
         }
-        if traversal::lookup(function).is_some() {
+        if function == "hop" {
+            // hop's rows come in no particular order (#452): the same rows.
+            let (mut got, mut expected) = (got, expected);
+            got.sort();
+            expected.sort();
+            assert_eq!(got, expected, "{sql}");
+        } else if traversal::lookup(function).is_some() {
             assert_eq!(got, expected, "{sql}");
         } else {
             assert_eq!(keyed(got, per_node), keyed(expected, per_node), "{sql}");

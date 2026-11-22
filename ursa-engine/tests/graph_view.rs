@@ -418,10 +418,12 @@ async fn views_encode_to_the_fixtures_the_page_reads() {
     assert!(codes.contains(&NULL) && codes.contains(&9));
     check_fixture("graph_view_rows", &view);
 
-    // The rules (#433): a hop result as rings, and paths as layers.
+    // The rules (#433): a hop result as rings, and paths as layers. `hop`'s
+    // rows come in no particular order (#452), so the fixture sorts them.
     let last = rows(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both') \
+         ORDER BY seed, distance, id",
     )
     .await;
     let view = draw(&ctx, "", last).await;
