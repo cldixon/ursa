@@ -495,7 +495,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `Renderer::new` takes the edge count and the caller writes the edges
   (`write_edges`), and `Graph::line_indices` takes a range.
   `tests/graph-timing.ts` prints the longest task while the view is made
-  and fails over 60 ms.
+  and fails over 60 ms. The shell keeps what its layout worker says while
+  the view is being made, so a small graph's layout that ends first is not
+  lost.
 - **Scenes that change in place in the graph view** (#441): a view made
   from a graph result applies a delta in time proportional to the delta, not
   to the graph. `createViewFromResult(canvas, bytes)` takes a result as UGR

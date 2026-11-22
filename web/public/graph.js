@@ -168,6 +168,15 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     worker.postMessage({ type: "start", n: graph.n, src, dst, module: url, layout: graph.layout }, [src.buffer, dst.buffer]);
     times.posted = performance.now();
   }
+  // The view is made in pieces, with turns of the event loop between them
+  // (#426), and a small graph's layout is done before the last: what the
+  // worker says meanwhile is kept for the handlers below.
+  const early = [];
+  worker.onmessage = (e) => early.push(["message", e]);
+  worker.onerror = (e) => {
+    e.preventDefault();
+    early.push(["error", e]);
+  };
 
   // At most 2 canvas pixels a CSS pixel: a phone at 3 would fill 2.25 times
   // the pixels each frame for a picture no sharper to the eye.
@@ -318,7 +327,7 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   };
 
   // The layout, in a worker of its own: a slow iteration never holds up a frame.
-  worker.onmessage = ({ data }) => {
+  const fromWorker = ({ data }) => {
     if (current !== state) return;
     if (data.times) for (const [k, v] of Object.entries(data.times)) times[k] ??= v - (performance.timeOrigin - data.origin);
     if (data.memory) state.layoutMemory = data.memory;
@@ -339,10 +348,21 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
       fail(`the layout stopped: ${data.message}`);
     }
   };
-  worker.onerror = (e) => {
+  const workerFailed = (e) => {
     e.preventDefault();
     fail(`the layout stopped: ${e.message || "its worker failed"}`);
   };
+  // What the worker said while the view was made, in order and a task
+  // each, as it would have arrived; then the worker's messages directly.
+  (async () => {
+    while (early.length) {
+      const [kind, e] = early.shift();
+      (kind === "message" ? fromWorker : workerFailed)(e);
+      await new Promise((resolve) => setTimeout(resolve));
+    }
+    worker.onmessage = fromWorker;
+    worker.onerror = workerFailed;
+  })();
 
   // A lost GPU: WebGL2 says so on the canvas; WebGPU's loss shows as a frame
   // that fails to draw (above).
