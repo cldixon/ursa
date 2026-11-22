@@ -1434,6 +1434,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `CREATE OR REPLACE EXTERNAL TABLE` over an unavailable table, with a
     definition that fails too, keeps the table (unavailable, as it was); it
     disappeared for the rest of the session.
+- **SQL: `SHOW GRAPHS` lists unavailable graphs, with a `status` and a
+  `reason`** (behaviour change, #401). A graph of the database that could
+  not be defined when it was opened (a file it reads was moved) was left
+  out, so it looked lost, and `CREATE PROPERTY GRAPH` with its name said
+  "already exists" for a graph nobody could see. It is now listed from its
+  stored definition, as DuckDB lists a view over a missing file, and two
+  columns are added after `vertex_key`: `status`, `ok` or `unavailable`,
+  and `reason`, NULL for a usable graph and otherwise the notice's message
+  after `graph g is unavailable: ` (`no file found at '…'; DROP PROPERTY
+  GRAPH g or restore the file`). A vertex key the stored definition leaves
+  out is NULL for such a graph. `.graphs` shows the same. `SHOW TABLES`
+  already listed unavailable views and tables.
 - **A truncated or fake `.parquet` file is an error, not a crash** (#332).
   A file whose footer claims more metadata than the file holds (a
   truncated download, a file still being written, `PAR1PAR1`) made the

@@ -217,7 +217,7 @@ ursa: graph karate is unavailable: it uses view ties, which is unavailable; repa
 
 The remedy follows the cause: a missing file can be restored; anything else (expired credentials, a network error, a file that no longer has the columns the view reads) ends `or fix the cause and open the database again`.
 
-Everything else works. An unavailable object is still listed by `SHOW TABLES` and `.tables`, and using it fails with the same message, as a broken view does in DuckDB. So do an unavailable graph's functions, `GRAPH_TABLE`, `DESCRIBE GRAPH` and its `karate.edges` and `karate.nodes` tables. A view or graph that uses an unavailable object is unavailable too, with its own message.
+Everything else works. An unavailable object is still listed, as a broken view is in DuckDB: a view or table by `SHOW TABLES` and `.tables`, a graph by `SHOW GRAPHS` and `.graphs`, with `status` `unavailable` and the message's reason (`it uses view ties, which is unavailable; repair ties, or DROP PROPERTY GRAPH karate`). Using it fails with the same message. So do an unavailable graph's functions, `GRAPH_TABLE`, `DESCRIBE GRAPH` and its `karate.edges` and `karate.nodes` tables. A view or graph that uses an unavailable object is unavailable too, with its own message.
 
 Its statement stays in the catalog as it was, so nothing is lost: restore the file, open the database again, and the object is back, with everything that uses it. Or repair it in a writable session:
 
