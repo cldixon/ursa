@@ -895,6 +895,38 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     stored index for g in club.ursa (…) in the current format: …`.
   - `ursa_core::IdMap::from_stored_ids` and `IdMap::lookup_table` are the
     two halves of this; `IdMap::from_user_ids` still interns eagerly.
+- **SQL: `GRAPH_TABLE` path searches are about twice as fast from one start
+  node, and run in parallel from several, with the same rows** (#451). The
+  search copied each node's adjacency list (two lists, merged into a third,
+  for an undirected edge) before reading it, and looked up and counted a
+  per-edge state, through a `match` on how the states were stored, before
+  the cheap test that rejects most edges. Now it reads the lists where they
+  lie (an undirected step merges the two as it reads them), tests first, and
+  is compiled once per kind of state table, with the loop's branches decided
+  per search. `ANY SHORTEST` keeps one bit per state instead of 8 bytes, so
+  its table is dense at any size; the other tables stay dense up to 16 bytes
+  a node of the graph (or 512 MiB) instead of a fixed 2^26 states, and the
+  map past that, the target slots and the per-target counts use FxHash
+  instead of SipHash. Each query no longer copies the index's whole id column
+  to build its result (`concat` of the starts and every node's id): a
+  point query on a stored index reads only the ids of the nodes its paths
+  pass. From several start nodes, the searches run on all cores, one walker
+  per thread, each with its own state table (at most 1 GiB of them
+  together), and their rows are appended in start order; when
+  `ursa.max_paths` stops the query, and with which error, is what searching
+  one start after another gives (each start is checked against the exact
+  count of the paths before it). Rows, their order and the `expanded`
+  metric are bit for bit as before: a new test pins every row of a matrix
+  of searches (directions, selectors, modes, bounds, start sets, targets,
+  limits, four graphs), recorded before the change, on one thread and on
+  four, and another the rows of SQL path queries from a built and a stored
+  index. On R-MAT graphs with a stored index, in a new process each time
+  (wall, shared 4-core machine): from node 0, `ANY SHORTEST ->{1,3}`
+  0.88 → 0.44 s at 32M edges, `ANY SHORTEST ->*` 0.87 → 0.39 s (with
+  `vertices(p)` 0.98 → 0.55 s), undirected `{1,2}` 1.22 → 0.62 s; one pair
+  0.10 → 0.03 s with 30-byte string ids; from 16 start nodes, `{1,3}`, 16.4M
+  paths, 12.7 → 2.2 s (12.7 → 5.5 CPU-s); 64 starts that reach the limit
+  fail after 7.6 → 1.1 s. Peak memory is about the same.
 - **SQL: an index build interns a vertex table's keys while it interns the
   edges, not before them** (#385, N49). With the edge scan parallel (#351),
   reading the keys first was the serial part of a build with a vertex table:
