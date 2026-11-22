@@ -648,13 +648,14 @@ async fn not_shown_counts_follow_the_steps() {
         .await
         .unwrap();
     let result = host.session().result();
-    for i in 17..result.n_nodes() {
+    assert_eq!(counts.len(), result.n_nodes());
+    for (i, &count) in counts.iter().enumerate().skip(17) {
         let key = int(result, i as u32);
         let degree: u32 = ties[key as usize][1].parse().unwrap();
         let shown = shown_edges(result)
             .iter()
             .filter(|&&(s, d)| s == key || d == key)
             .count() as u32;
-        assert_eq!(counts[i], degree - shown, "node {key}");
+        assert_eq!(count, degree - shown, "node {key}");
     }
 }

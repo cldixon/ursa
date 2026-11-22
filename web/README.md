@@ -155,6 +155,18 @@ static assets and an R2 bucket.
     changes in place: `graph.js`'s `applyDelta` gives each explore
     command's delta to the view (`view.applyDelta`), which writes only what
     changed.
+    - **The result's highlights are drawn**, as `ursa-viz` reads a
+      result: a path's route is highlighted, a `hop`'s seeds are ringed,
+      and the rest is dimmed. They follow the deltas (a hidden node's
+      route edge is not drawn).
+    - **What it costs.** A view made from a result holds the result as
+      well as what it draws. On `.graph rmat` (1M edges) the view's heap
+      is 60 MiB where the edge-list view of #426 was 16, and decoding the
+      result is one task of 63 to 92 ms on the page's thread
+      (`GraphResult::from_bytes`, not yet done in pieces), so
+      `tests/graph-timing.ts`, which allows 60, fails there until it is.
+      The drawings one explores from (a `hop`, a path, a pattern's
+      matches) are small, and cost nothing to speak of.
     - **What the page knows** (each node's id, its degree among what is
       shown, the legend, the counts in the header) is read again from the
       view's own result (`view.resultBytes()`) after each delta, and the
@@ -222,7 +234,9 @@ static assets and an R2 bucket.
     (`style.css`: background, edge ink, plain nodes, eight categorical hues
     and "other", stepped for each theme; and `--graph-highlight`,
     `--graph-selection` and `--graph-pin` for the view's highlight layer,
-    #435, which nothing in the shell drives yet), set with `view.setTheme(…)`; the
+    #435: a selection's rings and edges, and, since the view is made from
+    the result, #443, the result's own highlights, a path's route and a
+    hop's seeds ringed with the rest dimmed), set with `view.setTheme(…)`; the
     theme toggle (or the system's) recolours an open view. No CSS filter.
   - **Progress** (#390): the pane opens with "Loading graph view…" as soon
     as the engine takes more than 150 ms (not at all, for a quick error),

@@ -160,10 +160,17 @@ export function pinch(a0, b0, a1, b1) {
   return { dx: x - x0, dy: y - y0, factor: before > 0 && after > 0 ? after / before : 1, x, y };
 }
 
-/** The edges of `graph` (graph-data.js's drawing) that are shown, as copies: {src, dst}. */
+/** Whether any node or edge of `graph` (graph-data.js's drawing) is not shown. */
+function anyRemoved({ removed, edgeRemoved }) {
+  for (let i = 0; i < removed.length; i++) if (removed[i] & 1) return true;
+  for (let e = 0; e < edgeRemoved.length; e++) if (edgeRemoved[e] & 1) return true;
+  return false;
+}
+
+/** The edges of `graph` that are shown, as copies: {src, dst}. */
 function shownEdges(graph) {
   const { src, dst, removed, edgeRemoved } = graph;
-  if (!removed.some((f) => f & 1) && !edgeRemoved.some((f) => f & 1)) return { src: src.slice(), dst: dst.slice() };
+  if (!anyRemoved(graph)) return { src: src.slice(), dst: dst.slice() };
   const keep = [];
   for (let e = 0; e < src.length; e++) {
     if (!(edgeRemoved[e] & 1) && !(removed[src[e]] & 1) && !(removed[dst[e]] & 1)) keep.push(e);
@@ -175,6 +182,13 @@ function shownEdges(graph) {
 function degreesOf(graph) {
   const { src, dst, removed, edgeRemoved } = graph;
   const degree = new Float32Array(graph.n);
+  if (!anyRemoved(graph)) {
+    for (let e = 0; e < src.length; e++) {
+      degree[src[e]]++;
+      degree[dst[e]]++;
+    }
+    return degree;
+  }
   for (let e = 0; e < src.length; e++) {
     if (edgeRemoved[e] & 1 || removed[src[e]] & 1 || removed[dst[e]] & 1) continue;
     degree[src[e]]++;
@@ -261,6 +275,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   [canvas.width, canvas.height] = size();
 
   const degree = degreesOf(graph);
+  // A turn of the event loop: reading the result here, and the view reading
+  // it again, are two tasks of the page, not one long one.
+  await new Promise((resolve) => setTimeout(resolve));
   let view;
   try {
     // From the result, not its edge list alone: a view made so takes deltas.

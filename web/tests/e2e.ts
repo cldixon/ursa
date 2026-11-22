@@ -1869,6 +1869,10 @@ for (const scheme of ["light", "dark"] as const) {
       const text = await screen(p);
       check(id !== undefined && text.replace(/\s+/g, "").includes(`fromthegraphmemoryU.expand${id}`), "a double tap on a node runs .expand for it", text.split("\n").slice(-3).join(" | "));
     }
+    // One tap beside the graph: nothing is selected again.
+    await p.waitForTimeout(400);
+    await tap(empty);
+    await p.waitForTimeout(400);
 
     // A mouse still drags and zooms with its wheel on the same canvas, and the keys work.
     await p.mouse.move(box.x + 20, box.y + 20);
