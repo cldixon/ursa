@@ -25,6 +25,9 @@
 //! variants, which take table sources already resolved) are public so the graph
 //! algorithms can reuse them.
 //!
+//! A graph of the database that could not be defined when it was opened
+//! (#381) keeps its schema: its `edges` and `nodes` fail with why (#401).
+//!
 //! When a table under the graph cannot be read (it was deregistered through
 //! the DataFusion API, say), `edges` and `nodes` are still listed, with the
 //! columns they last had, and fail with the reason when a query reads them.
@@ -49,6 +52,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use parking_lot::RwLock;
 
 use super::{registry, GraphDef, PropertyGraph};
+use crate::database::UnavailableTable;
 
 /// The name of a graph's edge table in its schema.
 pub const EDGES: &str = "edges";
@@ -87,6 +91,13 @@ impl GraphSchema {
         self.graph()
             .is_some_and(|(_, graph)| graph.default_pair().is_some())
     }
+
+    /// Why the graph is unavailable, if it is: the database's graph that
+    /// could not be defined when it was opened (#381).
+    fn unavailable(&self) -> Option<String> {
+        let state = self.session.upgrade()?.read().clone();
+        registry(&state).unavailable(&self.graph)
+    }
 }
 
 #[async_trait]
@@ -110,11 +121,17 @@ impl SchemaProvider for GraphSchema {
             .upgrade()
             .map(|state| state.read().clone())
             .ok_or_else(|| DataFusionError::Internal("the session has been dropped".into()))?;
-        let Some(def) = registry(&state)
+        let graphs = registry(&state);
+        let Some(def) = graphs
             .get(&self.graph)
             .and_then(|graph| graph.default_pair())
         else {
-            return Ok(None);
+            // An unavailable graph's tables fail with why, as its functions
+            // do (#401); they are not listed, since its definition is not
+            // known.
+            return Ok(graphs.unavailable(&self.graph).map(|why| {
+                Arc::new(UnavailableTable::new(why, TableType::View)) as Arc<dyn TableProvider>
+            }));
         };
         let plan = if name == EDGES {
             edges_plan(&state, &def).await
@@ -143,7 +160,7 @@ impl SchemaProvider for GraphSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        (name == EDGES || name == NODES) && self.has_tables()
+        (name == EDGES || name == NODES) && (self.has_tables() || self.unavailable().is_some())
     }
 }
 

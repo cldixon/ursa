@@ -1,7 +1,8 @@
 //! A database opens when a statement of its catalog fails (#381): the object
 //! it defines is unavailable, with one notice, and fails only when used.
 //! `DROP` and `CREATE OR REPLACE` repair it; objects that use it are
-//! unavailable too; the catalog keeps every statement.
+//! unavailable too, and come back once it is repaired (#401); the catalog
+//! keeps every statement.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -194,8 +195,9 @@ async fn a_view_over_a_missing_csv_is_unavailable_until_repaired() {
     let mut replaced = stored.clone();
     replaced[0] = "CREATE OR REPLACE VIEW v AS SELECT 5 AS a".into();
     assert_eq!(catalog(&fx.db()), replaced);
-    // vv stays unavailable for the session; it comes back on the next open.
-    assert_eq!(err(&ctx, "FROM vv").await, dependant);
+    // vv, which uses it, is back too (#401), and the catalog is as it was.
+    assert_eq!(ok(&ctx, "FROM vv").await, ["5"]);
+    assert_eq!(catalog(&fx.db()), replaced);
     drop(ctx);
     let (ctx, said) = open(&fx.db(), &quick()).await;
     assert!(said.is_empty(), "{said:?}");
@@ -262,10 +264,16 @@ async fn a_graph_over_an_unavailable_view_is_unavailable_too() {
             "SELECT * FROM pagerank(g)",
             "SELECT * FROM GRAPH_TABLE (g MATCH (a)-[e]->(b) COLUMNS (a.id AS a))",
             "DESCRIBE GRAPH g",
+            // Its tables too, which said "table not found" (#401).
+            "SELECT count(*) FROM g.edges",
+            "FROM g.nodes",
+            "DESCRIBE g.edges",
         ] {
             let e = err(&ctx, sql).await;
             assert!(e.contains(graph), "{sql}: {e}");
         }
+        // Its tables are not listed: its definition is not known.
+        assert_eq!(tables(&ctx).await, ["ties"]);
         drop(ctx);
         assert_eq!(catalog(&fx.db()), stored);
     }
@@ -284,12 +292,16 @@ async fn a_graph_over_an_unavailable_view_is_unavailable_too() {
     )
     .await;
     assert_eq!(catalog(&fx.db()), stored);
-    // Repair the view, then the graph.
+    // Repairing the view brings the graph back (#401).
     ok(
         &ctx,
         "CREATE OR REPLACE VIEW ties AS SELECT 1 AS src, 2 AS dst",
     )
     .await;
+    assert_eq!(ok(&ctx, "SELECT count(*) FROM g.edges").await, ["1"]);
+    assert_eq!(ok(&ctx, "SELECT count(*) FROM g.nodes").await, ["2"]);
+    assert_eq!(catalog(&fx.db())[1], stored[1]);
+    // Replacing it works as on any graph.
     ok(
         &ctx,
         "CREATE OR REPLACE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst))",
@@ -377,6 +389,10 @@ async fn missing_parquet_globs_and_external_tables_are_unavailable() {
         said[2].ends_with("DROP TABLE x or restore the file"),
         "{said:?}"
     );
+    assert!(
+        said[0].ends_with("DROP VIEW p or restore the file"),
+        "{said:?}"
+    );
     assert_eq!(tables(&ctx).await, ["g", "ok", "p", "x"]);
     assert_eq!(ok(&ctx, "FROM ok").await, ["1"]);
     let e = err(&ctx, "FROM x").await;
@@ -453,4 +469,223 @@ async fn a_statement_that_defines_nothing_is_skipped_and_kept() {
             "CREATE VIEW y AS SELECT 2 AS x"
         ]
     );
+}
+
+#[tokio::test]
+async fn an_unavailable_graphs_tables_go_with_it() {
+    let fx = Fixture::new();
+    fx.write_csv("e.csv");
+    let e_csv = fx.path("e.csv");
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            e_csv.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    std::fs::remove_file(&e_csv).unwrap();
+
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    let e = err(&ctx, "FROM g.edges").await;
+    assert_eq!(e, said[0]);
+    ok(&ctx, "DROP PROPERTY GRAPH g").await;
+    let e = err(&ctx, "FROM g.edges").await;
+    assert!(e.contains("not found"), "{e}");
+    // Defined again, it has its tables.
+    fx.write_csv("e.csv");
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            e_csv.display()
+        ),
+    )
+    .await;
+    assert_eq!(ok(&ctx, "SELECT count(*) FROM g.edges").await, ["2"]);
+}
+
+#[tokio::test]
+async fn replacing_an_unavailable_graph_gives_it_its_tables() {
+    let fx = Fixture::new();
+    fx.write_csv("e.csv");
+    let e_csv = fx.path("e.csv");
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            e_csv.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    std::fs::rename(&e_csv, fx.path("f.csv")).unwrap();
+
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    assert_eq!(said.len(), 1, "{said:?}");
+    ok(
+        &ctx,
+        &format!(
+            "CREATE OR REPLACE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION \
+             KEY (b))",
+            fx.path("f.csv").display()
+        ),
+    )
+    .await;
+    assert_eq!(ok(&ctx, "SELECT count(*) FROM g.edges").await, ["2"]);
+    assert_eq!(ok(&ctx, "SELECT count(*) FROM g.nodes").await, ["4"]);
+}
+
+#[tokio::test]
+async fn the_remedy_is_worded_from_the_cause() {
+    let fx = Fixture::new();
+    fx.write_csv("t.csv");
+    let t = fx.path("t.csv");
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!("CREATE VIEW v AS SELECT a FROM '{}'", t.display()),
+    )
+    .await;
+    drop(ctx);
+    // The file is there, but not as the view reads it: restoring it is not
+    // the remedy.
+    std::fs::write(&t, "c,d\n1,2\n").unwrap();
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].starts_with("view v is unavailable: "), "{said:?}");
+    assert!(
+        said[0].ends_with("; DROP VIEW v or fix the cause and open the database again"),
+        "{said:?}"
+    );
+    assert!(!said[0].contains("restore the file"), "{said:?}");
+    assert_eq!(err(&ctx, "FROM v").await, said[0]);
+    drop(ctx);
+
+    // A missing file is restored.
+    std::fs::remove_file(&t).unwrap();
+    let (_, said) = open(&fx.db(), &quick()).await;
+    assert_eq!(
+        said,
+        [format!(
+            "view v is unavailable: {}; DROP VIEW v or restore the file",
+            no_file(&t)
+        )]
+    );
+}
+
+#[tokio::test]
+async fn repairs_reach_every_dependant_and_drops_say_why() {
+    let fx = Fixture::new();
+    fx.write_csv("t.csv");
+    let t = fx.path("t.csv");
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE VIEW v AS FROM '{}'; CREATE VIEW vv AS SELECT a AS src, b AS dst FROM v; \
+             CREATE VIEW vvv AS SELECT src FROM vv; CREATE PROPERTY GRAPH g EDGE TABLES (vv \
+             SOURCE KEY (src) DESTINATION KEY (dst))",
+            t.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    let stored = catalog(&fx.db());
+    std::fs::remove_file(&t).unwrap();
+
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    assert_eq!(said.len(), 4, "{said:?}");
+    // Repairing v brings back vv, then what uses vv.
+    ok(&ctx, "CREATE OR REPLACE VIEW v AS SELECT 1 AS a, 2 AS b").await;
+    assert_eq!(ok(&ctx, "FROM vvv").await, ["1"]);
+    assert_eq!(ok(&ctx, "SELECT count(*) FROM g.edges").await, ["1"]);
+    assert_eq!(&catalog(&fx.db())[1..], &stored[1..]);
+    drop(ctx);
+
+    // Dropping what they use: they stay unavailable, and say why now.
+    let fx = Fixture::new();
+    fx.write_csv("t.csv");
+    let t = fx.path("t.csv");
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE VIEW v AS FROM '{}'; CREATE VIEW vv AS SELECT a FROM v",
+            t.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    std::fs::remove_file(&t).unwrap();
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    assert_eq!(said.len(), 2, "{said:?}");
+    ok(&ctx, "DROP VIEW v").await;
+    let e = err(&ctx, "FROM vv").await;
+    assert!(e.starts_with("view vv is unavailable: "), "{e}");
+    assert!(!e.contains("it uses view v"), "{e}");
+    assert!(e.ends_with("; DROP VIEW vv, or repair what it uses"), "{e}");
+    // Defining v again brings it back.
+    ok(&ctx, "CREATE VIEW v AS SELECT 7 AS a").await;
+    assert_eq!(ok(&ctx, "FROM vv").await, ["7"]);
+}
+
+#[tokio::test]
+async fn a_failed_replace_keeps_an_unavailable_external_table() {
+    let fx = Fixture::new();
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    let parquet = fx.path("t.parquet");
+    ok(
+        &ctx,
+        &format!("COPY (SELECT 1 AS a) TO '{}'", parquet.display()),
+    )
+    .await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE EXTERNAL TABLE x STORED AS PARQUET LOCATION '{}'",
+            parquet.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    let stored = catalog(&fx.db());
+    std::fs::remove_file(&parquet).unwrap();
+
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    assert_eq!(said.len(), 1, "{said:?}");
+    let e = err(
+        &ctx,
+        &format!(
+            "CREATE OR REPLACE EXTERNAL TABLE x STORED AS PARQUET LOCATION '{}'",
+            fx.path("other.parquet").display()
+        ),
+    )
+    .await;
+    assert!(e.contains("other.parquet"), "{e}");
+    // Still there, still unavailable, as it was.
+    assert_eq!(tables(&ctx).await, ["x"]);
+    assert_eq!(err(&ctx, "FROM x").await, said[0]);
+    assert_eq!(catalog(&fx.db()), stored);
+    // A replace that works repairs it.
+    ok(
+        &ctx,
+        &format!(
+            "COPY (SELECT 2 AS a) TO '{}'",
+            fx.path("other.parquet").display()
+        ),
+    )
+    .await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE OR REPLACE EXTERNAL TABLE x STORED AS PARQUET LOCATION '{}'",
+            fx.path("other.parquet").display()
+        ),
+    )
+    .await;
+    assert_eq!(ok(&ctx, "FROM x").await, ["2"]);
 }
