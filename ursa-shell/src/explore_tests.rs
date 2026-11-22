@@ -609,3 +609,53 @@ async fn text_keys_are_quoted() {
         "{sql}"
     );
 }
+
+/// What a view's `+N` says (#443): a node's edges in the graph that lead to
+/// something not shown, following every step.
+#[tokio::test]
+async fn not_shown_counts_follow_the_steps() {
+    let mut host = Host::karate().await;
+    assert_eq!(host.shell.not_shown().await.unwrap(), Vec::<u32>::new());
+    host.says(".graph SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both')")
+        .await;
+    async fn of(host: &mut Host, key: i64) -> u32 {
+        let counts = host.shell.not_shown().await.unwrap();
+        let result = host.session().result();
+        assert_eq!(counts.len(), result.n_nodes());
+        let at = (0..result.n_nodes() as u32).find(|&i| int(result, i) == key);
+        counts[at.expect("the node is in the session") as usize]
+    }
+    // 0's neighbours are all drawn; 2 has 32, 27, 28 and 9 beyond them.
+    assert_eq!(of(&mut host, 0).await, 0);
+    assert_eq!(of(&mut host, 2).await, 4);
+    host.says(".expand 2 LIMIT 3").await;
+    assert_eq!(of(&mut host, 2).await, 1);
+    // 32 has 12 ties: those to 2, 8 and 31 are drawn.
+    assert_eq!(of(&mut host, 32).await, 9);
+    // A hidden node says nothing, and its neighbours count it as not shown.
+    host.says(".hide 32").await;
+    assert_eq!(of(&mut host, 32).await, 0);
+    assert_eq!(of(&mut host, 2).await, 2);
+    host.says(".undo").await;
+    host.says(".undo").await;
+    assert_eq!(of(&mut host, 2).await, 4);
+    // Other nodes in the slots an undone step had.
+    host.says(".expand 31 LIMIT 2").await;
+    let counts = host.shell.not_shown().await.unwrap();
+    let ties = host
+        .shell
+        .rows("SELECT id, degree FROM degree(karate, direction => 'both') ORDER BY id")
+        .await
+        .unwrap();
+    let result = host.session().result();
+    assert_eq!(counts.len(), result.n_nodes());
+    for (i, &count) in counts.iter().enumerate().skip(17) {
+        let key = int(result, i as u32);
+        let degree: u32 = ties[key as usize][1].parse().unwrap();
+        let shown = shown_edges(result)
+            .iter()
+            .filter(|&&(s, d)| s == key || d == key)
+            .count() as u32;
+        assert_eq!(count, degree - shown, "node {key}");
+    }
+}

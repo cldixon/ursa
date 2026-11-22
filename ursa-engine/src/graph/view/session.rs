@@ -465,7 +465,18 @@ pub struct Session {
     done: usize,
     /// Made by the first `.expand`, and kept up after it.
     edges: Option<EdgeIndex>,
+    /// Each node's degree in the property graph (both directions, every
+    /// edge counted), by slot, for the slots asked about so far
+    /// ([`Session::not_shown`]); [`NO_DEGREE`] for a node the graph has no
+    /// row for.
+    degrees: Vec<u32>,
 }
+
+/// The degree of a node the graph's `degree` has no row for.
+const NO_DEGREE: u32 = u32::MAX;
+/// Up to this many nodes' degrees are asked for by key; more, and the whole
+/// graph's are read.
+const DEGREES_BY_KEY: usize = 1_000;
 
 impl Session {
     /// A session on what `.graph` drew.
@@ -475,6 +486,7 @@ impl Session {
             steps: Vec::new(),
             done: 0,
             edges: None,
+            degrees: Vec::new(),
         }
     }
 
@@ -503,6 +515,76 @@ impl Session {
     }
 
     /// The node `id` names: of the first label that has the key.
+    /// For each node slot, how many of the node's edges in the property
+    /// graph lead to something that is not shown: its degree in the graph
+    /// (both directions, every edge counted, as `degree` counts) less its
+    /// shown edges here. It is what a view's `+N` badge says, and 0 for a
+    /// hidden node and for one the graph does not have. Empty when the
+    /// drawing is not of a property graph.
+    ///
+    /// The graph's degrees are read once for each node (one `degree` query
+    /// for the nodes not asked about before: by key for up to
+    /// [`DEGREES_BY_KEY`] of them, else the whole graph's), and the shown
+    /// edges are counted each time.
+    pub async fn not_shown(&mut self, ctx: &SessionContext, sql: &dyn RunSql) -> Result<Vec<u32>> {
+        let Some(graph) = self.result.graph() else {
+            return Ok(Vec::new());
+        };
+        let n = self.result.n_nodes();
+        self.degrees.truncate(n);
+        let known = self.degrees.len();
+        if known < n {
+            let graph = format!("\"{}\"", graph.replace('"', "\"\""));
+            let mut query = format!("SELECT id, degree FROM degree({graph}, direction => 'both')");
+            let one_type = (known..n).all(|i| self.key_type(i) == self.key_type(known));
+            if n - known <= DEGREES_BY_KEY && one_type {
+                query.push_str(" WHERE id IN (");
+                for i in known..n {
+                    if i > known {
+                        query.push_str(", ");
+                    }
+                    literal(&mut query, self.result.node_keys().get(i), self.key_type(i));
+                }
+                query.push(')');
+            }
+            let (_, batches) = sql.run(ctx, &query).await?;
+            let r = &self.result;
+            let mut degrees = vec![NO_DEGREE; n - known];
+            for batch in &batches {
+                let ids = Ids::of(batch.column(0))?;
+                let degree = cast(batch.column(1), &DataType::UInt64)?;
+                let degree = degree.as_primitive::<UInt64Type>();
+                for i in 0..batch.num_rows() {
+                    let found = r.node_labels().iter().zip(0u16..).find_map(|(l, at)| {
+                        let key = ids.key(i, l.key)?;
+                        r.node(at, &key)
+                    });
+                    if let Some(at) = found.filter(|&at| at as usize >= known) {
+                        degrees[at as usize - known] =
+                            degree.value(i).min(u64::from(u32::MAX - 1)) as u32;
+                    }
+                }
+            }
+            self.degrees.extend(degrees);
+        }
+        let r = &self.result;
+        let mut shown = vec![0u32; n];
+        let (src, dst) = (r.src(), r.dst());
+        for e in 0..r.n_edges() {
+            if r.edge_is_shown(e) {
+                shown[src[e] as usize] += 1;
+                shown[dst[e] as usize] += 1;
+            }
+        }
+        Ok((0..n)
+            .map(|i| match self.degrees[i] {
+                NO_DEGREE => 0,
+                _ if r.node_is_removed(i) => 0,
+                degree => degree.saturating_sub(shown[i]),
+            })
+            .collect())
+    }
+
     fn find(&self, id: &str) -> Option<u32> {
         let r = &self.result;
         r.node_labels().iter().zip(0u16..).find_map(|(label, l)| {
@@ -547,6 +629,7 @@ impl Session {
     fn step(&mut self, command: &str, sql: Vec<String>, delta: GraphDelta) -> Result<Outcome> {
         let before = self.shown();
         self.result.apply(&delta).map_err(model)?;
+        self.degrees.truncate(self.result.n_nodes());
         if let Some(edges) = &mut self.edges {
             edges.track(&delta);
         }
@@ -663,6 +746,7 @@ impl Session {
             changed(-step.nodes, -step.edges)
         );
         self.result.apply(&delta).map_err(model)?;
+        self.degrees.truncate(self.result.n_nodes());
         if let Some(edges) = &mut self.edges {
             edges.track(&delta);
         }
@@ -680,6 +764,7 @@ impl Session {
         let delta = step.delta.clone();
         let text = format!("Redid {}: {}", step.command, step.summary());
         self.result.apply(&delta).map_err(model)?;
+        self.degrees.truncate(self.result.n_nodes());
         if let Some(edges) = &mut self.edges {
             edges.track(&delta);
         }
