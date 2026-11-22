@@ -10,11 +10,18 @@
 // in it: the status line, the legend, the canvas, the view, the layout and
 // the pointer and keys.
 //
-// Drag (or the arrow keys) pans, the wheel (or + and -) zooms, a double-click
-// (or 0) fits the graph in view, and a click on a node names it in the
-// pane's header. On a touch screen one finger pans, two pinch to zoom (and
-// pan), a tap names a node and a double tap fits. Colours are the page's --graph-* tokens (style.css), read
-// again when the theme changes (retheme).
+// Drag (or the arrow keys) pans, the wheel (or + and -) zooms and a
+// double-click (or 0) fits the graph in view. A click on a node selects it,
+// Shift+click adds a node to the selection (or takes it out), and a click on
+// empty space (or Esc) clears it: the selected nodes carry a ring, their
+// edges are drawn wide, and the pane's header, a live region, says what is
+// selected ("Selected node 33: …"). A mouse or a pen over a node rings it and
+// shows a tooltip: its key, label, SIZE BY and COLOR BY values and degree.
+// On a touch screen one finger pans, two pinch to zoom (and pan), a tap
+// selects a node and a double tap fits. The selection itself is ursa-viz's
+// (its interact module): this module tells it what was clicked. Colours are
+// the page's --graph-* tokens (style.css), read again when the theme changes
+// (retheme).
 //
 // Time to the first drawing: preload() starts fetching ursa-viz and a layout
 // worker (which loads it too) while the engine is still running the query;
@@ -121,6 +128,8 @@ const DOUBLE_TAP_MS = 300;
 const DOUBLE_TAP_PX = 30;
 /** A finger that moves no further than this, in CSS pixels, taps; a mouse has less. */
 const TAP_SLOP_PX = 8;
+/** The header names this many selected nodes, and counts the rest. */
+const MAX_KEYS_NAMED = 5;
 
 /**
  * What two pointers ask of the view when they move from `a0`, `b0` to `a1`,
@@ -180,9 +189,16 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   canvas.setAttribute(
     "aria-label",
     `Graph of ${plural(graph.n, "node")} and ${plural(graph.src.length, "edge")}${styled ? `, ${styled} (see the legend)` : ""}. ` +
-      "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click, double tap or 0 to fit, click a node to name it.",
+      "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click, double tap or 0 to fit. " +
+      "Click a node to select it, Shift+click to add another, click empty space or press Escape to clear the selection.",
   );
-  stage.replaceChildren(canvas);
+  // The hovered node's tooltip: for the pointer only (the header says what
+  // is selected, for everyone), so assistive technology is not told of it.
+  const tip = document.createElement("div");
+  tip.className = "graph-tip";
+  tip.setAttribute("aria-hidden", "true");
+  tip.hidden = true;
+  stage.replaceChildren(canvas, tip);
   const size = () => [Math.max(1, Math.round(canvas.clientWidth * dpr)), Math.max(1, Math.round(canvas.clientHeight * dpr))];
   [canvas.width, canvas.height] = size();
 
@@ -211,6 +227,8 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   if (graph.size) view.sizeBy(graph.size, 3 * dpr, 14 * dpr);
   else view.sizeBy(degree, 1.5 * dpr, 8 * dpr);
   if (graph.color) view.colorBy(graph.color);
+  // A selection shows its nodes' edges too.
+  view.selectionEdges = true;
   view.fit();
 
   const state = {
@@ -229,7 +247,12 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     // Nothing is drawn before the layout's first positions.
     positioned: false,
     layoutDone: false,
-    picked: null,
+    // The selected nodes' indexes, in the order selected (the view's), and
+    // the node under the pointer.
+    selection: [],
+    hovered: null,
+    hoverPicks: 0,
+    tip,
     frames: 0,
     // The layout worker's wasm memory, in bytes, as its last message gave it.
     layoutMemory: null,
@@ -250,18 +273,40 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   renderLegend(legend, graph);
   state.drawnAs = graph.drawnAs;
 
-  // The header: the graph's size and how far the layout is, or the node last clicked.
+  // What is known of node `i`, for the tooltip and the header: its key, its
+  // label (the vertex table it is of), its degree, and its SIZE BY and COLOR
+  // BY values, as [name, value] pairs.
+  const describe = (i) => {
+    const values = [];
+    if (graph.size) values.push([graph.sizeBy, Number.isNaN(graph.size[i]) ? "none" : short(graph.size[i])]);
+    if (graph.color) values.push([graph.colorBy, categoryName(graph, graph.color[i], i)]);
+    return { id: state.ids.get(i), label: graph.labelOf(i), degree: state.degree[i], values };
+  };
+  // The selection, as the header says it: "Selected node 33: …", or the
+  // nodes' keys when there are several.
+  const selectionText = () => {
+    const nodes = state.selection;
+    if (nodes.length === 1) {
+      const d = describe(nodes[0]);
+      // SIZE BY degree is the degree already said.
+      const values = d.values.filter(([name, value]) => !(name === "degree" && value === short(d.degree)));
+      const parts = [d.label && `label ${d.label}`, `degree ${number(d.degree)}`, ...values.map(([name, value]) => `${name} ${value}`)];
+      return `Selected node ${d.id}: ${parts.filter(Boolean).join(", ")}`;
+    }
+    const keys = nodes.slice(0, MAX_KEYS_NAMED).map((i) => state.ids.get(i));
+    const more = nodes.length - keys.length;
+    return `Selected ${number(nodes.length)} nodes: ${keys.join(", ")}${more ? ` and ${number(more)} more` : ""}`;
+  };
+
+  // The header: what is selected, then the graph's size and how far the
+  // layout is.
   const header = () => {
     const counts = `${plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
-    const picked = state.picked;
     // The rule that drew it (graph-data.js's drawnAs): the pane never guesses silently.
     const drawn = graph.drawnAs ? ` · drawn as ${graph.drawnAs}` : "";
     let text;
-    if (picked) {
-      const extra = [];
-      if (graph.size) extra.push(`${graph.sizeBy} ${Number.isNaN(graph.size[picked.index]) ? "none" : short(graph.size[picked.index])}`);
-      if (graph.color) extra.push(`${graph.colorBy} ${categoryName(graph, graph.color[picked.index], picked.index)}`);
-      text = `${counts} · node ${picked.id} (degree ${number(picked.degree)})${extra.map((e) => ` · ${e}`).join("")}`;
+    if (state.selection.length) {
+      text = `${selectionText()} · ${counts}`;
     } else if (state.layoutDone) {
       text = `${counts}${drawn} · Done`;
     } else if (state.levels !== null) {
@@ -311,7 +356,7 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     if (!state.frame) state.frame = requestAnimationFrame(draw);
   };
   state.redraw = redraw;
-  // An action with nothing to draw (a click names a node in the header) is
+  // An action with nothing to draw (a click that changes no selection) is
   // shown by the next frame the browser paints.
   const shownSoon = () => {
     if (!state.frame) requestAnimationFrame(() => current === state && timings.painted());
@@ -331,6 +376,8 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
       state.positioned = true;
       header();
       redraw(false);
+      // The nodes moved under a pointer at rest.
+      if (pointerAt) hoverSoon();
     } else if (data.type === "done") {
       times.done ??= performance.now();
       state.layoutDone = true;
@@ -369,9 +416,88 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     const box = canvas.getBoundingClientRect();
     return { x: (e.clientX - box.left) * dpr, y: (e.clientY - box.top) * dpr };
   };
+
+  // Hover, for a mouse or a pen (a finger has no "over"): the node under the
+  // pointer carries a ring and a tooltip. The pointer's place is kept as it
+  // moves, and looked up once a frame at most, however many moves came.
+  let pointerAt = null;
+  let hoverFrame = 0;
+  const showTip = () => {
+    const node = state.hovered;
+    if (node === null) {
+      tip.hidden = true;
+      return;
+    }
+    const d = describe(node);
+    const row = (name, value, cls) => {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      const key = document.createElement("span");
+      key.className = "key";
+      key.textContent = name;
+      line.append(key, " ", String(value));
+      return line;
+    };
+    tip.replaceChildren(row("node", d.id, "id"), ...(d.label ? [row("label", d.label)] : []), ...d.values.map(([name, value]) => row(name, value)), row("degree", number(d.degree)));
+    tip.hidden = false;
+    // Beside the node, on the side with room.
+    const [x, y] = Array.from(view.nodePixel(node), (v) => v / dpr);
+    const [w, h] = [canvas.clientWidth, canvas.clientHeight];
+    const gap = 12;
+    const left = x + gap + tip.offsetWidth <= w ? x + gap : x - gap - tip.offsetWidth;
+    const top = y + gap + tip.offsetHeight <= h ? y + gap : y - gap - tip.offsetHeight;
+    tip.style.left = `${Math.max(0, Math.min(left, w - tip.offsetWidth))}px`;
+    tip.style.top = `${Math.max(0, Math.min(top, h - tip.offsetHeight))}px`;
+  };
+  const hover = () => {
+    hoverFrame = 0;
+    if (current !== state || !state.positioned) return;
+    let node = null;
+    // Not while a button or a finger is down: that is a drag.
+    if (pointerAt && pointers.size === 0) {
+      const start = performance.now();
+      node = view.hover(pointerAt.x, pointerAt.y) ?? null;
+      timings.picked(performance.now() - start);
+      state.hoverPicks++;
+    } else {
+      view.setHovered(undefined);
+    }
+    if (node !== state.hovered) {
+      state.hovered = node;
+      canvas.classList.toggle("over-node", node !== null);
+      redraw(false);
+    }
+    // Again even for the same node: it may have moved (a zoom, the layout).
+    showTip();
+  };
+  const hoverSoon = () => {
+    hoverFrame ||= requestAnimationFrame(hover);
+  };
+  state.cleanup.push(() => hoverFrame && cancelAnimationFrame(hoverFrame));
+  const hoverAt = (e) => {
+    pointerAt = e && e.pointerType !== "touch" ? at(e) : null;
+    hoverSoon();
+  };
+  on(canvas, "pointerleave", () => hoverAt(null));
+
+  // The selection is the view's: it is told what was clicked, and says what
+  // is selected now.
+  const selectionChanged = () => {
+    state.selection = Array.from(view.selection());
+    header();
+    redraw();
+  };
+  state.clearSelection = () => {
+    if (!view.clearSelection()) return false;
+    selectionChanged();
+    return true;
+  };
+
   on(canvas, "pointerdown", (e) => {
     if (e.button !== 0) return;
     pointers.set(e.pointerId, at(e));
+    // No hover while dragging.
+    hoverSoon();
     // A second finger: what the first began is no tap. A third is ignored.
     if (pointers.size === 1) drag = { id: e.pointerId, moved: false, from: pointers.get(e.pointerId), slop: (e.pointerType === "mouse" ? 1.5 : TAP_SLOP_PX) * dpr };
     else if (drag) drag.moved = true;
@@ -383,7 +509,10 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   });
   on(canvas, "pointermove", (e) => {
     const was = pointers.get(e.pointerId);
-    if (!was) return;
+    if (!was) {
+      if (pointers.size === 0) hoverAt(e);
+      return;
+    }
     const now = at(e);
     const [first, second] = pointers.keys();
     if (second !== undefined) {
@@ -408,7 +537,11 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     if (!pointers.delete(e.pointerId)) return;
     const tap = !cancelled && drag && drag.id === e.pointerId && !drag.moved;
     // A finger lifted from a pinch leaves the other panning, and no tap.
-    if (pointers.size === 0) drag = null;
+    if (pointers.size === 0) {
+      drag = null;
+      // The pointer is over what the drag left under it.
+      hoverAt(cancelled ? null : e);
+    }
     if (!tap) return;
     const { x, y } = at(e);
     if (e.pointerType !== "mouse") {
@@ -424,8 +557,7 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
       }
     }
     timings.action("click", e.timeStamp);
-    pick(x, y);
-    shownSoon();
+    if (!pick(x, y, e.shiftKey)) shownSoon();
   };
   on(canvas, "pointerup", (e) => release(e, false));
   on(canvas, "pointercancel", (e) => release(e, true));
@@ -436,6 +568,8 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
       e.preventDefault();
       view.zoom(Math.exp(-e.deltaY * 0.0015), e.offsetX * dpr, e.offsetY * dpr);
       redraw();
+      // What is under the pointer changed, though it did not move.
+      if (pointerAt) hoverSoon();
     },
     { passive: false },
   );
@@ -459,12 +593,16 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     redraw();
   });
 
-  function pick(x, y) {
+  // A click at (x, y): the node there is selected (added to the selection,
+  // or taken out of it, with Shift), and a click on empty space clears the
+  // selection. Returns whether the selection changed, and so the frame.
+  function pick(x, y, extend) {
     const start = performance.now();
     const node = view.pick(x, y);
     timings.picked(performance.now() - start);
-    state.picked = node === undefined ? null : { index: node, id: state.ids.get(node), degree: state.degree[node] };
-    header();
+    const changed = view.select(node, extend);
+    if (changed) selectionChanged();
+    return changed;
   }
 
   // The pane changes size with the window, and the terminal beside it.
@@ -547,6 +685,14 @@ export function retheme() {
   state.redraw();
 }
 
+/**
+ * Select nothing. Returns whether anything was selected: Esc clears a
+ * selection before it closes the pane (app.js).
+ */
+export function clearSelection() {
+  return current?.clearSelection?.() ?? false;
+}
+
 /** Stop the layout and drop the view and its canvas. */
 export function close() {
   seq++;
@@ -558,13 +704,34 @@ export function close() {
   for (const undo of state.cleanup) undo();
   state.view.free();
   state.canvas.remove();
+  state.tip.remove();
 }
 
 /** For tests: what is drawn. */
 export function info() {
   if (!current) return null;
-  const { nodes, edges, backend, iterations, level, levels, layoutDone, picked, frames } = current;
-  return { nodes, edges, backend, iterations, level, levels, layoutDone, picked, frames, drawnAs: current.drawnAs, width: current.canvas.width, height: current.canvas.height };
+  const { nodes, edges, backend, iterations, level, levels, layoutDone, frames, hoverPicks } = current;
+  const node = (index) => ({ index, id: current.ids.get(index), degree: current.degree[index] });
+  const selection = current.selection.map(node);
+  return {
+    nodes,
+    edges,
+    backend,
+    iterations,
+    level,
+    levels,
+    layoutDone,
+    // The selected nodes in the order selected, the last of them, the node
+    // under the pointer, and how many times the pointer was looked up.
+    selection,
+    picked: selection.at(-1) ?? null,
+    hovered: current.hovered === null ? null : node(current.hovered),
+    hoverPicks,
+    frames,
+    drawnAs: current.drawnAs,
+    width: current.canvas.width,
+    height: current.canvas.height,
+  };
 }
 
 /**
@@ -642,6 +809,22 @@ export async function memory({ timeoutMs = 10_000 } = {}) {
     out.userAgentError = String(e?.message ?? e);
   }
   return out;
+}
+
+/**
+ * For tests: where the node with the key `id` is drawn, {index, x, y} in CSS
+ * pixels from the canvas's top left, or null with no such node.
+ */
+export function nodePlace(id) {
+  const state = current;
+  if (!state) return null;
+  for (let index = 0; index < state.ids.length; index++) {
+    if (String(state.ids.get(index)) !== String(id)) continue;
+    const [x, y] = state.view.nodePixel(index);
+    const ratio = state.canvas.width / state.canvas.clientWidth;
+    return { index, x: x / ratio, y: y / ratio };
+  }
+  return null;
 }
 
 /** For tests: the node drawn at the canvas pixel (x, y), as a click picks it, or null. */
