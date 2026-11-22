@@ -1161,8 +1161,8 @@ export function nodePlace(id) {
 
 /**
  * For tests: up to `limit` shown nodes with the most edges not shown (the
- * engine's count), each {index, id, notShown, x, y} with its place in CSS
- * pixels of the canvas; only those on the canvas that a click there picks.
+ * engine's count), each {index, id, notShown, x, y} with its place in whole
+ * CSS pixels of the canvas; only those on the canvas that a click there picks.
  */
 export function expandable(limit = 10) {
   const state = current;
@@ -1174,9 +1174,10 @@ export function expandable(limit = 10) {
   const out = [];
   for (const index of order) {
     if (out.length >= limit) break;
-    const [x, y] = state.view.nodePixel(index);
-    if (x < 0 || y < 0 || x >= state.canvas.width || y >= state.canvas.height || state.view.pick(x, y) !== index) continue;
-    out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x: x / ratio, y: y / ratio });
+    // At a whole CSS pixel, as a mouse event gives its place.
+    const [x, y] = Array.from(state.view.nodePixel(index), (v) => Math.round(v / ratio));
+    if (x < 0 || y < 0 || x >= state.canvas.clientWidth || y >= state.canvas.clientHeight || state.view.pick(x * ratio, y * ratio) !== index) continue;
+    out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x, y });
   }
   return out;
 }

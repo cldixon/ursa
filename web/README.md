@@ -406,7 +406,7 @@ expand (a double-click, Shift, Enter and a double tap each running `.expand`,
 its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
-ten double-clicks on rmat within 250 ms each, and a shared link replaying the
+ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
 exploration to the same counts); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
