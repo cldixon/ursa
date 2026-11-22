@@ -1032,7 +1032,7 @@ async function drawGraph(text) {
   let drawn;
   try {
     const module = await loadGraphModule();
-    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, times });
+    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, times, ...inspectorHooks });
   } catch (e) {
     // Closed (Esc) before it was drawn: nothing went wrong.
     if (!graphOpen()) return true;
@@ -1045,6 +1045,14 @@ async function drawGraph(text) {
   await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
   return true;
 }
+
+// What the Graph view's inspector (graph-inspector.js) asks of the page: a
+// command typed and run in the terminal, as its buttons do (.expand 33), and
+// a node's or an edge's row of the graph's tables, from the engine.
+const inspectorHooks = {
+  run: (command) => run(command),
+  inspect: (args) => engine("inspect", args),
+};
 
 // The last explore command's answer, for tests: its `command`, how many
 // `nodes` and `edges` the engine shows after it, and `deltaBytes`, the size
@@ -1451,6 +1459,10 @@ window.ursaShell = {
   },
   graphInked: async () => graphLoaded?.inked() ?? null,
   graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
+  // For tests: the edge a click at a CSS pixel of the canvas picks, and what
+  // the inspector shows.
+  graphEdgeAt: (x, y) => graphLoaded?.edgeAt(x, y) ?? null,
+  graphInspector: () => graphLoaded?.inspected() ?? null,
   // For tests: where the node with a key is drawn, {index, x, y} in CSS pixels of the canvas.
   graphNodePlace: (id) => graphLoaded?.nodePlace(id) ?? null,
 };

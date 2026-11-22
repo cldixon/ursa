@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::highlight::{flag, BadHighlight, HighlightState};
-use crate::interact::Interact;
+use crate::interact::{nearest_edge, EdgePick, Interact};
 use crate::model::{
     EdgeBatch, GraphDelta, GraphResult, KeyType, NodeBatch, NodeLabel, Op, Positions, Provenance,
 };
@@ -447,9 +447,12 @@ impl GraphView {
     /// clears the selection; with `extend`, a click on a node adds it (or
     /// takes it out, if it was selected) and a click on empty space changes
     /// nothing. Returns whether the selection changed, and so the frame.
+    ///
+    /// A selected edge ([`GraphView::select_edge`]) is deselected by any
+    /// click but one on empty space with `extend`.
     pub fn select(&mut self, node: Option<u32>, extend: bool) -> Result<bool, JsValue> {
         self.check_nodes(node.as_slice())?;
-        let changed = self.interact.selection_mut().click(node, extend);
+        let changed = self.interact.click(node, extend);
         if changed {
             self.draw_selection()?;
         }
@@ -461,14 +464,73 @@ impl GraphView {
         self.interact.selection().nodes().to_vec()
     }
 
-    /// Select nothing. Returns whether anything was selected.
+    /// Select nothing: no node and no edge. Returns whether anything was
+    /// selected.
     #[wasm_bindgen(js_name = clearSelection)]
     pub fn clear_selection(&mut self) -> Result<bool, JsValue> {
-        let changed = self.interact.selection_mut().clear();
+        let changed = self.interact.clear();
         if changed {
             self.draw_selection()?;
         }
         Ok(changed)
+    }
+
+    /// The edge drawn nearest the pixel `(x, y)`, within `tolerance` pixels
+    /// of it (4 CSS pixels, as a rule), or `undefined`: its index. For a
+    /// click with no node under it ([`GraphView::pick`] first). An edge of
+    /// a hidden node is not there to pick, nor is a removed edge. It reads
+    /// every edge once (`interact::nearest_edge`).
+    #[wasm_bindgen(js_name = pickEdge)]
+    pub fn pick_edge(&self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
+        let camera = self.view.camera();
+        let graph = self.view.graph();
+        let (src, dst) = (graph.src(), graph.dst());
+        let (xs, ys) = self.view.positions();
+        let flags = self.view.highlight().flags();
+        let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
+        let result = self.view.result();
+        let skip = |e: u32| {
+            hidden(src[e as usize])
+                || hidden(dst[e as usize])
+                || result.is_some_and(|r| !r.edge_is_shown(e as usize))
+        };
+        let reach = tolerance / camera.pixels_per_unit;
+        nearest_edge(src, dst, xs, ys, skip, camera.to_world(x, y), reach)
+    }
+
+    /// Select the edge `edge` alone (as [`GraphView::pick_edge`] gave it):
+    /// it is drawn wide, and no node is selected. `undefined` deselects the
+    /// edge and leaves the nodes. Returns whether anything changed, and so
+    /// the frame.
+    #[wasm_bindgen(js_name = selectEdge)]
+    pub fn select_edge(&mut self, edge: Option<u32>) -> Result<bool, JsValue> {
+        let graph = self.view.graph();
+        let pick = match edge {
+            None => None,
+            Some(e) if (e as usize) < graph.n_edges() => Some(EdgePick {
+                edge: e,
+                src: graph.src()[e as usize],
+                dst: graph.dst()[e as usize],
+            }),
+            Some(e) => {
+                return Err(js_err(format!(
+                    "edge {e} is not one of the graph's {} edges",
+                    graph.n_edges()
+                )))
+            }
+        };
+        let changed = self.interact.select_edge(pick);
+        if changed {
+            self.draw_selection()?;
+        }
+        Ok(changed)
+    }
+
+    /// The selected edge, as `[edge, src, dst]` (its index and the nodes it
+    /// joins), or `undefined`.
+    #[wasm_bindgen(js_name = selectedEdge)]
+    pub fn selected_edge(&self) -> Option<Vec<u32>> {
+        self.interact.edge().map(|e| vec![e.edge, e.src, e.dst])
     }
 
     /// Whether the selected nodes' incident edges are drawn wide, in the
@@ -518,15 +580,18 @@ impl GraphView {
     }
 
     /// Draw the selection as it is now: its nodes' rings, and their
-    /// incident edges if asked for.
+    /// incident edges if asked for; or the selected edge.
     fn draw_selection(&mut self) -> Result<(), JsValue> {
         let selection = self.interact.selection();
         let nodes = selection.nodes().to_vec();
-        let edges = if self.selection_edges {
-            let graph = self.view.graph();
-            selection.incident_edges(graph.src(), graph.dst())
-        } else {
-            Vec::new()
+        let edges = match self.interact.edge() {
+            // A selected edge is drawn wide itself; no node is selected.
+            Some(e) => vec![e.src, e.dst],
+            None if self.selection_edges => {
+                let graph = self.view.graph();
+                selection.incident_edges(graph.src(), graph.dst())
+            }
+            None => Vec::new(),
         };
         self.highlight(|h| {
             h.set_only(flag::SELECTED, &nodes)?;
@@ -633,15 +698,32 @@ impl GraphView {
     }
 
     /// After the graph changed: the selection and the hover drop the nodes
-    /// that are gone or hidden, and a selection's edges are found again.
+    /// that are gone or hidden (and a selected edge that is gone, or at such
+    /// a node), and a selection's edges are found again.
     /// Nothing is read while nothing is selected or hovered.
     fn keep_interaction(&mut self) -> Result<(), JsValue> {
-        if self.interact.selection().is_empty() && self.interact.hovered().is_none() {
+        let picked = self.interact.edge();
+        if self.interact.selection().is_empty()
+            && self.interact.hovered().is_none()
+            && picked.is_none()
+        {
             return Ok(());
         }
         let flags = self.view.highlight().flags();
         let shown = |v: u32| flags.get(v as usize).is_some_and(|f| f & flag::HIDDEN == 0);
-        let (selection, hover) = self.interact.retain(shown);
+        let (mut selection, hover) = self.interact.retain(shown);
+        // The selected edge may be gone itself: popped, or removed.
+        if let Some(e) = self.interact.edge() {
+            let graph = self.view.graph();
+            let at = e.edge as usize;
+            let there = at < graph.n_edges()
+                && (graph.src()[at], graph.dst()[at]) == (e.src, e.dst)
+                && self.view.result().is_none_or(|r| r.edge_is_shown(at));
+            if !there {
+                self.interact.select_edge(None);
+                selection = true;
+            }
+        }
         if hover {
             self.highlight(|h| h.set_only(flag::HOVERED, &[]))?;
         }
