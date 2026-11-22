@@ -687,7 +687,12 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// commands whose name or help has PATTERN in it.
     fn help(&mut self, arg: &str) {
         match arg.to_ascii_lowercase().as_str() {
-            "graph" => return self.write_text(&format!("{}\n", graph_help())),
+            "graph" => {
+                // A host that draws graphs (it has a .graph command) says how.
+                let draws = self.host_commands.iter().any(|(c, _, _)| c == ".graph");
+                let drawing = if draws { DRAW_HELP } else { "" };
+                return self.write_text(&format!("{}\n{drawing}", graph_help()));
+            }
             "shortcuts" => return self.write_text(&format!("{}\n", self.shortcuts)),
             _ => {}
         }
@@ -1237,6 +1242,30 @@ Any file is a table: SELECT * FROM 'edges.csv' LIMIT 3;
 The SQL reference: {DOCS_URL}"
     )
 }
+
+/// What `.help graph` adds where the host draws graphs: `.graph` and its
+/// clauses (design §3, #434), which `ursa_engine::graph::view` parses.
+const DRAW_HELP: &str = "
+Draw a graph, with .graph:
+  .graph                         the last result, by what its columns are
+  .graph karate                  a property graph, or a table's rows
+  .graph SELECT src, dst FROM e  a query's rows
+
+Then any of these clauses, in any order:
+  AS edges(src, dst [, weight])  each row is an edge between the ids in two columns
+  AS nodes(id)                   each row is a node; the edges among them are the graph's
+  AS path(nodes [, edges])       each row is a path: a list of ids, and one of edge rows
+  AS hops(seed, id, distance)    each row is a node reached from a seed, some steps away
+  ON graph                       the property graph the ids belong to
+  NODES (SELECT id, … FROM …)    values for the nodes, for SIZE BY and COLOR BY to use
+  SIZE BY x  COLOR BY y          a column or an algorithm: SIZE BY pagerank COLOR BY louvain
+  LAYOUT force|rings|layers      the layout: by the edges' pull, or by distance or step
+                                 on circles or in rows
+
+AS names the columns when the result's own names do not say what they are:
+  .graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)
+  .graph AS hops(start, reached, steps) ON karate LAYOUT layers
+";
 
 /// The dot-command `name` was meant to be, if one is close enough to be a
 /// typo or `name` begins only one (as `.q` begins `.quit`).
@@ -1867,6 +1896,21 @@ mod tests {
             "ANY SHORTEST | ALL SHORTEST | SHORTEST k",
             ".functions lists the algorithms",
             DOCS_URL,
+        ] {
+            assert!(out.contains(needle), "{needle} missing from:\n{out}");
+        }
+        // .graph's clauses, where the host draws graphs.
+        assert!(!out.contains("AS edges("), "{out}");
+        shell.add_host_command(".graph", "?QUERY|NAME?", "Draw a graph");
+        let (out, _) = feed(&mut shell, &[".help graph"]).await;
+        for needle in [
+            "ANY SHORTEST | ALL SHORTEST | SHORTEST k",
+            "AS edges(src, dst [, weight])",
+            "AS nodes(id)",
+            "AS path(nodes [, edges])",
+            "AS hops(seed, id, distance)",
+            "ON graph",
+            "LAYOUT force|rings|layers",
         ] {
             assert!(out.contains(needle), "{needle} missing from:\n{out}");
         }
