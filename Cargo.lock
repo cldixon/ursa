@@ -4730,6 +4730,7 @@ dependencies = [
  "unicode-width",
  "ursa-engine",
  "ursa-sql",
+ "ursa-viz",
  "web-time",
 ]
 

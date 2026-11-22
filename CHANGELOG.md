@@ -418,6 +418,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **Exploring a drawn graph from the terminal: `.expand`, `.hide`, `.show`,
+  `.undo`, `.redo` and `.graph history`** (#440). The engine now keeps an
+  explore session for the graph `.graph` opened
+  (`ursa_engine::graph::view::Session`): the graph as it stands, with its
+  `(label, key)` → node map and what is shown, and the history of steps.
+  Each command is a line in the Web Shell's terminal, answers in one line
+  (`+16 nodes, +41 edges`, or why nothing changed) and gives the change as a
+  UGR delta for a view to apply. `.expand ID [in|out|both] [LIMIT n]` adds a
+  node's neighbours that are not shown (`hop`), the 100 of highest degree
+  first and then by key, so the same command always adds the same nodes, and
+  the graph's edges among every node (`induced_edges`); expanding again adds
+  the next ones. `.hide ID…` and `.show ID…|all` hide nodes and bring them
+  back with their edges; `.undo` applies the inverse of the last step with
+  no query, and `.redo` the step again. `--sql` prints a command's SQL
+  instead of changing anything, and `.graph history` lists the steps. With
+  no open graph, or an id that is not a node of it, the command says so.
+  `ursa-shell` lists the commands in `.help` and runs them
+  (`Shell::open_graph`, `Shell::explore`); `ursa-wasm` adds
+  `WebShell.explore(command)` and the engine worker an `explore` op. The
+  page's pane does not draw the deltas yet (#443): until then it keeps what
+  `.graph` drew, and the terminal's line says what changed.
 - **`.graph` draws what a result means** (#433). After a graph query, the
   Web Shell's `.graph` (`ursa-engine`'s `graph::view`) now reads what each
   column is, from the `ursa.*` metadata the graph functions and `GRAPH_TABLE`
