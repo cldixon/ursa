@@ -362,6 +362,17 @@ impl<O: Write, E: Write> Shell<O, E> {
         self.explorer.as_ref()
     }
 
+    /// For each node slot of the open graph, how many of its edges in the
+    /// property graph lead to something not shown: a view's `+N` badge
+    /// (`ExploreSession::not_shown`). Empty with no open graph, or one that
+    /// is not of a property graph.
+    pub async fn not_shown(&mut self) -> Result<Vec<u32>> {
+        match &mut self.explorer {
+            None => Ok(Vec::new()),
+            Some(session) => session.not_shown(&self.ctx, &ursa_sql::Sql).await,
+        }
+    }
+
     /// Run an explore command on the open graph (`.expand 33`, `.hide 5 6`,
     /// `.show all`, `.undo`, `.redo`, `.graph history`; `line` is the whole
     /// line, as [`Flow::Host`] hands it back). It prints what changed in one
@@ -413,6 +424,33 @@ impl<O: Write, E: Write> Shell<O, E> {
                 None
             }
         }
+    }
+
+    /// What the open graph's tables say of one of its nodes or edges, for a
+    /// host's inspector (`ursa_engine::graph::view::inspect`): the node's
+    /// row of its vertex table, or the edge's of its edge table, read with
+    /// one query by key. Nothing is printed, and the last result stays.
+    ///
+    /// An error (no open graph, an index or key that is not the graph's) is
+    /// returned, not printed.
+    pub async fn inspect(
+        &self,
+        what: view::inspect::Inspect<'_>,
+    ) -> Result<view::inspect::Inspected> {
+        let Some(session) = &self.explorer else {
+            return Err(DataFusionError::Plan(NO_GRAPH.into()));
+        };
+        view::inspect::inspect(&self.ctx, session.result(), what).await
+    }
+
+    /// How many neighbours a node of the open graph has in the whole property graph
+    /// (`ursa_engine::graph::view::inspect::graph_neighbours`), or `None` when
+    /// the drawing is of no property graph. Nothing is printed.
+    pub async fn graph_neighbours(&self, node: u32) -> Result<Option<u64>> {
+        let Some(session) = &self.explorer else {
+            return Err(DataFusionError::Plan(NO_GRAPH.into()));
+        };
+        view::inspect::graph_neighbours(&self.ctx, &ursa_sql::Sql, session.result(), node).await
     }
 
     /// Keep every row of the last result that had columns, for

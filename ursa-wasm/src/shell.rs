@@ -39,6 +39,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::{encode, js_error, Stored};
+use ursa_engine::graph::view::inspect::Inspect;
 use ursa_engine::graph::view::GraphView;
 
 /// Where added files live: `memory://uploads/`.
@@ -436,6 +437,78 @@ impl WebShell {
         })
     }
 
+    /// For each node slot of the open graph, how many of its edges in the
+    /// property graph lead to something that is not shown, resolving to a
+    /// `Uint32Array`: what the view's `+N` says of a node, and what
+    /// `.expand` would start to add. Empty with no open graph, or one that
+    /// is not of a property graph. It reads the graph's degrees once for
+    /// each node.
+    #[wasm_bindgen(js_name = notShown)]
+    pub fn not_shown(&self) -> Promise {
+        let shell = Rc::clone(&self.shell);
+        future_to_promise(async move {
+            not_shown(&shell)
+                .await
+                .map(|counts| js_sys::Uint32Array::from(counts.as_slice()).into())
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
+    /// What the open graph's tables say of its node `node` (its index in the
+    /// graph [`Self::graph`] gave, and `key`, the key the page shows for it,
+    /// which is checked), for the page's inspector. Resolves to JSON:
+    ///
+    /// ```json
+    /// {"table": "members", "sql": "SELECT * FROM members WHERE id = 33",
+    ///  "columns": [{"name": "id", "numeric": true}, {"name": "club", "numeric": false}],
+    ///  "rows": [["33", "Officer"]], "row": null, "note": null}
+    /// ```
+    ///
+    /// `rows` holds the node's row of its vertex table (one query by key),
+    /// each value as the shell prints it and `null` for NULL; it is empty,
+    /// and `note` says why, when the drawing is of no property graph or the
+    /// graph has no row for the key.
+    ///
+    /// With `neighbours`, the answer is instead `{"neighbours": 17}`: how
+    /// many the node has in the whole graph, either way (`null` with no
+    /// property graph).
+    ///
+    /// Nothing is printed and the last result stays. Rejects with no open
+    /// graph, or when `node` is not `key` in it.
+    #[wasm_bindgen(js_name = inspectNode)]
+    pub fn inspect_node(&self, node: u32, key: String, neighbours: bool) -> Promise {
+        let shell = Rc::clone(&self.shell);
+        future_to_promise(async move {
+            let what = Inspect::Node { node, key: &key };
+            inspect(&shell, what, neighbours)
+                .await
+                .map(|text| JsValue::from_str(&text))
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
+    /// What the open graph's tables say of its edge `edge` (its index, and
+    /// the keys the page shows for its two ends, which are checked):
+    /// [`Self::inspect_node`]'s JSON, with the edge's row of its edge table.
+    /// The row is found by its ends; where several rows join them, by the
+    /// edge's row number (`row`) if the drawing knows it, and else every
+    /// such row is given, with a `note`.
+    #[wasm_bindgen(js_name = inspectEdge)]
+    pub fn inspect_edge(&self, edge: u32, src: String, dst: String) -> Promise {
+        let shell = Rc::clone(&self.shell);
+        future_to_promise(async move {
+            let what = Inspect::Edge {
+                edge,
+                src: &src,
+                dst: &dst,
+            };
+            inspect(&shell, what, false)
+                .await
+                .map(|text| JsValue::from_str(&text))
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
     /// Close the open graph (the page closed its view): the explore
     /// commands say there is none until [`Self::graph`] opens another.
     #[wasm_bindgen(js_name = closeGraph)]
@@ -531,6 +604,16 @@ async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<
     })
 }
 
+/// What [`WebShell::not_shown`] resolves to.
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
+async fn not_shown(shell: &RefCell<Shell<Buffer, Buffer>>) -> Result<Vec<u32>> {
+    let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
+    shell.not_shown().await
+}
+
 /// Run an explore command, and take what it printed.
 #[allow(
     clippy::await_holding_refcell_ref,
@@ -580,6 +663,38 @@ async fn find(
         not_shown: serde_json::Value::Array(not_shown).to_string(),
         not_shown_total: found.not_shown_total as u32,
     })
+}
+
+/// [`WebShell::inspect_node`]'s and [`WebShell::inspect_edge`]'s JSON.
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
+async fn inspect(
+    shell: &RefCell<Shell<Buffer, Buffer>>,
+    what: Inspect<'_>,
+    neighbours: bool,
+) -> Result<String> {
+    let shell = shell.try_borrow().map_err(|_| busy())?;
+    if let (true, Inspect::Node { node, .. }) = (neighbours, what) {
+        let count = shell.graph_neighbours(node).await?;
+        return Ok(json!({ "neighbours": count }).to_string());
+    }
+    let found = shell.inspect(what).await?;
+    let columns: Vec<_> = found
+        .columns
+        .iter()
+        .map(|c| json!({ "name": c.name, "numeric": c.numeric }))
+        .collect();
+    Ok(json!({
+        "table": found.table,
+        "sql": found.sql,
+        "columns": columns,
+        "rows": found.rows,
+        "row": found.row,
+        "note": found.note,
+    })
+    .to_string())
 }
 
 /// Put `bytes` at `name` in `uploads`; the URL SQL reads it by.
@@ -943,6 +1058,68 @@ mod tests {
         // Node 3 is the view's third: hop gives 1, 2, 3.
         assert_eq!(found.take_selected(), [2]);
         assert!(found.take_selected().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inspect_gives_the_page_a_row_as_json() {
+        let shell = WebShell::new();
+        let inspect = |what, neighbours| inspect(&shell.shell, what, neighbours);
+        let node = Inspect::Node { node: 0, key: "1" };
+        let none = inspect(node, false).await.unwrap_err();
+        assert!(none.to_string().contains("no graph is open"), "{none}");
+
+        run(&shell, "CREATE TABLE people AS SELECT * FROM (VALUES (1, '<i>Ann</i>'), (2, NULL)) AS t(id, name);").await;
+        run(
+            &shell,
+            "CREATE TABLE calls AS SELECT * FROM (VALUES (1, 2, 0.5)) AS t(src, dst, hours);",
+        )
+        .await;
+        run(
+            &shell,
+            "CREATE PROPERTY GRAPH phone VERTEX TABLES (people KEY (id)) EDGE TABLES (calls \
+             SOURCE KEY (src) REFERENCES people (id) DESTINATION KEY (dst) REFERENCES people (id));",
+        )
+        .await;
+        run(&shell, "SELECT 41 AS kept;").await;
+        graph_of(&shell.shell, "phone").await.unwrap();
+
+        let row: serde_json::Value =
+            serde_json::from_str(&inspect(node, false).await.unwrap()).unwrap();
+        assert_eq!(
+            row,
+            json!({
+                "table": "people",
+                "sql": "SELECT * FROM people WHERE id = 1",
+                "columns": [{"name": "id", "numeric": true}, {"name": "name", "numeric": false}],
+                "rows": [["1", "<i>Ann</i>"]],
+                "row": null,
+                "note": null,
+            })
+        );
+        let null = Inspect::Node { node: 1, key: "2" };
+        let row: serde_json::Value =
+            serde_json::from_str(&inspect(null, false).await.unwrap()).unwrap();
+        assert_eq!(row["rows"], json!([["2", null]]));
+        assert_eq!(inspect(node, true).await.unwrap(), r#"{"neighbours":1}"#);
+
+        let edge = Inspect::Edge {
+            edge: 0,
+            src: "1",
+            dst: "2",
+        };
+        let row: serde_json::Value =
+            serde_json::from_str(&inspect(edge, false).await.unwrap()).unwrap();
+        assert_eq!(row["table"], "calls");
+        assert_eq!(row["rows"], json!([["1", "2", "0.5"]]));
+
+        // The page's picture is not the engine's: an error, not another row.
+        let stale = Inspect::Node { node: 0, key: "2" };
+        assert!(inspect(stale, false).await.is_err());
+        // Nothing was printed, and the last result is the user's still.
+        assert_eq!(shell.out.take(), "");
+        let last = shell.shell.borrow();
+        let (schema, _) = last.last_result().unwrap();
+        assert_eq!(schema.field(0).name(), "kept");
     }
 
     #[tokio::test]

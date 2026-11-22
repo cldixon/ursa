@@ -35,8 +35,10 @@ pub mod flag {
     /// Drawn over everything else, at full strength while the rest is
     /// dimmed, and never smaller than [`super::MIN_FRONT_RADIUS`].
     pub const FRONT: u8 = SELECTED | HOVERED | HIGHLIGHTED | SEED;
-    /// A highlight is set: everything not in [`FRONT`] is dimmed.
-    pub const DIMS_THE_REST: u8 = HIGHLIGHTED | SEED;
+    /// A highlight is set: everything not in [`FRONT`] is dimmed. A seed
+    /// alone does not dim: a hop's seed gets its ring, and the neighbourhood
+    /// drawn around it (and what is expanded from it) stays at full strength.
+    pub const DIMS_THE_REST: u8 = HIGHLIGHTED;
 }
 
 /// How strongly the rest is drawn while a highlight is set: 35%.
@@ -214,8 +216,8 @@ impl HighlightState {
         self.flags.iter().any(|f| f & bits != 0)
     }
 
-    /// Whether a highlight is set, so the rest is dimmed: a node is
-    /// highlighted or a seed, or an edge is highlighted.
+    /// Whether a highlight is set, so the rest is dimmed: a node or an edge
+    /// is highlighted. Seeds alone do not dim.
     pub fn dims_the_rest(&self) -> bool {
         !self.edges.is_empty() || self.any(flag::DIMS_THE_REST)
     }
@@ -613,10 +615,11 @@ mod tests {
         );
         assert_eq!(h.edges(), &[0, 1, 1, 2, 4, 5]);
         assert!(h.dims_the_rest());
-        // A new highlight replaces the old one; the selection stays.
+        // A new highlight replaces the old one; the selection stays. Seeds
+        // alone (a hop's) are ringed but dim nothing.
         h.set_paths(&[], &[], &[3]).unwrap();
         assert_eq!(h.flags(), &[0, 0, 0, seed, 0, 0, 0, flag::SELECTED]);
-        assert!(h.edges().is_empty() && h.dims_the_rest());
+        assert!(h.edges().is_empty() && !h.dims_the_rest());
         h.clear_highlight();
         assert!(!h.dims_the_rest());
         assert_eq!(h.flags()[7], flag::SELECTED);

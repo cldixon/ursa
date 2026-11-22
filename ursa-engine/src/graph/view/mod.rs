@@ -63,6 +63,7 @@ use crate::graph::{edges_plan, registry_of, GraphDef, PropertyGraph};
 mod build;
 pub mod clauses;
 pub mod find;
+pub mod inspect;
 pub mod rules;
 pub mod session;
 mod style;
