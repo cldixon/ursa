@@ -453,14 +453,17 @@ What the worker holds (#501), 56 MB at 1M edges where it was 101:
   gives, so the layout has the same bits.
 - **A lean hierarchy** (`Fa2Multilevel::new_lean`). R-MAT's coarse levels
   do not thin: at 1M edges the first four have 68 to 95% of the graph's
-  adjacency entries each, and with a weight an entry they were 52 MiB. A
+  adjacency entries each, and with a weight for every entry the hierarchy
+  was 53 MiB. A
   level with more than three quarters of the graph's entries lets go of its
   weights once the level above is built from them, and they are made again
   (one more contraction for each level between it and the graph) when the
   layout comes down to it; and every level is released once the layout is
   past it. The positions are the same at every step. It costs a 1M-edge
-  layout six contractions, about a tenth of a second in five; a graph whose
-  levels shrink pays nothing.
+  R-MAT layout six contractions, which is within the spread of the runs
+  here (5.2 to 5.6 s from the hierarchy to the end lean, 5.3 to 5.9 s
+  with every weight held; [`BENCH.md`](BENCH.md#memory-at-a-million-edges));
+  a graph whose levels shrink pays nothing.
 - **Positions in two copies.** `Layout.positions()` fills a new
   `Float32Array` from the layout's state, which the worker transfers;
   `GraphView.setPositions` copies it into the positions the view keeps

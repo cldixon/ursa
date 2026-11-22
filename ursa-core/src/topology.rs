@@ -590,7 +590,7 @@ impl UndirectedCsr {
     /// without the out-adjacency, the transpose and the edge ids that a
     /// [`Topology`] holds beside it. For a caller that needs only this (a
     /// layout): its peak is the edge list and one buffer of two slots an
-    /// edge, where a topology's is five times the edge list.
+    /// edge.
     ///
     /// Serial, and the result does not depend on the order of the edges.
     ///

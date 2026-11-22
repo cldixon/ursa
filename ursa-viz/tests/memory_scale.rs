@@ -154,6 +154,33 @@ fn a_million_edges_are_held_once_by_a_view_and_without_weights_by_a_layout() {
     let (x, y) = handed.positions();
     assert_eq!((bits(x), bits(y)), first);
     drop(handed);
+    // What lean costs in time: in a release build, the whole schedule with
+    // every level's weights held, and lean.
+    if !cfg!(debug_assertions) {
+        use ursa_core::algo::Fa2Multilevel;
+        let run = |lean: bool| {
+            let start = std::time::Instant::now();
+            let params = MultilevelParams::default();
+            let mut layout = if lean {
+                Fa2Multilevel::new_lean(&adjacency, params)
+            } else {
+                Fa2Multilevel::new(&adjacency, params)
+            };
+            let built = start.elapsed();
+            layout.step(&adjacency, f64::INFINITY);
+            let (x, _) = layout.positions();
+            (built, start.elapsed(), bits(x))
+        };
+        let (full, lean) = (run(false), run(true));
+        println!(
+            "the whole layout: {:.2} s with every weight held ({:.0} ms to build), {:.2} s lean ({:.0} ms)",
+            full.1.as_secs_f64(),
+            full.0.as_secs_f64() * 1e3,
+            lean.1.as_secs_f64(),
+            lean.0.as_secs_f64() * 1e3,
+        );
+        assert_eq!(full.2, lean.2);
+    }
     let topology = Topology::build(n, src, dst);
     assert_eq!(topology.undirected().targets, adjacency.targets);
     assert_eq!(topology.undirected().offsets, adjacency.offsets);
