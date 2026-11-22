@@ -4653,6 +4653,8 @@ dependencies = [
  "glob",
  "object_store",
  "parking_lot",
+ "rayon",
+ "rustc-hash 2.1.3",
  "rustix",
  "serde_json",
  "tempfile",

@@ -33,6 +33,7 @@ use ursa_core::{EdgeInterner, IdError, IdMap, Topology};
 
 use crate::csv::{csv_value_error, read_csv, CsvOptions};
 use crate::ids::{self, unview_field, EndpointTypeError};
+use crate::parquet_footer::ValidParquet;
 use crate::parquet_stats::CheckedBounds;
 use crate::store::{scan_state, StoreKey};
 use crate::types::pa_name;
@@ -335,7 +336,8 @@ async fn open_path(path: &str, source: ScanSource<'_>) -> Result<DataFrame> {
 /// file-level min/max exact only where every row group backs them
 /// ([`CheckedBounds`], #202): DataFusion (54 and 55) would otherwise read a column whose
 /// known values are all equal as that constant, the rows of a row group without
-/// bounds (all NaN, a long string) included. The table is built as
+/// bounds (all NaN, a long string) included. Each file's footer is checked
+/// before it is read ([`ValidParquet`], #332). The table is built as
 /// `read_parquet` builds it, sharing the runtime's file statistics cache.
 async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
     let table_path = ListingTableUrl::parse(path)?;
@@ -348,7 +350,9 @@ async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
             options.file_extension
         )));
     }
-    options.format = Arc::new(CheckedBounds::new(options.format));
+    options.format = Arc::new(ValidParquet::new(Arc::new(CheckedBounds::new(
+        options.format,
+    ))));
     let config = ListingTableConfig::new(table_path)
         .with_listing_options(options)
         .infer_schema(&ctx.state())
