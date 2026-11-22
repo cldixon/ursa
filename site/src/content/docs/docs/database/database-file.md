@@ -215,11 +215,13 @@ ursa: view ties is unavailable: no file found at '/home/me/club/karate_edges.csv
 ursa: graph karate is unavailable: it uses view ties, which is unavailable; repair ties, or DROP PROPERTY GRAPH karate
 ```
 
-Everything else works. An unavailable object is still listed by `SHOW TABLES` and `.tables`, and using it fails with the same message, as a broken view does in DuckDB. A view or graph that uses an unavailable object is unavailable too, with its own message.
+The remedy follows the cause: a missing file can be restored; anything else (expired credentials, a network error, a file that no longer has the columns the view reads) ends `or fix the cause and open the database again`.
+
+Everything else works. An unavailable object is still listed by `SHOW TABLES` and `.tables`, and using it fails with the same message, as a broken view does in DuckDB. So do an unavailable graph's functions, `GRAPH_TABLE`, `DESCRIBE GRAPH` and its `karate.edges` and `karate.nodes` tables. A view or graph that uses an unavailable object is unavailable too, with its own message.
 
 Its statement stays in the catalog as it was, so nothing is lost: restore the file, open the database again, and the object is back, with everything that uses it. Or repair it in a writable session:
 
 - `DROP VIEW ties` (or `DROP VIEW IF EXISTS ties`, `DROP TABLE`, `DROP PROPERTY GRAPH`) removes it from the catalog;
-- `CREATE OR REPLACE VIEW ties AS …` defines it again, in its place in the catalog. `CREATE VIEW ties` without `OR REPLACE` says it already exists.
+- `CREATE OR REPLACE VIEW ties AS …` defines it again, in its place in the catalog. `CREATE VIEW ties` without `OR REPLACE` says it already exists. If the new definition fails too, the object stays as it was, unavailable.
 
-An object that uses one you repaired stays unavailable until the database is opened again. A read-only session opens the database the same way, and cannot repair it.
+The objects that use one you repaired are defined again at once, from their statements in the catalog: repairing `ties` brings `karate` back. If one still fails (you dropped what it uses), its message says why, and it is tried again after your next `CREATE` or `DROP`. A read-only session opens the database the same way, and cannot repair it.

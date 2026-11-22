@@ -1313,6 +1313,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **SQL: loose ends of unavailable objects** (#401, after #381).
+  - `g.edges` and `g.nodes` of an unavailable graph fail with the graph's
+    message, as its functions, `GRAPH_TABLE` and `DESCRIBE GRAPH` do; they
+    said "table not found".
+  - The notice's remedy follows the cause: `or restore the file` for a
+    missing file, `or fix the cause and open the database again` for
+    anything else (expired `s3://` credentials, a network error, a file
+    without the columns a view reads).
+  - Repairs reach dependants: after `CREATE OR REPLACE` or `DROP` of an
+    object, the objects unavailable because they use it are defined again
+    from their catalog statements, so repairing a view brings back the views
+    and graphs over it without reopening the database. One that still
+    fails says why, and is tried again after the next change.
+  - `CREATE OR REPLACE EXTERNAL TABLE` over an unavailable table, with a
+    definition that fails too, keeps the table (unavailable, as it was); it
+    disappeared for the rest of the session.
 - **A truncated or fake `.parquet` file is an error, not a crash** (#332).
   A file whose footer claims more metadata than the file holds (a
   truncated download, a file still being written, `PAR1PAR1`) made the

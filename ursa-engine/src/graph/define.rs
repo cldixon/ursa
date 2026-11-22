@@ -104,7 +104,8 @@ pub async fn create_graph(
     }
     let state = ctx.state();
     let graphs = registry(&state);
-    if let Some(why) = graphs.unavailable(&spec.name) {
+    let unavailable = graphs.unavailable(&spec.name);
+    if let Some(why) = &unavailable {
         // The database's graph that could not be defined when it was opened
         // exists: it is kept, or replaced.
         if if_not_exists {
@@ -125,8 +126,9 @@ pub async fn create_graph(
         if !or_replace {
             return plan_err(format!("graph '{}' already exists", spec.name));
         }
-    } else if spec.name == INFORMATION_SCHEMA
-        || default_catalog(&state)?.schema(&spec.name).is_some()
+    } else if unavailable.is_none()
+        && (spec.name == INFORMATION_SCHEMA
+            || default_catalog(&state)?.schema(&spec.name).is_some())
     {
         return plan_err(format!(
             "cannot name a graph '{}': a schema of that name already exists, and a graph's \
@@ -591,8 +593,11 @@ fn resolve(state: &SessionState, table: &TableReference) -> ResolvedTableReferen
 pub fn drop_graph(ctx: &SessionContext, name: &str, if_exists: bool) -> Result<()> {
     let state = ctx.state();
     let graphs = registry(&state);
-    if graphs.remove(name).is_none() {
-        if graphs.clear_unavailable(name) || if_exists {
+    let removed = graphs.remove(name).is_some();
+    // An unavailable graph has a schema too (see `mark_unavailable`).
+    let was_unavailable = graphs.clear_unavailable(name);
+    if !removed && !was_unavailable {
+        if if_exists {
             return Ok(());
         }
         return Err(unknown_graph(name, &graphs));
@@ -605,6 +610,23 @@ pub fn drop_graph(ctx: &SessionContext, name: &str, if_exists: bool) -> Result<(
         catalog.deregister_schema(name, true)?;
     }
     Ok(())
+}
+
+/// Mark the database's graph called `name` unavailable: it could not be
+/// defined when the database was opened, and `message` says why (#381).
+/// Using it fails with `message` until it is dropped or replaced: its
+/// functions, `GRAPH_TABLE`, `DESCRIBE GRAPH`, and its `edges` and `nodes`
+/// tables, for which it gets its schema (#401).
+pub fn mark_unavailable(ctx: &SessionContext, name: &str, message: impl Into<String>) {
+    let state = ctx.state();
+    registry(&state).mark_unavailable(name, message);
+    if let Ok(catalog) = default_catalog_inner(&state) {
+        if catalog.schema(name).is_none() {
+            let schema = Arc::new(GraphSchema::new(name.to_string(), ctx.state_weak_ref()));
+            // A name already taken (by a schema) keeps its schema.
+            let _ = catalog.register_schema(name, schema);
+        }
+    }
 }
 
 /// The closest of `candidates` to `name` by edit distance, if any is close
