@@ -1,10 +1,10 @@
 use super::*;
-use crate::scene::Graph;
 use crate::highlight::flag;
 use crate::model::{
     BatchValues, Column, EdgeBatch, Encodings, Highlights, KeyType, NodeBatch, NodeLabel, Path,
     Positions, Provenance,
 };
+use crate::scene::Graph;
 
 /// A result of `n` nodes keyed `0..n`, with these edges and no positions.
 fn result(n: u32, edges: &[(u32, u32)]) -> GraphResult {

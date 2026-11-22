@@ -58,6 +58,23 @@ impl Pace {
     }
 }
 
+impl Pace {
+    /// Give the event loop a turn now, if this pace yields at all, whatever
+    /// the clock says: for work that needs the turn itself, not only the
+    /// time (a browser frees what was written to the GPU between tasks).
+    pub async fn turn(&mut self) {
+        if self.since.is_some() {
+            yield_now().await;
+            self.since = Some(now());
+        }
+    }
+
+    /// Whether this pace gives turns at all.
+    pub fn yields(&self) -> bool {
+        self.since.is_some()
+    }
+}
+
 /// The value of a future that never waits: one made with [`Pace::never`].
 pub(crate) fn ready<F: Future>(future: F) -> F::Output {
     match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {

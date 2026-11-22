@@ -60,7 +60,12 @@ pub fn decode(bytes: &[u8]) -> Result<Message, UgrError> {
     let (header, reader) = open(&bytes)?;
     match header {
         Header::Result(h) => {
-            let result = ready(read_result(*h, &reader, Room::default(), &mut Pace::never()));
+            let result = ready(read_result(
+                *h,
+                &reader,
+                Room::default(),
+                &mut Pace::never(),
+            ));
             Ok(Message::Result(Box::new(result?)))
         }
         Header::Delta(h) => Ok(Message::Delta(read_delta(h, &reader)?)),
@@ -790,7 +795,12 @@ impl Reader<'_> {
         self.sparse_with(name, count, 0)
     }
 
-    fn sparse_with<T: Le>(&self, name: &str, count: usize, extra: usize) -> Result<Vec<T>, UgrError> {
+    fn sparse_with<T: Le>(
+        &self,
+        name: &str,
+        count: usize,
+        extra: usize,
+    ) -> Result<Vec<T>, UgrError> {
         match self.opt_with::<T>(name, extra)? {
             Some(data) => {
                 check_count(name, data.len(), count as u64)?;
@@ -805,7 +815,11 @@ impl Reader<'_> {
     }
 
     /// [`Reader::sparse`], holding nothing for a section left out.
-    fn lazy<T: Le + Default + PartialEq>(&self, name: &str, count: usize) -> Result<Sparse<T>, UgrError> {
+    fn lazy<T: Le + Default + PartialEq>(
+        &self,
+        name: &str,
+        count: usize,
+    ) -> Result<Sparse<T>, UgrError> {
         match self.opt::<T>(name)? {
             Some(data) => {
                 check_count(name, data.len(), count as u64)?;
@@ -1024,7 +1038,7 @@ async fn read_result(
         highlights: r.highlights("highlights", h.highlights)?,
         encodings: h.encodings,
         provenance: h.provenance,
-        index: HashMap::new(),
+        index: Default::default(),
         named: Vec::new(),
     };
     result.validate_paced(pace).await?;

@@ -83,6 +83,27 @@ fn room_of(nodes: usize, edges: usize) -> Room {
     }
 }
 
+/// The most turns of the event loop [`settle`] waits for the GPU: a GPU
+/// that slow is waited for no longer, and the view is made holding more.
+const SETTLE_TURNS: usize = 16;
+
+/// For a paced view: give the event loop turns until the GPU has taken
+/// everything written to it, so that the staging of those writes is freed.
+async fn settle(device: &wgpu::Device, pace: &mut Pace) {
+    if !pace.yields() {
+        return;
+    }
+    for _ in 0..SETTLE_TURNS {
+        pace.turn().await;
+        if device
+            .poll(wgpu::PollType::Poll)
+            .map_or(true, |status| status.is_queue_empty())
+        {
+            return;
+        }
+    }
+}
+
 /// What a new view draws.
 enum Scene {
     Graph(Graph),
@@ -92,6 +113,11 @@ enum Scene {
 /// How many edges go to the GPU at a time when a view is made: half a
 /// megabyte of indexes.
 const EDGE_RUN: usize = 1 << 16;
+
+/// How many bytes of edges a paced view writes to the GPU before it gives
+/// the event loop a turn, so that the writes' staging is freed: half a
+/// megabyte, a run.
+const EDGE_STAGING: usize = 1 << 19;
 
 /// What [`View::apply`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +308,7 @@ impl View {
         // The edges, a run at a time: each is in the GPU's hands, and its
         // staging freed, before the next is made.
         let mut start = 0;
+        let mut staged = 0;
         while start < m {
             let run = start..m.min(start + EDGE_RUN);
             let lines = match (&live, &graph) {
@@ -293,7 +320,17 @@ impl View {
             queue.submit([]);
             let _ = device.poll(wgpu::PollType::Poll);
             start = run.end;
-            pace.breathe().await;
+            // What is written is staged in this program's memory until
+            // the GPU has taken it, which on WebGL2 it does between the
+            // page's tasks, in its own time: wait for it after each run,
+            // or all the runs are held at once.
+            staged += lines.len() * 4;
+            if staged >= EDGE_STAGING {
+                staged = 0;
+                settle(device, pace).await;
+            } else {
+                pace.breathe().await;
+            }
         }
         let mut view = Self {
             graph,

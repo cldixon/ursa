@@ -1358,3 +1358,212 @@ fn the_last_nodes_come_off_only_when_no_edge_names_them_whatever_came_and_went()
     let back = GraphResult::from_bytes(&r.to_bytes()).unwrap();
     assert_eq!(back.named, r.named);
 }
+
+// #501: what a result holds, and how it is read.
+
+#[test]
+fn labels_and_flags_that_are_all_zero_hold_nothing() {
+    let mut r = build(vec![
+        Op::AddNodeLabel(NodeLabel::new("", KeyType::Int)),
+        Op::AddEdgeLabel(String::new()),
+        Op::AddNodes(NodeBatch::of_label(0, [1i64, 2, 3])),
+        Op::AddEdges(EdgeBatch::of_label(0, vec![0, 1, 2], vec![1, 2, 0])),
+    ]);
+    let lazy = |r: &GraphResult| {
+        (
+            r.edge_label().as_slice().is_none(),
+            r.edge_flags().as_slice().is_none(),
+        )
+    };
+    assert_eq!(lazy(&r), (true, true));
+    assert_eq!(r.edge_label().to_vec(), [0, 0, 0]);
+    assert_eq!((r.edge_label()[2], r.edge_flags().get(1)), (0, 0));
+    assert!(r.edge_label().contains(&0) && !r.edge_label().contains(&1));
+    let bytes = r.to_bytes();
+    let back = GraphResult::from_bytes(&bytes).unwrap();
+    assert_eq!(lazy(&back), (true, true));
+    assert_eq!(back, r);
+
+    // Restoring an edge that is not removed is refused, and still holds
+    // nothing; removing one holds the flags, and the result is the same
+    // one after its undo, held or not.
+    let restore = delta(vec![Op::RestoreEdges(vec![1])]);
+    assert_eq!(
+        message(r.apply(&restore)),
+        "op 0 (restore_edges): edge 1 is not removed"
+    );
+    let past = delta(vec![Op::RestoreEdges(vec![9])]);
+    assert_eq!(
+        message(r.apply(&past)),
+        "op 0 (restore_edges): edge 9, but the result has 3 edges"
+    );
+    assert_eq!(lazy(&r), (true, true));
+    let remove = delta(vec![Op::RemoveEdges(vec![1])]);
+    r.apply(&remove).unwrap();
+    assert_eq!(lazy(&r), (true, false));
+    assert!(r.edge_is_removed(1) && !r.edge_is_shown(1) && r.edge_is_shown(0));
+    assert_ne!(r, back);
+    r.apply(&remove.invert()).unwrap();
+    assert_eq!(r, back);
+    assert_eq!(r.to_bytes(), bytes);
+
+    // A second edge label is held from the first edge that has it, and
+    // goes with the last.
+    let more = delta(vec![
+        Op::AddEdgeLabel("other".into()),
+        Op::AddEdges(EdgeBatch::of_label(1, vec![0], vec![2])),
+    ]);
+    r.apply(&more).unwrap();
+    assert_eq!(r.edge_label().to_vec(), [0, 0, 0, 1]);
+    assert_eq!(
+        GraphResult::from_bytes(&r.to_bytes())
+            .unwrap()
+            .edge_label()
+            .to_vec(),
+        [0, 0, 0, 1]
+    );
+    r.apply(&more.invert()).unwrap();
+    assert_eq!(r, back);
+    assert_eq!(r.to_bytes(), bytes);
+}
+
+/// Bytes that are not this program's slice: read a range at a time, and
+/// counted.
+struct Elsewhere<'a> {
+    bytes: &'a [u8],
+    read: std::cell::Cell<usize>,
+}
+
+impl Source for Elsewhere<'_> {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn read(&self, at: usize, out: &mut [u8]) {
+        self.read.set(self.read.get() + out.len());
+        out.copy_from_slice(&self.bytes[at..at + out.len()]);
+    }
+}
+
+#[test]
+fn a_result_is_read_from_any_source_with_room_and_is_the_same() {
+    let r = sample();
+    let bytes = r.to_bytes();
+    let source = Elsewhere {
+        bytes: &bytes,
+        read: std::cell::Cell::new(0),
+    };
+    let room = |nodes: usize, edges: usize| {
+        assert_eq!((nodes, edges), (r.n_nodes(), r.n_edges()));
+        Room { nodes: 3, edges: 2 }
+    };
+    let mut pace = crate::pace::Pace::never();
+    let read = crate::pace::ready(GraphResult::read_paced(&source, &room, &mut pace)).unwrap();
+    assert_eq!(read, r);
+    assert_eq!(read.index, r.index);
+    assert_eq!(read.to_bytes(), bytes);
+    // Each byte at most once: the frame, the header and the sections.
+    assert!(source.read.get() <= bytes.len());
+    // The room is there: three more nodes and two more edges move nothing.
+    assert!(read.src.capacity() >= r.n_edges() + 2);
+    assert!(read.dst.capacity() >= r.n_edges() + 2);
+    assert!(read.node_label.capacity() >= r.n_nodes() + 3);
+
+    // A delta is not a result, from a source either.
+    let step = delta(vec![Op::RemoveNodes(vec![0])]).to_bytes();
+    let source = Elsewhere {
+        bytes: &step,
+        read: std::cell::Cell::new(0),
+    };
+    let refused = crate::pace::ready(GraphResult::read_paced(&source, &room, &mut pace));
+    assert_eq!(
+        message(refused),
+        "UGR: the buffer holds a delta, not a result"
+    );
+    // A header that claims more nodes than its sections hold gets no room
+    // for them.
+    let lying = |nodes: usize, _: usize| Room {
+        nodes: usize::MAX / 16,
+        edges: nodes,
+    };
+    let source = Elsewhere {
+        bytes: &bytes,
+        read: std::cell::Cell::new(0),
+    };
+    let read = crate::pace::ready(GraphResult::read_paced(&source, &lying, &mut pace)).unwrap();
+    assert_eq!(read, r);
+}
+
+#[test]
+fn a_result_can_carry_its_adjacency_for_a_layout() {
+    use ursa_core::topology::UndirectedCsr;
+    let r = build(vec![
+        Op::AddNodeLabel(NodeLabel::new("", KeyType::Int)),
+        Op::AddEdgeLabel(String::new()),
+        Op::AddNodes(NodeBatch::of_label(0, [10i64, 20, 30, 40])),
+        // A repeat, both directions, a self-loop, and a node with no edge.
+        Op::AddEdges(EdgeBatch::of_label(
+            0,
+            vec![0, 1, 1, 2, 0],
+            vec![1, 0, 2, 2, 1],
+        )),
+    ]);
+    let plain = r.to_bytes();
+    assert!(ugr::read_adjacency(&plain).unwrap().is_none());
+
+    let adjacency = UndirectedCsr::from_edges(r.n_nodes(), r.src(), r.dst());
+    assert_eq!(adjacency.offsets, [0, 1, 3, 4, 4]);
+    assert_eq!(adjacency.targets, [1, 0, 2, 1]);
+    let bytes = r.to_bytes_with_adjacency(&adjacency);
+    let read = ugr::read_adjacency(&bytes).unwrap().unwrap();
+    assert_eq!(
+        (read.offsets, read.targets),
+        (adjacency.offsets.clone(), adjacency.targets.clone())
+    );
+    // The result is the same with or without it, and is written without.
+    let back = GraphResult::from_bytes(&bytes).unwrap();
+    assert_eq!(back, r);
+    assert_eq!(back.to_bytes(), plain);
+
+    // An adjacency that is not one is refused when it is read.
+    let broken = UndirectedCsr {
+        offsets: vec![0, 1, 3, 4, 4],
+        targets: vec![1, 0, 2, 3],
+    };
+    let bytes = r.to_bytes_with_adjacency(&broken);
+    let refused = message(ugr::read_adjacency(&bytes));
+    assert_eq!(
+        refused,
+        "UGR: node 1 has the neighbour 2, but node 2 does not have 1"
+    );
+    assert_eq!(GraphResult::from_bytes(&bytes).unwrap(), r);
+}
+
+#[test]
+fn the_key_index_reads_the_results_own_keys() {
+    let r = sample();
+    let n = r.n_nodes();
+    assert_eq!(r.index.len(), n);
+    assert_eq!(r.index.nodes(), (0..n as u32).collect::<Vec<_>>());
+    // A key of the other type than its label's names no node.
+    assert_eq!(r.node(0, &Key::Int(1)), Some(0));
+    assert_eq!(r.node(0, &Key::Text("1".into())), None);
+    assert_eq!(r.node(1, &Key::Text("1".into())), Some(3));
+    assert_eq!(r.node(1, &Key::Int(1)), None);
+    assert_eq!(r.node(7, &Key::Int(1)), None);
+    // A refused batch leaves the keys, the labels and the index as they were.
+    let mut r = build(vec![
+        Op::AddNodeLabel(NodeLabel::new("people", KeyType::Int)),
+        Op::AddNodes(NodeBatch::of_label(0, [1i64, 2, 3])),
+    ]);
+    let before = r.clone();
+    let twice = delta(vec![Op::AddNodes(NodeBatch::of_label(0, [50i64, 51, 50]))]);
+    assert_eq!(
+        message(r.apply(&twice)),
+        "op 0 (add_nodes): '50' of the label 'people' is node 3 already"
+    );
+    assert_eq!(r, before);
+    assert_eq!(r.index, before.index);
+    assert_eq!(r.node(0, &Key::Int(51)), None);
+    assert_eq!(r.to_bytes(), before.to_bytes());
+}

@@ -36,6 +36,9 @@ ursa-core = { path = "../ursa-core", version = "0.12.0-dev", default-features = 
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "wgsl"], optional = true }
 # Vertex data for the GPU, and the UGR wire format's sections.
 bytemuck = { version = "1", features = ["derive"] }
+# The result's key index: a table of node indexes over the keys the result
+# holds, four bytes a node (`model::result::KeyIndex`).
+hashbrown = { version = "0.17", default-features = false }
 # The UGR wire format's JSON header.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

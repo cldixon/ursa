@@ -517,7 +517,6 @@ impl GraphResult {
         if n + count > NULL as usize {
             return err("more nodes than a u32 can number");
         }
-        let mut keys = Vec::with_capacity(count);
         for (i, &label) in batch.labels.iter().enumerate() {
             let Some(node_label) = self.node_labels.get(label as usize) else {
                 return err(format!(
@@ -525,13 +524,12 @@ impl GraphResult {
                     self.node_labels.len()
                 ));
             };
-            let key = Key::parse(node_label.key, batch.keys.get(i)).map_err(|e| {
+            Key::check(node_label.key, batch.keys.get(i)).map_err(|e| {
                 ModelError(format!(
                     "new node {i} of the label '{}': {e}",
                     node_label.name
                 ))
             })?;
-            keys.push((label, key));
         }
         match (&self.positions, &batch.positions) {
             (Some(_), Some(p)) => check_positions(p, count)?,
@@ -542,21 +540,30 @@ impl GraphResult {
         check_batch_columns(&self.node_columns, &batch.columns, count, "node")?;
 
         // The identities must be new, among the nodes and among themselves.
-        for (i, id) in keys.iter().enumerate() {
-            if let Some(&first) = self.index.get(id) {
-                for done in &keys[..i] {
-                    self.index.remove(done);
-                }
-                return err(format!(
-                    "'{}' of the label '{}' is node {first} already",
-                    id.1, self.node_labels[id.0 as usize].name
-                ));
-            }
-            self.index.insert(id.clone(), (n + i) as u32);
-        }
-
+        // The index reads a node's key and label from the result, so the
+        // new ones go in first, and come out again if one is refused.
         self.node_label.extend_from_slice(&batch.labels);
         self.node_keys.extend(&batch.keys);
+        for i in n..n + count {
+            let first = self
+                .index
+                .insert(&self.node_keys, &self.node_label, i as u32);
+            if let Some(first) = first {
+                for done in n..i {
+                    self.index
+                        .remove(&self.node_keys, &self.node_label, done as u32);
+                }
+                let refused = err(format!(
+                    "'{}' of the label '{}' is node {first} already",
+                    self.node_keys.get(i),
+                    self.node_labels[self.node_label[i] as usize].name
+                ));
+                self.node_label.truncate(n);
+                self.node_keys.truncate(n);
+                return refused;
+            }
+        }
+
         self.node_flags.resize(n + count, 0);
         extend_columns(&mut self.node_columns, &batch.columns, count);
         if let (Some(p), Some(new)) = (&mut self.positions, &batch.positions) {
@@ -602,8 +609,8 @@ impl GraphResult {
         }
 
         for i in n..n + count {
-            let id = (self.node_label[i], self.node_key(i));
-            self.index.remove(&id);
+            self.index
+                .remove(&self.node_keys, &self.node_label, i as u32);
         }
         self.node_label.truncate(n);
         self.node_keys.truncate(n);

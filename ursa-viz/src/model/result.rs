@@ -2,6 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{BuildHasher, RandomState};
+
+use hashbrown::HashTable;
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +55,15 @@ impl Key {
                 Ok(v) if v.to_string() == text => Ok(Key::Int(v)),
                 _ => err(format!("the key '{text}' is not an integer")),
             },
+        }
+    }
+
+    /// Whether `text` is a key of type `ty` ([`Key::parse`]), without
+    /// making one.
+    pub fn check(ty: KeyType, text: &str) -> Result<(), ModelError> {
+        match ty {
+            KeyType::Text => Ok(()),
+            KeyType::Int => Key::parse(ty, text).map(|_| ()),
         }
     }
 
@@ -350,6 +362,83 @@ fn check_codes(codes: &[u32], n_values: usize, what: &str) -> Result<(), ModelEr
     }
 }
 
+/// `(label, key)` → node, for the nodes of a result.
+///
+/// It is a table of node indexes, hashed and compared by the label and the
+/// key text that the result already holds: four bytes and a control byte a
+/// node, where a map from the keys themselves would hold every key a second
+/// time (60 bytes a node, and three megabytes of a 46,318-node result).
+/// The price is that every call is given the result's keys and labels.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KeyIndex {
+    nodes: HashTable<u32>,
+    hasher: RandomState,
+}
+
+impl KeyIndex {
+    fn hash(&self, label: u16, key: &str) -> u64 {
+        self.hasher.hash_one((label, key))
+    }
+
+    /// The node of `label` with the key `key`, as text.
+    pub(crate) fn get(&self, keys: &Strings, labels: &[u16], label: u16, key: &str) -> Option<u32> {
+        let same = |&i: &u32| labels[i as usize] == label && keys.get(i as usize) == key;
+        self.nodes.find(self.hash(label, key), same).copied()
+    }
+
+    /// Add node `i`, whose key and label are in `keys` and `labels`; or, if
+    /// another node has its identity, add nothing and say which.
+    pub(crate) fn insert(&mut self, keys: &Strings, labels: &[u16], i: u32) -> Option<u32> {
+        let (label, key) = (labels[i as usize], keys.get(i as usize));
+        if let Some(first) = self.get(keys, labels, label, key) {
+            return Some(first);
+        }
+        let hasher = &self.hasher;
+        let rehash = |&j: &u32| hasher.hash_one((labels[j as usize], keys.get(j as usize)));
+        self.nodes
+            .insert_unique(hasher.hash_one((label, key)), i, rehash);
+        None
+    }
+
+    /// Take node `i` out, while `keys` and `labels` still have it.
+    pub(crate) fn remove(&mut self, keys: &Strings, labels: &[u16], i: u32) {
+        let hash = self.hash(labels[i as usize], keys.get(i as usize));
+        if let Ok(entry) = self.nodes.find_entry(hash, |&j| j == i) {
+            entry.remove();
+        }
+    }
+
+    /// Room for `more` nodes.
+    pub(crate) fn reserve(&mut self, keys: &Strings, labels: &[u16], more: usize) {
+        let hasher = &self.hasher;
+        let rehash = |&j: &u32| hasher.hash_one((labels[j as usize], keys.get(j as usize)));
+        self.nodes.reserve(more, rehash);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.nodes.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The nodes it holds, in index order.
+    pub(crate) fn nodes(&self) -> Vec<u32> {
+        let mut nodes: Vec<u32> = self.nodes.iter().copied().collect();
+        nodes.sort_unstable();
+        nodes
+    }
+}
+
+/// Equal when they hold the same nodes: of results that are equal, the same
+/// index.
+impl PartialEq for KeyIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.nodes() == other.nodes()
+    }
+}
+
 /// A small number per slot that is zero in most results: an edge's label
 /// where there is one edge table, its flags where none is removed. While
 /// every one is zero nothing is held for them, as the wire format writes
@@ -479,9 +568,7 @@ impl<T: Copy + Default + PartialEq> PartialEq for Sparse<T> {
         self.len == other.len
             && match (self.as_slice(), other.as_slice()) {
                 (Some(a), Some(b)) => a == b,
-                (Some(held), None) | (None, Some(held)) => {
-                    held.iter().all(|v| *v == T::default())
-                }
+                (Some(held), None) | (None, Some(held)) => held.iter().all(|v| *v == T::default()),
                 (None, None) => true,
             }
     }
@@ -661,7 +748,7 @@ pub struct GraphResult {
     pub(crate) provenance: Provenance,
 
     /// `(label, key)` → node index. Derived from the keys and labels.
-    pub(crate) index: HashMap<(u16, Key), u32>,
+    pub(crate) index: KeyIndex,
     /// The greatest node index the edges name, as it rises along them:
     /// `(edge, node)` for each edge that names a node past every earlier
     /// edge's. Derived from the edges. Its last entry says whether an edge
@@ -754,8 +841,14 @@ impl GraphResult {
 
     /// The node with this identity, removed or not.
     pub fn node(&self, label: u16, key: &Key) -> Option<u32> {
-        // The map's key is a pair, so the lookup needs one; a key is small.
-        self.index.get(&(label, key.clone())).copied()
+        // A label's keys are all of one type, and an integer key's text is
+        // its decimal form.
+        if self.node_labels.get(label as usize)?.key != key.key_type() {
+            return None;
+        }
+        let text = key.to_string();
+        self.index
+            .get(&self.node_keys, &self.node_label, label, &text)
     }
 
     /// Each node's flags ([`REMOVED`]).
@@ -886,7 +979,7 @@ impl GraphResult {
             p.x.reserve_exact(nodes);
             p.y.reserve_exact(nodes);
         }
-        self.index.reserve(nodes);
+        self.index.reserve(&self.node_keys, &self.node_label, nodes);
         // Exactly: `reserve` would double a full vector, eight megabytes of
         // room at a million edges where a sixty-fourth was asked for.
         self.src.reserve_exact(edges);
@@ -928,7 +1021,7 @@ impl GraphResult {
             ));
         }
         self.index.clear();
-        self.index.reserve(n);
+        self.index.reserve(&self.node_keys, &self.node_label, n);
         for i in 0..n {
             if i % PACED_NODES == PACED_NODES - 1 {
                 pace.breathe().await;
@@ -940,9 +1033,12 @@ impl GraphResult {
                     self.node_labels.len()
                 ));
             };
-            let key = Key::parse(node_label.key, self.node_keys.get(i))
+            Key::check(node_label.key, self.node_keys.get(i))
                 .map_err(|e| ModelError(format!("node {i}: {e}")))?;
-            if let Some(first) = self.index.insert((label, key), i as u32) {
+            let first = self
+                .index
+                .insert(&self.node_keys, &self.node_label, i as u32);
+            if let Some(first) = first {
                 return err(format!(
                     "nodes {first} and {i} are both '{}' of the label '{}'",
                     self.node_keys.get(i),
@@ -973,7 +1069,13 @@ impl GraphResult {
         while start < m {
             let end = m.min(start + PACED_EDGES);
             let label = self.edge_label.as_slice().map(|l| &l[start..end]);
-            self.check_edges(&self.src[start..end], &self.dst[start..end], label, n, start)?;
+            self.check_edges(
+                &self.src[start..end],
+                &self.dst[start..end],
+                label,
+                n,
+                start,
+            )?;
             start = end;
             pace.breathe().await;
         }

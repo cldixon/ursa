@@ -397,13 +397,14 @@ impl LiveResult {
         for i in 0..n {
             live.style_node(i, &mut drawn.parts(theme));
         }
-        live.degrees.degree.reserve(more_nodes);
-        drawn.x.reserve(more_nodes);
-        drawn.y.reserve(more_nodes);
-        drawn.style.radius.reserve(more_nodes);
-        drawn.style.color.reserve(more_nodes);
+        // Exactly: `reserve` on a full vector doubles it.
+        live.degrees.degree.reserve_exact(more_nodes);
+        drawn.x.reserve_exact(more_nodes);
+        drawn.y.reserve_exact(more_nodes);
+        drawn.style.radius.reserve_exact(more_nodes);
+        drawn.style.color.reserve_exact(more_nodes);
         if let Some(categories) = &mut drawn.categories {
-            categories.reserve(more_nodes);
+            categories.reserve_exact(more_nodes);
         }
         drawn.highlight.reserve(more_nodes);
         (live, drawn)

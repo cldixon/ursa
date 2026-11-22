@@ -1223,6 +1223,89 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_on_an_adjacency_is_the_layout_of_the_graph() {
+        let bits = |l: &LiveLayout| {
+            let (x, y) = l.positions();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            (bits(x), bits(y))
+        };
+        let g = skewed(400, 3000);
+        // The adjacency as another holder hands it over: its parts, checked.
+        let built = g.adjacency();
+        let handed = || {
+            let parts = UndirectedCsr::from_parts(
+                g.n_nodes(),
+                built.offsets.clone(),
+                built.targets.clone(),
+            );
+            Arc::new(parts.unwrap())
+        };
+        // It is the one a topology builds, so nothing a layout reads differs.
+        let topology =
+            ursa_core::topology::Topology::build(g.n_nodes(), g.src().to_vec(), g.dst().to_vec());
+        assert_eq!(topology.undirected().offsets, built.offsets);
+        assert_eq!(topology.undirected().targets, built.targets);
+
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        let mut of_graph = LiveLayout::multilevel(&g, params);
+        let mut of_parts = LiveLayout::multilevel_on(handed(), params);
+        assert!(of_graph.levels() > 2);
+        assert_eq!(bits(&of_graph), bits(&of_parts));
+        while !of_graph.is_done() {
+            of_graph.step(7);
+            of_parts.step(7);
+            assert_eq!(bits(&of_graph), bits(&of_parts));
+        }
+        assert!(of_parts.is_done());
+        // And it is the one-call layout, which holds every level's weights.
+        let mut whole = Fa2Multilevel::new(built, params);
+        whole.step(built, f64::INFINITY);
+        let (x, y) = whole.positions();
+        let (px, py) = of_parts.positions();
+        assert_eq!(
+            (x.iter().map(|f| f.to_bits()).collect::<Vec<_>>(), y.len()),
+            (px.iter().map(|f| f.to_bits()).collect::<Vec<_>>(), py.len())
+        );
+
+        let flat = (
+            LiveLayout::new(&g, Fa2Params::default()),
+            LiveLayout::new_on(handed(), Fa2Params::default()),
+        );
+        let (mut a, mut b) = flat;
+        a.step(5);
+        b.step(5);
+        assert_eq!(bits(&a), bits(&b));
+
+        let level: Vec<u32> = (0..g.n_nodes() as u32).map(|v| v % 5).collect();
+        let rings = LiveLayout::rings(&g, &level, RingsParams::default()).unwrap();
+        let on = LiveLayout::rings_on(handed(), &level, RingsParams::default()).unwrap();
+        assert_eq!(bits(&rings), bits(&on));
+        let layers = LiveLayout::layers(&g, &level, LayersParams::default()).unwrap();
+        let on = LiveLayout::layers_on(handed(), &level, LayersParams::default()).unwrap();
+        assert_eq!(bits(&layers), bits(&on));
+        assert!(LiveLayout::rings_on(handed(), &level[1..], RingsParams::default()).is_err());
+
+        // Growing: to the graph, or to its adjacency.
+        let mut bigger = Graph::new(g.n_nodes(), g.src().to_vec(), g.dst().to_vec()).unwrap();
+        bigger.append(3, &[0, 400, 401], &[400, 401, 402]).unwrap();
+        let (mut a, mut b) = (of_graph, of_parts);
+        a.grow(&bigger, Growth::default()).unwrap();
+        b.grow_on(Arc::clone(bigger.adjacency()), Growth::default())
+            .unwrap();
+        while !a.is_done() {
+            a.step(10);
+            b.step(10);
+        }
+        assert_eq!(bits(&a), bits(&b));
+        assert!(b
+            .grow_on(Arc::clone(g.adjacency()), Growth::default())
+            .is_err());
+    }
+
+    #[test]
     fn a_live_layout_is_layout_fa2() {
         let g = square();
         let params = Fa2Params::default();

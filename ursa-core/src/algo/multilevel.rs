@@ -311,7 +311,7 @@ fn contract(
         }
     }
 
-    let rows = coarse_rows(adj, weights, mass, group, &member_offsets, &members);
+    let rows = coarse_rows(adj, weights, mass, group, &member_offsets, &members, None);
     Coarse {
         n: nc,
         entries: rows.targets.len(),
@@ -336,9 +336,11 @@ struct Rows {
     mass: Vec<f32>,
 }
 
-/// How many coarse nodes' rows are gathered before they are appended: the
-/// rows of a run are held twice for a moment, the whole level never.
-const ROW_RUN: usize = 1 << 12;
+/// How many adjacency entries of the level below go into the rows gathered
+/// before they are appended (a run of coarse nodes; at least one): the rows
+/// of a run are held twice for a moment, the whole level never. Counted in
+/// entries, not nodes: a dense level has few nodes and long rows.
+const ROW_RUN: usize = 1 << 17;
 
 /// The rows of the coarse level whose node `c` has the members
 /// `members[member_offsets[c]..member_offsets[c + 1]]` of the level below
@@ -350,6 +352,9 @@ const ROW_RUN: usize = 1 << 12;
 /// anyway (members in index order, a stable sort). The rows are gathered a
 /// run of nodes at a time, in parallel within a run, and appended in order,
 /// so the result does not depend on the run's length or the thread count.
+///
+/// `weights_only` is for a level made before, of that many entries: only
+/// [`Rows::weights`] is filled, which is all a lean hierarchy let go of.
 fn coarse_rows(
     adj: &UndirectedCsr,
     weights: Option<&[f32]>,
@@ -357,18 +362,30 @@ fn coarse_rows(
     group: &[u32],
     member_offsets: &[u32],
     members: &[u32],
+    weights_only: Option<usize>,
 ) -> Rows {
     let nc = member_offsets.len() - 1;
-    // No more entries than the level below has.
-    let most = adj.targets.len();
-    let mut offsets = Vec::with_capacity(nc + 1);
-    offsets.push(0u64);
-    let mut targets: Vec<u32> = Vec::with_capacity(most);
+    // No more entries than the level below has; or exactly as many as the
+    // level had when it was first made.
+    let most = weights_only.unwrap_or(adj.targets.len());
+    let all = weights_only.is_none();
+    let mut offsets = Vec::with_capacity(if all { nc + 1 } else { 0 });
+    let mut targets: Vec<u32> = Vec::with_capacity(if all { most } else { 0 });
     let mut weights_out: Vec<f32> = Vec::with_capacity(most);
-    let mut mass_out = Vec::with_capacity(nc);
+    let mut mass_out = Vec::with_capacity(if all { nc } else { 0 });
+    if all {
+        offsets.push(0u64);
+    }
     let mut start = 0;
     while start < nc {
-        let end = nc.min(start + ROW_RUN);
+        let mut end = start;
+        let mut entries = 0;
+        while end < nc && (end == start || entries < ROW_RUN) {
+            for &u in &members[member_offsets[end] as usize..member_offsets[end + 1] as usize] {
+                entries += adj.degree(u);
+            }
+            end += 1;
+        }
         let rows: Vec<(Vec<u32>, Vec<f32>, f32)> = (start..end)
             .into_par_iter()
             .map_init(Vec::<(u32, f32)>::new, |scratch, c| {
@@ -401,10 +418,12 @@ fn coarse_rows(
             })
             .collect();
         for (t, w, m) in rows {
-            targets.extend_from_slice(&t);
             weights_out.extend_from_slice(&w);
-            offsets.push(targets.len() as u64);
-            mass_out.push(m);
+            if all {
+                targets.extend_from_slice(&t);
+                offsets.push(targets.len() as u64);
+                mass_out.push(m);
+            }
         }
         start = end;
     }
@@ -834,8 +853,17 @@ impl Fa2Multilevel {
                 Some(b) => (&b.adj, Some(&b.weights[..]), &b.mass[..]),
             };
             let group = level.groups();
-            let rows = coarse_rows(a, w, m, &group, &level.member_offsets, &level.members);
-            debug_assert_eq!(rows.targets, level.adj.targets);
+            let rows = coarse_rows(
+                a,
+                w,
+                m,
+                &group,
+                &level.member_offsets,
+                &level.members,
+                Some(level.entries),
+            );
+            drop(group);
+            debug_assert_eq!(rows.weights.len(), level.entries);
             level.weights = rows.weights;
             // The level between gave what it was made again for.
             if i - 1 > from {
