@@ -439,8 +439,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   dataset, from a `hop` result, a double-click's frame comes 118 to 190 ms
   after it in headless Chromium. The pane's view is now made with
   `createViewFromResult`, so that deltas apply to it. Such a view also
-  draws the result's own highlights: a path's route is highlighted and a
-  `hop`'s seeds are ringed, with the rest dimmed. It costs more for a whole
+  draws the result's own highlights: a path's route is highlighted, with
+  the rest dimmed, and a `hop`'s seeds are ringed (a seed alone dims
+  nothing, so a neighbourhood and what is expanded from it stay at full
+  strength). It costs more for a whole
   graph: at 1M edges the view's heap is 60 MiB (it was 16) and decoding the
   result is one 63 to 92 ms task on the page's thread.
 - **Exploring a drawn graph from the terminal: `.expand`, `.hide`, `.show`,

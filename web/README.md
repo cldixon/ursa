@@ -270,8 +270,8 @@ static assets and an R2 bucket.
     and "other", stepped for each theme; and `--graph-highlight`,
     `--graph-selection` and `--graph-pin` for the view's highlight layer,
     #435: a selection's rings and edges, and, since the view is made from
-    the result, #443, the result's own highlights, a path's route and a
-    hop's seeds ringed with the rest dimmed), set with `view.setTheme(…)`; the
+    the result, #443, the result's own highlights, a path's route, with the rest
+    dimmed, and a hop's seeds ringed), set with `view.setTheme(…)`; the
     theme toggle (or the system's) recolours an open view. No CSS filter.
   - **Progress** (#390): the pane opens with "Loading graph view…" as soon
     as the engine takes more than 150 ms (not at all, for a quick error),
