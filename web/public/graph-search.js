@@ -96,6 +96,8 @@ export function setup({ form, input, button, list, status, run, focusView }) {
         add.addEventListener("click", () => {
           li.remove();
           if (!items.children.length) clear();
+          // The button is gone: the focus is the graph's, not nowhere.
+          focusView();
           run(`.show ${idWord(key)}`);
         });
         li.append(" ", add);

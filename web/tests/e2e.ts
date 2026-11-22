@@ -1347,6 +1347,9 @@ for (const scheme of ["light", "dark"] as const) {
     await idle(s);
     const shown = await s.evaluate(() => (window as any).ursaShell.explored());
     check(shown.command === ".show 31" && shown.deltaBytes > 0 && squeezed(await after(".show 31", s)).startsWith(squeezed("+1 node")), "its button runs .show in the shell", JSON.stringify(shown));
+    // The button is gone, and the focus is the graph's.
+    check((await s.evaluate(() => document.activeElement?.tagName)) === "CANVAS" && !(await s.evaluate(() => document.querySelector("#graph-found button.add"))), "the focus goes back to the graph");
+    await s.click("#terminal");
     const sql = await said(".find 3 --sql");
     check(sql.startsWith(squeezed('SELECT CAST("id" AS VARCHAR) AS node')) && (await graphInfo(s)).selection.length === 1, ".find --sql prints the SQL and selects nothing", sql.slice(0, 80));
     check((await errors(s)) === before, "search prints no error");
@@ -1538,12 +1541,12 @@ for (const scheme of ["light", "dark"] as const) {
     const ms: number[] = [];
     let last: any = null;
     let capped = "";
-    for (const key of ["77", "4242", "9999"]) {
+    for (const key of ["1", "4242", "9999"]) {
       await type(`.find ${key}`, r);
       last = await r.evaluate(() => (window as any).ursaShell.found());
       ms.push(Math.round(last.ms));
       // More matches than are selected: the status says how many there were.
-      if (key === "77") capped = `${last.selected} of ${last.matched}: ${((await r.locator("#graph-status").textContent()) ?? "").slice(0, 60)}`;
+      if (key === "1") capped = `${last.selected} of ${last.matched}: ${((await r.locator("#graph-status").textContent()) ?? "").slice(0, 60)}`;
     }
     check(/^1000 of (\d+): Selected 1,000 of [\d,]+ matching nodes: /.test(capped) && Number(capped.match(/of (\d+)/)![1]) > 1000, "at most 1,000 matches are selected, and the status says how many there were", capped);
     const sorted = [...ms].sort((a, b) => a - b);
