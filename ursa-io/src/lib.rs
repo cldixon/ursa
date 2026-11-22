@@ -19,6 +19,8 @@
 //! - [`runtime`]: the process-wide Tokio runtime blocking reads run on.
 //! - [`dry`]: dry runs, which read a file's schema but no rows.
 //! - [`types`]: Arrow types as messages name them.
+//! - [`parquet_footer`]: a Parquet file's footer checked before it is read,
+//!   so a truncated or fake file is an error rather than a panic (#332).
 //!
 //! Errors are [`DataFusionError`]s, the engine error the scan's reads raise,
 //! with Ursa's own messages carried in one (a CSV value error as
@@ -27,6 +29,7 @@
 pub mod csv;
 pub mod dry;
 pub mod ids;
+pub mod parquet_footer;
 mod parquet_stats;
 pub mod runtime;
 pub mod scan;

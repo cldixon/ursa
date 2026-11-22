@@ -398,6 +398,10 @@ fn listing_key(table: &ListingTable) -> String {
 
 /// A file format and the options of it that change what is read.
 fn format_key(format: &dyn DataFusionFileFormat) -> String {
+    // The footer check (#332) changes nothing that is read.
+    if let Some(valid) = format.downcast_ref::<ursa_io::parquet_footer::ValidParquet>() {
+        return format_key(valid.inner().as_ref());
+    }
     if let Some(csv) = format.downcast_ref::<CsvFormat>() {
         let o = csv.options();
         return format!(
