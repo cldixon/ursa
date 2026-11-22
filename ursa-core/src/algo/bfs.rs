@@ -1,42 +1,44 @@
 //! Single-source breadth-first search — the frontier kernel behind unweighted
 //! `shortest_path` and the BFS-derived stats (`diameter`, `avg_path_length`).
 //!
-//! Two variants share one frontier loop: [`bfs_distances`] records the hop
-//! distance to every node (for the stats), and [`shortest_path`] additionally
-//! keeps predecessor pointers so a single source→target path can be
-//! reconstructed. Both run to exhaustion (no `k` cap, unlike `k_hop`).
+//! Two variants: [`bfs_distances`] records the hop distance to every node, and
+//! [`shortest_path`] keeps predecessor pointers so a single source→target path
+//! can be reconstructed. Both run to exhaustion (no `k` cap, unlike `k_hop`).
+//! `bfs_distances` switches direction on large levels (see the `frontier` module);
+//! `shortest_path` stays top-down, because which of several shortest paths it
+//! returns depends on the order the search finds nodes in.
 //!
 //! Direction is a per-operation parameter. `Both` is a true undirected walk over
 //! out- and in-neighbours, via the shared [`Topology::for_each_neighbor`] /
 //! [`Topology::for_each_weighted_neighbor`] helpers.
 
+use super::frontier::Frontier;
 use crate::topology::{Direction, EdgeMask, Topology};
 
 /// Hop distance from `source` to every node: `dist[v]` is the number of edges on
 /// a shortest `source → v` path, or `-1` if `v` is unreachable. `dist[source]` is
 /// `0`. An out-of-range `source` yields an all-`-1` vector.
+///
+/// The search switches to bottom-up steps on large levels and may split those
+/// across threads (see the `frontier` module); the distances are the same.
 pub fn bfs_distances(topo: &Topology, source: u32, dir: Direction) -> Vec<i32> {
     let n = topo.n_nodes();
     let mut dist = vec![-1i32; n];
     if (source as usize) >= n {
         return dist;
     }
+    if dir != Direction::Out {
+        topo.incoming();
+    }
     dist[source as usize] = 0;
-    let mut frontier = vec![source];
-    let mut next = Vec::new();
+    let mut search = Frontier::once(n);
+    search.start(topo, dir, &[source]);
     let mut level = 1;
-    while !frontier.is_empty() {
-        next.clear();
-        for &u in &frontier {
-            topo.for_each_neighbor(u, dir, None, |v| {
-                if dist[v as usize] < 0 {
-                    dist[v as usize] = level;
-                    next.push(v);
-                }
-            });
+    while search.advance(topo, dir, None) {
+        for &v in search.level() {
+            dist[v as usize] = level;
         }
         level += 1;
-        std::mem::swap(&mut frontier, &mut next);
     }
     dist
 }

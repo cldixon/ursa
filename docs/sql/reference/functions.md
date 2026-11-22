@@ -325,7 +325,7 @@ layout_fr(graph, iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)
 
 ### hop
 
-The nodes within n steps of each seed: one (seed, id, distance) row per seed and node reached, distance the fewest steps from the seed to it. A seed is not its own row; a repeated seed repeats its rows.
+The nodes within n steps of each seed: one (seed, id, distance) row per seed and node reached, distance the fewest steps from the seed to it. A seed is not its own row; a repeated seed repeats its rows. The rows come in no particular order; use ORDER BY for one.
 
 ```text
 hop(graph, seeds => …, n => 1, direction => 'out')

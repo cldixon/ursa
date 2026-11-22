@@ -5,36 +5,18 @@
 //! pair per reached node — so it flows back out as an `EdgeFrame` whose `src` is
 //! the seed and whose `dst` is the reached node.
 //!
-//! This is a plain breadth-first frontier expansion per seed: a `visited` bitmap
-//! bounds each seed's search to `n_nodes`, and the frontier advances exactly `k`
-//! levels. The seed itself is not emitted as its own reached node (0 hops); a
-//! node reached from a seed is emitted once, at the first level it appears.
-//! Direction-optimizing BFS (Beamer top-down/bottom-up) is deferred — correctness
-//! first, per the spec's "naive placement first" stance.
+//! This is a breadth-first frontier expansion per seed: a `visited` flag per
+//! node bounds each seed's search to `n_nodes`, and the frontier advances at
+//! most `k` levels. The seed itself is not emitted as its own reached node (0
+//! hops); a node reached from a seed is emitted once, at the first level it
+//! appears. Large levels are expanded bottom-up (direction-optimizing BFS, see
+//! the `frontier` module, #452): the same nodes at the same distances, but a
+//! level's nodes are not in the order a top-down search finds them.
 
 use crate::parallel::*;
 
+use super::frontier::Frontier;
 use crate::topology::{Direction, EdgeMask, Topology};
-
-/// Per-worker reusable BFS scratch, so a parallel seed sweep allocates the
-/// `n`-sized `visited` bitmap once per thread instead of once per seed.
-struct Scratch {
-    visited: Vec<bool>,
-    frontier: Vec<u32>,
-    next: Vec<u32>,
-    touched: Vec<u32>,
-}
-
-impl Scratch {
-    fn new(n: usize) -> Self {
-        Scratch {
-            visited: vec![false; n],
-            frontier: Vec::new(),
-            next: Vec::new(),
-            touched: Vec::new(),
-        }
-    }
-}
 
 /// For each seed, gather the nodes reachable within `k` hops (`k >= 1`).
 ///
@@ -46,9 +28,16 @@ impl Scratch {
 /// `k == 0` contribute nothing. `Both` walks out- and in-neighbours together (an
 /// undirected hop).
 ///
+/// **Row order.** The rows of each seed are together, the seeds in the order
+/// given, and within a seed the nearer levels first. The order of the nodes
+/// within one level is not defined: a small level is in the order the search
+/// finds them, a large one (expanded bottom-up) in node order. It depends only
+/// on the graph, the mask and the arguments, never on the thread count.
+///
 /// Each seed's BFS is independent, so the seed set is swept in parallel (rayon)
-/// with a per-worker reusable `Scratch`. Per-seed outputs are concatenated in
-/// seed order, so the result is byte-for-byte identical to a serial sweep.
+/// with a per-worker reusable search state; one seed alone splits its large
+/// levels across threads instead. Per-seed outputs are concatenated in seed
+/// order, so the result is byte-for-byte identical to a serial sweep.
 pub fn k_hop(topo: &Topology, seeds: &[u32], k: u32, dir: Direction) -> (Vec<u32>, Vec<u32>) {
     k_hop_masked(topo, None, seeds, k, dir)
 }
@@ -86,16 +75,23 @@ pub fn k_hop_distances_masked(
         topo.incoming();
     }
     // One (reached, distance) list per seed, in seed order.
-    let per_seed: Vec<(u32, Vec<u32>, Vec<u32>)> = seeds
-        .par_iter()
-        .map_init(
-            || Scratch::new(n),
-            |scratch, &seed| {
-                let (reached, distance) = bfs_seed(topo, mask, seed, k, dir, scratch);
-                (seed, reached, distance)
-            },
-        )
-        .collect();
+    let per_seed: Vec<(u32, Vec<u32>, Vec<u32>)> = if let [seed] = *seeds {
+        // One search: its bottom-up levels may use every thread.
+        let (reached, distance) =
+            bfs_seed(topo, mask, seed, k, dir, &mut Frontier::new(n).parallel());
+        vec![(seed, reached, distance)]
+    } else {
+        seeds
+            .par_iter()
+            .map_init(
+                || Frontier::new(n),
+                |search, &seed| {
+                    let (reached, distance) = bfs_seed(topo, mask, seed, k, dir, search);
+                    (seed, reached, distance)
+                },
+            )
+            .collect()
+    };
 
     let total: usize = per_seed.iter().map(|(_, r, _)| r.len()).sum();
     let mut src_out = Vec::with_capacity(total);
@@ -110,59 +106,31 @@ pub fn k_hop_distances_masked(
 }
 
 /// BFS from a single seed to depth `k`, returning the nodes it reaches and the
-/// level (1-based) at which each was first reached. Uses and restores
-/// `scratch` (only the touched nodes are reset) so it is reusable across seeds
-/// handled by the same worker.
+/// level (1-based) at which each was first reached. Uses and resets `search`
+/// so it is reusable across seeds handled by the same worker.
 fn bfs_seed(
     topo: &Topology,
     mask: Option<&EdgeMask>,
     seed: u32,
     k: u32,
     dir: Direction,
-    scratch: &mut Scratch,
+    search: &mut Frontier,
 ) -> (Vec<u32>, Vec<u32>) {
-    let n = topo.n_nodes();
     let mut dst_out: Vec<u32> = Vec::new();
     let mut distance_out: Vec<u32> = Vec::new();
-    if (seed as usize) >= n {
+    if (seed as usize) >= topo.n_nodes() {
         return (dst_out, distance_out); // unknown seed
     }
-
-    let Scratch {
-        visited,
-        frontier,
-        next,
-        touched,
-    } = scratch;
-    visited[seed as usize] = true;
-    frontier.clear();
-    frontier.push(seed);
-    touched.clear();
-    touched.push(seed);
-
+    search.start(topo, dir, &[seed]);
     for level in 1..=k {
-        next.clear();
-        for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, mask, |v| {
-                if !visited[v as usize] {
-                    visited[v as usize] = true;
-                    touched.push(v);
-                    next.push(v);
-                    dst_out.push(v);
-                    distance_out.push(level);
-                }
-            });
-        }
-        if next.is_empty() {
+        if !search.advance(topo, dir, mask) {
             break;
         }
-        std::mem::swap(frontier, next);
+        let reached = search.level();
+        dst_out.extend_from_slice(reached);
+        distance_out.extend(std::iter::repeat_n(level, reached.len()));
     }
-
-    // Restore visited for the next seed on this worker.
-    for &t in touched.iter() {
-        visited[t as usize] = false;
-    }
+    search.reset();
     (dst_out, distance_out)
 }
 
@@ -194,33 +162,17 @@ pub fn k_hop_reached_masked(
     k: u32,
     dir: Direction,
 ) -> Vec<bool> {
-    let n = topo.n_nodes();
-    let mut visited = vec![false; n];
-    let mut frontier: Vec<u32> = Vec::new();
-    for &s in seeds {
-        if (s as usize) < n && !visited[s as usize] {
-            visited[s as usize] = true;
-            frontier.push(s);
-        }
+    if dir != Direction::Out {
+        topo.incoming();
     }
-
-    let mut next: Vec<u32> = Vec::new();
+    let mut search = Frontier::once(topo.n_nodes());
+    search.start(topo, dir, seeds);
     for _level in 0..k {
-        next.clear();
-        for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, mask, |v| {
-                if !visited[v as usize] {
-                    visited[v as usize] = true;
-                    next.push(v);
-                }
-            });
-        }
-        if next.is_empty() {
+        if !search.advance(topo, dir, mask) {
             break;
         }
-        std::mem::swap(&mut frontier, &mut next);
     }
-    visited
+    search.into_visited()
 }
 
 #[cfg(test)]

@@ -252,7 +252,8 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
         name: "hop",
         summary: "The nodes within n steps of each seed: one (seed, id, distance) row per seed \
                   and node reached, distance the fewest steps from the seed to it. A seed is not \
-                  its own row; a repeated seed repeats its rows.",
+                  its own row; a repeated seed repeats its rows. The rows come in no particular \
+                  order; use ORDER BY for one.",
         networkx: Some(
             "nx.single_source_shortest_path_length(G, seed, cutoff=n), the seed left out \
              (in: on G.reverse(); both: on U)",

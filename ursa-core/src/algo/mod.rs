@@ -22,6 +22,7 @@ mod closeness;
 mod clustering;
 mod components;
 mod degree;
+pub(crate) mod frontier;
 mod hop;
 mod induced;
 mod label_prop;

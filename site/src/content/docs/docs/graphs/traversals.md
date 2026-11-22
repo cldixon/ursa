@@ -30,7 +30,7 @@ SELECT * FROM hop(karate,
                   n => 2);
 ```
 
-The second query returns 39 rows: each node within two steps of an Officer member, following edges in their stored direction, once for each member that reaches it. The seeds query runs as part of the same plan, so a filter in it is pushed into the scan of `karate_nodes.csv`. A seed that is not in the graph reaches nothing.
+The second query returns 39 rows: each node within two steps of an Officer member, following edges in their stored direction, once for each member that reaches it. The seeds query runs as part of the same plan, so a filter in it is pushed into the scan of `karate_nodes.csv`. A seed that is not in the graph reaches nothing. The rows come back in no particular order, which can differ from one run to another; add `ORDER BY` (for example `ORDER BY seed, distance, id`) when the order matters.
 
 ## random_walk
 

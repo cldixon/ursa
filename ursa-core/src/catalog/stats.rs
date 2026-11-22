@@ -13,6 +13,7 @@
 //! dropped) — which is what NetworkX reports for `G.to_undirected()`.
 
 use crate::algo::connected_components_weak;
+use crate::algo::frontier::Frontier;
 use crate::parallel::*;
 use crate::topology::{Direction, EdgeMask, Topology};
 
@@ -198,64 +199,31 @@ fn sample_sources(n: usize, frac: Option<f64>) -> Vec<u32> {
     }
 }
 
-/// Reusable per-source BFS scratch for [`bfs_source_scan`]. `touched` lists the
-/// nodes reached from the current source, so the fold and the reset cost
-/// `O(reached)` rather than a fresh `n`-length distance array per source.
-struct ScanScratch {
-    dist: Vec<i32>,
-    frontier: Vec<u32>,
-    next: Vec<u32>,
-    touched: Vec<u32>,
-}
-
-/// One source's `(sum, count, max)` over the finite distances `>= 1`, on
-/// reusable scratch (clean on entry, reset to clean on exit). The distances are
-/// integers, so the `f64` sum is exact.
+/// One source's `(sum, count, max)` over the finite distances `>= 1`, on a
+/// reusable search state (clean on entry, reset to clean on exit). The
+/// distances are integers, so the `f64` sum is exact. Each level adds `level ×
+/// its size`, so the order a level's nodes are found in (top-down or bottom-up,
+/// see `algo::frontier`) does not matter.
 fn bfs_fold_one(
     topo: &Topology,
     s: u32,
     dir: Direction,
     mask: Option<&EdgeMask>,
-    sc: &mut ScanScratch,
+    search: &mut Frontier,
 ) -> (f64, u64, i32) {
-    let ScanScratch {
-        dist,
-        frontier,
-        next,
-        touched,
-    } = sc;
-    dist[s as usize] = 0;
-    frontier.push(s);
     let mut level = 1i32;
     let mut sum = 0.0f64;
     let mut count = 0u64;
     let mut max = 0i32;
-    while !frontier.is_empty() {
-        next.clear();
-        for &u in frontier.iter() {
-            topo.for_each_neighbor(u, dir, mask, |v| {
-                if dist[v as usize] < 0 {
-                    dist[v as usize] = level;
-                    next.push(v);
-                }
-            });
-        }
-        if !next.is_empty() {
-            sum += level as f64 * next.len() as f64;
-            count += next.len() as u64;
-            max = level;
-        }
-        touched.extend_from_slice(next);
+    search.start(topo, dir, &[s]);
+    while search.advance(topo, dir, mask) {
+        let size = search.level().len();
+        sum += level as f64 * size as f64;
+        count += size as u64;
+        max = level;
         level += 1;
-        std::mem::swap(frontier, next);
     }
-    dist[s as usize] = -1;
-    for &v in touched.iter() {
-        dist[v as usize] = -1;
-    }
-    touched.clear();
-    frontier.clear();
-    next.clear();
+    search.reset();
     (sum, count, max)
 }
 
@@ -279,13 +247,8 @@ pub(crate) fn bfs_source_scan(
     let partials: Vec<(f64, u64, i32)> = sources
         .par_iter()
         .map_init(
-            || ScanScratch {
-                dist: vec![-1i32; n],
-                frontier: Vec::new(),
-                next: Vec::new(),
-                touched: Vec::new(),
-            },
-            |sc, &s| bfs_fold_one(topo, s, dir, mask, sc),
+            || Frontier::new(n),
+            |search, &s| bfs_fold_one(topo, s, dir, mask, search),
         )
         .collect();
 

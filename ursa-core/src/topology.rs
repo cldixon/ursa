@@ -830,6 +830,20 @@ impl Topology {
         (incoming.targets.len() == self.n_edges && checked.is_ok()).then_some(incoming)
     }
 
+    /// Whether [`Topology::incoming`] would return without building the
+    /// transpose: it is built, it is the out-adjacency (a symmetric view), or a
+    /// stored one is waiting to be read. Nothing is built or read.
+    pub fn incoming_is_cheap(&self) -> bool {
+        self.self_transpose
+            || self.inc.get().is_some()
+            || self
+                .inc_loader
+                .0
+                .lock()
+                .map(|l| l.is_some())
+                .unwrap_or_else(|e| e.into_inner().is_some())
+    }
+
     /// The in-adjacency if it has been built (or loaded), without building or
     /// loading it.
     pub fn incoming_if_built(&self) -> Option<&Adjacency> {

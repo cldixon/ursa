@@ -10,7 +10,7 @@ edges = ur.datasets.load_karate()
 
 ## Hops
 
-`ur.hop(edges, n).from_(seeds)` gives every node within `n` edges of each seed. The result is an `EdgeFrame` with one row per `(seed, reached)` pair, in the columns `src` and `dst`.
+`ur.hop(edges, n).from_(seeds)` gives every node within `n` edges of each seed. The result is an `EdgeFrame` with one row per `(seed, reached)` pair, in the columns `src` and `dst`. The rows come in no particular order, which can differ from one run to another; sort the result (`.sort(...)`) when the order matters.
 
 ```python
 within_two = ur.hop(edges, n=2, direction="both").from_([0, 33])
