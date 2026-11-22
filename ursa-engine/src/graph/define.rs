@@ -616,10 +616,16 @@ pub fn drop_graph(ctx: &SessionContext, name: &str, if_exists: bool) -> Result<(
 /// defined when the database was opened, and `message` says why (#381).
 /// Using it fails with `message` until it is dropped or replaced: its
 /// functions, `GRAPH_TABLE`, `DESCRIBE GRAPH`, and its `edges` and `nodes`
-/// tables, for which it gets its schema (#401).
-pub fn mark_unavailable(ctx: &SessionContext, name: &str, message: impl Into<String>) {
+/// tables, for which it gets its schema (#401). `definition`, its stored
+/// definition if it could be read, is what `SHOW GRAPHS` lists for it.
+pub fn mark_unavailable(
+    ctx: &SessionContext,
+    name: &str,
+    message: impl Into<String>,
+    definition: Option<GraphSpec>,
+) {
     let state = ctx.state();
-    registry(&state).mark_unavailable(name, message);
+    registry(&state).mark_unavailable(name, message, definition);
     if let Ok(catalog) = default_catalog_inner(&state) {
         if catalog.schema(name).is_none() {
             let schema = Arc::new(GraphSchema::new(name.to_string(), ctx.state_weak_ref()));

@@ -11,10 +11,12 @@ use datafusion::execution::context::SessionState;
 
 use super::define::unknown_graph;
 use super::schema::{edges_plan, graph_table, nodes_plan, EDGES, ID, NODES};
-use super::{registry, GraphRegistry, PropertyGraph};
+use super::{registry, GraphRegistry, GraphSpec, PropertyGraph};
+use crate::paths::looks_like_location;
 
 /// `SHOW GRAPHS`: one row per edge table of each graph (one row for a graph
-/// with no edge tables), sorted by graph name, with its definition.
+/// with no edge tables), sorted by graph name, with its definition and
+/// whether it can be used.
 ///
 /// | column         | value                                                     |
 /// | -------------- | --------------------------------------------------------- |
@@ -24,23 +26,33 @@ use super::{registry, GraphRegistry, PropertyGraph};
 /// | `destination`  | its `DESTINATION KEY` column                              |
 /// | `vertex_table` | the vertex table its endpoints refer to, or NULL          |
 /// | `vertex_key`   | that vertex table's key column, or NULL                   |
+/// | `status`       | `ok`, or `unavailable`                                    |
+/// | `reason`       | why it is unavailable and how to repair it, or NULL       |
 ///
 /// A graph with one edge table and at most one vertex table, as every graph
 /// before #295, has one row, as before.
+///
+/// A graph of the database that could not be defined when it was opened
+/// (#381) is listed too (#401), from its stored definition: `status` is
+/// `unavailable`, and `reason` is what its notice and using it say, after
+/// `graph g is unavailable: `. A vertex key the definition leaves out is
+/// NULL, since finding it needs the table; a definition that cannot be read
+/// gives one row with only the name.
 pub fn show_graphs(state: &SessionState) -> Result<RecordBatch> {
     let graphs = registry(state);
-    let mut rows: Vec<[Option<String>; 6]> = Vec::new();
+    let mut rows: Vec<[Option<String>; 8]> = Vec::new();
+    let ok = |row: [Option<String>; 6]| extend(row, "ok", None);
     for g in graphs.all() {
         if g.edge_tables.is_empty() {
             for v in &g.vertex_tables {
-                rows.push([
+                rows.push(ok([
                     Some(g.name.clone()),
                     None,
                     None,
                     None,
                     Some(table_name(&graphs, &g, &v.table)),
                     Some(v.key.clone()),
-                ]);
+                ]));
             }
             continue;
         }
@@ -48,17 +60,51 @@ pub fn show_graphs(state: &SessionState) -> Result<RecordBatch> {
             let vertex = g
                 .endpoint_vertex(e, true)
                 .or_else(|| g.endpoint_vertex(e, false));
-            rows.push([
+            rows.push(ok([
                 Some(g.name.clone()),
                 Some(table_name(&graphs, &g, &e.table)),
                 Some(e.source.clone()),
                 Some(e.destination.clone()),
                 vertex.map(|v| table_name(&graphs, &g, &v.table)),
                 vertex.map(|v| v.key.clone()),
-            ]);
+            ]));
         }
     }
-    let columns = (0..6)
+    for g in graphs.all_unavailable() {
+        if graphs.get(&g.name).is_some() {
+            continue;
+        }
+        let reason = g
+            .message
+            .split_once(" is unavailable: ")
+            .map_or(g.message.as_str(), |(_, why)| why);
+        let unavailable = |row| extend(row, "unavailable", Some(reason));
+        let definition = g.definition.as_ref();
+        let specs = definition.map(definition_rows).unwrap_or_default();
+        if specs.is_empty() {
+            rows.push(unavailable([
+                Some(g.name.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]));
+        }
+        for [edge_table, source, destination, vertex_table, vertex_key] in specs {
+            rows.push(unavailable([
+                Some(g.name.clone()),
+                edge_table,
+                source,
+                destination,
+                vertex_table,
+                vertex_key,
+            ]));
+        }
+    }
+    // Stable: a graph's rows keep their order.
+    rows.sort_by(|a, b| a[0].cmp(&b[0]));
+    let columns = (0..8)
         .map(|i| Arc::new(rows.iter().map(|r| r[i].clone()).collect::<StringArray>()) as ArrayRef)
         .collect();
     let schema = Schema::new(vec![
@@ -68,8 +114,65 @@ pub fn show_graphs(state: &SessionState) -> Result<RecordBatch> {
         Field::new("destination", DataType::Utf8, true),
         Field::new("vertex_table", DataType::Utf8, true),
         Field::new("vertex_key", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("reason", DataType::Utf8, true),
     ]);
     Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
+}
+
+/// A `SHOW GRAPHS` row: the definition's six columns, then `status` and
+/// `reason`.
+fn extend(row: [Option<String>; 6], status: &str, reason: Option<&str>) -> [Option<String>; 8] {
+    let [name, edge_table, source, destination, vertex_table, vertex_key] = row;
+    [
+        name,
+        edge_table,
+        source,
+        destination,
+        vertex_table,
+        vertex_key,
+        Some(status.to_string()),
+        reason.map(str::to_string),
+    ]
+}
+
+/// The `SHOW GRAPHS` columns after `name` for an unavailable graph, from its
+/// stored definition: as for a graph that is defined, except that a vertex
+/// key left out is NULL.
+fn definition_rows(spec: &GraphSpec) -> Vec<[Option<String>; 5]> {
+    let table = |t: &TableReference| match t {
+        TableReference::Bare { table } if looks_like_location(table) => {
+            format!("'{}'", table.replace('\'', "''"))
+        }
+        _ => t.to_string(),
+    };
+    let vertex = |name: Option<&String>| match name {
+        Some(name) => spec.vertex_tables.iter().find(|v| &v.name == name),
+        None if spec.vertex_tables.len() == 1 => spec.vertex_tables.first(),
+        None => None,
+    };
+    if spec.edge_tables.is_empty() {
+        return spec
+            .vertex_tables
+            .iter()
+            .map(|v| [None, None, None, Some(table(&v.table)), v.key.clone()])
+            .collect();
+    }
+    spec.edge_tables
+        .iter()
+        .map(|e| {
+            let e = &e.edge;
+            let v =
+                vertex(e.source_vertex.as_ref()).or_else(|| vertex(e.destination_vertex.as_ref()));
+            [
+                Some(table(&e.table)),
+                Some(e.source.clone()),
+                Some(e.destination.clone()),
+                v.map(|v| table(&v.table)),
+                v.and_then(|v| v.key.clone()),
+            ]
+        })
+        .collect()
 }
 
 /// `DESCRIBE GRAPH name`: one row per column of `<name>.nodes`, then of

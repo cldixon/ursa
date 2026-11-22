@@ -689,3 +689,145 @@ async fn a_failed_replace_keeps_an_unavailable_external_table() {
     .await;
     assert_eq!(ok(&ctx, "FROM x").await, ["2"]);
 }
+
+#[tokio::test]
+async fn show_graphs_lists_unavailable_graphs_with_why() {
+    let fx = Fixture::new();
+    fx.write_csv("e.csv");
+    fx.write_csv("h.csv");
+    let (e_csv, h_csv) = (fx.path("e.csv"), fx.path("h.csv"));
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE VIEW ties AS FROM '{}'; CREATE VIEW members AS SELECT 1 AS id; \
+             CREATE VIEW w AS SELECT 1 AS src, 2 AS dst; \
+             CREATE PROPERTY GRAPH g VERTEX TABLES (members KEY (id)) EDGE TABLES (ties \
+             SOURCE KEY (a) REFERENCES members (id) DESTINATION KEY (b) REFERENCES members (id)); \
+             CREATE PROPERTY GRAPH h EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b)); \
+             CREATE PROPERTY GRAPH a EDGE TABLES (w SOURCE KEY (src) DESTINATION KEY (dst))",
+            e_csv.display(),
+            h_csv.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    let shown = ok(&ctx, "SHOW GRAPHS").await;
+    assert_eq!(
+        shown,
+        [
+            "a,w,src,dst,,,ok,".to_string(),
+            "g,ties,a,b,members,id,ok,".to_string(),
+            format!("h,'{}',a,b,,,ok,", h_csv.display()),
+        ]
+    );
+    drop(ctx);
+    std::fs::rename(&e_csv, fx.path("e-moved.csv")).unwrap();
+    std::fs::rename(&h_csv, fx.path("h-moved.csv")).unwrap();
+
+    let (ctx, said) = open(&fx.db(), &quick()).await;
+    let g = "it uses view ties, which is unavailable; repair ties, or DROP PROPERTY GRAPH g";
+    let h = format!(
+        "{}; DROP PROPERTY GRAPH h or restore the file",
+        no_file(&h_csv)
+    );
+    assert!(
+        said.contains(&format!("graph g is unavailable: {g}")),
+        "{said:?}"
+    );
+    assert!(
+        said.contains(&format!("graph h is unavailable: {h}")),
+        "{said:?}"
+    );
+    // Listed from their stored definitions, with why (#401).
+    assert_eq!(
+        ok(&ctx, "SHOW GRAPHS").await,
+        [
+            "a,w,src,dst,,,ok,".to_string(),
+            format!("g,ties,a,b,members,id,unavailable,{g}"),
+            format!("h,'{}',a,b,,,unavailable,{h}", h_csv.display()),
+        ]
+    );
+    // Defining one again without OR REPLACE says it exists, and why it is
+    // unavailable.
+    let e = err(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH h EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            fx.path("h-moved.csv").display()
+        ),
+    )
+    .await;
+    assert_eq!(
+        e,
+        format!(
+            "graph 'h' already exists (graph h is unavailable: {h}); replace it with CREATE \
+             OR REPLACE PROPERTY GRAPH"
+        )
+    );
+
+    // Repairing the view makes g usable again (#401).
+    ok(
+        &ctx,
+        &format!(
+            "CREATE OR REPLACE VIEW ties AS FROM '{}'",
+            fx.path("e-moved.csv").display()
+        ),
+    )
+    .await;
+    let rows = ok(&ctx, "SHOW GRAPHS").await;
+    assert_eq!(rows[1], "g,ties,a,b,members,id,ok,");
+    assert!(
+        rows[2].starts_with("h,") && rows[2].contains(",unavailable,"),
+        "{rows:?}"
+    );
+    // DROP takes h off the list.
+    ok(&ctx, "DROP PROPERTY GRAPH h").await;
+    assert_eq!(ok(&ctx, "SHOW GRAPHS").await.len(), 2);
+    // Defined again, it is listed as it was.
+    std::fs::rename(fx.path("h-moved.csv"), &h_csv).unwrap();
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH h EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            h_csv.display()
+        ),
+    )
+    .await;
+    assert_eq!(ok(&ctx, "SHOW GRAPHS").await, shown);
+}
+
+#[tokio::test]
+async fn show_graphs_says_ok_once_the_file_is_put_back() {
+    let fx = Fixture::new();
+    fx.write_csv("e.csv");
+    let e_csv = fx.path("e.csv");
+    let (ctx, _) = open(&fx.db(), &quick()).await;
+    ok(
+        &ctx,
+        &format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{}' SOURCE KEY (a) DESTINATION KEY (b))",
+            e_csv.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+    std::fs::rename(&e_csv, fx.path("kept.csv")).unwrap();
+    let (ctx, _) = open(&fx.db(), &OpenOptions::read_only()).await;
+    assert_eq!(
+        ok(&ctx, "SHOW GRAPHS").await,
+        [format!(
+            "g,'{}',a,b,,,unavailable,{}; DROP PROPERTY GRAPH g or restore the file",
+            e_csv.display(),
+            no_file(&e_csv)
+        )]
+    );
+    drop(ctx);
+    std::fs::rename(fx.path("kept.csv"), &e_csv).unwrap();
+    let (ctx, _) = open(&fx.db(), &OpenOptions::read_only()).await;
+    assert_eq!(
+        ok(&ctx, "SHOW GRAPHS").await,
+        [format!("g,'{}',a,b,,,ok,", e_csv.display())]
+    );
+}
