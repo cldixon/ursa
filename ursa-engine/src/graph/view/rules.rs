@@ -22,13 +22,18 @@
 //! A node key or an endpoint is an integer, a string or a date
 //! ([`id_kind`]): a float or a list is never a node id.
 //!
-//! A property graph named to `.graph` is drawn whole ([`Rule::Graph`]). The
-//! `AS …` clause that overrides the rules is #434.
+//! A property graph named to `.graph` is drawn whole ([`Rule::Graph`]).
+//!
+//! An `AS …` clause is rule 0 ([`read_as`], #434): it names the shape and
+//! the columns, and nothing is inferred. Its columns must still be what the
+//! shape needs (ids, lists of ids, whole numbers), and a column that is not
+//! is an error that names it and lists the result's columns.
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::Result;
 use ursa_core::catalog::OutputKind;
 
+use super::clauses::{As, Name};
 use super::plan_err;
 use super::style::per_node_algorithm;
 use crate::graph::functions;
@@ -266,6 +271,235 @@ pub(crate) fn read(schema: &Schema) -> Result<Reading> {
         }
     }
     read_named(schema, &cols)
+}
+
+/// The result's columns and their types, for a message.
+fn columns_of(schema: &Schema) -> String {
+    let columns: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("{} ({})", f.name(), f.data_type()))
+        .collect();
+    match columns.len() {
+        0 => "The result has no columns".to_string(),
+        1 => format!("The result's one column is {}", columns[0]),
+        _ => format!("The result's columns are {}", columns.join(", ")),
+    }
+}
+
+/// Rule 0: a result read as its `AS …` clause says. The clause names the
+/// columns; a column that is missing, or is not what the shape needs, is an
+/// error that names it, lists the result's columns and says what to write.
+///
+/// What the columns say of themselves still counts where the clause says
+/// nothing: their vertex and edge tables, and their graph (`ursa.graph`)
+/// unless `ON graph` names one (`on`).
+pub(crate) fn read_as(schema: &Schema, clause: &As, on: bool) -> Result<Reading> {
+    let written = clause.shown();
+    let columns = columns_of(schema);
+    // The column a name names: as written, or else, unquoted, in any case.
+    let find = |name: &Name| -> Result<usize> {
+        let fields = schema.fields();
+        let exact = fields.iter().position(|f| f.name() == &name.ident);
+        let quoted = name.shown.starts_with('"');
+        let found = exact.or_else(|| {
+            let mut any = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !quoted && f.name().eq_ignore_ascii_case(&name.ident));
+            match (any.next(), any.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        });
+        match found {
+            Some(i) => Ok(i),
+            None => plan_err(format!(
+                "{written}: the result has no column {}. {columns}; name one of them",
+                name.shown
+            )),
+        }
+    };
+    let get = |i: usize, key: &str| schema.field(i).metadata().get(key).cloned();
+    let wrong = |i: usize, needs: &str| -> Result<usize> {
+        let f = schema.field(i);
+        plan_err(format!(
+            "{written}: column {} is {} ({}), and {needs}. {columns}",
+            f.name(),
+            what_is(f.data_type()),
+            f.data_type()
+        ))
+    };
+    // A column that holds node ids.
+    let id = |name: &Name, what: &str| -> Result<usize> {
+        let i = find(name)?;
+        match id_kind(schema.field(i).data_type()) {
+            Some(_) => Ok(i),
+            None => wrong(
+                i,
+                &format!("{what} is an id: an integer, a string or a date"),
+            ),
+        }
+    };
+    let role = |i: usize, role: &str| (schema.field(i).name().to_string(), role.to_string());
+    let mut r = match clause {
+        As::Edges { src, dst, weight } => {
+            let (s, d) = (id(src, "an edge's end")?, id(dst, "an edge's end")?);
+            if s == d {
+                return plan_err(format!(
+                    "{written}: both ends are the column {}, so every edge would join a node \
+                     to itself. Name the two columns of an edge's ends. {columns}",
+                    schema.field(s).name()
+                ));
+            }
+            let mut r = Reading::of(Shape::Edges { src: s, dst: d });
+            r.roles = vec![role(s, meta::ROLE_SRC), role(d, meta::ROLE_DST)];
+            if let Some(weight) = weight {
+                let w = find(weight)?;
+                if !schema.field(w).data_type().is_numeric() {
+                    wrong(w, "an edge's weight is a number")?;
+                }
+                r.attributes.push(w);
+                r.roles.push(role(w, "weight"));
+            }
+            r.edge_label = schema
+                .fields()
+                .iter()
+                .find(|f| f.metadata().get(meta::ROLE).map(String::as_str) == Some(meta::ROLE_EDGE))
+                .and_then(|f| f.metadata().get(meta::LABEL).cloned());
+            r
+        }
+        As::Nodes { id: key } => {
+            let k = id(key, "a node's id")?;
+            let mut r = Reading::of(Shape::Nodes { id: k });
+            r.roles.push(role(k, meta::ROLE_NODE));
+            // The defaults of rule 5: the first metric sizes the nodes and
+            // the first category colours them.
+            let kind = |f: &Field| match f.metadata().get(meta::ROLE).map(String::as_str) {
+                Some(meta::ROLE_METRIC) => Some(OutputKind::Metric),
+                Some(meta::ROLE_CATEGORY) => Some(OutputKind::Category),
+                Some(_) => None,
+                None => kind_by_name(f.name(), f.data_type()),
+            };
+            let others = || {
+                schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != k)
+                    .map(|(i, f)| (i, f.as_ref()))
+            };
+            if let Some((i, _)) = others()
+                .find(|(_, f)| kind(f) == Some(OutputKind::Metric) && f.data_type().is_numeric())
+            {
+                r.size = Some(i);
+                r.roles.push(role(i, meta::ROLE_METRIC));
+            }
+            if let Some((i, _)) = others().find(|(_, f)| kind(f) == Some(OutputKind::Category)) {
+                r.color = Some(i);
+                r.roles.push(role(i, meta::ROLE_CATEGORY));
+            }
+            r
+        }
+        As::Path { nodes, edges } => {
+            let n = find(nodes)?;
+            if !is_id_list(schema.field(n).data_type()) {
+                wrong(
+                    n,
+                    "a path's nodes are a list of ids (integers, strings or dates), as \
+                     vertices(p) gives",
+                )?;
+            }
+            let e = match edges {
+                None => None,
+                Some(edges) => {
+                    let e = find(edges)?;
+                    if !list_of(schema.field(e).data_type()).is_some_and(DataType::is_integer) {
+                        wrong(
+                            e,
+                            "a path's edges are a list of the edges' row numbers, as edges(p) \
+                             gives; leave it out to draw the nodes alone, AS path(nodes)",
+                        )?;
+                    }
+                    Some(e)
+                }
+            };
+            // element_id(p) is nodes and edges alternating.
+            let elements = get(n, meta::ROLE).as_deref() == Some(meta::ROLE_PATH_ELEMENTS);
+            let mut r = Reading::of(Shape::Path {
+                nodes: (!elements).then_some(n),
+                edges: e.filter(|_| !elements),
+                elements: elements.then_some(n),
+            });
+            r.roles.push(role(
+                n,
+                if elements {
+                    meta::ROLE_PATH_ELEMENTS
+                } else {
+                    meta::ROLE_PATH_NODES
+                },
+            ));
+            if let Some(e) = e.filter(|_| !elements) {
+                r.roles.push(role(e, meta::ROLE_PATH_EDGES));
+                r.edge_label = get(e, meta::LABEL);
+            }
+            r
+        }
+        As::Hops {
+            seed,
+            id: key,
+            distance,
+        } => {
+            let (s, k) = (id(seed, "a seed")?, id(key, "a node reached")?);
+            let d = find(distance)?;
+            if !schema.field(d).data_type().is_integer() {
+                wrong(
+                    d,
+                    "a distance is a whole number of steps (CAST it to INTEGER if it is one)",
+                )?;
+            }
+            let mut r = Reading::of(Shape::Hop {
+                seed: s,
+                id: k,
+                distance: d,
+            });
+            r.roles = vec![
+                role(s, meta::ROLE_SEED),
+                role(k, meta::ROLE_NODE),
+                role(d, meta::ROLE_DISTANCE),
+            ];
+            r
+        }
+    };
+    // What the key columns say of themselves: their graph and their tables.
+    let keys: Vec<usize> = match &r.shape {
+        Shape::Edges { src, dst } => vec![*src, *dst],
+        Shape::Nodes { id } => vec![*id],
+        Shape::Path {
+            nodes, elements, ..
+        } => nodes.iter().chain(elements).copied().collect(),
+        Shape::Hop { seed, id, .. } => vec![*seed, *id],
+        Shape::Steps { .. } | Shape::Matches { .. } => Vec::new(),
+    };
+    for &k in &keys {
+        if let Some(label) = get(k, meta::LABEL) {
+            r.labels.push((k, label));
+            r.marked = true;
+        }
+        if let Some(graph) = get(k, meta::GRAPH).filter(|_| !on) {
+            match &r.graph {
+                Some(other) if *other != graph => {
+                    return plan_err(format!(
+                        "{written}: the columns come from the graphs {other} and {graph}, and \
+                         ids of two graphs do not meet. Name columns of one graph, or say \
+                         which graph the ids belong to: ON {other}"
+                    ))
+                }
+                _ => r.graph = Some(graph),
+            }
+        }
+    }
+    Ok(r)
 }
 
 /// The roles a node's key has.
@@ -728,6 +962,24 @@ fn id_kind(t: &DataType) -> Option<&'static str> {
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => Some("date"),
         t if t.is_integer() => Some("integer"),
         _ => None,
+    }
+}
+
+/// What a column of type `t` holds, in a word, for the message.
+fn what_is(t: &DataType) -> String {
+    if let Some(element) = list_of(t) {
+        return match id_kind(element) {
+            Some(kind) => format!("a list of {kind}s"),
+            None => "a list".to_string(),
+        };
+    }
+    match id_kind(t) {
+        Some("integer") => "an integer".to_string(),
+        Some(kind) => format!("a {kind}"),
+        None => match value_kind(t) {
+            "not an id" => "a value that is no id or number".to_string(),
+            kind => kind.to_string(),
+        },
     }
 }
 

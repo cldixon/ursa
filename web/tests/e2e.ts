@@ -1204,6 +1204,87 @@ for (const scheme of ["light", "dark"] as const) {
   }
   await s.keyboard.press("Escape");
   check(!(await graphOpen(s)), "Esc closes the drawing of a node table");
+  // AS, ON and LAYOUT (#434): the user says what a result is. Each form on
+  // columns of other names, which the rules read otherwise or not at all.
+  {
+    // Computed columns carry no metadata: by the rules, s and i are edges.
+    const hops = "SELECT seed + 0 AS s, id + 0 AS i, CAST(distance AS INT) AS far FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+    const pairs = "SELECT 'tie' AS tag, a.id AS x, b.id AS y FROM members a JOIN ties t ON t.src = a.id JOIN members b ON b.id = t.dst";
+    for (const [what, command, as, nodes, edges, legend, fixed] of [
+      // One of each form.
+      ["AS edges", `${pairs} AS edges(x, y)`, "edges (x, y)", 34, 78, "", false],
+      ["AS nodes", "SELECT id + 100 AS id, id AS who FROM members WHERE id < 5 AS nodes(who)", "nodes of karate (who)", 5, 7, "", false],
+      ["AS path", "SELECT 'route' AS id, [16, 5, 0, 8, 33, 26] AS stops AS path(stops)", "a path (stops)", 6, 5, "", true],
+      ["AS hops", `${hops} AS hops(s, i, far)`, "rings on karate (s, i, far)", 26, 59, "colour: distance0 (1)1 (16)2 (9)", true],
+      // ON names the graph, so an algorithm sizes rows drawn as edges.
+      ["ON graph", `${pairs} AS edges(x, y) ON karate SIZE BY pagerank`, "edges of karate (x, y)", 34, 78, "size: pagerank", false],
+      // LAYOUT overrides the rule: a hop by its edges' pull, in any order.
+      ["LAYOUT force", `${hops} LAYOUT force AS hops(s, i, far)`, "rings on karate (s, i, far)", 26, 59, "colour: distance", false],
+      ["LAYOUT layers", "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both') LAYOUT layers", "rings on karate (seed, id, distance)", 26, 59, "colour: distance", true],
+    ] as [string, string, string, number, number, string, boolean][]) {
+      const before = await errors(s);
+      await type(`.graph ${command}`, s);
+      const out = squeezed(await after(".graph", s));
+      await graphSettled(s);
+      const drawn = await graphInfo(s);
+      const status = (await s.locator("#graph-status").textContent()) ?? "";
+      const shown = ((await s.locator("#graph-legend").textContent()) ?? "").trim();
+      check(
+        out.includes(squeezed(`Drawing ${edges} edges, ${nodes} nodes as ${as} (`)) &&
+          drawn.nodes === nodes &&
+          drawn.edges === edges &&
+          drawn.drawnAs === as &&
+          status === `${nodes} nodes · ${edges} edges · drawn as ${as} · Done` &&
+          (legend === "" ? shown === "" : shown.includes(legend)) &&
+          // Rings and layers are placed at once; a force layout iterates.
+          (fixed ? drawn.iterations === 0 : drawn.iterations > 0) &&
+          (await errors(s)) === before,
+        `.graph … ${what}: drawn as ${as}`,
+        `${out.slice(-120)} | ${status} | ${shown} | ${JSON.stringify(drawn)}`,
+      );
+      await s.keyboard.press("Escape");
+    }
+    // On the last result, as the refusal of rule 6 says to.
+    await type("SELECT club, id AS member, id + 1 AS next FROM members WHERE id < 4;", s);
+    await type(".graph AS edges(member, next)", s);
+    await graphSettled(s);
+    {
+      const drawn = await graphInfo(s);
+      check(drawn.nodes === 5 && drawn.edges === 4 && drawn.drawnAs === "edges (member, next)", ".graph AS edges(…) draws the last result", JSON.stringify(drawn));
+    }
+    await s.keyboard.press("Escape");
+    // Every misuse says what to write, and draws nothing.
+    for (const [command, says] of [
+      [`${pairs} AS edges(x, z)`, ["AS edges(x, z): the result has no column z. The result's columns are tag (Utf8), x (Int64), y (Int64); name one of them"]],
+      [`${pairs} AS edges(tag)`, ["AS edges(…) takes the columns of an edge's two ends, and then its weight's, and was given 1: AS edges(src, dst [, weight])"]],
+      ["SELECT * FROM pagerank(karate) AS edges(id, pagerank)", ["AS edges(id, pagerank): column pagerank is a number that is not whole (Float64), and an edge's end is an id: an integer, a string or a date. The result's columns are id (Int64), pagerank (Float64)"]],
+      ["SELECT * FROM pagerank(karate) AS path(id)", ["AS path(id): column id is an integer (Int64), and a path's nodes are a list of ids"]],
+      [`${hops} AS hops(s, i)`, ["AS hops(…) takes three columns: the seed, the node reached and its distance, and was given 2: AS hops(seed, id, distance)"]],
+      [`${hops} AS hop(s, i, far)`, ["AS hop is not a form; write AS hops(seed, id, distance)"]],
+      ["karate AS tree(id)", ["AS tree is not a form; write one of AS edges(src, dst [, weight]), AS nodes(id), AS path(nodes [, edges]) or AS hops(seed, id, distance)"]],
+      [`${pairs} AS edges(x, y) ON nope`, ["ON nope: there is no property graph named 'nope'. The graphs are karate; name one of them"]],
+      [`${pairs} AS edges(x, y) LAYOUT rings`, ["LAYOUT rings places each node by its distance from a seed or its step along a path, and edges have neither", "AS hops(seed, id, distance)", "LAYOUT force"]],
+      ["karate LAYOUT spiral", ["LAYOUT needs force, rings or layers, and 'spiral' is none of them"]],
+      ["karate AS nodes(id)", ["AS nodes(id) says how to read a result's rows, and 'karate' is a property graph, drawn whole. Leave the clause out (.graph karate)"]],
+    ] as [string, string[]][]) {
+      const before = await errors(s);
+      await type(`.graph ${command}`, s);
+      const out = await after(".graph", s);
+      check(
+        says.every((part) => squeezed(out).includes(squeezed(part))) && (await errors(s)) === before + 1 && !(await graphOpen(s)),
+        `.graph ${command.slice(-28)}: says what to write`,
+        out.split("\n").slice(-6).join(" "),
+      );
+    }
+    // .help graph lists the clauses.
+    await type(".help graph", s);
+    const help = await after(".help graph", s);
+    check(
+      ["AS edges(src, dst [, weight])", "AS nodes(id)", "AS path(nodes [, edges])", "AS hops(seed, id, distance)", "ON graph", "LAYOUT force|rings|layers"].every((part) => help.includes(part)),
+      ".help graph lists .graph's clauses",
+      help.slice(-600),
+    );
+  }
   // The explore session (#440): commands typed in the terminal change the
   // engine's graph, which answers with what changed and a delta. (Drawing the
   // delta in the pane is #443, so the counts here are the engine's.)

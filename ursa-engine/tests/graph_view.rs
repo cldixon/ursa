@@ -20,7 +20,8 @@ use datafusion::common::TableReference;
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 use ursa_engine::graph::view::{
-    interpret, of_command, DataFusionSql, GraphView, Rows, RunSql, MAX_CATEGORIES,
+    interpret, interpret_with, of_command, parse, DataFusionSql, GraphView, Rows, RunSql,
+    MAX_CATEGORIES,
 };
 use ursa_engine::graph::{create_graph, EdgeTable, GraphDef, VertexTable};
 use ursa_engine::{new_session, user_message};
@@ -769,6 +770,237 @@ async fn paths_and_edges_without_metadata() {
         r.edge_column("weight").unwrap().values,
         Values::F32(vec![0.5, 1.5])
     );
+}
+
+/// A result read as `clauses` say (`AS …`, `ON graph`, `LAYOUT …`).
+async fn interpreted_as(
+    ctx: &SessionContext,
+    sql: &str,
+    clauses: &str,
+) -> datafusion::error::Result<GraphView> {
+    let (source, style) = parse(clauses).unwrap_or_else(|e| panic!("{clauses}: {e}"));
+    assert_eq!(source, "", "{clauses}");
+    let (schema, batches) = DataFusionSql.run(ctx, sql).await.unwrap();
+    interpret_with(ctx, &DataFusionSql, schema, batches, &style).await
+}
+
+/// `AS …` (#434) draws a result whose columns have any names, by what the
+/// clause says and not by the rules; `ON graph` names the graph, and
+/// `LAYOUT` the layout.
+#[tokio::test]
+async fn as_on_and_layout_override_the_rules() {
+    let ctx = karate().await;
+    let drawn = |sql: &'static str, clauses: &'static str| {
+        let ctx = &ctx;
+        async move {
+            interpreted_as(ctx, sql, clauses)
+                .await
+                .unwrap_or_else(|e| panic!("{sql} {clauses}: {}", user_message(&e)))
+        }
+    };
+    let refused = |sql: &'static str, clauses: &'static str| {
+        let ctx = &ctx;
+        async move { user_message(&interpreted_as(ctx, sql, clauses).await.expect_err(clauses)) }
+    };
+
+    // Edges: the rules refuse these columns (a tag and an id are no pair).
+    let edges = "SELECT 'tie' AS tag, src AS x, dst AS y, 2.5 AS w FROM ties ORDER BY src, dst";
+    let err = refused(edges, "").await;
+    assert!(err.contains("cannot draw"), "{err}");
+    let view = drawn(edges, "AS edges(x, y)").await;
+    let r = &view.result;
+    assert_eq!(view.drawn_as(), "edges (x, y)");
+    assert_eq!((r.n_nodes(), r.n_edges()), (34, 78));
+    assert_eq!(r.graph(), None);
+    assert!(r.edge_columns().is_empty());
+    assert_eq!(r.encodings().layout, Layout::Force);
+    // The same edges as the edge table's own, in its order.
+    let plain = interpreted(&ctx, "SELECT src, dst FROM ties ORDER BY src, dst").await;
+    assert_eq!(ends(&view), ends(&plain));
+    assert_eq!(ids(&view), ids(&plain));
+    // The other way round, with a weight.
+    let view = drawn(edges, "AS edges(y, x, w)").await;
+    assert_eq!(view.drawn_as(), "edges (y, x, w)");
+    // The first row, 0 → 1, is now 1 → 0: nodes are numbered as first seen.
+    assert_eq!(ids(&view)[..2], ["1", "0"]);
+    assert_eq!((ends(&view).0[0], ends(&view).1[0]), (0, 1));
+    assert_eq!(
+        view.result.edge_column("w").unwrap().values,
+        Values::F32(vec![2.5; 78])
+    );
+    // ON names the graph, so an algorithm can size its nodes.
+    let view = drawn(edges, "ON karate AS edges(x, y) SIZE BY pagerank").await;
+    assert_eq!(view.drawn_as(), "edges of karate (x, y)");
+    assert_eq!(view.result.graph(), Some("karate"));
+    assert_eq!(size(&view).len(), 34);
+    assert!(size(&view).iter().all(|v| *v > 0.0));
+
+    // Nodes: `who` is the key, though the rules would take `id`.
+    let nodes = "SELECT id + 100 AS id, id AS who, club FROM members WHERE id < 5 ORDER BY id";
+    let view = drawn(nodes, "AS nodes(who)").await;
+    assert_eq!(ids(&view), ["0", "1", "2", "3", "4"]);
+    assert!(
+        view.drawn_as().starts_with("nodes of karate (who"),
+        "{}",
+        view.drawn_as()
+    );
+    // Karate's ties among 0..4, each a row of its edge table.
+    assert_eq!(view.result.n_edges(), 7);
+    real_edges(&ctx, &view).await;
+    // By the rules, the ids are 100..104, which are no one in karate.
+    let by_rule = interpreted(&ctx, nodes).await;
+    assert_eq!(ids(&by_rule), ["100", "101", "102", "103", "104"]);
+    assert_eq!(by_rule.result.n_edges(), 0);
+
+    // A path: the list, though the rules would draw `id` as a node.
+    let path = "SELECT 'route' AS id, [16, 5, 0, 8, 33] AS stops";
+    assert_eq!(
+        interpreted(&ctx, path)
+            .await
+            .result
+            .provenance()
+            .rule
+            .as_deref(),
+        Some("nodes")
+    );
+    let view = drawn(path, "AS path(stops)").await;
+    assert_eq!(view.drawn_as(), "a path (stops)");
+    assert_eq!(ids(&view), ["16", "5", "0", "8", "33"]);
+    assert_eq!(
+        view.result.highlights().paths,
+        [ModelPath {
+            nodes: vec![0, 1, 2, 3, 4],
+            edges: vec![0, 1, 2, 3]
+        }]
+    );
+    assert_eq!(view.result.encodings().layout, Layout::Layers);
+    // With its edges' rows, on the graph ON names.
+    let view = drawn(
+        "SELECT [0, 8, 33] AS stops, [7, 60] AS rows",
+        "AS path(stops, rows) ON karate LAYOUT force",
+    )
+    .await;
+    assert_eq!(view.drawn_as(), "a path on karate (stops, rows)");
+    assert_eq!(view.result.edge_row(1), Some(60));
+    assert_eq!(view.result.encodings().layout, Layout::Force);
+    assert_eq!(u32s(&view, "step"), [0, 1, 2]);
+
+    // Hops: computed columns carry no metadata, and by the rules their
+    // first two are edges.
+    let hops = "SELECT seed + 0 AS s, id + 0 AS i, CAST(distance AS INT) AS far \
+                FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+    assert_eq!(
+        interpreted(&ctx, hops)
+            .await
+            .result
+            .provenance()
+            .rule
+            .as_deref(),
+        Some("edges")
+    );
+    let view = drawn(hops, "AS hops(s, i, far)").await;
+    let r = &view.result;
+    assert_eq!(view.drawn_as(), "rings on karate (s, i, far)");
+    // What the hop result itself draws: 26 nodes, the 59 real edges.
+    let own = interpreted(
+        &ctx,
+        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+    )
+    .await;
+    assert_eq!((r.n_nodes(), r.n_edges()), (26, 59));
+    assert_eq!(ids(&view), ids(&own));
+    assert_eq!(ends(&view), ends(&own));
+    assert_eq!(u32s(&view, "distance"), u32s(&own, "distance"));
+    assert_eq!(r.highlights().seeds, [0]);
+    assert_eq!(r.encodings().layout, Layout::Rings);
+    real_edges(&ctx, &view).await;
+    // LAYOUT overrides the rule's layout, and nothing else.
+    for (clause, layout) in [
+        ("LAYOUT layers", Layout::Layers),
+        ("LAYOUT force", Layout::Force),
+        ("LAYOUT rings", Layout::Rings),
+    ] {
+        let other = interpreted_as(&ctx, hops, &format!("AS hops(s, i, far) {clause}"))
+            .await
+            .unwrap();
+        assert_eq!(other.result.encodings().layout, layout, "{clause}");
+        assert_eq!(other.result.highlights(), r.highlights(), "{clause}");
+        assert_eq!(ends(&other), ends(&view), "{clause}");
+    }
+    // On a result the rules read too.
+    let view = drawn(
+        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "LAYOUT layers",
+    )
+    .await;
+    assert_eq!(view.result.encodings().layout, Layout::Layers);
+
+    // What cannot be done says what to write.
+    for (sql, clauses, says) in [
+        (
+            edges,
+            "AS edges(x, z)",
+            "AS edges(x, z): the result has no column z. The result's columns are tag (Utf8), \
+             x (Int64), y (Int64), w (Float64); name one of them",
+        ),
+        (
+            edges,
+            "AS edges(x, w)",
+            "AS edges(x, w): column w is a number that is not whole (Float64), and an edge's \
+             end is an id: an integer, a string or a date. The result's columns are tag (Utf8)",
+        ),
+        (
+            edges,
+            "AS edges(x, y) ON nope",
+            "ON nope: there is no property graph named 'nope'. The graphs are karate; name one \
+             of them",
+        ),
+        (
+            edges,
+            "AS edges(x, y) LAYOUT rings",
+            "LAYOUT rings places each node by its distance from a seed or its step along a \
+             path, and edges have neither. Draw a hop result or paths",
+        ),
+        (
+            nodes,
+            "AS nodes(who) LAYOUT layers",
+            "and nodes have neither",
+        ),
+    ] {
+        let err = refused(sql, clauses).await;
+        assert!(err.contains(says), "{clauses}: {err}");
+    }
+    // A property graph is drawn whole.
+    let err = refusal(&ctx, "karate AS nodes(id)", None).await;
+    assert!(
+        err.contains(
+            "AS nodes(id) says how to read a result's rows, and 'karate' is a property graph, \
+             drawn whole. Leave the clause out (.graph karate)"
+        ),
+        "{err}"
+    );
+    let err = refusal(&ctx, "karate ON karate", None).await;
+    assert!(
+        err.contains("'karate' is a property graph already"),
+        "{err}"
+    );
+    let err = refusal(&ctx, "karate LAYOUT rings", None).await;
+    assert!(err.contains("a property graph has neither"), "{err}");
+    // LAYOUT force is what a property graph has anyway.
+    let view = draw(&ctx, "karate LAYOUT force", None).await;
+    assert_eq!(view.result.encodings().layout, Layout::Force);
+    // The whole command: a table by name, and a query, with the clause.
+    let view = draw(&ctx, "ties AS edges(dst, src)", None).await;
+    assert_eq!(view.drawn_as(), "edges (dst, src)");
+    let view = draw(
+        &ctx,
+        "SELECT m.id AS x, t.dst AS y FROM members m JOIN ties t ON t.src = m.id AS edges(x, y) \
+         ON karate",
+        None,
+    )
+    .await;
+    assert_eq!(view.drawn_as(), "edges of karate (x, y)");
+    assert_eq!(view.result.n_edges(), 78);
 }
 
 /// The explore session (#440) on DataFusion's SQL alone: an expansion adds
