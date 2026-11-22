@@ -53,6 +53,9 @@ aws-profile = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-smithy-htt
 # Native only: the local file system and cloud stores do not build for wasm32 (#278).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ursa-core = { path = "../ursa-core", version = "0.12.0-dev", features = ["rayon"] }
+# A path search from many start nodes runs them on rayon's pool (#451); the
+# browser build runs them one after another, with the same rows.
+rayon = { workspace = true }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 
 # The free space on a database's disk, which the default

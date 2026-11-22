@@ -1391,4 +1391,212 @@ mod tests {
         );
         assert!(found.contains(&(vec![0, 3, 0], vec![2, 3])));
     }
+
+    /// FNV-1a, 64 bits: a hash that is the same on every platform and run.
+    struct Fnv(u64);
+
+    impl Fnv {
+        fn new() -> Self {
+            Fnv(0xcbf2_9ce4_8422_2325)
+        }
+
+        fn bytes(&mut self, b: &[u8]) {
+            for &x in b {
+                self.0 ^= u64::from(x);
+                self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+
+        fn int(&mut self, v: i64) {
+            self.bytes(&v.to_le_bytes());
+        }
+    }
+
+    /// splitmix64.
+    fn mix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// `m` R-MAT edges over `2^scale` node slots (the Graph500 quadrants),
+    /// with node keys spread out (`key * 3 + 1`) so they are not the dense
+    /// numbers.
+    fn rmat(m: usize, scale: u32, seed: u64) -> Vec<(i64, i64)> {
+        let mut st = seed;
+        let (a, ab, abc) = (0.57, 0.76, 0.95);
+        (0..m)
+            .map(|_| {
+                let (mut s, mut d) = (0i64, 0i64);
+                for _ in 0..scale {
+                    let r = (mix(&mut st) >> 11) as f64 / (1u64 << 53) as f64;
+                    s = s << 1 | i64::from(r >= ab);
+                    d = d << 1 | i64::from((r >= a && r < ab) || r >= abc);
+                }
+                (s * 3 + 1, d * 3 + 1)
+            })
+            .collect()
+    }
+
+    /// `m` uniform edges among `n` nodes, with self-loops and parallel edges.
+    fn uniform(m: usize, n: u64, seed: u64) -> Vec<(i64, i64)> {
+        let mut st = seed;
+        (0..m)
+            .map(|_| ((mix(&mut st) % n) as i64, (mix(&mut st) % n) as i64))
+            .collect()
+    }
+
+    /// One run of `s`, as a hash of every row in order (start, end, length,
+    /// vertices, edges, element ids) and how many prefixes it extended, or of
+    /// its error.
+    fn pinned(
+        topology: &Topology,
+        ids: &IdMap,
+        s: &Search,
+        starts: &ArrayRef,
+        targets: Option<&ArrayRef>,
+        max_paths: Option<usize>,
+        hash: &mut Fnv,
+    ) -> usize {
+        let columns = PathColumns {
+            vertices: true,
+            edges: true,
+            elements: true,
+        };
+        let schema = Arc::new(super::schema(&DataType::Int64, columns));
+        let edge_row = |e: u32| u64::from(e) * 2 + 5;
+        let result = run(
+            topology, ids, &edge_row, s, starts, targets, false, columns, schema, max_paths,
+        );
+        match result {
+            Err(e) => {
+                hash.bytes(b"error");
+                hash.bytes(e.to_string().as_bytes());
+                0
+            }
+            Ok((batches, expanded)) => {
+                let mut n = 0;
+                for b in &batches {
+                    for c in 0..3 {
+                        let col = b.column(c).as_primitive::<Int64Type>();
+                        hash.int(col.len() as i64);
+                        col.values().iter().for_each(|&v| hash.int(v));
+                    }
+                    for c in 3..6 {
+                        let list = b.column(c).as_list::<i32>();
+                        list.offsets().iter().for_each(|&o| hash.int(i64::from(o)));
+                        let values = list.values().as_primitive::<Int64Type>();
+                        values.values().iter().for_each(|&v| hash.int(v));
+                    }
+                    n += b.num_rows();
+                }
+                hash.int(expanded as i64);
+                n
+            }
+        }
+    }
+
+    /// The rows of path searches over a matrix of graphs, directions,
+    /// selectors, modes, bounds, start nodes, targets and limits, pinned as
+    /// one hash per graph: recorded before the search was made faster
+    /// (#451), so a change that moves a row, changes a path or changes when
+    /// `ursa.max_paths` refuses a search fails here. The same on one thread
+    /// and on four.
+    #[test]
+    fn rows_and_their_order_are_pinned() {
+        let mut chain: Vec<(i64, i64)> = (0..9).map(|i| (i, i + 1)).collect();
+        for i in 0..10 {
+            chain.extend((0..4).map(|j| (i, 100 + 10 * i + j)));
+        }
+        chain.extend([(0, 5), (2, 7), (5, 5), (7, 2), (3, 1)]);
+        let graphs: Vec<(&str, Vec<(i64, i64)>)> = vec![
+            ("know", KNOW.to_vec()),
+            ("chain", chain),
+            ("uniform", uniform(140, 40, 7)),
+            ("rmat", rmat(600, 7, 11)),
+        ];
+        let quantifiers: &[(u32, Option<u32>)] = &[
+            (0, Some(0)),
+            (0, Some(2)),
+            (1, Some(1)),
+            (1, Some(3)),
+            (1, None),
+            (2, Some(3)),
+            (3, None),
+        ];
+        let expected: &[(&str, u64, usize)] = &[
+            ("know", 11234326496623982603, 71739),
+            ("chain", 17288712035607911604, 234240),
+            ("uniform", 15178768632453315796, 385893),
+            ("rmat", 17019204663491492836, 276899),
+        ];
+        let mut got = Vec::new();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for (name, edges) in &graphs {
+                let (topology, ids) = index(edges);
+                let mut keys: Vec<i64> = edges.iter().flat_map(|&(s, d)| [s, d]).collect();
+                keys.sort();
+                keys.dedup();
+                let all: ArrayRef = Arc::new(Int64Array::from(keys.clone()));
+                let one: ArrayRef = Arc::new(Int64Array::from(vec![keys[0]]));
+                // A few, out of key order, with a null and a key that is no node.
+                let some: ArrayRef = Arc::new(Int64Array::from(vec![
+                    Some(keys[keys.len() / 2]),
+                    None,
+                    Some(-77),
+                    Some(keys[0]),
+                    Some(keys[keys.len() - 1]),
+                    Some(keys[1]),
+                ]));
+                let targets: ArrayRef = Arc::new(Int64Array::from(vec![
+                    keys[keys.len() / 3],
+                    keys[0],
+                    -5,
+                    keys[keys.len() - 2],
+                ]));
+                let mut hash = Fnv::new();
+                let mut rows = 0;
+                for direction in [Direction::Right, Direction::Left, Direction::Any] {
+                    for selector in [
+                        Selector::All,
+                        Selector::Shortest(1),
+                        Selector::Shortest(3),
+                        Selector::AllShortest,
+                    ] {
+                        for mode in [Mode::Walk, Mode::Trail, Mode::Simple, Mode::Acyclic] {
+                            for &(min, max) in quantifiers {
+                                if selector == Selector::All && mode == Mode::Walk && max.is_none()
+                                {
+                                    continue;
+                                }
+                                let s = search(direction, min, max, selector, mode);
+                                for starts in [&one, &some, &all] {
+                                    for t in [None, Some(&targets)] {
+                                        for cap in [Some(300), Some(3_000)] {
+                                            hash.bytes(s.to_string().as_bytes());
+                                            rows += pool.install(|| {
+                                                pinned(
+                                                    &topology, &ids, &s, starts, t, cap, &mut hash,
+                                                )
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                got.push((*name, hash.0, rows));
+            }
+        }
+        let (one, four) = got.split_at(graphs.len());
+        assert_eq!(one, four, "one thread and four differ");
+        assert_eq!(one, expected, "the pinned rows changed");
+    }
 }
