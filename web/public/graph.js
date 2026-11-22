@@ -1057,6 +1057,9 @@ export function info() {
     // counts of what is not shown are in.
     slots: current.view.nodeCount,
     deltas: current.deltas,
+    // Whether the layout's first positions are in, and the layout's epoch.
+    positioned: current.positioned,
+    epoch: current.epoch,
     busy: [...current.busy.keys()].map(node),
     notShownKnown: current.notShown !== null,
     frames,

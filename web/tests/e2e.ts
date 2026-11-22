@@ -797,14 +797,26 @@ const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ur
 const graphOpen = (p: Page): Promise<boolean> => p.evaluate(() => (window as any).ursaShell.graphOpen());
 /** Wait until the view has drawn a frame and its layout has run to the end. */
 async function graphSettled(p: Page) {
-  await p.waitForFunction(
-    () => {
-      const g = (window as any).ursaShell.graph();
-      return g && g.frames > 0 && g.layoutDone;
-    },
-    null,
-    { timeout: 60_000, polling: 200 },
-  );
+  try {
+    await p.waitForFunction(
+      () => {
+        const g = (window as any).ursaShell.graph();
+        return g && g.frames > 0 && g.layoutDone;
+      },
+      null,
+      { timeout: 60_000, polling: 200 },
+    );
+  } catch (e) {
+    // What the page shows, so that a view that closed itself (a lost WebGL
+    // context, a layout that stopped) says so here.
+    const seen = await p
+      .evaluate(() => {
+        const shell = (window as any).ursaShell;
+        return { open: shell.graphOpen(), graph: shell.graph(), status: document.getElementById("graph-status")?.textContent, screen: shell.screen().split("\n").slice(-6) };
+      })
+      .catch(() => null);
+    throw new Error(`the graph view did not settle: ${JSON.stringify(seen)}`, { cause: e });
+  }
 }
 /** The terminal's columns, once a resize has settled. */
 async function settledCols(p: Page) {
