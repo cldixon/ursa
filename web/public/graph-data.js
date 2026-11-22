@@ -14,9 +14,9 @@ export const MAX_CATEGORIES = 8;
 /** The null of a dictionary column's codes: a node with no value. */
 const NULL = 0xffffffff;
 /**
- * What the engine adds to the colour column's name when SIZE BY and COLOR BY
- * name the same thing (graph::view's COLOR_SUFFIX): a result's columns have
- * distinct names.
+ * What the engine adds to the colour column's name when another node column
+ * has it, as when SIZE BY and COLOR BY name the same thing (graph::view's
+ * COLOR_SUFFIX): a result's columns have distinct names.
  */
 const COLOR_SUFFIX = " (colour)";
 
@@ -28,7 +28,13 @@ const COLOR_SUFFIX = " (colour)";
  *   labelOf(i)     node i's label (the vertex table it is of), or null
  *   skipped        rows left out because an endpoint is NULL
  *   name           the property graph drawn, or null
- *   provenance     {sql, rule}: the SQL it came from and the rule that drew it
+ *   provenance     {sql, rule, roles?, notes?}: the SQL it came from, the
+ *                  result → graph rule that drew it, the columns the rule read
+ *                  and what it adds (what was left out, other readings)
+ *   drawnAs        what it was drawn as, for the status line (drawnAs below)
+ *   layout         when the rule asks for rings or layers: {kind, level}, each
+ *                  node's ring or layer (a hop's distance, a path's step;
+ *                  0xffffffff for none), a view of the buffer
  *   size, sizeBy   with SIZE BY: each node's value (NaN: none), and its name
  *   color, colorBy with COLOR BY: each node's colour index, 0..k for the k
  *                  largest categories (at most 8), 8 for the rest and for no
@@ -50,12 +56,19 @@ export function drawingOf(result, skipped = 0) {
     name: result.graph,
     provenance: result.provenance,
     labelOf: (i) => nodes.labelNames[nodes.labels[i]]?.name || null,
+    drawnAs: drawnAs(result),
   };
   const column = (name) => {
     const found = nodes.columns.find((c) => c.name === name);
     if (!found) throw new Error(`the graph has no node column '${name}' to draw by`);
     return found;
   };
+  // Rings and layers are laid out by level: the column the highlights name.
+  const level = result.highlights?.distance;
+  if (encodings.layout && encodings.layout !== "force" && level != null) {
+    const c = column(level);
+    if (c.type === "u32") graph.layout = { kind: encodings.layout, level: c.values };
+  }
   if (encodings.size_by != null) {
     const c = column(encodings.size_by);
     if (c.type === "dict") throw new Error(`the node column '${c.name}' is text, and sizes are numbers`);
@@ -83,7 +96,9 @@ export function drawingOf(result, skipped = 0) {
       }
     }
     const typed = c.name.endsWith(COLOR_SUFFIX) ? c.name.slice(0, -COLOR_SUFFIX.length) : null;
-    graph.colorBy = typed !== null && typed === encodings.size_by ? typed : c.name;
+    // The suffix is there when another column has the name: SIZE BY's, or
+    // the rule's (a hop's distance).
+    graph.colorBy = typed !== null && nodes.columns.some((o) => o.name === typed) ? typed : c.name;
     graph.color = color;
     graph.colorLabels = Array.from({ length: top }, (_, i) => c.dict.get(i));
     graph.colorCounts = counts;
@@ -91,4 +106,31 @@ export function drawingOf(result, skipped = 0) {
     graph.colorMissing = missing;
   }
   return graph;
+}
+
+/**
+ * What `result` was drawn as, by its provenance: the rule, the graph, the
+ * columns read and the rule's notes. "a path on karate (members, ties)",
+ * "nodes of karate (id, pagerank, community)", "edges (src, dst)", "the graph
+ * karate". The status line says "drawn as" and then this; "" when the result
+ * names no rule. (graph::view's drawn_as says the same.)
+ */
+export function drawnAs(result) {
+  const { rule, roles = [], notes = [] } = result.provenance ?? {};
+  if (!rule) return "";
+  const paths = result.highlights?.paths?.length ?? 0;
+  const [what, joins] =
+    {
+      graph: ["the graph", " "],
+      edges: ["edges", " of "],
+      path: [paths > 1 ? `${paths.toLocaleString("en-US")} paths` : "a path", " on "],
+      rings: ["rings", " on "],
+      pattern: ["pattern matches", " on "],
+      nodes: ["nodes", " of "],
+    }[rule] ?? [rule, " on "];
+  let out = what;
+  if (result.graph != null) out += joins + result.graph;
+  if (roles.length) out += ` (${roles.map((r) => r.column).join(", ")})`;
+  for (const note of notes) out += ` · ${note}`;
+  return out;
 }

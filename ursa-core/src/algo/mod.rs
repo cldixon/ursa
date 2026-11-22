@@ -26,6 +26,7 @@ mod hop;
 mod induced;
 mod label_prop;
 mod layout;
+mod levels;
 mod linked;
 mod louvain;
 mod multilevel;
@@ -37,6 +38,7 @@ mod pagerank;
 pub mod quadtree;
 mod random_walk;
 mod rng;
+mod subrounds;
 pub use rng::sample_indices;
 mod triangle;
 mod undirected;
@@ -62,6 +64,7 @@ pub use layout::{
     layout_circle, layout_fa2, layout_fr, layout_random, Fa2Params, Fa2State, LayoutParams,
     Positions,
 };
+pub use levels::{layout_layers, layout_rings, LayersParams, RingsParams, NO_LEVEL};
 pub use louvain::{louvain, louvain_weighted};
 pub use multilevel::{layout_fa2_multilevel, Fa2Multilevel, MultilevelParams};
 pub use neighbor_agg::{neighbor_aggregate, AggKind};

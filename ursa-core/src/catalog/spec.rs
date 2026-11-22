@@ -581,12 +581,21 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
             )
             .within(Range::at_least(1.0)),
             SEED,
+            param(
+                "parallel",
+                ParamType::Bool,
+                Value::Bool(false),
+                "Vote in parallel sub-rounds: faster on many cores, and the same labels on any \
+                 thread count, but different labels from the serial default, with no NetworkX \
+                 equivalent.",
+            ),
         ],
         outputs: &[out("label_propagation", ColumnType::UInt32)],
         shape: Shape::PerNode,
         build: |v| Call::LabelPropagation {
             max_iter: v.count("max_iter"),
             seed: v.seed("seed"),
+            parallel: v.bool("parallel"),
         },
     },
     FunctionSpec {

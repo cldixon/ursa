@@ -366,6 +366,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the old nodes 0.003% of the view's width on average. The same additions
   in the same order give the same bits on any thread count. A layout that
   uses none of this has the bits it had (`tests/layout_golden.rs`).
+- **Rings and layers: fixed layouts for neighbourhoods and paths** (#436).
+  `ursa_core::algo::layout_rings` draws a `hop` result from each node's
+  distance: the seed at the centre, distance `d` on the circle of radius
+  `d`, a crowded ring widened so that no two nodes are nearer than a
+  quarter of a unit, and several seeds as one ring system each, side by
+  side. `layout_layers` draws paths from each node's position along them:
+  layer `l` on the line at `x = l`, one path alone a straight line. The
+  order on a ring or a line is chosen by four barycentre sweeps (ties by
+  node index), and each node is then placed as near its neighbours' mean as
+  its spacing allows. Neither iterates: 2 ms for 2,048 nodes and 8,334
+  edges, 0.3 s at 1M edges, on one thread (`ursa-viz/BENCH.md`). Both are
+  serial, so the same input gives the same bits on any thread count;
+  layers are the same bits on every platform. In `ursa-viz`,
+  `LiveLayout::rings` and `LiveLayout::layers` (done at once, and they
+  grow like any layout), `Layout.rings`, `Layout.layers` and `Layout.kind`
+  in the wasm API, and the shell's layout worker takes
+  `layout: {kind, level}` and posts one message. On karate, two hops from
+  node 0 are two rings of 16 and 9 nodes, and all shortest paths from 16 to
+  26 are six layers, drawn without a crossing. No existing layout changes.
 - **Layouts in SQL: `layout_fa2` and `layout_fr`** (#395). Both are table
   functions of `(id, x, y)`, like the algorithms, and work inside
   `algorithms(g, …)`, where their columns are `x` and `y`, or
@@ -399,6 +418,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **`.graph` draws what a result means** (#433). After a graph query, the
+  Web Shell's `.graph` (`ursa-engine`'s `graph::view`) now reads what each
+  column is, from the `ursa.*` metadata the graph functions and `GRAPH_TABLE`
+  write and else from its name and type, and draws the result by the first
+  rule that matches: **paths** (`vertices(p)`, with `edges(p)` or
+  `element_id(p)`, the steps of `shortest_path()`, or a list of ids) as the
+  union of the rows' paths; a **`hop` result** (`seed`, `id`, `distance`) as
+  its seeds and the nodes reached, with the graph's real edges among them
+  and coloured by distance, where it drew a star; **edges** as before
+  (`src`/`dst`, now also `source`/`target` and `from`/`to`, two pattern
+  variables, or the first two id columns); **pattern matches** of three or
+  more node variables as every edge of the pattern, where it drew only the
+  first two columns; and **nodes** (`pagerank`, `algorithms`, a table with
+  an `id`) with the graph's edges among them (`induced_edges`), sized by
+  their first metric and coloured by their first category, where it refused
+  or drew each id tied to its score. What is no graph says what its columns
+  are and what would draw them. The pane's status line and the terminal say
+  what the result was drawn as (`drawn as a path on karate (members,
+  ties)`). A result's provenance (UGR) gains `roles` and `notes`, and its
+  highlights carry the paths, the seeds and each node's distance or step,
+  with the layout the rule asks for. A plain edge table is drawn as it was:
+  the same nodes and edges, in the same order.
 - **`.graph` is resolved in the engine** (#425). What turns a source and its
   `NODES`, `SIZE BY` and `COLOR BY` clauses into a graph moved from
   `ursa-wasm` to `ursa-engine` (`graph::view`), so the CLI and the notebook
@@ -562,8 +603,53 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     run's. On one thread it does about 1.7 times the serial run's work.
   - `examples/louvain_memory.rs` takes `--parallel`, and `--planted P` for a
     planted-partition graph with P% of edges between communities.
+- **Parallel label propagation, opt-in: `label_propagation(g, parallel =>
+  true)`** (#453). In Python `ur.label_propagation(edges, parallel=True)`;
+  in Rust a `parallel` argument to `ursa_core::algo::label_propagation`. The
+  frame of parallel Louvain: each sweep takes 64 fixed sub-rounds of the
+  seeded visit order, the nodes of a sub-round vote in parallel against the
+  labels at its start, and the new labels are written in order. The same
+  seed gives the same labels on any number of threads, but not the labels
+  the serial default finds (on a graph of at most 64 nodes it is the serial
+  run), and NetworkX has no equivalent. The default stays serial.
+  - Two neighbours of one sub-round would trade labels for ever (the
+    two-colouring of synchronous label propagation), so a node does not
+    read a higher label than its own from a node of its sub-round. Without
+    that rule, 14 nodes of the R-MAT graph below still traded labels in the
+    20th sweep; with it, the run stops after a sweep that changes nothing, in
+    as many sweeps as the serial run (5).
+  - Pinned by: the same labels on 1, 2, 3, 4 and 8 threads; golden label
+    hashes on karate, planted-partition and R-MAT graphs, masked and not;
+    and, on planted-partition graphs, a modularity no more than 1% below the
+    serial run's and a community count within 2% of it (measured: within
+    0.2% for both).
+  - Each thread keeps a table sized to the degree of the node it is on, and
+    each sub-round a list of its active nodes.
+- **Serial label propagation is 2.7 to 3.1 times faster, with the same
+  labels** (#453). A node votes again only once a neighbour has taken a
+  label other than its own since its last vote; any other node would vote
+  for the label it holds. On a shared 4-core machine, 32M edges, 20 sweeps
+  allowed:
+
+  | graph | before | serial now | `parallel => true` |
+  |---|---|---|---|
+  | R-MAT, 2^21 nodes | 11.0 s | 4.0 s | 2.3 s at 3.3 cores |
+  | planted partition, 20% of edges between | 21.4 s | 7.5 s | 3.3 s at 3.6 cores |
+  | planted partition, 50% between | 35.0 s | 11.2 s | 4.9 s at 3.7 cores |
+
+  Peak memory is unchanged (605 MB, of which the graph is 575 MB) and
+  8 MB more for the parallel run. Without a mask, a vote no longer reads
+  the edge ids.
 
 ### Changed
+
+- **A Parquet file's schema metadata is kept when Ursa reads it.** Ursa's
+  sessions set `datafusion.execution.parquet.skip_metadata = false`, so the
+  `ursa.*` column roles (#431) of a result written to Parquet come back with
+  it when the file is read, as they do from an Arrow file, and `.graph` draws
+  the file as it drew the result. DataFusion's default drops every Parquet
+  file's metadata; `SET datafusion.execution.parquet.skip_metadata = true`
+  restores that.
 
 - **Graph function parameters are range-checked** (behaviour change, #416).
   A number with no meaning for its parameter was accepted and gave a
@@ -660,6 +746,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   On a 32M-edge, 2.1M-node R-MAT graph with 105 sources on 4 threads: peak
   RSS 1,019 MB to 814 MB (the graph alone is 576 MB), time unchanged (61 s
   and 60 s, within the noise of a shared machine).
+- **Unweighted Louvain holds about half the memory, with the same
+  communities** (#450). An unweighted run's level-0 working graph stored an
+  8-byte `f64` per adjacency slot for a weight that counts parallel edges
+  (1, or 2 for a reciprocal pair). It now stores that count in one byte, 5
+  bytes a slot instead of 12; a graph with more than 255 parallel edges
+  between two nodes, a weighted run, and every aggregated level keep `f64`s.
+  Local moving (serial and `parallel => true`) and the aggregation read
+  either store through the same code, compiled once for each. Results are
+  unchanged, bit for bit. On R-MAT graphs (4 shared cores), Louvain's peak
+  heap went from 488 to 227 MB at 20M edges and from 1,295 to 630 MB at 50M
+  (peak RSS 1.72 → 1.11 GB), serial or parallel, at the same speed or
+  slightly faster; weighted runs are unchanged.
 - **SQL: a stored graph index is memory-mapped, not read whole** (#382).
   Loading one read the whole file on one core, so at full scale (2.42B
   edges, an 18.6 GiB index) every query in a new process paid 15 s, even a

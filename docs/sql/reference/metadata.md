@@ -4,6 +4,8 @@ A result says what its columns are. Every graph function and `GRAPH_TABLE` marks
 
 The metadata changes no value, no column name and no type. A plain table, and a query over files only, has none.
 
+The Web Shell's `.graph` reads it to draw a result as what it is: a `hop` result as its seeds and the nodes reached with the graph's edges among them, `vertices(p)` as paths, three pattern variables as every edge of the pattern, and an algorithm's `id` and score as nodes sized by the score. Without it, `.graph` goes by the columns' names and types.
+
 ## The keys
 
 | Key | On | Value |
@@ -177,4 +179,4 @@ SELECT arrow_metadata(id, 'ursa.graph') AS graph FROM 'ranks.arrow' LIMIT 1;
 └────────┘
 ```
 
-Read back with Ursa, an Arrow file's metadata is there. A Parquet file's is in the file but is left out when the file is read, as the metadata of every Parquet file is by default; `SET datafusion.execution.parquet.skip_metadata = false` keeps it. CSV and JSON have no place for it.
+Read back with Ursa, an Arrow file's metadata is there, and so is a Parquet file's: Ursa keeps a Parquet file's schema metadata when it reads one, where DataFusion's default drops it. `SET datafusion.execution.parquet.skip_metadata = true` drops it, as DataFusion does. CSV and JSON have no place for it.

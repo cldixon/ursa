@@ -172,7 +172,9 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   {
     const src = graph.src.slice();
     const dst = graph.dst.slice();
-    worker.postMessage({ type: "start", n: graph.n, src, dst, module: url }, [src.buffer, dst.buffer]);
+    // graph.layout, {kind: "rings" | "layers", level}, asks for a fixed layout
+    // (graph-worker.js): each node's distance or layer in `level`.
+    worker.postMessage({ type: "start", n: graph.n, src, dst, module: url, layout: graph.layout }, [src.buffer, dst.buffer]);
     times.posted = performance.now();
   }
 
@@ -269,6 +271,7 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
     state.cleanup.push(() => timings.drop(shown));
   }
   renderLegend(legend, graph);
+  state.drawnAs = graph.drawnAs;
 
   // What is known of node `i`, for the tooltip and the header: its key, its
   // label (the vertex table it is of), its degree, and its SIZE BY and COLOR
@@ -299,19 +302,21 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   // layout is.
   const header = () => {
     const counts = `${plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
+    // The rule that drew it (graph-data.js's drawnAs): the pane never guesses silently.
+    const drawn = graph.drawnAs ? ` · drawn as ${graph.drawnAs}` : "";
     let text;
     if (state.selection.length) {
       text = `${selectionText()} · ${counts}`;
     } else if (state.layoutDone) {
-      text = `${counts} · Done`;
+      text = `${counts}${drawn} · Done`;
     } else if (state.levels !== null) {
-      text = `${counts} · Laying out · level ${state.levels - state.level} of ${state.levels}`;
+      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}`;
     } else {
       text = `Loading graph view… ${counts}`;
     }
     // Only when it changes: the line is a live region.
     if (status.textContent !== text) status.textContent = text;
-    status.title = `${counts} · drawn with ${state.backend}`;
+    status.title = `${counts}${drawn} · drawn with ${state.backend}`;
   };
   state.header = header;
   header();
@@ -614,7 +619,7 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   state.cleanup.push(() => legend.replaceChildren());
   state.cleanup.push(() => (legend.hidden = true));
 
-  return { nodes: state.nodes, edges: state.edges, backend: state.backend };
+  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs };
 }
 
 /** A node's COLOR BY category, as the legend names it. */
@@ -723,6 +728,7 @@ export function info() {
     hovered: current.hovered === null ? null : node(current.hovered),
     hoverPicks,
     frames,
+    drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,
   };

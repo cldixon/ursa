@@ -333,6 +333,47 @@ edges is 6.1 s here, 4.4 s there): compare along a row, not with them.
   software WebGL2 that cost 26 ms a frame at 2,048 nodes (a third of the
   frame), which is why they have a buffer of their own.
 
+## Rings and layers
+
+The fixed layouts (`layout_rings`, `layout_layers`, #436), natively, by
+`ursa-core`'s `layout_levels` example: each R-MAT graph whole, every node
+levelled by its distance from node 0 and the unreached nodes left without a
+level. That is the largest neighbourhood each graph has; a `hop` result is
+usually far smaller. Not part of `bun run bench`; to rerun it:
+
+```sh
+cargo run -p ursa-core --release --no-default-features --example layout_levels
+```
+
+Run 2026-11-21 on the same machine, one thread (both layouts are serial, so
+rayon changes nothing), the median of five, the adjacency already built.
+*mean edge* is the mean edge length before and after the four barycentre
+sweeps, in ring or layer spacings.
+
+| graph | nodes | edges | nodes per level | rings ms | rings mean edge | layers ms | layers mean edge |
+|---|--:|--:|---|--:|--:|--:|--:|
+| 1k | 256 | 751 | 1, 79, 99, 6 (71 without) | 0.22 | 4.40 → 3.46 | 0.10 | 14.6 → 10.3 |
+| 10k | 2,048 | 8,334 | 1, 433, 876, 78 (660 without) | 2.1 | 29.5 → 25.2 | 1.2 | 103 → 77 |
+| 100k | 16,384 | 88,822 | 1, 2,082, 7,461, 708, 12 (6,120 without) | 21 | 214 → 191 | 12 | 752 → 550 |
+| 1m | 131,072 | 928,785 | 1, 9,706, 60,268, 6,390, 60 (54,647 without) | 305 | 1,667 → 1,481 | 166 | 5,872 → 4,394 |
+
+- **A neighbourhood of a few thousand nodes is laid out within a frame**
+  (2 ms at 2,048 nodes), and one of 16,384 nodes in about one and a half
+  (21 ms). Both grow with the adjacency: about 40 ns an adjacency entry a
+  sweep for rings.
+- **At 1M edges rings take 0.3 s**, where coarse to fine takes 7.5 s. In the
+  browser (`tests/browser/view.ts`, the neighbourhood of node 0 within three
+  hops: 76,365 nodes, 999,881 edges) the worker took 0.99 s for rings and
+  0.47 s for layers, building the adjacency included, and posted one
+  message.
+- **The sweeps shorten edges by 11 to 27%** on these graphs. R-MAT is the
+  hard case: a level's nodes share most of their neighbours, so no order is
+  much better than another. On karate's shortest paths the order leaves no
+  crossing.
+- **On karate** the worker took about 2 ms for either layout
+  (`view.ts`): two hops from node 0 are 26 nodes on two rings, the nearest
+  two 84 px apart on a 1000 by 700 canvas.
+
 ## Deltas
 
 What a scene that changes in place costs (#441): a view made from a result

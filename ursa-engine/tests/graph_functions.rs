@@ -82,11 +82,6 @@ async fn run_an_algorithm_matches_getting_started() {
     );
 }
 
-/// Getting Started, "Combine algorithms and attributes", with the node
-/// attributes read from a view of the file (`karate.nodes` belongs to the
-/// graph DDL), and the joins written with `ON`: DataFusion 55 cannot plan a
-/// chain of four `USING` joins, for plain tables too (see
-/// `four_using_joins_are_ambiguous_in_datafusion`).
 /// `louvain(g, parallel => true)` (#387): a community per node, the same as
 /// a column of `algorithms()`, and only a boolean is accepted.
 #[tokio::test]
@@ -120,6 +115,50 @@ async fn louvain_runs_in_parallel_on_request() {
     );
 }
 
+/// `label_propagation(g, parallel => true)` (#453): a label per node, the
+/// same as a column of `algorithms()`, and only a boolean is accepted. Karate
+/// has at most 64 nodes, so each sub-round holds one node and the labels are
+/// the serial run's.
+#[tokio::test]
+async fn label_propagation_runs_in_parallel_on_request() {
+    let ctx = karate().await;
+    let alone = table(
+        &ctx,
+        "SELECT id, label_propagation FROM label_propagation(karate, seed => 1, parallel => true) \
+         ORDER BY id",
+    )
+    .await
+    .unwrap();
+    let within = table(
+        &ctx,
+        "SELECT id, c AS label_propagation FROM algorithms(karate, \
+         c => label_propagation(seed => 1, parallel => true)) ORDER BY id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(alone, within);
+    let serial = table(
+        &ctx,
+        "SELECT id, label_propagation FROM label_propagation(karate, seed => 1) ORDER BY id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(alone, serial);
+    assert_eq!(
+        error(
+            &ctx,
+            "SELECT * FROM label_propagation(karate, parallel => 1)"
+        )
+        .await,
+        "label_propagation(parallel =>) must be a boolean; got 1"
+    );
+}
+
+/// Getting Started, "Combine algorithms and attributes", with the node
+/// attributes read from a view of the file (`karate.nodes` belongs to the
+/// graph DDL), and the joins written with `ON`: DataFusion 55 cannot plan a
+/// chain of four `USING` joins, for plain tables too (see
+/// `four_using_joins_are_ambiguous_in_datafusion`).
 #[tokio::test]
 async fn combine_algorithms_and_attributes() {
     let ctx = karate().await;
