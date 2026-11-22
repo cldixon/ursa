@@ -16,6 +16,9 @@
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
 //!   stepped a few iterations per frame, and grown when the graph gains
 //!   nodes), node styles and the camera. No GPU.
+//! - [`spatial`]: a grid over the node positions, and one over the edges, so
+//!   that a pick reads the nodes and edges near the pointer and a zoomed-in
+//!   frame draws the nodes in view. No GPU.
 //! - `render` (feature `render`, on by default): drawing with wgpu: WebGPU
 //!   or WebGL2 in the browser, Vulkan, Metal or DX12 natively. Edges are a
 //!   line list over the node positions, so a layout step uploads 8 bytes a
@@ -25,7 +28,7 @@
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
 //! With `default-features = false` the crate is [`model`], [`scene`],
-//! [`highlight`], [`interact`] and [`live`] alone: no GPU and no browser, which is how the engine depends on it.
+//! [`highlight`], [`interact`], [`spatial`] and [`live`] alone: no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
@@ -38,6 +41,7 @@ pub mod pace;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod scene;
+pub mod spatial;
 #[cfg(feature = "render")]
 pub mod view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]

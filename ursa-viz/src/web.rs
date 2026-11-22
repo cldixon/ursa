@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::highlight::{flag, BadHighlight, HighlightState};
-use crate::interact::{nearest_edge, EdgePick, Interact};
+use crate::interact::{EdgePick, Interact};
 use crate::model::{
     EdgeBatch, GraphDelta, GraphResult, KeyType, NodeBatch, NodeLabel, Op, Positions, Provenance,
 };
@@ -221,6 +221,7 @@ impl GraphView {
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        self.view.prepare(&self.device, &self.queue);
         self.view.draw(&self.device, &self.queue, &target);
         frame.present();
         Ok(())
@@ -264,9 +265,42 @@ impl GraphView {
         pixels.map_err(js_err)
     }
 
-    /// The node under the pixel `(x, y)`, or `undefined`.
-    pub fn pick(&self, x: f32, y: f32) -> Option<u32> {
+    /// The node under the pixel `(x, y)`, or `undefined`. With the
+    /// positions at rest it reads only the nodes near the pixel
+    /// ([`GraphView::grid_ready`]).
+    pub fn pick(&mut self, x: f32, y: f32) -> Option<u32> {
         self.view.pick(x, y)
+    }
+
+    /// [`GraphView::pick`], testing every node: the same answer, for a
+    /// test to compare.
+    #[wasm_bindgen(js_name = pickLinear)]
+    pub fn pick_linear(&self, x: f32, y: f32) -> Option<u32> {
+        self.view.pick_linear(x, y)
+    }
+
+    /// Whether the grid over the nodes has every node where it is now. The
+    /// view builds it once the positions rest (three frames or picks with
+    /// none changed); until then, and while a layout runs, a pick tests
+    /// every node, and every node is drawn.
+    #[wasm_bindgen(getter, js_name = gridReady)]
+    pub fn grid_ready(&self) -> bool {
+        self.view.grid_ready()
+    }
+
+    /// Build the grid over the nodes now, without waiting for the
+    /// positions to rest: for timing it.
+    #[wasm_bindgen(js_name = rebuildGrid)]
+    pub fn rebuild_grid(&mut self) {
+        self.view.rebuild_grid();
+    }
+
+    /// How many node instances the last frame's pass over the nodes drew:
+    /// every node, or, zoomed in with the positions at rest, the nodes in
+    /// view.
+    #[wasm_bindgen(getter, js_name = nodesDrawn)]
+    pub fn nodes_drawn(&self) -> u32 {
+        self.view.nodes_drawn() as u32
     }
 
     /// Node radii from a numeric column, one value per node.
@@ -479,23 +513,18 @@ impl GraphView {
     /// of it (4 CSS pixels, as a rule), or `undefined`: its index. For a
     /// click with no node under it ([`GraphView::pick`] first). An edge of
     /// a hidden node is not there to pick, nor is a removed edge. It reads
-    /// every edge once (`interact::nearest_edge`).
+    /// the edges near the pixel when the positions are at rest, and every
+    /// edge otherwise (`interact::nearest_edge`).
     #[wasm_bindgen(js_name = pickEdge)]
-    pub fn pick_edge(&self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
-        let camera = self.view.camera();
-        let graph = self.view.graph();
-        let (src, dst) = (graph.src(), graph.dst());
-        let (xs, ys) = self.view.positions();
-        let flags = self.view.highlight().flags();
-        let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
-        let result = self.view.result();
-        let skip = |e: u32| {
-            hidden(src[e as usize])
-                || hidden(dst[e as usize])
-                || result.is_some_and(|r| !r.edge_is_shown(e as usize))
-        };
-        let reach = tolerance / camera.pixels_per_unit;
-        nearest_edge(src, dst, xs, ys, skip, camera.to_world(x, y), reach)
+    pub fn pick_edge(&mut self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
+        self.view.pick_edge(x, y, tolerance)
+    }
+
+    /// [`GraphView::pick_edge`], testing every edge: the same answer, for
+    /// a test to compare.
+    #[wasm_bindgen(js_name = pickEdgeLinear)]
+    pub fn pick_edge_linear(&self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
+        self.view.pick_edge_linear(x, y, tolerance)
     }
 
     /// Select the edge `edge` alone (as [`GraphView::pick_edge`] gave it):
