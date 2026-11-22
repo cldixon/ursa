@@ -21,6 +21,7 @@ later, in a notebook widget or a native window through the same `View`.
 | `model` | the graph-result model, deltas and the UGR wire format (below). No GPU. |
 | `scene` | the graph, the live layout, node styles, the camera. No GPU; tested natively. |
 | `highlight` | each node's flags (selected, pinned, hidden, …) and the highlighted edges. No GPU. |
+| `spatial` | a grid over the node positions, and one over the edges: a pick reads what is near the pointer, and a zoomed-in frame draws the nodes in view. No GPU. |
 | `live` | a result as the view draws it, kept in step with its deltas: which slots a delta changes. No GPU. |
 | `budget` | the frame budget: how much a frame draws while the view moves, from what the last frames cost. No GPU. |
 | `order` | the edges' drawing order, most important first: what a prefix of them is. No GPU. |
@@ -29,7 +30,7 @@ later, in a notebook widget or a native window through the same `View`.
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
 | `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`, `rings`, `layers`, `edgeOrder`). |
 
-With `default-features = false` the crate is `model`, `scene`, `highlight` and `live`, with
+With `default-features = false` the crate is `model`, `scene`, `highlight`, `interact`, `spatial` and `live`, with
 no wgpu in its dependencies: what an engine needs to produce a graph, and
 nothing to draw one.
 
@@ -319,9 +320,9 @@ view.selectedEdge();                        // [edge, src, dst], or undefined
 - **An edge is picked** when no node is under the pointer (`pick` first):
   `pickEdge` gives the edge nearest the pixel, within the tolerance, of the
   edges that are drawn (not removed, and with neither end hidden); of
-  parallel edges, the first. It is a linear pass over the edges, each
-  rejected by its bounding box as a rule, so it is for a click, not for
-  every pointer move, until the view has a spatial grid.
+  parallel edges, the first. With the positions at rest it reads the edges
+  near the pixel ([the grid](#the-spatial-grid-pick-hover-and-culling));
+  otherwise every edge, each rejected by its bounding box as a rule.
 - Nodes are selected or an edge is, never both: `selectEdge` clears the
   nodes, and a click on a node or on empty space deselects the edge. The
   selected edge is drawn wide, as a selection's edges are, and leaves the
@@ -355,6 +356,69 @@ and checks all of it: the path's width and colour, the dimming, the rings,
 the hidden node and the bytes uploaded. Under WebGPU, whose frames cannot be
 read back headless, it checks that the same calls draw with no error from
 the device.
+
+## The spatial grid: pick, hover and culling
+
+A pick used to test every node: 4.9 ms at a million, on every pointer move
+that hovers. The view now keeps a grid over the node positions (#500,
+`spatial::NodeGrid`), and a pick tests the nodes in the cells around the
+pointer:
+
+| at 1,048,576 nodes, native, one core | |
+|---|---|
+| building the grid | 9.5 to 11.7 ms |
+| a pick with it | 6 to 22 µs |
+| a pick that tests every node | 3.6 to 4.0 ms |
+
+- **The grid.** Cells tile the box that holds the middle 98% of the
+  positions on each axis (one stray node does not stretch them), about two
+  nodes to a cell, at most 4096 cells a side; a node outside the box is in
+  the nearest border cell. It is built by two counting sorts (by row, then
+  each row by column), so a cell's nodes are in index order. It takes 4
+  bytes a node and 4 a cell.
+- **The pick is the same pick.** The grid only says which nodes to test.
+  Each is tested as before (the distance in pixels to its centre, against
+  its drawn radius and 2 px), a hidden node is skipped, and of nodes
+  equally near the lowest index wins, as the first did in the pass over
+  every node. `pickLinear` and `pickEdgeLinear` are that pass, kept for the
+  tests, which compare the two at thousands of pixels: on nodes, beside
+  them and anywhere, fitted and zoomed, on random and on clustered
+  positions.
+- **While positions move, the grid waits.** A layout moves every node every
+  frame, so the grid has nothing right: a pick tests every node, as before.
+  After three frames or picks with no position changed the view builds the
+  grid (`gridReady`). While a layout runs that never happens, unless its
+  steps are slower than the frames, when building a grid costs less than
+  the step and serves every pick until the next. A delta that only adds
+  nodes keeps the grid for the nodes it has, and a pick tests the new ones
+  as well, until the grid is built again. An undo's saved positions move
+  everything.
+- **An edge pick** reads a grid of the edges (`spatial::EdgeGrid`): each
+  edge is filed by its middle, in a level of cells just longer than the
+  edge, so the edges that pass a point are in the cells around it on each
+  level, wherever their ends are. It is built for the second edge picked
+  with the positions at rest (60 ms and 4 bytes an edge at 1M edges, a few
+  picks' worth), for up to 4M edges; past that, and for the first pick, an
+  edge pick reads every edge (9 to 16 ms at 1M edges). With it a pick takes
+  0.4 to 1.6 ms on a layout whose edges are mostly short, and no less than
+  10 ms on one whose edges all cross the drawing, where most edges do pass
+  near any point.
+- **Culling.** When under half the nodes, and at most 65,536, are in the
+  cells in view, `render` draws those alone: it gathers them in index
+  order and uploads them as one buffer, 20 bytes a node, when the camera, a
+  position, a style or a flag changes. The frame is the frame with every
+  node drawn, byte for byte (`setCulling(false)` draws that one;
+  `nodesDrawn` says how many instances the node pass draws). Selected,
+  hovered and highlighted nodes are in their own pass and are never
+  culled; a pinned node's ring is counted in its reach. Zoomed into 1% of
+  a 131K-node R-MAT drawing, the node pass draws 0.8 to 2.4% of the
+  instances.
+  A graph under 1,024 nodes is never culled.
+
+In Rust, a binding calls `View::prepare` before `View::draw` (the web one
+does, in `render`): it counts the quiet frame and works out the nodes in
+view. `View::pick` and `View::pick_edge` take `&mut self` for the same
+count.
 
 ## Scenes that change in place
 
@@ -728,6 +792,16 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   (half the nodes, nearly all the edges), so they cost about what the graph
   does. Cheaper iterations (attraction gathers 2M random reads; repulsion
   could be approximated harder far out) would buy the rest.
+- **A grid while the layout runs.** The grid waits for the positions to
+  rest (#500), so a hover during a layout still tests every node, and every
+  node is drawn. A grid that tolerates small moves (cells widened by the
+  furthest any node has moved) would serve the layout's last, slow stretch.
+- **Culling past 65,536 nodes in view.** The nodes in view are uploaded
+  when the camera moves, so they are capped; between that and half the
+  nodes, every node is drawn. Drawing ranges of a buffer sorted by cell
+  would have no cap, but would draw overlapping nodes in another order than
+  the unculled frame does, and hold every node a second time on the GPU.
+- **Edges are not culled**: the line list draws every edge, in view or not.
 - **Rings and layers from the shell.** The shell's worker takes
   `graph.layout = {kind, level}` from `graph.js`, but nothing sets it yet:
   the rules that turn a `hop` result or a path column into one are #433.

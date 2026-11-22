@@ -323,7 +323,7 @@ static assets and an R2 bucket.
     | field | what |
     |---|---|
     | `frames` | `count`, the frames drawn since the page loaded; `render`, the time in `view.render()` of the last 120; `interval`, the time from one frame's start to the next's, of the last 120 frames that input asked for (a drag, a wheel, a key) and that began within 100 ms of the page's thread being free of the frame before: the view moving. It is the frame's whole cost; `render` is only the call. Each is `{count, p50, p95, max}` in ms. |
-    | `pick` | `{count, last, p95}`: the time in `view.pick()` of a click or a hover, over the last 120. |
+    | `pick` | `{count, last, p95}`: the time in `view.pick()` of a click or a hover, over the last 120. With the layout at rest a pick reads the view's spatial grid (#500), not every node. |
     | `actions` | the last 32, oldest first: `{command, at, engine, delta, frame}`. `command` is what was typed (`.graph karate`) or the input (`click`, `fit`, `key +`); `at` is when the input arrived, in ms after the last `.graph`'s Enter; `engine` is the ms the engine took and `delta` the ms applying its answer to the view (both `null` for an input that needs neither); `frame` is the ms from the input to when the page's thread was free of the frame that showed it: with no GPU the browser rasterises a frame on that thread after `render()` returns (4 s at a million edges), so this is when the pixels are there, where `firstDraw` is when `render()` returned. A click that changes no selection draws nothing, and is shown by the next frame the browser paints. |
     | `longTasks` | the page's last 64 tasks over 50 ms: `{start, duration}`, `start` in ms after Enter. |
 

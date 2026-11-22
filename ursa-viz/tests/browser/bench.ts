@@ -20,7 +20,8 @@
 //   importance order: the time between frames, median and p95, and how many
 //   edges and nodes the last frame drew. This is the interaction trace to
 //   read on a laptop: its p95 is what the budget holds;
-// - pick latency (`view.pick` at random pixels);
+// - pick latency (`view.pick` at random pixels), the time to build the grid
+//   it reads, and how many nodes a frame zoomed into 1% of the drawing draws;
 // - memory: the page's and the layout worker's wasm memory, and
 //   `performance.measureUserAgentSpecificMemory` (the server sends
 //   COOP/COEP, so the page is cross-origin isolated) or `performance.memory`;
@@ -291,6 +292,18 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             pickMs.push(performance.now() - t);
             if (hit !== undefined) hits++;
           }
+          // The grid the picks read: building it, and what a frame zoomed
+          // into 1% of the drawing (a tenth each way) draws with it.
+          const gridBuildMs: number[] = [];
+          for (let i = 0; i < 9; i++) {
+            const t = performance.now();
+            view.rebuildGrid();
+            gridBuildMs.push(performance.now() - t);
+          }
+          view.zoom(10, canvas.width / 2, canvas.height / 2);
+          view.render();
+          const culledNodes = view.nodesDrawn;
+          view.fit();
           // Memory.
           const memory: any = { pageWasmBytes: w.wasm.memory.buffer.byteLength, workerWasmBytes: w.stats.workerMemoryBytes };
           const pm = (performance as any).memory;
@@ -346,7 +359,7 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
           };
           view.fit();
           w.pauseFrames(false);
-          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, memory, budget };
+          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, gridBuildMs, culledNodes, memory, budget };
         },
         { frames: FRAMES, picks: PICKS, budgetMs: FRAME_BUDGET_MS },
       ),
@@ -357,6 +370,7 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
     }
     for (const k of ["pan", "zoom"]) result.budget[k] = { ...result.budget[k], interval: undefined, rafIntervalMs: summary(result.budget[k].interval) };
     result.pickMs = summary(result.pickMs);
+    result.gridBuildMs = summary(result.gridBuildMs);
     result.burstMsPerFrame = summary(result.burstMs);
     delete result.burstMs;
     const h = result.highlight;

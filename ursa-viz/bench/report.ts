@@ -32,8 +32,8 @@ for (const b of backends) {
   out.push("");
   out.push(`Frame sync: ${sync}.`);
   out.push("");
-  out.push("| graph | nodes | edges | first frame | layout done, coarse to fine | flat, ms/it | pan frame, ms (median / p95) | zoom frame, ms | burst, ms/frame | rAF interval, ms | pick, ms (median / p95) | wasm MiB (page / worker) | JS heap MiB | uploads × bytes |");
-  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+  out.push("| graph | nodes | edges | first frame | layout done, coarse to fine | flat, ms/it | pan frame, ms (median / p95) | zoom frame, ms | burst, ms/frame | rAF interval, ms | pick, ms (median / p95) | grid, ms | nodes drawn at 1% | wasm MiB (page / worker) | JS heap MiB | uploads × bytes |");
+  out.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const c of ml) {
     if (c.error) {
       out.push(`| ${label(c)} | – | – | error: ${c.error.slice(0, 60)} |||||||||||`);
@@ -41,7 +41,7 @@ for (const b of backends) {
     }
     const flat = cases.find((f: any) => f.mode === "flat" && f.graph === c.graph && f.size === c.size);
     out.push(
-      `| ${label(c)} | ${c.nodes.toLocaleString("en")} | ${c.edges.toLocaleString("en")} | ${t(c.firstFrameMs)} | ${t(c.layoutDoneMs)} | ${flat?.msPerIteration ?? "–"} | ${pair(c.pan?.frameMs)} | ${pair(c.zoom?.frameMs)} | ${ms(c.burstMsPerFrame?.median, 1)} | ${ms(c.pan?.rafIntervalMs?.median, 1)} | ${pair(c.pickMs, 3)} | ${mb(c.memory?.pageWasmBytes)} / ${mb(c.memory?.workerWasmBytes)} | ${mb(c.memory?.jsHeapUsedBytes)} | ${c.uploads} × ${c.bytesPerUpload.toLocaleString("en")} |`,
+      `| ${label(c)} | ${c.nodes.toLocaleString("en")} | ${c.edges.toLocaleString("en")} | ${t(c.firstFrameMs)} | ${t(c.layoutDoneMs)} | ${flat?.msPerIteration ?? "–"} | ${pair(c.pan?.frameMs)} | ${pair(c.zoom?.frameMs)} | ${ms(c.burstMsPerFrame?.median, 1)} | ${ms(c.pan?.rafIntervalMs?.median, 1)} | ${pair(c.pickMs, 3)} | ${ms(c.gridBuildMs?.median, 2)} | ${c.culledNodes?.toLocaleString("en") ?? "–"} | ${mb(c.memory?.pageWasmBytes)} / ${mb(c.memory?.workerWasmBytes)} | ${mb(c.memory?.jsHeapUsedBytes)} | ${c.uploads} × ${c.bytesPerUpload.toLocaleString("en")} |`,
     );
   }
   out.push("");

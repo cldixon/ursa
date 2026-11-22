@@ -575,6 +575,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   New: `ursa_engine::graph::view::inspect`, `Shell::inspect`,
   `WebShell.inspectNode` and `inspectEdge`, and in `ursa-viz`
   `interact::nearest_edge`, `pickEdge`, `selectEdge` and `selectedEdge`.
+- **A spatial grid in the graph view: a pick reads the nodes near the
+  pointer, and a zoomed-in frame draws the nodes in view** (#500). With the
+  positions at rest, `ursa-viz` keeps a uniform grid over them and a pick
+  or a hover tests the nodes in the cells around the pointer: 6 to 22 µs at
+  a million nodes, where testing every node took 3.6 to 4.9 ms on every
+  pointer move; the grid is built in 10 to 12 ms. An edge pick reads a grid
+  of the edges by length. Zoomed in so that under half the nodes (and at
+  most 65,536) are in view, the node pass draws those alone: under 3% of
+  the instances at 1% of an R-MAT drawing. Every pick is the pick that
+  tests everything, ties included, and the culled frame is the whole frame
+  byte for byte; while a layout moves the nodes, picks test every node and
+  frames draw every node, as before. A frame and a pick no longer add up
+  every node's area to size the nodes. New in `ursa-viz`: the `spatial`
+  module (`NodeGrid`, `EdgeGrid`, `Discs`), `View::prepare`,
+  `View::pick_edge`, and in the wasm API `gridReady`, `rebuildGrid`,
+  `nodesDrawn`, `setCulling`, `pickLinear` and `pickEdgeLinear`.
+  `View::pick` takes `&mut self`.
 - **Hover and selection in the graph view** (#438). In the web shell's
   `.graph` pane, a mouse or a pen over a node rings it and shows a tooltip
   (its key, label, `SIZE BY` and `COLOR BY` values and degree), looked up

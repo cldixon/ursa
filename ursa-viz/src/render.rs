@@ -253,20 +253,6 @@ fn node_vs(
     return node(corner, x, y, radius, color, flags.x, false);
 }
 
-// Some of the nodes, from a buffer of their own, while the view moves: the
-// pass over every node, for the nodes gathered.
-@vertex
-fn some_node_vs(
-    @builtin(vertex_index) corner: u32,
-    @location(0) x: f32,
-    @location(1) y: f32,
-    @location(2) radius: f32,
-    @location(3) color: vec4<f32>,
-    @location(4) flags: vec4<u32>,
-) -> NodeOut {
-    return node(corner, x, y, radius, color, flags.x, false);
-}
-
 @vertex
 fn front_node_vs(
     @builtin(vertex_index) corner: u32,
@@ -376,8 +362,8 @@ pub struct Renderer {
     /// The edges while a node is hidden: it reads the flags too.
     hiding_edges: wgpu::RenderPipeline,
     nodes: wgpu::RenderPipeline,
-    /// The pass over every node, for a buffer of some of them.
-    some_nodes: wgpu::RenderPipeline,
+    /// The nodes in view, from one buffer ([`Renderer::set_culled_nodes`]).
+    culled_nodes: wgpu::RenderPipeline,
     front_nodes: wgpu::RenderPipeline,
     wide_edges: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
@@ -396,6 +382,10 @@ pub struct Renderer {
     /// The nodes a frame that does not draw them all draws, most important
     /// first, each a [`FrontNode`] ([`Renderer::set_some_nodes`]).
     some: Instances,
+    /// The nodes in view, each a [`FrontNode`], in index order: drawn in
+    /// place of every node while `culling`.
+    culled: Instances,
+    culling: bool,
     n_nodes: u32,
     n_indices: u32,
     /// How many nodes and edges the buffers have room for.
@@ -428,7 +418,17 @@ pub struct Renderer {
 /// canvas, the nodes cover at most `coverage` of it: 1 for a small graph,
 /// down to `0.15` for a huge one (131K nodes on a laptop screen).
 pub fn node_radius_scale(radius: &[f32], width: f32, height: f32, coverage: f32) -> f32 {
-    let area: f32 = radius.iter().map(|r| std::f32::consts::PI * r * r).sum();
+    radius_scale_for(disc_area(radius), width, height, coverage)
+}
+
+/// The area of every node's disc at full size, in square pixels: what
+/// [`node_radius_scale`] reads of the radii, for a caller that keeps it.
+pub fn disc_area(radius: &[f32]) -> f32 {
+    radius.iter().map(|r| std::f32::consts::PI * r * r).sum()
+}
+
+/// [`node_radius_scale`], from the discs' area ([`disc_area`]).
+pub fn radius_scale_for(area: f32, width: f32, height: f32, coverage: f32) -> f32 {
     if area <= 0.0 {
         return 1.0;
     }
@@ -774,9 +774,11 @@ impl Renderer {
             &front_buffers,
         );
         pace.breathe().await;
-        let some_nodes = pipeline(
-            "some nodes",
-            "some_node_vs",
+        // The pass over every node, reading one buffer: for the nodes in
+        // view alone.
+        let culled_nodes = pipeline(
+            "nodes in view",
+            "node_vs",
             "node_fs",
             triangles,
             &front_buffers,
@@ -832,7 +834,7 @@ impl Renderer {
             edges,
             hiding_edges,
             nodes,
-            some_nodes,
+            culled_nodes,
             front_nodes,
             wide_edges,
             uniforms,
@@ -847,6 +849,8 @@ impl Renderer {
             wide: Instances::new(device, "highlighted edges", WIDE_STRIDE),
             front: Instances::new(device, "nodes in front", FRONT_STRIDE),
             some: Instances::new(device, "some nodes", FRONT_STRIDE),
+            culled: Instances::new(device, "nodes in view", FRONT_STRIDE),
+            culling: false,
             n_nodes: n_nodes as u32,
             n_indices: 2 * n_edges as u32,
             node_capacity: node_capacity as u32,
@@ -1166,6 +1170,44 @@ impl Renderer {
         self.some.len
     }
 
+    /// Draw only these nodes in the pass over every node (`Some`: the nodes
+    /// in view, in index order, 20 bytes each), or every node again
+    /// (`None`, which uploads nothing). The nodes given must be every node
+    /// that pass would put a fragment on the canvas for, as they are in the
+    /// node buffers: the frame is then the same, bit for bit. Whoever
+    /// changes a position, a style, a flag or the camera says so again.
+    pub fn set_culled_nodes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nodes: Option<&[FrontNode]>,
+    ) {
+        self.culling = nodes.is_some();
+        if let Some(nodes) = nodes {
+            self.culled.set(device, queue, nodes);
+        }
+    }
+
+    /// Draw every node again in the pass over every node.
+    pub fn set_culled_nodes_off(&mut self) {
+        self.culling = false;
+    }
+
+    /// How many instances the pass over every node draws: every node, or
+    /// the nodes in view ([`Renderer::set_culled_nodes`]).
+    pub fn nodes_drawn(&self) -> u32 {
+        if self.culling {
+            self.culled.len
+        } else {
+            self.n_nodes
+        }
+    }
+
+    /// Bytes of nodes in view written to the GPU so far.
+    pub fn culled_bytes_uploaded(&self) -> u64 {
+        self.culled.bytes_uploaded
+    }
+
     /// How many highlighted edges are drawn.
     pub fn highlight_edges(&self) -> u32 {
         self.wide.len
@@ -1299,11 +1341,21 @@ impl Renderer {
                 pass.draw_indexed(0..n_indices, 0, 0..1);
             }
             if let Some(some) = some_nodes {
+                // A moving frame: the largest nodes alone, never the
+                // nodes in view as well.
                 let some = (some as u32).min(self.some.len);
                 if draw_nodes && some > 0 {
-                    pass.set_pipeline(&self.some_nodes);
+                    pass.set_pipeline(&self.culled_nodes);
                     pass.set_vertex_buffer(0, self.some.slice());
                     pass.draw(0..6, 0..some);
+                }
+            } else if draw_nodes && self.culling {
+                // The nodes in view alone, as the pass below would draw
+                // them.
+                if self.culled.len > 0 {
+                    pass.set_pipeline(&self.culled_nodes);
+                    pass.set_vertex_buffer(0, self.culled.slice());
+                    pass.draw(0..6, 0..self.culled.len);
                 }
             } else if draw_nodes && self.n_nodes > 0 {
                 pass.set_pipeline(&self.nodes);

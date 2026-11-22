@@ -5,16 +5,20 @@
 //! frame into a texture. `web` is one such binding; a native window or a
 //! notebook widget would be others.
 
+use std::cell::Cell;
+
 use ursa_core::algo::{fa2_seed_positions, Fa2Params};
 
 use crate::budget::{split, total_units, Frame, FrameBudget};
-use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
+use crate::highlight::{flag, BadHighlight, HighlightState, MARK_REACH};
+use crate::interact::nearest_edge;
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
 use crate::order::{check_order, BadOrder, Ordered};
 use crate::pace::{ready, yield_now, Pace};
-use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
+use crate::render::{disc_area, radius_scale_for, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
+use crate::spatial::{Discs, EdgeGrid, NodeGrid};
 
 pub struct View {
     graph: Graph,
@@ -64,6 +68,8 @@ pub struct View {
     some: SomeNodes,
     /// What the last moving frame drew: nodes and edges.
     moving_drew: (usize, usize),
+    /// Where the nodes are, for picking and culling ([`Spatial`]).
+    spatial: Spatial,
 }
 
 /// The nodes for a frame that does not draw them all: the largest first.
@@ -108,6 +114,58 @@ pub struct FrameInfo {
     pub frames: usize,
     /// The cost a moving frame is held to, in milliseconds.
     pub limit: f64,
+}
+
+/// The grids over the positions, and how far they can be trusted: the
+/// positions move every frame while a layout runs, and a grid is built
+/// only once they have stopped.
+#[derive(Debug, Default)]
+struct Spatial {
+    /// The grid over the nodes, as last built.
+    grid: Option<NodeGrid>,
+    /// The nodes before this one are where the grid has them. The rest have
+    /// moved since, or are new: a pick tests each of them.
+    fresh: usize,
+    /// Frames and picks since a position last changed.
+    quiet: u32,
+    /// At least every node's radius, in pixels.
+    max_radius: f32,
+    /// The area of every node's disc, until a radius changes: a frame and
+    /// a pick both need it, and it is a pass over every node.
+    disc_area: Cell<Option<f32>>,
+    /// The grid over the edges, built for the second edge picked with the
+    /// positions at rest: building it costs a few picks that read every
+    /// edge, which one stray click should not pay.
+    edges: Option<EdgeGrid>,
+    /// Edges picked since the positions came to rest.
+    edge_picks: u32,
+    /// Whether the nodes in view have been worked out for the scene and
+    /// camera as they are ([`View::prepare`]).
+    culled: bool,
+    /// Never draw the nodes in view alone ([`View::set_culling`]).
+    no_culling: bool,
+}
+
+/// A grid is built once this many frames and picks have passed with no
+/// position changed. While a layout runs that never happens (a frame, a
+/// hover, and the positions change again), unless its steps are slower
+/// than the frames, when a grid costs less than a step and is used until
+/// the next.
+const QUIET: u32 = 3;
+
+/// The most edges an edge grid is built over (four bytes an edge): past
+/// it, picking an edge reads every edge.
+const EDGE_GRID_MAX: usize = 1 << 22;
+
+/// A graph with fewer nodes draws them all, in view or not.
+const CULL_MIN_NODES: usize = 1024;
+
+/// The most nodes in view that are drawn alone: they are uploaded, 20
+/// bytes each, when the camera moves.
+const CULL_MAX_NODES: usize = 1 << 16;
+
+fn max_radius(radius: &[f32]) -> f32 {
+    radius.iter().copied().fold(0.0, f32::max)
 }
 
 type Bounds = Option<(f32, f32, f32, f32)>;
@@ -318,7 +376,9 @@ impl View {
             reorder: None,
             some: SomeNodes::default(),
             moving_drew: (0, 0),
+            spatial: Spatial::default(),
         };
+        view.spatial.max_radius = max_radius(&view.style.radius);
         if view.live.is_some() {
             view.upload_flags(device, queue, false);
         }
@@ -410,6 +470,25 @@ impl View {
             changes.positions = true;
         }
         let ((n0, n1), (m0, m1)) = (changes.nodes, changes.edges);
+        // The grid still has the nodes that were there and did not move.
+        let spatial = &mut self.spatial;
+        spatial.fresh = match changes.positions {
+            true => 0,
+            false => spatial.fresh.min(changes.new_nodes_from).min(n1),
+        };
+        spatial.quiet = 0;
+        spatial.edges = None;
+        spatial.edge_picks = 0;
+        let restyled = changes.restyled.iter().cloned();
+        for run in restyled.chain(std::iter::once(changes.new_nodes_from.min(n1)..n1)) {
+            let most = max_radius(&self.style.radius[run]);
+            spatial.max_radius = spatial.max_radius.max(most);
+        }
+        spatial.culled = false;
+        if n0 != n1 || changes.new_nodes_from < n1 || !changes.restyled.is_empty() {
+            spatial.disc_area.set(None);
+        }
+        self.renderer.set_culled_nodes_off();
         let grows = self.renderer.grows();
         self.renderer.resize(device, queue, n1, m1);
 
@@ -509,6 +588,7 @@ impl View {
         let before = uploaded(&self.renderer);
         let dirty = self.highlight.take_dirty();
         self.renderer.set_flags(queue, &self.highlight, &dirty);
+        self.uncull();
         if layer || !dirty.is_empty() {
             self.front = self.highlight.front_nodes().collect();
             self.upload_highlight(device, queue, true, true);
@@ -588,6 +668,12 @@ impl View {
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.budget.moved();
         self.renderer.set_positions(queue, &self.x, &self.y);
+        // Every node moved: no grid has them now.
+        self.spatial.fresh = 0;
+        self.spatial.quiet = 0;
+        self.spatial.edges = None;
+        self.spatial.edge_picks = 0;
+        self.uncull();
         // The highlighted edges and the nodes in front hold positions.
         self.upload_highlight(device, queue, true, true);
         self.fitted = None;
@@ -622,6 +708,7 @@ impl View {
         self.highlight = next;
         let dirty = self.highlight.take_dirty();
         self.renderer.set_flags(queue, &self.highlight, &dirty);
+        self.uncull();
         if flags_changed {
             self.front = self.highlight.front_nodes().collect();
         }
@@ -691,17 +778,6 @@ impl View {
             .collect()
     }
 
-    /// Node `i`'s radius as drawn, in pixels, with nodes shrunk by `scale`
-    /// ([`View::radius_scale`]): a node in front is never tiny.
-    fn drawn_radius(&self, i: usize, scale: f32) -> f32 {
-        let r = self.style.radius[i] * scale;
-        if self.highlight.flags()[i] & flag::FRONT != 0 {
-            r.max(MIN_FRONT_RADIUS)
-        } else {
-            r
-        }
-    }
-
     /// Where node `i` is drawn, in pixels from the canvas's top left.
     pub fn node_pixel(&self, i: usize) -> (f32, f32) {
         self.camera.to_pixel(self.x[i], self.y[i])
@@ -711,8 +787,11 @@ impl View {
         assert_eq!(style.radius.len(), self.graph.n_nodes());
         assert_eq!(style.color.len(), self.graph.n_nodes());
         self.renderer.set_style(queue, &style);
+        self.spatial.max_radius = max_radius(&style.radius);
+        self.spatial.disc_area.set(None);
         self.style = style;
         self.some = SomeNodes::default();
+        self.uncull();
         // The nodes in front hold their radius and colour.
         self.upload_highlight(device, queue, false, true);
     }
@@ -760,6 +839,7 @@ impl View {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.budget.moved();
         self.camera.viewport = (width.max(1) as f32, height.max(1) as f32);
+        self.uncull();
         if self.follow {
             self.fit_camera();
         }
@@ -769,12 +849,14 @@ impl View {
         self.budget.moved();
         self.follow = false;
         self.camera.pan(dx, dy);
+        self.uncull();
     }
 
     pub fn zoom(&mut self, factor: f32, px: f32, py: f32) {
         self.budget.moved();
         self.follow = false;
         self.camera.zoom(factor, px, py);
+        self.uncull();
     }
 
     /// Fit the whole layout in view, and keep it fitted as it moves.
@@ -797,6 +879,7 @@ impl View {
             self.budget.moved();
             self.camera.fit(b);
             self.fitted_zoom = self.camera.pixels_per_unit;
+            self.uncull();
         }
     }
 
@@ -845,25 +928,201 @@ impl View {
         });
     }
 
+    /// The nodes as a pick sees them.
+    fn discs(&self) -> Discs<'_> {
+        Discs {
+            x: &self.x,
+            y: &self.y,
+            radius: &self.style.radius,
+            flags: self.highlight.flags(),
+            camera: &self.camera,
+            scale: self.radius_scale(),
+        }
+    }
+
+    /// Whether the grid has every node where it is now.
+    fn grid_is_fresh(&self) -> bool {
+        let n = self.x.len();
+        (self.spatial.grid.as_ref()).is_some_and(|g| g.len() == n && self.spatial.fresh == n)
+    }
+
+    /// A frame or a pick with the positions as they were: once there have
+    /// been [`QUIET`] of them, the positions are at rest, and the grid is
+    /// built if it is behind.
+    fn rested(&mut self) {
+        self.spatial.quiet = self.spatial.quiet.saturating_add(1);
+        if self.spatial.quiet >= QUIET && !self.grid_is_fresh() {
+            self.rebuild_grid();
+        }
+    }
+
+    /// Build the grid over the nodes now, wherever they are: one pass over
+    /// the positions (see `BENCH.md`). The view does it itself once the
+    /// positions rest; this is for a caller that knows they have, and for
+    /// timing it.
+    pub fn rebuild_grid(&mut self) {
+        self.spatial.grid = Some(NodeGrid::build(&self.x, &self.y));
+        self.spatial.fresh = self.x.len();
+        self.uncull();
+    }
+
+    /// Whether the grid has every node where it is now: a pick reads only
+    /// the nodes near the pointer, and a zoomed-in frame draws only the
+    /// nodes in view.
+    pub fn grid_ready(&self) -> bool {
+        self.grid_is_fresh()
+    }
+
     /// The node drawn under the pixel `(px, py)`, if any: the nearest node
-    /// whose disc covers it. A hidden node is not there to pick.
-    pub fn pick(&self, px: f32, py: f32) -> Option<u32> {
-        let (x, y) = (&self.x, &self.y);
-        let scale = self.radius_scale();
-        let mut best: Option<(u32, f32)> = None;
+    /// whose disc covers it and, of nodes equally near, the first. A hidden
+    /// node is not there to pick.
+    ///
+    /// It reads the nodes in the grid's cells around the pixel, and every
+    /// node that moved or was added since the grid was built: all of them
+    /// while a layout runs. The answer is the same either way
+    /// ([`View::pick_linear`]).
+    pub fn pick(&mut self, px: f32, py: f32) -> Option<u32> {
+        self.rested();
+        let discs = self.discs();
+        match &self.spatial.grid {
+            Some(grid) => discs.pick(grid, self.spatial.fresh, self.spatial.max_radius, px, py),
+            None => discs.pick_linear(px, py),
+        }
+    }
+
+    /// [`View::pick`], testing every node: what the grid must agree with.
+    pub fn pick_linear(&self, px: f32, py: f32) -> Option<u32> {
+        self.discs().pick_linear(px, py)
+    }
+
+    /// Whether edge `e` is not drawn: it was removed, or a node it joins is
+    /// hidden.
+    fn edge_is_gone(&self, e: u32) -> bool {
         let flags = self.highlight.flags();
-        for i in 0..x.len() {
-            if flags[i] & flag::HIDDEN != 0 {
-                continue;
-            }
-            let (qx, qy) = self.camera.to_pixel(x[i], y[i]);
-            let d2 = (qx - px).powi(2) + (qy - py).powi(2);
-            let r = self.drawn_radius(i, scale) + 2.0;
-            if d2 <= r * r && best.is_none_or(|(_, b)| d2 < b) {
-                best = Some((i as u32, d2));
+        let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
+        let (src, dst) = (self.graph.src(), self.graph.dst());
+        hidden(src[e as usize])
+            || hidden(dst[e as usize])
+            || (self.live.as_ref()).is_some_and(|l| !l.result().edge_is_shown(e as usize))
+    }
+
+    /// The edge drawn nearest the pixel `(px, py)`, within `tolerance`
+    /// pixels of it: its index. Of edges equally near, the first. An edge
+    /// of a hidden node is not there to pick, nor is a removed edge.
+    ///
+    /// With the positions at rest it reads the edges near the pixel, from a
+    /// grid of the edges built for the second such pick (up to 4M edges);
+    /// otherwise every edge. The answer is the same either way
+    /// ([`View::pick_edge_linear`]).
+    pub fn pick_edge(&mut self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
+        self.rested();
+        let (src, dst) = (self.graph.src(), self.graph.dst());
+        let at_rest = self.grid_is_fresh() && src.len() <= EDGE_GRID_MAX;
+        if at_rest && self.spatial.edges.is_none() {
+            self.spatial.edge_picks += 1;
+            if self.spatial.edge_picks >= 2 {
+                self.spatial.edges = Some(EdgeGrid::build(src, dst, &self.x, &self.y));
             }
         }
-        best.map(|(i, _)| i)
+        let Some(grid) = self.spatial.edges.as_ref().filter(|_| at_rest) else {
+            return self.pick_edge_linear(px, py, tolerance);
+        };
+        let at = self.camera.to_world(px, py);
+        let reach = tolerance / self.camera.pixels_per_unit;
+        let skip = |e| self.edge_is_gone(e);
+        grid.nearest(src, dst, &self.x, &self.y, skip, at, reach)
+    }
+
+    /// [`View::pick_edge`], testing every edge.
+    pub fn pick_edge_linear(&self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
+        let (src, dst) = (self.graph.src(), self.graph.dst());
+        let at = self.camera.to_world(px, py);
+        let reach = tolerance / self.camera.pixels_per_unit;
+        let skip = |e| self.edge_is_gone(e);
+        nearest_edge(src, dst, &self.x, &self.y, skip, at, reach)
+    }
+
+    /// The camera, a position, a style or a flag changed: the nodes in
+    /// view are worked out again before the next frame.
+    fn uncull(&mut self) {
+        self.spatial.culled = false;
+        self.renderer.set_culled_nodes_off();
+    }
+
+    /// Get ready to draw a frame: call it before [`View::draw`]. Once the
+    /// positions rest it builds the grid, and when under half the nodes
+    /// (and at most 65,536) are in view it gives the renderer those alone
+    /// to draw, 20 bytes each, uploaded when the camera or a node changes.
+    /// The frame is the same, bit for bit: only nodes that put nothing on
+    /// the canvas are left out, and the rest are drawn in the same order.
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.rested();
+        if std::mem::replace(&mut self.spatial.culled, true) {
+            return;
+        }
+        if let Some(nodes) = self.nodes_in_view() {
+            let flags = self.highlight.flags();
+            let nodes: Vec<FrontNode> = nodes
+                .into_iter()
+                .map(|i| {
+                    let i = i as usize;
+                    let (radius, color) = (self.style.radius[i], self.style.color[i]);
+                    FrontNode::new(self.x[i], self.y[i], radius, color, flags[i])
+                })
+                .collect();
+            self.renderer.set_culled_nodes(device, queue, Some(&nodes));
+        }
+    }
+
+    /// Whether a zoomed-in frame may draw the nodes in view alone
+    /// ([`View::prepare`]): on unless turned off, which a test does to
+    /// compare the two frames.
+    pub fn set_culling(&mut self, on: bool) {
+        self.spatial.no_culling = !on;
+        self.uncull();
+    }
+
+    /// The nodes the pass over every node draws on the canvas, in index
+    /// order, if they are few enough to draw alone and the grid has every
+    /// node. A hidden node, and a node in front (drawn in its own pass),
+    /// is not among them.
+    fn nodes_in_view(&self) -> Option<Vec<u32>> {
+        let n = self.x.len();
+        if n < CULL_MIN_NODES || self.spatial.no_culling || !self.grid_is_fresh() {
+            return None;
+        }
+        let grid = self.spatial.grid.as_ref()?;
+        let discs = self.discs();
+        // A node's quad reaches this far from its centre, and a little is
+        // added for the rounding on the way to the canvas.
+        let reach = self.spatial.max_radius * discs.scale + 1.0 + MARK_REACH;
+        if !reach.is_finite() {
+            return None;
+        }
+        let (w, h) = self.camera.viewport;
+        let (w, h) = (f64::from(w), f64::from(h));
+        let reach = f64::from(reach) * 1.0001 + 1e-4 * (w + h) + 1e-3;
+        let cells = discs.cells_in(grid, -reach, -reach, w + reach, h + reach);
+        let count = grid.count(cells);
+        if 2 * count >= n || count > CULL_MAX_NODES {
+            return None;
+        }
+        let flags = self.highlight.flags();
+        let apart = flag::HIDDEN | flag::FRONT;
+        let mut nodes: Vec<u32> = grid
+            .runs(cells)
+            .flatten()
+            .copied()
+            .filter(|&i| flags[i as usize] & apart == 0)
+            .collect();
+        nodes.sort_unstable();
+        Some(nodes)
+    }
+
+    /// How many nodes the pass over every node draws: all of them, or the
+    /// nodes in view ([`View::prepare`]).
+    pub fn nodes_drawn(&self) -> usize {
+        self.renderer.nodes_drawn() as usize
     }
 
     /// Draw a frame offscreen and read it back: `width * height` RGBA pixels,
@@ -965,7 +1224,15 @@ impl View {
     /// 8% of the canvas, easing back to full size as the view zooms in.
     pub fn radius_scale(&self) -> f32 {
         let (w, h) = self.camera.viewport;
-        let fitted = node_radius_scale(&self.style.radius, w, h, 0.08);
+        let area = match self.spatial.disc_area.get() {
+            Some(area) => area,
+            None => {
+                let area = disc_area(&self.style.radius);
+                self.spatial.disc_area.set(Some(area));
+                area
+            }
+        };
+        let fitted = radius_scale_for(area, w, h, 0.08);
         let zoomed_in = (self.camera.pixels_per_unit / self.fitted_zoom).max(1.0);
         (fitted * zoomed_in.sqrt()).min(1.0)
     }
@@ -1095,6 +1362,9 @@ impl View {
         target: &wgpu::TextureView,
         now_ms: f64,
     ) -> Frame {
+        // The grid once the positions rest, and the nodes in view: what a
+        // frame that draws every node draws of them ([`View::prepare`]).
+        self.prepare(device, queue);
         let (n, m) = self.renderer.counts();
         let frame = self.budget.frame(now_ms, total_units(n, m));
         let (nodes, edges) = split(frame.units, n, m);

@@ -171,37 +171,13 @@ pub fn nearest_edge(
     at: (f32, f32),
     tolerance: f32,
 ) -> Option<u32> {
-    let (px, py) = at;
     let mut best: Option<(u32, f32)> = None;
     let mut reach = tolerance * tolerance;
     for (i, (&s, &d)) in src.iter().zip(dst).enumerate() {
-        let (Some(&ax), Some(&ay), Some(&bx), Some(&by)) = (
-            x.get(s as usize),
-            y.get(s as usize),
-            x.get(d as usize),
-            y.get(d as usize),
-        ) else {
+        let Some(d2) = edge_distance2(s, d, x, y, at, tolerance) else {
             continue;
         };
-        // Outside the segment's box grown by the tolerance: too far.
-        if px < ax.min(bx) - tolerance
-            || px > ax.max(bx) + tolerance
-            || py < ay.min(by) - tolerance
-            || py > ay.max(by) + tolerance
-        {
-            continue;
-        }
-        let (ex, ey) = (bx - ax, by - ay);
-        let len2 = ex * ex + ey * ey;
-        // How far along the segment the nearest point is; a loop is a point.
-        let t = if len2 > 0.0 {
-            (((px - ax) * ex + (py - ay) * ey) / len2).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let (qx, qy) = (ax + t * ex - px, ay + t * ey - py);
-        let d2 = qx * qx + qy * qy;
-        // NaN positions compare false, and are never picked.
+        // The first of the nearest: a later edge must be nearer.
         let nearer = match best {
             None => d2 <= reach,
             Some(_) => d2 < reach,
@@ -212,6 +188,44 @@ pub fn nearest_edge(
         }
     }
     best.map(|(i, _)| i)
+}
+
+/// The squared distance from the point `at` to the edge between nodes `s`
+/// and `d`, if it is within `tolerance`: the one test of an edge, whoever
+/// picks ([`nearest_edge`], and the grid that reads fewer edges,
+/// `spatial::EdgeGrid`). `None` for an end that is not a node, or at a
+/// position that is not a number.
+pub(crate) fn edge_distance2(
+    s: u32,
+    d: u32,
+    x: &[f32],
+    y: &[f32],
+    at: (f32, f32),
+    tolerance: f32,
+) -> Option<f32> {
+    let (px, py) = at;
+    let (ax, ay) = (*x.get(s as usize)?, *y.get(s as usize)?);
+    let (bx, by) = (*x.get(d as usize)?, *y.get(d as usize)?);
+    // Outside the segment's box grown by the tolerance: too far.
+    if px < ax.min(bx) - tolerance
+        || px > ax.max(bx) + tolerance
+        || py < ay.min(by) - tolerance
+        || py > ay.max(by) + tolerance
+    {
+        return None;
+    }
+    let (ex, ey) = (bx - ax, by - ay);
+    let len2 = ex * ex + ey * ey;
+    // How far along the segment the nearest point is; a loop is a point.
+    let t = if len2 > 0.0 {
+        (((px - ax) * ex + (py - ay) * ey) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (qx, qy) = (ax + t * ex - px, ay + t * ey - py);
+    let d2 = qx * qx + qy * qy;
+    // NaN positions compare false, and are never picked.
+    (d2 <= tolerance * tolerance).then_some(d2)
 }
 
 /// A selected edge: its index, and the nodes it joins.
