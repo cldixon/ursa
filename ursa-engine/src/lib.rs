@@ -91,6 +91,11 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
             true,
         )
         .expect("registering a file format cannot fail");
+    // ... and an empty one is an error, not zero rows: DataFusion's listing
+    // skips a 0-byte file before the format sees it.
+    if let Some(parquet) = state.table_factories_mut().get_mut("PARQUET") {
+        *parquet = Arc::new(file_table::CheckedParquetTables(Arc::clone(parquet)));
+    }
     for ext in ["jsonl", "ndjson"] {
         state
             .register_file_format(Arc::new(file_table::JsonLines(ext)), false)

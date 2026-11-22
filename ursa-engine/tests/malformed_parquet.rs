@@ -80,18 +80,9 @@ async fn malformed_parquet_files_error_naming_the_file() {
     }
 }
 
-/// DataFusion skips an empty file, whatever its format: it holds no rows.
-/// Nothing reaches the parquet crate, so there is nothing to check.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_empty_parquet_file_is_skipped_as_datafusion_skips_any_empty_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = std::path::absolute(dir.path())
-        .unwrap()
-        .join("empty.parquet");
-    std::fs::write(&path, b"").unwrap();
-    let ctx = new_session();
-    let rows: usize = ctx
-        .sql(&format!("SELECT * FROM '{}'", path.display()))
+/// The number of rows `sql` returns.
+async fn rows(ctx: &SessionContext, sql: &str) -> usize {
+    ctx.sql(sql)
         .await
         .unwrap()
         .collect()
@@ -99,8 +90,95 @@ async fn an_empty_parquet_file_is_skipped_as_datafusion_skips_any_empty_file() {
         .unwrap()
         .iter()
         .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(rows, 0);
+        .sum()
+}
+
+/// The error an empty file gives, naming it.
+fn empty_error(path: &std::path::Path) -> String {
+    format!(
+        "cannot read '{}': it is not a valid Parquet file: the file is empty",
+        path.display()
+    )
+}
+
+/// An empty `.parquet` file is an error naming it, as in DuckDB and PyArrow,
+/// not zero rows. DataFusion's listing skips a 0-byte file before the format
+/// sees it, so Ursa lists the files itself. (`read_parquet` is tested in
+/// ursa-cli: it is opened by `ursa_sql::execute`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_parquet_file_named_directly_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::path::absolute(dir.path())
+        .unwrap()
+        .join("empty.parquet");
+    std::fs::write(&path, b"").unwrap();
+    let shown = path.display();
+    let expected = empty_error(&path);
+    let ctx = new_session();
+    for sql in [
+        format!("SELECT * FROM '{shown}'"),
+        format!("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION '{shown}'"),
+    ] {
+        let message = error_of(&ctx, &sql).await;
+        assert!(message.contains(&expected), "{sql}: {message}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_parquet_file_in_a_glob_or_directory_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let ctx = new_session();
+    let good = root.join("a.parquet");
+    ok(
+        &ctx,
+        &format!("COPY (SELECT 1 AS x) TO '{}'", good.display()),
+    )
+    .await;
+    let glob = format!("{}/*.parquet", root.display());
+    let directory = format!("{}/", root.display());
+    assert_eq!(rows(&ctx, &format!("SELECT * FROM '{glob}'")).await, 1);
+    assert_eq!(rows(&ctx, &format!("SELECT * FROM '{directory}'")).await, 1);
+
+    let empty = root.join("b.parquet");
+    std::fs::write(&empty, b"").unwrap();
+    let expected = empty_error(&empty);
+    // A new session: DataFusion caches a session's listings.
+    let ctx = new_session();
+    for sql in [
+        format!("SELECT * FROM '{glob}'"),
+        format!("SELECT * FROM '{directory}'"),
+        format!("CREATE EXTERNAL TABLE g STORED AS PARQUET LOCATION '{glob}'"),
+        format!("CREATE EXTERNAL TABLE d STORED AS PARQUET LOCATION '{directory}'"),
+    ] {
+        let message = error_of(&ctx, &sql).await;
+        assert!(message.contains(&expected), "{sql}: {message}");
+    }
+    // The valid file still reads by itself.
+    assert_eq!(
+        rows(&ctx, &format!("SELECT * FROM '{}'", good.display())).await,
+        1
+    );
+}
+
+/// Only Parquet changes: DataFusion still skips an empty CSV or JSON file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_csv_or_json_file_is_still_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    std::fs::write(root.join("a.csv"), b"x\n1\n").unwrap();
+    std::fs::write(root.join("b.csv"), b"").unwrap();
+    std::fs::write(root.join("a.json"), b"{\"x\": 1}\n").unwrap();
+    std::fs::write(root.join("b.json"), b"").unwrap();
+    let ctx = new_session();
+    for ext in ["csv", "json"] {
+        let glob = format!("{}/*.{ext}", root.display());
+        assert_eq!(
+            rows(&ctx, &format!("SELECT * FROM '{glob}'")).await,
+            1,
+            "{ext}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

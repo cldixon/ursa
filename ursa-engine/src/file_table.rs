@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::catalog::{TableProvider, UrlTableFactory};
+use datafusion::catalog::{TableProvider, TableProviderFactory, UrlTableFactory};
 use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::common::GetExt;
 use datafusion::datasource::file_format::json::JsonFormatFactory;
@@ -28,6 +28,7 @@ use datafusion::datasource::file_format::{FileFormat as DataFusionFileFormat, Fi
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::CreateExternalTable;
 use futures::StreamExt;
 use parking_lot::RwLock;
 
@@ -237,7 +238,31 @@ pub async fn open_files(
         .infer_schema(state)
         .await
         .map_err(|e| explain(&shown, &e))?;
-    Ok(Arc::new(ListingTable::try_new(config)?))
+    let table = ListingTable::try_new(config)?;
+    // An empty Parquet file is an error naming it, not zero rows.
+    ursa_io::parquet_footer::check_listed_files(state, &table).await?;
+    Ok(Arc::new(table))
+}
+
+/// `CREATE EXTERNAL TABLE … STORED AS PARQUET`: DataFusion's table factory,
+/// with an empty file in the table's locations an error naming it, not zero
+/// rows (see [`ursa_io::parquet_footer::check_listed_files`]).
+#[derive(Debug)]
+pub(crate) struct CheckedParquetTables(pub(crate) Arc<dyn TableProviderFactory>);
+
+#[async_trait]
+impl TableProviderFactory for CheckedParquetTables {
+    async fn create(
+        &self,
+        state: &dyn Session,
+        cmd: &CreateExternalTable,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let table = self.0.create(state, cmd).await?;
+        if let Some(listing) = table.downcast_ref::<ListingTable>() {
+            ursa_io::parquet_footer::check_listed_files(state, listing).await?;
+        }
+        Ok(table)
+    }
 }
 
 /// JSON under another extension, for DataFusion's own lookups of a format by
