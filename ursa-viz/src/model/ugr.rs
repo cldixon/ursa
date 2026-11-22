@@ -10,11 +10,14 @@ use std::fmt;
 
 use bytemuck::Pod;
 use serde::{Deserialize, Serialize};
+use ursa_core::topology::UndirectedCsr;
+
+use crate::pace::{ready, Pace};
 
 use super::delta::{BatchColumn, BatchValues, EdgeBatch, GraphDelta, NodeBatch, Op};
 use super::result::{
     Column, Encodings, GraphResult, Highlights, ModelError, NodeLabel, Path, Positions, Provenance,
-    Role, Strings, Target, Values, NO_ROW,
+    Role, Sparse, Strings, Target, Values, NO_ROW,
 };
 
 /// The first four bytes of a UGR buffer; the digit is the format's version.
@@ -54,17 +57,71 @@ pub enum Message {
 
 /// Decode a buffer that may be a result or a delta.
 pub fn decode(bytes: &[u8]) -> Result<Message, UgrError> {
-    let (header, reader) = open(bytes)?;
+    let (header, reader) = open(&bytes)?;
     match header {
-        Header::Result(h) => Ok(Message::Result(Box::new(read_result(*h, &reader)?))),
+        Header::Result(h) => {
+            let result = ready(read_result(*h, &reader, Room::default(), &mut Pace::never()));
+            Ok(Message::Result(Box::new(result?)))
+        }
         Header::Delta(h) => Ok(Message::Delta(read_delta(h, &reader)?)),
     }
+}
+
+/// Where a UGR buffer is read from: bytes this program holds, or bytes it
+/// can copy from (a page's `ArrayBuffer`, outside a WebAssembly memory).
+/// The decoder copies each section once, from the source to where the
+/// result keeps it, so a buffer held elsewhere is never held here as well.
+pub trait Source {
+    /// How many bytes there are.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copy the bytes from `at` on into `out`, all of it: the caller has
+    /// checked that `at + out.len()` is within [`Source::len`].
+    fn read(&self, at: usize, out: &mut [u8]);
+}
+
+impl Source for &[u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read(&self, at: usize, out: &mut [u8]) {
+        out.copy_from_slice(&self[at..at + out.len()]);
+    }
+}
+
+/// Room a decoded result is given beyond what it holds: for as many more
+/// nodes and edges, so that the deltas a view applies to it first move
+/// nothing ([`GraphResult::reserve`], without allocating twice). A count
+/// from a header is not trusted with it: room is given only once a section
+/// of that many elements is there to read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Room {
+    pub nodes: usize,
+    pub edges: usize,
 }
 
 impl GraphResult {
     /// The result as one UGR buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
-        write_result(self)
+        write_result(self, None)
+    }
+
+    /// [`GraphResult::to_bytes`], with the undirected adjacency of the
+    /// result's edges in the buffer beside them (UGR's
+    /// `edges.adjacency.*`), for a writer that holds it already: a layout
+    /// then uses it as it is ([`read_adjacency`]) and sorts nothing.
+    ///
+    /// `adjacency` must be the adjacency of every edge slot of this result
+    /// ([`UndirectedCsr::from_edges`] of its nodes, `src` and `dst`), and a
+    /// result with a removed node or edge has none to give, since a layout
+    /// reads only what is shown. Neither is checked here.
+    pub fn to_bytes_with_adjacency(&self, adjacency: &UndirectedCsr) -> Vec<u8> {
+        write_result(self, Some(adjacency))
     }
 
     /// Decode a result, checking every invariant of the model.
@@ -74,7 +131,54 @@ impl GraphResult {
             Message::Delta(_) => bad("the buffer holds a delta, not a result"),
         }
     }
+
+    /// [`GraphResult::from_bytes`] for a view of a large result on a page:
+    /// read from any [`Source`], a section at a time; with `room` for the
+    /// first deltas; and giving the event loop a turn as `pace` says
+    /// between the sections and the checks, so that no piece holds the
+    /// thread for long. The result is the same.
+    ///
+    /// `room(nodes, edges)` is asked once the header has said how many
+    /// there are.
+    pub async fn read_paced(
+        source: &dyn Source,
+        room: &dyn Fn(usize, usize) -> Room,
+        pace: &mut Pace,
+    ) -> Result<Self, UgrError> {
+        let (header, reader) = open(source)?;
+        match header {
+            Header::Result(h) => {
+                let room = room(h.nodes.count as usize, h.edges.count as usize);
+                read_result(*h, &reader, room, pace).await
+            }
+            Header::Delta(_) => bad("the buffer holds a delta, not a result"),
+        }
+    }
 }
+
+/// The undirected adjacency a result's buffer carries beside its edges
+/// ([`GraphResult::to_bytes_with_adjacency`]), checked
+/// ([`UndirectedCsr::from_parts`]); `None` if it carries none, as most do.
+pub fn read_adjacency(bytes: &[u8]) -> Result<Option<UndirectedCsr>, UgrError> {
+    let (header, reader) = open(&bytes)?;
+    let Header::Result(h) = header else {
+        return bad("the buffer holds a delta, not a result");
+    };
+    let (Some(offsets), Some(targets)) = (
+        reader.opt::<u64>(ADJACENCY_OFFSETS)?,
+        reader.opt::<u32>(ADJACENCY_TARGETS)?,
+    ) else {
+        return Ok(None);
+    };
+    UndirectedCsr::from_parts(h.nodes.count as usize, offsets, targets)
+        .map(Some)
+        .map_err(UgrError)
+}
+
+/// The sections of a result's undirected adjacency: `nodes + 1` offsets,
+/// and each node's neighbours.
+const ADJACENCY_OFFSETS: &str = "edges.adjacency.offsets";
+const ADJACENCY_TARGETS: &str = "edges.adjacency.targets";
 
 impl GraphDelta {
     /// The delta as one UGR buffer.
@@ -425,7 +529,7 @@ fn column_header(column: &Column) -> ColumnH {
     }
 }
 
-fn write_result(r: &GraphResult) -> Vec<u8> {
+fn write_result(r: &GraphResult, adjacency: Option<&UndirectedCsr>) -> Vec<u8> {
     let mut w = Writer::default();
     w.strings("nodes.keys", &r.node_keys);
     w.sparse("nodes.labels".into(), &r.node_label);
@@ -438,11 +542,19 @@ fn write_result(r: &GraphResult) -> Vec<u8> {
     };
     w.put("edges.src", &r.src);
     w.put("edges.dst", &r.dst);
-    w.sparse("edges.labels".into(), &r.edge_label);
+    if let Some(labels) = r.edge_label.as_slice() {
+        w.sparse("edges.labels".into(), labels);
+    }
     if let Some(rows) = &r.edge_rows {
         w.put("edges.rows", rows);
     }
-    w.sparse("edges.flags".into(), &r.edge_flags);
+    if let Some(flags) = r.edge_flags.as_slice() {
+        w.sparse("edges.flags".into(), flags);
+    }
+    if let Some(adjacency) = adjacency {
+        w.put(ADJACENCY_OFFSETS, &adjacency.offsets);
+        w.put(ADJACENCY_TARGETS, &adjacency.targets);
+    }
     let edges = EdgesH {
         count: r.n_edges() as u64,
         labels: r.edge_labels.clone(),
@@ -528,20 +640,25 @@ fn write_delta(delta: &GraphDelta) -> Vec<u8> {
 // Reading.
 
 struct Reader<'a> {
-    body: &'a [u8],
+    source: &'a dyn Source,
+    /// Where the body starts in `source`, and how long it is.
+    start: usize,
+    body: usize,
     sections: HashMap<String, SectionH>,
 }
 
 /// Split a buffer into its header and its body, checking the framing.
-fn open(bytes: &[u8]) -> Result<(Header, Reader<'_>), UgrError> {
-    if bytes.len() < 8 {
+fn open(source: &dyn Source) -> Result<(Header, Reader<'_>), UgrError> {
+    let len = source.len();
+    if len < 8 {
         return bad(format!(
-            "the buffer is truncated: {} bytes, and the magic and the header's length take 8",
-            bytes.len()
+            "the buffer is truncated: {len} bytes, and the magic and the header's length take 8"
         ));
     }
-    if bytes[..4] != MAGIC {
-        return match &bytes[..4] {
+    let mut frame = [0u8; 8];
+    source.read(0, &mut frame);
+    if frame[..4] != MAGIC {
+        return match &frame[..4] {
             [b'U', b'G', b'R', version] => bad(format!(
                 "version '{}', and this reader reads version 1",
                 *version as char
@@ -549,32 +666,31 @@ fn open(bytes: &[u8]) -> Result<(Header, Reader<'_>), UgrError> {
             _ => bad("not a UGR buffer: it does not start with \"UGR1\""),
         };
     }
-    let header_len = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes")) as usize;
-    let Some(json) = bytes.get(8..8 + header_len) else {
+    let header_len = u32::from_le_bytes(frame[4..8].try_into().expect("four bytes")) as usize;
+    if header_len > len - 8 {
         return bad(format!(
             "the buffer is truncated: its header is {header_len} bytes, and {} follow",
-            bytes.len() - 8
+            len - 8
         ));
-    };
+    }
+    let mut json = vec![0u8; header_len];
+    source.read(8, &mut json);
     let mut header: Header =
-        serde_json::from_slice(json).map_err(|e| UgrError(format!("the header: {e}")))?;
+        serde_json::from_slice(&json).map_err(|e| UgrError(format!("the header: {e}")))?;
+    drop(json);
     let (body_len, sections) = match &mut header {
         Header::Result(h) => (h.body, std::mem::take(&mut h.sections)),
         Header::Delta(h) => (h.body, std::mem::take(&mut h.sections)),
     };
-    let start = (8 + header_len).next_multiple_of(ALIGN);
-    let body = bytes.get(start..).unwrap_or(&[]);
-    if (body.len() as u64) < body_len {
+    let start = (8 + header_len).next_multiple_of(ALIGN).min(len);
+    let body = len - start;
+    if (body as u64) < body_len {
         return bad(format!(
-            "the buffer is truncated: its body is {body_len} bytes, and {} follow the header",
-            body.len()
+            "the buffer is truncated: its body is {body_len} bytes, and {body} follow the header"
         ));
     }
-    if body.len() as u64 > body_len {
-        return bad(format!(
-            "{} bytes follow the body",
-            body.len() as u64 - body_len
-        ));
+    if body as u64 > body_len {
+        return bad(format!("{} bytes follow the body", body as u64 - body_len));
     }
     let mut by_name = HashMap::with_capacity(sections.len());
     for section in sections {
@@ -585,6 +701,8 @@ fn open(bytes: &[u8]) -> Result<(Header, Reader<'_>), UgrError> {
     Ok((
         header,
         Reader {
+            source,
+            start,
             body,
             sections: by_name,
         },
@@ -594,6 +712,11 @@ fn open(bytes: &[u8]) -> Result<(Header, Reader<'_>), UgrError> {
 impl Reader<'_> {
     /// A section's elements, or `None` if the buffer has no such section.
     fn opt<T: Le>(&self, name: &str) -> Result<Option<Vec<T>>, UgrError> {
+        self.opt_with(name, 0)
+    }
+
+    /// [`Reader::opt`], in a vector with room for `extra` more elements.
+    fn opt_with<T: Le>(&self, name: &str, extra: usize) -> Result<Option<Vec<T>>, UgrError> {
         let Some(section) = self.sections.get(name) else {
             return Ok(None);
         };
@@ -614,24 +737,24 @@ impl Reader<'_> {
             .count
             .checked_mul(size_of::<T>() as u64)
             .and_then(|len| section.offset.checked_add(len));
-        let bytes = match end {
-            Some(end) if end <= self.body.len() as u64 => {
-                &self.body[section.offset as usize..end as usize]
-            }
-            _ => {
-                return bad(format!(
-                    "the section '{name}' ({} {} at {}) runs past the body's {} bytes",
-                    section.count,
-                    section.ty,
-                    section.offset,
-                    self.body.len()
-                ))
-            }
-        };
-        // A copy, since `bytes` may sit at any address; the cast is of the
-        // new, aligned vector.
-        let mut out = vec![T::zeroed(); section.count as usize];
-        bytemuck::cast_slice_mut::<T, u8>(&mut out).copy_from_slice(bytes);
+        if !end.is_some_and(|end| end <= self.body as u64) {
+            return bad(format!(
+                "the section '{name}' ({} {} at {}) runs past the body's {} bytes",
+                section.count, section.ty, section.offset, self.body
+            ));
+        }
+        // The one copy of the section: from the source, which may sit at
+        // any address or in no memory of ours, into the aligned vector the
+        // result keeps.
+        let count = section.count as usize;
+        // Never more room than the section is long: `extra` may come from a
+        // count the header only claims.
+        let mut out = Vec::with_capacity(count + extra.min(count));
+        out.resize(count, T::zeroed());
+        self.source.read(
+            self.start + section.offset as usize,
+            bytemuck::cast_slice_mut::<T, u8>(&mut out),
+        );
         if cfg!(target_endian = "big") {
             for v in &mut out {
                 *v = v.swap();
@@ -641,7 +764,11 @@ impl Reader<'_> {
     }
 
     fn get<T: Le>(&self, name: &str) -> Result<Vec<T>, UgrError> {
-        match self.opt(name)? {
+        self.get_with(name, 0)
+    }
+
+    fn get_with<T: Le>(&self, name: &str, extra: usize) -> Result<Vec<T>, UgrError> {
+        match self.opt_with(name, extra)? {
             Some(data) => Ok(data),
             None => bad(format!("the section '{name}' is missing")),
         }
@@ -649,25 +776,53 @@ impl Reader<'_> {
 
     /// A section that must have `count` elements.
     fn exact<T: Le>(&self, name: &str, count: u64) -> Result<Vec<T>, UgrError> {
-        let data = self.get::<T>(name)?;
+        self.exact_with(name, count, 0)
+    }
+
+    fn exact_with<T: Le>(&self, name: &str, count: u64, extra: usize) -> Result<Vec<T>, UgrError> {
+        let data = self.get_with::<T>(name, extra)?;
         check_count(name, data.len(), count)?;
         Ok(data)
     }
 
     /// A section left out when every element is 0.
     fn sparse<T: Le>(&self, name: &str, count: usize) -> Result<Vec<T>, UgrError> {
-        match self.opt::<T>(name)? {
+        self.sparse_with(name, count, 0)
+    }
+
+    fn sparse_with<T: Le>(&self, name: &str, count: usize, extra: usize) -> Result<Vec<T>, UgrError> {
+        match self.opt_with::<T>(name, extra)? {
             Some(data) => {
                 check_count(name, data.len(), count as u64)?;
                 Ok(data)
             }
-            None => Ok(vec![T::zeroed(); count]),
+            None => {
+                let mut zeros = Vec::with_capacity(count + extra.min(count));
+                zeros.resize(count, T::zeroed());
+                Ok(zeros)
+            }
+        }
+    }
+
+    /// [`Reader::sparse`], holding nothing for a section left out.
+    fn lazy<T: Le + Default + PartialEq>(&self, name: &str, count: usize) -> Result<Sparse<T>, UgrError> {
+        match self.opt::<T>(name)? {
+            Some(data) => {
+                check_count(name, data.len(), count as u64)?;
+                Ok(Sparse::from_vec(data))
+            }
+            None => Ok(Sparse::zeros(count)),
         }
     }
 
     fn strings(&self, name: &str) -> Result<Strings, UgrError> {
-        let offsets = self.get(&format!("{name}.offsets"))?;
-        let bytes = self.get(&format!("{name}.bytes"))?;
+        self.strings_with(name, 0)
+    }
+
+    /// [`Reader::strings`], with room for `extra` more of them.
+    fn strings_with(&self, name: &str, extra: usize) -> Result<Strings, UgrError> {
+        let offsets = self.get_with(&format!("{name}.offsets"), extra)?;
+        let bytes = self.get_with(&format!("{name}.bytes"), 8 * extra)?;
         Strings::from_parts(offsets, bytes).map_err(|e| UgrError(format!("'{name}': {e}")))
     }
 
@@ -815,41 +970,64 @@ fn check_count(name: &str, have: usize, want: u64) -> Result<(), UgrError> {
     Ok(())
 }
 
-fn read_result(h: ResultH, r: &Reader<'_>) -> Result<GraphResult, UgrError> {
-    let node_keys = r.strings("nodes.keys")?;
+/// A result from its header and its sections, each copied once into a
+/// vector with `room`, with a turn of the event loop as `pace` says after
+/// each of the large ones, and then while the result is checked.
+async fn read_result(
+    h: ResultH,
+    r: &Reader<'_>,
+    room: Room,
+    pace: &mut Pace,
+) -> Result<GraphResult, UgrError> {
+    let node_keys = r.strings_with("nodes.keys", room.nodes)?;
     check_count("nodes.keys", node_keys.len(), h.nodes.count)?;
     let n = node_keys.len();
-    let src: Vec<u32> = r.exact("edges.src", h.edges.count)?;
+    let node_label = r.sparse_with("nodes.labels", n, room.nodes)?;
+    let node_flags = r.sparse_with("nodes.flags", n, room.nodes)?;
+    pace.breathe().await;
+    let node_columns = r.columns("nodes", h.nodes.columns)?;
+    let positions = r.positions("nodes", h.nodes.positions)?;
+    pace.breathe().await;
+    let src: Vec<u32> = r.exact_with("edges.src", h.edges.count, room.edges)?;
     let m = src.len();
-    let edge_rows: Option<Vec<u64>> = r.opt("edges.rows")?;
+    pace.breathe().await;
+    let dst: Vec<u32> = r.exact_with("edges.dst", h.edges.count, room.edges)?;
+    pace.breathe().await;
+    let edge_rows: Option<Vec<u64>> = r.opt_with("edges.rows", room.edges)?;
     if edge_rows
         .as_ref()
         .is_some_and(|rows| rows.iter().all(|&row| row == NO_ROW))
     {
         return bad("'edges.rows' is present, but no row is known");
     }
+    pace.breathe().await;
+    let edge_label = r.lazy("edges.labels", m)?;
+    let edge_flags = r.lazy("edges.flags", m)?;
+    pace.breathe().await;
+    let edge_columns = r.columns("edges", h.edges.columns)?;
+    pace.breathe().await;
     let mut result = GraphResult {
         graph: h.graph,
         node_labels: h.nodes.labels,
         edge_labels: h.edges.labels,
         node_keys,
-        node_label: r.sparse("nodes.labels", n)?,
-        node_flags: r.sparse("nodes.flags", n)?,
-        node_columns: r.columns("nodes", h.nodes.columns)?,
-        positions: r.positions("nodes", h.nodes.positions)?,
+        node_label,
+        node_flags,
+        node_columns,
+        positions,
         src,
-        dst: r.exact("edges.dst", h.edges.count)?,
-        edge_label: r.sparse("edges.labels", m)?,
+        dst,
+        edge_label,
         edge_rows,
-        edge_flags: r.sparse("edges.flags", m)?,
-        edge_columns: r.columns("edges", h.edges.columns)?,
+        edge_flags,
+        edge_columns,
         highlights: r.highlights("highlights", h.highlights)?,
         encodings: h.encodings,
         provenance: h.provenance,
         index: HashMap::new(),
         named: Vec::new(),
     };
-    result.validate()?;
+    result.validate_paced(pace).await?;
     Ok(result)
 }
 

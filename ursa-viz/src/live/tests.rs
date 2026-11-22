@@ -1,4 +1,5 @@
 use super::*;
+use crate::scene::Graph;
 use crate::highlight::flag;
 use crate::model::{
     BatchValues, Column, EdgeBatch, Encodings, Highlights, KeyType, NodeBatch, NodeLabel, Path,
@@ -70,7 +71,7 @@ impl Scene {
             radius: bits(&drawn.style.radius),
             color: drawn.style.color.clone(),
             flags: drawn.highlight.flags().to_vec(),
-            lines: live.line_indices(0..drawn.graph.n_edges()),
+            lines: live.line_indices(0..live.result().n_edges()),
         };
         Self {
             live,
@@ -142,11 +143,10 @@ impl Scene {
         let (fresh_live, fresh) = LiveResult::new(self.live.result().clone(), &self.theme);
         let d = &self.drawn;
         let n = self.live.result().n_nodes();
-        // Neither a view's making nor its deltas build an adjacency (#426).
-        assert!(!d.graph.has_topology() && !fresh.graph.has_topology());
-        assert_eq!(d.graph.n_nodes(), n);
-        assert_eq!(d.graph.src(), self.live.result().src());
-        assert_eq!(d.graph.dst(), self.live.result().dst());
+        // The result is the one holder of the edges (#501): what is drawn
+        // has no graph of its own to keep in step.
+        let result = self.live.result();
+        let graph = Graph::new(n, result.src().to_vec(), result.dst().to_vec()).unwrap();
         assert_eq!(d.x.len(), n);
         assert_eq!(d.y.len(), n);
         assert!(
@@ -162,7 +162,11 @@ impl Scene {
             fresh.highlight.edges(),
             "highlighted edges"
         );
-        assert_eq!(self.live.degrees.degree, d.graph.degrees(), "degrees");
+        assert_eq!(self.live.degrees.degree, graph.degrees(), "degrees");
+        assert_eq!(
+            fresh_live.degrees.degree, self.live.degrees.degree,
+            "degrees"
+        );
         assert_eq!(
             self.live.info(&self.theme),
             fresh_live.info(&self.theme),
@@ -174,7 +178,7 @@ impl Scene {
             radius: bits(&d.style.radius),
             color: d.style.color.clone(),
             flags: d.highlight.flags().to_vec(),
-            lines: self.live.line_indices(0..d.graph.n_edges()),
+            lines: self.live.line_indices(0..result.n_edges()),
         };
         assert_eq!(self.gpu, want, "the GPU holds what is drawn");
     }
@@ -230,7 +234,7 @@ fn new_nodes_and_edges_take_the_slots_after_the_last() {
     // What was there is where it was.
     assert_eq!(scene.gpu.x[..5], before.x[..]);
     assert_eq!(scene.gpu.lines[..12], before.lines[..]);
-    assert_eq!(scene.drawn.graph.n_edges(), 9);
+    assert_eq!(scene.result().n_edges(), 9);
 
     // Its inverse is a shorter range: only the three older nodes are written.
     let back = scene.apply(&delta.invert()).unwrap();
@@ -699,7 +703,7 @@ fn any_run_of_steps_and_undos_draws_what_a_new_view_would() {
             // Remove an edge, or restore one.
             4 => {
                 let e = rng.below(m);
-                GraphDelta::new(vec![if r.edge_flags()[e] & REMOVED != 0 {
+                GraphDelta::new(vec![if r.edge_is_removed(e) {
                     Op::RestoreEdges(vec![e as u32])
                 } else {
                     Op::RemoveEdges(vec![e as u32])

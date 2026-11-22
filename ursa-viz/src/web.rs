@@ -17,8 +17,13 @@ use web_sys::HtmlCanvasElement;
 
 use crate::highlight::{flag, BadHighlight, HighlightState};
 use crate::interact::{nearest_edge, EdgePick, Interact};
+use std::sync::Arc;
+
+use ursa_core::topology::UndirectedCsr;
+
 use crate::model::{
     EdgeBatch, GraphDelta, GraphResult, KeyType, NodeBatch, NodeLabel, Op, Positions, Provenance,
+    Source,
 };
 use crate::scene::{parse_color, Graph, Growth, LiveLayout, NodeStyle, Theme};
 use crate::view::View;
@@ -68,25 +73,52 @@ pub async fn create_view(
 }
 
 /// A view of a graph result, on `canvas`: `bytes` is the result as UGR
-/// (`ursa-viz/UGR.md`). Its nodes are drawn where the result puts them (or
-/// where a layout would start them), sized and coloured by its encodings
-/// (by degree, without), with its paths and seeds highlighted and its
-/// removed nodes hidden. [`GraphView::apply_delta`] then changes it in
-/// place.
+/// (`ursa-viz/UGR.md`), a `Uint8Array`. Its nodes are drawn where the
+/// result puts them (or where a layout would start them), sized and
+/// coloured by its encodings (by degree, without), with its paths and seeds
+/// highlighted and its removed nodes hidden. [`GraphView::apply_delta`]
+/// then changes it in place.
+///
+/// The buffer stays the page's: it is not copied into this module's memory
+/// whole. Each section is copied once, to where the view keeps it, with a
+/// turn of the event loop between the large ones and while the result is
+/// checked, as between the pieces of making the view. `bytes` must not
+/// change, or be transferred, until the promise settles.
 #[wasm_bindgen(js_name = createViewFromResult)]
 pub async fn create_view_from_result(
     canvas: HtmlCanvasElement,
-    bytes: &[u8],
+    bytes: js_sys::Uint8Array,
 ) -> Result<GraphView, JsValue> {
     console_error_panic_hook::set_once();
-    let result = GraphResult::from_bytes(bytes).map_err(js_err)?;
-    view_on(canvas, Scene::Result(Box::new(result))).await
+    view_on(canvas, Scene::Ugr(bytes)).await
 }
 
 /// What a new view draws.
 enum Scene {
     Graph(Graph),
-    Result(Box<GraphResult>),
+    /// A result as UGR, in the page's memory.
+    Ugr(js_sys::Uint8Array),
+}
+
+/// A page's bytes as a [`Source`]: read in place, a range at a time.
+struct PageBytes(js_sys::Uint8Array);
+
+impl Source for PageBytes {
+    fn len(&self) -> usize {
+        self.0.length() as usize
+    }
+
+    fn read(&self, at: usize, out: &mut [u8]) {
+        let range = self.0.subarray(at as u32, (at + out.len()) as u32);
+        // Shorter only if the page let go of the buffer meanwhile (it was
+        // transferred): what is read then fails the result's checks, or
+        // draws what the zeros say; it is not read past its end.
+        if range.length() as usize == out.len() {
+            range.copy_to(out);
+        } else {
+            out.fill(0);
+        }
+    }
 }
 
 async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, JsValue> {
@@ -154,8 +186,11 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         Scene::Graph(graph) => {
             View::new_paced(&device, &queue, config.format, graph, width, height).await
         }
-        Scene::Result(result) => {
-            View::from_result_paced(&device, &queue, config.format, *result, width, height).await
+        Scene::Ugr(bytes) => {
+            let bytes = PageBytes(bytes);
+            View::from_ugr_paced(&device, &queue, config.format, &bytes, width, height)
+                .await
+                .map_err(js_err)?
         }
     };
     Ok(GraphView {
@@ -183,17 +218,17 @@ impl GraphView {
     /// [`GraphView::step`], a layout on the view's own thread, makes it.
     #[wasm_bindgen(getter, js_name = hasTopology)]
     pub fn has_topology(&self) -> bool {
-        self.view.graph().has_topology()
+        self.view.has_adjacency()
     }
 
     #[wasm_bindgen(getter, js_name = nodeCount)]
     pub fn node_count(&self) -> u32 {
-        self.view.graph().n_nodes() as u32
+        self.view.n_nodes() as u32
     }
 
     #[wasm_bindgen(getter, js_name = edgeCount)]
     pub fn edge_count(&self) -> u32 {
-        self.view.graph().n_edges() as u32
+        self.view.n_edges() as u32
     }
 
     /// Layout iterations run so far.
@@ -483,8 +518,7 @@ impl GraphView {
     #[wasm_bindgen(js_name = pickEdge)]
     pub fn pick_edge(&self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
         let camera = self.view.camera();
-        let graph = self.view.graph();
-        let (src, dst) = (graph.src(), graph.dst());
+        let (src, dst) = self.view.edges();
         let (xs, ys) = self.view.positions();
         let flags = self.view.highlight().flags();
         let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
@@ -504,18 +538,18 @@ impl GraphView {
     /// the frame.
     #[wasm_bindgen(js_name = selectEdge)]
     pub fn select_edge(&mut self, edge: Option<u32>) -> Result<bool, JsValue> {
-        let graph = self.view.graph();
+        let (src, dst) = self.view.edges();
         let pick = match edge {
             None => None,
-            Some(e) if (e as usize) < graph.n_edges() => Some(EdgePick {
+            Some(e) if (e as usize) < src.len() => Some(EdgePick {
                 edge: e,
-                src: graph.src()[e as usize],
-                dst: graph.dst()[e as usize],
+                src: src[e as usize],
+                dst: dst[e as usize],
             }),
             Some(e) => {
                 return Err(js_err(format!(
                     "edge {e} is not one of the graph's {} edges",
-                    graph.n_edges()
+                    src.len()
                 )))
             }
         };
@@ -572,7 +606,7 @@ impl GraphView {
     }
 
     fn check_nodes(&self, nodes: &[u32]) -> Result<(), JsValue> {
-        let n = self.view.graph().n_nodes();
+        let n = self.view.n_nodes();
         match nodes.iter().find(|&&v| v as usize >= n) {
             Some(&node) => Err(js_err(BadHighlight::Node { node, nodes: n })),
             None => Ok(()),
@@ -588,8 +622,8 @@ impl GraphView {
             // A selected edge is drawn wide itself; no node is selected.
             Some(e) => vec![e.src, e.dst],
             None if self.selection_edges => {
-                let graph = self.view.graph();
-                selection.incident_edges(graph.src(), graph.dst())
+                let (src, dst) = self.view.edges();
+                selection.incident_edges(src, dst)
             }
             None => Vec::new(),
         };
@@ -637,7 +671,7 @@ impl GraphView {
     /// left.
     #[wasm_bindgen(js_name = nodePixel)]
     pub fn node_pixel(&self, node: u32) -> Result<Vec<f32>, JsValue> {
-        let n = self.view.graph().n_nodes();
+        let n = self.view.n_nodes();
         if node as usize >= n {
             return Err(js_err(BadHighlight::Node { node, nodes: n }));
         }
@@ -714,10 +748,10 @@ impl GraphView {
         let (mut selection, hover) = self.interact.retain(shown);
         // The selected edge may be gone itself: popped, or removed.
         if let Some(e) = self.interact.edge() {
-            let graph = self.view.graph();
+            let (src, dst) = self.view.edges();
             let at = e.edge as usize;
-            let there = at < graph.n_edges()
-                && (graph.src()[at], graph.dst()[at]) == (e.src, e.dst)
+            let there = at < src.len()
+                && (src[at], dst[at]) == (e.src, e.dst)
                 && self.view.result().is_none_or(|r| r.edge_is_shown(at));
             if !there {
                 self.interact.select_edge(None);
@@ -766,31 +800,41 @@ impl GraphView {
         self.view.result().map(GraphResult::to_bytes)
     }
 
-    /// Draw these positions: `x` then `y`, one per node each, as
-    /// [`Layout::positions`] gives them.
+    /// Draw these positions: `x` then `y`, one per node each, a
+    /// `Float32Array` as [`Layout::positions`] gives them.
+    ///
+    /// The array is copied once, from the page's memory into the positions
+    /// the view keeps (for picking, and for the nodes drawn in front), and
+    /// those are what is written to the GPU: it never passes through a
+    /// second array here.
     #[wasm_bindgen(js_name = setPositions)]
-    pub fn set_positions(&mut self, xy: &[f32]) -> Result<(), JsValue> {
-        let n = self.view.graph().n_nodes();
-        if xy.len() != 2 * n {
+    pub fn set_positions(&mut self, xy: &js_sys::Float32Array) -> Result<(), JsValue> {
+        let n = self.view.n_nodes();
+        if xy.length() as usize != 2 * n {
             return Err(js_err(format!(
                 "expected {} values (x then y); got {}",
                 2 * n,
-                xy.len()
+                xy.length()
             )));
         }
+        let n = n as u32;
         self.view
-            .set_positions(&self.device, &self.queue, &xy[..n], &xy[n..]);
+            .set_positions_with(&self.device, &self.queue, |x, y| {
+                xy.subarray(0, n).copy_to(x);
+                xy.subarray(n, 2 * n).copy_to(y);
+            });
         Ok(())
     }
 
-    /// The positions now: `x` then `y`, one per node each.
-    pub fn positions(&self) -> Vec<f32> {
+    /// The positions now: `x` then `y`, one per node each, in a new
+    /// `Float32Array` (one copy, from the view's memory).
+    pub fn positions(&self) -> js_sys::Float32Array {
         let (x, y) = self.view.positions();
-        x.iter().chain(y).copied().collect()
+        positions_array(x, y)
     }
 
     fn check_len(&self, n: usize) -> Result<(), JsValue> {
-        let want = self.view.graph().n_nodes();
+        let want = self.view.n_nodes();
         if n != want {
             return Err(js_err(format!(
                 "expected one value per node ({want}); got {n}"
@@ -975,6 +1019,37 @@ const _: () = {
     assert!(NodeFlag::Seed as u8 == flag::SEED);
 };
 
+/// `x` then `y` in a new `Float32Array`: each copied once, from this
+/// module's memory to the page's, with no array between. The page owns the
+/// result, and can transfer it.
+fn positions_array(x: &[f32], y: &[f32]) -> js_sys::Float32Array {
+    let n = x.len() as u32;
+    let out = js_sys::Float32Array::new_with_length(2 * n);
+    out.subarray(0, n).copy_from(x);
+    out.subarray(n, 2 * n).copy_from(y);
+    out
+}
+
+/// The undirected adjacency of the graph of `n_nodes` nodes and the edges
+/// `(src[i], dst[i])`, which is all a layout reads of it; the edge list is
+/// freed before the layout is made.
+fn adjacency_of(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Arc<UndirectedCsr>, JsValue> {
+    let graph = checked_graph(n_nodes, src, dst)?;
+    Ok(Arc::clone(graph.adjacency()))
+}
+
+/// An undirected adjacency from its parts, checked
+/// ([`UndirectedCsr::from_parts`]).
+fn adjacency_from(
+    n_nodes: u32,
+    offsets: Vec<u64>,
+    targets: Vec<u32>,
+) -> Result<Arc<UndirectedCsr>, JsValue> {
+    UndirectedCsr::from_parts(n_nodes as usize, offsets, targets)
+        .map(Arc::new)
+        .map_err(js_err)
+}
+
 /// The graph of `n_nodes` nodes and the edges `(src[i], dst[i])`, or why it
 /// is not one.
 fn checked_graph(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Graph, JsValue> {
@@ -1009,13 +1084,57 @@ impl Layout {
         multilevel: Option<bool>,
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
-        let graph = checked_graph(n_nodes, src, dst)?;
+        let adjacency = adjacency_of(n_nodes, src, dst)?;
+        Ok(Self::on(adjacency, multilevel))
+    }
+
+    fn on(adjacency: Arc<UndirectedCsr>, multilevel: Option<bool>) -> Layout {
         let layout = if multilevel.unwrap_or(true) {
-            LiveLayout::multilevel(&graph, ursa_core::algo::MultilevelParams::default())
+            LiveLayout::multilevel_on(adjacency, ursa_core::algo::MultilevelParams::default())
         } else {
-            LiveLayout::new(&graph, ursa_core::algo::Fa2Params::default())
+            LiveLayout::new_on(adjacency, ursa_core::algo::Fa2Params::default())
         };
-        Ok(Layout { layout })
+        Layout { layout }
+    }
+
+    /// [`Layout::new`] for a caller that holds the graph's undirected
+    /// adjacency (UGR's `edges.adjacency.*`, `ursa-viz/UGR.md`) and not
+    /// only its edges: node `i`'s neighbours are
+    /// `targets[offsets[i]..offsets[i + 1]]`, each list ascending, with no
+    /// repeats and no `i`, and every pair in both nodes' lists. `offsets`
+    /// is a `BigUint64Array` of `n_nodes + 1`. The adjacency is checked in
+    /// one pass and used as it is: nothing is sorted, and no edge list is
+    /// held. The layout is the same, bit for bit, as [`Layout::new`]'s of
+    /// edges with that adjacency.
+    ///
+    /// `kind` picks a fixed layout instead, with `level` as
+    /// [`Layout::rings`] and [`Layout::layers`] take it: `"rings"` or
+    /// `"layers"`.
+    #[wasm_bindgen(js_name = fromAdjacency)]
+    pub fn from_adjacency(
+        n_nodes: u32,
+        offsets: Vec<u64>,
+        targets: Vec<u32>,
+        kind: Option<String>,
+        level: Option<Vec<u32>>,
+    ) -> Result<Layout, JsValue> {
+        console_error_panic_hook::set_once();
+        let adjacency = adjacency_from(n_nodes, offsets, targets)?;
+        let level = level.as_deref().unwrap_or(&[]);
+        match kind.as_deref() {
+            None | Some("force") => Ok(Self::on(adjacency, None)),
+            Some("rings") => {
+                let params = ursa_core::algo::RingsParams::default();
+                let layout = LiveLayout::rings_on(adjacency, level, params).map_err(js_err)?;
+                Ok(Layout { layout })
+            }
+            Some("layers") => {
+                let params = ursa_core::algo::LayersParams::default();
+                let layout = LiveLayout::layers_on(adjacency, level, params).map_err(js_err)?;
+                Ok(Layout { layout })
+            }
+            Some(other) => Err(js_err(format!("no layout called {other}"))),
+        }
     }
 
     /// A layout of the graph that starts from `xy` (`x` then `y`, one per
@@ -1030,12 +1149,12 @@ impl Layout {
         xy: &[f32],
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
-        let graph = checked_graph(n_nodes, src, dst)?;
+        let adjacency = adjacency_of(n_nodes, src, dst)?;
         let n = (n_nodes as usize).min(xy.len());
         let (x, y) = xy.split_at(n);
         let params = ursa_core::algo::MultilevelParams::default().fa2;
-        let layout =
-            LiveLayout::from_positions(&graph, params, x.to_vec(), y.to_vec()).map_err(js_err)?;
+        let layout = LiveLayout::from_positions_on(adjacency, params, x.to_vec(), y.to_vec())
+            .map_err(js_err)?;
         Ok(Layout { layout })
     }
 
@@ -1053,9 +1172,9 @@ impl Layout {
         distance: &[u32],
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
-        let graph = checked_graph(n_nodes, src, dst)?;
+        let adjacency = adjacency_of(n_nodes, src, dst)?;
         let params = ursa_core::algo::RingsParams::default();
-        let layout = LiveLayout::rings(&graph, distance, params).map_err(js_err)?;
+        let layout = LiveLayout::rings_on(adjacency, distance, params).map_err(js_err)?;
         Ok(Layout { layout })
     }
 
@@ -1071,9 +1190,9 @@ impl Layout {
         layer: &[u32],
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
-        let graph = checked_graph(n_nodes, src, dst)?;
+        let adjacency = adjacency_of(n_nodes, src, dst)?;
         let params = ursa_core::algo::LayersParams::default();
-        let layout = LiveLayout::layers(&graph, layer, params).map_err(js_err)?;
+        let layout = LiveLayout::layers_on(adjacency, layer, params).map_err(js_err)?;
         Ok(Layout { layout })
     }
 
@@ -1106,10 +1225,10 @@ impl Layout {
         parents: Option<Vec<u32>>,
         pinned: Option<Vec<u32>>,
     ) -> Result<(), JsValue> {
-        let graph = checked_graph(n_nodes, src, dst)?;
+        let adjacency = adjacency_of(n_nodes, src, dst)?;
         self.layout
-            .grow(
-                &graph,
+            .grow_on(
+                adjacency,
                 Growth {
                     parents: parents.as_deref(),
                     pinned: pinned.as_deref().unwrap_or(&[]),
@@ -1162,9 +1281,14 @@ impl Layout {
         self.layout.levels() as u32
     }
 
-    /// The positions now: `x` then `y`, one per node each.
-    pub fn positions(&self) -> Vec<f32> {
+    /// The positions now: `x` then `y`, one per node each, in a new
+    /// `Float32Array`. They are copied once, from the layout's state into
+    /// the array, which is the caller's to transfer to the page:
+    /// `postMessage({xy}, [xy.buffer])`, then
+    /// [`GraphView::set_positions`], which copies them once more. No other
+    /// copy is made on the way to the GPU.
+    pub fn positions(&self) -> js_sys::Float32Array {
         let (x, y) = self.layout.positions();
-        x.iter().chain(y).copied().collect()
+        positions_array(x, y)
     }
 }

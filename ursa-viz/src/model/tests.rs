@@ -403,7 +403,7 @@ fn validate_catches_what_apply_would_not_let_in() {
             "node 4: the key 'Zürich' is not an integer",
         ),
         (|r| r.dst[0] = 99, "edge 0 names node 99"),
-        (|r| r.edge_label[2] = 5, "edge 2 has the label 5"),
+        (|r| r.edge_label.make_mut()[2] = 5, "edge 2 has the label 5"),
         (
             |r| r.node_flags.pop().map(drop).unwrap(),
             "5 nodes, but 5 keys and 4 flags",

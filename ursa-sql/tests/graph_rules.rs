@@ -366,7 +366,7 @@ async fn a_pattern_over_two_vertex_tables_keeps_their_keys_apart() {
     assert_eq!(r.node_label(), [0, 0, 0, 1, 1]);
     assert_eq!((r.src(), r.dst()), (&[0, 1, 1, 2][..], &[1, 3, 2, 4][..]));
     assert_eq!(r.edge_labels(), ["knows", "lives"]);
-    assert_eq!(r.edge_label(), [0, 1, 0, 1]);
+    assert_eq!(r.edge_label().to_vec(), [0, 1, 0, 1]);
     // A property is on its variable's nodes, of its vertex table.
     let town = &r.node_column("town").unwrap().values;
     let towns: Vec<Option<&str>> = (0..5).map(|i| town.text(i)).collect();

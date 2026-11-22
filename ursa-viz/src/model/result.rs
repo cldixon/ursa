@@ -5,6 +5,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pace::{ready, Pace};
+
+/// How many nodes, and how many edges, a paced check reads between two
+/// chances to give the thread up: a few milliseconds of work each.
+const PACED_NODES: usize = 1 << 13;
+const PACED_EDGES: usize = 1 << 18;
+
 /// The null of a `u32` column and of a dictionary column's codes.
 pub const NULL: u32 = u32::MAX;
 
@@ -343,6 +350,164 @@ fn check_codes(codes: &[u32], n_values: usize, what: &str) -> Result<(), ModelEr
     }
 }
 
+/// A small number per slot that is zero in most results: an edge's label
+/// where there is one edge table, its flags where none is removed. While
+/// every one is zero nothing is held for them, as the wire format writes
+/// nothing: at a million edges that is three megabytes a result does not
+/// take. Two are equal when their values are, held or not.
+#[derive(Debug, Clone, Default)]
+pub struct Sparse<T> {
+    len: usize,
+    /// One per slot, or empty while every one is zero.
+    data: Vec<T>,
+}
+
+impl<T: Copy + Default + PartialEq> Sparse<T> {
+    /// `len` zeros.
+    pub fn zeros(len: usize) -> Self {
+        Self {
+            len,
+            data: Vec::new(),
+        }
+    }
+
+    /// One value per slot. The vector is dropped if every one is zero.
+    pub fn from_vec(data: Vec<T>) -> Self {
+        let zero = T::default();
+        if data.iter().all(|v| *v == zero) {
+            Self::zeros(data.len())
+        } else {
+            Self {
+                len: data.len(),
+                data,
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The values as a slice; `None` while nothing is held for them, when
+    /// every one is zero.
+    pub fn as_slice(&self) -> Option<&[T]> {
+        (!self.data.is_empty()).then_some(&self.data[..])
+    }
+
+    /// Slot `i`'s value. Panics past the last slot.
+    pub fn get(&self, i: usize) -> T {
+        assert!(i < self.len, "slot {i} of {}", self.len);
+        self.data.get(i).copied().unwrap_or_default()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = T> + '_ {
+        (0..self.len).map(|i| self.data.get(i).copied().unwrap_or_default())
+    }
+
+    pub fn to_vec(&self) -> Vec<T> {
+        match self.as_slice() {
+            Some(data) => data.to_vec(),
+            None => vec![T::default(); self.len],
+        }
+    }
+
+    pub fn contains(&self, value: &T) -> bool {
+        match self.as_slice() {
+            Some(data) => data.contains(value),
+            None => self.len > 0 && *value == T::default(),
+        }
+    }
+
+    /// Whether the slots from `from` on hold `tail`.
+    pub(crate) fn ends_with(&self, from: usize, tail: &[T]) -> bool {
+        match self.as_slice() {
+            Some(data) => data[from..] == *tail,
+            None => self.len - from == tail.len() && tail.iter().all(|v| *v == T::default()),
+        }
+    }
+
+    /// Whether any slot from `from` on is not zero.
+    pub(crate) fn any_from(&self, from: usize) -> bool {
+        self.as_slice()
+            .is_some_and(|data| data[from..].iter().any(|v| *v != T::default()))
+    }
+
+    /// The values held, one per slot: to change one.
+    pub(crate) fn make_mut(&mut self) -> &mut [T] {
+        if self.data.is_empty() {
+            self.data = vec![T::default(); self.len];
+        }
+        &mut self.data
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, more: &[T]) {
+        if self.data.is_empty() && more.iter().any(|v| *v != T::default()) {
+            self.data = Vec::with_capacity(self.len + more.len());
+            self.data.resize(self.len, T::default());
+        }
+        if !self.data.is_empty() {
+            self.data.extend_from_slice(more);
+        }
+        self.len += more.len();
+    }
+
+    pub(crate) fn extend_zeros(&mut self, more: usize) {
+        self.len += more;
+        if !self.data.is_empty() {
+            self.data.resize(self.len, T::default());
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+        self.data.truncate(len);
+    }
+
+    pub(crate) fn reserve(&mut self, more: usize) {
+        if !self.data.is_empty() {
+            self.data.reserve(more);
+        }
+    }
+}
+
+impl<T: Copy + Default + PartialEq> PartialEq for Sparse<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && match (self.as_slice(), other.as_slice()) {
+                (Some(a), Some(b)) => a == b,
+                (Some(held), None) | (None, Some(held)) => {
+                    held.iter().all(|v| *v == T::default())
+                }
+                (None, None) => true,
+            }
+    }
+}
+
+impl<T: Copy + Default + PartialEq> PartialEq<[T]> for Sparse<T> {
+    fn eq(&self, other: &[T]) -> bool {
+        self.len == other.len() && self.ends_with(0, other)
+    }
+}
+
+macro_rules! sparse_index {
+    ($($t:ty),*) => {$(
+        impl std::ops::Index<usize> for Sparse<$t> {
+            type Output = $t;
+            /// Slot `i`'s value. Panics past the last slot.
+            fn index(&self, i: usize) -> &$t {
+                static ZERO: $t = 0;
+                assert!(i < self.len, "slot {i} of {}", self.len);
+                self.data.get(i).unwrap_or(&ZERO)
+            }
+        }
+    )*};
+}
+sparse_index!(u8, u16);
+
 /// A named column of the nodes or of the edges: a property or a metric.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
@@ -484,11 +649,11 @@ pub struct GraphResult {
 
     pub(crate) src: Vec<u32>,
     pub(crate) dst: Vec<u32>,
-    pub(crate) edge_label: Vec<u16>,
+    pub(crate) edge_label: Sparse<u16>,
     /// `None` when no edge's row is known; else one per edge, [`NO_ROW`]
     /// for the unknown, and never all of them unknown.
     pub(crate) edge_rows: Option<Vec<u64>>,
-    pub(crate) edge_flags: Vec<u8>,
+    pub(crate) edge_flags: Sparse<u8>,
     pub(crate) edge_columns: Vec<Column>,
 
     pub(crate) highlights: Highlights,
@@ -634,7 +799,7 @@ impl GraphResult {
     }
 
     /// Each edge's label, as an index into [`edge_labels`](Self::edge_labels).
-    pub fn edge_label(&self) -> &[u16] {
+    pub fn edge_label(&self) -> &Sparse<u16> {
         &self.edge_label
     }
 
@@ -653,14 +818,19 @@ impl GraphResult {
     }
 
     /// Each edge's flags ([`REMOVED`]).
-    pub fn edge_flags(&self) -> &[u8] {
+    pub fn edge_flags(&self) -> &Sparse<u8> {
         &self.edge_flags
+    }
+
+    /// Whether edge `i` is itself removed, whatever its ends are.
+    pub fn edge_is_removed(&self, i: usize) -> bool {
+        self.edge_flags.get(i) & REMOVED != 0
     }
 
     /// Whether edge `i` is to be drawn: it is not removed, and neither end
     /// is. So removing a node hides its edges, and restoring it shows them.
     pub fn edge_is_shown(&self, i: usize) -> bool {
-        self.edge_flags[i] & REMOVED == 0
+        !self.edge_is_removed(i)
             && !self.node_is_removed(self.src[i] as usize)
             && !self.node_is_removed(self.dst[i] as usize)
     }
@@ -733,6 +903,12 @@ impl GraphResult {
     /// so this is for a result made another way: the wire format's decoder
     /// calls it.
     pub fn validate(&mut self) -> Result<(), ModelError> {
+        ready(self.validate_paced(&mut Pace::never()))
+    }
+
+    /// [`GraphResult::validate`], giving the event loop a turn as `pace`
+    /// says between its passes over the nodes and the edges.
+    pub(crate) async fn validate_paced(&mut self, pace: &mut Pace) -> Result<(), ModelError> {
         let n = self.n_nodes();
         let m = self.n_edges();
         if self.node_labels.len() > u16::MAX as usize || self.edge_labels.len() > u16::MAX as usize
@@ -752,6 +928,9 @@ impl GraphResult {
         self.index.clear();
         self.index.reserve(n);
         for i in 0..n {
+            if i % PACED_NODES == PACED_NODES - 1 {
+                pace.breathe().await;
+            }
             let label = self.node_label[i];
             let Some(node_label) = self.node_labels.get(label as usize) else {
                 return err(format!(
@@ -787,9 +966,18 @@ impl GraphResult {
                 self.edge_flags.len()
             ));
         }
-        self.check_edges(&self.src, &self.dst, &self.edge_label, n, 0)?;
+        pace.breathe().await;
+        let mut start = 0;
+        while start < m {
+            let end = m.min(start + PACED_EDGES);
+            let label = self.edge_label.as_slice().map(|l| &l[start..end]);
+            self.check_edges(&self.src[start..end], &self.dst[start..end], label, n, start)?;
+            start = end;
+            pace.breathe().await;
+        }
         self.named.clear();
         self.note_named(0);
+        pace.breathe().await;
         if let Some(rows) = &self.edge_rows {
             if rows.len() != m {
                 return err(format!("{m} edges, but {} rows", rows.len()));
@@ -841,15 +1029,18 @@ impl GraphResult {
 
     /// The edges `src[i] → dst[i]` name nodes below `n_nodes` and labels the
     /// result has. `first` is the index of the first, for the message.
+    ///
+    /// `label` is each edge's label, or `None` for the first label on every
+    /// one.
     pub(crate) fn check_edges(
         &self,
         src: &[u32],
         dst: &[u32],
-        label: &[u16],
+        label: Option<&[u16]>,
         n_nodes: usize,
         first: usize,
     ) -> Result<(), ModelError> {
-        for (i, ((&s, &d), &l)) in src.iter().zip(dst).zip(label).enumerate() {
+        for (i, (&s, &d)) in src.iter().zip(dst).enumerate() {
             for node in [s, d] {
                 if node as usize >= n_nodes {
                     return err(format!(
@@ -858,6 +1049,13 @@ impl GraphResult {
                     ));
                 }
             }
+        }
+        let labels = match label {
+            Some(label) => label,
+            None if src.is_empty() => &[],
+            None => &[0],
+        };
+        for (i, &l) in labels.iter().enumerate() {
             if l as usize >= self.edge_labels.len() {
                 return err(format!(
                     "edge {} has the label {l}, but the result has {} edge labels",

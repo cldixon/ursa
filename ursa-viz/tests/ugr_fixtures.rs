@@ -91,9 +91,9 @@ fn expect(r: &GraphResult) -> Value {
             "labelNames": r.edge_labels(),
             "src": r.src(),
             "dst": r.dst(),
-            "labels": r.edge_label(),
+            "labels": r.edge_label().to_vec(),
             "rows": r.edge_rows().map(|rows| rows.iter().map(u64::to_string).collect::<Vec<_>>()),
-            "flags": r.edge_flags(),
+            "flags": r.edge_flags().to_vec(),
             "columns": columns(r.edge_columns()),
         },
         "highlights": {

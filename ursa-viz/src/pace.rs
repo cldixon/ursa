@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
 use wasm_bindgen::JsCast;
 
 /// How long a paced piece of work holds the thread before it gives the
@@ -67,22 +67,22 @@ pub(crate) fn ready<F: Future>(future: F) -> F::Output {
 }
 
 /// Milliseconds on a clock that only moves forward enough to pace by: the
-/// browser's; natively nothing yields, so no clock is read.
+/// browser's (feature `web`); elsewhere nothing yields, so no clock is read.
 fn now() -> f64 {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
     {
         js_sys::Date::now()
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
     {
         0.0
     }
 }
 
-/// Give the event loop a turn: a macrotask in the browser, where GPU
-/// callbacks are delivered; natively, nothing to wait for.
+/// Give the event loop a turn: a macrotask in the browser (feature `web`),
+/// where GPU callbacks are delivered; elsewhere, nothing to wait for.
 pub(crate) async fn yield_now() {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
     {
         let promise = js_sys::Promise::new(&mut |resolve, _| {
             let global = js_sys::global();
