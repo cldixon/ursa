@@ -96,7 +96,7 @@ async fn rows(ctx: &SessionContext, sql: &str) -> usize {
 /// The error an empty file gives, naming it.
 fn empty_error(path: &std::path::Path) -> String {
     format!(
-        "cannot read '{}': it is not a valid Parquet file: the file is empty (0 bytes)",
+        "cannot read '{}': it is not a valid Parquet file: the file is empty",
         path.display()
     )
 }

@@ -1867,8 +1867,7 @@ fn an_empty_parquet_file_is_an_error_naming_it() {
         let message = err(ursa(&["-c", &sql]));
         assert!(
             message.contains(&format!(
-                "cannot read '{empty}': it is not a valid Parquet file: the file is empty (0 \
-                 bytes)"
+                "cannot read '{empty}': it is not a valid Parquet file: the file is empty"
             )),
             "{sql}: {message}"
         );

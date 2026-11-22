@@ -1523,7 +1523,7 @@ mod tests {
         let empty = root.join("b.parquet");
         std::fs::write(&empty, b"").unwrap();
         let expected = format!(
-            "cannot read '{}': it is not a valid Parquet file: the file is empty (0 bytes)",
+            "cannot read '{}': it is not a valid Parquet file: the file is empty",
             shown(&empty)
         );
         for path in [shown(&empty), glob] {

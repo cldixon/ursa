@@ -57,7 +57,7 @@ const SMALLEST: u64 = 4 + FOOTER;
 /// ends of a Parquet file of `size` bytes, if they are not.
 fn footer_problem(size: u64, head: &[u8], tail: &[u8]) -> Option<String> {
     if size == 0 {
-        return Some("the file is empty (0 bytes)".into());
+        return Some("the file is empty".into());
     }
     if size < SMALLEST {
         return Some(format!(
@@ -342,7 +342,7 @@ mod tests {
     fn footers_that_do_not_fit_the_file_are_problems() {
         // Too small to hold the two magic numbers and a length.
         let why = footer_problem(0, &[], &[]).unwrap();
-        assert_eq!(why, "the file is empty (0 bytes)");
+        assert_eq!(why, "the file is empty");
         for size in [4, 8, 11] {
             let why = footer_problem(size, &[], &[]).unwrap();
             assert!(why.contains("at least 12"), "{why}");

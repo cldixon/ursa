@@ -864,13 +864,13 @@ def scan_cases(tmp: Path) -> dict:
             lambda: ur.scan_edges(p("empty.parquet"), src="s", dst="d"),
             ur.ComputeError,
             f"scan_edges('{p('empty.parquet')}'): the file is not valid Parquet (the file is "
-            "empty (0 bytes))",
+            "empty)",
         ),
         "empty_in_glob": (
             lambda: ur.scan_edges(p("with_empty/*.parquet"), src="s", dst="d"),
             ur.ComputeError,
             f"scan_edges('{p('with_empty/*.parquet')}'): '{p('with_empty/b.parquet')}' is not "
-            "valid Parquet (the file is empty (0 bytes))",
+            "valid Parquet (the file is empty)",
         ),
         "csv": (
             lambda: ur.scan_edges(p("bad.csv"), src="s", dst="d"),

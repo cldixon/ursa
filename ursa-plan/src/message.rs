@@ -767,22 +767,19 @@ mod tests {
     fn a_bad_parquet_file_is_named_when_the_label_does_not_name_it() {
         let footer = || {
             Box::new(DataFusionError::Plan(
-                "cannot read '/d/b.parquet': it is not a valid Parquet file: the file is empty \
-                 (0 bytes)"
+                "cannot read '/d/b.parquet': it is not a valid Parquet file: the file is empty"
                     .into(),
             ))
         };
         let e = DataFusionError::Context("scan_edges('/d/b.parquet')".into(), footer());
         assert_eq!(
             engine_message(&e),
-            "scan_edges('/d/b.parquet'): the file is not valid Parquet (the file is empty (0 \
-             bytes))"
+            "scan_edges('/d/b.parquet'): the file is not valid Parquet (the file is empty)"
         );
         let e = DataFusionError::Context("scan_edges('/d/*.parquet')".into(), footer());
         assert_eq!(
             engine_message(&e),
-            "scan_edges('/d/*.parquet'): '/d/b.parquet' is not valid Parquet (the file is empty \
-             (0 bytes))"
+            "scan_edges('/d/*.parquet'): '/d/b.parquet' is not valid Parquet (the file is empty)"
         );
     }
 }
