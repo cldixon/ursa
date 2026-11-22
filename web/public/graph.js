@@ -728,7 +728,10 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   // A search's answer (.find): select `nodes`, the first of `matched`
   // matches, and fit them.
   state.selectFound = (nodes, matched) => {
-    view.setSelection(nodes);
+    // The engine's graph can be ahead of the view's (a change not drawn
+    // yet): a node the view has not got is left out.
+    const count = view.nodeCount;
+    view.setSelection(nodes.every((i) => i < count) ? nodes : nodes.filter((i) => i < count));
     selectionChanged(matched);
     fitSelection();
   };
