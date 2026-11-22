@@ -1147,12 +1147,25 @@ export async function memory({ timeoutMs = 10_000 } = {}) {
 }
 
 /**
+ * For tests: the view at the layout's newest positions, which the next frame
+ * would draw: a test that reads a node's place as the layout ends clicks
+ * where the node will be.
+ */
+function atNewest(state) {
+  if (!state.pending) return;
+  state.view.setPositions(state.pending);
+  state.pending = null;
+  state.redraw?.(false);
+}
+
+/**
  * For tests: where the node with the key `id` is drawn, {index, x, y} in CSS
  * pixels from the canvas's top left, or null with no such node.
  */
 export function nodePlace(id) {
   const state = current;
   if (!state) return null;
+  atNewest(state);
   for (let index = 0; index < state.ids.length; index++) {
     if (String(state.ids.get(index)) !== String(id)) continue;
     const [x, y] = state.view.nodePixel(index);
@@ -1170,6 +1183,7 @@ export function nodePlace(id) {
 export function expandable(limit = 10) {
   const state = current;
   if (!state?.notShown) return [];
+  atNewest(state);
   const ratio = state.canvas.width / state.canvas.clientWidth;
   const order = Array.from(state.notShown.keys())
     .filter((i) => state.notShown[i] > 0 && !(state.graph.removed[i] & 1))
@@ -1187,6 +1201,7 @@ export function expandable(limit = 10) {
 
 /** For tests: the node drawn at the canvas pixel (x, y), as a click picks it, or null. */
 export function nodeAt(x, y) {
+  if (current) atNewest(current);
   const node = current?.view.pick(x, y);
   return node === undefined ? null : node;
 }
