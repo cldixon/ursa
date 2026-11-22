@@ -180,12 +180,12 @@ static assets and an R2 bucket.
     pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
     double-click or `0` fits. A click on a node selects it (#438):
     it carries a ring, its edges are drawn wide, and the pane's header, a
-    live region, reads `Selected node 33: label members, degree 17, club
-    Officer`. Shift+click adds a node (or takes it out), a click on empty
+    live region, reads `Selected node 33: degree 17, club Officer`. Shift+click adds a node (or takes it out), a click on empty
     space clears the selection, and so does Esc, which closes the pane only
     when nothing is selected. A mouse or a pen over a node rings it and
-    shows a tooltip beside it: its key, label, `SIZE BY` and `COLOR BY`
-    values and degree; the pointer is looked up once a frame at most. The
+    shows a tooltip beside it: its key, its label (when the result names
+    one: the engine names none yet), `SIZE BY` and `COLOR BY` values and
+    degree; the pointer is looked up once a frame at most. The
     selection set is `ursa-viz`'s (`interact`); `graph.js` tells it what
     was clicked. On a touch screen (#428) one finger pans and two pinch: the
     view zooms by the change in the fingers' distance around the point

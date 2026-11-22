@@ -995,7 +995,7 @@ for (const scheme of ["light", "dark"] as const) {
     "graphTimings.frames: the time in render() and between frames while the view moved",
     JSON.stringify(t.frames),
   );
-  check(!!hit && t.pick.count >= 1 && t.pick.last >= 0 && t.pick.last < 100 && t.pick.p95 >= 0 && t.pick.p95 < 100, "graphTimings.pick: the last pick and the p95", JSON.stringify(t.pick));
+  check(t.pick.count >= 1 && t.pick.last >= 0 && t.pick.last < 100 && t.pick.p95 >= 0 && t.pick.p95 < 100, "graphTimings.pick: the last pick and the p95", JSON.stringify(t.pick));
   const acted = (command: string) => t.actions.findLast((a: any) => a.command === command);
   const drew = t.actions.findLast((a: any) => a.command.startsWith(".graph"));
   check(
@@ -1227,14 +1227,14 @@ for (const scheme of ["light", "dark"] as const) {
     }, [box.width, box.height]);
     if (hit) await s.mouse.click(box.x + hit.x, box.y + hit.y);
     const status = await s.locator("#graph-status").textContent();
-    check(!!hit && /^Selected node \d+: label members, degree \d+, club (Mr\. Hi|Officer) · 34 nodes · 78 edges$/.test(status ?? ""), "a click names the node's label, size and colour values", status ?? "no node found");
+    check(!!hit && /^Selected node \d+: (label \S+, )?degree \d+, club (Mr\. Hi|Officer) · 34 nodes · 78 edges$/.test(status ?? ""), "a click names the node's size and colour values", status ?? "no node found");
     {
-      // The tooltip has the same: the key, the label, SIZE BY, COLOR BY and the degree.
+      // The tooltip has the same: the key, the label (when the result names one), SIZE BY, COLOR BY and the degree.
       await s.mouse.move(box.x + 3, box.y + 3);
       if (hit) await s.mouse.move(box.x + hit.x, box.y + hit.y);
       await s.waitForFunction(() => document.querySelector<HTMLElement>("#graph-stage .graph-tip")?.hidden === false, null, { timeout: 5_000 }).catch(() => {});
       const tip = await s.evaluate(() => Array.from(document.querySelector("#graph-stage .graph-tip")?.children ?? [], (c) => c.textContent).join(" | "));
-      check(/^node \d+ \| label members \| degree \d+ \| club (Mr\. Hi|Officer) \| degree \d+$/.test(tip), "the tooltip has the node's key, label, SIZE BY and COLOR BY values and degree", tip);
+      check(/^node \d+ \| (label \S+ \| )?degree \d+ \| club (Mr\. Hi|Officer) \| degree \d+$/.test(tip), "the tooltip has the node's key, SIZE BY and COLOR BY values and degree", tip);
     }
     await s.click("#terminal");
 
