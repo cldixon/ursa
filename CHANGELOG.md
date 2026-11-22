@@ -770,6 +770,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **An empty `.parquet` file is an error naming it** (behaviour change: an
+  empty Parquet file used to read as zero rows). DataFusion's listing
+  skipped a 0-byte file before the footer check (#332) saw it, so
+  `FROM 'empty.parquet'` returned no rows, and a glob or directory holding
+  one read as if it were not there. Ursa now lists a Parquet table's files
+  itself and stops at an empty one, as DuckDB and PyArrow do: `cannot read
+  'empty.parquet': it is not a valid Parquet file: the file is empty`. It
+  covers a file named directly and one found by a glob or a directory, in `FROM '…'`, `read_parquet`, `CREATE EXTERNAL TABLE … STORED
+  AS PARQUET`, graphs over them and the Python scans, which name the file
+  for a glob (`scan_edges('data/*.parquet'): 'data/b.parquet' is not valid
+  Parquet (…)`). An empty CSV or JSON file is still skipped. A table is
+  checked when it is created: an external table whose file becomes empty
+  later reads it as no rows.
 - **`hop`'s rows come back in no particular order** (behaviour change,
   #452). SQL `hop(…)` and Python `ur.hop(…).from_(…)` return the same rows
   as before, with the same distances, but not always in the same order: the
