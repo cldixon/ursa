@@ -418,6 +418,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **Web Shell: double-click a node and its neighbours appear** (#443). The
+  Graph view now draws what the explore commands change. A double-click on a
+  node (a double tap, or Enter in the pane with nodes selected) runs
+  `.expand ID` in the terminal as if typed: it is echoed after a dimmed
+  `from the graph`, answered in one line, kept in `.history`, and replayed
+  by a shared link, which now includes `.graph` drawings and the explore
+  commands that changed them. Shift expands with `LIMIT 5000`; a
+  double-click on empty space still fits; `.graph echo off` runs these
+  commands without writing them. The new nodes start beside their
+  neighbours and the layout grows warm, the nodes already drawn held or
+  slow. `.hide` and `.show` are drawn too, `.undo` puts every node back
+  where it was before the step, in one frame, and `.redo` draws the step
+  where it had settled. While a command waits its turn its node carries a
+  busy ring. A node with edges in the graph that lead to something not
+  shown says `+N`, in its tooltip and in the header when it is selected (no
+  badge is drawn: there is no label overlay yet); the count is the engine's
+  (`Session::not_shown`, `Shell::not_shown`, `WebShell.notShown()`). Each
+  expansion is an action in `graphTimings()`. On the million-edge R-MAT
+  dataset, from a `hop` result, a double-click's frame comes 118 to 190 ms
+  after it in headless Chromium. The pane's view is now made with
+  `createViewFromResult`, so that deltas apply to it.
 - **Exploring a drawn graph from the terminal: `.expand`, `.hide`, `.show`,
   `.undo`, `.redo` and `.graph history`** (#440). The engine now keeps an
   explore session for the graph `.graph` opened
@@ -437,8 +458,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `ursa-shell` lists the commands in `.help` and runs them
   (`Shell::open_graph`, `Shell::explore`); `ursa-wasm` adds
   `WebShell.explore(command)` and the engine worker an `explore` op. The
-  page's pane does not draw the deltas yet (#443): until then it keeps what
-  `.graph` drew, and the terminal's line says what changed.
+  page's pane draws the deltas since #443.
 - **`.graph` draws what a result means** (#433). After a graph query, the
   Web Shell's `.graph` (`ursa-engine`'s `graph::view`) now reads what each
   column is, from the `ursa.*` metadata the graph functions and `GRAPH_TABLE`

@@ -357,6 +357,23 @@ impl WebShell {
         })
     }
 
+    /// For each node slot of the open graph, how many of its edges in the
+    /// property graph lead to something that is not shown, resolving to a
+    /// `Uint32Array`: what the view's `+N` says of a node, and what
+    /// `.expand` would start to add. Empty with no open graph, or one that
+    /// is not of a property graph. It reads the graph's degrees once for
+    /// each node.
+    #[wasm_bindgen(js_name = notShown)]
+    pub fn not_shown(&self) -> Promise {
+        let shell = Rc::clone(&self.shell);
+        future_to_promise(async move {
+            not_shown(&shell)
+                .await
+                .map(|counts| js_sys::Uint32Array::from(counts.as_slice()).into())
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
     /// Close the open graph (the page closed its view): the explore
     /// commands say there is none until [`Self::graph`] opens another.
     #[wasm_bindgen(js_name = closeGraph)]
@@ -450,6 +467,16 @@ async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<
         result: result.clone(),
         skipped,
     })
+}
+
+/// What [`WebShell::not_shown`] resolves to.
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
+async fn not_shown(shell: &RefCell<Shell<Buffer, Buffer>>) -> Result<Vec<u32>> {
+    let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
+    shell.not_shown().await
 }
 
 /// Run an explore command, and take what it printed.

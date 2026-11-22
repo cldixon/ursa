@@ -837,14 +837,15 @@ async function cancelPending() {
 const LOOKS = /^\s*\.(help|tables|graphs|describe|functions|version|print|history|files|share|quit|exit|dataset)\b/;
 
 /** Feed one line to the shell and write what it printed. True if no error. */
-async function feed(line, { echo }) {
+async function feed(line, { echo, from = "" }) {
   if (echo) {
     // Shown as typed, but with control characters escaped: a command from a
     // shared link cannot rewrite the screen as it is echoed. The shell's
     // highlighter leaves comments plain: the page greys them.
     const shown = visible(line);
     const { text: ansi } = /^\s*--/.test(line) ? { text: `\x1b[90m${shown}\x1b[0m` } : await engine("highlight", { text: shown });
-    await write(`${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
+    // `from` says where a command the user did not type came from, dimmed.
+    await write(`${from ? `\x1b[2m${from}\x1b[0m ` : ""}${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
   }
   statement.push(line);
   const r = await engine("feed", { line });
@@ -874,7 +875,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); the pane says what it was drawn as; click a node to select it (Shift+click adds); Esc clears the selection, then closes it"],
+  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); the pane says what it was drawn as; click a node to select it (Shift+click adds); double-click a node, or press Enter with nodes selected, to add its neighbours (it runs .expand ID here; Shift adds up to 5,000; .graph echo off stops showing those commands); Esc clears the selection, then closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
   [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
@@ -907,10 +908,16 @@ async function hostCommand(line) {
   const [name, ...rest] = line.trim().replace(/;\s*$/, "").split(/\s+/);
   const arg = rest.join(" ");
   switch (name) {
-    case ".graph":
+    case ".graph": {
       if (/^history\b/i.test(arg)) return explore(line);
+      if (/^echo\b/i.test(arg)) return graphEcho(rest.slice(1));
       // The query as typed: its spaces may be in a string.
-      return drawGraph(line.trim().slice(name.length).trim());
+      const drawn = await drawGraph(line.trim().slice(name.length).trim());
+      // A drawing is part of the session a link replays: what is explored
+      // starts from it.
+      if (drawn && graphOpen()) ran.push(line.trim());
+      return drawn;
+    }
     case ".expand":
     case ".hide":
     case ".show":
@@ -1029,10 +1036,12 @@ async function drawGraph(text) {
   }
   clearTimeout(soon);
   open();
+  // This drawing: a command its view asked for is not run on the next one.
+  const drawing = ++drawings;
   let drawn;
   try {
     const module = await loadGraphModule();
-    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, times });
+    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, onCommand: (command) => fromGraph(command, drawing), times });
   } catch (e) {
     // Closed (Esc) before it was drawn: nothing went wrong.
     if (!graphOpen()) return true;
@@ -1043,7 +1052,70 @@ async function drawGraph(text) {
   const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
   const as = drawn.drawnAs ? ` as ${drawn.drawnAs}` : "";
   await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  countNotShown();
   return true;
+}
+
+/**
+ * Ask the engine how many of each node's edges lead to something not shown,
+ * and tell the view (its +N, in the tooltip and the header). Not waited for:
+ * the answer is for whatever is drawn when it comes, or it is dropped.
+ */
+function countNotShown() {
+  engine("notShown").then(
+    ({ counts }) => graphOpen() && graphLoaded?.setNotShown(counts),
+    () => {},
+  );
+}
+
+// Bumped by each drawing: see fromGraph.
+let drawings = 0;
+
+// Whether a command the Graph view runs (a double-click's .expand) is shown
+// in the terminal, with its answer: `.graph echo off|on`.
+let graphEchoes = true;
+
+/** `.graph echo ?on|off?`: show the view's commands in the terminal, or not. */
+async function graphEcho(words) {
+  const word = (words[0] ?? "").toLowerCase();
+  if (words.length > 1 || !["", "on", "off"].includes(word)) return errorLine("usage: .graph echo on|off");
+  if (word) graphEchoes = word === "on";
+  await write(
+    graphEchoes
+      ? "The graph view's commands are shown here as they run (.graph echo off hides them).\r\n"
+      : "The graph view's commands run without being shown here; .history still lists them (.graph echo on shows them again).\r\n",
+  );
+  return true;
+}
+
+// Set while a command the view asked for runs with the echo off: its answer
+// is not written, unless it is an error.
+let unechoed = false;
+
+/**
+ * Run `command` for the Graph view (`.expand 33`, a double-click on node
+ * 33) as a typed line runs: in its turn after whatever is running, echoed
+ * after the prompt with a dimmed "from the graph" before it, its answer
+ * under it, and kept in the history. With `.graph echo off` neither is
+ * written (an error still is). Resolves to whether it ran without an error.
+ * It is dropped if the drawing it was asked of (`drawing`) is closed or
+ * replaced before its turn.
+ */
+function fromGraph(command, drawing) {
+  const session = generation;
+  return enqueue(async () => {
+    if (session !== generation || drawing !== drawings || !graphOpen()) return false;
+    setAside();
+    // A statement left half typed would take this command as its next line.
+    if (statement.length) await cancelPending();
+    remember(command);
+    unechoed = !graphEchoes;
+    try {
+      return await feed(command, { echo: graphEchoes, from: "from the graph" });
+    } finally {
+      unechoed = false;
+    }
+  });
 }
 
 // The last explore command's answer, for tests: its `command`, how many
@@ -1054,14 +1126,36 @@ let explored = null;
 /**
  * An explore command (.expand, .hide, .show, .undo, .redo, .graph history):
  * the engine changes its graph and prints what changed, and gives the change
- * as a UGR delta. The shell itself (ursa-shell) lists these commands in .help.
- * Drawing the delta in the pane is #443: until then the pane keeps what
- * .graph drew.
+ * as a UGR delta, which the pane applies to its drawing (graph.js's
+ * applyDelta): new nodes appear beside their neighbours, hidden ones go, and
+ * an undo puts every node back where it was. The shell itself (ursa-shell)
+ * lists these commands in .help. A command that changed the graph is part
+ * of the session a shared link replays.
  */
 async function explore(line) {
+  const at = performance.now();
   const r = await engine("explore", { command: line });
-  explored = { command: line, nodes: r.nodes, edges: r.edges, deltaBytes: r.delta?.byteLength ?? 0 };
-  await write(r.out + r.err);
+  const command = line.trim().replace(/;\s*$/, "");
+  explored = { command: line, nodes: r.nodes, edges: r.edges, deltaBytes: r.delta?.byteLength ?? 0, drawn: null };
+  let lost = null;
+  if (r.delta && graphOpen()) {
+    const kind = /^\.(undo|redo)\b/i.exec(command)?.[1].toLowerCase() ?? "step";
+    try {
+      explored.drawn = (await loadGraphModule()).applyDelta(r.delta, { kind, command, at, engine: performance.now() - at });
+    } catch (e) {
+      lost = String(e?.message ?? e);
+    }
+  }
+  if (!unechoed || r.err) await write(r.out + r.err);
+  if (lost !== null) {
+    // The pane no longer draws what the engine holds: close both.
+    closeGraph();
+    return errorLine(`the graph view could not draw the change (${lost}); run .graph to draw it again`);
+  }
+  if (r.delta) {
+    ran.push(command);
+    countNotShown();
+  }
   return !r.err;
 }
 
@@ -1425,7 +1519,9 @@ window.ursaShell = {
   graphOpen,
   graph: () => graphLoaded?.info() ?? null,
   // The last explore command (.expand, .hide, …): {command, nodes, edges,
-  // deltaBytes}, the engine's counts of what is shown after it.
+  // deltaBytes, drawn}, the engine's counts of what is shown after it, and
+  // what the pane drew of its delta ({nodes, edges, slots, bytesUploaded,
+  // restored}; null with no delta).
   explored: () => explored,
   // The last .graph: when each step ended, in ms after Enter; and what the
   // view costs to use (#430, graph-timings.js): `frames` (how many, and the
@@ -1451,6 +1547,8 @@ window.ursaShell = {
   },
   graphInked: async () => graphLoaded?.inked() ?? null,
   graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
+  // For tests: shown nodes with edges not shown, the most first, each with its place.
+  graphExpandable: (limit) => graphLoaded?.expandable(limit) ?? [],
   // For tests: where the node with a key is drawn, {index, x, y} in CSS pixels of the canvas.
   graphNodePlace: (id) => graphLoaded?.nodePlace(id) ?? null,
 };

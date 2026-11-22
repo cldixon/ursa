@@ -147,10 +147,59 @@ static assets and an R2 bucket.
     the line to print (`+16 nodes, +41 edges`), the change as one UGR delta
     buffer (transferred; `null` for none), and how many nodes and edges the
     engine shows after it. Closing the pane closes the engine's graph
-    (`closeGraph`), after which the commands say none is open. **The pane
-    does not draw the deltas yet** (#443): it keeps what `.graph` drew.
+    (`closeGraph`), after which the commands say none is open.
     `window.ursaShell.explored()` gives the last command's
-    `{command, nodes, edges, deltaBytes}`, which the e2e test reads.
+    `{command, nodes, edges, deltaBytes, drawn}`, which the e2e test reads.
+  - **Click to expand, and the deltas drawn** (#443). The pane's view is
+    made from the graph result itself (`createViewFromResult`), so it
+    changes in place: `graph.js`'s `applyDelta` gives each explore
+    command's delta to the view (`view.applyDelta`), which writes only what
+    changed.
+    - **What the page knows** (each node's id, its degree among what is
+      shown, the legend, the counts in the header) is read again from the
+      view's own result (`view.resultBytes()`) after each delta, and the
+      page sets every node's size and colour again, as it does for the
+      first drawing: sizes in CSS pixels, eight colours and "other".
+    - **The layout grows.** The worker gets `{type: "grow", n, src, dst}`
+      (the edges shown) and calls `Layout.grow`: new nodes start beside
+      their neighbours, and the nodes there were are held or slow. The
+      header reads `Placing the new nodes`, then `Done`. Each message of
+      the worker carries the `epoch` of the delta it follows, and the page
+      drops positions of a graph it no longer draws.
+    - **Undo and redo put every node back.** The page keeps the positions
+      before each step (up to 16 million numbers; older steps then undo
+      where the nodes are) and hands them back with the inverse delta, so
+      `.undo` is one frame with no layout, the same pixels as before the
+      step, and `.redo` draws the step where it had settled. The worker is
+      told where the nodes are (`{type: "place", …}`, `Layout.fromPositions`).
+    - **A double-click on a node** (a double tap, or Enter in the pane with
+      nodes selected) runs `.expand ID` through the terminal's queue, as a
+      typed line runs: echoed after the prompt with a dimmed `from the
+      graph` before it, answered in one line (`+16 nodes, +41 edges`), kept
+      in `.history`. With Shift it is `.expand ID LIMIT 5000`. A
+      double-click on empty space still fits. `.graph echo off` runs these
+      commands without writing them or their answers (an error is still
+      written, and `.history` still lists them); `.graph echo on` shows
+      them again.
+    - **While a command runs** the next ones wait their turn (the engine
+      runs one at a time), and each node waiting carries a busy ring: an
+      element over the canvas (`.graph-busy`), moved with its node as each
+      frame is drawn, still under `prefers-reduced-motion`.
+    - **`+N`.** There is no label overlay yet to draw a badge, so the
+      tooltip (`not shown +4`) and the header (`Selected node 2: degree 6,
+      +4 not shown`) say it. N is the engine's count
+      (`Session::not_shown`, the worker's `notShown` op): the node's degree
+      in the property graph, both directions, less its edges shown here. It
+      counts edges, as `degree` does, so parallel edges count each. The
+      page asks for it after each drawing and each delta, without waiting.
+    - **Timings and sharing.** Each expansion is an action of
+      `graphTimings()`: `{command: ".expand 33", at, engine, delta, frame}`,
+      from the double-click to the frame that drew its delta. On the
+      million-edge R-MAT graph, from a `hop` result, ten double-clicks took
+      118 to 190 ms each from click to frame (50 to 100 ms of it in the
+      engine; headless Chromium, software WebGL2, 2026-11-22). A drawing
+      (`.graph …`) and each explore command that changed it are now part
+      of what Share replays, so a shared link draws the same exploration.
   - **The engine's graph** (#425): `.graph` is resolved in `ursa-engine`
     (`graph::view`: the clauses, the source, the ids as dense node indexes,
     `SIZE BY`, `COLOR BY` and `NODES`), not in `ursa-wasm`, so the CLI and
@@ -239,7 +288,8 @@ static assets and an R2 bucket.
     then the engine's width); Esc (in the terminal or the pane) or the
     close button closes the pane, and New or a dataset does too. In the
     pane, drag or the arrow keys pan, the wheel or `+`/`-` zoom, a
-    double-click or `0` fits. A click on a node selects it (#438):
+    double-click on empty space or `0` fits, and a double-click on a node
+    expands it (#443, above). A click on a node selects it (#438):
     it carries a ring, its edges are drawn wide, and the pane's header, a
     live region, reads `Selected node 33: degree 17, club Officer`. Shift+click adds a node (or takes it out), a click on empty
     space clears the selection, and so does Esc, which closes the pane only
@@ -252,7 +302,7 @@ static assets and an R2 bucket.
     view zooms by the change in the fingers' distance around the point
     between them, and pans as that point moves, so what is between the
     fingers stays there. A tap names a node (a second finger cancels it),
-    and a double tap fits. The canvas draws at most 2 pixels for each CSS
+    and a double tap expands the node under it, or fits. The canvas draws at most 2 pixels for each CSS
     pixel, whatever the screen's ratio. A lost WebGL context or GPU device, or a layout that stops,
     closes the pane with an error in the terminal.
 - `src/index.ts`: the Worker. `/data/<file>` serves `datasets/<file>` from the
@@ -337,7 +387,13 @@ sequences and `.export`), New, the theme toggle and history; the Graph view
 in both themes; `SIZE BY` and `COLOR BY` from an algorithm, a vertex column and
 `NODES (…)`, each of their errors, at least two palette colours read back in
 each theme with no inversion, a theme switch with the pane open, the legend's
-text, and the status from Enter to Done, within a second for rmat; a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+text, and the status from Enter to Done, within a second for rmat; click to
+expand (a double-click, Shift, Enter and a double tap each running `.expand`,
+its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
+header and the tooltip, the busy rings of queued commands, `.undo` restoring
+the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
+ten double-clicks on rmat within 250 ms each, and a shared link replaying the
+exploration to the same counts); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

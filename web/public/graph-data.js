@@ -25,6 +25,11 @@ const COLOR_SUFFIX = " (colour)";
  *
  *   n, src, dst    the nodes' count and the edges' ends, as dense node indexes
  *   ids            each node's id as the shell prints it: {length, get(i)}
+ *   removed, edgeRemoved
+ *                  a byte for each node and each edge: 1 for one that is
+ *                  not shown (hidden by the explore session; a hidden node
+ *                  keeps its index), 0 otherwise. An edge at a removed node
+ *                  is not shown either.
  *   labelOf(i)     node i's label (the vertex table it is of), or null
  *   skipped        rows left out because an endpoint is NULL
  *   name           the property graph drawn, or null
@@ -42,6 +47,7 @@ const COLOR_SUFFIX = " (colour)";
  *   colorLabels, colorCounts, colorOther, colorMissing
  *                  the legend: the coloured categories and how many nodes each
  *                  has, the nodes in other categories, and those with no value
+ *                  (of the nodes shown)
  *
  * The arrays are views of the buffer `result` was read from, except `color`.
  */
@@ -52,6 +58,8 @@ export function drawingOf(result, skipped = 0) {
     src: edges.src,
     dst: edges.dst,
     ids: nodes.keys,
+    removed: nodes.flags,
+    edgeRemoved: edges.flags,
     skipped,
     name: result.graph,
     provenance: result.provenance,
@@ -86,11 +94,14 @@ export function drawingOf(result, skipped = 0) {
     let missing = 0;
     for (let i = 0; i < color.length; i++) {
       const code = c.values[i];
+      // The legend counts the nodes shown.
+      const shown = (nodes.flags[i] & 1) === 0;
       if (code < top) {
         color[i] = code;
-        counts[code]++;
+        if (shown) counts[code]++;
       } else {
         color[i] = MAX_CATEGORIES;
+        if (!shown) continue;
         if (code === NULL) missing++;
         else other++;
       }

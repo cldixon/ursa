@@ -324,6 +324,17 @@ impl<O: Write, E: Write> Shell<O, E> {
         self.explorer.as_ref()
     }
 
+    /// For each node slot of the open graph, how many of its edges in the
+    /// property graph lead to something not shown: a view's `+N` badge
+    /// (`ExploreSession::not_shown`). Empty with no open graph, or one that
+    /// is not of a property graph.
+    pub async fn not_shown(&mut self) -> Result<Vec<u32>> {
+        match &mut self.explorer {
+            None => Ok(Vec::new()),
+            Some(session) => session.not_shown(&self.ctx, &ursa_sql::Sql).await,
+        }
+    }
+
     /// Run an explore command on the open graph (`.expand 33`, `.hide 5 6`,
     /// `.show all`, `.undo`, `.redo`, `.graph history`; `line` is the whole
     /// line, as [`Flow::Host`] hands it back). It prints what changed in one

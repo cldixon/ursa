@@ -32,6 +32,12 @@
 //                                               null when nothing changed;
 //                                               `nodes` and `edges` are how many
 //                                               are shown after it)
+//   notShown  {}               -> {counts}       (for each node slot of the open
+//                                               graph, how many of its edges in
+//                                               the property graph lead to
+//                                               something not shown, a
+//                                               Uint32Array, transferred: the
+//                                               view's +N; empty with no graph)
 //   closeGraph {}              -> {}             (the page closed its view)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
@@ -114,6 +120,9 @@ async function handle({ id, op, ...args }) {
       const reply = { id, ok: true, out: e.out, err: e.err, delta: bytes.length ? bytes : null, nodes: e.nodes, edges: e.edges };
       e.free();
       postMessage(reply, reply.delta ? [reply.delta.buffer] : []);
+    } else if (op === "notShown") {
+      const counts = await shell.notShown();
+      postMessage({ id, ok: true, counts }, [counts.buffer]);
     } else if (op === "closeGraph") {
       shell?.closeGraph();
       postMessage({ id, ok: true });
