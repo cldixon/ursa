@@ -97,8 +97,13 @@ load the wasm (`wasm-release`).
   task, one sync, per frame, which is the draw cost without the compositor's
   pacing.
 - **Pick**: `view.pick` at 200 pseudo-random pixels (a fixed sequence), with
-  the drawing fitted to the view. Pick is a linear scan of the nodes on the
-  CPU, so its cost is per node whether it hits or not.
+  the drawing fitted to the view and the positions at rest, so the picks
+  read the spatial grid (#500). In the tables below, run before the grid,
+  pick was a pass over every node, and its cost was per node whether it hit
+  or not.
+- **Grid** (from the next run on): the median of nine `view.rebuildGrid()`
+  calls, and `view.nodesDrawn` for a frame zoomed 10× into the middle of
+  the drawing (1% of its area).
 - **Memory**: the page's and the worker's wasm memory (`memory.buffer`), and
   the page's JS heap (`performance.memory.usedJSHeapSize`, with
   `--enable-precise-memory-info`). The server sends COOP/COEP so the page is
@@ -117,6 +122,43 @@ load the wasm (`wasm-release`).
   cargo run -p ursa-core --release --example fa2_multilevel -- bench 1k,10k,100k,1m rmat,grid
   cargo run -p ursa-core --release --no-default-features --example fa2_multilevel -- bench
   ```
+
+## The spatial grid (#500)
+
+Measured 2026-11-22, apart from the tables below, on the same container
+(4 cores, shared with other builds at the time, so each time is given with
+the pass over every node measured beside it).
+
+Native, one core, 1,048,576 nodes (`cargo test -p ursa-viz
+--no-default-features --release --lib spatial -- --ignored --nocapture`);
+positions spread evenly, in six clusters with strays, and on a jittered
+lattice; 1.1M edges, a tenth of them between any two nodes:
+
+| positions | grid built | pick | pick, every node | edge grid built | edge pick | edge pick, every edge |
+|---|---|---|---|---|---|---|
+| random | 9.5 ms | 5.8 µs | 3.96 ms | 53 ms | 10.2 ms | 16.3 ms |
+| clustered | 11.7 ms | 22 µs | 3.66 ms | 49 ms | 0.44 ms | 6.1 ms |
+| lattice | 10.0 ms | 8.4 µs | 3.73 ms | 60 ms | 1.56 ms | 8.8 ms |
+
+On random positions every edge crosses the drawing, so most edges do pass
+near any point and the edge grid has little to leave out.
+
+In the browser (wasm, headless Chromium, WebGL2; `ONLY=grid bun
+tests/browser/view.ts`, which also checks every pick against the pass over
+every node and the culled frame against the whole one, byte for byte):
+
+| graph | nodes | edges | grid built | pick | pick, every node | edge pick | edge pick, every edge | node instances drawn, zoomed into 1% |
+|---|---|---|---|---|---|---|---|---|
+| clusters 8×500 | 4,000 | 24,391 | 0.2 ms | under 1 µs | 0.024 ms | 0.013 ms | 0.34 ms | 264 to 492 (6.6 to 12.3%: a cluster is dense) |
+| R-MAT | 131,072 | 1,000,000 | 2.1 ms | 1 µs | 0.77 ms | 12.6 ms | 37.6 ms | 1,031 to 3,178 (0.8 to 2.4%) |
+| R-MAT (`ONLY="grid nodes 1M"`) | 1,048,576 | 1,000,000 | 21.2 ms | 8 µs | 9.4 ms | 16.5 ms | 38.2 ms | 22,296 to 22,478 (2.1%) |
+
+The last row ran with the machine's load at 7.6 on 4 cores: its pass over
+every node took 9.4 ms, against the 4.9 ms of the run below, and the grid
+2.3 of those passes (the issue's 15 ms is 3.1). The test holds the ratios,
+not the times: a pick at most a 24th of the pass over every node, and the
+grid at most 4 of them. R-MAT here is three flat iterations from the seed:
+its edges cross the whole drawing, which is the edge grid's worst case.
 
 ## Results
 
@@ -205,8 +247,9 @@ What stands out, for setting targets:
   worker's positions 2 or 3 times in the whole layout (WebGPU, ~50), and the
   first frame came after 31 s. The worker kept its pace (9.9 s against
   7.8 s, sharing the CPU); the page just never showed it.
-- **Pick is a linear scan**: 0.55 ms at 131K nodes, 1.8 to 2.2 ms at 500K.
-  Fine for a click; too slow for hover at a few million nodes.
+- **Pick was a linear scan** in this run: 0.55 ms at 131K nodes, 1.8 to
+  2.2 ms at 500K. Fine for a click; too slow for hover at a few million
+  nodes. It reads a grid now: see [the spatial grid](#the-spatial-grid-500).
 - **Memory is the worker's**: at 1M edges the worker's wasm memory is 107
   to 116 MiB (the hierarchy, every level's adjacency) and the page's 54 to
   82 MiB (the view's copy of the graph and positions). wasm

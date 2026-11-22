@@ -404,7 +404,17 @@ pub struct Renderer {
 /// canvas, the nodes cover at most `coverage` of it: 1 for a small graph,
 /// down to `0.15` for a huge one (131K nodes on a laptop screen).
 pub fn node_radius_scale(radius: &[f32], width: f32, height: f32, coverage: f32) -> f32 {
-    let area: f32 = radius.iter().map(|r| std::f32::consts::PI * r * r).sum();
+    radius_scale_for(disc_area(radius), width, height, coverage)
+}
+
+/// The area of every node's disc at full size, in square pixels: what
+/// [`node_radius_scale`] reads of the radii, for a caller that keeps it.
+pub fn disc_area(radius: &[f32]) -> f32 {
+    radius.iter().map(|r| std::f32::consts::PI * r * r).sum()
+}
+
+/// [`node_radius_scale`], from the discs' area ([`disc_area`]).
+pub fn radius_scale_for(area: f32, width: f32, height: f32, coverage: f32) -> f32 {
     if area <= 0.0 {
         return 1.0;
     }

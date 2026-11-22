@@ -295,6 +295,13 @@ impl GraphView {
         self.view.rebuild_grid();
     }
 
+    /// Whether a zoomed-in frame may draw the nodes in view alone: on
+    /// unless turned off. The frame is the same either way.
+    #[wasm_bindgen(js_name = setCulling)]
+    pub fn set_culling(&mut self, on: bool) {
+        self.view.set_culling(on);
+    }
+
     /// How many node instances the last frame's pass over the nodes drew:
     /// every node, or, zoomed in with the positions at rest, the nodes in
     /// view.

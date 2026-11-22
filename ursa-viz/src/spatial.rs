@@ -15,7 +15,7 @@ use crate::interact::edge_distance2;
 use crate::scene::Camera;
 
 /// How many positions the grid's box is found from.
-const SAMPLE: usize = 4096;
+const SAMPLE: usize = 1024;
 /// The most cells along a side.
 const MAX_SIDE: usize = 4096;
 /// The most cells in all.

@@ -5,6 +5,8 @@
 //! frame into a texture. `web` is one such binding; a native window or a
 //! notebook widget would be others.
 
+use std::cell::Cell;
+
 use ursa_core::algo::{fa2_seed_positions, Fa2Params};
 
 use crate::highlight::{flag, BadHighlight, HighlightState, MARK_REACH};
@@ -12,7 +14,7 @@ use crate::interact::nearest_edge;
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
 use crate::pace::{ready, yield_now, Pace};
-use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
+use crate::render::{disc_area, radius_scale_for, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
 use crate::spatial::{Discs, EdgeGrid, NodeGrid};
 
@@ -71,6 +73,9 @@ struct Spatial {
     quiet: u32,
     /// At least every node's radius, in pixels.
     max_radius: f32,
+    /// The area of every node's disc, until a radius changes: a frame and
+    /// a pick both need it, and it is a pass over every node.
+    disc_area: Cell<Option<f32>>,
     /// The grid over the edges, built for the second edge picked with the
     /// positions at rest: building it costs a few picks that read every
     /// edge, which one stray click should not pay.
@@ -80,6 +85,8 @@ struct Spatial {
     /// Whether the nodes in view have been worked out for the scene and
     /// camera as they are ([`View::prepare`]).
     culled: bool,
+    /// Never draw the nodes in view alone ([`View::set_culling`]).
+    no_culling: bool,
 }
 
 /// A grid is built once this many frames and picks have passed with no
@@ -413,6 +420,9 @@ impl View {
             spatial.max_radius = spatial.max_radius.max(most);
         }
         spatial.culled = false;
+        if n0 != n1 || changes.new_nodes_from < n1 || !changes.restyled.is_empty() {
+            spatial.disc_area.set(None);
+        }
         self.renderer.set_culled_nodes_off();
         let grows = self.renderer.grows();
         self.renderer.resize(device, queue, n1, m1);
@@ -682,6 +692,7 @@ impl View {
         assert_eq!(style.color.len(), self.graph.n_nodes());
         self.renderer.set_style(queue, &style);
         self.spatial.max_radius = max_radius(&style.radius);
+        self.spatial.disc_area.set(None);
         self.style = style;
         self.uncull();
         // The nodes in front hold their radius and colour.
@@ -962,13 +973,21 @@ impl View {
         }
     }
 
+    /// Whether a zoomed-in frame may draw the nodes in view alone
+    /// ([`View::prepare`]): on unless turned off, which a test does to
+    /// compare the two frames.
+    pub fn set_culling(&mut self, on: bool) {
+        self.spatial.no_culling = !on;
+        self.uncull();
+    }
+
     /// The nodes the pass over every node draws on the canvas, in index
     /// order, if they are few enough to draw alone and the grid has every
     /// node. A hidden node, and a node in front (drawn in its own pass),
     /// is not among them.
     fn nodes_in_view(&self) -> Option<Vec<u32>> {
         let n = self.x.len();
-        if n < CULL_MIN_NODES || !self.grid_is_fresh() {
+        if n < CULL_MIN_NODES || self.spatial.no_culling || !self.grid_is_fresh() {
             return None;
         }
         let grid = self.spatial.grid.as_ref()?;
@@ -1104,7 +1123,15 @@ impl View {
     /// 8% of the canvas, easing back to full size as the view zooms in.
     pub fn radius_scale(&self) -> f32 {
         let (w, h) = self.camera.viewport;
-        let fitted = node_radius_scale(&self.style.radius, w, h, 0.08);
+        let area = match self.spatial.disc_area.get() {
+            Some(area) => area,
+            None => {
+                let area = disc_area(&self.style.radius);
+                self.spatial.disc_area.set(Some(area));
+                area
+            }
+        };
+        let fitted = radius_scale_for(area, w, h, 0.08);
         let zoomed_in = (self.camera.pixels_per_unit / self.fitted_zoom).max(1.0);
         (fitted * zoomed_in.sqrt()).min(1.0)
     }
