@@ -477,6 +477,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the worker transfers and `graph.js` reads with `ursa-viz/ui/ugr.js` as
   typed arrays over it, in place of an array copied per getter. What
   `.graph` draws, its messages and its legend are unchanged.
+- **An inspector in the graph view, and edge picking** (#444). Selecting a
+  node in the web shell's Graph view opens a panel with its key, its degree
+  as drawn and its neighbours in the whole graph, the values drawn, and its
+  row of the vertex table, read with one query by key. A click within 4 px
+  of an edge selects the edge, and the panel shows its ends and its row of
+  the edge table. Several selected nodes show their count, the edges among
+  them and a `WHERE id IN (…)` clause to copy. Buttons run `.expand`,
+  `.hide`, a shortest path, and `.graph` with `COLOR BY` or `SIZE BY` a
+  property, in the terminal; `i` moves the focus to the panel and Esc back.
+  New: `ursa_engine::graph::view::inspect`, `Shell::inspect`,
+  `WebShell.inspectNode` and `inspectEdge`, and in `ursa-viz`
+  `interact::nearest_edge`, `pickEdge`, `selectEdge` and `selectedEdge`.
 - **Hover and selection in the graph view** (#438). In the web shell's
   `.graph` pane, a mouse or a pen over a node rings it and shows a tooltip
   (its key, label, `SIZE BY` and `COLOR BY` values and degree), looked up

@@ -1113,6 +1113,9 @@ for (const scheme of ["light", "dark"] as const) {
     const [a0, a1] = [(await place(0))!, (await place(1))!];
     const mid = { x: (a0.x + a1.x) / 2, y: (a0.y + a1.y) / 2 };
     const under = await g.evaluate(([x, y]) => (window as any).ursaShell.graphEdgeAt(x, y), [mid.x, mid.y]);
+    // With nothing selected: the panel is over part of the view while it is open.
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
     await g.mouse.click(box.x + mid.x, box.y + mid.y);
     await rowsRead();
     shown = await inspector();
@@ -1131,20 +1134,25 @@ for (const scheme of ["light", "dark"] as const) {
     shown = await inspector();
     check(shown?.kind === "node" && shown.title === "node 0" && (await graphInfo(g)).edge === null && row(shown).club === "Mr. Hi", "an edge's end is selected from the inspector", shown?.title);
 
-    // Several nodes: the counts, and a WHERE clause to copy.
+    // Several nodes: the counts, and a WHERE clause to copy. Node 33 and the
+    // node furthest left, which the panel (on the right) is never over.
     const now33 = (await place(33))!;
-    const now0 = (await place(0))!;
-    const clear = (await onCanvas(now33.x, now33.y)) && (await onCanvas(now0.x, now0.y));
+    const all = await Promise.all(Array.from({ length: 34 }, (_, id) => place(id).then((at) => ({ id, ...at! }))));
+    const left = all.filter((n) => n.id !== 33).reduce((a, b) => (b.x < a.x ? b : a));
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
     await g.mouse.click(box.x + now33.x, box.y + now33.y);
+    const clear = await onCanvas(left.x, left.y);
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + now0.x, box.y + now0.y);
+    await g.mouse.click(box.x + left.x, box.y + left.y);
     await g.keyboard.up("Shift");
     shown = await inspector();
-    check(clear && shown?.kind === "nodes" && shown.title === "2 nodes" && shown.count === 2 && shown.edges === 0 && shown.where === "WHERE id IN (33, 0)" && shown.text.includes("WHERE id IN (33, 0)") && shown.buttons.includes("copy") && shown.buttons.includes("path between"), "several nodes show their count, the edges among them and a WHERE clause to copy", JSON.stringify(shown));
+    const where = `WHERE id IN (33, ${left.id})`;
+    check(clear && shown?.kind === "nodes" && shown.title === "2 nodes" && shown.count === 2 && (shown.edges === 0 || shown.edges === 1) && shown.where === where && shown.text.includes(where) && shown.buttons.includes("copy") && shown.buttons.includes("path between"), "several nodes show their count, the edges among them and a WHERE clause to copy", JSON.stringify(shown));
     await gctx.grantPermissions(["clipboard-read", "clipboard-write"]);
     await press("copy");
     const copied = await g.evaluate(() => navigator.clipboard.readText()).catch((e) => String(e));
-    check(copied === "WHERE id IN (33, 0)", "copy puts the WHERE clause on the clipboard", copied);
+    check(copied === where, "copy puts the WHERE clause on the clipboard", copied);
     if (shots) await g.screenshot({ path: `${shots}/graph-inspector-nodes.png` });
 
     // The panel never covers what was just selected: a node on the right
@@ -1153,6 +1161,8 @@ for (const scheme of ["light", "dark"] as const) {
       const ids = Array.from({ length: 34 }, (_, i) => i);
       const places = await Promise.all(ids.map((id) => place(id)));
       const rightmost = places.reduce((a, b) => (b!.x > a!.x ? b : a))!;
+      await g.focus("#graph-stage canvas");
+      await g.keyboard.press("Escape");
       await g.mouse.click(box.x + rightmost.x, box.y + rightmost.y);
       const side = (await inspector())?.side;
       const covered = !(await onCanvas(rightmost.x, rightmost.y));

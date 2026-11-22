@@ -874,7 +874,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); the pane says what it was drawn as; click a node to select it (Shift+click adds); Esc clears the selection, then closes it"],
+  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); the pane says what it was drawn as; click a node or an edge to select it (Shift+click adds a node) and the inspector shows its row; i moves to the inspector; Esc clears the selection, then closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
   [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
