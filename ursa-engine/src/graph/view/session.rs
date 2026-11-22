@@ -22,7 +22,10 @@
 //! | `.undo`, `.redo` | steps the history | none |
 //! | `.graph history` | lists the steps | none |
 //!
-//! `--sql` on a command prints its SQL and changes nothing.
+//! `--sql` on a command prints its SQL and changes nothing: no step, no
+//! delta. For `.expand` it prints both statements as a step would run them,
+//! and to do so it runs the first, a query, whose rows are the nodes the
+//! second names.
 //!
 //! # Expanding
 //!
