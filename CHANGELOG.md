@@ -1257,6 +1257,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Shell: the DuckDB dot-commands people reach for first** (#418).
+  - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,
+    a number column's separator ending in `:`, `NULL` for a null; a `|` in
+    a value is `\|`). `.mode line` writes one `column = value` a line, a
+    blank line between rows. Both are `--format markdown` and `--format
+    line` too.
+  - DuckDB's mode names work: `duckbox` and `box` are `table`, `jsonlines`
+    is `ndjson`, `lines` is `line`, in `.mode` and `--format`.
+  - `.output FILE` sends what the shell prints to a file until `.output`;
+    `.once FILE` for the next command only, so the output of `SHOW GRAPHS`
+    or `DESCRIBE GRAPH` can be saved too.
+  - `.schema ?PATTERN?` prints the statements that define the database's
+    views, external tables and graphs (the session's views without a
+    database file), each ending with `;`.
+  - `.headers on|off` turns the header row of `csv` and `tsv` on or off.
+  - `.help` names the DuckDB aliases. `.nullvalue`, `.separator`,
+    `.databases` and `.shell` are not added.
 - **SQL: `DESCRIBE FROM t` lists the columns** (#417). It returned a table
   of no rows, for a table or a file (`DESCRIBE FROM 'edges.csv'`): the
   FROM-first rewrite did not run under `DESCRIBE`, so the statement described
