@@ -399,6 +399,10 @@ fn as_on_and_layout_are_clauses_too() {
         "SELECT DISTINCT ON (src) src, dst FROM e",
         "SELECT layout FROM t ORDER BY layout",
         "SELECT x FROM (SELECT 1 AS edges(x)) AS t",
+        "SELECT * FROM (VALUES (1, 2)) AS t(a, b)",
+        "FROM layout l",
+        "TABLE ties",
+        "a.b",
     ] {
         assert_eq!(parsed(q), (q.into(), Style::default()), "{q}");
     }
@@ -446,6 +450,14 @@ fn a_misused_as_on_or_layout_says_what_to_write() {
         ("LAYOUT", "LAYOUT needs force, rings or layers: LAYOUT force lets"),
         ("karate SIZE BY degree LAYOUT circle", "LAYOUT needs force, rings or layers, and 'circle' is none of them"),
         ("LAYOUT rings LAYOUT force", "LAYOUT is given twice"),
+        // After a source that is one name, everything is clauses.
+        ("karate LAYOUT spiral", "LAYOUT needs force, rings or layers, and 'spiral' is none of them"),
+        ("karate AS tree(a, b)", "AS tree is not a form"),
+        ("\"My Graph\" sized by x", "unexpected 'sized' after the graph's source"),
+        ("karate LAYOUT", "LAYOUT needs force, rings or layers: "),
+        // In a query, a form typed nearly right is the clause it was meant as.
+        ("SELECT s, i FROM t AS hop(s, i, d)", "AS hop is not a form; write AS hops(seed, id, distance)"),
+        ("FROM t AS edge(a, b)", "AS edge is not a form; write AS edges(src, dst [, weight])"),
         ("AS nodes(a) GROUP BY z", "unexpected 'GROUP' after the graph's source; the clauses are ON graph, AS …, NODES (…), SIZE BY x, COLOR BY y and LAYOUT l"),
     ] {
         let err = parse(text).unwrap_err().to_string();

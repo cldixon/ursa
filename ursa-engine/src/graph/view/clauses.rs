@@ -175,6 +175,33 @@ pub const USAGE: &str = ".graph [SOURCE] [ON graph] [AS edges(src, dst [, weight
                          path(nodes [, edges]) | hops(seed, id, distance)] [NODES (SELECT id, … \
                          FROM …)] [SIZE BY x] [COLOR BY y] [LAYOUT force|rings|layers]";
 
+/// The words a statement begins with: a source that begins with one is a
+/// query, not a name with clauses after it.
+const STATEMENTS: [&str; 22] = [
+    "SELECT",
+    "FROM",
+    "WITH",
+    "VALUES",
+    "TABLE",
+    "SHOW",
+    "DESCRIBE",
+    "DESC",
+    "EXPLAIN",
+    "SUMMARIZE",
+    "PIVOT",
+    "UNPIVOT",
+    "CREATE",
+    "DROP",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "COPY",
+    "SET",
+    "CALL",
+    "ALTER",
+    "MATCH",
+];
+
 /// The four forms of `AS …`, as a message shows them.
 const FORMS: &str =
     "AS edges(src, dst [, weight]), AS nodes(id), AS path(nodes [, edges]) or AS hops(seed, id, \
@@ -220,7 +247,11 @@ fn layout_of(word: &str) -> Option<Layout> {
 /// - `ON name` followed by nothing or by another clause, unless it is the
 ///   `ON` of a `JOIN`.
 ///
-/// Text that begins with `AS`, `ON` or `LAYOUT` is clauses, with no source.
+/// Text that begins with `AS`, `ON` or `LAYOUT` is clauses, with no source,
+/// and so is everything after a source that is one name (`karate LAYOUT
+/// spiral`): there a word that is no clause is an error that lists them. In
+/// a query, `AS edge(`, `AS node(`, `AS paths(` and `AS hop(` are read as the
+/// clause they were meant to be, for the same reason.
 pub fn parse(text: &str) -> Result<(String, Style)> {
     let text = text.trim().trim_end_matches(';').trim_end();
     let toks = tokens(text);
@@ -245,7 +276,10 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
                 i == 0
                     || (matches!(
                         word(i + 1).as_deref(),
-                        Some("EDGES" | "NODES" | "PATH" | "HOPS")
+                        // The forms, and what is typed for them by mistake.
+                        Some(
+                            "EDGES" | "NODES" | "PATH" | "HOPS" | "EDGE" | "NODE" | "PATHS" | "HOP"
+                        )
                     ) && kind(i + 2) == Some(Tok::Open))
             }
             Some("LAYOUT") => i == 0 || word(i + 1).as_deref().and_then(layout_of).is_some(),
@@ -259,10 +293,23 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
     }
     let is_clause = |i: usize| starts(i, &word, &kind, toks.len());
     let mut depth = 0i32;
-    let mut first = None;
+    // After a source that is one name (`karate`, not a statement), whatever
+    // follows is clauses: a word that is none is told so, not handed to SQL.
+    let named = !is_clause(0)
+        && match (toks.first(), kind(1)) {
+            (Some((Tok::Quoted, _, _)), Some(Tok::Word)) => true,
+            (Some((Tok::Word, _, _)), Some(Tok::Word)) => {
+                !STATEMENTS.contains(&word(0).unwrap_or_default().as_str())
+            }
+            _ => false,
+        };
+    let mut first = named.then_some(1);
     // JOINs still waiting for their ON or USING: that ON is SQL's.
     let mut joins = 0u32;
     for (i, t) in toks.iter().enumerate() {
+        if first.is_some() {
+            break;
+        }
         match t.0 {
             Tok::Open => depth += 1,
             Tok::Close => depth -= 1,

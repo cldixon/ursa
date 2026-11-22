@@ -140,7 +140,10 @@ static assets and an R2 bucket.
     - A property graph is drawn whole: `.graph karate AS …` and `.graph
       karate ON …` say so. SQL's own `AS` and `ON` stay the query's (an
       alias, a join's condition); only `FROM t AS edges(a, b)`, a table
-      alias named for a form with a column list, is read as the clause.
+      alias named for a form (or `edge`, `node`, `paths`, `hop`, which are
+      told the form they meant) with a column list, is read as the clause.
+      After a source that is one name, everything is clauses, so `.graph
+      karate LAYOUT spiral` is told what `LAYOUT` takes, not handed to SQL.
     - `.help graph` lists the clauses (the shell adds them to the page where
       the host has a `.graph` command).
   - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES
