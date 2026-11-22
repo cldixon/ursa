@@ -287,7 +287,7 @@ fn bench_linear(c: &mut Criterion) {
             b.iter(|| clustering_coefficient(&t, None))
         });
         g.bench_function(BenchmarkId::new("label_propagation", name), |b| {
-            b.iter(|| label_propagation(&t, None, 10, Some(42)))
+            b.iter(|| label_propagation(&t, None, 10, Some(42), false))
         });
         // ~100 sampled Brandes sources at every size.
         let frac = 100.0 / t.n_nodes() as f64;

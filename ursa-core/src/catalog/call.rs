@@ -166,6 +166,9 @@ pub enum Call {
     LabelPropagation {
         max_iter: u32,
         seed: Option<u64>,
+        /// Sweeps in parallel sub-rounds (#453): deterministic, but not the
+        /// serial run's labels.
+        parallel: bool,
     },
     Louvain {
         resolution: f64,
@@ -316,7 +319,8 @@ impl Call {
                 "seed",
             ) => opt_u64(*seed),
             (Call::Louvain { resolution, .. }, "resolution") => Value::Float(*resolution),
-            (Call::Louvain { parallel, .. }, "parallel") => Value::Bool(*parallel),
+            (Call::Louvain { parallel, .. }, "parallel")
+            | (Call::LabelPropagation { parallel, .. }, "parallel") => Value::Bool(*parallel),
             (Call::LayoutFr { iterations, .. }, "iterations") => {
                 Value::UInt(u64::from(*iterations))
             }

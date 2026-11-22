@@ -31,6 +31,7 @@ use crate::parallel::*;
 
 use super::linked::Linked;
 use super::rng::{shuffled_order, DEFAULT_SEED};
+use super::subrounds::{places, run_of, sub_rounds};
 use crate::topology::{EdgeMask, Topology};
 
 /// Run `$body` with `$w` bound to the slice (or vector) inside a [`Weights`],
@@ -495,33 +496,10 @@ fn one_level_parallel_in<W: Weight>(
 ) -> Vec<u32> {
     let n = graph.n();
     let n_full = level.map_or(n, Linked::n);
-    let run_len = n_full.div_ceil(RUNS).max(1);
-    // The visit order of the working graph's nodes, and where each run starts
-    // in it (`RUNS + 1` boundaries).
-    let full = shuffled_order(n_full, seed);
-    let (order, bounds): (Vec<u32>, Vec<usize>) = match level {
-        None => (full, (0..=RUNS).map(|r| (r * run_len).min(n)).collect()),
-        Some(l) => {
-            let (order, gaps, _) = l.compact_order(&full);
-            drop(full);
-            let mut bounds = vec![0usize];
-            let mut skipped = 0usize;
-            for (i, &gap) in gaps.iter().enumerate() {
-                // `i + skipped` is the node's place in the full order.
-                skipped += gap as usize;
-                while bounds.len() <= RUNS && i + skipped >= bounds.len() * run_len {
-                    bounds.push(i);
-                }
-            }
-            bounds.resize(RUNS + 1, order.len());
-            (order, bounds)
-        }
-    };
-    // Each node's place in `order`.
-    let mut place = vec![0u32; n];
-    for (i, &u) in order.iter().enumerate() {
-        place[u as usize] = i as u32;
-    }
+    // The visit order of the working graph's nodes, where each run starts in
+    // it (`RUNS + 1` boundaries), and each node's place in it.
+    let (order, bounds) = sub_rounds(n_full, seed, level, RUNS);
+    let place = places(&order);
 
     let mut comm: Vec<u32> = (0..n as u32).collect();
     let mut tot: Vec<f64> = graph.k.clone();
@@ -647,8 +625,7 @@ fn one_level_parallel_in<W: Weight>(
             for (woken, delta) in marked {
                 intra += delta;
                 for i in woken {
-                    let run = bounds.partition_point(|&b| b <= i as usize) - 1;
-                    listed[run].push(i);
+                    listed[run_of(&bounds, i as usize)].push(i);
                 }
             }
             for &(u, _) in &movers {

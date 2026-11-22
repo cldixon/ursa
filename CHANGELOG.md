@@ -592,6 +592,43 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     run's. On one thread it does about 1.7 times the serial run's work.
   - `examples/louvain_memory.rs` takes `--parallel`, and `--planted P` for a
     planted-partition graph with P% of edges between communities.
+- **Parallel label propagation, opt-in: `label_propagation(g, parallel =>
+  true)`** (#453). In Python `ur.label_propagation(edges, parallel=True)`;
+  in Rust a `parallel` argument to `ursa_core::algo::label_propagation`. The
+  frame of parallel Louvain: each sweep takes 64 fixed sub-rounds of the
+  seeded visit order, the nodes of a sub-round vote in parallel against the
+  labels at its start, and the new labels are written in order. The same
+  seed gives the same labels on any number of threads, but not the labels
+  the serial default finds (on a graph of at most 64 nodes it is the serial
+  run), and NetworkX has no equivalent. The default stays serial.
+  - Two neighbours of one sub-round would trade labels for ever (the
+    two-colouring of synchronous label propagation), so a node does not
+    read a higher label than its own from a node of its sub-round. Without
+    that rule, 14 nodes of the R-MAT graph below still traded labels in the
+    20th sweep; with it, the run stops after a sweep that changes nothing, in
+    as many sweeps as the serial run (5).
+  - Pinned by: the same labels on 1, 2, 3, 4 and 8 threads; golden label
+    hashes on karate, planted-partition and R-MAT graphs, masked and not;
+    and, on planted-partition graphs, a modularity no more than 1% below the
+    serial run's and a community count within 2% of it (measured: within
+    0.2% for both).
+  - Each thread keeps a table sized to the degree of the node it is on, and
+    each sub-round a list of its active nodes.
+- **Serial label propagation is 2.7 to 3.1 times faster, with the same
+  labels** (#453). A node votes again only once a neighbour has taken a
+  label other than its own since its last vote; any other node would vote
+  for the label it holds. On a shared 4-core machine, 32M edges, 20 sweeps
+  allowed:
+
+  | graph | before | serial now | `parallel => true` |
+  |---|---|---|---|
+  | R-MAT, 2^21 nodes | 11.0 s | 4.0 s | 2.3 s at 3.3 cores |
+  | planted partition, 20% of edges between | 21.4 s | 7.5 s | 3.3 s at 3.6 cores |
+  | planted partition, 50% between | 35.0 s | 11.2 s | 4.9 s at 3.7 cores |
+
+  Peak memory is unchanged (605 MB, of which the graph is 575 MB) and
+  8 MB more for the parallel run. Without a mask, a vote no longer reads
+  the edge ids.
 
 ### Changed
 

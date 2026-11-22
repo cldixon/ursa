@@ -59,6 +59,7 @@ In the table, `G` is a NetworkX `DiGraph` with the same rows, and `U = nx.Graph(
 | `ur.louvain(edges)` | `nx.community.louvain_communities(U)` | Compare the modularity, not the labels. |
 | `ur.louvain(edges, parallel=True)` | none | Parallel sub-rounds (#387): deterministic, but other communities than the serial run. Compare the modularity. |
 | `ur.label_propagation(edges)` | `nx.community.label_propagation_communities(U)` | Compare the modularity, not the labels. |
+| `ur.label_propagation(edges, parallel=True)` | none | Parallel sub-rounds (#453): deterministic, but other labels than the serial run. Compare the modularity. |
 | `ur.shortest_path(edges, s, t)` | `nx.shortest_path(G, s, t)` | With `weight=`: `nx.dijkstra_path(G, s, t, weight=...)`. |
 
 ## Closeness

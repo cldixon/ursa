@@ -38,6 +38,7 @@ mod pagerank;
 pub mod quadtree;
 mod random_walk;
 mod rng;
+mod subrounds;
 pub use rng::sample_indices;
 mod triangle;
 mod undirected;

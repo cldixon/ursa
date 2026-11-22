@@ -70,6 +70,30 @@ def test_parallel_louvain_is_reproducible():
     assert runs[0][0] == runs[0][3] and runs[0][4] == runs[0][7]
 
 
+def test_parallel_label_propagation_is_reproducible():
+    # #453: opt-in parallel sweeps, deterministic like the default. A ring of
+    # 20 six-node cliques (120 nodes, so a sub-round holds two nodes).
+    src, dst = [], []
+    for c in range(20):
+        base = 6 * c
+        for i in range(6):
+            for j in range(i + 1, 6):
+                src.append(base + i)
+                dst.append(base + j)
+        src.append(base + 5)
+        dst.append((base + 6) % 120)
+    edges = ur.from_arrow(pa.table({"s": src, "d": dst}), src="s", dst="d")
+    frame = ur.label_propagation(edges, seed=1, parallel=True)
+    runs = [{r["id"]: r["label_propagation"] for r in frame.collect().to_dicts()} for _ in range(3)]
+    for r in runs[1:]:
+        assert r == runs[0]
+    labels = runs[0]
+    # Label propagation may merge a few neighbouring cliques, never split one.
+    assert 15 <= len(set(labels.values())) <= 20
+    for c in range(20):
+        assert len({labels[6 * c + i] for i in range(6)}) == 1
+
+
 # --- #40.3: sampled betweenness takes a reproducible seed ------------------
 def test_betweenness_sample_seed_is_reproducible():
     src = [0, 1, 2, 3, 4, 5, 6, 0, 2, 4]
