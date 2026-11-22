@@ -139,7 +139,8 @@ pub struct GraphVerb {
     pub theta: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jitter_tolerance: Option<Value>,
-    /// `louvain`: local moving in parallel sub-rounds (#387).
+    /// `louvain`: local moving in parallel sub-rounds (#387);
+    /// `label_propagation`: votes in parallel sub-rounds (#453).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel: Option<Value>,
     /// Which output of a multi-output kernel this column takes (#115): 0 = x,

@@ -108,13 +108,87 @@ export function compact(g) {
   return { n, src: g.src.map((u) => index[u]), dst: g.dst.map((v) => index[v]) };
 }
 
+const NONE = 0xffffffff;
+
+/** Each node's neighbours, both ways. */
+function adjacency(g) {
+  const adj = Array.from({ length: g.n }, () => []);
+  for (let i = 0; i < g.src.length; i++) {
+    adj[g.src[i]].push(g.dst[i]);
+    adj[g.dst[i]].push(g.src[i]);
+  }
+  return adj;
+}
+
+/** Each node's distance from the nearest of `seeds`, NONE past `max`. */
+function distances(g, adj, seeds, max = Infinity) {
+  const d = new Uint32Array(g.n).fill(NONE);
+  let frontier = [...seeds];
+  for (const s of seeds) d[s] = 0;
+  for (let step = 1; step <= max && frontier.length; step++) {
+    const next = [];
+    for (const v of frontier) for (const u of adj[v]) if (d[u] === NONE) { d[u] = step; next.push(u); }
+    frontier = next;
+  }
+  return d;
+}
+
+/** The nodes `keep[v]`, renumbered, with the edges `edge(a, b)` keeps and `level` for each. */
+function subgraph(g, keep, level, edge) {
+  const ids = [], dense = new Uint32Array(g.n).fill(NONE);
+  for (let v = 0; v < g.n; v++) if (keep(v)) { dense[v] = ids.length; ids.push(v); }
+  const src = [], dst = [];
+  for (let i = 0; i < g.src.length; i++) {
+    const a = g.src[i], b = g.dst[i];
+    if (dense[a] !== NONE && dense[b] !== NONE && edge(a, b)) { src.push(dense[a]); dst.push(dense[b]); }
+  }
+  return { n: ids.length, src: Uint32Array.from(src), dst: Uint32Array.from(dst), ids: Uint32Array.from(ids), level: Uint32Array.from(ids, (v) => level[v]) };
+}
+
+/**
+ * What `hop(g, seeds, n => hops)` draws: the nodes within `hops` of a seed,
+ * the graph's edges among them, and each one's distance as its `level`.
+ */
+export function neighbourhood(g, seeds, hops) {
+  const d = distances(g, adjacency(g), seeds, hops);
+  return subgraph(g, (v) => d[v] !== NONE, d, () => true);
+}
+
+/**
+ * What `ALL SHORTEST` from `from` to `to` draws: the nodes and edges on a
+ * shortest path, and each node's position along it as its `level`.
+ */
+export function shortestPaths(g, from, to) {
+  const adj = adjacency(g);
+  const a = distances(g, adj, [from]), b = distances(g, adj, [to]);
+  const on = (v) => a[v] !== NONE && b[v] !== NONE && a[v] + b[v] === a[to];
+  return subgraph(g, on, a, (u, v) => Math.abs(a[u] - a[v]) === 1);
+}
+
+/**
+ * The graph the page's parameters name: `graph=rmat|grid|clusters|karate`.
+ * With `layout=rings&seeds=0,5&hops=2` it is that graph's neighbourhood, and
+ * with `layout=layers&from=16&to=26` its shortest paths, each with a `level`
+ * per node for the fixed layout and `ids`, each node's index in the graph.
+ */
 export function fromParams(params) {
+  const g = whole(params);
+  const layout = params.get("layout");
+  const numbers = (name, or) => (params.get(name) ?? or).split(",").map(Number);
+  if (layout === "rings") return { ...neighbourhood(g, numbers("seeds", "0"), Number(params.get("hops") ?? 2)), layout };
+  if (layout === "layers" && params.has("seeds")) return { ...neighbourhood(g, numbers("seeds", "0"), Number(params.get("hops") ?? 2)), layout };
+  if (layout === "layers") return { ...shortestPaths(g, Number(params.get("from") ?? 0), Number(params.get("to") ?? g.n - 1)), layout };
+  return g;
+}
+
+function whole(params) {
   if (params.get("compact") === "1") {
     const rest = new URLSearchParams(params);
     rest.delete("compact");
-    return compact(fromParams(rest));
+    return compact(whole(rest));
   }
   const kind = params.get("graph") ?? "rmat";
+  if (kind === "karate") return karate();
   if (kind === "grid") return grid(Number(params.get("w") ?? 100), Number(params.get("h") ?? 100));
   if (kind === "karate") return karate();
   if (kind === "clusters") return clusters(Number(params.get("k") ?? 8), Number(params.get("size") ?? 500));

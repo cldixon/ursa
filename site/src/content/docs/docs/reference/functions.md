@@ -144,13 +144,14 @@ closeness(graph, weight => NULL, direction => 'out')
 Community labels by label propagation.
 
 ```text
-label_propagation(graph, max_iter => 20, seed => NULL)
+label_propagation(graph, max_iter => 20, seed => NULL, parallel => false)
 ```
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
 | `max_iter` | integer | `20` | – | Iteration cap. Must be at least 1. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
+| `parallel` | boolean | `false` | – | Vote in parallel sub-rounds: faster on many cores, and the same labels on any thread count, but different labels from the serial default, with no NetworkX equivalent. |
 
 **Returns:** One row per node: `id` (the node), `label_propagation` (UInt32)
 

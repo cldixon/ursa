@@ -24,7 +24,11 @@ use ursa_core::algo::{
     louvain, louvain_weighted, pagerank, pagerank_weighted, symmetric_view_weighted, Fa2Multilevel,
     Fa2Params, LayoutParams, MultilevelParams, PageRankParams,
 };
-use ursa_core::algo::{fa2_grow, Fa2State, WarmParams};
+use ursa_core::algo::{
+    bfs_distances, fa2_grow, layout_layers, layout_rings, Fa2State, LayersParams, RingsParams,
+    WarmParams, NO_LEVEL,
+};
+use ursa_core::topology::Direction;
 use ursa_core::Topology;
 
 /// A deterministic pseudo-random directed graph via a hand-rolled LCG, so the test
@@ -301,13 +305,49 @@ fn louvain_parallel_is_thread_count_independent() {
 #[test]
 fn label_propagation_is_thread_count_independent() {
     let t = seeded_graph(400, 4000);
-    let reference = on_pool(1, || label_propagation(&t, None, 20, Some(7)));
+    let reference = on_pool(1, || label_propagation(&t, None, 20, Some(7), false));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || label_propagation(&t, None, 20, Some(7))),
+            on_pool(threads, || label_propagation(&t, None, 20, Some(7), false)),
             reference,
             "label propagation diverged at {threads} threads"
         );
+    }
+}
+
+/// Parallel label propagation (#453): the same labels on 1, 2, 3, 4 and 8
+/// threads, masked and not, on graphs whose runs hold hundreds of nodes each
+/// (so votes really are split across threads), one sparse enough to keep many
+/// communities and one with nodes no kept edge touches (the compact path).
+#[test]
+fn label_propagation_parallel_is_thread_count_independent() {
+    let n = 60_000;
+    for m in [70_000, 150_000] {
+        let t = seeded_graph(n, m);
+        // Keep two edges in three, and none touching the top tenth of the
+        // nodes, which leaves them isolated.
+        let out = t.out();
+        let mut keep = vec![false; t.n_edges()];
+        for u in 0..n as u32 {
+            for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                keep[e as usize] = e % 3 != 1 && u < (n as u32 * 9 / 10) && v < (n as u32 * 9 / 10);
+            }
+        }
+        let mask = ursa_core::EdgeMask::from_bools(&keep);
+        for masked in [false, true] {
+            let mask = masked.then_some(&mask);
+            let run = || label_propagation(&t, mask, 20, Some(7), true);
+            let reference = on_pool(1, run);
+            assert_ne!(reference, label_propagation(&t, mask, 20, Some(7), false));
+            for &threads in &THREADS {
+                assert_eq!(
+                    on_pool(threads, run),
+                    reference,
+                    "parallel label propagation ({m} edges, masked {masked}) diverged at \
+                     {threads} threads"
+                );
+            }
+        }
     }
 }
 
@@ -344,6 +384,52 @@ fn layout_fr_is_thread_count_independent() {
         let got = on_pool(threads, || layout_fr(&topo, None, params));
         assert_eq!(got.0, baseline.0, "x diverged on {threads} threads");
         assert_eq!(got.1, baseline.1, "y diverged on {threads} threads");
+    }
+}
+
+/// Rings and layers (#436) are serial, so the pool cannot reach them; this
+/// holds them to that if either is ever parallelised. Levels are distances
+/// from two seeds, with the unreached nodes left without one.
+#[test]
+fn layout_rings_and_layers_are_thread_count_independent() {
+    let topo = seeded_graph(2000, 5000);
+    let (a, b) = (
+        bfs_distances(&topo, 0, Direction::Both),
+        bfs_distances(&topo, 1000, Direction::Both),
+    );
+    let level: Vec<u32> = a
+        .iter()
+        .zip(&b)
+        .map(|(&a, &b)| match (a, b) {
+            (-1, -1) => NO_LEVEL,
+            (-1, d) | (d, -1) => d as u32,
+            (a, b) => a.min(b) as u32,
+        })
+        .collect();
+    let adj = topo.undirected();
+    let run = || {
+        (
+            layout_rings(adj, &level, RingsParams::default()),
+            layout_layers(adj, &level, LayersParams::default()),
+        )
+    };
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|f| f.to_bits()).collect() };
+    let baseline = on_pool(1, run);
+    assert!(baseline.0 .0.iter().all(|v| v.is_finite()));
+    for threads in [2, 3, 4, 8] {
+        let got = on_pool(threads, run);
+        for (name, got, want) in [
+            ("rings x", &got.0 .0, &baseline.0 .0),
+            ("rings y", &got.0 .1, &baseline.0 .1),
+            ("layers x", &got.1 .0, &baseline.1 .0),
+            ("layers y", &got.1 .1, &baseline.1 .1),
+        ] {
+            assert_eq!(
+                bits(got),
+                bits(want),
+                "{name} diverged on {threads} threads"
+            );
+        }
     }
 }
 

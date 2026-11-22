@@ -24,7 +24,7 @@ later, in a notebook widget or a native window through the same `View`.
 | `live` | a result as the view draws it, kept in step with its deltas: which slots a delta changes. No GPU. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
-| `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`). |
+| `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`, `rings`, `layers`). |
 
 With `default-features = false` the crate is `model`, `scene`, `highlight` and `live`, with
 no wgpu in its dependencies: what an engine needs to produce a graph, and
@@ -400,6 +400,65 @@ a node's size, and the leaves of one hub settle about a third as far apart
 as the average pair of nodes in the drawing; the test bounds that ratio, not
 pixels.
 
+## Rings and layers
+
+A result whose nodes have a level needs no force at all (#436). A `hop`
+result gives each node its distance from a seed, and a set of shortest paths
+gives each node its position along the path. Two **fixed** layouts draw
+those, done as they are made:
+
+```js
+// distance per node: 0 for a seed, 0xFFFFFFFF for none
+const rings = Layout.rings(n, src, dst, distance);
+// layer per node: its position along the path
+const layers = Layout.layers(n, src, dst, layer);
+rings.done;        // true: no step() to run
+rings.positions(); // x then y, as any layout's
+rings.kind;        // "rings" ("layers", or "force" for the others)
+```
+
+- **Rings** (`LiveLayout::rings`, `ursa_core::algo::layout_rings`): the seed
+  at the centre and distance `d` on the circle of radius `d`. A ring with
+  more nodes than fit a quarter of a unit apart gets the radius it needs,
+  and the rings outside it move out, so no two nodes are nearer than that.
+  Several seeds get a ring system each, side by side in rows in seed order;
+  a node is in the system of the seed it is nearest through the drawn edges
+  (the lowest-numbered when several tie).
+- **Layers** (`LiveLayout::layers`, `layout_layers`): layer `l` on the
+  vertical line at `x = l`, the first at the left, nodes half a unit apart.
+  One path alone is a straight line. It is also the drawing for a `hop`
+  result with several seeds, by distance from the nearest. When a layer is
+  more than twice as high as the drawing is wide the lines are spread, so a
+  wide neighbourhood is not one column.
+- **The order on a ring or a line** is chosen to shorten edges, by four
+  barycentre sweeps: out from the first level and back, each level is
+  ordered by the mean place of its nodes' neighbours on the level just
+  visited (neighbours on the same level count half), ties by node index.
+  Each node then goes as near that mean as it can while keeping its distance
+  from the nodes beside it, so a child sits in line with its parent and a
+  full ring is evenly spaced.
+- **Nodes without a level** go after the last: one more ring, or one more
+  line.
+- **Deterministic:** both are serial, so the same input gives the same bits
+  on any thread count. Layers use only `+ - * /` and are the same bits on
+  every platform; rings need `sin`, `cos` and `atan2`, whose last bit is
+  the platform's.
+- **Cost:** 2 ms for a neighbourhood of 2,048 nodes and 8,334 edges on one
+  thread, 21 ms for 16,384 nodes and 88,822 edges, 305 ms for 131,072 nodes
+  and 928,785 edges (rings; layers take half that), where coarse to fine
+  takes seconds ([`BENCH.md`](BENCH.md#rings-and-layers)).
+- A fixed layout can **grow** like any other (`Layout.grow`): the new nodes
+  settle beside their parents by force, not on a ring or a layer, and
+  `kind` is `"force"` from then on.
+
+In the worker, `{type: "start", …, layout: {kind: "rings", level}}` posts one
+`positions` message and `done` (`web/public/graph-worker.js`). The demo
+draws them with `&layout=rings&seeds=0&hops=2` and
+`&layout=layers&from=16&to=26` (add `&graph=karate`), and
+`tests/browser/view.ts` checks them: on karate, two hops from node 0 are two
+rings of 16 and 9 nodes, each node on its radius and none drawn over
+another; all shortest paths from 16 to 26 are six layers.
+
 ## Measured
 
 Time to a converged layout: coarse to fine to the end of its schedule; flat
@@ -456,7 +515,9 @@ bunx serve ursa-viz      # then open /demo/?graph=rmat&scale=17&edges=1000000
 The demo takes `?graph=rmat&scale=&edges=`, `?graph=grid&w=&h=`,
 `?graph=clusters&k=&size=` or `?graph=karate`, plus `&multilevel=0` for flat
 ForceAtlas2 (and, flat, `&iterations=`), `&theme=dark` and
-`&highlight=path` to start with a path highlighted. Drag to pan, wheel to
+`&highlight=path` to start with a path highlighted;
+`&layout=rings&seeds=0&hops=2` or `&layout=layers&from=16&to=26` draws a
+neighbourhood or the shortest paths with a fixed layout. Drag to pan, wheel to
 zoom, double-click to fit. The pointer's node is hovered; a click selects
 it, shift-click adds to the selection, and two selected nodes draw the
 shortest path between them. `p` pins the selection, `h` hides it, `u` shows
@@ -497,6 +558,11 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   (half the nodes, nearly all the edges), so they cost about what the graph
   does. Cheaper iterations (attraction gathers 2M random reads; repulsion
   could be approximated harder far out) would buy the rest.
+- **Rings and layers from the shell.** The shell's worker takes
+  `graph.layout = {kind, level}` from `graph.js`, but nothing sets it yet:
+  the rules that turn a `hop` result or a path column into one are #433.
+- **Rings that stay rings when they grow.** Growing a fixed layout hands it
+  to ForceAtlas2, whose scale is not the rings' (a ring step is one unit).
 - **Growing from the shell.** `Layout.grow` is in the wasm API; the
   shell's layout worker does not call it yet (`{type: "grow"}`, with #443).
 - **The view's own layout.** `View::step`, for a page that lays out on its

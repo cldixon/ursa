@@ -566,16 +566,16 @@ async fn exported_files_keep_it() {
     let arrow = FileReader::try_new(std::fs::File::open(file("out.arrow")).unwrap(), None).unwrap();
     assert_eq!(describe(&arrow.schema()), expected);
 
-    // Read back by Ursa: an Arrow file's is kept. A Parquet file's is
-    // dropped by default, as DataFusion drops every Parquet file's
-    // metadata, and kept with its `skip_metadata` setting off.
+    // Read back by Ursa, both keep it: an Arrow file always, a Parquet file
+    // because Ursa's sessions turn DataFusion's `skip_metadata` off. Turned
+    // back on, the Parquet file's roles are dropped.
     let read = |name: &str| format!("SELECT * FROM '{}'", file(name).display());
     assert_eq!(roles(&ctx, &read("out.arrow")).await, expected);
-    assert_eq!(roles(&ctx, &read("out.parquet")).await, "a:\nb:\npagerank:");
+    assert_eq!(roles(&ctx, &read("out.parquet")).await, expected);
     run(
         &ctx,
-        "SET datafusion.execution.parquet.skip_metadata = false",
+        "SET datafusion.execution.parquet.skip_metadata = true",
     )
     .await;
-    assert_eq!(roles(&ctx, &read("out.parquet")).await, expected);
+    assert_eq!(roles(&ctx, &read("out.parquet")).await, "a:\nb:\npagerank:");
 }

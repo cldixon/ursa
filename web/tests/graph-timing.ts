@@ -14,6 +14,8 @@
 //   the view of its answer, and ms from Enter to when the page's thread was
 //   free of the frame that showed it (firstDraw is when render() returned);
 // - the page's long tasks since Enter;
+// - the longest task while the view was made (#426), which fails the run if
+//   it is over 60 ms: the view builds no adjacency, and is made in pieces;
 // - frame times while a scripted wheel zoom runs for WHEEL_MS (5000): the
 //   time from one frame to the next, and the time in render() itself (with
 //   no GPU the browser rasterises after render() returns, on the page's
@@ -41,6 +43,8 @@ const browser =
     : await chromium.launch({ args, channel: process.env.CHANNEL ?? "chromium" }).catch(() => chromium.launch({ args }));
 console.log(`${browser.browserType().name()} ${browser.version()}${process.env.CHANNEL === "shell" ? " (headless shell)" : ""}`);
 const all: Record<string, number>[] = [];
+// What took too long: the run fails if anything did.
+const slow: string[] = [];
 const mb = (bytes: number | null | undefined) => (bytes == null ? "–" : `${(bytes / 2 ** 20).toFixed(1)} MiB`);
 for (let r = 0; r < runs; r++) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
@@ -77,6 +81,14 @@ for (let r = 0; r < runs; r++) {
   const shown = t.actions.find((a: any) => a.command.startsWith(".graph"));
   console.log(`  action ${JSON.stringify(shown?.command)}: engine ${shown?.engine} ms, view ${shown?.delta} ms, Enter to its frame shown ${shown?.frame} ms`);
   console.log("  main-thread tasks over 50 ms since Enter [start, ms]:", JSON.stringify(t.longTasks.filter((l: any) => l.start + l.duration > 0).map((l: any) => [l.start, l.duration])));
+
+  // Making the view (#426): from when the layout worker was posted its
+  // graph to when createView returned. No task that overlaps it may hold
+  // the page's thread for more than 60 ms.
+  const making = t.longTasks.filter((l: any) => l.start + l.duration > rel.posted && l.start < rel.view);
+  rel.viewLongestTask = Math.max(0, ...making.map((l: any) => l.duration));
+  console.log(`  making the view, ${Math.round(rel.view - rel.posted)} ms: ${making.length} tasks over 50 ms, the longest ${rel.viewLongestTask} ms`);
+  if (rel.viewLongestTask > 60) slow.push(`run ${r + 1}: a task of ${rel.viewLongestTask} ms while the view was made; at most 60 ms are allowed`);
 
   // A wheel zoom, in and back out, for wheelMs: a wheel event every
   // animation frame, dispatched on the page (an event through the browser's
@@ -136,10 +148,14 @@ for (let r = 0; r < runs; r++) {
   await ctx.close();
 }
 const median = (xs: number[]) => xs.sort((a, b) => a - b)[Math.floor(xs.length / 2)];
-const steps = ["shown", "wheelFrameP95", "wheelRenderP95", "pick", "clickToFrame", "engineHeapMiB", "viewHeapMiB", "layoutHeapMiB"];
+const steps = ["viewLongestTask", "shown", "wheelFrameP95", "wheelRenderP95", "pick", "clickToFrame", "engineHeapMiB", "viewHeapMiB", "layoutHeapMiB"];
 const keys = Object.keys(all[0]).filter((k) => !steps.includes(k)).sort((a, b) => all[0][a] - all[0][b]);
 console.log("median ms from Enter:");
 for (const k of keys) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);
 console.log("median, in use:");
 for (const k of steps) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);
 await browser.close();
+if (slow.length) {
+  console.error("\nFAIL:\n" + slow.join("\n"));
+  process.exit(1);
+}

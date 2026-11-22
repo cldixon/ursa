@@ -11,7 +11,7 @@ use datafusion::error::Result;
 use ursa_viz::model::{GraphResult, Key, KeyType, Provenance, Role, Values, NULL};
 
 use super::build::{build, from_shape, EdgeList};
-use super::rules::{endpoint_columns, shape_of};
+use super::rules::{endpoint_columns, read, shape_of, MatchEdge, Reading, Shape};
 use super::style::{color_by, size_by, OTHER};
 use super::*;
 
@@ -79,7 +79,8 @@ fn nulls_are_skipped_and_mixed_types_compare_as_text() {
 fn what_cannot_be_drawn_says_why() {
     let one = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
     let err = from_result(&one, &[]).unwrap_err().to_string();
-    assert!(err.contains("the result has 1 column;"), "{err}");
+    assert!(err.contains("it has 1 column (x: Int64)"), "{err}");
+    assert!(err.contains(".graph AS nodes(x)"), "{err}");
     let two = Arc::new(Schema::new(vec![
         Field::new("src", DataType::Int64, true),
         Field::new("dst", DataType::Int64, true),
@@ -399,6 +400,7 @@ fn provenance() -> Provenance {
     Provenance {
         sql: Some("SELECT src, dst FROM e".into()),
         rule: Some(Rule::Edges.name().into()),
+        ..Provenance::default()
     }
 }
 
@@ -581,4 +583,419 @@ fn rules_have_names() {
         rules::Shape::Edges { src: 2, dst: 1 }
     );
     assert_eq!(shape_of(&schema).unwrap().rule(), Rule::Edges);
+}
+
+// The result → graph rules (#433): what `read` makes of a schema, with the
+// `ursa.*` metadata the graph functions write and without it.
+
+/// A field as a graph function marks it: `role`, of graph `karate`, with
+/// the vertex or edge table `label` and the pattern variable `var`.
+fn marked(name: &str, t: DataType, role: &str, label: Option<&str>, var: Option<&str>) -> Field {
+    of_graph(name, t, role, "karate", label, var)
+}
+
+fn of_graph(
+    name: &str,
+    t: DataType,
+    role: &str,
+    graph: &str,
+    label: Option<&str>,
+    var: Option<&str>,
+) -> Field {
+    let mut m = crate::graph::provenance::metadata(role, graph, label);
+    if let Some(var) = var {
+        m.insert("ursa.var".into(), var.into());
+    }
+    Field::new(name, t, true).with_metadata(m.into_iter().collect())
+}
+
+fn plain(name: &str, t: DataType) -> Field {
+    Field::new(name, t, true)
+}
+
+fn reading(fields: Vec<Field>) -> Reading {
+    read(&Schema::new(fields)).unwrap()
+}
+
+fn roles(r: &Reading) -> Vec<(&str, &str)> {
+    r.roles
+        .iter()
+        .map(|(c, role)| (c.as_str(), role.as_str()))
+        .collect()
+}
+
+const I: DataType = DataType::Int64;
+const F: DataType = DataType::Float64;
+
+#[test]
+fn rule_1_a_path_column_is_paths() {
+    // COLUMNS (path_length(p), vertices(p), edges(p)).
+    let r = reading(vec![
+        plain("steps", I),
+        marked(
+            "members",
+            list_of(I),
+            "path_nodes",
+            Some("members"),
+            Some("p"),
+        ),
+        marked("ties", list_of(I), "path_edges", Some("ties"), Some("p")),
+    ]);
+    assert_eq!(
+        r.shape,
+        Shape::Path {
+            nodes: Some(1),
+            edges: Some(2),
+            elements: None
+        }
+    );
+    assert_eq!(r.shape.rule(), Rule::Path);
+    assert_eq!(r.graph.as_deref(), Some("karate"));
+    assert_eq!(r.label_of(1), Some("members"));
+    assert_eq!(r.edge_label.as_deref(), Some("ties"));
+    assert_eq!(
+        roles(&r),
+        [("members", "path_nodes"), ("ties", "path_edges")]
+    );
+    // vertices(p) alone, and element_id(p) alone.
+    let r = reading(vec![marked(
+        "members",
+        list_of(I),
+        "path_nodes",
+        None,
+        Some("p"),
+    )]);
+    assert_eq!(
+        r.shape,
+        Shape::Path {
+            nodes: Some(0),
+            edges: None,
+            elements: None
+        }
+    );
+    let r = reading(vec![marked(
+        "el",
+        list_of(I),
+        "path_elements",
+        None,
+        Some("p"),
+    )]);
+    assert_eq!(
+        r.shape,
+        Shape::Path {
+            nodes: None,
+            edges: None,
+            elements: Some(0)
+        }
+    );
+    // Without metadata: a list of ids is a path, when the first two columns
+    // are not a pair of ids.
+    let r = reading(vec![plain("steps", I), plain("members", list_of(I))]);
+    assert_eq!(
+        r.shape,
+        Shape::Path {
+            nodes: Some(1),
+            edges: None,
+            elements: None
+        }
+    );
+    assert!(!r.marked);
+    assert_eq!(roles(&r), [("members", "path_nodes")]);
+    let r = reading(vec![plain("route", list_of(DataType::Utf8))]);
+    assert_eq!(r.shape.rule(), Rule::Path);
+    // A list of floats is no path.
+    let err = read(&Schema::new(vec![plain("xs", list_of(F))])).unwrap_err();
+    assert!(err.to_string().contains("cannot draw this result"), "{err}");
+}
+
+#[test]
+fn rule_1_the_steps_of_shortest_path_are_a_path_by_their_roles() {
+    let r = reading(vec![
+        marked("src", I, "src", Some("members"), None),
+        marked("dst", I, "dst", Some("members"), None),
+        marked("hop", I, "step", None, None),
+        plain("cost", F),
+    ]);
+    assert_eq!(
+        r.shape,
+        Shape::Steps {
+            src: 0,
+            dst: 1,
+            step: 2
+        }
+    );
+    assert_eq!(r.shape.rule(), Rule::Path);
+    assert_eq!(r.attributes, [3]);
+    // By names alone: edges.
+    let r = reading(vec![
+        plain("src", I),
+        plain("dst", I),
+        plain("hop", I),
+        plain("cost", F),
+    ]);
+    assert_eq!(r.shape, Shape::Edges { src: 0, dst: 1 });
+    assert_eq!(roles(&r), [("src", "src"), ("dst", "dst")]);
+}
+
+#[test]
+fn rule_2_seed_id_and_distance_are_rings() {
+    let hop = Shape::Hop {
+        seed: 0,
+        id: 1,
+        distance: 2,
+    };
+    let r = reading(vec![
+        marked("seed", I, "seed", Some("members"), None),
+        marked("id", I, "node", Some("members"), None),
+        marked("distance", DataType::UInt32, "distance", None, None),
+    ]);
+    assert_eq!(r.shape, hop);
+    assert_eq!(r.shape.rule(), Rule::Rings);
+    assert_eq!(r.graph.as_deref(), Some("karate"));
+    // Whatever the columns are called.
+    let r = reading(vec![
+        marked("from_node", I, "seed", None, None),
+        marked("reached", I, "node", None, None),
+        marked("far", DataType::UInt32, "distance", None, None),
+    ]);
+    assert_eq!(r.shape, hop);
+    // Without metadata, by the three names together.
+    let r = reading(vec![plain("seed", I), plain("id", I), plain("distance", I)]);
+    assert_eq!(r.shape, hop);
+    assert_eq!(
+        roles(&r),
+        [("seed", "seed"), ("id", "node"), ("distance", "distance")]
+    );
+    // A hop result with its distance renamed or computed: edges seed–id,
+    // and a note, with metadata and without.
+    for fields in [
+        vec![
+            marked("seed", I, "seed", None, None),
+            marked("id", I, "node", None, None),
+            plain("d", I),
+        ],
+        vec![plain("seed", I), plain("id", I), plain("d", I)],
+    ] {
+        let r = reading(fields);
+        assert_eq!(r.shape, Shape::Edges { src: 0, dst: 1 });
+        assert!(
+            r.notes[0].contains("no distance column, so no rings"),
+            "{:?}",
+            r.notes
+        );
+    }
+}
+
+#[test]
+fn rule_3_endpoints_are_edges() {
+    // By role, wherever and whatever they are called.
+    let r = reading(vec![
+        marked("edge", I, "edge", Some("ties"), None),
+        marked("b", I, "dst", Some("members"), None),
+        marked("a", I, "src", Some("members"), None),
+    ]);
+    assert_eq!(r.shape, Shape::Edges { src: 2, dst: 1 });
+    assert_eq!(r.edge_label.as_deref(), Some("ties"));
+    assert_eq!(roles(&r), [("a", "src"), ("b", "dst")]);
+    // Exactly two node variables of a pattern, with their properties.
+    let r = reading(vec![
+        marked("ca", DataType::Utf8, "property", Some("members"), Some("a")),
+        marked("cb", DataType::Utf8, "property", Some("members"), Some("b")),
+        marked("x", I, "node", Some("members"), Some("a")),
+        marked("y", I, "node", Some("members"), Some("b")),
+    ]);
+    assert_eq!(r.shape, Shape::Edges { src: 2, dst: 3 });
+    assert_eq!(r.properties, [(0, 2), (1, 3)]);
+    // Two node keys and a metric: edges; the metric is an edge attribute.
+    let r = reading(vec![
+        marked("a", I, "node", None, Some("a")),
+        marked("b", I, "node", None, Some("b")),
+        marked("pagerank", F, "metric", None, None),
+    ]);
+    assert_eq!(r.shape, Shape::Edges { src: 0, dst: 1 });
+    assert_eq!(r.attributes, [2]);
+    // A node key twice (a self-join): two keys are two ends.
+    let r = reading(vec![
+        marked("id", I, "node", Some("members"), None),
+        marked("id", I, "node", Some("members"), None),
+    ]);
+    assert_eq!(r.shape, Shape::Edges { src: 0, dst: 1 });
+    // By name: src/dst, source/target, from/to, in any case and place.
+    for (s, d) in [("src", "dst"), ("Source", "TARGET"), ("from", "to")] {
+        let r = reading(vec![plain("weight", F), plain(d, I), plain(s, I)]);
+        assert_eq!(r.shape, Shape::Edges { src: 2, dst: 1 }, "{s}, {d}");
+        assert_eq!(r.attributes, [0]);
+        assert!(!r.marked);
+    }
+    // With no metadata and no names: the first two columns, ids of one kind.
+    let r = reading(vec![plain("a", I), plain("b", I), plain("w", F)]);
+    assert_eq!(r.shape, Shape::Edges { src: 0, dst: 1 });
+    assert_eq!(roles(&r), [("a", "src"), ("b", "dst")]);
+    // …which a list beside them does not change; the status line says what
+    // else it could be.
+    let r = reading(vec![
+        plain("a", I),
+        plain("b", I),
+        plain("tags", list_of(I)),
+    ]);
+    assert_eq!(r.shape, Shape::Edges { src: 0, dst: 1 });
+    assert_eq!(r.notes, ["also a path (tags): .graph AS path(tags)"]);
+}
+
+#[test]
+fn rule_4_three_node_variables_are_pattern_matches() {
+    let pattern = r#"[{"directed":false,"edge":null,"from":"a","label":"ties","to":"b"},
+                      {"directed":true,"edge":"e","from":"c","label":"pays","to":"b"},
+                      {"directed":true,"edge":null,"from":"c","label":"ties","to":"d"}]"#;
+    let schema = Schema::new(vec![
+        marked("a", I, "node", Some("members"), Some("a")),
+        marked(
+            "club",
+            DataType::Utf8,
+            "property",
+            Some("members"),
+            Some("b"),
+        ),
+        marked("b", I, "node", Some("members"), Some("b")),
+        marked("c", I, "node", Some("firms"), Some("c")),
+    ])
+    .with_metadata([("ursa.pattern".to_string(), pattern.to_string())].into());
+    let r = read(&schema).unwrap();
+    // One edge for each edge of the pattern whose two ends are in COLUMNS:
+    // d is not, so c→d is not drawn.
+    assert_eq!(
+        r.shape,
+        Shape::Matches {
+            keys: vec![0, 2, 3],
+            edges: vec![
+                MatchEdge {
+                    from: 0,
+                    to: 1,
+                    directed: false,
+                    label: "ties".into()
+                },
+                MatchEdge {
+                    from: 2,
+                    to: 1,
+                    directed: true,
+                    label: "pays".into()
+                },
+            ],
+        }
+    );
+    assert_eq!(r.shape.rule(), Rule::Matches);
+    assert_eq!(r.properties, [(1, 2)]);
+    assert_eq!(r.label_of(0), Some("members"));
+    assert_eq!(r.label_of(3), Some("firms"));
+    assert_eq!(roles(&r), [("a", "node"), ("b", "node"), ("c", "node")]);
+}
+
+#[test]
+fn rule_5_one_node_key_is_nodes() {
+    // algorithms(karate, pagerank(), community => louvain()).
+    let r = reading(vec![
+        marked("id", I, "node", Some("members"), None),
+        marked("pagerank", F, "metric", None, None),
+        marked("community", DataType::UInt32, "category", None, None),
+    ]);
+    assert_eq!(r.shape, Shape::Nodes { id: 0 });
+    assert_eq!(r.shape.rule(), Rule::Nodes);
+    assert_eq!((r.size, r.color), (Some(1), Some(2)));
+    assert_eq!(
+        roles(&r),
+        [
+            ("id", "node"),
+            ("pagerank", "metric"),
+            ("community", "category")
+        ]
+    );
+    // A column is what its call is, whatever it is named; and a plain
+    // column beside a node key is read by its name.
+    let r = reading(vec![
+        marked("score", F, "metric", None, None),
+        marked("member", I, "node", None, None),
+        plain("louvain", I),
+        plain("club", DataType::Utf8),
+    ]);
+    assert_eq!(r.shape, Shape::Nodes { id: 1 });
+    assert_eq!((r.size, r.color), (Some(0), Some(2)));
+    // Without metadata: `id` (or `node`) is the key by name. An integer id
+    // and an integer community are nodes coloured by community, not edges.
+    let r = reading(vec![plain("id", I), plain("community", I)]);
+    assert_eq!(r.shape, Shape::Nodes { id: 0 });
+    assert_eq!((r.size, r.color), (None, Some(1)));
+    assert_eq!(roles(&r), [("id", "node"), ("community", "category")]);
+    let r = reading(vec![plain("pagerank", F), plain("Node", DataType::Utf8)]);
+    assert_eq!(r.shape, Shape::Nodes { id: 1 });
+    assert_eq!((r.size, r.color), (Some(0), None));
+    // One column, a vertex table's keys.
+    let r = reading(vec![plain("id", I)]);
+    assert_eq!(r.shape, Shape::Nodes { id: 0 });
+    // A float is never a node id, whatever it is called.
+    assert!(read(&Schema::new(vec![plain("id", F), plain("x", F)])).is_err());
+}
+
+#[test]
+fn rule_6_what_is_not_a_graph_says_what_would_be() {
+    let refused = |fields: Vec<Field>| read(&Schema::new(fields)).unwrap_err().to_string();
+    let err = refused(vec![
+        plain("a", I),
+        plain("score", F),
+        plain("b", DataType::Utf8),
+    ]);
+    assert!(
+        err.contains("it has 3 columns (a: Int64, score: Float64, b: Utf8)"),
+        "{err}"
+    );
+    assert!(err.contains(".graph AS edges(a, b)"), "{err}");
+    assert!(err.contains(".graph AS nodes(a)"), "{err}");
+    let err = refused(vec![plain("x", F), plain("y", F)]);
+    assert!(
+        err.contains("None of its columns can be a node's id"),
+        "{err}"
+    );
+    // Metadata that is not enough for a rule: a metric alone.
+    let err = refused(vec![marked("pagerank", F, "metric", None, None)]);
+    assert!(err.contains("it has 1 column (pagerank: Float64)"), "{err}");
+}
+
+#[test]
+fn what_is_ambiguous_is_decided_and_said() {
+    // Endpoint columns and a path column: the path, the more specific.
+    let r = reading(vec![
+        marked("src", I, "src", None, None),
+        marked("dst", I, "dst", None, None),
+        marked("members", list_of(I), "path_nodes", None, Some("p")),
+    ]);
+    assert_eq!(r.shape.rule(), Rule::Path);
+    assert_eq!(
+        r.notes,
+        ["also edges (src, dst): .graph AS edges(src, dst)"]
+    );
+    // Several graphs in one query: ids of two graphs do not meet.
+    let err = read(&Schema::new(vec![
+        of_graph("a", I, "node", "karate", None, Some("a")),
+        of_graph("b", I, "node", "florentine", None, Some("b")),
+    ]))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("its node columns come from the graphs karate and florentine"),
+        "{err}"
+    );
+    // The graph is the node columns': a metric of another graph beside a
+    // node key does not make two.
+    let r = reading(vec![
+        of_graph("id", I, "node", "karate", None, None),
+        of_graph("pagerank", F, "metric", "florentine", None, None),
+    ]);
+    assert_eq!(r.graph.as_deref(), Some("karate"));
+    // src and dst named but not ids are an error, not another shape.
+    let err = read(&Schema::new(vec![plain("src", I), plain("dst", F)]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot draw columns src and dst as edges"),
+        "{err}"
+    );
 }
