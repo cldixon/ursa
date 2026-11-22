@@ -38,6 +38,16 @@
 //                                               something not shown, a
 //                                               Uint32Array, transferred: the
 //                                               view's +N; empty with no graph)
+//   inspect   {node, key, neighbours?} | {edge, src, dst}
+//                              -> {table, sql, columns, rows, row, note, ms}
+//                                               (the inspector's row: what the
+//                                               open graph's tables say of its
+//                                               node or edge, by index, with the
+//                                               keys the page shows, which are
+//                                               checked; see WebShell.inspectNode.
+//                                               With `neighbours`, {neighbours, ms}:
+//                                               how many it has in the whole graph.
+//                                               `ms` is the engine's time)
 //   closeGraph {}              -> {}             (the page closed its view)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
@@ -123,6 +133,10 @@ async function handle({ id, op, ...args }) {
     } else if (op === "notShown") {
       const counts = await shell.notShown();
       postMessage({ id, ok: true, counts }, [counts.buffer]);
+    } else if (op === "inspect") {
+      const start = performance.now();
+      const text = args.edge === undefined ? await shell.inspectNode(args.node, args.key, !!args.neighbours) : await shell.inspectEdge(args.edge, args.src, args.dst);
+      postMessage({ id, ok: true, ...JSON.parse(text), ms: performance.now() - start });
     } else if (op === "closeGraph") {
       shell?.closeGraph();
       postMessage({ id, ok: true });

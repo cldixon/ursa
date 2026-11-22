@@ -1086,6 +1086,147 @@ for (const scheme of ["light", "dark"] as const) {
   // .graph NAME: a property graph.
   await type(".graph karate", g);
   check((await after(".graph karate", g)).startsWith("Drawing 78 edges, 34 nodes as the graph karate (Esc closes)"), ".graph karate draws the property graph", (await after(".graph karate", g)).split("\n")[0]);
+  // #444: the inspector. Selecting something shows everything known of it.
+  {
+    await graphSettled(g);
+    const inspector = (): Promise<any> => g.evaluate(() => (window as any).ursaShell.graphInspector());
+    const rowsRead = () => g.waitForFunction(() => (window as any).ursaShell.graphInspector()?.rows, null, { timeout: 10_000 }).catch(() => {});
+    const row = (shown: any, i = 0): Record<string, string | null> => Object.fromEntries(shown?.rows?.[i] ?? []);
+    const press = (text: string) => g.locator("#graph-stage .graph-inspector button", { hasText: text }).first().click();
+    const onCanvas = (x: number, y: number) => g.evaluate(([x, y]) => document.elementFromPoint(x, y)?.tagName === "CANVAS", [box.x + x, box.y + y]);
+    check((await inspector()) === null && (await g.locator("#graph-stage .graph-inspector").isHidden()), "the inspector is closed while nothing is selected");
+
+    // A node: its key, its degree drawn and in the graph, and its row.
+    const at33 = (await place(33))!;
+    await g.mouse.click(box.x + at33.x, box.y + at33.y);
+    await rowsRead();
+    await g.waitForFunction(() => (window as any).ursaShell.graphInspector()?.neighbours !== undefined, null, { timeout: 5_000 }).catch(() => {});
+    let shown = await inspector();
+    check(shown?.kind === "node" && shown.title === "node 33" && shown.table === "members" && row(shown).id === "33" && row(shown).club === "Officer", "clicking member 33 shows its row: club Officer", JSON.stringify(shown?.rows));
+    check(shown?.neighbours === 17 && /degree\s*17 drawn · 17 neighbours in karate/.test(shown.text) && shown.sql === "SELECT * FROM members WHERE id = 33", "the inspector says the node's degree as drawn, its neighbours in the graph, and the query", shown?.text);
+    check(["expand", "hide", "pin", "path from here", "colour by", "size by"].every((b) => shown?.buttons.includes(b)), "a node has expand, hide, pin, path from here, and colour by and size by on its properties", JSON.stringify(shown?.buttons));
+    console.log(`     the row came ${Math.round(shown?.rowMs)} ms after the selection (${Math.round(shown?.engineMs)} ms in the engine)`);
+    if (shots) await g.screenshot({ path: `${shots}/graph-inspector-node.png` });
+
+    // Keys: i moves the focus into the panel, Esc back, and the selection stays.
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("i");
+    const inPanel = (await inspector())?.focused;
+    await g.keyboard.press("Escape");
+    check(inPanel === true && (await g.evaluate(() => document.activeElement?.tagName)) === "CANVAS" && (await graphInfo(g)).selection.length === 1 && (await inspector())?.kind === "node", "i focuses the inspector, and Esc returns to the graph with the selection kept");
+
+    // Pin marks the node; the button says so.
+    await press("pin");
+    check((await graphInfo(g)).pinned.join() === "33" && (await inspector()).buttons.includes("unpin"), "pin pins the node", JSON.stringify((await graphInfo(g)).pinned));
+    await press("unpin");
+    check((await graphInfo(g)).pinned.length === 0, "unpin takes the pin off");
+
+    // An edge: a click on it, with no node there, shows its ends and its row.
+    const [a0, a1] = [(await place(0))!, (await place(1))!];
+    const mid = { x: (a0.x + a1.x) / 2, y: (a0.y + a1.y) / 2 };
+    const under = await g.evaluate(([x, y]) => (window as any).ursaShell.graphEdgeAt(x, y), [mid.x, mid.y]);
+    // With nothing selected: the panel is over part of the view while it is open.
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
+    await g.mouse.click(box.x + mid.x, box.y + mid.y);
+    await rowsRead();
+    shown = await inspector();
+    info = await graphInfo(g);
+    check(under?.src == 0 && under?.dst == 1 && info.edge?.src.id == 0 && info.edge?.dst.id == 1 && info.selection.length === 0 && /^Selected edge 0 → 1 · 34 nodes · 78 edges$/.test(await statusText()), "a click on an edge selects it, and the status names it", `${JSON.stringify(under)} ${await statusText()}`);
+    check(shown?.kind === "edge" && shown.title === "edge 0 → 1" && shown.table === "ties" && shown.rows.length === 1 && row(shown).src === "0" && row(shown).dst === "1" && /from\s*0/.test(shown.text) && /to\s*1/.test(shown.text), "clicking a tie shows its ends and its row", JSON.stringify(shown?.rows));
+    // 3 px off the edge is still the edge; 12 px off is empty space.
+    const [ex, ey] = [a1.x - a0.x, a1.y - a0.y];
+    const len = Math.hypot(ex, ey);
+    const off = (d: number) => g.evaluate(([x, y]) => (window as any).ursaShell.graphEdgeAt(x, y), [mid.x - (ey / len) * d, mid.y + (ex / len) * d]);
+    const [near, far] = [await off(3), await off(12)];
+    check(near?.index === under?.index && far?.index !== under?.index, "an edge is picked within 4 px of it, and no further", `${JSON.stringify(near)} ${JSON.stringify(far)}`);
+    // An end's button selects that node.
+    await press("select");
+    await rowsRead();
+    shown = await inspector();
+    check(shown?.kind === "node" && shown.title === "node 0" && (await graphInfo(g)).edge === null && row(shown).club === "Mr. Hi", "an edge's end is selected from the inspector", shown?.title);
+
+    // Several nodes: the counts, and a WHERE clause to copy. Node 33 and the
+    // node furthest left, which the panel (on the right) is never over.
+    const now33 = (await place(33))!;
+    const all = await Promise.all(Array.from({ length: 34 }, (_, id) => place(id).then((at) => ({ id, ...at! }))));
+    const left = all.filter((n) => n.id !== 33).reduce((a, b) => (b.x < a.x ? b : a));
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
+    await g.mouse.click(box.x + now33.x, box.y + now33.y);
+    const clear = await onCanvas(left.x, left.y);
+    await g.keyboard.down("Shift");
+    await g.mouse.click(box.x + left.x, box.y + left.y);
+    await g.keyboard.up("Shift");
+    shown = await inspector();
+    const where = `WHERE id IN (33, ${left.id})`;
+    check(clear && shown?.kind === "nodes" && shown.title === "2 nodes" && shown.count === 2 && (shown.edges === 0 || shown.edges === 1) && shown.where === where && shown.text.includes(where) && shown.buttons.includes("copy") && shown.buttons.includes("path between"), "several nodes show their count, the edges among them and a WHERE clause to copy", JSON.stringify(shown));
+    await gctx.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await press("copy");
+    const copied = await g.evaluate(() => navigator.clipboard.readText()).catch((e) => String(e));
+    check(copied === where, "copy puts the WHERE clause on the clipboard", copied);
+    if (shots) await g.screenshot({ path: `${shots}/graph-inspector-nodes.png` });
+
+    // The panel never covers what was just selected: a node on the right
+    // of the view puts it on the left.
+    {
+      const ids = Array.from({ length: 34 }, (_, i) => i);
+      const places = await Promise.all(ids.map((id) => place(id)));
+      const rightmost = places.reduce((a, b) => (b!.x > a!.x ? b : a))!;
+      await g.focus("#graph-stage canvas");
+      await g.keyboard.press("Escape");
+      await g.mouse.click(box.x + rightmost.x, box.y + rightmost.y);
+      const side = (await inspector())?.side;
+      const covered = !(await onCanvas(rightmost.x, rightmost.y));
+      check(side === "left" && !covered, "the inspector moves to the left when the selected node is on the right", `${side}, node at ${Math.round(rightmost.x)} of ${Math.round(box.width)}`);
+    }
+
+    // Esc clears the selection, and the inspector goes with it.
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
+    check((await graphOpen(g)) && (await inspector()) === null && (await g.locator("#graph-stage .graph-inspector").isHidden()), "Esc clears the selection and closes the inspector, not the pane");
+
+    // A button runs its command in the terminal: colour by redraws the graph.
+    await g.mouse.click(box.x + now33.x, box.y + now33.y);
+    await rowsRead();
+    await g.locator("#graph-stage .graph-inspector dd", { hasText: "Officer" }).locator("button", { hasText: "colour by" }).click();
+    await idle(g);
+    await graphSettled(g);
+    const legendText = (await g.locator("#graph-legend").textContent()) ?? "";
+    check((await screen(g)).includes("memory U .graph karate COLOR BY club") && /colour: club/.test(legendText) && legendText.includes("Officer"), "colour by on a property runs .graph with the clause", legendText);
+    // The legend moved the canvas down.
+    const below = (await g.locator("#graph-stage canvas").boundingBox())!;
+    const re33 = (await place(33))!;
+    await g.mouse.click(below.x + re33.x, below.y + re33.y);
+    await rowsRead();
+    await press("expand");
+    await idle(g);
+    check((await screen(g)).includes("memory U .expand 33"), "expand runs .expand in the terminal", (await after(".expand 33", g)).split("\n")[0]);
+
+    // A value with markup is text: no element comes of it.
+    await g.click("#terminal");
+    await type("CREATE TABLE notes AS SELECT * FROM (VALUES (1, '<img src=x onerror=alert(1)><b>bold</b>'), (2, 'plain')) AS t(id, body);", g);
+    await type("CREATE TABLE refs AS SELECT 1 AS src, 2 AS dst;", g);
+    await type("CREATE PROPERTY GRAPH markup VERTEX TABLES (notes KEY (id)) EDGE TABLES (refs SOURCE KEY (src) REFERENCES notes (id) DESTINATION KEY (dst) REFERENCES notes (id));", g);
+    await type(".graph markup", g);
+    await graphSettled(g);
+    const plain = (await g.locator("#graph-stage canvas").boundingBox())!;
+    const m1 = (await place(1))!;
+    await g.mouse.click(plain.x + m1.x, plain.y + m1.y);
+    await rowsRead();
+    shown = await inspector();
+    const made = await g.evaluate(() => document.querySelectorAll("#graph-stage .graph-inspector img, #graph-stage .graph-inspector b").length);
+    const wraps = await g.evaluate(() => {
+      const value = [...document.querySelectorAll<HTMLElement>("#graph-stage .graph-inspector .value")].find((v) => v.textContent!.includes("<b>"));
+      const panel = document.querySelector<HTMLElement>("#graph-stage .graph-inspector")!;
+      return !!value && getComputedStyle(value).userSelect === "text" && panel.scrollWidth <= panel.clientWidth;
+    });
+    check(row(shown).body === "<img src=x onerror=alert(1)><b>bold</b>" && made === 0 && wraps, "a value with markup is shown as text, wrapped and selectable", JSON.stringify(shown?.rows));
+    // Back to karate, with nothing selected, for what follows.
+    await g.click("#terminal");
+    await type(".graph karate", g);
+    await graphSettled(g);
+  }
   // .graph QUERY replaces the drawing.
   await type(".graph SELECT src, dst FROM ties WHERE src = 1;", g);
   // Its line wraps in the narrower terminal.

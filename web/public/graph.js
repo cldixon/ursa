@@ -18,7 +18,10 @@
 // Shift+click adds a node to the selection (or takes it out), and a click on
 // empty space (or Esc) clears it: the selected nodes carry a ring, their
 // edges are drawn wide, and the pane's header, a live region, says what is
-// selected ("Selected node 33: …"). A mouse or a pen over a node rings it and
+// selected ("Selected node 33: …"). A click on an edge (within 4 px of it,
+// with no node under the pointer) selects the edge. Whatever is selected, the
+// inspector (graph-inspector.js) shows what is known of it, in a panel over
+// the right of the view: `i` moves the focus into it, and Esc back. A mouse or a pen over a node rings it and
 // shows a tooltip: its key, label, SIZE BY and COLOR BY values and degree.
 // On a touch screen one finger pans, two pinch to zoom (and pan), a tap
 // selects a node and a double tap expands it, or fits. The selection itself is ursa-viz's
@@ -47,6 +50,7 @@
 // read again from the view's result after each delta.
 
 import { drawingOf } from "./graph-data.js";
+import { createInspector } from "./graph-inspector.js";
 import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
@@ -141,6 +145,8 @@ const DOUBLE_TAP_MS = 300;
 const DOUBLE_TAP_PX = 30;
 /** A finger that moves no further than this, in CSS pixels, taps; a mouse has less. */
 const TAP_SLOP_PX = 8;
+/** An edge is picked by a click this near it, in CSS pixels, with no node under the pointer. */
+const EDGE_REACH_PX = 4;
 /** The header names this many selected nodes, and counts the rest. */
 const MAX_KEYS_NAMED = 5;
 
@@ -213,11 +219,15 @@ const MAX_SAVED_POSITIONS = 16_000_000;
  * `onCommand(command)` runs a command the view asks for (`.expand 33`, for a
  * double-click on node 33) as the terminal runs a typed one, and resolves
  * once it has run.
+ *
+ * `run(command)` types a command in the terminal and runs it, and
+ * `inspect(args)` asks the engine for a node's or an edge's row (the engine
+ * worker's `inspect`): the inspector's buttons and rows.
  * `times` gets the moments each step ended (performance.now()), for
  * graphTimings. Resolves once the view is made (it draws when the layout's
  * first positions come), to {nodes, edges, backend}.
  */
-export async function show(stage, sent, { status, legend, onError, onCommand, times = {} }) {
+export async function show(stage, sent, { status, legend, onError, onCommand, times = {}, run, inspect }) {
   close();
   // What is drawn: read again from the view's result after each delta.
   let graph = drawingOf(readResult(sent.ugr), sent.skipped);
@@ -340,6 +350,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // The selected nodes' indexes, in the order selected (the view's), and
     // the node under the pointer.
     selection: [],
+    // The selected edge, {edge, src, dst} (its index and its ends'), or null.
+    edge: null,
     hovered: null,
     hoverPicks: 0,
     tip,
@@ -376,6 +388,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // nodes' keys when there are several.
   const selectionText = () => {
     const nodes = state.selection;
+    if (state.edge) return `Selected edge ${state.ids.get(state.edge.src)} → ${state.ids.get(state.edge.dst)}`;
     if (nodes.length === 1) {
       const d = describe(nodes[0]);
       // SIZE BY degree is the degree already said.
@@ -396,7 +409,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // The rule that drew it (graph-data.js's drawnAs): the pane never guesses silently.
     const drawn = graph.drawnAs ? ` · drawn as ${graph.drawnAs}` : "";
     let text;
-    if (state.selection.length) {
+    if (state.selection.length || state.edge) {
       text = `${selectionText()} · ${counts}`;
     } else if (state.layoutDone) {
       text = `${counts}${drawn} · Done`;
@@ -492,6 +505,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // What the worker said while the view was made, in order and a task
   // each, as it would have arrived; then the worker's messages directly.
   (async () => {
+    // Once the rest of this function has run: the handlers read what it
+    // declares further down (the pointer's place).
+    await null;
     while (early.length) {
       const [kind, e] = early.shift();
       (kind === "message" ? fromWorker : workerFailed)(e);
@@ -601,9 +617,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // is selected now.
   const selectionChanged = () => {
     state.selection = Array.from(view.selection());
+    const edge = view.selectedEdge();
+    state.edge = edge ? { edge: edge[0], src: edge[1], dst: edge[2] } : null;
     header();
     redraw();
+    state.inspector.selectionChanged();
   };
+  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw });
   state.clearSelection = () => {
     if (!view.clearSelection()) return false;
     selectionChanged();
@@ -708,7 +728,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     else if (e.key === "+" || e.key === "=") view.zoom(1.25, ...middle);
     else if (e.key === "-" || e.key === "_") view.zoom(0.8, ...middle);
     else if (e.key === "0") view.fit();
-    else return;
+    else if (e.key === "i") {
+      // Into the inspector, if it is open; Esc there comes back.
+      if (state.inspector.focus()) e.preventDefault();
+      return;
+    } else return;
     e.preventDefault();
     timings.action(`key ${e.key}`, e.timeStamp);
     redraw();
@@ -720,8 +744,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   function pick(x, y, extend) {
     const start = performance.now();
     const node = view.pick(x, y);
+    // With no node there, the edge within 4 px (a plain click only: Shift
+    // builds a selection of nodes).
+    const edge = node === undefined && !extend ? view.pickEdge(x, y, EDGE_REACH_PX * dpr) : undefined;
     timings.picked(performance.now() - start);
-    const changed = view.select(node, extend);
+    const changed = edge === undefined ? view.select(node, extend) : view.selectEdge(edge);
     if (changed) selectionChanged();
     return changed;
   }
@@ -925,6 +952,86 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs };
 }
 
+/**
+ * The inspector of the drawing `state` (graph-inspector.js), its panel in
+ * `stage`: it shows what is selected, each time the selection changes. This
+ * says what is selected as the inspector's plain data, and does what its
+ * buttons ask: `run` a command in the terminal, `inspect` a row in the
+ * engine, pin a node, select an edge's end. Returns {selectionChanged(),
+ * focus(), state(), remove()}.
+ */
+function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }) {
+  const { view, graph, canvas } = state;
+  // The pinned nodes: marked with a small ring (the highlight layer's).
+  state.pinned = new Set();
+  const key = (i) => String(state.ids.get(i));
+  const panel = createInspector({
+    run: (command) => run?.(command),
+    fetchRow: (subject) => (subject.kind === "node" ? inspect({ node: subject.index, key: subject.key }) : inspect({ edge: subject.index, src: subject.src.key, dst: subject.dst.key })),
+    fetchNeighbours: (subject) => inspect({ node: subject.index, key: subject.key, neighbours: true }).then((r) => r.neighbours ?? null),
+    pin(index) {
+      const on = !state.pinned.has(index);
+      if (on) state.pinned.add(index);
+      else state.pinned.delete(index);
+      view.setPinned(Uint32Array.from(state.pinned));
+      redraw();
+      return on;
+    },
+    select(index) {
+      if (view.select(index, false)) selectionChanged();
+    },
+    onLeave: () => canvas.focus(),
+  });
+  stage.append(panel.element);
+  const name = graph.name ?? null;
+  // A column of a node's row can size or colour the nodes where the drawing
+  // is the graph itself: there SIZE BY and COLOR BY read the vertex tables.
+  const styled = name !== null && graph.provenance?.rule === "graph";
+  const node = (i) => ({ index: i, key: key(i), keyType: graph.keyTypeOf(i) });
+  // The panel is over the right of the view, unless what is selected is drawn
+  // there: then over the left, so a click never hides what it selected.
+  const sideOf = (...nodes) => {
+    const ratio = canvas.width / Math.max(1, canvas.clientWidth);
+    const width = canvas.clientWidth;
+    const edge = width - Math.min(280, width * 0.45) - 24;
+    return nodes.some((i) => view.nodePixel(i)[0] / ratio > edge) ? "left" : "right";
+  };
+  return {
+    selectionChanged() {
+      const nodes = state.selection;
+      if (state.edge) {
+        const { edge, src, dst } = state.edge;
+        const known = edge < graph.src.length ? graph.edgeOf(edge) : { label: null, row: null, values: [] };
+        panel.show({ kind: "edge", side: sideOf(src, dst), index: edge, src: node(src), dst: node(dst), ...known });
+      } else if (nodes.length === 1) {
+        const [i] = nodes;
+        panel.show({
+          kind: "node",
+          side: sideOf(i),
+          ...node(i),
+          label: graph.labelOf(i),
+          graph: name,
+          command: state.times.command ?? ".graph",
+          degree: state.degree[i],
+          values: i < graph.n ? graph.valuesOf(i) : [],
+          pinned: state.pinned.has(i),
+          styled,
+        });
+      } else if (nodes.length > 1) {
+        const among = new Set(nodes);
+        let edges = 0;
+        for (let e = 0; e < graph.src.length; e++) if (among.has(graph.src[e]) && among.has(graph.dst[e])) edges++;
+        panel.show({ kind: "nodes", side: sideOf(nodes.at(-1)), nodes: nodes.map(node), edges, graph: name });
+      } else {
+        panel.close();
+      }
+    },
+    focus: () => panel.focus(),
+    state: () => panel.state(),
+    remove: () => panel.element.remove(),
+  };
+}
+
 /** A node's COLOR BY category, as the legend names it. */
 function categoryName(graph, index, node) {
   if (index < graph.colorLabels.length) return graph.colorLabels[index];
@@ -1030,6 +1137,7 @@ export function close() {
   state.view.free();
   state.canvas.remove();
   state.tip.remove();
+  state.inspector?.remove();
 }
 
 /** For tests: what is drawn. */
@@ -1049,6 +1157,9 @@ export function info() {
     // The selected nodes in the order selected, the last of them, the node
     // under the pointer, and how many times the pointer was looked up.
     selection,
+    // The selected edge: its index and its ends.
+    edge: current.edge && { index: current.edge.edge, src: node(current.edge.src), dst: node(current.edge.dst) },
+    pinned: Array.from(current.pinned ?? [], (i) => current.ids.get(i)),
     picked: selection.at(-1) ?? null,
     hovered: current.hovered === null ? null : node(current.hovered),
     hoverPicks,
@@ -1197,6 +1308,26 @@ export function expandable(limit = 10) {
     out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x, y });
   }
   return out;
+}
+
+/**
+ * For tests: the edge a click at (x, y) picks (CSS pixels from the canvas's
+ * top left), {index, src, dst} with its ends' keys, or null: none within
+ * reach, or a node is there.
+ */
+export function edgeAt(x, y) {
+  const state = current;
+  if (!state) return null;
+  const ratio = state.canvas.width / state.canvas.clientWidth;
+  if (state.view.pick(x * ratio, y * ratio) !== undefined) return null;
+  const index = state.view.pickEdge(x * ratio, y * ratio, EDGE_REACH_PX * ratio);
+  if (index === undefined) return null;
+  return { index, src: state.ids.get(state.graph.src[index]), dst: state.ids.get(state.graph.dst[index]) };
+}
+
+/** For tests: what the inspector shows (graph-inspector.js's state()), or null. */
+export function inspected() {
+  return current?.inspector?.state() ?? null;
 }
 
 /** For tests: the node drawn at the canvas pixel (x, y), as a click picks it, or null. */

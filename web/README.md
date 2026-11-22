@@ -347,7 +347,42 @@ static assets and an R2 bucket.
     one: the engine names none yet), `SIZE BY` and `COLOR BY` values and
     degree; the pointer is looked up once a frame at most. The
     selection set is `ursa-viz`'s (`interact`); `graph.js` tells it what
-    was clicked. On a touch screen (#428) one finger pans and two pinch: the
+    was clicked. A click within 4 px of an edge, with no node under it,
+    selects the edge (`Selected edge 0 → 1`).
+
+    **The inspector** (#444, `graph-inspector.js` and `graph-inspector.css`)
+    shows what is known of the selection, in a panel over the top right of
+    the view (the top left when what was selected is drawn on the right; a
+    sheet over the lower half under 640 px):
+    - **a node:** its key and label, its degree as drawn and how many
+      neighbours it has in the whole graph, the values drawn (`SIZE BY`,
+      `COLOR BY`, a hop's distance), and its row of the vertex table, read
+      with one query by key (`SELECT * FROM members WHERE id = 33`, which
+      the panel shows). Buttons run commands in the terminal, as if typed:
+      **expand** (`.expand 33`), **hide** (`.hide 33`), and **path from
+      here**, which waits for a second node and then draws
+      `shortest_path` between the two. **pin** marks the node with the
+      pin ring. Where the drawing is a property graph itself (`.graph
+      NAME`), each property has **colour by** (and **size by**, if it is
+      numeric), which run the `.graph` command again with that clause.
+    - **an edge:** its two ends (each with a button that selects it), its
+      edge columns, and its row of the edge table, found by its ends;
+      where several rows join them, by its row number if the drawing knows
+      it, and else all of them are shown, with a note.
+    - **several nodes:** how many, the edges drawn among them, and a
+      `WHERE id IN (…)` clause with a copy button.
+
+    A drawing that is not of a property graph has no row to show, and the
+    panel says so. `i` in the view moves the focus into the panel and Esc
+    there moves it back; Esc in the view clears the selection, which closes
+    the panel. Every value is set with `textContent` and wraps: nothing
+    from the data is ever HTML. The rows come from the worker's `inspect`
+    op (`WebShell.inspectNode`, `WebShell.inspectEdge`), which prints
+    nothing and leaves the last result alone. The module imports nothing
+    and takes its data and callbacks from `graph.js`, so it can move to
+    `ursa-viz/ui/` as it is. `window.ursaShell.graphInspector()` gives
+    what it shows, and `graphEdgeAt(x, y)` the edge a click would pick.
+    On a touch screen (#428) one finger pans and two pinch: the
     view zooms by the change in the fingers' distance around the point
     between them, and pans as that point moves, so what is between the
     fingers stays there. A tap names a node (a second finger cancels it),

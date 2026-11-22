@@ -20,6 +20,30 @@ const NULL = 0xffffffff;
  */
 const COLOR_SUFFIX = " (colour)";
 
+/** An edge with no known row in its table (UGR's `edges.rows`). */
+const NO_ROW = 0xffffffffffffffffn;
+
+/**
+ * Row `i`'s value in each of `columns` (a result's node or edge columns), as
+ * [name, text] pairs; a row with no value in a column is left out of it. The
+ * colour column's " (colour)" twin of another column is left out too.
+ */
+function valuesOf(columns, i) {
+  const out = [];
+  for (const c of columns) {
+    if (c.name.endsWith(COLOR_SUFFIX) && columns.some((o) => o.name === c.name.slice(0, -COLOR_SUFFIX.length))) continue;
+    const v = c.values[i];
+    if (c.type === "dict") {
+      if (v !== NULL) out.push([c.name, c.dict.get(v)]);
+    } else if (c.type === "f32") {
+      if (!Number.isNaN(v)) out.push([c.name, String(Number(v.toPrecision(6)))]);
+    } else if (v !== NULL) {
+      out.push([c.name, String(v)]);
+    }
+  }
+  return out;
+}
+
 /**
  * The drawing of `result` (ugr.js's readResult of the engine's buffer):
  *
@@ -31,6 +55,13 @@ const COLOR_SUFFIX = " (colour)";
  *                  keeps its index), 0 otherwise. An edge at a removed node
  *                  is not shown either.
  *   labelOf(i)     node i's label (the vertex table it is of), or null
+ *   keyTypeOf(i)   "int" or "text": how node i's key is written in SQL
+ *   valuesOf(i)    node i's value in each node column, as [name, text] pairs
+ *                  (the inspector's "drawn" values): what SIZE BY and COLOR BY
+ *                  made and what the rule read (a hop's distance)
+ *   edgeOf(e)      edge e, for the inspector: {label, row, values}, its edge
+ *                  table (or null), its row in that table (a string, or null
+ *                  where the engine did not know it) and its edge columns
  *   skipped        rows left out because an endpoint is NULL
  *   name           the property graph drawn, or null
  *   provenance     {sql, rule, roles?, notes?}: the SQL it came from, the
@@ -64,6 +95,16 @@ export function drawingOf(result, skipped = 0) {
     name: result.graph,
     provenance: result.provenance,
     labelOf: (i) => nodes.labelNames[nodes.labels[i]]?.name || null,
+    keyTypeOf: (i) => nodes.labelNames[nodes.labels[i]]?.key ?? "text",
+    valuesOf: (i) => valuesOf(nodes.columns, i),
+    edgeOf: (e) => {
+      const row = edges.rows?.[e];
+      return {
+        label: edges.labelNames[edges.labels[e]] || null,
+        row: row === undefined || row === NO_ROW ? null : String(row),
+        values: valuesOf(edges.columns, e),
+      };
+    },
     drawnAs: drawnAs(result),
   };
   const column = (name) => {
