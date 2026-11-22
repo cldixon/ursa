@@ -95,6 +95,7 @@ fn expect(r: &GraphResult) -> Value {
             "rows": r.edge_rows().map(|rows| rows.iter().map(u64::to_string).collect::<Vec<_>>()),
             "flags": r.edge_flags().to_vec(),
             "columns": columns(r.edge_columns()),
+            "adjacency": Value::Null,
         },
         "highlights": {
             "paths": paths,
@@ -347,6 +348,19 @@ fn the_fixtures_are_what_the_encoder_writes() {
     let bytes = delta.to_bytes();
     assert_eq!(GraphDelta::from_bytes(&bytes).unwrap(), delta);
     check("expand", &bytes, &expected);
+
+    // `plain` with its undirected adjacency beside the edges (#501), by
+    // hand: 0 - 1, 1 - 2, 2 - 0, and the self-loop left out.
+    let result = plain();
+    let adjacency = ursa_core::topology::UndirectedCsr::from_edges(3, result.src(), result.dst());
+    let bytes = result.to_bytes_with_adjacency(&adjacency);
+    assert_eq!(GraphResult::from_bytes(&bytes).unwrap(), result);
+    let mut expected = expect(&result);
+    expected["edges"]["adjacency"] = json!({
+        "offsets": ["0", "2", "4", "6"],
+        "targets": [1, 2, 0, 2, 0, 1],
+    });
+    check("adjacent", &bytes, &expected);
 }
 
 /// The committed bytes still decode to the values: a reader of version 1
@@ -366,6 +380,15 @@ fn the_committed_fixtures_decode() {
         GraphResult::from_bytes(&read("plain.ugr")).unwrap(),
         plain()
     );
+    // With an adjacency beside its edges it is the same result, and the
+    // adjacency reads back.
+    assert_eq!(
+        GraphResult::from_bytes(&read("adjacent.ugr")).unwrap(),
+        plain()
+    );
+    let adjacency = ugr::read_adjacency(&read("adjacent.ugr")).unwrap().unwrap();
+    assert_eq!(adjacency.targets, [1, 2, 0, 2, 0, 1]);
+    assert!(ugr::read_adjacency(&read("plain.ugr")).unwrap().is_none());
     let mut town = GraphResult::from_bytes(&read("town.ugr")).unwrap();
     assert_eq!(town, self::town());
     // The delta applies to the result it was made for, and undoes.

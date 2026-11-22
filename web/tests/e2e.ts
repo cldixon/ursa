@@ -1070,6 +1070,16 @@ for (const scheme of ["light", "dark"] as const) {
     JSON.stringify({ ...mem, userAgent: mem.userAgent && { bytes: mem.userAgent.bytes, parts: mem.userAgent.breakdown.length } }),
   );
 
+  {
+    const held: any = await g.evaluate(() => (window as any).ursaShell.graphTimings().memory);
+    const part = (p: any) => pages(p?.bytes) && p.perEdge === Math.round(p.bytes / held.edges);
+    check(
+      held && held.edges > 0 && part(held.view) && part(held.layout) && held.view.bytes === mem.wasm.view && held.layout.bytes === mem.wasm.layout,
+      "graphTimings.memory: what the view and the layout worker hold, in bytes and bytes an edge",
+      JSON.stringify(held),
+    );
+  }
+
   // Esc, in the terminal, clears a selection first, then closes the pane: the
   // terminal takes the whole width again.
   {

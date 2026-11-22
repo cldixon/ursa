@@ -796,8 +796,16 @@ impl GraphView {
     /// The result drawn, with every delta applied, as UGR; `undefined` for
     /// a view not made from one.
     #[wasm_bindgen(js_name = resultBytes)]
-    pub fn result_bytes(&self) -> Option<Vec<u8>> {
-        self.view.result().map(GraphResult::to_bytes)
+    pub fn result_bytes(&self) -> Option<js_sys::Uint8Array> {
+        // Each section straight from the result into the page's array: the
+        // buffer is never built in this module's memory.
+        let encoded = self.view.result()?.encoded();
+        let out = js_sys::Uint8Array::new_with_length(encoded.len() as u32);
+        encoded.write(|at, bytes| {
+            out.subarray(at as u32, (at + bytes.len()) as u32)
+                .copy_from(bytes)
+        });
+        Some(out)
     }
 
     /// Draw these positions: `x` then `y`, one per node each, a

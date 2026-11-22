@@ -5,6 +5,7 @@
 //! Encoding is canonical: equal values give equal bytes, so decoding what
 //! the encoder wrote and encoding it again gives the same buffer.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -113,6 +114,12 @@ pub struct Room {
 impl GraphResult {
     /// The result as one UGR buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.encoded().to_vec()
+    }
+
+    /// The result in its wire format, for a caller that puts the bytes
+    /// somewhere other than a vector ([`Encoded::write`]).
+    pub fn encoded(&self) -> Encoded<'_> {
         write_result(self, None)
     }
 
@@ -126,7 +133,7 @@ impl GraphResult {
     /// result with a removed node or edge has none to give, since a layout
     /// reads only what is shown. Neither is checked here.
     pub fn to_bytes_with_adjacency(&self, adjacency: &UndirectedCsr) -> Vec<u8> {
-        write_result(self, Some(adjacency))
+        write_result(self, Some(adjacency)).to_vec()
     }
 
     /// Decode a result, checking every invariant of the model.
@@ -188,7 +195,7 @@ const ADJACENCY_TARGETS: &str = "edges.adjacency.targets";
 impl GraphDelta {
     /// The delta as one UGR buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
-        write_delta(self)
+        write_delta(self).to_vec()
     }
 
     /// Decode a delta. Whether it fits a result is for
@@ -369,35 +376,99 @@ le! {
 
 // Writing.
 
+/// The sections of a buffer being written: each borrowed from the value it
+/// is a part of, so that nothing is copied until the buffer is
+/// ([`Encoded`]).
 #[derive(Default)]
-struct Writer {
+struct Writer<'a> {
     sections: Vec<SectionH>,
-    body: Vec<u8>,
+    /// Each section's bytes, in order.
+    parts: Vec<Cow<'a, [u8]>>,
+    /// The body's length so far, padding included.
+    body: usize,
+}
+
+/// A value in its wire format, not yet in one piece: the header, and the
+/// sections where the value holds them. [`Encoded::to_vec`] is the buffer;
+/// [`Encoded::write`] puts it somewhere else (a page's array) a section at
+/// a time, so that a large result is never held a second time on the way.
+pub struct Encoded<'a> {
+    /// The magic, the header's length and the header, padded.
+    head: Vec<u8>,
+    /// Where each section starts in the body, and its bytes.
+    parts: Vec<(usize, Cow<'a, [u8]>)>,
+    body: usize,
+}
+
+impl Encoded<'_> {
+    /// The buffer's length in bytes.
+    pub fn len(&self) -> usize {
+        self.head.len() + self.body
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Give `put` each run of the buffer's bytes and where it starts. The
+    /// bytes between runs (padding to a multiple of 8) are zero, and are
+    /// not given: the destination starts as `len()` zeros.
+    pub fn write(&self, mut put: impl FnMut(usize, &[u8])) {
+        put(0, &self.head);
+        for (offset, bytes) in &self.parts {
+            if !bytes.is_empty() {
+                put(self.head.len() + offset, bytes);
+            }
+        }
+    }
+
+    /// The buffer.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.len()];
+        self.write(|at, bytes| out[at..at + bytes.len()].copy_from_slice(bytes));
+        out
+    }
 }
 
 fn pad(bytes: &mut Vec<u8>) {
     bytes.resize(bytes.len().next_multiple_of(ALIGN), 0);
 }
 
-impl Writer {
-    fn put<T: Le>(&mut self, name: impl Into<String>, data: &[T]) {
-        self.sections.push(SectionH {
-            name: name.into(),
-            ty: T::NAME.to_string(),
-            offset: self.body.len() as u64,
-            count: data.len() as u64,
-        });
-        if cfg!(target_endian = "little") {
-            self.body.extend_from_slice(bytemuck::cast_slice(data));
+impl<'a> Writer<'a> {
+    fn put<T: Le>(&mut self, name: impl Into<String>, data: &'a [T]) {
+        let bytes = if cfg!(target_endian = "little") {
+            Cow::Borrowed(bytemuck::cast_slice(data))
         } else {
-            for &v in data {
-                self.body.extend_from_slice(bytemuck::bytes_of(&v.swap()));
-            }
-        }
-        pad(&mut self.body);
+            let swapped: Vec<T> = data.iter().map(|v| v.swap()).collect();
+            Cow::Owned(bytemuck::cast_slice(&swapped).to_vec())
+        };
+        self.part(name.into(), T::NAME, data.len(), bytes);
     }
 
-    fn strings(&mut self, name: &str, strings: &Strings) {
+    /// [`Writer::put`] for a section made for the buffer, which no value
+    /// holds: small ones (a result's path offsets).
+    fn put_owned<T: Le>(&mut self, name: impl Into<String>, data: Vec<T>) {
+        let swapped: Vec<T> = if cfg!(target_endian = "little") {
+            data
+        } else {
+            data.iter().map(|v| v.swap()).collect()
+        };
+        let bytes = Cow::Owned(bytemuck::cast_slice(&swapped).to_vec());
+        self.part(name.into(), T::NAME, swapped.len(), bytes);
+    }
+
+    fn part(&mut self, name: String, ty: &str, count: usize, bytes: Cow<'a, [u8]>) {
+        self.sections.push(SectionH {
+            name,
+            ty: ty.to_string(),
+            offset: self.body as u64,
+            count: count as u64,
+        });
+        self.body = (self.body + bytes.len()).next_multiple_of(ALIGN);
+        self.parts.push(bytes);
+    }
+
+    fn strings(&mut self, name: &str, strings: &'a Strings) {
         let (offsets, bytes) = strings.parts();
         self.put(format!("{name}.offsets"), offsets);
         self.put(format!("{name}.bytes"), bytes);
@@ -405,13 +476,13 @@ impl Writer {
 
     /// Labels and flags are left out when every one is 0, which they are
     /// for most results.
-    fn sparse<T: Le + PartialEq + Default>(&mut self, name: String, data: &[T]) {
+    fn sparse<T: Le + PartialEq + Default>(&mut self, name: String, data: &'a [T]) {
         if data.iter().any(|v| *v != T::default()) {
             self.put(name, data);
         }
     }
 
-    fn values(&mut self, name: String, values: &Values) {
+    fn values(&mut self, name: String, values: &'a Values) {
         match values {
             Values::F32(v) => self.put(name, v),
             Values::U32(v) => self.put(name, v),
@@ -422,7 +493,15 @@ impl Writer {
         }
     }
 
-    fn columns(&mut self, prefix: &str, columns: &[Column]) -> Vec<ColumnH> {
+    /// The old or the new column of a `SetColumn`, if there is one.
+    fn side(&mut self, name: String, column: &'a Option<Column>) -> Option<ColumnH> {
+        column.as_ref().map(|c| {
+            self.values(name, &c.values);
+            column_header(c)
+        })
+    }
+
+    fn columns(&mut self, prefix: &str, columns: &'a [Column]) -> Vec<ColumnH> {
         let headers = columns.iter().map(column_header).collect();
         for (i, column) in columns.iter().enumerate() {
             self.values(format!("{prefix}.columns.{i}"), &column.values);
@@ -430,7 +509,7 @@ impl Writer {
         headers
     }
 
-    fn batch_columns(&mut self, prefix: &str, columns: &[BatchColumn]) -> Vec<BatchColumnH> {
+    fn batch_columns(&mut self, prefix: &str, columns: &'a [BatchColumn]) -> Vec<BatchColumnH> {
         let mut headers = Vec::new();
         for (i, column) in columns.iter().enumerate() {
             let name = format!("{prefix}.columns.{i}");
@@ -450,7 +529,7 @@ impl Writer {
         headers
     }
 
-    fn positions(&mut self, prefix: &str, positions: Option<&Positions>) -> bool {
+    fn positions(&mut self, prefix: &str, positions: Option<&'a Positions>) -> bool {
         if let Some(p) = positions {
             self.put(format!("{prefix}.x"), &p.x);
             self.put(format!("{prefix}.y"), &p.y);
@@ -458,7 +537,7 @@ impl Writer {
         positions.is_some()
     }
 
-    fn highlights(&mut self, prefix: &str, h: &Highlights) -> HighlightsH {
+    fn highlights(&mut self, prefix: &str, h: &'a Highlights) -> HighlightsH {
         let mut node_offsets = vec![0u32];
         let mut edge_offsets = vec![0u32];
         let mut nodes = Vec::new();
@@ -469,10 +548,10 @@ impl Writer {
             node_offsets.push(u32::try_from(nodes.len()).expect("under 4G path nodes"));
             edge_offsets.push(edges.len() as u32);
         }
-        self.put(format!("{prefix}.paths.offsets"), &node_offsets);
-        self.put(format!("{prefix}.paths.nodes"), &nodes);
-        self.put(format!("{prefix}.paths.edge_offsets"), &edge_offsets);
-        self.put(format!("{prefix}.paths.edges"), &edges);
+        self.put_owned(format!("{prefix}.paths.offsets"), node_offsets);
+        self.put_owned(format!("{prefix}.paths.nodes"), nodes);
+        self.put_owned(format!("{prefix}.paths.edge_offsets"), edge_offsets);
+        self.put_owned(format!("{prefix}.paths.edges"), edges);
         self.put(format!("{prefix}.seeds"), &h.seeds);
         HighlightsH {
             paths: h.paths.len() as u64,
@@ -481,7 +560,7 @@ impl Writer {
         }
     }
 
-    fn node_batch(&mut self, prefix: &str, batch: &NodeBatch) -> NodeBatchH {
+    fn node_batch(&mut self, prefix: &str, batch: &'a NodeBatch) -> NodeBatchH {
         self.strings(&format!("{prefix}.keys"), &batch.keys);
         self.sparse(format!("{prefix}.labels"), &batch.labels);
         NodeBatchH {
@@ -491,7 +570,7 @@ impl Writer {
         }
     }
 
-    fn edge_batch(&mut self, prefix: &str, batch: &EdgeBatch) -> EdgeBatchH {
+    fn edge_batch(&mut self, prefix: &str, batch: &'a EdgeBatch) -> EdgeBatchH {
         self.put(format!("{prefix}.src"), &batch.src);
         self.put(format!("{prefix}.dst"), &batch.dst);
         self.sparse(format!("{prefix}.labels"), &batch.labels);
@@ -505,24 +584,28 @@ impl Writer {
         }
     }
 
-    fn index(&mut self, prefix: &str, index: &[u32]) -> IndexH {
+    fn index(&mut self, prefix: &str, index: &'a [u32]) -> IndexH {
         self.put(format!("{prefix}.index"), index);
         IndexH {
             count: index.len() as u64,
         }
     }
 
-    fn finish(self, header: impl FnOnce(u64, Vec<SectionH>) -> Header) -> Vec<u8> {
-        let header = header(self.body.len() as u64, self.sections);
+    fn finish(self, header: impl FnOnce(u64, Vec<SectionH>) -> Header) -> Encoded<'a> {
+        let offsets: Vec<usize> = self.sections.iter().map(|s| s.offset as usize).collect();
+        let header = header(self.body as u64, self.sections);
         let json = serde_json::to_vec(&header).expect("a header is plain JSON");
-        let mut out = Vec::with_capacity(2 * ALIGN + json.len() + self.body.len());
-        out.extend_from_slice(&MAGIC);
+        let mut head = Vec::with_capacity(2 * ALIGN + json.len());
+        head.extend_from_slice(&MAGIC);
         let len = u32::try_from(json.len()).expect("a header under 4 GiB");
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&json);
-        pad(&mut out);
-        out.extend_from_slice(&self.body);
-        out
+        head.extend_from_slice(&len.to_le_bytes());
+        head.extend_from_slice(&json);
+        pad(&mut head);
+        Encoded {
+            head,
+            parts: offsets.into_iter().zip(self.parts).collect(),
+            body: self.body,
+        }
     }
 }
 
@@ -534,7 +617,7 @@ fn column_header(column: &Column) -> ColumnH {
     }
 }
 
-fn write_result(r: &GraphResult, adjacency: Option<&UndirectedCsr>) -> Vec<u8> {
+fn write_result<'a>(r: &'a GraphResult, adjacency: Option<&'a UndirectedCsr>) -> Encoded<'a> {
     let mut w = Writer::default();
     w.strings("nodes.keys", &r.node_keys);
     w.sparse("nodes.labels".into(), &r.node_label);
@@ -580,7 +663,7 @@ fn write_result(r: &GraphResult, adjacency: Option<&UndirectedCsr>) -> Vec<u8> {
     })
 }
 
-fn write_delta(delta: &GraphDelta) -> Vec<u8> {
+fn write_delta(delta: &GraphDelta) -> Encoded<'_> {
     let mut w = Writer::default();
     let mut ops = Vec::with_capacity(delta.ops.len());
     for (i, op) in delta.ops.iter().enumerate() {
@@ -604,20 +687,12 @@ fn write_delta(delta: &GraphDelta) -> Vec<u8> {
                 index,
                 old,
                 new,
-            } => {
-                let mut side = |name: &str, column: &Option<Column>| {
-                    column.as_ref().map(|c| {
-                        w.values(format!("{p}.{name}"), &c.values);
-                        column_header(c)
-                    })
-                };
-                OpH::SetColumn {
-                    target: *target,
-                    index: *index,
-                    old: side("old", old),
-                    new: side("new", new),
-                }
-            }
+            } => OpH::SetColumn {
+                target: *target,
+                index: *index,
+                old: w.side(format!("{p}.old"), old),
+                new: w.side(format!("{p}.new"), new),
+            },
             Op::SetHighlights { old, new } => OpH::SetHighlights {
                 old: w.highlights(&format!("{p}.old"), old),
                 new: w.highlights(&format!("{p}.new"), new),

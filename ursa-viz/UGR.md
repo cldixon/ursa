@@ -117,6 +117,8 @@ does not define, where one it does define is required, is an error.
 | `edges.labels` | `u16` | `edges.count` | each edge's label. Omitted if all 0. |
 | `edges.rows` | `u64` | `edges.count` | each edge's row in its edge table. Omitted if none is known. |
 | `edges.flags` | `u8` | `edges.count` | bit 0: the edge is removed. Omitted if all 0. |
+| `edges.adjacency.offsets` | `u64` | `nodes.count + 1` | optional, with the next: where each node's neighbours start in `edges.adjacency.targets` |
+| `edges.adjacency.targets` | `u32` | any | optional: each node's neighbours, end to end |
 | `edges.columns.I`, `.values` | | `edges.count` | as for nodes |
 | `highlights.paths.offsets` | `u32` | paths + 1 | where each path's nodes start in `highlights.paths.nodes` |
 | `highlights.paths.nodes` | `u32` | any | the paths' nodes, in order, end to end |
@@ -127,6 +129,30 @@ does not define, where one it does define is required, is an error.
 A node's identity is its label and its key, and no two nodes of a result
 share one. An index is a slot: a removed node or edge keeps its slot and its
 data, and an edge is drawn when neither it nor either of its ends is removed.
+
+**The adjacency** (`edges.adjacency.*`, #501) is the undirected adjacency of
+the edges, for a layout, which reads nothing else of a graph: node `i`'s
+neighbours are `targets[offsets[i] .. offsets[i + 1]]`, in ascending order,
+each once, never `i` itself, and `j` is among `i`'s exactly when `i` is among
+`j`'s. It is every edge slot's ends with self-loops left out and repeats
+merged: what `ursa_core::topology::UndirectedCsr::from_edges` makes of
+`nodes.count`, `edges.src` and `edges.dst`.
+
+- It is **derived and optional**. A writer that holds the adjacency already
+  (an index over the same node numbering) includes it, so that the layout
+  sorts nothing; a writer that would have to build it leaves it out, and the
+  layout builds it from the edges, off the page's thread. The layout is the
+  same either way, bit for bit.
+- A writer includes it only for a result with **no removed node or edge**: a
+  layout lays out what is shown.
+- It is **not part of the model.** `GraphResult::from_bytes` does not read
+  it, and `to_bytes` does not write it; `to_bytes_with_adjacency` does, and
+  `ugr::read_adjacency` reads it back, checked (the shape above, in one
+  pass, `UndirectedCsr::from_parts`). So a buffer with one decodes to the
+  same result as the buffer without, and only the buffer without is
+  canonical.
+- `ui/ugr.js` gives it as `edges.adjacency`: `{offsets, targets}`, views of
+  the buffer, or `null`.
 
 The design's sketch of the format (§6) put the highlights in the header. They
 are sections here, because a result of ten thousand paths is not a header.
@@ -193,6 +219,26 @@ identity, a key that is not its label's type, an edge to a node that is not
 there, a code past its dictionary, a path whose edges do not join its nodes).
 The Rust decoder checks all of these. `ui/ugr.js` checks the framing and the
 sections, and trusts the values, as a view of the engine's own output can.
+
+## Reading a large result
+
+`GraphResult::from_bytes` takes a slice. A view on a page reads the same
+buffer another way (`GraphResult::read_paced`, #501):
+
+- **From a `Source`:** anything that can copy a range of the buffer out. A
+  page's `Uint8Array` is one, so the buffer stays in the page's memory and
+  is never copied whole into the WebAssembly memory: each section is copied
+  once, from the source to the vector the result keeps.
+- **With room:** each vector is allocated with room for the view's first
+  deltas, so nothing is allocated twice.
+- **In pieces:** the event loop gets a turn between the large sections and
+  while the result is checked (every 8,192 nodes and 262,144 edges), so
+  decoding a million edges is no task of the page's over 60 ms.
+
+Labels and flags left out of the buffer because every one is 0 are not held
+in memory either (`model::Sparse`): three bytes an edge that most results do
+not take. The key index is a table of node indexes over the keys the result
+holds, five bytes a node.
 
 ## Size and speed
 

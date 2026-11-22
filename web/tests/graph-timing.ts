@@ -22,7 +22,12 @@
 //   thread, so the interval is the frame's cost);
 // - a pick, by a click in the middle of the canvas;
 // - the wasm heaps (the engine's, the view's and the layout worker's) and
-//   the page's memory as the browser measures it.
+//   the page's memory as the browser measures it; and, from
+//   graphTimings().memory, what the two ursa-viz instances hold in bytes an
+//   edge. On rmat (a million edges) the run fails if the view's is over
+//   20 MiB or the layout worker's over 60 MB (#501): they are 17.9 MiB and
+//   55.7 MB, the same every run, since a WebAssembly memory grows by what
+//   is asked of it and not by the machine's load.
 //
 // Then the medians over the runs.
 import { chromium } from "playwright";
@@ -42,6 +47,10 @@ const browser =
     ? await chromium.launch({ args })
     : await chromium.launch({ args, channel: process.env.CHANNEL ?? "chromium" }).catch(() => chromium.launch({ args }));
 console.log(`${browser.browserType().name()} ${browser.version()}${process.env.CHANNEL === "shell" ? " (headless shell)" : ""}`);
+// What the page's view and the layout worker may hold at a million edges
+// (#501): 20 MiB and 60 MB of WebAssembly memory.
+const VIEW_BYTES = 20 * 2 ** 20;
+const LAYOUT_BYTES = 60e6;
 const all: Record<string, number>[] = [];
 // What took too long: the run fails if anything did.
 const slow: string[] = [];
@@ -144,6 +153,15 @@ for (let r = 0; r < runs; r++) {
   rel.engineHeapMiB = Math.round(m.wasm.engine / 2 ** 20);
   rel.viewHeapMiB = Math.round(m.wasm.view / 2 ** 20);
   rel.layoutHeapMiB = Math.round(m.wasm.layout / 2 ** 20);
+  const held = (await timings()).memory;
+  console.log(
+    `  ursa-viz, ${held.edges.toLocaleString("en-US")} edges: the view ${held.view.bytes.toLocaleString("en-US")} bytes (${held.view.perEdge} an edge), ` +
+      `the layout worker ${held.layout.bytes.toLocaleString("en-US")} bytes (${held.layout.perEdge} an edge)`,
+  );
+  if (dataset === "rmat") {
+    if (held.view.bytes > VIEW_BYTES) slow.push(`run ${r + 1}: the view holds ${mb(held.view.bytes)}; at most ${mb(VIEW_BYTES)} are allowed`);
+    if (held.layout.bytes > LAYOUT_BYTES) slow.push(`run ${r + 1}: the layout worker holds ${(held.layout.bytes / 1e6).toFixed(1)} MB; at most ${LAYOUT_BYTES / 1e6} MB are allowed`);
+  }
   all.push(rel);
   await ctx.close();
 }
