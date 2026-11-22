@@ -211,6 +211,9 @@ view.selection();                           // the selected nodes, in the order 
 view.clearSelection();                      // true if anything was selected
 view.hover(x, y);                           // the node under the pointer becomes the hovered one; returns it
 view.hovered;                               // or undefined
+view.pickEdge(x, y, 4 * dpr);               // the edge within 4 px of the pixel, or undefined
+view.selectEdge(edge);                      // select it alone: true if anything changed
+view.selectedEdge();                        // [edge, src, dst], or undefined
 ```
 
 - A click on a node selects it alone; on empty space (`undefined`) it clears
@@ -225,9 +228,20 @@ view.hovered;                               // or undefined
   edge once, and uploads 16 bytes for each edge found.
 - A node that is hidden (`setHidden`) or removed by a delta leaves the
   selection and the hover.
+- **An edge is picked** when no node is under the pointer (`pick` first):
+  `pickEdge` gives the edge nearest the pixel, within the tolerance, of the
+  edges that are drawn (not removed, and with neither end hidden); of
+  parallel edges, the first. It is a linear pass over the edges, each
+  rejected by its bounding box as a rule, so it is for a click, not for
+  every pointer move, until the view has a spatial grid.
+- Nodes are selected or an edge is, never both: `selectEdge` clears the
+  nodes, and a click on a node or on empty space deselects the edge. The
+  selected edge is drawn wide, as a selection's edges are, and leaves the
+  selection when it or one of its ends is removed or hidden.
 
 In Rust: `interact::Selection` (`click`, `set`, `add`, `toggle`, `clear`,
-`retain`, `incident_edges`) and `interact::Interact`.
+`retain`, `incident_edges`), `interact::nearest_edge`, and
+`interact::Interact` (`click`, `select_edge`, `edge`, `clear`).
 
 How it is drawn, on WebGL2 as on WebGPU:
 
