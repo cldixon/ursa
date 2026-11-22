@@ -719,13 +719,13 @@ fn find_out_what_is_available_matches_getting_started() {
     assert_eq!(
         out,
         "\
-┌───────────────────┬────────────┬────────┬─────────────┬──────────────┬────────────┐
-│       name        │ edge_table │ source │ destination │ vertex_table │ vertex_key │
-│       Utf8        │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
-├───────────────────┼────────────┼────────┼─────────────┼──────────────┼────────────┤
-│ karate            │ ties       │ src    │ dst         │ members      │ id         │
-│ karate_edges_only │ ties       │ src    │ dst         │ NULL         │ NULL       │
-└───────────────────┴────────────┴────────┴─────────────┴──────────────┴────────────┘
+┌───────────────────┬────────────┬────────┬─────────────┬──────────────┬────────────┬────────┬────────┐
+│       name        │ edge_table │ source │ destination │ vertex_table │ vertex_key │ status │ reason │
+│       Utf8        │    Utf8    │  Utf8  │    Utf8     │     Utf8     │    Utf8    │  Utf8  │  Utf8  │
+├───────────────────┼────────────┼────────┼─────────────┼──────────────┼────────────┼────────┼────────┤
+│ karate            │ ties       │ src    │ dst         │ members      │ id         │ ok     │ NULL   │
+│ karate_edges_only │ ties       │ src    │ dst         │ NULL         │ NULL       │ ok     │ NULL   │
+└───────────────────┴────────────┴────────┴─────────────┴──────────────┴────────────┴────────┴────────┘
 ┌────────────┬─────────────┬───────────┬─────────────┬──────────────┐
 │ table_name │ column_name │ data_type │    role     │    origin    │
 │    Utf8    │    Utf8     │   Utf8    │    Utf8     │     Utf8     │
@@ -750,8 +750,8 @@ fn find_out_what_is_available_matches_getting_started() {
     assert_eq!(
         out,
         "\
-[{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\"},\
-{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":null,\"vertex_key\":null}]
+[{\"name\":\"karate\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":\"members\",\"vertex_key\":\"id\",\"status\":\"ok\",\"reason\":null},\
+{\"name\":\"karate_edges_only\",\"edge_table\":\"ties\",\"source\":\"src\",\"destination\":\"dst\",\"vertex_table\":null,\"vertex_key\":null,\"status\":\"ok\",\"reason\":null}]
 [{\"table_name\":\"nodes\",\"column_name\":\"id\",\"data_type\":\"Int64\",\"role\":\"node id\",\"origin\":\"ties.src, ties.dst\"},\
 {\"table_name\":\"edges\",\"column_name\":\"src\",\"data_type\":\"Int64\",\"role\":\"source\",\"origin\":\"ties.src\"},\
 {\"table_name\":\"edges\",\"column_name\":\"dst\",\"data_type\":\"Int64\",\"role\":\"destination\",\"origin\":\"ties.dst\"}]
@@ -779,12 +779,12 @@ fn a_graph_over_file_paths() {
     assert_eq!(
         ok(ursa(&["-c", &sql])),
         "\
-┌────────────┬──────────────────────────────────────────────────┬────────┬─────────────┬──────────────┬────────────┐
-│    name    │                    edge_table                    │ source │ destination │ vertex_table │ vertex_key │
-│    Utf8    │                       Utf8                       │  Utf8  │    Utf8     │     Utf8     │    Utf8    │
-├────────────┼──────────────────────────────────────────────────┼────────┼─────────────┼──────────────┼────────────┤
-│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src    │ dst         │ NULL         │ NULL       │
-└────────────┴──────────────────────────────────────────────────┴────────┴─────────────┴──────────────┴────────────┘
+┌────────────┬──────────────────────────────────────────────────┬────────┬─────────────┬──────────────┬────────────┬────────┬────────┐
+│    name    │                    edge_table                    │ source │ destination │ vertex_table │ vertex_key │ status │ reason │
+│    Utf8    │                       Utf8                       │  Utf8  │    Utf8     │     Utf8     │    Utf8    │  Utf8  │  Utf8  │
+├────────────┼──────────────────────────────────────────────────┼────────┼─────────────┼──────────────┼────────────┼────────┼────────┤
+│ florentine │ 'python/ursa/datasets/data/florentine_edges.csv' │ src    │ dst         │ NULL         │ NULL       │ ok     │ NULL   │
+└────────────┴──────────────────────────────────────────────────┴────────┴─────────────┴──────────────┴────────────┴────────┴────────┘
 ┌──────────┬────────┐
 │    id    │ degree │
 │   Utf8   │ UInt32 │
