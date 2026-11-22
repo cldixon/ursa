@@ -131,7 +131,7 @@ fn path(n: u32) -> Edges {
 /// Every edge row kept unless the seeded draw drops it (about a third).
 fn mask(m: usize, seed: u64) -> EdgeMask {
     let mut st = seed;
-    let keep: Vec<bool> = (0..m).map(|_| next(&mut st) % 3 != 0).collect();
+    let keep: Vec<bool> = (0..m).map(|_| !next(&mut st).is_multiple_of(3)).collect();
     EdgeMask::from_bools(&keep)
 }
 

@@ -735,6 +735,28 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   On a 32M-edge, 2.1M-node R-MAT graph with 105 sources on 4 threads: peak
   RSS 1,019 MB to 814 MB (the graph alone is 576 MB), time unchanged (61 s
   and 60 s, within the noise of a shared machine).
+- **Unweighted closeness uses a sixth of the CPU or less, with the same
+  results** (#422). `closeness` ran one breadth-first search per node. It now
+  runs 64 sources per pass, one bit of a 64-bit word per source (multi-source
+  BFS, Then et al., VLDB 2014), so a node's adjacency list is read once per
+  level on which any of the 64 searches reaches it, not once per search. Each
+  source's distance sum and reach count are the same integers as before, so
+  every score is the same `f64`, bit for bit, in every direction and under an
+  edge mask: a new test pins golden hashes recorded before the change (karate,
+  R-MAT, a disconnected graph with isolated nodes, a sparse directed graph, a
+  long path; masked and not) and compares with a per-source search, and the
+  thread-count test now covers unweighted closeness. Weighted closeness
+  (Dijkstra) is unchanged. On R-MAT graphs of 65,536 nodes on a shared 4-core
+  machine (best of two runs):
+
+  | graph | before | now |
+  |---|---|---|
+  | 1M edges, `out` | 38.3 s, 119 CPU-s | 6.4 s, 19.8 CPU-s |
+  | 1M edges, `in` | 62.8 s, 123 CPU-s | 14.0 s, 20.5 CPU-s |
+  | 1M edges, `both` | 87.5 s, 309 CPU-s | 13.0 s, 34.9 CPU-s |
+  | 2M edges, `out` | 92.6 s, 213 CPU-s | 15.9 s, 29.5 CPU-s |
+
+  Each thread holds 16 bytes per node (was 4), plus its frontier list.
 - **Unweighted Louvain holds about half the memory, with the same
   communities** (#450). An unweighted run's level-0 working graph stored an
   8-byte `f64` per adjacency slot for a weight that counts parallel edges
