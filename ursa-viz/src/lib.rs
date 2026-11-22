@@ -13,6 +13,10 @@
 //!   which slots a delta changes, in time proportional to the delta. No GPU.
 //! - [`interact`]: the selection set and the hovered node: what a click
 //!   selects. No GPU.
+//! - [`budget`]: the frame budget: how much a frame draws while the view
+//!   moves, from what the last frames cost. No GPU.
+//! - [`order`]: the edges' drawing order, most important first, so that a
+//!   prefix of them is a backbone of the drawing. No GPU.
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
 //!   stepped a few iterations per frame, and grown when the graph gains
 //!   nodes), node styles and the camera. No GPU.
@@ -25,7 +29,8 @@
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
 //! With `default-features = false` the crate is [`model`], [`scene`],
-//! [`highlight`], [`interact`], [`live`], [`budget`] and [`order`] alone: no GPU and no browser, which is how the engine depends on it.
+//! [`highlight`], [`interact`], [`live`], [`budget`] and [`order`] alone:
+//! no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 

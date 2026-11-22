@@ -1366,10 +1366,10 @@ export function info() {
     busy: [...current.busy.keys()].map(node),
     notShownKnown: current.notShown !== null,
     frames,
-    // The frame budget (#495): {k, edges, ordered, p95, frames, limit}
-    // (GraphView.frameInfo), and the ms the layout worker took to order
-    // the edges (null until it has).
-    frame: { ...current.view.frameInfo(), orderMs: current.orderMs },
+    // The frame budget (#495): {k, nodes, edges, ordered, p95, frames, limit}
+    // (GraphView.frameInfo), whether the last frame left anything out, and
+    // the ms the layout worker took to order the edges (null until it has).
+    frame: { ...current.view.frameInfo(), partial: current.view.framePartial, orderMs: current.orderMs },
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,

@@ -892,15 +892,24 @@ for (const scheme of ["light", "dark"] as const) {
     const types = (m: any[]) => m.map((x) => x.type).join(",");
     const ringXy: number[] = fixed.rings[0]?.xy ?? [];
     const radii = [0, 1, 2, 3, 4, 5].map((v) => Math.hypot(ringXy[v], ringXy[6 + v]));
+    // (After the positions, once, the order to draw the edges in: #495.)
     check(
-      types(fixed.rings) === "positions,done" && fixed.rings[0].total === 0 && radii.every((r, v) => Math.abs(r - [0, 1, 1, 1, 2, 2][v]) < 1e-5),
+      types(fixed.rings) === "positions,order,done" && fixed.rings[0].total === 0 && radii.every((r, v) => Math.abs(r - [0, 1, 1, 1, 2, 2][v]) < 1e-5),
       "the layout worker lays out rings in one message: each node at its distance",
       `${types(fixed.rings)}; radii ${radii.map((r) => r.toFixed(3))}`,
     );
     check(
-      types(fixed.layers) === "positions,done" && JSON.stringify(fixed.layers[0].xy) === JSON.stringify([-1, 0, 0, 0, 1, 1, 0, 0.5, 0, -0.5, 0.25, -0.25]),
+      types(fixed.layers) === "positions,order,done" && JSON.stringify(fixed.layers[0].xy) === JSON.stringify([-1, 0, 0, 0, 1, 1, 0, 0.5, 0, -0.5, 0.25, -0.25]),
       "the layout worker lays out layers in one message: each layer a line, left to right",
       `${types(fixed.layers)}; ${JSON.stringify(fixed.layers[0]?.xy)}`,
+    );
+    // With no hierarchy, the edges at the nodes of highest degree are
+    // first: node 0's and node 2's (degree 3 each), all five here, each once.
+    const ringOrder: number[] = Array.from(fixed.rings[1]?.order ?? []);
+    check(
+      ringOrder.length === 5 && [...ringOrder].sort().join() === "0,1,2,3,4" && fixed.rings[1].ms >= 0,
+      "the layout worker posts the order to draw the edges in, once: a permutation of them",
+      JSON.stringify(ringOrder),
     );
     check(types(fixed.other) === "error" && fixed.other[0].message === "no layout called spiral", "the layout worker refuses a layout it does not know", JSON.stringify(fixed.other));
   }
@@ -2011,6 +2020,48 @@ for (const scheme of ["light", "dark"] as const) {
     "a big graph: its status within a second, then its layout's levels, then Done",
     `"${first?.[1]}" at ${Math.round((first?.[0] ?? 0) - enter)} ms; levels ${JSON.stringify(laying.slice(0, 3))}…; ms after Enter ${JSON.stringify(times)}`,
   );
+  // #495: the frame budget, on the million edges. The layout worker's order
+  // of the edges is in the view; a wheel zoom, an event an animation frame,
+  // is drawn in frames 50 ms apart at most (the 95th percentile; twice that
+  // is allowed here, for a machine busy with other things), each with a
+  // prefix of the edges and the largest nodes; and once the view rests, a
+  // frame with everything.
+  {
+    await r.waitForFunction(() => (window as any).ursaShell.graph()?.frame.ordered === 1_000_000, null, { timeout: 30_000, polling: 100 }).catch(() => {});
+    const before = await graphInfo(r);
+    const box = (await r.locator("#graph-stage canvas").boundingBox())!;
+    await r.evaluate(() => (window as any).ursaShell.graphTimingsReset());
+    const moving: any = await r.evaluate(
+      ([x, y]) =>
+        new Promise((done) => {
+          const canvas = document.querySelector("#graph-stage canvas")!;
+          const began = performance.now();
+          const step = () => {
+            const t = performance.now() - began;
+            if (t >= 2_000) return done((window as any).ursaShell.graph().frame);
+            canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: t < 1_000 ? -30 : 30, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+            requestAnimationFrame(step);
+          };
+          requestAnimationFrame(step);
+        }),
+      [box.x + box.width / 2, box.y + box.height / 2],
+    );
+    const zoomed = (await r.evaluate(() => (window as any).ursaShell.graphTimings())).frames;
+    check(
+      before.frame.ordered === 1_000_000 && before.frame.edges === 1_000_000 && before.frame.orderMs >= 0,
+      "a big graph: the layout worker's order of the edges is in the view",
+      JSON.stringify(before.frame),
+    );
+    check(
+      zoomed.interval.count >= 20 && zoomed.interval.p95 <= 100 && moving.partial && moving.k >= 256 && moving.k < 1_000_000 && moving.nodes >= 64 && moving.frames >= 20 && moving.p95 > 0,
+      "a big graph: a wheel zoom is drawn in frames at most 50 ms apart (p95; 100 allowed), each a prefix of the edges",
+      `intervals ${JSON.stringify(zoomed.interval)}; ${JSON.stringify(moving)}`,
+    );
+    const rested = await r
+      .waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 60_000, polling: 100 })
+      .then(() => true, () => false);
+    check(rested, "a big graph: at rest, a frame with every edge", JSON.stringify((await graphInfo(r)).frame));
+  }
   // #445: a key search on the million edges answers within 50 ms (the
   // engine's round trip; drawing the selection is the view's, after it).
   {

@@ -228,6 +228,31 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **A frame budget for the graph view: pan and zoom no longer wait for the
+  graph's size** (#495). While the camera or the positions change, a frame
+  draws a prefix of the edges and, where the nodes are too many as well,
+  the largest of them: as much as the last frames' costs say fits in a
+  frame (12 ms, or 1.3 of the display's refresh periods). At rest, 200 ms
+  after the last movement, it draws everything, the same pixels as before.
+  The edges are in importance order, so a prefix is a backbone of the
+  drawing: by the level of the layout's hierarchy at which an edge's two
+  ends merge, coarsest first, then one edge of each merged edge a round, the
+  heaviest first, then a hash (`Fa2Multilevel::edge_order` in `ursa-core`;
+  by the larger degree of the two ends where there is no hierarchy:
+  `edge_order_by_degree`). The layout worker computes the order once
+  (0.3 s at 1M edges) and the view writes it to the GPU a piece at a time.
+  `ursa-viz` gains `budget` (the controller: it searches for the largest
+  budget that fits, since a browser's frame cost is whole refresh periods)
+  and `order`; `View::draw_frame`, `set_edge_order` and `frame_info`; and
+  in the wasm API `renderFrame`, `frameCost`, `framePartial`, `keepMoving`,
+  `setEdgeOrder`, `orderEdges`, `frameInfo` (also `info().frame`) and
+  `Layout.edgeOrder`. On `.graph rmat` (1M edges) in headless Chromium's
+  software WebGL2, frames of a scripted wheel zoom are 29 ms apart at the
+  95th percentile (3.3 s before), the first frame is shown 1.5 s after Enter
+  (6.0 s) and the layout is done at 5.8 s (10.6 s), the page no longer
+  rasterising a million edges for each set of positions; that renderer fits
+  512 edges and 170 nodes in a frame. Not measured on a GPU
+  (`ursa-viz/BENCH.md`).
 - **Ursa Web Shell: the Graph view times itself** (#430).
   `window.ursaShell.graphTimings()` gains `frames` (the count, and the p50,
   p95 and max of the time in `render()` and of the time between frames

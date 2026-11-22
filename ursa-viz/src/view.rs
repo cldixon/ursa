@@ -11,7 +11,7 @@ use crate::budget::{split, total_units, Frame, FrameBudget};
 use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
-use crate::order::{BadOrder, EdgeSlots};
+use crate::order::{check_order, BadOrder, Ordered};
 use crate::pace::{ready, yield_now, Pace};
 use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
@@ -55,9 +55,9 @@ pub struct View {
     fitted: Option<Fitted>,
     /// How many edges a frame draws while the view moves.
     budget: FrameBudget,
-    /// Where each edge is in the renderer's edge buffer: in the slot of its
-    /// index, until [`View::set_edge_order`].
-    slots: EdgeSlots,
+    /// How many edges are drawn in importance order
+    /// ([`View::set_edge_order`]): the first ones.
+    ordered: Ordered,
     /// An order being written to the GPU ([`View::order_edges`]).
     reorder: Option<Reorder>,
     /// The nodes a moving frame draws when it cannot draw them all.
@@ -81,7 +81,6 @@ struct SomeNodes {
 struct Reorder {
     /// `order[slot]` is the edge to draw in that slot.
     order: Vec<u32>,
-    slots: EdgeSlots,
     /// The new buffer, and how many of its slots are written.
     buffer: wgpu::Buffer,
     written: usize,
@@ -315,7 +314,7 @@ impl View {
             layout_stale: false,
             fitted: None,
             budget: FrameBudget::new(),
-            slots: EdgeSlots::identity(),
+            ordered: Ordered::default(),
             reorder: None,
             some: SomeNodes::default(),
             moving_drew: (0, 0),
@@ -440,33 +439,29 @@ impl View {
                 .write_styles(queue, run.start, &radius[run.clone()], color);
         }
         let new_edges = changes.new_edges_from..m1;
-        if changes.new_edges_from < self.slots.ordered() {
-            // Edges the order was made for are gone (an undo past them),
-            // so it no longer fills the first slots: every edge goes back
-            // to the slot of its index.
-            self.slots = EdgeSlots::identity();
-            let mut start = 0;
-            while start < m1 {
-                let run = start..m1.min(start + EDGE_RUN);
-                let lines = live.line_indices(run.clone());
-                bytes += self.renderer.write_edges(queue, start, &lines);
-                start = run.end;
-            }
-        } else {
+        let runs = if self
+            .ordered
+            .keeps(changes.new_edges_from, &changes.edge_runs)
+        {
             // New edges go after the ones there are, in the slots of their
-            // indexes, whatever the order of the rest.
-            let lines = live.line_indices(new_edges.clone());
-            bytes += self.renderer.write_edges(queue, new_edges.start, &lines);
-            for run in &changes.edge_runs {
-                if run.start >= self.slots.ordered() {
-                    let lines = live.line_indices(run.clone());
-                    bytes += self.renderer.write_edges(queue, run.start, &lines);
-                    continue;
-                }
-                for (slot, edges) in self.slots.slot_runs(run.clone()) {
-                    let lines = live.lines_of(&edges);
-                    bytes += self.renderer.write_edges(queue, slot, &lines);
-                }
+            // indexes, whatever the order of the rest; and so are the
+            // edges added since the order that change now.
+            std::iter::once(new_edges).chain(changes.edge_runs.iter().cloned())
+        } else {
+            // An ordered edge changed, or ordered edges are gone (an undo
+            // past them): the view does not know its slot
+            // ([`crate::order`]), so every edge goes back to the slot of
+            // its index.
+            self.ordered = Ordered::default();
+            std::iter::once(0..m1).chain([].iter().cloned())
+        };
+        for run in runs {
+            let mut start = run.start;
+            while start < run.end {
+                let piece = start..run.end.min(start + EDGE_RUN);
+                let lines = live.line_indices(piece.clone());
+                bytes += self.renderer.write_edges(queue, start, &lines);
+                start = piece.end;
             }
         }
         if changes.highlights {
@@ -981,7 +976,9 @@ impl View {
     /// [`LiveLayout::edge_order`]). Edges after those stay after them, in
     /// index order. A frame that draws every edge is the same pixels in any
     /// order; the order is for the frames that draw a prefix
-    /// ([`View::draw_frame`]).
+    /// ([`View::draw_frame`]). A delta that removes or restores an ordered
+    /// edge, or takes ordered edges off, puts every edge back in index
+    /// order ([`crate::order`]).
     ///
     /// Nothing is written here: [`View::order_edges`] writes the edges to
     /// a new buffer, a run at a time, and the frames draw the old one until
@@ -991,10 +988,9 @@ impl View {
         device: &wgpu::Device,
         order: Vec<u32>,
     ) -> Result<(), BadOrder> {
-        let slots = EdgeSlots::from_order(&order, self.graph.n_edges())?;
+        check_order(&order, self.graph.n_edges())?;
         self.reorder = Some(Reorder {
             order,
-            slots,
             buffer: self.renderer.edge_buffer(device),
             written: 0,
         });
@@ -1043,7 +1039,7 @@ impl View {
             return true;
         }
         self.renderer.replace_edges(reorder.buffer);
-        self.slots = reorder.slots;
+        self.ordered = Ordered(ordered);
         false
     }
 
@@ -1061,11 +1057,6 @@ impl View {
         }
     }
 
-    /// Where each edge is in the renderer's edge buffer.
-    pub fn edge_slots(&self) -> &EdgeSlots {
-        &self.slots
-    }
-
     /// The frame budget: how many edges a frame draws while the view moves.
     pub fn budget(&self) -> &FrameBudget {
         &self.budget
@@ -1077,7 +1068,7 @@ impl View {
             k: self.moving_drew.1,
             nodes: self.moving_drew.0,
             edges: self.renderer.counts().1,
-            ordered: self.slots.ordered(),
+            ordered: self.ordered.0,
             p95: self.budget.p95_ms(),
             frames: self.budget.observed(),
             limit: self.budget.limit_ms(),

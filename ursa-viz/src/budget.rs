@@ -39,10 +39,10 @@
 //! A frame fits if it costs no more than [`TARGET_MS`], or, where the
 //! display's period is longer than that, 1.3 periods (22 ms at 60 Hz: one
 //! period, with room for the timer's jitter). A device that cannot show
-//! even the least budget ([`MIN_UNITS`]) in that time has a floor of its
-//! own (a software renderer takes 20 to 35 ms to show an empty canvas):
-//! there a frame fits if it costs no more than 1.3 times the floor, up to
-//! [`MAX_LIMIT_MS`].
+//! even the least budget ([`MIN_UNITS`]) in that time stays at the least: a
+//! software renderer takes 20 to 30 ms to show a canvas with next to
+//! nothing on it, and draws 170 nodes and 512 edges of a million while it
+//! moves.
 //!
 //! A new view starts at [`FIRST_UNITS`] and doubles its budget every frame
 //! that fits, until one does not: a million edges by the seventh frame, if
@@ -53,9 +53,6 @@ pub const TARGET_MS: f64 = 12.0;
 /// How long after the last movement the view is at rest, in milliseconds:
 /// everything is drawn again.
 pub const REST_MS: f64 = 200.0;
-/// The most a moving frame is held to, on a device whose floor is above
-/// the target: under the 50 ms a frame may take anywhere.
-pub const MAX_LIMIT_MS: f64 = 45.0;
 /// The budget a new view starts with, in units.
 pub const FIRST_UNITS: usize = 1 << 14;
 /// The least budget: a moving frame never draws less than this, or than
@@ -137,9 +134,6 @@ pub struct FrameBudget {
     /// The shortest frame seen: the display's refresh period, if shorter
     /// than 60 Hz's.
     period: f64,
-    /// The shortest frame seen that drew the least budget and still did
-    /// not fit: what this device takes to show anything.
-    floor: Option<f64>,
     /// When the view last moved, and whether it has since the last frame.
     last_move: f64,
     moved: bool,
@@ -168,7 +162,6 @@ impl FrameBudget {
             fitted: 0,
             struck: false,
             period: PERIOD_MS,
-            floor: None,
             last_move: f64::NEG_INFINITY,
             moved: false,
             drawn: (0, 0),
@@ -215,15 +208,9 @@ impl FrameBudget {
     }
 
     /// The cost a frame is held to: [`TARGET_MS`], or 1.3 of the display's
-    /// refresh periods if that is more, or 1.3 times what the device takes
-    /// to show the least budget if that is more still, up to
-    /// [`MAX_LIMIT_MS`].
+    /// refresh periods if that is more.
     pub fn limit_ms(&self) -> f64 {
-        let limit = TARGET_MS.max(1.3 * self.period);
-        match self.floor {
-            Some(floor) => limit.max((1.3 * floor).min(MAX_LIMIT_MS)),
-            None => limit,
-        }
+        TARGET_MS.max(1.3 * self.period)
     }
 
     /// The last moving frame cost `cost_ms`: from its start to when the
@@ -241,15 +228,6 @@ impl FrameBudget {
         self.period = self.period.min(cost_ms.max(8.0));
         let (drawn, edges) = self.drawn;
         let all = drawn >= edges;
-        if drawn <= MIN_UNITS && !all {
-            // Nothing less to draw. If it did not fit, that is the
-            // device's floor; if it fits the target, the device has none.
-            if cost_ms > self.limit_ms() {
-                self.floor = Some(self.floor.map_or(cost_ms, |f| f.min(cost_ms)));
-            } else if cost_ms <= TARGET_MS.max(1.3 * self.period) {
-                self.floor = None;
-            }
-        }
         let fit = cost_ms <= self.limit_ms();
         let hold = if self.starting { 1 } else { HOLD };
         if !fit && std::mem::take(&mut self.starting) {
@@ -581,41 +559,6 @@ mod tests {
         }
         assert_eq!(budget.p95_ms(), Some(17.0));
         assert_eq!(budget.observed(), 102 + WINDOW);
-    }
-
-    #[test]
-    fn a_device_with_a_floor_is_held_to_it() {
-        // Software that takes 25 ms to show anything, and 5 µs an edge
-        // after that: the least budget does not fit 22 ms, so a frame fits
-        // at 1.3 times the floor, and the budget grows to that.
-        let device = Device {
-            fixed: 25.0,
-            per_edge: 5e-3,
-            period: None,
-        };
-        let mut budget = FrameBudget::new();
-        let ks = run(&mut budget, device, M, 1500);
-        let floor = device.cost(MIN_UNITS);
-        assert!((budget.limit_ms() - 1.3 * floor).abs() < 1e-9);
-        let settled = &ks[500..];
-        let best = device.fits(budget.limit_ms(), M) as f64;
-        let (lo, hi) = (
-            *settled.iter().min().unwrap() as f64,
-            *settled.iter().max().unwrap() as f64,
-        );
-        assert!(
-            lo >= 0.85 * best && hi <= 1.1 * best,
-            "{lo}..{hi} of {best}"
-        );
-        assert!(budget.p95_ms().unwrap() as f64 <= MAX_LIMIT_MS);
-        // However slow, never more than 45 ms is called fitting.
-        let mut budget = FrameBudget::new();
-        let slow = Device {
-            fixed: 70.0,
-            ..device
-        };
-        run(&mut budget, slow, M, 100);
-        assert_eq!(budget.limit_ms(), MAX_LIMIT_MS);
     }
 
     #[test]

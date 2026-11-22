@@ -358,6 +358,34 @@ static assets and an R2 bucket.
     of 219 MiB for the page and its workers. On karate: frames 16.7 ms
     apart (p95 20 ms), `render()` 1.4 ms, a pick 0.2 ms.
 
+  - **The frame budget** (#495): while the view moves (a pan, a zoom, a
+    layout still running) a frame draws only what fits in one: a prefix of
+    the edges, most important first, and the largest nodes if the nodes are
+    too many as well. Once nothing has moved for 200 ms, and the layout is
+    done, a frame draws everything. `graph.js` draws with
+    `view.renderFrame(now)`, tells the view what each moving frame cost (the
+    time to the next animation frame: `view.frameCost`), and sets a timer
+    for the frame at rest when one left something out. The layout worker
+    posts the edges' importance order once, after its first positions
+    (`{type: "order", order, ms}`, from the layout's hierarchy:
+    `Layout.edgeOrder`), and the view writes it to the GPU a piece a task.
+    A result that comes with removed nodes or edges is drawn in index
+    order: the worker is sent only the edges shown, so its numbering is not
+    the view's. `window.ursaShell.graph().frame` says what the budget is
+    doing: `{k, nodes, edges, ordered, p95, frames, limit, partial,
+    orderMs}` (the edges and nodes the last moving frame drew, the edges
+    there are, how many are in importance order, the p95 and count of the
+    moving frames' costs, the ms a frame is held to, whether the last frame
+    left anything out, and the ms the worker took to order the edges).
+
+    On `.graph rmat` (1M edges, headless Chromium, software WebGL2, three
+    runs, 2026-11-22), frames of the scripted wheel zoom are 25 to 46 ms
+    apart at the p95 (3.3 s before), each with 512 edges and 170 nodes,
+    which is what that renderer shows in a frame; the first frame is shown
+    1.5 s after Enter (6.0 s), the layout is done at 5.8 s (10.6 s), and a
+    click's frame comes 0.12 s after it (3.4 s). `tests/graph-timing.ts`
+    fails a run whose p95 is over 50 ms; the e2e allows 100.
+
     The layout worker (`graph-worker.js`) also lays out **rings and layers**
     (#436): a graph that carries `layout: {kind: "rings" | "layers", level}`,
     each node's distance from a seed or its layer, is laid out in one
@@ -509,7 +537,7 @@ its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
 ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
-exploration to the same counts); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+exploration to the same counts; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and
