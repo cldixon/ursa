@@ -32,6 +32,17 @@
 //                                               null when nothing changed;
 //                                               `nodes` and `edges` are how many
 //                                               are shown after it)
+//   find      {command}        -> {out, err, selected, matches, notShown,
+//                                   notShownTotal}  (.find TEXT or .find WHERE
+//                                               condition on the open graph; see
+//                                               WebShell.find. `selected` is the
+//                                               view's indexes of the matches it
+//                                               shows, a Uint32Array of at most
+//                                               1,000, transferred; `matches` how
+//                                               many there are; `notShown` the
+//                                               first matches it does not show,
+//                                               [{key, hidden}], of
+//                                               `notShownTotal`)
 //   notShown  {}               -> {counts}       (for each node slot of the open
 //                                               graph, how many of its edges in
 //                                               the property graph lead to
@@ -130,6 +141,12 @@ async function handle({ id, op, ...args }) {
       const reply = { id, ok: true, out: e.out, err: e.err, delta: bytes.length ? bytes : null, nodes: e.nodes, edges: e.edges };
       e.free();
       postMessage(reply, reply.delta ? [reply.delta.buffer] : []);
+    } else if (op === "find") {
+      const f = await shell.find(args.command);
+      const selected = f.takeSelected();
+      const reply = { id, ok: true, out: f.out, err: f.err, selected, matches: f.matches, notShown: JSON.parse(f.notShown), notShownTotal: f.notShownTotal };
+      f.free();
+      postMessage(reply, [selected.buffer]);
     } else if (op === "notShown") {
       const counts = await shell.notShown();
       postMessage({ id, ok: true, counts }, [counts.buffer]);

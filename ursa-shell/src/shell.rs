@@ -32,6 +32,7 @@ use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDial
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
 use futures::TryStreamExt;
+use ursa_engine::graph::view::find::Found as FoundNodes;
 use ursa_engine::graph::view::{self, Command as ExploreCommand, Session as ExploreSession};
 use ursa_viz::model::GraphDelta;
 
@@ -155,6 +156,13 @@ pub const EXPLORE_COMMANDS: &[(&str, &str, &str)] = &[
         "ID ?in|out|both? ?LIMIT n? ?--sql?",
         "Add a node's neighbours to the graph drawn, and the edges among its nodes: the 100 of \
          highest degree that are not shown, or LIMIT n; --sql prints the SQL instead",
+    ),
+    (
+        ".find",
+        "TEXT|WHERE condition ?--sql?",
+        "Select the nodes of the graph drawn that match, and fit them in view: a key that starts \
+         with TEXT or a label column that contains it, or a condition on the vertex table's \
+         columns (.find WHERE club = 'Officer'); it names the matches that are not shown",
     ),
     (
         ".graph",
@@ -384,6 +392,32 @@ impl<O: Write, E: Write> Shell<O, E> {
             Ok(outcome) => {
                 self.say(&outcome.text);
                 outcome.delta
+            }
+            Err(e) => {
+                self.error(&ursa_engine::user_message(&e));
+                None
+            }
+        }
+    }
+
+    /// Run `.find` on the open graph (`.find 33`, `.find WHERE club =
+    /// 'Officer'`; `line` is the whole line, as [`Flow::Host`] hands it
+    /// back): it prints how many nodes matched and names the matches that
+    /// are not shown, and gives what it found for the host's view to select
+    /// and fit. The graph does not change. With `--sql` it prints its SQL
+    /// and finds nothing.
+    ///
+    /// An error (no open graph, a condition no vertex table can answer) is
+    /// printed as the shell's errors are.
+    pub async fn find(&mut self, line: &str) -> Option<FoundNodes> {
+        let ran = match &self.explorer {
+            None => Err(DataFusionError::Plan(NO_GRAPH.into())),
+            Some(session) => view::find::find(session, &self.ctx, &ursa_sql::Sql, line).await,
+        };
+        match ran {
+            Ok(found) => {
+                self.say(&found.text);
+                Some(found)
             }
             Err(e) => {
                 self.error(&ursa_engine::user_message(&e));
@@ -1552,6 +1586,10 @@ fn edit_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 #[path = "explore_tests.rs"]
 mod explore_tests;
+
+#[cfg(test)]
+#[path = "find_tests.rs"]
+mod find_tests;
 
 #[cfg(test)]
 mod tests {

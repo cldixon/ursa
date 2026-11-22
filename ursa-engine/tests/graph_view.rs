@@ -1081,3 +1081,82 @@ async fn an_expansion_is_capped_by_degree_then_key_and_is_the_same_every_time() 
         "the same bytes every time"
     );
 }
+
+/// `.find` (#445) on DataFusion's SQL alone: its statements, and what they
+/// select of a view and name outside it. The command as a shell runs it is
+/// tested in `ursa-shell` (`find_tests.rs`).
+#[tokio::test]
+async fn find_asks_the_vertex_table_and_splits_the_view_from_the_graph() {
+    use ursa_engine::graph::view::find::{find, NotShown};
+    use ursa_engine::graph::view::Session;
+
+    let ctx = karate().await;
+    let base = interpreted(
+        &ctx,
+        "SELECT * FROM hop(karate, seeds => [16], n => 1, direction => 'both')",
+    )
+    .await
+    .result;
+    let session = Session::new(base.clone());
+    let keys = |nodes: &[u32]| -> Vec<String> {
+        let all = session.result().node_keys();
+        nodes.iter().map(|&i| all.get(i as usize).into()).collect()
+    };
+
+    // A key: the key itself, then the keys it starts; the label column last.
+    let found = find(&session, &ctx, &DataFusionSql, ".find 6")
+        .await
+        .unwrap();
+    assert_eq!(
+        found.sql,
+        ["SELECT CAST(\"id\" AS VARCHAR) AS node, \
+          CASE WHEN lower(CAST(\"id\" AS VARCHAR)) = '6' THEN 0 \
+          WHEN starts_with(lower(CAST(\"id\" AS VARCHAR)), '6') THEN 1 ELSE 2 END AS rank \
+          FROM members \
+          WHERE starts_with(lower(CAST(\"id\" AS VARCHAR)), '6') \
+          OR strpos(lower(\"club\"), '6') > 0 ORDER BY rank, \"id\""]
+    );
+    assert_eq!(keys(&found.selected), ["6"]);
+    assert_eq!((found.matches, found.not_shown_total), (1, 0));
+    assert_eq!(found.text, "Selected 1 node");
+
+    // A condition: the rows of the vertex table, those drawn selected.
+    let found = find(
+        &session,
+        &ctx,
+        &DataFusionSql,
+        ".find WHERE club = 'Mr. Hi' AND id BETWEEN 4 AND 7",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        found.sql,
+        ["SELECT CAST(\"id\" AS VARCHAR) AS node FROM members \
+          WHERE (club = 'Mr. Hi' AND id BETWEEN 4 AND 7) ORDER BY \"id\""]
+    );
+    assert_eq!(keys(&found.selected), ["5", "6"]);
+    let outside = |key: &str| NotShown {
+        key: key.into(),
+        hidden: false,
+    };
+    assert_eq!(found.not_shown, [outside("4"), outside("7")]);
+    assert_eq!(found.text, "Selected 2 nodes\nNot shown: 4, 7");
+
+    // The same answer every time, and the session is as it was.
+    let again = find(&session, &ctx, &DataFusionSql, ".find WHERE id < 20")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let next = find(&session, &ctx, &DataFusionSql, ".find WHERE id < 20")
+            .await
+            .unwrap();
+        assert_eq!(next, again);
+    }
+    assert_eq!(*session.result(), base);
+    assert!(session.steps().is_empty());
+
+    let e = find(&session, &ctx, &DataFusionSql, ".find WHERE rank > 1")
+        .await
+        .unwrap_err();
+    assert!(user_message(&e).contains("rank"), "{}", user_message(&e));
+}

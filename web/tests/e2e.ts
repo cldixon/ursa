@@ -1470,6 +1470,130 @@ for (const scheme of ["light", "dark"] as const) {
     const closed = await said(".expand 2");
     check(closed.includes(squeezed("Error: no graph is open")), "with the pane closed, .expand says no graph is open", closed.slice(0, 80));
   }
+  // Search and focus (#445): `/` in the pane and .find in the terminal select
+  // the nodes that match and fit them; f fits the selection; the matches the
+  // view does not show are listed.
+  {
+    const found = (): Promise<any> => s.evaluate(() => (window as any).ursaShell.found());
+    const said = async (line: string) => {
+      await type(line, s);
+      return squeezed(await after(line, s));
+    };
+    const status = async () => (await s.locator("#graph-status").textContent()) ?? "";
+    // The selection's box, in CSS pixels of the canvas, once the camera rests.
+    const fitted = async () => {
+      await s.waitForFunction(() => !(window as any).ursaShell.graph()?.fitting, null, { timeout: 10_000 });
+      await s.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
+      return s.evaluate(() => {
+        const shell = (window as any).ursaShell;
+        const canvas = document.querySelector("#graph-stage canvas")!;
+        const at = shell.graph().selection.map((n: any) => shell.graphNodePlace(n.id));
+        const xs = at.map((p: any) => p.x);
+        const ys = at.map((p: any) => p.y);
+        const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+        return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth, height: canvas.clientHeight, ids: shell.graph().selection.map((n: any) => String(n.id)) };
+      });
+    };
+    const centred = (b: any) => Math.abs(b.cx - b.width / 2) <= 2 && Math.abs(b.cy - b.height / 2) <= 2;
+    const before = await errors(s);
+    await type(".graph karate", s);
+    await graphSettled(s);
+
+    // `/` opens the box in the pane's header; Enter runs .find in the shell.
+    await s.focus("#graph-stage canvas");
+    await s.keyboard.press("/");
+    const box = await s.evaluate(() => ({ open: !document.getElementById("graph-search")!.hidden, focused: document.activeElement?.id, typed: (document.activeElement as HTMLInputElement).value }));
+    check(box.open && box.focused === "graph-search-input" && box.typed === "", "/ in the pane opens the search box, focused", JSON.stringify(box));
+    await s.keyboard.type("33");
+    await s.keyboard.press("Enter");
+    await idle(s);
+    let b = await fitted();
+    let f = await found();
+    const typed = squeezed(await after(".find 33", s));
+    check(
+      f.command === ".find 33" && f.matched === 1 && typed.startsWith(squeezed("Selected 1 node")) && /^Selected node 33: /.test(await status()) && b.ids.join() === "33" && centred(b),
+      "/33 selects node 33 and centres it, as .find 33 typed in the terminal",
+      `${JSON.stringify(f)} | ${JSON.stringify(b)} | ${await status()}`,
+    );
+    const closed = await s.evaluate(() => ({ hidden: document.getElementById("graph-search")!.hidden, focus: document.activeElement?.tagName }));
+    check(closed.hidden && closed.focus === "CANVAS", "Enter closes the box, and the focus is the graph's again", JSON.stringify(closed));
+
+    // Esc in the box closes the box, not the pane, and keeps the selection.
+    await s.keyboard.press("/");
+    await s.keyboard.type("zz");
+    await s.keyboard.press("Escape");
+    check((await graphOpen(s)) && (await s.evaluate(() => document.getElementById("graph-search")!.hidden)) && /^Selected node 33: /.test(await status()), "Esc in the search box closes the box alone", await status());
+
+    // A condition on the vertex table's columns, from the terminal.
+    await s.click("#terminal");
+    const officers = "9,14,15,18,20,22,23,24,25,26,27,28,29,30,31,32,33";
+    const where = await said(".find WHERE club = 'Officer'");
+    b = await fitted();
+    f = await found();
+    check(
+      where.startsWith(squeezed("Selected 17 nodes")) && f.matched === 17 && f.notShownTotal === 0 && b.ids.join() === officers && /^Selected 17 nodes: 9, 14, 15, 18, 20 and 12 more · 34 nodes/.test(await status()),
+      ".find WHERE club = 'Officer' selects the officers' members",
+      `${where.slice(0, 60)} | ${b.ids.join()} | ${await status()}`,
+    );
+    check(centred(b) && Math.max(b.w / b.width, b.h / b.height) > 0.7 && b.w <= b.width && b.h <= b.height, "the matches are fitted in view", JSON.stringify(b));
+
+    // f fits the selection again after the view has moved; the move takes 200 ms.
+    await s.focus("#graph-stage canvas");
+    for (let i = 0; i < 3; i++) await s.keyboard.press("ArrowLeft");
+    await s.keyboard.press("-");
+    const away = await fitted();
+    await s.keyboard.press("f");
+    const moving = (await graphInfo(s)).fitting;
+    b = await fitted();
+    check(!centred(away) && moving && centred(b) && Math.max(b.w / b.width, b.h / b.height) > 0.7, "f fits the selection, with a camera move", `${JSON.stringify(away)} -> ${JSON.stringify(b)}`);
+    // Under prefers-reduced-motion the camera is there at once.
+    await s.emulateMedia({ reducedMotion: "reduce" });
+    await s.keyboard.press("0");
+    await s.keyboard.press("f");
+    const still = (await graphInfo(s)).fitting;
+    b = await fitted();
+    check(!still && centred(b), "with reduced motion, f moves the camera at once", JSON.stringify(b));
+    await s.emulateMedia({ reducedMotion: "no-preference" });
+
+    // A search with no match says so and keeps the selection.
+    await s.click("#terminal");
+    const none = await said(".find nobody");
+    check(none.startsWith(squeezed("No node matches 'nobody'")) && (await graphInfo(s)).selection.length === 17, "a search that matches nothing keeps the selection", none.slice(0, 60));
+
+    // Part of the graph: the matches that are not drawn are named under the
+    // header, and a hidden one has a button that shows it again.
+    await type(hop.replace("n => 2", "n => 1"), s);
+    await type(".graph", s);
+    await graphSettled(s);
+    await type(".hide 31", s);
+    const part = await said(".find 3");
+    f = await found();
+    const listed = await s.evaluate(() => {
+      const el = document.getElementById("graph-found")!;
+      return { hidden: el.hidden, text: el.textContent, buttons: Array.from(el.querySelectorAll("button.add"), (x) => x.getAttribute("aria-label")) };
+    });
+    check(
+      part.startsWith(squeezed("Selected 1 node Not shown: 30, 31 (hidden), 32, 33")) && f.matched === 1 && f.notShownTotal === 4 && (await fitted()).ids.join() === "3" && !listed.hidden && listed.text!.startsWith("Not shown (4):30") && listed.buttons.join() === "Show node 31 again",
+      "matches that are not drawn are listed as not shown, a hidden one with a button",
+      `${part.slice(0, 80)} | ${JSON.stringify(f)} | ${JSON.stringify(listed)}`,
+    );
+    await s.click("#graph-found button.add");
+    await idle(s);
+    const shown = await s.evaluate(() => (window as any).ursaShell.explored());
+    check(shown.command === ".show 31" && shown.deltaBytes > 0 && squeezed(await after(".show 31", s)).startsWith(squeezed("+1 node")), "its button runs .show in the shell", JSON.stringify(shown));
+    // The button is gone, and the focus is the graph's.
+    check((await s.evaluate(() => document.activeElement?.tagName)) === "CANVAS" && !(await s.evaluate(() => document.querySelector("#graph-found button.add"))), "the focus goes back to the graph");
+    await s.click("#terminal");
+    const sql = await said(".find 3 --sql");
+    check(sql.startsWith(squeezed('SELECT CAST("id" AS VARCHAR) AS node')) && (await graphInfo(s)).selection.length === 1, ".find --sql prints the SQL and selects nothing", sql.slice(0, 80));
+    check((await errors(s)) === before, "search prints no error");
+    await s.keyboard.press("Escape");
+    await s.keyboard.press("Escape");
+    check(!(await graphOpen(s)) && (await s.evaluate(() => document.getElementById("graph-found")!.hidden)), "closing the pane clears the matches not shown");
+    const noGraph = await said(".find 3");
+    check(noGraph.includes(squeezed("Error: no graph is open")), "with the pane closed, .find says no graph is open", noGraph.slice(0, 80));
+  }
+
   // Click to expand (#443): the pane draws each delta, a double-click on a
   // node runs `.expand ID` through the terminal, and an undo puts the frame
   // back as it was.
@@ -1887,6 +2011,25 @@ for (const scheme of ["light", "dark"] as const) {
     "a big graph: its status within a second, then its layout's levels, then Done",
     `"${first?.[1]}" at ${Math.round((first?.[0] ?? 0) - enter)} ms; levels ${JSON.stringify(laying.slice(0, 3))}…; ms after Enter ${JSON.stringify(times)}`,
   );
+  // #445: a key search on the million edges answers within 50 ms (the
+  // engine's round trip; drawing the selection is the view's, after it).
+  {
+    const ms: number[] = [];
+    let last: any = null;
+    let capped = "";
+    for (const key of ["1", "4242", "9999"]) {
+      await type(`.find ${key}`, r);
+      last = await r.evaluate(() => (window as any).ursaShell.found());
+      ms.push(Math.round(last.ms));
+      // More matches than are selected: the status says how many there were.
+      if (key === "1") capped = `${last.selected} of ${last.matched}: ${((await r.locator("#graph-status").textContent()) ?? "").slice(0, 60)}`;
+    }
+    check(/^1000 of (\d+): Selected 1,000 of [\d,]+ matching nodes: /.test(capped) && Number(capped.match(/of (\d+)/)![1]) > 1000, "at most 1,000 matches are selected, and the status says how many there were", capped);
+    const sorted = [...ms].sort((a, b) => a - b);
+    check(sorted[1] <= 50 && last.command === ".find 9999" && last.matched >= 1, "a key search on rmat answers in 50 ms", `${ms.join(", ")} ms; ${JSON.stringify({ ...last, notShown: undefined })}`);
+    await r.waitForFunction(() => !(window as any).ursaShell.graph()?.fitting, null, { timeout: 60_000 });
+    await r.keyboard.press("Escape");
+  }
   await r.keyboard.press("Escape");
   check(!(await graphOpen(r)) && (await errors(r)) === 0, "a big graph's view closes");
 

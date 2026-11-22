@@ -24,7 +24,9 @@
 // the right of the view: `i` moves the focus into it, and Esc back. A mouse or a pen over a node rings it and
 // shows a tooltip: its key, label, SIZE BY and COLOR BY values and degree.
 // On a touch screen one finger pans, two pinch to zoom (and pan), a tap
-// selects a node and a double tap expands it, or fits. The selection itself is ursa-viz's
+// selects a node and a double tap expands it, or fits. `f` fits the selection,
+// and a search (app.js runs .find, for the terminal and for the pane's `/`)
+// selects what it found and fits it (selectFound). The selection itself is ursa-viz's
 // (its interact module): this module tells it what was clicked. Colours are
 // the page's --graph-* tokens (style.css), read again when the theme changes
 // (retheme).
@@ -149,6 +151,11 @@ const TAP_SLOP_PX = 8;
 const EDGE_REACH_PX = 4;
 /** The header names this many selected nodes, and counts the rest. */
 const MAX_KEYS_NAMED = 5;
+/** Fitting the selection (`f`, .find) moves the camera over this long, in ms. */
+const FIT_MS = 200;
+/** It zooms in by no more than this at once, and leaves this share of the canvas around the selection. */
+const MAX_FIT_ZOOM = 8;
+const FIT_MARGIN = 0.8;
 
 /**
  * What two pointers ask of the view when they move from `a0`, `b0` to `a1`,
@@ -270,7 +277,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       `Graph of ${plural(nodes, "node")} and ${plural(edges, "edge")}${styled ? `, ${styled} (see the legend)` : ""}. ` +
         "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click empty space or press 0 to fit. " +
         "Click a node to select it, Shift+click to add another, click empty space or press Escape to clear the selection. " +
-        "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours.",
+        "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours. Slash finds nodes, F fits the selection.",
     );
   };
   describeCanvas(graph.n, graph.src.length);
@@ -350,6 +357,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // The selected nodes' indexes, in the order selected (the view's), and
     // the node under the pointer.
     selection: [],
+    // How many nodes the search that made the selection matched (0: none did).
+    matched: 0,
+    // The camera is moving to fit the selection.
+    fitting: false,
     // The selected edge, {edge, src, dst} (its index and its ends'), or null.
     edge: null,
     hovered: null,
@@ -399,7 +410,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     }
     const keys = nodes.slice(0, MAX_KEYS_NAMED).map((i) => state.ids.get(i));
     const more = nodes.length - keys.length;
-    return `Selected ${number(nodes.length)} nodes: ${keys.join(", ")}${more ? ` and ${number(more)} more` : ""}`;
+    // A search that matched more than it selected says how many (.find's cap).
+    const of = state.matched > nodes.length ? ` of ${number(state.matched)} matching` : "";
+    return `Selected ${number(nodes.length)}${of} nodes: ${keys.join(", ")}${more ? ` and ${number(more)} more` : ""}`;
   };
 
   // The header: what is selected, then the graph's size and how far the
@@ -627,7 +640,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   };
   state.inspectNow = () => inspectLater && inspectNow();
   state.cleanup.push(() => clearTimeout(inspectLater));
-  const selectionChanged = (byTouch = false) => {
+  // `matched`: how many nodes the search that selected them matched.
+  const selectionChanged = (byTouch = false, matched = 0) => {
+    state.matched = matched;
     state.selection = Array.from(view.selection());
     const edge = view.selectedEdge();
     state.edge = edge ? { edge: edge[0], src: edge[1], dst: edge[2] } : null;
@@ -768,6 +783,100 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     return changed;
   }
 
+  // Fit the selection (`f`, and a search's matches): the camera moves over
+  // FIT_MS so that the selected nodes fill FIT_MARGIN of the canvas, or at
+  // once under prefers-reduced-motion. One node (or nodes on one point) is
+  // centred at the zoom the view has. Returns whether there was a selection
+  // to fit.
+  let fitFrame = 0;
+  const cancelFit = () => {
+    if (fitFrame) cancelAnimationFrame(fitFrame);
+    fitFrame = 0;
+    state.fitting = false;
+  };
+  state.cleanup.push(cancelFit);
+  const fitSelection = (timeStamp = performance.now()) => {
+    cancelFit();
+    const nodes = state.selection;
+    if (!nodes.length || !state.positioned) return false;
+    if (state.pending) {
+      view.setPositions(state.pending);
+      state.pending = null;
+    }
+    // The selection's box, in canvas pixels, and the nodes at its sides: a
+    // pan or a zoom keeps them at its sides, so they say where the box is
+    // as the camera moves (and as the layout moves the nodes).
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+    const sides = [nodes[0], nodes[0], nodes[0], nodes[0]];
+    for (const i of nodes) {
+      const [x, y] = view.nodePixel(i);
+      if (x < x0) [x0, sides[0]] = [x, i];
+      if (x > x1) [x1, sides[1]] = [x, i];
+      if (y < y0) [y0, sides[2]] = [y, i];
+      if (y > y1) [y1, sides[3]] = [y, i];
+    }
+    const centre = () => {
+      const [l, r, t, b] = sides.map((i) => view.nodePixel(i));
+      return [(l[0] + r[0]) / 2, (t[1] + b[1]) / 2];
+    };
+    const [w, h] = [canvas.width, canvas.height];
+    const [bw, bh] = [x1 - x0, y1 - y0];
+    const factor = bw < 1 && bh < 1 ? 1 : Math.min(MAX_FIT_ZOOM, FIT_MARGIN * Math.min(w / Math.max(bw, 1), h / Math.max(bh, 1)));
+    const from = centre();
+    let zoomed = 1;
+    // `p` of the way, 0 to 1: zoomed by factor^p about the canvas's middle,
+    // the box's centre that far towards it.
+    const moveTo = (p) => {
+      const z = factor ** p;
+      view.zoom(z / zoomed, w / 2, h / 2);
+      zoomed = z;
+      const [cx, cy] = centre();
+      view.pan(from[0] + (w / 2 - from[0]) * p - cx, from[1] + (h / 2 - from[1]) * p - cy);
+      redraw(false);
+      if (pointerAt) hoverSoon();
+    };
+    timings.action("fit selection", timeStamp);
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      moveTo(1);
+      return true;
+    }
+    const start = performance.now();
+    state.fitting = true;
+    const tick = (now) => {
+      fitFrame = 0;
+      if (current !== state) return;
+      const t = Math.min(1, Math.max(0, (now - start) / FIT_MS));
+      // Ease out: quick away, slow to rest.
+      moveTo(1 - (1 - t) ** 3);
+      if (t < 1) fitFrame = requestAnimationFrame(tick);
+      else state.fitting = false;
+    };
+    fitFrame = requestAnimationFrame(tick);
+    return true;
+  };
+  // A hand on the view takes the camera back.
+  on(canvas, "pointerdown", cancelFit);
+  on(canvas, "wheel", cancelFit, { passive: true });
+  on(canvas, "keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key !== "f" && e.key !== "F") {
+      cancelFit();
+      return;
+    }
+    e.preventDefault();
+    fitSelection(e.timeStamp);
+  });
+  state.fitSelection = fitSelection;
+  // A search's answer (.find): select `nodes`, the first of `matched`
+  // matches, and fit them.
+  state.selectFound = (nodes, matched) => {
+    // The engine's graph can be ahead of the view's (a change not drawn
+    // yet): a node the view has not got is left out.
+    const count = view.nodeCount;
+    view.setSelection(nodes.every((i) => i < count) ? nodes : nodes.filter((i) => i < count));
+    selectionChanged(false, matched);
+    fitSelection();
+  };
   // Expanding (#443). A double-click, a double tap or Enter asks the page
   // to run `.expand ID` as the terminal runs a typed line: it is echoed,
   // kept in the history and replayed by a shared link, and its answer comes
@@ -1119,6 +1228,22 @@ export function clearSelection() {
 }
 
 /**
+ * Select what a search found (.find, the pane's `/`): `nodes`, the view's
+ * indexes of the first of `matched` matches, and fit them in view. Returns
+ * whether there is a view to select in.
+ */
+export function selectFound(nodes, matched = nodes.length) {
+  if (!current?.selectFound) return false;
+  current.selectFound(nodes, matched);
+  return true;
+}
+
+/** Fit the selection in view, as `f` does. Returns whether there was one. */
+export function fitSelection() {
+  return current?.fitSelection?.() ?? false;
+}
+
+/**
  * Apply an explore command's delta (UGR bytes, as the engine gave them) to
  * what is drawn: `kind` is "undo", "redo" or "step", `command` the line that
  * made it, `at` when it began (performance.now()) and `engine` its ms in the
@@ -1178,6 +1303,10 @@ export function info() {
     picked: selection.at(-1) ?? null,
     hovered: current.hovered === null ? null : node(current.hovered),
     hoverPicks,
+    // How many nodes the search that made the selection matched (0: no
+    // search made it), and whether the camera is moving to fit it.
+    matched: current.matched,
+    fitting: current.fitting,
     // Exploring: the node slots (shown or hidden), the deltas applied, the
     // nodes with a command running or queued, and whether the engine's
     // counts of what is not shown are in.

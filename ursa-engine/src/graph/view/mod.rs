@@ -30,7 +30,9 @@
 //!
 //! [`Session`] is the explore session of a drawing (design §4, #440): the
 //! commands that change it (`.expand`, `.hide`, `.show`, `.undo`, `.redo`),
-//! each as SQL and a [`GraphDelta`] for the view.
+//! each as SQL and a [`GraphDelta`] for the view. [`find`] is its search
+//! (#445): the nodes that match a text or a condition, for the view to
+//! select.
 //!
 //! This module runs SQL text (a source that is a query, `NODES (…)`, the
 //! algorithms of `SIZE BY pagerank`), and the SQL front end is `ursa-sql`,
@@ -60,6 +62,7 @@ use crate::graph::{edges_plan, registry_of, GraphDef, PropertyGraph};
 
 mod build;
 pub mod clauses;
+pub mod find;
 pub mod inspect;
 pub mod rules;
 pub mod session;

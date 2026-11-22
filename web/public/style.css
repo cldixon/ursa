@@ -454,6 +454,50 @@ html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transp
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
+/* Search (/): the box takes the status line's place while it is open
+   (graph-search.js); under the header, the matches that are not shown. */
+.graph-search { flex: 1; min-width: 0; display: flex; }
+.graph-search[hidden] { display: none; }
+.graph-search input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+.graph-search input:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.graph-found {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 6px 6px 7px 14px;
+  border-bottom: 1px solid var(--border);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+.graph-found[hidden] { display: none; }
+.graph-found ul { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0; padding: 0; list-style: none; flex: 1; min-width: 0; }
+.graph-found li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.graph-found .key { color: var(--fg); }
+.graph-found button {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.graph-found button:hover { color: var(--prompt); }
+.graph-found button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.graph-found .dismiss { border: 0; font-size: 15px; line-height: 1; padding: 2px 6px; }
 .graph-stage { flex: 1; min-height: 0; position: relative; overflow: hidden; }
 .graph-stage canvas {
   position: absolute;

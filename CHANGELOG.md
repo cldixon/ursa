@@ -418,6 +418,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   wgpu is now the crate's `render` feature, on by default: with
   `default-features = false` it builds with no GPU dependency, for the
   engine to produce results with. The view and the shell draw as before.
+- **Search in the Graph view: `/`, `.find` and `f`** (#445). `.find TEXT`
+  selects the nodes of the drawn graph whose key starts with the text, then
+  those whose label column (the vertex table's first text column) contains
+  it; `.find WHERE condition` selects by any SQL condition on the vertex
+  table's columns (`.find WHERE club = 'Officer'`). The view selects the
+  matches and moves the camera to fit them (200 ms, or at once under
+  `prefers-reduced-motion`). At most 1,000 are selected, and the status says
+  how many matched. Matches that are not drawn are named in the terminal and
+  listed under the pane's header; a hidden one has a button that shows it
+  again. In the pane, `/` opens a search box that runs `.find`, and `f` fits
+  the selection. `--sql` prints the search's SQL. The engine's side is
+  `ursa_engine::graph::view::find`, run by `Shell::find` and
+  `WebShell.find(command)`.
+
 - **Web Shell: double-click a node and its neighbours appear** (#443). The
   Graph view now draws what the explore commands change. A double-click on a
   node (a double tap, or Enter in the pane with nodes selected) runs

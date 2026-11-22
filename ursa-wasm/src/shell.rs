@@ -174,6 +174,62 @@ impl Default for WebShell {
     }
 }
 
+/// What `.find` found, from [`WebShell::find`]: what it printed, and the
+/// nodes for the page's view to select and fit.
+#[wasm_bindgen]
+pub struct FoundNodes {
+    out: String,
+    err: String,
+    selected: Vec<u32>,
+    matches: u32,
+    not_shown: String,
+    not_shown_total: u32,
+}
+
+#[wasm_bindgen]
+impl FoundNodes {
+    /// What the command printed: how many nodes it selected and the matches
+    /// that are not shown, or the SQL for `--sql`.
+    #[wasm_bindgen(getter)]
+    pub fn out(&self) -> String {
+        self.out.clone()
+    }
+
+    /// The error it printed, if it failed: no open graph, or a condition no
+    /// vertex table can answer.
+    #[wasm_bindgen(getter)]
+    pub fn err(&self) -> String {
+        self.err.clone()
+    }
+
+    /// The matches the view shows, as its node indexes, the best first: at
+    /// most 1,000. Once: the array is moved out.
+    #[wasm_bindgen(js_name = takeSelected)]
+    pub fn take_selected(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.selected)
+    }
+
+    /// How many matches the view shows: more than were selected, past the
+    /// cap.
+    #[wasm_bindgen(getter)]
+    pub fn matches(&self) -> u32 {
+        self.matches
+    }
+
+    /// The first matches the view does not show, as JSON: `[{"key": "34",
+    /// "hidden": false}, …]`, `hidden` for a node `.show` brings back.
+    #[wasm_bindgen(getter, js_name = notShown)]
+    pub fn not_shown(&self) -> String {
+        self.not_shown.clone()
+    }
+
+    /// How many matches the view does not show.
+    #[wasm_bindgen(getter, js_name = notShownTotal)]
+    pub fn not_shown_total(&self) -> u32 {
+        self.not_shown_total
+    }
+}
+
 #[wasm_bindgen]
 impl WebShell {
     /// A shell over a new engine session, drawing tables in colour for a
@@ -360,6 +416,21 @@ impl WebShell {
         let (out, err) = (self.out.clone(), self.err.clone());
         future_to_promise(async move {
             explore(&shell, &out, &err, &command)
+                .await
+                .map(JsValue::from)
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
+    /// Run `.find TEXT` or `.find WHERE condition` on the open graph (the
+    /// whole line, as `feed` handed it back), resolving to a [`FoundNodes`]:
+    /// what it printed, and the nodes that match for the page's view to
+    /// select and fit. The graph does not change.
+    pub fn find(&self, command: String) -> Promise {
+        let shell = Rc::clone(&self.shell);
+        let (out, err) = (self.out.clone(), self.err.clone());
+        future_to_promise(async move {
+            find(&shell, &out, &err, &command)
                 .await
                 .map(JsValue::from)
                 .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
@@ -563,6 +634,34 @@ async fn explore(
         delta: delta.map(|d| d.to_bytes()).unwrap_or_default(),
         nodes: nodes as u32,
         edges: edges as u32,
+    })
+}
+
+/// Run `.find`, and take what it printed.
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
+async fn find(
+    shell: &RefCell<Shell<Buffer, Buffer>>,
+    out: &Buffer,
+    err: &Buffer,
+    command: &str,
+) -> Result<FoundNodes> {
+    let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
+    let found = shell.find(command).await.unwrap_or_default();
+    let not_shown: Vec<serde_json::Value> = found
+        .not_shown
+        .iter()
+        .map(|n| serde_json::json!({"key": n.key, "hidden": n.hidden}))
+        .collect();
+    Ok(FoundNodes {
+        out: out.take(),
+        err: err.take(),
+        selected: found.selected,
+        matches: found.matches as u32,
+        not_shown: serde_json::Value::Array(not_shown).to_string(),
+        not_shown_total: found.not_shown_total as u32,
     })
 }
 
@@ -917,6 +1016,48 @@ mod tests {
             .unwrap()
             .err()
             .contains("no graph is open"));
+    }
+
+    /// `.find` gives the page what it printed and the nodes to select. The
+    /// command itself is tested in `ursa-shell` (`find_tests.rs`).
+    #[tokio::test]
+    async fn find_gives_the_page_a_line_and_the_nodes_to_select() {
+        let shell = WebShell::new();
+        let find = |command: &'static str| find(&shell.shell, &shell.out, &shell.err, command);
+        let back = run(&shell, ".find 3;").await;
+        assert_eq!(
+            (back["flow"].as_str(), back["command"].as_str()),
+            (Some("host"), Some(".find 3"))
+        );
+        let none = find(".find 3").await.unwrap();
+        assert!(none.err.contains("Error: no graph is open"), "{}", none.err);
+        assert!(none.selected.is_empty() && none.not_shown == "[]");
+
+        run(&shell, "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (3, 4), (4, 35)) AS t(src, dst);").await;
+        run(
+            &shell,
+            "CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+        )
+        .await;
+        graph_of(
+            &shell.shell,
+            "SELECT * FROM hop(club, seeds => [1], direction => 'both')",
+        )
+        .await
+        .unwrap();
+        let mut found = find(".find 3").await.unwrap();
+        assert_eq!(
+            (found.out(), found.err()),
+            (
+                "Selected 1 node\nNot shown: 35\n".to_string(),
+                String::new()
+            )
+        );
+        assert_eq!((found.matches(), found.not_shown_total()), (1, 1));
+        assert_eq!(found.not_shown(), r#"[{"hidden":false,"key":"35"}]"#);
+        // Node 3 is the view's third: hop gives 1, 2, 3.
+        assert_eq!(found.take_selected(), [2]);
+        assert!(found.take_selected().is_empty());
     }
 
     #[tokio::test]

@@ -38,7 +38,7 @@ static assets and an R2 bucket.
     `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
     CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME? ?AS …? ?SIZE BY x? ?COLOR BY y?`
     (`.help graph` lists every clause),
-    `.history ?N?` and `.share`. The explore commands (`.expand`, `.hide`, `.show`,
+    `.history ?N?` and `.share`. The explore commands (`.expand`, `.find`, `.hide`, `.show`,
     `.undo`, `.redo`, `.graph history`) are the shell's own list
     (`ursa-shell`'s `EXPLORE_COMMANDS`), handed back the same way.
   - **Datasets.** Picking one starts a fresh session and runs its commands at
@@ -185,6 +185,34 @@ static assets and an R2 bucket.
     (`closeGraph`), after which the commands say none is open.
     `window.ursaShell.explored()` gives the last command's
     `{command, nodes, edges, deltaBytes, drawn}`, which the e2e test reads.
+  - **Search and focus** (#445, design §6): `.find TEXT` selects the nodes
+    of the graph drawn whose key starts with TEXT, then those whose label
+    column (the vertex table's first text column that is not its key)
+    contains it, whatever the letters' case; `.find WHERE condition` those
+    the vertex table's rows satisfy (`.find WHERE club = 'Officer'`). The
+    engine answers (`ursa-engine`'s `graph::view::find`: one statement for
+    each vertex table, which `--sql` prints; it reads the explore session
+    and changes nothing, so it is no step for `.undo`), through the worker's
+    `find` op (`WebShell.find`): `{out, err, selected, matches, notShown,
+    notShownTotal}`. `selected` is the view's indexes of the matches it
+    shows, the best first and at most 1,000; `matches` is how many there
+    are, which the status says past the cap (`Selected 1,000 of 2,345
+    matching nodes: …`). `graph.js`'s `selectFound` selects them and fits
+    them: the camera moves over 200 ms until the selection fills 80% of the
+    canvas (zooming in by 8 at most; one node is centred at the zoom the
+    view has), or at once under `prefers-reduced-motion`. `f` in the pane
+    fits the selection again (`0` the whole graph). `/` in the pane, or the
+    header's magnifier, opens a search box in the header
+    (`graph-search.js`); Enter there types `.find` and the text into the
+    shell, so a search is in the terminal like any command, and Esc closes
+    the box alone. The matches the view does not show (`notShown`, the
+    first 20) are listed under the header: a hidden node with a "show"
+    button, which runs `.show KEY`; a node of the graph that was never
+    drawn is named only, until `.graph +` can add it. A search that
+    matches nothing in the view leaves the selection as it was.
+    `window.ursaShell.found()` gives the last search's `{command, ms,
+    matched, selected, notShown, notShownTotal}`, `ms` being the engine's
+    round trip, which the e2e test holds to 50 ms on rmat.
   - **Click to expand, and the deltas drawn** (#443). The pane's view is
     made from the graph result itself (`createViewFromResult`), so it
     changes in place: `graph.js`'s `applyDelta` gives each explore
