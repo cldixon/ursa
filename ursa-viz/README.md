@@ -22,6 +22,7 @@ later, in a notebook widget or a native window through the same `View`.
 | `scene` | the graph, the live layout, node styles, the camera. No GPU; tested natively. |
 | `highlight` | each node's flags (selected, pinned, hidden, …) and the highlighted edges. No GPU. |
 | `live` | a result as the view draws it, kept in step with its deltas: which slots a delta changes. No GPU. |
+| `pace` (feature `render`) | making a view in pieces, with a turn of the event loop between them. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
 | `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`, `rings`, `layers`). |
@@ -116,6 +117,40 @@ edges in `tests/model_scale.rs`.
 - **Highlights** are a second layer (below): flags in a buffer of their own,
   and the highlighted edges as instanced quads over the line list.
 
+## Making a view
+
+Making a view costs an upload, not a graph build (#426). At 46K nodes and
+1M edges `createView` holds the page's thread for no task over 50 ms and
+leaves the page's wasm memory at 16 MiB; it was one task of 190 to 350 ms
+and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)).
+
+- **No adjacency.** A `Graph` is the node count and the edge list. Its
+  topology, which a layout needs and a frame does not, is built when first
+  asked for (`Graph::topology`), so the page's view never builds one: its
+  layout runs in a worker. `View::step`, a layout on the view's own thread,
+  builds it on its first call. `GraphView.hasTopology` says whether it is
+  there.
+- **Degrees from the edge list.** A node's degree is its distinct
+  neighbours, as the adjacency counts them. `Graph::degrees` counts them in
+  three passes over the edges, with no sort: each pair of nodes is put in
+  the list of its lower-indexed end, and a pair seen twice in a list is
+  counted once. A view made from a result keeps those lists (one `u32` a
+  pair) to keep the degrees right as deltas add and remove edges.
+- **Positions without a layout.** The nodes start where ForceAtlas2 seeds
+  them, which depends on their count alone
+  (`ursa_core::algo::fa2_seed_positions`).
+- **Edges a run at a time.** The edges go to the GPU 65,536 at a time, each
+  run submitted before the next is made, so a million edges are never held
+  again as one list of indexes.
+- **In pieces.** What is left is compiling the shader, linking five
+  pipelines and the uploads: 150 to 200 ms on software WebGL2. On a page
+  (`createView`, `createViewFromResult`; `View::new_paced` and
+  `View::from_result_paced`) the view gives the event loop a turn between
+  pieces whenever it has held the thread for 4 ms (`pace`), so a click or a
+  frame waits for one piece, not all of them. The largest piece is the
+  shader, about 30 ms. `View::new` and `View::from_result` make the same
+  view in one go, for a caller with no event loop.
+
 ## Highlights: paths, selection, pins, hidden nodes
 
 A path, a selection or a hover is drawn by a layer of its own (#435, the
@@ -162,6 +197,37 @@ Rust, `View::set_result_highlights(&GraphResult)` does the same from a
 result's highlights (its paths' own edges, where it names them) and hides
 its removed nodes; `View::set_highlight` takes any change to the
 `HighlightState`.
+
+### The selection and the hover
+
+`setSelection` and `setHovered` are the view's own state too: the
+`interact` module (no GPU) holds the selection set and the hovered node, and
+says what a click does to them, so every front end selects alike.
+
+```js
+view.selectionEdges = true;                 // draw the selected nodes' edges wide (off at first)
+view.select(view.pick(x, y), e.shiftKey);   // a click: true if the selection changed
+view.selection();                           // the selected nodes, in the order selected
+view.clearSelection();                      // true if anything was selected
+view.hover(x, y);                           // the node under the pointer becomes the hovered one; returns it
+view.hovered;                               // or undefined
+```
+
+- A click on a node selects it alone; on empty space (`undefined`) it clears
+  the selection.
+- With Shift (`extend`), a click on a node adds it, or takes it out if it was
+  selected; on empty space it changes nothing.
+- `hover` uploads nothing while the pointer stays on one node, or on none.
+  The page calls it once a frame at most.
+- With `selectionEdges`, the edges at a selected node are drawn wide in the
+  highlight colour, as highlighted edges are, but nothing else is dimmed: a
+  selection is not a highlight. Each change of the selection reads every
+  edge once, and uploads 16 bytes for each edge found.
+- A node that is hidden (`setHidden`) or removed by a delta leaves the
+  selection and the hover.
+
+In Rust: `interact::Selection` (`click`, `set`, `add`, `toggle`, `clear`,
+`retain`, `incident_edges`) and `interact::Interact`.
 
 How it is drawn, on WebGL2 as on WebGPU:
 
@@ -521,7 +587,8 @@ neighbourhood or the shortest paths with a fixed layout. Drag to pan, wheel to
 zoom, double-click to fit. The pointer's node is hovered; a click selects
 it, shift-click adds to the selection, and two selected nodes draw the
 shortest path between them. `p` pins the selection, `h` hides it, `u` shows
-everything again and Escape clears. With `&result=1` the view is made from a
+everything again and Escape clears. `&compact=1` drops the nodes no edge
+names (R-MAT at scale 16 with 1M edges is then the shell's 46K nodes). With `&result=1` the view is made from a
 graph result, and once the layout is done `e` expands the selected node (one
 delta: five new nodes and their edges) and `z` undoes the last expansion.
 
@@ -532,6 +599,7 @@ checks them:
 bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONLY=<name>; MODE=flat|multilevel
 ONLY=highlight bun ursa-viz/tests/browser/view.ts     # the highlight layer alone (always on WebGL2)
 ONLY=delta bun ursa-viz/tests/browser/view.ts         # deltas alone; ONLY="delta karate" without the 1M-edge timing
+ONLY=create bun ursa-viz/tests/browser/view.ts        # making a view of 1M edges: the longest task and the wasm memory
 ```
 
 ## Benchmark

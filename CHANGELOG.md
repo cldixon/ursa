@@ -477,6 +477,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the worker transfers and `graph.js` reads with `ursa-viz/ui/ugr.js` as
   typed arrays over it, in place of an array copied per getter. What
   `.graph` draws, its messages and its legend are unchanged.
+- **Hover and selection in the graph view** (#438). In the web shell's
+  `.graph` pane, a mouse or a pen over a node rings it and shows a tooltip
+  (its key, label, `SIZE BY` and `COLOR BY` values and degree), looked up
+  once a frame at most. A click selects a node, Shift+click adds one (or
+  takes it out), and a click on empty space clears the selection; the
+  selected nodes carry a ring and their edges are drawn wide. The pane's
+  header, a live region, reads `Selected node 33: …` in place of the node a
+  click named. Esc clears a selection before it closes the pane. The
+  selection set is `ursa-viz`'s new `interact` module (no GPU), which the
+  wasm view exposes as `select`, `selection`, `clearSelection`, `hover`,
+  `hovered` and `selectionEdges`.
 - **A highlight layer in the graph view** (#435): a path, a selection or a
   hover can be seen. `ursa-viz` keeps a flags byte per node (selected,
   hovered, pinned, dimmed, highlighted, hidden, seed) in a buffer of its
@@ -501,6 +512,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   (`ursa-viz/BENCH.md`). The shell does not drive the layer yet. `View`'s
   methods that upload (`step`, `set_positions`, `set_style`, `color_by`,
   `set_theme`) now take the device as well as the queue.
+- **Making the graph view costs an upload, not a graph build** (#426). The
+  page's view no longer builds a topology, an undirected adjacency and a
+  layout state to read degrees and starting positions: degrees are counted
+  from the edge list, the nodes start where a layout would seed them
+  (`ursa_core::algo::fa2_seed_positions`), the edges go to the GPU a run at
+  a time, and `createView` and `createViewFromResult` give the event loop a
+  turn between compiling the shader, linking each pipeline and the uploads.
+  At 46K nodes and 1M edges in headless Chromium, `createView` was one task
+  of 190 to 350 ms on the page's thread and 50 MB of wasm memory; it is now
+  no task over 50 ms and 16 MiB. `View::step` builds the adjacency on its
+  first call. In Rust, `View::new` takes the queue as well as the device,
+  `View::new_paced` and `View::from_result_paced` are what a page calls,
+  `Renderer::new` takes the edge count and the caller writes the edges
+  (`write_edges`), and `Graph::line_indices` takes a range.
+  `tests/graph-timing.ts` prints the longest task while the view is made
+  and fails over 60 ms. The shell keeps what its layout worker says while
+  the view is being made, so a small graph's layout that ends first is not
+  lost.
 - **Scenes that change in place in the graph view** (#441): a view made
   from a graph result applies a delta in time proportional to the delta, not
   to the graph. `createViewFromResult(canvas, bytes)` takes a result as UGR

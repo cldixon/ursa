@@ -439,6 +439,48 @@ The issue's budget is 64 KB and 2 ms outside the frame.
   flags are written without reading the others, and the model keeps the
   greatest node index its edges name, as it rises along them.
 
+## Making a view
+
+What `createView` costs the page (#426), on R-MAT's 1,000,000 edges over
+the 46,445 nodes they name (`graph=rmat&scale=16&edges=1000000&compact=1`,
+the shell's `.graph rmat`), software WebGL2, the same container with no
+GPU. `ONLY=create bun tests/browser/view.ts` measures it, three pages each:
+the page's tasks over 50 ms (a long-task observer) while the view is made,
+and the size of the page's wasm memory when it is.
+
+| | longest task | `createView`, in all | wasm memory after |
+|---|---|---|---|
+| before: a topology, a CSR and a layout state built to read degrees and seeds | 280–400 ms | 420–460 ms | 52.7 MiB |
+| no adjacency, in one go | 190–270 ms | 200–270 ms | 30.3 MiB |
+| no adjacency, edges a run at a time, in pieces (now) | none over 50 ms | 190–260 ms | 16.3–17.4 MiB |
+| `createViewFromResult`, before | 280–400 ms | 530 ms | 98.5 MiB |
+| `createViewFromResult`, now | none over 50 ms | 230–300 ms | 62.9 MiB |
+
+- **Where the time went.** Of the old task, 130 to 200 ms built the
+  topology. Counting the degrees from the edge list takes 25 to 35 ms, in
+  three passes of about 10 ms.
+- **What is left is the GPU's.** Compiling the WGSL takes 20 to 30 ms, the
+  first pipeline 15 to 20 ms, the other four 3 to 15 ms each, and the
+  buffers and the 8 MB of edges 20 to 30 ms. None of it depends on the
+  graph but the last, so the view is made in pieces, with a turn of the
+  event loop between them: the largest piece is the shader.
+- **The pieces add about 10 ms** of waiting for the event loop to
+  `createView` as a whole.
+- **Memory.** The 16 MiB is the edge list (8 MB), which the view keeps for
+  `View::step` and for picking an edge's ends, the lists the degrees are
+  counted from (4 MB, freed) and the runs of edges on their way to the GPU.
+  A view made from a result holds the result as well as its graph, and the
+  demo builds the result's bytes in the same memory: most of the 63 MiB.
+- **The first step of a layout on the view's own thread** builds the
+  adjacency then: 550 to 680 ms with its first iteration, and the memory
+  grows to 39 MiB.
+- **A browser's first WebGL2 context** starts its GPU process, which held
+  the page's thread for a second here. The harness makes a small view
+  first, so that is not measured.
+- **These are a loaded machine's numbers.** With other builds running on
+  its four cores a piece took up to 65 ms once; the harness holds the
+  median of three pages to 60 ms.
+
 ## Caveats
 
 - **No GPU.** WebGL2 runs on SwiftShader, on the same 4 cores as the layout

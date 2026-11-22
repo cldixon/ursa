@@ -4,8 +4,11 @@
 //! None of this touches the GPU, so it is tested natively and is the same on
 //! every platform. [`crate::render`] draws it.
 
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+#[cfg(test)]
+use ursa_core::algo::fa2_seed_positions;
 use ursa_core::algo::{
     fa2_grow, layout_layers, layout_rings, Fa2Multilevel, Fa2Params, Fa2State, LayersParams,
     MultilevelParams, RingsParams, WarmParams,
@@ -19,14 +22,20 @@ use ursa_core::topology::Topology;
 /// SQL shell maps its result's `src`/`dst` ids to them, and the DataFrame API
 /// already has them in its topology.
 ///
+/// A graph is two things. What a frame needs is the node count and the
+/// edge list, which is all [`Graph::new`] keeps: making one reads the edges
+/// once, to check them. What a layout needs is the adjacency
+/// ([`Graph::topology`]), which costs far more than the edge list in time
+/// and memory, so it is built when first asked for and not before. A view
+/// whose layout runs on another thread never asks.
+///
 /// A graph grows and shrinks at its end ([`Graph::append`],
-/// [`Graph::truncate`]) in time proportional to the change: its topology,
-/// which a layout needs and a frame does not, is built again when next asked
-/// for.
+/// [`Graph::truncate`]) in time proportional to the change: its topology
+/// is built again when next asked for.
 #[derive(Debug)]
 pub struct Graph {
     n_nodes: usize,
-    /// Built by [`Graph::new`], and again on demand after a change.
+    /// Built on demand ([`Graph::topology`]), and again after a change.
     topology: OnceLock<Arc<Topology>>,
     src: Vec<u32>,
     dst: Vec<u32>,
@@ -60,14 +69,12 @@ impl Graph {
             "src and dst must have one entry per edge"
         );
         check_edges(n_nodes, 0, &src, &dst)?;
-        let graph = Self {
+        Ok(Self {
             n_nodes,
             topology: OnceLock::new(),
             src,
             dst,
-        };
-        graph.topology();
-        Ok(graph)
+        })
     }
 
     /// `new_nodes` more nodes, after the ones there are, and these edges
@@ -134,28 +141,41 @@ impl Graph {
         self.src.len()
     }
 
-    /// The edges as one index list, `src, dst` per edge: a line list over the
-    /// node positions.
-    pub fn line_indices(&self) -> Vec<u32> {
-        let mut out = Vec::with_capacity(self.src.len() * 2);
-        for (&s, &d) in self.src.iter().zip(&self.dst) {
+    /// The edges of `range` as one index list, `src, dst` per edge: a line
+    /// list over the node positions.
+    pub fn line_indices(&self, range: Range<usize>) -> Vec<u32> {
+        let mut out = Vec::with_capacity(range.len() * 2);
+        for (&s, &d) in self.src[range.clone()].iter().zip(&self.dst[range]) {
             out.push(s);
             out.push(d);
         }
         out
     }
 
-    /// Each node's undirected degree (distinct neighbours, self-loops left out).
+    /// Each node's undirected degree (distinct neighbours, self-loops left
+    /// out): the degree the topology's undirected adjacency gives, counted
+    /// from the edge list without building it.
     pub fn degrees(&self) -> Vec<u32> {
-        let adj = self.topology().undirected();
-        (0..self.n_nodes() as u32)
-            .map(|u| adj.degree(u) as u32)
-            .collect()
+        match self.topology.get() {
+            Some(topology) => {
+                let adj = topology.undirected();
+                (0..self.n_nodes() as u32)
+                    .map(|u| adj.degree(u) as u32)
+                    .collect()
+            }
+            None => Pairs::new(self).1,
+        }
     }
 
-    /// The graph's adjacency: built once, and again after the graph
-    /// changes ([`Graph::append`], [`Graph::truncate`]), when it is next
-    /// asked for.
+    /// Whether the adjacency is built: a view that only draws never builds
+    /// it.
+    pub fn has_topology(&self) -> bool {
+        self.topology.get().is_some()
+    }
+
+    /// The graph's adjacency, for a layout: built when first asked for, and
+    /// again after the graph changes ([`Graph::append`],
+    /// [`Graph::truncate`]), when it is next asked for.
     pub fn topology(&self) -> &Arc<Topology> {
         self.topology.get_or_init(|| {
             Arc::new(Topology::build(
@@ -164,6 +184,153 @@ impl Graph {
                 self.dst.clone(),
             ))
         })
+    }
+}
+
+/// The pairs of nodes a graph's edges join, each pair once, however many
+/// edges join it and whichever way they point: enough to count each node's
+/// distinct neighbours and to ask whether two nodes are joined, in at most
+/// one `u32` per edge and one per node. It is not an adjacency: a pair is
+/// kept at its lower-indexed end only, so a node's list is not its
+/// neighbours, and it costs three passes over the edge list to make, with
+/// no sort and no copy of the edges. A page makes it a pass at a time
+/// ([`Pairs::count`]).
+#[derive(Debug)]
+pub(crate) struct Pairs {
+    /// Node `u`'s list, the higher-indexed nodes it is joined to, is
+    /// `other[offsets[u]..offsets[u + 1]]`.
+    offsets: Vec<u32>,
+    other: Vec<u32>,
+    /// The lists sorted so far ([`Pairs::joined`]); empty until one is.
+    sorted: Vec<bool>,
+}
+
+impl Pairs {
+    /// A list this short is read through; a longer one is sorted the first
+    /// time it is asked about, and searched.
+    const SHORT: usize = 32;
+
+    /// The pairs of `graph`, and each node's distinct neighbours
+    /// (self-loops left out).
+    pub(crate) fn new(graph: &Graph) -> (Self, Vec<u32>) {
+        let mut counted = Self::count(graph);
+        counted.fill(graph);
+        counted.finish()
+    }
+
+    /// The first of the three passes [`Pairs::new`] makes, for a caller
+    /// that gives its thread up between them: then [`Counted::fill`] and
+    /// [`Counted::finish`], with the same graph.
+    pub(crate) fn count(graph: &Graph) -> Counted {
+        // The lists' sizes, then their starts; filling them moves each
+        // start to its list's end, which is the next list's start.
+        let mut offsets = vec![0u32; graph.n_nodes() + 1];
+        let mut pairs = 0usize;
+        for (&s, &d) in graph.src().iter().zip(graph.dst()) {
+            if s != d {
+                offsets[s.min(d) as usize + 1] += 1;
+                pairs += 1;
+            }
+        }
+        let mut total = 0;
+        for slot in &mut offsets[1..] {
+            let len = *slot;
+            *slot = total;
+            total += len;
+        }
+        Counted {
+            offsets,
+            other: vec![0u32; pairs],
+        }
+    }
+
+    /// Give back the room the repeated pairs took: for pairs that are kept.
+    pub(crate) fn shrink(&mut self) {
+        self.other.shrink_to_fit();
+    }
+
+    /// Whether an edge joins `s` and `d`, two different nodes. A long list
+    /// is sorted the first time it is asked about, once.
+    pub(crate) fn joined(&mut self, s: u32, d: u32) -> bool {
+        let n = self.offsets.len() - 1;
+        let (lo, hi) = (s.min(d) as usize, s.max(d));
+        if hi as usize >= n || s == d {
+            return false;
+        }
+        let list = &mut self.other[self.offsets[lo] as usize..self.offsets[lo + 1] as usize];
+        if list.len() <= Self::SHORT {
+            return list.contains(&hi);
+        }
+        if self.sorted.is_empty() {
+            self.sorted = vec![false; n];
+        }
+        if !self.sorted[lo] {
+            list.sort_unstable();
+            self.sorted[lo] = true;
+        }
+        list.binary_search(&hi).is_ok()
+    }
+}
+
+/// [`Pairs`] being made: the lists sized ([`Pairs::count`]).
+#[derive(Debug)]
+pub(crate) struct Counted {
+    offsets: Vec<u32>,
+    other: Vec<u32>,
+}
+
+impl Counted {
+    /// The second pass: every edge into its list.
+    pub(crate) fn fill(&mut self, graph: &Graph) {
+        let (offsets, other) = (&mut self.offsets, &mut self.other);
+        for (&s, &d) in graph.src().iter().zip(graph.dst()) {
+            if s != d {
+                let next = &mut offsets[s.min(d) as usize + 1];
+                other[*next as usize] = s.max(d);
+                *next += 1;
+            }
+        }
+    }
+
+    /// The third pass: the pairs, and each node's distinct neighbours.
+    pub(crate) fn finish(self) -> (Pairs, Vec<u32>) {
+        let Self {
+            mut offsets,
+            mut other,
+        } = self;
+        let n = offsets.len() - 1;
+        // A pair is in one list only: keep and count it the first time it
+        // is seen there, and drop its repeats. `seen[v]` is the last list
+        // (plus one) that named `v`.
+        let mut degrees = vec![0u32; n];
+        let mut seen = vec![0u32; n];
+        let (mut kept, mut start) = (0usize, 0usize);
+        for u in 0..n {
+            let end = offsets[u + 1] as usize;
+            offsets[u] = kept as u32;
+            let mark = u as u32 + 1;
+            let mut degree = 0;
+            for i in start..end {
+                let v = other[i] as usize;
+                if seen[v] != mark {
+                    seen[v] = mark;
+                    degree += 1;
+                    degrees[v] += 1;
+                    other[kept] = v as u32;
+                    kept += 1;
+                }
+            }
+            degrees[u] += degree;
+            start = end;
+        }
+        offsets[n] = kept as u32;
+        other.truncate(kept);
+        let pairs = Pairs {
+            offsets,
+            other,
+            sorted: Vec::new(),
+        };
+        (pairs, degrees)
     }
 }
 
@@ -870,6 +1037,89 @@ mod tests {
         Graph::new(4, vec![0, 1, 2, 3], vec![1, 2, 3, 0]).unwrap()
     }
 
+    /// A skewed multigraph: hubs at the low indexes, parallel edges, both
+    /// directions and self-loops.
+    fn skewed(n: u32, m: usize) -> Graph {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut below = |k: u32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) % u64::from(k)) as u32
+        };
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for _ in 0..m {
+            // The lesser of two draws: low indexes are named most.
+            src.push(below(n).min(below(n)));
+            dst.push(below(n).min(below(n)).min(below(n)));
+        }
+        Graph::new(n as usize, src, dst).unwrap()
+    }
+
+    #[test]
+    fn a_graph_builds_no_adjacency_until_a_layout_asks() {
+        let graph = skewed(300, 4000);
+        assert!(!graph.has_topology());
+        // Degrees and line indices come from the edge list.
+        let degrees = graph.degrees();
+        assert_eq!(graph.line_indices(0..4000).len(), 8000);
+        assert!(!graph.has_topology());
+        // The seeded positions are a layout's, and need no layout.
+        let (x, y) = fa2_seed_positions(graph.n_nodes(), &Fa2Params::default());
+        assert!(!graph.has_topology());
+
+        // A layout asks; its adjacency gives the same degrees, and it
+        // starts from the same positions, bit for bit.
+        let layout = LiveLayout::new(&graph, Fa2Params::default());
+        assert!(graph.has_topology());
+        let adj = graph.topology().undirected();
+        let exact: Vec<u32> = (0..300).map(|u| adj.degree(u) as u32).collect();
+        assert_eq!(degrees, exact);
+        assert_eq!(graph.degrees(), exact);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&x), bits(layout.positions().0));
+        assert_eq!(bits(&y), bits(layout.positions().1));
+
+        // A change drops the adjacency, until it is next asked for.
+        let mut graph = graph;
+        graph.append(1, &[300], &[0]).unwrap();
+        assert!(!graph.has_topology());
+        assert_eq!(graph.degrees()[300], 1);
+        assert!(!graph.has_topology());
+    }
+
+    #[test]
+    fn pairs_know_who_is_joined_and_count_distinct_neighbours() {
+        for graph in [
+            skewed(300, 4000),
+            skewed(7, 60),
+            Graph::new(3, vec![1, 1], vec![1, 1]).unwrap(),
+            Graph::new(0, vec![], vec![]).unwrap(),
+        ] {
+            let n = graph.n_nodes() as u32;
+            let (mut pairs, degrees) = Pairs::new(&graph);
+            let adj = graph.topology().undirected();
+            let exact: Vec<u32> = (0..n).map(|u| adj.degree(u) as u32).collect();
+            assert_eq!(degrees, exact);
+            // Each pair is kept once.
+            assert_eq!(2 * pairs.other.len() as u32, exact.iter().sum::<u32>());
+            // Asked twice: a long list is sorted by the first answer.
+            for _ in 0..2 {
+                for s in 0..n {
+                    for d in 0..n {
+                        let joined = s != d && adj.neighbors(s).binary_search(&d).is_ok();
+                        assert_eq!(pairs.joined(s, d), joined, "{s} and {d}");
+                    }
+                }
+            }
+            // Past the nodes there are, nothing is joined.
+            assert!(!pairs.joined(0, n) && !pairs.joined(n + 3, 0));
+        }
+        // The hubs' lists are long enough to be sorted and searched.
+        let (pairs, _) = Pairs::new(&skewed(300, 4000));
+        assert!(pairs.offsets[1] as usize > Pairs::SHORT);
+    }
+
     #[test]
     fn a_graph_grows_and_shrinks_at_its_end() {
         let mut graph = Graph::new(3, vec![0, 1], vec![1, 2]).unwrap();
@@ -877,7 +1127,7 @@ mod tests {
         // Two more nodes, and three more edges.
         graph.append(2, &[2, 3, 0], &[3, 4, 4]).unwrap();
         assert_eq!((graph.n_nodes(), graph.n_edges()), (5, 5));
-        assert_eq!(graph.line_indices()[4..], [2, 3, 3, 4, 0, 4]);
+        assert_eq!(graph.line_indices(2..5), [2, 3, 3, 4, 0, 4]);
         // The adjacency is the grown graph's, when next asked for.
         assert_eq!(graph.degrees(), [2, 2, 2, 2, 2]);
         assert_eq!(graph.topology().n_nodes(), 5);
@@ -904,7 +1154,7 @@ mod tests {
         );
         let g = square();
         assert_eq!((g.n_nodes(), g.n_edges()), (4, 4));
-        assert_eq!(g.line_indices(), vec![0, 1, 1, 2, 2, 3, 3, 0]);
+        assert_eq!(g.line_indices(0..4), vec![0, 1, 1, 2, 2, 3, 3, 0]);
         assert_eq!(g.degrees(), vec![2, 2, 2, 2]);
     }
 
