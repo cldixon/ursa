@@ -1831,8 +1831,55 @@ fn a_file_that_cannot_be_read_is_named_once() {
     }
     let parquet = dir.join("bad.parquet").display().to_string();
     let message = err(ursa(&["-c", &format!("SELECT * FROM '{parquet}';")]));
-    assert!(
-        message.starts_with(&format!("Error: cannot read '{parquet}': Parquet error: ")),
-        "{message}"
+    assert_eq!(
+        message,
+        format!(
+            "Error: cannot read '{parquet}': it is not a valid Parquet file: it does not end \
+             with the Parquet magic number PAR1\n"
+        )
     );
+}
+
+/// #332: a truncated or fake Parquet file is an error naming it, however it
+/// is read, never a panic (the parquet crate subtracted with overflow on a
+/// footer that claims more metadata than the file holds).
+#[test]
+fn a_truncated_parquet_file_is_an_error_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let mut truncated = b"PAR1".to_vec();
+    truncated.extend_from_slice(&[0; 16]);
+    truncated.extend_from_slice(&1000u32.to_le_bytes());
+    truncated.extend_from_slice(b"PAR1");
+    std::fs::write(dir.join("x.parquet"), truncated).unwrap();
+    std::fs::write(dir.join("y.parquet"), b"PAR1PAR1").unwrap();
+    for (file, why) in [
+        (
+            "x.parquet",
+            "its footer says the metadata is 1000 bytes, but the file is 28 bytes; it may be \
+             truncated",
+        ),
+        (
+            "y.parquet",
+            "it is 8 bytes, and a Parquet file is at least 12",
+        ),
+    ] {
+        let path = dir.join(file).display().to_string();
+        for sql in [
+            format!("SELECT * FROM '{path}';"),
+            format!("SELECT * FROM read_parquet('{path}');"),
+            format!(
+                "CREATE PROPERTY GRAPH g EDGE TABLES ('{path}' SOURCE KEY (a) DESTINATION KEY (b));"
+            ),
+        ] {
+            let message = err(ursa(&["-c", &sql]));
+            assert!(!message.contains("panicked"), "{sql}: {message}");
+            assert!(
+                message.contains(&format!(
+                    "cannot read '{path}': it is not a valid Parquet file: {why}"
+                )),
+                "{sql}: {message}"
+            );
+        }
+    }
 }

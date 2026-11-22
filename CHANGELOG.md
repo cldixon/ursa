@@ -876,6 +876,38 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     stored index for g in club.ursa (…) in the current format: …`.
   - `ursa_core::IdMap::from_stored_ids` and `IdMap::lookup_table` are the
     two halves of this; `IdMap::from_user_ids` still interns eagerly.
+- **SQL: `GRAPH_TABLE` path searches are about twice as fast from one start
+  node, and run in parallel from several, with the same rows** (#451). The
+  search copied each node's adjacency list (two lists, merged into a third,
+  for an undirected edge) before reading it, and looked up and counted a
+  per-edge state, through a `match` on how the states were stored, before
+  the cheap test that rejects most edges. Now it reads the lists where they
+  lie (an undirected step merges the two as it reads them), tests first, and
+  is compiled once per kind of state table, with the loop's branches decided
+  per search. `ANY SHORTEST` keeps one bit per state instead of 8 bytes, so
+  its table is dense at any size; the other tables stay dense up to 16 bytes
+  a node of the graph (or 512 MiB) instead of a fixed 2^26 states, and the
+  map past that, the target slots and the per-target counts use FxHash
+  instead of SipHash. Each query no longer copies the index's whole id column
+  to build its result (`concat` of the starts and every node's id): a
+  point query on a stored index reads only the ids of the nodes its paths
+  pass. From several start nodes, the searches run on all cores, one walker
+  per thread, each with its own state table (at most 1 GiB of them
+  together), and their rows are appended in start order; when
+  `ursa.max_paths` stops the query, and with which error, is what searching
+  one start after another gives (each start is checked against the exact
+  count of the paths before it). Rows, their order and the `expanded`
+  metric are bit for bit as before: a new test pins every row of a matrix
+  of searches (directions, selectors, modes, bounds, start sets, targets,
+  limits, four graphs), recorded before the change, on one thread and on
+  four, and another the rows of SQL path queries from a built and a stored
+  index. On R-MAT graphs with a stored index, in a new process each time
+  (wall, shared 4-core machine): from node 0, `ANY SHORTEST ->{1,3}`
+  0.88 → 0.44 s at 32M edges, `ANY SHORTEST ->*` 0.87 → 0.39 s (with
+  `vertices(p)` 0.98 → 0.55 s), undirected `{1,2}` 1.22 → 0.62 s; one pair
+  0.10 → 0.03 s with 30-byte string ids; from 16 start nodes, `{1,3}`, 16.4M
+  paths, 12.7 → 2.2 s (12.7 → 5.5 CPU-s); 64 starts that reach the limit
+  fail after 7.6 → 1.1 s. Peak memory is about the same.
 - **SQL: an index build interns a vertex table's keys while it interns the
   edges, not before them** (#385, N49). With the edge scan parallel (#351),
   reading the keys first was the serial part of a build with a vertex table:
@@ -1274,6 +1306,35 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `.headers on|off` turns the header row of `csv` and `tsv` on or off.
   - `.help` names the DuckDB aliases. `.nullvalue`, `.separator`,
     `.databases` and `.shell` are not added.
+- **SQL: loose ends of unavailable objects** (#401, after #381).
+  - `g.edges` and `g.nodes` of an unavailable graph fail with the graph's
+    message, as its functions, `GRAPH_TABLE` and `DESCRIBE GRAPH` do; they
+    said "table not found".
+  - The notice's remedy follows the cause: `or restore the file` for a
+    missing file, `or fix the cause and open the database again` for
+    anything else (expired `s3://` credentials, a network error, a file
+    without the columns a view reads).
+  - Repairs reach dependants: after `CREATE OR REPLACE` or `DROP` of an
+    object, the objects unavailable because they use it are defined again
+    from their catalog statements, so repairing a view brings back the views
+    and graphs over it without reopening the database. One that still
+    fails says why, and is tried again after the next change.
+  - `CREATE OR REPLACE EXTERNAL TABLE` over an unavailable table, with a
+    definition that fails too, keeps the table (unavailable, as it was); it
+    disappeared for the rest of the session.
+- **A truncated or fake `.parquet` file is an error, not a crash** (#332).
+  A file whose footer claims more metadata than the file holds (a
+  truncated download, a file still being written, `PAR1PAR1`) made the
+  parquet crate subtract with overflow: a panic in a debug build, a garbage
+  read in a release build. Ursa now checks each Parquet file's ends before
+  the parquet crate reads it (at least 12 bytes, `PAR1` at both ends, a
+  metadata length that fits) and names the file: `cannot read 'x.parquet':
+  it is not a valid Parquet file: it is 8 bytes, and a Parquet file is at
+  least 12`. It covers `FROM 'x.parquet'`, globs, `read_parquet`, `CREATE
+  EXTERNAL TABLE … STORED AS PARQUET`, graphs over them, and the Python
+  scans (`scan_edges('x.parquet')`: `the file is not valid Parquet (…)`),
+  in the CLI, Python and the browser alike. arrow-rs fixed the overflow in
+  parquet 60; Ursa is on 59 until DataFusion moves.
 - **SQL: `DESCRIBE FROM t` lists the columns** (#417). It returned a table
   of no rows, for a table or a file (`DESCRIBE FROM 'edges.csv'`): the
   FROM-first rewrite did not run under `DESCRIBE`, so the statement described

@@ -28,7 +28,8 @@
 //!   a file that is gone) does not stop it opening (#381): its object is
 //!   unavailable, with one notice, and fails only when used; `DROP` and
 //!   `CREATE OR REPLACE` repair it, and its statement is kept as it is.
-//!   See `replay`.
+//!   An object unavailable because it uses one is retried once what it uses
+//!   is replaced or dropped (#401). See `replay`.
 //! - `TEMPORARY` views and external tables run and are not stored.
 //! - In a read-only session, every statement that defines or drops anything
 //!   is refused.
@@ -224,7 +225,7 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
         let before = pending.len();
         let mut failed = Vec::new();
         for (index, sql) in pending {
-            if let Err(e) = replay_one(ctx, database, &sql).await {
+            if let Err(e) = replay_one(ctx, database, &sql, false).await {
                 failed.push((index, sql, ursa_engine::user_message(&e)));
             }
         }
@@ -238,11 +239,7 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
                 .map(|u| (u.kind, u.name.clone()));
             match (uses, defined_object(ctx, &sql)) {
                 (Some((kind, name)), Some(object)) => {
-                    let message = format!(
-                        "{} {} is unavailable: it uses {kind} {name}, which is unavailable; \
-                         repair {name}, or {}",
-                        object.kind, object.name, object.drop
-                    );
+                    let message = object.unavailable_using(kind, &name);
                     unavailable.push(object.mark(ctx, index, message));
                 }
                 _ => still.push((index, sql, cause)),
@@ -254,10 +251,7 @@ async fn replay(ctx: &SessionContext, database: &Database) -> Result<()> {
             let (index, sql, cause) = still.remove(0);
             match defined_object(ctx, &sql) {
                 Some(object) => {
-                    let message = format!(
-                        "{} {} is unavailable: {cause}; {} or restore the file",
-                        object.kind, object.name, object.drop
-                    );
+                    let message = object.unavailable_for(&cause);
                     unavailable.push(object.mark(ctx, index, message));
                 }
                 None => skipped.push((
@@ -317,21 +311,140 @@ enum Target {
 impl DefinedObject {
     /// Mark the object unavailable in `ctx`, with `message`.
     fn mark(self, ctx: &SessionContext, index: usize, message: String) -> Unavailable {
-        match self.target {
+        match &self.target {
             Target::Table(reference, table_type) => {
                 // A name already taken (a duplicate entry) keeps its table.
                 let _ = ctx.register_table(
-                    reference,
-                    Arc::new(UnavailableTable::new(message.clone(), table_type)),
+                    reference.clone(),
+                    Arc::new(UnavailableTable::new(message.clone(), *table_type)),
                 );
             }
-            Target::Graph(name) => graph::registry_of(ctx).mark_unavailable(&name, message.clone()),
+            Target::Graph(name) => graph::mark_unavailable(ctx, name, message.clone()),
         }
         Unavailable {
             index,
             kind: self.kind,
             name: self.name,
             message,
+        }
+    }
+
+    /// Mark the object, unavailable already, unavailable with `message`
+    /// instead.
+    fn mark_again(&self, ctx: &SessionContext, message: String) {
+        match &self.target {
+            Target::Table(reference, table_type) => {
+                let _ = ctx.deregister_table(reference.clone());
+                let _ = ctx.register_table(
+                    reference.clone(),
+                    Arc::new(UnavailableTable::new(message, *table_type)),
+                );
+            }
+            Target::Graph(name) => graph::mark_unavailable(ctx, name, message),
+        }
+    }
+
+    /// Why the object is unavailable in `ctx`, if it is.
+    async fn unavailable_in(&self, ctx: &SessionContext) -> Option<String> {
+        match &self.target {
+            Target::Table(reference, _) => {
+                let provider = ctx.table_provider(reference.clone()).await.ok()?;
+                db::as_unavailable(provider.as_ref()).map(|t| t.message().to_string())
+            }
+            Target::Graph(name) => graph::registry_of(ctx).unavailable(name),
+        }
+    }
+
+    /// The message of the object, unavailable because its statement failed
+    /// with `cause`: why, and how to repair it, worded from the cause (#401).
+    /// A missing file can be restored; anything else (expired credentials, a
+    /// network error, a file that is not valid) is fixed where it is, and the
+    /// database opened again.
+    fn unavailable_for(&self, cause: &str) -> String {
+        let remedy = if is_missing_file(cause) {
+            "or restore the file"
+        } else {
+            "or fix the cause and open the database again"
+        };
+        format!(
+            "{} {} is unavailable: {cause}; {} {remedy}",
+            self.kind, self.name, self.drop
+        )
+    }
+
+    /// The message of the object, unavailable because it uses `kind` `name`,
+    /// which is unavailable.
+    fn unavailable_using(&self, kind: &str, name: &str) -> String {
+        format!(
+            "{} {} is unavailable: it uses {kind} {name}, which is unavailable; repair {name}, \
+             or {}",
+            self.kind, self.name, self.drop
+        )
+    }
+}
+
+/// Whether `cause`, why a stored statement failed, is that a file is missing.
+fn is_missing_file(cause: &str) -> bool {
+    cause.contains("no file found at '")
+        || cause.contains("No files found at ")
+        || (cause.contains("Object at location ") && cause.contains(" not found"))
+}
+
+/// The remedy of an object that uses another, and still fails once that one
+/// was replaced or dropped ([`retry_dependants`]).
+const REPAIR_WHAT_IT_USES: &str = "or repair what it uses";
+
+/// Whether `message` says an object is unavailable because of another that
+/// it uses: one that is unavailable ([`DefinedObject::unavailable_using`]),
+/// or one that was replaced or dropped since ([`retry_dependants`]).
+fn uses_an_unavailable_object(message: &str) -> bool {
+    (message.contains(" is unavailable: it uses ") && message.contains(", which is unavailable; "))
+        || message.ends_with(REPAIR_WHAT_IT_USES)
+}
+
+/// Define again the objects that are unavailable because they use one that
+/// was (#401), now that a statement replaced or dropped something: each
+/// whose statement now runs is available. One that still fails for another
+/// reason (what it uses was dropped) says the new reason, and is tried again
+/// after the next change.
+async fn retry_dependants(ctx: &SessionContext, database: &Database) {
+    loop {
+        let mut waiting = Vec::new();
+        for sql in database.statements() {
+            let Some(object) = defined_object(ctx, &sql) else {
+                continue;
+            };
+            if let Some(message) = object.unavailable_in(ctx).await {
+                waiting.push((sql, object, message));
+            }
+        }
+        let mut repaired = false;
+        for (sql, object, message) in &waiting {
+            if !uses_an_unavailable_object(message) {
+                continue;
+            }
+            let Err(e) = replay_one(ctx, database, sql, true).await else {
+                repaired = true;
+                continue;
+            };
+            let cause = ursa_engine::user_message(&e);
+            let uses = waiting
+                .iter()
+                .find(|(_, _, m)| m != message && cause.contains(m.as_str()))
+                .map(|(_, o, _)| (o.kind, o.name.clone()));
+            let again = match uses {
+                Some((kind, name)) => object.unavailable_using(kind, &name),
+                None => format!(
+                    "{} {} is unavailable: {cause}; {}, {REPAIR_WHAT_IT_USES}",
+                    object.kind, object.name, object.drop
+                ),
+            };
+            if &again != message {
+                object.mark_again(ctx, again);
+            }
+        }
+        if !repaired {
+            return;
         }
     }
 }
@@ -376,8 +489,15 @@ fn defined_object(ctx: &SessionContext, sql: &str) -> Option<DefinedObject> {
 }
 
 /// Run one stored statement, its relative paths resolved against the
-/// database's directory, wherever the process runs.
-async fn replay_one(ctx: &SessionContext, database: &Database, sql: &str) -> Result<()> {
+/// database's directory, wherever the process runs. With `replace`, as
+/// `CREATE OR REPLACE` (without `IF NOT EXISTS`): it defines again an
+/// object that is unavailable.
+async fn replay_one(
+    ctx: &SessionContext,
+    database: &Database,
+    sql: &str,
+    replace: bool,
+) -> Result<()> {
     let mut statements = parse_sql_for(ctx, sql)?;
     if statements.len() != 1 {
         return Err(DataFusionError::Plan(
@@ -385,6 +505,9 @@ async fn replay_one(ctx: &SessionContext, database: &Database, sql: &str) -> Res
         ));
     }
     let mut statement = statements.remove(0);
+    if replace {
+        or_replace(&mut statement);
+    }
     paths::rewrite_locations(ctx, &mut statement, |location| {
         database.replayed_location(location)
     });
@@ -395,7 +518,65 @@ async fn replay_one(ctx: &SessionContext, database: &Database, sql: &str) -> Res
         )));
     };
     check_available(ctx, &statement, Some(&key)).await?;
-    run(ctx, statement).await.map(|_| ())
+    run_keeping_unavailable(ctx, &key, statement)
+        .await
+        .map(|_| ())
+}
+
+/// `statement`, which defines an object, as `CREATE OR REPLACE` without `IF
+/// NOT EXISTS`.
+fn or_replace(statement: &mut UrsaStatement) {
+    match statement {
+        UrsaStatement::CreatePropertyGraph(g) => {
+            g.or_replace = true;
+            g.if_not_exists = false;
+        }
+        UrsaStatement::DataFusion(df) => match df.as_mut() {
+            DFStatement::CreateExternalTable(t) => {
+                t.or_replace = true;
+                t.if_not_exists = false;
+            }
+            DFStatement::Statement(s) => {
+                if let SQLStatement::CreateView(v) = s.as_mut() {
+                    v.or_replace = true;
+                    v.if_not_exists = false;
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Run `statement`, which defines the object `key`. If that object is an
+/// unavailable table and the statement fails, it stays as it was:
+/// DataFusion's `CREATE OR REPLACE EXTERNAL TABLE` drops the table before it
+/// opens the new one, so a new definition that fails too would leave no table
+/// for the rest of the session (#401).
+async fn run_keeping_unavailable(
+    ctx: &SessionContext,
+    key: &Key,
+    statement: UrsaStatement,
+) -> Result<DataFrame> {
+    let kept = match key {
+        Key::Table(name) => {
+            let reference = TableReference::from(name.as_str());
+            match ctx.table_provider(reference.clone()).await {
+                Ok(provider) if db::as_unavailable(provider.as_ref()).is_some() => {
+                    Some((reference, provider))
+                }
+                _ => None,
+            }
+        }
+        Key::Graph(_) => None,
+    };
+    let result = run(ctx, statement).await;
+    if let (Err(_), Some((reference, provider))) = (&result, kept) {
+        if !ctx.table_exist(reference.clone()).unwrap_or(true) {
+            let _ = ctx.register_table(reference, provider);
+        }
+    }
+    result
 }
 
 /// Refuse `statement` if it reads a view or table that is unavailable (see
@@ -518,7 +699,7 @@ pub(crate) async fn execute(
             key, if_not_exists, ..
         } => {
             let stored = stored_text(ctx, database, &statement, text)?;
-            let frame = run(ctx, statement).await?;
+            let frame = run_keeping_unavailable(ctx, &key, statement).await?;
             let mut statements = database.statements();
             match position(ctx, &statements, &key) {
                 Some(_) if if_not_exists => {}
@@ -526,6 +707,7 @@ pub(crate) async fn execute(
                 None => statements.push(stored),
             }
             database.save(statements)?;
+            retry_dependants(ctx, database).await;
             Ok(frame)
         }
         Effect::Drop { keys } => {
@@ -536,6 +718,7 @@ pub(crate) async fn execute(
                 .filter(|s| !stored_key(ctx, s).is_some_and(|k| keys.contains(&k)))
                 .collect();
             database.save(statements)?;
+            retry_dependants(ctx, database).await;
             Ok(frame)
         }
     }

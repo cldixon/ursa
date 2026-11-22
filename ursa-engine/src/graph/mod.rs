@@ -53,7 +53,7 @@ pub mod schema;
 
 pub use define::{
     check_ddl, check_drop, check_drop_schema, check_replace, closest_name, create_graph,
-    drop_graph, unknown_graph, EdgeSpec, GraphSpec, VertexSpec,
+    drop_graph, mark_unavailable, unknown_graph, EdgeSpec, GraphSpec, VertexSpec,
 };
 pub use describe::{describe_graph, show_graphs};
 pub use schema::{edges_plan, edges_plan_from, nodes_plan, nodes_plan_from, GraphSchema};
