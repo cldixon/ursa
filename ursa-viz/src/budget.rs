@@ -131,9 +131,11 @@ pub struct FrameBudget {
     fitted: u32,
     /// The held prefix missed on the last frame.
     struck: bool,
-    /// The shortest frame seen: the display's refresh period, if shorter
-    /// than 60 Hz's.
+    /// The display's refresh period: 60 Hz's, or shorter once three frames
+    /// running were shorter (one short reading is the clock's jitter).
     period: f64,
+    /// The longest of the short frames running, and how many.
+    short: (f64, u32),
     /// When the view last moved, and whether it has since the last frame.
     last_move: f64,
     moved: bool,
@@ -162,6 +164,7 @@ impl FrameBudget {
             fitted: 0,
             struck: false,
             period: PERIOD_MS,
+            short: (0.0, 0),
             last_move: f64::NEG_INFINITY,
             moved: false,
             drawn: (0, 0),
@@ -225,7 +228,15 @@ impl FrameBudget {
             self.costs[self.observed % WINDOW] = cost_ms as f32;
         }
         self.observed += 1;
-        self.period = self.period.min(cost_ms.max(8.0));
+        if cost_ms < 0.9 * self.period {
+            self.short = (self.short.0.max(cost_ms), self.short.1 + 1);
+            if self.short.1 >= 3 {
+                self.period = self.short.0.max(4.0);
+                self.short = (0.0, 0);
+            }
+        } else {
+            self.short = (0.0, 0);
+        }
         let (drawn, edges) = self.drawn;
         let all = drawn >= edges;
         let fit = cost_ms <= self.limit_ms();
@@ -518,6 +529,30 @@ mod tests {
         budget.observe(180.0);
         let after = run(&mut budget, device, M, 5);
         assert!(after[0] >= frame.units.min(before) * 96 / 100, "{after:?}");
+    }
+
+    #[test]
+    fn the_refresh_period_is_learned_from_frames_not_from_one() {
+        let mut budget = FrameBudget::new();
+        let at_60hz = budget.limit_ms();
+        assert!((at_60hz - 1.3 * 1000.0 / 60.0).abs() < 1e-9);
+        // One short reading (the clock's jitter) changes nothing.
+        budget.observe(11.0);
+        budget.observe(16.7);
+        budget.observe(11.0);
+        budget.observe(11.5);
+        budget.observe(16.7);
+        assert_eq!(budget.limit_ms(), at_60hz);
+        // Three running are the display's: 90 Hz here.
+        budget.observe(11.1);
+        budget.observe(11.2);
+        budget.observe(11.1);
+        assert!((budget.limit_ms() - 1.3 * 11.2).abs() < 1e-9);
+        // At 240 Hz the target is the limit.
+        for _ in 0..3 {
+            budget.observe(4.17);
+        }
+        assert_eq!(budget.limit_ms(), TARGET_MS);
     }
 
     #[test]

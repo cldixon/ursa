@@ -316,11 +316,10 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             const start = performance.now();
             for (let i = 0; i < frames + 20 && (i < 40 || performance.now() - start < budgetMs); i++) {
               const ts = (await raf()) as number;
-              const now = performance.now();
-              if (moving) view.frameCost(now - started);
+              if (moving) view.frameCost(ts - started);
               move(i);
-              started = now;
-              moving = view.renderFrame(now);
+              started = ts;
+              moving = view.renderFrame(ts);
               if (i >= 20) interval.push(ts - last); // 20 for the budget to find its level
               last = ts;
             }

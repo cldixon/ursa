@@ -217,7 +217,8 @@ impl GraphView {
 
     /// Draw a frame within the frame budget: while the view moves (the
     /// camera or the positions changed since the last frame, or less than
-    /// [`GraphView::frame_rest_ms`] before `now`, a `performance.now()`),
+    /// [`GraphView::frame_rest_ms`] before `now`, the animation frame's
+    /// time),
     /// only as many edges as the last frames' costs say fit in a frame,
     /// the most important first ([`GraphView::set_edge_order`]), drawn
     /// deeper to make up for the rest, and, where the nodes are too many
@@ -225,16 +226,16 @@ impl GraphView {
     /// as [`GraphView::render`].
     ///
     /// Returns whether the view is moving. If it is, measure what the
-    /// frame cost, from `now` to the next animation frame, and say
-    /// ([`GraphView::frame_cost`]): the budget follows it. And if
+    /// frame cost, from this animation frame's time to the next's (whole
+    /// refreshes of the display, whenever in its frame each callback ran),
+    /// and say ([`GraphView::frame_cost`]): the budget follows it. And if
     /// [`GraphView::frame_partial`] is then true, something was left out:
     /// draw again once nothing has moved for `frameRestMs`.
     ///
     /// ```js
-    /// function draw() {
-    ///   const start = performance.now();
-    ///   if (view.renderFrame(start)) {
-    ///     requestAnimationFrame(() => view.frameCost(performance.now() - start));
+    /// function draw(time) {  // an animation frame's
+    ///   if (view.renderFrame(time)) {
+    ///     requestAnimationFrame((next) => view.frameCost(next - time));
     ///     clearTimeout(rest);
     ///     if (view.framePartial) rest = setTimeout(() => requestAnimationFrame(draw), view.frameRestMs);
     ///   }

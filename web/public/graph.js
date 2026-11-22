@@ -457,7 +457,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
 
   // Frames: drawn when something changed (new positions, a pan or zoom), not
   // every animation frame, so an idle view costs nothing.
-  const draw = () => {
+  const draw = (frameTime) => {
     state.frame = 0;
     if (current !== state || state.paused || !state.positioned) return;
     if (state.pending) {
@@ -470,12 +470,12 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       // as fit in a frame; at rest, all of them.
       // A layout that is running is movement, between its positions too.
       if (!state.layoutDone) view.keepMoving();
-      const moving = view.renderFrame(start);
+      const moving = view.renderFrame(frameTime);
       const end = performance.now();
       timings.frameDrawn(start, end);
       state.frames++;
       times.firstDraw ??= end;
-      if (moving) budgeted(start);
+      if (moving) budgeted(frameTime);
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
       return;
@@ -484,11 +484,12 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   };
   // After a moving frame: what it cost, which the budget follows, is the
   // time to the next animation frame (with no GPU the browser rasterises on
-  // this thread first; with one, a late frame misses a refresh). And if it
-  // left edges out, a frame with all of them once nothing has moved for a
-  // while.
-  const budgeted = (start) => {
-    requestAnimationFrame(() => current === state && view.frameCost(performance.now() - start));
+  // this thread first; with one, a late frame misses a refresh), from one
+  // frame's time to the next's: whole refreshes, whenever in its frame each
+  // callback ran. And if it left anything out, a frame with everything once
+  // nothing has moved for a while.
+  const budgeted = (frameTime) => {
+    requestAnimationFrame((next) => current === state && view.frameCost(next - frameTime));
     clearTimeout(state.rest);
     state.rest = view.framePartial ? setTimeout(rested, view.frameRestMs + 1) : 0;
   };
