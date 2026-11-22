@@ -1,4 +1,5 @@
-//! One kernel on one R-MAT graph, for measuring a change to it (#420, #454).
+//! One kernel on one R-MAT graph, for measuring a change to it (#420, #454,
+//! #422).
 //!
 //! Prints the kernel's wall time, the CPU time it used (all threads) and a
 //! hash of its result, so two builds can be compared and shown to agree. Run
@@ -12,6 +13,8 @@
 //!     --kernel betweenness --edges 32000000 --scale 21 --sources 105
 //! cargo run --release -p ursa-core --example rmat_kernel -- \
 //!     --kernel label-propagation --edges 32000000 --scale 21 [--parallel]
+//! cargo run --release -p ursa-core --example rmat_kernel -- \
+//!     --kernel closeness --edges 1000000 --scale 16 [--direction both]
 //! ```
 //!
 //! `--scale` is the log2 of the node slots (default: `edges / 16` slots, as
@@ -26,11 +29,14 @@
 //! and modularity with the hash. `--planted P` replaces the R-MAT graph with a
 //! planted-partition one: `edges / 16` nodes in communities of 16 to 79 nodes,
 //! with P% of the edges drawn between communities.
+//!
+//! `--kernel closeness` is exact unweighted closeness from every node, along
+//! `--direction` (`out`, the default, `in` or `both`).
 
 use std::time::Instant;
 
-use ursa_core::algo::{betweenness, label_propagation, triangle_count};
-use ursa_core::Topology;
+use ursa_core::algo::{betweenness, closeness_directed, label_propagation, triangle_count};
+use ursa_core::{Direction, Topology};
 
 /// splitmix64.
 fn next(state: &mut u64) -> u64 {
@@ -192,8 +198,22 @@ fn main() {
             communities = Some(label_propagation(&t, None, 20, Some(1), parallel));
             String::new()
         }
+        "closeness" => {
+            let dir = match arg(&args, "--direction").as_deref() {
+                None | Some("out") => Direction::Out,
+                Some("in") => Direction::In,
+                Some("both") => Direction::Both,
+                Some(other) => panic!("--direction is out, in or both, not {other}"),
+            };
+            let c = closeness_directed(&t, None, dir);
+            let hash = fnv(c.iter().map(|x| x.to_bits()));
+            format!("{dir:?}, result hash {hash:016x}")
+        }
         other => {
-            panic!("--kernel is triangles, betweenness, label-propagation or none, not {other}")
+            panic!(
+                "--kernel is triangles, betweenness, label-propagation, closeness or none, \
+                 not {other}"
+            )
         }
     };
     let wall = start.elapsed().as_secs_f64();
