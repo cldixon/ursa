@@ -324,12 +324,12 @@ async fn show_and_describe_a_graph_of_several_tables() {
     assert_eq!(
         ok(&ctx, "SHOW GRAPHS").await,
         "\
-+--------+------------+--------+-------------+--------------+------------+
-| name   | edge_table | source | destination | vertex_table | vertex_key |
-+--------+------------+--------+-------------+--------------+------------+
-| social | follows    | a      | b           | people       | id         |
-| social | wrote      | author | post        | people       | id         |
-+--------+------------+--------+-------------+--------------+------------+"
++--------+------------+--------+-------------+--------------+------------+--------+--------+
+| name   | edge_table | source | destination | vertex_table | vertex_key | status | reason |
++--------+------------+--------+-------------+--------------+------------+--------+--------+
+| social | follows    | a      | b           | people       | id         | ok     |        |
+| social | wrote      | author | post        | people       | id         | ok     |        |
++--------+------------+--------+-------------+--------------+------------+--------+--------+"
     );
     let described = ok(&ctx, "DESCRIBE GRAPH social").await;
     for row in [

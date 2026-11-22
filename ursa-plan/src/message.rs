@@ -68,6 +68,15 @@ pub fn engine_message(e: &DataFusionError) -> String {
             if label.contains("{}") {
                 return label.replacen("{}", &engine_message(inner), 1);
             }
+            // ursa-io's footer check (#332) names the file. A scan's label
+            // names it too, unless the scan read a glob or a directory.
+            let raw = inner.to_string();
+            if let Some((file, why)) = footer_error(strip_prefixes(raw.trim())) {
+                let name = file.rsplit('/').next().unwrap_or(file);
+                if !label.contains(&format!("{name}'")) {
+                    return with_label(label, format!("'{file}' is not valid Parquet ({why})"));
+                }
+            }
             with_label(label, engine_message(inner))
         }
         DataFusionError::Shared(inner) => engine_message(inner),
@@ -461,12 +470,9 @@ fn translate(m: &str) -> Option<String> {
                 .into(),
         );
     }
-    // ursa-io's footer check (#332): the scan's label names the file already.
-    if let Some(why) = m
-        .strip_prefix("cannot read '")
-        .and_then(|rest| rest.split_once("': it is not a valid Parquet file: "))
-        .map(|(_, why)| why)
-    {
+    // ursa-io's footer check (#332): the scan's label names the file already
+    // (or `engine_message` names it, for a glob or a directory).
+    if let Some((_, why)) = footer_error(m) {
         return Some(format!("the file is not valid Parquet ({why})"));
     }
     if m.starts_with("Invalid Parquet file.") || m.starts_with("Corrupt footer") {
@@ -487,6 +493,13 @@ fn translate(m: &str) -> Option<String> {
         return Some(format!("could not read the file as CSV: {cause}"));
     }
     None
+}
+
+/// The file and the reason of an error from ursa-io's footer check (#332):
+/// `cannot read '<file>': it is not a valid Parquet file: <why>`.
+fn footer_error(m: &str) -> Option<(&str, &str)> {
+    m.strip_prefix("cannot read '")?
+        .split_once("': it is not a valid Parquet file: ")
 }
 
 /// A serde error reading the argument `label` (`rename()`, `join(how=)`) from its
@@ -748,5 +761,25 @@ mod tests {
         let inner = DataFusionError::Execution("x".into());
         let e = DataFusionError::Context("a ({}) b".into(), Box::new(inner));
         assert_eq!(engine_message(&e), "a (x) b");
+    }
+
+    #[test]
+    fn a_bad_parquet_file_is_named_when_the_label_does_not_name_it() {
+        let footer = || {
+            Box::new(DataFusionError::Plan(
+                "cannot read '/d/b.parquet': it is not a valid Parquet file: the file is empty"
+                    .into(),
+            ))
+        };
+        let e = DataFusionError::Context("scan_edges('/d/b.parquet')".into(), footer());
+        assert_eq!(
+            engine_message(&e),
+            "scan_edges('/d/b.parquet'): the file is not valid Parquet (the file is empty)"
+        );
+        let e = DataFusionError::Context("scan_edges('/d/*.parquet')".into(), footer());
+        assert_eq!(
+            engine_message(&e),
+            "scan_edges('/d/*.parquet'): '/d/b.parquet' is not valid Parquet (the file is empty)"
+        );
     }
 }

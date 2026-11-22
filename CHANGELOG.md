@@ -779,6 +779,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **An empty `.parquet` file is an error naming it** (behaviour change: an
+  empty Parquet file used to read as zero rows). DataFusion's listing
+  skipped a 0-byte file before the footer check (#332) saw it, so
+  `FROM 'empty.parquet'` returned no rows, and a glob or directory holding
+  one read as if it were not there. Ursa now lists a Parquet table's files
+  itself and stops at an empty one, as DuckDB and PyArrow do: `cannot read
+  'empty.parquet': it is not a valid Parquet file: the file is empty`. It
+  covers a file named directly and one found by a glob or a directory, in `FROM '…'`, `read_parquet`, `CREATE EXTERNAL TABLE … STORED
+  AS PARQUET`, graphs over them and the Python scans, which name the file
+  for a glob (`scan_edges('data/*.parquet'): 'data/b.parquet' is not valid
+  Parquet (…)`). An empty CSV or JSON file is still skipped. A table is
+  checked when it is created: an external table whose file becomes empty
+  later reads it as no rows.
 - **`hop`'s rows come back in no particular order** (behaviour change,
   #452). SQL `hop(…)` and Python `ur.hop(…).from_(…)` return the same rows
   as before, with the same distances, but not always in the same order: the
@@ -1460,6 +1473,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `CREATE OR REPLACE EXTERNAL TABLE` over an unavailable table, with a
     definition that fails too, keeps the table (unavailable, as it was); it
     disappeared for the rest of the session.
+- **SQL: `SHOW GRAPHS` lists unavailable graphs, with a `status` and a
+  `reason`** (behaviour change, #401). A graph of the database that could
+  not be defined when it was opened (a file it reads was moved) was left
+  out, so it looked lost, and `CREATE PROPERTY GRAPH` with its name said
+  "already exists" for a graph nobody could see. It is now listed from its
+  stored definition, as DuckDB lists a view over a missing file, and two
+  columns are added after `vertex_key`: `status`, `ok` or `unavailable`,
+  and `reason`, NULL for a usable graph and otherwise the notice's message
+  after `graph g is unavailable: ` (`no file found at '…'; DROP PROPERTY
+  GRAPH g or restore the file`). A vertex key the stored definition leaves
+  out is NULL for such a graph. `.graphs` shows the same. `SHOW TABLES`
+  already listed unavailable views and tables.
 - **A truncated or fake `.parquet` file is an error, not a crash** (#332).
   A file whose footer claims more metadata than the file holds (a
   truncated download, a file still being written, `PAR1PAR1`) made the

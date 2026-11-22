@@ -765,6 +765,12 @@ def scan_cases(tmp: Path) -> dict:
     (tmp / "truncated.parquet").write_bytes(
         b"PAR1" + bytes(16) + (1000).to_bytes(4, "little") + b"PAR1"
     )
+    # An empty file is an error too, named or found by a glob, as in DuckDB
+    # and PyArrow (DataFusion's listing skips it).
+    (tmp / "empty.parquet").write_bytes(b"")
+    (tmp / "with_empty").mkdir()
+    pq.write_table(EDGES, tmp / "with_empty" / "a.parquet")
+    (tmp / "with_empty" / "b.parquet").write_bytes(b"")
     (tmp / "bad.csv").write_text('s,d\n1,2\n"x')
     pq.write_table(EDGES.set_column(2, "w", pa.array([1, 2, 3, 4])), tmp / "e_int.parquet")
     p = lambda name: str(tmp / name)  # noqa: E731
@@ -853,6 +859,18 @@ def scan_cases(tmp: Path) -> dict:
             ur.ComputeError,
             f"scan_nodes('{p('truncated.parquet')}'): the file is not valid Parquet (its footer "
             "says the metadata is 1000 bytes, but the file is 28 bytes; it may be truncated)",
+        ),
+        "empty": (
+            lambda: ur.scan_edges(p("empty.parquet"), src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges('{p('empty.parquet')}'): the file is not valid Parquet (the file is "
+            "empty)",
+        ),
+        "empty_in_glob": (
+            lambda: ur.scan_edges(p("with_empty/*.parquet"), src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges('{p('with_empty/*.parquet')}'): '{p('with_empty/b.parquet')}' is not "
+            "valid Parquet (the file is empty)",
         ),
         "csv": (
             lambda: ur.scan_edges(p("bad.csv"), src="s", dst="d"),
