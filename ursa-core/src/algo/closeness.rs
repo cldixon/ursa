@@ -1,13 +1,15 @@
 //! Closeness centrality — a BFS from every node, folding finite distances.
 //!
-//! The cheapest of the centralities: a BFS (hop count) or Dijkstra (edge weight)
-//! from each source, parallelised over sources with Rayon. Each rayon chunk
-//! allocates its traversal scratch **once** and resets only the nodes it touched
-//! between sources, so the per-source distance buffer (and the Dijkstra heap /
-//! settled flags) is allocated once per split instead of once per source. Results
-//! are byte-identical: the unweighted fold is an exact `i64` sum (order does not
-//! matter), and the weighted fold keeps the original ascending node-order summation
-//! so its `f64` total is bit-for-bit unchanged.
+//! Unweighted (hop count): 64 sources per breadth-first pass, one bit of a `u64`
+//! per source (#422), the passes parallelised with Rayon. A node's adjacency list
+//! is read once per level on which any of the 64 searches has it in the frontier,
+//! not once per search. Weighted (edge weight): one Dijkstra per source,
+//! parallelised over sources. Each rayon split allocates its scratch **once** and
+//! resets only the nodes it touched between passes or sources. Results are
+//! byte-identical to one search per source: the unweighted fold is an exact `i64`
+//! sum and count per source (order does not matter), and the weighted fold keeps
+//! the original ascending node-order summation so its `f64` total is bit-for-bit
+//! unchanged.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -17,22 +19,30 @@ use crate::parallel::*;
 use super::bfs::TotalF64;
 use crate::topology::{Direction, EdgeMask, Topology};
 
-/// Reusable per-source scratch for the unweighted (hop-count) BFS. `touched` lists
-/// the nodes reached from the current source so they can be reset in `O(reached)`
-/// rather than re-zeroing all `n`.
-struct ClosenessScratch {
-    dist: Vec<i32>,
-    frontier: Vec<u32>,
-    next: Vec<u32>,
+/// Sources per unweighted pass: one bit of a `u64` each (#422).
+const BATCH: usize = 64;
+
+/// Reusable scratch for one batch of up to 64 unweighted searches run together
+/// (multi-source BFS, Then et al., VLDB 2014). Bit `i` of a node's word belongs
+/// to source `i` of the batch. `seen` and `next` are indexed by node and are all
+/// zero between batches; the frontier is a dense list of `(node, word)` pairs, so
+/// a level reads its words in order. `touched` lists the nodes `seen` set a bit
+/// in, so the reset costs `O(reached)` rather than `O(n)`.
+struct ClosenessBatchScratch {
+    seen: Vec<u64>,
+    next: Vec<u64>,
+    frontier: Vec<(u32, u64)>,
+    reached: Vec<u32>,
     touched: Vec<u32>,
 }
 
-impl ClosenessScratch {
+impl ClosenessBatchScratch {
     fn new(n: usize) -> Self {
-        ClosenessScratch {
-            dist: vec![-1i32; n],
+        ClosenessBatchScratch {
+            seen: vec![0u64; n],
+            next: vec![0u64; n],
             frontier: Vec::new(),
-            next: Vec::new(),
+            reached: Vec::new(),
             touched: Vec::new(),
         }
     }
@@ -80,78 +90,102 @@ pub fn closeness_directed(topo: &Topology, mask: Option<&EdgeMask>, dir: Directi
         // Build the lazily cached transpose here, not inside the parallel loop.
         topo.incoming();
     }
-    // `map_init` keeps the per-source work-stealing parallelism (each node writes
-    // its own output slot, so there is no cross-source ordering to preserve) while
-    // building the scratch once per rayon thread and reusing it across that
-    // thread's sources.
-    (0..n as u32)
-        .into_par_iter()
-        .map_init(
-            || ClosenessScratch::new(n),
-            |sc, u| closeness_one(topo, mask, dir, u, sc),
-        )
-        .collect()
+    // 64 consecutive sources per pass, the passes in parallel. Each pass writes
+    // its own 64 output slots, so there is no cross-pass ordering to preserve, and
+    // the scratch is built once per rayon split and reused across its passes.
+    let mut out = vec![0.0f64; n];
+    out.par_chunks_mut(BATCH).enumerate().for_each_init(
+        || ClosenessBatchScratch::new(n),
+        |sc, (b, slots)| closeness_batch(topo, mask, dir, (b * BATCH) as u32, slots, sc),
+    );
+    out
 }
 
-/// One unweighted closeness value, over reusable scratch (clean on entry; the
-/// touched nodes are reset to clean on exit). The `i64` distance sum is exact, so
-/// summing the reached set (rather than scanning all `n` in node order) gives an
-/// identical result.
-fn closeness_one(
+/// Unweighted closeness of the sources `first .. first + slots.len()` (at most
+/// 64), written to `slots`, from one breadth-first pass that carries all of their
+/// searches as bits.
+///
+/// A step ORs each frontier node's word into its neighbours' `next`, less what
+/// they have already seen; a node's adjacency list is read once per level on
+/// which any of the searches has it in the frontier, not once per search. When
+/// bit `i` first reaches a node at level `d`, `d` is added to source `i`'s
+/// distance sum and 1 to its reach count. Those are the integers the
+/// one-search-per-source kernel folded (every node at finite distance `≥ 1`
+/// once, at its BFS depth), so `reachable / sum` is the same `f64`, bit for bit.
+/// Scratch is clean on entry and left clean on exit.
+fn closeness_batch(
     topo: &Topology,
     mask: Option<&EdgeMask>,
     dir: Direction,
-    u: u32,
-    sc: &mut ClosenessScratch,
-) -> f64 {
-    let ClosenessScratch {
-        dist,
-        frontier,
+    first: u32,
+    slots: &mut [f64],
+    sc: &mut ClosenessBatchScratch,
+) {
+    let ClosenessBatchScratch {
+        seen,
         next,
+        frontier,
+        reached,
         touched,
     } = sc;
+    let k = slots.len();
+    debug_assert!(k <= BATCH);
 
-    dist[u as usize] = 0;
-    touched.push(u);
-    frontier.push(u);
-    let mut level = 1i32;
+    for i in 0..k {
+        let s = first + i as u32;
+        let bit = 1u64 << i;
+        seen[s as usize] = bit;
+        frontier.push((s, bit));
+        touched.push(s);
+    }
+
+    let mut sum = [0i64; BATCH];
+    let mut reach = [0i64; BATCH];
+    let mut level = 1i64;
     while !frontier.is_empty() {
-        next.clear();
-        for &v in frontier.iter() {
+        for &(v, word) in frontier.iter() {
             topo.for_each_neighbor(v, dir, mask, |w| {
-                if dist[w as usize] < 0 {
-                    dist[w as usize] = level;
-                    next.push(w);
-                    touched.push(w);
+                let w = w as usize;
+                let new = word & !seen[w];
+                if new != 0 {
+                    if next[w] == 0 {
+                        reached.push(w as u32);
+                    }
+                    next[w] |= new;
                 }
             });
         }
-        level += 1;
-        std::mem::swap(frontier, next);
-    }
-
-    let mut sum = 0i64;
-    let mut reachable = 0i64;
-    for &w in touched.iter() {
-        let d = dist[w as usize];
-        if d >= 1 {
-            sum += d as i64;
-            reachable += 1;
+        frontier.clear();
+        for &w in reached.iter() {
+            let new = std::mem::take(&mut next[w as usize]);
+            if seen[w as usize] == 0 {
+                touched.push(w);
+            }
+            seen[w as usize] |= new;
+            frontier.push((w, new));
+            let mut bits = new;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                sum[i] += level;
+                reach[i] += 1;
+                bits &= bits - 1;
+            }
         }
+        reached.clear();
+        level += 1;
     }
-    let result = if sum > 0 {
-        reachable as f64 / sum as f64
-    } else {
-        0.0
-    };
 
+    for (i, slot) in slots.iter_mut().enumerate() {
+        *slot = if sum[i] > 0 {
+            reach[i] as f64 / sum[i] as f64
+        } else {
+            0.0
+        };
+    }
     for &w in touched.iter() {
-        dist[w as usize] = -1;
+        seen[w as usize] = 0;
     }
     touched.clear();
-    frontier.clear();
-    next.clear();
-    result
 }
 
 /// Weighted closeness centrality: as [`closeness`], but distances are minimum
@@ -278,6 +312,91 @@ fn closeness_weighted_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The one-search-per-source kernel this replaced (#422), kept as the
+    // reference the batched kernel is compared with bit for bit.
+
+    /// Reusable per-source scratch for the unweighted (hop-count) BFS. `touched` lists
+    /// the nodes reached from the current source so they can be reset in `O(reached)`
+    /// rather than re-zeroing all `n`.
+    struct ClosenessScratch {
+        dist: Vec<i32>,
+        frontier: Vec<u32>,
+        next: Vec<u32>,
+        touched: Vec<u32>,
+    }
+
+    impl ClosenessScratch {
+        fn new(n: usize) -> Self {
+            ClosenessScratch {
+                dist: vec![-1i32; n],
+                frontier: Vec::new(),
+                next: Vec::new(),
+                touched: Vec::new(),
+            }
+        }
+    }
+
+    /// One unweighted closeness value, over reusable scratch (clean on entry; the
+    /// touched nodes are reset to clean on exit). The `i64` distance sum is exact, so
+    /// summing the reached set (rather than scanning all `n` in node order) gives an
+    /// identical result.
+    fn closeness_one(
+        topo: &Topology,
+        mask: Option<&EdgeMask>,
+        dir: Direction,
+        u: u32,
+        sc: &mut ClosenessScratch,
+    ) -> f64 {
+        let ClosenessScratch {
+            dist,
+            frontier,
+            next,
+            touched,
+        } = sc;
+
+        dist[u as usize] = 0;
+        touched.push(u);
+        frontier.push(u);
+        let mut level = 1i32;
+        while !frontier.is_empty() {
+            next.clear();
+            for &v in frontier.iter() {
+                topo.for_each_neighbor(v, dir, mask, |w| {
+                    if dist[w as usize] < 0 {
+                        dist[w as usize] = level;
+                        next.push(w);
+                        touched.push(w);
+                    }
+                });
+            }
+            level += 1;
+            std::mem::swap(frontier, next);
+        }
+
+        let mut sum = 0i64;
+        let mut reachable = 0i64;
+        for &w in touched.iter() {
+            let d = dist[w as usize];
+            if d >= 1 {
+                sum += d as i64;
+                reachable += 1;
+            }
+        }
+        let result = if sum > 0 {
+            reachable as f64 / sum as f64
+        } else {
+            0.0
+        };
+
+        for &w in touched.iter() {
+            dist[w as usize] = -1;
+        }
+        touched.clear();
+        frontier.clear();
+        next.clear();
+        result
+    }
 
     #[test]
     fn closeness_of_a_directed_triangle() {
@@ -426,6 +545,39 @@ mod tests {
                         want.to_bits(),
                         "n={n} {dir:?} u={u}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_kernel_equals_one_search_per_source_bit_for_bit() {
+        // A sparse random graph with partial reaches, parallel edges, self-loops
+        // and 50 isolated nodes, n not a multiple of 64; every direction, masked
+        // and not, against the kernel the batched one replaced.
+        let (n, m) = (777u32, 1200usize);
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for _ in 0..m {
+            src.push(next() % (n - 50));
+            dst.push(next() % (n - 50));
+        }
+        let keep: Vec<bool> = (0..m).map(|_| next() % 4 != 0).collect();
+        let mask = EdgeMask::from_bools(&keep);
+        let t = Topology::build(n as usize, src, dst);
+        for dir in [Direction::Out, Direction::In, Direction::Both] {
+            for mask in [None, Some(&mask)] {
+                let got = closeness_directed(&t, mask, dir);
+                let mut sc = ClosenessScratch::new(n as usize);
+                for u in 0..n {
+                    let want = closeness_one(&t, mask, dir, u, &mut sc);
+                    assert_eq!(got[u as usize].to_bits(), want.to_bits(), "{dir:?} u={u}");
                 }
             }
         }

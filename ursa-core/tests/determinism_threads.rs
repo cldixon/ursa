@@ -19,10 +19,11 @@
 
 use rayon::ThreadPoolBuilder;
 use ursa_core::algo::{
-    betweenness, betweenness_weighted, closeness_weighted, connected_components_strong,
-    connected_components_weak, label_propagation, layout_fa2, layout_fa2_multilevel, layout_fr,
-    louvain, louvain_weighted, pagerank, pagerank_weighted, symmetric_view_weighted, Fa2Multilevel,
-    Fa2Params, LayoutParams, MultilevelParams, PageRankParams,
+    betweenness, betweenness_weighted, closeness_directed, closeness_weighted,
+    connected_components_strong, connected_components_weak, label_propagation, layout_fa2,
+    layout_fa2_multilevel, layout_fr, louvain, louvain_weighted, pagerank, pagerank_weighted,
+    symmetric_view_weighted, Fa2Multilevel, Fa2Params, LayoutParams, MultilevelParams,
+    PageRankParams,
 };
 use ursa_core::algo::{
     bfs_distances, fa2_grow, layout_layers, layout_rings, Fa2State, LayersParams, RingsParams,
@@ -170,6 +171,32 @@ fn betweenness_small_samples_are_thread_count_independent() {
                     reference_w,
                     "weighted betweenness (n={n}, {frac}) diverged at {threads} threads"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn closeness_is_thread_count_independent() {
+    // Unweighted closeness runs 64 sources per pass (#422); each pass writes its
+    // own 64 output slots, so the result must not depend on how passes are spread
+    // over workers. Every direction, masked and not, and a node count that is not
+    // a multiple of 64.
+    for (n, m) in [(400, 4000), (3001, 2500)] {
+        let t = seeded_graph(n, m);
+        let keep: Vec<bool> = (0..m).map(|e| e % 3 != 1).collect();
+        let mask = ursa_core::EdgeMask::from_bools(&keep);
+        for dir in [Direction::Out, Direction::In, Direction::Both] {
+            for mask in [None, Some(&mask)] {
+                let reference = on_pool(1, || closeness_directed(&t, mask, dir));
+                for &threads in &THREADS {
+                    assert_eq!(
+                        on_pool(threads, || closeness_directed(&t, mask, dir)),
+                        reference,
+                        "closeness (n={n}, {dir:?}, masked={}) diverged at {threads} threads",
+                        mask.is_some()
+                    );
+                }
             }
         }
     }
