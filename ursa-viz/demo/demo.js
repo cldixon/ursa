@@ -44,6 +44,10 @@ stats.initMs = performance.now() - t0;
 const tg = performance.now();
 const g = fromParams(params);
 stats.generateMs = performance.now() - tg;
+const fromResult = params.get("result");
+const circle = () => Float32Array.from({ length: 2 * g.n }, (_, i) => (i < g.n ? Math.cos : Math.sin)((2 * Math.PI * (i % g.n)) / g.n));
+// The result as the engine would hand it over: not part of making the view.
+const resultBytes = fromResult ? viz.resultFromEdges(g.n, g.src, g.dst, fromResult === "xy" ? circle() : undefined) : null;
 // A task of its own for making the view, so that what it costs the page's
 // thread is not counted with making the graph.
 await new Promise((resolve) => setTimeout(resolve));
@@ -51,10 +55,8 @@ const t1 = performance.now();
 // Page-clock marks (ms since navigation), for the bench: when the graph was
 // ready, the first frame with layout positions, the layout's end.
 stats.graphReadyAt = t1;
-const fromResult = params.get("result");
-const circle = () => Float32Array.from({ length: 2 * g.n }, (_, i) => (i < g.n ? Math.cos : Math.sin)((2 * Math.PI * (i % g.n)) / g.n));
-const view = fromResult
-  ? await viz.createViewFromResult(canvas, viz.resultFromEdges(g.n, g.src, g.dst, fromResult === "xy" ? circle() : undefined))
+const view = resultBytes
+  ? await viz.createViewFromResult(canvas, resultBytes)
   : await viz.createView(canvas, g.n, g.src, g.dst);
 window.viz = viz;
 stats.createMs = performance.now() - t1;

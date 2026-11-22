@@ -169,7 +169,12 @@ struct Degrees {
 
 impl Degrees {
     fn new(graph: &Graph) -> Self {
-        let (mut base, degree) = Pairs::new(graph);
+        let (base, degree) = Pairs::new(graph);
+        Self::of(graph, base, degree)
+    }
+
+    /// `graph`'s pairs and degrees ([`Pairs::new`]), kept.
+    fn of(graph: &Graph, mut base: Pairs, degree: Vec<u32>) -> Self {
         base.shrink();
         Self {
             degree,
@@ -334,13 +339,14 @@ impl LiveResult {
     /// from the edge list ([`Graph::degrees`]).
     pub fn new(mut result: GraphResult, theme: &Theme) -> (Self, Drawn) {
         let graph = Self::graph_of(&mut result);
-        Self::with_graph(result, graph, theme)
+        let (pairs, degrees) = Pairs::new(&graph);
+        Self::with_graph(result, graph, pairs, degrees, theme)
     }
 
-    /// The first half of [`LiveResult::new`], for a caller that gives the
-    /// event loop a turn between the two: room in `result` for its first
-    /// deltas, and its graph, with as much room.
-    pub fn graph_of(result: &mut GraphResult) -> Graph {
+    /// The first part of [`LiveResult::new`], for a caller that gives its
+    /// thread up between the parts (a view being made on a page): room in
+    /// `result` for its first deltas, and its graph, with as much room.
+    pub(crate) fn graph_of(result: &mut GraphResult) -> Graph {
         let (n, m) = (result.n_nodes(), result.n_edges());
         result.reserve(room(n), room(m));
         let mut graph = Graph::new(n, result.src().to_vec(), result.dst().to_vec())
@@ -349,9 +355,16 @@ impl LiveResult {
         graph
     }
 
-    /// The second half of [`LiveResult::new`]: `graph` is
-    /// [`LiveResult::graph_of`] this `result`.
-    pub fn with_graph(result: GraphResult, graph: Graph, theme: &Theme) -> (Self, Drawn) {
+    /// The last part of [`LiveResult::new`]: `graph` is
+    /// [`LiveResult::graph_of`] this `result`, and `pairs` and `degrees`
+    /// are that graph's ([`Pairs::new`]).
+    pub(crate) fn with_graph(
+        result: GraphResult,
+        graph: Graph,
+        pairs: Pairs,
+        degrees: Vec<u32>,
+        theme: &Theme,
+    ) -> (Self, Drawn) {
         let n = result.n_nodes();
         debug_assert_eq!((n, result.n_edges()), (graph.n_nodes(), graph.n_edges()));
         let more_nodes = room(n);
@@ -366,7 +379,7 @@ impl LiveResult {
             .expect("the highlight has the result's nodes");
         let removed = |flags: &[u8]| flags.iter().filter(|&&f| f & REMOVED != 0).count();
         let mut live = Self {
-            degrees: Degrees::new(&graph),
+            degrees: Degrees::of(&graph, pairs, degrees),
             hidden_nodes: removed(result.node_flags()),
             removed_edges: removed(result.edge_flags()),
             result,

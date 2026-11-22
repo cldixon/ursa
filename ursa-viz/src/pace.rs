@@ -19,9 +19,9 @@ use wasm_bindgen::JsCast;
 /// How long a paced piece of work holds the thread before it gives the
 /// event loop a turn at the next [`Pace::breathe`], in milliseconds. The
 /// longest hold is this and the piece that follows: the largest pieces at a
-/// million edges (counting degrees, compiling the shader, the first
-/// pipeline) are 20 to 30 ms each.
-pub const BUDGET_MS: f64 = 8.0;
+/// million edges (compiling the shader, linking the first pipeline, a pass
+/// over the edges) are 10 to 30 ms each.
+pub const BUDGET_MS: f64 = 4.0;
 
 /// Whether work gives up the thread as it goes, and when it last did.
 #[derive(Debug)]

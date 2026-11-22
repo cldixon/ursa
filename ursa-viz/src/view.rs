@@ -12,7 +12,7 @@ use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
 use crate::pace::{ready, yield_now, Pace};
 use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
-use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Theme};
+use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
 
 pub struct View {
     graph: Graph,
@@ -173,11 +173,22 @@ impl View {
     ) -> Self {
         let theme = Theme::light();
         pace.breathe().await;
-        let (live, drawn) = match scene {
-            Scene::Graph(graph) => {
-                // The degrees, from the edge list.
-                let style = NodeStyle::by_degree(&graph.degrees());
-                pace.breathe().await;
+        // The graph, and its degrees from the edge list, a pass at a time.
+        let (graph, result) = match scene {
+            Scene::Graph(graph) => (graph, None),
+            Scene::Result(mut result) => (LiveResult::graph_of(&mut result), Some(result)),
+        };
+        pace.breathe().await;
+        let mut counted = Pairs::count(&graph);
+        pace.breathe().await;
+        counted.fill(&graph);
+        pace.breathe().await;
+        let (pairs, degrees) = counted.finish();
+        pace.breathe().await;
+        let (live, drawn) = match result {
+            None => {
+                drop(pairs);
+                let style = NodeStyle::by_degree(&degrees);
                 // The seeded positions, as a layout starts from them.
                 let (x, y) = fa2_seed_positions(graph.n_nodes(), &Fa2Params::default());
                 let highlight = HighlightState::new(graph.n_nodes());
@@ -191,10 +202,8 @@ impl View {
                 };
                 (None, drawn)
             }
-            Scene::Result(mut result) => {
-                let graph = LiveResult::graph_of(&mut result);
-                pace.breathe().await;
-                let (live, drawn) = LiveResult::with_graph(*result, graph, &theme);
+            Some(result) => {
+                let (live, drawn) = LiveResult::with_graph(*result, graph, pairs, degrees, &theme);
                 (Some(live), drawn)
             }
         };

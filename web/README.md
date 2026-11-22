@@ -192,7 +192,8 @@ static assets and an R2 bucket.
     allocation.
     Percentiles are worked out when `graphTimings()` is read.
     `tests/graph-timing.ts` prints all of it: the steps, the `.graph`
-    action, the long tasks, the frame times of a scripted wheel zoom, a pick
+    action, the long tasks (and the longest while the view was made, which
+    fails the run over 60 ms: the view builds no topology, #426), the frame times of a scripted wheel zoom, a pick
     and the heaps. It runs the full Chromium (`channel: "chromium"`), since
     Playwright's headless shell has no `measureUserAgentSpecificMemory`;
     `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`

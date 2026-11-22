@@ -193,7 +193,8 @@ impl Graph {
 /// one `u32` per edge and one per node. It is not an adjacency: a pair is
 /// kept at its lower-indexed end only, so a node's list is not its
 /// neighbours, and it costs three passes over the edge list to make, with
-/// no sort and no copy of the edges.
+/// no sort and no copy of the edges. A page makes it a pass at a time
+/// ([`Pairs::count`]).
 #[derive(Debug)]
 pub(crate) struct Pairs {
     /// Node `u`'s list, the higher-indexed nodes it is joined to, is
@@ -212,13 +213,20 @@ impl Pairs {
     /// The pairs of `graph`, and each node's distinct neighbours
     /// (self-loops left out).
     pub(crate) fn new(graph: &Graph) -> (Self, Vec<u32>) {
-        let n = graph.n_nodes();
-        let (src, dst) = (graph.src(), graph.dst());
+        let mut counted = Self::count(graph);
+        counted.fill(graph);
+        counted.finish()
+    }
+
+    /// The first of the three passes [`Pairs::new`] makes, for a caller
+    /// that gives its thread up between them: then [`Counted::fill`] and
+    /// [`Counted::finish`], with the same graph.
+    pub(crate) fn count(graph: &Graph) -> Counted {
         // The lists' sizes, then their starts; filling them moves each
         // start to its list's end, which is the next list's start.
-        let mut offsets = vec![0u32; n + 1];
+        let mut offsets = vec![0u32; graph.n_nodes() + 1];
         let mut pairs = 0usize;
-        for (&s, &d) in src.iter().zip(dst) {
+        for (&s, &d) in graph.src().iter().zip(graph.dst()) {
             if s != d {
                 offsets[s.min(d) as usize + 1] += 1;
                 pairs += 1;
@@ -230,46 +238,10 @@ impl Pairs {
             *slot = total;
             total += len;
         }
-        let mut other = vec![0u32; pairs];
-        for (&s, &d) in src.iter().zip(dst) {
-            if s != d {
-                let next = &mut offsets[s.min(d) as usize + 1];
-                other[*next as usize] = s.max(d);
-                *next += 1;
-            }
-        }
-        // A pair is in one list only: keep and count it the first time it
-        // is seen there, and drop its repeats. `seen[v]` is the last list
-        // (plus one) that named `v`.
-        let mut degrees = vec![0u32; n];
-        let mut seen = vec![0u32; n];
-        let (mut kept, mut start) = (0usize, 0usize);
-        for u in 0..n {
-            let end = offsets[u + 1] as usize;
-            offsets[u] = kept as u32;
-            let mark = u as u32 + 1;
-            let mut degree = 0;
-            for i in start..end {
-                let v = other[i] as usize;
-                if seen[v] != mark {
-                    seen[v] = mark;
-                    degree += 1;
-                    degrees[v] += 1;
-                    other[kept] = v as u32;
-                    kept += 1;
-                }
-            }
-            degrees[u] += degree;
-            start = end;
-        }
-        offsets[n] = kept as u32;
-        other.truncate(kept);
-        let pairs = Self {
+        Counted {
             offsets,
-            other,
-            sorted: Vec::new(),
-        };
-        (pairs, degrees)
+            other: vec![0u32; pairs],
+        }
     }
 
     /// Give back the room the repeated pairs took: for pairs that are kept.
@@ -297,6 +269,68 @@ impl Pairs {
             self.sorted[lo] = true;
         }
         list.binary_search(&hi).is_ok()
+    }
+}
+
+/// [`Pairs`] being made: the lists sized ([`Pairs::count`]).
+#[derive(Debug)]
+pub(crate) struct Counted {
+    offsets: Vec<u32>,
+    other: Vec<u32>,
+}
+
+impl Counted {
+    /// The second pass: every edge into its list.
+    pub(crate) fn fill(&mut self, graph: &Graph) {
+        let (offsets, other) = (&mut self.offsets, &mut self.other);
+        for (&s, &d) in graph.src().iter().zip(graph.dst()) {
+            if s != d {
+                let next = &mut offsets[s.min(d) as usize + 1];
+                other[*next as usize] = s.max(d);
+                *next += 1;
+            }
+        }
+    }
+
+    /// The third pass: the pairs, and each node's distinct neighbours.
+    pub(crate) fn finish(self) -> (Pairs, Vec<u32>) {
+        let Self {
+            mut offsets,
+            mut other,
+        } = self;
+        let n = offsets.len() - 1;
+        // A pair is in one list only: keep and count it the first time it
+        // is seen there, and drop its repeats. `seen[v]` is the last list
+        // (plus one) that named `v`.
+        let mut degrees = vec![0u32; n];
+        let mut seen = vec![0u32; n];
+        let (mut kept, mut start) = (0usize, 0usize);
+        for u in 0..n {
+            let end = offsets[u + 1] as usize;
+            offsets[u] = kept as u32;
+            let mark = u as u32 + 1;
+            let mut degree = 0;
+            for i in start..end {
+                let v = other[i] as usize;
+                if seen[v] != mark {
+                    seen[v] = mark;
+                    degree += 1;
+                    degrees[v] += 1;
+                    other[kept] = v as u32;
+                    kept += 1;
+                }
+            }
+            degrees[u] += degree;
+            start = end;
+        }
+        offsets[n] = kept as u32;
+        other.truncate(kept);
+        let pairs = Pairs {
+            offsets,
+            other,
+            sorted: Vec::new(),
+        };
+        (pairs, degrees)
     }
 }
 

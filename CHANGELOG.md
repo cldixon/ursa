@@ -480,6 +480,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   (`ursa-viz/BENCH.md`). The shell does not drive the layer yet. `View`'s
   methods that upload (`step`, `set_positions`, `set_style`, `color_by`,
   `set_theme`) now take the device as well as the queue.
+- **Making the graph view costs an upload, not a graph build** (#426). The
+  page's view no longer builds a topology, an undirected adjacency and a
+  layout state to read degrees and starting positions: degrees are counted
+  from the edge list, the nodes start where a layout would seed them
+  (`ursa_core::algo::fa2_seed_positions`), the edges go to the GPU a run at
+  a time, and `createView` and `createViewFromResult` give the event loop a
+  turn between compiling the shader, linking each pipeline and the uploads.
+  At 46K nodes and 1M edges in headless Chromium, `createView` was one task
+  of 190 to 350 ms on the page's thread and 50 MB of wasm memory; it is now
+  no task over 50 ms and 16 MiB. `View::step` builds the adjacency on its
+  first call. In Rust, `View::new` takes the queue as well as the device,
+  `View::new_paced` and `View::from_result_paced` are what a page calls,
+  `Renderer::new` takes the edge count and the caller writes the edges
+  (`write_edges`), and `Graph::line_indices` takes a range.
+  `tests/graph-timing.ts` prints the longest task while the view is made
+  and fails over 60 ms.
 - **Scenes that change in place in the graph view** (#441): a view made
   from a graph result applies a delta in time proportional to the delta, not
   to the graph. `createViewFromResult(canvas, bytes)` takes a result as UGR
