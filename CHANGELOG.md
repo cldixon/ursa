@@ -247,11 +247,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   in the wasm API `renderFrame`, `frameCost`, `framePartial`, `keepMoving`,
   `setEdgeOrder`, `orderEdges`, `frameInfo` (also `info().frame`) and
   `Layout.edgeOrder`. On `.graph rmat` (1M edges) in headless Chromium's
-  software WebGL2, frames of a scripted wheel zoom are 29 ms apart at the
-  95th percentile (3.3 s before), the first frame is shown 1.5 s after Enter
-  (6.0 s) and the layout is done at 5.8 s (10.6 s), the page no longer
-  rasterising a million edges for each set of positions; that renderer fits
-  512 edges and 170 nodes in a frame. Not measured on a GPU
+  software WebGL2, frames of a scripted wheel zoom are 25 to 46 ms apart at
+  the 95th percentile over four runs (3.3 s before), the first frame is
+  shown 1.5 s after Enter (6.0 s) and the layout is done at 5.8 s (10.6 s),
+  the page no longer rasterising a million edges for each set of positions;
+  that renderer fits 512 edges and 170 nodes in a frame, and a frame at
+  rest still takes it seconds. Not measured on a GPU
   (`ursa-viz/BENCH.md`).
 - **Ursa Web Shell: the Graph view times itself** (#430).
   `window.ursaShell.graphTimings()` gains `frames` (the count, and the p50,

@@ -378,13 +378,17 @@ static assets and an R2 bucket.
     moving frames' costs, the ms a frame is held to, whether the last frame
     left anything out, and the ms the worker took to order the edges).
 
-    On `.graph rmat` (1M edges, headless Chromium, software WebGL2, three
+    On `.graph rmat` (1M edges, headless Chromium, software WebGL2, four
     runs, 2026-11-22), frames of the scripted wheel zoom are 25 to 46 ms
     apart at the p95 (3.3 s before), each with 512 edges and 170 nodes,
     which is what that renderer shows in a frame; the first frame is shown
-    1.5 s after Enter (6.0 s), the layout is done at 5.8 s (10.6 s), and a
-    click's frame comes 0.12 s after it (3.4 s). `tests/graph-timing.ts`
-    fails a run whose p95 is over 50 ms; the e2e allows 100.
+    1.5 s after Enter (6.0 s) and the layout is done at 5.8 s (10.6 s). A
+    frame at rest still draws everything in one go, 4 to 6 s of the page's
+    thread with no GPU: one after the layout, one after each movement, and
+    one for a click on the view at rest. `tests/graph-timing.ts` starts its
+    zoom from rest and fails a run whose p95 is over 50 ms; the e2e allows
+    100 (`ursa-viz/BENCH.md` has the runs, and what a busy machine does to
+    them).
 
     The layout worker (`graph-worker.js`) also lays out **rings and layers**
     (#436): a graph that carries `layout: {kind: "rings" | "layers", level}`,

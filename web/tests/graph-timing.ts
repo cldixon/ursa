@@ -22,7 +22,8 @@
 //   thread, so the interval is the frame's cost); and what the frame budget
 //   (#495) drew in them. The run fails if the 95th percentile of the
 //   intervals is over 50 ms;
-// - a pick, by a click in the middle of the canvas;
+// - a pick, by a click in the middle of the canvas, with the view at rest
+//   (its frame draws every edge);
 // - the wasm heaps (the engine's, the view's and the layout worker's) and
 //   the page's memory as the browser measures it.
 //
@@ -99,6 +100,13 @@ for (let r = 0; r < runs; r++) {
   const box = (await p.locator("#graph-stage canvas").boundingBox())!;
   const [cx, cy] = [box.x + box.width / 2, box.y + box.height / 2];
   await p.mouse.move(cx, cy);
+  // From rest: the frame with every edge that follows the layout (#495) is
+  // drawn, so that the zoom's frames are the view moving and nothing else.
+  // (With no GPU that frame holds the page's thread for seconds, as every
+  // frame did before the budget: a zoom begun under it waits for it.)
+  const atRest = () => p.waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 120_000, polling: 100 });
+  await atRest();
+  await p.evaluate(() => new Promise((done) => requestAnimationFrame(() => setTimeout(done, 150))));
   await p.evaluate(() => (window as any).ursaShell.graphTimingsReset());
   const began = Date.now();
   const events: number = await p.evaluate(
@@ -139,6 +147,8 @@ for (let r = 0; r < runs; r++) {
   rel.wheelRenderP95 = w.render.p95;
   rel.shown = shown?.frame;
 
+  // A click on the view at rest: its frame draws every edge.
+  await atRest();
   await p.mouse.click(cx, cy);
   // The frame that shows the click.
   await p.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));

@@ -2028,6 +2028,14 @@ for (const scheme of ["light", "dark"] as const) {
   // frame with everything.
   {
     await r.waitForFunction(() => (window as any).ursaShell.graph()?.frame.ordered === 1_000_000, null, { timeout: 30_000, polling: 100 }).catch(() => {});
+    // From rest: the layout is done, and its frame with every edge is
+    // drawn (seconds of the page's thread, with no GPU), so the zoom's
+    // frames are the view moving and nothing else.
+    const settled = await r
+      .waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 60_000, polling: 100 })
+      .then(() => true, () => false);
+    check(settled, "a big graph: after the layout, a frame with every edge", JSON.stringify((await graphInfo(r)).frame));
+    await r.evaluate(() => new Promise((done) => requestAnimationFrame(() => setTimeout(done, 150))));
     const before = await graphInfo(r);
     const box = (await r.locator("#graph-stage canvas").boundingBox())!;
     await r.evaluate(() => (window as any).ursaShell.graphTimingsReset());
@@ -2060,7 +2068,7 @@ for (const scheme of ["light", "dark"] as const) {
     const rested = await r
       .waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 60_000, polling: 100 })
       .then(() => true, () => false);
-    check(rested, "a big graph: at rest, a frame with every edge", JSON.stringify((await graphInfo(r)).frame));
+    check(rested, "a big graph: at rest again, a frame with every edge", JSON.stringify((await graphInfo(r)).frame));
   }
   // #445: a key search on the million edges answers within 50 ms (the
   // engine's round trip; drawing the selection is the view's, after it).
