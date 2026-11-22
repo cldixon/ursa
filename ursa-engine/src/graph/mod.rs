@@ -421,7 +421,20 @@ pub struct GraphRegistry {
     catalogs: OnceLock<Arc<dyn CatalogProviderList>>,
     /// Graphs of the session's database that could not be defined when it
     /// was opened, by name, with why (see [`crate::database::unavailable`]).
-    unavailable: RwLock<BTreeMap<String, String>>,
+    unavailable: RwLock<BTreeMap<String, UnavailableGraph>>,
+}
+
+/// A graph of the session's database that could not be defined when it was
+/// opened (see [`GraphRegistry::mark_unavailable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableGraph {
+    /// Its name.
+    pub name: String,
+    /// Why, and how to repair it: `graph g is unavailable: …`.
+    pub message: String,
+    /// Its definition as stored, if the statement could be read: what
+    /// `SHOW GRAPHS` lists for it. Vertex keys left out are not known.
+    pub definition: Option<GraphSpec>,
 }
 
 impl GraphRegistry {
@@ -502,12 +515,25 @@ impl GraphRegistry {
 
     /// Mark the graph called `name` unavailable: it could not be defined when
     /// the database was opened, and `message` says why. Using it fails with
-    /// `message` until it is dropped or replaced.
-    pub fn mark_unavailable(&self, name: &str, message: impl Into<String>) {
+    /// `message` until it is dropped or replaced. `definition` is its stored
+    /// definition, if known, which `SHOW GRAPHS` lists.
+    pub fn mark_unavailable(
+        &self,
+        name: &str,
+        message: impl Into<String>,
+        definition: Option<GraphSpec>,
+    ) {
         self.unavailable
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string(), message.into());
+            .insert(
+                name.to_string(),
+                UnavailableGraph {
+                    name: name.to_string(),
+                    message: message.into(),
+                    definition,
+                },
+            );
     }
 
     /// Why the graph called `name` is unavailable, if it is.
@@ -516,7 +542,17 @@ impl GraphRegistry {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(name)
+            .map(|g| g.message.clone())
+    }
+
+    /// Every unavailable graph, sorted by name.
+    pub fn all_unavailable(&self) -> Vec<UnavailableGraph> {
+        self.unavailable
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
             .cloned()
+            .collect()
     }
 
     /// Forget that the graph called `name` is unavailable (it was dropped or
