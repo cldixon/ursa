@@ -439,6 +439,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WebShell.explore(command)` and the engine worker an `explore` op. The
   page's pane does not draw the deltas yet (#443): until then it keeps what
   `.graph` drew, and the terminal's line says what changed.
+- **`.graph … AS edges(…) | nodes(…) | path(…) | hops(…)`, `ON graph` and
+  `LAYOUT`** (#434). The Web Shell's `.graph` takes three more clauses, in
+  any order after its source, beside `NODES`, `SIZE BY` and `COLOR BY`.
+  **`AS …`** says what a result's rows are and names the columns, in place
+  of the rules (it is rule 0, and nothing is inferred), so a result whose
+  columns have any names is drawn: `.graph SELECT a.id AS x, b.id AS y FROM
+  … AS edges(x, y)`. The forms are `AS edges(src, dst [, weight])`, `AS
+  nodes(id)`, `AS path(nodes [, edges])` and `AS hops(seed, id, distance)`;
+  the refusal of a result that is no graph already named them. **`ON
+  graph`** names the property graph the ids belong to: where `AS nodes` and
+  `AS hops` read their edges, and what `SIZE BY pagerank` runs on for rows
+  drawn as edges. **`LAYOUT force|rings|layers`** sets the layout, whatever
+  the rule chose. A column that is missing or of the wrong type is an error
+  that names it, lists the result's columns and their types, and says what
+  the form needs; every other misuse (a form that is not one, the wrong
+  number of columns, a clause given twice, a graph that is not there, rings
+  for a drawing with no distances, a clause on a property graph) says what
+  to write. `.help graph` lists the clauses. `ursa-engine`'s `graph::view`
+  gains `As`, `Style::{shape, on, layout}`, `interpret_with` and `USAGE`.
 - **`.graph` draws what a result means** (#433). After a graph query, the
   Web Shell's `.graph` (`ursa-engine`'s `graph::view`) now reads what each
   column is, from the `ursa.*` metadata the graph functions and `GRAPH_TABLE`
