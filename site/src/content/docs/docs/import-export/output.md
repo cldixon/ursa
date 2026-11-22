@@ -5,7 +5,7 @@ description: "Print results as tables, CSV, TSV, JSON, NDJSON or Arrow, for peop
 
 ## Output modes
 
-The shell prints `table` by default. `.mode csv`, `.mode tsv`, `.mode json` and `.mode ndjson` switch it. On the command line, `--format` sets the mode for the shell and for `-c` alike:
+The shell prints `table` by default. `.mode csv`, `.mode tsv`, `.mode json`, `.mode ndjson`, `.mode markdown` and `.mode line` switch it. DuckDB's names for the same modes work too: `duckbox` and `box` are `table`, `jsonlines` is `ndjson`, and `lines` is `line`. On the command line, `--format` sets the mode for the shell and for `-c` alike:
 
 ```bash
 ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 2"
@@ -16,6 +16,35 @@ ursa club.ursa --format json -c "SELECT * FROM degree(karate) ORDER BY id LIMIT 
 ```
 
 `--format arrow` writes an Arrow IPC stream, for another program to read. It works only with `-c` or `-f`, and only for one query that returns rows: a second result, or none at all (a script of only `CREATE` statements), is an error. `.mode` cannot switch to it.
+
+`markdown` writes a Markdown table, as DuckDB's `.mode markdown` does, to paste into an issue, a document or a chat. Each name is centred over its column, a number column's separator ends in `:` so it is right-aligned where the table is rendered, and a null is `NULL`. A `|` in a value is written `\|` and a line break `\n`, so each row stays one row of the table:
+
+```sql
+.mode markdown
+SELECT id, club FROM 'karate_nodes.csv' LIMIT 2;
+```
+
+```text
+| id |  club  |
+|---:|--------|
+| 0  | Mr. Hi |
+| 1  | Mr. Hi |
+```
+
+`line` writes one `column = value` line per column, the names right-aligned, and a blank line between rows, as DuckDB's `.mode line` does. It is the readable mode for a wide row:
+
+```sql
+.mode line
+SELECT name, family, networkx FROM ursa_functions() WHERE name = 'pagerank';
+```
+
+```text
+    name = pagerank
+  family = algorithm
+networkx = nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))
+```
+
+`.headers off` leaves out the header row of `csv` and `tsv`, as in DuckDB; `.headers on` puts it back. The other modes always name their columns.
 
 ### Reading results in a program
 

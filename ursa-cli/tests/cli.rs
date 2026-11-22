@@ -106,6 +106,23 @@ fn output_formats() {
         ok(ursa(&["--format", "ndjson", "-c", &sql])),
         "{\"src\":0,\"dst\":1}\n{\"src\":0,\"dst\":2}\n"
     );
+    // DuckDB's Markdown and line modes, and its names for Ursa's (#418).
+    assert_eq!(
+        ok(ursa(&["--format", "markdown", "-c", &sql])),
+        "| src | dst |\n|----:|----:|\n| 0   | 1   |\n| 0   | 2   |\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "line", "-c", &sql])),
+        "  src = 0\n  dst = 1\n\n  src = 0\n  dst = 2\n"
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "duckbox", "-c", &sql])),
+        ok(ursa(&["--format", "table", "-c", &sql]))
+    );
+    assert_eq!(
+        ok(ursa(&["--format", "jsonlines", "-c", &sql])),
+        ok(ursa(&["--format", "ndjson", "-c", &sql]))
+    );
     // An Arrow IPC stream starts with the continuation marker.
     let arrow = ursa(&["--format", "arrow", "-c", &sql]);
     assert!(arrow.status.success());
