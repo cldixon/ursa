@@ -22,6 +22,17 @@
 //                                               buffer, transferred, which
 //                                               graph.js reads; `skipped` the rows
 //                                               left out for a NULL endpoint)
+//   explore   {command}        -> {out, err, delta, nodes, edges}  (an explore
+//                                               command on the graph the last
+//                                               `graph` opened: .expand, .hide,
+//                                               .show, .undo, .redo, .graph
+//                                               history; see WebShell.explore.
+//                                               `delta` is the change as one UGR
+//                                               delta buffer, transferred, or
+//                                               null when nothing changed;
+//                                               `nodes` and `edges` are how many
+//                                               are shown after it)
+//   closeGraph {}              -> {}             (the page closed its view)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
 let shell = null;
@@ -97,6 +108,15 @@ async function handle({ id, op, ...args }) {
       const skipped = g.skipped;
       g.free();
       postMessage({ id, ok: true, ugr, skipped }, [ugr.buffer]);
+    } else if (op === "explore") {
+      const e = await shell.explore(args.command);
+      const bytes = e.takeDelta();
+      const reply = { id, ok: true, out: e.out, err: e.err, delta: bytes.length ? bytes : null, nodes: e.nodes, edges: e.edges };
+      e.free();
+      postMessage(reply, reply.delta ? [reply.delta.buffer] : []);
+    } else if (op === "closeGraph") {
+      shell?.closeGraph();
+      postMessage({ id, ok: true });
     } else {
       throw new Error(`unknown op ${op}`);
     }

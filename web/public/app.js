@@ -908,8 +908,15 @@ async function hostCommand(line) {
   const arg = rest.join(" ");
   switch (name) {
     case ".graph":
+      if (/^history\b/i.test(arg)) return explore(line);
       // The query as typed: its spaces may be in a string.
       return drawGraph(line.trim().slice(name.length).trim());
+    case ".expand":
+    case ".hide":
+    case ".show":
+    case ".undo":
+    case ".redo":
+      return explore(line);
     case ".clear":
       term.clear();
       await write("\x1b[H\x1b[2J");
@@ -1039,9 +1046,30 @@ async function drawGraph(text) {
   return true;
 }
 
+// The last explore command's answer, for tests: its `command`, how many
+// `nodes` and `edges` the engine shows after it, and `deltaBytes`, the size
+// of the change it sent (0 for none).
+let explored = null;
+
+/**
+ * An explore command (.expand, .hide, .show, .undo, .redo, .graph history):
+ * the engine changes its graph and prints what changed, and gives the change
+ * as a UGR delta. The shell itself (ursa-shell) lists these commands in .help.
+ * Drawing the delta in the pane is #443: until then the pane keeps what
+ * .graph drew.
+ */
+async function explore(line) {
+  const r = await engine("explore", { command: line });
+  explored = { command: line, nodes: r.nodes, edges: r.edges, deltaBytes: r.delta?.byteLength ?? 0 };
+  await write(r.out + r.err);
+  return !r.err;
+}
+
 /** Close the pane: the terminal takes the whole width again, and the focus. */
 function closeGraph() {
   if (graphPane.hidden) return;
+  // The engine's graph closes with the pane's: .expand then says none is open.
+  engine("closeGraph").catch(() => {});
   const hadFocus = graphPane.contains(document.activeElement);
   graphPane.hidden = true;
   graphModule?.then((m) => m.close(), () => {});
@@ -1396,6 +1424,9 @@ window.ursaShell = {
   // draws, a frame's inked pixels, and the node at a canvas pixel.
   graphOpen,
   graph: () => graphLoaded?.info() ?? null,
+  // The last explore command (.expand, .hide, …): {command, nodes, edges,
+  // deltaBytes}, the engine's counts of what is shown after it.
+  explored: () => explored,
   // The last .graph: when each step ended, in ms after Enter; and what the
   // view costs to use (#430, graph-timings.js): `frames` (how many, and the
   // p50, p95 and max of the time in render() and of the time between frames

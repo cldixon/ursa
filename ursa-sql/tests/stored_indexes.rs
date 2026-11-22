@@ -1445,3 +1445,139 @@ async fn storing_the_reverse_adjacency_is_said() {
         close(ctx);
     }
 }
+
+/// FNV-1a over `rows`, each followed by a newline: a hash that is the same
+/// on every platform and run.
+fn fnv(rows: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for row in rows {
+        for &b in row.as_bytes().iter().chain(b"\n") {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Path searches give the same rows, in the same order, from an index the
+/// session built and from one a later session loads from the database
+/// (memory-mapped), and those rows are pinned: recorded before the search
+/// was made faster (#451). The queries have no `ORDER BY` where the order
+/// is the search's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn path_searches_give_pinned_rows_from_a_built_and_a_stored_index() {
+    let fixture = Fixture::new(20_000).await;
+    let queries: &[(&str, usize, u64)] = &[
+        // A {1,3} search from one node, every path column.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->{1,3}(b)
+               COLUMNS (b.id AS b, path_length(p) AS len, vertices(p) AS v, edges(p) AS es))",
+            130,
+            4398551478105111179,
+        ),
+        // Its histogram, as a high-degree start's would be asked.
+        (
+            "SELECT len, count(*) FROM GRAPH_TABLE (g
+               MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->{1,3}(b)
+               COLUMNS (path_length(p) AS len)) GROUP BY len ORDER BY len",
+            3,
+            15902166953952693435,
+        ),
+        // Unbounded, to every node it reaches.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a WHERE a.id = 3)-[e]->*(b)
+               COLUMNS (b.id AS b, vertices(p) AS v))",
+            3325,
+            13449080192362342466,
+        ),
+        // ALL SHORTEST, either way along the edges.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a WHERE a.id = 5)-[e]-{1,2}(b)
+               COLUMNS (b.id AS b, edges(p) AS es))",
+            214,
+            12504163379020412563,
+        ),
+        // Against the edges.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a WHERE a.id = 9)<-[e]-{1,3}(b)
+               COLUMNS (b.id AS b, vertices(p) AS v))",
+            213,
+            11368705239152041053,
+        ),
+        // Several start nodes.
+        (
+            "FROM GRAPH_TABLE (g
+               MATCH p = ANY SHORTEST (a WHERE a.id IN (3, 1, 4, 159, 26))-[e]->{1,2}(b)
+               COLUMNS (a.id AS a, b.id AS b, edges(p) AS es))",
+            179,
+            6849450228634005670,
+        ),
+        // One pair: the search stops at the target.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->*(b WHERE b.id = 77)
+               COLUMNS (vertices(p) AS v, edges(p) AS es))",
+            1,
+            2679366451992929664,
+        ),
+        // SHORTEST 2 trails to three targets.
+        (
+            "FROM GRAPH_TABLE (g
+               MATCH p = SHORTEST 2 TRAIL (a WHERE a.id = 2)-[e]->{1,3}(b WHERE b.id IN (10, 20, 30))
+               COLUMNS (b.id AS b, edges(p) AS es))",
+            1,
+            11495189137844326480,
+        ),
+        // Every walk of one or two edges.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = (a WHERE a.id = 1)-[e]->{1,2}(b)
+               COLUMNS (b.id AS b, edges(p) AS es))",
+            52,
+            15388977107142198429,
+        ),
+        // ACYCLIC, either way.
+        (
+            "FROM GRAPH_TABLE (g MATCH p = ACYCLIC (a WHERE a.id = 7)-[e]-{2,2}(b)
+               COLUMNS (b.id AS b, vertices(p) AS v))",
+            85,
+            12601560286801748730,
+        ),
+    ];
+    // Under a limit of 50: the walks are refused; ANY SHORTEST counts the
+    // paths it keeps, never fewer than one per node, so its 592 are not.
+    const LIMITED: &str = "SET ursa.max_paths = 50;
+        SELECT count(*) FROM GRAPH_TABLE (g
+          MATCH p = (a WHERE a.id IN (0, 1, 2))-[e]->{1,3}(b) COLUMNS (b.id))";
+    const KEPT: &str = "SELECT count(*) FROM GRAPH_TABLE (g
+          MATCH p = ANY SHORTEST (a WHERE a.id IN (0, 1, 2))-[e]->{1,3}(b) COLUMNS (b.id))";
+    let all = |ctx: SessionContext| async move {
+        let mut out = Vec::new();
+        for (sql, _, _) in queries {
+            let rows = ok(&ctx, sql).await;
+            out.push((rows.len(), fnv(&rows)));
+        }
+        let limited = run(&ctx, LIMITED)
+            .await
+            .map_err(|e| ursa_engine::user_message(&e));
+        assert_eq!(ok(&ctx, KEPT).await, ["592"]);
+        ok(&ctx, "RESET ursa.max_paths").await;
+        (out, limited, ctx)
+    };
+    let (built, built_limited, ctx) = all(open(&fixture.db()).await).await;
+    assert_eq!(counts(&ctx), (1, 0));
+    // The same again in the same session: the order is the search's.
+    let (again, _, ctx) = all(ctx).await;
+    assert_eq!(again, built);
+    close(ctx);
+    let (stored, stored_limited, ctx) = all(open(&fixture.db()).await).await;
+    assert_eq!(counts(&ctx), (0, 1));
+    close(ctx);
+    assert_eq!(stored, built, "stored and built differ");
+    assert_eq!(stored_limited, built_limited);
+    let pinned: Vec<(usize, u64)> = queries.iter().map(|&(_, n, h)| (n, h)).collect();
+    assert_eq!(built, pinned, "the pinned rows changed");
+    let message = built_limited.unwrap_err();
+    assert!(
+        message.contains("the path search reached 50 paths"),
+        "{message}"
+    );
+}

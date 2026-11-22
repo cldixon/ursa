@@ -26,6 +26,10 @@
 //! and each node's level, for the view to draw. [`GraphView::legend`] is the
 //! legend of `COLOR BY`.
 //!
+//! [`Session`] is the explore session of a drawing (design §4, #440): the
+//! commands that change it (`.expand`, `.hide`, `.show`, `.undo`, `.redo`),
+//! each as SQL and a [`GraphDelta`] for the view.
+//!
 //! This module runs SQL text (a source that is a query, `NODES (…)`, the
 //! algorithms of `SIZE BY pagerank`), and the SQL front end is `ursa-sql`,
 //! which depends on this crate. So the caller hands in how to run it, as a
@@ -55,6 +59,7 @@ use crate::graph::{edges_plan, registry_of, GraphDef, PropertyGraph};
 mod build;
 pub mod clauses;
 pub mod rules;
+pub mod session;
 mod style;
 
 #[cfg(test)]
@@ -64,6 +69,7 @@ use build::{build_indexed, EdgeList, NodeIndex};
 pub use clauses::{identifier, parse, Name, Style};
 pub use rules::Rule;
 use rules::{MatchEdge, Shape};
+pub use session::{Command, Outcome, Session, Step};
 use style::{
     color_by, degree_column, resolve, run_algorithms, size_by, vertex_column, ColorBy, Found,
     NodeValues,

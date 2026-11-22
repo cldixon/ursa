@@ -17,6 +17,9 @@ clap = ["dep:clap"]
 [dependencies]
 ursa-engine = { path = "../ursa-engine", version = "0.12.0-dev" }
 ursa-sql = { path = "../ursa-sql", version = "0.12.0-dev" }
+# The graph model's delta, which an explore command gives the host's view. No
+# default features: no GPU.
+ursa-viz = { path = "../ursa-viz", version = "0.12.0-dev", default-features = false }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 futures = "0.3"

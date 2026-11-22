@@ -83,6 +83,14 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     // Last of all: hide the inputs a path search over a held index skips.
     let ctx = ctx.with_physical_optimizer_rule(graph::collapse_held_rule());
     let mut state = ctx.build();
+    // Parquet files have their footers checked before the parquet crate
+    // reads them: a truncated or fake file is an error, not a panic (#332).
+    state
+        .register_file_format(
+            Arc::new(ursa_io::parquet_footer::ValidParquetFactory::new()),
+            true,
+        )
+        .expect("registering a file format cannot fail");
     for ext in ["jsonl", "ndjson"] {
         state
             .register_file_format(Arc::new(file_table::JsonLines(ext)), false)

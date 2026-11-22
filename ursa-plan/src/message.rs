@@ -461,6 +461,14 @@ fn translate(m: &str) -> Option<String> {
                 .into(),
         );
     }
+    // ursa-io's footer check (#332): the scan's label names the file already.
+    if let Some(why) = m
+        .strip_prefix("cannot read '")
+        .and_then(|rest| rest.split_once("': it is not a valid Parquet file: "))
+        .map(|(_, why)| why)
+    {
+        return Some(format!("the file is not valid Parquet ({why})"));
+    }
     if m.starts_with("Invalid Parquet file.") || m.starts_with("Corrupt footer") {
         return Some(format!(
             "the file is not valid Parquet ({})",

@@ -14,6 +14,11 @@
 //! colour, for the terminal to show. The page owns the screen: line editing,
 //! history and its own dot-commands ([`WebShell::add_host_command`], such as
 //! `.share`), which `feed` hands back as `flow: "host"`.
+//!
+//! The page's Graph view is the shell's too: [`WebShell::graph`] opens a
+//! graph to draw, and [`WebShell::explore`] runs the commands that change it
+//! (`.expand`, `.hide`, `.show`, `.undo`, `.redo`), each giving back a delta
+//! for the view to apply.
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -21,7 +26,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result};
-use datafusion::prelude::SessionContext;
 use js_sys::{Promise, Uint8Array};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -35,7 +39,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::{encode, js_error, Stored};
-use ursa_engine::graph::view::{self, GraphView, Rows};
+use ursa_engine::graph::view::GraphView;
 
 /// Where added files live: `memory://uploads/`.
 pub(crate) fn uploads_url() -> Url {
@@ -73,8 +77,6 @@ pub struct WebShell {
     width: Rc<Cell<usize>>,
     /// Files the page added ([`WebShell::add_file`]), at `memory://uploads/`.
     uploads: Arc<InMemory>,
-    /// The shell's session (the same state), for [`WebShell::graph`].
-    ctx: SessionContext,
 }
 
 /// A graph for the page's Graph view, from [`WebShell::graph`]: a graph
@@ -116,6 +118,55 @@ impl GraphData {
     }
 }
 
+/// What an explore command did, from [`WebShell::explore`]: what it printed,
+/// and the change for the page's view, a graph delta as UGR bytes.
+#[wasm_bindgen]
+pub struct Explored {
+    out: String,
+    err: String,
+    delta: Vec<u8>,
+    nodes: u32,
+    edges: u32,
+}
+
+#[wasm_bindgen]
+impl Explored {
+    /// What the command printed: one line (`+16 nodes, +41 edges`, or why
+    /// nothing changed), the SQL for `--sql`, or the steps for `.graph
+    /// history`.
+    #[wasm_bindgen(getter)]
+    pub fn out(&self) -> String {
+        self.out.clone()
+    }
+
+    /// The error it printed, if it failed: no open graph, or an id that is
+    /// not a node of it.
+    #[wasm_bindgen(getter)]
+    pub fn err(&self) -> String {
+        self.err.clone()
+    }
+
+    /// The change as a UGR delta (`ursa-viz/UGR.md`), in a `Uint8Array` with
+    /// a buffer of its own, to transfer and apply to the view; empty when
+    /// the command changed nothing. It gives the bytes once.
+    #[wasm_bindgen(js_name = takeDelta)]
+    pub fn take_delta(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.delta)
+    }
+
+    /// How many nodes are shown after the command.
+    #[wasm_bindgen(getter)]
+    pub fn nodes(&self) -> u32 {
+        self.nodes
+    }
+
+    /// How many edges are shown after the command.
+    #[wasm_bindgen(getter)]
+    pub fn edges(&self) -> u32 {
+        self.edges
+    }
+}
+
 impl Default for WebShell {
     fn default() -> Self {
         Self::new()
@@ -140,6 +191,7 @@ impl WebShell {
         shell.set_screen(Box::new(move || screen.get()), true);
         shell.set_error_color(true);
         shell.keep_last_result();
+        shell.add_explore_commands();
         shell.set_version(env!("CARGO_PKG_VERSION"));
         WebShell {
             shell: Rc::new(RefCell::new(shell)),
@@ -147,7 +199,6 @@ impl WebShell {
             err,
             width,
             uploads,
-            ctx,
         }
     }
 
@@ -270,20 +321,48 @@ impl WebShell {
     /// Rejects, with a message to show, when there is nothing to draw, more
     /// than 2,000,000 edges, or a name or clause that does not fit.
     ///
-    /// The engine resolves all of it (`ursa_engine::graph::view`); this hands
-    /// it the shell's session and its last result.
+    /// The engine resolves all of it (`ursa_engine::graph::view`), with the
+    /// shell's session and its last result.
+    ///
+    /// The graph becomes the shell's open graph, which [`Self::explore`]
+    /// changes; a rejection leaves the one that was open.
     pub fn graph(&self, text: String) -> Promise {
-        let ctx = self.ctx.clone();
-        let last = match self.borrow() {
-            Ok(shell) => shell.last_result().cloned(),
-            Err(e) => return Promise::reject(&e.into()),
-        };
+        let shell = Rc::clone(&self.shell);
         future_to_promise(async move {
-            graph_of(&ctx, last, &text)
+            graph_of(&shell, &text)
                 .await
                 .map(|g| GraphData::from(g).into())
                 .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
         })
+    }
+
+    /// Run an explore command on the open graph, resolving to an
+    /// [`Explored`]: `.expand ID [in|out|both] [LIMIT n]`, `.hide ID…`,
+    /// `.show ID…|all`, `.undo`, `.redo` or `.graph history`, the whole line
+    /// as `feed` handed it back. `--sql` prints a command's SQL and changes
+    /// nothing.
+    ///
+    /// What it printed is `out` (or `err`: no open graph, an id that is not
+    /// a node of it), and the change is a UGR delta for the page's view,
+    /// which the engine's own copy of the graph has applied already. `.undo`
+    /// gives the inverse of the step it takes back, with no query.
+    pub fn explore(&self, command: String) -> Promise {
+        let shell = Rc::clone(&self.shell);
+        let (out, err) = (self.out.clone(), self.err.clone());
+        future_to_promise(async move {
+            explore(&shell, &out, &err, &command)
+                .await
+                .map(JsValue::from)
+                .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
+        })
+    }
+
+    /// Close the open graph (the page closed its view): the explore
+    /// commands say there is none until [`Self::graph`] opens another.
+    #[wasm_bindgen(js_name = closeGraph)]
+    pub fn close_graph(&self) -> Result<(), JsError> {
+        self.borrow_mut()?.close_graph();
+        Ok(())
     }
 
     /// `text` coloured as the shell colours what is typed (ANSI), as what
@@ -337,9 +416,7 @@ async fn feed(
     line: &str,
 ) -> Result<String> {
     let flow = {
-        let mut shell = shell.try_borrow_mut().map_err(|_| {
-            DataFusionError::Execution("the shell is already running a line".into())
-        })?;
+        let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
         shell.feed(line).await
     };
     let (flow, command) = match flow {
@@ -356,9 +433,46 @@ async fn feed(
     .to_string())
 }
 
-/// What [`WebShell::graph`] draws, given the shell's last result.
-async fn graph_of(ctx: &SessionContext, last: Option<Rows>, text: &str) -> Result<GraphView> {
-    view::of_command(ctx, &ursa_sql::Sql, text, last).await
+fn busy() -> DataFusionError {
+    DataFusionError::Execution("the shell is already running a line".into())
+}
+
+/// What [`WebShell::graph`] draws: the shell's open graph from now on.
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
+async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<GraphView> {
+    let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
+    let skipped = shell.open_graph(text).await?;
+    let result = shell.explorer().expect("a graph was opened").result();
+    Ok(GraphView {
+        result: result.clone(),
+        skipped,
+    })
+}
+
+/// Run an explore command, and take what it printed.
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
+async fn explore(
+    shell: &RefCell<Shell<Buffer, Buffer>>,
+    out: &Buffer,
+    err: &Buffer,
+    command: &str,
+) -> Result<Explored> {
+    let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
+    let delta = shell.explore(command).await;
+    let (nodes, edges) = shell.explorer().map_or((0, 0), |s| s.shown());
+    Ok(Explored {
+        out: out.take(),
+        err: err.take(),
+        delta: delta.map(|d| d.to_bytes()).unwrap_or_default(),
+        nodes: nodes as u32,
+        edges: edges as u32,
+    })
 }
 
 /// Put `bytes` at `name` in `uploads`; the URL SQL reads it by.
@@ -551,21 +665,20 @@ mod tests {
     #[tokio::test]
     async fn graph_draws_the_last_result_a_query_or_a_property_graph() {
         let shell = WebShell::new();
-        let last = || shell.borrow().unwrap().last_result().cloned();
-        let err = graph_of(&shell.ctx, last(), "").await.unwrap_err();
+        let err = graph_of(&shell.shell, "").await.unwrap_err();
         assert!(err.to_string().contains("no result to draw yet"), "{err}");
 
         run(&shell, "CREATE VIEW people AS SELECT * FROM (VALUES ('ann'), ('bob'), ('cy'), ('dee')) AS t(name);").await;
         run(&shell, "CREATE VIEW knows AS SELECT * FROM (VALUES ('bob', 'ann', 1), ('cy', 'bob', 2)) AS t(a, b, w);").await;
         run(&shell, "SELECT w, a AS Src, b AS DST FROM knows;").await;
         // The last result: src and dst by name, not position.
-        let g = graph_of(&shell.ctx, last(), "").await.unwrap();
+        let g = graph_of(&shell.shell, "").await.unwrap();
         assert_eq!(ids(&g), ["bob", "ann", "cy"]);
         assert_eq!((g.result.src(), g.result.dst()), (&[0, 2][..], &[1, 0][..]));
         assert_eq!(g.result.provenance().rule.as_deref(), Some("edges"));
 
         // A query, with or without its semicolon; the first two columns.
-        let g = graph_of(&shell.ctx, last(), " SELECT b, a FROM knows; ")
+        let g = graph_of(&shell.shell, " SELECT b, a FROM knows; ")
             .await
             .unwrap();
         assert_eq!(ids(&g), ["ann", "bob", "cy"]);
@@ -574,15 +687,15 @@ mod tests {
             Some("SELECT b, a FROM knows")
         );
         // Ursa's dialect: a FROM-first query.
-        let g = graph_of(&shell.ctx, last(), "FROM knows").await.unwrap();
+        let g = graph_of(&shell.shell, "FROM knows").await.unwrap();
         assert_eq!(g.result.n_nodes(), 3);
         // A table by name.
-        let g = graph_of(&shell.ctx, last(), "knows").await.unwrap();
+        let g = graph_of(&shell.shell, "knows").await.unwrap();
         assert_eq!(g.result.n_nodes(), 3);
 
         // A property graph: its vertices first, so dee, with no edges, is drawn.
         run(&shell, "CREATE PROPERTY GRAPH social VERTEX TABLES (people KEY (name)) EDGE TABLES (knows SOURCE KEY (a) REFERENCES people (name) DESTINATION KEY (b) REFERENCES people (name));").await;
-        let g = graph_of(&shell.ctx, last(), "Social").await.unwrap();
+        let g = graph_of(&shell.shell, "Social").await.unwrap();
         assert_eq!(ids(&g), ["ann", "bob", "cy", "dee"]);
         assert_eq!((g.result.src(), g.result.dst()), (&[1, 2][..], &[0, 1][..]));
         assert_eq!(g.result.graph(), Some("social"));
@@ -595,29 +708,105 @@ mod tests {
             ("SELECT nope", "nope"),
             ("-- nothing", "no query to draw"),
         ] {
-            let err = graph_of(&shell.ctx, last(), text).await.unwrap_err();
+            let err = graph_of(&shell.shell, text).await.unwrap_err();
             assert!(
                 ursa_engine::user_message(&err).contains(says),
                 "{text}: {err}"
             );
         }
         run(&shell, "SELECT 42 AS answer;").await;
-        let err = graph_of(&shell.ctx, last(), "").await.unwrap_err();
+        let err = graph_of(&shell.shell, "").await.unwrap_err();
         assert!(err.to_string().contains("1 column"), "{err}");
+    }
+
+    /// An explore command changes the shell's open graph and gives the page
+    /// what it printed and the change as UGR bytes. The commands themselves
+    /// are tested in `ursa-shell` (`explore_tests.rs`).
+    #[tokio::test]
+    async fn explore_gives_the_page_a_line_and_a_delta() {
+        use ursa_viz::model::{GraphDelta, GraphResult};
+        let shell = WebShell::new();
+        let explore =
+            |command: &'static str| explore(&shell.shell, &shell.out, &shell.err, command);
+        // The commands are the shell's own: listed, and handed back.
+        let help = run(&shell, ".help").await;
+        assert!(
+            help["out"].as_str().unwrap().contains(".expand ID"),
+            "{help}"
+        );
+        let back = run(&shell, ".expand 3;").await;
+        assert_eq!(
+            (back["flow"].as_str(), back["command"].as_str()),
+            (Some("host"), Some(".expand 3"))
+        );
+        let none = explore(".expand 3").await.unwrap();
+        assert!(none.err.contains("Error: no graph is open"), "{}", none.err);
+        assert!(none.out.is_empty() && none.delta.is_empty());
+
+        run(&shell, "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (3, 4), (4, 5)) AS t(src, dst);").await;
+        run(
+            &shell,
+            "CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+        )
+        .await;
+        let g = graph_of(
+            &shell.shell,
+            "SELECT * FROM hop(club, seeds => [1], direction => 'both')",
+        )
+        .await
+        .unwrap();
+        let mut view = GraphResult::from_bytes(&g.result.to_bytes()).unwrap();
+        assert_eq!((view.n_nodes(), view.n_edges()), (3, 3));
+
+        let mut expanded = explore(".expand 3").await.unwrap();
+        assert_eq!(
+            (expanded.out(), expanded.err()),
+            ("+1 node, +1 edge\n".to_string(), String::new())
+        );
+        assert_eq!((expanded.nodes(), expanded.edges()), (4, 4));
+        let bytes = expanded.take_delta();
+        assert!(expanded.take_delta().is_empty());
+        view.apply(&GraphDelta::from_bytes(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(
+            view.node_keys().iter().collect::<Vec<_>>(),
+            ["1", "2", "3", "4"]
+        );
+
+        let mut undone = explore(".undo").await.unwrap();
+        assert_eq!(undone.out(), "Undid .expand 3: -1 node, -1 edge\n");
+        view.apply(&GraphDelta::from_bytes(&undone.take_delta()).unwrap())
+            .unwrap();
+        assert_eq!(view.to_bytes(), g.result.to_bytes());
+
+        let missing = explore(".hide 9").await.unwrap();
+        assert!(
+            missing
+                .err()
+                .contains("no node '9' in the graph that is drawn"),
+            "{}",
+            missing.err()
+        );
+        assert_eq!((missing.nodes(), missing.edges()), (3, 3));
+        shell.close_graph().unwrap();
+        assert!(explore(".undo")
+            .await
+            .unwrap()
+            .err()
+            .contains("no graph is open"));
     }
 
     #[tokio::test]
     async fn graph_styles_reach_the_page_as_ugr_bytes() {
         use ursa_viz::model::{GraphResult, Values};
         let shell = WebShell::new();
-        let last = || shell.borrow().unwrap().last_result().cloned();
         // Two triangles joined by one edge: two communities.
         run(&shell, "CREATE VIEW people AS SELECT * FROM (VALUES (1, 'red', 10, 'a'), (2, 'red', 20, 'b'), (3, 'red', 30, 'c'), (4, 'blue', 40, 'd'), (5, 'blue', 50, 'e'), (6, 'blue', 60, 'f')) AS t(id, side, age, name);").await;
         run(&shell, "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (4, 5), (5, 6), (6, 4), (3, NULL), (3, 4)) AS t(src, dst);").await;
         run(&shell, "CREATE PROPERTY GRAPH club VERTEX TABLES (people KEY (id)) EDGE TABLES (ties SOURCE KEY (src) REFERENCES people (id) DESTINATION KEY (dst) REFERENCES people (id));").await;
 
         // Algorithms, run on the graph through the shell's SQL, joined on id.
-        let g = graph_of(&shell.ctx, last(), "club SIZE BY pagerank COLOR BY louvain")
+        let g = graph_of(&shell.shell, "club SIZE BY pagerank COLOR BY louvain")
             .await
             .unwrap();
         assert_eq!(g.legend().unwrap().counts, vec![3, 3]);
@@ -644,21 +833,17 @@ mod tests {
             "SELECT * FROM hop(club, seeds => [3], n => 1, direction => 'both');",
         )
         .await;
-        let g = graph_of(&shell.ctx, last(), "").await.unwrap();
+        let g = graph_of(&shell.shell, "").await.unwrap();
         assert_eq!(g.drawn_as(), "rings on club (seed, id, distance)");
         // 3 and its neighbours 1, 2 and 4: the triangle and the bridge.
         assert_eq!((g.result.n_nodes(), g.result.n_edges()), (4, 4));
 
         // A query with a subquery in NODES, and an error from a clause.
-        let g = graph_of(
-            &shell.ctx,
-            last(),
-            "FROM ties NODES (FROM people) SIZE BY age",
-        )
-        .await
-        .unwrap();
+        let g = graph_of(&shell.shell, "FROM ties NODES (FROM people) SIZE BY age")
+            .await
+            .unwrap();
         assert_eq!(g.result.encodings().size_by.as_deref(), Some("age"));
-        let err = graph_of(&shell.ctx, last(), "ties COLOR BY louvain")
+        let err = graph_of(&shell.shell, "ties COLOR BY louvain")
             .await
             .unwrap_err();
         assert!(
