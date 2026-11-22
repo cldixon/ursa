@@ -157,7 +157,7 @@ fn main() {
         }),
         ("louvain", |t| louvain(t, None, 1.0, Some(1), false).len()),
         ("label_propagation", |t| {
-            label_propagation(t, None, 20, Some(1)).len()
+            label_propagation(t, None, 20, Some(1), false).len()
         }),
         ("weak components", |t| {
             connected_components_weak(t, None).len()

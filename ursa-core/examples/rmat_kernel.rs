@@ -10,6 +10,8 @@
 //!     --kernel triangles --edges 16000000 --scale 20
 //! cargo run --release -p ursa-core --example rmat_kernel -- \
 //!     --kernel betweenness --edges 32000000 --scale 21 --sources 105
+//! cargo run --release -p ursa-core --example rmat_kernel -- \
+//!     --kernel label-propagation --edges 32000000 --scale 21 [--parallel]
 //! ```
 //!
 //! `--scale` is the log2 of the node slots (default: `edges / 16` slots, as
@@ -18,10 +20,16 @@
 //! the betweenness sample. The R-MAT edges are those of the Graph500 generator
 //! (quadrants 0.57, 0.19, 0.19, 0.05) from a seeded stream, so every run sees
 //! the same graph. The thread count is rayon's (`RAYON_NUM_THREADS`).
+//!
+//! `--kernel label-propagation` runs 20 sweeps (seed 1), serially or, with
+//! `--parallel`, in parallel sub-rounds (#453), and prints the community count
+//! and modularity with the hash. `--planted P` replaces the R-MAT graph with a
+//! planted-partition one: `edges / 16` nodes in communities of 16 to 79 nodes,
+//! with P% of the edges drawn between communities.
 
 use std::time::Instant;
 
-use ursa_core::algo::{betweenness, triangle_count};
+use ursa_core::algo::{betweenness, label_propagation, triangle_count};
 use ursa_core::Topology;
 
 /// splitmix64.
@@ -48,6 +56,57 @@ fn rmat(edges: usize, scale: u32, seed: u64) -> (Vec<u32>, Vec<u32>) {
             (s, d)
         })
         .unzip()
+}
+
+/// A planted-partition graph: `edges / 16` nodes cut into consecutive
+/// communities of 16 to 79 nodes; each edge's source drawn uniformly, and its
+/// destination from the whole graph for `percent`% of the edges, from the
+/// source's community otherwise.
+fn planted(edges: usize, percent: usize) -> (usize, Vec<u32>, Vec<u32>) {
+    let n = (edges / 16).max(16);
+    let mut st = 7u64;
+    let mut start = vec![0u32; n];
+    let mut size = vec![0u32; n];
+    let mut lo = 0usize;
+    while lo < n {
+        let len = (16 + (next(&mut st) % 64) as usize).min(n - lo);
+        for u in lo..lo + len {
+            start[u] = lo as u32;
+            size[u] = len as u32;
+        }
+        lo += len;
+    }
+    let (src, dst) = (0..edges)
+        .map(|_| {
+            let s = (next(&mut st) % n as u64) as usize;
+            let d = if (next(&mut st) % 100) < percent as u64 {
+                (next(&mut st) % n as u64) as u32
+            } else {
+                start[s] + (next(&mut st) % u64::from(size[s])) as u32
+            };
+            (s as u32, d)
+        })
+        .unzip();
+    (n, src, dst)
+}
+
+/// Modularity (γ = 1) of the communities `labels` over the edges, taken as
+/// undirected.
+fn modularity(t: &Topology, labels: &[u32]) -> f64 {
+    let out = t.out();
+    let (mut tot, mut intra) = (vec![0.0f64; labels.len()], 0.0f64);
+    for u in 0..t.n_nodes() as u32 {
+        for &v in out.neighbors(u) {
+            let (a, b) = (labels[u as usize], labels[v as usize]);
+            tot[a as usize] += 1.0;
+            tot[b as usize] += 1.0;
+            if a == b {
+                intra += 2.0;
+            }
+        }
+    }
+    let m2 = 2.0 * t.n_edges() as f64;
+    intra / m2 - tot.iter().map(|x| (x / m2) * (x / m2)).sum::<f64>()
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -90,22 +149,30 @@ fn main() {
         "--vertices is below the {slots} node slots"
     );
     let sources = number("--sources").unwrap_or(105);
+    let parallel = args.iter().any(|a| a == "--parallel");
 
-    let (mut src, mut dst) = rmat(edges, scale, 42);
-    let step = (vertices / slots) as u32;
-    if step > 1 {
-        src.iter_mut()
-            .chain(dst.iter_mut())
-            .for_each(|v| *v *= step);
-    }
-    let t = Topology::build(vertices, src, dst);
+    let t = if let Some(percent) = number("--planted") {
+        let (n, src, dst) = planted(edges, percent);
+        Topology::build(n, src, dst)
+    } else {
+        let (mut src, mut dst) = rmat(edges, scale, 42);
+        let step = (vertices / slots) as u32;
+        if step > 1 {
+            src.iter_mut()
+                .chain(dst.iter_mut())
+                .for_each(|v| *v *= step);
+        }
+        Topology::build(vertices, src, dst)
+    };
+    let vertices = t.n_nodes();
     // Built before timing, as an index read from storage has them.
     t.incoming();
     if kernel == "triangles" {
         t.undirected();
     }
+    let mut communities = None;
     let (start, cpu) = (Instant::now(), cpu_seconds());
-    let result = match kernel.as_str() {
+    let mut result = match kernel.as_str() {
         "none" => String::new(),
         "triangles" => {
             let counts = triangle_count(&t, None);
@@ -120,12 +187,31 @@ fn main() {
             let hash = fnv(bc.iter().map(|x| x.to_bits()));
             format!("{sources} sources, result hash {hash:016x}")
         }
-        other => panic!("--kernel is triangles, betweenness or none, not {other}"),
+        "label-propagation" => {
+            // Described after the clock stops: the modularity takes a pass.
+            communities = Some(label_propagation(&t, None, 20, Some(1), parallel));
+            String::new()
+        }
+        other => {
+            panic!("--kernel is triangles, betweenness, label-propagation or none, not {other}")
+        }
     };
     let wall = start.elapsed().as_secs_f64();
     let cpu = cpu
         .zip(cpu_seconds())
         .map_or_else(|| "?".into(), |(a, b)| format!("{:.1}", b - a));
+    if let Some(labels) = communities {
+        let hash = fnv(labels.iter().map(|&l| u64::from(l)));
+        let mut distinct = labels.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        result = format!(
+            "{}, {} communities, modularity {:.5}, result hash {hash:016x}",
+            if parallel { "parallel" } else { "serial" },
+            distinct.len(),
+            modularity(&t, &labels)
+        );
+    }
     println!("{kernel}: {edges} edges, {vertices} nodes: {wall:.2} s wall, {cpu} CPU-s");
     println!("{result}");
 }

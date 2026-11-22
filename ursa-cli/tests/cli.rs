@@ -1168,7 +1168,7 @@ triangle_count,algorithm,0,\"\"
 clustering_coefficient,algorithm,0,\"\"
 betweenness,algorithm,4,out both
 closeness,algorithm,2,out in both
-label_propagation,algorithm,2,\"\"
+label_propagation,algorithm,3,\"\"
 louvain,algorithm,4,\"\"
 layout_fa2,layout,9,\"\"
 layout_fr,layout,4,\"\"

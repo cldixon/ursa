@@ -305,13 +305,49 @@ fn louvain_parallel_is_thread_count_independent() {
 #[test]
 fn label_propagation_is_thread_count_independent() {
     let t = seeded_graph(400, 4000);
-    let reference = on_pool(1, || label_propagation(&t, None, 20, Some(7)));
+    let reference = on_pool(1, || label_propagation(&t, None, 20, Some(7), false));
     for &threads in &THREADS {
         assert_eq!(
-            on_pool(threads, || label_propagation(&t, None, 20, Some(7))),
+            on_pool(threads, || label_propagation(&t, None, 20, Some(7), false)),
             reference,
             "label propagation diverged at {threads} threads"
         );
+    }
+}
+
+/// Parallel label propagation (#453): the same labels on 1, 2, 3, 4 and 8
+/// threads, masked and not, on graphs whose runs hold hundreds of nodes each
+/// (so votes really are split across threads), one sparse enough to keep many
+/// communities and one with nodes no kept edge touches (the compact path).
+#[test]
+fn label_propagation_parallel_is_thread_count_independent() {
+    let n = 60_000;
+    for m in [70_000, 150_000] {
+        let t = seeded_graph(n, m);
+        // Keep two edges in three, and none touching the top tenth of the
+        // nodes, which leaves them isolated.
+        let out = t.out();
+        let mut keep = vec![false; t.n_edges()];
+        for u in 0..n as u32 {
+            for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                keep[e as usize] = e % 3 != 1 && u < (n as u32 * 9 / 10) && v < (n as u32 * 9 / 10);
+            }
+        }
+        let mask = ursa_core::EdgeMask::from_bools(&keep);
+        for masked in [false, true] {
+            let mask = masked.then_some(&mask);
+            let run = || label_propagation(&t, mask, 20, Some(7), true);
+            let reference = on_pool(1, run);
+            assert_ne!(reference, label_propagation(&t, mask, 20, Some(7), false));
+            for &threads in &THREADS {
+                assert_eq!(
+                    on_pool(threads, run),
+                    reference,
+                    "parallel label propagation ({m} edges, masked {masked}) diverged at \
+                     {threads} threads"
+                );
+            }
+        }
     }
 }
 

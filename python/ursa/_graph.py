@@ -445,13 +445,21 @@ def closeness(
     )
 
 
-def label_propagation(edges: EdgeFrame, max_iter: int = 20, seed: int | None = None) -> GraphExpr:
-    """Community detection via label propagation."""
+def label_propagation(
+    edges: EdgeFrame, max_iter: int = 20, seed: int | None = None, parallel: bool = False
+) -> GraphExpr:
+    """Community detection via label propagation.
+
+    ``parallel=True`` votes in parallel sub-rounds: faster on many cores, and a
+    given ``seed`` still gives the same labels on any thread count, but not the
+    ones the serial default finds. It has no NetworkX equivalent (the default
+    matches ``nx.community.label_propagation_communities``)."""
     return _graph_expr(
         "label_propagation",
         edges=_ir.check_edges(edges, "label_propagation"),
         max_iter=max_iter,
         seed=seed,
+        parallel=parallel,
     )
 
 
