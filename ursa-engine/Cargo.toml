@@ -30,6 +30,8 @@ futures = "0.3"
 glob = "0.3"
 # The lock type of `SessionContext::state_weak_ref` (already in the tree via DataFusion).
 parking_lot = "0.12"
+# The path search's state maps (#451; already in the tree via ursa-core).
+rustc-hash = "2"
 # The graph index cache's single-flight cell, and running kernels off the async
 # workers (already in the tree via DataFusion).
 tokio = { version = "1", features = ["rt", "sync"] }
@@ -53,6 +55,9 @@ aws-profile = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-smithy-htt
 # Native only: the local file system and cloud stores do not build for wasm32 (#278).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ursa-core = { path = "../ursa-core", version = "0.12.0-dev", features = ["rayon"] }
+# A path search from many start nodes runs them on rayon's pool (#451); the
+# browser build runs them one after another, with the same rows.
+rayon = { workspace = true }
 object_store = { workspace = true, features = ["fs", "aws", "gcp", "azure"] }
 
 # The free space on a database's disk, which the default
