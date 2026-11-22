@@ -222,14 +222,19 @@ static assets and an R2 bucket.
       result: a path's route is highlighted, a `hop`'s seeds are ringed,
       and the rest is dimmed. They follow the deltas (a hidden node's
       route edge is not drawn).
-    - **What it costs.** A view made from a result holds the result as
-      well as what it draws. On `.graph rmat` (1M edges) the view's heap
-      is 60 MiB where the edge-list view of #426 was 16, and decoding the
-      result is one task of 63 to 92 ms on the page's thread
-      (`GraphResult::from_bytes`, not yet done in pieces), so
-      `tests/graph-timing.ts`, which allows 60, fails there until it is.
-      The drawings one explores from (a `hop`, a path, a pattern's
-      matches) are small, and cost nothing to speak of.
+    - **What it costs** (#501, #492). A view made from a result holds
+      the result, and the edges once. On `.graph rmat` (1M edges) the
+      view's WebAssembly memory is 17.9 MiB (it was 59.6 when the view
+      kept a graph beside the result, and 16 for the edge-list view of
+      #426), and the result is decoded in pieces, out of the page's
+      buffer, so no task while the view is made is over 60 ms (decoding
+      was one of 63 to 92). The layout worker holds 55.7 MB (it was 101):
+      it builds the adjacency a layout reads and no topology, and holds a
+      dense coarse level's weights only while it lays that level out.
+      Positions come from the worker in an array filled once from the
+      layout and transferred, and the view copies it once.
+      `tests/graph-timing.ts` fails if the view is over 20 MiB or the
+      worker over 60 MB.
     - **What the page knows** (each node's id, its degree among what is
       shown, the legend, the counts in the header) is read again from the
       view's own result (`view.resultBytes()`) after each delta, and the
@@ -327,6 +332,13 @@ static assets and an R2 bucket.
     | `actions` | the last 32, oldest first: `{command, at, engine, delta, frame}`. `command` is what was typed (`.graph karate`) or the input (`click`, `fit`, `key +`); `at` is when the input arrived, in ms after the last `.graph`'s Enter; `engine` is the ms the engine took and `delta` the ms applying its answer to the view (both `null` for an input that needs neither); `frame` is the ms from the input to when the page's thread was free of the frame that showed it: with no GPU the browser rasterises a frame on that thread after `render()` returns (4 s at a million edges), so this is when the pixels are there, where `firstDraw` is when `render()` returned. A click that changes no selection draws nothing, and is shown by the next frame the browser paints. |
     | `longTasks` | the page's last 64 tasks over 50 ms: `{start, duration}`, `start` in ms after Enter. |
 
+    `graphTimings().memory` is `{edges, view, layout}` (#501): the edge
+    slots of what is drawn, and for the view and for the layout worker
+    `{bytes, perEdge}`, its WebAssembly memory and those bytes an edge. A
+    WebAssembly memory only grows, so each is the most its instance has
+    held: the worker is new with each drawing, the view's module is the
+    page's.
+
     `await window.ursaShell.graphMemory()` gives `wasm.engine`, `wasm.view`
     and `wasm.layout`, the bytes of each WebAssembly instance's memory (the
     engine's worker, the view on the page, the layout's worker), and
@@ -343,7 +355,8 @@ static assets and an R2 bucket.
     `tests/graph-timing.ts` prints all of it: the steps, the `.graph`
     action, the long tasks (and the longest while the view was made, which
     fails the run over 60 ms: the view builds no topology, #426), the frame times of a scripted wheel zoom, a pick
-    and the heaps. It runs the full Chromium (`channel: "chromium"`), since
+    and the heaps (on rmat it fails if the view holds over 20 MiB or the
+    layout worker over 60 MB, #501). It runs the full Chromium (`channel: "chromium"`), since
     Playwright's headless shell has no `measureUserAgentSpecificMemory`;
     `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`
     tests the arithmetic.

@@ -85,7 +85,7 @@ fn room_of(nodes: usize, edges: usize) -> Room {
 
 /// The most turns of the event loop [`settle`] waits for the GPU: a GPU
 /// that slow is waited for no longer, and the view is made holding more.
-const SETTLE_TURNS: usize = 16;
+const SETTLE_TURNS: usize = 32;
 
 /// For a paced view: give the event loop turns until the GPU has taken
 /// everything written to it, so that the staging of those writes is freed.

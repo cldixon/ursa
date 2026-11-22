@@ -534,11 +534,13 @@ impl<T: Copy + Default + PartialEq> Sparse<T> {
     }
 
     pub(crate) fn extend_from_slice(&mut self, more: &[T]) {
-        if self.data.is_empty() && more.iter().any(|v| *v != T::default()) {
-            self.data = Vec::with_capacity(self.len + more.len());
-            self.data.resize(self.len, T::default());
-        }
-        if !self.data.is_empty() {
+        let held = !self.data.is_empty();
+        if held || more.iter().any(|v| *v != T::default()) {
+            if !held {
+                // The zeros so far, and then the first that is not.
+                self.data = Vec::with_capacity(self.len + more.len());
+                self.data.resize(self.len, T::default());
+            }
             self.data.extend_from_slice(more);
         }
         self.len += more.len();

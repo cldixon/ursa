@@ -1425,6 +1425,27 @@ fn labels_and_flags_that_are_all_zero_hold_nothing() {
     r.apply(&more.invert()).unwrap();
     assert_eq!(r, back);
     assert_eq!(r.to_bytes(), bytes);
+
+    // Labels held from the first edge there is, and zeros after them.
+    let mut labelled = EdgeBatch::of_label(0, vec![0, 1, 2, 0], vec![1, 2, 0, 2]);
+    labelled.labels = vec![0, 1, 0, 1];
+    let mut two = build(vec![
+        Op::AddNodeLabel(NodeLabel::new("", KeyType::Int)),
+        Op::AddEdgeLabel("a".into()),
+        Op::AddEdgeLabel("b".into()),
+        Op::AddNodes(NodeBatch::of_label(0, [1i64, 2, 3])),
+        Op::AddEdges(labelled),
+    ]);
+    assert_eq!(two.edge_label().to_vec(), [0, 1, 0, 1]);
+    let zeros = delta(vec![Op::AddEdges(EdgeBatch::of_label(0, vec![1], vec![0]))]);
+    two.apply(&zeros).unwrap();
+    assert_eq!(two.edge_label().to_vec(), [0, 1, 0, 1, 0]);
+    assert_eq!(two.edge_label()[3], 1);
+    let read = GraphResult::from_bytes(&two.to_bytes()).unwrap();
+    assert_eq!(read, two);
+    assert_eq!(read.edge_label().to_vec(), [0, 1, 0, 1, 0]);
+    two.apply(&zeros.invert()).unwrap();
+    assert_eq!(two.edge_label().to_vec(), [0, 1, 0, 1]);
 }
 
 /// Bytes that are not this program's slice: read a range at a time, and
