@@ -14,7 +14,8 @@
 //   1-pixel `readPixels`; WebGPU: `queue.onSubmittedWorkDone`), one frame per
 //   animation frame, median and p95. Wall time, not GPU timestamps: the view
 //   requests no `timestamp-query` feature;
-// - pick latency (`view.pick` at random pixels);
+// - pick latency (`view.pick` at random pixels), the time to build the grid
+//   it reads, and how many nodes a frame zoomed into 1% of the drawing draws;
 // - memory: the page's and the layout worker's wasm memory, and
 //   `performance.measureUserAgentSpecificMemory` (the server sends
 //   COOP/COEP, so the page is cross-origin isolated) or `performance.memory`;
@@ -285,6 +286,18 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             pickMs.push(performance.now() - t);
             if (hit !== undefined) hits++;
           }
+          // The grid the picks read: building it, and what a frame zoomed
+          // into 1% of the drawing (a tenth each way) draws with it.
+          const gridBuildMs: number[] = [];
+          for (let i = 0; i < 9; i++) {
+            const t = performance.now();
+            view.rebuildGrid();
+            gridBuildMs.push(performance.now() - t);
+          }
+          view.zoom(10, canvas.width / 2, canvas.height / 2);
+          view.render();
+          const culledNodes = view.nodesDrawn;
+          view.fit();
           // Memory.
           const memory: any = { pageWasmBytes: w.wasm.memory.buffer.byteLength, workerWasmBytes: w.stats.workerMemoryBytes };
           const pm = (performance as any).memory;
@@ -302,7 +315,7 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             }
           }
           w.pauseFrames(false);
-          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, memory };
+          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, gridBuildMs, culledNodes, memory };
         },
         { frames: FRAMES, picks: PICKS, budgetMs: FRAME_BUDGET_MS },
       ),
@@ -312,6 +325,7 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
       result[k] = { cpuMs: summary(r.cpu), frameMs: summary(r.total), rafIntervalMs: summary(r.interval) };
     }
     result.pickMs = summary(result.pickMs);
+    result.gridBuildMs = summary(result.gridBuildMs);
     result.burstMsPerFrame = summary(result.burstMs);
     delete result.burstMs;
     const h = result.highlight;

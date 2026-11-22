@@ -37,6 +37,15 @@
 // on the page's thread is over 60 ms, the page's wasm memory is at most
 // 20 MiB afterwards, and the view has no adjacency until a layout on its
 // own thread steps. ONLY=create runs these alone.
+//
+// Then the spatial grid (#500), on WebGL2: on the clusters and on R-MAT
+// with 1M edges, a pick and an edge pick with the grid are the picks that
+// test every node and edge, at pixels on nodes, beside them and anywhere,
+// fitted and zoomed in, with nodes hidden, selected and added by a delta;
+// while the positions move every pick tests every node; and zoomed into 1%
+// of the drawing the node pass draws at most 5% of the instances, in a
+// frame that is the frame with every node drawn, byte for byte. ONLY=grid
+// runs these alone.
 import { chromium, type Page } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -605,6 +614,182 @@ if (CREATE_CASES.length) {
         `(${runs.map((x) => `${x.longest} ms of ${x.tasks} over 50, ${x.createMs.toFixed(0)} ms in all`).join("; ")}) · wasm memory after ${mib(wasm)} · ` +
         `no adjacency until step(1): ${r.stepMs.toFixed(0)} ms, then ${mib(r.steppedWasmBytes)}`,
     );
+  }
+  await gl.close();
+}
+// The spatial grid.
+const GRID_CASES = [
+  { name: "grid clusters", query: "graph=clusters&k=8&size=500&result=1", edgeMs: 0 },
+  { name: "grid rmat 1M", query: "graph=rmat&scale=17&edges=1000000&result=1&multilevel=0&iterations=3", edgeMs: 1 },
+  // The issue's size, a million nodes: minutes with no GPU, so only when
+  // asked for by name (ONLY="grid nodes 1M").
+  { name: "grid nodes 1M", query: "graph=rmat&scale=20&edges=1000000&result=1&multilevel=0&iterations=1", edgeMs: 1, big: true },
+].filter((c) => (c.big ? ONLY === c.name : !ONLY || c.name.startsWith(ONLY)));
+if (GRID_CASES.length) {
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  for (const c of GRID_CASES) {
+    const name = c.name;
+    const fail = (what: string) => failures.push(`${name}: ${what}`);
+    const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+    page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+    page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+    await page.goto(`${base}?${c.query}`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    await page.waitForTimeout(500);
+    // The issue's 5% is R-MAT's; a cluster is denser, and half is what the
+    // view promises.
+    const r: any = await page.evaluate(async (share) => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph, n = g.n;
+      const canvas = document.getElementById("view") as HTMLCanvasElement;
+      const [W, H] = [canvas.width, canvas.height];
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 200));
+      const problems: string[] = [];
+      const out: any = { backend: view.backend, nodes: n, edges: g.src.length };
+      let seed = 500;
+      const rnd = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32);
+      // Pixels on nodes, beside them, on edges and anywhere.
+      const pixels = (count: number) => {
+        const at: number[][] = [];
+        for (let k = 0; k < count; k++) {
+          const i = Math.floor(rnd() * view.nodeCount), [x, y] = view.nodePixel(i);
+          if (k % 4 === 0) at.push([rnd() * W, rnd() * H]);
+          else if (k % 4 === 1) at.push([x, y]);
+          else if (k % 4 === 2) at.push([x + (rnd() - 0.5) * 12, y + (rnd() - 0.5) * 12]);
+          else {
+            const e = Math.floor(rnd() * g.src.length), [ax, ay] = view.nodePixel(g.src[e]), [bx, by] = view.nodePixel(g.dst[e]), t = rnd();
+            at.push([ax + (bx - ax) * t + rnd() * 3, ay + (by - ay) * t + rnd() * 3]);
+          }
+        }
+        return at;
+      };
+      // Every pick with the grid is the pick without it.
+      const same = (what: string, count: number, edges: number) => {
+        let hits = 0, edgeHits = 0, wrong = 0;
+        const at = pixels(count);
+        for (const [x, y] of at) {
+          const [a, b] = [view.pick(x, y), view.pickLinear(x, y)];
+          if (a !== b && wrong++ < 3) problems.push(`${what}: at ${x.toFixed(1)}, ${y.toFixed(1)} the grid picks node ${a}, every node tested picks ${b}`);
+          if (b !== undefined) hits++;
+        }
+        for (const [x, y] of at.slice(0, edges)) {
+          const [a, b] = [view.pickEdge(x, y, 4), view.pickEdgeLinear(x, y, 4)];
+          if (a !== b && wrong++ < 3) problems.push(`${what}: at ${x.toFixed(1)}, ${y.toFixed(1)} the grid picks edge ${a}, every edge tested picks ${b}`);
+          if (b !== undefined) edgeHits++;
+        }
+        if (hits < count / 8) problems.push(`${what}: only ${hits} of ${count} pixels are on a node`);
+        if (edges && !edgeHits) problems.push(`${what}: no pixel of ${edges} is on an edge`);
+        return [hits, edgeHits];
+      };
+      const many = n > 50_000 ? 400 : 2000, edgePicks = n > 50_000 ? 40 : 400;
+      // The positions rest: three frames or picks, and the grid is there.
+      view.setPositions(view.positions());
+      if (view.gridReady) problems.push("the grid is ready as the positions change");
+      view.render(); view.pick(1, 1);
+      if (view.gridReady) problems.push("the grid is built after two quiet calls, not three");
+      view.pick(1, 1);
+      if (!view.gridReady) problems.push("the grid is not built after three quiet calls");
+      out.fitted = same("fitted", many, edgePicks);
+      // With nodes hidden and selected.
+      const hub = g.src[0];
+      view.setHidden(Uint32Array.of(hub, 1, 2));
+      view.setSelection(Uint32Array.of(5, 6));
+      out.flagged = same("with nodes hidden and selected", many, edgePicks);
+      const [hx, hy] = view.nodePixel(hub);
+      if (view.pick(hx, hy) === hub) problems.push(`hidden node ${hub} can be picked`);
+      const [sx, sy] = view.nodePixel(5);
+      if (view.pick(sx, sy) === undefined) problems.push("nothing is picked on selected node 5");
+      view.setHidden(new Uint32Array()); view.setSelection(new Uint32Array());
+      // New nodes, before the grid has them and after; and after the undo.
+      // The view places them, around the node they hang off.
+      const delta = new viz.DeltaBuilder().addNodes(n, 20).addEdges(Uint32Array.from({ length: 20 }, (_, k) => n + k), new Uint32Array(20)).toBytes();
+      view.applyDelta(delta);
+      if (view.gridReady) problems.push("the grid is ready with nodes it has not seen");
+      const [nx, ny] = view.nodePixel(n + 7);
+      const fresh = [view.pick(nx, ny), view.pickLinear(nx, ny)];
+      if (fresh[0] !== fresh[1] || fresh[0] === undefined) problems.push(`on new node ${n + 7} the grid picks ${fresh[0]}, every node tested ${fresh[1]}`);
+      if (view.gridReady) problems.push("one pick after a delta built the grid");
+      out.grown = same("after a delta", many, edgePicks);
+      if (!view.gridReady) problems.push("the grid was not rebuilt after the delta");
+      view.applyDelta(viz.invertDelta(delta));
+      out.undone = same("after the undo", many, edgePicks);
+      // Zoomed in, where a pixel is a small part of a cell.
+      view.zoom(10, W * 0.4, H * 0.45);
+      out.zoomed = same("zoomed in 10x", many, edgePicks);
+      // A node's own pixel picks a node at least as near.
+      // The clock here ticks in tenths of a millisecond: each time is the
+      // mean of a run of calls.
+      const each = (at: number[][], f: (x: number, y: number) => any) => { const t = performance.now(); for (const [x, y] of at) f(x, y); return (performance.now() - t) / at.length; };
+      view.fit(); view.render(); view.render(); view.render();
+      const at = Array.from({ length: 2000 }, () => [rnd() * W, rnd() * H]);
+      out.pickMs = each(at, (x, y) => view.pick(x, y));
+      out.linearMs = each(at.slice(0, 50), (x, y) => view.pickLinear(x, y));
+      out.buildMs = each(at.slice(0, 20), () => view.rebuildGrid());
+      view.pickEdge(1, 1, 4); view.pickEdge(1, 1, 4);
+      out.edgeMs = each(at.slice(0, 200), (x, y) => view.pickEdge(x, y, 4));
+      out.edgeLinearMs = each(at.slice(0, 20), (x, y) => view.pickEdgeLinear(x, y, 4));
+      // Culling: every node while they all show, and fewer zoomed into 1%
+      // of the drawing (a tenth each way), in the same frame.
+      const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      const inked = (a: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i += 4) if (a[i] < 235 || a[i + 1] < 235 || a[i + 2] < 235) d++; return d; };
+      view.render();
+      out.drawnFitted = view.nodesDrawn;
+      if (out.drawnFitted !== n) problems.push(`fitted, ${out.drawnFitted} of ${n} nodes are drawn`);
+      out.views = [];
+      // The middle of the drawing, and around two of its nodes.
+      for (const [zx, zy] of [[W / 2, H / 2], view.nodePixel(g.src[0]), view.nodePixel(g.dst[g.dst.length >> 1])]) {
+        view.fit(); view.zoom(10, zx, zy);
+        // A selected, a pinned and a hovered node in view, and a hidden one.
+        const inView = [];
+        for (let i = 0; i < n && inView.length < 4; i++) { const [x, y] = view.nodePixel(i); if (x > 50 && y > 50 && x < W - 50 && y < H - 50) inView.push(i); }
+        if (inView.length === 4) { view.setSelection(Uint32Array.of(inView[0])); view.setPinned(Uint32Array.of(inView[1])); view.setHovered(inView[2]); view.setHidden(Uint32Array.of(inView[3])); }
+        view.setCulling(true); view.render();
+        const drawn = view.nodesDrawn;
+        const culled: Uint8Array = await view.snapshot();
+        view.setCulling(false); view.render();
+        if (view.nodesDrawn !== n) problems.push(`with culling off, ${view.nodesDrawn} of ${n} nodes are drawn`);
+        const all: Uint8Array = await view.snapshot();
+        view.setCulling(true);
+        const d = differ(culled, all);
+        if (d) problems.push(`zoomed in at ${zx}, ${zy}, ${d} bytes of the frame with ${drawn} nodes drawn differ from the frame with all ${n}`);
+        if (!(drawn <= share * n)) problems.push(`zoomed into 1% of the drawing at ${zx}, ${zy}, ${drawn} of ${n} node instances are drawn: over ${100 * share}%`);
+        // Panning says which nodes are in view again.
+        view.pan(-40, 25); view.render();
+        const panned: Uint8Array = await view.snapshot();
+        view.setCulling(false); view.render();
+        const d2 = differ(panned, await view.snapshot());
+        view.setCulling(true);
+        if (d2) problems.push(`panned, ${d2} bytes of the culled frame differ`);
+        out.views.push({ drawn, inked: inked(all), marked: inView.length });
+        view.setSelection(new Uint32Array()); view.setPinned(new Uint32Array()); view.setHovered(undefined); view.setHidden(new Uint32Array());
+      }
+      // While the positions move, every node is drawn and tested.
+      view.setPositions(view.positions()); view.render();
+      if (view.nodesDrawn !== n) problems.push(`as the positions move, ${view.nodesDrawn} of ${n} nodes are drawn`);
+      for (let k = 0; k < 5; k++) { view.setPositions(view.positions()); view.render(); view.pick(10, 10); }
+      if (view.gridReady) problems.push("the grid was built while the positions changed every frame");
+      view.fit();
+      w.pauseFrames(false);
+      return { problems, ...out };
+    }, c.edgeMs ? 0.05 : 0.5).catch((e) => ({ problems: [String(e)] }));
+    for (const p of r.problems) fail(p);
+    if (r.backend && r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
+    const ms = (v: number) => `${v?.toFixed(v < 1 ? 3 : 1)} ms`;
+    if (c.edgeMs) {
+      // The issue's numbers are 0.2 ms a pick and 15 ms to build the grid
+      // at 1M nodes, where a pick that tests every node took 4.9 ms. This
+      // machine is shared and this graph may be smaller, so the times are
+      // held to the same ratios of that pick, measured in the same run
+      // (with some room for the grid: a run of 20 against a run of 50).
+      if (!(r.pickMs <= r.linearMs / 24.5)) fail(`a pick takes ${ms(r.pickMs)}, and ${ms(r.linearMs)} testing every node: not 24 times less`);
+      if (!(r.buildMs <= 4 * r.linearMs)) fail(`building the grid takes ${ms(r.buildMs)}: over 4 picks that test every node (${ms(r.linearMs)})`);
+    }
+    console.log(
+      `${name}: ${r.backend} · ${r.nodes?.toLocaleString()} nodes, ${r.edges?.toLocaleString()} edges · picks equal to the linear scan's (nodes hit, edges hit): fitted ${r.fitted}, flagged ${r.flagged}, after a delta ${r.grown}, undone ${r.undone}, zoomed ${r.zoomed} · ` +
+        `pick ${ms(r.pickMs)} (every node: ${ms(r.linearMs)}) · grid built in ${ms(r.buildMs)} · edge pick ${ms(r.edgeMs)} (every edge: ${ms(r.edgeLinearMs)}) · ` +
+        `zoomed into 1%: ${r.views?.map((v: any) => `${v.drawn} of ${r.nodes} instances (${(100 * v.drawn / r.nodes).toFixed(2)}%), ${v.inked} px inked, same frame`).join("; ")}`,
+    );
+    await page.close();
   }
   await gl.close();
 }
