@@ -7,9 +7,11 @@
 
 use ursa_core::algo::{fa2_seed_positions, Fa2Params};
 
+use crate::budget::{split, total_units, Frame, FrameBudget};
 use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
+use crate::order::{BadOrder, EdgeSlots};
 use crate::pace::{ready, yield_now, Pace};
 use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
@@ -51,6 +53,62 @@ pub struct View {
     /// follows and nothing has moved since: a delta that only adds nodes
     /// widens it by theirs, without reading every position again.
     fitted: Option<Fitted>,
+    /// How many edges a frame draws while the view moves.
+    budget: FrameBudget,
+    /// Where each edge is in the renderer's edge buffer: in the slot of its
+    /// index, until [`View::set_edge_order`].
+    slots: EdgeSlots,
+    /// An order being written to the GPU ([`View::order_edges`]).
+    reorder: Option<Reorder>,
+    /// The nodes a moving frame draws when it cannot draw them all.
+    some: SomeNodes,
+    /// What the last moving frame drew: nodes and edges.
+    moving_drew: (usize, usize),
+}
+
+/// The nodes for a frame that does not draw them all: the largest first.
+#[derive(Default)]
+struct SomeNodes {
+    /// Every node, by radius, largest first (then by index); empty until
+    /// a frame needs it, and after the nodes or their radii change.
+    order: Vec<u32>,
+    /// The renderer's copy of the first of them is as they are now.
+    fresh: bool,
+}
+
+/// An edge order on its way to the GPU: the frames draw the buffer there
+/// was until the new one is whole.
+struct Reorder {
+    /// `order[slot]` is the edge to draw in that slot.
+    order: Vec<u32>,
+    slots: EdgeSlots,
+    /// The new buffer, and how many of its slots are written.
+    buffer: wgpu::Buffer,
+    written: usize,
+}
+
+/// What the frame budget is doing, for a status line and for tests
+/// ([`View::frame_info`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameInfo {
+    /// The edges the last moving frame drew: the prefix. 0 before any.
+    pub k: usize,
+    /// The nodes the last moving frame drew: the largest. 0 before any.
+    pub nodes: usize,
+    /// The edges a frame at rest draws: every slot.
+    pub edges: usize,
+    /// How many of them are in importance order ([`View::set_edge_order`]):
+    /// the first ones. The rest are after them, in index order.
+    pub ordered: usize,
+    /// The 95th percentile of the last 120 moving frames' costs, in
+    /// milliseconds, as the binding measured them ([`View::frame_cost`]);
+    /// `None` before any.
+    pub p95: Option<f32>,
+    /// How many moving frames' costs were measured.
+    pub frames: usize,
+    /// The cost a moving frame is held to, in milliseconds.
+    pub limit: f64,
 }
 
 type Bounds = Option<(f32, f32, f32, f32)>;
@@ -256,6 +314,11 @@ impl View {
             live,
             layout_stale: false,
             fitted: None,
+            budget: FrameBudget::new(),
+            slots: EdgeSlots::identity(),
+            reorder: None,
+            some: SomeNodes::default(),
+            moving_drew: (0, 0),
         };
         if view.live.is_some() {
             view.upload_flags(device, queue, false);
@@ -305,6 +368,9 @@ impl View {
         delta: &GraphDelta,
         positions: Option<(&[f32], &[f32])>,
     ) -> Result<Applied, ModelError> {
+        // An order on its way to the GPU is written out first: the delta
+        // changes the buffer it fills.
+        self.order_edges(device, queue, usize::MAX);
         let Some(live) = self.live.as_mut() else {
             return Err(ModelError(
                 "this view was not made from a result, so it has none to apply a delta to".into(),
@@ -374,10 +440,34 @@ impl View {
                 .write_styles(queue, run.start, &radius[run.clone()], color);
         }
         let new_edges = changes.new_edges_from..m1;
-        let runs = std::iter::once(&new_edges).chain(&changes.edge_runs);
-        for run in runs {
-            let lines = live.line_indices(run.clone());
-            bytes += self.renderer.write_edges(queue, run.start, &lines);
+        if changes.new_edges_from < self.slots.ordered() {
+            // Edges the order was made for are gone (an undo past them),
+            // so it no longer fills the first slots: every edge goes back
+            // to the slot of its index.
+            self.slots = EdgeSlots::identity();
+            let mut start = 0;
+            while start < m1 {
+                let run = start..m1.min(start + EDGE_RUN);
+                let lines = live.line_indices(run.clone());
+                bytes += self.renderer.write_edges(queue, start, &lines);
+                start = run.end;
+            }
+        } else {
+            // New edges go after the ones there are, in the slots of their
+            // indexes, whatever the order of the rest.
+            let lines = live.line_indices(new_edges.clone());
+            bytes += self.renderer.write_edges(queue, new_edges.start, &lines);
+            for run in &changes.edge_runs {
+                if run.start >= self.slots.ordered() {
+                    let lines = live.line_indices(run.clone());
+                    bytes += self.renderer.write_edges(queue, run.start, &lines);
+                    continue;
+                }
+                for (slot, edges) in self.slots.slot_runs(run.clone()) {
+                    let lines = live.lines_of(&edges);
+                    bytes += self.renderer.write_edges(queue, slot, &lines);
+                }
+            }
         }
         if changes.highlights {
             bytes += self.upload_flags(device, queue, true);
@@ -400,6 +490,11 @@ impl View {
         if (n0, m0) != (n1, m1) {
             self.layout_stale = true;
         }
+        if changes.positions {
+            self.budget.moved();
+        }
+        // The nodes, or their sizes, may have changed.
+        self.some = SomeNodes::default();
         if n0 != n1 || changes.positions {
             self.refit(&changes);
         }
@@ -496,6 +591,7 @@ impl View {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.budget.moved();
         self.renderer.set_positions(queue, &self.x, &self.y);
         // The highlighted edges and the nodes in front hold positions.
         self.upload_highlight(device, queue, true, true);
@@ -550,6 +646,11 @@ impl View {
         if edges && !(!self.highlight.any_wide_edges() && self.renderer.highlight_edges() == 0) {
             let ends = self.highlight_ends();
             self.renderer.set_highlight_edges(device, queue, &ends);
+        }
+        if front {
+            // Positions, styles or flags changed: the nodes a moving frame
+            // draws are gathered again when one next needs them.
+            self.some.fresh = false;
         }
         if front && !(self.front.is_empty() && self.renderer.front_nodes() == 0) {
             let flags = self.highlight.flags();
@@ -616,6 +717,7 @@ impl View {
         assert_eq!(style.color.len(), self.graph.n_nodes());
         self.renderer.set_style(queue, &style);
         self.style = style;
+        self.some = SomeNodes::default();
         // The nodes in front hold their radius and colour.
         self.upload_highlight(device, queue, false, true);
     }
@@ -661,6 +763,7 @@ impl View {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        self.budget.moved();
         self.camera.viewport = (width.max(1) as f32, height.max(1) as f32);
         if self.follow {
             self.fit_camera();
@@ -668,11 +771,13 @@ impl View {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32) {
+        self.budget.moved();
         self.follow = false;
         self.camera.pan(dx, dy);
     }
 
     pub fn zoom(&mut self, factor: f32, px: f32, py: f32) {
+        self.budget.moved();
         self.follow = false;
         self.camera.zoom(factor, px, py);
     }
@@ -694,6 +799,7 @@ impl View {
 
     fn fit_to(&mut self, bounds: Bounds) {
         if let Some(b) = bounds {
+            self.budget.moved();
             self.camera.fit(b);
             self.fitted_zoom = self.camera.pixels_per_unit;
         }
@@ -869,7 +975,214 @@ impl View {
         (fitted * zoomed_in.sqrt()).min(1.0)
     }
 
-    /// Draw a frame into `target`.
+    /// Draw the edges in `order`, most important first: `order[slot]` is
+    /// the edge to draw in that slot, a permutation of the first
+    /// `order.len()` edges (the edges there were when it was computed:
+    /// [`LiveLayout::edge_order`]). Edges after those stay after them, in
+    /// index order. A frame that draws every edge is the same pixels in any
+    /// order; the order is for the frames that draw a prefix
+    /// ([`View::draw_frame`]).
+    ///
+    /// Nothing is written here: [`View::order_edges`] writes the edges to
+    /// a new buffer, a run at a time, and the frames draw the old one until
+    /// it is whole. On an error nothing changes.
+    pub fn set_edge_order(
+        &mut self,
+        device: &wgpu::Device,
+        order: Vec<u32>,
+    ) -> Result<(), BadOrder> {
+        let slots = EdgeSlots::from_order(&order, self.graph.n_edges())?;
+        self.reorder = Some(Reorder {
+            order,
+            slots,
+            buffer: self.renderer.edge_buffer(device),
+            written: 0,
+        });
+        Ok(())
+    }
+
+    /// Write up to `max_edges` more edges of the order being set
+    /// ([`View::set_edge_order`]), eight bytes each, and draw from the new
+    /// buffer once it is whole. Returns whether there is more to write: a
+    /// page calls it once a task until there is not, so that a million
+    /// edges never hold its thread. A delta writes what is left at once.
+    pub fn order_edges(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        max_edges: usize,
+    ) -> bool {
+        let Some(mut reorder) = self.reorder.take() else {
+            return false;
+        };
+        let m = self.graph.n_edges();
+        let ordered = reorder.order.len();
+        let mut left = max_edges;
+        while reorder.written < m && left > 0 {
+            let start = reorder.written;
+            let end = m.min(start + left.min(EDGE_RUN));
+            // The ordered edges, then the rest in the slots of their indexes.
+            let lines = if start < ordered {
+                let end = end.min(ordered);
+                self.lines_of(&reorder.order[start..end])
+            } else {
+                match &self.live {
+                    Some(live) => live.line_indices(start..end),
+                    None => self.graph.line_indices(start..end),
+                }
+            };
+            self.renderer
+                .write_edges_to(queue, &reorder.buffer, start, &lines);
+            queue.submit([]);
+            let _ = device.poll(wgpu::PollType::Poll);
+            reorder.written += lines.len() / 2;
+            left -= lines.len() / 2;
+        }
+        if reorder.written < m {
+            self.reorder = Some(reorder);
+            return true;
+        }
+        self.renderer.replace_edges(reorder.buffer);
+        self.slots = reorder.slots;
+        false
+    }
+
+    /// The edges `edges` as the renderer draws them, in that order.
+    fn lines_of(&self, edges: &[u32]) -> Vec<u32> {
+        match &self.live {
+            Some(live) => live.lines_of(edges),
+            None => {
+                let (src, dst) = (self.graph.src(), self.graph.dst());
+                edges
+                    .iter()
+                    .flat_map(|&e| [src[e as usize], dst[e as usize]])
+                    .collect()
+            }
+        }
+    }
+
+    /// Where each edge is in the renderer's edge buffer.
+    pub fn edge_slots(&self) -> &EdgeSlots {
+        &self.slots
+    }
+
+    /// The frame budget: how many edges a frame draws while the view moves.
+    pub fn budget(&self) -> &FrameBudget {
+        &self.budget
+    }
+
+    /// What the frame budget is doing.
+    pub fn frame_info(&self) -> FrameInfo {
+        FrameInfo {
+            k: self.moving_drew.1,
+            nodes: self.moving_drew.0,
+            edges: self.renderer.counts().1,
+            ordered: self.slots.ordered(),
+            p95: self.budget.p95_ms(),
+            frames: self.budget.observed(),
+            limit: self.budget.limit_ms(),
+        }
+    }
+
+    /// Draw a frame into `target`, within the frame budget
+    /// ([`crate::budget`]): if the camera or the positions changed since
+    /// the last frame, or less than [`crate::budget::REST_MS`] before
+    /// `now_ms` (any clock, in milliseconds), only as much as the last
+    /// frames' costs say fits: the first edges of the buffer and, if the
+    /// nodes are too many as well, the largest of them. Otherwise
+    /// everything, as [`View::draw`] does.
+    ///
+    /// The binding does two things with what this returns. After a
+    /// `moving` frame it measures the frame's cost, from its start to when
+    /// the next could start, and reports it ([`View::frame_cost`]). After a
+    /// `partial` one it draws again once the view has rested, so that what
+    /// stays on screen has everything.
+    pub fn draw_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        now_ms: f64,
+    ) -> Frame {
+        let (n, m) = self.renderer.counts();
+        let frame = self.budget.frame(now_ms, total_units(n, m));
+        let (nodes, edges) = split(frame.units, n, m);
+        if frame.moving {
+            self.moving_drew = (nodes, edges);
+        }
+        let some = (nodes < n).then_some(nodes);
+        if let Some(some) = some {
+            self.gather_some(device, queue, some);
+        }
+        self.renderer.draw_prefix(
+            device,
+            queue,
+            target,
+            &self.camera,
+            self.draw_nodes,
+            self.radius_scale(),
+            edges,
+            some,
+        );
+        frame
+    }
+
+    /// Have the renderer hold at least the `count` largest nodes, as they
+    /// are now: gathered again only if they changed or it holds too few
+    /// (then twice as many as asked for, so that a budget that grows a
+    /// little does not gather every frame).
+    fn gather_some(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, count: usize) {
+        let n = self.graph.n_nodes();
+        if self.some.order.len() != n {
+            let radius = &self.style.radius;
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            order.sort_unstable_by(|&a, &b| {
+                radius[b as usize]
+                    .total_cmp(&radius[a as usize])
+                    .then(a.cmp(&b))
+            });
+            self.some = SomeNodes {
+                order,
+                fresh: false,
+            };
+        }
+        let held = self.renderer.some_nodes() as usize;
+        if self.some.fresh && held >= count.min(n) {
+            return;
+        }
+        let gather = (2 * count).min(n);
+        let flags = self.highlight.flags();
+        let nodes: Vec<FrontNode> = self.some.order[..gather]
+            .iter()
+            .map(|&i| {
+                let i = i as usize;
+                FrontNode::new(
+                    self.x[i],
+                    self.y[i],
+                    self.style.radius[i],
+                    self.style.color[i],
+                    flags[i],
+                )
+            })
+            .collect();
+        self.renderer.set_some_nodes(device, queue, &nodes);
+        self.some.fresh = true;
+    }
+
+    /// The view is still moving, though nothing has changed since the last
+    /// frame (a layout on another thread is between two sets of
+    /// positions): the next [`View::draw_frame`] is a moving one.
+    pub fn keep_moving(&mut self) {
+        self.budget.moved();
+    }
+
+    /// The last moving frame ([`View::draw_frame`]) cost `ms`.
+    pub fn frame_cost(&mut self, ms: f64) {
+        self.budget.observe(ms);
+    }
+
+    /// Draw a frame into `target`: everything, whether the view moves or
+    /// not.
     pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
         self.renderer.draw(
             device,

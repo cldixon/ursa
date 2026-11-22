@@ -372,6 +372,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     paused: false,
     pending: null,
     frame: 0,
+    // The timer for the frame that draws every edge once the view rests
+    // (#495), and whether the layout worker numbers the edges as the view
+    // does (it is sent only the edges shown), so that its order is the view's.
+    rest: 0,
+    orderable: !anyRemoved(graph),
+    // How long the worker took to order the edges, in ms, once it has.
+    orderMs: null,
     times,
     cleanup: [],
   };
@@ -459,16 +466,54 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     }
     try {
       const start = performance.now();
-      view.render();
+      // Within the frame budget (#495): while the view moves, as many edges
+      // as fit in a frame; at rest, all of them.
+      // A layout that is running is movement, between its positions too.
+      if (!state.layoutDone) view.keepMoving();
+      const moving = view.renderFrame(start);
       const end = performance.now();
       timings.frameDrawn(start, end);
       state.frames++;
       times.firstDraw ??= end;
+      if (moving) budgeted(start);
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
       return;
     }
     placeBusy();
+  };
+  // After a moving frame: what it cost, which the budget follows, is the
+  // time to the next animation frame (with no GPU the browser rasterises on
+  // this thread first; with one, a late frame misses a refresh). And if it
+  // left edges out, a frame with all of them once nothing has moved for a
+  // while.
+  const budgeted = (start) => {
+    requestAnimationFrame(() => current === state && view.frameCost(performance.now() - start));
+    clearTimeout(state.rest);
+    state.rest = view.framePartial ? setTimeout(rested, view.frameRestMs + 1) : 0;
+  };
+  // Nothing has moved for a while: everything, unless the layout is still
+  // running (its next positions are on their way: look again later).
+  const rested = () => {
+    if (current !== state) return;
+    if (state.layoutDone) redraw(false);
+    else state.rest = setTimeout(rested, view.frameRestMs);
+  };
+  state.cleanup.push(() => clearTimeout(state.rest));
+  // The order the layout worker gives the edges, most important first: the
+  // view writes it to the GPU a piece a task, and draws the order it had
+  // until the new one is whole. A frame with every edge is the same either way.
+  const orderEdges = ({ order, ms }) => {
+    if (!state.orderable) return;
+    state.orderMs = ms;
+    try {
+      view.setEdgeOrder(order);
+    } catch {
+      // Not an order of this view's edges: they stay as they are.
+      return;
+    }
+    const more = () => current === state && view.orderEdges() && setTimeout(more);
+    more();
   };
   // `input` unless the layout or a test asked: graphTimings' frame intervals
   // are of frames the user's movement asked for.
@@ -488,6 +533,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (current !== state) return;
     if (data.times) for (const [k, v] of Object.entries(data.times)) times[k] ??= v - (performance.timeOrigin - data.origin);
     if (data.memory) state.layoutMemory = data.memory;
+    // The edges' drawing order (#495) is of the edges the layout started
+    // with, whatever was added since.
+    if (data.type === "order") return orderEdges(data);
     // Of a graph before the last delta: not what is drawn now.
     if (data.type !== "error" && (data.epoch ?? 0) !== state.epoch) return;
     if (data.type === "positions") {
@@ -1318,6 +1366,10 @@ export function info() {
     busy: [...current.busy.keys()].map(node),
     notShownKnown: current.notShown !== null,
     frames,
+    // The frame budget (#495): {k, edges, ordered, p95, frames, limit}
+    // (GraphView.frameInfo), and the ms the layout worker took to order
+    // the edges (null until it has).
+    frame: { ...current.view.frameInfo(), orderMs: current.orderMs },
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,

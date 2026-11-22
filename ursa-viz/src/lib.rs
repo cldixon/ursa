@@ -25,14 +25,16 @@
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
 //! With `default-features = false` the crate is [`model`], [`scene`],
-//! [`highlight`], [`interact`] and [`live`] alone: no GPU and no browser, which is how the engine depends on it.
+//! [`highlight`], [`interact`], [`live`], [`budget`] and [`order`] alone: no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
+pub mod budget;
 pub mod highlight;
 pub mod interact;
 pub mod live;
 pub mod model;
+pub mod order;
 #[cfg(feature = "render")]
 pub mod pace;
 #[cfg(feature = "render")]

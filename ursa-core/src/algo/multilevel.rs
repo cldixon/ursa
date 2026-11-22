@@ -713,6 +713,184 @@ impl Fa2Multilevel {
     }
 }
 
+impl Fa2Multilevel {
+    /// The order to draw the edges `(src[e], dst[e])` in, most important
+    /// first, so that any prefix of it is a backbone of the drawing and not
+    /// a corner of it: `order[i]` is the edge drawn `i`-th. A renderer that
+    /// has to draw fewer edges than there are (while the view moves) draws
+    /// the first of these.
+    ///
+    /// The key, in order:
+    ///
+    /// 1. **The level at which the edge's two ends merge**, coarsest first:
+    ///    an edge whose ends are still apart at the coarsest level joins two
+    ///    of the drawing's far groups; one whose ends merge at level 1 is
+    ///    local fill.
+    /// 2. **One edge of each merged edge per round.** Just below the level
+    ///    where its ends merge, the edge is one of the input edges a merged
+    ///    edge stands for (its weight). Each merged edge gives its first
+    ///    input edge before any gives its second, and so on, so a short
+    ///    prefix shows every tie between groups, not all of the heaviest
+    ///    one. (An edge whose ends merge at the first level stands for
+    ///    itself: the local fill is in hash order.)
+    /// 3. **Weight** within a round, heaviest first.
+    /// 4. **A hash** of the edge's index.
+    ///
+    /// The edges are those of the graph the hierarchy was built from, in any
+    /// order and with any duplicates; an edge that names no node of it, or
+    /// joins a node to itself, comes last. A pure function of the hierarchy
+    /// and the edge list: the same on any thread count. With no coarse
+    /// level there is no hierarchy to rank by: see [`edge_order_by_degree`].
+    ///
+    /// # Panics
+    ///
+    /// If `src` and `dst` differ in length.
+    pub fn edge_order(&self, src: &[u32], dst: &[u32]) -> Vec<u32> {
+        assert_eq!(src.len(), dst.len(), "one src and one dst per edge");
+        let levels = self.coarse.len();
+        let n0 = self.x.len();
+        // Each level's nodes to their groups in the level above.
+        let parents: Vec<Vec<u32>> = self
+            .coarse
+            .iter()
+            .map(|c| {
+                let mut parent = vec![NONE; c.fine_n];
+                for g in 0..c.n() {
+                    for &u in c.members(g) {
+                        parent[u as usize] = g as u32;
+                    }
+                }
+                parent
+            })
+            .collect();
+        // First, for each edge, the level its ends merge at (0: it joins
+        // nothing) and, at the level below that, the merged edge it is part
+        // of (its adjacency entry there): `level << 32 | entry`. Eight
+        // bytes an edge is all this holds besides the hierarchy.
+        let m = src.len();
+        let mut keys = vec![0u64; m];
+        for e in 0..m {
+            let (mut a, mut b) = (src[e], dst[e]);
+            if a as usize >= n0 || b as usize >= n0 || a == b {
+                continue;
+            }
+            // `l` is the level `a` and `b` are nodes of.
+            let mut l = 0;
+            while l < levels {
+                let (pa, pb) = (parents[l][a as usize], parents[l][b as usize]);
+                if pa == NONE || pb == NONE || pa == pb {
+                    break;
+                }
+                (a, b) = (pa, pb);
+                l += 1;
+            }
+            // Apart at level `l`, together (or gone) at `l + 1`.
+            let mut entry = NONE;
+            if l > 0 {
+                let adj = &self.coarse[l - 1].adj;
+                let (lo, hi) = (a.min(b), a.max(b));
+                let base = adj.offsets[lo as usize] as usize;
+                if let Ok(at) = adj.neighbors(lo).binary_search(&hi) {
+                    entry = (base + at) as u32;
+                }
+            }
+            keys[e] = ((l + 1).min(63) as u64) << 32 | u64::from(entry);
+        }
+        drop(parents);
+        // Then its round: how many edges before it, in index order, are
+        // part of the same merged edge. A level at a time, so only one
+        // level's counters are held; and with that, its key.
+        for l in 1..=levels {
+            let coarse = &self.coarse[l - 1];
+            let mut seen = vec![0u16; coarse.adj.targets.len()];
+            for (e, key) in keys.iter_mut().enumerate() {
+                let (level, entry) = ((*key >> 32) as usize, *key as u32);
+                if level == l + 1 && entry != NONE {
+                    let count = &mut seen[entry as usize];
+                    let weight = coarse.weights[entry as usize];
+                    *key = order_key(level, u32::from(*count), weight, e);
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        // An edge that stands for itself, or joins nothing.
+        for (e, key) in keys.iter_mut().enumerate() {
+            let (level, entry) = ((*key >> 32) as usize, *key as u32);
+            if level <= 1 || entry == NONE {
+                *key = order_key(level, 0, 1.0, e);
+            }
+        }
+        sorted_edges(keys)
+    }
+}
+
+/// The sort key of edge `e`: `level` (up to 63) highest first, then `round`
+/// lowest first, then `weight` heaviest first, in its high half; and in its
+/// low half a hash of `e` that `e` can be read back from. Rounds past
+/// 16,383 and weights past 4,095 tie.
+fn order_key(level: usize, round: u32, weight: f32, e: usize) -> u64 {
+    const ROUNDS: u64 = (1 << 14) - 1;
+    const WEIGHTS: u64 = (1 << 12) - 1;
+    let level = 63 - (level as u64).min(63);
+    let round = u64::from(round).min(ROUNDS);
+    let weight = WEIGHTS - (weight.max(0.0) as u64).min(WEIGHTS);
+    (level << 26 | round << 12 | weight) << 32 | u64::from(mix32(e as u32))
+}
+
+/// The edges of `keys` (each a rank in its high half and [`mix32`] of its
+/// edge in its low half), sorted: in place, with nothing else held.
+fn sorted_edges(mut keys: Vec<u64>) -> Vec<u32> {
+    keys.sort_unstable();
+    keys.into_iter().map(|key| unmix32(key as u32)).collect()
+}
+
+/// MurmurHash3's 32-bit finalizer: a permutation of the `u32`s that sends
+/// neighbouring indexes far apart, the same on every platform.
+fn mix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xC2B2_AE35);
+    h ^ (h >> 16)
+}
+
+/// [`mix32`]'s inverse.
+fn unmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7ED1_B41D);
+    h ^= (h >> 13) ^ (h >> 26);
+    h = h.wrapping_mul(0xA5CB_9243);
+    h ^ (h >> 16)
+}
+
+/// [`Fa2Multilevel::edge_order`] for a graph with no hierarchy (a flat
+/// layout, rings, layers, or a graph too small to coarsen): the edges
+/// `(src[e], dst[e])` by the larger degree of their two ends in `adj`,
+/// highest first, then by a hash of the index. A node is drawn larger the
+/// more neighbours it has, so the edges at the largest nodes come first. An
+/// edge that names no node of `adj` comes last.
+///
+/// # Panics
+///
+/// If `src` and `dst` differ in length.
+pub fn edge_order_by_degree(adj: &UndirectedCsr, src: &[u32], dst: &[u32]) -> Vec<u32> {
+    assert_eq!(src.len(), dst.len(), "one src and one dst per edge");
+    let n = adj.offsets.len().saturating_sub(1);
+    let keys: Vec<u64> = (0..src.len())
+        .map(|e| {
+            let (a, b) = (src[e], dst[e]);
+            let degree = if (a as usize) < n && (b as usize) < n {
+                1 + adj.degree(a).max(adj.degree(b)) as u64
+            } else {
+                0
+            };
+            let rank = u64::from(u32::MAX) - degree.min(u64::from(u32::MAX));
+            rank << 32 | u64::from(mix32(e as u32))
+        })
+        .collect();
+    sorted_edges(keys)
+}
+
 /// Coarse-to-fine ForceAtlas2 in one call: [`Fa2Multilevel`] run to the end of
 /// its schedule. A `mask` restricts the edges as for [`super::layout_fa2`].
 pub fn layout_fa2_multilevel(
@@ -863,6 +1041,180 @@ mod tests {
         let ones = vec![1.0f32; adj.targets.len()];
         b.step_weighted(adj, Some(&ones), 20);
         assert_eq!(a.positions(), b.positions());
+    }
+
+    /// Two 6-cliques joined by 3 edges.
+    fn barbell() -> (Topology, Vec<u32>, Vec<u32>) {
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for base in [0u32, 6] {
+            for i in 0..6 {
+                for j in i + 1..6 {
+                    src.push(base + i);
+                    dst.push(base + j);
+                }
+            }
+        }
+        for i in 0..3 {
+            src.push(i);
+            dst.push(6 + i);
+        }
+        let topo = Topology::build(12, src.clone(), dst.clone());
+        (topo, src, dst)
+    }
+
+    fn is_permutation(order: &[u32], m: usize) -> bool {
+        let mut seen = vec![false; m];
+        order.len() == m
+            && order
+                .iter()
+                .all(|&e| (e as usize) < m && !std::mem::replace(&mut seen[e as usize], true))
+    }
+
+    /// By the definition, slowly: the level the ends of `(a, b)` merge at,
+    /// and the two groups they are in just below it.
+    fn merge_of(state: &Fa2Multilevel, mut a: u32, mut b: u32) -> (usize, (u32, u32)) {
+        for (l, c) in state.coarse.iter().enumerate() {
+            let group = |u: u32| (0..c.n()).find(|&g| c.members(g).contains(&u));
+            match (group(a), group(b)) {
+                (Some(x), Some(y)) if x != y => (a, b) = (x as u32, y as u32),
+                _ => return (l + 1, (a.min(b), a.max(b))),
+            }
+        }
+        (state.coarse.len() + 1, (a.min(b), a.max(b)))
+    }
+
+    #[test]
+    fn the_edge_order_is_by_merge_level_then_a_round_of_each_merged_edge() {
+        // A grid with a few long chords, twice over (so merged edges stand
+        // for several input edges from the first level up).
+        let (w, h) = (12u32, 9u32);
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if x + 1 < w {
+                        src.push(i);
+                        dst.push(i + 1);
+                    }
+                    if y + 1 < h {
+                        src.push(i + w);
+                        dst.push(i);
+                    }
+                }
+            }
+        }
+        for i in 0..6 {
+            src.push(i);
+            dst.push(w * h - 1 - 7 * i);
+        }
+        let topo = Topology::build((w * h) as usize, src.clone(), dst.clone());
+        let params = MultilevelParams {
+            coarsest_nodes: 4,
+            ..Default::default()
+        };
+        let state = Fa2Multilevel::new(topo.undirected(), params);
+        assert!(state.coarse_levels() >= 3, "{:?}", state.level_sizes());
+        let order = state.edge_order(&src, &dst);
+        assert!(is_permutation(&order, src.len()));
+        assert_eq!(order, state.edge_order(&src, &dst));
+
+        // Each edge's level, merged edge, and round: how many edges of a
+        // lower index share its merged edge.
+        let merges: Vec<_> = (0..src.len())
+            .map(|e| merge_of(&state, src[e], dst[e]))
+            .collect();
+        // (An edge whose ends merge at the first level stands for itself.)
+        let round = |e: usize| match merges[e].0 {
+            1 => 0,
+            _ => merges[..e].iter().filter(|m| **m == merges[e]).count(),
+        };
+        let key: Vec<(usize, usize)> = order
+            .iter()
+            .map(|&e| (merges[e as usize].0, round(e as usize)))
+            .collect();
+        // Coarsest level first; within a level, round by round.
+        assert!(
+            key.windows(2)
+                .all(|w| w[0].0 > w[1].0 || (w[0].0 == w[1].0 && w[0].1 <= w[1].1)),
+            "{key:?}"
+        );
+        // The first edges' ends are apart at the coarsest level.
+        assert_eq!(key[0], (state.coarse_levels() + 1, 0));
+        // A round has each of its merged edges once, the heaviest first.
+        // (A merged edge's weight counts each pair of input nodes once.)
+        let weight = |m: &(usize, (u32, u32))| {
+            let mut pairs: Vec<(u32, u32)> = (0..src.len())
+                .filter(|&e| merges[e] == *m)
+                .map(|e| (src[e].min(dst[e]), src[e].max(dst[e])))
+                .collect();
+            pairs.sort_unstable();
+            pairs.dedup();
+            pairs.len()
+        };
+        let mut rounds = 0;
+        let mut at = 0;
+        while at < order.len() {
+            let len = key[at..].iter().take_while(|k| **k == key[at]).count();
+            if key[at].0 >= 2 {
+                let of: Vec<_> = order[at..at + len]
+                    .iter()
+                    .map(|&e| merges[e as usize])
+                    .collect();
+                let mut distinct = of.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert_eq!(distinct.len(), of.len(), "{:?}", key[at]);
+                let weights: Vec<usize> = of.iter().map(weight).collect();
+                assert!(weights.windows(2).all(|w| w[0] >= w[1]), "{weights:?}");
+                rounds += usize::from(len >= 2);
+            }
+            at += len;
+        }
+        assert!(rounds >= 4, "{rounds}");
+    }
+
+    #[test]
+    fn the_hash_of_an_edge_index_can_be_read_back() {
+        for e in (0..1_000_000u32).chain([u32::MAX, u32::MAX - 1, 1 << 31]) {
+            assert_eq!(unmix32(mix32(e)), e);
+        }
+        // Not the index's order.
+        assert!(mix32(1) > mix32(2) || mix32(2) > mix32(3));
+    }
+
+    #[test]
+    fn edges_that_join_nothing_come_last() {
+        let (topo, mut src, mut dst) = barbell();
+        let params = MultilevelParams {
+            coarsest_nodes: 2,
+            ..Default::default()
+        };
+        let state = Fa2Multilevel::new(topo.undirected(), params);
+        // A self-loop and an edge off the end of the graph.
+        src.extend([4, 99]);
+        dst.extend([4, 0]);
+        let m = src.len();
+        let order = state.edge_order(&src, &dst);
+        assert!(is_permutation(&order, m));
+        let mut last = order[m - 2..].to_vec();
+        last.sort_unstable();
+        assert_eq!(last, [m as u32 - 2, m as u32 - 1]);
+        assert!(state.edge_order(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn without_a_hierarchy_the_edges_at_the_largest_nodes_come_first() {
+        // A star of 5 and a path: the star's edges, then the path's.
+        let src = vec![10, 11, 0, 0, 0, 0, 0, 12];
+        let dst = vec![11, 12, 1, 2, 3, 4, 5, 13];
+        let topo = Topology::build(14, src.clone(), dst.clone());
+        let order = edge_order_by_degree(topo.undirected(), &src, &dst);
+        assert!(is_permutation(&order, 8));
+        let mut first = order[..5].to_vec();
+        first.sort_unstable();
+        assert_eq!(first, [2, 3, 4, 5, 6]);
+        assert_eq!(order, edge_order_by_degree(topo.undirected(), &src, &dst));
     }
 
     #[test]
