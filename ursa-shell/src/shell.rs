@@ -32,6 +32,8 @@ use datafusion::sql::sqlparser::dialect::{dialect_from_str, Dialect, GenericDial
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
 use futures::TryStreamExt;
+use ursa_engine::graph::view::{self, Command as ExploreCommand, Session as ExploreSession};
+use ursa_viz::model::GraphDelta;
 
 use crate::highlight::{self, ERROR, RESET};
 use crate::input::{self, Status};
@@ -124,6 +126,35 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (".version", "", "Show the version"),
 ];
 
+/// The explore commands (design §4, #440): what a host with a graph view
+/// adds with [`Shell::add_explore_commands`] and runs with
+/// [`Shell::explore`]. Name, arguments, help.
+pub const EXPLORE_COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        ".expand",
+        "ID ?in|out|both? ?LIMIT n? ?--sql?",
+        "Add a node's neighbours to the graph drawn, and the edges among its nodes: the 100 of \
+         highest degree that are not shown, or LIMIT n; --sql prints the SQL instead",
+    ),
+    (
+        ".graph",
+        "history",
+        "List the steps of the exploration: each command and what it changed",
+    ),
+    (".hide", "ID…", "Hide nodes of the graph drawn"),
+    (".redo", "", "Redo the step .undo took back"),
+    (".show", "ID…|all", "Show hidden nodes again"),
+    (
+        ".undo",
+        "",
+        "Undo the last .expand, .hide or .show, with no query",
+    ),
+];
+
+/// What `.expand` and the others say with no graph drawn.
+const NO_GRAPH: &str = "no graph is open: draw one first, with .graph NAME for a property graph \
+                        or .graph after a query";
+
 /// A shell session: an engine session, the shell's settings, and the
 /// statement being typed.
 pub struct Shell<O: Write, E: Write> {
@@ -150,6 +181,8 @@ pub struct Shell<O: Write, E: Write> {
     /// Keep the last result's rows ([`Self::last_result`]).
     keep_last: bool,
     last: Option<(SchemaRef, Vec<RecordBatch>)>,
+    /// The explore session of the graph the host draws ([`Self::open_graph`]).
+    explorer: Option<ExploreSession>,
     timer: bool,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
@@ -186,6 +219,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             version: env!("CARGO_PKG_VERSION").to_string(),
             keep_last: false,
             last: None,
+            explorer: None,
             timer: false,
             buffer: String::new(),
             buffer_state: highlight::State::Start,
@@ -255,6 +289,65 @@ impl<O: Write, E: Write> Shell<O, E> {
     pub fn add_host_command(&mut self, name: &str, args: &str, help: &str) {
         self.host_commands
             .push((name.to_string(), args.to_string(), help.to_string()));
+    }
+
+    /// Add the explore commands ([`EXPLORE_COMMANDS`]) as host commands:
+    /// `.help` lists them and [`Self::feed`] hands them back, for the host to
+    /// run with [`Self::explore`] and apply to its view.
+    pub fn add_explore_commands(&mut self) {
+        for (name, args, help) in EXPLORE_COMMANDS {
+            self.add_host_command(name, args, help);
+        }
+    }
+
+    /// Open a graph to draw and explore (a host's `.graph TEXT`): what
+    /// `ursa_engine::graph::view::of_command` makes of `text`, with the last
+    /// result when `text` names no source (it needs
+    /// [`Self::keep_last_result`]). The graph is [`Self::explorer`]'s result,
+    /// and it replaces the one that was open. Gives the rows left out for a
+    /// NULL endpoint.
+    ///
+    /// An error is returned, not printed, and leaves the graph that was open.
+    pub async fn open_graph(&mut self, text: &str) -> Result<usize> {
+        let drawn = view::of_command(&self.ctx, &ursa_sql::Sql, text, self.last.clone()).await?;
+        self.explorer = Some(ExploreSession::new(drawn.result));
+        Ok(drawn.skipped)
+    }
+
+    /// Close the graph: the explore commands have nothing to act on.
+    pub fn close_graph(&mut self) {
+        self.explorer = None;
+    }
+
+    /// The explore session of the open graph: what is shown, and the steps.
+    pub fn explorer(&self) -> Option<&ExploreSession> {
+        self.explorer.as_ref()
+    }
+
+    /// Run an explore command on the open graph (`.expand 33`, `.hide 5 6`,
+    /// `.show all`, `.undo`, `.redo`, `.graph history`; `line` is the whole
+    /// line, as [`Flow::Host`] hands it back). It prints what changed in one
+    /// line, or why nothing did, and gives the change for the host's view to
+    /// apply. With `--sql` it prints the command's SQL and changes nothing.
+    ///
+    /// An error (no open graph, an id that is not a node of it, a line that
+    /// is not a command) is printed as the shell's errors are.
+    pub async fn explore(&mut self, line: &str) -> Option<GraphDelta> {
+        let ran = match &mut self.explorer {
+            // A line that is no command says so with or without a graph.
+            None => ExploreCommand::parse(line).and_then(|_| Err(DataFusionError::Plan(NO_GRAPH.into()))),
+            Some(session) => session.run(&self.ctx, &ursa_sql::Sql, line).await,
+        };
+        match ran {
+            Ok(outcome) => {
+                self.say(&outcome.text);
+                outcome.delta
+            }
+            Err(e) => {
+                self.error(&ursa_engine::user_message(&e));
+                None
+            }
+        }
     }
 
     /// Keep every row of the last result that had columns, for
@@ -1192,6 +1285,10 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
     row[b.len()]
 }
+
+#[cfg(test)]
+#[path = "explore_tests.rs"]
+mod explore_tests;
 
 #[cfg(test)]
 mod tests {
