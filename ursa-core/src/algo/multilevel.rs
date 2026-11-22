@@ -171,11 +171,48 @@ struct Coarse {
     dropped: Vec<u32>,
     /// Node count of the level below.
     fine_n: usize,
+    /// This level's node count and adjacency entries: kept when the level
+    /// itself is let go ([`Coarse::release`]).
+    n: usize,
+    entries: usize,
 }
 
 impl Coarse {
     fn n(&self) -> usize {
-        self.mass.len()
+        self.n
+    }
+
+    /// Whether the weights are not held now: a lean hierarchy's
+    /// ([`Fa2Multilevel::new_lean`]) are made again when the level is
+    /// reached.
+    fn lacks_weights(&self) -> bool {
+        self.weights.len() != self.adj.targets.len()
+    }
+
+    /// The group of each node of the level below, [`NONE`] for a dropped
+    /// one: what [`group_nodes`] gave, read back from the members.
+    fn groups(&self) -> Vec<u32> {
+        let mut group = vec![NONE; self.fine_n];
+        for c in 0..self.n {
+            for &u in self.members(c) {
+                group[u as usize] = c as u32;
+            }
+        }
+        group
+    }
+
+    /// Let go of everything but the counts: the layout is past this level,
+    /// and nothing reads it again.
+    fn release(&mut self) {
+        self.adj = UndirectedCsr {
+            offsets: Vec::new(),
+            targets: Vec::new(),
+        };
+        self.weights = Vec::new();
+        self.mass = Vec::new();
+        self.member_offsets = Vec::new();
+        self.members = Vec::new();
+        self.dropped = Vec::new();
     }
 
     fn members(&self, c: usize) -> &[u32] {
@@ -274,62 +311,110 @@ fn contract(
         }
     }
 
-    // Each coarse node gathers its own row: its members' edges, mapped to
-    // groups, merged by target. Sums of edge counts are whole numbers, exact
-    // in f32 well past any graph this lays out, and run in a fixed order
-    // anyway (members in index order, a stable sort).
-    let rows: Vec<(Vec<u32>, Vec<f32>, f32)> = (0..nc)
-        .into_par_iter()
-        .map_init(Vec::<(u32, f32)>::new, |scratch, c| {
-            scratch.clear();
-            let mut m = 0.0f32;
-            for &u in &members[member_offsets[c] as usize..member_offsets[c + 1] as usize] {
-                m += mass[u as usize];
-                let base = adj.offsets[u as usize] as usize;
-                for (e, &v) in adj.neighbors(u).iter().enumerate() {
-                    // A grouped node's neighbours are all grouped: only
-                    // isolated nodes are dropped.
-                    let gv = group[v as usize];
-                    if gv as usize != c {
-                        scratch.push((gv, weights.map_or(1.0, |w| w[base + e])));
-                    }
-                }
-            }
-            scratch.sort_by_key(|&(t, _)| t);
-            let mut targets: Vec<u32> = Vec::new();
-            let mut ws: Vec<f32> = Vec::new();
-            for &(t, w) in scratch.iter() {
-                if targets.last() == Some(&t) {
-                    *ws.last_mut().unwrap() += w;
-                } else {
-                    targets.push(t);
-                    ws.push(w);
-                }
-            }
-            (targets, ws, m)
-        })
-        .collect();
-
-    let mut offsets = Vec::with_capacity(nc + 1);
-    offsets.push(0u64);
-    let total: usize = rows.iter().map(|r| r.0.len()).sum();
-    let mut targets = Vec::with_capacity(total);
-    let mut weights_out = Vec::with_capacity(total);
-    let mut mass_out = Vec::with_capacity(nc);
-    for (t, w, m) in rows {
-        targets.extend_from_slice(&t);
-        weights_out.extend_from_slice(&w);
-        offsets.push(targets.len() as u64);
-        mass_out.push(m);
-    }
+    let rows = coarse_rows(adj, weights, mass, group, &member_offsets, &members);
     Coarse {
-        adj: UndirectedCsr { offsets, targets },
-        weights: weights_out,
-        mass: mass_out,
+        n: nc,
+        entries: rows.targets.len(),
+        adj: UndirectedCsr {
+            offsets: rows.offsets,
+            targets: rows.targets,
+        },
+        weights: rows.weights,
+        mass: rows.mass,
         member_offsets,
         members,
         dropped,
         fine_n: n,
+    }
+}
+
+/// The adjacency, weights and masses of a coarse level.
+struct Rows {
+    offsets: Vec<u64>,
+    targets: Vec<u32>,
+    weights: Vec<f32>,
+    mass: Vec<f32>,
+}
+
+/// How many coarse nodes' rows are gathered before they are appended: the
+/// rows of a run are held twice for a moment, the whole level never.
+const ROW_RUN: usize = 1 << 12;
+
+/// The rows of the coarse level whose node `c` has the members
+/// `members[member_offsets[c]..member_offsets[c + 1]]` of the level below
+/// (`adj`, `weights`, `mass`, each node in `group[i]`).
+///
+/// Each coarse node gathers its own row: its members' edges, mapped to
+/// groups, merged by target. Sums of edge counts are whole numbers, exact
+/// in f32 well past any graph this lays out, and run in a fixed order
+/// anyway (members in index order, a stable sort). The rows are gathered a
+/// run of nodes at a time, in parallel within a run, and appended in order,
+/// so the result does not depend on the run's length or the thread count.
+fn coarse_rows(
+    adj: &UndirectedCsr,
+    weights: Option<&[f32]>,
+    mass: &[f32],
+    group: &[u32],
+    member_offsets: &[u32],
+    members: &[u32],
+) -> Rows {
+    let nc = member_offsets.len() - 1;
+    // No more entries than the level below has.
+    let most = adj.targets.len();
+    let mut offsets = Vec::with_capacity(nc + 1);
+    offsets.push(0u64);
+    let mut targets: Vec<u32> = Vec::with_capacity(most);
+    let mut weights_out: Vec<f32> = Vec::with_capacity(most);
+    let mut mass_out = Vec::with_capacity(nc);
+    let mut start = 0;
+    while start < nc {
+        let end = nc.min(start + ROW_RUN);
+        let rows: Vec<(Vec<u32>, Vec<f32>, f32)> = (start..end)
+            .into_par_iter()
+            .map_init(Vec::<(u32, f32)>::new, |scratch, c| {
+                scratch.clear();
+                let mut m = 0.0f32;
+                for &u in &members[member_offsets[c] as usize..member_offsets[c + 1] as usize] {
+                    m += mass[u as usize];
+                    let base = adj.offsets[u as usize] as usize;
+                    for (e, &v) in adj.neighbors(u).iter().enumerate() {
+                        // A grouped node's neighbours are all grouped: only
+                        // isolated nodes are dropped.
+                        let gv = group[v as usize];
+                        if gv as usize != c {
+                            scratch.push((gv, weights.map_or(1.0, |w| w[base + e])));
+                        }
+                    }
+                }
+                scratch.sort_by_key(|&(t, _)| t);
+                let mut targets: Vec<u32> = Vec::new();
+                let mut ws: Vec<f32> = Vec::new();
+                for &(t, w) in scratch.iter() {
+                    if targets.last() == Some(&t) {
+                        *ws.last_mut().unwrap() += w;
+                    } else {
+                        targets.push(t);
+                        ws.push(w);
+                    }
+                }
+                (targets, ws, m)
+            })
+            .collect();
+        for (t, w, m) in rows {
+            targets.extend_from_slice(&t);
+            weights_out.extend_from_slice(&w);
+            offsets.push(targets.len() as u64);
+            mass_out.push(m);
+        }
+        start = end;
+    }
+    targets.shrink_to_fit();
+    weights_out.shrink_to_fit();
+    Rows {
+        offsets,
+        targets,
+        weights: weights_out,
+        mass: mass_out,
     }
 }
 
@@ -340,9 +425,17 @@ pub(super) fn degree_mass(adj: &UndirectedCsr) -> Vec<f32> {
     (0..n).map(|i| 1.0 + adj.degree(i as u32) as f32).collect()
 }
 
+/// A lean hierarchy holds a level's weights only while that level is laid
+/// out, if the level has more than this share of the input graph's
+/// adjacency entries: a dense core that grouping does not thin. Levels that
+/// shrink, as most graphs' do, keep theirs.
+const LEAN_SHARE: f64 = 0.75;
+
 /// The coarsened levels of `adj`, finest first: `coarsen(adj)[0]` groups the
-/// nodes of `adj` itself.
-fn coarsen(adj: &UndirectedCsr, coarsest_nodes: usize) -> Vec<Coarse> {
+/// nodes of `adj` itself. `lean` lets go of the weights of the levels that
+/// are nearly as large as `adj`, each once the level above it is made of
+/// them ([`Fa2Multilevel::new_lean`]).
+fn coarsen(adj: &UndirectedCsr, coarsest_nodes: usize, lean: bool) -> Vec<Coarse> {
     let mut levels: Vec<Coarse> = Vec::new();
     let base_mass = degree_mass(adj);
     loop {
@@ -363,6 +456,16 @@ fn coarsen(adj: &UndirectedCsr, coarsest_nodes: usize) -> Vec<Coarse> {
             break;
         }
         let next = contract(a, w, m, &group, nc);
+        // The level below `next` has given all it had to give until the
+        // layout comes down to it. The coarsest keeps its weights: it is
+        // laid out first.
+        if lean {
+            if let Some(below) = levels.last_mut() {
+                if below.entries as f64 > LEAN_SHARE * adj.targets.len() as f64 {
+                    below.weights = Vec::new();
+                }
+            }
+        }
         levels.push(next);
     }
     levels
@@ -530,7 +633,28 @@ pub struct Fa2Multilevel {
 impl Fa2Multilevel {
     /// The hierarchy of `adj`, and seeded positions for its coarsest level.
     pub fn new(adj: &UndirectedCsr, params: MultilevelParams) -> Self {
-        let coarse = coarsen(adj, params.coarsest_nodes);
+        Self::build(adj, params, false)
+    }
+
+    /// [`Self::new`], holding less: for a layout that shares a small memory
+    /// with what it lays out (a browser's worker). Every position is the
+    /// same, bit for bit, at every step.
+    ///
+    /// A graph with a dense core has levels that grouping does not thin:
+    /// the 1M-edge R-MAT graph's first four each have 70 to 95% of its
+    /// adjacency entries, and their weights are half of what the hierarchy
+    /// holds. A lean hierarchy lets go of the weights of each such level
+    /// (one with more than three quarters of the input's entries) once the
+    /// level above it is built, and makes them again, from the input graph
+    /// up, when the layout comes down to that level. That costs one more
+    /// contraction for each level between, which is paid during the
+    /// layout, and nothing for a graph whose levels shrink.
+    pub fn new_lean(adj: &UndirectedCsr, params: MultilevelParams) -> Self {
+        Self::build(adj, params, true)
+    }
+
+    fn build(adj: &UndirectedCsr, params: MultilevelParams, lean: bool) -> Self {
+        let coarse = coarsen(adj, params.coarsest_nodes, lean);
         let levels = coarse.len();
         // An iteration's cost is about its nodes plus its adjacency entries.
         let sizes: Vec<f64> = (0..=levels)
@@ -539,7 +663,7 @@ impl Fa2Multilevel {
                     (adj.offsets.len() - 1 + adj.targets.len()) as f64
                 } else {
                     let c = &coarse[l - 1];
-                    (c.n() + c.adj.targets.len()) as f64
+                    (c.n() + c.entries) as f64
                 }
             })
             .collect();
@@ -593,7 +717,7 @@ impl Fa2Multilevel {
     /// first.
     pub fn level_entries(&self, adj: &UndirectedCsr) -> Vec<usize> {
         std::iter::once(adj.targets.len())
-            .chain(self.coarse.iter().map(|c| c.adj.targets.len()))
+            .chain(self.coarse.iter().map(|c| c.entries))
             .collect()
     }
 
@@ -647,6 +771,7 @@ impl Fa2Multilevel {
             if self.level == 0 {
                 self.state.step(adj, iterations);
             } else {
+                self.ensure_weights(adj);
                 let c = &self.coarse[self.level - 1];
                 self.state
                     .step_weighted(&c.adj, Some(&c.weights), iterations);
@@ -676,6 +801,47 @@ impl Fa2Multilevel {
         };
         self.state = Fa2State::from_positions(self.params.fa2, fx, fy, mass);
         self.level = l - 1;
+        // Nothing reads a level the layout has come down from: the levels
+        // below are prolonged from the one being laid out.
+        self.coarse[l - 1].release();
+    }
+
+    /// Make the weights of the level being laid out, if a lean hierarchy
+    /// let go of them: contract again from the nearest level below that has
+    /// its own (the input graph's are all one), a level at a time, keeping
+    /// only the last. They are the weights the hierarchy was built with:
+    /// the same rows, gathered the same way.
+    fn ensure_weights(&mut self, adj: &UndirectedCsr) {
+        let l = self.level;
+        if l == 0 || !self.coarse[l - 1].lacks_weights() {
+            return;
+        }
+        // Level `from` has weights, or is the input graph.
+        let mut from = l - 1;
+        while from > 0 && self.coarse[from - 1].lacks_weights() {
+            from -= 1;
+        }
+        let base_mass = if from == 0 {
+            degree_mass(adj)
+        } else {
+            Vec::new()
+        };
+        for i in from + 1..=l {
+            let (below, level) = self.coarse.split_at_mut(i - 1);
+            let level = &mut level[0];
+            let (a, w, m) = match below.last() {
+                None => (adj, None, &base_mass[..]),
+                Some(b) => (&b.adj, Some(&b.weights[..]), &b.mass[..]),
+            };
+            let group = level.groups();
+            let rows = coarse_rows(a, w, m, &group, &level.member_offsets, &level.members);
+            debug_assert_eq!(rows.targets, level.adj.targets);
+            level.weights = rows.weights;
+            // The level between gave what it was made again for.
+            if i - 1 > from {
+                self.coarse[i - 2].weights = Vec::new();
+            }
+        }
     }
 
     /// Bring the input graph's positions up to date: the current level's,
@@ -777,7 +943,7 @@ mod tests {
         // A path of 100 and 50 isolated nodes.
         let t = Topology::build(150, (0..99).collect(), (1..100).collect());
         let adj = t.undirected();
-        let levels = coarsen(adj, 10);
+        let levels = coarsen(adj, 10, false);
         assert!(!levels.is_empty());
         assert_eq!(levels[0].dropped, (100..150).collect::<Vec<u32>>());
         assert_eq!(levels[0].fine_n, 150);
@@ -833,6 +999,62 @@ mod tests {
         }
         assert_eq!(a.positions(), b.positions());
         assert_eq!(a.into_positions(), layout_fa2_multilevel(&t, None, params));
+    }
+
+    #[test]
+    fn a_lean_hierarchy_gives_the_same_bits_at_every_step() {
+        // A random graph of mean degree 30: grouping halves its nodes and
+        // merges few of its edges, so its first levels are as large as it is.
+        let n = 3000u64;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let (src, dst): (Vec<u32>, Vec<u32>) =
+            (0..45_000).map(|_| (next() as u32, next() as u32)).unzip();
+        let t = Topology::build(n as usize, src, dst);
+        let adj = t.undirected();
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        let mut full = Fa2Multilevel::new(adj, params);
+        let mut lean = Fa2Multilevel::new_lean(adj, params);
+        let lacking = |ml: &Fa2Multilevel| ml.coarse.iter().filter(|c| c.lacks_weights()).count();
+        assert_eq!(lacking(&full), 0);
+        // Two levels in a row, so that one is made again from the other.
+        assert!(lacking(&lean) >= 2, "{:?}", lean.level_entries(adj));
+        assert!(lean.coarse[0].lacks_weights() && lean.coarse[1].lacks_weights());
+        assert_eq!(full.level_sizes(), lean.level_sizes());
+        assert_eq!(full.level_entries(adj), lean.level_entries(adj));
+        assert_eq!(full.schedule(), lean.schedule());
+        let bits = |ml: &Fa2Multilevel| {
+            let (x, y) = ml.positions();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            (bits(x), bits(y))
+        };
+        assert_eq!(bits(&full), bits(&lean));
+        let mut budgets = [0.7, 3.0, 0.05, 11.0].iter().cycle();
+        let sizes = full.level_sizes();
+        while !full.is_done() {
+            let budget = *budgets.next().unwrap();
+            full.step(adj, budget);
+            lean.step(adj, budget);
+            assert_eq!(full.level(), lean.level());
+            assert_eq!(bits(&full), bits(&lean), "level {}", full.level());
+            // The counts outlive the levels the layout has come down from.
+            assert_eq!(full.level_sizes(), sizes);
+            assert_eq!(lean.level_entries(adj), full.level_entries(adj));
+        }
+        assert!(lean.is_done());
+        // And both are the one-call layout.
+        assert_eq!(
+            lean.into_positions(),
+            layout_fa2_multilevel(&t, None, params)
+        );
     }
 
     #[test]

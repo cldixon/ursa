@@ -469,7 +469,7 @@ impl<T: Copy + Default + PartialEq> Sparse<T> {
 
     pub(crate) fn reserve(&mut self, more: usize) {
         if !self.data.is_empty() {
-            self.data.reserve(more);
+            self.data.reserve_exact(more);
         }
     }
 }
@@ -872,27 +872,29 @@ impl GraphResult {
         fn columns(columns: &mut [Column], more: usize) {
             for column in columns {
                 match &mut column.values {
-                    Values::F32(v) => v.reserve(more),
-                    Values::U32(v) | Values::Dict { codes: v, .. } => v.reserve(more),
+                    Values::F32(v) => v.reserve_exact(more),
+                    Values::U32(v) | Values::Dict { codes: v, .. } => v.reserve_exact(more),
                 }
             }
         }
         // A key is a few bytes of text.
         self.node_keys.reserve(nodes, 8 * nodes);
-        self.node_label.reserve(nodes);
-        self.node_flags.reserve(nodes);
+        self.node_label.reserve_exact(nodes);
+        self.node_flags.reserve_exact(nodes);
         columns(&mut self.node_columns, nodes);
         if let Some(p) = &mut self.positions {
-            p.x.reserve(nodes);
-            p.y.reserve(nodes);
+            p.x.reserve_exact(nodes);
+            p.y.reserve_exact(nodes);
         }
         self.index.reserve(nodes);
-        self.src.reserve(edges);
-        self.dst.reserve(edges);
+        // Exactly: `reserve` would double a full vector, eight megabytes of
+        // room at a million edges where a sixty-fourth was asked for.
+        self.src.reserve_exact(edges);
+        self.dst.reserve_exact(edges);
         self.edge_label.reserve(edges);
         self.edge_flags.reserve(edges);
         if let Some(rows) = &mut self.edge_rows {
-            rows.reserve(edges);
+            rows.reserve_exact(edges);
         }
         columns(&mut self.edge_columns, edges);
     }

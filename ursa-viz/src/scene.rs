@@ -511,8 +511,12 @@ impl LiveLayout {
     }
 
     /// [`LiveLayout::multilevel`], on an adjacency ([`LiveLayout::new_on`]).
+    ///
+    /// The hierarchy is a lean one (`Fa2Multilevel::new_lean`): the same
+    /// positions at every step, holding less of a graph whose levels do not
+    /// thin.
     pub fn multilevel_on(adjacency: Arc<UndirectedCsr>, params: MultilevelParams) -> Self {
-        let state = Fa2Multilevel::new(&adjacency, params);
+        let state = Fa2Multilevel::new_lean(&adjacency, params);
         Self {
             adjacency,
             engine: Engine::Multilevel(Box::new(state)),

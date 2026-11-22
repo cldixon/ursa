@@ -58,12 +58,15 @@ import { readResult } from "./ugr.js";
 import * as timings from "./graph-timings.js";
 
 let viz = null;
+// Its WebAssembly memory, once loaded: what the view holds (memoryNow).
+let vizMemory = null;
 /** ursa-viz, loaded and initialised once: its module, its wasm exports and its URL. */
 function loadViz() {
   viz ??= (async () => {
     const manifest = await (await fetch("/viz/viz.json")).json();
     const module = await import(manifest.module);
     const wasm = await module.default();
+    vizMemory = wasm.memory;
     return { module, wasm, url: new URL(manifest.module, location.origin).href };
   })().catch((e) => {
     viz = null; // try again next time
@@ -247,10 +250,18 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // The layout first: its hierarchy is built while the view is made here.
   const worker = takeWorker(url);
   {
-    const { src, dst } = shownEdges(graph);
     // graph.layout, {kind: "rings" | "layers", level}, asks for a fixed layout
     // (graph-worker.js): each node's distance or layer in `level`.
-    worker.postMessage({ type: "start", n: graph.n, src, dst, module: url, layout: graph.layout }, [src.buffer, dst.buffer]);
+    const start = { type: "start", n: graph.n, module: url, layout: graph.layout };
+    if (graph.adjacency && !anyRemoved(graph)) {
+      // The engine had the adjacency to send: the layout uses it as it is
+      // (a copy of it: the result's buffer stays this page's).
+      const adjacency = { offsets: graph.adjacency.offsets.slice(), targets: graph.adjacency.targets.slice() };
+      worker.postMessage({ ...start, adjacency }, [adjacency.offsets.buffer, adjacency.targets.buffer]);
+    } else {
+      const { src, dst } = shownEdges(graph);
+      worker.postMessage({ ...start, src, dst }, [src.buffer, dst.buffer]);
+    }
     times.posted = performance.now();
   }
   // The view is made in pieces, with turns of the event loop between them
@@ -1021,7 +1032,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const n1 = view.nodeCount;
     if (restored || n1 < n0) {
       const { src, dst } = shownEdges(graph);
-      const xy = new Float32Array(view.positions());
+      const xy = view.positions();
       state.epoch++;
       state.layoutDone = true;
       state.growing = false;
@@ -1366,7 +1377,24 @@ export async function inked() {
  * the page's clock given from `origin` (the last `.graph`'s Enter). See
  * graph-timings.js's read().
  */
-export const readTimings = (origin) => timings.read(origin);
+export const readTimings = (origin) => ({ ...timings.read(origin), memory: memoryNow() });
+
+/**
+ * For graphTimings (#501): what the two ursa-viz instances hold now, each
+ * as {bytes, perEdge}: the bytes of its WebAssembly memory (the view's, on
+ * this page; the layout worker's, as its last message gave it) and those
+ * bytes per edge slot of the graph drawn (`edges`). Null with nothing
+ * drawn. A WebAssembly memory only grows, so each is its instance's peak
+ * since it loaded: a spare worker starts fresh with each drawing, and the
+ * view's module is this page's for as long as it is open.
+ */
+function memoryNow() {
+  const state = current;
+  if (!state) return null;
+  const edges = state.view.edgeCount;
+  const part = (bytes) => (bytes == null ? null : { bytes, perEdge: edges ? Math.round(bytes / edges) : null });
+  return { edges, view: part(vizMemory?.buffer.byteLength), layout: part(state.layoutMemory) };
+}
 /** For tests: forget the frames and picks timed so far. */
 export const resetTimings = () => timings.reset();
 
