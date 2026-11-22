@@ -414,6 +414,9 @@ export async function show(stage, sent, { status, legend, onError, times = {}, r
   // What the worker said while the view was made, in order and a task
   // each, as it would have arrived; then the worker's messages directly.
   (async () => {
+    // Once the rest of this function has run: the handlers read what it
+    // declares further down (the pointer's place).
+    await null;
     while (early.length) {
       const [kind, e] = early.shift();
       (kind === "message" ? fromWorker : workerFailed)(e);
@@ -681,7 +684,7 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
   const panel = createInspector({
     run: (command) => run?.(command),
     fetchRow: (subject) => (subject.kind === "node" ? inspect({ node: subject.index, key: subject.key }) : inspect({ edge: subject.index, src: subject.src.key, dst: subject.dst.key })),
-    fetchDegree: (subject) => inspect({ node: subject.index, key: subject.key, degree: true }).then((r) => r.degree ?? null),
+    fetchNeighbours: (subject) => inspect({ node: subject.index, key: subject.key, neighbours: true }).then((r) => r.neighbours ?? null),
     pin(index) {
       const on = !state.pinned.has(index);
       if (on) state.pinned.add(index);

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use datafusion::prelude::SessionContext;
-use ursa_engine::graph::view::inspect::{graph_degree, inspect, Inspect, Inspected};
+use ursa_engine::graph::view::inspect::{graph_neighbours, inspect, Inspect, Inspected};
 use ursa_engine::graph::view::{of_command, GraphView, RunSql};
 use ursa_sql::Sql;
 
@@ -120,7 +120,7 @@ async fn a_node_of_a_graph_shows_its_vertex_table_row() {
 
     // Its degree in the whole graph, though a drawing shows part of it.
     assert_eq!(
-        graph_degree(&ctx, &Sql, &view.result, node(&view, "33"))
+        graph_neighbours(&ctx, &Sql, &view.result, node(&view, "33"))
             .await
             .unwrap(),
         Some(17)
@@ -132,7 +132,9 @@ async fn a_node_of_a_graph_shows_its_vertex_table_row() {
     .await;
     let at = node(&part, "33");
     assert_eq!(
-        graph_degree(&ctx, &Sql, &part.result, at).await.unwrap(),
+        graph_neighbours(&ctx, &Sql, &part.result, at)
+            .await
+            .unwrap(),
         Some(17)
     );
     assert_eq!(
@@ -276,7 +278,7 @@ async fn a_drawing_with_no_table_says_so_and_a_stale_index_is_an_error() {
     );
     assert!(edge_row(&ctx, &rows, "1", "2").await.rows.is_empty());
     assert_eq!(
-        graph_degree(&ctx, &Sql, &rows.result, 0).await.unwrap(),
+        graph_neighbours(&ctx, &Sql, &rows.result, 0).await.unwrap(),
         None
     );
 

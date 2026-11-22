@@ -23,8 +23,8 @@
 //! path, and any name, reads the same; [`Inspected::sql`] is the query as a
 //! user would type it. Nothing here changes the session or its last result.
 //!
-//! [`graph_degree`] is a node's degree in the whole graph, for "degree 17 in
-//! the graph, 9 drawn".
+//! [`graph_neighbours`] is how many neighbours a node has in the whole graph,
+//! for "9 drawn, 17 neighbours in karate".
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
@@ -434,11 +434,13 @@ async fn one_partition(
     Ok(plan.output_partitioning().partition_count() == 1)
 }
 
-/// Node `node`'s degree in the whole graph `result` names, counting edges in
-/// both directions: `SELECT degree FROM degree(G, direction => 'both') WHERE
-/// id = key`, run by `sql`. `None` when the drawing names no graph, or the
-/// graph has no such node.
-pub async fn graph_degree(
+/// How many neighbours node `node` has in the whole graph `result` names,
+/// whichever way the edges run: `SELECT count(*) FROM hop(G, seeds => [key],
+/// n => 1, direction => 'both')`, run by `sql`. It reads the node's edges
+/// from the graph's index, not every edge, so it costs what the node's degree
+/// does. On a graph with no parallel edges and no loops it is the node's
+/// degree. `None` when the drawing names no graph.
+pub async fn graph_neighbours(
     ctx: &SessionContext,
     sql: &dyn RunSql,
     result: &GraphResult,
@@ -457,16 +459,16 @@ pub async fn graph_degree(
         .run(
             ctx,
             &format!(
-                "SELECT degree FROM degree(\"{}\", direction => 'both') WHERE id = {key}",
+                "SELECT count(*) FROM hop(\"{}\", seeds => [{key}], n => 1, direction => 'both')",
                 graph.replace('"', "\"\"")
             ),
         )
         .await?;
     for batch in &batches {
         if batch.num_rows() > 0 {
-            let degree = cast(batch.column(0), &DataType::UInt64)?;
-            let degree = degree.as_primitive::<UInt64Type>();
-            return Ok(degree.is_valid(0).then(|| degree.value(0)));
+            let count = cast(batch.column(0), &DataType::UInt64)?;
+            let count = count.as_primitive::<UInt64Type>();
+            return Ok(count.is_valid(0).then(|| count.value(0)));
         }
     }
     Ok(None)

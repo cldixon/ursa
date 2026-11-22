@@ -373,18 +373,18 @@ impl WebShell {
     /// and `note` says why, when the drawing is of no property graph or the
     /// graph has no row for the key.
     ///
-    /// With `degree`, the answer is instead `{"degree": 17}`: the
-    /// node's degree in the whole graph, both directions (`null` with no
+    /// With `neighbours`, the answer is instead `{"neighbours": 17}`: how
+    /// many the node has in the whole graph, either way (`null` with no
     /// property graph).
     ///
     /// Nothing is printed and the last result stays. Rejects with no open
     /// graph, or when `node` is not `key` in it.
     #[wasm_bindgen(js_name = inspectNode)]
-    pub fn inspect_node(&self, node: u32, key: String, degree: bool) -> Promise {
+    pub fn inspect_node(&self, node: u32, key: String, neighbours: bool) -> Promise {
         let shell = Rc::clone(&self.shell);
         future_to_promise(async move {
             let what = Inspect::Node { node, key: &key };
-            inspect(&shell, what, degree)
+            inspect(&shell, what, neighbours)
                 .await
                 .map(|text| JsValue::from_str(&text))
                 .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
@@ -539,12 +539,12 @@ async fn explore(
 async fn inspect(
     shell: &RefCell<Shell<Buffer, Buffer>>,
     what: Inspect<'_>,
-    degree: bool,
+    neighbours: bool,
 ) -> Result<String> {
     let shell = shell.try_borrow().map_err(|_| busy())?;
-    if let (true, Inspect::Node { node, .. }) = (degree, what) {
-        let degree = shell.graph_degree(node).await?;
-        return Ok(json!({ "degree": degree }).to_string());
+    if let (true, Inspect::Node { node, .. }) = (neighbours, what) {
+        let count = shell.graph_neighbours(node).await?;
+        return Ok(json!({ "neighbours": count }).to_string());
     }
     let found = shell.inspect(what).await?;
     let columns: Vec<_> = found
@@ -887,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn inspect_gives_the_page_a_row_as_json() {
         let shell = WebShell::new();
-        let inspect = |what, degree| inspect(&shell.shell, what, degree);
+        let inspect = |what, neighbours| inspect(&shell.shell, what, neighbours);
         let node = Inspect::Node { node: 0, key: "1" };
         let none = inspect(node, false).await.unwrap_err();
         assert!(none.to_string().contains("no graph is open"), "{none}");
@@ -924,7 +924,7 @@ mod tests {
         let row: serde_json::Value =
             serde_json::from_str(&inspect(null, false).await.unwrap()).unwrap();
         assert_eq!(row["rows"], json!([["2", null]]));
-        assert_eq!(inspect(node, true).await.unwrap(), r#"{"degree":1}"#);
+        assert_eq!(inspect(node, true).await.unwrap(), r#"{"neighbours":1}"#);
 
         let edge = Inspect::Edge {
             edge: 0,

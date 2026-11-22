@@ -368,14 +368,14 @@ impl<O: Write, E: Write> Shell<O, E> {
         view::inspect::inspect(&self.ctx, session.result(), what).await
     }
 
-    /// A node of the open graph's degree in the whole property graph
-    /// (`ursa_engine::graph::view::inspect::graph_degree`), or `None` when
+    /// How many neighbours a node of the open graph has in the whole property graph
+    /// (`ursa_engine::graph::view::inspect::graph_neighbours`), or `None` when
     /// the drawing is of no property graph. Nothing is printed.
-    pub async fn graph_degree(&self, node: u32) -> Result<Option<u64>> {
+    pub async fn graph_neighbours(&self, node: u32) -> Result<Option<u64>> {
         let Some(session) = &self.explorer else {
             return Err(DataFusionError::Plan(NO_GRAPH.into()));
         };
-        view::inspect::graph_degree(&self.ctx, &ursa_sql::Sql, session.result(), node).await
+        view::inspect::graph_neighbours(&self.ctx, &ursa_sql::Sql, session.result(), node).await
     }
 
     /// Keep every row of the last result that had columns, for

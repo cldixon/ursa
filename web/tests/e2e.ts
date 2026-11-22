@@ -1088,10 +1088,10 @@ for (const scheme of ["light", "dark"] as const) {
     const at33 = (await place(33))!;
     await g.mouse.click(box.x + at33.x, box.y + at33.y);
     await rowsRead();
-    await g.waitForFunction(() => (window as any).ursaShell.graphInspector()?.graphDegree !== undefined, null, { timeout: 5_000 }).catch(() => {});
+    await g.waitForFunction(() => (window as any).ursaShell.graphInspector()?.neighbours !== undefined, null, { timeout: 5_000 }).catch(() => {});
     let shown = await inspector();
     check(shown?.kind === "node" && shown.title === "node 33" && shown.table === "members" && row(shown).id === "33" && row(shown).club === "Officer", "clicking member 33 shows its row: club Officer", JSON.stringify(shown?.rows));
-    check(shown?.graphDegree === 17 && /degree\s*17 drawn · 17 in karate/.test(shown.text) && shown.sql === "SELECT * FROM members WHERE id = 33", "the inspector says the node's degree, drawn and in the graph, and the query", shown?.text);
+    check(shown?.neighbours === 17 && /degree\s*17 drawn · 17 neighbours in karate/.test(shown.text) && shown.sql === "SELECT * FROM members WHERE id = 33", "the inspector says the node's degree as drawn, its neighbours in the graph, and the query", shown?.text);
     check(["expand", "hide", "pin", "path from here", "colour by", "size by"].every((b) => shown?.buttons.includes(b)), "a node has expand, hide, pin, path from here, and colour by and size by on its properties", JSON.stringify(shown?.buttons));
     console.log(`     the row came ${Math.round(shown?.rowMs)} ms after the selection (${Math.round(shown?.engineMs)} ms in the engine)`);
     if (shots) await g.screenshot({ path: `${shots}/graph-inspector-node.png` });

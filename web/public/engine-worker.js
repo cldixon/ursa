@@ -32,15 +32,15 @@
 //                                               null when nothing changed;
 //                                               `nodes` and `edges` are how many
 //                                               are shown after it)
-//   inspect   {node, key, degree?} | {edge, src, dst}
+//   inspect   {node, key, neighbours?} | {edge, src, dst}
 //                              -> {table, sql, columns, rows, row, note, ms}
 //                                               (the inspector's row: what the
 //                                               open graph's tables say of its
 //                                               node or edge, by index, with the
 //                                               keys the page shows, which are
 //                                               checked; see WebShell.inspectNode.
-//                                               With `degree`, {degree, ms}: the
-//                                               node's degree in the whole graph.
+//                                               With `neighbours`, {neighbours, ms}:
+//                                               how many it has in the whole graph.
 //                                               `ms` is the engine's time)
 //   closeGraph {}              -> {}             (the page closed its view)
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
@@ -126,7 +126,7 @@ async function handle({ id, op, ...args }) {
       postMessage(reply, reply.delta ? [reply.delta.buffer] : []);
     } else if (op === "inspect") {
       const start = performance.now();
-      const text = args.edge === undefined ? await shell.inspectNode(args.node, args.key, !!args.degree) : await shell.inspectEdge(args.edge, args.src, args.dst);
+      const text = args.edge === undefined ? await shell.inspectNode(args.node, args.key, !!args.neighbours) : await shell.inspectEdge(args.edge, args.src, args.dst);
       postMessage({ id, ok: true, ...JSON.parse(text), ms: performance.now() - start });
     } else if (op === "closeGraph") {
       shell?.closeGraph();
