@@ -58,9 +58,15 @@
     <section id="graph-pane" class="graph-pane" aria-label="Graph view" hidden>
       <div class="graph-head">
         <span id="graph-status" class="graph-status" aria-live="polite"></span>
+        <!-- Search (/): public/graph-search.js. Enter runs .find in the shell. -->
+        <form id="graph-search" class="graph-search" role="search" hidden>
+          <input id="graph-search-input" type="search" aria-label="Find nodes: a key, a label, or WHERE and a condition" placeholder="Find a key or a label, or WHERE …" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+        </form>
+        <button id="graph-find" type="button" class="graph-close" title="Find nodes (/)" aria-label="Find nodes" aria-expanded="false" aria-controls="graph-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14.7 14.7 19 19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
         <button id="graph-close" type="button" class="graph-close" title="Close the graph view (Esc)" aria-label="Close the graph view"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
       </div>
       <div id="graph-legend" class="graph-legend" aria-label="Legend" hidden></div>
+      <div id="graph-found" class="graph-found" hidden></div>
       <div id="graph-stage" class="graph-stage"></div>
     </section>
   </div>

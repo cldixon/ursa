@@ -9,6 +9,7 @@
 import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { DATASETS } from "./datasets.js";
+import { setup as setupSearch } from "./graph-search.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...children) => {
@@ -874,7 +875,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); the pane says what it was drawn as; click a node to select it (Shift+click adds); Esc clears the selection, then closes it"],
+  [".graph", "?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); the pane says what it was drawn as; click a node to select it (Shift+click adds); / in the pane finds nodes (.find) and f fits the selection in view; Esc clears the selection, then closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
   [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
@@ -911,6 +912,8 @@ async function hostCommand(line) {
       if (/^history\b/i.test(arg)) return explore(line);
       // The query as typed: its spaces may be in a string.
       return drawGraph(line.trim().slice(name.length).trim());
+    case ".find":
+      return find(line);
     case ".expand":
     case ".hide":
     case ".show":
@@ -1032,6 +1035,8 @@ async function drawGraph(text) {
   let drawn;
   try {
     const module = await loadGraphModule();
+    // A new drawing: the last search's matches were of the old one.
+    search.clear();
     drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, times });
   } catch (e) {
     // Closed (Esc) before it was drawn: nothing went wrong.
@@ -1065,9 +1070,47 @@ async function explore(line) {
   return !r.err;
 }
 
+// The last .find's answer, for tests: its `command`, the `ms` the engine
+// took to answer (the worker's round trip), how many nodes `matched` in the
+// view and how many of them were `selected`, and the matches `notShown`
+// ([{key, hidden}], the first of `notShownTotal`).
+let found = null;
+
+// The pane's search (graph-search.js): `/` opens its box, and Enter there
+// types .find into the shell.
+const search = setupSearch({
+  form: $("graph-search"),
+  input: $("graph-search-input"),
+  button: $("graph-find"),
+  list: $("graph-found"),
+  status: $("graph-status"),
+  run: (command) => run(command),
+  focusView: () => (graphPane.querySelector("canvas") ?? term).focus(),
+});
+
+/**
+ * `.find TEXT` or `.find WHERE condition`: the engine says which nodes of the
+ * graph drawn match (ursa-engine's graph::view::find), the view selects them
+ * and fits them (graph.js's selectFound), and the pane lists the matches
+ * that are not shown. A search that matches nothing in the view leaves the
+ * selection as it was.
+ */
+async function find(line) {
+  const start = performance.now();
+  const r = await engine("find", { command: line });
+  found = { command: line, ms: performance.now() - start, matched: r.matches, selected: r.selected.length, notShown: r.notShown, notShownTotal: r.notShownTotal };
+  await write(r.out + r.err);
+  if (r.err) return false;
+  if (r.selected.length) graphLoaded?.selectFound(r.selected, r.matches);
+  search.show(r.notShown, r.notShownTotal);
+  return true;
+}
+
 /** Close the pane: the terminal takes the whole width again, and the focus. */
 function closeGraph() {
   if (graphPane.hidden) return;
+  search.close(false);
+  search.clear();
   // The engine's graph closes with the pane's: .expand then says none is open.
   engine("closeGraph").catch(() => {});
   const hadFocus = graphPane.contains(document.activeElement);
@@ -1094,6 +1137,12 @@ $("graph-close").onclick = () => {
   term.focus();
 };
 graphPane.addEventListener("keydown", (e) => {
+  // `/` searches, from anywhere in the pane.
+  if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    search.open();
+    return;
+  }
   if (e.key !== "Escape") return;
   e.preventDefault();
   // A selection is cleared first; Esc again closes the pane.
@@ -1427,6 +1476,8 @@ window.ursaShell = {
   // The last explore command (.expand, .hide, …): {command, nodes, edges,
   // deltaBytes}, the engine's counts of what is shown after it.
   explored: () => explored,
+  // The last .find: {command, ms, matched, selected, notShown, notShownTotal}.
+  found: () => found,
   // The last .graph: when each step ended, in ms after Enter; and what the
   // view costs to use (#430, graph-timings.js): `frames` (how many, and the
   // p50, p95 and max of the time in render() and of the time between frames
