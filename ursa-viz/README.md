@@ -704,6 +704,16 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   (half the nodes, nearly all the edges), so they cost about what the graph
   does. Cheaper iterations (attraction gathers 2M random reads; repulsion
   could be approximated harder far out) would buy the rest.
+- **A grid while the layout runs.** The grid waits for the positions to
+  rest (#500), so a hover during a layout still tests every node, and every
+  node is drawn. A grid that tolerates small moves (cells widened by the
+  furthest any node has moved) would serve the layout's last, slow stretch.
+- **Culling past 65,536 nodes in view.** The nodes in view are uploaded
+  when the camera moves, so they are capped; between that and half the
+  nodes, every node is drawn. Drawing ranges of a buffer sorted by cell
+  would have no cap, but would draw overlapping nodes in another order than
+  the unculled frame does, and hold every node a second time on the GPU.
+- **Edges are not culled**: the line list draws every edge, in view or not.
 - **Rings and layers from the shell.** The shell's worker takes
   `graph.layout = {kind, level}` from `graph.js`, but nothing sets it yet:
   the rules that turn a `hop` result or a path column into one are #433.
