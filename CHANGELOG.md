@@ -456,6 +456,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the worker transfers and `graph.js` reads with `ursa-viz/ui/ugr.js` as
   typed arrays over it, in place of an array copied per getter. What
   `.graph` draws, its messages and its legend are unchanged.
+- **Hover and selection in the graph view** (#438). In the web shell's
+  `.graph` pane, a mouse or a pen over a node rings it and shows a tooltip
+  (its key, label, `SIZE BY` and `COLOR BY` values and degree), looked up
+  once a frame at most. A click selects a node, Shift+click adds one (or
+  takes it out), and a click on empty space clears the selection; the
+  selected nodes carry a ring and their edges are drawn wide. The pane's
+  header, a live region, reads `Selected node 33: …` in place of the node a
+  click named. Esc clears a selection before it closes the pane. The
+  selection set is `ursa-viz`'s new `interact` module (no GPU), which the
+  wasm view exposes as `select`, `selection`, `clearSelection`, `hover`,
+  `hovered` and `selectionEdges`.
 - **A highlight layer in the graph view** (#435): a path, a selection or a
   hover can be seen. `ursa-viz` keeps a flags byte per node (selected,
   hovered, pinned, dimmed, highlighted, hidden, seed) in a buffer of its

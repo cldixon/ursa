@@ -198,6 +198,37 @@ result's highlights (its paths' own edges, where it names them) and hides
 its removed nodes; `View::set_highlight` takes any change to the
 `HighlightState`.
 
+### The selection and the hover
+
+`setSelection` and `setHovered` are the view's own state too: the
+`interact` module (no GPU) holds the selection set and the hovered node, and
+says what a click does to them, so every front end selects alike.
+
+```js
+view.selectionEdges = true;                 // draw the selected nodes' edges wide (off at first)
+view.select(view.pick(x, y), e.shiftKey);   // a click: true if the selection changed
+view.selection();                           // the selected nodes, in the order selected
+view.clearSelection();                      // true if anything was selected
+view.hover(x, y);                           // the node under the pointer becomes the hovered one; returns it
+view.hovered;                               // or undefined
+```
+
+- A click on a node selects it alone; on empty space (`undefined`) it clears
+  the selection.
+- With Shift (`extend`), a click on a node adds it, or takes it out if it was
+  selected; on empty space it changes nothing.
+- `hover` uploads nothing while the pointer stays on one node, or on none.
+  The page calls it once a frame at most.
+- With `selectionEdges`, the edges at a selected node are drawn wide in the
+  highlight colour, as highlighted edges are, but nothing else is dimmed: a
+  selection is not a highlight. Each change of the selection reads every
+  edge once, and uploads 16 bytes for each edge found.
+- A node that is hidden (`setHidden`) or removed by a delta leaves the
+  selection and the hover.
+
+In Rust: `interact::Selection` (`click`, `set`, `add`, `toggle`, `clear`,
+`retain`, `incident_edges`) and `interact::Interact`.
+
 How it is drawn, on WebGL2 as on WebGPU:
 
 - The flags are a vertex buffer of their own, four bytes a node (the flags

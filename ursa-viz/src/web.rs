@@ -16,6 +16,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::highlight::{flag, BadHighlight, HighlightState};
+use crate::interact::Interact;
 use crate::model::{
     EdgeBatch, GraphDelta, GraphResult, KeyType, NodeBatch, NodeLabel, Op, Positions, Provenance,
 };
@@ -38,6 +39,11 @@ pub struct GraphView {
     device: wgpu::Device,
     queue: wgpu::Queue,
     backend: String,
+    /// The selection and the hovered node.
+    interact: Interact,
+    /// Draw the selection's incident edges wide
+    /// ([`GraphView::set_selection_edges`]).
+    selection_edges: bool,
 }
 
 /// A view of the graph of `n_nodes` nodes and the edges `(src[i], dst[i])`
@@ -160,6 +166,8 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         device,
         queue,
         backend,
+        interact: Interact::new(),
+        selection_edges: false,
     })
 }
 
@@ -424,16 +432,106 @@ impl GraphView {
     }
 
     /// The selected nodes: exactly these, each with a ring in the selection
-    /// colour. An empty array selects none.
+    /// colour (and, with [`GraphView::set_selection_edges`], their edges
+    /// drawn wide). An empty array selects none.
     #[wasm_bindgen(js_name = setSelection)]
     pub fn set_selection(&mut self, nodes: &[u32]) -> Result<(), JsValue> {
-        self.highlight(|h| h.set_only(flag::SELECTED, nodes))
+        self.check_nodes(nodes)?;
+        self.interact.selection_mut().set(nodes);
+        self.draw_selection()
+    }
+
+    /// A click, for the selection: on `node` (as [`GraphView::pick`] gave
+    /// it) or on empty space (`undefined`), with Shift held (`extend`) or
+    /// not. A plain click on a node selects it alone, and on empty space
+    /// clears the selection; with `extend`, a click on a node adds it (or
+    /// takes it out, if it was selected) and a click on empty space changes
+    /// nothing. Returns whether the selection changed, and so the frame.
+    pub fn select(&mut self, node: Option<u32>, extend: bool) -> Result<bool, JsValue> {
+        self.check_nodes(node.as_slice())?;
+        let changed = self.interact.selection_mut().click(node, extend);
+        if changed {
+            self.draw_selection()?;
+        }
+        Ok(changed)
+    }
+
+    /// The selected nodes, in the order they were selected.
+    pub fn selection(&self) -> Vec<u32> {
+        self.interact.selection().nodes().to_vec()
+    }
+
+    /// Select nothing. Returns whether anything was selected.
+    #[wasm_bindgen(js_name = clearSelection)]
+    pub fn clear_selection(&mut self) -> Result<bool, JsValue> {
+        let changed = self.interact.selection_mut().clear();
+        if changed {
+            self.draw_selection()?;
+        }
+        Ok(changed)
+    }
+
+    /// Whether the selected nodes' incident edges are drawn wide, in the
+    /// highlight colour, over the others (off at first). They dim nothing.
+    /// Each selection change then reads every edge once, and uploads 16
+    /// bytes for each edge at a selected node.
+    #[wasm_bindgen(setter, js_name = selectionEdges)]
+    pub fn set_selection_edges(&mut self, on: bool) -> Result<(), JsValue> {
+        if self.selection_edges != on {
+            self.selection_edges = on;
+            self.draw_selection()?;
+        }
+        Ok(())
     }
 
     /// The node under the pointer, with a thin ring, or none (`undefined`).
     #[wasm_bindgen(js_name = setHovered)]
     pub fn set_hovered(&mut self, node: Option<u32>) -> Result<(), JsValue> {
-        self.highlight(|h| h.set_only(flag::HOVERED, node.as_slice()))
+        self.check_nodes(node.as_slice())?;
+        if self.interact.hover(node) {
+            self.highlight(|h| h.set_only(flag::HOVERED, node.as_slice()))?;
+        }
+        Ok(())
+    }
+
+    /// The pointer is at the canvas pixel `(x, y)`: the node under it
+    /// ([`GraphView::pick`]) becomes the hovered one. Returns it. Nothing
+    /// is uploaded while the pointer stays on one node, or on none.
+    pub fn hover(&mut self, x: f32, y: f32) -> Result<Option<u32>, JsValue> {
+        let node = self.view.pick(x, y);
+        self.set_hovered(node)?;
+        Ok(node)
+    }
+
+    /// The hovered node, if any.
+    #[wasm_bindgen(getter)]
+    pub fn hovered(&self) -> Option<u32> {
+        self.interact.hovered()
+    }
+
+    fn check_nodes(&self, nodes: &[u32]) -> Result<(), JsValue> {
+        let n = self.view.graph().n_nodes();
+        match nodes.iter().find(|&&v| v as usize >= n) {
+            Some(&node) => Err(js_err(BadHighlight::Node { node, nodes: n })),
+            None => Ok(()),
+        }
+    }
+
+    /// Draw the selection as it is now: its nodes' rings, and their
+    /// incident edges if asked for.
+    fn draw_selection(&mut self) -> Result<(), JsValue> {
+        let selection = self.interact.selection();
+        let nodes = selection.nodes().to_vec();
+        let edges = if self.selection_edges {
+            let graph = self.view.graph();
+            selection.incident_edges(graph.src(), graph.dst())
+        } else {
+            Vec::new()
+        };
+        self.highlight(|h| {
+            h.set_only(flag::SELECTED, &nodes)?;
+            h.set_selection_edges(&edges)
+        })
     }
 
     /// The pinned nodes: exactly these, each with a small ring in the pin
@@ -445,10 +543,12 @@ impl GraphView {
     }
 
     /// The hidden nodes: exactly these. A hidden node is not drawn, nor
-    /// are its edges, and it cannot be picked; it keeps its index.
+    /// are its edges, and it cannot be picked; it keeps its index. It
+    /// leaves the selection.
     #[wasm_bindgen(js_name = setHidden)]
     pub fn set_hidden(&mut self, nodes: &[u32]) -> Result<(), JsValue> {
-        self.highlight(|h| h.set_only(flag::HIDDEN, nodes))
+        self.highlight(|h| h.set_only(flag::HIDDEN, nodes))?;
+        self.keep_interaction()
     }
 
     /// Bytes of flags written to the GPU so far: 4 for each node whose
@@ -520,6 +620,7 @@ impl GraphView {
             .view
             .apply_at(&self.device, &self.queue, &delta, xy)
             .map_err(js_err)?;
+        self.keep_interaction()?;
         let (node_capacity, edge_capacity) = self.view.renderer().capacity();
         Ok(DeltaStats {
             nodes: applied.changes.nodes.1 as u32,
@@ -529,6 +630,25 @@ impl GraphView {
             node_capacity: node_capacity as u32,
             edge_capacity: edge_capacity as u32,
         })
+    }
+
+    /// After the graph changed: the selection and the hover drop the nodes
+    /// that are gone or hidden, and a selection's edges are found again.
+    /// Nothing is read while nothing is selected or hovered.
+    fn keep_interaction(&mut self) -> Result<(), JsValue> {
+        if self.interact.selection().is_empty() && self.interact.hovered().is_none() {
+            return Ok(());
+        }
+        let flags = self.view.highlight().flags();
+        let shown = |v: u32| flags.get(v as usize).is_some_and(|f| f & flag::HIDDEN == 0);
+        let (selection, hover) = self.interact.retain(shown);
+        if hover {
+            self.highlight(|h| h.set_only(flag::HOVERED, &[]))?;
+        }
+        if selection || self.selection_edges && !self.interact.selection().is_empty() {
+            self.draw_selection()?;
+        }
+        Ok(())
     }
 
     /// What is shown now, for a status line and a legend, for a view made
