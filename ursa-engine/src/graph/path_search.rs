@@ -65,6 +65,13 @@
 //! one back to its start is a cycle. Otherwise the search lists every path
 //! the mode allows.
 //!
+//! A pruned search keeps its states in a table it tests before anything else
+//! per edge (one bit a state for `ANY SHORTEST`), and reads the adjacency
+//! lists where they lie (#451). From several start nodes, a walker per thread
+//! takes the next start, and the starts' rows are appended in start order: the
+//! rows, their order and the limit's verdict are those of one start after
+//! another (see [`run`]).
+//!
 //! ## The limit
 //!
 //! A search stops with an error once it holds more paths than
@@ -80,21 +87,23 @@
 //! - Every other search counts the prefixes it holds and the paths it keeps:
 //!   a walk's prefixes can grow exponentially with its length.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, ListArray, UInt32Array,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::{concat, take};
+use datafusion::arrow::compute::{interleave, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DFSchemaRef, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use rustc_hash::FxHashMap;
 use ursa_core::{IdMap, Topology};
 
 use super::node::{check_vertices, endpoint_id_type};
@@ -406,90 +415,221 @@ struct Entry {
 
 const ROOT: u32 = u32::MAX;
 
-/// Per search state, (node, edges so far up to `min`): how many prefixes
-/// reached it, and the length of the first.
-enum States {
-    Dense {
-        seen: Vec<(u32, u32)>,
-        touched: Vec<usize>,
-        width: usize,
-    },
-    Sparse(HashMap<(u32, u32), (u32, u32)>),
+/// A dense state table may take this many bytes whatever the graph's size
+/// (the 2^26 states of 8 bytes the table was limited to before #451)...
+const DENSE_MIN_BYTES: usize = 512 << 20;
+/// ...or this many per node of the graph, which holds that much per node
+/// already: `ALL SHORTEST` with a `+` quantifier (two states per node) stays
+/// dense at any size.
+const DENSE_BYTES_PER_NODE: usize = 16;
+
+/// The most bytes of state tables a search from many start nodes gives its
+/// parallel walkers together; past it, fewer walkers run.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_STATES_BYTES: usize = 1 << 30;
+
+/// Per search state, (node, edges so far up to `min`), numbered
+/// `node * width + c`: how many prefixes reached it, and the length of the
+/// first. A pruned search keeps a prefix only if its state accepts it.
+trait States: Send {
+    /// Whether to keep a prefix of `len` edges that reaches state `i`,
+    /// counting it if so.
+    fn accept(&mut self, i: usize, len: u32, selector: Selector) -> bool;
+    /// Count the start's prefix of no edges at state `i`.
+    fn start(&mut self, i: usize);
+    /// Forget every state reached.
+    fn clear(&mut self);
 }
 
-impl States {
-    fn new(n_nodes: usize, min: u32) -> Self {
-        let width = min as usize + 1;
-        match n_nodes.checked_mul(width) {
-            Some(n) if n <= 1 << 26 => States::Dense {
-                seen: vec![(0, 0); n],
-                touched: Vec::new(),
-                width,
-            },
-            _ => States::Sparse(HashMap::new()),
+/// The selector's test on a state (prefixes kept, length of the first),
+/// counting the prefix if it passes.
+#[inline(always)]
+fn accept_pair(state: &mut (u32, u32), len: u32, selector: Selector) -> bool {
+    let accept = match selector {
+        Selector::All => true,
+        Selector::Shortest(k) => state.0 < k,
+        Selector::AllShortest => state.0 == 0 || state.1 == len,
+    };
+    if accept {
+        if state.0 == 0 {
+            state.1 = len;
         }
+        state.0 += 1;
+    }
+    accept
+}
+
+/// No states: a search that is not pruned keeps every prefix its mode
+/// allows.
+struct NoStates;
+
+impl States for NoStates {
+    fn accept(&mut self, _: usize, _: u32, _: Selector) -> bool {
+        true
+    }
+    fn start(&mut self, _: usize) {}
+    fn clear(&mut self) {}
+}
+
+/// `ANY SHORTEST`'s states: one bit each, whether a prefix reached it (it
+/// keeps the first, and the length is never asked). 2 bits a node for a `+`
+/// quantifier, so it is dense at any size.
+struct Bits {
+    words: Vec<u64>,
+    touched: Vec<usize>,
+}
+
+impl States for Bits {
+    #[inline(always)]
+    fn accept(&mut self, i: usize, _: u32, _: Selector) -> bool {
+        let (word, bit) = (&mut self.words[i >> 6], 1u64 << (i & 63));
+        if *word & bit != 0 {
+            return false;
+        }
+        *word |= bit;
+        self.touched.push(i);
+        true
     }
 
-    fn get(&mut self, node: u32, c: u32) -> &mut (u32, u32) {
-        match self {
-            States::Dense {
-                seen,
-                touched,
-                width,
-            } => {
-                let i = node as usize * *width + c as usize;
-                if seen[i].0 == 0 {
-                    touched.push(i);
-                }
-                &mut seen[i]
-            }
-            States::Sparse(map) => map.entry((node, c)).or_insert((0, 0)),
-        }
+    fn start(&mut self, i: usize) {
+        self.accept(i, 0, Selector::Shortest(1));
     }
 
     fn clear(&mut self) {
-        match self {
-            States::Dense { seen, touched, .. } => {
-                for i in touched.drain(..) {
-                    seen[i] = (0, 0);
-                }
+        // Every bit set is in `touched`, so a word with one is cleared whole.
+        if self.touched.len() > self.words.len() {
+            self.words.fill(0);
+        } else {
+            for &i in &self.touched {
+                self.words[i >> 6] = 0;
             }
-            States::Sparse(map) => map.clear(),
+        }
+        self.touched.clear();
+    }
+}
+
+/// The states as a table, for `SHORTEST k` and `ALL SHORTEST`.
+struct Pairs {
+    seen: Vec<(u32, u32)>,
+    touched: Vec<usize>,
+}
+
+impl States for Pairs {
+    #[inline(always)]
+    fn accept(&mut self, i: usize, len: u32, selector: Selector) -> bool {
+        let state = &mut self.seen[i];
+        let first = state.0 == 0;
+        let accept = accept_pair(state, len, selector);
+        if accept && first {
+            self.touched.push(i);
+        }
+        accept
+    }
+
+    fn start(&mut self, i: usize) {
+        if self.seen[i].0 == 0 {
+            self.touched.push(i);
+        }
+        self.seen[i] = (1, 0);
+    }
+
+    fn clear(&mut self) {
+        for i in self.touched.drain(..) {
+            self.seen[i] = (0, 0);
+        }
+    }
+}
+
+/// The states as a map, when a table would be too large.
+struct Sparse(FxHashMap<usize, (u32, u32)>);
+
+impl States for Sparse {
+    #[inline]
+    fn accept(&mut self, i: usize, len: u32, selector: Selector) -> bool {
+        accept_pair(self.0.entry(i).or_insert((0, 0)), len, selector)
+    }
+
+    fn start(&mut self, i: usize) {
+        self.0.insert(i, (1, 0));
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Which state table a search uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    None,
+    Bits,
+    Pairs,
+    Sparse,
+}
+
+impl Table {
+    /// The table for a search over `n_nodes` nodes with `width` states each.
+    fn choose(pruned: bool, selector: Selector, n_nodes: usize, width: usize) -> Self {
+        if !pruned {
+            return Table::None;
+        }
+        let budget = DENSE_MIN_BYTES.max(n_nodes.saturating_mul(DENSE_BYTES_PER_NODE));
+        let states = n_nodes.saturating_mul(width);
+        if selector == Selector::Shortest(1) && states / 8 <= budget {
+            Table::Bits
+        } else if states.saturating_mul(8) <= budget {
+            Table::Pairs
+        } else {
+            Table::Sparse
+        }
+    }
+
+    /// The bytes one walker's table takes once the search has touched it
+    /// all, if they are known.
+    fn bytes(self, states: usize) -> Option<usize> {
+        match self {
+            Table::None => Some(0),
+            Table::Bits => Some(states.div_ceil(64) * 8),
+            Table::Pairs => Some(states * 8),
+            Table::Sparse => None,
         }
     }
 }
 
 /// The edges a step can take from `u`, in edge-row order, as (next node,
-/// edge row).
-fn steps(topology: &Topology, direction: Direction, u: u32, out: &mut Vec<(u32, u32)>) {
-    out.clear();
-    fn pairs(a: &ursa_core::Adjacency, u: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
-        a.neighbors(u)
-            .iter()
-            .copied()
-            .zip(a.edge_ids(u).iter().copied())
-    }
-    match direction {
-        Direction::Right => out.extend(pairs(topology.out(), u)),
-        Direction::Left => out.extend(pairs(topology.incoming(), u)),
-        Direction::Any => {
-            let forward: Vec<(u32, u32)> = pairs(topology.out(), u).collect();
-            // A self-loop is in both lists: it is taken once, forward.
-            let backward: Vec<(u32, u32)> = pairs(topology.incoming(), u)
-                .filter(|&(w, _)| w != u)
-                .collect();
-            let (mut i, mut j) = (0, 0);
-            while i < forward.len() || j < backward.len() {
-                let take_forward =
-                    j == backward.len() || (i < forward.len() && forward[i].1 < backward[j].1);
-                if take_forward {
-                    out.push(forward[i]);
-                    i += 1;
-                } else {
-                    out.push(backward[j]);
-                    j += 1;
-                }
+/// edge row): the adjacency lists read as they are, and for an undirected
+/// step both merged by edge row as they are read. A self-loop is in both
+/// lists: it is taken once, forward.
+struct Undirected<'a> {
+    forward: (&'a [u32], &'a [u32]),
+    backward: (&'a [u32], &'a [u32]),
+    u: u32,
+    i: usize,
+    j: usize,
+}
+
+impl Iterator for Undirected<'_> {
+    type Item = (u32, u32);
+
+    #[inline]
+    fn next(&mut self) -> Option<(u32, u32)> {
+        let (bw, be) = self.backward;
+        while self.j < bw.len() && bw[self.j] == self.u {
+            self.j += 1;
+        }
+        let (fw, fe) = self.forward;
+        let take_forward = self.j == bw.len() || (self.i < fw.len() && fe[self.i] < be[self.j]);
+        if take_forward {
+            let i = self.i;
+            if i == fw.len() {
+                return None;
             }
+            self.i += 1;
+            Some((fw[i], fe[i]))
+        } else {
+            let j = self.j;
+            self.j += 1;
+            Some((bw[j], be[j]))
         }
     }
 }
@@ -523,6 +663,29 @@ fn allowed(entries: &[Entry], at: u32, w: u32, edge: u32, mode: Mode, start: u32
     }
 }
 
+/// The paths one start node found, in the order found, and what its search
+/// counted for the limit.
+#[derive(Default)]
+struct Found {
+    /// The start's row.
+    row: u32,
+    /// Per path, its last node (an index into [`Rows`]' values) and length.
+    ends: Vec<u32>,
+    lengths: Vec<i64>,
+    /// The paths' nodes, first to last, one after another, when asked.
+    vertices: Vec<u32>,
+    /// The paths' edges' rows in the edge table, when asked.
+    edges: Vec<i64>,
+    /// Prefixes extended.
+    expanded: usize,
+    /// Paths that count toward the limit (the path of no edges of a start
+    /// that is no node does not).
+    kept: usize,
+    /// The most prefixes and paths held at once, where the search checked
+    /// (see [`Walker::extend`]); `None` if it never did.
+    peak: Option<usize>,
+}
+
 /// Collects a search's rows into batches.
 struct Rows<'a> {
     starts: &'a ArrayRef,
@@ -536,27 +699,14 @@ struct Rows<'a> {
     edge_offsets: Vec<i32>,
     edge_values: Vec<i64>,
     batches: Vec<RecordBatch>,
-    /// The starts, then every node of the index, as user ids: what the
-    /// node references index.
-    values: ArrayRef,
-    /// The edge table's row of an edge of the index.
-    edge_row: &'a dyn Fn(u32) -> u64,
+    /// Every node of the index, as user ids. A node is referred to by its
+    /// index in the starts, then these (see [`Rows::gather`]).
+    ids: Option<ArrayRef>,
 }
 
 impl<'a> Rows<'a> {
-    fn new(
-        ids: &'a IdMap,
-        starts: &'a ArrayRef,
-        columns: PathColumns,
-        schema: SchemaRef,
-        edge_row: &'a dyn Fn(u32) -> u64,
-    ) -> Result<Self> {
-        let values = if ids.is_empty() {
-            Arc::clone(starts)
-        } else {
-            concat(&[starts.as_ref(), ids.user_id_array().as_ref()])?
-        };
-        Ok(Self {
+    fn new(ids: &'a IdMap, starts: &'a ArrayRef, columns: PathColumns, schema: SchemaRef) -> Self {
+        Self {
             starts,
             columns,
             schema,
@@ -568,36 +718,59 @@ impl<'a> Rows<'a> {
             edge_offsets: vec![0],
             edge_values: Vec::new(),
             batches: Vec::new(),
-            values,
-            edge_row,
-        })
+            // The ids array is the index's own (borrowed from a stored
+            // index's file): it is read only where a path ends or passes.
+            ids: (!ids.is_empty()).then(|| ids.user_id_array()),
+        }
     }
 
-    /// The index into `values` of dense node `d`.
-    fn dense(&self, d: u32) -> u32 {
-        (self.starts.len() as u32) + d
-    }
-
-    /// A path from start row `start`: its nodes (as `values` indexes) and
-    /// edges, first to last.
-    fn push(&mut self, start: u32, nodes: &[u32], edges: &[u32]) -> Result<()> {
-        self.start_rows.push(start);
-        self.ends.push(*nodes.last().expect("a path has a node"));
-        self.lengths.push(edges.len() as i64);
-        if self.columns.vertices || self.columns.elements {
-            self.vertex_values.extend_from_slice(nodes);
-            self.vertex_offsets.push(self.vertex_values.len() as i32);
-        }
-        if self.columns.edges || self.columns.elements {
-            let edge_row = self.edge_row;
-            self.edge_values
-                .extend(edges.iter().map(|&e| edge_row(e) as i64));
-            self.edge_offsets.push(self.edge_values.len() as i32);
-        }
-        if self.start_rows.len() >= BATCH_ROWS {
-            self.flush()?;
+    /// Append one start's paths.
+    fn append(&mut self, found: &Found) -> Result<()> {
+        let vertices = self.columns.vertices || self.columns.elements;
+        let edges = self.columns.edges || self.columns.elements;
+        let (mut v, mut e) = (0, 0);
+        for (&end, &len) in found.ends.iter().zip(&found.lengths) {
+            let len = len as usize;
+            self.start_rows.push(found.row);
+            self.ends.push(end);
+            self.lengths.push(len as i64);
+            if vertices {
+                self.vertex_values
+                    .extend_from_slice(&found.vertices[v..v + len + 1]);
+                v += len + 1;
+                self.vertex_offsets.push(self.vertex_values.len() as i32);
+            }
+            if edges {
+                self.edge_values.extend_from_slice(&found.edges[e..e + len]);
+                e += len;
+                self.edge_offsets.push(self.edge_values.len() as i32);
+            }
+            if self.start_rows.len() >= BATCH_ROWS {
+                self.flush()?;
+            }
         }
         Ok(())
+    }
+
+    /// The user ids of `nodes`: indexes into the starts, then into the
+    /// index's ids after them.
+    fn gather(&self, nodes: Vec<u32>) -> Result<ArrayRef> {
+        let n = self.starts.len() as u32;
+        let Some(ids) = &self.ids else {
+            return Ok(take(self.starts.as_ref(), &UInt32Array::from(nodes), None)?);
+        };
+        if nodes.iter().all(|&i| i >= n) {
+            let nodes: Vec<u32> = nodes.into_iter().map(|i| i - n).collect();
+            return Ok(take(ids.as_ref(), &UInt32Array::from(nodes), None)?);
+        }
+        let at: Vec<(usize, usize)> = nodes
+            .into_iter()
+            .map(|i| match i.checked_sub(n) {
+                Some(d) => (1, d as usize),
+                None => (0, i as usize),
+            })
+            .collect();
+        Ok(interleave(&[self.starts.as_ref(), ids.as_ref()], &at)?)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -609,22 +782,16 @@ impl<'a> Rows<'a> {
             &UInt32Array::from(std::mem::take(&mut self.start_rows)),
             None,
         )?;
-        let end = take(
-            self.values.as_ref(),
-            &UInt32Array::from(std::mem::take(&mut self.ends)),
-            None,
-        )?;
+        let ends = std::mem::take(&mut self.ends);
+        let end = self.gather(ends)?;
         let mut columns: Vec<ArrayRef> = vec![
             start,
             end,
             Arc::new(Int64Array::from(std::mem::take(&mut self.lengths))),
         ];
         let vertex_offsets = std::mem::replace(&mut self.vertex_offsets, vec![0]);
-        let vertex_values = take(
-            self.values.as_ref(),
-            &UInt32Array::from(std::mem::take(&mut self.vertex_values)),
-            None,
-        )?;
+        let vertex_values = std::mem::take(&mut self.vertex_values);
+        let vertex_values = self.gather(vertex_values)?;
         let edge_offsets = std::mem::replace(&mut self.edge_offsets, vec![0]);
         let edge_values = std::mem::take(&mut self.edge_values);
         let field = |i: usize| match self.schema.field(i).data_type() {
@@ -684,7 +851,7 @@ impl<'a> Rows<'a> {
 /// The targets of a search: the dense nodes its paths may end at, each with
 /// a slot, and the target keys that are no node of the index.
 struct Goals {
-    slots: HashMap<u32, u32>,
+    slots: FxHashMap<u32, u32>,
     unknown: HashSet<ScalarValue>,
 }
 
@@ -693,7 +860,7 @@ impl Goals {
         let dense = ids
             .dense_from_array(targets.as_ref())
             .map_err(|e| DataFusionError::Execution(format!("in GRAPH_TABLE: {e}")))?;
-        let mut slots = HashMap::new();
+        let mut slots = FxHashMap::default();
         let mut unknown = HashSet::new();
         for (row, d) in dense.iter().enumerate() {
             if targets.is_null(row) {
@@ -713,29 +880,63 @@ impl Goals {
     }
 }
 
-/// What one search is doing, apart from its rows.
-struct Walker<'a> {
+/// What every walker of one search shares.
+struct Plan<'a> {
     topology: &'a Topology,
+    edge_row: &'a (dyn Fn(u32) -> u64 + Sync),
     search: &'a Search,
+    starts: &'a ArrayRef,
+    /// The starts' dense nodes.
+    dense: &'a [Option<u32>],
+    goals: Option<&'a Goals>,
+    known_only: bool,
+    columns: PathColumns,
     restricted: bool,
     pruned: bool,
-    states: States,
-    entries: Vec<Entry>,
-    next: Vec<(u32, u32)>,
-    /// Paths listed so far.
-    total: usize,
-    /// The most prefixes and paths the search may hold (`ursa.max_paths`),
-    /// unless it is `bounded`.
-    cap: Option<usize>,
+    /// States per node: `min + 1`.
+    width: usize,
     /// Whether the search's memory is bounded by the graph's nodes (see the
     /// module docs): it counts only the paths it keeps.
     bounded: bool,
-    /// Prefixes extended so far.
-    expanded: usize,
-    /// The targets' slots, when a pruned search has targets: their paths are
-    /// known once pushed (see [`Reach`]).
-    slots: Option<&'a HashMap<u32, u32>>,
+    /// The most prefixes and paths the search may hold (`ursa.max_paths`),
+    /// unless it is `bounded`.
+    cap: Option<usize>,
+    /// The most paths a `bounded` search may keep.
+    kept_limit: Option<usize>,
+    /// Paths a `bounded` search has kept so far, from every start (each
+    /// walker adds its own now and then, and at the end of a start).
+    kept_all: AtomicUsize,
+    /// Set when a search from many start nodes has failed: the others stop.
+    stop: AtomicBool,
+}
+
+/// A `bounded` walker adds the paths it kept to [`Plan::kept_all`] after
+/// this many.
+const KEPT_BATCH: usize = 4096;
+
+/// What one search is doing, from one start node after another.
+struct Walker<'a, T> {
+    plan: &'a Plan<'a>,
+    states: T,
+    entries: Vec<Entry>,
+    /// The paths of the current start.
+    found: Found,
+    /// Its paths kept so far, and those not yet added to `kept_all`.
+    kept: usize,
+    unshared: usize,
+    /// Paths kept by the starts before it (as far as known: see
+    /// [`drive_parallel`]).
+    before: usize,
+    /// Per last node, for a search that lists every path: (paths kept,
+    /// length of the first).
+    targets: FxHashMap<u32, (u32, u32)>,
+    /// Per target slot, for this start: (paths kept, length of the first).
+    slot_paths: Vec<(u32, u32)>,
+    touched: Vec<u32>,
     reach: Reach,
+    /// Scratch for one path's nodes and edges.
+    nodes: Vec<u32>,
+    edges: Vec<u32>,
 }
 
 /// How far a pruned search with targets has reached them, counting the
@@ -773,37 +974,84 @@ impl Reach {
     }
 }
 
-impl Walker<'_> {
+impl<'a, T: States> Walker<'a, T> {
+    fn new(plan: &'a Plan<'a>, states: T) -> Self {
+        let slots = plan.goals.map_or(0, |g| g.slots.len());
+        Self {
+            plan,
+            states,
+            entries: Vec::new(),
+            found: Found::default(),
+            kept: 0,
+            unshared: 0,
+            before: 0,
+            targets: FxHashMap::default(),
+            slot_paths: vec![(0, 0); slots],
+            touched: Vec::new(),
+            reach: Reach::default(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
     /// Push the prefixes that extend entry `at` by one edge.
+    #[inline]
     fn extend(&mut self, at: u32, start: u32) -> Result<()> {
-        let entry = self.entries[at as usize];
-        let min = self.search.quantifier.min;
-        self.expanded += 1;
-        steps(
-            self.topology,
-            self.search.direction,
-            entry.node,
-            &mut self.next,
-        );
-        for &(w, edge) in self.next.iter() {
-            if self.restricted && !allowed(&self.entries, at, w, edge, self.search.mode, start) {
+        let topology = self.plan.topology;
+        let u = self.entries[at as usize].node;
+        self.found.expanded += 1;
+        match self.plan.search.direction {
+            Direction::Right => {
+                let a = topology.out();
+                let steps = a.neighbors(u).iter().copied();
+                self.extend_with(at, start, steps.zip(a.edge_ids(u).iter().copied()))
+            }
+            Direction::Left => {
+                let a = topology.incoming();
+                let steps = a.neighbors(u).iter().copied();
+                self.extend_with(at, start, steps.zip(a.edge_ids(u).iter().copied()))
+            }
+            Direction::Any => {
+                let (out, inc) = (topology.out(), topology.incoming());
+                let steps = Undirected {
+                    forward: (out.neighbors(u), out.edge_ids(u)),
+                    backward: (inc.neighbors(u), inc.edge_ids(u)),
+                    u,
+                    i: 0,
+                    j: 0,
+                };
+                self.extend_with(at, start, steps)
+            }
+        }
+    }
+
+    /// [`Self::extend`] over the edges `steps` (next node, edge row), in
+    /// edge-row order.
+    #[inline(always)]
+    fn extend_with(
+        &mut self,
+        at: u32,
+        start: u32,
+        steps: impl Iterator<Item = (u32, u32)>,
+    ) -> Result<()> {
+        let plan = self.plan;
+        let search = plan.search;
+        let min = search.quantifier.min;
+        let len = self.entries[at as usize].len + 1;
+        let c = len.min(min) as usize;
+        let slots = plan.goals.filter(|_| plan.pruned).map(|g| &g.slots);
+        let cap = plan.cap.filter(|_| !plan.bounded);
+        for (w, edge) in steps {
+            if plan.restricted && !allowed(&self.entries, at, w, edge, search.mode, start) {
                 continue;
             }
-            let len = entry.len + 1;
-            if self.pruned {
-                let state = self.states.get(w, len.min(min));
-                let accept = match self.search.selector {
-                    Selector::All => true,
-                    Selector::Shortest(k) => state.0 < k,
-                    Selector::AllShortest => state.0 == 0 || state.1 == len,
-                };
-                if !accept {
-                    continue;
-                }
-                if state.0 == 0 {
-                    state.1 = len;
-                }
-                state.0 += 1;
+            // The cheap test first: most edges reach a state already full.
+            if plan.pruned
+                && !self
+                    .states
+                    .accept(w as usize * plan.width + c, len, search.selector)
+            {
+                continue;
             }
             self.entries.push(Entry {
                 node: w,
@@ -811,34 +1059,229 @@ impl Walker<'_> {
                 edge,
                 len,
             });
-            // A pruned search lists this prefix: a target may have its paths.
-            let listed = len >= min && !(self.search.mode == Mode::Acyclic && w == start);
-            if let (true, true, Some(&slot)) =
-                (self.pruned, listed, self.slots.and_then(|s| s.get(&w)))
-            {
-                let reach = &mut self.reach;
-                let pushed = &mut reach.pushed[slot as usize];
-                if *pushed == 0 {
-                    reach.touched.push(slot);
-                    reach.longest = reach.longest.max(len);
-                }
-                *pushed += 1;
-                let filled = match self.search.selector {
-                    Selector::All => false,
-                    Selector::Shortest(k) => *pushed == k,
-                    Selector::AllShortest => *pushed == 1,
-                };
-                if filled {
-                    reach.unfilled -= 1;
+            if let Some(slots) = slots {
+                // A pruned search lists this prefix: a target may have its paths.
+                let listed = len >= min && !(search.mode == Mode::Acyclic && w == start);
+                if let (true, Some(&slot)) = (listed, slots.get(&w)) {
+                    let reach = &mut self.reach;
+                    let pushed = &mut reach.pushed[slot as usize];
+                    if *pushed == 0 {
+                        reach.touched.push(slot);
+                        reach.longest = reach.longest.max(len);
+                    }
+                    *pushed += 1;
+                    let filled = match search.selector {
+                        Selector::All => false,
+                        Selector::Shortest(k) => *pushed == k,
+                        Selector::AllShortest => *pushed == 1,
+                    };
+                    if filled {
+                        reach.unfilled -= 1;
+                    }
                 }
             }
-            if let (false, Some(cap)) = (self.bounded, self.cap) {
-                if self.entries.len() + self.total > cap {
-                    return Err(too_many_paths(cap, self.search, false));
+            if let Some(cap) = cap {
+                let held = self.entries.len() + self.kept;
+                self.found.peak = Some(self.found.peak.map_or(held, |p| p.max(held)));
+                if held + self.before > cap {
+                    return Err(too_many_paths(cap, search, false));
                 }
             }
         }
         Ok(())
+    }
+
+    /// Add the paths kept and not yet shared to [`Plan::kept_all`]; an error
+    /// once every start's together are over the limit.
+    fn share_kept(&mut self) -> Result<()> {
+        let plan = self.plan;
+        let Some(limit) = plan.kept_limit else {
+            return Ok(());
+        };
+        let all = plan.kept_all.fetch_add(self.unshared, Ordering::Relaxed) + self.unshared;
+        self.unshared = 0;
+        if all > limit {
+            return Err(too_many_paths(limit, plan.search, true));
+        }
+        Ok(())
+    }
+
+    /// The paths from the start at `row`, given that the starts before it
+    /// kept `before` paths (or at least that many).
+    fn search(&mut self, row: usize, before: usize) -> Result<Found> {
+        let plan = self.plan;
+        let search = plan.search;
+        let min = search.quantifier.min;
+        let max = search.quantifier.max;
+        let mut found = std::mem::take(&mut self.found);
+        found.row = row as u32;
+        found.ends.clear();
+        found.lengths.clear();
+        found.vertices.clear();
+        found.edges.clear();
+        found.expanded = 0;
+        found.kept = 0;
+        found.peak = None;
+        self.found = found;
+        if plan.starts.is_null(row) {
+            return Ok(std::mem::take(&mut self.found));
+        }
+        let vertices = plan.columns.vertices || plan.columns.elements;
+        let edges = plan.columns.edges || plan.columns.elements;
+        let offset = plan.starts.len() as u32;
+        let Some(start) = plan.dense[row] else {
+            // A node with no edges: only the path of no edges.
+            let ends_at_a_target = match plan.goals {
+                None => true,
+                Some(g) => g
+                    .unknown
+                    .contains(&ScalarValue::try_from_array(plan.starts.as_ref(), row)?),
+            };
+            if min == 0 && !plan.known_only && ends_at_a_target {
+                let f = &mut self.found;
+                f.ends.push(row as u32);
+                f.lengths.push(0);
+                if vertices {
+                    f.vertices.push(row as u32);
+                }
+            }
+            return Ok(std::mem::take(&mut self.found));
+        };
+        if plan.goals.is_some_and(|g| g.slots.is_empty()) {
+            return Ok(std::mem::take(&mut self.found)); // no target is a node: no path ends at one
+        }
+        self.kept = 0;
+        self.unshared = 0;
+        self.before = before;
+        for slot in self.touched.drain(..) {
+            self.slot_paths[slot as usize] = (0, 0);
+        }
+        self.reach.reset(self.slot_paths.len());
+        // Targets not yet done, and (ALL SHORTEST) the length past which
+        // none has another path once every one is found.
+        let mut remaining = self.slot_paths.len();
+        let mut longest = 0u32;
+        let mut stop_after: Option<u32> = None;
+        self.states.clear();
+        self.targets.clear();
+        self.entries.clear();
+        self.entries.push(Entry {
+            node: start,
+            parent: ROOT,
+            edge: 0,
+            len: 0,
+        });
+        self.states.start(start as usize * plan.width);
+        let mut head = 0;
+        'search: while head < self.entries.len() {
+            if head % 1024 == 1023 && plan.stop.load(Ordering::Relaxed) {
+                return Err(DataFusionError::Execution("stopped".into()));
+            }
+            let at = head as u32;
+            let entry = self.entries[head];
+            head += 1;
+            if stop_after.is_some_and(|len| entry.len > len) {
+                break;
+            }
+            let c = entry.len.min(min);
+            // The target slot of the entry's node, when the search has targets;
+            // with targets, a node that is none of them ends no path.
+            //
+            // Two plain values rather than one `Option<Option<u32>>`: rustc
+            // 1.97 at `opt-level` "s" and "z" (the browser engine's build)
+            // matched `Some(Some(_))` on a `None` here, and indexed out of
+            // bounds. The browser parity test runs GRAPH_TABLE at "z".
+            let (slot, ends_here) = match plan.goals {
+                None => (None, true),
+                Some(g) => {
+                    let slot = g.slots.get(&entry.node).copied();
+                    (slot, slot.is_some())
+                }
+            };
+            if c == min && ends_here {
+                let keep = if plan.pruned {
+                    true
+                } else {
+                    let t = self.targets.entry(entry.node).or_insert((0, entry.len));
+                    let keep = match search.selector {
+                        Selector::All => true,
+                        Selector::Shortest(k) => t.0 < k,
+                        Selector::AllShortest => t.1 == entry.len,
+                    };
+                    if keep {
+                        t.0 += 1;
+                    }
+                    keep
+                };
+                // ACYCLIC: a path back to its start is a cycle.
+                let closed = search.mode == Mode::Acyclic && entry.len > 0 && entry.node == start;
+                if keep && !closed {
+                    self.nodes.clear();
+                    self.edges.clear();
+                    let mut i = at;
+                    while i != ROOT {
+                        let e = self.entries[i as usize];
+                        self.nodes.push(offset + e.node);
+                        if e.parent != ROOT {
+                            self.edges.push(e.edge);
+                        }
+                        i = e.parent;
+                    }
+                    let f = &mut self.found;
+                    f.ends.push(offset + entry.node);
+                    f.lengths.push(i64::from(entry.len));
+                    if vertices {
+                        f.vertices.extend(self.nodes.iter().rev());
+                    }
+                    if edges {
+                        let edge_row = plan.edge_row;
+                        f.edges
+                            .extend(self.edges.iter().rev().map(|&e| edge_row(e) as i64));
+                    }
+                    f.kept += 1;
+                    self.kept += 1;
+                    self.unshared += 1;
+                    if self.unshared == KEPT_BATCH {
+                        self.share_kept()?;
+                    }
+                    if let Some(slot) = slot {
+                        let f = &mut self.slot_paths[slot as usize];
+                        if f.0 == 0 {
+                            self.touched.push(slot);
+                            f.1 = entry.len;
+                        }
+                        f.0 += 1;
+                        let done = match search.selector {
+                            Selector::All => false,
+                            Selector::Shortest(k) => f.0 == k,
+                            Selector::AllShortest => f.0 == 1,
+                        };
+                        if done {
+                            remaining -= 1;
+                            longest = longest.max(f.1);
+                            if remaining == 0 {
+                                match search.selector {
+                                    Selector::AllShortest => stop_after = Some(longest),
+                                    _ => break 'search,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if max.is_some_and(|max| entry.len >= max) {
+                continue;
+            }
+            if plan.pruned
+                && plan.goals.is_some()
+                && !self.reach.extends(entry.len, search.selector)
+            {
+                continue; // every target has its paths among those pushed
+            }
+            self.extend(at, start)?;
+        }
+        self.share_kept()?;
+        Ok(std::mem::take(&mut self.found))
     }
 }
 
@@ -870,6 +1313,32 @@ fn too_many_paths(limit: usize, search: &Search, bounded: bool) -> DataFusionErr
     ))
 }
 
+/// The paths kept by the starts committed so far, and the prefixes they
+/// extended.
+#[derive(Default)]
+struct Tally {
+    kept: usize,
+    expanded: usize,
+}
+
+impl Tally {
+    /// Append one start's paths, the next in start order, after checking
+    /// the limit as a search from one start after another would have:
+    /// `found` was searched knowing only that the starts before it kept at
+    /// least as many paths as they did.
+    fn commit(&mut self, plan: &Plan, rows: &mut Rows, found: &Found) -> Result<()> {
+        if let (Some(cap), Some(peak)) = (plan.cap.filter(|_| !plan.bounded), found.peak) {
+            if peak + self.kept > cap {
+                return Err(too_many_paths(cap, plan.search, false));
+            }
+        }
+        rows.append(found)?;
+        self.kept += found.kept;
+        self.expanded += found.expanded;
+        Ok(())
+    }
+}
+
 /// Run `search` from each of `starts` (keys of the graph's id type, each
 /// once) on the index `topology`/`ids`; the rows of [`schema`], and how many
 /// path prefixes the search extended. `edge_row` gives the edge table's row
@@ -879,11 +1348,15 @@ fn too_many_paths(limit: usize, search: &Search, bounded: bool) -> DataFusionErr
 /// With `known_only`, a start that is no node of the index has no path.
 /// `max_paths` is `ursa.max_paths` (`None` for no limit; see the module
 /// docs).
+///
+/// Many start nodes are searched in parallel, each by a walker of its own,
+/// and their rows appended in start order: the rows, their order and when
+/// the limit stops the search are those of one start after another.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     topology: &Topology,
     ids: &IdMap,
-    edge_row: &dyn Fn(u32) -> u64,
+    edge_row: &(dyn Fn(u32) -> u64 + Sync),
     search: &Search,
     starts: &ArrayRef,
     targets: Option<&ArrayRef>,
@@ -896,8 +1369,8 @@ pub fn run(
         .dense_from_array(starts.as_ref())
         .map_err(|e| DataFusionError::Execution(format!("in GRAPH_TABLE: {e}")))?;
     let goals = targets.map(|t| Goals::new(ids, t)).transpose()?;
-    let mut rows = Rows::new(ids, starts, columns, schema, edge_row)?;
-    let Quantifier { min, max } = search.quantifier;
+    let mut rows = Rows::new(ids, starts, columns, schema);
+    let Quantifier { min, .. } = search.quantifier;
     let restricted = search.mode != Mode::Walk;
     let pruned = !restricted
         || (matches!(
@@ -914,162 +1387,196 @@ pub fn run(
         }
         _ => None,
     };
-    let mut walker = Walker {
+    if search.direction != Direction::Right && dense.iter().any(Option::is_some) {
+        // Built here, outside the walkers, if it is not yet.
+        topology.incoming();
+    }
+    let n_nodes = topology.n_nodes();
+    let width = min as usize + 1;
+    let plan = Plan {
         topology,
+        edge_row,
         search,
+        starts,
+        dense: &dense,
+        goals: goals.as_ref(),
+        known_only,
+        columns,
         restricted,
         pruned,
-        states: States::new(topology.n_nodes(), min),
-        entries: Vec::new(),
-        next: Vec::new(),
-        total: 0,
-        cap: max_paths,
+        width,
         bounded,
-        expanded: 0,
-        slots: goals.as_ref().map(|g| &g.slots),
-        reach: Reach::default(),
+        cap: max_paths,
+        kept_limit,
+        kept_all: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
     };
-    // Per last node, for a search that lists every path: (paths kept, length of the first).
-    let mut targets: HashMap<u32, (u32, u32)> = HashMap::new();
-    // Per target slot, for this start: (paths kept, length of the first).
-    let mut found: Vec<(u32, u32)> = vec![(0, 0); goals.as_ref().map_or(0, |g| g.slots.len())];
-    let mut touched: Vec<u32> = Vec::new();
-    let (mut nodes, mut edges) = (Vec::new(), Vec::new());
-    for (row, start) in dense.iter().enumerate() {
-        if starts.is_null(row) {
-            continue;
-        }
-        let Some(start) = *start else {
-            // A node with no edges: only the path of no edges.
-            let ends_at_a_target = match &goals {
-                None => true,
-                Some(g) => g
-                    .unknown
-                    .contains(&ScalarValue::try_from_array(starts.as_ref(), row)?),
-            };
-            if min == 0 && !known_only && ends_at_a_target {
-                rows.push(row as u32, &[row as u32], &[])?;
-            }
-            continue;
+    let states = n_nodes * width;
+    let table = Table::choose(pruned, search.selector, n_nodes, width);
+    let walkers = walkers(&plan, table.bytes(states));
+    let mut tally = Tally::default();
+    match table {
+        Table::None => drive(&plan, &mut rows, &mut tally, walkers, || NoStates)?,
+        Table::Bits => drive(&plan, &mut rows, &mut tally, walkers, || Bits {
+            words: vec![0; states.div_ceil(64)],
+            touched: Vec::new(),
+        })?,
+        Table::Pairs => drive(&plan, &mut rows, &mut tally, walkers, || Pairs {
+            seen: vec![(0, 0); states],
+            touched: Vec::new(),
+        })?,
+        Table::Sparse => drive(&plan, &mut rows, &mut tally, walkers, || {
+            Sparse(FxHashMap::default())
+        })?,
+    }
+    rows.flush()?;
+    Ok((rows.batches, tally.expanded))
+}
+
+/// How many walkers search from the starts at once: one per thread, one per
+/// start at most, and as many as their state tables fit in
+/// [`PARALLEL_STATES_BYTES`] (one for a sparse table, whose size is not
+/// known).
+fn walkers(plan: &Plan, table_bytes: Option<usize>) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (plan, table_bytes);
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let starts = plan.dense.iter().filter(|d| d.is_some()).count();
+        let fit = match table_bytes {
+            Some(0) => usize::MAX,
+            Some(b) => (PARALLEL_STATES_BYTES / b).max(1),
+            None => 1,
         };
-        let row = row as u32;
-        if goals.as_ref().is_some_and(|g| g.slots.is_empty()) {
-            continue; // no target is a node: no path ends at one
-        }
-        for slot in touched.drain(..) {
-            found[slot as usize] = (0, 0);
-        }
-        walker.reach.reset(found.len());
-        // Targets not yet done, and (ALL SHORTEST) the length past which
-        // none has another path once every one is found.
-        let mut remaining = found.len();
-        let mut longest = 0u32;
-        let mut stop_after: Option<u32> = None;
-        walker.states.clear();
-        targets.clear();
-        walker.entries.clear();
-        walker.entries.push(Entry {
-            node: start,
-            parent: ROOT,
-            edge: 0,
-            len: 0,
-        });
-        *walker.states.get(start, 0) = (1, 0);
-        let mut head = 0;
-        'search: while head < walker.entries.len() {
-            let at = head as u32;
-            let entry = walker.entries[head];
-            head += 1;
-            if stop_after.is_some_and(|len| entry.len > len) {
-                break;
-            }
-            let c = entry.len.min(min);
-            // The target slot of the entry's node, when the search has targets;
-            // with targets, a node that is none of them ends no path.
-            //
-            // Two plain values rather than one `Option<Option<u32>>`: rustc
-            // 1.97 at `opt-level` "s" and "z" (the browser engine's build)
-            // matched `Some(Some(_))` on a `None` here, and indexed `found`
-            // out of bounds. The browser parity test runs GRAPH_TABLE at "z".
-            let (slot, ends_here) = match &goals {
-                None => (None, true),
-                Some(g) => {
-                    let slot = g.slots.get(&entry.node).copied();
-                    (slot, slot.is_some())
-                }
-            };
-            if c == min && ends_here {
-                let keep = if pruned {
-                    true
-                } else {
-                    let t = targets.entry(entry.node).or_insert((0, entry.len));
-                    let keep = match search.selector {
-                        Selector::All => true,
-                        Selector::Shortest(k) => t.0 < k,
-                        Selector::AllShortest => t.1 == entry.len,
+        rayon::current_num_threads().min(starts).min(fit).max(1)
+    }
+}
+
+/// Search from every start, with `walkers` walkers, each with the state
+/// table `states` makes, and append the paths to `rows` in start order.
+fn drive<T: States>(
+    plan: &Plan,
+    rows: &mut Rows,
+    tally: &mut Tally,
+    walkers: usize,
+    states: impl Fn() -> T + Sync,
+) -> Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if walkers > 1 {
+        return drive_parallel(plan, rows, tally, walkers, states);
+    }
+    let _ = walkers;
+    let mut walker = Walker::new(plan, states());
+    for row in 0..plan.dense.len() {
+        let found = walker.search(row, tally.kept)?;
+        tally.commit(plan, rows, &found)?;
+        walker.found = found; // its buffers, for the next start
+    }
+    Ok(())
+}
+
+/// [`drive`] on rayon's threads. Each walker takes the next start, searches
+/// it, and leaves its paths for the start-order commit; whoever finishes the
+/// start next in order commits it and any after it that are done. A walker
+/// runs at most `4 × walkers` starts ahead of the commit, so a slow start
+/// holds back only that many finished ones.
+///
+/// A walker searches a start knowing the paths kept by the starts committed
+/// when it took it, at most as many as the starts before it kept. So when
+/// it reaches the limit, one start after another would have reached it too,
+/// by then or before, with the same error; and the commit checks each start
+/// against the exact count before it, as one after another would.
+#[cfg(not(target_arch = "wasm32"))]
+fn drive_parallel<T: States>(
+    plan: &Plan,
+    rows: &mut Rows,
+    tally: &mut Tally,
+    walkers: usize,
+    states: impl Fn() -> T + Sync,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    struct Shared<'r, 'a> {
+        rows: &'r mut Rows<'a>,
+        tally: &'r mut Tally,
+        /// The next start to take, and the next to commit.
+        next: usize,
+        commit: usize,
+        done: BTreeMap<usize, Found>,
+        error: Option<DataFusionError>,
+    }
+    let n = plan.dense.len();
+    let window = 4 * walkers;
+    let shared = Mutex::new(Shared {
+        rows,
+        tally,
+        next: 0,
+        commit: 0,
+        done: BTreeMap::new(),
+        error: None,
+    });
+    let moved = Condvar::new();
+    let lock = || shared.lock().unwrap_or_else(PoisonError::into_inner);
+    rayon::scope(|scope| {
+        for _ in 0..walkers {
+            scope.spawn(|_| {
+                let mut walker = Walker::new(plan, states());
+                loop {
+                    let (row, before) = {
+                        let mut s = lock();
+                        loop {
+                            if s.error.is_some() || s.next == n {
+                                return;
+                            }
+                            if s.next < s.commit + window {
+                                break;
+                            }
+                            s = moved.wait(s).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        s.next += 1;
+                        (s.next - 1, s.tally.kept)
                     };
-                    if keep {
-                        t.0 += 1;
-                    }
-                    keep
-                };
-                // ACYCLIC: a path back to its start is a cycle.
-                let closed = search.mode == Mode::Acyclic && entry.len > 0 && entry.node == start;
-                if keep && !closed {
-                    nodes.clear();
-                    edges.clear();
-                    let mut i = at;
-                    while i != ROOT {
-                        let e = walker.entries[i as usize];
-                        nodes.push(rows.dense(e.node));
-                        if e.parent != ROOT {
-                            edges.push(e.edge);
+                    let found = walker.search(row, before);
+                    let mut s = lock();
+                    match found {
+                        Err(e) => {
+                            if s.error.is_none() && !plan.stop.load(Ordering::Relaxed) {
+                                s.error = Some(e);
+                            }
+                            plan.stop.store(true, Ordering::Relaxed);
                         }
-                        i = e.parent;
-                    }
-                    nodes.reverse();
-                    edges.reverse();
-                    rows.push(row, &nodes, &edges)?;
-                    walker.total += 1;
-                    if let Some(limit) = kept_limit.filter(|&l| walker.total > l) {
-                        return Err(too_many_paths(limit, search, true));
-                    }
-                    if let Some(slot) = slot {
-                        let f = &mut found[slot as usize];
-                        if f.0 == 0 {
-                            touched.push(slot);
-                            f.1 = entry.len;
-                        }
-                        f.0 += 1;
-                        let done = match search.selector {
-                            Selector::All => false,
-                            Selector::Shortest(k) => f.0 == k,
-                            Selector::AllShortest => f.0 == 1,
-                        };
-                        if done {
-                            remaining -= 1;
-                            longest = longest.max(f.1);
-                            if remaining == 0 {
-                                match search.selector {
-                                    Selector::AllShortest => stop_after = Some(longest),
-                                    _ => break 'search,
+                        Ok(found) => {
+                            s.done.insert(row, found);
+                            let s = &mut *s;
+                            while s.error.is_none() {
+                                let Some(found) = s.done.remove(&s.commit) else {
+                                    break;
+                                };
+                                match s.tally.commit(plan, s.rows, &found) {
+                                    Ok(()) => s.commit += 1,
+                                    Err(e) => {
+                                        s.error = Some(e);
+                                        plan.stop.store(true, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
                     }
+                    drop(s);
+                    moved.notify_all();
                 }
-            }
-            if max.is_some_and(|max| entry.len >= max) {
-                continue;
-            }
-            if pruned && goals.is_some() && !walker.reach.extends(entry.len, search.selector) {
-                continue; // every target has its paths among those pushed
-            }
-            walker.extend(at, start)?;
+            });
         }
+    });
+    let shared = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
+    match shared.error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    rows.flush()?;
-    Ok((rows.batches, walker.expanded))
 }
 
 #[cfg(test)]
@@ -1494,6 +2001,51 @@ mod tests {
                 }
                 hash.int(expanded as i64);
                 n
+            }
+        }
+    }
+
+    /// The three state tables keep the same prefixes: the map, used past
+    /// the dense tables' memory budget, which no graph in these tests
+    /// reaches, and the bits of `ANY SHORTEST`, against the table.
+    #[test]
+    fn state_tables_agree() {
+        let mut st = 5u64;
+        for selector in [
+            Selector::All,
+            Selector::Shortest(1),
+            Selector::Shortest(3),
+            Selector::AllShortest,
+        ] {
+            let n = 300;
+            let mut pairs = Pairs {
+                seen: vec![(0, 0); n],
+                touched: Vec::new(),
+            };
+            let mut sparse = Sparse(FxHashMap::default());
+            let mut bits = Bits {
+                words: vec![0; n.div_ceil(64)],
+                touched: Vec::new(),
+            };
+            for round in 0..20 {
+                pairs.clear();
+                sparse.clear();
+                bits.clear();
+                let first = (mix(&mut st) % n as u64) as usize;
+                pairs.start(first);
+                sparse.start(first);
+                bits.start(first);
+                // Rounds that reach a few states, and rounds that reach most.
+                let steps = if round % 2 == 0 { 40 } else { 3000 };
+                for _ in 0..steps {
+                    let i = (mix(&mut st) % n as u64) as usize;
+                    let len = 1 + (mix(&mut st) % 4) as u32;
+                    let kept = pairs.accept(i, len, selector);
+                    assert_eq!(sparse.accept(i, len, selector), kept, "{selector:?}");
+                    if selector == Selector::Shortest(1) {
+                        assert_eq!(bits.accept(i, len, selector), kept);
+                    }
+                }
             }
         }
     }
