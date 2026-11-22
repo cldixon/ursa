@@ -13,6 +13,12 @@
 //! checked once per table (by path, size and modification time), so a scan
 //! after the schema was inferred costs no more reads.
 //!
+//! DataFusion's listing drops a 0-byte file before the format sees it (the
+//! `size > 0` filters in `ListingOptions::infer_schema` and
+//! `pruned_partition_list`), so an empty Parquet file would read as no rows.
+//! [`check_listed_files`] lists a table's locations as its scan will and
+//! makes an empty Parquet file the same error, as DuckDB and PyArrow do.
+//!
 //! [`ValidParquetFactory`] is the session's `parquet` format factory wrapped
 //! the same way, so `FROM 'x.parquet'`, `read_parquet`, `CREATE EXTERNAL TABLE
 //! … STORED AS PARQUET` and graphs over them all get the check.
@@ -26,12 +32,14 @@ use datafusion::common::{GetExt, Statistics};
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
 use datafusion::datasource::file_format::{FileFormat, FileFormatFactory, FileMeta};
+use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::physical_plan::{FileScanConfig, FileSinkConfig, FileSource};
 use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::ExecutionPlan;
+use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore};
 use std::collections::HashMap;
 
@@ -48,6 +56,9 @@ const SMALLEST: u64 = 4 + FOOTER;
 /// Why `head` (the file's first 4 bytes) and `tail` (its last 8) are not the
 /// ends of a Parquet file of `size` bytes, if they are not.
 fn footer_problem(size: u64, head: &[u8], tail: &[u8]) -> Option<String> {
+    if size == 0 {
+        return Some("the file is empty (0 bytes)".into());
+    }
     if size < SMALLEST {
         return Some(format!(
             "it is {size} byte{}, and a Parquet file is at least {SMALLEST}",
@@ -104,6 +115,31 @@ pub async fn check_parquet_file(store: &dyn ObjectStore, object: &ObjectMeta) ->
             shown(store, &object.location)
         ))),
     }
+}
+
+/// An error naming the first empty file `table` lists, if `table` reads
+/// Parquet through [`ValidParquet`]. DataFusion's listing skips a 0-byte file
+/// before the format is given it (see the module docs), so the files are
+/// listed here as the table's scan lists them: its locations (a file, a glob
+/// or a directory), filtered by its file extension. Check a table when it is
+/// created; a file that becomes empty later is still skipped by its scans.
+pub async fn check_listed_files(state: &dyn Session, table: &ListingTable) -> Result<()> {
+    let options = table.options();
+    if options.format.downcast_ref::<ValidParquet>().is_none() {
+        return Ok(());
+    }
+    for url in table.table_paths() {
+        let store = state.runtime_env().object_store(url)?;
+        let mut files = url
+            .list_all_files(state, store.as_ref(), &options.file_extension)
+            .await?;
+        while let Some(file) = files.try_next().await? {
+            if file.size == 0 {
+                check_parquet_file(store.as_ref(), &file).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A Parquet file format that checks each file's footer before `inner` reads
@@ -305,7 +341,9 @@ mod tests {
     #[test]
     fn footers_that_do_not_fit_the_file_are_problems() {
         // Too small to hold the two magic numbers and a length.
-        for size in [0, 4, 8, 11] {
+        let why = footer_problem(0, &[], &[]).unwrap();
+        assert_eq!(why, "the file is empty (0 bytes)");
+        for size in [4, 8, 11] {
             let why = footer_problem(size, &[], &[]).unwrap();
             assert!(why.contains("at least 12"), "{why}");
         }

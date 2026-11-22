@@ -337,7 +337,8 @@ async fn open_path(path: &str, source: ScanSource<'_>) -> Result<DataFrame> {
 /// ([`CheckedBounds`], #202): DataFusion (54 and 55) would otherwise read a column whose
 /// known values are all equal as that constant, the rows of a row group without
 /// bounds (all NaN, a long string) included. Each file's footer is checked
-/// before it is read ([`ValidParquet`], #332). The table is built as
+/// before it is read ([`ValidParquet`], #332), and an empty file is an error
+/// ([`check_listed_files`](crate::parquet_footer::check_listed_files)). The table is built as
 /// `read_parquet` builds it, sharing the runtime's file statistics cache.
 async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
     let table_path = ListingTableUrl::parse(path)?;
@@ -359,6 +360,9 @@ async fn read_parquet(ctx: &SessionContext, path: &str) -> Result<DataFrame> {
         .await?;
     let provider = ListingTable::try_new(config)?
         .with_cache(ctx.runtime_env().cache_manager.get_file_statistic_cache());
+    // An empty file is an error, not zero rows: DataFusion's listing would
+    // skip it before the footer check sees it.
+    crate::parquet_footer::check_listed_files(&ctx.state(), &provider).await?;
     ctx.read_table(Arc::new(provider))
 }
 
@@ -1495,6 +1499,39 @@ mod tests {
         }
         assert_eq!(built[0], built[1]);
         assert_eq!(built[0], built[2]);
+    }
+
+    #[test]
+    fn an_empty_parquet_file_is_an_error_naming_it() {
+        // DataFusion's listing skips a 0-byte file; a scan names it instead, as
+        // DuckDB and PyArrow do, whether it is named or found by a glob.
+        let root = std::env::temp_dir().join(format!("ursa_scan_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let good = root.join("a.parquet");
+        write_multi_row_group_parquet(&good, 10);
+        let shown = |p: &std::path::Path| p.to_str().unwrap().to_string();
+        let glob = shown(&root.join("*.parquet"));
+        assert_eq!(
+            scan_edges_batch(one(&glob), "from", "to", &[])
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>(),
+            10
+        );
+        let empty = root.join("b.parquet");
+        std::fs::write(&empty, b"").unwrap();
+        let expected = format!(
+            "cannot read '{}': it is not a valid Parquet file: the file is empty (0 bytes)",
+            shown(&empty)
+        );
+        for path in [shown(&empty), glob] {
+            let e = scan_edges_batch(one(&path), "from", "to", &[]).unwrap_err();
+            assert!(e.to_string().contains(&expected), "{path}: {e}");
+        }
+        assert!(scan_edges_batch(one(&shown(&good)), "from", "to", &[]).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

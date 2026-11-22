@@ -1840,6 +1840,46 @@ fn a_file_that_cannot_be_read_is_named_once() {
     );
 }
 
+/// An empty Parquet file is an error naming it, as in DuckDB, not zero rows:
+/// named, in a glob or in a directory, however it is read.
+#[test]
+fn an_empty_parquet_file_is_an_error_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let good = dir.join("a.parquet").display().to_string();
+    ursa(&["-c", &format!("COPY (SELECT 1 AS a, 2 AS b) TO '{good}';")]);
+    std::fs::write(dir.join("b.parquet"), b"").unwrap();
+    let empty = dir.join("b.parquet").display().to_string();
+    let glob = dir.join("*.parquet").display().to_string();
+    let directory = format!("{}/", dir.display());
+    for sql in [
+        format!("SELECT * FROM '{empty}';"),
+        format!("SELECT * FROM read_parquet('{empty}');"),
+        format!("SELECT * FROM '{glob}';"),
+        format!("SELECT * FROM read_parquet('{glob}');"),
+        format!("SELECT * FROM read_parquet(['{good}', '{empty}']);"),
+        format!("SELECT * FROM '{directory}';"),
+        format!("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION '{directory}';"),
+        format!(
+            "CREATE PROPERTY GRAPH g EDGE TABLES ('{glob}' SOURCE KEY (a) DESTINATION KEY (b));"
+        ),
+    ] {
+        let message = err(ursa(&["-c", &sql]));
+        assert!(
+            message.contains(&format!(
+                "cannot read '{empty}': it is not a valid Parquet file: the file is empty (0 \
+                 bytes)"
+            )),
+            "{sql}: {message}"
+        );
+    }
+    let out = ursa(&[
+        "-c",
+        &format!("SELECT count(*) FROM read_parquet('{good}');"),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+}
+
 /// #332: a truncated or fake Parquet file is an error naming it, however it
 /// is read, never a panic (the parquet crate subtracted with overflow on a
 /// footer that claims more metadata than the file holds).
