@@ -5,14 +5,12 @@
 //! frame into a texture. `web` is one such binding; a native window or a
 //! notebook widget would be others.
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
-
-use ursa_core::algo::Fa2Params;
+use ursa_core::algo::{fa2_seed_positions, Fa2Params};
 
 use crate::highlight::{flag, BadHighlight, HighlightState, MIN_FRONT_RADIUS};
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op};
+use crate::pace::{ready, yield_now, Pace};
 use crate::render::{node_radius_scale, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Theme};
 
@@ -66,6 +64,16 @@ struct Fitted {
     before: Vec<(usize, Bounds)>,
 }
 
+/// What a new view draws.
+enum Scene {
+    Graph(Graph),
+    Result(Box<GraphResult>),
+}
+
+/// How many edges go to the GPU at a time when a view is made: half a
+/// megabyte of indexes.
+const EDGE_RUN: usize = 1 << 16;
+
 /// What [`View::apply`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
@@ -81,47 +89,49 @@ pub struct Applied {
 impl View {
     /// A view of `graph` drawn into `format` textures of `width` x `height`
     /// pixels. Nodes are sized by degree until [`View::set_style`].
+    ///
+    /// Making a view costs an upload, not a graph build: the degrees are
+    /// counted from the edge list and the nodes start where a layout would
+    /// seed them, so no adjacency and no layout is made until
+    /// [`View::step`] asks for one (a view whose layout runs elsewhere
+    /// never does), and the edges go to the GPU a run at a time, never
+    /// held a second time as a list of indexes.
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         graph: Graph,
         width: u32,
         height: u32,
     ) -> Self {
-        // The seeded positions, as the layout starts from them.
-        let start = LiveLayout::new(&graph, Fa2Params::default());
-        let (x, y) = (start.positions().0.to_vec(), start.positions().1.to_vec());
-        drop(start);
-        let style = NodeStyle::by_degree(&graph.degrees());
-        let renderer = Renderer::new(device, format, &x, &y, &style, &graph.line_indices());
-        let highlight = HighlightState::new(graph.n_nodes());
-        let mut view = Self {
-            graph,
-            layout: None,
-            x,
-            y,
-            style,
-            theme: Theme::light(),
-            categories: None,
-            highlight,
-            front: Vec::new(),
-            camera: Camera::new(width as f32, height as f32),
-            renderer,
-            follow: true,
-            fitted_zoom: 1.0,
-            draw_nodes: true,
-            live: None,
-            layout_stale: false,
-            fitted: None,
-        };
-        view.fit();
-        view
+        let scene = Scene::Graph(graph);
+        let mut pace = Pace::never();
+        ready(Self::make(
+            device, queue, format, scene, width, height, &mut pace,
+        ))
+    }
+
+    /// [`View::new`], giving the event loop a turn between its pieces
+    /// ([`Pace::yielding`]): what a page calls, so that making the view
+    /// never holds its thread for long.
+    pub async fn new_paced(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        graph: Graph,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let scene = Scene::Graph(graph);
+        let mut pace = Pace::yielding();
+        Self::make(device, queue, format, scene, width, height, &mut pace).await
     }
 
     /// A view of `result`: its nodes where it puts them (or where a layout
     /// would start them), sized and coloured by its encodings (by degree,
     /// without), its paths and seeds highlighted and its removed nodes
-    /// hidden. [`View::apply`] then changes it in place.
+    /// hidden. [`View::apply`] then changes it in place. Like
+    /// [`View::new`], it builds no adjacency and no layout.
     pub fn from_result(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -130,8 +140,64 @@ impl View {
         width: u32,
         height: u32,
     ) -> Self {
+        let scene = Scene::Result(Box::new(result));
+        let mut pace = Pace::never();
+        ready(Self::make(
+            device, queue, format, scene, width, height, &mut pace,
+        ))
+    }
+
+    /// [`View::from_result`], giving the event loop a turn between its
+    /// pieces, as [`View::new_paced`] does.
+    pub async fn from_result_paced(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        result: GraphResult,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let scene = Scene::Result(Box::new(result));
+        let mut pace = Pace::yielding();
+        Self::make(device, queue, format, scene, width, height, &mut pace).await
+    }
+
+    async fn make(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        scene: Scene,
+        width: u32,
+        height: u32,
+        pace: &mut Pace,
+    ) -> Self {
         let theme = Theme::light();
-        let (live, drawn) = LiveResult::new(result, &theme);
+        pace.breathe().await;
+        let (live, drawn) = match scene {
+            Scene::Graph(graph) => {
+                // The degrees, from the edge list.
+                let style = NodeStyle::by_degree(&graph.degrees());
+                pace.breathe().await;
+                // The seeded positions, as a layout starts from them.
+                let (x, y) = fa2_seed_positions(graph.n_nodes(), &Fa2Params::default());
+                let highlight = HighlightState::new(graph.n_nodes());
+                let drawn = Drawn {
+                    graph,
+                    x,
+                    y,
+                    style,
+                    categories: None,
+                    highlight,
+                };
+                (None, drawn)
+            }
+            Scene::Result(mut result) => {
+                let graph = LiveResult::graph_of(&mut result);
+                pace.breathe().await;
+                let (live, drawn) = LiveResult::with_graph(*result, graph, &theme);
+                (Some(live), drawn)
+            }
+        };
         let Drawn {
             graph,
             x,
@@ -140,15 +206,29 @@ impl View {
             categories,
             highlight,
         } = drawn;
-        let lines = live.line_indices(0..graph.n_edges());
-        let mut renderer = Renderer::new(device, format, &x, &y, &style, &lines);
-        // Room for the first deltas, so that they do not grow the buffers.
-        renderer.reserve(
-            device,
-            queue,
-            starting_capacity(graph.n_nodes()),
-            starting_capacity(graph.n_edges()),
-        );
+        let (n, m) = (graph.n_nodes(), graph.n_edges());
+        // A view that takes deltas has room for the first, so that they do
+        // not grow the buffers.
+        let room = match live {
+            Some(_) => (starting_capacity(n), starting_capacity(m)),
+            None => (n, m),
+        };
+        let renderer = Renderer::new_paced(device, format, &x, &y, &style, m, room, pace).await;
+        // The edges, a run at a time: each is in the GPU's hands, and its
+        // staging freed, before the next is made.
+        let mut start = 0;
+        while start < m {
+            let run = start..m.min(start + EDGE_RUN);
+            let lines = match &live {
+                Some(live) => live.line_indices(run.clone()),
+                None => graph.line_indices(run.clone()),
+            };
+            renderer.write_edges(queue, start, &lines);
+            queue.submit([]);
+            let _ = device.poll(wgpu::PollType::Poll);
+            start = run.end;
+            pace.breathe().await;
+        }
         let mut view = Self {
             graph,
             layout: None,
@@ -164,11 +244,13 @@ impl View {
             follow: true,
             fitted_zoom: 1.0,
             draw_nodes: true,
-            live: Some(live),
+            live,
             layout_stale: false,
             fitted: None,
         };
-        view.upload_flags(device, queue, false);
+        if view.live.is_some() {
+            view.upload_flags(device, queue, false);
+        }
         view.fit();
         view
     }
@@ -787,28 +869,5 @@ impl View {
             self.draw_nodes,
             self.radius_scale(),
         );
-    }
-}
-
-/// Give the event loop a turn: a macrotask in the browser, where GPU
-/// callbacks are delivered; natively, nothing to wait for.
-async fn yield_now() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let promise = js_sys::Promise::new(&mut |resolve, _| {
-            let global = js_sys::global();
-            let set_timeout = js_sys::Reflect::get(&global, &"setTimeout".into())
-                .ok()
-                .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
-            match set_timeout {
-                Some(f) => {
-                    let _ = f.call2(&global, &resolve, &0.into());
-                }
-                None => {
-                    let _ = resolve.call0(&wasm_bindgen::JsValue::UNDEFINED);
-                }
-            }
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 }

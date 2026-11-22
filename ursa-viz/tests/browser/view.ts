@@ -26,6 +26,11 @@
 // frame read back is the first frame, byte for byte. On R-MAT with 1M
 // edges, a delta of 100 nodes and 300 edges uploads at most 64 KB and takes
 // at most 2 ms. ONLY=delta runs these alone (ONLY="delta karate" the first).
+//
+// Then making a view (#426), on WebGL2: at 46K nodes and 1M edges no task
+// on the page's thread is over 60 ms, the page's wasm memory is at most
+// 20 MiB afterwards, and the view has no adjacency until a layout on its
+// own thread steps. ONLY=create runs these alone.
 import { chromium } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -410,6 +415,77 @@ if (HIGHLIGHT_CASES.length) {
     console.log(`highlight on ${backend}: a path, a selection, a pin and a hidden node drawn with ${errors.length} errors`);
     await gpu.close();
   }
+}
+// Making a view (#426), on WebGL2: R-MAT's 1M edges over the 46K nodes
+// they name (the shell's `.graph rmat`). The view builds no adjacency, so
+// making it holds the page's thread for no task over 60 ms and leaves the
+// page's wasm memory at 20 MiB or less; the adjacency is built by the first
+// step() of a layout on the view's own thread, and not before. A view made
+// from a result is held to the same task length.
+const CREATE_CASES = ["create rmat 1M", "create result rmat 1M"].filter((c) => !ONLY || c.startsWith(ONLY));
+if (CREATE_CASES.length) {
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  for (const name of CREATE_CASES) {
+    const fail = (what: string) => failures.push(`${name}: ${what}`);
+    const fromResult = name.includes("result");
+    const runs: any[] = [];
+    // Three runs, each a new page: the longest task is the worst of them.
+    for (let run = 0; run < 3; run++) {
+      const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+      page.on("pageerror", (e) => fail(e.message));
+      page.on("console", (m) => m.type() === "error" && fail(m.text()));
+      // Flat and no iterations: the worker's layout is not what is measured.
+      await page.goto(`${base}?graph=rmat&scale=16&edges=1000000&compact=1&multilevel=0&iterations=0${fromResult ? "&result=1" : ""}`);
+      await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+      const r: any = await page.evaluate(async (last) => {
+        const w = window as any, view = w.view, s = w.stats;
+        w.pauseFrames(true);
+        // The observer's entries arrive after the tasks they report.
+        await new Promise((r) => setTimeout(r, 300));
+        const [from, to] = [s.graphReadyAt, s.graphReadyAt + s.createMs];
+        const tasks = s.longTasks.filter(([start, ms]: number[]) => start + ms > from && start < to).map(([, ms]: number[]) => ms);
+        const out: any = {
+          backend: view.backend, nodes: view.nodeCount, edges: view.edgeCount, createMs: s.createMs,
+          longest: Math.max(0, ...tasks), tasks: tasks.length, wasmBytes: s.createWasmBytes, topology: view.hasTopology,
+        };
+        if (last) {
+          // What a view does without a layout of its own builds nothing.
+          view.setPositions(view.positions());
+          view.render();
+          view.pick(500, 350);
+          out.topologyInUse = view.hasTopology;
+          // A layout on the view's own thread builds it, on its first step.
+          const t = performance.now();
+          view.step(1);
+          out.stepMs = performance.now() - t;
+          out.topologyStepped = view.hasTopology;
+          out.steppedWasmBytes = w.wasm.memory.buffer.byteLength;
+          out.iterations = view.iterations;
+        }
+        return out;
+      }, run === 2).catch((e) => ({ error: String(e) }));
+      if (r.error) fail(r.error);
+      else runs.push(r);
+      await page.close();
+    }
+    if (runs.length < 3) continue;
+    const r = runs[2];
+    const longest = Math.max(...runs.map((x) => x.longest));
+    const wasm = Math.max(...runs.map((x) => x.wasmBytes));
+    const mib = (bytes: number) => `${(bytes / 2 ** 20).toFixed(1)} MiB`;
+    if (r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
+    if (r.edges !== 1_000_000) fail(`${r.edges} edges, not 1,000,000`);
+    if (!(longest <= 60)) fail(`making the view held the page's thread for ${longest} ms in one task; at most 60 ms are allowed`);
+    if (!fromResult && !(wasm <= 20 * 2 ** 20)) fail(`the page's wasm memory is ${mib(wasm)} after making the view; at most 20 MiB are allowed`);
+    if (runs.some((x) => x.topology) || r.topologyInUse) fail("the view built the graph's adjacency without a layout of its own");
+    if (!r.topologyStepped || r.iterations !== 1) fail(`step(1) should build the adjacency and run one iteration (built: ${r.topologyStepped}, iterations: ${r.iterations})`);
+    console.log(
+      `${name}: ${r.backend} · ${r.nodes.toLocaleString()} nodes, ${r.edges.toLocaleString()} edges · the longest task while making the view ${longest} ms ` +
+        `(${runs.map((x) => `${x.longest} ms of ${x.tasks} over 50, ${x.createMs.toFixed(0)} ms in all`).join("; ")}) · wasm memory after ${mib(wasm)} · ` +
+        `no adjacency until step(1): ${r.stepMs.toFixed(0)} ms, then ${mib(r.steppedWasmBytes)}`,
+    );
+  }
+  await gl.close();
 }
 // Scenes that change in place.
 const DELTA_CASES = ["delta karate", "delta rmat 1M"].filter((c) => !ONLY || c.startsWith(ONLY));

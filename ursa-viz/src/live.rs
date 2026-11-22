@@ -27,15 +27,14 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use serde::Serialize;
-use ursa_core::algo::Fa2Params;
-use ursa_core::topology::Topology;
+use ursa_core::algo::{fa2_seed_positions, Fa2Params};
 
 use crate::highlight::HighlightState;
 use crate::model::{GraphDelta, GraphResult, ModelError, Op, Target, Values, NULL, REMOVED};
-use crate::scene::{bounds, Graph, LiveLayout, NodeStyle, Theme, NO_CATEGORY};
+use crate::scene::{bounds, Graph, NodeStyle, Pairs, Theme, NO_CATEGORY};
 
 /// The radii a column maps to ([`NodeStyle::sizes_from`]), in pixels.
 pub const SIZE_BY_RADII: (f32, f32) = (3.0, 14.0);
@@ -156,11 +155,11 @@ impl Changes {
 
 /// Each node's undirected degree (distinct neighbours, self-loops left
 /// out), kept as edges come and go at the end of the graph, without
-/// building its adjacency again.
+/// building its adjacency at all.
 #[derive(Debug)]
 struct Degrees {
-    /// The adjacency of the graph as it was when this was made.
-    base: Arc<Topology>,
+    /// The pairs of nodes joined in the graph as it was when this was made.
+    base: Pairs,
     /// How many of the graph's edges `base` has: the first ones.
     base_edges: usize,
     degree: Vec<u32>,
@@ -170,27 +169,19 @@ struct Degrees {
 
 impl Degrees {
     fn new(graph: &Graph) -> Self {
+        let (mut base, degree) = Pairs::new(graph);
+        base.shrink();
         Self {
-            base: Arc::clone(graph.topology()),
+            degree,
+            base,
             base_edges: graph.n_edges(),
-            degree: graph.degrees(),
             added: HashMap::new(),
         }
     }
 
     /// Whether `base` has an edge between `s` and `d`.
-    fn in_base(&self, s: u32, d: u32) -> bool {
-        let n = self.base.n_nodes() as u32;
-        if s >= n || d >= n {
-            return false;
-        }
-        let adj = self.base.undirected();
-        let (a, b) = if adj.degree(s) <= adj.degree(d) {
-            (s, d)
-        } else {
-            (d, s)
-        };
-        adj.neighbors(a).binary_search(&b).is_ok()
+    fn in_base(&mut self, s: u32, d: u32) -> bool {
+        self.base.joined(s, d)
     }
 
     /// An edge after `base`'s comes (`on`) or goes. Whether its ends'
@@ -338,20 +329,36 @@ impl LiveResult {
     /// coloured as the result's encodings say (by degree, in the theme's
     /// node colour, without), with its highlights and its removed nodes
     /// hidden.
+    ///
+    /// No adjacency is built for it, and no layout: the degrees are counted
+    /// from the edge list ([`Graph::degrees`]).
     pub fn new(mut result: GraphResult, theme: &Theme) -> (Self, Drawn) {
+        let graph = Self::graph_of(&mut result);
+        Self::with_graph(result, graph, theme)
+    }
+
+    /// The first half of [`LiveResult::new`], for a caller that gives the
+    /// event loop a turn between the two: room in `result` for its first
+    /// deltas, and its graph, with as much room.
+    pub fn graph_of(result: &mut GraphResult) -> Graph {
         let (n, m) = (result.n_nodes(), result.n_edges());
-        let (more_nodes, more_edges) = (room(n), room(m));
-        result.reserve(more_nodes, more_edges);
+        result.reserve(room(n), room(m));
         let mut graph = Graph::new(n, result.src().to_vec(), result.dst().to_vec())
             .expect("a result's edges name its nodes");
-        graph.reserve(more_edges);
+        graph.reserve(room(m));
+        graph
+    }
+
+    /// The second half of [`LiveResult::new`]: `graph` is
+    /// [`LiveResult::graph_of`] this `result`.
+    pub fn with_graph(result: GraphResult, graph: Graph, theme: &Theme) -> (Self, Drawn) {
+        let n = result.n_nodes();
+        debug_assert_eq!((n, result.n_edges()), (graph.n_nodes(), graph.n_edges()));
+        let more_nodes = room(n);
         let (x, y) = match result.positions() {
             Some(p) => (p.x.clone(), p.y.clone()),
-            None => {
-                let start = LiveLayout::new(&graph, Fa2Params::default());
-                let (x, y) = start.positions();
-                (x.to_vec(), y.to_vec())
-            }
+            // Where a layout would start them: no layout is made for it.
+            None => fa2_seed_positions(n, &Fa2Params::default()),
         };
         let mut highlight = HighlightState::new(n);
         highlight

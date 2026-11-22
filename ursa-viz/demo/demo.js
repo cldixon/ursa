@@ -1,6 +1,7 @@
 // The graph view, bare: a generated graph, its layout running in a worker,
 // drawn every frame. Drag to pan, wheel to zoom, double-click to fit.
-// ?graph=rmat&scale=17&edges=1000000 | grid | clusters | karate;
+// ?graph=rmat&scale=17&edges=1000000 | grid | clusters | karate
+// (&compact=1 drops the nodes no edge names);
 // &multilevel=0 for flat ForceAtlas2 (coarse to fine is the default);
 // &theme=dark.
 //
@@ -28,6 +29,11 @@ canvas.width = Math.round(canvas.clientWidth * dpr);
 canvas.height = Math.round(canvas.clientHeight * dpr);
 
 const stats = (window.stats = { phase: "loading" });
+// The page's tasks over 50 ms: `[start, duration]`, on the page's clock.
+stats.longTasks = [];
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) stats.longTasks.push([e.startTime, e.duration]);
+}).observe({ type: "longtask", buffered: true });
 
 const t0 = performance.now();
 // The wasm's exports: `memory` is what the bench reads.
@@ -36,6 +42,9 @@ stats.initMs = performance.now() - t0;
 const tg = performance.now();
 const g = fromParams(params);
 stats.generateMs = performance.now() - tg;
+// A task of its own for making the view, so that what it costs the page's
+// thread is not counted with making the graph.
+await new Promise((resolve) => setTimeout(resolve));
 const t1 = performance.now();
 // Page-clock marks (ms since navigation), for the bench: when the graph was
 // ready, the first frame with layout positions, the layout's end.
@@ -47,6 +56,7 @@ const view = fromResult
   : await viz.createView(canvas, g.n, g.src, g.dst);
 window.viz = viz;
 stats.createMs = performance.now() - t1;
+stats.createWasmBytes = window.wasm.memory.buffer.byteLength;
 const dark = params.get("theme") === "dark";
 if (dark) {
   view.setThemeNamed("dark");

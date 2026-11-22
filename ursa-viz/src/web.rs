@@ -142,10 +142,14 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         config.format = plain;
     }
     surface.configure(&device, &config);
+    // In pieces, with a turn of the event loop between them: the page's
+    // thread is never held for long.
     let view = match scene {
-        Scene::Graph(graph) => View::new(&device, config.format, graph, width, height),
+        Scene::Graph(graph) => {
+            View::new_paced(&device, &queue, config.format, graph, width, height).await
+        }
         Scene::Result(result) => {
-            View::from_result(&device, &queue, config.format, *result, width, height)
+            View::from_result_paced(&device, &queue, config.format, *result, width, height).await
         }
     };
     Ok(GraphView {
@@ -165,6 +169,13 @@ impl GraphView {
     #[wasm_bindgen(getter)]
     pub fn backend(&self) -> String {
         self.backend.clone()
+    }
+
+    /// Whether the view has built the graph's adjacency: only
+    /// [`GraphView::step`], a layout on the view's own thread, makes it.
+    #[wasm_bindgen(getter, js_name = hasTopology)]
+    pub fn has_topology(&self) -> bool {
+        self.view.graph().has_topology()
     }
 
     #[wasm_bindgen(getter, js_name = nodeCount)]

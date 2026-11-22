@@ -99,7 +99,21 @@ export function shortestPath(g, from, to) {
   return path.reverse();
 }
 
+/** `g` without the nodes no edge names, the rest renumbered in order. */
+export function compact(g) {
+  const index = new Int32Array(g.n).fill(-1);
+  for (let e = 0; e < g.src.length; e++) index[g.src[e]] = index[g.dst[e]] = 0;
+  let n = 0;
+  for (let i = 0; i < g.n; i++) if (index[i] === 0) index[i] = n++;
+  return { n, src: g.src.map((u) => index[u]), dst: g.dst.map((v) => index[v]) };
+}
+
 export function fromParams(params) {
+  if (params.get("compact") === "1") {
+    const rest = new URLSearchParams(params);
+    rest.delete("compact");
+    return compact(fromParams(rest));
+  }
   const kind = params.get("graph") ?? "rmat";
   if (kind === "grid") return grid(Number(params.get("w") ?? 100), Number(params.get("h") ?? 100));
   if (kind === "karate") return karate();
