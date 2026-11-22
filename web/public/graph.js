@@ -615,13 +615,27 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
 
   // The selection is the view's: it is told what was clicked, and says what
   // is selected now.
-  const selectionChanged = () => {
+  // The inspector follows. After a tap (`byTouch`) it waits until a second
+  // tap would no longer be a double tap: its panel, under the view on a
+  // phone, would otherwise open over the node between the two taps and
+  // take the second, so a double tap never expanded (#443).
+  let inspectLater = 0;
+  const inspectNow = () => {
+    clearTimeout(inspectLater);
+    inspectLater = 0;
+    if (current === state) state.inspector.selectionChanged();
+  };
+  state.inspectNow = () => inspectLater && inspectNow();
+  state.cleanup.push(() => clearTimeout(inspectLater));
+  const selectionChanged = (byTouch = false) => {
     state.selection = Array.from(view.selection());
     const edge = view.selectedEdge();
     state.edge = edge ? { edge: edge[0], src: edge[1], dst: edge[2] } : null;
     header();
     redraw();
-    state.inspector.selectionChanged();
+    if (!byTouch) return inspectNow();
+    clearTimeout(inspectLater);
+    inspectLater = setTimeout(inspectNow, DOUBLE_TAP_MS + 50);
   };
   state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw });
   state.clearSelection = () => {
@@ -692,7 +706,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       }
     }
     timings.action("click", e.timeStamp);
-    if (!pick(x, y, e.shiftKey)) shownSoon();
+    if (!pick(x, y, e.shiftKey, e.pointerType !== "mouse")) shownSoon();
   };
   on(canvas, "pointerup", (e) => release(e, false));
   on(canvas, "pointercancel", (e) => release(e, true));
@@ -730,6 +744,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     else if (e.key === "0") view.fit();
     else if (e.key === "i") {
       // Into the inspector, if it is open; Esc there comes back.
+      state.inspectNow();
       if (state.inspector.focus()) e.preventDefault();
       return;
     } else return;
@@ -741,7 +756,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // A click at (x, y): the node there is selected (added to the selection,
   // or taken out of it, with Shift), and a click on empty space clears the
   // selection. Returns whether the selection changed, and so the frame.
-  function pick(x, y, extend) {
+  function pick(x, y, extend, byTouch = false) {
     const start = performance.now();
     const node = view.pick(x, y);
     // With no node there, the edge within 4 px (a plain click only: Shift
@@ -749,7 +764,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const edge = node === undefined && !extend ? view.pickEdge(x, y, EDGE_REACH_PX * dpr) : undefined;
     timings.picked(performance.now() - start);
     const changed = edge === undefined ? view.select(node, extend) : view.selectEdge(edge);
-    if (changed) selectionChanged();
+    if (changed) selectionChanged(byTouch);
     return changed;
   }
 
@@ -1296,6 +1311,7 @@ export function expandable(limit = 10) {
   if (!state?.notShown) return [];
   atNewest(state);
   const ratio = state.canvas.width / state.canvas.clientWidth;
+  const box = state.canvas.getBoundingClientRect();
   const order = Array.from(state.notShown.keys())
     .filter((i) => state.notShown[i] > 0 && !(state.graph.removed[i] & 1))
     .sort((a, b) => state.notShown[b] - state.notShown[a] || a - b);
@@ -1305,6 +1321,8 @@ export function expandable(limit = 10) {
     // At a whole CSS pixel, as a mouse event gives its place.
     const [x, y] = Array.from(state.view.nodePixel(index), (v) => Math.round(v / ratio));
     if (x < 0 || y < 0 || x >= state.canvas.clientWidth || y >= state.canvas.clientHeight || state.view.pick(x * ratio, y * ratio) !== index) continue;
+    // Not one under the inspector's panel: a click there is the panel's.
+    if (document.elementFromPoint(box.left + x, box.top + y) !== state.canvas) continue;
     out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x, y });
   }
   return out;
@@ -1327,6 +1345,7 @@ export function edgeAt(x, y) {
 
 /** For tests: what the inspector shows (graph-inspector.js's state()), or null. */
 export function inspected() {
+  current?.inspectNow?.();
   return current?.inspector?.state() ?? null;
 }
 

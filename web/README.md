@@ -228,6 +228,10 @@ static assets and an R2 bucket.
       commands without writing them or their answers (an error is still
       written, and `.history` still lists them); `.graph echo on` shows
       them again.
+    - **The inspector waits for a double tap.** After a tap its panel
+      (#444) opens 350 ms later, once a second tap would no longer be a
+      double tap: under the view on a phone, it would otherwise open over
+      the node and take the second tap. A mouse's click opens it at once.
     - **While a command runs** the next ones wait their turn (the engine
       runs one at a time), and each node waiting carries a busy ring: an
       element over the canvas (`.graph-busy`), moved with its node as each
