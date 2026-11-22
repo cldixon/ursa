@@ -235,7 +235,9 @@ impl Completer for ShellHelper {
                 .collect();
             return Ok((start, candidates));
         }
-        let names_a_file = typed.starts_with(".read ") || typed.starts_with(".open ");
+        let names_a_file = [".read ", ".open ", ".output ", ".once "]
+            .iter()
+            .any(|command| typed.starts_with(command));
         if names_a_file || before.matches('\'').count() % 2 == 1 {
             return self.files.complete(line, pos, ctx);
         }

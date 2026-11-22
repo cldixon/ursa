@@ -90,6 +90,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     (".graphs", "", "List the graphs (SHOW GRAPHS)"),
     (
+        ".headers",
+        "on|off",
+        "Turn the header row of csv and tsv output on or off",
+    ),
+    (
         ".help",
         "?PATTERN?",
         "Show help for the commands matching PATTERN",
@@ -107,16 +112,31 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         ".mode",
         "MODE",
-        "Set the output mode: table, csv, tsv, json or ndjson",
+        "Set the output mode: table, csv, tsv, json, ndjson, markdown or line",
+    ),
+    (
+        ".once",
+        "FILE",
+        "Send the output of the next command only to FILE",
     ),
     (
         ".open",
         "FILE.ursa",
         "Open a database file, before anything is defined (as ATTACH)",
     ),
+    (
+        ".output",
+        "?FILE?",
+        "Send output to FILE, or back to the screen if FILE is omitted",
+    ),
     (".print", "STRING...", "Print literal STRING"),
     (".quit", "", "Exit the shell (also Ctrl-D)"),
     (".read", "FILE", "Run the SQL and dot-commands in FILE"),
+    (
+        ".schema",
+        "?PATTERN?",
+        "Show the statements that define the views, tables and graphs",
+    ),
     (".tables", "", "List the tables and views"),
     (
         ".timer",
@@ -184,6 +204,13 @@ pub struct Shell<O: Write, E: Write> {
     /// The explore session of the graph the host draws ([`Self::open_graph`]).
     explorer: Option<ExploreSession>,
     timer: bool,
+    /// CSV and TSV start with a header row (`.headers on|off`).
+    headers: bool,
+    /// Where output goes instead of [`Self::out`] (`.output FILE`, `.once
+    /// FILE`).
+    redirect: Option<Redirect>,
+    /// How many redirects have been made, to tell them apart.
+    redirects: u64,
     /// SQL typed so far that is not yet a complete statement.
     buffer: String,
     /// Where the next line starts, after `buffer`, for colouring it.
@@ -221,6 +248,9 @@ impl<O: Write, E: Write> Shell<O, E> {
             last: None,
             explorer: None,
             timer: false,
+            headers: true,
+            redirect: None,
+            redirects: 0,
             buffer: String::new(),
             buffer_state: highlight::State::Start,
             depth: Rc::new(Cell::new(0)),
@@ -432,15 +462,16 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// How tables are drawn now.
     fn table_style(&self) -> TableStyle {
         let max_width = match (self.max_width, &self.screen) {
-            (0, Some(width)) => width(),
+            (0, Some(width)) if self.redirect.is_none() => width(),
             (n, _) => n,
         };
         TableStyle {
             max_rows: self.max_rows,
             style: Style {
                 max_width,
-                color: self.color,
+                color: self.color && self.redirect.is_none(),
             },
+            headers: self.headers,
         }
     }
 
@@ -494,6 +525,8 @@ impl<O: Write, E: Write> Shell<O, E> {
     }
 
     async fn run_step(&mut self, step: Step) -> Flow {
+        // `.once FILE` lasts for one step: the one after it.
+        let once = self.redirect.as_ref().filter(|r| r.once).map(|r| r.id);
         let flow = match step {
             Step::Command(line) => self.command(&line).await,
             Step::Sql(sql, offset) => {
@@ -501,6 +534,9 @@ impl<O: Write, E: Write> Shell<O, E> {
                 Flow::Continue
             }
         };
+        if once.is_some() && once == self.redirect.as_ref().map(|r| r.id) {
+            self.end_redirect();
+        }
         if self.failed || self.closed {
             Flow::Exit
         } else {
@@ -585,10 +621,46 @@ impl<O: Write, E: Write> Shell<O, E> {
         let written = if self.mode == OutputFormat::Arrow {
             write!(self.err, "{text}").and_then(|()| self.err.flush())
         } else {
-            write!(self.out, "{text}").and_then(|()| self.out.flush())
+            let out = self.output();
+            write!(out, "{text}").and_then(|()| out.flush())
         };
         if written.is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
             self.closed = true;
+        }
+    }
+
+    /// Where output goes now: the file of `.output` or `.once`, or the
+    /// shell's output.
+    fn output(&mut self) -> &mut dyn Write {
+        match &mut self.redirect {
+            Some(redirect) => &mut redirect.file,
+            None => &mut self.out,
+        }
+    }
+
+    /// Send output to `path` from now on (`.output`), or for the next step
+    /// only (`.once`). The file is created, or emptied if it exists.
+    fn redirect_to(&mut self, path: &Path, once: bool) {
+        match std::fs::File::create(path) {
+            Ok(file) => {
+                self.end_redirect();
+                self.redirects += 1;
+                self.redirect = Some(Redirect {
+                    file: std::io::BufWriter::new(file),
+                    once,
+                    id: self.redirects,
+                });
+            }
+            Err(e) => self.error(&format!("cannot write to '{}': {e}", path.display())),
+        }
+    }
+
+    /// Send output back to the shell's output, closing the file.
+    fn end_redirect(&mut self) {
+        if let Some(mut redirect) = self.redirect.take() {
+            if let Err(e) = redirect.file.flush() {
+                self.error(&format!("cannot write the output file: {e}"));
+            }
         }
     }
 
@@ -623,6 +695,7 @@ impl<O: Write, E: Write> Shell<O, E> {
                 let config = self.ctx.state().config().options().format.clone();
                 let options = (&config).try_into()?;
                 let table = self.table_style();
+                let mode = self.mode;
                 let stream = if self.keep_last {
                     // Every row, for the host to write out later (`.export`).
                     let schema = stream.schema();
@@ -635,7 +708,8 @@ impl<O: Write, E: Write> Shell<O, E> {
                 } else {
                     stream
                 };
-                write_stream(self.mode, stream, &mut self.out, &options, table).await?;
+                let mut out = self.output();
+                write_stream(mode, stream, &mut out, &options, table).await?;
                 self.results += 1;
             }
             if self.timer {
@@ -679,6 +753,24 @@ impl<O: Write, E: Write> Shell<O, E> {
                 "off" => self.timer = false,
                 _ => self.error("usage: .timer on|off"),
             },
+            ".headers" => match arg.to_ascii_lowercase().as_str() {
+                "" => {
+                    let state = if self.headers { "on" } else { "off" };
+                    self.say(&format!("Headers are {state}."));
+                }
+                "on" => self.headers = true,
+                "off" => self.headers = false,
+                _ => self.error("usage: .headers on|off"),
+            },
+            ".output" => match path_arg(arg) {
+                Some(path) => self.redirect_to(&path, false),
+                None => self.end_redirect(),
+            },
+            ".once" => match path_arg(arg) {
+                Some(path) => self.redirect_to(&path, true),
+                None => self.error("usage: .once FILE"),
+            },
+            ".schema" => self.schema(arg).await,
             ".tables" => self.tables().await,
             ".graphs" => self.run_sql("SHOW GRAPHS;", 0).await,
             ".describe" => self.describe(arg).await,
@@ -714,7 +806,12 @@ impl<O: Write, E: Write> Shell<O, E> {
     /// commands whose name or help has PATTERN in it.
     fn help(&mut self, arg: &str) {
         match arg.to_ascii_lowercase().as_str() {
-            "graph" => return self.write_text(&format!("{}\n", graph_help())),
+            "graph" => {
+                // A host that draws graphs (it has a .graph command) says how.
+                let draws = self.host_commands.iter().any(|(c, _, _)| c == ".graph");
+                let drawing = if draws { DRAW_HELP } else { "" };
+                return self.write_text(&format!("{}\n{drawing}", graph_help()));
+            }
             "shortcuts" => return self.write_text(&format!("{}\n", self.shortcuts)),
             _ => {}
         }
@@ -756,7 +853,8 @@ impl<O: Write, E: Write> Shell<O, E> {
         }
         if needle.is_empty() {
             text.push_str(
-                "\nRun .help graph for the graph SQL: property graphs, MATCH and algorithms\n\
+                "\nDuckDB's .mode names duckbox, box and jsonlines work too\n\
+                 Run .help graph for the graph SQL: property graphs, MATCH and algorithms\n\
                  Run .help shortcuts for keyboard shortcuts\n",
             );
         }
@@ -814,7 +912,8 @@ impl<O: Write, E: Write> Shell<O, E> {
             ),
             Some(mode) => self.mode = mode,
             None => self.error(&format!(
-                "unknown mode '{arg}'; the modes are table, csv, tsv, json and ndjson"
+                "unknown mode '{arg}'; the modes are table, csv, tsv, json, ndjson, markdown \
+                 and line (DuckDB's duckbox, box, jsonlines and lines work too)"
             )),
         }
     }
@@ -841,6 +940,49 @@ impl<O: Write, E: Write> Shell<O, E> {
             excluded = excluded.join(", "),
         );
         self.run_sql(&sql, 0).await;
+    }
+
+    /// `.schema ?PATTERN?`: the statements that define the database's views,
+    /// external tables and graphs, as its catalog stores them (local paths
+    /// relative to the database's directory), in the order they are defined,
+    /// each ending with `;`. In a session without a database file, the
+    /// views' statements. PATTERN keeps the objects whose name matches it,
+    /// in any case: a `LIKE` pattern (`%`, `_`), or a glob (`*`, `?`) as in
+    /// DuckDB.
+    async fn schema(&mut self, pattern: &str) {
+        match Box::pin(self.schema_text(pattern)).await {
+            Ok(text) => self.write_text(&text),
+            Err(e) => self.error(&ursa_engine::user_message(&e)),
+        }
+    }
+
+    async fn schema_text(&self, pattern: &str) -> Result<String> {
+        let statements = match ursa_engine::database::database(&self.ctx.state()) {
+            Some(database) => database.statements(),
+            None => self
+                .rows(
+                    "SELECT definition FROM information_schema.views \
+                     WHERE definition IS NOT NULL ORDER BY table_schema, table_name",
+                )
+                .await?
+                .into_iter()
+                .map(|mut row| row.remove(0))
+                .collect(),
+        };
+        let mut text = String::new();
+        for statement in statements {
+            if !pattern.is_empty() {
+                let matches = defined_name(&self.ctx, &statement)
+                    .is_some_and(|name| matches_pattern(pattern, &name));
+                if !matches {
+                    continue;
+                }
+            }
+            let statement = statement.trim_end().trim_end_matches(';');
+            text.push_str(&crate::table::visible(statement));
+            text.push_str(";\n");
+        }
+        Ok(text)
     }
 
     /// `.describe NAME`: `DESCRIBE GRAPH` for a graph, `DESCRIBE` otherwise.
@@ -1090,6 +1232,64 @@ impl<O: Write, E: Write> Shell<O, E> {
     }
 }
 
+/// Where output goes after `.output FILE` or `.once FILE`.
+struct Redirect {
+    file: std::io::BufWriter<std::fs::File>,
+    /// `.once`: for the next step only.
+    once: bool,
+    id: u64,
+}
+
+/// The name of the view, external table or graph `sql` defines, as written.
+fn defined_name(ctx: &SessionContext, sql: &str) -> Option<String> {
+    use datafusion::sql::parser::Statement as DFStatement;
+    use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
+    let mut statements = ursa_sql::parse_sql_for(ctx, sql).ok()?;
+    let name = match statements.pop()? {
+        ursa_sql::UrsaStatement::CreatePropertyGraph(g) => g.name,
+        ursa_sql::UrsaStatement::DataFusion(df) => match *df {
+            DFStatement::CreateExternalTable(t) => t.name,
+            DFStatement::Statement(s) => match *s {
+                SQLStatement::CreateView(v) => v.name,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let last = name.0.last()?.as_ident()?.value.clone();
+    Some(last)
+}
+
+/// Whether `name` matches `pattern`, ignoring case: a glob (`*`, `?`) if
+/// the pattern has one, as DuckDB's `.schema` takes it, or else a `LIKE`
+/// pattern (`%`, `_`).
+fn matches_pattern(pattern: &str, name: &str) -> bool {
+    let glob = pattern.contains(['*', '?']);
+    let (many, one) = if glob { ('*', '?') } else { ('%', '_') };
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    // Wildcard matching with backtracking to the last `many`.
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == one || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == many {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((sp, sn)) = star {
+            p = sp + 1;
+            n = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == many)
+}
+
 /// A file argument, without surrounding quotes.
 fn path_arg(arg: &str) -> Option<PathBuf> {
     let arg = arg.trim();
@@ -1219,7 +1419,7 @@ const TERMINAL_SHORTCUTS: &str = "\
 Enter          Run the statement once it ends with ; (or a dot-command)
 Up, Down       Step through the history
 Ctrl-R         Search the history
-Tab            Complete a dot-command, or a file name after .read, .open or a quote
+Tab            Complete a dot-command, or a file name after .read, .open, .output, .once or a quote
 Ctrl-C         Drop what is typed, or cancel the running statement
 Ctrl-D         Exit";
 
@@ -1264,6 +1464,30 @@ Any file is a table: SELECT * FROM 'edges.csv' LIMIT 3;
 The SQL reference: {DOCS_URL}"
     )
 }
+
+/// What `.help graph` adds where the host draws graphs: `.graph` and its
+/// clauses (design §3, #434), which `ursa_engine::graph::view` parses.
+const DRAW_HELP: &str = "
+Draw a graph, with .graph:
+  .graph                         the last result, by what its columns are
+  .graph karate                  a property graph, or a table's rows
+  .graph SELECT src, dst FROM e  a query's rows
+
+Then any of these clauses, in any order:
+  AS edges(src, dst [, weight])  each row is an edge between the ids in two columns
+  AS nodes(id)                   each row is a node; the edges among them are the graph's
+  AS path(nodes [, edges])       each row is a path: a list of ids, and one of edge rows
+  AS hops(seed, id, distance)    each row is a node reached from a seed, some steps away
+  ON graph                       the property graph the ids belong to
+  NODES (SELECT id, … FROM …)    values for the nodes, for SIZE BY and COLOR BY to use
+  SIZE BY x  COLOR BY y          a column or an algorithm: SIZE BY pagerank COLOR BY louvain
+  LAYOUT force|rings|layers      the layout: by the edges' pull, or by distance or step
+                                 on circles or in rows
+
+AS names the columns when the result's own names do not say what they are:
+  .graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)
+  .graph AS hops(start, reached, steps) ON karate LAYOUT layers
+";
 
 /// The dot-command `name` was meant to be, if one is close enough to be a
 /// typo or `name` begins only one (as `.q` begins `.quit`).
@@ -1503,9 +1727,251 @@ mod tests {
                 && err.contains("Give --format arrow on the command line"),
             "{err}"
         );
-        let (_, err) = feed(&mut shell, &[".mode box"]).await;
-        assert!(err.contains("unknown mode 'box'"), "{err}");
+        let (_, err) = feed(&mut shell, &[".mode boxes"]).await;
+        assert!(err.contains("unknown mode 'boxes'"), "{err}");
         assert_eq!(shell.mode(), OutputFormat::Table);
+    }
+
+    /// #418: DuckDB's names for the modes Ursa has, and its Markdown and
+    /// line modes, in DuckDB's format.
+    #[tokio::test]
+    async fn duckdb_mode_names_and_the_markdown_and_line_modes() {
+        let sql = "SELECT * FROM (VALUES (1, 'alice', 0.25), (22, 'bob', NULL)) AS t(id, \
+                   name, score) ORDER BY id;";
+        let table = in_mode("table", sql).await;
+        assert_eq!(in_mode("duckbox", sql).await, table);
+        assert_eq!(in_mode("box", sql).await, table);
+        assert_eq!(in_mode("DuckBox", sql).await, table);
+        assert_eq!(
+            in_mode("jsonlines", sql).await,
+            in_mode("ndjson", sql).await
+        );
+        assert_eq!(in_mode("lines", sql).await, in_mode("line", sql).await);
+
+        // Names centred, values from the left, number columns' separators
+        // ending in `:`.
+        assert_eq!(
+            in_mode("markdown", sql).await,
+            "| id | name  | score |\n\
+             |---:|-------|------:|\n\
+             | 1  | alice | 0.25  |\n\
+             | 22 | bob   | NULL  |\n"
+        );
+        // A `|` or a line break stays in its cell; no rows is the header.
+        assert_eq!(
+            in_mode("markdown", "SELECT 'a|b' AS \"x y\", 'c\nd' AS z;").await,
+            "| x y  |  z   |\n|------|------|\n| a\\|b | c\\nd |\n"
+        );
+        assert_eq!(
+            in_mode("markdown", "SELECT 1 AS a WHERE false;").await,
+            "| a |\n|--:|\n"
+        );
+
+        // Names right-aligned, at least 5 wide; a blank line between rows.
+        assert_eq!(
+            in_mode("line", sql).await,
+            "   id = 1\n name = alice\nscore = 0.25\n\n   id = 22\n name = bob\nscore = NULL\n"
+        );
+        assert_eq!(
+            in_mode("line", "SELECT 1 AS a, 2 AS a_long_name;").await,
+            "          a = 1\na_long_name = 2\n"
+        );
+        assert_eq!(in_mode("line", "SELECT 1 AS a WHERE false;").await, "");
+
+        let mut shell = shell();
+        let (out, _) = feed(&mut shell, &[".mode duckbox", ".mode"]).await;
+        assert_eq!(out, "The output mode is table.\n");
+        let (out, _) = feed(&mut shell, &[".mode markdown", ".mode"]).await;
+        assert_eq!(out, "The output mode is markdown.\n");
+    }
+
+    /// #418: `.headers off` drops the header row of csv and tsv, and nothing
+    /// else.
+    #[tokio::test]
+    async fn headers_turn_the_csv_and_tsv_header_row_on_and_off() {
+        let mut shell = shell();
+        let (out, _) = feed(&mut shell, &[".headers"]).await;
+        assert_eq!(out, "Headers are on.\n");
+        let (out, err) = feed(
+            &mut shell,
+            &[
+                ".headers off",
+                ".mode csv",
+                "SELECT 1 AS x, 2 AS y;",
+                ".mode tsv",
+                "SELECT 1 AS x, 2 AS y;",
+                ".mode json",
+                "SELECT 1 AS x;",
+                ".headers",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        assert_eq!(out, "1,2\n1\t2\n[{\"x\":1}]\nHeaders are off.\n");
+        let (out, _) = feed(&mut shell, &[".headers ON", ".mode csv", "SELECT 1 AS x;"]).await;
+        assert_eq!(out, "x\n1\n");
+        let (_, err) = feed(&mut shell, &[".headers maybe"]).await;
+        assert_eq!(err, "Error: usage: .headers on|off\n");
+    }
+
+    /// #418: `.output FILE` sends every result to FILE until `.output`;
+    /// `.once FILE` the next command's only.
+    #[tokio::test]
+    async fn output_and_once_send_results_to_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let all = dir.path().join("all.txt");
+        let one = dir.path().join("one.md");
+        let mut shell = shell();
+        shell.set_mode(OutputFormat::Csv);
+        let (out, err) = feed(
+            &mut shell,
+            &[
+                &format!(".output {}", all.display()),
+                "SELECT 1 AS x;",
+                ".print between",
+                "SHOW GRAPHS;",
+                ".output",
+                "SELECT 2 AS x;",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        assert_eq!(out, "x\n2\n");
+        assert_eq!(
+            std::fs::read_to_string(&all).unwrap(),
+            "x\n1\nbetween\nname,edge_table,source,destination,vertex_table,vertex_key\n"
+        );
+
+        let (out, err) = feed(
+            &mut shell,
+            &[
+                ".mode markdown",
+                &format!(".once '{}'", one.display()),
+                "SELECT 3 AS x;",
+                "SELECT 4 AS x;",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        assert_eq!(out, "| x |\n|--:|\n| 4 |\n");
+        assert_eq!(
+            std::fs::read_to_string(&one).unwrap(),
+            "| x |\n|--:|\n| 3 |\n"
+        );
+
+        // A file is overwritten; a table in it is not drawn for a screen.
+        let (out, _) = feed(
+            &mut shell,
+            &[
+                ".mode table",
+                &format!(".once {}", one.display()),
+                "SELECT 5 AS x;",
+            ],
+        )
+        .await;
+        assert_eq!(out, "");
+        assert_eq!(
+            std::fs::read_to_string(&one).unwrap(),
+            "┌───────┐\n│   x   │\n│ Int64 │\n├───────┤\n│     5 │\n└───────┘\n"
+        );
+
+        // Errors still go to the error stream.
+        let (out, err) = feed(
+            &mut shell,
+            &[&format!(".once {}", one.display()), "SELEC 1;"],
+        )
+        .await;
+        assert_eq!(out, "");
+        assert!(err.starts_with("Error: "), "{err}");
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "");
+
+        let missing = dir.path().join("no/such/dir.txt");
+        let (_, err) = feed(&mut shell, &[&format!(".output {}", missing.display())]).await;
+        assert!(
+            err.starts_with(&format!("Error: cannot write to '{}': ", missing.display())),
+            "{err}"
+        );
+        let (_, err) = feed(&mut shell, &[".once"]).await;
+        assert_eq!(err, "Error: usage: .once FILE\n");
+    }
+
+    /// #418: `.schema` prints the statements that define the database's
+    /// objects, or the session's views without one.
+    #[tokio::test]
+    async fn schema_prints_the_defining_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.ursa");
+        let mut memory = shell();
+        let (out, err) = feed(
+            &mut memory,
+            &[
+                "CREATE VIEW people AS SELECT 1 AS id;",
+                "CREATE VIEW knows AS SELECT 1 AS src, 1 AS dst;",
+                ".schema",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            "CREATE VIEW knows AS SELECT 1 AS src, 1 AS dst;\n\
+             CREATE VIEW people AS SELECT 1 AS id;\n"
+        );
+
+        let mut shell = shell();
+        let (out, err) = feed(
+            &mut shell,
+            &[
+                &format!(".open {}", db.display()),
+                "CREATE VIEW people AS SELECT 1 AS id;",
+                "CREATE VIEW knows AS SELECT 1 AS src, 1 AS dst;",
+                "CREATE PROPERTY GRAPH social VERTEX TABLES (people KEY (id)) EDGE TABLES \
+                 (knows SOURCE KEY (src) REFERENCES people (id) DESTINATION KEY (dst) \
+                 REFERENCES people (id));",
+                ".schema",
+            ],
+        )
+        .await;
+        assert_eq!(err, "");
+        let lines: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert_eq!(lines[0], "CREATE VIEW people AS SELECT 1 AS id;");
+        assert_eq!(lines[1], "CREATE VIEW knows AS SELECT 1 AS src, 1 AS dst;");
+        assert!(
+            lines[2].starts_with("CREATE PROPERTY GRAPH social"),
+            "{out}"
+        );
+        assert!(lines[2].ends_with(';'), "{out}");
+
+        let (out, _) = feed(&mut shell, &[".schema PEOPLE"]).await;
+        assert_eq!(out, "CREATE VIEW people AS SELECT 1 AS id;\n");
+        let (out, _) = feed(&mut shell, &[".schema %o%"]).await;
+        assert_eq!(out.lines().count(), 3, "{out}");
+        let (out, _) = feed(&mut shell, &[".schema k*"]).await;
+        assert_eq!(out, "CREATE VIEW knows AS SELECT 1 AS src, 1 AS dst;\n");
+        let (out, _) = feed(&mut shell, &[".schema so_ial"]).await;
+        assert!(out.starts_with("CREATE PROPERTY GRAPH social"), "{out}");
+        let (out, err) = feed(&mut shell, &[".schema nothing"]).await;
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn patterns_match_as_like_or_glob() {
+        for (pattern, name, matches) in [
+            ("people", "People", true),
+            ("peo%", "people", true),
+            ("%ple", "people", true),
+            ("p_ople", "people", true),
+            ("p_ople", "pople", false),
+            ("%", "", true),
+            ("pe*", "people", true),
+            ("*o*e", "people", true),
+            ("p?ople", "people", true),
+            ("p%", "knows", false),
+            ("k*s", "knowsx", false),
+        ] {
+            assert_eq!(matches_pattern(pattern, name), matches, "{pattern} {name}");
+        }
     }
 
     /// Run `sql` in `mode` and return what it printed, failing on an error.
@@ -1894,6 +2360,21 @@ mod tests {
             "ANY SHORTEST | ALL SHORTEST | SHORTEST k",
             ".functions lists the algorithms",
             DOCS_URL,
+        ] {
+            assert!(out.contains(needle), "{needle} missing from:\n{out}");
+        }
+        // .graph's clauses, where the host draws graphs.
+        assert!(!out.contains("AS edges("), "{out}");
+        shell.add_host_command(".graph", "?QUERY|NAME?", "Draw a graph");
+        let (out, _) = feed(&mut shell, &[".help graph"]).await;
+        for needle in [
+            "ANY SHORTEST | ALL SHORTEST | SHORTEST k",
+            "AS edges(src, dst [, weight])",
+            "AS nodes(id)",
+            "AS path(nodes [, edges])",
+            "AS hops(seed, id, distance)",
+            "ON graph",
+            "LAYOUT force|rings|layers",
         ] {
             assert!(out.contains(needle), "{needle} missing from:\n{out}");
         }

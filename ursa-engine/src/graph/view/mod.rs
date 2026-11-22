@@ -2,8 +2,8 @@
 //! [`GraphResult`] any front end can show: the browser shell, and the CLI
 //! and the notebook after it.
 //!
-//! [`of_command`] reads `.graph`'s text,
-//! `[SOURCE] [NODES (query)] [SIZE BY x] [COLOR BY y]`:
+//! [`of_command`] reads `.graph`'s text, `[SOURCE] [ON graph] [AS …]
+//! [NODES (query)] [SIZE BY x] [COLOR BY y] [LAYOUT l]`:
 //!
 //! 1. [`clauses`] splits the text into its source and its [`Style`].
 //! 2. A [`Source`] is found: the last result, a query's, a table's rows, or a
@@ -14,7 +14,9 @@
 //!    matches, or nodes; or they are not a graph, and the error says what
 //!    would be. A property graph is its edge tables and its vertex tables'
 //!    keys, so a node with no edges is drawn too. [`interpret`] is this step
-//!    alone, on a result.
+//!    alone, on a result. `AS …` is rule 0 (#434): it names the shape and
+//!    its columns, and nothing is inferred. `ON graph` names the graph the
+//!    ids belong to, and `LAYOUT` the layout, whatever the rule chose.
 //! 4. Ids become dense node indexes `0..n`, in the order they are first
 //!    seen, so the same rows always give the same graph.
 //! 5. `SIZE BY` and `COLOR BY` each become a node column, which the result's
@@ -67,7 +69,7 @@ mod style;
 mod tests;
 
 use build::{build_indexed, EdgeList, NodeIndex};
-pub use clauses::{identifier, parse, Name, Style};
+pub use clauses::{identifier, parse, As, Name, Style, USAGE};
 pub use rules::Rule;
 use rules::{MatchEdge, Shape};
 pub use session::{Command, Outcome, Session, Step};
@@ -331,6 +333,26 @@ pub async fn draw(
 ) -> Result<GraphView> {
     let (mut drawing, text) = match source {
         Source::Graph(g) => {
+            // A property graph is drawn whole: there is nothing to read.
+            if let Some(shape) = &style.shape {
+                return plan_err(format!(
+                    "{} says how to read a result's rows, and '{}' is a property graph, drawn \
+                     whole. Leave the clause out (.graph {}), or draw a query's rows: .graph \
+                     SELECT … FROM … {}",
+                    shape.shown(),
+                    g.name,
+                    g.name,
+                    shape.shown()
+                ));
+            }
+            if let Some(on) = &style.on {
+                return plan_err(format!(
+                    "ON {} names the graph a result's ids belong to, and '{}' is a property graph \
+                     already. Leave the clause out (.graph {}), or draw a query's rows: .graph \
+                     SELECT … FROM … ON {}",
+                    on.shown, g.name, g.name, on.shown
+                ));
+            }
             let (edges, index) = property_graph_indexed(ctx, &g).await?;
             (Drawing::of_graph(edges, index, g), None)
         }
@@ -338,9 +360,12 @@ pub async fn draw(
             schema,
             batches,
             sql: text,
-        } => (read_rows(ctx, sql, schema, batches).await?, text),
+        } => (read_rows(ctx, sql, schema, batches, style).await?, text),
     };
     apply_style(ctx, sql, &mut drawing, style).await?;
+    if let Some(layout) = style.layout {
+        set_layout(&mut drawing, layout)?;
+    }
     let provenance = Provenance {
         sql: text,
         rule: Some(drawing.rule.name().to_string()),
@@ -368,8 +393,55 @@ pub async fn interpret(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<GraphView> {
+    interpret_with(ctx, sql, schema, batches, &Style::default()).await
+}
+
+/// [`interpret`] with `.graph`'s clauses (`style`): `AS …` in place of the
+/// rules (rule 0), `ON graph` for the graph the ids belong to, `LAYOUT`,
+/// and `SIZE BY`, `COLOR BY` and `NODES`.
+pub async fn interpret_with(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    style: &Style,
+) -> Result<GraphView> {
     let source = Source::of_rows((schema, batches));
-    draw(ctx, sql, source, &Style::default()).await
+    draw(ctx, sql, source, style).await
+}
+
+/// `LAYOUT`: the layout of `drawing`, whatever its rule chose. Rings and
+/// layers place each node by its level (a hop's distance, a path's step), so
+/// a drawing without one cannot have them.
+fn set_layout(drawing: &mut Drawing, layout: ursa_viz::model::Layout) -> Result<()> {
+    use ursa_viz::model::Layout;
+    let name = match layout {
+        Layout::Force => "force",
+        Layout::Rings => "rings",
+        Layout::Layers => "layers",
+    };
+    if layout != Layout::Force && drawing.edges.level.is_none() {
+        let what = match drawing.rule {
+            Rule::Graph => "a property graph",
+            Rule::Edges => "edges",
+            Rule::Matches => "pattern matches",
+            Rule::Nodes => "nodes",
+            Rule::Path | Rule::Rings => "this drawing",
+        };
+        return plan_err(format!(
+            "LAYOUT {name} places each node by its distance from a seed or its step along a path, \
+             and {what} {} neither. Draw a hop result or paths (.graph SELECT * FROM hop(g, seeds \
+             => [1], n => 2) LAYOUT {name}), say which columns are one (AS hops(seed, id, \
+             distance)), or use LAYOUT force",
+            if what == "this drawing" || what == "a property graph" {
+                "has"
+            } else {
+                "have"
+            }
+        ));
+    }
+    drawing.edges.layout = layout;
+    Ok(())
 }
 
 /// A drawing before its style: the nodes and edges a rule read, and what
@@ -405,15 +477,51 @@ impl Drawing {
     }
 }
 
-/// The graph a result's nodes belong to: the one its columns name, or else
-/// (`or_the_only`) the session's only property graph.
+/// The graph a result's nodes belong to: the one `ON graph` names (`on`),
+/// else the one its columns name, or else (`or_the_only`) the session's only
+/// property graph.
 fn graph_of(
     ctx: &SessionContext,
+    reading: &rules::Reading,
+    on: Option<&Name>,
+    or_the_only: bool,
+    notes: &mut Vec<String>,
+) -> Result<Option<Arc<PropertyGraph>>> {
+    let registry = registry_of(ctx);
+    if let Some(on) = on {
+        let Some(found) = registry.get(&on.ident) else {
+            let mut names: Vec<String> = registry.all().iter().map(|g| g.name.clone()).collect();
+            names.sort();
+            return plan_err(format!(
+                "ON {}: there is no property graph named '{}'. {}",
+                on.shown,
+                on.ident,
+                if names.is_empty() {
+                    "This session has none: make one with CREATE PROPERTY GRAPH, or leave the \
+                     clause out"
+                        .to_string()
+                } else {
+                    format!("The graphs are {}; name one of them", names.join(", "))
+                }
+            ));
+        };
+        if let Some(theirs) = reading.graph.as_deref().filter(|g| *g != found.name) {
+            notes.push(format!(
+                "read on {} as ON says; the columns are from {theirs}",
+                found.name
+            ));
+        }
+        return Ok(Some(found));
+    }
+    Ok(graph_of_columns(&registry, reading, or_the_only, notes))
+}
+
+fn graph_of_columns(
+    registry: &crate::graph::GraphRegistry,
     reading: &rules::Reading,
     or_the_only: bool,
     notes: &mut Vec<String>,
 ) -> Option<Arc<PropertyGraph>> {
-    let registry = registry_of(ctx);
     if let Some(name) = &reading.graph {
         let found = registry.get(name);
         if found.is_none() {
@@ -434,8 +542,13 @@ async fn read_rows(
     sql: &dyn RunSql,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    style: &Style,
 ) -> Result<Drawing> {
-    let reading = rules::read(&schema)?;
+    // Rule 0: what `AS …` says; else the first rule that matches.
+    let reading = match &style.shape {
+        Some(shape) => rules::read_as(&schema, shape, style.on.is_some())?,
+        None => rules::read(&schema)?,
+    };
     let mut notes = reading.notes.clone();
     let name = |column: usize| schema.field(column).name().as_str();
     // One batch, for the rules that read rows by position.
@@ -460,12 +573,13 @@ async fn read_rows(
     let mut graph = graph_of(
         ctx,
         &reading,
+        style.on.as_ref(),
         matches!(reading.shape, Shape::Hop { .. } | Shape::Nodes { .. }),
         &mut notes,
-    );
+    )?;
     // The session's only graph is a guess until its edges are read: ids
     // that are not its own are of no graph.
-    let guessed = reading.graph.is_none();
+    let guessed = reading.graph.is_none() && style.on.is_none();
     // The label of each key column, for the nodes' properties.
     let mut key_labels: Vec<(usize, u16)> = Vec::new();
     let (mut edges, index) = match &reading.shape {
