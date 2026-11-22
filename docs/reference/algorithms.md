@@ -69,10 +69,12 @@ Betweenness centrality (Brandes), not normalized. The default is directed: each 
 ### `ur.label_propagation`
 
 ```py
-ur.label_propagation(edges, max_iter: int = 20, seed: int | None = None)
+ur.label_propagation(edges, max_iter: int = 20, seed: int | None = None, parallel: bool = False)
 ```
 
 Community detection by label propagation, on the undirected view. One integer label per node. `max_iter` is at least 1. The result is a heuristic: compare the modularity, not the labels.
+
+`parallel=True` lets nodes vote in parallel sub-rounds, which is faster on a machine with many cores. A given `seed` still gives the same labels on any number of threads, but not the labels the serial default finds, and NetworkX has no equivalent of it. On the planted-partition graphs it is tested on, its modularity and community count are within 1% of the serial run's.
 
 ### `ur.louvain`
 

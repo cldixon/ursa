@@ -171,7 +171,11 @@ fn defaults_are_the_python_apis() {
     );
     assert_eq!(
         defaults("label_propagation"),
-        [("max_iter", UInt(20)), ("seed", Null)]
+        [
+            ("max_iter", UInt(20)),
+            ("seed", Null),
+            ("parallel", Bool(false))
+        ]
     );
     assert_eq!(defaults("connected_components"), [("mode", Str("weak"))]);
     assert_eq!(
@@ -630,11 +634,13 @@ fn calls_compare_by_their_parameters() {
     assert_ne!(
         Call::LabelPropagation {
             max_iter: 20,
-            seed: None
+            seed: None,
+            parallel: false
         },
         Call::LabelPropagation {
             max_iter: 20,
-            seed: Some(0)
+            seed: Some(0),
+            parallel: false
         }
     );
     // Different functions with the same parameters differ.

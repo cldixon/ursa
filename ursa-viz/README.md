@@ -21,11 +21,12 @@ later, in a notebook widget or a native window through the same `View`.
 | `model` | the graph-result model, deltas and the UGR wire format (below). No GPU. |
 | `scene` | the graph, the live layout, node styles, the camera. No GPU; tested natively. |
 | `highlight` | each node's flags (selected, pinned, hidden, …) and the highlighted edges. No GPU. |
+| `live` | a result as the view draws it, kept in step with its deltas: which slots a delta changes. No GPU. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
-| `web` (feature) | the wasm-bindgen API: `createView` for a canvas, `Layout` for a worker (`step`, `grow`). |
+| `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`, `rings`, `layers`). |
 
-With `default-features = false` the crate is `model`, `scene` and `highlight`, with
+With `default-features = false` the crate is `model`, `scene`, `highlight` and `live`, with
 no wgpu in its dependencies: what an engine needs to produce a graph, and
 nothing to draw one.
 
@@ -35,8 +36,9 @@ nothing to draw one.
 data everything drawn is made of. The engine produces it
 (`ursa_engine::graph::view`, #425: what `.graph` draws), and the web shell
 reads it as UGR with `ui/ugr.js`; the notebook widget and an exported page
-will read it the same way. The view above does not take it directly yet
-(#426 and after): the shell hands it the arrays it read.
+will read it the same way. A view can be made from a result and changed by
+its deltas ([below](#scenes-that-change-in-place)); the shell does not do
+so yet (#443): it hands the view the arrays it read.
 
 - **`GraphResult`**: nodes, edges, their columns, highlights, encodings and
   provenance.
@@ -171,7 +173,7 @@ How it is drawn, on WebGL2 as on WebGPU:
 - A highlighted edge is an instance of a quad: its two ends' positions, 16
   bytes, in a small buffer of their own, written again when the positions
   change (an instance cannot index the position buffers without a storage
-  buffer). The line list's index buffer is not writable after it is made.
+  buffer). The line list's index buffer is not written for a highlight.
 - The nodes in front are a small buffer too (position, radius, colour and
   flags, 20 bytes a node), drawn by the node shader after the highlighted
   edges; the pass over every node leaves them out by their flags. So a
@@ -185,6 +187,107 @@ and checks all of it: the path's width and colour, the dimming, the rings,
 the hidden node and the bytes uploaded. Under WebGPU, whose frames cannot be
 read back headless, it checks that the same calls draw with no error from
 the device.
+
+## Scenes that change in place
+
+A scene is a base result and the deltas applied to it (#441, the design's
+§3 and §6). A view made from a result applies a delta **in time
+proportional to the delta, not to the graph**: an expansion of 100 nodes
+and 300 edges on a view of a million edges uploads 5 KB and takes 0.7 ms
+outside the frame in Chromium ([`BENCH.md`](BENCH.md#deltas)).
+
+```js
+const view = await createViewFromResult(canvas, resultBytes);  // a GraphResult as UGR
+const before = view.positions();                // an undo's positions: saved before the step
+const applied = view.applyDelta(deltaBytes);    // a GraphDelta as UGR; throws, changing nothing, if it does not fit
+applied.nodes; applied.edges;                   // the slots there are now
+applied.bytesUploaded; applied.grew;            // what it wrote to the GPU, and whether a buffer doubled
+view.info();                                    // what is shown: counts, what sizes the nodes, the colour legend
+
+view.applyDelta(invertDelta(deltaBytes), before);  // undo: the inverse delta, and every node back where it was
+```
+
+In Rust, `View::from_result`, `View::apply(&GraphDelta)` and
+`View::apply_at` (with positions), `View::info` and `View::result`.
+
+What a delta does to what is drawn:
+
+- **New nodes and edges take the slots after the last.** The node and edge
+  buffers are append-only: they grow by doubling, what they held is copied
+  on the GPU (`copyBufferSubData` on WebGL2; nothing is uploaded again),
+  and a delta writes only its own slots: 16 bytes a node (position, radius,
+  colour) and 4 of flags, 8 an edge. A view made from a result starts with
+  room for a sixty-fourth more, rounded up to a power of two (a million
+  edges: 1,048,576), on the GPU and in the result's own arrays, so its
+  first deltas move nothing.
+- **A removed node keeps its slot, hidden by its flag**: 4 bytes. Its edges
+  are left out by the pipeline that reads the flags (the highlight layer's,
+  used only while a node is hidden), so none of them is written.
+- **A removed edge keeps its slot as a line from its source to itself**,
+  which draws nothing: 8 bytes, and the same to restore it.
+- **Taking slots off the end** (a step undone) is a shorter draw range. It
+  writes nothing.
+- **Styles follow the result's encodings.** With `size_by`, a node's radius
+  is its value's place in the column's range (3 to 14 px, by square root);
+  without, its degree's (`1.5 + sqrt(degree)`, at most 12). With `color_by`,
+  its colour is its category's in the theme's palette (a text column's
+  values in order of appearance; a null gets the node colour). A delta
+  restyles what it has to and writes only the nodes whose radius or colour
+  came out different, in runs (4 bytes a node, 8 if a colour changed): the
+  two ends of a new edge between nodes that were not neighbours, when nodes
+  are sized by degree; every node, when a new node's value widens the
+  column's range, or a column that sizes or colours is set.
+- **Highlights and positions:** `SetHighlights` redraws the highlight layer
+  from the result's paths and seeds. `SetPositions`, or the positions given
+  with the delta, move every node (8 bytes a node, as a layout step does).
+- **A new node the delta gives no position** starts beside a node a new
+  edge joins it to, on a golden-angle spiral, so that it is drawn at once
+  where it belongs; the layout (`Layout.grow`, then `setPositions`) then
+  places it properly.
+
+**Undo is the inverse delta** (`invertDelta(bytes)`, or
+`GraphDelta::invert`), with no query: no index changes, and everything
+drawn is a function of the result and the positions, so a delta and its
+inverse leave the frame as it was, bit for bit. The positions are the
+page's to keep: a layout moves the nodes after a step, so the page saves
+`view.positions()` before each step and gives them back with the inverse.
+
+`info()` follows every delta, for the status line and the legend:
+
+```js
+{ nodes: 37, edges: 83,                  // shown: not removed, and for an edge, neither end removed
+  hiddenNodes: 0, hiddenEdges: 0,
+  nodeSlots: 37, edgeSlots: 83,          // every slot: the next node's and the next edge's index
+  size: { column: null, range: null },   // column null: by degree
+  color: { column: "kind", entries: [{ category: 0, label: "a", color: "#2a78d6", count: 20 }, …], other: 0, none: 2 } }  // or null
+```
+
+The colour legend lists the twelve categories with the most shown nodes;
+`other` counts the rest and `none` the nodes with no value. The node counts
+are kept as deltas come. The shown edges are counted, on the first call
+after a delta, only while a node is hidden (its edges are not shown); the
+legend, only when a column colours the nodes.
+
+How it is built: `live::LiveResult` holds the result and, for each delta,
+works out which slots changed (`live::Changes`), with no GPU, so the
+bookkeeping is tested natively: against a stand-in for the buffers that is
+written only as `Changes` says, after every step of a run of random deltas
+and undos, what it holds must be what a new view of the result would draw.
+`View::apply` then writes those slots. Degrees are kept as edges come and
+go, from the adjacency the view started with and a count of the pairs added
+since, so a delta never builds the adjacency again; `scene::Graph` builds
+its own again only when a layout on this thread next asks for it. The
+model answers "does an edge still name one of the last nodes?" without
+reading the edges, so undoing an expansion costs what the expansion did.
+While the camera follows the drawing, it is refitted from the last fit's
+bounds and the new nodes', not from every position.
+
+`ursa-viz/tests/browser/view.ts` reads frames back on WebGL2 and checks it
+(`ONLY=delta`): a growth changes only the pixels around what it added,
+though the buffers doubled under it; removed nodes and edges are gone; a
+delta that does not fit changes nothing; and after each inverse the frame
+is the first frame, byte for byte. For a page with no engine (the demo, the
+tests) the wasm has `resultFromEdges` and a small `DeltaBuilder`.
 
 ## Colours
 
@@ -297,6 +400,65 @@ a node's size, and the leaves of one hub settle about a third as far apart
 as the average pair of nodes in the drawing; the test bounds that ratio, not
 pixels.
 
+## Rings and layers
+
+A result whose nodes have a level needs no force at all (#436). A `hop`
+result gives each node its distance from a seed, and a set of shortest paths
+gives each node its position along the path. Two **fixed** layouts draw
+those, done as they are made:
+
+```js
+// distance per node: 0 for a seed, 0xFFFFFFFF for none
+const rings = Layout.rings(n, src, dst, distance);
+// layer per node: its position along the path
+const layers = Layout.layers(n, src, dst, layer);
+rings.done;        // true: no step() to run
+rings.positions(); // x then y, as any layout's
+rings.kind;        // "rings" ("layers", or "force" for the others)
+```
+
+- **Rings** (`LiveLayout::rings`, `ursa_core::algo::layout_rings`): the seed
+  at the centre and distance `d` on the circle of radius `d`. A ring with
+  more nodes than fit a quarter of a unit apart gets the radius it needs,
+  and the rings outside it move out, so no two nodes are nearer than that.
+  Several seeds get a ring system each, side by side in rows in seed order;
+  a node is in the system of the seed it is nearest through the drawn edges
+  (the lowest-numbered when several tie).
+- **Layers** (`LiveLayout::layers`, `layout_layers`): layer `l` on the
+  vertical line at `x = l`, the first at the left, nodes half a unit apart.
+  One path alone is a straight line. It is also the drawing for a `hop`
+  result with several seeds, by distance from the nearest. When a layer is
+  more than twice as high as the drawing is wide the lines are spread, so a
+  wide neighbourhood is not one column.
+- **The order on a ring or a line** is chosen to shorten edges, by four
+  barycentre sweeps: out from the first level and back, each level is
+  ordered by the mean place of its nodes' neighbours on the level just
+  visited (neighbours on the same level count half), ties by node index.
+  Each node then goes as near that mean as it can while keeping its distance
+  from the nodes beside it, so a child sits in line with its parent and a
+  full ring is evenly spaced.
+- **Nodes without a level** go after the last: one more ring, or one more
+  line.
+- **Deterministic:** both are serial, so the same input gives the same bits
+  on any thread count. Layers use only `+ - * /` and are the same bits on
+  every platform; rings need `sin`, `cos` and `atan2`, whose last bit is
+  the platform's.
+- **Cost:** 2 ms for a neighbourhood of 2,048 nodes and 8,334 edges on one
+  thread, 21 ms for 16,384 nodes and 88,822 edges, 305 ms for 131,072 nodes
+  and 928,785 edges (rings; layers take half that), where coarse to fine
+  takes seconds ([`BENCH.md`](BENCH.md#rings-and-layers)).
+- A fixed layout can **grow** like any other (`Layout.grow`): the new nodes
+  settle beside their parents by force, not on a ring or a layer, and
+  `kind` is `"force"` from then on.
+
+In the worker, `{type: "start", …, layout: {kind: "rings", level}}` posts one
+`positions` message and `done` (`web/public/graph-worker.js`). The demo
+draws them with `&layout=rings&seeds=0&hops=2` and
+`&layout=layers&from=16&to=26` (add `&graph=karate`), and
+`tests/browser/view.ts` checks them: on karate, two hops from node 0 are two
+rings of 16 and 9 nodes, each node on its radius and none drawn over
+another; all shortest paths from 16 to 26 are six layers.
+
 ## Measured
 
 Time to a converged layout: coarse to fine to the end of its schedule; flat
@@ -353,11 +515,15 @@ bunx serve ursa-viz      # then open /demo/?graph=rmat&scale=17&edges=1000000
 The demo takes `?graph=rmat&scale=&edges=`, `?graph=grid&w=&h=`,
 `?graph=clusters&k=&size=` or `?graph=karate`, plus `&multilevel=0` for flat
 ForceAtlas2 (and, flat, `&iterations=`), `&theme=dark` and
-`&highlight=path` to start with a path highlighted. Drag to pan, wheel to
+`&highlight=path` to start with a path highlighted;
+`&layout=rings&seeds=0&hops=2` or `&layout=layers&from=16&to=26` draws a
+neighbourhood or the shortest paths with a fixed layout. Drag to pan, wheel to
 zoom, double-click to fit. The pointer's node is hovered; a click selects
 it, shift-click adds to the selection, and two selected nodes draw the
 shortest path between them. `p` pins the selection, `h` hides it, `u` shows
-everything again and Escape clears.
+everything again and Escape clears. With `&result=1` the view is made from a
+graph result, and once the layout is done `e` expands the selected node (one
+delta: five new nodes and their edges) and `z` undoes the last expansion.
 
 The browser harness runs the demo on each test graph, reads frames back and
 checks them:
@@ -365,6 +531,7 @@ checks them:
 ```sh
 bun ursa-viz/tests/browser/view.ts [screenshot dir]   # WEBGPU=0 for WebGL2; ONLY=<name>; MODE=flat|multilevel
 ONLY=highlight bun ursa-viz/tests/browser/view.ts     # the highlight layer alone (always on WebGL2)
+ONLY=delta bun ursa-viz/tests/browser/view.ts         # deltas alone; ONLY="delta karate" without the 1M-edge timing
 ```
 
 ## Benchmark
@@ -391,6 +558,11 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   (half the nodes, nearly all the edges), so they cost about what the graph
   does. Cheaper iterations (attraction gathers 2M random reads; repulsion
   could be approximated harder far out) would buy the rest.
+- **Rings and layers from the shell.** The shell's worker takes
+  `graph.layout = {kind, level}` from `graph.js`, but nothing sets it yet:
+  the rules that turn a `hop` result or a path column into one are #433.
+- **Rings that stay rings when they grow.** Growing a fixed layout hands it
+  to ForceAtlas2, whose scale is not the rings' (a ring step is one unit).
 - **Growing from the shell.** `Layout.grow` is in the wasm API; the
   shell's layout worker does not call it yet (`{type: "grow"}`, with #443).
 - **The view's own layout.** `View::step`, for a page that lays out on its
@@ -405,7 +577,22 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   plain WebGPU reads back there. To check on real hardware, and with wgpu 30,
   which needs wasm-bindgen 0.2.127 or later (the workspace is on 0.2.126).
 - **Highlights from the shell.** The layer and its API are in the view;
-  `.graph`, `.path` and the pointer do not drive it yet (#433, #438, #441).
+  `.graph`, `.path` and the pointer do not drive it yet (#433, #438).
+- **Deltas from the shell.** `applyDelta` is in the view; `.graph` still
+  makes its view from `src`/`dst` arrays and never changes it (#443, with
+  the explore session that emits the deltas). `graph.js` keeps its own
+  status line and legend until then; `info()` is what they will read.
+- **A history in the view.** Undo is the inverse delta and the positions
+  the page saved; the stack of steps is the explore session's (#443).
+- **Doubling under a delta.** The delta that outgrows the buffers pays for
+  the copy of what they held (on the GPU, and of the result's arrays):
+  about 12 ms at a million edges here, once per doubling. Growing ahead of
+  need, in an idle moment, would hide it.
+- **Edge styles.** A delta's edge columns are kept in the result; edges are
+  all drawn alike, so nothing of them is uploaded.
+- **Encodings in physical pixels.** A result's sizes are 3 to 14 px (or by
+  degree, 1.5 to 12) whatever the device's pixel ratio; the shell scales its
+  own by the ratio today.
 - **Highlights' own widths and colours.** Every highlighted edge is 3 px in
   the one highlight colour (`Renderer::highlight_width` sets the width for
   all); a width or a colour per edge would be 8 more bytes an instance.

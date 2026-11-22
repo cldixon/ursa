@@ -207,6 +207,12 @@ static assets and an R2 bucket.
     heaps are 49 MiB (engine), 52 MiB (view) and 97 MiB (layout worker),
     of 219 MiB for the page and its workers. On karate: frames 16.7 ms
     apart (p95 20 ms), `render()` 1.4 ms, a pick 0.2 ms.
+
+    The layout worker (`graph-worker.js`) also lays out **rings and layers**
+    (#436): a graph that carries `layout: {kind: "rings" | "layers", level}`,
+    each node's distance from a seed or its layer, is laid out in one
+    message, with no levels to wait for. Nothing sets it yet: the rules
+    that draw a `hop` result as rings and paths as layers are #433.
     `graph.js` is imported on the first `.graph`, and it loads `ursa-viz`
     (about 1 MB gzipped), so a session that draws nothing downloads neither.
     The terminal keeps the focus and refits to its half (xterm's fit addon,

@@ -9,6 +9,8 @@
 //!
 //! - [`model`]: the graph-result model, deltas and the UGR wire format: what
 //!   the engine produces and every front end reads.
+//! - [`live`]: a result as the view draws it, kept in step with its deltas:
+//!   which slots a delta changes, in time proportional to the delta. No GPU.
 //! - [`scene`]: the graph, the live layout (`ursa-core`'s [`Fa2State`],
 //!   stepped a few iterations per frame, and grown when the graph gains
 //!   nodes), node styles and the camera. No GPU.
@@ -20,12 +22,13 @@
 //!   binding to drive.
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
-//! With `default-features = false` the crate is [`model`], [`scene`] and
-//! [`highlight`] alone: no GPU and no browser, which is how the engine depends on it.
+//! With `default-features = false` the crate is [`model`], [`scene`],
+//! [`highlight`] and [`live`] alone: no GPU and no browser, which is how the engine depends on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
 pub mod highlight;
+pub mod live;
 pub mod model;
 #[cfg(feature = "render")]
 pub mod render;
@@ -36,6 +39,7 @@ pub mod view;
 pub mod web;
 
 pub use highlight::HighlightState;
+pub use live::{Changes, LiveResult};
 pub use model::{GraphDelta, GraphResult};
 pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};
 #[cfg(feature = "render")]

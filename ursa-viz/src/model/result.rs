@@ -170,6 +170,12 @@ impl Strings {
         self.offsets.len() - 1
     }
 
+    /// Room for `count` more strings of `bytes` bytes in all.
+    pub fn reserve(&mut self, count: usize, bytes: usize) {
+        self.offsets.reserve(count);
+        self.bytes.reserve(bytes);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -491,11 +497,17 @@ pub struct GraphResult {
 
     /// `(label, key)` → node index. Derived from the keys and labels.
     pub(crate) index: HashMap<(u16, Key), u32>,
+    /// The greatest node index the edges name, as it rises along them:
+    /// `(edge, node)` for each edge that names a node past every earlier
+    /// edge's. Derived from the edges. Its last entry says whether an edge
+    /// still names one of the last nodes, without reading the edges, so
+    /// taking nodes off the end costs what they hold.
+    pub(crate) named: Vec<(u32, u32)>,
 }
 
 impl PartialEq for GraphResult {
     fn eq(&self, other: &Self) -> bool {
-        // All but `index`, which the rest determines.
+        // All but `index` and `named`, which the rest determines.
         self.graph == other.graph
             && self.node_labels == other.node_labels
             && self.edge_labels == other.edge_labels
@@ -682,6 +694,39 @@ impl GraphResult {
         }
     }
 
+    /// Make room for `nodes` more nodes and `edges` more edges, so that a
+    /// delta that adds up to as many moves nothing the result holds: a view
+    /// that takes deltas does this once, when it is made, and not under the
+    /// first of them.
+    pub fn reserve(&mut self, nodes: usize, edges: usize) {
+        fn columns(columns: &mut [Column], more: usize) {
+            for column in columns {
+                match &mut column.values {
+                    Values::F32(v) => v.reserve(more),
+                    Values::U32(v) | Values::Dict { codes: v, .. } => v.reserve(more),
+                }
+            }
+        }
+        // A key is a few bytes of text.
+        self.node_keys.reserve(nodes, 8 * nodes);
+        self.node_label.reserve(nodes);
+        self.node_flags.reserve(nodes);
+        columns(&mut self.node_columns, nodes);
+        if let Some(p) = &mut self.positions {
+            p.x.reserve(nodes);
+            p.y.reserve(nodes);
+        }
+        self.index.reserve(nodes);
+        self.src.reserve(edges);
+        self.dst.reserve(edges);
+        self.edge_label.reserve(edges);
+        self.edge_flags.reserve(edges);
+        if let Some(rows) = &mut self.edge_rows {
+            rows.reserve(edges);
+        }
+        columns(&mut self.edge_columns, edges);
+    }
+
     // Invariants.
 
     /// Check every invariant, and rebuild the key index. `apply` keeps them,
@@ -743,6 +788,8 @@ impl GraphResult {
             ));
         }
         self.check_edges(&self.src, &self.dst, &self.edge_label, n, 0)?;
+        self.named.clear();
+        self.note_named(0);
         if let Some(rows) = &self.edge_rows {
             if rows.len() != m {
                 return err(format!("{m} edges, but {} rows", rows.len()));
@@ -764,6 +811,32 @@ impl GraphResult {
         }
         self.check_highlights(&self.highlights)?;
         self.check_encodings(&self.encodings)
+    }
+
+    /// Note the nodes the edges from `first` on name, in `named`.
+    pub(crate) fn note_named(&mut self, first: usize) {
+        let mut top = self.named.last().map(|&(_, node)| node);
+        for e in first..self.src.len() {
+            let node = self.src[e].max(self.dst[e]);
+            if top.is_none_or(|t| node > t) {
+                self.named.push((e as u32, node));
+                top = Some(node);
+            }
+        }
+    }
+
+    /// Forget, in `named`, the edges from `len` on.
+    pub(crate) fn forget_named(&mut self, len: usize) {
+        while self.named.last().is_some_and(|&(e, _)| e as usize >= len) {
+            self.named.pop();
+        }
+    }
+
+    /// Whether an edge names a node at or past `n`.
+    pub(crate) fn names_past(&self, n: usize) -> bool {
+        self.named
+            .last()
+            .is_some_and(|&(_, node)| node as usize >= n)
     }
 
     /// The edges `src[i] → dst[i]` name nodes below `n_nodes` and labels the

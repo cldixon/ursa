@@ -2,7 +2,9 @@
 // drawn every frame. Drag to pan, wheel to zoom, double-click to fit.
 // ?graph=rmat&scale=17&edges=1000000 | grid | clusters | karate;
 // &multilevel=0 for flat ForceAtlas2 (coarse to fine is the default);
-// &theme=dark.
+// &theme=dark. &layout=rings&seeds=0&hops=2 draws a neighbourhood as
+// rings, and &layout=layers&from=16&to=26 the shortest paths as layers
+// (graphs.js).
 //
 // The highlight layer: the pointer's node is hovered, a click selects it
 // (shift-click adds to the selection, a click on nothing clears it), and a
@@ -10,7 +12,14 @@
 // selection, `p` pins or unpins it, `h` hides it and `u` shows everything
 // again; Escape clears the path and the selection. &highlight=path starts
 // with a path drawn (on karate, one of five edges).
-import init, { createView } from "../pkg/ursa_viz.js";
+//
+// Scenes that change in place: &result=1 makes the view from a graph result
+// (UGR), so deltas apply to it. Once the layout is done, `e` expands the
+// selected node (five new nodes and their edges, one delta) and `z` undoes
+// the last expansion (the inverse delta, and the positions saved before
+// it). &result=xy gives the result positions (a circle), so a delta's new
+// nodes must bring their own: for the tests.
+import init, * as viz from "../pkg/ursa_viz.js";
 import { fromParams, shortestPath } from "./graphs.js";
 
 const params = new URLSearchParams(location.search);
@@ -33,7 +42,12 @@ const t1 = performance.now();
 // Page-clock marks (ms since navigation), for the bench: when the graph was
 // ready, the first frame with layout positions, the layout's end.
 stats.graphReadyAt = t1;
-const view = await createView(canvas, g.n, g.src, g.dst);
+const fromResult = params.get("result");
+const circle = () => Float32Array.from({ length: 2 * g.n }, (_, i) => (i < g.n ? Math.cos : Math.sin)((2 * Math.PI * (i % g.n)) / g.n));
+const view = fromResult
+  ? await viz.createViewFromResult(canvas, viz.resultFromEdges(g.n, g.src, g.dst, fromResult === "xy" ? circle() : undefined))
+  : await viz.createView(canvas, g.n, g.src, g.dst);
+window.viz = viz;
 stats.createMs = performance.now() - t1;
 const dark = params.get("theme") === "dark";
 if (dark) {
@@ -65,6 +79,7 @@ let pending = null;
 worker.onmessage = ({ data }) => {
   if (data.type === "positions") {
     pending = data.xy;
+    stats.positionMessages = (stats.positionMessages ?? 0) + 1;
     stats.firstPositionsAt ??= performance.now();
     stats.workerMemoryBytes = data.memoryBytes;
     stats.iterations = data.iterations;
@@ -81,7 +96,8 @@ worker.onmessage = ({ data }) => {
 const multilevel = params.get("multilevel") !== "0";
 const maxIterations = Number(params.get("iterations") ?? 300);
 stats.multilevel = multilevel;
-worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations, multilevel }, []);
+stats.layout = g.layout ?? "force";
+worker.postMessage({ type: "start", n: g.n, src: g.src, dst: g.dst, maxIterations, multilevel, layout: g.layout, level: g.level }, []);
 
 // Frames: draw every animation frame, recording how long each draw takes,
 // and the positions uploaded (8 bytes a node each time).
@@ -93,6 +109,8 @@ function frame() {
   if (paused) { requestAnimationFrame(frame); return; }
   const t = performance.now();
   let uploaded = false;
+  // Positions for the graph as it was before a delta are dropped.
+  if (pending && pending.length !== 2 * view.nodeCount) pending = null;
   if (pending) {
     view.setPositions(pending);
     stats.uploads++;
@@ -113,7 +131,9 @@ function frame() {
     stats.drawMsMedian = sorted[Math.floor(sorted.length / 2)];
     statsEl.textContent =
       `${stats.backend} · ${stats.nodes.toLocaleString()} nodes · ${stats.edges.toLocaleString()} edges\n` +
-      (multilevel
+      (g.layout
+        ? `layout ${g.layout}` + (stats.layoutDone ? ` · done in ${stats.layoutMs.toFixed(1)} ms` : "") + "\n"
+        : multilevel
         ? `layout coarse to fine, level ${stats.level ?? "–"} · ${stats.iterations} it of work` +
           (stats.layoutDone ? ` · done in ${(stats.layoutMs / 1000).toFixed(1)} s` : "") + "\n"
         : `layout ${stats.iterations}/${maxIterations} it · ${stats.msPerIteration?.toFixed(1) ?? "–"} ms/it (worker)` +
@@ -171,8 +191,25 @@ window.addEventListener("keydown", (e) => {
     selection.clear();
     view.setSelection(new Uint32Array());
     view.clearHighlights();
+  } else if (e.key === "e" && fromResult === "1" && stats.layoutDone && selection.size) {
+    // One delta: five new nodes, each joined to the selected node, and in a ring.
+    const [at] = selection, n = view.nodeCount, fresh = [0, 1, 2, 3, 4].map((k) => n + k);
+    const delta = new viz.DeltaBuilder()
+      .addNodes(n, 5)
+      .addEdges(Uint32Array.from([...fresh, ...fresh]), Uint32Array.from([...fresh.map(() => at), ...fresh.map((_, k) => n + ((k + 1) % 5))]))
+      .toBytes();
+    const positions = view.positions();
+    const applied = view.applyDelta(delta);
+    undo.push({ delta, positions });
+    Object.assign(stats, { nodes: applied.nodes, edges: applied.edges, deltaBytes: applied.bytesUploaded });
+  } else if (e.key === "z" && undo.length) {
+    // The inverse delta, and every node back where it was: no query.
+    const { delta, positions } = undo.pop();
+    const applied = view.applyDelta(viz.invertDelta(delta), positions);
+    Object.assign(stats, { nodes: applied.nodes, edges: applied.edges, deltaBytes: applied.bytesUploaded });
   }
 });
+const undo = [];
 canvas.addEventListener("wheel", (e) => { e.preventDefault(); view.zoom(Math.exp(-e.deltaY * 0.0015), e.offsetX * dpr, e.offsetY * dpr); }, { passive: false });
 canvas.addEventListener("dblclick", () => view.fit());
 new ResizeObserver(() => {

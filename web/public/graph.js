@@ -163,7 +163,9 @@ export async function show(stage, sent, { status, legend, onError, times = {} })
   {
     const src = graph.src.slice();
     const dst = graph.dst.slice();
-    worker.postMessage({ type: "start", n: graph.n, src, dst, module: url }, [src.buffer, dst.buffer]);
+    // graph.layout, {kind: "rings" | "layers", level}, asks for a fixed layout
+    // (graph-worker.js): each node's distance or layer in `level`.
+    worker.postMessage({ type: "start", n: graph.n, src, dst, module: url, layout: graph.layout }, [src.buffer, dst.buffer]);
     times.posted = performance.now();
   }
 

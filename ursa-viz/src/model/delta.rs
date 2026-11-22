@@ -594,7 +594,7 @@ impl GraphResult {
         }
         check_tail_columns(&self.node_columns, &batch.columns, n, "node")?;
         let named = |nodes: &[u32]| nodes.iter().any(|&v| v as usize >= n);
-        if named(&self.src) || named(&self.dst) {
+        if self.names_past(n) {
             return err("an edge still names one of the last nodes");
         }
         if named(&self.highlights.seeds) || self.highlights.paths.iter().any(|p| named(&p.nodes)) {
@@ -652,6 +652,7 @@ impl GraphResult {
             }
         }
         extend_columns(&mut self.edge_columns, &batch.columns, count);
+        self.note_named(m);
         Ok(())
     }
 
@@ -686,6 +687,7 @@ impl GraphResult {
 
         self.src.truncate(m);
         self.dst.truncate(m);
+        self.forget_named(m);
         self.edge_label.truncate(m);
         self.edge_flags.truncate(m);
         if let Some(rows) = &mut self.edge_rows {

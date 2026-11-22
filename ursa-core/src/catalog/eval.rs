@@ -397,9 +397,13 @@ impl<'a> Evaluator<'a> {
                 };
                 one(Arc::new(Float64Array::from(scores)))
             }
-            Call::LabelPropagation { max_iter, seed } => one(Arc::new(UInt32Array::from(
-                label_propagation(topo, mask, max_iter, seed),
-            ))),
+            Call::LabelPropagation {
+                max_iter,
+                seed,
+                parallel,
+            } => one(Arc::new(UInt32Array::from(label_propagation(
+                topo, mask, max_iter, seed, parallel,
+            )))),
             Call::Louvain {
                 resolution,
                 seed,

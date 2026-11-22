@@ -4,9 +4,12 @@
 //! None of this touches the GPU, so it is tested natively and is the same on
 //! every platform. [`crate::render`] draws it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use ursa_core::algo::{fa2_grow, Fa2Multilevel, Fa2Params, Fa2State, MultilevelParams, WarmParams};
+use ursa_core::algo::{
+    fa2_grow, layout_layers, layout_rings, Fa2Multilevel, Fa2Params, Fa2State, LayersParams,
+    MultilevelParams, RingsParams, WarmParams,
+};
 use ursa_core::topology::Topology;
 
 /// A graph to show: `n_nodes` nodes, and one edge per `(src[i], dst[i])`, as
@@ -15,9 +18,16 @@ use ursa_core::topology::Topology;
 /// Dense indexes keep the view independent of where the graph came from: the
 /// SQL shell maps its result's `src`/`dst` ids to them, and the DataFrame API
 /// already has them in its topology.
+///
+/// A graph grows and shrinks at its end ([`Graph::append`],
+/// [`Graph::truncate`]) in time proportional to the change: its topology,
+/// which a layout needs and a frame does not, is built again when next asked
+/// for.
 #[derive(Debug)]
 pub struct Graph {
-    topology: Arc<Topology>,
+    n_nodes: usize,
+    /// Built by [`Graph::new`], and again on demand after a change.
+    topology: OnceLock<Arc<Topology>>,
     src: Vec<u32>,
     dst: Vec<u32>,
 }
@@ -49,23 +59,75 @@ impl Graph {
             dst.len(),
             "src and dst must have one entry per edge"
         );
-        for (edge, (&s, &d)) in src.iter().zip(&dst).enumerate() {
-            for node in [s, d] {
-                if node as usize >= n_nodes {
-                    return Err(BadEdge {
-                        edge,
-                        node,
-                        n_nodes,
-                    });
-                }
-            }
+        check_edges(n_nodes, 0, &src, &dst)?;
+        let graph = Self {
+            n_nodes,
+            topology: OnceLock::new(),
+            src,
+            dst,
+        };
+        graph.topology();
+        Ok(graph)
+    }
+
+    /// `new_nodes` more nodes, after the ones there are, and these edges
+    /// after the ones there are. No index changes. On an error nothing does.
+    pub fn append(&mut self, new_nodes: usize, src: &[u32], dst: &[u32]) -> Result<(), BadEdge> {
+        assert_eq!(
+            src.len(),
+            dst.len(),
+            "src and dst must have one entry per edge"
+        );
+        check_edges(self.n_nodes + new_nodes, self.src.len(), src, dst)?;
+        if new_nodes > 0 || !src.is_empty() {
+            self.n_nodes += new_nodes;
+            self.src.extend_from_slice(src);
+            self.dst.extend_from_slice(dst);
+            self.topology = OnceLock::new();
         }
-        let topology = Arc::new(Topology::build(n_nodes, src.clone(), dst.clone()));
-        Ok(Self { topology, src, dst })
+        Ok(())
+    }
+
+    /// Make room for `edges` more edges, so that appending up to as many
+    /// moves none.
+    pub fn reserve(&mut self, edges: usize) {
+        self.src.reserve(edges);
+        self.dst.reserve(edges);
+    }
+
+    /// Keep the first `n_nodes` nodes and the first `n_edges` edges, which
+    /// must name only those nodes: what undoes an [`append`](Self::append).
+    pub fn truncate(&mut self, n_nodes: usize, n_edges: usize) -> Result<(), BadEdge> {
+        let (n_nodes, n_edges) = (n_nodes.min(self.n_nodes), n_edges.min(self.src.len()));
+        if n_nodes < self.n_nodes {
+            check_edges(n_nodes, 0, &self.src[..n_edges], &self.dst[..n_edges])?;
+        }
+        self.truncate_checked(n_nodes, n_edges);
+        Ok(())
+    }
+
+    /// [`Graph::truncate`] for a caller that knows the edges that stay name
+    /// only nodes that stay (a [`crate::model::GraphResult`] has checked):
+    /// it does not read them.
+    pub(crate) fn truncate_checked(&mut self, n_nodes: usize, n_edges: usize) {
+        if n_nodes < self.n_nodes || n_edges < self.src.len() {
+            self.n_nodes = n_nodes;
+            self.src.truncate(n_edges);
+            self.dst.truncate(n_edges);
+            self.topology = OnceLock::new();
+        }
     }
 
     pub fn n_nodes(&self) -> usize {
-        self.topology.n_nodes()
+        self.n_nodes
+    }
+
+    pub fn src(&self) -> &[u32] {
+        &self.src
+    }
+
+    pub fn dst(&self) -> &[u32] {
+        &self.dst
     }
 
     pub fn n_edges(&self) -> usize {
@@ -85,15 +147,40 @@ impl Graph {
 
     /// Each node's undirected degree (distinct neighbours, self-loops left out).
     pub fn degrees(&self) -> Vec<u32> {
-        let adj = self.topology.undirected();
+        let adj = self.topology().undirected();
         (0..self.n_nodes() as u32)
             .map(|u| adj.degree(u) as u32)
             .collect()
     }
 
+    /// The graph's adjacency: built once, and again after the graph
+    /// changes ([`Graph::append`], [`Graph::truncate`]), when it is next
+    /// asked for.
     pub fn topology(&self) -> &Arc<Topology> {
-        &self.topology
+        self.topology.get_or_init(|| {
+            Arc::new(Topology::build(
+                self.n_nodes,
+                self.src.clone(),
+                self.dst.clone(),
+            ))
+        })
     }
+}
+
+/// Every edge names a node below `n_nodes`; `first` is the first edge's index.
+fn check_edges(n_nodes: usize, first: usize, src: &[u32], dst: &[u32]) -> Result<(), BadEdge> {
+    for (i, (&s, &d)) in src.iter().zip(dst).enumerate() {
+        for node in [s, d] {
+            if node as usize >= n_nodes {
+                return Err(BadEdge {
+                    edge: first + i,
+                    node,
+                    n_nodes,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// ForceAtlas2, run a few iterations at a time so the view can draw it as it
@@ -102,9 +189,14 @@ impl Graph {
 /// or coarse to fine ([`LiveLayout::multilevel`]), `Fa2Multilevel`'s, the same
 /// as `layout_fa2_multilevel` once done.
 ///
-/// Either can then **grow** ([`LiveLayout::grow`]): the graph gains nodes and
-/// edges, the new nodes start beside the ones they came from, and a short
-/// warm schedule settles them while what was drawn is held.
+/// A result whose nodes have a level needs no iterations at all:
+/// [`LiveLayout::rings`] (a neighbourhood, by distance from its seeds) and
+/// [`LiveLayout::layers`] (paths, by position along them) are **fixed**
+/// layouts, done as soon as they are made.
+///
+/// Any of them can then **grow** ([`LiveLayout::grow`]): the graph gains
+/// nodes and edges, the new nodes start beside the ones they came from, and
+/// a short warm schedule settles them while what was drawn is held.
 #[derive(Debug)]
 pub struct LiveLayout {
     topology: Arc<Topology>,
@@ -123,7 +215,56 @@ enum Engine {
         run: u32,
         total: u32,
     },
+    /// Rings or layers: positions that were right when they were made, with
+    /// nothing to run.
+    Fixed {
+        kind: LayoutKind,
+        x: Vec<f32>,
+        y: Vec<f32>,
+    },
 }
+
+/// Which layout a [`LiveLayout`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    /// ForceAtlas2: flat, coarse to fine, or warm after growing.
+    Force,
+    /// Concentric rings by distance from the seeds ([`LiveLayout::rings`]).
+    Rings,
+    /// Layers left to right ([`LiveLayout::layers`]).
+    Layers,
+}
+
+impl LayoutKind {
+    /// `"force"`, `"rings"` or `"layers"`: the names `.graph … LAYOUT` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            LayoutKind::Force => "force",
+            LayoutKind::Rings => "rings",
+            LayoutKind::Layers => "layers",
+        }
+    }
+}
+
+/// Levels that are not one per node of the graph ([`LiveLayout::rings`],
+/// [`LiveLayout::layers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadLevels {
+    pub n_nodes: usize,
+    pub got: usize,
+}
+
+impl std::fmt::Display for BadLevels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected one level per node ({}); got {}",
+            self.n_nodes, self.got
+        )
+    }
+}
+
+impl std::error::Error for BadLevels {}
 
 /// What a layout gains in [`LiveLayout::grow`], besides the grown graph.
 #[derive(Debug, Clone, Copy, Default)]
@@ -227,6 +368,62 @@ impl LiveLayout {
         })
     }
 
+    /// Concentric rings, for a neighbourhood (a `hop` result):
+    /// `distance[v]` is node `v`'s distance from a seed, 0 for a seed and
+    /// [`ursa_core::algo::NO_LEVEL`] for a node that has none. One seed is
+    /// at the centre with distance `d` on the circle of radius `d`; several
+    /// seeds get a ring system each, side by side. The order on each ring
+    /// shortens the graph's edges. It is `ursa_core::algo::layout_rings`,
+    /// and it is done at once: [`Self::is_done`] from the start, with no
+    /// iterations to run.
+    pub fn rings(graph: &Graph, distance: &[u32], params: RingsParams) -> Result<Self, BadLevels> {
+        Self::fixed(graph, distance, LayoutKind::Rings, |adj| {
+            layout_rings(adj, distance, params)
+        })
+    }
+
+    /// Layers left to right, for paths: `layer[v]` is node `v`'s position
+    /// along its path (or its distance from the nearest of several seeds),
+    /// [`ursa_core::algo::NO_LEVEL`] for a node that has none. Layer `l` is
+    /// a vertical line at `x = l`, and one path alone is a straight line. It
+    /// is `ursa_core::algo::layout_layers`, done at once like
+    /// [`Self::rings`].
+    pub fn layers(graph: &Graph, layer: &[u32], params: LayersParams) -> Result<Self, BadLevels> {
+        Self::fixed(graph, layer, LayoutKind::Layers, |adj| {
+            layout_layers(adj, layer, params)
+        })
+    }
+
+    fn fixed(
+        graph: &Graph,
+        levels: &[u32],
+        kind: LayoutKind,
+        place: impl FnOnce(&ursa_core::topology::UndirectedCsr) -> (Vec<f32>, Vec<f32>),
+    ) -> Result<Self, BadLevels> {
+        let n = graph.n_nodes();
+        if levels.len() != n {
+            return Err(BadLevels {
+                n_nodes: n,
+                got: levels.len(),
+            });
+        }
+        let topology = Arc::clone(graph.topology());
+        let (x, y) = place(topology.undirected());
+        Ok(Self {
+            topology,
+            engine: Engine::Fixed { kind, x, y },
+        })
+    }
+
+    /// Which layout this is. A fixed layout that has grown is a force
+    /// layout from then on.
+    pub fn kind(&self) -> LayoutKind {
+        match &self.engine {
+            Engine::Fixed { kind, .. } => *kind,
+            _ => LayoutKind::Force,
+        }
+    }
+
     /// Grow the layout to `graph`: the graph it had, with the same node
     /// indexes, plus new nodes after them and any new edges.
     ///
@@ -250,7 +447,9 @@ impl LiveLayout {
     /// same bits, on any thread count (`ursa_core::algo::fa2_grow`). A
     /// coarse-to-fine layout can be grown before its schedule is done; it
     /// grows from the positions it has reached, and the rest of that
-    /// schedule is dropped.
+    /// schedule is dropped. Rings and layers grow from their positions too,
+    /// as a force layout (coarse to fine's force law): the new nodes settle
+    /// beside their parents, not on a ring or a layer.
     pub fn grow(&mut self, graph: &Graph, growth: Growth<'_>) -> Result<(), BadGrowth> {
         let had = self.positions().0.len();
         let n = graph.n_nodes();
@@ -279,6 +478,9 @@ impl LiveLayout {
                 let (x, y) = m.positions();
                 // The masses are the grown graph's, set below.
                 Fa2State::from_positions(m.params().fa2, x.to_vec(), y.to_vec(), vec![1.0; had])
+            }
+            Engine::Fixed { x, y, .. } => {
+                Fa2State::from_positions(MultilevelParams::default().fa2, x, y, vec![1.0; had])
             }
         };
         self.topology = Arc::clone(graph.topology());
@@ -311,6 +513,7 @@ impl LiveLayout {
                 state.step(adj, iterations);
                 *run += iterations;
             }
+            Engine::Fixed { .. } => {}
         }
     }
 
@@ -321,33 +524,37 @@ impl LiveLayout {
             Engine::Flat(s) => s.iterations(),
             Engine::Multilevel(s) => s.work_done().round() as u32,
             Engine::Warm { run, .. } => *run,
+            Engine::Fixed { .. } => 0,
         }
     }
 
     /// The work of the whole schedule, in iterations of the whole graph, for
     /// coarse to fine; `None` for flat, which runs for as long as it is
-    /// stepped.
+    /// stepped; 0 for rings and layers.
     pub fn total(&self) -> Option<u32> {
         match &self.engine {
             Engine::Flat(_) => None,
             Engine::Multilevel(s) => Some(s.total_work().round() as u32),
             Engine::Warm { total, .. } => Some(*total),
+            Engine::Fixed { .. } => Some(0),
         }
     }
 
-    /// Whether coarse to fine has run its schedule (never, for flat).
+    /// Whether the layout has run its schedule: never, for flat; from the
+    /// start, for rings and layers.
     pub fn is_done(&self) -> bool {
         match &self.engine {
             Engine::Flat(_) => false,
             Engine::Multilevel(s) => s.is_done(),
             Engine::Warm { run, total, .. } => run >= total,
+            Engine::Fixed { .. } => true,
         }
     }
 
     /// The level being laid out: 0 is the graph itself (always, for flat).
     pub fn level(&self) -> usize {
         match &self.engine {
-            Engine::Flat(_) | Engine::Warm { .. } => 0,
+            Engine::Flat(_) | Engine::Warm { .. } | Engine::Fixed { .. } => 0,
             Engine::Multilevel(s) => s.level(),
         }
     }
@@ -356,7 +563,7 @@ impl LiveLayout {
     /// graph itself (1, for flat).
     pub fn levels(&self) -> usize {
         match &self.engine {
-            Engine::Flat(_) | Engine::Warm { .. } => 1,
+            Engine::Flat(_) | Engine::Warm { .. } | Engine::Fixed { .. } => 1,
             Engine::Multilevel(s) => s.coarse_levels() + 1,
         }
     }
@@ -366,6 +573,7 @@ impl LiveLayout {
         match &self.engine {
             Engine::Flat(s) | Engine::Warm { state: s, .. } => s.positions(),
             Engine::Multilevel(s) => s.positions(),
+            Engine::Fixed { x, y, .. } => (x, y),
         }
     }
 }
@@ -477,33 +685,46 @@ impl NodeStyle {
     /// capped at 12.
     pub fn by_degree(degrees: &[u32]) -> Self {
         Self {
-            radius: degrees
-                .iter()
-                .map(|&d| (1.5 + (d as f32).sqrt()).min(12.0))
-                .collect(),
+            radius: degrees.iter().map(|&d| Self::degree_radius(d)).collect(),
             color: vec![NODE_COLOR; degrees.len()],
         }
+    }
+
+    /// The radius [`NodeStyle::by_degree`] gives a node of degree `d`.
+    pub fn degree_radius(d: u32) -> f32 {
+        (1.5 + (d as f32).sqrt()).min(12.0)
     }
 
     /// Radii from a numeric column (`pagerank`, say): its range mapped to
     /// `min_r..max_r` pixels by square root, so area tracks value. Values that
     /// are not finite get `min_r`.
     pub fn sizes_from(values: &[f32], min_r: f32, max_r: f32) -> Vec<f32> {
-        let finite = values.iter().copied().filter(|v| v.is_finite());
-        let (lo, hi) = finite.fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| {
-            (a.min(v), b.max(v))
-        });
+        let range = Self::size_range(values.iter().copied());
         values
             .iter()
-            .map(|&v| {
-                // No spread (or nothing finite): every node the same size.
-                if !v.is_finite() || hi <= lo || !hi.is_finite() {
-                    return min_r;
-                }
-                let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0).sqrt();
-                min_r + t * (max_r - min_r)
-            })
+            .map(|&v| Self::size_from(v, range, min_r, max_r))
             .collect()
+    }
+
+    /// The least and the greatest of the finite `values`: the range
+    /// [`NodeStyle::sizes_from`] maps to radii. With nothing finite, it is
+    /// `(inf, -inf)`.
+    pub fn size_range(values: impl IntoIterator<Item = f32>) -> (f32, f32) {
+        let finite = values.into_iter().filter(|v| v.is_finite());
+        finite.fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| {
+            (a.min(v), b.max(v))
+        })
+    }
+
+    /// The radius [`NodeStyle::sizes_from`] gives the value `v` of a column
+    /// whose range is `(lo, hi)`.
+    pub fn size_from(v: f32, (lo, hi): (f32, f32), min_r: f32, max_r: f32) -> f32 {
+        // No spread (or nothing finite): every node the same size.
+        if !v.is_finite() || hi <= lo || !hi.is_finite() {
+            return min_r;
+        }
+        let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0).sqrt();
+        min_r + t * (max_r - min_r)
     }
 
     /// Colours from categories (`louvain`'s community, say): category `c` gets
@@ -529,6 +750,10 @@ pub const PALETTE: [u32; 8] = [
 pub const DARK_PALETTE: [u32; 8] = [
     0x3987e5ff, 0xd95926ff, 0x199e70ff, 0xc98500ff, 0xd55181ff, 0x0ca30cff, 0x9085e9ff, 0xe66767ff,
 ];
+
+/// The category of a node that has none (a null in the column it is
+/// coloured by): drawn in the theme's node colour.
+pub const NO_CATEGORY: u32 = u32::MAX;
 
 /// The colours a view draws with, each `0xRRGGBBAA`: the background, the
 /// edges' ink (their opacity is [`crate::render::Renderer::edge_alpha`]
@@ -579,13 +804,16 @@ impl Theme {
 
     /// Category colours with this theme's palette.
     pub fn colors(&self, categories: &[u32]) -> Vec<u32> {
-        if self.palette.is_empty() {
-            return vec![self.node; categories.len()];
+        categories.iter().map(|&c| self.color(c)).collect()
+    }
+
+    /// Category `c`'s colour: `palette[c % palette.len()]`, or the node
+    /// colour for [`NO_CATEGORY`] (and with an empty palette).
+    pub fn color(&self, c: u32) -> u32 {
+        if c == NO_CATEGORY || self.palette.is_empty() {
+            return self.node;
         }
-        categories
-            .iter()
-            .map(|&c| self.palette[c as usize % self.palette.len()])
-            .collect()
+        self.palette[c as usize % self.palette.len()]
     }
 }
 
@@ -643,6 +871,31 @@ mod tests {
     }
 
     #[test]
+    fn a_graph_grows_and_shrinks_at_its_end() {
+        let mut graph = Graph::new(3, vec![0, 1], vec![1, 2]).unwrap();
+        assert_eq!(graph.degrees(), [1, 2, 1]);
+        // Two more nodes, and three more edges.
+        graph.append(2, &[2, 3, 0], &[3, 4, 4]).unwrap();
+        assert_eq!((graph.n_nodes(), graph.n_edges()), (5, 5));
+        assert_eq!(graph.line_indices()[4..], [2, 3, 3, 4, 0, 4]);
+        // The adjacency is the grown graph's, when next asked for.
+        assert_eq!(graph.degrees(), [2, 2, 2, 2, 2]);
+        assert_eq!(graph.topology().n_nodes(), 5);
+
+        // An edge that names no node changes nothing, and says which.
+        let bad = graph.append(1, &[5, 0], &[0, 6]).unwrap_err();
+        assert_eq!((bad.edge, bad.node, bad.n_nodes), (6, 6, 6));
+        assert_eq!((graph.n_nodes(), graph.n_edges()), (5, 5));
+        // Nor does taking off a node an edge that stays still names.
+        assert!(graph.truncate(3, 3).is_err());
+        assert_eq!((graph.n_nodes(), graph.n_edges()), (5, 5));
+
+        graph.truncate(3, 2).unwrap();
+        assert_eq!((graph.n_nodes(), graph.n_edges()), (3, 2));
+        assert_eq!(graph.degrees(), [1, 2, 1]);
+    }
+
+    #[test]
     fn a_graph_checks_its_edges() {
         let err = Graph::new(2, vec![0, 1], vec![1, 2]).unwrap_err();
         assert_eq!(
@@ -668,6 +921,52 @@ mod tests {
         let (x, y) = live.positions();
         let (ex, ey) = state.positions();
         assert_eq!((x, y), (ex, ey));
+    }
+
+    #[test]
+    fn rings_and_layers_are_done_at_once_and_grow() {
+        // A seed, two neighbours and one node two hops out.
+        let g = Graph::new(4, vec![0, 0, 1], vec![1, 2, 3]).unwrap();
+        let level = [0, 1, 1, 2];
+        let rings = LiveLayout::rings(&g, &level, RingsParams::default()).unwrap();
+        assert_eq!(rings.kind(), LayoutKind::Rings);
+        assert!(rings.is_done());
+        assert_eq!((rings.iterations(), rings.total()), (0, Some(0)));
+        assert_eq!((rings.level(), rings.levels()), (0, 1));
+        let (ex, ey) = layout_rings(g.topology().undirected(), &level, RingsParams::default());
+        assert_eq!(rings.positions(), (&ex[..], &ey[..]));
+        let (x, y) = rings.positions();
+        for v in 0..4 {
+            assert!((x[v].hypot(y[v]) - level[v] as f32).abs() < 1e-5);
+        }
+
+        let mut layers = LiveLayout::layers(&g, &level, LayersParams::default()).unwrap();
+        assert_eq!(layers.kind().name(), "layers");
+        assert!(layers.is_done());
+        let before = (layers.positions().0.to_vec(), layers.positions().1.to_vec());
+        assert_eq!(before.0, vec![-1.0, 0.0, 0.0, 1.0]);
+        // Stepping a fixed layout does nothing.
+        layers.step(50);
+        assert_eq!(layers.positions(), (&before.0[..], &before.1[..]));
+
+        // One level too few.
+        let err = LiveLayout::rings(&g, &level[..3], RingsParams::default()).unwrap_err();
+        assert_eq!(err.to_string(), "expected one level per node (4); got 3");
+
+        // A fixed layout grows as any other: node 3 gains a neighbour, which
+        // starts beside it, and the layout is a force layout from then on.
+        let grown = Graph::new(5, vec![0, 0, 1, 3], vec![1, 2, 3, 4]).unwrap();
+        layers
+            .grow(&grown, Growth::default())
+            .expect("a fixed layout grows");
+        assert_eq!(layers.kind(), LayoutKind::Force);
+        assert!(!layers.is_done());
+        while !layers.is_done() {
+            layers.step(10);
+        }
+        let (x, y) = layers.positions();
+        assert_eq!(x.len(), 5);
+        assert!(x.iter().chain(y).all(|v| v.is_finite()));
     }
 
     #[test]
