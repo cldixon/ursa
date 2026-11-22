@@ -759,6 +759,12 @@ def scan_cases(tmp: Path) -> dict:
     pq.write_table(EDGES, tmp / "e.parquet")
     pq.write_table(NODES, tmp / "n.parquet")
     (tmp / "bad.parquet").write_bytes(b"not parquet at all")
+    # A footer that claims more metadata than the file holds: the parquet
+    # crate subtracted with overflow (#332).
+    (tmp / "short.parquet").write_bytes(b"PAR1PAR1")
+    (tmp / "truncated.parquet").write_bytes(
+        b"PAR1" + bytes(16) + (1000).to_bytes(4, "little") + b"PAR1"
+    )
     (tmp / "bad.csv").write_text('s,d\n1,2\n"x')
     pq.write_table(EDGES.set_column(2, "w", pa.array([1, 2, 3, 4])), tmp / "e_int.parquet")
     p = lambda name: str(tmp / name)  # noqa: E731
@@ -833,7 +839,20 @@ def scan_cases(tmp: Path) -> dict:
         "corrupt": (
             lambda: ur.scan_edges(p("bad.parquet"), src="s", dst="d"),
             ur.ComputeError,
-            f"scan_edges('{p('bad.parquet')}'): the file is not valid Parquet (corrupt footer)",
+            f"scan_edges('{p('bad.parquet')}'): the file is not valid Parquet (it does not end "
+            "with the Parquet magic number PAR1)",
+        ),
+        "too_short": (
+            lambda: ur.scan_edges(p("short.parquet"), src="s", dst="d"),
+            ur.ComputeError,
+            f"scan_edges('{p('short.parquet')}'): the file is not valid Parquet (it is 8 bytes, "
+            "and a Parquet file is at least 12)",
+        ),
+        "truncated": (
+            lambda: ur.scan_nodes(p("truncated.parquet"), id="id"),
+            ur.ComputeError,
+            f"scan_nodes('{p('truncated.parquet')}'): the file is not valid Parquet (its footer "
+            "says the metadata is 1000 bytes, but the file is 28 bytes; it may be truncated)",
         ),
         "csv": (
             lambda: ur.scan_edges(p("bad.csv"), src="s", dst="d"),

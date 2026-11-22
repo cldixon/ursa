@@ -1289,6 +1289,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **A truncated or fake `.parquet` file is an error, not a crash** (#332).
+  A file whose footer claims more metadata than the file holds (a
+  truncated download, a file still being written, `PAR1PAR1`) made the
+  parquet crate subtract with overflow: a panic in a debug build, a garbage
+  read in a release build. Ursa now checks each Parquet file's ends before
+  the parquet crate reads it (at least 12 bytes, `PAR1` at both ends, a
+  metadata length that fits) and names the file: `cannot read 'x.parquet':
+  it is not a valid Parquet file: it is 8 bytes, and a Parquet file is at
+  least 12`. It covers `FROM 'x.parquet'`, globs, `read_parquet`, `CREATE
+  EXTERNAL TABLE … STORED AS PARQUET`, graphs over them, and the Python
+  scans (`scan_edges('x.parquet')`: `the file is not valid Parquet (…)`),
+  in the CLI, Python and the browser alike. arrow-rs fixed the overflow in
+  parquet 60; Ursa is on 59 until DataFusion moves.
 - **SQL: `DESCRIBE FROM t` lists the columns** (#417). It returned a table
   of no rows, for a table or a file (`DESCRIBE FROM 'edges.csv'`): the
   FROM-first rewrite did not run under `DESCRIBE`, so the statement described
