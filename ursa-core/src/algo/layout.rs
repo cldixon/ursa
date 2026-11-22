@@ -132,6 +132,13 @@ impl Default for Fa2Params {
     }
 }
 
+/// Where [`Fa2State::new`] starts the nodes of a graph of `n` nodes, `x` and
+/// `y`: the seeded positions depend on the node count and the parameters,
+/// not on the edges, so a caller that only draws them needs no adjacency.
+pub fn fa2_seed_positions(n: usize, params: &Fa2Params) -> Positions {
+    seed_positions(n, params.k.max(1e-4), params.seed.unwrap_or(DEFAULT_SEED))
+}
+
 /// Deterministic initial placement on a phyllotactic spiral, jittered by `seed`.
 ///
 /// A spiral rather than uniform random: it starts the nodes evenly spread with no

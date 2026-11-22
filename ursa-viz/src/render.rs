@@ -42,9 +42,9 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 use crate::highlight::{DIM_LEVEL, HIGHLIGHT_WIDTH, MARK_REACH, MIN_FRONT_RADIUS};
+use crate::pace::{ready, Pace};
 use crate::scene::{rgba, Camera, NodeStyle, Theme};
 
 /// The camera and the colours, as the shaders read them.
@@ -412,23 +412,29 @@ pub fn default_edge_alpha(n_nodes: usize, n_edges: usize) -> f32 {
     (0.6 / (1.0 + per_node * (n_nodes as f32).log10().max(1.0) / 20.0)).clamp(0.03, 0.6)
 }
 
+/// A buffer of `size` bytes that starts with `contents`; the rest is zeros.
 fn buffer(
     device: &wgpu::Device,
     label: &str,
     contents: &[u8],
+    size: u64,
     usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
-    // A zero-sized buffer cannot be bound; keep four bytes for an empty graph.
-    let contents: &[u8] = if contents.is_empty() {
-        &[0; 4]
-    } else {
-        contents
-    };
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    debug_assert!(contents.len() as u64 <= size && size > 0);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        contents,
+        size,
         usage,
-    })
+        mapped_at_creation: !contents.is_empty(),
+    });
+    if !contents.is_empty() {
+        buffer
+            .slice(..contents.len() as u64)
+            .get_mapped_range_mut()
+            .copy_from_slice(contents);
+        buffer.unmap();
+    }
+    buffer
 }
 
 /// A node's buffers (`x`, `y`, `radius`, `color`, `flags`) are four bytes a
@@ -549,20 +555,50 @@ impl Instances {
 
 impl Renderer {
     /// Pipelines for drawing into textures of `format`, and buffers for a
-    /// graph whose edges are `line_indices` (`src, dst` per edge).
+    /// graph of these nodes and `n_edges` edges, with room for `room` nodes
+    /// and edges if that is more (a view that takes deltas starts with
+    /// some, so that its first delta does not grow the buffers).
+    ///
+    /// The nodes are uploaded; the edges are not: the caller writes them
+    /// with [`Renderer::write_edges`], a run at a time, so a million edges
+    /// are never held a second time as one list of indexes. Until then the
+    /// edge buffer is zeros, which draw nothing.
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         x: &[f32],
         y: &[f32],
         style: &NodeStyle,
-        line_indices: &[u32],
+        n_edges: usize,
+        room: (usize, usize),
+    ) -> Self {
+        let mut pace = Pace::never();
+        ready(Self::new_paced(
+            device, format, x, y, style, n_edges, room, &mut pace,
+        ))
+    }
+
+    /// [`Renderer::new`], giving the event loop a turn as `pace` says
+    /// between compiling the shader and linking each pipeline, which is
+    /// most of what a renderer costs to make.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_paced(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        x: &[f32],
+        y: &[f32],
+        style: &NodeStyle,
+        n_edges: usize,
+        room: (usize, usize),
+        pace: &mut Pace,
     ) -> Self {
         let n_nodes = x.len();
+        pace.breathe().await;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ursa-viz"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source())),
         });
+        pace.breathe().await;
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -659,6 +695,7 @@ impl Renderer {
         let triangles = wgpu::PrimitiveTopology::TriangleList;
         let edge_buffers = [per(&floats[0], vertex), per(&floats[1], vertex)];
         let edges = pipeline("edges", "edge_vs", "edge_fs", lines, &edge_buffers);
+        pace.breathe().await;
         let hiding_edge_buffers = [
             per(&floats[0], vertex),
             per(&floats[1], vertex),
@@ -671,6 +708,7 @@ impl Renderer {
             lines,
             &hiding_edge_buffers,
         );
+        pace.breathe().await;
         let node_buffers = [
             per(&floats[0], instance),
             per(&floats[1], instance),
@@ -679,6 +717,7 @@ impl Renderer {
             per(&node_flags, instance),
         ];
         let nodes = pipeline("nodes", "node_vs", "node_fs", triangles, &node_buffers);
+        pace.breathe().await;
         // The same attributes, from one buffer of `FrontNode`s.
         let front_attr = |format, offset, shader_location| wgpu::VertexAttribute {
             format,
@@ -704,6 +743,7 @@ impl Renderer {
             triangles,
             &front_buffers,
         );
+        pace.breathe().await;
         let wide_attrs = [
             wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Float32x2,
@@ -728,12 +768,26 @@ impl Renderer {
             triangles,
             &wide_buffers,
         );
-        let usage = NODE_USAGE;
+        pace.breathe().await;
         let theme = Theme::light();
+        // An empty graph's buffers hold room for one node and one edge: a
+        // zero-sized buffer cannot be bound.
+        let node_capacity = n_nodes.max(room.0).max(1);
+        let edge_capacity = n_edges.max(room.1);
+        let node = |label: &str, contents: &[u8]| {
+            buffer(
+                device,
+                label,
+                contents,
+                node_capacity as u64 * NODE_STRIDE,
+                NODE_USAGE,
+            )
+        };
         let lines = buffer(
             device,
             "edges",
-            bytemuck::cast_slice(line_indices),
+            &[],
+            edge_capacity.max(1) as u64 * EDGE_STRIDE,
             EDGE_USAGE,
         );
         Self {
@@ -744,19 +798,18 @@ impl Renderer {
             wide_edges,
             uniforms,
             bind_group,
-            x: buffer(device, "x", bytemuck::cast_slice(x), usage),
-            y: buffer(device, "y", bytemuck::cast_slice(y), usage),
-            radius: buffer(device, "radius", bytemuck::cast_slice(&style.radius), usage),
-            color: buffer(device, "color", &rgba_bytes(&style.color), usage),
-            flags: buffer(device, "flags", &vec![0; 4 * n_nodes], usage),
-            edge_capacity: (lines.size() / EDGE_STRIDE) as u32,
+            x: node("x", bytemuck::cast_slice(x)),
+            y: node("y", bytemuck::cast_slice(y)),
+            radius: node("radius", bytemuck::cast_slice(&style.radius)),
+            color: node("color", &rgba_bytes(&style.color)),
+            flags: node("flags", &[]),
+            edge_capacity: edge_capacity as u32,
             lines,
             wide: Instances::new(device, "highlighted edges", WIDE_STRIDE),
             front: Instances::new(device, "nodes in front", FRONT_STRIDE),
             n_nodes: n_nodes as u32,
-            n_indices: line_indices.len() as u32,
-            // An empty graph's buffers hold four bytes: room for one node.
-            node_capacity: n_nodes.max(1) as u32,
+            n_indices: 2 * n_edges as u32,
+            node_capacity: node_capacity as u32,
             grows: 0,
             dims_the_rest: false,
             any_hidden: false,
@@ -766,7 +819,7 @@ impl Renderer {
             highlight_color: theme.highlight,
             selection_color: theme.selection,
             pin_color: theme.pin,
-            edge_alpha: default_edge_alpha(n_nodes, line_indices.len() / 2),
+            edge_alpha: default_edge_alpha(n_nodes, n_edges),
             dim_level: DIM_LEVEL,
             highlight_width: HIGHLIGHT_WIDTH,
         }

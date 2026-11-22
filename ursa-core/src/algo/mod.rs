@@ -61,8 +61,8 @@ pub use hop::{
 pub use induced::{induced_edges, InducedEdges};
 pub use label_prop::label_propagation;
 pub use layout::{
-    layout_circle, layout_fa2, layout_fr, layout_random, Fa2Params, Fa2State, LayoutParams,
-    Positions,
+    fa2_seed_positions, layout_circle, layout_fa2, layout_fr, layout_random, Fa2Params, Fa2State,
+    LayoutParams, Positions,
 };
 pub use levels::{layout_layers, layout_rings, LayersParams, RingsParams, NO_LEVEL};
 pub use louvain::{louvain, louvain_weighted};

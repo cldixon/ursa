@@ -142,6 +142,8 @@ impl Scene {
         let (fresh_live, fresh) = LiveResult::new(self.live.result().clone(), &self.theme);
         let d = &self.drawn;
         let n = self.live.result().n_nodes();
+        // Neither a view's making nor its deltas build an adjacency (#426).
+        assert!(!d.graph.has_topology() && !fresh.graph.has_topology());
         assert_eq!(d.graph.n_nodes(), n);
         assert_eq!(d.graph.src(), self.live.result().src());
         assert_eq!(d.graph.dst(), self.live.result().dst());

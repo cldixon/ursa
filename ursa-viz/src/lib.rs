@@ -34,6 +34,8 @@ pub mod interact;
 pub mod live;
 pub mod model;
 #[cfg(feature = "render")]
+pub mod pace;
+#[cfg(feature = "render")]
 pub mod render;
 pub mod scene;
 #[cfg(feature = "render")]
